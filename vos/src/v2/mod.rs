@@ -10,7 +10,6 @@
 //! This is a clean boundary. None of the types in this module accept legacy
 //! `RefinePayload`, `EffectLog`, or continuation encodings.
 
-mod accumulate;
 mod causal;
 mod continuation;
 mod contracts;
@@ -31,10 +30,6 @@ pub(crate) mod wire;
 
 pub use crate::attestation::AttestationPreparationV2;
 
-pub use accumulate::{
-    AccumulateError, AccumulationOutcome, AccumulationValidator, AllowPublic, InMemoryServiceState,
-    PublishedEffects,
-};
 pub use continuation::ContinuationSnapshotV2;
 pub use contracts::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,

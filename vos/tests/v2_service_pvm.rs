@@ -13,19 +13,19 @@ use vos::network::RaftRpcHandler;
 use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, WorkerConfig};
 use vos::v2::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
-    AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AllowPublic,
-    AttestationDeliveryV2, AttestationVerificationV2, AuthorizationEvidenceV2, BlobRefV2, CallId,
+    AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AttestationDeliveryV2,
+    AttestationVerificationV2, AuthorizationEvidenceV2, BlobRefV2, CallId,
     CommittedAccumulateBatchV2, CommittedAccumulateEntryV2, CommittedAccumulateLogV2,
     CommittedImageStoreV2, CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2, GasAccountingV2,
-    Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InMemoryServiceState, InvocationId,
-    JamServiceV2, LocalJamStoreV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2,
-    MethodPolicyV2, NoRefineProtocolHostV2, Origin, ProducerId, ProgramId, ProofCommitmentV2,
+    Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId, JamServiceV2,
+    LocalJamStoreV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
+    NoRefineProtocolHostV2, Origin, ProducerId, ProgramId, ProofCommitmentV2,
     ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
     RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RootServiceId,
     ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
-    ServicePvmV2, SpaceRoleCredentialV2, SubjectId, TransitionV2, V2Wire, WorkEnvelopeV2,
-    WorkflowOperationV2, public_policy_hash, space_role_policy_hash,
+    ServicePvmV2, SpaceRoleCredentialV2, StateKeyV2, SubjectId, TransitionV2, V2Wire,
+    WorkEnvelopeV2, WorkflowOperationV2, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     AttestedMethod, Decode, Encode, StateCommitmentV3,
@@ -2126,26 +2126,78 @@ fn yielding_actor_restores_exactly_after_restart() {
     let actor_program = ProgramId::of_pvm(&actor);
     let initial_state = Vec::new();
     let initial_state_ref = BlobRefV2::of_bytes(&initial_state);
-    let mut first_work = work(actor_program, initial_state_ref.clone());
+    let seed_work = work(actor_program, initial_state_ref.clone());
+    let mut host = LocalJamStoreV2::default();
+    assert_eq!(host.import_blob(initial_state), initial_state_ref);
+    assert_eq!(host.import_program(actor), actor_program);
+    let mut committed_service = JamServiceV2::new(
+        service_pvm.clone(),
+        ProgramId::of_pvm(&service_pvm),
+        NoRefineProtocolHostV2,
+        host,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        service: seed_work.service.clone(),
+        consistency: ConsistencyModeV2::Local,
+        actors: vec![ActorGenesisV2 {
+            actor: seed_work.target,
+            name: "root".into(),
+            parent: None,
+            producer: ProducerId([51; 32]),
+            program: actor_program,
+            initial_state: initial_state_ref,
+            crdt: false,
+            methods: vec![MethodPolicyV2 {
+                method: "ping".into(),
+                schema: Hash([50; 32]),
+                policy: public_policy_hash(),
+                public: true,
+                attested: false,
+            }],
+        }],
+        external_actors: vec![],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([52; 32]),
+            authenticator: vec![53],
+        },
+    });
+    let AccumulateRequestV2::Install(genesis) = &install else {
+        unreachable!()
+    };
+    committed_service
+        .accumulate_host_mut()
+        .allow_install(genesis);
+    assert!(matches!(
+        committed_service.accumulate(&install).unwrap().result,
+        AccumulationResultV2::Installed(_)
+    ));
+
     let mut ping = vec![vos::value::TAG_DYNAMIC];
     ping.extend_from_slice(&Msg::new("ping").encode());
-    first_work.method = "ping".into();
-    first_work.arguments = ping;
-    let mut committed =
-        InMemoryServiceState::new(first_work.service.clone(), ConsistencyModeV2::Local);
-    committed.install_actor(first_work.target, actor_program);
-    committed.make_blob_available(initial_state_ref.hash);
-    first_work.base = committed.current_base();
-    let first_imports = RefineImportsV2 {
-        programs: vec![ImportedProgramV2 {
-            program: actor_program,
-            pvm: actor.clone(),
-        }],
-        blobs: vec![ImportedBlobV2 {
-            reference: initial_state_ref,
-            bytes: initial_state,
-        }],
-    };
+    let prepared = LocalWorkSchedulerV2::prepare(
+        committed_service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: seed_work.invocation,
+            workflow_step: 0,
+            logical_timeslot: 1,
+            target: seed_work.target,
+            method: "ping".into(),
+            arguments: ping,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .expect("guest-installed actor can be scheduled");
+    let first_work = prepared.work;
+    let first_imports = prepared.imports;
 
     let first_output = service
         .refine_actor_tree_with_backend(
@@ -2211,52 +2263,62 @@ fn yielding_actor_restores_exactly_after_restart() {
         .and_then(|write| write.value.clone())
         .expect("checkpoint commits the mutation before await");
     assert_eq!(u32::decode(&checkpoint_state), 1);
-    assert_eq!(
-        committed.row(first_work.target, vos::lifecycle::STATE_KEY_BYTES),
-        None
-    );
-    assert_eq!(committed.continuation(first_work.target), None);
     for artifact in &first_output.exported_blobs {
-        committed.make_blob_available(artifact.reference.hash);
+        assert_eq!(
+            committed_service
+                .accumulate_host_mut()
+                .import_blob(artifact.bytes.clone()),
+            artifact.reference
+        );
     }
-    let checkpoint_outcome = committed
-        .accumulate(&first_work, &first, &AllowPublic)
-        .unwrap();
-    assert!(checkpoint_outcome.published.reply.is_none());
+    let checkpoint = committed_service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: first_work.clone(),
+            transition: first.clone(),
+            provided_blobs: vec![],
+        }))
+        .expect("physical guest Accumulate commits the checkpoint");
+    assert!(matches!(
+        checkpoint.result,
+        AccumulationResultV2::Accepted {
+            published: PublishedEffectsV2 { reply: None, .. },
+            duplicate: false,
+            ..
+        }
+    ));
+
+    // Simulate a process restart after guest Accumulate committed slice 0.
+    // The read-only scheduler reconstructs the next work solely from the
+    // canonical committed service image.
+    let persisted = committed_service.accumulate_host().snapshot_bytes();
+    let restarted_store = LocalJamStoreV2::from_snapshot_bytes(&persisted)
+        .expect("canonical committed image survives process restart");
+    let mut committed_service = JamServiceV2::new(
+        service_pvm.clone(),
+        ProgramId::of_pvm(&service_pvm),
+        NoRefineProtocolHostV2,
+        restarted_store,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let resumed_prepared = LocalWorkSchedulerV2::prepare_resume(
+        committed_service.accumulate_host(),
+        first_work.invocation,
+        2,
+        None,
+    )
+    .expect("committed checkpoint reconstructs exact resume work");
+    let resumed_work = resumed_prepared.work;
+    let resumed_imports = resumed_prepared.imports;
     assert_eq!(
-        committed.row(first_work.target, vos::lifecycle::STATE_KEY_BYTES),
-        Some(checkpoint_state.as_slice())
+        resumed_work.imported_actors[0].state,
+        BlobRefV2::of_bytes(&checkpoint_state)
     );
     assert_eq!(
-        committed.continuation(first_work.target),
+        resumed_work.imported_actors[0].continuation.as_ref(),
         Some(&first_continuation)
     );
-
-    // Simulate a process restart after Accumulate committed slice 0. Only
-    // canonical programs, the committed state, and the continuation blob are
-    // supplied to the next Refine invocation.
-    let checkpoint_state_ref = BlobRefV2::of_bytes(&checkpoint_state);
-    committed.make_blob_available(checkpoint_state_ref.hash);
-    let mut resumed_work = first_work.clone();
-    resumed_work.workflow_step = 1;
-    resumed_work.base = committed.current_base();
-    resumed_work.imported_actors[0].state = checkpoint_state_ref.clone();
-    resumed_work.imported_actors[0].continuation = Some(first_continuation.clone());
-    let mut resumed_blobs = vec![
-        ImportedBlobV2 {
-            reference: checkpoint_state_ref,
-            bytes: checkpoint_state,
-        },
-        first_output.exported_blobs[0].clone(),
-    ];
-    resumed_blobs.sort_by_key(|blob| blob.reference.hash);
-    let resumed_imports = RefineImportsV2 {
-        programs: vec![ImportedProgramV2 {
-            program: actor_program,
-            pvm: actor,
-        }],
-        blobs: resumed_blobs,
-    };
 
     let resumed_output = service
         .refine_actor_tree_with_backend(
@@ -2320,18 +2382,69 @@ fn yielding_actor_restores_exactly_after_restart() {
         1,
         "code before .await must not execute again"
     );
-    assert_eq!(
-        committed.continuation(first_work.target),
-        Some(&first_continuation),
-        "Refine cannot delete durable continuation state"
-    );
-    let completed = committed
-        .accumulate(&resumed_work, &resumed, &AllowPublic)
+    let header = committed_service
+        .accumulate_host()
+        .header()
+        .unwrap()
         .unwrap();
-    assert_eq!(completed.published.reply, resumed.reply);
-    assert_eq!(committed.continuation(first_work.target), None);
+    let continuation_bytes = committed_service
+        .accumulate_host()
+        .state_row(
+            header.service_root,
+            &StateKeyV2::Continuation(first_work.target),
+        )
+        .unwrap()
+        .expect("Refine cannot delete durable continuation state");
     assert_eq!(
-        committed.row(first_work.target, vos::lifecycle::STATE_KEY_BYTES),
+        BlobRefV2::decode(&continuation_bytes).unwrap(),
+        first_continuation
+    );
+    let completed = committed_service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: resumed_work,
+            transition: resumed.clone(),
+            provided_blobs: vec![],
+        }))
+        .expect("physical guest Accumulate commits completion");
+    let AccumulationResultV2::Accepted {
+        published,
+        duplicate: false,
+        ..
+    } = completed.result
+    else {
+        panic!("resumed transition was rejected")
+    };
+    assert_eq!(published.reply, resumed.reply);
+
+    let header = committed_service
+        .accumulate_host()
+        .header()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        committed_service
+            .accumulate_host()
+            .state_row(
+                header.service_root,
+                &StateKeyV2::Continuation(first_work.target),
+            )
+            .unwrap(),
+        None
+    );
+    let state_reference = committed_service
+        .accumulate_host()
+        .state_row(
+            header.service_root,
+            &StateKeyV2::ActorRow {
+                actor: first_work.target,
+                key: vos::lifecycle::STATE_KEY_BYTES.to_vec(),
+            },
+        )
+        .unwrap()
+        .and_then(|bytes| BlobRefV2::decode(&bytes).ok())
+        .expect("completed actor state remains guest-owned");
+    assert_eq!(
+        committed_service.accumulate_host().blob(&state_reference),
         Some(resumed_state.as_slice())
     );
 }
