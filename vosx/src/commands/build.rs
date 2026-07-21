@@ -14,7 +14,7 @@ pub struct Args {
     pub name: Option<String>,
     pub version: String,
     pub out_dir: PathBuf,
-    pub service_program_id: String,
+    pub service_pvm: PathBuf,
     pub interfaces: Option<PathBuf>,
     pub role_policies: Option<PathBuf>,
     pub schemas: Option<PathBuf>,
@@ -77,7 +77,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         None => generated_role_policies,
     };
     let source_map = read_optional(args.source_map.as_deref())?;
-    let service_program = ProgramId(parse_hash(&args.service_program_id)?);
+    let service_pvm = std::fs::read(&args.service_pvm)
+        .with_context(|| format!("read pinned service PVM {}", args.service_pvm.display()))?;
+    let service_program = service_program_id(&service_pvm)?;
     let actor_program = ProgramId::of_pvm(&actor_pvm);
 
     let keypair = crate::identity::load_or_create()?;
@@ -207,12 +209,11 @@ fn read_optional(path: Option<&Path>) -> anyhow::Result<Vec<u8>> {
         .map_err(Into::into)
 }
 
-fn parse_hash(value: &str) -> anyhow::Result<[u8; 32]> {
-    let bytes = hex::decode(value.trim_start_matches("0x"))
-        .map_err(|_| anyhow!("--service-program-id must be 64 hex characters"))?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow!("--service-program-id must be exactly 32 bytes"))
+fn service_program_id(bytes: &[u8]) -> anyhow::Result<ProgramId> {
+    if bytes.is_empty() || javm::program::parse_blob(bytes).is_none() {
+        bail!("--service-pvm must contain one canonical JAR program")
+    }
+    Ok(ProgramId::of_pvm(bytes))
 }
 
 #[cfg(test)]
@@ -220,10 +221,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn service_program_id_is_exact() {
-        assert_eq!(parse_hash(&"ab".repeat(32)).unwrap(), [0xab; 32]);
-        assert!(parse_hash("ab").is_err());
-        assert!(parse_hash("zz").is_err());
+    fn service_program_is_derived_from_valid_canonical_bytes() {
+        let mut assembler = grey_transpiler::assembler::Assembler::new();
+        assembler
+            .load_imm_64(grey_transpiler::assembler::Reg::A0, 0)
+            .ecalli(0);
+        let pvm = assembler.build();
+        assert_eq!(service_program_id(&pvm).unwrap(), ProgramId::of_pvm(&pvm));
+        assert!(service_program_id(&[]).is_err());
+        assert!(service_program_id(b"not a JAR program").is_err());
     }
 
     #[test]
