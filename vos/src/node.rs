@@ -4479,6 +4479,7 @@ where
             causal_parent: None,
             parent_call: None,
             awaited_reply: None,
+            awaited_timeout: None,
             imported_blobs: vec![],
             proof_requested: ingress.proof_requested,
         };

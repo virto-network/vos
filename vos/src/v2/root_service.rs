@@ -323,6 +323,7 @@ fn request_from_direct_ingress(ingress: DirectIngressV2) -> LocalWorkRequestV2 {
         causal_parent: None,
         parent_call: None,
         awaited_reply: None,
+        awaited_timeout: None,
         imported_blobs: ingress.imported_blobs,
         proof_requested: ingress.proof_requested,
     }
@@ -2096,6 +2097,7 @@ mod tests {
             causal_parent: Some(caller_invocation),
             parent_call: Some(call),
             awaited_reply: None,
+            awaited_timeout: None,
             consistency: ConsistencyModeV2::Local,
             base: super::super::ConsistencyBaseV2::Linear {
                 revision: 1,

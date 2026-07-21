@@ -389,6 +389,11 @@ pub struct WorkEnvelopeV2 {
     /// cross-root result. The reply is injected at the captured protocol-call
     /// boundary; it is never treated as a fresh handler argument.
     pub awaited_reply: Option<AccumulatedReplyV2>,
+    /// Present only when guest Accumulate has atomically expired the pending
+    /// cross-root outbox record at a consensus logical timeslot. Like a reply,
+    /// this is injected at the captured protocol-call boundary rather than
+    /// replaying the actor handler.
+    pub awaited_timeout: Option<AccumulatedTimeoutV2>,
     pub consistency: ConsistencyModeV2,
     pub base: ConsistencyBaseV2,
     /// Maximum causal height among `base` heads. Present only for CRDT work;
@@ -450,6 +455,7 @@ impl WorkEnvelopeV2 {
         let mut checkpoint = self.clone();
         checkpoint.logical_timeslot = 0;
         checkpoint.awaited_reply = None;
+        checkpoint.awaited_timeout = None;
         let empty = BlobRefV2::of_bytes(&[]);
         for actor in &mut checkpoint.imported_actors {
             actor.state = empty.clone();
@@ -565,6 +571,63 @@ pub struct AccumulatedReplyV2 {
     pub reply: ReplyRecordV2,
     pub receipt: AccumulationReceiptV2,
     pub attestation: Option<Box<AttestationDeliveryV2>>,
+}
+
+/// Deterministic result of expiring one durable cross-root call. The deadline
+/// and observation time are JAM logical timeslots, never wall-clock values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallTimeoutV2 {
+    pub call_id: CallId,
+    pub caller_invocation: InvocationId,
+    pub await_ordinal: u64,
+    pub deadline_timeslot: u64,
+    pub expired_at: u64,
+}
+
+impl CallTimeoutV2 {
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(b"vos/call-timeout/v2", &[&self.encode()])
+    }
+}
+
+/// Complete guest-owned request to expire a pending outbox entry. Linear
+/// services bind the exact current revision; CRDT services bind the observed
+/// causal frontier and carry one workflow-only DAG node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallExpirationEnvelopeV2 {
+    pub service: ServiceIdentityV2,
+    pub timeout: CallTimeoutV2,
+    pub base: ConsistencyBaseV2,
+    pub base_causal_height: Option<u64>,
+    pub crdt_change: Option<CrdtChangeV2>,
+}
+
+impl CallExpirationEnvelopeV2 {
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(b"vos/call-expiration/v2", &[&self.encode()])
+    }
+}
+
+/// Receipt-bound timeout admitted by the source service's own Accumulate
+/// path. Carrying the complete expiration input lets Refine and Accumulate
+/// independently verify that the receipt commits to the exact call outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccumulatedTimeoutV2 {
+    pub expiration: CallExpirationEnvelopeV2,
+    pub receipt: AccumulationReceiptV2,
+}
+
+impl AccumulatedTimeoutV2 {
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        if self.receipt.service != self.expiration.service
+            || self.receipt.accepted_transition != self.expiration.commitment()
+            || self.receipt.reply_commitment.is_some()
+            || self.receipt.outbox_commitment.is_some()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
 }
 
 /// Complete committed attestation transport. The proof blob is carried next
@@ -685,6 +748,9 @@ pub enum WorkflowOperationV2 {
     /// The reply receipt itself is an accumulation input, not persistent
     /// workflow state copied into every later DAG node.
     ConsumeOutbox(CallId),
+    /// Causally remove one pending outbox record and retain its deterministic
+    /// logical-timeslot outcome for exact continuation resumption.
+    ExpireCall(CallTimeoutV2),
     Reply(ReplyRecordV2),
     /// Direct caller input admitted before actor execution. CRDT services
     /// carry this as its own causal node so a busy or restarted replica can
@@ -754,6 +820,19 @@ impl CrdtChangeV2 {
         e.fixed(&call.0);
         e.list(heads, |e, head| e.fixed(&head.0));
         ChangeId(Hash::digest(b"vos/crdt-delivery-id/v2", &[&bytes]).0)
+    }
+
+    pub fn derive_expiration_id(
+        service: &ServiceIdentityV2,
+        timeout: &CallTimeoutV2,
+        heads: &[Hash],
+    ) -> ChangeId {
+        let mut bytes = Vec::new();
+        let mut e = Encoder(&mut bytes);
+        encode_service(&mut e, service);
+        e.bytes(&timeout.encode());
+        e.list(heads, |e, head| e.fixed(&head.0));
+        ChangeId(Hash::digest(b"vos/crdt-expiration-id/v2", &[&bytes]).0)
     }
 
     pub fn derive_ingress_id(ingress: &CrdtIngressV2, heads: &[Hash]) -> ChangeId {
@@ -1087,6 +1166,7 @@ impl DirectIngressV2 {
             && work.causal_parent.is_none()
             && work.parent_call.is_none()
             && work.awaited_reply.is_none()
+            && work.awaited_timeout.is_none()
             && self.imported_blobs == work.imported_blobs
             && self.proof_requested == work.proof_requested
     }
@@ -1195,6 +1275,7 @@ pub enum AccumulateRequestV2 {
     Apply(AccumulationEnvelopeV2),
     PrepareAttested(AccumulationEnvelopeV2),
     Deliver(DeliveryEnvelopeV2),
+    ExpireCall(CallExpirationEnvelopeV2),
     SyncCrdt(CrdtSyncEnvelopeV2),
     AcknowledgePublication(PublicationAckV2),
 }
@@ -1311,6 +1392,10 @@ pub enum AccumulationResultV2 {
         duplicate: bool,
     },
     Prepared(AttestationPreparationV2),
+    CallExpired {
+        timeout: AccumulatedTimeoutV2,
+        duplicate: bool,
+    },
     Rejected(AccumulationRejectionV2),
     PublicationAcknowledged {
         input: WorkInputIdV2,
@@ -1443,6 +1528,9 @@ impl V2Wire for WorkEnvelopeV2 {
         e.option(&self.causal_parent, |e, id| e.fixed(&id.0));
         e.option(&self.parent_call, |e, id| e.fixed(&id.0));
         e.option(&self.awaited_reply, |e, reply| e.bytes(&reply.encode()));
+        e.option(&self.awaited_timeout, |e, timeout| {
+            e.bytes(&timeout.encode())
+        });
         e.u8(self.consistency as u8);
         encode_base(&mut e, &self.base);
         e.option(&self.base_causal_height, |e, height| e.u64(*height));
@@ -1469,7 +1557,10 @@ impl V2Wire for WorkEnvelopeV2 {
         let causal_parent = d.option(|d| d.fixed().map(InvocationId))?;
         let parent_call = d.option(|d| d.fixed().map(CallId))?;
         let awaited_reply = d.option(|d| AccumulatedReplyV2::decode(&d.bytes()?))?;
-        if awaited_reply.is_some() && workflow_step == 0 {
+        let awaited_timeout = d.option(|d| AccumulatedTimeoutV2::decode(&d.bytes()?))?;
+        if (awaited_reply.is_some() || awaited_timeout.is_some()) && workflow_step == 0
+            || awaited_reply.is_some() && awaited_timeout.is_some()
+        {
             return Err(DecodeError::NonCanonical);
         }
         let consistency = ConsistencyModeV2::decode(d)?;
@@ -1507,6 +1598,13 @@ impl V2Wire for WorkEnvelopeV2 {
             .and_then(|reply| reply.attestation.as_ref())
             .is_some_and(|attestation| attestation.producer_name.is_empty())
         {
+            return Err(DecodeError::NonCanonical);
+        }
+        if awaited_timeout.as_ref().is_some_and(|timeout| {
+            timeout.expiration.service != service
+                || timeout.expiration.timeout.caller_invocation != invocation
+                || logical_timeslot < timeout.expiration.timeout.expired_at
+        }) {
             return Err(DecodeError::NonCanonical);
         }
         for actor in &imported_actors {
@@ -1550,6 +1648,7 @@ impl V2Wire for WorkEnvelopeV2 {
             causal_parent,
             parent_call,
             awaited_reply,
+            awaited_timeout,
             consistency,
             base,
             base_causal_height,
@@ -2209,6 +2308,95 @@ impl V2Wire for AccumulatedReplyV2 {
     }
 }
 
+impl V2Wire for CallTimeoutV2 {
+    const MAGIC: [u8; 4] = *b"VTO2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.fixed(&self.call_id.0);
+        e.fixed(&self.caller_invocation.0);
+        e.u64(self.await_ordinal);
+        e.u64(self.deadline_timeslot);
+        e.u64(self.expired_at);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            call_id: CallId(d.fixed()?),
+            caller_invocation: InvocationId(d.fixed()?),
+            await_ordinal: d.u64()?,
+            deadline_timeslot: d.u64()?,
+            expired_at: d.u64()?,
+        };
+        if value.call_id != value.caller_invocation.call_id(value.await_ordinal)
+            || value.expired_at < value.deadline_timeslot
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+impl V2Wire for CallExpirationEnvelopeV2 {
+    const MAGIC: [u8; 4] = *b"VCE2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        encode_service(&mut e, &self.service);
+        e.bytes(&self.timeout.encode());
+        encode_base(&mut e, &self.base);
+        e.option(&self.base_causal_height, |e, height| e.u64(*height));
+        e.option(&self.crdt_change, |e, change| e.bytes(&change.encode()));
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            service: decode_service(d)?,
+            timeout: CallTimeoutV2::decode(&d.bytes()?)?,
+            base: decode_base(d)?,
+            base_causal_height: d.option(Decoder::u64)?,
+            crdt_change: d.option(|d| CrdtChangeV2::decode(&d.bytes()?))?,
+        };
+        match (&value.base, value.base_causal_height, &value.crdt_change) {
+            (ConsistencyBaseV2::Linear { .. }, None, None) => {}
+            (ConsistencyBaseV2::Crdt { heads }, Some(height), Some(change))
+                if change.id
+                    == CrdtChangeV2::derive_expiration_id(
+                        &value.service,
+                        &value.timeout,
+                        heads,
+                    )
+                    && change.causal_dependencies == *heads
+                    && height.checked_add(1) == Some(change.causal_height)
+                    && change.operations.is_empty()
+                    && change.materializations.is_empty()
+                    && change.workflow
+                        == [WorkflowOperationV2::ExpireCall(value.timeout.clone())] => {}
+            _ => return Err(DecodeError::NonCanonical),
+        }
+        Ok(value)
+    }
+}
+
+impl V2Wire for AccumulatedTimeoutV2 {
+    const MAGIC: [u8; 4] = *b"VAT2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.bytes(&self.expiration.encode());
+        e.bytes(&self.receipt.encode());
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            expiration: CallExpirationEnvelopeV2::decode(&d.bytes()?)?,
+            receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+}
+
 impl V2Wire for CommittedAttestationPackageV2 {
     const MAGIC: [u8; 4] = *b"VCP2";
 
@@ -2613,6 +2801,10 @@ impl V2Wire for AccumulateRequestV2 {
                 e.u8(3);
                 e.bytes(&envelope.encode());
             }
+            Self::ExpireCall(envelope) => {
+                e.u8(7);
+                e.bytes(&envelope.encode());
+            }
             Self::SyncCrdt(envelope) => {
                 e.u8(4);
                 e.bytes(&envelope.encode());
@@ -2633,6 +2825,9 @@ impl V2Wire for AccumulateRequestV2 {
                 &d.bytes()?,
             )?)),
             3 => Ok(Self::Deliver(DeliveryEnvelopeV2::decode(&d.bytes()?)?)),
+            7 => Ok(Self::ExpireCall(CallExpirationEnvelopeV2::decode(
+                &d.bytes()?,
+            )?)),
             4 => Ok(Self::SyncCrdt(CrdtSyncEnvelopeV2::decode(&d.bytes()?)?)),
             5 => Ok(Self::AcknowledgePublication(PublicationAckV2::decode(
                 &d.bytes()?,
@@ -2650,9 +2845,7 @@ impl V2Wire for PublishedEffectsV2 {
         e.option(&self.reply, encode_reply);
         e.list(&self.outbox, encode_message);
         e.list(&self.exported_blobs, encode_blob_ref);
-        e.option(&self.statement, |e, statement| {
-            e.bytes(&statement.encode())
-        });
+        e.option(&self.statement, |e, statement| e.bytes(&statement.encode()));
         e.option(&self.proof, encode_proof);
     }
 
@@ -2707,6 +2900,11 @@ impl V2Wire for AccumulationResultV2 {
                 e.u8(2);
                 e.bytes(&preparation.encode());
             }
+            Self::CallExpired { timeout, duplicate } => {
+                e.u8(6);
+                e.bytes(&timeout.encode());
+                e.bool(*duplicate);
+            }
             Self::Rejected(rejection) => {
                 e.u8(3);
                 encode_rejection(&mut e, rejection);
@@ -2760,6 +2958,10 @@ impl V2Wire for AccumulationResultV2 {
             2 => Ok(Self::Prepared(AttestationPreparationV2::decode(
                 &d.bytes()?,
             )?)),
+            6 => Ok(Self::CallExpired {
+                timeout: AccumulatedTimeoutV2::decode(&d.bytes()?)?,
+                duplicate: d.bool()?,
+            }),
             3 => Ok(Self::Rejected(decode_rejection(d)?)),
             4 => Ok(Self::PublicationAcknowledged {
                 input: decode_work_input(d)?,
@@ -3084,6 +3286,7 @@ pub(crate) fn crdt_change_blob_references(change: &CrdtChangeV2) -> Vec<&BlobRef
             WorkflowOperationV2::Inbox(_)
             | WorkflowOperationV2::Outbox(_)
             | WorkflowOperationV2::ConsumeOutbox(_)
+            | WorkflowOperationV2::ExpireCall(_)
             | WorkflowOperationV2::Reply(_) => {}
         }
     }
@@ -3531,6 +3734,10 @@ fn encode_workflow_operation(e: &mut Encoder<'_>, value: &WorkflowOperationV2) {
             e.u8(5);
             e.fixed(&call.0);
         }
+        WorkflowOperationV2::ExpireCall(timeout) => {
+            e.u8(8);
+            e.bytes(&timeout.encode());
+        }
         WorkflowOperationV2::Ingress(ingress) => {
             e.u8(6);
             encode_crdt_ingress(e, ingress);
@@ -3554,6 +3761,9 @@ fn decode_workflow_operation(d: &mut Decoder<'_>) -> Result<WorkflowOperationV2,
         3 => Ok(WorkflowOperationV2::Outbox(decode_message(d)?)),
         4 => Ok(WorkflowOperationV2::Reply(decode_reply(d)?)),
         5 => Ok(WorkflowOperationV2::ConsumeOutbox(CallId(d.fixed()?))),
+        8 => Ok(WorkflowOperationV2::ExpireCall(CallTimeoutV2::decode(
+            &d.bytes()?,
+        )?)),
         6 => Ok(WorkflowOperationV2::Ingress(decode_crdt_ingress(d)?)),
         7 => Ok(WorkflowOperationV2::Spawn(decode_actor_spawn(d)?)),
         _ => Err(DecodeError::InvalidTag),
@@ -3873,6 +4083,7 @@ mod tests {
             causal_parent: None,
             parent_call: None,
             awaited_reply: None,
+            awaited_timeout: None,
             consistency: ConsistencyModeV2::Local,
             base: ConsistencyBaseV2::Linear {
                 revision: 7,
@@ -4610,6 +4821,63 @@ mod tests {
         assert_eq!(
             AccumulateRequestV2::decode(&delivery.encode()).unwrap(),
             delivery
+        );
+
+        let timeout = CallTimeoutV2 {
+            call_id: caller_invocation.call_id(0),
+            caller_invocation,
+            await_ordinal: 0,
+            deadline_timeslot: 9,
+            expired_at: 9,
+        };
+        let expiration = CallExpirationEnvelopeV2 {
+            service: service(),
+            timeout: timeout.clone(),
+            base: ConsistencyBaseV2::Linear {
+                revision: 7,
+                state_root: Hash([8; 32]),
+            },
+            base_causal_height: None,
+            crdt_change: None,
+        };
+        let expire = AccumulateRequestV2::ExpireCall(expiration.clone());
+        assert_eq!(
+            AccumulateRequestV2::decode(&expire.encode()).unwrap(),
+            expire
+        );
+        let accumulated_timeout = AccumulatedTimeoutV2 {
+            expiration: expiration.clone(),
+            receipt: AccumulationReceiptV2 {
+                service: service(),
+                accepted_transition: expiration.commitment(),
+                reply_commitment: None,
+                outbox_commitment: None,
+                resulting_state_root: Some(Hash([24; 32])),
+                resulting_crdt_heads: vec![],
+                sequence: 8,
+                checkpoint: 0,
+                consistency: ConsistencyModeV2::Local,
+            },
+        };
+        assert_eq!(
+            AccumulationResultV2::decode(
+                &AccumulationResultV2::CallExpired {
+                    timeout: accumulated_timeout.clone(),
+                    duplicate: false,
+                }
+                .encode()
+            )
+            .unwrap(),
+            AccumulationResultV2::CallExpired {
+                timeout: accumulated_timeout,
+                duplicate: false,
+            }
+        );
+        let mut early = expiration;
+        early.timeout.expired_at = 8;
+        assert_eq!(
+            CallExpirationEnvelopeV2::decode(&early.encode()),
+            Err(DecodeError::NonCanonical)
         );
 
         let AccumulateRequestV2::Apply(mut divergent) = apply else {

@@ -34,12 +34,14 @@ pub use crate::attestation::AttestationPreparationV2;
 
 pub use continuation::ContinuationSnapshotV2;
 pub use contracts::{
-    AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
+    AccumulateRequestV2, AccumulatedReplyV2, AccumulatedTimeoutV2, AccumulationEnvelopeV2,
+    AccumulationReceiptV2,
     AccumulationRejectionV2, AccumulationResultV2, ActorCallRequestV2, ActorCrdtStateV2,
     ActorDirectoryV2, ActorGenesisV2, ActorSliceInputV2, ActorSliceOutputV2, ActorSpawnRequestV2,
     ActorSpawnV2, ActorTreeImportV2, ActorWriteV2, AttestationDeliveryV2, AttestationResumeV2,
     AttestationVerificationV2, AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2,
-    CheckpointTokenV2, CommittedAttestationPackageV2, ConsistencyBaseV2, ConsistencyModeV2,
+    CallExpirationEnvelopeV2, CallTimeoutV2, CheckpointTokenV2, CommittedAttestationPackageV2,
+    ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationChangeV2, CrdtChangeV2, CrdtIngressV2, CrdtMaterializationV2, CrdtOperationV2,
     CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DeliveryEnvelopeV2, DirectIngressV2,
     ExternalActorBindingV2, ExternalActorDirectoryV2, GasAccountingV2, ImportedActorV2,
@@ -99,7 +101,8 @@ pub use state_tree::{
 pub use storage::{
     DedupRecordV2, DeliveryRecordV2, IngressRecordV2, PublicationRecordV2,
     SERVICE_STORE_SCHEMA_VERSION, StateKeyV2, StoreHeaderV2, StoreOpenError, WorkflowCheckpointV2,
-    attestation_archive_storage_key, crdt_change_storage_key, crdt_node_receipt_storage_key,
+    attestation_archive_storage_key, call_expiration_storage_key, crdt_change_storage_key,
+    crdt_node_receipt_storage_key,
     crdt_node_storage_key, dedup_storage_key, delivery_storage_key, header_storage_key,
     ingress_storage_key, publication_storage_key, receipt_storage_key,
 };

@@ -114,6 +114,9 @@ pub fn execute_guest_accumulate<S: GuestAccumulateStoreV2>(
             apply(store, &envelope, ApplyMode::PrepareAttested)
         }
         AccumulateRequestV2::Deliver(envelope) => deliver(store, &envelope),
+        AccumulateRequestV2::ExpireCall(_) => {
+            Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition))
+        }
         AccumulateRequestV2::SyncCrdt(envelope) => sync_crdt(store, &envelope),
         AccumulateRequestV2::AcknowledgePublication(acknowledgement) => {
             acknowledge_publication(store, &acknowledgement)
@@ -1038,6 +1041,9 @@ fn materialize_workflow_crdt(
                     cid,
                     None,
                 ),
+                WorkflowOperationV2::ExpireCall(_) => {
+                    return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+                }
                 WorkflowOperationV2::Reply(reply) => insert_causal_value(
                     frontier,
                     result.replies.entry(reply.call_id).or_default(),
@@ -3207,6 +3213,7 @@ mod tests {
             causal_parent: None,
             parent_call: None,
             awaited_reply: None,
+            awaited_timeout: None,
             consistency: ConsistencyModeV2::Local,
             base: ConsistencyBaseV2::Linear {
                 revision: 0,
@@ -4900,6 +4907,7 @@ mod tests {
             causal_parent: None,
             parent_call: None,
             awaited_reply: None,
+            awaited_timeout: None,
             consistency: ConsistencyModeV2::Crdt,
             base: ConsistencyBaseV2::Crdt { heads },
             base_causal_height,

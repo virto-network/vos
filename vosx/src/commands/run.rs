@@ -124,6 +124,7 @@ fn run_v2(package_path: &Path, service_path: &Path, items: Vec<Vec<u8>>, gas: u6
                 causal_parent: None,
                 parent_call: None,
                 awaited_reply: None,
+                awaited_timeout: None,
                 imported_blobs: vec![],
                 proof_requested: false,
             })

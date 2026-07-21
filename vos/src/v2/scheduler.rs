@@ -12,7 +12,7 @@ use core::convert::Infallible;
 use super::causal::{CausalFrontierError, CausalFrontierV2, load_causal_frontier};
 use super::contracts::crdt_change_blob_references;
 use super::{
-    AccumulatedReplyV2, ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2,
+    AccumulatedReplyV2, AccumulatedTimeoutV2, ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2,
     BlobRefV2, CallId, ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2,
     CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DecodeError, DeliveryEnvelopeV2, DirectIngressV2,
     ExternalActorDirectoryV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId,
@@ -37,6 +37,7 @@ pub struct LocalWorkRequestV2 {
     pub causal_parent: Option<InvocationId>,
     pub parent_call: Option<CallId>,
     pub awaited_reply: Option<AccumulatedReplyV2>,
+    pub awaited_timeout: Option<AccumulatedTimeoutV2>,
     pub imported_blobs: Vec<BlobRefV2>,
     pub proof_requested: bool,
 }
@@ -108,6 +109,7 @@ impl LocalWorkSchedulerV2 {
             || request.causal_parent.is_some()
             || request.parent_call.is_some()
             || request.awaited_reply.is_some()
+            || request.awaited_timeout.is_some()
         {
             return Err(ScheduleErrorV2::InvalidWorkflowStep(request.invocation));
         }
@@ -387,6 +389,7 @@ impl LocalWorkSchedulerV2 {
                 causal_parent: Some(message.caller_invocation),
                 parent_call: Some(message.call_id),
                 awaited_reply: None,
+                awaited_timeout: None,
                 imported_blobs: Vec::new(),
                 proof_requested: message.proof_requested,
             },
@@ -430,6 +433,7 @@ impl LocalWorkSchedulerV2 {
                 causal_parent: template.causal_parent,
                 parent_call: template.parent_call,
                 awaited_reply,
+                awaited_timeout: None,
                 imported_blobs: template.imported_blobs,
                 proof_requested: template.proof_requested,
             },
@@ -568,6 +572,7 @@ impl LocalWorkSchedulerV2 {
             causal_parent: request.causal_parent,
             parent_call: request.parent_call,
             awaited_reply: request.awaited_reply,
+            awaited_timeout: request.awaited_timeout,
             consistency: header.consistency,
             base,
             base_causal_height,

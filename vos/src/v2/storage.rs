@@ -14,7 +14,7 @@ use super::{
     PublishedEffectsV2, ReplyRecordV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 8;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 9;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -25,6 +25,7 @@ const PUBLICATION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/publication/";
 const ATTESTATION_ARCHIVE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/attestation-archive/";
 const DELIVERY_STORAGE_PREFIX: &[u8] = b"\0vos/v2/delivery/";
 const INGRESS_STORAGE_PREFIX: &[u8] = b"\0vos/v2/ingress/";
+const CALL_EXPIRATION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/call-expiration/";
 const CRDT_NODE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node/";
 const CRDT_NODE_RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node-receipt/";
 const CRDT_CHANGE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-change/";
@@ -544,6 +545,15 @@ pub fn ingress_storage_key(invocation: InvocationId) -> Vec<u8> {
     let mut key = Vec::with_capacity(INGRESS_STORAGE_PREFIX.len() + invocation.0.len());
     key.extend_from_slice(INGRESS_STORAGE_PREFIX);
     key.extend_from_slice(&invocation.0);
+    key
+}
+
+/// Guest-owned durable timeout outcome used to reconstruct an exact resume
+/// after process restart or CRDT synchronization.
+pub fn call_expiration_storage_key(call: CallId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(CALL_EXPIRATION_STORAGE_PREFIX.len() + call.0.len());
+    key.extend_from_slice(CALL_EXPIRATION_STORAGE_PREFIX);
+    key.extend_from_slice(&call.0);
     key
 }
 
