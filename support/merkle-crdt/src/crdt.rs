@@ -98,6 +98,24 @@ impl<H: Hasher, P: Payload, S: Store<H, P>> MerkleCrdt<H, P, S> {
             return Err(SyncError::InvalidAuthor);
         }
 
+        // Validate the complete candidate ancestry before making even an
+        // unreachable batch durable. `fetch_missing` deliberately stops at a
+        // CID already held locally, so validation of only `missing` would let
+        // a previously staged unauthorized ancestor cause new descendants to
+        // be written before activation failed.
+        let overlay = missing.iter().cloned().collect::<BTreeMap<_, _>>();
+        let candidate_roots = self
+            .clock
+            .roots()
+            .iter()
+            .cloned()
+            .chain(core::iter::once(remote_root.clone()));
+        if !ancestry_is_valid_with_overlay(candidate_roots, &self.store, &overlay, validator)
+            .map_err(map_local_error)?
+        {
+            return Err(SyncError::InvalidAuthor);
+        }
+
         // Store failures may leave an unreachable prefix for a backend using
         // Store::put_batch's default. Logical state is unchanged, and retry
         // safely finishes the ancestry. Transactional stores override the
@@ -239,6 +257,40 @@ fn ancestry_is_valid<H: Hasher, P: Payload, S: Store<H, P>, V: NodeValidator<H, 
     let mut stack: Vec<Cid<H>> = clock.roots().iter().cloned().collect();
     while let Some(cid) = stack.pop() {
         if !visited.insert(cid.clone()) {
+            continue;
+        }
+        let node = store.get(&cid)?.ok_or(Error::MissingNode)?;
+        if node.cid() != cid {
+            return Err(Error::InvalidCid);
+        }
+        if !validator.validate(&cid, &node) {
+            return Ok(false);
+        }
+        stack.extend(node.children.iter().cloned());
+    }
+    Ok(true)
+}
+
+fn ancestry_is_valid_with_overlay<H: Hasher, P: Payload, S: Store<H, P>, V: NodeValidator<H, P>>(
+    roots: impl IntoIterator<Item = Cid<H>>,
+    store: &S,
+    overlay: &BTreeMap<Cid<H>, DagNode<H, P>>,
+    validator: &V,
+) -> Result<bool, Error<S::Error>> {
+    let mut visited = BTreeSet::new();
+    let mut stack = roots.into_iter().collect::<Vec<_>>();
+    while let Some(cid) = stack.pop() {
+        if !visited.insert(cid.clone()) {
+            continue;
+        }
+        if let Some(node) = overlay.get(&cid) {
+            if node.cid() != cid {
+                return Err(Error::InvalidCid);
+            }
+            if !validator.validate(&cid, node) {
+                return Ok(false);
+            }
+            stack.extend(node.children.iter().cloned());
             continue;
         }
         let node = store.get(&cid)?.ok_or(Error::MissingNode)?;
@@ -651,6 +703,40 @@ mod tests {
             local.sync_validated(&root, &remote, &RejectAll),
             Err(SyncError::InvalidAuthor)
         ));
+        assert_eq!(*local.state(), 0);
+        assert!(local.roots().is_empty());
+    }
+
+    #[test]
+    fn invalid_staged_ancestry_rejects_before_new_descendants_are_written() {
+        struct RejectNegative;
+        impl NodeValidator<TestHasher, CounterOp> for RejectNegative {
+            fn validate(
+                &self,
+                _cid: &Cid<TestHasher>,
+                node: &DagNode<TestHasher, CounterOp>,
+            ) -> bool {
+                node.payload.0 >= 0
+            }
+        }
+
+        let mut remote: TestCrdt = MerkleCrdt::default();
+        let invalid_ancestor = remote.apply(CounterOp(-3)).unwrap();
+        let remote_root = remote.apply(CounterOp(8)).unwrap();
+        let mut local_store = MemStore::new();
+        local_store
+            .put(
+                invalid_ancestor.clone(),
+                remote.store().get(&invalid_ancestor).unwrap().unwrap(),
+            )
+            .unwrap();
+        let mut local: TestCrdt = MerkleCrdt::new(local_store);
+
+        assert!(matches!(
+            local.sync_validated(&remote_root, remote.store(), &RejectNegative),
+            Err(SyncError::InvalidAuthor)
+        ));
+        assert!(!local.store().contains(&remote_root).unwrap());
         assert_eq!(*local.state(), 0);
         assert!(local.roots().is_empty());
     }
