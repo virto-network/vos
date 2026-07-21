@@ -249,6 +249,19 @@ pub fn verify_role_credential(request: &[u8]) -> u64 {
     )
 }
 
+/// Authenticate an exact canonical actor upgrade against the platform package
+/// authority configured by the service host. The install/upgrade authority
+/// capability is shared because all 7-bit VOS protocol slots are occupied.
+#[cfg(feature = "service")]
+#[inline]
+pub fn verify_upgrade_authorization(request: &[u8]) -> u64 {
+    ecall2(
+        hostcall::INSTALL_AUTH_VERIFY,
+        request.as_ptr() as u64,
+        request.len() as u64,
+    )
+}
+
 /// Probe the service-owned program cache for exact canonical actor PVM bytes.
 #[cfg(feature = "service")]
 #[inline]

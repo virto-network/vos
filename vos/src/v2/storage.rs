@@ -11,10 +11,10 @@ use alloc::vec::Vec;
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 use super::{
     AccumulatedReplyV2, AccumulationReceiptV2, ActorId, CallId, ConsistencyModeV2, Hash,
-    InvocationId, PublishedEffectsV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
+    InvocationId, ProgramId, PublishedEffectsV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 13;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 14;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -26,6 +26,7 @@ const DELIVERY_STORAGE_PREFIX: &[u8] = b"\0vos/v2/delivery/";
 const REPLY_ADMISSION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/reply-admission/";
 const CALL_EXPIRATION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/call-expiration/";
 const PENDING_CALL_DEADLINE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/pending-deadline/";
+const ACTOR_UPGRADE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/actor-upgrade/";
 const CRDT_NODE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node/";
 const CRDT_NODE_RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node-receipt/";
 const CRDT_CHANGE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-change/";
@@ -238,6 +239,17 @@ pub struct DedupRecordV2 {
     pub receipt: AccumulationReceiptV2,
 }
 
+/// Physical exactly-once record for an accepted actor upgrade. It is kept
+/// outside the service tree because its receipt commits to the resulting tree
+/// root. The actor descriptor and generated policies remain inside the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorUpgradeRecordV2 {
+    pub upgrade: Hash,
+    pub actor: ActorId,
+    pub previous_program: ProgramId,
+    pub program: ProgramId,
+    pub receipt: AccumulationReceiptV2,
+}
 /// Recoverable effects created by one committed actor slice. The host may
 /// expose them only after the surrounding service transaction commits, then
 /// removes the row through guest Accumulate acknowledgement.
@@ -408,6 +420,41 @@ impl V2Wire for PublicationRecordV2 {
     }
 }
 
+impl V2Wire for ActorUpgradeRecordV2 {
+    const MAGIC: [u8; 4] = *b"VUR2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.fixed(&self.upgrade.0);
+        e.fixed(&self.actor.0);
+        e.fixed(&self.previous_program.0);
+        e.fixed(&self.program.0);
+        e.bytes(&self.receipt.encode());
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            upgrade: Hash(d.fixed()?),
+            actor: ActorId(d.fixed()?),
+            previous_program: ProgramId(d.fixed()?),
+            program: ProgramId(d.fixed()?),
+            receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
+        };
+        if value.previous_program == value.program
+            || value.receipt.accepted_transition != value.upgrade
+            || value.receipt.reply_commitment.is_some()
+            || value.receipt.outbox_commitment.is_some()
+            || value.receipt.resulting_state_root.is_none()
+            || !value.receipt.resulting_crdt_heads.is_empty()
+            || value.receipt.consistency == ConsistencyModeV2::Crdt
+            || value.receipt.checkpoint != 0
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
 impl V2Wire for DeliveryRecordV2 {
     const MAGIC: [u8; 4] = *b"VDR2";
 
@@ -544,6 +591,13 @@ pub fn pending_call_deadline_storage_key(call: CallId) -> Vec<u8> {
     let mut key = Vec::with_capacity(PENDING_CALL_DEADLINE_STORAGE_PREFIX.len() + call.0.len());
     key.extend_from_slice(PENDING_CALL_DEADLINE_STORAGE_PREFIX);
     key.extend_from_slice(&call.0);
+    key
+}
+
+pub fn actor_upgrade_storage_key(upgrade: Hash) -> Vec<u8> {
+    let mut key = Vec::with_capacity(ACTOR_UPGRADE_STORAGE_PREFIX.len() + upgrade.0.len());
+    key.extend_from_slice(ACTOR_UPGRADE_STORAGE_PREFIX);
+    key.extend_from_slice(&upgrade.0);
     key
 }
 
@@ -751,6 +805,7 @@ mod tests {
         let reply_admission = reply_admission_storage_key(CallId([4; 32]));
         let expiration = call_expiration_storage_key(CallId([4; 32]));
         let deadline = pending_call_deadline_storage_key(CallId([4; 32]));
+        let upgrade = actor_upgrade_storage_key(Hash([8; 32]));
         assert_ne!(dedup, receipt);
         assert_ne!(dedup, publication);
         assert_ne!(receipt, publication);
@@ -760,6 +815,8 @@ mod tests {
         assert_ne!(expiration, deadline);
         assert_ne!(expiration, reply_admission);
         assert_ne!(deadline, delivery);
+        assert_ne!(upgrade, receipt);
+        assert_ne!(upgrade, publication);
         assert_ne!(dedup.as_slice(), header_storage_key());
         assert_ne!(crdt_node_storage_key(Hash([6; 32])), receipt);
         assert_ne!(

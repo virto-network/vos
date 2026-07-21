@@ -131,14 +131,13 @@ pub const ROLE_CREDENTIAL_VERIFY: u32 = 124;
 /// committed reply is admitted as continuation input. Accumulate-only.
 pub const RECEIPT_VERIFY: u32 = 125;
 
-/// Authorize one exact canonical service genesis before an empty service
-/// account is initialized. Accumulate-only.
+/// Authorize one exact canonical service genesis or idle actor upgrade against
+/// platform package authority. Accumulate-only.
 pub const INSTALL_AUTH_VERIFY: u32 = 126;
 
 /// Query one canonical actor PVM by `ProgramId` inside the current Accumulate
 /// transaction. This is a VOS service capability, not a JAM protocol slot.
 pub const PROGRAM_LOOKUP: u32 = 127;
-
 #[cfg(test)]
 mod tests {
     use super::*;

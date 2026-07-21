@@ -88,12 +88,13 @@ pub use state_tree::{
     ServiceStateTreeV2, StateTreeError, StateTreeStore, empty_state_root, state_position,
 };
 pub use storage::{
-    DedupRecordV2, DeliveryRecordV2, PendingCallDeadlineV2, PublicationRecordV2,
-    ReplyAdmissionRecordV2, SERVICE_STORE_SCHEMA_VERSION, StateKeyV2, StoreHeaderV2,
-    StoreOpenError, WorkflowCheckpointV2, call_expiration_storage_key, crdt_change_storage_key,
-    crdt_node_receipt_storage_key, crdt_node_storage_key, dedup_storage_key, delivery_storage_key,
-    header_storage_key, pending_call_deadline_storage_key, publication_storage_key,
-    receipt_storage_key, reply_admission_storage_key,
+    ActorUpgradeRecordV2, DedupRecordV2, DeliveryRecordV2, PendingCallDeadlineV2,
+    PublicationRecordV2, ReplyAdmissionRecordV2, SERVICE_STORE_SCHEMA_VERSION, StateKeyV2,
+    StoreHeaderV2, StoreOpenError, WorkflowCheckpointV2, actor_upgrade_storage_key,
+    call_expiration_storage_key, crdt_change_storage_key, crdt_node_receipt_storage_key,
+    crdt_node_storage_key, dedup_storage_key, delivery_storage_key, header_storage_key,
+    pending_call_deadline_storage_key, publication_storage_key, receipt_storage_key,
+    reply_admission_storage_key,
 };
 #[cfg(feature = "std")]
 pub use transport::{

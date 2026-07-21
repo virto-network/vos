@@ -998,6 +998,10 @@ impl ServicePvmV2 {
                                 duplicate: false,
                                 ..
                             }
+                            | AccumulationResultV2::ActorUpgraded {
+                                duplicate: false,
+                                ..
+                            }
                     ) {
                         host.commit(transaction)?;
                     }
