@@ -1501,12 +1501,23 @@ fn node_runs_a_raft_root_through_the_canonical_request_log() {
     )
     .expect("node attaches the v2 Raft worker and root-tree owner");
 
-    std::thread::sleep(std::time::Duration::from_millis(350));
     let mut attested_arguments = vec![vos::value::TAG_DYNAMIC];
     attested_arguments.extend_from_slice(&Msg::new("attested_value").encode());
-    let attested = node
-        .invoke_actor_attested(actor, attested_arguments)
-        .expect("the Raft root proves before proposing its guest Apply");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let attested = loop {
+        if let Some(attested) = node.invoke_actor_attested_with_timeout(
+            actor,
+            attested_arguments.clone(),
+            std::time::Duration::from_secs(120),
+        ) {
+            break attested;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the Raft root did not become ready to prove its guest Apply"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     assert_eq!(attested.value, Value::U32(0));
     assert_eq!(attested.proof, b"node raft proof");
 

@@ -4123,9 +4123,23 @@ impl VosNode {
         target: crate::v2::ActorId,
         arguments: Vec<u8>,
     ) -> Option<crate::actors::client::AttestedInvocationResult> {
+        self.invoke_actor_attested_with_timeout(target, arguments, Duration::from_secs(10))
+    }
+
+    /// Like [`Self::invoke_actor_attested`], with an explicit upper bound for
+    /// tracing, proof production, Raft ordering, guest Accumulate, and reply
+    /// publication. Heavy proof backends should not inherit the ordinary
+    /// ten-second request timeout accidentally.
+    pub fn invoke_actor_attested_with_timeout(
+        &self,
+        target: crate::v2::ActorId,
+        arguments: Vec<u8>,
+        timeout: Duration,
+    ) -> Option<crate::actors::client::AttestedInvocationResult> {
         use crate::v2::V2Wire;
 
-        let bytes = self.invoke_actor_with_proof_mode(target, arguments, true)?;
+        let bytes =
+            self.invoke_actor_with_proof_mode_and_timeout(target, arguments, true, timeout)?;
         let package = crate::v2::CommittedAttestationPackageV2::decode(&bytes).ok()?;
         let attestation = package.reply.attestation?;
         let value = if package.reply.reply.result.is_empty() {
@@ -4148,6 +4162,21 @@ impl VosNode {
         target: crate::v2::ActorId,
         arguments: Vec<u8>,
         proof_requested: bool,
+    ) -> Option<Vec<u8>> {
+        self.invoke_actor_with_proof_mode_and_timeout(
+            target,
+            arguments,
+            proof_requested,
+            Duration::from_secs(10),
+        )
+    }
+
+    fn invoke_actor_with_proof_mode_and_timeout(
+        &self,
+        target: crate::v2::ActorId,
+        arguments: Vec<u8>,
+        proof_requested: bool,
+        timeout: Duration,
     ) -> Option<Vec<u8>> {
         use crate::v2::V2Wire;
 
@@ -4180,7 +4209,7 @@ impl VosNode {
             arguments,
             proof_requested,
         };
-        self.invoke(ServiceId(route), ingress.encode())
+        self.invoke_with_timeout(ServiceId(route), ingress.encode(), timeout)
     }
 
     /// Like [`invoke`](Self::invoke) but with an explicit timeout.
