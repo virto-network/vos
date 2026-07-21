@@ -15,10 +15,11 @@ use super::{
     AccumulationResultV2, ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2,
     BlobRefV2, CommittedImageStoreV2, ConsistencyModeV2, DurableJamStoreV2,
     DurableStoreOpenErrorV2, ExternalActorBindingV2, ExternalActorDirectoryV2, JamServiceV2,
-    LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MethodPolicyV2,
-    NoRefineProtocolHostV2, PackageError, ProgramId, PublicationAckV2, PublicationRecordV2,
-    PublishedEffectsV2, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2,
-    StateKeyV2, V2Wire, VosPackageV2, WorkInputIdV2,
+    LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2,
+    MethodPolicyV2, NoRefineProtocolHostV2, PackageError, PreparedWorkV2, ProgramId,
+    PublicationAckV2, PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
+    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire,
+    VosPackageV2, WorkInputIdV2,
 };
 
 /// Strict host/network ingress for one direct root-tree invocation. Origin and
@@ -131,6 +132,15 @@ pub struct CommittedRootTreeSliceV2 {
     pub publication: Option<PublicationRecordV2>,
     pub duplicate: bool,
     pub refine_gas_used: u64,
+    pub accumulate_gas_used: u64,
+}
+
+/// Destination-side result of admitting one finalized cross-root message.
+/// The inbox is visible only after physical Accumulate commits this receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedDeliveryV2 {
+    pub receipt: AccumulationReceiptV2,
+    pub duplicate: bool,
     pub accumulate_gas_used: u64,
 }
 
@@ -400,6 +410,100 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         }
         let prepared = LocalWorkSchedulerV2::prepare(self.service.accumulate_host(), request)
             .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        self.invoke_prepared(prepared)
+    }
+
+    /// Execute a message only after destination Accumulate has admitted its
+    /// finalized source outbox record into the guest-owned inbox.
+    pub fn invoke_inbox(
+        &mut self,
+        call: super::CallId,
+        logical_timeslot: u64,
+    ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        let prepared = LocalWorkSchedulerV2::prepare_inbox(
+            self.service.accumulate_host(),
+            call,
+            logical_timeslot,
+        )
+        .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        if prepared.work.proof_requested {
+            return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
+        }
+        self.invoke_prepared(prepared)
+    }
+
+    /// Resume the exact committed machine snapshot for an invocation. The
+    /// scheduler reconstructs the slice from guest state rather than a
+    /// process-local handler future.
+    pub fn resume(
+        &mut self,
+        invocation: super::InvocationId,
+        logical_timeslot: u64,
+        awaited_reply: Option<super::AccumulatedReplyV2>,
+    ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        let prepared = LocalWorkSchedulerV2::prepare_resume(
+            self.service.accumulate_host(),
+            invocation,
+            logical_timeslot,
+            awaited_reply,
+        )
+        .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        if prepared.work.proof_requested {
+            return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
+        }
+        self.invoke_prepared(prepared)
+    }
+
+    /// Admit one finalized source outbox record through destination physical
+    /// Accumulate. The host policy makes only this exact receipt available;
+    /// membership, service identity, base freshness and deduplication remain
+    /// guest-owned checks.
+    pub fn deliver_finalized(
+        &mut self,
+        logical_timeslot: u64,
+        message: MessageRecordV2,
+        source_outbox: Vec<MessageRecordV2>,
+        source_receipt: AccumulationReceiptV2,
+    ) -> Result<CommittedDeliveryV2, LocalRootTreeInvokeErrorV2> {
+        let verification = ReceiptVerificationRequestV2 {
+            receipt: source_receipt.clone(),
+        };
+        self.service
+            .accumulate_host_mut()
+            .allow_receipt(&verification);
+        let delivery = LocalWorkSchedulerV2::prepare_delivery(
+            self.service.accumulate_host(),
+            logical_timeslot,
+            message,
+            source_outbox,
+            source_receipt,
+        )
+        .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        let accumulated = self
+            .service
+            .accumulate(&AccumulateRequestV2::Deliver(delivery))
+            .map_err(LocalRootTreeInvokeErrorV2::Service)?;
+        match accumulated.result {
+            AccumulationResultV2::Accepted {
+                receipt,
+                published,
+                duplicate,
+            } if published == PublishedEffectsV2::default() => Ok(CommittedDeliveryV2 {
+                receipt,
+                duplicate,
+                accumulate_gas_used: accumulated.gas_used,
+            }),
+            AccumulationResultV2::Rejected(rejection) => {
+                Err(LocalRootTreeInvokeErrorV2::Rejected(rejection))
+            }
+            _ => Err(LocalRootTreeInvokeErrorV2::UnexpectedResult),
+        }
+    }
+
+    fn invoke_prepared(
+        &mut self,
+        prepared: PreparedWorkV2,
+    ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
         let refined = self
             .service
             .refine_actor_tree(&prepared.work, &prepared.imports)
