@@ -83,7 +83,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     })
 }
 
-fn canonical_program(
+pub(crate) fn canonical_program(
     name: &str,
     version: &str,
     source_hash: BlobHash,

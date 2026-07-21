@@ -7,8 +7,8 @@
 //! space) and by the genesis apply that runs on a space's first
 //! `space up`:
 //!
-//! - Each `path = "…"` ELF gets blob-cached and published as
-//!   `<name>:recipe` if not already in the catalog.
+//! - Each `path = "…"` signed `.vos` package (or explicitly legacy ELF) gets
+//!   blob-cached and published under its immutable program tag.
 //! - Each agent gets `install()`'d if no instance with that
 //!   `name` is already registered.
 //! - Agents already in the registry are left alone (their
@@ -119,11 +119,10 @@ pub struct ExtensionDef {
 #[derive(Deserialize, Debug, Default)]
 pub struct AgentDef {
     pub name: String,
-    /// Path to the actor ELF — relative to the recipe file's
-    /// directory. A hand-written recipe carries this; a `space export`
-    /// output does NOT (blobs are content-addressed, with no source
-    /// path on a running node) and instead carries `program_hash`, so
-    /// `apply` resolves the blob by hash. Empty when absent.
+    /// Path to the signed actor `.vos` package (or an explicitly legacy ELF)
+    /// relative to the recipe file's directory. A hand-written recipe carries
+    /// this; a `space export` output does not and instead carries
+    /// `program_hash`, so `apply` resolves the blob by hash. Empty when absent.
     #[serde(default)]
     pub path: String,
     /// `name:version` of the already-published program (emitted by
@@ -665,28 +664,36 @@ fn reconcile_one(
     //    `path`; the path-less `program_hash` form is `apply`-only.
     if agent.path.is_empty() {
         anyhow::bail!(
-            "recipe agent '{}' has no `path` — a genesis-applied recipe installs from source \
-             ELFs. (The path-less `program_hash` form is only for `space apply` against an \
-             already-published catalog.)",
+            "recipe agent '{}' has no `path` — a genesis-applied recipe installs from exact \
+             program artifacts. (The path-less `program_hash` form is only for `space apply` \
+             against an already-published catalog.)",
             agent.name,
         );
     }
-    let elf_path = recipe_dir.join(&agent.path);
-    let elf_bytes = std::fs::read(&elf_path).map_err(|e| {
+    let artifact_path = recipe_dir.join(&agent.path);
+    let artifact_bytes = std::fs::read(&artifact_path).map_err(|e| {
         anyhow::anyhow!(
             "read {} for agent '{}': {e}",
-            elf_path.display(),
+            artifact_path.display(),
             agent.name
         )
     })?;
-    let hash = blob_store::cache_put(&elf_bytes)
+    let (program_name, program_version, _) =
+        crate::commands::space::apply::program_ref(agent)?;
+    let source_hash = blob_store::BlobHash::of(&artifact_bytes);
+    let (hash, artifact_bytes, package_metadata) =
+        crate::commands::space::publish::canonical_program(
+            &program_name,
+            &program_version,
+            source_hash,
+            artifact_bytes,
+        )?;
+    let cached = blob_store::cache_put(&artifact_bytes)
         .map_err(|e| anyhow::anyhow!("cache blob for '{}': {e}", agent.name))?;
+    debug_assert_eq!(cached, hash);
 
-    // 2. Ensure published. Treat the agent's `name` as the
-    //    program name; recipes don't carry per-program
-    //    versions yet, so we use the literal "recipe" tag.
-    let program_name = agent.name.clone();
-    let program_version = "recipe".to_string();
+    // 2. Ensure the exact validated artifact is published under the package's
+    //    explicit immutable tag (or the recipe's default instance tag).
     let existing: Option<ProgramRow> =
         vos::block_on(reg.program(&mut &*node, program_name.clone(), program_version.clone()))
             .map_err(|e| anyhow::anyhow!("registry.program('{program_name}'): {e}"))?;
@@ -764,7 +771,9 @@ fn reconcile_one(
     //     the registry's `meta_for_*` queries will return empty
     //     and consumers fall back to whatever heuristic they
     //     have today.
-    if let Some(meta_blob) = vos::metadata::raw_section_from_elf(&elf_bytes) {
+    let metadata = package_metadata
+        .or_else(|| vos::metadata::raw_section_from_elf(&artifact_bytes));
+    if let Some(meta_blob) = metadata {
         // Meta registration is a nice-to-have (it enables schema-aware
         // coercion for the gateway / dynamic CLIs); it must never abort the
         // install. Both a non-Ok status (e.g. FORBIDDEN on a non-admin node —
@@ -832,7 +841,7 @@ fn reconcile_one(
         None => vos::registry::SyncFloor::Member,
     };
 
-    let install_args = encode_init_args(&agent.name, &elf_bytes, &agent.init, name_ids)?;
+    let install_args = encode_init_args(&agent.name, &artifact_bytes, &agent.init, name_ids)?;
     let install_payloads = encode_on_start_payloads(&agent.on_start)?;
 
     // Empty `auth`: the daemon signs on relay (see the publish call
@@ -1151,6 +1160,30 @@ pub(crate) fn validate_recipe_names(recipe: &Recipe) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clerk_acceptance_recipes_install_only_matching_v2_packages() {
+        for source in [
+            include_str!("../../../../tests/acceptance/clerk/space-clerk-demo.toml"),
+            include_str!("../../../../tests/acceptance/clerk/space-bank-a.toml"),
+            include_str!("../../../../tests/acceptance/clerk/space-bank-b.toml"),
+            include_str!("../../../../tests/acceptance/clerk/space-venue.toml"),
+        ] {
+            let recipe: Recipe = toml::from_str(source).expect("Clerk recipe parses");
+            for agent in flatten(&recipe.agents) {
+                let path = Path::new(&agent.path);
+                assert_eq!(
+                    path.extension().and_then(|value| value.to_str()),
+                    Some("vos"),
+                );
+                assert_eq!(
+                    path.file_stem().and_then(|value| value.to_str()),
+                    Some(agent.name.as_str()),
+                    "the implicit agent:recipe tag must match the signed package identity",
+                );
+            }
+        }
+    }
 
     #[test]
     fn export_output_parses_as_a_recipe() {

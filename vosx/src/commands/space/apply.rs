@@ -7,7 +7,8 @@
 //! into `local.toml`:
 //!
 //! - **Replicated half** → the registry, over `DaemonClient`: each
-//!   `[[agent]]`'s ELF is blob-cached + published under its immutable
+//!   `[[agent]]`'s signed `.vos` package (or explicitly legacy ELF) is
+//!   blob-cached + published under its immutable
 //!   program tag (if missing) and installed (if no instance exists).
 //!   The bytes reach the daemon through the shared content-addressed
 //!   blob cache — `publish` only ships `(name, version, hash)`.
@@ -179,7 +180,7 @@ pub(crate) fn apply_recipe(
     // A real apply heals the content-addressed cache even for skipped
     // instances. Dry runs never reach this write.
     for plan in &plans {
-        if let Some(bytes) = &plan.elf_bytes {
+        if let Some(bytes) = &plan.artifact_bytes {
             let cached = blob_store::cache_put(bytes)
                 .map_err(|e| anyhow::anyhow!("cache blob for '{}': {e}", plan.instance_name))?;
             debug_assert_eq!(cached.0, plan.hash);
@@ -216,7 +217,8 @@ struct PreparedAgent {
     program_name: String,
     program_version: String,
     hash: [u8; 32],
-    elf_bytes: Option<Vec<u8>>,
+    artifact_bytes: Option<Vec<u8>>,
+    metadata: Option<Vec<u8>>,
     needs_publish: bool,
     action: ApplyAction,
 }
@@ -233,25 +235,33 @@ fn preflight_one(
     // 1. Resolve the blob hash + program identity from either a source
     //    `path` (a hand-written recipe) or `program_hash` (a `space
     //    export` output, which carries no path). Path-based also yields
-    //    the ELF bytes — needed to publish and to encode init args; the
+    //    artifact bytes — needed to publish and to encode legacy init args; the
     //    hash-based form resolves against the already-published catalog,
     //    which is what makes `export | apply --diff` all-skips.
     let (program_name, program_version, explicit_program) = program_ref(agent)?;
-    let (hash, elf_bytes) = if !agent.path.is_empty() {
-        let elf_path = recipe_dir.join(&agent.path);
-        let bytes = std::fs::read(&elf_path).map_err(|e| {
+    let (hash, artifact_bytes, metadata) = if !agent.path.is_empty() {
+        let artifact_path = recipe_dir.join(&agent.path);
+        let bytes = std::fs::read(&artifact_path).map_err(|e| {
             anyhow::anyhow!(
                 "read {} for agent '{}': {e}",
-                elf_path.display(),
+                artifact_path.display(),
                 agent.name
             )
         })?;
-        let h = blob_store::BlobHash::of(&bytes);
-        (h.0, Some(bytes))
+        let source_hash = blob_store::BlobHash::of(&bytes);
+        let (hash, bytes, package_metadata) = super::publish::canonical_program(
+            &program_name,
+            &program_version,
+            source_hash,
+            bytes,
+        )?;
+        let metadata = package_metadata
+            .or_else(|| vos::metadata::raw_section_from_elf(&bytes));
+        (hash.0, Some(bytes), metadata)
     } else if let Some(ph) = &agent.program_hash {
         let h = blob_store::BlobHash::from_hex(ph)
             .map_err(|_| anyhow::anyhow!("agent '{}': program_hash must be 64 hex", agent.name))?;
-        (h.0, None)
+        (h.0, None, None)
     } else {
         anyhow::bail!(
             "agent '{}' has neither `path` (a source recipe) nor `program_hash` (an exported \
@@ -272,7 +282,8 @@ fn preflight_one(
             program_name,
             program_version,
             hash,
-            elf_bytes,
+            artifact_bytes,
+            metadata,
             needs_publish: false,
             action: ApplyAction::Skip,
         });
@@ -292,7 +303,8 @@ fn preflight_one(
             program_name,
             program_version,
             hash,
-            elf_bytes,
+            artifact_bytes,
+            metadata,
             needs_publish: false,
             action: ApplyAction::VersionRequired,
         });
@@ -306,7 +318,7 @@ fn preflight_one(
             agent.name,
         ),
         None => {
-            if elf_bytes.is_none() {
+            if artifact_bytes.is_none() {
                 anyhow::bail!(
                     "agent '{}': program {program_name}:{program_version} (hash {}) is not in the \
                      catalog and this recipe carries no `path` to publish it from",
@@ -324,7 +336,8 @@ fn preflight_one(
             program_name,
             program_version,
             hash,
-            elf_bytes,
+            artifact_bytes,
+            metadata,
             needs_publish,
             action: if upgrade {
                 ApplyAction::Upgrade
@@ -353,17 +366,23 @@ fn preflight_one(
         })?,
         None => SyncFloor::Member,
     };
-    // Installing a new instance needs the ELF (to encode init args). The
-    // path-less `program_hash` form only supports the already-installed
+    // Installing a new instance needs the exact artifact. Legacy ELF recipes
+    // use it to encode init args; v2 packages admit no host-side init payload.
+    // The path-less `program_hash` form only supports the already-installed
     // (skip) path — the round-trip case.
-    let Some(install_elf_bytes) = &elf_bytes else {
+    let Some(install_artifact_bytes) = &artifact_bytes else {
         anyhow::bail!(
             "agent '{}' is not installed and this recipe carries no `path` — the path-less \
              (exported) form can only reconcile already-installed instances",
             agent.name,
         );
     };
-    let install_args = encode_init_args(&agent.name, install_elf_bytes, &agent.init, name_ids)?;
+    let install_args = encode_init_args(
+        &agent.name,
+        install_artifact_bytes,
+        &agent.init,
+        name_ids,
+    )?;
     let install_payloads = encode_on_start_payloads(&agent.on_start)?;
 
     Ok(PreparedAgent {
@@ -371,7 +390,8 @@ fn preflight_one(
         program_name,
         program_version,
         hash,
-        elf_bytes,
+        artifact_bytes,
+        metadata,
         needs_publish,
         action: ApplyAction::Install {
             consistency,
@@ -396,8 +416,8 @@ fn execute_one(
             plan.hash.to_vec(),
         )? {
             Status::Ok => {
-                if let Some(bytes) = &plan.elf_bytes {
-                    forward_meta(client, &blob_store::BlobHash(plan.hash), bytes);
+                if let Some(metadata) = &plan.metadata {
+                    forward_meta(client, &blob_store::BlobHash(plan.hash), metadata);
                 }
             }
             Status::Forbidden => anyhow::bail!(
@@ -489,7 +509,7 @@ fn execute_one(
 /// The program `(name, version)` an agent installs from. Changed agents
 /// must name an explicit immutable `program = "name:version"`; the
 /// implicit `<instance>:recipe` tag is only for initial/idempotent apply.
-fn program_ref(agent: &AgentDef) -> anyhow::Result<(String, String, bool)> {
+pub(crate) fn program_ref(agent: &AgentDef) -> anyhow::Result<(String, String, bool)> {
     match &agent.program {
         Some(pv) => {
             let Some((name, version)) = pv.split_once(':') else {
@@ -605,11 +625,8 @@ fn absolutize(recipe_dir: &Path, path: &str) -> String {
 /// Best-effort: forward a program's `.vos_meta` schema so dynamic
 /// dispatch resolves types. A blob without meta, or a transport hiccup,
 /// is a no-op — it never blocks the apply.
-fn forward_meta(client: &DaemonClient, hash: &blob_store::BlobHash, elf_bytes: &[u8]) {
-    let Some(meta_blob) = vos::metadata::raw_section_from_elf(elf_bytes) else {
-        return;
-    };
-    if let Err(e) = client.register_meta(hash.0.to_vec(), meta_blob) {
+fn forward_meta(client: &DaemonClient, hash: &blob_store::BlobHash, metadata: &[u8]) {
+    if let Err(e) = client.register_meta(hash.0.to_vec(), metadata.to_vec()) {
         tracing::debug!("register_meta during apply skipped: {e}");
     }
 }

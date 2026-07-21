@@ -8,14 +8,14 @@ hyperspace = "bank-federation"
 
 [[agent]]
 name = "clerk-ledger"
-path = "../../../actors/clerk-ledger/target/riscv64em-javm/release/clerk_ledger.elf"
+path = "../../../dist/clerk/clerk-ledger.vos"
 # Raft from genesis — HA across bank-b's nodes; distinct group from bank-a.
 consistency = "raft"
 replication_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 [[agent]]
 name = "clerk-bridge"
-path = "../../../actors/clerk-bridge/target/riscv64em-javm/release/clerk_bridge.elf"
+path = "../../../dist/clerk/clerk-bridge.vos"
 # Local + network_reachable — holds anchor/dedup/window state, must persist.
 consistency = "local"
 network_reachable = true

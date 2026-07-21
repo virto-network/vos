@@ -22,7 +22,7 @@ hyperspace = "bank-federation"
 
 [[agent]]
 name = "clerk-ledger"
-path = "../../../actors/clerk-ledger/target/riscv64em-javm/release/clerk_ledger.elf"
+path = "../../../dist/clerk/clerk-ledger.vos"
 # Raft from genesis — high availability across the bank operator's nodes.
 # The monotone locality seal forbids widening Local -> Raft later, so it must
 # be Raft from the start. Raft is tier-2 and answers the network by design;
@@ -33,7 +33,7 @@ replication_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 [[agent]]
 name = "clerk-bridge"
-path = "../../../actors/clerk-bridge/target/riscv64em-javm/release/clerk_bridge.elf"
+path = "../../../dist/clerk/clerk-bridge.vos"
 # Local (NOT Ephemeral): the bridge holds the F2 `last_root_after` anchor,
 # the voucher dedup set, AND the per-window receiver-term sums — all of which
 # must survive a restart (an Ephemeral restart would zero the receiver sum

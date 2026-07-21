@@ -3,7 +3,7 @@
 # this acceptance directory.
 #
 #   cargo build -p http-gateway -p vosx          # gateway is DEBUG only — release LTO hangs
-#   just build-clerk-ledger && just build-clerk-bridge
+#   just package-clerk dist/vos-service.pvm dist/clerk
 #   ./target/debug/vosx space new clerk-demo --recipe tests/acceptance/clerk/space-clerk-demo.toml
 #   RUST_LOG=warn ./target/debug/vosx space up clerk-demo &      # SIGTERM to stop
 #
@@ -26,7 +26,7 @@ name = "clerk-ledger"
 # seal forbids widening Local -> Raft later). A single node self-elects, so
 # this drives fine from the gateway; the full HA story is the multi-node
 # bank manifests (tests/acceptance/clerk/space-bank-a.toml).
-path = "../../../actors/clerk-ledger/target/riscv64em-javm/release/clerk_ledger.elf"
+path = "../../../dist/clerk/clerk-ledger.vos"
 consistency = "raft"
 
 [[agent]]
@@ -34,7 +34,7 @@ name = "clerk-bridge"
 # Local + network_reachable: the bridge holds the F2 anchor, dedup set, and
 # per-window receiver-term sums (must persist), and answers peer banks over
 # the network. NOT Ephemeral.
-path = "../../../actors/clerk-bridge/target/riscv64em-javm/release/clerk_bridge.elf"
+path = "../../../dist/clerk/clerk-bridge.vos"
 consistency = "local"
 network_reachable = true
 

@@ -19,7 +19,7 @@ hyperspace = "bank-federation"
 
 [[agent]]
 name = "clerk-settle"
-path = "../../../actors/clerk-settle/target/riscv64em-javm/release/clerk_settle.elf"
+path = "../../../dist/clerk/clerk-settle.vos"
 # Raft from genesis — the registered banks + settled-window log are HA across
 # the venue operator's nodes. Raft answers the network by design (no opt-out
 # needed). Only one venue runs, and "clerk-settle" is a distinct name from the
