@@ -799,8 +799,30 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
     /// Canonical identities of every actor owned by this physical service
     /// route. Transport authentication binds the complete tree, since an
     /// inline child may be the producer of a durable cross-root message.
-    pub fn actor_ids(&self) -> impl Iterator<Item = ActorId> + '_ {
-        self.expected_actors.iter().map(|actor| actor.actor)
+    pub fn actor_ids(&self) -> Result<Vec<ActorId>, LocalRootTreeInvokeErrorV2> {
+        let Some(header) = self
+            .service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+        else {
+            // An uninitialized Raft follower still reserves the signed static
+            // tree while it waits for the genesis log entry.
+            return Ok(self
+                .expected_actors
+                .iter()
+                .map(|actor| actor.actor)
+                .collect());
+        };
+        let bytes = self
+            .service
+            .accumulate_host()
+            .state_row(header.service_root, &StateKeyV2::ActorDirectory)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::ExistingActorMismatch)?;
+        ActorDirectoryV2::decode(&bytes)
+            .map(|directory| directory.actors)
+            .map_err(|_| LocalRootTreeInvokeErrorV2::ExistingActorMismatch)
     }
 
     pub const fn consistency(&self) -> ConsistencyModeV2 {
@@ -889,28 +911,145 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             .state_row(header.service_root, &StateKeyV2::ActorDirectory)
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
             .and_then(|bytes| ActorDirectoryV2::decode(&bytes).ok());
-        let expected_directory = self
-            .expected_actors
-            .iter()
-            .map(|actor| actor.actor)
-            .collect::<Vec<_>>();
-        if directory
-            .as_ref()
-            .is_none_or(|directory| directory.actors != expected_directory)
+        let Some(directory) = directory else {
+            return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
+        };
+        if directory.actors.len() > super::MAX_ROOT_TREE_ACTORS
+            || self
+                .expected_actors
+                .iter()
+                .any(|expected| directory.actors.binary_search(&expected.actor).is_err())
         {
             return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
         }
-        for expected in &self.expected_actors {
+
+        let mut descriptors = Vec::with_capacity(directory.actors.len());
+        let mut names = BTreeSet::new();
+        for actor in &directory.actors {
             let descriptor = self
+                .service
+                .accumulate_host()
+                .state_row(header.service_root, &StateKeyV2::ActorDescriptor(*actor))
+                .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+                .and_then(|bytes| ActorGenesisV2::decode(&bytes).ok())
+                .ok_or(LocalRootTreeInvokeErrorV2::ExistingActorMismatch)?;
+            if descriptor.actor != *actor
+                || descriptor.name.is_empty()
+                || descriptor.parent == Some(*actor)
+                || !names.insert((descriptor.parent, descriptor.name.clone()))
+                || self
+                    .service
+                    .accumulate_host()
+                    .program(descriptor.program)
+                    .is_none()
+            {
+                return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
+            }
+            let name_row = self
                 .service
                 .accumulate_host()
                 .state_row(
                     header.service_root,
-                    &StateKeyV2::ActorDescriptor(expected.actor),
+                    &StateKeyV2::ActorName {
+                        parent: descriptor.parent,
+                        name: descriptor.name.clone(),
+                    },
                 )
+                .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?;
+            if name_row.as_deref() != Some(actor.0.as_slice()) {
+                return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
+            }
+            for method in &descriptor.methods {
+                let policy = self
+                    .service
+                    .accumulate_host()
+                    .state_row(
+                        header.service_root,
+                        &StateKeyV2::MethodPolicy {
+                            actor: *actor,
+                            method: method.method.clone(),
+                        },
+                    )
+                    .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?;
+                if policy.as_deref() != Some(method.encode().as_slice()) {
+                    return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
+                }
+            }
+            let state_key = if self.consistency == ConsistencyModeV2::Crdt {
+                StateKeyV2::CrdtMaterialization(*actor)
+            } else {
+                StateKeyV2::ActorRow {
+                    actor: *actor,
+                    key: crate::actors::lifecycle::STATE_KEY_BYTES.to_vec(),
+                }
+            };
+            let state = self
+                .service
+                .accumulate_host()
+                .state_row(header.service_root, &state_key)
                 .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
-                .and_then(|bytes| ActorGenesisV2::decode(&bytes).ok());
-            if descriptor.as_ref() != Some(expected) {
+                .and_then(|bytes| BlobRefV2::decode(&bytes).ok());
+            if state
+                .as_ref()
+                .is_none_or(|state| self.service.accumulate_host().blob(state).is_none())
+                || self
+                    .service
+                    .accumulate_host()
+                    .blob(&descriptor.initial_state)
+                    .is_none()
+            {
+                return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
+            }
+            descriptors.push(descriptor);
+        }
+        if descriptors
+            .iter()
+            .filter(|descriptor| descriptor.parent.is_none())
+            .map(|descriptor| descriptor.actor)
+            .ne(core::iter::once(self.root_actor))
+        {
+            return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
+        }
+        for descriptor in &descriptors {
+            if let Some(expected) = self
+                .expected_actors
+                .iter()
+                .find(|expected| expected.actor == descriptor.actor)
+            {
+                if descriptor != expected {
+                    return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
+                }
+            } else {
+                let Some(parent_id) = descriptor.parent else {
+                    return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
+                };
+                let Some(parent) = descriptors
+                    .iter()
+                    .find(|candidate| candidate.actor == parent_id)
+                else {
+                    return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
+                };
+                if descriptor.actor != ActorId::owned_child(parent_id, &descriptor.name)
+                    || descriptor.producer != parent.producer
+                    || descriptor.program != parent.program
+                    || descriptor.crdt != parent.crdt
+                    || descriptor.methods != parent.methods
+                {
+                    return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
+                }
+            }
+            let mut cursor = descriptor.actor;
+            for _ in 0..descriptors.len() {
+                if cursor == self.root_actor {
+                    break;
+                }
+                cursor = descriptors
+                    .iter()
+                    .find(|candidate| candidate.actor == cursor)
+                    .and_then(|candidate| candidate.parent)
+                    .ok_or(LocalRootTreeInvokeErrorV2::ExistingActorMismatch)?;
+            }
+            if cursor != self.root_actor {
                 return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
             }
         }

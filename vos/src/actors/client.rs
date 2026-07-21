@@ -68,8 +68,7 @@ pub enum ClientError {
     NotFound,
     /// `Context::child` resolved an actor outside the caller's owned tree.
     NotOwnedChild,
-    /// V2 child creation cannot fall back to the legacy registry service.
-    /// The guest-owned spawn transition has not been committed.
+    /// The current actor state or consistency mode cannot admit a v2 child.
     SpawnUnavailable,
     /// The runtime returned an attestation package whose typed method, claim
     /// wire, or statement did not match the committed reply.
@@ -89,7 +88,7 @@ impl core::fmt::Display for ClientError {
             Self::NotOwnedChild => write!(f, "client: actor is not an owned child"),
             Self::SpawnUnavailable => write!(
                 f,
-                "client: child creation requires the guest-owned v2 spawn transition"
+                "client: child creation is unavailable for this actor state or consistency mode"
             ),
             Self::InvalidAttestation(error) => write!(f, "client: {error}"),
             Self::Call(error) => write!(f, "client: {error}"),

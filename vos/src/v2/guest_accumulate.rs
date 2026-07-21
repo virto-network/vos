@@ -1253,9 +1253,22 @@ fn apply<S: GuestAccumulateStoreV2>(
     } else {
         None
     };
+    if mode == ApplyMode::Commit
+        && let Some(receipt) = duplicate_receipt.clone()
+    {
+        // The guest-authenticated dedup row binds the complete work and
+        // transition commitments. Return before comparing imports with the
+        // now-current directory: the accepted transition may itself have
+        // created an actor or otherwise advanced the service image.
+        return Ok(AccumulationResultV2::Accepted {
+            receipt,
+            published: PublishedEffectsV2::default(),
+            duplicate: true,
+        });
+    }
 
     let mut tree = ServiceStateTreeV2::new(store, header.service_root);
-    let Some(directory) =
+    let Some(mut directory) =
         tree_get_wire::<_, super::ActorDirectoryV2>(&tree, &StateKeyV2::ActorDirectory)?
     else {
         return Ok(rejected(AccumulationRejectionV2::WrongProgram));
@@ -1321,22 +1334,13 @@ fn apply<S: GuestAccumulateStoreV2>(
     }
 
     if let Some(receipt) = duplicate_receipt {
-        return Ok(match mode {
-            ApplyMode::Commit => AccumulationResultV2::Accepted {
-                receipt,
-                published: PublishedEffectsV2::default(),
-                duplicate: true,
-            },
-            ApplyMode::PrepareAttested => {
-                let preparation = match AttestationPreparationV2::for_transition(
-                    work, transition, &policy, receipt,
-                ) {
-                    Ok(preparation) => preparation,
-                    Err(_) => return Ok(rejected(AccumulationRejectionV2::InvalidProof)),
-                };
-                AccumulationResultV2::Prepared(preparation)
-            }
-        });
+        debug_assert_eq!(mode, ApplyMode::PrepareAttested);
+        let preparation =
+            match AttestationPreparationV2::for_transition(work, transition, &policy, receipt) {
+                Ok(preparation) => preparation,
+                Err(_) => return Ok(rejected(AccumulationRejectionV2::InvalidProof)),
+            };
+        return Ok(AccumulationResultV2::Prepared(preparation));
     }
 
     let base_workflow = if let ConsistencyBaseV2::Crdt { heads } = &work.base {
@@ -1448,7 +1452,7 @@ fn apply<S: GuestAccumulateStoreV2>(
         return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
     if header.consistency == ConsistencyModeV2::Crdt
-        && !transition.attestation_verifications.is_empty()
+        && (!transition.attestation_verifications.is_empty() || !transition.spawns.is_empty())
     {
         // Once-only admission requires a linearizable service transaction.
         // CRDT applications must use an application-specific conflict-free
@@ -1468,6 +1472,40 @@ fn apply<S: GuestAccumulateStoreV2>(
     }
     if contains_cycle(&transition.outbox) {
         return Ok(rejected(AccumulationRejectionV2::MessageCycle));
+    }
+    if directory
+        .actors
+        .len()
+        .saturating_add(transition.spawns.len())
+        > super::MAX_ROOT_TREE_ACTORS
+    {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
+    let mut spawn_descriptors = Vec::with_capacity(transition.spawns.len());
+    for spawn in &transition.spawns {
+        let Some(parent) =
+            tree_get_wire::<_, ActorGenesisV2>(&tree, &StateKeyV2::ActorDescriptor(spawn.parent))?
+        else {
+            return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+        };
+        if spawn.actor != ActorId::owned_child(spawn.parent, &spawn.name)
+            || directory.actors.binary_search(&spawn.actor).is_ok()
+            || tree
+                .get(&StateKeyV2::ActorName {
+                    parent: Some(spawn.parent),
+                    name: spawn.name.clone(),
+                })
+                .map_err(GuestAccumulateError::StateTree)?
+                .is_some()
+        {
+            return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
+        let mut descriptor = parent;
+        descriptor.actor = spawn.actor;
+        descriptor.name = spawn.name.clone();
+        descriptor.parent = Some(spawn.parent);
+        descriptor.initial_state = spawn.initial_state.clone();
+        spawn_descriptors.push(descriptor);
     }
     for message in &transition.inbox {
         if tree_get_wire::<_, ActorGenesisV2>(&tree, &StateKeyV2::ActorDescriptor(message.to))?
@@ -1541,6 +1579,49 @@ fn apply<S: GuestAccumulateStoreV2>(
                 invocation: verification.statement.invocation,
             },
             Some(&verification.encode()),
+        )?;
+    }
+
+    for (spawn, descriptor) in transition.spawns.iter().zip(&spawn_descriptors) {
+        let insert_at = directory
+            .actors
+            .binary_search(&spawn.actor)
+            .expect_err("spawn actor collision was validated");
+        directory.actors.insert(insert_at, spawn.actor);
+        tree_apply(
+            &mut tree,
+            &StateKeyV2::ActorDescriptor(spawn.actor),
+            Some(&descriptor.encode()),
+        )?;
+        tree_apply(
+            &mut tree,
+            &StateKeyV2::ActorName {
+                parent: Some(spawn.parent),
+                name: spawn.name.clone(),
+            },
+            Some(&spawn.actor.0),
+        )?;
+        for method in &descriptor.methods {
+            tree_apply(
+                &mut tree,
+                &StateKeyV2::MethodPolicy {
+                    actor: spawn.actor,
+                    method: method.method.clone(),
+                },
+                Some(&method.encode()),
+            )?;
+        }
+        tree_apply(
+            &mut tree,
+            &actor_state_key(header.consistency, spawn.actor),
+            Some(&spawn.initial_state.encode()),
+        )?;
+    }
+    if !transition.spawns.is_empty() {
+        tree_apply(
+            &mut tree,
+            &StateKeyV2::ActorDirectory,
+            Some(&directory.encode()),
         )?;
     }
 
@@ -2017,7 +2098,15 @@ fn canonical_transition_shape(
         }
         previous = Some(key);
     }
-    is_sorted_unique_by(&transition.continuations, |change| change.actor.0)
+    is_sorted_unique_by(&transition.spawns, |spawn| spawn.actor.0)
+        && transition.spawns.iter().all(|spawn| {
+            spawn.actor == ActorId::owned_child(spawn.parent, &spawn.name)
+                && work
+                    .imported_actors
+                    .binary_search_by_key(&spawn.parent, |actor| actor.actor)
+                    .is_ok()
+        })
+        && is_sorted_unique_by(&transition.continuations, |change| change.actor.0)
         && is_sorted_unique_by(&transition.inbox, |message| message.call_id.0)
         && is_sorted_unique_by(&transition.outbox, |message| message.call_id.0)
         && is_sorted_unique_by(&transition.attestation_verifications, |verification| {
@@ -2437,6 +2526,7 @@ fn referenced_blobs<'a>(
                 .chain(actor.continuation.iter())
         }))
         .chain(transition.exported_blobs.iter())
+        .chain(transition.spawns.iter().map(|spawn| &spawn.initial_state))
         .chain(
             transition
                 .continuations
@@ -2731,9 +2821,9 @@ mod tests {
     use super::*;
     use crate::attestation::{AttestationStatementV3, StateCommitmentV3};
     use crate::v2::{
-        ActorWriteV2, AttestationVerificationV2, ContinuationChangeV2, CrdtMaterializationV2,
-        CrdtOperationV2, DeploymentId, GasAccountingV2, ImportedActorV2, ImportedBlobV2,
-        InvocationId, OperationId, Origin, ProgramId, ReplyRecordV2, RootServiceId,
+        ActorSpawnV2, ActorWriteV2, AttestationVerificationV2, ContinuationChangeV2,
+        CrdtMaterializationV2, CrdtOperationV2, DeploymentId, GasAccountingV2, ImportedActorV2,
+        ImportedBlobV2, InvocationId, OperationId, Origin, ProgramId, ReplyRecordV2, RootServiceId,
         ServiceIdentityV2, TransitionV2, WorkEnvelopeV2,
     };
 
@@ -2955,6 +3045,7 @@ mod tests {
                 key: crate::actors::lifecycle::STATE_KEY_BYTES.to_vec(),
                 value: Some(state.to_vec()),
             }],
+            spawns: Vec::new(),
             crdt_change: None,
             continuations: Vec::new(),
             inbox: Vec::new(),
@@ -2971,6 +3062,95 @@ mod tests {
             gas: GasAccountingV2::default(),
             proof: None,
         }
+    }
+
+    #[test]
+    fn owned_child_spawn_is_atomic_deduplicated_and_guest_materialized() {
+        let mut store = MemStore::default();
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let work = linear_work(initial, install.resulting_state_root.unwrap());
+        let child = ActorId::owned_child(actor(), "child");
+        let child_bytes = b"child-state".to_vec();
+        let child_state = BlobRefV2::of_bytes(&child_bytes);
+        let mut transition = linear_transition(&work, b"after");
+        transition.spawns.push(ActorSpawnV2 {
+            actor: child,
+            name: "child".into(),
+            parent: actor(),
+            initial_state: child_state.clone(),
+        });
+        let envelope = AccumulationEnvelopeV2 {
+            work: work.clone(),
+            transition: transition.clone(),
+            provided_blobs: vec![ImportedBlobV2 {
+                reference: child_state.clone(),
+                bytes: child_bytes,
+            }],
+        };
+        let before = store.clone();
+        let mut missing = envelope.clone();
+        missing.provided_blobs.clear();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Apply(missing)).unwrap(),
+            rejected(AccumulationRejectionV2::MissingBlob(child_state.hash))
+        );
+        assert_eq!(
+            store, before,
+            "missing child state must commit no partial directory"
+        );
+
+        let accepted =
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Apply(envelope.clone()))
+                .unwrap();
+        assert!(matches!(
+            accepted,
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+        {
+            let header =
+                StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
+            let tree = ServiceStateTreeV2::new(&mut store, header.service_root);
+            let directory = tree_get_wire::<_, super::super::ActorDirectoryV2>(
+                &tree,
+                &StateKeyV2::ActorDirectory,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(directory.actors.len(), 2);
+            assert!(directory.actors.binary_search(&actor()).is_ok());
+            assert!(directory.actors.binary_search(&child).is_ok());
+            let descriptor =
+                tree_get_wire::<_, ActorGenesisV2>(&tree, &StateKeyV2::ActorDescriptor(child))
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(descriptor.actor, child);
+            assert_eq!(descriptor.parent, Some(actor()));
+            assert_eq!(descriptor.name, "child");
+            assert_eq!(descriptor.initial_state, child_state);
+            assert_eq!(descriptor.program, program());
+            assert_eq!(
+                tree_get_wire::<_, BlobRefV2>(
+                    &tree,
+                    &StateKeyV2::ActorRow {
+                        actor: child,
+                        key: crate::actors::lifecycle::STATE_KEY_BYTES.to_vec(),
+                    },
+                )
+                .unwrap(),
+                Some(child_state)
+            );
+        }
+
+        assert!(matches!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Apply(envelope)).unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -4557,6 +4737,7 @@ mod tests {
             target_program: work.target_program,
             base: work.base.clone(),
             writes: Vec::new(),
+            spawns: Vec::new(),
             crdt_change: Some(CrdtChangeV2 {
                 id: change_id,
                 causal_dependencies: match &work.base {

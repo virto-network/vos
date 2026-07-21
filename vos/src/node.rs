@@ -67,6 +67,7 @@ impl AgentResult {
 pub enum V2NodeRegistrationError {
     CorruptStore(crate::v2::LocalStoreReadErrorV2),
     StoreUninitialized,
+    InvalidActorDirectory,
     ServiceRouteOccupied(ServiceId),
     ActorRouteOccupied(crate::v2::ActorId),
     InvalidConsistency(crate::v2::ConsistencyModeV2),
@@ -3066,7 +3067,9 @@ impl VosNode {
         {
             return Err(V2NodeRegistrationError::ServiceRouteOccupied(id));
         }
-        let actor_ids = service.actor_ids().collect::<Vec<_>>();
+        let actor_ids = service
+            .actor_ids()
+            .map_err(|_| V2NodeRegistrationError::InvalidActorDirectory)?;
         {
             let mut routes = self.v2_actor_routes.write().unwrap();
             if let Some(actor) = actor_ids
@@ -4252,6 +4255,7 @@ where
         Ok(false) => info!(%id, "v2 Raft root is waiting for committed service genesis"),
         Err(error) => warn!(%id, ?error, "v2 root-tree startup catch-up failed"),
     }
+    refresh_v2_owned_actor_routes(id, &service, &actor_routes);
     #[cfg(all(feature = "network", feature = "storage"))]
     if let Some(hooks) = sync_hooks.as_mut() {
         refresh_v2_crdt_export(id, &service, hooks);
@@ -4277,6 +4281,9 @@ where
                         false
                     }
                 };
+                if accepted {
+                    refresh_v2_owned_actor_routes(id, &service, &actor_routes);
+                }
                 let _ = request.reply.send(accepted);
             }
             refresh_v2_crdt_export(id, &service, hooks);
@@ -4291,6 +4298,7 @@ where
                 &actor_routes,
                 &mut state,
             );
+            refresh_v2_owned_actor_routes(id, &service, &actor_routes);
         }
         if last_publication_retry.elapsed() >= Duration::from_millis(250) {
             match service.catch_up() {
@@ -4305,13 +4313,8 @@ where
                     continue;
                 }
             }
-            retry_v2_work(
-                id,
-                &mut service,
-                &outbox,
-                &actor_routes,
-                &mut state,
-            );
+            retry_v2_work(id, &mut service, &outbox, &actor_routes, &mut state);
+            refresh_v2_owned_actor_routes(id, &service, &actor_routes);
             last_publication_retry = Instant::now();
         }
         let request = match invoke_rx.recv_timeout(Duration::from_millis(10)) {
@@ -4449,6 +4452,7 @@ where
                     &actor_routes,
                     &mut state,
                 );
+                refresh_v2_owned_actor_routes(id, &service, &actor_routes);
                 continue;
             }
             Ok(crate::v2::RootTreeIngressRecoveryV2::Completed { reply }) => {
@@ -4505,6 +4509,7 @@ where
                 send_v2_status(request.reply, crate::actors::run::STATUS_PANICKED, id);
             }
         }
+        refresh_v2_owned_actor_routes(id, &service, &actor_routes);
     }
     actor_routes
         .write()
@@ -4514,6 +4519,37 @@ where
         id,
         panics: 0,
         error: None,
+    }
+}
+
+fn refresh_v2_owned_actor_routes<B>(
+    id: ServiceId,
+    service: &crate::v2::LocalRootTreeServiceV2<B>,
+    actor_routes: &RwLock<HashMap<crate::v2::ActorId, u32>>,
+) where
+    B: crate::v2::CommittedImageStoreV2,
+{
+    let actors = match service.actor_ids() {
+        Ok(actors) => actors,
+        Err(error) => {
+            warn!(%id, ?error, "v2 committed actor directory could not be routed");
+            return;
+        }
+    };
+    let mut routes = actor_routes.write().unwrap();
+    for actor in actors {
+        match routes.get(&actor) {
+            Some(route) if *route == id.0 => {}
+            Some(route) => warn!(
+                %id,
+                ?actor,
+                occupied_route = *route,
+                "v2 committed child route is already occupied"
+            ),
+            None => {
+                routes.insert(actor, id.0);
+            }
+        }
     }
 }
 

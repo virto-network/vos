@@ -70,6 +70,19 @@ impl ProgramId {
     }
 }
 
+impl ActorId {
+    /// Stable identity of an owned child in its parent's namespace. Retries
+    /// of the same spawn request therefore address one actor, while the
+    /// parent's globally unique identity keeps equal child names in separate
+    /// trees distinct.
+    pub fn owned_child(parent: Self, name: &str) -> Self {
+        Self(crate::crypto::blake2b_hash::<32>(
+            b"vos/owned-child/v2",
+            &[&parent.0, name.as_bytes()],
+        ))
+    }
+}
+
 impl ProducerId {
     pub fn of_public_key(public_key: &[u8]) -> Self {
         Self(crate::crypto::blake2b_hash::<32>(
@@ -163,5 +176,22 @@ mod tests {
     fn program_id_uses_canonical_bytes() {
         assert_eq!(ProgramId::of_pvm(b"pvm"), ProgramId::of_pvm(b"pvm"));
         assert_ne!(ProgramId::of_pvm(b"pvm"), ProgramId::of_pvm(b"elf"));
+    }
+
+    #[test]
+    fn owned_child_ids_are_parent_and_name_scoped() {
+        let parent = ActorId([1; 32]);
+        assert_eq!(
+            ActorId::owned_child(parent, "worker"),
+            ActorId::owned_child(parent, "worker")
+        );
+        assert_ne!(
+            ActorId::owned_child(parent, "worker"),
+            ActorId::owned_child(parent, "other")
+        );
+        assert_ne!(
+            ActorId::owned_child(parent, "worker"),
+            ActorId::owned_child(ActorId([2; 32]), "worker")
+        );
     }
 }

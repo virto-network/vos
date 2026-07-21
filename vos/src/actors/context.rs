@@ -59,6 +59,8 @@ pub struct Context<A: Actor> {
     #[cfg(feature = "pvm")]
     pending_actor_calls: Vec<crate::v2::ActorCallRequestV2>,
     #[cfg(feature = "pvm")]
+    pending_actor_spawns: Vec<crate::v2::ActorSpawnRequestV2>,
+    #[cfg(feature = "pvm")]
     first_await_ordinal: u64,
     #[cfg(feature = "pvm")]
     next_await_ordinal: u64,
@@ -74,6 +76,8 @@ pub struct Context<A: Actor> {
     nested_writes: BTreeMap<(crate::v2::ActorId, Vec<u8>), Option<Vec<u8>>>,
     #[cfg(feature = "pvm")]
     nested_actor_calls: Vec<crate::v2::ActorCallRequestV2>,
+    #[cfg(feature = "pvm")]
+    nested_actor_spawns: Vec<crate::v2::ActorSpawnRequestV2>,
     #[cfg(feature = "pvm")]
     nested_crdt_operations: Vec<crate::v2::CrdtOperationV2>,
     #[cfg(feature = "pvm")]
@@ -124,6 +128,8 @@ impl<A: Actor> Context<A> {
             #[cfg(feature = "pvm")]
             pending_actor_calls: Vec::new(),
             #[cfg(feature = "pvm")]
+            pending_actor_spawns: Vec::new(),
+            #[cfg(feature = "pvm")]
             first_await_ordinal: 0,
             #[cfg(feature = "pvm")]
             next_await_ordinal: 0,
@@ -139,6 +145,8 @@ impl<A: Actor> Context<A> {
             nested_writes: BTreeMap::new(),
             #[cfg(feature = "pvm")]
             nested_actor_calls: Vec::new(),
+            #[cfg(feature = "pvm")]
+            nested_actor_spawns: Vec::new(),
             #[cfg(feature = "pvm")]
             nested_crdt_operations: Vec::new(),
             #[cfg(feature = "pvm")]
@@ -918,6 +926,7 @@ impl<A: Actor> Context<A> {
                 .insert((write.actor, write.key), write.value);
         }
         self.nested_actor_calls.extend(output.outbox);
+        self.nested_actor_spawns.extend(output.spawns);
         if output.yielded {
             let Some(checkpoint) = output.checkpoint else {
                 return Some(super::run::Ask::ready_err(
@@ -1187,11 +1196,50 @@ impl<A: Actor> Context<A> {
         T: super::codec::Encode,
     {
         let name = name.into();
-        if self.actor_id.is_some() {
-            // A v2 actor must never escape into the route-only v1 registry
-            // protocol. Child creation will be enabled only by a typed spawn
-            // record validated and committed by guest Accumulate.
-            return Err(super::client::ClientError::SpawnUnavailable);
+        if let Some(parent) = self.actor_id {
+            #[cfg(feature = "pvm")]
+            {
+                if self.actor_change.is_some()
+                    || name.is_empty()
+                    || self
+                        .actor_tree
+                        .binary_search_by_key(&parent, |actor| actor.actor)
+                        .is_err()
+                    || self.actor_tree.len() + self.pending_actor_spawns.len()
+                        >= crate::v2::MAX_ROOT_TREE_ACTORS
+                    || self
+                        .actor_tree
+                        .iter()
+                        .any(|actor| actor.parent == Some(parent) && actor.name == name)
+                    || self
+                        .pending_actor_spawns
+                        .iter()
+                        .any(|spawn| spawn.parent == parent && spawn.name == name)
+                {
+                    return Err(super::client::ClientError::SpawnUnavailable);
+                }
+                let actor = crate::v2::ActorId::owned_child(parent, &name);
+                if self
+                    .actor_tree
+                    .iter()
+                    .any(|candidate| candidate.actor == actor)
+                {
+                    return Err(super::client::ClientError::SpawnUnavailable);
+                }
+                self.pending_actor_spawns
+                    .push(crate::v2::ActorSpawnRequestV2 {
+                        actor,
+                        name,
+                        parent,
+                        initial_state: init.encode(),
+                    });
+                return Ok(R::bind(actor, self));
+            }
+            #[cfg(not(feature = "pvm"))]
+            {
+                let _ = (parent, init);
+                return Err(super::client::ClientError::SpawnUnavailable);
+            }
         }
         let request = super::value::Msg::new("spawn_child")
             .with("owner", self.id.0)
@@ -1366,8 +1414,10 @@ impl<A: Actor> Context<A> {
         self.pending_provides.clear();
         self.pending_spawns.clear();
         self.pending_actor_calls.clear();
+        self.pending_actor_spawns.clear();
         self.nested_writes.clear();
         self.nested_actor_calls.clear();
+        self.nested_actor_spawns.clear();
         self.nested_crdt_operations.clear();
         self.nested_crdt_states.clear();
         self.reply = None;
@@ -1625,6 +1675,15 @@ impl<A: Actor> Context<A> {
         calls.append(&mut self.pending_actor_calls);
         calls.sort_by_key(|call| call.await_ordinal);
         calls
+    }
+
+    #[cfg(feature = "pvm")]
+    #[doc(hidden)]
+    pub fn __drain_actor_spawns_v2(&mut self) -> Vec<crate::v2::ActorSpawnRequestV2> {
+        let mut spawns = core::mem::take(&mut self.nested_actor_spawns);
+        spawns.append(&mut self.pending_actor_spawns);
+        spawns.sort_by_key(|spawn| spawn.actor);
+        spawns
     }
 
     #[cfg(feature = "pvm")]
@@ -2086,6 +2145,35 @@ mod tests {
             crate::block_on(ctx.spawn::<TestRef, _>("child", &TestMsg)),
             Err(crate::ClientError::SpawnUnavailable)
         ));
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn v2_spawn_buffers_a_deterministic_owned_child_request() {
+        let root = crate::v2::ActorId([1; 32]);
+        let mut ctx: Context<TestActor> = Context::new(ServiceId(0));
+        ctx.__set_actor_id(root);
+        ctx.actor_tree = alloc::vec![crate::v2::ActorTreeImportV2 {
+            actor: root,
+            name: "root".into(),
+            parent: None,
+            program: crate::v2::ProgramId([9; 32]),
+            state: alloc::vec![],
+            causal_states: alloc::vec![],
+            next_crdt_ordinal: 0,
+            suspended: false,
+        }];
+
+        assert!(crate::block_on(ctx.spawn::<TestRef, _>("child", &TestMsg)).is_ok());
+        let spawns = ctx.__drain_actor_spawns_v2();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(
+            spawns[0].actor,
+            crate::v2::ActorId::owned_child(root, "child")
+        );
+        assert_eq!(spawns[0].parent, root);
+        assert_eq!(spawns[0].name, "child");
+        assert_eq!(spawns[0].initial_state, TestMsg.encode());
     }
 
     #[test]

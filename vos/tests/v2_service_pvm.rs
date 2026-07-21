@@ -855,6 +855,81 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
 }
 
 #[test]
+fn guest_spawned_child_survives_restart_and_joins_the_owned_scheduler() {
+    let Some((mut config, _, root, _)) = workflow_root_configs() else {
+        return;
+    };
+    config.owned_actors.clear();
+    let mut service =
+        LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
+            .expect("root-only actor tree installs");
+    let mut spawn_arguments = vec![vos::value::TAG_DYNAMIC];
+    spawn_arguments.extend_from_slice(&Msg::new("spawn_dynamic").encode());
+    let spawned = service
+        .invoke(LocalWorkRequestV2 {
+            invocation: InvocationId([97; 32]),
+            workflow_step: 0,
+            logical_timeslot: 1,
+            target: root,
+            method: "spawn_dynamic".into(),
+            arguments: spawn_arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        })
+        .expect("actor output requests a guest-owned child spawn");
+    assert_eq!(
+        spawned
+            .published
+            .reply
+            .as_ref()
+            .and_then(|reply| Value::try_decode(&reply.result)),
+        Some(Value::Bool(true))
+    );
+    let child = ActorId::owned_child(root, "dynamic");
+    let actor_ids = service.actor_ids().unwrap();
+    assert_eq!(actor_ids.len(), 2);
+    assert!(actor_ids.binary_search(&root).is_ok());
+    assert!(actor_ids.binary_search(&child).is_ok());
+    let publication = spawned.publication.unwrap();
+    assert!(!service.acknowledge_publication(&publication).unwrap());
+
+    let backend = service.into_backend();
+    let restarted = LocalRootTreeServiceV2::open(config, backend)
+        .expect("the committed dynamic directory validates after restart");
+    assert!(restarted.actor_ids().unwrap().binary_search(&child).is_ok());
+
+    let mut node = VosNode::new();
+    node.register_v2_root_at_id("spawn-root".into(), restarted, ServiceId(197), true)
+        .expect("registration binds the complete committed directory");
+    let mut call_arguments = vec![vos::value::TAG_DYNAMIC];
+    call_arguments.extend_from_slice(&Msg::new("call_dynamic").encode());
+    let reply = node
+        .invoke_handle()
+        .invoke_with_timeout(
+            ServiceId(197),
+            vos::v2::RootTreeInvocationV2 {
+                invocation: InvocationId([98; 32]),
+                logical_timeslot: 2,
+                target: root,
+                method: "call_dynamic".into(),
+                arguments: call_arguments,
+                proof_requested: false,
+            }
+            .encode(),
+            std::time::Duration::from_secs(120),
+        )
+        .expect("the restarted root calls the dynamically committed child inline");
+    assert_eq!(Value::try_decode(&reply), Some(Value::U32(6)));
+    node.shutdown();
+    assert!(node.collect().into_iter().all(|result| result.is_ok()));
+}
+
+#[test]
 fn raft_root_tree_orders_genesis_ingress_apply_and_ack_through_ic5() {
     let Some((mut config, _, actor, _)) = workflow_root_configs() else {
         return;
@@ -4099,6 +4174,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             key: vos::lifecycle::STATE_KEY_BYTES.to_vec(),
             value: Some(b"committed actor state".to_vec()),
         }],
+        spawns: vec![],
         crdt_change: None,
         continuations: vec![ContinuationChangeV2 {
             actor: work.target,
@@ -4282,6 +4358,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         target_program: resumed.work.target_program,
         base: resumed.work.base.clone(),
         writes: vec![],
+        spawns: vec![],
         crdt_change: None,
         continuations: vec![ContinuationChangeV2 {
             actor: resumed.work.target,
@@ -4325,6 +4402,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         target_program: delivered.work.target_program,
         base: delivered.work.base.clone(),
         writes: vec![],
+        spawns: vec![],
         crdt_change: None,
         continuations: vec![],
         inbox: vec![],
@@ -4400,6 +4478,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         target_program: proof_work.target_program,
         base: proof_work.base.clone(),
         writes: vec![],
+        spawns: vec![],
         crdt_change: None,
         continuations: vec![],
         inbox: vec![],
@@ -4790,6 +4869,7 @@ fn physical_guest_verifies_consumed_attestations_and_rejects_replay() {
             key: vos::lifecycle::STATE_KEY_BYTES.to_vec(),
             value: Some(state.to_vec()),
         }],
+        spawns: vec![],
         crdt_change: None,
         continuations: vec![],
         inbox: vec![],
@@ -5180,6 +5260,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             key: vos::lifecycle::STATE_KEY_BYTES.to_vec(),
             value: Some(b"leader state".to_vec()),
         }],
+        spawns: vec![],
         crdt_change: None,
         continuations: vec![],
         inbox: vec![],
@@ -5249,6 +5330,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             key: vos::lifecycle::STATE_KEY_BYTES.to_vec(),
             value: Some(b"failover state".to_vec()),
         }],
+        spawns: vec![],
         crdt_change: None,
         continuations: vec![],
         inbox: vec![],
@@ -5397,6 +5479,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         target_program: prepared.work.target_program,
         base: prepared.work.base.clone(),
         writes: vec![],
+        spawns: vec![],
         crdt_change: None,
         continuations: vec![],
         inbox: vec![],
@@ -5782,6 +5865,7 @@ fn physical_guest_accumulate_authenticates_cross_root_delivery() {
             key: vos::lifecycle::STATE_KEY_BYTES.to_vec(),
             value: Some(initial_bytes),
         }],
+        spawns: vec![],
         crdt_change: None,
         continuations: vec![],
         inbox: vec![],

@@ -35,6 +35,22 @@ impl WorkflowV2 {
     }
 
     #[msg]
+    async fn spawn_dynamic(&mut self, ctx: &mut Context<Self>) -> bool {
+        ctx.spawn::<WorkflowV2Ref, _>("dynamic", &WorkflowV2 { value: 5 })
+            .await
+            .is_ok()
+    }
+
+    #[msg]
+    async fn call_dynamic(&mut self, ctx: &mut Context<Self>) -> u32 {
+        if let Ok(mut child) = ctx.child::<WorkflowV2Ref>("dynamic").await {
+            child.increment(1).await.unwrap_or_default()
+        } else {
+            0
+        }
+    }
+
+    #[msg]
     async fn child_await_peer(&mut self, ctx: &mut Context<Self>) -> u32 {
         self.value += 1;
         if let Ok(Value::U32(value)) = ctx

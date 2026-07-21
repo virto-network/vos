@@ -163,6 +163,26 @@ pub struct ActorCrdtStateV2 {
     pub next_ordinal: u32,
 }
 
+/// Actor-to-service request to create one same-program owned child. The raw
+/// initial state is content-addressed by Refine before entering the consensus
+/// transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorSpawnRequestV2 {
+    pub actor: ActorId,
+    pub name: String,
+    pub parent: ActorId,
+    pub initial_state: Vec<u8>,
+}
+
+/// Canonical child creation committed atomically with one linear transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorSpawnV2 {
+    pub actor: ActorId,
+    pub name: String,
+    pub parent: ActorId,
+    pub initial_state: BlobRefV2,
+}
+
 /// Canonical code supplied to Refine. An ELF, JIT image, or proving artifact
 /// is never accepted here: `pvm` is the exact executable/proof identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,6 +302,8 @@ pub struct ActorSliceOutputV2 {
     /// complete inline actor call tree. Refine content-addresses these
     /// candidates but never persists them directly.
     pub crdt_states: Vec<ActorCrdtStateV2>,
+    /// Same-program owned children requested by this execution slice.
+    pub spawns: Vec<ActorSpawnRequestV2>,
     /// Cross-root calls emitted by this slice. The owning service derives each
     /// stable `CallId` from the work invocation and `await_ordinal`.
     pub outbox: Vec<ActorCallRequestV2>,
@@ -774,6 +796,7 @@ pub struct TransitionV2 {
     pub target_program: ProgramId,
     pub base: ConsistencyBaseV2,
     pub writes: Vec<ActorWriteV2>,
+    pub spawns: Vec<ActorSpawnV2>,
     pub crdt_change: Option<CrdtChangeV2>,
     pub continuations: Vec<ContinuationChangeV2>,
     pub inbox: Vec<MessageRecordV2>,
@@ -817,6 +840,7 @@ impl TransitionV2 {
             target_program: self.target_program,
             base: self.base.clone(),
             writes: self.writes.clone(),
+            spawns: self.spawns.clone(),
             crdt_change: self.crdt_change.clone(),
             continuations: self.continuations.clone(),
             inbox: self.inbox.clone(),
@@ -1607,6 +1631,7 @@ impl V2Wire for ActorSliceOutputV2 {
             e.bytes(&state.state);
             e.u32(state.next_ordinal);
         });
+        e.list(&self.spawns, encode_actor_spawn_request);
         e.list(&self.outbox, encode_actor_call);
         e.list(
             &self.attestation_verifications,
@@ -1636,6 +1661,7 @@ impl V2Wire for ActorSliceOutputV2 {
                     next_ordinal: d.u32()?,
                 })
             })?,
+            spawns: d.list(decode_actor_spawn_request)?,
             outbox: d.list(decode_actor_call)?,
             attestation_verifications: d.list(decode_attestation_verification)?,
             verification_blobs: d.list(|d| {
@@ -1686,6 +1712,14 @@ impl V2Wire for ActorSliceOutputV2 {
                 .crdt_states
                 .windows(2)
                 .any(|pair| pair[0].actor >= pair[1].actor)
+            || value
+                .spawns
+                .windows(2)
+                .any(|pair| pair[0].actor >= pair[1].actor)
+            || value.spawns.iter().any(|spawn| {
+                spawn.name.is_empty()
+                    || spawn.actor != ActorId::owned_child(spawn.parent, &spawn.name)
+            })
             || value.crdt_states.iter().any(|state| state.state.is_empty())
             || (!value.crdt_operations.is_empty() && value.crdt_states.is_empty())
             || (value.yielded
@@ -1786,6 +1820,7 @@ impl V2Wire for TransitionV2 {
         e.fixed(&self.target_program.0);
         encode_base(&mut e, &self.base);
         e.list(&self.writes, encode_write);
+        e.list(&self.spawns, encode_actor_spawn);
         e.option(&self.crdt_change, |e, change| e.bytes(&change.encode()));
         e.list(&self.continuations, encode_continuation_change);
         e.list(&self.inbox, encode_message);
@@ -1812,6 +1847,7 @@ impl V2Wire for TransitionV2 {
             target_program: ProgramId(d.fixed()?),
             base: decode_base(d)?,
             writes: d.list(decode_write)?,
+            spawns: d.list(decode_actor_spawn)?,
             crdt_change: d.option(|d| CrdtChangeV2::decode(&d.bytes()?))?,
             continuations: d.list(decode_continuation_change)?,
             inbox: d.list(decode_message)?,
@@ -1827,6 +1863,7 @@ impl V2Wire for TransitionV2 {
             proof: d.option(decode_proof)?,
         };
         ensure_attestation_verifications_canonical(&result.attestation_verifications)?;
+        ensure_sorted_unique(&result.spawns, |spawn| spawn.actor.0)?;
         ensure_sorted_unique(&result.exported_blobs, |b| b.hash.0)?;
         Ok(result)
     }
@@ -2868,6 +2905,7 @@ fn validate_accumulation_envelope(value: &AccumulationEnvelopeV2) -> Result<(), 
         (ConsistencyBaseV2::Crdt { heads }, Some(change))
             if value.work.consistency == ConsistencyModeV2::Crdt
                 && value.transition.writes.is_empty()
+                && value.transition.spawns.is_empty()
                 && Some(change.id) == CrdtChangeV2::derive_id(&value.work)
                 && change.causal_dependencies.as_slice() == heads.as_slice()
                 && value
@@ -2910,6 +2948,7 @@ fn transition_blob_references(transition: &TransitionV2) -> impl Iterator<Item =
     transition
         .exported_blobs
         .iter()
+        .chain(transition.spawns.iter().map(|spawn| &spawn.initial_state))
         .chain(
             transition
                 .continuations
@@ -3305,6 +3344,42 @@ fn encode_write(e: &mut Encoder<'_>, value: &ActorWriteV2) {
     e.fixed(&value.actor.0);
     e.bytes(&value.key);
     e.option(&value.value, |e, value| e.bytes(value));
+}
+
+fn encode_actor_spawn_request(e: &mut Encoder<'_>, value: &ActorSpawnRequestV2) {
+    e.fixed(&value.actor.0);
+    e.string(&value.name);
+    e.fixed(&value.parent.0);
+    e.bytes(&value.initial_state);
+}
+
+fn decode_actor_spawn_request(d: &mut Decoder<'_>) -> Result<ActorSpawnRequestV2, DecodeError> {
+    Ok(ActorSpawnRequestV2 {
+        actor: ActorId(d.fixed()?),
+        name: d.string()?,
+        parent: ActorId(d.fixed()?),
+        initial_state: d.bytes()?,
+    })
+}
+
+fn encode_actor_spawn(e: &mut Encoder<'_>, value: &ActorSpawnV2) {
+    e.fixed(&value.actor.0);
+    e.string(&value.name);
+    e.fixed(&value.parent.0);
+    encode_blob_ref(e, &value.initial_state);
+}
+
+fn decode_actor_spawn(d: &mut Decoder<'_>) -> Result<ActorSpawnV2, DecodeError> {
+    let value = ActorSpawnV2 {
+        actor: ActorId(d.fixed()?),
+        name: d.string()?,
+        parent: ActorId(d.fixed()?),
+        initial_state: decode_blob_ref(d)?,
+    };
+    if value.name.is_empty() || value.actor != ActorId::owned_child(value.parent, &value.name) {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(value)
 }
 
 fn decode_write(d: &mut Decoder<'_>) -> Result<ActorWriteV2, DecodeError> {
@@ -3880,6 +3955,7 @@ mod tests {
             }],
             crdt_operations: vec![],
             crdt_states: vec![],
+            spawns: vec![],
             outbox: vec![ActorCallRequestV2 {
                 await_ordinal: 7,
                 from: ActorId([21; 32]),
@@ -3927,6 +4003,7 @@ mod tests {
                     next_ordinal: 4,
                 },
             ],
+            spawns: vec![],
             outbox: vec![],
             attestation_verifications: vec![],
             verification_blobs: vec![],
@@ -3985,6 +4062,7 @@ mod tests {
             writes: vec![],
             crdt_operations: vec![],
             crdt_states: vec![],
+            spawns: vec![],
             outbox: vec![],
             attestation_verifications: vec![],
             verification_blobs: vec![],
@@ -4105,6 +4183,7 @@ mod tests {
             writes: vec![],
             crdt_operations: vec![],
             crdt_states: vec![],
+            spawns: vec![],
             outbox: vec![],
             attestation_verifications: vec![verification],
             verification_blobs: vec![proof_candidate],
@@ -4174,6 +4253,7 @@ mod tests {
                 state_root: Hash::ZERO,
             },
             writes: vec![],
+            spawns: vec![],
             crdt_change: None,
             continuations: vec![],
             inbox: vec![],
@@ -4291,6 +4371,7 @@ mod tests {
             target_program: work.target_program,
             base: work.base.clone(),
             writes: vec![],
+            spawns: vec![],
             crdt_change: None,
             continuations: vec![],
             inbox: vec![],
@@ -4609,6 +4690,7 @@ mod tests {
             target_program: work.target_program,
             base: work.base.clone(),
             writes: vec![],
+            spawns: vec![],
             crdt_change: Some(CrdtChangeV2 {
                 id: change_id,
                 causal_dependencies: vec![Hash([31; 32])],
