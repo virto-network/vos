@@ -61,9 +61,19 @@ fn ai_extension_so() -> PathBuf {
     if release.exists() {
         return release;
     }
+    let debug = workspace()
+        .join("target")
+        .join("debug")
+        .join("libai_extension.so");
+    if debug.exists() {
+        return debug;
+    }
+    // `cargo test --workspace` builds cdylibs under `debug/deps`; a plain
+    // `cargo build` places the same loadable artifact directly under `debug`.
     workspace()
         .join("target")
         .join("debug")
+        .join("deps")
         .join("libai_extension.so")
 }
 
@@ -362,7 +372,6 @@ fn strip_ansi(s: &str) -> String {
     }
     out
 }
-
 
 
 
