@@ -33,7 +33,9 @@ use vos::node::{ExtensionConfig, VosNode};
 use vos::value::Args;
 
 use crate::blob_store;
-use crate::commands::space::common::{auto_replication_id, instance_service_id, parse_consistency};
+use crate::commands::space::common::{
+    LocalOperatorInvoker, auto_replication_id, instance_service_id, parse_consistency,
+};
 use crate::commands::space::payload_codec;
 
 /// Slim view of the recipe TOML — only the fields the
@@ -448,8 +450,9 @@ pub(crate) fn register_extension(
         // Empty `auth`: the daemon signs on relay with the operator key
         // (see the catalog mutators). A non-admin node's metadata write
         // is refused and arrives via sync instead — non-fatal below.
+        let mut operator = LocalOperatorInvoker::new(node);
         let status = vos::block_on(reg.register_extension_meta(
-            &mut &*node,
+            &mut operator,
             ext.name.clone(),
             meta_blob,
             Vec::new(),
@@ -764,8 +767,9 @@ fn reconcile_one(
             // signature authorizes the op; on a joined non-admin node it
             // doesn't, yielding Status::Forbidden — which is expected, the
             // row arrives via registry sync instead (handled below).
+            let mut operator = LocalOperatorInvoker::new(node);
             let status = vos::block_on(reg.publish(
-                &mut &*node,
+                &mut operator,
                 program_name.clone(),
                 program_version.clone(),
                 hash.0.to_vec(),
@@ -826,7 +830,8 @@ fn reconcile_one(
         // `.vos_meta` that overflows the registry guest's FETCH buffer) are
         // tolerated: log and move on, agent still spawns without a schema.
         // Empty `auth`: signed on relay by the daemon (operator key).
-        match vos::block_on(reg.register_meta(&mut &*node, program_hash.to_vec(), meta_blob, Vec::new())) {
+        let mut operator = LocalOperatorInvoker::new(node);
+        match vos::block_on(reg.register_meta(&mut operator, program_hash.to_vec(), meta_blob, Vec::new())) {
             Ok(Status::Ok) => {
                 tracing::debug!("registered meta for {program_name}:{program_version}");
             }
@@ -893,8 +898,9 @@ fn reconcile_one(
     // above). Status::Forbidden here means this isn't the admin node, so
     // the agent row is authored on the operator's node and arrives via
     // sync — tolerated the same way as Status::InstanceExists below.
+    let mut operator = LocalOperatorInvoker::new(node);
     let status = vos::block_on(reg.install(
-        &mut &*node,
+        &mut operator,
         agent.name.clone(),
         program_name.clone(),
         program_version.clone(),

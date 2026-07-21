@@ -18,6 +18,7 @@ use vos::abi::service::ServiceId;
 use vos::node::{AgentConfig, Consistency, VosNode};
 
 use crate::blob_store::{self, BlobSource};
+use crate::commands::space::common::LocalOperatorInvoker;
 use crate::commands::space::op_sign::op_auth;
 use crate::output;
 use crate::paths;
@@ -192,8 +193,9 @@ pub(crate) fn scaffold(
         "grant_role",
         &[&operator_peer_id, &[AUTH_ROLE_ADMIN], &grant_epoch.to_le_bytes()],
     )?;
+    let mut genesis_admin = LocalOperatorInvoker::new(&node);
     let status = vos::block_on(reg.grant_role(
-        &mut &node,
+        &mut genesis_admin,
         operator_peer_id.clone(),
         AUTH_ROLE_ADMIN,
         grant_epoch,
@@ -215,7 +217,7 @@ pub(crate) fn scaffold(
         ],
     )?;
     let status = vos::block_on(reg.add_node(
-        &mut &node,
+        &mut genesis_admin,
         local_prefix as u32,
         node_peer_id,
         NODE_ROLE_VOTER,

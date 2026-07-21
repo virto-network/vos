@@ -7,7 +7,44 @@
 //! actor's `resolve` handler also needs it.
 
 use vos::abi::service::ServiceId;
+use vos::actors::client::{ClientError, Invoker};
 use vos::node::Consistency;
+
+/// Local catalog invoker used after the daemon has authenticated its operator
+/// key. The explicit Admin byte opens generated registry gates; the registry
+/// handler still verifies each mutation's operator signature, so a non-admin
+/// signer is refused rather than receiving ambient System authority.
+pub struct LocalOperatorInvoker<'a> {
+    node: &'a vos::node::VosNode,
+}
+
+impl<'a> LocalOperatorInvoker<'a> {
+    pub fn new(node: &'a vos::node::VosNode) -> Self {
+        Self { node }
+    }
+}
+
+impl Invoker for LocalOperatorInvoker<'_> {
+    fn invoke(
+        &mut self,
+        target: ServiceId,
+        payload: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<vos::value::Value, ClientError>> + '_ {
+        let outcome = self.node.invoke_local_with_space_role(
+            target,
+            payload,
+            vos::SpaceRole::Admin,
+            std::time::Duration::from_secs(10),
+        );
+        async move {
+            match outcome {
+                Some(bytes) if bytes.is_empty() => Ok(vos::value::Value::Unit),
+                Some(bytes) => Ok(<vos::value::Value as vos::Decode>::decode(&bytes)),
+                None => Err(ClientError::Unreachable),
+            }
+        }
+    }
+}
 
 /// Parse `name` or `name:version`. Bare `name` ⇒ `name:latest`.
 /// Empty halves (`":1.0"`, `"foo:"`) are rejected.

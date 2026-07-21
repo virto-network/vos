@@ -1232,12 +1232,10 @@ impl InvokeHandle {
         let tx = tx?;
         let (reply_tx, reply_rx) = mpsc::channel();
         tx.send(InvokeRequest {
-            // Host-side API entry: the embedder calling into the
-            // daemon from inside the process. `Caller::System`
-            // bypasses role checks via the trust shortcut so
-            // host-side bootstrap (admin grant before any peer
-            // is enrolled) and test harness calls don't hit the
-            // M6 macro-emitted gate.
+            // Host-side API entry: the embedder calling into the daemon from
+            // inside the process. System records origin only and carries no
+            // implicit role; privileged bootstrap uses the explicit-role
+            // method on `VosNode`.
             caller: crate::actors::Caller::System,
             space_role: None,
             actor_local_role: None,
@@ -1710,9 +1708,9 @@ impl NodeService {
 /// decode the reply as a single `u8`. The free-function core of the
 /// auth probes, shared by [`NodeService::probe_registry_for_u8`] (the
 /// libp2p gate) and [`relay_actor_local_role`] (extension relays),
-/// which both have the routes table but not a `NodeService`. The probe
-/// asserts `Caller::System` so it bypasses any role-gated registry read
-/// handler. Returns `None` if the registry is unreachable, the reply
+/// which both have the routes table but not a `NodeService`. The probe uses a
+/// System origin without a role, so registry probe methods must remain public.
+/// Returns `None` if the registry is unreachable, the reply
 /// times out, or the payload doesn't decode.
 #[cfg(feature = "network")]
 fn registry_probe_reply(routes: &InvokeRoutes, payload: Vec<u8>) -> Option<Vec<u8>> {
@@ -4260,9 +4258,10 @@ impl VosNode {
             let (reply_tx, reply_rx) = mpsc::channel();
             tx.send(InvokeRequest {
                 // Host-side `VosNode::invoke` entry point.
-                // `Caller::System` is the right variant for
-                // embedder-originated calls (test harnesses, the
-                // `vosx space up` bootstrap admin grant, etc.).
+                // `Caller::System` records embedder origin but deliberately
+                // carries no role. Privileged bootstrap uses
+                // `invoke_local_with_space_role` with separately
+                // authenticated evidence.
                 // External peers can't synthesise this variant
                 // — libp2p inbounds always arrive as
                 // `Caller::Peer` via `dispatch_invoke`.
@@ -4305,6 +4304,43 @@ impl VosNode {
         }
 
         None
+    }
+
+    /// Invoke a local service as a platform caller carrying one explicit
+    /// space-role grant. This is an advanced host/bootstrap primitive: the
+    /// embedder must authenticate the authority used to select `space_role`.
+    /// It never falls back to the network, where these process-local role
+    /// bytes would not be authenticated transport evidence.
+    pub fn invoke_local_with_space_role(
+        &self,
+        target: ServiceId,
+        msg: Vec<u8>,
+        space_role: crate::actors::SpaceRole,
+        timeout: Duration,
+    ) -> Option<Vec<u8>> {
+        let tx = {
+            let map = self.invoke_routes.lock().ok()?;
+            map.get(&target.0).cloned().or_else(|| {
+                target
+                    .is_on_node(self.node_prefix)
+                    .then(|| map.get(&(target.0 & 0xFFFF)).cloned())
+                    .flatten()
+            })
+        }?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(InvokeRequest {
+            caller: crate::actors::Caller::System,
+            space_role: Some(space_role.as_u8()),
+            actor_local_role: None,
+            msg,
+            reply: ReplyChannel::Sync(reply_tx),
+            chain: Vec::new(),
+        })
+        .ok()?;
+        reply_rx
+            .recv_timeout(timeout)
+            .ok()
+            .and_then(|envelope| unwrap_invoke_envelope(&envelope))
     }
 
     /// Route a single envelope to its destination.
