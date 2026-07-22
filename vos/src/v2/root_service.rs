@@ -375,6 +375,7 @@ pub enum LocalRootTreeConfigErrorV2 {
     WrongExecutionSemantics,
     InvalidConsistency,
     InvalidOwnedActorTree,
+    InvalidExternalActorBindings,
     TooManyOwnedActors,
     ReplicationDriverRequired,
     ZeroGas,
@@ -759,6 +760,15 @@ impl LocalRootTreeConfigV2 {
             if cursor != self.root_actor {
                 return Err(LocalRootTreeConfigErrorV2::InvalidOwnedActorTree);
             }
+        }
+        if self.external_actors.len() != self.package.manifest.external_actors.len()
+            || self
+                .external_actors
+                .iter()
+                .zip(&self.package.manifest.external_actors)
+                .any(|(binding, name)| binding.name != *name)
+        {
+            return Err(LocalRootTreeConfigErrorV2::InvalidExternalActorBindings);
         }
         if self.refine_gas == 0 || self.accumulate_gas == 0 {
             return Err(LocalRootTreeConfigErrorV2::ZeroGas);

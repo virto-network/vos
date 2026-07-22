@@ -349,7 +349,7 @@ fn workflow_root_configs() -> Option<(
         .unwrap()
         .encode();
     let public_key = b"node-cross-root-workflow".to_vec();
-    let package = VosPackageV2 {
+    let peer_package = VosPackageV2 {
         manifest: PackageManifestV2 {
             name: metadata.actor_name.clone(),
             version: "2.0.0".into(),
@@ -375,29 +375,33 @@ fn workflow_root_configs() -> Option<(
             signature: vec![1],
         },
     };
-    package.validate().unwrap();
-    let deployment = package.deployment_id();
+    peer_package.validate().unwrap();
+    let mut source_package = peer_package.clone();
+    source_package.manifest.external_actors = vec!["private-age".into()];
+    source_package.validate().unwrap();
     let space = vos::v2::SpaceId([101; 32]);
     let source_actor = ActorId([43; 32]);
     let peer_actor = ActorId([44; 32]);
     let source_identity = ServiceIdentityV2 {
         space,
         root_service: RootServiceId([102; 32]),
-        deployment,
+        deployment: source_package.deployment_id(),
         service_program,
         service_abi: vos::v2::ABI_VERSION,
         execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
     };
     let peer_identity = ServiceIdentityV2 {
+        deployment: peer_package.deployment_id(),
         root_service: RootServiceId([103; 32]),
         ..source_identity.clone()
     };
     let config = |identity: ServiceIdentityV2,
                   actor: ActorId,
+                  package: VosPackageV2,
                   external_actors: Vec<vos::v2::ExternalActorBindingV2>| {
         LocalRootTreeConfigV2 {
             service_pvm: service_pvm.clone(),
-            package: package.clone(),
+            package,
             service: identity,
             root_actor: actor,
             actor_name: metadata.actor_name.clone(),
@@ -416,12 +420,13 @@ fn workflow_root_configs() -> Option<(
     let mut source = config(
         source_identity,
         source_actor,
+        source_package,
         vec![vos::v2::ExternalActorBindingV2 {
-            name: "peer".into(),
+            name: "private-age".into(),
             service: peer_identity.clone(),
             actor: peer_actor,
-            producer: package.deployment_signature.producer,
-            actor_deployment: package.deployment_id(),
+            producer: peer_package.deployment_signature.producer,
+            actor_deployment: peer_package.deployment_id(),
             program: actor_program,
         }],
     );
@@ -431,7 +436,7 @@ fn workflow_root_configs() -> Option<(
         parent: source_actor,
         initial_state: vec![],
     });
-    let peer = config(peer_identity, peer_actor, vec![]);
+    let peer = config(peer_identity, peer_actor, peer_package, vec![]);
     Some((source, peer, source_actor, peer_actor))
 }
 
@@ -915,7 +920,7 @@ fn public_workflow_example_resumes_root_and_child_after_cross_root_accumulate() 
         "v2_workflow",
         peer_actor,
         ConsistencyModeV2::Local,
-        vec!["peer".into()],
+        vec![],
     ) else {
         return;
     };
@@ -925,6 +930,11 @@ fn public_workflow_example_resumes_root_and_child_after_cross_root_accumulate() 
         parent: source_actor,
         initial_state: vec![],
     });
+    assert_eq!(
+        source_config.validate(),
+        Err(vos::v2::LocalRootTreeConfigErrorV2::InvalidExternalActorBindings),
+        "a signed dependency cannot be omitted from the installed directory"
+    );
     source_config.external_actors.push(vos::v2::ExternalActorBindingV2 {
         name: "peer".into(),
         service: peer_config.service.clone(),
@@ -933,6 +943,7 @@ fn public_workflow_example_resumes_root_and_child_after_cross_root_accumulate() 
         actor_deployment: peer_config.package.deployment_id(),
         program: peer_config.package.manifest.actor_program,
     });
+    assert!(source_config.validate().is_ok());
 
     let source = LocalRootTreeServiceV2::open(source_config, FailableCommittedImages::default())
         .expect("public workflow root and child install through physical Accumulate");
@@ -2452,10 +2463,9 @@ fn node_routes_cross_root_await_through_both_guest_accumulate_entries() {
         .with_env_filter("vos=debug")
         .with_test_writer()
         .try_init();
-    let Some((mut source_config, mut peer_config, source_actor, _)) = workflow_root_configs() else {
+    let Some((source_config, mut peer_config, source_actor, _)) = workflow_root_configs() else {
         return;
     };
-    source_config.external_actors[0].name = "private-age".into();
     peer_config.actor_name = "private-age".into();
     let source = LocalRootTreeServiceV2::open(source_config, FailableCommittedImages::default())
         .expect("source root installs");
