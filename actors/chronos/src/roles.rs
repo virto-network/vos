@@ -5,9 +5,9 @@
 /// so any caller past the libp2p auth gate may read, by design: chronos exposes
 /// only publicly-recomputable values. Advancing the clock/chain (`init`/
 /// `advance`) is the privileged feeder operation, gated to `Advancer`; in
-/// production the Raft leader's node drives it (a `System` caller bypasses the
-/// gate). `default_role` only labels intent here — it is not consulted for the
-/// unguarded read handlers.
+/// production the Raft leader's node drives it with an explicit Advancer role.
+/// A `System` origin alone does not bypass the gate. `default_role` only labels
+/// intent here — it is not consulted for the unguarded read handlers.
 #[derive(
     vos::rkyv::Archive,
     vos::rkyv::Serialize,

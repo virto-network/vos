@@ -2,10 +2,10 @@
 //!
 //! Confined-tier ledgers still answer any peer that can route to their
 //! `ServiceId` (the ACL is the only gate at that boundary), so the money-path
-//! mutators and the balance/transfer reads are role-gated. `Caller::System`
-//! and `Caller::Actor` map to `SpaceRole::Admin` and bypass these checks, so
-//! the operator (driving via the daemon) and the clerk-bridge (an actor,
-//! crediting on redeem) are unaffected — the gate bites only external peers.
+//! mutators and the balance/transfer reads are role-gated. Host operators must
+//! supply an explicit space role, and internal actors must use a declared
+//! capability or actor-local grant. Merely originating as `Caller::System` or
+//! `Caller::Actor` grants no ledger role.
 
 /// Ordered: `Operator` >= `Member` >= `None`, so an `Operator` also satisfies a
 /// `Member` gate (can read), while a `Member` cannot satisfy an `Operator` gate

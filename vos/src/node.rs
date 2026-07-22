@@ -261,13 +261,12 @@ pub struct AgentConfig {
     pub tick_ms: Option<u64>,
     /// Declared intra-system capabilities — the ceiling [`SpaceRole`] this
     /// agent may relay to each named target on its OUTBOUND invokes. Empty
-    /// (the default) keeps the legacy behaviour: an agent's outbound calls
-    /// arrive as the trusted [`Caller::Actor`], which bypasses role gates —
-    /// every existing agent→agent call relies on this. A NON-empty list
-    /// opts this agent into bounded relay instead: it relays the real
-    /// caller's role capped by these caps (the same model as an extension's
-    /// `intra_caps`), so a privileged downstream call needs a
-    /// correspondingly-privileged original caller. See [`IntraCap`].
+    /// (the default) preserves only the authenticated [`Caller::Actor`]
+    /// identity; it grants no downstream role. A non-empty list enables a
+    /// bounded relay: the real caller's role is capped by the declared entry
+    /// (the same model as an extension's `intra_caps`), so a privileged
+    /// downstream call needs both caller authority and a matching capability.
+    /// See [`IntraCap`].
     pub intra_caps: Vec<crate::actors::IntraCap>,
     /// Pre-spawned Raft worker for `Consistency::Raft` multi-mode
     /// replication. `register` spawns this when the right
@@ -337,8 +336,7 @@ impl AgentConfig {
 
     /// Opt this agent into bounded caller-relay on its outbound invokes —
     /// the ceiling [`SpaceRole`] it may relay to each named target. Empty
-    /// (the default) keeps the legacy trusted [`Caller::Actor`] relay. See
-    /// [`IntraCap`].
+    /// preserves actor identity but carries no role. See [`IntraCap`].
     pub fn with_intra_caps(mut self, caps: Vec<crate::actors::IntraCap>) -> Self {
         self.intra_caps = caps;
         self
@@ -502,10 +500,8 @@ pub struct ExtensionConfig {
     /// M9 — relay-only mode for extensions that proxy external
     /// traffic (the HTTP gateway). When `true`, the host's
     /// invoke closure tags every outbound call from this
-    /// extension as [`Caller::Unauthenticated`] instead of the
-    /// default [`Caller::Actor`] intra-system bypass. Default
-    /// `false` for traditional extensions that compose with
-    /// other actors as trusted in-process peers.
+    /// extension as [`Caller::Unauthenticated`] instead of an authenticated
+    /// [`Caller::Actor`] origin. Neither form grants an implicit role.
     ///
     /// Deprecated synonym for `intra_caps = []`: now that the
     /// default *denies* (an extension with no declared caps relays
@@ -1927,9 +1923,9 @@ impl crate::network::NetworkService for NodeService {
                     (actor_local != AUTH_ROLE_NONE).then_some(actor_local),
                 )
             }
-            // Unauthenticated has no grant lookups; intra-system
-            // Actor callers bypass via the Context::has_role
-            // short-circuit.
+            // Non-peer transport origins have no registry grant lookup.
+            // Internal callers must arrive with explicit role evidence on an
+            // in-process route; Caller identity alone grants no role.
             _ => (None, None),
         };
 
@@ -2180,8 +2176,8 @@ fn replay_dag_into_runtime(
         // dispatch replays as refused (its durable node may still
         // carry framework effects like the genesis state write), a
         // granted one as granted. Legacy logs without a recorded
-        // prefix decode as trusted-System, their historical replay
-        // identity.
+        // prefix decode as System, their historical replay identity (without
+        // any implicit role).
         if msg.is_empty() {
             runtime.send_to(svc_id, Vec::new());
         } else {
@@ -5801,10 +5797,9 @@ fn agent_thread(
     //   - Depth: cap at MAX_CROSS_AGENT_DEPTH hops. Same abort.
     let invoke_routes_for_ext = invoke_routes.clone();
     let chain_for_ext = current_chain.clone();
-    // For an agent that opted into bounded outbound relay (declared
-    // `intra_caps`), the closure resolves each target's name + relays the real
-    // caller capped per cap. Empty caps (the default) keep the legacy trusted
-    // `Caller::Actor` relay that every existing agent→agent call relies on.
+    // For an agent that declared `intra_caps`, resolve each target name and
+    // relay the real caller capped by the matching capability. Empty caps keep
+    // actor identity only; Context role checks still require explicit evidence.
     let agent_names_for_ext = agent_names.clone();
     let intra_caps_for_ext = config.intra_caps.clone();
     #[cfg(feature = "network")]
@@ -5841,15 +5836,11 @@ fn agent_thread(
             map.get(&target.0).cloned()
         };
         if let Some(tx) = local_tx {
-            // Caller for the relayed invoke. Default (no declared
-            // `intra_caps`): the trusted `Caller::Actor` — `id` is the
-            // calling agent's ServiceId, and being past the libp2p gate it
-            // bypasses role checks (the legacy behaviour every existing
-            // agent→agent call relies on). With `intra_caps` declared: bounded
-            // relay of the real inbound caller (read from this thread's
-            // `RELAY_CALLER`, stamped around the invoke dispatch), capped by the
-            // cap for this target — exactly the extension relay model, so a
-            // privileged downstream call needs a privileged original caller.
+            // Caller for the relayed invoke. With no declared `intra_caps`,
+            // preserve the calling actor's authenticated identity but attach
+            // no role. With caps, relay the real inbound caller (read from this
+            // thread's `RELAY_CALLER`) and intersect its authority with the
+            // matching target capability.
             let (caller, space_role, actor_local_role) = if intra_caps_for_ext.is_empty() {
                 (crate::actors::Caller::Actor(id), None, None)
             } else {
@@ -6564,10 +6555,8 @@ fn forbidden_envelope() -> Vec<u8> {
     encode_invoke_envelope(STATUS_FORBIDDEN, &[], &[])
 }
 
-/// Replay-side wrapper for already-logged messages. Always
-/// emits a trusted-System prefix so the role
-/// check passes during replay — original authorisation is
-/// implicit in the fact the log was committed.
+/// Replay-side wrapper for already-logged messages. It reproduces the exact
+/// committed caller/role prefix; replay does not mint new authority.
 fn encode_replay_payload(prefix: &crate::effect_log::CallerPrefix, msg: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(6 + msg.len());
     out.push(crate::actors::lifecycle::TAG_CALLER_PREFIX);
@@ -6791,20 +6780,19 @@ fn dispatch_once(
         // attacker could send a libp2p Tell whose payload begins
         // with TAG_CALLER_PREFIX (0xFE) and have dispatch_one
         // strip + parse the attacker's bytes as a "host-issued"
-        // caller assertion — forging trust=System bypasses every
-        // role check. With the wrap, the attacker's prefix bytes
+        // caller assertion — forging a host-issued System identity. With the
+        // wrap, the attacker's prefix bytes
         // become inner-message bytes the Msg decoder mis-parses
         // and rejects.
         //
         // Internal Tells (ctx.tell from one actor to another)
-        // could legitimately want Caller::Actor trust, but the
+        // could legitimately want Caller::Actor identity, but the
         // inbox mixes them with external Tells and `env.from` is
         // attacker-controlled in the external case — so the safe
         // default is Unauthenticated for everything that arrives
-        // through this path. Intra-system callers that need
-        // trusted dispatch use ctx.ask (invoke path), which goes
-        // through handle_invoke_request and gets the right
-        // Caller::Actor wrap.
+        // through this path. Intra-system callers that need authenticated
+        // identity use ctx.ask; privileged calls additionally need explicit
+        // role evidence or a declared capability.
         //
         // Empty payloads are the runtime's wake-up tick (used to
         // re-schedule yielded services); the runtime filters them
@@ -7190,7 +7178,8 @@ fn extension_thread(
                     // Stamp the real caller of this invoke for
                     // the duration of the dispatch, so an `EFFECT_ASK_DISPATCH`
                     // raised by the handler relays it (bounded by `intra_caps`)
-                    // instead of the `Caller::Actor` bypass. RAII-cleared after
+                    // instead of substituting the extension's actor identity.
+                    // RAII-cleared after
                     // the dispatch (and on panic, via the catch in run_ext_task)
                     // so it never leaks to the next invoke or a self-originated
                     // call. The envelope path below leaves it unstamped → such
@@ -7442,10 +7431,9 @@ fn relay_actor_local_role(
 /// [`relay_actor_local_role`] — they're per-actor, in the target's own
 /// role space, and pass through faithfully rather than via this cap.)
 ///
-/// The returned caller is always NON-trusted (Peer or
-/// Unauthenticated) so the downstream actor's role check actually
-/// consults the (capped) `space_role` rather than short-circuiting
-/// through the [`Caller::is_trusted`] bypass.
+/// The returned carrier is always Peer or Unauthenticated so downstream code
+/// observes only the explicitly relayed role, never a substituted extension
+/// identity.
 ///
 /// - No matching cap → `(Unauthenticated, None)`: the extension has
 ///   no authority for this target; role-gated handlers refuse.
@@ -7453,10 +7441,9 @@ fn relay_actor_local_role(
 ///   with no external caller) → `(Unauthenticated, None)`.
 /// - Peer caller → relays the peer's identity + `min(space_role,
 ///   ceiling)`.
-/// - System / Actor caller (trusted incoming) → relays anonymously
-///   (`Unauthenticated`) carrying `min(Admin, ceiling)`: trusted
-///   callers have full authority, but the cap still bounds it, and
-///   dropping the trusted variant keeps the cap effective.
+/// - System / Actor caller with a matching declared capability → relays
+///   anonymously carrying that capability's ceiling. The origin kind alone
+///   grants no role.
 fn resolve_relay_caller(
     propagated: Option<&PropagatedCaller>,
     caps: &[crate::actors::IntraCap],
@@ -7716,7 +7703,7 @@ struct Fulfiller<'a> {
     /// The extension's declared intra-system caps. An
     /// `EFFECT_ASK_DISPATCH` relays the real caller of the invoke in flight
     /// (read from `RELAY_CALLER`), bounded by `min(caller role, cap ceiling)`
-    /// for the target — never the `Caller::Actor` intra-system bypass — so a
+    /// for the target rather than substituting the extension's actor identity, so a
     /// role-gated target (e.g. the registry's admin-gated `publish`) still
     /// consults the caller's real role.
     intra_caps: &'a [crate::actors::IntraCap],
@@ -7744,9 +7731,9 @@ impl Fulfiller<'_> {
             // the `Option<Vec<u8>>` contract `ctx.ask_dispatch` decodes (the
             // old `ServiceCtx::ask_raw` shape).
             //
-            // SECURITY: the relayed caller is NOT `Caller::Actor` (that's the
-            // intra-system role-bypass — it would let any caller's `dev
-            // publish` reach the registry's admin-gated handler as trusted).
+            // SECURITY: the relayed caller is not replaced by the extension's
+            // `Caller::Actor` identity, which would erase the external caller's
+            // authorization context.
             // Instead relay the real caller of the invoke currently in flight
             // on this thread (`RELAY_CALLER`, stamped by `extension_thread`
             // before driving this dispatch), bounded by `min(caller role,
@@ -8129,7 +8116,7 @@ impl ConnFulfiller {
 /// `actor_local_role` are the relayed authority the caller already computed —
 /// `Caller::Unauthenticated` (no role) for a transport conn task (no inbound
 /// caller); for an actor-mode extension's `ctx.ask_dispatch`, the *bounded*
-/// real caller (`resolve_relay_caller`), NOT the `Caller::Actor` bypass, so a
+/// real caller (`resolve_relay_caller`), not a substituted extension identity, so a
 /// role-gated target consults the caller's capped role. Returns the unwrapped reply
 /// bytes on a `STATUS_DONE`/`STATUS_YIELDED` envelope (`Some`, possibly empty
 /// for a `()` return) or `None` on any failure (no route / send error / timeout
@@ -9781,20 +9768,21 @@ mod tests {
             (Caller::Unauthenticated, None),
         );
 
-        // 7. Trusted incoming (System / Actor) → relayed ANONYMOUSLY
-        //    (non-trusted carrier) but still capped, so the cap binds.
+        // 7. A host-authenticated System / Actor origin may exercise an
+        //    explicitly declared capability. Relay it anonymously with only
+        //    that capability's ceiling; its origin kind is not a role.
         for trusted in [Caller::System, Caller::Actor(ServiceId(9))] {
             let p_trusted = pc(trusted, None);
             let (c, sr) = resolve_relay_caller(Some(&p_trusted), &dev_cap, Some("space-registry"));
             assert!(
                 !c.is_trusted(),
-                "carrier must be non-trusted so the cap is not bypassed: {c:?}",
+                "carrier must expose only the declared capability: {c:?}",
             );
             assert_eq!(c, Caller::Unauthenticated);
             assert_eq!(
                 sr,
                 Some(SpaceRole::Developer.as_u8()),
-                "Admin capped to ceiling"
+                "explicit capability supplies only its declared ceiling"
             );
         }
 
@@ -9971,8 +9959,9 @@ mod tests {
     // the leading 6-byte header and trusts it. If any path
     // sends inbox-sourced bytes to the runtime *without* the
     // host's wrap, an attacker can prepend their own forged
-    // header — flipping trust_flag=1 turns Caller::System on
-    // and bypasses every role check.
+    // header — flipping trust_flag=1 forges a host-issued Caller::System
+    // identity. System grants no ambient role, but origin/authentication-based
+    // application policy must still never accept an attacker-controlled flag.
     //
     // These tests pin the two host-side wrap shapes (replay +
     // inbox) so a refactor that drops the wrap (or flips a

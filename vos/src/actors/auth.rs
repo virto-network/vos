@@ -615,11 +615,9 @@ mod tests {
 
     #[test]
     fn caller_is_trusted() {
-        // Trust shortcut: anything originating inside the
-        // daemon process (System, Actor) bypasses role checks.
-        // External-identity variants (Unauthenticated, Peer)
-        // must NOT bypass — they have to go through the
-        // registry's grant lookup.
+        // `is_trusted` distinguishes host-issued caller prefixes from
+        // transport-provided identity. It does not grant a role; Context role
+        // checks consume only explicit space or actor-local role evidence.
         assert!(!Caller::Unauthenticated.is_trusted());
         assert!(!Caller::Peer(alloc::vec![1]).is_trusted());
         assert!(Caller::System.is_trusted());

@@ -8,12 +8,11 @@
 //! accounting — `window_rotate` (bracket a settlement window) and
 //! `anchor_reset` (post-settlement wedge recovery) — are role-gated.
 //!
-//! `Caller::System` and `Caller::Actor` map to `SpaceRole::Admin` and
-//! bypass these checks, so the bank operator driving via the daemon is
-//! unaffected — the gate bites external peers. Under Raft leader-forward
-//! the caller is attributed to the forwarding node's peer, so a voter
-//! node's peer must hold the `Admin`/`Developer` grant (see the
-//! clerk-ledger gate for the same rule).
+//! Host and actor origins receive no ambient role. A bank operator supplies an
+//! explicit `Admin`/`Developer` grant, while an internal actor uses a declared
+//! capability or actor-local grant. Under Raft leader-forward the caller is
+//! attributed to the forwarding node's peer, so every voter that may forward
+//! an operator call must hold the corresponding grant.
 
 /// Ordered: `Operator` >= `Member` >= `None`.
 #[derive(

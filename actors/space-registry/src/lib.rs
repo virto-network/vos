@@ -1729,12 +1729,11 @@ impl SpaceRegistry {
     /// peer whose grant chain bottoms out at the root and is not
     /// dominated by a revoke (see [`effective_role`](Self::effective_role)).
     ///
-    /// This runs at handler time on BOTH the live dispatch and every
-    /// peer's causal replay (where the op arrives as `Caller::System`
-    /// and the `#[msg(role)]` gate is a no-op). So a forged op merged
-    /// via CRDT — a fabricated AuthGrantRow{ADMIN} or MemberRow{VOTER}
-    /// — is refused on each honest node unless it carries a signature
-    /// an admin (or the root) actually produced.
+    /// This runs at handler time on both live dispatch and causal replay.
+    /// Replay cannot treat transport origin or a claimed role prefix as proof
+    /// that a DAG operation was authorized, so a fabricated
+    /// AuthGrantRow{ADMIN} or MemberRow{VOTER} is refused unless it carries a
+    /// signature an admin (or the root) actually produced.
     ///
     /// Because `effective_role` is computed on demand from the stored
     /// grant graph and the grow-only revoke high-waters — never from a
@@ -2064,8 +2063,8 @@ fn compare_bytes(a: &[u8], b: &[u8]) -> i8 {
 // at handler time — and crucially, because the op (with its `auth`
 // arg) is recorded into the replicated DAG, the same verification
 // re-runs on every peer's causal replay. That closes the forge gap:
-// a replayed op that arrives as `Caller::System` still has to carry
-// a signature an admin (or the genesis root) actually produced, so a
+// a replayed op still has to carry a signature an admin (or the genesis root)
+// actually produced, so a
 // peer can't merge a fabricated AuthGrantRow{ADMIN} or
 // MemberRow{VOTER} to self-escalate or seize consensus.
 //
@@ -3022,9 +3021,9 @@ mod tests {
         pack_auth(&peer_id_for(&key.verifying_key().to_bytes()), &sig.to_bytes())
     }
 
-    /// Dispatch as `Caller::System` — the trusted caller CRDT replay
-    /// uses, which clears the `#[msg(role)]` gate. Models the exact
-    /// path a forged op merged via sync takes on an honest node.
+    /// Invoke the handler body under a replay-shaped System origin. This
+    /// deliberately exercises the operation's intrinsic signature check
+    /// independently of the macro dispatch gate.
     fn dispatch_as_system<M>(
         r: &mut SpaceRegistry,
         msg: M,
@@ -3039,10 +3038,9 @@ mod tests {
 
     #[test]
     fn forged_admin_grant_rejected_on_system_replay_path() {
-        // The key mechanism: on replay the op arrives as Caller::System,
-        // so the #[msg(role=Admin)] gate is a no-op — yet authorize_op
-        // still rejects a forgery, so a CRDT-merged AuthGrantRow{ADMIN}
-        // never applies on an honest node.
+        // The key mechanism: authorize_op rejects the forgery independently
+        // of caller origin, so a CRDT-merged AuthGrantRow{ADMIN} never applies
+        // on an honest node.
         let mut r = registry();
         let attacker_key = SigningKey::from_bytes(&[42u8; 32]);
         let attacker = peer_id_for(&attacker_key.verifying_key().to_bytes());
@@ -3243,10 +3241,9 @@ mod tests {
     #[test]
     fn forged_install_rejected_on_system_replay_path() {
         // The catalog-forgery guard: a non-admin peer forges an `install` op (a
-        // fabricated AgentRow) and merges it via CRDT. On replay it
-        // arrives as Caller::System, so the #[msg(role)] gate is a
-        // no-op — yet authorize_op rejects it, so reconcile never sees
-        // the row and the forged agent never spawns on an honest node.
+        // fabricated AgentRow) and merges it via CRDT. authorize_op rejects it
+        // during replay regardless of caller identity, so reconcile never
+        // sees the row and the forged agent never spawns on an honest node.
         let mut r = registry();
         let attacker_key = SigningKey::from_bytes(&[42u8; 32]);
         let hash = alloc::vec![7u8; 32];
@@ -4128,9 +4125,8 @@ mod tests {
 
     #[test]
     fn forged_revoke_invite_rejected_on_system_replay_path() {
-        // A non-admin's forged revoke_invite merged via CRDT (arriving as
-        // Caller::System, so the #[msg(role)] gate is a no-op) is still
-        // refused by authorize_op — it never marks the token revoked.
+        // A non-admin's forged revoke_invite merged via CRDT is refused by
+        // authorize_op during replay; it never marks the token revoked.
         let mut r = registry();
         let attacker = SigningKey::from_bytes(&[42u8; 32]);
         let token_pub = SigningKey::from_bytes(&[55u8; 32]).verifying_key().to_bytes();
