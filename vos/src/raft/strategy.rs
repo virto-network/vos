@@ -284,12 +284,13 @@ impl CommitStrategy for RaftCommit {
                     node_appended: false,
                 });
             }
-            // Reload meta to learn the worker's current commit_index.
-            // The agent calls this after running the replay loop
-            // up through every committed log entry, so commit_index
-            // is the exact point our `last_applied` should reach.
+            // `self.meta.commit_index` is the frontier the caller actually
+            // replayed. Snapshot it before reloading worker-owned fields: a
+            // newer entry may commit while replay is running, but marking that
+            // newer index applied here would suppress its notification even
+            // though this materialized state does not contain it.
+            let replayed_through = self.meta.commit_index;
             self.meta = RaftMeta::load(&self.db)?;
-            let new_last_applied = self.meta.commit_index;
             let txn = self.db.begin_write()?;
             {
                 if state_changed
@@ -312,8 +313,8 @@ impl CommitStrategy for RaftCommit {
                     }
                 }
             }
-            if new_last_applied > self.meta.last_applied {
-                self.meta.last_applied = new_last_applied;
+            if replayed_through > self.meta.last_applied {
+                self.meta.last_applied = replayed_through;
                 // Write ONLY META_LAST_APPLIED, not the full
                 // RaftMeta — we loaded `self.meta` earlier; the
                 // worker may have advanced `commit_index` /
@@ -441,19 +442,19 @@ impl CommitStrategy for RaftCommit {
     ) -> Result<CommitReceipt, CommitError> {
         // Post-replay materialization of the whole rebuilt keyspace —
         // the log-less commit path's semantics (advance `last_applied`
-        // to the worker's commit_index, append nothing), except the KV
+        // to the frontier this replay observed, append nothing), except the KV
         // table is swapped wholesale: replay recomputes every row, so
         // rows the replayed history no longer produces must not linger.
+        let replayed_through = self.meta.commit_index;
         self.meta = RaftMeta::load(&self.db)?;
-        let new_last_applied = self.meta.commit_index;
         let txn = self.db.begin_write()?;
         {
             let mut state_table = txn.open_table(STATE_TABLE)?;
             state_table.insert(STATE_KEY, state)?;
         }
         crate::commit::swap_kv_rows(&txn, rows)?;
-        if new_last_applied > self.meta.last_applied {
-            self.meta.last_applied = new_last_applied;
+        if replayed_through > self.meta.last_applied {
+            self.meta.last_applied = replayed_through;
             self.meta.write_host_fields_in_txn(&txn)?;
         }
         txn.commit()?;
@@ -668,6 +669,42 @@ mod tests {
         for (i, log) in logs.iter().enumerate() {
             assert_eq!(log.msg, alloc::vec![i as u8; 4]);
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rebuilt_state_does_not_mark_concurrently_committed_entry_applied() {
+        let (path, dir) = temp_path();
+        let mut s = RaftCommit::open(&path, cfg()).unwrap();
+
+        // The materializer snapshots and replays through index 1.
+        let mut meta = RaftMeta::load(&s.db).unwrap();
+        meta.commit_index = 1;
+        {
+            let txn = s.db.begin_write().unwrap();
+            meta.write_in_txn(&txn).unwrap();
+            txn.commit().unwrap();
+        }
+        s.reload().unwrap();
+
+        // While replay is running, the worker commits index 2 out of band.
+        let mut advanced = RaftMeta::load(&s.db).unwrap();
+        advanced.commit_index = 2;
+        {
+            let txn = s.db.begin_write().unwrap();
+            advanced.write_worker_fields_in_txn(&txn).unwrap();
+            txn.commit().unwrap();
+        }
+
+        s.commit_rebuilt(b"state-through-1", &[]).unwrap();
+        let persisted = RaftMeta::load(&s.db).unwrap();
+        assert_eq!(persisted.commit_index, 2);
+        assert_eq!(persisted.last_applied, 1);
+        assert!(
+            s.needs_sync_reload(),
+            "index 2 must remain pending for the next materialization"
+        );
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

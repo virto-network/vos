@@ -10191,6 +10191,13 @@ fn raft_clerk_ledger_operator_gate_under_leader_forward() {
     let read_root = |node: &VosNode, id: ServiceId| -> Option<Vec<u8>> {
         vos::block_on(ClerkLedgerRef::at(id).state_root(&mut local_admin(node))).ok()
     };
+    let read_counts = |node: &VosNode, id: ServiceId| -> (Option<u32>, Option<u32>) {
+        let ledger = ClerkLedgerRef::at(id);
+        (
+            vos::block_on(ledger.account_count(&mut local_admin(node))).ok(),
+            vos::block_on(ledger.transfer_count(&mut local_admin(node))).ok(),
+        )
+    };
     let converged_root = wait_for(
         || {
             let ra = read_root(&node_a, ledger_a)?;
@@ -10199,7 +10206,18 @@ fn raft_clerk_ledger_operator_gate_under_leader_forward() {
         },
         Duration::from_secs(20),
     )
-    .expect("both replicas converge on the same non-empty state root");
+    .unwrap_or_else(|| {
+        panic!(
+            "both replicas must converge on one non-empty state root; \
+             A={:?} counts={:?}, B={:?} counts={:?}, raft_A={:?}, raft_B={:?}",
+            read_root(&node_a, ledger_a),
+            read_counts(&node_a, ledger_a),
+            read_root(&node_b, ledger_b),
+            read_counts(&node_b, ledger_b),
+            net_a_arc.local_raft_status(&ledger_rep),
+            net_b_arc.local_raft_status(&ledger_rep),
+        )
+    });
 
     // ── 5) Kill + restart node B; assert it re-converges ─────────
     //
