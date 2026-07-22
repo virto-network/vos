@@ -22,13 +22,44 @@ use cipher_clerk::types::{
     Account as CcAccount, Direction, Journal as CcJournal, Transfer as CcTransfer,
 };
 use vos::storage::CommittedMap;
+use vos::value::Msg;
 
 use crate::oracle::NoopOracle;
 use crate::smt::compute_state_root;
 use crate::view::LedgerView;
+use crate::{ClerkLedgerMsg, ClerkLedgerRole};
 
 const LEAF_DOMAIN: &[u8] = b"cipher-clerk/smt/leaf/v1";
 const NODE_DOMAIN: &[u8] = b"cipher-clerk/smt/node/v1";
+
+#[test]
+fn state_root_methods_publish_regular_and_attested_policies() {
+    let regular =
+        ClerkLedgerMsg::from_msg(&Msg::new("state_root")).expect("regular state-root message");
+    assert!(!regular.is_attested());
+    assert_eq!(regular.required_role(), Some(ClerkLedgerRole::Member as u8));
+    assert_eq!(regular.required_space_role(), None);
+
+    let attested = ClerkLedgerMsg::from_msg(&Msg::new("attest_state_root"))
+        .expect("attested state-root message");
+    assert!(attested.is_attested());
+    assert_eq!(
+        attested.required_role(),
+        Some(ClerkLedgerRole::Member as u8)
+    );
+    assert_eq!(
+        attested.required_space_role(),
+        Some(vos::SpaceRole::Member.as_u8())
+    );
+
+    let metadata = ClerkLedgerMsg::META
+        .messages
+        .iter()
+        .find(|message| message.name == "attest_state_root")
+        .expect("attested state-root metadata");
+    assert!(metadata.attested);
+    assert_eq!(metadata.space_role, Some(vos::SpaceRole::Member.as_u8()));
+}
 
 fn mk_account(id_byte: u8) -> CcAccount {
     CcAccount::new(

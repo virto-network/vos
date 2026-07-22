@@ -224,6 +224,13 @@ impl ClerkLedger {
     fn journal_row(&self) -> Option<CcJournal> {
         self.journal_id.and_then(|id| self.journal.get(&id))
     }
+
+    fn current_state_root(&self) -> Vec<u8> {
+        match self.journal_id {
+            Some(_) => self.composite_root().to_vec(),
+            None => Vec::new(),
+        }
+    }
 }
 
 #[messages]
@@ -564,10 +571,19 @@ impl ClerkLedger {
     /// maps mutate.
     #[msg(role = ClerkLedgerRole::Member)]
     async fn state_root(&self) -> Vec<u8> {
-        match self.journal_id {
-            Some(_) => self.composite_root().to_vec(),
-            None => Vec::new(),
-        }
+        self.current_state_root()
+    }
+
+    /// Portable proof of the same composite root returned by `state_root`.
+    /// This method is intentionally single-slice: voucher redemption and its
+    /// deferred cross-root ledger call remain outside the attested path.
+    #[msg(
+        attested,
+        role = ClerkLedgerRole::Member,
+        space_role = SpaceRole::Member
+    )]
+    async fn attest_state_root(&self) -> Vec<u8> {
+        self.current_state_root()
     }
 
     /// Append a shielded-note commitment (a 32-byte Pedersen point)
