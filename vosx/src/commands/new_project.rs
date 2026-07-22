@@ -113,7 +113,7 @@ pub struct SharedBoard {{
     edits: crdt::Counter,
 
     #[crdt(const)]
-    space: [u8; 32],
+    space: SpaceId,
 
     #[crdt(skip)]
     cache: Option<String>,
@@ -128,7 +128,7 @@ impl SharedBoard {{
             order: crdt::List::default(),
             notes: crdt::Text::default(),
             edits: crdt::Counter::default(),
-            space: [0; 32],
+            space: SpaceId::ZERO,
             cache: None,
         }}
     }}
@@ -137,6 +137,29 @@ impl SharedBoard {{
     fn set_title(&mut self, title: String) {{
         self.title
             .set(title)
+            .expect("CRDT mutations in actor methods have stable operation identities");
+    }}
+
+    #[msg]
+    fn add_task(&mut self, id: u64, text: String) {{
+        self.tasks
+            .insert(id, text)
+            .expect("CRDT mutations in actor methods have stable operation identities");
+        self.order
+            .push(id)
+            .expect("CRDT mutations in actor methods have stable operation identities");
+        self.edits
+            .increment(1)
+            .expect("CRDT mutations in actor methods have stable operation identities");
+    }}
+
+    #[msg]
+    fn insert_note(&mut self, index: u32, text: String) {{
+        self.notes
+            .insert(index as usize, &text)
+            .expect("CRDT mutations in actor methods have stable operation identities");
+        self.edits
+            .increment(1)
             .expect("CRDT mutations in actor methods have stable operation identities");
     }}
 
@@ -203,6 +226,12 @@ mod tests {
         assert!(CONFIG.contains("-Zcrate-attr=no_std"));
         assert!(CONFIG.contains("-Zcrate-attr=no_main"));
         assert!(!counter_source("x").contains("#![no_std]"));
-        assert!(crdt_source("x").contains("#[actor(crdt)]"));
+        let crdt = crdt_source("x");
+        assert!(crdt.contains("#[actor(crdt)]"));
+        assert!(crdt.contains("space: SpaceId"));
+        assert!(crdt.contains("self.tasks"));
+        assert!(crdt.contains("self.order"));
+        assert!(crdt.contains("self.notes"));
+        assert!(crdt.contains("self.edits"));
     }
 }

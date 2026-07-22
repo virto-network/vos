@@ -11,7 +11,7 @@ pub struct Board {
     edits: crdt::Counter,
 
     #[crdt(const)]
-    space: [u8; 32],
+    space: SpaceId,
 
     #[crdt(skip)]
     cached_summary: Option<String>,
@@ -26,7 +26,7 @@ impl Board {
             order: crdt::List::default(),
             notes: crdt::Text::default(),
             edits: crdt::Counter::default(),
-            space: [0; 32],
+            space: SpaceId::ZERO,
             cached_summary: None,
         }
     }

@@ -62,7 +62,7 @@ pub mod prelude {
     // `handle_connection` body is kept verbatim, so it must resolve via the
     // prelude like the rest of an extension's surface.
     pub use crate::Context;
-    pub use crate::{ActorId, CallError, CallId, InvocationId, Origin, SpaceRole};
+    pub use crate::{ActorId, CallError, CallId, InvocationId, Origin, SpaceId, SpaceRole};
     pub use crate::{Attestation, AttestationError, Verified};
     #[cfg(feature = "macros")]
     pub use crate::{actor, messages};
@@ -185,7 +185,7 @@ pub use attestation::{
     AttestedMethod, ProducedAttestationProofV2, ProofVerifier, StateCommitmentV3, Verified,
     VerificationContext, VerifyAttestationBuilder, VerifyAttestationFrom, verify_once,
 };
-pub use v2::{ActorId, CallId, InvocationId, Origin, ProducerId, ProgramId, SubjectId};
+pub use v2::{ActorId, CallId, InvocationId, Origin, ProducerId, ProgramId, SpaceId, SubjectId};
 // Per-task future machinery for native extensions: the scheduler lives
 // host-side (see node.rs). Re-exported at the crate root so the
 // `__vos_emit_worker_glue!` macro can name `$crate::TaskTable` / `$crate::TaskState`

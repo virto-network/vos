@@ -3,7 +3,20 @@ use core::fmt;
 macro_rules! id_type {
     ($name:ident, $label:literal) => {
         #[repr(transparent)]
-        #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(
+            crate::rkyv::Archive,
+            crate::rkyv::Serialize,
+            crate::rkyv::Deserialize,
+            Clone,
+            Copy,
+            Default,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+        )]
+        #[rkyv(crate = crate::rkyv)]
         pub struct $name(pub [u8; 32]);
 
         impl $name {
