@@ -1,0 +1,31 @@
+[workspace]
+
+[package]
+name = "space-authority"
+description = "Canonical VOS v2 role-authority actor"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["bin"]
+bin = []
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+vos = { path = "../../vos", default-features = false, features = ["macros", "service"] }
+ed25519-dalek = { version = "2", default-features = false }
+
+[target.'cfg(not(target_arch = "riscv64"))'.dependencies]
+vos = { path = "../../vos", default-features = false, features = ["macros", "extension"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+
+[dev-dependencies]
+vos = { path = "../../vos", default-features = false, features = ["macros", "extension", "std", "storage", "network"] }
