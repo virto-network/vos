@@ -16,7 +16,6 @@ include = [
     "build.rs",
     "Cargo.toml",
     "blobs/space_registry.elf",
-    "blobs/dev_project.elf",
 ]
 
 [dependencies]

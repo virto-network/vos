@@ -37,17 +37,6 @@ fn main() {
         "`space new`/`space up <token>` will require --registry",
         "cd actors/space-registry && cargo actor",
     );
-
-    bundle_actor(
-        &manifest_dir,
-        &out_dir,
-        "dev-project",
-        "dev_project.elf",
-        "bundled_dev_project.elf",
-        "VOSX_BUNDLED_DEV_PROJECT_ELF",
-        "`dev new` will require --program-source",
-        "cd actors/dev-project && cargo actor",
-    );
 }
 
 /// Wire up one bundled actor ELF. Tries the working-tree dev path

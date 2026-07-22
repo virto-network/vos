@@ -321,6 +321,8 @@ installs the root tree through physical Accumulate, schedules Refine from
 guest-committed state, and publishes the reply only after physical Accumulate
 accepts the transition. `run` rejects raw ELF/PVM inputs; ELF is transpiled
 only by `build`, and registries or runners consume the resulting exact package.
+Application actors are never baked into `vosx` as raw ELF publication shortcuts;
+`space publish` requires an explicit signed `.vos` source.
 
 `space up --service-pvm <exact-vos-service.pvm>` recognizes signed `.vos`
 catalog artifacts and opens each Local, Raft, or CRDT deployment as one durable

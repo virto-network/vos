@@ -570,6 +570,32 @@ mod routing_tests {
     }
 
     #[test]
+    fn space_publish_accepts_only_an_explicit_package_source() {
+        assert!(
+            Cli::try_parse_from([
+                "vosx",
+                "space",
+                "publish",
+                "demo",
+                "counter:2.0.0",
+                "counter.vos",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "vosx",
+                "space",
+                "publish",
+                "demo",
+                "--bundled",
+                "dev-project",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn path_like_first_positional_runs_one_shot() {
         // The existing `vosx ./foo.elf` shape must keep working.
         for v in ["./foo.elf", "/abs/path.elf", "rel\\path"] {
