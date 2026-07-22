@@ -157,7 +157,17 @@ impl ChangeId {
 /// Authenticated origin presented to an actor. `System` is only an identity
 /// class; authorization still requires a matching platform capability in the
 /// work envelope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    crate::rkyv::Archive,
+    crate::rkyv::Serialize,
+    crate::rkyv::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+)]
+#[rkyv(crate = crate::rkyv)]
 pub enum Origin {
     Anonymous,
     Member(SubjectId),
@@ -206,5 +216,12 @@ mod tests {
             ActorId::owned_child(parent, "worker"),
             ActorId::owned_child(ActorId([2; 32]), "worker")
         );
+    }
+
+    #[test]
+    fn typed_origin_round_trips_as_actor_state() {
+        let origin = Origin::Member(SubjectId([7; 32]));
+        let bytes = crate::Encode::encode(&origin);
+        assert_eq!(<Origin as crate::Decode>::try_decode(&bytes), Some(origin));
     }
 }
