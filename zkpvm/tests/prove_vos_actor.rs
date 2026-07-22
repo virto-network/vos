@@ -125,6 +125,34 @@ fn load_actor_blob(name: &str) -> Option<Vec<u8>> {
     Some(grey_transpiler::link_elf(&elf_data).expect("failed to transpile ELF"))
 }
 
+/// Load one of the checked-in legacy hash workloads. The `.pvm` files in
+/// this v1 fixture directory are build caches, so accept one only when the
+/// pinned JAR parser recognizes it; otherwise derive the workload from its
+/// matching ELF with the pinned transpiler.
+fn load_hash_blob(name: &str) -> Option<Vec<u8>> {
+    let base = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tests/fixtures/legacy-v1/actors/hash-bench/"
+    );
+    let pvm_path = format!("{base}hash-{name}.pvm");
+    if let Ok(blob) = std::fs::read(&pvm_path) {
+        if program::parse_blob(&blob).is_some() {
+            return Some(blob);
+        }
+        eprintln!("legacy hash-{name}.pvm cache is stale; transpiling its ELF");
+    }
+
+    let elf_path = format!("{base}hash-{name}.elf");
+    let elf = match std::fs::read(&elf_path) {
+        Ok(elf) => elf,
+        Err(_) => {
+            eprintln!("SKIP: hash-{name} fixture absent; build hash-bench variants first");
+            return None;
+        }
+    };
+    Some(grey_transpiler::link_elf(&elf).expect("transpile legacy hash workload"))
+}
+
 /// Trace-only variant of clerk-refine-bench: validates the actor
 /// builds + runs.  Trace-only because profile_clerk_refine_bench
 /// also runs the full prove path.
@@ -363,21 +391,8 @@ fn trace_clerk_private_pay_bench() {
 
 /// Profile a specific hash variant by PVM blob name
 fn profile_hash_variant(name: &str) {
-    let base = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../tests/fixtures/legacy-v1/actors/hash-bench/"
-    );
-    let pvm_path = format!("{base}hash-{name}.pvm");
-    let elf_path = format!("{base}hash-{name}.elf");
-    let blob = match std::fs::read(&pvm_path) {
-        Ok(data) => data,
-        Err(_) => match std::fs::read(&elf_path) {
-            Ok(elf) => grey_transpiler::link_elf(&elf).expect("transpile"),
-            Err(_) => {
-                eprintln!("SKIP: hash-{name} fixture absent; build hash-bench variants first");
-                return;
-            }
-        },
+    let Some(blob) = load_hash_blob(name) else {
+        return;
     };
 
     let parsed = program::parse_blob(&blob).expect("parse blob");
@@ -444,16 +459,8 @@ fn compare_hash_algorithms() {
 
 #[test]
 fn debug_blake2s_prefix() {
-    let base = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../tests/fixtures/legacy-v1/actors/hash-bench/"
-    );
-    let blob = match std::fs::read(format!("{base}hash-blake2s.pvm")) {
-        Ok(b) => b,
-        Err(_) => {
-            eprintln!("SKIP: hash-blake2s.pvm fixture absent");
-            return;
-        }
+    let Some(blob) = load_hash_blob("blake2s") else {
+        return;
     };
     let parsed = program::parse_blob(&blob).expect("parse");
     let mut code_data = None;
@@ -519,16 +526,8 @@ fn debug_blake2s_prefix() {
 
 #[test]
 fn prove_diverse() {
-    let base = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../tests/fixtures/legacy-v1/actors/hash-bench/"
-    );
-    let blob = match std::fs::read(format!("{base}hash-diverse.pvm")) {
-        Ok(b) => b,
-        Err(_) => {
-            eprintln!("SKIP: hash-diverse.pvm fixture absent");
-            return;
-        }
+    let Some(blob) = load_hash_blob("diverse") else {
+        return;
     };
     let parsed = program::parse_blob(&blob).expect("parse blob");
     let mut code_data = None;
@@ -561,16 +560,8 @@ fn prove_diverse() {
 
 #[test]
 fn trace_diverse_steps() {
-    let base = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../tests/fixtures/legacy-v1/actors/hash-bench/"
-    );
-    let blob = match std::fs::read(format!("{base}hash-diverse.pvm")) {
-        Ok(b) => b,
-        Err(_) => {
-            eprintln!("SKIP: hash-diverse.pvm fixture absent");
-            return;
-        }
+    let Some(blob) = load_hash_blob("diverse") else {
+        return;
     };
     let (interp, _) = interpreter_from_blob(&blob, 100_000_000);
     let mut tracing = TracingPvm::new(interp);
@@ -590,16 +581,8 @@ fn trace_diverse_steps() {
 
 #[test]
 fn trace_keccak_steps() {
-    let base = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../tests/fixtures/legacy-v1/actors/hash-bench/"
-    );
-    let blob = match std::fs::read(format!("{base}hash-keccak.pvm")) {
-        Ok(b) => b,
-        Err(_) => {
-            eprintln!("SKIP: hash-keccak.pvm fixture absent");
-            return;
-        }
+    let Some(blob) = load_hash_blob("keccak") else {
+        return;
     };
     let (interp, _) = interpreter_from_blob(&blob, 100_000_000);
     let mut tracing = TracingPvm::new(interp);
