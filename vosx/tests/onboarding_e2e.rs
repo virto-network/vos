@@ -156,6 +156,41 @@ fn service_pvm_fixture(output_dir: &Path) -> Option<PathBuf> {
     Some(pvm)
 }
 
+fn counter_package_fixture(output_dir: &Path, service_pvm: &Path) -> Option<PathBuf> {
+    let actor_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../examples/actors/target/riscv64em-javm/release/v2_counter.elf");
+    if !actor_elf.is_file() {
+        eprintln!(
+            "skipping: build the public counter with \
+             `cd examples/actors && cargo +nightly actor -p v2-counter` ({})",
+            actor_elf.display(),
+        );
+        return None;
+    }
+    let output = Command::new(vosx_bin())
+        .arg("build")
+        .arg(&actor_elf)
+        .arg("--name")
+        .arg("onboarding-counter")
+        .arg("--version")
+        .arg("acceptance")
+        .arg("--service-pvm")
+        .arg(service_pvm)
+        .arg("--out-dir")
+        .arg(output_dir)
+        .env("XDG_DATA_HOME", output_dir.join("build-data"))
+        .env("XDG_CONFIG_HOME", output_dir.join("build-config"))
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("build signed onboarding package");
+    assert!(
+        output.status.success(),
+        "`vosx build` failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    Some(output_dir.join("onboarding-counter.vos"))
+}
+
 fn wait_for_endpoint(data_home: &Path, log_path: &Path, who: &str) -> PathBuf {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -188,19 +223,49 @@ fn poll_until(secs: u64, mut f: impl FnMut() -> bool, on_fail: impl FnOnce() -> 
 }
 
 #[test]
-#[ignore = "needs a signed v2 application package fixture for the member-floor spawn assertion"]
 fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
     let space = "onb";
+    let artifacts = TempDir::new("onb-artifacts");
+    let Some(service_pvm) = service_pvm_fixture(artifacts.path()) else {
+        return;
+    };
+    let Some(counter_package) = counter_package_fixture(artifacts.path(), &service_pvm) else {
+        return;
+    };
     let data_b = TempDir::new("b-data");
     let cfg_b = TempDir::new("b-config");
 
-    // ── host A: create + boot + install a MEMBER-floor app agent ───
-    // Once this ignored test gains a signed v2 package fixture, B has
-    // something to spawn as soon as it is a member.
-    // member. Its sync floor defaults to `member`, so a node judged
-    // non-member would narrow it out — exercising node_is_member's
-    // node-key grant path.
-    let (data_a, cfg_a, _daemon_a, log_a) = boot_admin(space);
+    // ── host A: create + boot + install a MEMBER-floor v2 actor ────
+    // The package is signed and pins the same generic service bytes supplied
+    // to every daemon. Nothing is bundled or retranspiled by the registry.
+    let (data_a, cfg_a, _daemon_a, log_a) = boot_admin_with_service(space, Some(&service_pvm));
+    vosx_ok(
+        data_a.path(),
+        cfg_a.path(),
+        &[
+            "space",
+            "publish",
+            space,
+            "onboarding-counter:acceptance",
+            counter_package.to_str().expect("package path is UTF-8"),
+        ],
+    );
+    vosx_ok(
+        data_a.path(),
+        cfg_a.path(),
+        &[
+            "space",
+            "install",
+            space,
+            "onboarding-counter:acceptance",
+            "--name",
+            "counter",
+            "--consistency",
+            "local",
+            "--sync",
+            "member",
+        ],
+    );
 
     // ── host A: mint a member invite (default bootnodes = A's addrs) ─
     let stdout = vosx_ok(
@@ -218,8 +283,14 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
 
     // ── host B: literally `space up <token>` — join + redeem + sync ─
     let log_b = data_b.path().join("daemon-b.stderr");
-    let daemon_b = Daemon(spawn_up(data_b.path(), cfg_b.path(), &token, &log_b));
-    wait_for_endpoint(data_b.path(), &log_b, "B");
+    let daemon_b = Daemon(spawn_up_with_service(
+        data_b.path(),
+        cfg_b.path(),
+        &token,
+        &log_b,
+        Some(&service_pvm),
+    ));
+    let endpoint_b = wait_for_endpoint(data_b.path(), &log_b, "B");
 
     // (1) Redemption reaches A: an `# invites` section appears in A's
     //     members only once the `redeem_invite` handler records the row.
@@ -259,40 +330,43 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
         },
     );
 
-    // (3) B SPAWNS the Member-floor agent: node_is_member must recognize
-    //     B's redeemed node-key grant, else node_meets_floor narrows
-    //     dev-project out and B logs "not spawned … sync floor is above".
-    //     A spawned agent opens its own per-node redb, so a redb in B's
-    //     agents dir other than the registry's (00000000.redb) is the
-    //     spawn signal — sync alone (the row) would not create it.
-    let agents_dir = find_endpoint(data_b.path())
-        .and_then(|ep| ep.parent().map(|p| p.join("agents")))
-        .expect("B has a space data dir");
+    // (3) B SPAWNS the Member-floor actor: node_is_member must recognize
+    //     B's redeemed node-key grant, fetch the exact package blob, and
+    //     create its guest-owned image. A non-voter correctly routes authority
+    //     calls to the Raft leader without hosting an authority image locally.
+    let services_dir = endpoint_b
+        .parent()
+        .expect("B endpoint has a space directory")
+        .join("v2-services");
     poll_until(
         40,
-        || spawned_app_agent(&agents_dir),
+        || spawned_v2_application(&services_dir),
         || {
             format!(
-                "B synced dev-project's row but never SPAWNED it — node_is_member likely still \
+                "B synced counter's row but never SPAWNED it — node_is_member likely still \
                  ignores the redeemed node-key grant, so node_meets_floor narrowed the Member \
-                 agent out. B log:\n{}",
+                 actor out, or the exact package blob was unavailable. B log:\n{}",
                 fs::read_to_string(&log_b).unwrap_or_default(),
             )
         },
     );
 
     // (4) The spawned agent is live + reachable on B — a real call
-    //     (list_branches, a no-arg read) returns rather than erroring.
+    //     (`value`, a no-arg read) returns rather than erroring.
     poll_until(
         30,
         || {
-            vosx(data_b.path(), cfg_b.path(), &["space", "call", space, "dev-project", "list_branches"])
-                .status
-                .success()
+            vosx(
+                data_b.path(),
+                cfg_b.path(),
+                &["space", "call", space, "counter", "value"],
+            )
+            .status
+            .success()
         },
         || {
             format!(
-                "a call to the spawned dev-project on B never succeeded. B log:\n{}",
+                "a call to the spawned counter on B never succeeded. B log:\n{}",
                 fs::read_to_string(&log_b).unwrap_or_default(),
             )
         },
@@ -306,7 +380,13 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
     drop(daemon_b); // SIGKILL B's first daemon
     let restart_at = std::time::SystemTime::now();
     let log_b2 = data_b.path().join("daemon-b2.stderr");
-    let _daemon_b2 = Daemon(spawn_up(data_b.path(), cfg_b.path(), space, &log_b2));
+    let _daemon_b2 = Daemon(spawn_up_with_service(
+        data_b.path(),
+        cfg_b.path(),
+        space,
+        &log_b2,
+        Some(&service_pvm),
+    ));
     // Wait for a FRESH endpoint (newer than the kill), past the stale one.
     poll_until(
         20,
@@ -316,37 +396,46 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
                 .and_then(|m| m.modified().ok())
                 .is_some_and(|mt| mt >= restart_at)
         },
-        || format!("B didn't re-attach after a bare restart; log:\n{}", fs::read_to_string(&log_b2).unwrap_or_default()),
+        || {
+            format!(
+                "B didn't re-attach after a bare restart; log:\n{}",
+                fs::read_to_string(&log_b2).unwrap_or_default()
+            )
+        },
     );
-    // Re-spawn is proven by the agent being reachable again (the redb
-    // file persists on disk regardless, so its presence proves nothing);
-    // a successful call means B re-registered dev-project from the cached
-    // registry row + blob with no token/manifest in play.
+    // Reopen is proven by the actor being reachable again (the service image
+    // persists on disk regardless, so its presence proves nothing); a
+    // successful call means B re-registered counter from the cached
+    // registry row + signed package with no token/manifest in play.
     poll_until(
         30,
         || {
-            vosx(data_b.path(), cfg_b.path(), &["space", "call", space, "dev-project", "list_branches"])
-                .status
-                .success()
+            vosx(
+                data_b.path(),
+                cfg_b.path(),
+                &["space", "call", space, "counter", "value"],
+            )
+            .status
+            .success()
         },
-        || format!("B didn't re-spawn dev-project after a bare `space up {space}` restart; log:\n{}", fs::read_to_string(&log_b2).unwrap_or_default()),
+        || {
+            format!(
+                "B didn't re-spawn counter after a bare `space up {space}` restart; log:\n{}",
+                fs::read_to_string(&log_b2).unwrap_or_default()
+            )
+        },
     );
 }
 
-/// True once B's agents dir holds a per-agent redb other than the
-/// registry's `00000000.redb` — i.e. an app agent actually spawned.
-fn spawned_app_agent(agents_dir: &Path) -> bool {
-    let Ok(entries) = fs::read_dir(agents_dir) else {
+/// A local v2 image proves the synchronized application row became a running
+/// root-tree service. Joiners are not authority Raft voters by default.
+fn spawned_v2_application(services_dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(services_dir) else {
         return false;
     };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        if name.ends_with(".redb") && name != "00000000.redb" {
-            return true;
-        }
-    }
-    false
+    entries
+        .flatten()
+        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "image"))
 }
 
 /// Run a `vosx` command and assert it succeeded, returning stdout.
