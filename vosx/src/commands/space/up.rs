@@ -877,12 +877,72 @@ impl Invoker for TimedNode<'_> {
     }
 }
 
+fn authority_invite_redemption(
+    payload: &crate::token::InvitePayload,
+    holder_peer_id: Vec<u8>,
+    redeem_signature: [u8; vos::registry::OP_SIG_LEN],
+    holder_signature: Vec<u8>,
+) -> anyhow::Result<vos::v2::RoleAuthorityInviteRedemptionV2> {
+    let role = match vos::SpaceRole::from_u8(payload.role) {
+        Some(role @ (vos::SpaceRole::Member | vos::SpaceRole::Developer)) => role,
+        _ => anyhow::bail!("invite role {} is not canonical v2", payload.role),
+    };
+    let holder_signature = holder_signature
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("node invite signature is not Ed25519"))?;
+    Ok(vos::v2::RoleAuthorityInviteRedemptionV2 {
+        space: vos::v2::SpaceId(payload.space_id),
+        token_pub: payload.token_pub,
+        role,
+        expires_at: payload.expires_at,
+        admin_peer_id: payload.admin_peer_id.clone(),
+        admin_signature: payload.admin_sig,
+        holder_peer_id,
+        redeem_signature,
+        holder_signature,
+    })
+}
+
+fn authority_invite_invocation(
+    redemption: &vos::v2::RoleAuthorityInviteRedemptionV2,
+    peer_prefix: u16,
+) -> (ServiceId, vos::v2::RootTreeInvocationV2) {
+    use vos::Encode;
+    use vos::v2::V2Wire;
+
+    let root_service = v2_root_service_id(redemption.space, vos::v2::ROLE_AUTHORITY_INSTANCE_V2);
+    let target = v2_root_actor_id(root_service, vos::v2::ROLE_AUTHORITY_INSTANCE_V2);
+    let redemption = redemption.encode();
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(
+        &vos::value::Msg::new(vos::v2::ROLE_AUTHORITY_INVITE_METHOD_V2)
+            .with("redemption", redemption.clone())
+            .encode(),
+    );
+    (
+        instance_service_id(vos::v2::ROLE_AUTHORITY_INSTANCE_V2, peer_prefix),
+        vos::v2::RootTreeInvocationV2 {
+            invocation: vos::v2::InvocationId::derive(
+                b"vos/invite-authority-redemption/v2",
+                &redemption,
+            ),
+            logical_timeslot: 1,
+            target,
+            method: vos::v2::ROLE_AUTHORITY_INVITE_METHOD_V2.into(),
+            arguments,
+            proof_requested: false,
+        },
+    )
+}
+
 /// One redeem attempt: build the joiner's two signatures and invoke each
-/// connected peer's `redeem_invite` until one grants this node's key.
-/// `Ok(true)` = accepted (clear the pending token); `Ok(false)` = no
-/// peer answered `Ok` this pass (retry); `Err` = malformed token /
-/// unreadable key (warned once, then retried).
+/// connected peer's registry, then its canonical authority, until both grant
+/// this node's key. `Ok(true)` clears the pending token only after the
+/// authority's guest Accumulate reply is published; a partial legacy-only
+/// success remains retryable.
 fn try_redeem(node: &VosNode, data_dir: &Path, token_str: &str) -> anyhow::Result<bool> {
+    use vos::v2::V2Wire;
+
     let payload = crate::token::parse(token_str)?;
 
     // Redemption grants the DAEMON's node key (not the operator CLI
@@ -895,12 +955,14 @@ fn try_redeem(node: &VosNode, data_dir: &Path, token_str: &str) -> anyhow::Resul
 
     // Both signatures cover the same canonical: the token secret proves
     // possession, the node key proves control of the granted peer-id.
-    let redeem_sig = crate::token::redeem_sig(&payload, &node_peer_id)?.to_vec();
+    let redeem_sig = crate::token::redeem_sig(&payload, &node_peer_id)?;
     let redeem_canon =
         vos::registry::canonical_op_bytes("redeem_invite", &[&payload.token_pub, &node_peer_id]);
     let node_sig = node_kp
         .sign(&redeem_canon)
         .map_err(|e| anyhow::anyhow!("node_sig sign: {e}"))?;
+    let authority_redemption =
+        authority_invite_redemption(&payload, node_peer_id.clone(), redeem_sig, node_sig.clone())?;
 
     let Some(net) = node.network() else {
         return Ok(false);
@@ -924,11 +986,32 @@ fn try_redeem(node: &VosNode, data_dir: &Path, token_str: &str) -> anyhow::Resul
             payload.admin_peer_id.clone(),
             payload.admin_sig.to_vec(),
             node_peer_id.clone(),
-            redeem_sig.clone(),
+            redeem_sig.to_vec(),
             node_sig.clone(),
         ));
         match status {
-            Ok(Status::Ok) => return Ok(true),
+            Ok(Status::Ok) => {
+                let (authority_route, invocation) =
+                    authority_invite_invocation(&authority_redemption, peer_prefix);
+                match node.invoke_with_timeout(
+                    authority_route,
+                    invocation.encode(),
+                    REDEEM_INVOKE_TIMEOUT,
+                ) {
+                    Some(reply)
+                        if <vos::value::Value as vos::Decode>::try_decode(&reply)
+                            .is_some_and(|value| value.as_bool() == Some(true)) =>
+                    {
+                        return Ok(true);
+                    }
+                    Some(_) => tracing::debug!(
+                        "v2 authority via {peer} rejected invite after registry acceptance"
+                    ),
+                    None => tracing::debug!(
+                        "v2 authority via {peer} unavailable after registry acceptance"
+                    ),
+                }
+            }
             Ok(other) => tracing::debug!("redeem via {peer}: {other}"),
             Err(e) => tracing::debug!("redeem via {peer}: {e}"),
         }
@@ -2885,6 +2968,85 @@ mod tests {
         assert_eq!(
             binding.actor,
             v2_root_actor_id(root_service, vos::v2::ROLE_AUTHORITY_INSTANCE_V2)
+        );
+    }
+
+    #[test]
+    fn invite_redemption_maps_exact_evidence_to_stable_authority_ingress() {
+        use vos::Decode;
+
+        let payload = crate::token::InvitePayload {
+            space_id: [7; 32],
+            name: "invited-space".into(),
+            bootnodes: vec!["/memory/1".into()],
+            role: vos::registry::AUTH_ROLE_DEVELOPER,
+            expires_at: 123_456,
+            admin_peer_id: vec![8; 38],
+            token_pub: [9; 32],
+            admin_sig: [10; vos::registry::OP_SIG_LEN],
+            token_secret: [11; 32],
+        };
+        let redemption = authority_invite_redemption(
+            &payload,
+            vec![12; 38],
+            [13; vos::registry::OP_SIG_LEN],
+            vec![14; vos::registry::OP_SIG_LEN],
+        )
+        .unwrap();
+        assert_eq!(redemption.space, vos::v2::SpaceId(payload.space_id));
+        assert_eq!(redemption.role, vos::SpaceRole::Developer);
+        assert_eq!(redemption.admin_peer_id, payload.admin_peer_id);
+        assert_eq!(redemption.admin_signature, payload.admin_sig);
+        assert_eq!(redemption.holder_peer_id, vec![12; 38]);
+        assert_eq!(redemption.redeem_signature, [13; 64]);
+        assert_eq!(redemption.holder_signature, [14; 64]);
+
+        let (route, invocation) = authority_invite_invocation(&redemption, 0x1234);
+        let repeated = authority_invite_invocation(&redemption, 0x1234);
+        let root_service = v2_root_service_id(
+            vos::v2::SpaceId(payload.space_id),
+            vos::v2::ROLE_AUTHORITY_INSTANCE_V2,
+        );
+        assert_eq!(
+            route,
+            instance_service_id(vos::v2::ROLE_AUTHORITY_INSTANCE_V2, 0x1234)
+        );
+        assert_eq!(repeated, (route, invocation.clone()));
+        assert_eq!(
+            invocation.target,
+            v2_root_actor_id(root_service, vos::v2::ROLE_AUTHORITY_INSTANCE_V2)
+        );
+        assert_eq!(invocation.method, vos::v2::ROLE_AUTHORITY_INVITE_METHOD_V2);
+        assert!(!invocation.proof_requested);
+        assert_eq!(invocation.arguments[0], vos::value::TAG_DYNAMIC);
+        let message = vos::value::Msg::decode(&invocation.arguments[1..]);
+        assert_eq!(message.name, vos::v2::ROLE_AUTHORITY_INVITE_METHOD_V2);
+        let encoded_redemption = message.args.get("redemption").unwrap().as_bytes().unwrap();
+        assert_eq!(
+            vos::v2::RoleAuthorityInviteRedemptionV2::decode(encoded_redemption).unwrap(),
+            redemption
+        );
+    }
+
+    #[test]
+    fn invite_redemption_rejects_non_delegable_roles_and_wrong_signature_width() {
+        let mut payload = crate::token::InvitePayload {
+            space_id: [21; 32],
+            name: "invited-space".into(),
+            bootnodes: vec![],
+            role: vos::registry::AUTH_ROLE_ADMIN,
+            expires_at: 123_456,
+            admin_peer_id: vec![22; 38],
+            token_pub: [23; 32],
+            admin_sig: [24; vos::registry::OP_SIG_LEN],
+            token_secret: [25; 32],
+        };
+        assert!(
+            authority_invite_redemption(&payload, vec![26; 38], [27; 64], vec![28; 64]).is_err()
+        );
+        payload.role = vos::registry::AUTH_ROLE_READONLY;
+        assert!(
+            authority_invite_redemption(&payload, vec![26; 38], [27; 64], vec![28; 63]).is_err()
         );
     }
 
