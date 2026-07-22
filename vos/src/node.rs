@@ -5829,9 +5829,7 @@ fn v2_work_authorization(
         crate::actors::Caller::Unauthenticated => crate::v2::Origin::Anonymous,
         crate::actors::Caller::System => crate::v2::Origin::System,
         crate::actors::Caller::Peer(peer) => {
-            crate::v2::Origin::Member(crate::v2::SubjectId(
-                crate::v2::Hash::digest(b"vos/peer-subject/v2", &[peer]).0,
-            ))
+            crate::v2::Origin::Member(crate::v2::SubjectId::of_authenticated_peer(peer))
         }
         crate::actors::Caller::Actor(service) => {
             let actor = actor_routes

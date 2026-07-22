@@ -105,6 +105,18 @@ impl ProducerId {
     }
 }
 
+impl SubjectId {
+    /// Canonical v2 identity of a transport-authenticated peer. The raw
+    /// libp2p multihash remains a host credential; actor wires carry only this
+    /// fixed-width, domain-separated subject.
+    pub fn of_authenticated_peer(peer_id: &[u8]) -> Self {
+        Self(crate::crypto::blake2b_hash::<32>(
+            b"vos/peer-subject/v2",
+            &[peer_id],
+        ))
+    }
+}
+
 impl InvocationId {
     /// Derive a stable invocation identifier from an application namespace and
     /// caller-provided nonce.
@@ -215,6 +227,18 @@ mod tests {
         assert_ne!(
             ActorId::owned_child(parent, "worker"),
             ActorId::owned_child(ActorId([2; 32]), "worker")
+        );
+    }
+
+    #[test]
+    fn authenticated_peer_subjects_are_stable_and_peer_scoped() {
+        assert_eq!(
+            SubjectId::of_authenticated_peer(b"peer-a"),
+            SubjectId::of_authenticated_peer(b"peer-a")
+        );
+        assert_ne!(
+            SubjectId::of_authenticated_peer(b"peer-a"),
+            SubjectId::of_authenticated_peer(b"peer-b")
         );
     }
 

@@ -240,9 +240,9 @@ impl<A: Actor> Context<A> {
         self.origin = match &caller {
             Caller::Unauthenticated => crate::v2::Origin::Anonymous,
             Caller::System => crate::v2::Origin::System,
-            Caller::Peer(bytes) => crate::v2::Origin::Member(crate::v2::SubjectId(
-                crate::crypto::blake2b_hash::<32>(b"vos/subject/v2", &[bytes]),
-            )),
+            Caller::Peer(bytes) => {
+                crate::v2::Origin::Member(crate::v2::SubjectId::of_authenticated_peer(bytes))
+            }
             Caller::Actor(id) => {
                 crate::v2::Origin::Actor(crate::v2::ActorId(crate::crypto::blake2b_hash::<32>(
                     b"vos/legacy-service-actor/v2",
@@ -2114,10 +2114,15 @@ mod tests {
         ctx.set_caller(Caller::Unauthenticated);
         assert_eq!(ctx.caller(), &Caller::Unauthenticated);
 
-        ctx.set_caller(Caller::Peer(alloc::vec![0xde, 0xad, 0xbe, 0xef]));
+        let peer = alloc::vec![0xde, 0xad, 0xbe, 0xef];
+        ctx.set_caller(Caller::Peer(peer.clone()));
         assert_eq!(
             ctx.caller(),
             &Caller::Peer(alloc::vec![0xde, 0xad, 0xbe, 0xef])
+        );
+        assert_eq!(
+            ctx.origin(),
+            crate::v2::Origin::Member(crate::v2::SubjectId::of_authenticated_peer(&peer))
         );
 
         ctx.set_caller(Caller::Actor(ServiceId(42)));

@@ -8,7 +8,9 @@
 //! into the credential accepted by another root service.
 
 use vos::prelude::*;
-use vos::v2::{RoleAuthorityMutationV2, RoleAuthorizationClaimV2, SpaceId, V2Wire};
+use vos::v2::{
+    Origin, RoleAuthorityMutationV2, RoleAuthorizationClaimV2, SpaceId, SubjectId, V2Wire,
+};
 
 #[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Debug, Clone, PartialEq, Eq,
@@ -26,11 +28,17 @@ struct GrantRow {
 /// no state rather than an authority which could be claimed after install.
 pub fn initial_state(space: SpaceId, root_peer_id: Vec<u8>) -> Option<Vec<u8>> {
     vos::registry::ed25519_pubkey_from_peer_id(&root_peer_id)?;
+    let root = Origin::Member(SubjectId::of_authenticated_peer(&root_peer_id));
     Some(
         SpaceAuthority {
             space,
             root_peer_id,
-            grants: Vec::new(),
+            grants: vec![GrantRow {
+                holder: root,
+                role: SpaceRole::Admin.as_u8(),
+                grant_epoch: 1,
+                revoke_epoch: 0,
+            }],
         }
         .encode(),
     )
@@ -151,8 +159,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use vos::abi::service::ServiceId;
     use vos::v2::{
-        ActorId, DeploymentId, Hash, InvocationId, Origin, ProgramId, RootServiceId,
-        ServiceIdentityV2, SubjectId,
+        ActorId, DeploymentId, Hash, InvocationId, ProgramId, RootServiceId, ServiceIdentityV2,
     };
     use vos::{Decode, Message};
 
@@ -244,6 +251,17 @@ mod tests {
         assert_eq!(authorize(&mut actor, &member), member.encode());
         let admin = claim(space, holder, SpaceRole::Admin);
         assert!(authorize(&mut actor, &admin).is_empty());
+    }
+
+    #[test]
+    fn initial_state_contains_an_explicit_root_admin_grant() {
+        let signing = SigningKey::from_bytes(&[21; 32]);
+        let peer = root_peer(&signing);
+        let space = SpaceId([22; 32]);
+        let mut authority = actor(space, &signing);
+        let root = Origin::Member(SubjectId::of_authenticated_peer(&peer));
+        let admin = claim(space, root, SpaceRole::Admin);
+        assert_eq!(authorize(&mut authority, &admin), admin.encode());
     }
 
     #[test]
