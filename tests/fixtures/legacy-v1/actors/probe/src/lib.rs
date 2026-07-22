@@ -26,6 +26,18 @@ impl Probe {
         Probe { seen: 0 }
     }
 
+    /// Bounded scheduler child used by the journal-isolation regression. Each
+    /// cold drive reads the previously persisted four-byte state, advances it
+    /// once, and yields until the eighth step. Keeping this fixture bounded
+    /// makes the regression independent of gas exhaustion.
+    #[msg]
+    async fn start(&mut self, ctx: &mut Context<Self>) {
+        self.seen += 1;
+        if self.seen < 8 {
+            ctx.yield_now().await;
+        }
+    }
+
     /// Count this message, then yield. A batch of `ping`s therefore
     /// consumes one message per tick: the host must re-queue the mail
     /// the guest had not yet FETCHed before it yielded.
