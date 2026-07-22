@@ -25,6 +25,8 @@ pub enum SyncError<L, R> {
     MissingNode,
     /// A fetched node's recomputed CID didn't match the expected CID.
     InvalidCid,
+    /// The fetched nodes contain a causal cycle instead of a DAG.
+    InvalidDag,
     /// A fetched node failed the application-provided author/signature policy.
     InvalidAuthor,
 }
@@ -36,6 +38,7 @@ impl<L: core::fmt::Display, R: core::fmt::Display> core::fmt::Display for SyncEr
             SyncError::Remote(e) => write!(f, "remote store error: {e}"),
             SyncError::MissingNode => write!(f, "referenced node not found"),
             SyncError::InvalidCid => write!(f, "fetched node CID verification failed"),
+            SyncError::InvalidDag => write!(f, "fetched nodes contain a causal cycle"),
             SyncError::InvalidAuthor => write!(f, "fetched node author validation failed"),
         }
     }
@@ -115,7 +118,7 @@ where
     // Step 2: Topological sort — oldest (leaves) first, newest (roots) last.
     // We want: if A references B as a child, B comes before A.
     // This is a reverse topological sort using out-degree (Kahn's algorithm).
-    Ok(topological_sort(missing))
+    topological_sort(missing).ok_or(SyncError::InvalidDag)
 }
 
 /// Policy hook for signed-author or payload validation. Merkle addressing
@@ -136,7 +139,7 @@ impl<H: Hasher, P> NodeValidator<H, P> for AcceptAll {
 /// Topologically sort DAG nodes so children (older events) come before parents (newer events).
 pub(crate) fn topological_sort<H: Hasher, P>(
     mut nodes: BTreeMap<Cid<H>, DagNode<H, P>>,
-) -> Vec<(Cid<H>, DagNode<H, P>)> {
+) -> Option<Vec<(Cid<H>, DagNode<H, P>)>> {
     let cid_set: BTreeSet<Cid<H>> = nodes.keys().cloned().collect();
 
     // out_degree: for each node, count children that are also in the missing set
@@ -182,7 +185,7 @@ pub(crate) fn topological_sort<H: Hasher, P>(
         result.push((cid, node));
     }
 
-    result
+    nodes.is_empty().then_some(result)
 }
 
 #[cfg(test)]
@@ -237,5 +240,31 @@ mod tests {
         let c1 = clock.record(1u64, &mut store).unwrap();
         let missing = fetch_missing(&c1, &store, &store).unwrap();
         assert!(missing.is_empty());
+    }
+
+    struct CollidingHasher;
+    impl Hasher for CollidingHasher {
+        type Output = [u8; 32];
+
+        fn hash(_data: &[u8]) -> Self::Output {
+            [0; 32]
+        }
+    }
+
+    #[test]
+    fn fetch_missing_rejects_a_content_addressed_cycle() {
+        let cid = Cid::<CollidingHasher>([0; 32]);
+        let node = DagNode::new(1u64, [cid.clone()].into_iter().collect());
+        assert_eq!(node.cid(), cid);
+
+        let local = MemStore::<CollidingHasher, u64>::new();
+        let mut remote = MemStore::new();
+        remote.put(cid.clone(), node).unwrap();
+
+        assert!(matches!(
+            fetch_missing(&cid, &local, &remote),
+            Err(SyncError::InvalidDag)
+        ));
+        assert!(local.is_empty());
     }
 }

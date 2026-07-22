@@ -215,6 +215,7 @@ fn map_local_error<L, R>(error: Error<L>) -> SyncError<L, R> {
         Error::Store(error) => SyncError::Local(error),
         Error::MissingNode => SyncError::MissingNode,
         Error::InvalidCid => SyncError::InvalidCid,
+        Error::InvalidDag => SyncError::InvalidDag,
         Error::InvalidAuthor => SyncError::InvalidAuthor,
     }
 }
@@ -242,7 +243,8 @@ fn materialize<H: Hasher, P: Payload, S: Store<H, P>>(
         nodes.insert(cid, node);
     }
     let mut state = P::State::default();
-    for (_, node) in sync::topological_sort(nodes) {
+    let nodes = sync::topological_sort(nodes).ok_or(Error::InvalidDag)?;
+    for (_, node) in nodes {
         P::apply(&mut state, &node.payload);
     }
     Ok(state)
@@ -586,6 +588,30 @@ mod tests {
             TestCrdt::from_roots(store, [false_root]),
             Err(Error::InvalidCid)
         ));
+    }
+
+    struct CollidingHasher;
+    impl Hasher for CollidingHasher {
+        type Output = [u8; 32];
+
+        fn hash(_data: &[u8]) -> Self::Output {
+            [0; 32]
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_a_content_addressed_cycle() {
+        let root = Cid::<CollidingHasher>([0; 32]);
+        let node = DagNode::new(CounterOp(3), [root.clone()].into_iter().collect());
+        assert_eq!(node.cid(), root);
+        let mut store = MemStore::new();
+        store.put(root.clone(), node).unwrap();
+
+        let recovered: Result<
+            MerkleCrdt<CollidingHasher, CounterOp, MemStore<CollidingHasher, CounterOp>>,
+            _,
+        > = MerkleCrdt::from_roots(store, [root]);
+        assert!(matches!(recovered, Err(Error::InvalidDag)));
     }
 
     #[test]
