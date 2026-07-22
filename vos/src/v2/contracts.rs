@@ -112,6 +112,7 @@ pub struct RoleAuthorityBindingV2 {
 }
 
 pub const ROLE_AUTHORITY_MUTATION_METHOD_V2: &str = "mutate_role";
+pub const ROLE_AUTHORITY_INVITE_METHOD_V2: &str = "redeem_invite";
 pub const ROLE_AUTHORITY_DECISION_METHOD_V2: &str = "authorize_role";
 /// Reserved installed root name for the one canonical authority service in a
 /// space. Application manifests cannot choose a sibling authority by route.
@@ -152,6 +153,36 @@ impl RoleAuthorityMutationV2 {
         match self {
             Self::Grant { epoch, .. } | Self::Revoke { epoch, .. } => *epoch,
         }
+    }
+}
+
+/// Offline delegated-grant evidence carried from invite minting through
+/// redemption into the canonical role authority.
+///
+/// The admin signature binds `(space, role, expires_at, token_pub)`. The token
+/// and joining node signatures both bind `(token_pub, holder_peer_id)`. The
+/// authority verifies the complete chain and records the admin as grantor, so
+/// revoking that admin invalidates grants derived from its invites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleAuthorityInviteRedemptionV2 {
+    pub space: SpaceId,
+    pub token_pub: [u8; 32],
+    pub role: crate::SpaceRole,
+    pub expires_at: u64,
+    pub admin_peer_id: Vec<u8>,
+    pub admin_signature: [u8; 64],
+    pub holder_peer_id: Vec<u8>,
+    pub redeem_signature: [u8; 64],
+    pub holder_signature: [u8; 64],
+}
+
+impl RoleAuthorityInviteRedemptionV2 {
+    pub fn holder(&self) -> Origin {
+        Origin::Member(SubjectId::of_authenticated_peer(&self.holder_peer_id))
+    }
+
+    pub fn grantor(&self) -> Origin {
+        Origin::Member(SubjectId::of_authenticated_peer(&self.admin_peer_id))
     }
 }
 
@@ -2421,6 +2452,58 @@ impl V2Wire for RoleAuthorityMutationV2 {
         };
         if value.epoch() == 0
             || !matches!(value.holder(), Origin::Member(_) | Origin::Actor(_))
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+impl V2Wire for RoleAuthorityInviteRedemptionV2 {
+    const MAGIC: [u8; 4] = *b"VIG2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        encoder.fixed(&self.space.0);
+        encoder.fixed(&self.token_pub);
+        encoder.u8(self.role.as_u8());
+        encoder.u64(self.expires_at);
+        encoder.bytes(&self.admin_peer_id);
+        encoder.bytes(&self.admin_signature);
+        encoder.bytes(&self.holder_peer_id);
+        encoder.bytes(&self.redeem_signature);
+        encoder.bytes(&self.holder_signature);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            space: SpaceId(decoder.fixed()?),
+            token_pub: decoder.fixed()?,
+            role: crate::SpaceRole::from_u8(decoder.u8()?).ok_or(DecodeError::NonCanonical)?,
+            expires_at: decoder.u64()?,
+            admin_peer_id: decoder.bytes()?,
+            admin_signature: decoder
+                .bytes()?
+                .try_into()
+                .map_err(|_| DecodeError::NonCanonical)?,
+            holder_peer_id: decoder.bytes()?,
+            redeem_signature: decoder
+                .bytes()?
+                .try_into()
+                .map_err(|_| DecodeError::NonCanonical)?,
+            holder_signature: decoder
+                .bytes()?
+                .try_into()
+                .map_err(|_| DecodeError::NonCanonical)?,
+        };
+        if !matches!(
+            value.role,
+            crate::SpaceRole::Member | crate::SpaceRole::Developer
+        ) || value.expires_at == 0
+            || value.admin_peer_id.is_empty()
+            || value.admin_peer_id.len() > 256
+            || value.holder_peer_id.is_empty()
+            || value.holder_peer_id.len() > 256
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -4754,6 +4837,40 @@ mod tests {
         assert_eq!(
             RoleAuthorityMutationV2::decode(&invalid.encode()),
             Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn authority_invite_wire_binds_the_complete_delegation_chain() {
+        let redemption = RoleAuthorityInviteRedemptionV2 {
+            space: SpaceId([41; 32]),
+            token_pub: [42; 32],
+            role: crate::SpaceRole::Developer,
+            expires_at: 43,
+            admin_peer_id: vec![44; 38],
+            admin_signature: [45; 64],
+            holder_peer_id: vec![46; 38],
+            redeem_signature: [47; 64],
+            holder_signature: [48; 64],
+        };
+        assert_eq!(
+            RoleAuthorityInviteRedemptionV2::decode(&redemption.encode()).unwrap(),
+            redemption,
+        );
+        assert!(matches!(redemption.holder(), Origin::Member(_)));
+        assert!(matches!(redemption.grantor(), Origin::Member(_)));
+
+        let mut admin = redemption.clone();
+        admin.role = crate::SpaceRole::Admin;
+        assert_eq!(
+            RoleAuthorityInviteRedemptionV2::decode(&admin.encode()),
+            Err(DecodeError::NonCanonical),
+        );
+        let mut malformed = redemption;
+        malformed.holder_peer_id.clear();
+        assert_eq!(
+            RoleAuthorityInviteRedemptionV2::decode(&malformed.encode()),
+            Err(DecodeError::NonCanonical),
         );
     }
 
