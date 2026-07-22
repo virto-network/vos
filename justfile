@@ -63,8 +63,10 @@ build-legacy-pvm-fixtures:
 build-actor name:
     cd actors/{{name}}; cargo +nightly actor
 
-# Build all generated artifacts consumed by the test suite.
-build-test-artifacts: build-extensions build-pvm build-actors build-voucher-check
+# The retired voucher-check proof guest is intentionally opt-in: it depends on
+# an external cipher-clerk checkout and is not part of the v2 actor/package ABI.
+# Build all in-repository artifacts consumed by the default test suite.
+build-test-artifacts: build-extensions build-pvm build-actors
     cargo build
 
 # Build all built-in actors used by host tests.
@@ -74,7 +76,8 @@ build-actors: (build-actor "space-registry") (build-actor "space-bridge") \
     cargo build -p prover-extension
     cargo build -p prover-extension --release
 
-# Build the voucher-check PVM guest used by Mode::External voucher proofs.
+# This recipe requires the developer's separate cipher-clerk checkout.
+# Build the retired v1 voucher-check proof guest for explicit legacy zk tests.
 build-voucher-check:
     cd tests/fixtures/legacy-v1/actors/voucher-check; cargo +nightly build --release
 
