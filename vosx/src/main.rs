@@ -525,7 +525,8 @@ fn exit_code_for(e: &anyhow::Error) -> i32 {
 
 #[cfg(test)]
 mod routing_tests {
-    use super::{is_top_level_help, should_dynamic_dispatch};
+    use super::{Cli, is_top_level_help, should_dynamic_dispatch};
+    use clap::Parser;
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -547,6 +548,25 @@ mod routing_tests {
         // extension instances.
         assert!(should_dynamic_dispatch(&s(&["ai", "generate"])));
         assert!(should_dynamic_dispatch(&s(&["dev", "compile"])));
+    }
+
+    #[test]
+    fn space_install_has_no_host_owned_init_flag() {
+        assert!(
+            Cli::try_parse_from(["vosx", "space", "install", "demo", "counter:0.1.0",]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "vosx",
+                "space",
+                "install",
+                "demo",
+                "counter:0.1.0",
+                "--init",
+                "value=1",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

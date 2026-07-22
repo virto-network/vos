@@ -222,10 +222,6 @@ pub enum SpaceCommand {
         /// the program's `name`.
         #[arg(long)]
         name: Option<String>,
-        /// Init args as `key=value` pairs (repeatable). Values
-        /// are typed as u64 / bool / String in that order.
-        #[arg(long, value_name = "KEY=VALUE")]
-        init: Vec<String>,
         /// Consistency mode: ephemeral, local, crdt, or raft.
         #[arg(long, default_value = "local")]
         consistency: String,
@@ -420,7 +416,6 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             space,
             program_ref,
             name,
-            init,
             consistency,
             replication_id,
             sync,
@@ -428,7 +423,6 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             space,
             program_ref,
             name,
-            init,
             consistency,
             replication_id,
             sync,

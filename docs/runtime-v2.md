@@ -335,6 +335,13 @@ the receiver assembles complete ancestry and submits it to physical
 materializes v2 actor state. Raw ELF/PVM catalog rows are never started by the
 production daemon.
 
+`space install` records only the signed deployment identity, root-tree
+replication settings, and immutable external bindings. It does not accept
+constructor arguments or execute actor code. Any application initialization is
+an explicit typed invocation after installation, so authorization,
+deduplication, state changes, and replies cross the same durable
+Refine/Accumulate boundary as every later message.
+
 This is a clean storage and wire break. A v1 store or package must be reset and
 reinstalled; there is no v1 decoder or migration in a v2 service.
 
