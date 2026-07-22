@@ -27,8 +27,9 @@ use vos::v2::{
     MethodPolicyV2, NoRefineProtocolHostV2, Origin, OwnedActorInstallV2, PackageManifestV2,
     PackageRolePoliciesV2, ProducerId, ProgramId, ProofCommitmentV2, ProofVerificationRequestV2,
     PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2,
-    RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RoleAuthorityBindingV2, RootServiceId,
-    RootTreeIngressRecoveryV2, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2,
+    RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RoleAuthorityBindingV2,
+    RoleAuthorityMutationV2, RootServiceId, RootTreeIngressRecoveryV2, ScheduleErrorV2,
+    ServiceDispatchError, ServiceGenesisV2,
     ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, SpaceRoleCredentialV2, StateKeyV2,
     SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2,
     WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
@@ -559,14 +560,26 @@ fn public_example_root_config(
     let Some(service_elf) = service_elf() else {
         return None;
     };
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../examples/actors/target/riscv64em-javm/release")
-        .join(format!("{binary}.elf"));
+    let (path, build_hint) = if binary == "space_authority" {
+        (
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../actors/space-authority/target/riscv64em-javm/release")
+                .join(format!("{binary}.elf")),
+            "just build-actor space-authority",
+        )
+    } else {
+        (
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../examples/actors/target/riscv64em-javm/release")
+                .join(format!("{binary}.elf")),
+            "just build-examples",
+        )
+    };
     let actor_elf = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(_) => {
             eprintln!(
-                "skipping: build the public {binary} example with `just build-examples` ({})",
+                "skipping: build the public {binary} actor with `{build_hint}` ({})",
                 path.display()
             );
             return None;
@@ -985,6 +998,103 @@ fn public_workflow_example_resumes_root_and_child_after_cross_root_accumulate() 
 
     shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     assert!(router.join().unwrap().into_iter().all(|result| result.is_ok()));
+}
+
+#[test]
+fn canonical_space_authority_produces_extractable_accumulated_assertion() {
+    let authority_actor = ActorId([184; 32]);
+    let Some(mut authority_config) = public_example_root_config(
+        "space_authority",
+        authority_actor,
+        ConsistencyModeV2::Local,
+        vec![],
+    ) else {
+        return;
+    };
+    authority_config.actor_name = "space-authority".into();
+    let root = identity::Keypair::generate_ed25519();
+    let root_peer_id = PeerId::from(root.public()).to_bytes();
+    authority_config.initial_state = space_authority::initial_state(
+        authority_config.service.space,
+        root_peer_id,
+    )
+    .expect("the authority genesis pins an Ed25519 space root");
+    let binding = RoleAuthorityBindingV2 {
+        service: authority_config.service.clone(),
+        actor: authority_actor,
+    };
+    let mut authority =
+        LocalRootTreeServiceV2::open(authority_config, FailableCommittedImages::default())
+            .expect("the canonical authority installs through guest Accumulate");
+
+    let holder = Origin::Member(SubjectId([185; 32]));
+    let grant = RoleAuthorityMutationV2::Grant {
+        space: binding.service.space,
+        holder,
+        role: vos::SpaceRole::Developer,
+        epoch: 1,
+    };
+    let signature = root
+        .sign(&grant.encode())
+        .expect("the space root signs the canonical mutation wire");
+    assert_eq!(
+        invoke_public_example(
+            &mut authority,
+            authority_actor,
+            InvocationId([186; 32]),
+            1,
+            "mutate_role",
+            Msg::new("mutate_role")
+                .with("mutation", grant.encode())
+                .with("signature", signature),
+        ),
+        Value::Bool(true)
+    );
+
+    let claim = vos::v2::RoleAuthorizationClaimV2 {
+        space: binding.service.space,
+        holder,
+        role: vos::SpaceRole::Member,
+        audience: ServiceIdentityV2 {
+            root_service: RootServiceId([187; 32]),
+            deployment: DeploymentId([188; 32]),
+            service_program: ProgramId([189; 32]),
+            ..binding.service.clone()
+        },
+        invocation: InvocationId([190; 32]),
+        target: ActorId([191; 32]),
+        method: "restricted".into(),
+        policy: Hash([192; 32]),
+    };
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(
+        &Msg::new("authorize_role")
+            .with("claim", claim.encode())
+            .encode(),
+    );
+    let committed = authority
+        .invoke(LocalWorkRequestV2 {
+            invocation: claim.authority_invocation(),
+            workflow_step: 0,
+            logical_timeslot: 2,
+            target: authority_actor,
+            method: "authorize_role".into(),
+            arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        })
+        .expect("the canonical authority decision commits before publication");
+    let assertion = committed
+        .role_assertion(claim.clone(), &binding)
+        .expect("the actor reply and guest receipt form the exact role assertion");
+    assert_eq!(assertion.claim, claim);
+    assert!(assertion.matches_authority(&binding));
 }
 
 #[test]

@@ -148,6 +148,9 @@ tally = { path = "../tests/fixtures/legacy-v1/actors/tally", default-features = 
 # tests load the pre-built actor ELF separately and only need the
 # Ref surface from the rlib.
 space-registry = { path = "../actors/space-registry", default-features = false }
+# Canonical v2 authority state encoder used by the physical generic-service
+# integration gate. The runtime itself remains application-agnostic.
+space-authority = { path = "../actors/space-authority", default-features = false }
 # The channel sequencer's reply types (`CommitOutcome` / `Status`), so the
 # in-PVM commit-retry gate can mint byte-identical msg-ctl replies through the
 # external-invoke seam and drive `commit_chain_op`'s catch-up loop without a

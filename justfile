@@ -71,6 +71,7 @@ build-test-artifacts: build-extensions build-pvm build-actors
 
 # Build all built-in actors used by host tests.
 build-actors: (build-actor "space-registry") (build-actor "space-bridge") \
+              (build-actor "space-authority") \
               (build-actor "clerk-ledger") (build-actor "clerk-bridge") \
               (build-actor "clerk-settle")
     cargo build -p prover-extension
