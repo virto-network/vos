@@ -546,6 +546,7 @@ fn public_example_root_config(
     binary: &str,
     actor: ActorId,
     consistency: ConsistencyModeV2,
+    external_actor_names: Vec<String>,
 ) -> Option<LocalRootTreeConfigV2> {
     let Some(service_elf) = service_elf() else {
         return None;
@@ -583,7 +584,7 @@ fn public_example_root_config(
             service_program,
             actor_program,
             crdt: metadata.crdt,
-            external_actors: vec![],
+            external_actors: external_actor_names,
             interfaces_hash: artifact_hash(b"interfaces", &[]),
             role_policies_hash: artifact_hash(b"role-policies", &role_policies),
             schemas_hash: artifact_hash(b"schemas", &schemas),
@@ -854,7 +855,12 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
 #[test]
 fn public_counter_example_runs_end_to_end_through_the_generic_service() {
     let actor = ActorId([154; 32]);
-    let Some(config) = public_example_root_config("v2_counter", actor, ConsistencyModeV2::Local)
+    let Some(config) = public_example_root_config(
+        "v2_counter",
+        actor,
+        ConsistencyModeV2::Local,
+        vec![],
+    )
     else {
         return;
     };
@@ -884,6 +890,86 @@ fn public_counter_example_runs_end_to_end_through_the_generic_service() {
         Value::U64(5),
         "ordinary Rust state persists between separately accumulated calls"
     );
+}
+
+#[test]
+fn public_workflow_example_resumes_root_and_child_after_cross_root_accumulate() {
+    let source_actor = ActorId([164; 32]);
+    let peer_actor = ActorId([165; 32]);
+    let child_actor = ActorId([166; 32]);
+    let Some(mut source_config) = public_example_root_config(
+        "v2_workflow",
+        source_actor,
+        ConsistencyModeV2::Local,
+        vec!["peer".into()],
+    ) else {
+        return;
+    };
+    let Some(peer_config) = public_example_root_config(
+        "v2_workflow",
+        peer_actor,
+        ConsistencyModeV2::Local,
+        vec!["peer".into()],
+    ) else {
+        return;
+    };
+    source_config.owned_actors.push(OwnedActorInstallV2 {
+        actor: child_actor,
+        name: "child".into(),
+        parent: source_actor,
+        initial_state: vec![],
+    });
+    source_config.external_actors.push(vos::v2::ExternalActorBindingV2 {
+        name: "peer".into(),
+        service: peer_config.service.clone(),
+        actor: peer_actor,
+        producer: peer_config.package.deployment_signature.producer,
+        actor_deployment: peer_config.package.deployment_id(),
+        program: peer_config.package.manifest.actor_program,
+    });
+
+    let source = LocalRootTreeServiceV2::open(source_config, FailableCommittedImages::default())
+        .expect("public workflow root and child install through physical Accumulate");
+    let peer = LocalRootTreeServiceV2::open(peer_config, FailableCommittedImages::default())
+        .expect("public workflow peer installs through physical Accumulate");
+    let mut node = VosNode::new();
+    let source_route = ServiceId(241);
+    node.register_v2_root_at_id("public-workflow".into(), source, source_route, true)
+        .unwrap();
+    node.register_v2_root_at_id("public-workflow-peer".into(), peer, ServiceId(242), true)
+        .unwrap();
+    let handle = node.invoke_handle();
+    let shutdown = node.shutdown_handle();
+    let router = std::thread::spawn(move || {
+        node.run_forever();
+        node.collect()
+    });
+
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("run").encode());
+    let reply = handle
+        .invoke_with_timeout(
+            source_route,
+            vos::v2::RootTreeInvocationV2 {
+                invocation: InvocationId([167; 32]),
+                logical_timeslot: 1,
+                target: source_actor,
+                method: "run".into(),
+                arguments,
+                proof_requested: false,
+            }
+            .encode(),
+            std::time::Duration::from_secs(120),
+        )
+        .expect("public workflow resumes only after the peer guest commit");
+    assert_eq!(
+        Value::try_decode(&reply),
+        Some(Value::U64(18)),
+        "root +10, child +1, peer 7, then exact-stack resumption"
+    );
+
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(router.join().unwrap().into_iter().all(|result| result.is_ok()));
 }
 
 #[test]
@@ -1974,7 +2060,12 @@ fn two_node_crdt_roots_exchange_guest_owned_causal_state() {
 fn public_shared_board_example_converges_through_guest_owned_crdt_sync() {
     let actor = ActorId([157; 32]);
     let Some(config) =
-        public_example_root_config("v2_shared_board", actor, ConsistencyModeV2::Crdt)
+        public_example_root_config(
+            "v2_shared_board",
+            actor,
+            ConsistencyModeV2::Crdt,
+            vec![],
+        )
     else {
         return;
     };
