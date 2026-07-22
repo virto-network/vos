@@ -16,5 +16,8 @@ just package-clerk dist/vos-service.pvm dist/clerk
 ```
 
 The manifests install those exact signed `.vos` bytes from `dist/clerk`; a
-registry must never retranspile the actors' ELF diagnostics. Manifest paths are
-relative to this directory and retain distinct bank replication IDs.
+registry must never retranspile the actors' ELF diagnostics. The bridge package
+signs its `clerk-ledger` dependency, so voucher redemption crosses root trees
+through the durable v2 outbox/inbox path rather than a route-only application
+address. Manifest paths are relative to this directory and retain distinct bank
+replication IDs.

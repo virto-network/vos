@@ -31,9 +31,9 @@
 //!
 //! ## State (persisted as actor rkyv archive)
 //!
-//! - `local_ledger_id`: ServiceId of this bank's clerk-ledger.
-//!   `0` means not-bootstrapped. Carried for diagnostics + future
-//!   cross-actor dispatch (which this slice does not yet do).
+//! - `local_ledger_id`: legacy raw-runtime route for this bank's
+//!   clerk-ledger. Packaged v2 deployments resolve the signed
+//!   `clerk-ledger` actor binding instead.
 //! - `ivk_secret_bytes`: this bank's incoming-viewing-key secret,
 //!   canonical 32-byte Ristretto scalar. Used per-call to
 //!   reconstruct an `IncomingViewingKey` and open envelopes.
@@ -800,21 +800,30 @@ impl ClerkBridge {
             return early_redeem(Status::VoucherInvalid);
         }
 
-        // Cross-actor dispatch: invoke clerk-ledger's
-        // apply_transfer handler on the same node. The mailbox
-        // routes by ServiceId; clerk-bridge and clerk-ledger run
-        // on the same node so this is a local dispatch (no libp2p
-        // hop).
-        let ledger = ClerkLedgerRef::at(ServiceId(self.local_ledger_id));
-        let Ok(ledger_status) = ledger
-            .apply_transfer(
-                ctx,
-                inflow_transfer_bytes,
-                inflow_openings_bytes,
-                batch_seed_timestamp,
-            )
-            .await
-        else {
+        // In v2 the package signs the external actor name and the root-tree
+        // scheduler turns this into a durable outbox/inbox await. The raw
+        // ServiceId branch exists only for the legacy ELF regression runner;
+        // it is not reachable from a correctly installed v2 package.
+        let ledger_status = if let Ok(mut ledger) = ctx.actor::<ClerkLedgerRef>("clerk-ledger").await
+        {
+            ledger
+                .apply_transfer(
+                    inflow_transfer_bytes,
+                    inflow_openings_bytes,
+                    batch_seed_timestamp,
+                )
+                .await
+        } else {
+            ClerkLedgerRef::at(ServiceId(self.local_ledger_id))
+                .apply_transfer(
+                    ctx,
+                    inflow_transfer_bytes,
+                    inflow_openings_bytes,
+                    batch_seed_timestamp,
+                )
+                .await
+        };
+        let Ok(ledger_status) = ledger_status else {
             return early_redeem(Status::LedgerRejected);
         };
 

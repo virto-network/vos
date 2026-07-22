@@ -52,7 +52,7 @@ build-clerk:
 # Package Clerk for the v2 registry path; manifests never install an ELF.
 package-clerk service_pvm="dist/vos-service.pvm" out_dir="dist/clerk": build-clerk
     cargo run -p vosx -- build actors/clerk-ledger --name clerk-ledger --version recipe --service-pvm {{service_pvm}} --out-dir {{out_dir}}
-    cargo run -p vosx -- build actors/clerk-bridge --name clerk-bridge --version recipe --service-pvm {{service_pvm}} --out-dir {{out_dir}}
+    cargo run -p vosx -- build actors/clerk-bridge --name clerk-bridge --version recipe --service-pvm {{service_pvm}} --out-dir {{out_dir}} --external-actor clerk-ledger
     cargo run -p vosx -- build actors/clerk-settle --name clerk-settle --version recipe --service-pvm {{service_pvm}} --out-dir {{out_dir}}
 
 # Build ELFs retained only by the old-host regression suite.
