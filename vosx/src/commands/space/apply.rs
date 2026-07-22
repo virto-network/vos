@@ -29,14 +29,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use vos::registry::{SyncFloor, Status};
+use vos::registry::{Status, SyncFloor};
 
 use crate::blob_store;
 use crate::commands::space::client::DaemonClient;
-use crate::commands::space::common::{auto_replication_id, instance_service_id, parse_consistency};
-use crate::commands::space::reconcile::{
-    self, encode_init_args, encode_on_start_payloads, flatten, AgentDef, Recipe,
-};
+use crate::commands::space::common::{auto_replication_id, parse_consistency};
+use crate::commands::space::reconcile::{self, AgentDef, Recipe, flatten};
 use crate::commands::space::subscriptions::{self, AgentLocal, ExtensionLocal, LocalConfig};
 use crate::output;
 
@@ -112,15 +110,6 @@ pub(crate) fn apply_recipe(
         .id_bytes()
         .ok_or_else(|| anyhow::anyhow!("space id in index is not 32 bytes of hex"))?;
 
-    // name → derived svc id, for `Vec<u32>` init-arg resolution (e.g.
-    // `children = ["greeter"]`). Same derivation the daemon uses to
-    // register the agents, so the ids match.
-    let prefix = client.daemon_prefix();
-    let mut name_ids: BTreeMap<String, u32> = BTreeMap::new();
-    for a in flatten(&recipe.agents) {
-        name_ids.insert(a.name.clone(), instance_service_id(&a.name, prefix).0);
-    }
-
     // Node-local half → local.toml. Recipe fields overwrite the recipe-
     // owned sections (cap_policy, per-agent policy, extensions) while
     // node-owned fields (subscriptions, listen) are preserved.
@@ -133,7 +122,7 @@ pub(crate) fn apply_recipe(
     let mut plans = Vec::new();
     let mut planned_tags: BTreeMap<(String, String), [u8; 32]> = BTreeMap::new();
     for agent in flatten(&recipe.agents) {
-        let mut plan = preflight_one(client, agent, recipe_dir, &space_id, &name_ids, upgrade)?;
+        let mut plan = preflight_one(client, agent, recipe_dir, &space_id, upgrade)?;
         if plan.needs_publish {
             let key = (plan.program_name.clone(), plan.program_version.clone());
             match planned_tags.get(&key) {
@@ -202,8 +191,6 @@ enum ApplyAction {
     Install {
         consistency: u8,
         replication_id: [u8; 32],
-        install_args: Vec<u8>,
-        install_payloads: Vec<u8>,
         network_reachable: bool,
         sync_role: SyncFloor,
     },
@@ -223,15 +210,15 @@ struct PreparedAgent {
     action: ApplyAction,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn preflight_one(
     client: &DaemonClient,
     agent: &AgentDef,
     recipe_dir: &Path,
     space_id: &[u8; 32],
-    name_ids: &BTreeMap<String, u32>,
     upgrade: bool,
 ) -> anyhow::Result<PreparedAgent> {
+    reconcile::validate_v2_recipe_lifecycle(agent)?;
+
     // 1. Resolve the blob hash + program identity from either a source
     //    `path` (a hand-written recipe) or `program_hash` (a `space
     //    export` output, which carries no path). Path-based also yields
@@ -255,7 +242,6 @@ fn preflight_one(
             source_hash,
             bytes,
         )?;
-        reconcile::validate_v2_recipe_lifecycle(agent)?;
         let metadata = package_metadata
             .or_else(|| vos::metadata::raw_section_from_elf(&bytes));
         (hash.0, Some(bytes), metadata)
@@ -371,20 +357,13 @@ fn preflight_one(
     // admit no host-side init payload.
     // The path-less `program_hash` form only supports the already-installed
     // (skip) path — the round-trip case.
-    let Some(install_artifact_bytes) = &artifact_bytes else {
+    if artifact_bytes.is_none() {
         anyhow::bail!(
             "agent '{}' is not installed and this recipe carries no `path` — the path-less \
              (exported) form can only reconcile already-installed instances",
             agent.name,
         );
-    };
-    let install_args = encode_init_args(
-        &agent.name,
-        install_artifact_bytes,
-        &agent.init,
-        name_ids,
-    )?;
-    let install_payloads = encode_on_start_payloads(&agent.on_start)?;
+    }
 
     Ok(PreparedAgent {
         instance_name: agent.name.clone(),
@@ -397,8 +376,6 @@ fn preflight_one(
         action: ApplyAction::Install {
             consistency,
             replication_id,
-            install_args,
-            install_payloads,
             network_reachable: agent.network_reachable,
             sync_role,
         },
@@ -460,8 +437,6 @@ fn execute_one(
         ApplyAction::Install {
             consistency,
             replication_id,
-            install_args,
-            install_payloads,
             network_reachable,
             sync_role,
         } => {
@@ -472,8 +447,8 @@ fn execute_one(
                 plan.hash.to_vec(),
                 replication_id.to_vec(),
                 *consistency,
-                install_args.clone(),
-                install_payloads.clone(),
+                Vec::new(),
+                Vec::new(),
                 *network_reachable,
                 sync_role.clone(),
             )?;

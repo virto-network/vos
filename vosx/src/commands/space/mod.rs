@@ -38,7 +38,6 @@ pub mod list;
 pub mod members;
 pub mod new;
 pub mod op_sign;
-pub mod payload_codec;
 pub mod programs;
 pub mod publish;
 pub mod raft_status;
