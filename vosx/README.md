@@ -9,26 +9,38 @@ the full CLI as JSON.
 
 ## Quick start
 
-The space-registry and the `dev-project` agent are bundled into the
-binary, so a fresh checkout needs no artifact builds:
+The space-registry infrastructure is bundled into the binary. Application
+actors are built as signed `.vos` v2 packages; the registry stores those
+exact package bytes and never retranspiles an ELF:
 
 ```bash
-cargo build -p vosx           # once; binary at target/debug/vosx
+cargo build -p vosx
+
+# build the protocol-pinned generic service PVM
+(cd services/vos-service && cargo +nightly actor)
+target/debug/vosx service-pvm \
+  services/vos-service/target/riscv64em-javm/release/vos_service.elf \
+  --out dist/vos-service.pvm
+
+# build one canonical actor PVM and its signed package
+target/debug/vosx build examples/actors/counter \
+  --name counter \
+  --service-pvm dist/vos-service.pvm
 
 # create a space (identity + genesis) and boot its daemon
-vosx space new demo
-vosx space up demo &
+target/debug/vosx space new demo
+target/debug/vosx space up demo --service-pvm dist/vos-service.pvm &
 
-# publish + install an agent, then talk to it
-vosx space publish demo --bundled dev-project
-vosx space install demo dev-project:0.1.0
-vosx space call demo dev-project list_branches
+# publish + install the immutable package, then talk to it
+target/debug/vosx space publish demo counter:0.1.0 dist/counter.vos
+target/debug/vosx space install demo counter:0.1.0
+target/debug/vosx space call demo counter increment by=1
 
 # the ergonomic sibling — dynamic dispatch against any agent's schema
-vosx --space demo dev-project list_branches
+target/debug/vosx --space demo counter value
 
-vosx space info demo          # liveness, endpoint, bootnode hint
-vosx space down demo          # SIGTERM the daemon
+target/debug/vosx space info demo          # liveness, endpoint, bootnode hint
+target/debug/vosx space down demo          # SIGTERM the daemon
 ```
 
 ## Onboard a second node
@@ -66,8 +78,9 @@ vosx space export demo > snapshot.toml    # live registry → recipe
 ```
 
 `apply` is idempotent — re-applying the same recipe is all-skips.
-Changed agent content must name an explicit immutable
-`program = "name:version"`; `--upgrade` re-points the instances.
+Application entries name an explicit immutable signed package with
+`program = "name:version"`; legacy lifecycle bytes are rejected.
+`--upgrade` re-points the instances.
 
 ## Command map
 

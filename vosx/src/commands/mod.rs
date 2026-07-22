@@ -1,6 +1,6 @@
 //! Per-subcommand implementations.
 //!
-//! - `run` — raw PVM/ELF execution, no space context.
+//! - `run` — signed `.vos` v2 package execution, no space context.
 //! - `service_pvm` — build and validate the protocol infrastructure PVM.
 //! - `space::*` — everything space-related: lifecycle (new,
 //!   list, info, up, join, delete), program/agent management
