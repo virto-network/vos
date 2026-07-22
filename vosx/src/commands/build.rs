@@ -25,6 +25,11 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
+    let keypair = crate::identity::load_or_create()?;
+    run_with_signer(args, &keypair)
+}
+
+fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::Result<()> {
     let program = resolve_program_input(&args.program)?;
     let input = std::fs::read(&program).with_context(|| format!("read {}", program.display()))?;
     let is_pvm = program.extension().and_then(|x| x.to_str()) == Some("pvm");
@@ -91,7 +96,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         bail!("--external-actor names must be unique");
     }
 
-    let keypair = crate::identity::load_or_create()?;
     let public_key = keypair.public().encode_protobuf();
     let producer = ProducerId::of_public_key(&public_key);
     let mut package = VosPackageV2 {
@@ -241,6 +245,86 @@ fn service_program_id(bytes: &[u8]) -> anyhow::Result<ProgramId> {
 mod tests {
     use super::*;
 
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "vosx-v2-build-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn service_pvm() -> Vec<u8> {
+        use grey_transpiler::assembler::Reg;
+
+        fn emit(code: &mut Vec<u8>, bitmask: &mut Vec<u8>, bytes: &[u8]) {
+            code.extend_from_slice(bytes);
+            bitmask.push(1);
+            bitmask.resize(code.len(), 0);
+        }
+
+        fn halt(code: &mut Vec<u8>, bitmask: &mut Vec<u8>) {
+            let mut load = vec![20, Reg::T0 as u8];
+            load.extend_from_slice(&(javm::PVM_HALT_ADDR as u64).to_le_bytes());
+            emit(code, bitmask, &load);
+            let mut jump = vec![50, Reg::T0 as u8];
+            jump.extend_from_slice(&0u32.to_le_bytes());
+            emit(code, bitmask, &jump);
+        }
+
+        let mut code = vec![40, 0, 0, 0, 0, 40, 0, 0, 0, 0];
+        let mut bitmask = vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        let refine_body = code.len();
+        halt(&mut code, &mut bitmask);
+        let accumulate_body = code.len();
+        halt(&mut code, &mut bitmask);
+        code[1..5].copy_from_slice(&(refine_body as i32).to_le_bytes());
+        code[6..10].copy_from_slice(&((accumulate_body as i32) - 5).to_le_bytes());
+        grey_transpiler::emitter::build_service_program_with_args_pages(
+            &code,
+            &bitmask,
+            &[],
+            &[],
+            &[],
+            1,
+            0,
+            4,
+            vos::v2::SERVICE_ARGUMENT_PAGES_V2,
+        )
+    }
+
+    fn build_args(root: &Path, out_dir: PathBuf) -> Args {
+        Args {
+            program: root.join("actor.pvm"),
+            name: None,
+            version: "2.0.0".into(),
+            out_dir,
+            service_pvm: root.join("vos-service.pvm"),
+            interfaces: None,
+            role_policies: None,
+            schemas: Some(root.join("actor.meta")),
+            source_map: None,
+            include_elf: false,
+            crdt: false,
+            external_actors: Vec::new(),
+        }
+    }
+
     #[test]
     fn service_program_rejects_actor_only_and_malformed_pvms() {
         let mut assembler = grey_transpiler::assembler::Assembler::new();
@@ -295,5 +379,59 @@ mod tests {
             root.join("target/riscv64em-javm/release")
                 .join(format!("{}.elf", "v2-counter".replace('-', "_")))
         );
+    }
+
+    #[test]
+    fn repeated_builds_emit_one_identical_actor_pvm_and_package() {
+        use vos::metadata::{ActorMeta, MessageMeta};
+
+        const META: ActorMeta = ActorMeta {
+            actor_name: "deterministic-counter",
+            messages: &[MessageMeta {
+                name: "value",
+                is_query: true,
+                fields: &[],
+                returns: "u64",
+                doc: "",
+                timeout_ms: 0,
+                mode: 0,
+                attested: false,
+                space_role: None,
+            }],
+            constructor: &[],
+            kind: 0,
+            caps: &[],
+            cli_methods: &[],
+            doc: "",
+            crdt: false,
+        };
+
+        let temp = TempDir::new("deterministic");
+        let actor_pvm = grey_transpiler::assembler::Assembler::new().build();
+        let (metadata, metadata_len) = vos::metadata::encode::<512>(&META);
+        std::fs::write(temp.0.join("actor.pvm"), &actor_pvm).unwrap();
+        std::fs::write(temp.0.join("actor.meta"), &metadata[..metadata_len]).unwrap();
+        std::fs::write(temp.0.join("vos-service.pvm"), service_pvm()).unwrap();
+
+        let first = temp.0.join("first");
+        let second = temp.0.join("second");
+        let signer = libp2p::identity::Keypair::generate_ed25519();
+        run_with_signer(build_args(&temp.0, first.clone()), &signer).unwrap();
+        run_with_signer(build_args(&temp.0, second.clone()), &signer).unwrap();
+
+        assert_eq!(
+            std::fs::read(first.join("deterministic-counter.pvm")).unwrap(),
+            actor_pvm,
+        );
+        assert_eq!(
+            std::fs::read(first.join("deterministic-counter.pvm")).unwrap(),
+            std::fs::read(second.join("deterministic-counter.pvm")).unwrap(),
+        );
+        assert_eq!(
+            std::fs::read(first.join("deterministic-counter.vos")).unwrap(),
+            std::fs::read(second.join("deterministic-counter.vos")).unwrap(),
+        );
+        assert!(!first.join("deterministic-counter.attestation.pvm").exists());
+        assert_eq!(std::fs::read_dir(first).unwrap().count(), 2);
     }
 }
