@@ -1,37 +1,64 @@
-# Replication: CRDT vs Raft
+# Replication: Local, Raft, and CRDT
 
-> Scaffold — to be expanded.
+A VOS v2 consistency mode belongs to one installed root actor tree. The root
+and every owned child execute inside one generic JAM service and therefore
+share its scheduler, atomic Accumulate transaction, and replication boundary.
+Calls to another root tree always cross the durable outbox/inbox protocol.
 
-Each `[[agent]]` in a manifest picks one of four consistency modes.
-The choice is local to the agent: a single space can mix all four.
-
-| Mode | Replication | Read-from-any-replica | Writes block on |
+| Mode | Replication | Admission rule | Best fit |
 |---|---|---|---|
-| `ephemeral` | none, in-memory | n/a | nothing |
-| `local` | redb on local disk | n/a | local fsync |
-| `crdt` | merkle-CRDT, eventual | yes | local commit |
-| `raft` | Raft consensus, strict | leader only (today) | quorum ack |
+| `ephemeral` | none | exact current revision | disposable state and tests |
+| `local` | durable local image | exact current revision and state root | one-node applications |
+| `raft` | replicated request log | leader orders the exact Accumulate request | ledgers and uniqueness |
+| `crdt` | causal Merkle DAG | every declared causal dependency is available | conflict-free collaboration |
 
-**CRDT** fits commutative state — counters, sets, LWW maps,
-append-only logs — where reads-from-anywhere are valuable and
-divergence is naturally healed by the merge function.
+Local and Raft transitions are linear. Refine binds the current revision and
+state root; guest Accumulate rejects a stale result intact so the scheduler can
+run it again from a fresh base. Raft replicates canonical
+`AccumulateRequestV2` bytes and every replica applies them through physical
+IC-5. It does not replicate an `EffectLog` or a leader-produced state image.
 
-**Raft** fits strictly sequenced state — ledgers, unique-name
-registries, anything where two concurrent writes must be ordered
-rather than merged.
+CRDT is explicit source-level opt-in with `#[actor(crdt)]`. Ordinary actors may
+use Ephemeral, Local, or Raft without CRDT field overhead, and installation
+rejects an ordinary actor configured as CRDT. A CRDT actor uses the replicated
+field types under `vos::crdt`:
 
-## What this chapter will cover
+- `Value<T>` retains concurrent assignments and exposes them through
+  `conflicts()`, while every replica selects the same visible value;
+- `Map<K, V>` is an observed-remove map with an independent value register per
+  key;
+- `Set<T>` is an add-wins observed-remove set;
+- `List<T>` is an RGA-style sequence with stable element IDs;
+- `Text` applies the same sequence model to Unicode scalar edits;
+- `Counter` preserves every additive positive or negative operation.
 
-- Picking a mode: the decision tree
-- The Merkle-CRDT layer: DAG nodes, anti-entropy, the `merkle-crdt` crate
-- Raft cluster setup, membership, and leader-only reads (today)
-- How the registry threads consistency-mode metadata into the runtime
-- The `crdt` consistency mode also underpins VOS's sync layer — see
-  [Sync Layer: Merkle-CRDTs](sync.md) for the protocol-level treatment
+One execution slice emits one canonical CRDT change containing stable operation
+IDs and causal metadata. It never uses wall-clock timestamps. Concurrent DAG
+branches are retained; deterministic winner selection is local to a declared
+`Value` or duplicate workflow step and never discards a whole branch.
 
-## Source map
+The Merkle DAG supplies causal transport, content addressing, ancestry checks,
+and persistence. It does not make arbitrary payloads converge. Application
+state must still use a convergent type, which is why plain mutable fields are
+rejected in `#[actor(crdt)]` definitions.
 
-- [`support/merkle-crdt/`](https://github.com/virto-network/vos/tree/master/support/merkle-crdt)
-- [`support/vos-raft/`](https://github.com/virto-network/vos/tree/master/support/vos-raft)
-- [`vos/src/raft/`](https://github.com/virto-network/vos/tree/master/vos/src/raft)
-- [`vos/src/data_layer.rs`](https://github.com/virto-network/vos/tree/master/vos/src/data_layer.rs)
+Workflow state has its own built-in CRDT operations for ingress, continuations,
+replies, outbox records, timeouts, spawns, and upgrades. A resumed VM continues
+against the causal snapshot captured at its await boundary; later concurrent
+state is merged with the operations it emits, not injected into its suspended
+heap. Identical replicas of one workflow step deduplicate by stable invocation
+and call IDs. Divergent results for that same step are invalid transitions.
+
+Continuation bytes are content addressed before their headers become visible.
+Local commits flush pages before the service image, Raft makes the exact request
+durable through its log/application cursor, and CRDT nodes are activated only
+after their complete ancestry and referenced blobs are present and verified.
+
+Choose Raft, or design a purpose-built conflict-free construction, for rules
+that require global uniqueness, overdraft prevention, irreversible ordering,
+or a single authoritative winner. The CRDT mode provides causal convergence,
+not global finality.
+
+Implementation details and wire contracts are in [runtime-v2.md](runtime-v2.md).
+The lower-level DAG protocol is described in [Sync Layer:
+Merkle-CRDTs](sync.md).

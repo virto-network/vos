@@ -55,7 +55,8 @@ cargo run -p vosx -- run dist/Counter.vos \
 
 ## Consistency modes
 
-Each `[[agent]]` in a recipe picks a `consistency` mode:
+Each installed root actor tree picks one `consistency` mode. Its owned children
+share the same JAM service, scheduler, state transaction, and replication mode:
 
 | Mode | Replication | Read-from-any-replica | Writes block on |
 |---|---|---|---|
@@ -66,9 +67,8 @@ Each `[[agent]]` in a recipe picks a `consistency` mode:
 
 CRDT is available only to `#[actor(crdt)]` programs whose fields use explicit
 convergent types such as `Counter`, `Value`, `Map`, `Set`, `List`, and `Text`.
-Raft fits
-strictly sequenced state where divergence corrupts (ledgers,
-unique-name registries). Modes mix freely per-agent.
+Raft fits strictly sequenced state where divergence corrupts (ledgers,
+unique-name registries). Modes mix freely between root services.
 
 Raft requires a cluster membership list (every replica's `node_prefix`). The
 daemon driver and package flow are documented in
@@ -127,8 +127,8 @@ impl Counter {
 
 `#[actor]` emits the canonical actor PVM entrypoint. The generic VOS service,
 not application code, owns Refine and Accumulate. `#[messages]` generates the
-per-handler message types, route-only `CounterRef`, and a bound handle whose
-methods need no extra context argument:
+per-handler message types, the `CounterRef` reference marker, and a bound handle
+whose methods need no extra context argument:
 
 ```rust
 use counter::CounterRef;
