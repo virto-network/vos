@@ -102,6 +102,70 @@ pub struct SpaceRoleCredentialV2 {
     pub authenticator: Vec<u8>,
 }
 
+/// Exact registry service whose accumulated replies may authorize role-gated
+/// work in an installed root tree. This binding is platform configuration,
+/// not credential-controlled input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleAuthorityBindingV2 {
+    pub service: ServiceIdentityV2,
+    pub actor: ActorId,
+}
+
+/// One invocation-scoped role decision produced by the space's pinned
+/// authority service.
+///
+/// Binding the complete destination prevents an old grant response from being
+/// replayed for another actor, method, generated policy, or invocation. A
+/// revocation racing after this assertion therefore has ordinary causal
+/// semantics: this already-authorized invocation may proceed, but a later
+/// invocation requires a different assertion and receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleAuthorizationClaimV2 {
+    pub space: SpaceId,
+    pub holder: Origin,
+    pub role: crate::SpaceRole,
+    pub audience: ServiceIdentityV2,
+    pub invocation: InvocationId,
+    pub target: ActorId,
+    pub method: String,
+    pub policy: Hash,
+}
+
+impl RoleAuthorizationClaimV2 {
+    /// Stable authority workflow identity for this one exact decision.
+    pub fn authority_invocation(&self) -> InvocationId {
+        InvocationId::derive(b"vos/role-authorization/v2", &self.encode())
+    }
+
+    /// Reply shape the authority service must commit for this decision.
+    pub fn authority_reply(&self, authority: ActorId) -> ReplyRecordV2 {
+        ReplyRecordV2 {
+            call_id: self.authority_invocation().root_reply_id(),
+            producer: authority,
+            result: self.encode(),
+        }
+    }
+}
+
+/// Receipt-bound role assertion carried by a future disclosed credential or
+/// private authorization witness. Guest Accumulate still asks the platform
+/// receipt verifier for finality; this type proves that the finalized reply is
+/// the exact invocation-scoped claim issued by the pinned authority service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccumulatedRoleAssertionV2 {
+    pub claim: RoleAuthorizationClaimV2,
+    pub receipt: AccumulationReceiptV2,
+}
+
+impl AccumulatedRoleAssertionV2 {
+    pub fn matches_authority(&self, authority: &RoleAuthorityBindingV2) -> bool {
+        self.claim.space == authority.service.space
+            && self.receipt.service == authority.service
+            && self.receipt.reply_commitment
+                == Some(self.claim.authority_reply(authority.actor).commitment())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobRefV2 {
     pub hash: Hash,
@@ -2235,6 +2299,89 @@ impl V2Wire for BlobRefV2 {
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         decode_blob_ref(d)
+    }
+}
+
+impl V2Wire for RoleAuthorityBindingV2 {
+    const MAGIC: [u8; 4] = *b"VAB2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        encode_service(&mut encoder, &self.service);
+        encoder.fixed(&self.actor.0);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            service: decode_service(decoder)?,
+            actor: ActorId(decoder.fixed()?),
+        };
+        if value.actor == ActorId::ZERO {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+impl V2Wire for RoleAuthorizationClaimV2 {
+    const MAGIC: [u8; 4] = *b"VCL2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        encoder.fixed(&self.space.0);
+        encode_origin(&mut encoder, self.holder);
+        encoder.u8(self.role.as_u8());
+        encode_service(&mut encoder, &self.audience);
+        encoder.fixed(&self.invocation.0);
+        encoder.fixed(&self.target.0);
+        encoder.string(&self.method);
+        encoder.fixed(&self.policy.0);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            space: SpaceId(decoder.fixed()?),
+            holder: decode_origin(decoder)?,
+            role: crate::SpaceRole::from_u8(decoder.u8()?).ok_or(DecodeError::NonCanonical)?,
+            audience: decode_service(decoder)?,
+            invocation: InvocationId(decoder.fixed()?),
+            target: ActorId(decoder.fixed()?),
+            method: decoder.string()?,
+            policy: Hash(decoder.fixed()?),
+        };
+        if !matches!(value.holder, Origin::Member(_) | Origin::Actor(_))
+            || value.space != value.audience.space
+            || value.invocation == InvocationId::ZERO
+            || value.target == ActorId::ZERO
+            || value.method.is_empty()
+            || value.policy == Hash::ZERO
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+impl V2Wire for AccumulatedRoleAssertionV2 {
+    const MAGIC: [u8; 4] = *b"VRA2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        encoder.bytes(&self.claim.encode());
+        encoder.bytes(&self.receipt.encode());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            claim: RoleAuthorizationClaimV2::decode(&decoder.bytes()?)?,
+            receipt: AccumulationReceiptV2::decode(&decoder.bytes()?)?,
+        };
+        if value.receipt.service.space != value.claim.space
+            || value.receipt.reply_commitment.is_none()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
     }
 }
 
@@ -4452,6 +4599,59 @@ mod tests {
         let mut sibling = credential.clone();
         sibling.space = SpaceId([33; 32]);
         assert_ne!(sibling.commitment(), credential.commitment());
+    }
+
+    #[test]
+    fn accumulated_role_assertion_binds_authority_and_exact_invocation() {
+        let audience = service();
+        let authority = RoleAuthorityBindingV2 {
+            service: ServiceIdentityV2 {
+                space: audience.space,
+                root_service: RootServiceId([40; 32]),
+                deployment: DeploymentId([41; 32]),
+                service_program: ProgramId([42; 32]),
+                service_abi: super::super::ABI_VERSION,
+                execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            },
+            actor: ActorId([43; 32]),
+        };
+        let claim = RoleAuthorizationClaimV2 {
+            space: audience.space,
+            holder: Origin::Member(SubjectId([44; 32])),
+            role: crate::SpaceRole::Developer,
+            audience,
+            invocation: InvocationId([45; 32]),
+            target: ActorId([46; 32]),
+            method: "publish".into(),
+            policy: Hash([47; 32]),
+        };
+        let assertion = AccumulatedRoleAssertionV2 {
+            receipt: AccumulationReceiptV2 {
+                service: authority.service.clone(),
+                accepted_transition: Hash([48; 32]),
+                reply_commitment: Some(claim.authority_reply(authority.actor).commitment()),
+                outbox_commitment: None,
+                resulting_state_root: Some(Hash([49; 32])),
+                resulting_crdt_heads: vec![],
+                sequence: 7,
+                checkpoint: 7,
+                consistency: ConsistencyModeV2::Local,
+            },
+            claim,
+        };
+        assert!(assertion.matches_authority(&authority));
+        assert_eq!(
+            AccumulatedRoleAssertionV2::decode(&assertion.encode()).unwrap(),
+            assertion
+        );
+
+        let mut replayed = assertion.clone();
+        replayed.claim.invocation = InvocationId([50; 32]);
+        assert!(!replayed.matches_authority(&authority));
+
+        let mut sibling_authority = authority;
+        sibling_authority.service.root_service = RootServiceId([51; 32]);
+        assert!(!assertion.matches_authority(&sibling_authority));
     }
 
     #[test]
