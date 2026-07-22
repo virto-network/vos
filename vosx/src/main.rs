@@ -3,7 +3,7 @@
 //! Top-level surface is intentionally tiny: every space-related
 //! operation lives under `vosx space *`. The remaining
 //! top-level commands are for things that don't fit the space
-//! model — currently just `run` for raw ELF/PVM execution.
+//! model — v2 project creation/building and explicit signed-package execution.
 //!
 //! The earlier manifest-driven commands (`new`, `up`, `join`,
 //! `ls`, `ps`, `call`) folded into `vosx space *`; they had
@@ -58,11 +58,6 @@ const EXIT_NOT_FOUND: i32 = 3;
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
-
-    /// Raw ELF/PVM blob to run as a one-shot. Equivalent to
-    /// `vosx run <file>`. Anything space-related needs an
-    /// explicit `vosx space *` subcommand.
-    file: Option<PathBuf>,
 
     /// Output format. `text` (default) is human-readable;
     /// `json` emits a single JSON value per command for scripts
@@ -212,9 +207,8 @@ fn main() {
     // Pre-parser: peek argv and decide whether to enter the
     // dynamic-dispatch path before handing off to clap. clap's
     // Subcommand derive only knows the built-in verbs (`run`,
-    // `space`, `help-schema`); a `vosx gateway stop` invocation
-    // would otherwise slip through as the `file` positional and
-    // fail with a confusing "no such ELF" error.
+    // `space`, `help-schema`); dynamic extension verbs must bypass
+    // clap before its unknown-subcommand error.
     //
     // The verb is the first non-flag argv token. We route to the
     // dynamic dispatcher when:
@@ -222,8 +216,8 @@ fn main() {
     //   * the verb exists,
     //   * it's not a built-in (`run`, `space`, `help-schema`,
     //     `help`),
-    //   * and it's not a path-like token (one-shot signed-package
-    //     execution still takes precedence for `vosx ./Counter.vos`).
+    //   * and it's not a path-like token (clap then reports that the removed
+    //     positional raw-run shortcut is invalid).
     //
     // Anything else falls through to `Cli::parse()` so clap's
     // own --help / --version / parse-error machinery stays intact.
@@ -368,17 +362,14 @@ fn main() {
                 println!("path    = {}", path.display());
             }
         }
-        None => match cli.file {
-            Some(p) => commands::run::run(&p, &[], &[], &[], None, 100_000_000),
-            None => {
-                eprintln!(
-                    "vosx: no command. Try `vosx space new foo`, \
-                     `vosx run dist/Counter.vos --service-pvm dist/vos-service.pvm --method value`, \
-                     or `vosx --help`."
-                );
-                std::process::exit(EXIT_USAGE_ERROR);
-            }
-        },
+        None => {
+            eprintln!(
+                "vosx: no command. Try `vosx space new foo`, \
+                 `vosx run dist/Counter.vos --service-pvm dist/vos-service.pvm --method value`, \
+                 or `vosx --help`."
+            );
+            std::process::exit(EXIT_USAGE_ERROR);
+        }
     }
 }
 
@@ -417,8 +408,8 @@ fn is_top_level_help(argv: &[String]) -> bool {
 /// dispatcher. The first non-flag token is the candidate verb;
 /// any of the built-in subcommand names — including clap's
 /// auto-generated `help` — falls back to clap. A path-like token
-/// (one with `/` or `\`, or starting with `.`) is preserved for
-/// the one-shot signed-package run path.
+/// (one with `/` or `\`, or starting with `.`) stays on the clap path so the
+/// removed positional raw-run shortcut fails as a usage error.
 fn should_dynamic_dispatch(argv: &[String]) -> bool {
     const BUILTIN_VERBS: &[&str] = &[
         "new",
@@ -596,10 +587,10 @@ mod routing_tests {
     }
 
     #[test]
-    fn path_like_first_positional_runs_one_shot() {
-        // The existing `vosx ./foo.elf` shape must keep working.
-        for v in ["./foo.elf", "/abs/path.elf", "rel\\path"] {
+    fn path_like_positional_cannot_bypass_explicit_v2_run() {
+        for v in ["./Counter.vos", "/abs/counter.elf", "rel\\counter.pvm"] {
             assert!(!should_dynamic_dispatch(&s(&[v])), "verb={v}");
+            assert!(Cli::try_parse_from(["vosx", v]).is_err(), "path={v}");
         }
     }
 
