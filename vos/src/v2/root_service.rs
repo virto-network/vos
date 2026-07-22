@@ -1021,6 +1021,10 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         &self.identity
     }
 
+    pub fn role_authority(&self) -> Option<&RoleAuthorityBindingV2> {
+        self.expected_role_authority.as_ref()
+    }
+
     pub const fn root_actor(&self) -> ActorId {
         self.root_actor
     }
@@ -1503,6 +1507,54 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             .binary_search_by(|policy| policy.method.as_str().cmp(method))
             .ok()
             .map(|index| descriptor.methods[index].clone()))
+    }
+
+    /// Recover an authority decision from guest-owned durable workflow and
+    /// receipt rows after its transient publication was acknowledged. This is
+    /// the exact-invocation retry path used by the node authorization adapter;
+    /// it never re-executes the authority actor or fabricates a receipt.
+    pub fn recover_role_assertion(
+        &self,
+        claim: RoleAuthorizationClaimV2,
+        authority: &RoleAuthorityBindingV2,
+    ) -> Result<AccumulatedRoleAssertionV2, LocalRootTreeInvokeErrorV2> {
+        if authority.service != self.identity || !self.owns_actor(authority.actor)? {
+            return Err(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication);
+        }
+        let input = WorkInputIdV2 {
+            invocation: claim.authority_invocation(),
+            workflow_step: 0,
+        };
+        let checkpoint = self
+            .service
+            .accumulate_host()
+            .workflow_checkpoint(input.invocation)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication)?;
+        let receipt = self
+            .service
+            .accumulate_host()
+            .accumulation_receipt(input)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication)?;
+        let expected_reply = claim.authority_reply(authority.actor);
+        if checkpoint.input != input
+            || checkpoint.resume_work.target != authority.actor
+            || checkpoint.resume_work.method != super::ROLE_AUTHORITY_DECISION_METHOD_V2
+            || checkpoint.reply.as_ref() != Some(&expected_reply)
+            || receipt.service != authority.service
+            || receipt.accepted_transition != checkpoint.transition_commitment
+            || receipt.reply_commitment != Some(expected_reply.commitment())
+            || receipt.outbox_commitment.is_some()
+            || receipt.checkpoint != 0
+        {
+            return Err(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication);
+        }
+        let assertion = AccumulatedRoleAssertionV2 { claim, receipt };
+        if !assertion.matches_authority(authority) {
+            return Err(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication);
+        }
+        Ok(assertion)
     }
 
     /// Classify a direct invocation retry from guest-authenticated workflow

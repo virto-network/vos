@@ -284,6 +284,7 @@ impl CommittedImageStoreV2 for FileCommittedImageStoreV2 {
 pub enum LocalStoreReadErrorV2 {
     InvalidHeader(StoreOpenError),
     CorruptStateTree,
+    CorruptReceipt,
     CorruptPublication,
     CorruptDelivery,
     CorruptIngress,
@@ -723,6 +724,30 @@ impl LocalJamStoreV2 {
                     .map_err(|_| LocalStoreReadErrorV2::CorruptStateTree)
             })
             .transpose()
+    }
+
+    /// Recover the exact guest-written accumulation receipt for a completed
+    /// input. Receipts are durable bookkeeping, unlike transient publication
+    /// rows, so platform consumers can validate an invocation retry after its
+    /// effects were acknowledged.
+    pub fn accumulation_receipt(
+        &self,
+        input: super::WorkInputIdV2,
+    ) -> Result<Option<super::AccumulationReceiptV2>, LocalStoreReadErrorV2> {
+        self.row(&super::receipt_storage_key(input))
+            .map(super::AccumulationReceiptV2::decode)
+            .transpose()
+            .map_err(|_| LocalStoreReadErrorV2::CorruptReceipt)
+            .and_then(|receipt| {
+                if receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.checkpoint != input.workflow_step)
+                {
+                    Err(LocalStoreReadErrorV2::CorruptReceipt)
+                } else {
+                    Ok(receipt)
+                }
+            })
     }
 
     /// Make an installation input available to guest Accumulate. This is a
