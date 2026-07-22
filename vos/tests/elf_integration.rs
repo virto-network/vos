@@ -3093,9 +3093,19 @@ fn crdt_counter_shutdown_under_active_load() {
         }
     });
 
-    // Let the burst run for a bit so there's actually work in
-    // flight when shutdown lands.
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    // Establish that the actor has completed at least one durable commit
+    // before testing shutdown. A fixed sleep is not a readiness condition:
+    // under the full workspace's parallel PVM/redb load the first dispatch
+    // can legitimately take longer, making this test fail without exercising
+    // shutdown at all. The producer immediately starts its next invoke after
+    // incrementing `count`, so shutdown still races active work.
+    wait_for(
+        || {
+            (count.load(std::sync::atomic::Ordering::Relaxed) > 0).then_some(())
+        },
+        std::time::Duration::from_secs(5),
+    )
+    .expect("at least one inc must commit before the shutdown race");
 
     // Hard test: collect (which drives shutdown internally) must
     // return without hanging even though the side thread is
