@@ -35,9 +35,12 @@ just package-examples dist/vos-service.pvm dist/examples
 ```
 
 From the repository root, package the verifier with its cross-root producer
-declared explicitly:
+declared explicitly. The workflow similarly signs its `peer` dependency:
 
 ```sh
+cargo run -p vosx -- build examples/actors/workflow \
+  --service-pvm dist/vos-service.pvm \
+  --external-actor peer
 cargo run -p vosx -- build examples/actors/private-age \
   --service-pvm dist/vos-service.pvm
 cargo run -p vosx -- build examples/actors/age-gate \

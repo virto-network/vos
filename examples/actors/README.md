@@ -29,6 +29,9 @@ deployment identity:
 ```sh
 cargo run -p vosx -- build examples/actors/private-age \
   --service-pvm dist/vos-service.pvm
+cargo run -p vosx -- build examples/actors/workflow \
+  --service-pvm dist/vos-service.pvm \
+  --external-actor peer
 cargo run -p vosx -- build examples/actors/age-gate \
   --service-pvm dist/vos-service.pvm \
   --external-actor private-age

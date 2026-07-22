@@ -35,10 +35,10 @@ build-examples:
     cd examples/actors; cargo +nightly actor -p v2-age-gate
     cd examples/actors; cargo +nightly actor -p v2-shared-board
 
-# Package all public v2 scenarios with one PVM and a signed verifier dependency.
+# Package all public v2 scenarios with one PVM and signed external dependencies.
 package-examples service_pvm="dist/vos-service.pvm" out_dir="dist/examples": build-examples
     cargo run -p vosx -- build examples/actors/counter --service-pvm {{service_pvm}} --out-dir {{out_dir}}
-    cargo run -p vosx -- build examples/actors/workflow --service-pvm {{service_pvm}} --out-dir {{out_dir}}
+    cargo run -p vosx -- build examples/actors/workflow --service-pvm {{service_pvm}} --out-dir {{out_dir}} --external-actor peer
     cargo run -p vosx -- build examples/actors/private-age --service-pvm {{service_pvm}} --out-dir {{out_dir}}
     cargo run -p vosx -- build examples/actors/age-gate --service-pvm {{service_pvm}} --out-dir {{out_dir}} --external-actor private-age
     cargo run -p vosx -- build examples/actors/shared-board --service-pvm {{service_pvm}} --out-dir {{out_dir}}

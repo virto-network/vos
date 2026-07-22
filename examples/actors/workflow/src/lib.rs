@@ -1,12 +1,12 @@
 //! Root/child workflow with an exact durable cross-root await.
 //!
-//! Install this canonical program as `root` and its owned `child`. A separate
-//! root tree may install it as the peer. The outer method mutates before the
-//! child call; the child mutates before awaiting the peer. Both mutations are
-//! part of the durable checkpoint and execute exactly once after restart.
+//! Install this canonical program as `root` and its owned `child`, and bind a
+//! separate root tree under the signed external name `peer`. The outer method
+//! mutates before the child call; the child mutates before awaiting the peer.
+//! Both mutations are part of the durable checkpoint and execute exactly once
+//! after restart.
 
 use vos::prelude::*;
-use vos::value::Value;
 
 #[actor]
 pub struct Workflow {
@@ -21,12 +21,12 @@ impl Workflow {
 
     /// Entry point installed on the root actor.
     #[msg]
-    async fn run(&mut self, peer: [u8; 32], ctx: &mut Context<Self>) -> u64 {
+    async fn run(&mut self, ctx: &mut Context<Self>) -> u64 {
         self.value += 10;
         let Ok(mut child) = ctx.child::<WorkflowRef>("child").await else {
             return self.value;
         };
-        if let Ok(child_value) = child.await_peer(peer).await {
+        if let Ok(child_value) = child.await_peer().await {
             self.value += child_value;
         }
         self.value
@@ -35,12 +35,12 @@ impl Workflow {
     /// Entry point installed on the owned child. A cross-root call always
     /// enters the durable outbox/inbox path and checkpoints this exact VM.
     #[msg]
-    async fn await_peer(&mut self, peer: [u8; 32], ctx: &mut Context<Self>) -> u64 {
+    async fn await_peer(&mut self, ctx: &mut Context<Self>) -> u64 {
         self.value += 1;
-        if let Ok(Value::U64(peer_value)) = ctx
-            .ask_actor(ActorId(peer), &Msg::new("peer_value"), Some(100))
-            .await
-        {
+        let Ok(mut peer) = ctx.actor::<WorkflowRef>("peer").await else {
+            return self.value;
+        };
+        if let Ok(peer_value) = peer.peer_value().await {
             self.value += peer_value;
         }
         self.value
