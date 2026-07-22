@@ -9,7 +9,7 @@ use crate::core::step::{CompactStep, MemAccess, PvmStep, RegWrite, expand_steps}
 pub use crate::core::ecall::{
     ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
     ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
-    ECALL_VOS_DEBUG_WRITE,
+    ECALL_VOS_DEBUG_WRITE, ECALL_VOS_SUSPEND,
 };
 
 /// A recorded blake2b call for the precompile chip.
@@ -457,7 +457,7 @@ impl TracingPvm {
                 // state, no fetched message.  Same effect as a
                 // proper stub but without disturbing the
                 // register ledger.
-                1 | 2 | 4 | 5 | 6 | ECALL_VOS_DEBUG_WRITE | 26 => None,
+                1 | 2 | 4 | 5 | 6 | ECALL_VOS_DEBUG_WRITE | ECALL_VOS_SUSPEND | 26 => None,
                 _ => Some(ExitReason::HostCall(id)),
             },
             // Opcode-3 Ecall is outside the GP conformance ISA. Old VOS blobs
@@ -1383,6 +1383,12 @@ mod tests {
 
         let mut reserved = vos_stub_program(11);
         assert_eq!(reserved.run_with_vos_stubs(), ExitReason::HostCall(11));
+    }
+
+    #[test]
+    fn vos_stub_accepts_task_suspension_capability() {
+        let mut tracing = vos_stub_program(ECALL_VOS_SUSPEND);
+        assert_eq!(tracing.run_with_vos_stubs(), ExitReason::Halt);
     }
 
     #[test]

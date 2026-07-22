@@ -1868,6 +1868,9 @@ fn build_task_kernel(
 ///   that does gets the same garbage the trace would. `DEBUG_WRITE`
 ///   additionally mirrors to stderr — a host-side effect the guest
 ///   cannot observe;
+/// - `SUSPEND` returns the refine-finalization value zero. For a Task this is
+///   pure scheduling metadata: its emitted state lives in the parent-owned
+///   TaskRecord and the next drive is a fresh witness-delivered invocation;
 /// - everything else (INVOKE, TRANSFER, NOW_MS, the ristretto
 ///   precompiles — no vos host handler yet, though the tracer has one)
 ///   returns `false`: fail loud, exactly where the tracer would end the
@@ -1897,6 +1900,12 @@ fn handle_task_hostcall(kernel: &mut InvocationKernel, call_id: u32) -> bool {
         | hostcall::STORAGE_W
         | hostcall::INFO
         | hostcall::OUTPUT => {}
+        hostcall::SUSPEND => {
+            kernel
+                .resume_protocol_call(0, 0)
+                .expect("task suspension must resume its pending protocol boundary");
+            return true;
+        }
         hostcall::DEBUG_WRITE => {
             let buf = kread(kernel, echo7 as u32, echo8 as usize);
             let _ = std::io::stderr().write_all(&buf);

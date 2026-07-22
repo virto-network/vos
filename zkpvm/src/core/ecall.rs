@@ -87,3 +87,7 @@ pub const ECALL_VOS_GROW_HEAP: u32 = 117;
 pub const ECALL_VOS_DEBUG_WRITE: u32 = 118;
 /// VOS scheduler-supplied nested actor invocation capability.
 pub const ECALL_VOS_INVOKE: u32 = 119;
+/// VOS scheduler-supplied suspension capability. In a witness-delivered Task
+/// this returns the refine-finalization value `0`; the TaskRecord carries the
+/// resulting state into the next cold invocation.
+pub const ECALL_VOS_SUSPEND: u32 = 122;

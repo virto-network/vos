@@ -11734,10 +11734,7 @@ fn task_invoke_live_equals_traced() {
     // type than vos's javm — compare the Debug form; the decodable v3
     // payload below is the real halt proof.
     let exit = format!("{:?}", tracing.run_with_vos_stubs());
-    assert!(
-        exit == "HostCall(0)" || exit == "Ecall",
-        "traced task must halt cleanly, got {exit}"
-    );
+    assert_eq!(exit, "Halt", "traced task must halt at the GP halt address");
     let ptr = tracing.pvm.registers[7] as usize;
     let len = tracing.pvm.registers[8] as usize;
     let raw = &tracing.pvm.flat_mem()[ptr..ptr + len];
