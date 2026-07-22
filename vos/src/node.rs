@@ -9447,8 +9447,6 @@ mod tests {
                     .with("program_hash", hash.clone())
                     .with("replication_id", rep.clone())
                     .with("consistency", consistency as u64)
-                    .with("install_args", Vec::<u8>::new())
-                    .with("install_payloads", Vec::<u8>::new())
                     .with("network_reachable", false)
                     .with("sync_role", crate::registry::SyncFloor::Member as u64)
                     .with(
@@ -9464,8 +9462,6 @@ mod tests {
                                 &hash,
                                 &rep,
                                 &[consistency],
-                                &[],
-                                &[],
                                 &[0u8], // network_reachable = false
                                 &[crate::registry::SyncFloor::Member as u8], // sync_role
                             ],

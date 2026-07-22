@@ -85,9 +85,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             program.hash.to_vec(),
             replication_id.to_vec(),
             consistency,
-            Vec::new(), // v2 actors initialize through an explicit durable invocation
-            Vec::new(), // v2 has no host-owned cold-start payloads
-            false,      // network_reachable — CLI installs stay confined by default
+            false, // network_reachable — CLI installs stay confined by default
             sync_role,
         )?;
 

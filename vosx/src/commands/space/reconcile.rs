@@ -859,8 +859,6 @@ fn reconcile_one(
         program_hash.to_vec(),
         replication_id.to_vec(),
         consistency,
-        Vec::new(),
-        Vec::new(),
         agent.network_reachable,
         sync_role,
         Vec::new(),

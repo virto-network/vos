@@ -527,8 +527,6 @@ impl DaemonClient {
         program_hash: Vec<u8>,
         replication_id: Vec<u8>,
         consistency: u8,
-        install_args: Vec<u8>,
-        install_payloads: Vec<u8>,
         network_reachable: bool,
         sync_role: vos::registry::SyncFloor,
     ) -> anyhow::Result<Status> {
@@ -540,8 +538,6 @@ impl DaemonClient {
             program_hash,
             replication_id,
             consistency,
-            install_args,
-            install_payloads,
             network_reachable,
             sync_role,
             Vec::new(),

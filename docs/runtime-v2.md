@@ -340,7 +340,9 @@ replication settings, and immutable external bindings. It does not accept
 constructor arguments or execute actor code. Any application initialization is
 an explicit typed invocation after installation, so authorization,
 deduplication, state changes, and replies cross the same durable
-Refine/Accumulate boundary as every later message.
+Refine/Accumulate boundary as every later message. The v2 registry `install`
+wire and `AgentRow` contain no constructor-argument or cold-start-payload
+fields.
 
 This is a clean storage and wire break. A v1 store or package must be reset and
 reinstalled; there is no v1 decoder or migration in a v2 service.

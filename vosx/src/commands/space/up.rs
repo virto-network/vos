@@ -1462,12 +1462,6 @@ fn v2_config_from_row(
     })?;
     let package = validate_exact_v2_package(&exact_package, &row.instance_name, pinned)?;
     validate_v2_consistency(&row.instance_name, &package, consistency)?;
-    if !row.install_args.is_empty() || !row.install_payloads.is_empty() {
-        anyhow::bail!(
-            "{} uses legacy install args/on_start payloads; v2 initialization must be an explicit actor invocation",
-            row.instance_name
-        );
-    }
     if policies.get(&row.instance_name).is_some_and(|policy| {
         policy.tick_ms.is_some() || !policy.intra_caps.is_empty() || policy.device_secret
     }) {
@@ -1661,13 +1655,6 @@ fn resolve_v2_external_actors_with(
         }
         let package = validate_exact_v2_package(&exact_package, name, pinned)?;
         validate_v2_consistency(name, &package, consistency)?;
-        if !row.install_args.is_empty() || !row.install_payloads.is_empty() {
-            anyhow::bail!(
-                "declared external actor '{}' uses legacy install args/on_start payloads; \
-                 reinstall it as a v2 actor before binding it",
-                name,
-            );
-        }
         let root_service = v2_root_service_id(space, name);
         bindings.push(vos::v2::ExternalActorBindingV2 {
             name: name.clone(),
@@ -2537,8 +2524,6 @@ mod tests {
             consistency: Consistency::Raft as u8,
             network_reachable: true,
             sync_role: vos::registry::SyncFloor::Public,
-            install_args: vec![],
-            install_payloads: vec![],
         };
         let pinned = PinnedV2Service {
             pvm: std::sync::Arc::new(service_pvm),
@@ -2579,8 +2564,6 @@ mod tests {
             consistency: Consistency::Crdt as u8,
             network_reachable: true,
             sync_role: vos::registry::SyncFloor::Public,
-            install_args: vec![],
-            install_payloads: vec![],
         };
         let pinned = PinnedV2Service {
             pvm: std::sync::Arc::new(service_pvm),
@@ -2630,8 +2613,6 @@ mod tests {
             consistency: Consistency::Local as u8,
             network_reachable: false,
             sync_role: vos::registry::SyncFloor::Member,
-            install_args: vec![],
-            install_payloads: vec![],
         };
         let producer_row = vos::registry::AgentRow {
             instance_name: "private-age".into(),
@@ -2642,8 +2623,6 @@ mod tests {
             consistency: Consistency::Local as u8,
             network_reachable: false,
             sync_role: vos::registry::SyncFloor::Member,
-            install_args: vec![],
-            install_payloads: vec![],
         };
         let rows = vec![consumer_row.clone(), producer_row.clone()];
         let exact_producer = producer.encode();
@@ -2696,19 +2675,6 @@ mod tests {
             .unwrap(),
             ExternalActorResolution::MissingBlob(producer_row.program_hash)
         );
-
-        let mut legacy_rows = rows;
-        legacy_rows[1].install_args = b"legacy".to_vec();
-        let error = resolve_v2_external_actors_with(
-            space_id,
-            &consumer_row,
-            &consumer,
-            &legacy_rows,
-            &pinned,
-            |hash| Ok((hash == producer_row.program_hash).then(|| exact_producer.clone())),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("legacy install args/on_start"));
     }
 
     #[test]

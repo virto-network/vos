@@ -61,17 +61,6 @@ pub struct AgentRow {
     /// per-actor grant (the generalized `msg-*` private semantics). See
     /// [`SyncFloor`].
     pub sync_role: SyncFloor,
-    /// rkyv-encoded `vos::init::InitArgs` captured at install
-    /// time. New replicas use this to bootstrap their copy of
-    /// the agent before its first message arrives. Empty when
-    /// the agent was installed without init args.
-    pub install_args: Vec<u8>,
-    /// Optional one-shot messages to dispatch when the agent
-    /// is first cold-started. rkyv-encoded `Vec<Vec<u8>>`
-    /// where each inner `Vec<u8>` is a `[TAG_DYNAMIC] + rkyv(Msg)`
-    /// payload. Reconciled from the manifest's `on_start = [{msg=…}]`
-    /// list. Empty when the agent has no on_start.
-    pub install_payloads: Vec<u8>,
 }
 
 /// Serving-side sync floor for a replica — who its state (`FetchHeads`/
@@ -577,14 +566,8 @@ fn catalog_op_canonical(msg: &Msg) -> Option<Vec<u8>> {
             let program_hash = a.get_bytes("program_hash")?;
             let replication_id = a.get_bytes("replication_id")?;
             let consistency = a.get_u8("consistency")?;
-            let install_args = a.get_bytes("install_args")?;
-            let install_payloads = a.get_bytes("install_payloads")?;
-            // Absent field (e.g. an older client) defaults to false (confined),
-            // matching the mutator's decode of a missing bool param.
-            let network_reachable = a.get_bool("network_reachable").unwrap_or(false);
-            // Absent floor defaults to `Member`, matching the mutator's
-            // `SyncFloor::from_u8(...).unwrap_or_default()` decode.
-            let sync_role = a.get_u8("sync_role").unwrap_or(SyncFloor::Member as u8);
+            let network_reachable = a.get_bool("network_reachable")?;
+            let sync_role = a.get_u8("sync_role")?;
             canonical_op_bytes(
                 "install",
                 &[
@@ -594,8 +577,6 @@ fn catalog_op_canonical(msg: &Msg) -> Option<Vec<u8>> {
                     &program_hash,
                     &replication_id,
                     &[consistency],
-                    &install_args,
-                    &install_payloads,
                     &[network_reachable as u8],
                     &[sync_role],
                 ],
@@ -1044,8 +1025,6 @@ impl RegistryRef {
         program_hash: Vec<u8>,
         replication_id: Vec<u8>,
         consistency: u8,
-        install_args: Vec<u8>,
-        install_payloads: Vec<u8>,
         network_reachable: bool,
         sync_role: SyncFloor,
         auth: Vec<u8>,
@@ -1060,8 +1039,6 @@ impl RegistryRef {
                     .with("program_hash", program_hash)
                     .with("replication_id", replication_id)
                     .with("consistency", consistency)
-                    .with("install_args", install_args)
-                    .with("install_payloads", install_payloads)
                     .with("network_reachable", network_reachable)
                     .with("sync_role", sync_role as u8)
                     .with("auth", auth),
@@ -1388,8 +1365,6 @@ mod tests {
             .with("program_hash", alloc::vec![7u8; 32])
             .with("replication_id", alloc::vec![9u8; 32])
             .with("consistency", 2u64)
-            .with("install_args", alloc::vec![1u8, 2, 3])
-            .with("install_payloads", Vec::<u8>::new())
             .with("network_reachable", true)
             .with("sync_role", SyncFloor::Private as u64);
         assert_eq!(
@@ -1403,8 +1378,6 @@ mod tests {
                     &[7u8; 32],
                     &[9u8; 32],
                     &[2u8],
-                    &[1u8, 2, 3],
-                    &[],
                     &[1u8],
                     &[2u8],
                 ],

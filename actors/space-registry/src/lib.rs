@@ -13,10 +13,9 @@
 //!    and Identities (people / bots, author signed messages
 //!    with a Merkle-inclusion or ZK proof of set membership).
 //!
-//! Init args for an installed agent are NOT stored in the
-//! Agents table; they live in the registry's own DAG as the
-//! genesis effect of the `install` operation. Auditable via
-//! the DAG; not part of the queryable schema.
+//! Actor initialization is not part of registry installation.
+//! Applications initialize through explicit durable invocations
+//! after the signed deployment row has been committed.
 //!
 //! Hashes (`program_hash`, `replication_id`, `peer_id`) cross
 //! message boundaries as `Vec<u8>` because the dynamic-`Msg`
@@ -646,9 +645,8 @@ impl SpaceRegistry {
     /// Instantiate a program as an agent. The caller resolves
     /// `(program_name, program_version)` to a hash and passes
     /// the hash so the install pins to a specific blob.
-    /// Init args are NOT stored here — they're applied host-side
-    /// when the agent is spawned and recorded in the registry's
-    /// DAG node for this `install` call.
+    /// Installation commits deployment identity and replication policy only;
+    /// actor initialization is an explicit durable invocation.
     #[msg(role = SpaceRegistryRole::Admin)]
     async fn install(
         &mut self,
@@ -658,8 +656,6 @@ impl SpaceRegistry {
         program_hash: Vec<u8>,
         replication_id: Vec<u8>,
         consistency: u8,
-        install_args: Vec<u8>,
-        install_payloads: Vec<u8>,
         network_reachable: bool,
         sync_role: u8,
         auth: Vec<u8>,
@@ -674,8 +670,6 @@ impl SpaceRegistry {
                     &program_hash,
                     &replication_id,
                     &[consistency],
-                    &install_args,
-                    &install_payloads,
                     &[network_reachable as u8],
                     &[sync_role],
                 ],
@@ -776,8 +770,6 @@ impl SpaceRegistry {
                 consistency,
                 network_reachable,
                 sync_role: SyncFloor::from_u8(sync_role).unwrap_or_default(),
-                install_args,
-                install_payloads,
             },
         );
         // Burn the replication_id so it can never seed a second install.
@@ -2471,8 +2463,6 @@ mod tests {
                 program_hash: hash.clone(),
                 replication_id: rep.clone(),
                 consistency,
-                install_args: Vec::new(),
-                install_payloads: Vec::new(),
                 network_reachable: false,
                 sync_role: SyncFloor::Member as u8,
                 auth: root_auth(
@@ -2484,8 +2474,6 @@ mod tests {
                         &hash,
                         &rep,
                         &[consistency],
-                        &[],
-                        &[],
                         &[0u8],
                         &[SyncFloor::Member as u8],
                     ],
@@ -2553,14 +2541,12 @@ mod tests {
                 program_hash: hash.clone(),
                 replication_id: rep.clone(),
                 consistency: 0, // Ephemeral
-                install_args: Vec::new(),
-                install_payloads: Vec::new(),
                 network_reachable: true,
                 sync_role: SyncFloor::Member as u8,
                 auth: root_auth(
                     "install",
                     &[
-                        b"bridge", b"p", b"1", &hash, &rep, &[0u8], &[], &[], &[1u8],
+                        b"bridge", b"p", b"1", &hash, &rep, &[0u8], &[1u8],
                         &[SyncFloor::Member as u8],
                     ],
                 ),
@@ -2608,14 +2594,12 @@ mod tests {
                 program_hash: hash.clone(),
                 replication_id: rep.clone(),
                 consistency: 2, // Crdt
-                install_args: Vec::new(),
-                install_payloads: Vec::new(),
                 network_reachable: false,
                 sync_role: SyncFloor::Private as u8,
                 auth: root_auth(
                     "install",
                     &[
-                        b"secret", b"p", b"1", &hash, &rep, &[2u8], &[], &[], &[0u8],
+                        b"secret", b"p", b"1", &hash, &rep, &[2u8], &[0u8],
                         &[SyncFloor::Private as u8],
                     ],
                 ),
@@ -2660,14 +2644,12 @@ mod tests {
                 program_hash: hash.clone(),
                 replication_id: rep.clone(),
                 consistency: 2,
-                install_args: Vec::new(),
-                install_payloads: Vec::new(),
                 network_reachable: false,
                 sync_role: SyncFloor::Member as u8,
                 auth: root_auth(
                     "install",
                     &[
-                        b"plain", b"plain", b"1", &hash, &rep, &[2], &[], &[], &[0],
+                        b"plain", b"plain", b"1", &hash, &rep, &[2], &[0],
                         &[SyncFloor::Member as u8],
                     ],
                 ),
@@ -3252,7 +3234,7 @@ mod tests {
             &attacker_key,
             "install",
             &[
-                b"evil", b"p", b"1", &hash, &rep, &[2u8], &[], &[], &[0u8],
+                b"evil", b"p", b"1", &hash, &rep, &[2u8], &[0u8],
                 &[SyncFloor::Member as u8],
             ],
         );
@@ -3265,8 +3247,6 @@ mod tests {
                 program_hash: hash,
                 replication_id: rep,
                 consistency: 2,
-                install_args: Vec::new(),
-                install_payloads: Vec::new(),
                 network_reachable: false,
                 sync_role: SyncFloor::Member as u8,
                 auth: forged,
@@ -3333,8 +3313,6 @@ mod tests {
                 program_hash: alloc::vec![7u8; 32],
                 replication_id: alloc::vec![9u8; 32],
                 consistency: 2,
-                install_args: Vec::new(),
-                install_payloads: Vec::new(),
                 network_reachable: false,
                 sync_role: SyncFloor::Member as u8,
                 auth: Vec::new(),
@@ -3639,7 +3617,7 @@ mod tests {
         let install_auth = root_auth(
             "install",
             &[
-                b"res", b"p", b"1", &hash, &rep, &[2u8], &[], &[], &[0u8],
+                b"res", b"p", b"1", &hash, &rep, &[2u8], &[0u8],
                 &[SyncFloor::Member as u8],
             ],
         );
@@ -3653,8 +3631,6 @@ mod tests {
                     program_hash: hash.clone(),
                     replication_id: rep.clone(),
                     consistency: 2,
-                    install_args: Vec::new(),
-                    install_payloads: Vec::new(),
                     network_reachable: false,
                     sync_role: SyncFloor::Member as u8,
                     auth: install_auth.clone(),
@@ -3688,14 +3664,12 @@ mod tests {
                     program_hash: hash.clone(),
                     replication_id: rep2.clone(),
                     consistency: 2,
-                    install_args: Vec::new(),
-                    install_payloads: Vec::new(),
                     network_reachable: false,
                     sync_role: SyncFloor::Member as u8,
                     auth: root_auth(
                         "install",
                         &[
-                            b"res", b"p", b"1", &hash, &rep2, &[2u8], &[], &[], &[0u8],
+                            b"res", b"p", b"1", &hash, &rep2, &[2u8], &[0u8],
                             &[SyncFloor::Member as u8],
                         ],
                     ),
@@ -3738,14 +3712,12 @@ mod tests {
                     program_hash: h1.clone(),
                     replication_id: rep.clone(),
                     consistency: 2,
-                    install_args: Vec::new(),
-                    install_payloads: Vec::new(),
                     network_reachable: false,
                     sync_role: SyncFloor::Member as u8,
                     auth: root_auth(
                         "install",
                         &[
-                            b"app", b"p", b"1", &h1, &rep, &[2u8], &[], &[], &[0u8],
+                            b"app", b"p", b"1", &h1, &rep, &[2u8], &[0u8],
                             &[SyncFloor::Member as u8],
                         ],
                     ),

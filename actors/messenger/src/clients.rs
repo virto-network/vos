@@ -149,8 +149,6 @@ pub(crate) async fn reg_install(
         .with("program_hash", template.program_hash.to_vec())
         .with("replication_id", replication_id.to_vec())
         .with("consistency", template.consistency as u64)
-        .with("install_args", Vec::<u8>::new())
-        .with("install_payloads", Vec::<u8>::new())
         .with("network_reachable", template.network_reachable)
         .with("sync_role", template.sync_role as u64);
     let value = ask_value(ctx, ServiceId(REGISTRY_ID), &msg)
