@@ -1,6 +1,6 @@
 //! Build-time-bundled PVM actor ELFs.
 //!
-//! Two actors get bundled today:
+//! Three actors get bundled today:
 //!
 //! - **space-registry**: per-space program/agent/member catalog.
 //!   Required for every `vosx space new` / `space up <token>`; without it
@@ -9,6 +9,9 @@
 //!   commit DAG. Backing actor for the dev extension's compile /
 //!   publish flow; bundled so `vosx dev new` can publish + install
 //!   the program in one shot without out-of-band scaffolding.
+//! - **space-authority**: canonical actor PVM used to construct the root-signed
+//!   authority package at first v2 startup. Package signing remains local to
+//!   the immutable space root.
 //!
 //! `build.rs` prefers the working-tree path under
 //! `actors/<name>/target/riscv64em-javm/release/` and falls back to
@@ -19,6 +22,7 @@
 
 const BUNDLED_REGISTRY_ELF: &[u8] = include_bytes!(env!("VOSX_BUNDLED_REGISTRY_ELF"));
 const BUNDLED_DEV_PROJECT_ELF: &[u8] = include_bytes!(env!("VOSX_BUNDLED_DEV_PROJECT_ELF"));
+const BUNDLED_SPACE_AUTHORITY_PVM: &[u8] = include_bytes!(env!("VOSX_BUNDLED_SPACE_AUTHORITY_PVM"));
 
 /// Returns the bundled space-registry ELF bytes, or `None` if
 /// vosx was built without the actor pre-built.
@@ -45,5 +49,16 @@ pub fn dev_project_elf() -> Option<&'static [u8]> {
         None
     } else {
         Some(BUNDLED_DEV_PROJECT_ELF)
+    }
+}
+
+/// Returns the canonical space-authority PVM bytes, or `None` when a
+/// development build omitted the checked infrastructure artifact.
+pub fn space_authority_pvm() -> Option<&'static [u8]> {
+    #[allow(clippy::const_is_empty)]
+    if BUNDLED_SPACE_AUTHORITY_PVM.is_empty() {
+        None
+    } else {
+        Some(BUNDLED_SPACE_AUTHORITY_PVM)
     }
 }

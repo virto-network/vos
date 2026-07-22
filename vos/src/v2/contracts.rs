@@ -134,6 +134,9 @@ pub struct RoleAuthorityBindingV2 {
 pub const ROLE_AUTHORITY_MUTATION_METHOD_V2: &str = "mutate_role";
 pub const ROLE_AUTHORITY_INVITE_METHOD_V2: &str = "redeem_invite";
 pub const ROLE_AUTHORITY_DECISION_METHOD_V2: &str = "authorize_role";
+/// Reserved installed root name for the one canonical authority service in a
+/// space. Application manifests cannot choose a sibling authority by route.
+pub const ROLE_AUTHORITY_INSTANCE_V2: &str = "space-authority";
 
 /// Signed authority-state mutation. The canonical v2 wire bytes are the
 /// exact Ed25519 message verified by the authority actor, so a signature for
@@ -195,11 +198,15 @@ pub struct RoleAuthorityInviteRedemptionV2 {
 
 impl RoleAuthorityInviteRedemptionV2 {
     pub fn holder(&self) -> Origin {
-        Origin::Member(SubjectId::of_authenticated_peer(&self.holder_peer_id))
+        Origin::Member(crate::actors::context::authenticated_peer_subject(
+            &self.holder_peer_id,
+        ))
     }
 
     pub fn grantor(&self) -> Origin {
-        Origin::Member(SubjectId::of_authenticated_peer(&self.admin_peer_id))
+        Origin::Member(crate::actors::context::authenticated_peer_subject(
+            &self.admin_peer_id,
+        ))
     }
 }
 
