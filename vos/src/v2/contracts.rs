@@ -180,7 +180,11 @@ impl RoleAuthorizationClaimV2 {
         ReplyRecordV2 {
             call_id: self.authority_invocation().root_reply_id(),
             producer: authority,
-            result: self.encode(),
+            // Generated actor methods returning `Vec<u8>` use the canonical
+            // dynamic actor ABI: the bytes are framed as `Value::Bytes`.
+            // Binding that exact frame keeps the producer helper aligned with
+            // the same actor PVM developers and Refine execute.
+            result: crate::Encode::encode(&crate::value::Value::Bytes(self.encode())),
         }
     }
 }
@@ -4785,6 +4789,15 @@ mod tests {
             },
             claim,
         };
+        let crate::value::Value::Bytes(result) =
+            <crate::value::Value as crate::Decode>::try_decode(
+                &assertion.claim.authority_reply(authority.actor).result,
+            )
+            .unwrap()
+        else {
+            panic!("authority actor reply must use the canonical bytes frame")
+        };
+        assert_eq!(result, assertion.claim.encode());
         assert!(assertion.matches_authority(&authority));
         assert_eq!(
             AccumulatedRoleAssertionV2::decode(&assertion.encode()).unwrap(),
