@@ -1612,6 +1612,7 @@ fn validate_role_authority_deployment(
         != vec![
             (vos::v2::ROLE_AUTHORITY_DECISION_METHOD_V2, true, false),
             (vos::v2::ROLE_AUTHORITY_MUTATION_METHOD_V2, true, false),
+            (vos::v2::ROLE_AUTHORITY_INVITE_METHOD_V2, true, false),
         ]
     {
         anyhow::bail!("space-authority package exposes a non-canonical method policy surface");

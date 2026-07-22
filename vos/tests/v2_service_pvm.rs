@@ -28,7 +28,8 @@ use vos::v2::{
     PackageRolePoliciesV2, ProducerId, ProgramId, ProofCommitmentV2, ProofVerificationRequestV2,
     PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2,
     RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RoleAuthorityBindingV2,
-    RoleAuthorityMutationV2, RootServiceId, RootTreeIngressRecoveryV2, ScheduleErrorV2,
+    RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2, RootServiceId,
+    RootTreeIngressRecoveryV2, ScheduleErrorV2,
     ServiceDispatchError, ServiceGenesisV2,
     ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, SpaceRoleCredentialV2, StateKeyV2,
     SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2,
@@ -1051,6 +1052,76 @@ fn canonical_space_authority_produces_extractable_accumulated_assertion() {
         Value::Bool(true)
     );
 
+    let token = identity::Keypair::generate_ed25519();
+    let invited = identity::Keypair::generate_ed25519();
+    let invited_peer_id = PeerId::from(invited.public()).to_bytes();
+    let token_pub = vos::registry::ed25519_pubkey_from_peer_id(
+        &PeerId::from(token.public()).to_bytes(),
+    )
+    .expect("the invite token is Ed25519");
+    let expires_at = 1_000u64;
+    let invite = vos::registry::canonical_op_bytes(
+        "invite",
+        &[
+            &binding.service.space.0,
+            &[vos::SpaceRole::Member.as_u8()],
+            &expires_at.to_le_bytes(),
+            &token_pub,
+        ],
+    );
+    let redeem =
+        vos::registry::canonical_op_bytes("redeem_invite", &[&token_pub, &invited_peer_id]);
+    let redemption = RoleAuthorityInviteRedemptionV2 {
+        space: binding.service.space,
+        token_pub,
+        role: vos::SpaceRole::Member,
+        expires_at,
+        admin_peer_id: PeerId::from(root.public()).to_bytes(),
+        admin_signature: root.sign(&invite).unwrap().try_into().unwrap(),
+        holder_peer_id: invited_peer_id.clone(),
+        redeem_signature: token.sign(&redeem).unwrap().try_into().unwrap(),
+        holder_signature: invited.sign(&redeem).unwrap().try_into().unwrap(),
+    };
+    assert_eq!(
+        invoke_public_example(
+            &mut authority,
+            authority_actor,
+            InvocationId([193; 32]),
+            2,
+            "redeem_invite",
+            Msg::new("redeem_invite").with("redemption", redemption.encode()),
+        ),
+        Value::Bool(true),
+        "the canonical actor PVM verifies and commits the invite chain",
+    );
+    let invited_holder = Origin::Member(SubjectId::of_authenticated_peer(&invited_peer_id));
+    let invited_claim = vos::v2::RoleAuthorizationClaimV2 {
+        space: binding.service.space,
+        holder: invited_holder,
+        role: vos::SpaceRole::Member,
+        audience: ServiceIdentityV2 {
+            root_service: RootServiceId([196; 32]),
+            deployment: DeploymentId([197; 32]),
+            service_program: ProgramId([198; 32]),
+            ..binding.service.clone()
+        },
+        invocation: InvocationId([194; 32]),
+        target: ActorId([199; 32]),
+        method: "restricted".into(),
+        policy: Hash([200; 32]),
+    };
+    assert_eq!(
+        invoke_public_example(
+            &mut authority,
+            authority_actor,
+            InvocationId([195; 32]),
+            3,
+            "authorize_role",
+            Msg::new("authorize_role").with("claim", invited_claim.encode()),
+        ),
+        Value::Bytes(invited_claim.encode()),
+    );
+
     let claim = vos::v2::RoleAuthorizationClaimV2 {
         space: binding.service.space,
         holder,
@@ -1076,7 +1147,7 @@ fn canonical_space_authority_produces_extractable_accumulated_assertion() {
         .invoke(LocalWorkRequestV2 {
             invocation: claim.authority_invocation(),
             workflow_step: 0,
-            logical_timeslot: 2,
+            logical_timeslot: 4,
             target: authority_actor,
             method: "authorize_role".into(),
             arguments,

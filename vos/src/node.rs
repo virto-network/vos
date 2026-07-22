@@ -1861,6 +1861,34 @@ fn redeem_invite_is_expired(msg: &crate::value::Msg, now: Option<u64>) -> bool {
     now.is_none_or(|now| now >= expires_at)
 }
 
+/// Apply the same host-time admission check to the v2 authority's wrapped
+/// root-tree invocation. Once admitted, the PVM replays only deterministic
+/// signature and delegation checks; wall time never enters actor state.
+#[cfg(feature = "network")]
+fn authority_invite_is_expired(msg: &[u8], now: Option<u64>) -> bool {
+    use crate::v2::V2Wire;
+
+    let Ok(invocation) = crate::v2::RootTreeInvocationV2::decode(msg) else {
+        return false;
+    };
+    if invocation.method != crate::v2::ROLE_AUTHORITY_INVITE_METHOD_V2 {
+        return false;
+    }
+    let Some(arguments) = intercepted_msg(&invocation.arguments) else {
+        return true;
+    };
+    if arguments.name != crate::v2::ROLE_AUTHORITY_INVITE_METHOD_V2 {
+        return true;
+    }
+    let Some(redemption) = arguments.args.get_bytes("redemption") else {
+        return true;
+    };
+    let Ok(redemption) = crate::v2::RoleAuthorityInviteRedemptionV2::decode(&redemption) else {
+        return true;
+    };
+    now.is_none_or(|now| now >= redemption.expires_at)
+}
+
 #[cfg(feature = "network")]
 impl crate::network::NetworkService for NodeService {
     fn dispatch_invoke(
@@ -1888,15 +1916,18 @@ impl crate::network::NetworkService for NodeService {
         // Expiry is checked once, on the serving host, before the operation is
         // admitted into the registry DAG. The signed deadline is re-verified
         // by the actor; replay never consults wall time.
-        if to_unscoped == ServiceId::REGISTRY.local_id() as u32
-            && intercepted_msg(&msg).is_some_and(|decoded| {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .map(|d| d.as_secs());
-                redeem_invite_is_expired(&decoded, now)
-            })
-        {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs());
+        let expired_registry_invite = to_unscoped == ServiceId::REGISTRY.local_id() as u32
+            && intercepted_msg(&msg).is_some_and(|decoded| redeem_invite_is_expired(&decoded, now));
+        let expired_authority_invite = self
+            .agent_name_for(to_unscoped)
+            .as_deref()
+            .is_some_and(|name| name == crate::v2::ROLE_AUTHORITY_INSTANCE_V2)
+            && authority_invite_is_expired(&msg, now);
+        if expired_registry_invite || expired_authority_invite {
             warn!(peer = ?caller_peer_id, "redeem_invite refused: token expired");
             return forbidden_envelope();
         }
@@ -12318,7 +12349,9 @@ mod tests {
     #[test]
     #[cfg(feature = "network")]
     fn redeem_invite_expiry_is_checked_at_admission_boundary() {
-        use crate::value::Msg;
+        use crate::actors::codec::Encode;
+        use crate::v2::V2Wire;
+        use crate::value::{Msg, TAG_DYNAMIC};
         let before = Msg::new("redeem_invite").with("expires_at", 101u64);
         let boundary = Msg::new("redeem_invite").with("expires_at", 100u64);
         let malformed = Msg::new("redeem_invite");
@@ -12327,6 +12360,38 @@ mod tests {
         assert!(redeem_invite_is_expired(&malformed, Some(100)));
         assert!(redeem_invite_is_expired(&before, None), "clock failure denies");
         assert!(!redeem_invite_is_expired(&Msg::new("programs"), Some(100)));
+
+        let redemption = crate::v2::RoleAuthorityInviteRedemptionV2 {
+            space: crate::v2::SpaceId([1; 32]),
+            token_pub: [2; 32],
+            role: crate::SpaceRole::Member,
+            expires_at: 101,
+            admin_peer_id: vec![3; 38],
+            admin_signature: [4; 64],
+            holder_peer_id: vec![5; 38],
+            redeem_signature: [6; 64],
+            holder_signature: [7; 64],
+        };
+        let mut arguments = vec![TAG_DYNAMIC];
+        arguments.extend_from_slice(
+            &Msg::new(crate::v2::ROLE_AUTHORITY_INVITE_METHOD_V2)
+                .with("redemption", redemption.encode())
+                .encode(),
+        );
+        let invocation = crate::v2::RootTreeInvocationV2 {
+            invocation: crate::v2::InvocationId([8; 32]),
+            logical_timeslot: 1,
+            target: crate::v2::ActorId([9; 32]),
+            method: crate::v2::ROLE_AUTHORITY_INVITE_METHOD_V2.into(),
+            arguments,
+            proof_requested: false,
+        };
+        assert!(!authority_invite_is_expired(
+            &invocation.encode(),
+            Some(100)
+        ));
+        assert!(authority_invite_is_expired(&invocation.encode(), Some(101)));
+        assert!(authority_invite_is_expired(&invocation.encode(), None));
     }
 
     #[cfg(feature = "network")]
