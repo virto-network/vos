@@ -24,8 +24,12 @@ build-wasm:
     cd examples/wasm/echo; cargo build --target wasm32-unknown-unknown --release
     cd examples/wasm/fetcher; cargo build --target wasm32-unknown-unknown --release
 
-# Build the public v2 actors and the legacy PVM regression fixtures.
-build-pvm: build-examples build-legacy-pvm-fixtures
+# Build the generic service, public v2 actors, and physical-service fixtures.
+build-pvm: build-service build-examples build-legacy-pvm-fixtures
+
+# Build the protocol-pinned generic JAM service ELF used by packages and daemons.
+build-service:
+    cd services/vos-service; cargo +nightly actor
 
 # Build the four public v2 examples (private-age + age-gate is one scenario).
 build-examples:

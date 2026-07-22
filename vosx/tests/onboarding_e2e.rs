@@ -96,9 +96,23 @@ fn vosx(data_home: &Path, config_home: &Path, args: &[&str]) -> Output {
 
 /// Spawn a long-running `space up <arg>` daemon, logging to a file.
 fn spawn_up(data_home: &Path, config_home: &Path, arg: &str, log_path: &Path) -> Child {
+    spawn_up_with_service(data_home, config_home, arg, log_path, None)
+}
+
+fn spawn_up_with_service(
+    data_home: &Path,
+    config_home: &Path,
+    arg: &str,
+    log_path: &Path,
+    service_pvm: Option<&Path>,
+) -> Child {
     let log_file = fs::File::create(log_path).expect("create log");
-    Command::new(vosx_bin())
-        .args(["space", "up", arg])
+    let mut command = Command::new(vosx_bin());
+    command.args(["space", "up", arg]);
+    if let Some(service_pvm) = service_pvm {
+        command.arg("--service-pvm").arg(service_pvm);
+    }
+    command
         .env("XDG_DATA_HOME", data_home)
         .env("XDG_CONFIG_HOME", config_home)
         .env("RUST_LOG", "info")
@@ -108,6 +122,38 @@ fn spawn_up(data_home: &Path, config_home: &Path, arg: &str, log_path: &Path) ->
         .stderr(log_file)
         .spawn()
         .expect("spawn vosx space up")
+}
+
+/// Transpile the exact generic service guest built by `just build-pvm`.
+/// Direct `cargo test` runs may not have that target artifact, matching the
+/// existing physical-service integration tests: print the prerequisite and
+/// let the caller skip instead of silently substituting a synthetic PVM.
+fn service_pvm_fixture(output_dir: &Path) -> Option<PathBuf> {
+    let elf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../services/vos-service/target/riscv64em-javm/release/vos_service.elf");
+    if !elf.is_file() {
+        eprintln!(
+            "skipping: build the generic service with \
+             `cd services/vos-service && cargo +nightly actor` ({})",
+            elf.display(),
+        );
+        return None;
+    }
+    let pvm = output_dir.join("vos-service.pvm");
+    let output = Command::new(vosx_bin())
+        .arg("service-pvm")
+        .arg(&elf)
+        .arg("--out")
+        .arg(&pvm)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("transpile canonical service PVM");
+    assert!(
+        output.status.success(),
+        "`vosx service-pvm` failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    Some(pvm)
 }
 
 fn wait_for_endpoint(data_home: &Path, log_path: &Path, who: &str) -> PathBuf {
@@ -318,11 +364,24 @@ fn vosx_ok(data_home: &Path, config_home: &Path, args: &[&str]) -> String {
 /// Boot an admin host for invite and membership tests. Application package
 /// installation is deliberately separate: v2 has no raw bundled actors.
 fn boot_admin(space: &str) -> (TempDir, TempDir, Daemon, PathBuf) {
+    boot_admin_with_service(space, None)
+}
+
+fn boot_admin_with_service(
+    space: &str,
+    service_pvm: Option<&Path>,
+) -> (TempDir, TempDir, Daemon, PathBuf) {
     let data_a = TempDir::new("a-data");
     let cfg_a = TempDir::new("a-config");
     vosx_ok(data_a.path(), cfg_a.path(), &["space", "new", space]);
     let log_a = data_a.path().join("daemon-a.stderr");
-    let daemon_a = Daemon(spawn_up(data_a.path(), cfg_a.path(), space, &log_a));
+    let daemon_a = Daemon(spawn_up_with_service(
+        data_a.path(),
+        cfg_a.path(),
+        space,
+        &log_a,
+        service_pvm,
+    ));
     wait_for_endpoint(data_a.path(), &log_a, "A");
     (data_a, cfg_a, daemon_a, log_a)
 }
@@ -396,7 +455,11 @@ fn expired_token_not_redeemed_and_non_member_cannot_sync() {
 #[test]
 fn double_redemption_is_flagged() {
     let space = "dbl";
-    let (data_a, cfg_a, _da, _la) = boot_admin(space);
+    let service_dir = TempDir::new("dbl-service");
+    let Some(service_pvm) = service_pvm_fixture(service_dir.path()) else {
+        return;
+    };
+    let (data_a, cfg_a, _da, _la) = boot_admin_with_service(space, Some(&service_pvm));
     let stdout = vosx_ok(
         data_a.path(),
         cfg_a.path(),
@@ -409,14 +472,34 @@ fn double_redemption_is_flagged() {
     let data_b = TempDir::new("dbl-b-data");
     let cfg_b = TempDir::new("dbl-b-config");
     let log_b = data_b.path().join("b.stderr");
-    let _db = Daemon(spawn_up(data_b.path(), cfg_b.path(), &token, &log_b));
-    wait_for_endpoint(data_b.path(), &log_b, "B");
+    let _db = Daemon(spawn_up_with_service(
+        data_b.path(),
+        cfg_b.path(),
+        &token,
+        &log_b,
+        Some(&service_pvm),
+    ));
+    let endpoint_b = wait_for_endpoint(data_b.path(), &log_b, "B");
+    let pending_b = endpoint_b
+        .parent()
+        .expect("B endpoint has a space directory")
+        .join(".pending-invite.token");
 
     let data_c = TempDir::new("dbl-c-data");
     let cfg_c = TempDir::new("dbl-c-config");
     let log_c = data_c.path().join("c.stderr");
-    let _dc = Daemon(spawn_up(data_c.path(), cfg_c.path(), &token, &log_c));
-    wait_for_endpoint(data_c.path(), &log_c, "C");
+    let _dc = Daemon(spawn_up_with_service(
+        data_c.path(),
+        cfg_c.path(),
+        &token,
+        &log_c,
+        Some(&service_pvm),
+    ));
+    let endpoint_c = wait_for_endpoint(data_c.path(), &log_c, "C");
+    let pending_c = endpoint_c
+        .parent()
+        .expect("C endpoint has a space directory")
+        .join(".pending-invite.token");
 
     // A records BOTH redemptions on the one InviteRow → members flags it.
     poll_until(
@@ -429,6 +512,27 @@ fn double_redemption_is_flagged() {
             format!(
                 "A never flagged the double-redemption. members:\n{}\nB log:\n{}\nC log:\n{}",
                 vosx_ok(data_a.path(), cfg_a.path(), &["space", "members", space]),
+                fs::read_to_string(&log_b).unwrap_or_default(),
+                fs::read_to_string(&log_c).unwrap_or_default(),
+            )
+        },
+    );
+
+    // Legacy registry acceptance is only the first half of v2 onboarding.
+    // The daemon removes this bearer secret only after the canonical
+    // space-authority PVM accepts the same evidence through physical
+    // Accumulate and publishes `Bool(true)`. Require both divergent holders
+    // to finish that guest-owned commit, not merely appear in the legacy
+    // InviteRow checked above.
+    poll_until(
+        20,
+        || !pending_b.exists() && !pending_c.exists(),
+        || {
+            format!(
+                "one or both joiners never committed invite redemption to space-authority \
+                 (pending B={}, C={}). B log:\n{}\nC log:\n{}",
+                pending_b.exists(),
+                pending_c.exists(),
                 fs::read_to_string(&log_b).unwrap_or_default(),
                 fs::read_to_string(&log_c).unwrap_or_default(),
             )
