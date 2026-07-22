@@ -125,9 +125,9 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Run a single PVM/ELF program with no recipe (one-shot).
-    /// No registry, no networking — just boot the kernel,
-    /// deliver the supplied work items, halt.
+    /// Run one signed `.vos` v2 package with no recipe (one-shot).
+    /// No registry or networking; the pinned generic service still performs
+    /// physical Refine and guest-owned Accumulate.
     Run {
         program: PathBuf,
         /// Deliver file contents as a FETCH work item (repeatable).
@@ -222,8 +222,8 @@ fn main() {
     //   * the verb exists,
     //   * it's not a built-in (`run`, `space`, `help-schema`,
     //     `help`),
-    //   * and it's not a path-like token (one-shot ELF run still
-    //     takes precedence so `vosx ./foo.elf` keeps working).
+    //   * and it's not a path-like token (one-shot signed-package
+    //     execution still takes precedence for `vosx ./Counter.vos`).
     //
     // Anything else falls through to `Cli::parse()` so clap's
     // own --help / --version / parse-error machinery stays intact.
@@ -373,7 +373,8 @@ fn main() {
             None => {
                 eprintln!(
                     "vosx: no command. Try `vosx space new foo`, \
-                     `vosx run path/to.elf`, or `vosx --help`."
+                     `vosx run dist/Counter.vos --service-pvm dist/vos-service.pvm --method value`, \
+                     or `vosx --help`."
                 );
                 std::process::exit(EXIT_USAGE_ERROR);
             }
@@ -417,7 +418,7 @@ fn is_top_level_help(argv: &[String]) -> bool {
 /// any of the built-in subcommand names — including clap's
 /// auto-generated `help` — falls back to clap. A path-like token
 /// (one with `/` or `\`, or starting with `.`) is preserved for
-/// the existing one-shot ELF run path.
+/// the one-shot signed-package run path.
 fn should_dynamic_dispatch(argv: &[String]) -> bool {
     const BUILTIN_VERBS: &[&str] = &[
         "new",

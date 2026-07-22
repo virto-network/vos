@@ -28,7 +28,7 @@
 //! before clap. The verb must be neither a built-in subcommand
 //! (`run`, `space`, `help-schema`, `help`) nor a path-like token
 //! (contains `/` or `\`, or starts with `.`). Path-likes still
-//! flow into `commands::run` as one-shot ELF execution.
+//! flow into `commands::run` as one-shot signed-package execution.
 
 use anyhow::{Context, anyhow, bail};
 use vos::metadata::{ParsedMessage, ParsedMeta};

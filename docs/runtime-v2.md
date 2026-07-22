@@ -5,8 +5,9 @@
 > scheduler, local cross-root delivery/resume, and guest-owned CRDT
 > synchronization described here are present in the v2 conformance runtime.
 > The production node now opens signed `.vos` rows through the same root-tree
-> services. Raw ELF/PVM registry rows still use legacy paths during cutover;
-> legacy host behavior is not evidence of v2 conformance.
+> services. Signed v2 package and one-shot execution surfaces reject raw
+> artifacts. Existing raw registry rows remain an isolated legacy startup path
+> during the production-node cutover; regression actors are test fixtures.
 
 VOS v2 assigns one logical JAM service to a root actor and its owned child
 tree. The protocol-pinned `vos-service.pvm` is one generic program with the
@@ -317,8 +318,8 @@ shape. `build` derives the service `ProgramId` from the validated PVM bytes; it
 never accepts a hand-entered service hash. `run` validates that same identity,
 installs the root tree through physical Accumulate, schedules Refine from
 guest-committed state, and publishes the reply only after physical Accumulate
-accepts the transition. Raw ELF/PVM inputs still use the explicitly legacy
-single-actor runner while the production daemon is being cut over.
+accepts the transition. `run` rejects raw ELF/PVM inputs; ELF is transpiled
+only by `build`, and registries or runners consume the resulting exact package.
 
 `space up --service-pvm <exact-vos-service.pvm>` recognizes signed `.vos`
 catalog artifacts and opens each Local, Raft, or CRDT deployment as one durable

@@ -1,13 +1,12 @@
 //! `vosx run` one-shot execution.
 //!
 //! Signed `.vos` packages run through the canonical v2 root-tree service.
-//! Raw ELF/PVM inputs retain the legacy executor only as an explicit
-//! infrastructure/regression path during the production-node cutover.
+//! ELF is accepted only by `vosx build`, where it is transpiled once into the
+//! canonical actor PVM stored in the signed package.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use vos::runtime::{GasConfig, VosRuntime};
 use vos::v2::{
     ActorId, AuthorizationEvidenceV2, ConsistencyModeV2, DeploymentId, Hash, InvocationId,
     LocalRootTreeConfigV2, LocalRootTreeServiceV2, LocalWorkRequestV2, MemoryCommittedImageStoreV2,
@@ -28,20 +27,22 @@ pub fn run(
     let mut items = load_items(payloads, hex);
     items.extend(methods.iter().map(|method| dynamic_message(method)));
 
-    if program.extension().and_then(|extension| extension.to_str()) == Some("vos") {
-        let service_pvm = service_pvm.unwrap_or_else(|| {
-            die("running a .vos package requires --service-pvm <vos-service.pvm>")
-        });
-        if items.is_empty() {
-            die("running a .vos package requires --method, --payload, or --hex work input");
-        }
-        run_v2(program, service_pvm, items, gas);
-    } else {
-        if !methods.is_empty() {
-            die("--method is available only for signed .vos v2 packages");
-        }
-        run_legacy(program, items, gas);
+    if !is_v2_package(program) {
+        die(
+            "vosx run accepts only signed .vos v2 packages; use `vosx build <actor-project-or-elf> \
+             --service-pvm <vos-service.pvm>` first",
+        );
     }
+    let service_pvm = service_pvm
+        .unwrap_or_else(|| die("running a .vos package requires --service-pvm <vos-service.pvm>"));
+    if items.is_empty() {
+        die("running a .vos package requires --method, --payload, or --hex work input");
+    }
+    run_v2(program, service_pvm, items, gas);
+}
+
+fn is_v2_package(path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("vos")
 }
 
 fn run_v2(package_path: &Path, service_path: &Path, items: Vec<Vec<u8>>, gas: u64) {
@@ -211,24 +212,6 @@ fn dynamic_message(method: &str) -> Vec<u8> {
     payload
 }
 
-fn run_legacy(program: &Path, mut items: Vec<Vec<u8>>, gas: u64) {
-    let blob = load_blob(program);
-    let mut runtime = VosRuntime::with_gas_config(GasConfig { refine_gas: gas });
-    let index = runtime.register_service_blob(blob);
-    let id = runtime.register_service(index);
-    tracing::info!("loaded '{}' as {id:?}", program.display());
-
-    if items.is_empty() {
-        items.push(Vec::new());
-    }
-    for item in items {
-        runtime.send_to(id, item);
-    }
-    tracing::info!("running");
-    runtime.run_blocking();
-    exit_with_status(runtime.panics);
-}
-
 fn load_items(payloads: &[PathBuf], hex_items: &[String]) -> Vec<Vec<u8>> {
     let mut items = Vec::new();
     for path in payloads {
@@ -253,15 +236,6 @@ fn load_file(path: &Path) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|error| die(&format!("reading {}: {error}", path.display())))
 }
 
-fn load_blob(path: &Path) -> Vec<u8> {
-    let data = load_file(path);
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("pvm") => data,
-        _ => grey_transpiler::link_elf(&data)
-            .unwrap_or_else(|error| die(&format!("transpiling '{}': {error:?}", path.display()))),
-    }
-}
-
 fn read_stdin() -> Vec<u8> {
     let mut buffer = Vec::new();
     std::io::stdin()
@@ -281,14 +255,6 @@ fn hex_decode(hex: &str) -> Option<Vec<u8>> {
                 .collect::<Option<Vec<_>>>()
         })
         .flatten()
-}
-
-fn exit_with_status(panics: u32) {
-    if panics > 0 {
-        eprintln!("\nvosx: {panics} panic(s)");
-        std::process::exit(1);
-    }
-    eprintln!("\nvosx: done");
 }
 
 #[cfg(test)]
@@ -316,5 +282,12 @@ mod tests {
             local_service_identity(second, program).root_service
         );
         assert_ne!(local_root_actor(first), local_root_actor(second));
+    }
+
+    #[test]
+    fn one_shot_runner_accepts_only_signed_v2_packages() {
+        assert!(is_v2_package(Path::new("Counter.vos")));
+        assert!(!is_v2_package(Path::new("counter.elf")));
+        assert!(!is_v2_package(Path::new("counter.pvm")));
     }
 }

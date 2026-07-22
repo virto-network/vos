@@ -50,10 +50,10 @@ pub use run::{
 pub use run::{run_refine_service, run_task_service};
 pub use value::InvokeError;
 
-/// JAM refine entry (PC=0). Always uses the service lifecycle so
-/// actors can run both standalone (`vosx run actor.elf -s`) and as
-/// invoked children. State is read from storage on cold start; FETCH
-/// items are treated as messages.
+/// Actor PC-0 entry retained for low-level runtime fixtures. Packaged v2
+/// actors execute as nested PVMs owned by the generic root-tree service.
+/// State is read from storage on cold start; FETCH items are treated as
+/// messages.
 #[cfg(feature = "service")]
 pub fn run_refine_entry<A: Actor>() {
     run::run_refine_service::<A>()
