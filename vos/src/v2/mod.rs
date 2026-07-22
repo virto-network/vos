@@ -50,10 +50,11 @@ pub use contracts::{
     MessageRecordV2, MethodPolicyV2, ProofCommitmentV2, ProofVerificationRequestV2,
     PublicationAckV2, PublishedEffectsV2, ROLE_AUTHORITY_DECISION_METHOD_V2,
     ROLE_AUTHORITY_MUTATION_METHOD_V2, ReceiptVerificationRequestV2, RefineError, RefineImportsV2,
-    RefineOutputV2, ReplyRecordV2, RoleAuthorityBindingV2, RoleAuthorityMutationV2,
-    RoleAuthorizationClaimV2, RoleCredentialV2, RoleCredentialVerificationRequestV2,
-    ServiceGenesisV2, ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2,
-    WorkInputIdV2, WorkflowOperationV2,
+    RefineOutputV2, ReplyRecordV2, RoleAuthorityBindingV2, RoleAuthorityInviteRedemptionV2,
+    RoleAuthorityMutationV2, RoleAuthorizationClaimV2, RoleCredentialV2,
+    RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServiceIdentityV2,
+    ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
+    ROLE_AUTHORITY_INVITE_METHOD_V2,
 };
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStoreV2, ProofVerificationV2, ReceiptVerificationV2,
