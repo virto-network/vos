@@ -17,6 +17,7 @@ use vos::prelude::*;
 
 #[actor]
 struct Agent {
+    started: bool,
     round: u32,
     tasks: Tasks,
     children: Vec<u32>,
@@ -27,6 +28,7 @@ impl Agent {
     fn new(children: Vec<u32>) -> Self {
         log::info!("agent: init");
         Agent {
+            started: false,
             round: 0,
             tasks: Tasks::new(),
             children,
@@ -83,6 +85,14 @@ impl Agent {
     /// Actors without a `start` handler silently skip it.
     #[msg]
     async fn start(&mut self, ctx: &mut Context<Self>) {
+        // A physical PVM cold start is not necessarily a logical actor start:
+        // restart/replay and concurrent CRDT genesis branches may enter this
+        // hook again with persisted state. Only the first logical transition
+        // may enqueue the configured children.
+        if self.started {
+            return;
+        }
+        self.started = true;
         for &child_id in &self.children {
             self.tasks.spawn(Child::Peer(child_id), &Msg::new("start"));
         }
