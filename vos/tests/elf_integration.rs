@@ -220,13 +220,17 @@ fn cooperative_loop_with_greeter() {
 /// this test pins the property so a future refactor can't
 /// silently regress it.
 ///
-/// Assertion: after N bounded `tick_blocking()` rounds the
-/// runtime still has work pending (scheduler hasn't stopped
-/// queuing self-`tick` messages) and nothing has panicked. The
-/// counter actor in `tests/fixtures/legacy-v1/actors/counter` is the canonical
-/// self-yielding fixture used by `tests/fixtures/legacy-v1/space.toml`.
+/// Assertion: the scheduler keeps re-driving a yielded child until its
+/// bounded handler completes. Each cold peer drive runs the probe's lifecycle
+/// hook; it yields while advancing from one through seven. The completing
+/// drive advances the hook to eight and then dispatches the queued `start`
+/// message, producing the authoritative terminal count of nine. Treating any
+/// yield as `Done` leaves that count lower. A bounded fixture guarantees this
+/// regression drains
+/// instead of spending an entire gas slice in an intentionally infinite
+/// guest loop.
 #[test]
-fn scheduler_keeps_driving_yielding_counter() {
+fn scheduler_drives_yielding_child_to_completion() {
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
         "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
@@ -239,21 +243,21 @@ fn scheduler_keeps_driving_yielding_counter() {
             return;
         }
     };
-    let counter_data = example_elf("counter");
+    let probe_data = example_elf("probe");
 
     let scheduler_blob = transpile_actor(&scheduler_data);
-    let counter_blob = transpile_actor(&counter_data);
+    let probe_blob = transpile_actor(&probe_data);
 
     let mut rt = VosRuntime::new();
 
     let sched_blob_idx = rt.register_service_blob(scheduler_blob);
     let sched_id = rt.register_service(sched_blob_idx);
-    let counter_blob_idx = rt.register_service_blob(counter_blob);
-    let counter_id = rt.register_service(counter_blob_idx);
+    let probe_blob_idx = rt.register_service_blob(probe_blob);
+    let probe_id = rt.register_service(probe_blob_idx);
 
     let args = vos::init::InitArgs::new().with(
         "children",
-        vos::init::InitValue::ListU32(vec![counter_id.0]),
+        vos::init::InitValue::ListU32(vec![probe_id.0]),
     );
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
     rt.storage
@@ -261,41 +265,49 @@ fn scheduler_keeps_driving_yielding_counter() {
 
     rt.send_to(sched_id, Vec::new());
 
-    // Drain a bounded number of ticks. The scheduler self-sends
-    // `tick` after each round so `has_work()` should stay true as
-    // long as the counter remains yielded. If the regression
-    // returned (yield treated as Done), the scheduler would
-    // drop the counter from `run_queue`, stop scheduling ticks,
-    // and has_work() would go false within the first round.
-    const TICKS: usize = 8;
-    let mut productive = 0usize;
-    for _ in 0..TICKS {
-        if rt.tick_blocking() {
-            productive += 1;
-        }
-        if !rt.has_work() {
-            break;
-        }
-    }
+    rt.run_blocking();
 
     assert_eq!(rt.panics, 0, "no service should have panicked");
-    assert!(
-        productive >= TICKS,
-        "expected the scheduler to drive at least {TICKS} productive ticks; \
-         got {productive} — yielded counter dropped early"
+    assert!(!rt.has_work(), "bounded scheduler workload should drain");
+
+    let status = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &vos::value::Msg::new("task_status").with("id", 0u64),
     );
-    assert!(
-        rt.has_work(),
-        "scheduler should still have pending tick after {TICKS} rounds — \
-         a yielding counter must keep the run queue non-empty"
+    assert_eq!(
+        status.as_u32(),
+        Some(vos::agent::TaskStatus::Done as u32),
+        "the scheduler must retain the child's terminal status"
     );
-    // The counter is invoked synchronously through the scheduler
-    // (lifecycle::invoke), not as a top-level suspended service —
-    // its yielded state lives in the scheduler's run_queue, not
-    // in the runtime's data layer. So we don't check
-    // `is_suspended(counter_id)`; the productive-tick + has_work
-    // assertions above are the real signal.
-    let _ = counter_id;
+    let state = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &vos::value::Msg::new("task_state").with("id", 0u64),
+    )
+    .as_bytes()
+    .expect("task_state returns bytes")
+    .to_vec();
+    assert_eq!(state.len(), 4, "probe task state should be a four-byte u32");
+    assert_eq!(
+        u32::from_le_bytes([state[0], state[1], state[2], state[3]]),
+        9,
+        "the scheduler must re-drive all seven lifecycle yield boundaries"
+    );
+
+    // A peer's storage row is the entering state staged for its last invoke;
+    // its authoritative post-invoke state is retained in the parent-owned
+    // TaskRecord asserted above.
+    let raw = rt
+        .storage
+        .read(probe_id, vos::lifecycle::STATE_KEY_BYTES)
+        .expect("probe STATE_KEY persisted");
+    assert_eq!(raw.len(), 4, "probe state should be a four-byte u32");
+    assert_eq!(
+        u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
+        7,
+        "peer storage should retain the final invocation's entering state"
+    );
 }
 
 #[test]
