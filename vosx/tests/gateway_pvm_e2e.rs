@@ -26,8 +26,8 @@
 //! 2. Dispatch to a *registered* agent returns 200 (and a
 //!    sensible body); dispatch to an *unknown* name returns 404.
 //! 3. State-bearing handlers persist across requests — the
-//!    counter actor's count advances on each successive
-//!    `/counter/start`.
+//!    counter actor observes all three successive `/counter/inc`
+//!    calls when `/counter/get` reads it back.
 //!
 //! Build prerequisites
 //!
@@ -66,8 +66,9 @@ fn gateway_so() -> PathBuf {
 }
 
 fn actor_elf(name: &str) -> PathBuf {
+    let binary = name.replace('-', "_");
     workspace().join(format!(
-        "tests/fixtures/legacy-v1/actors/{name}/target/riscv64em-javm/release/{name}.elf"
+        "tests/fixtures/legacy-v1/actors/{name}/target/riscv64em-javm/release/{binary}.elf"
     ))
 }
 
@@ -80,7 +81,7 @@ fn ensure_built() {
             "cd tests/fixtures/legacy-v1 && just build",
         ),
         (
-            actor_elf("counter"),
+            actor_elf("crdt-counter"),
             "cd tests/fixtures/legacy-v1 && just build",
         ),
         (
@@ -272,7 +273,7 @@ path = "{gateway}"
 init = {{ bind_addr = "127.0.0.1", port = {port} }}
 "#,
         greeter = actor_elf("greeter").display(),
-        counter = actor_elf("counter").display(),
+        counter = actor_elf("crdt-counter").display(),
         math = actor_elf("math").display(),
         gateway = gateway_so().display(),
     );
@@ -452,20 +453,33 @@ fn pvm_actors_via_gateway() {
         "greeter.start returns (); expected JSON null"
     );
 
-    // 3. Dispatch to counter. Same shape — different actor,
-    //    different registered ServiceId. If the registry is
-    //    returning the same garbage id for every name (blake2b
-    //    no-op'd), the gateway hits the same target as step 3
-    //    and the counter never ticks.
+    // 3. Dispatch to the finite stateful counter. It is installed
+    //    under the name `counter`, but uses the `crdt-counter`
+    //    fixture because the legacy `counter.start()` deliberately
+    //    yields forever and therefore has no HTTP response to send.
+    //    Reaching this distinct registered ServiceId also proves the
+    //    registry is not returning one garbage id for every name.
     for _ in 0..3 {
-        let (status, body) = http_request(daemon.port(), "POST", "/counter/start", None, &[]);
+        let (status, body) = http_request(daemon.port(), "POST", "/counter/inc", None, &[]);
         assert_eq!(
             status,
             200,
-            "POST /counter/start expected 200, got {status} body={:?}",
+            "POST /counter/inc expected 200, got {status} body={:?}",
             String::from_utf8_lossy(&body),
         );
     }
+    let (status, body) = http_request(daemon.port(), "GET", "/counter/get", None, &[]);
+    assert_eq!(
+        status,
+        200,
+        "GET /counter/get expected 200, got {status} body={:?}",
+        String::from_utf8_lossy(&body),
+    );
+    assert_eq!(
+        std::str::from_utf8(&body).expect("body utf-8").trim(),
+        "3",
+        "counter state should persist across requests",
+    );
 
     // 4. Math actor with JSON-encoded args — exercises the full
     //    typed-arg round trip. `parse_flat_json` encodes small
@@ -831,7 +845,7 @@ fn pvm_actors_via_gateway() {
     //      no token. Asserts both the surface (HELP/TYPE lines)
     //      and a counter actually moved across all the requests
     //      we issued above. `responses_total{status_class="2xx"}`
-    //      must be at least 4 (greeter + 3 counter + 3 math +
+    //      must be at least 4 (greeter + 4 counter + 3 math +
     //      GET + schema + openapi = many 2xx).
     let (status, body) = http_request(daemon.port(), "GET", "/__metrics", None, &[]);
     assert_eq!(status, 200, "GET /__metrics expected 200, got {status}");
@@ -868,15 +882,16 @@ fn pvm_actors_via_gateway() {
     //     pin an exact number — the readiness poll above can retry
     //     an unbounded number of times depending on install timing
     //     — just require it advanced by at least the dispatch
-    //     requests in steps 3–9 (greeter + 3 counter + 3 math + 1
-    //     GET + 404 + /__schema + /__schema/math + /__schema/missing
-    //     = 12). Step 10's `describe` invokes the registry via a
+    //     requests in steps 3–9 (greeter + 3 counter increments +
+    //     counter read + 3 math + 1 GET + 404 + /__schema +
+    //     /__schema/math + /__schema/missing = 13). Step 10's
+    //     `describe` invokes the registry via a
     //     fresh libp2p client, which doesn't go through the
     //     gateway's request counter, so it doesn't add here.
     let count1 = dispatch_request_count(&daemon);
     assert!(
-        count1 >= count0 + 12,
-        "expected counter to advance by ≥12, got {count0} → {count1}",
+        count1 >= count0 + 13,
+        "expected counter to advance by ≥13, got {count0} → {count1}",
     );
 
     // 10b. Sprint 5: concurrent /math/add stress. The sequential
