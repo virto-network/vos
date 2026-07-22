@@ -396,6 +396,17 @@ pub enum LocalRootTreeOpenErrorV2<E> {
     MissingInstalledProgram(ProgramId),
 }
 
+impl<E: core::fmt::Debug> core::fmt::Display for LocalRootTreeOpenErrorV2<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Store(error) => write!(f, "cannot open VOS v2 root tree: {error}"),
+            _ => write!(f, "cannot open VOS v2 root tree: {self:?}"),
+        }
+    }
+}
+
+impl<E: core::fmt::Debug> core::error::Error for LocalRootTreeOpenErrorV2<E> {}
+
 #[derive(Debug)]
 pub enum LocalRootTreeInvokeErrorV2 {
     ProofProducerRequired,

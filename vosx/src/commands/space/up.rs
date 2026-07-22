@@ -1720,7 +1720,7 @@ fn register_v2_root_from_row(
     }
 
     let service = vos::v2::LocalRootTreeServiceV2::open(config, backend)
-        .map_err(|error| anyhow::anyhow!("open v2 root tree '{instance_name}': {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("open v2 root tree '{instance_name}': {error}"))?;
     if service.consistency() == vos::v2::ConsistencyModeV2::Crdt {
         node.register_v2_crdt_root_at_id(
             instance_name,

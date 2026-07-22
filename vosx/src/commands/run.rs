@@ -99,7 +99,7 @@ fn run_v2(package_path: &Path, service_path: &Path, items: Vec<Vec<u8>>, gas: u6
         },
         MemoryCommittedImageStoreV2::default(),
     )
-    .unwrap_or_else(|error| die(&format!("opening local root-tree service: {error:?}")));
+    .unwrap_or_else(|error| die(&format!("opening local root-tree service: {error}")));
 
     for (ordinal, arguments) in items.into_iter().enumerate() {
         let method = method_from_payload(&arguments)

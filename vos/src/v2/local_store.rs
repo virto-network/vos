@@ -192,12 +192,32 @@ pub trait CommittedServiceImageHostV2 {
 #[derive(Debug)]
 pub enum DurableStoreOpenErrorV2<E> {
     Backend(E),
+    LegacyStore,
+    IncompatibleSnapshot { found_abi: u16 },
     InvalidSnapshot(DecodeError),
 }
 
 impl<E: core::fmt::Debug> core::fmt::Display for DurableStoreOpenErrorV2<E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "cannot open durable VOS v2 service state: {self:?}")
+        match self {
+            Self::Backend(error) => {
+                write!(f, "cannot read durable VOS v2 service state: {error:?}")
+            }
+            Self::LegacyStore => f.write_str(
+                "this is a legacy VOS store; runtime v2 cannot migrate it—export any needed data, \
+                 reset the store, and reinstall the signed .vos package",
+            ),
+            Self::IncompatibleSnapshot { found_abi } => write!(
+                f,
+                "durable service image uses unsupported VOS ABI {found_abi}; runtime v2 does not \
+                 migrate persisted images—reset the store and reinstall the signed .vos package",
+            ),
+            Self::InvalidSnapshot(error) => write!(
+                f,
+                "durable VOS v2 service image is corrupt or incompatible ({error}); restore a \
+                 known-good image, or reset the store and reinstall the signed .vos package",
+            ),
+        }
     }
 }
 
@@ -307,8 +327,23 @@ pub struct DurableJamStoreV2<B> {
 impl<B: CommittedImageStoreV2> DurableJamStoreV2<B> {
     pub fn open(mut backend: B) -> Result<Self, DurableStoreOpenErrorV2<B::Error>> {
         let local = match backend.load().map_err(DurableStoreOpenErrorV2::Backend)? {
-            Some(bytes) => LocalJamStoreV2::from_snapshot_bytes(&bytes)
-                .map_err(DurableStoreOpenErrorV2::InvalidSnapshot)?,
+            Some(bytes) => {
+                if bytes.get(..4) != Some(&LocalJamStoreSnapshotV2::MAGIC) {
+                    return Err(DurableStoreOpenErrorV2::LegacyStore);
+                }
+                let found_abi = bytes
+                    .get(4..6)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u16::from_le_bytes)
+                    .ok_or(DurableStoreOpenErrorV2::InvalidSnapshot(
+                        DecodeError::Truncated,
+                    ))?;
+                if found_abi != super::ABI_VERSION {
+                    return Err(DurableStoreOpenErrorV2::IncompatibleSnapshot { found_abi });
+                }
+                LocalJamStoreV2::from_snapshot_bytes(&bytes)
+                    .map_err(DurableStoreOpenErrorV2::InvalidSnapshot)?
+            }
             None => LocalJamStoreV2::new(),
         };
         Ok(Self { local, backend })
@@ -1194,6 +1229,40 @@ mod tests {
             LocalJamStoreSnapshotV2::decode(&corrupt_program.encode()),
             Err(DecodeError::NonCanonical)
         );
+    }
+
+    #[test]
+    fn durable_open_reports_an_actionable_clean_break() {
+        let open_error = |image| match DurableJamStoreV2::open(TestImageStore {
+            image: Some(image),
+            ..TestImageStore::default()
+        }) {
+            Ok(_) => panic!("invalid durable image opened"),
+            Err(error) => error,
+        };
+
+        let legacy = open_error(b"legacy-state".to_vec());
+        assert!(matches!(legacy, DurableStoreOpenErrorV2::LegacyStore));
+        assert!(legacy.to_string().contains("reset the store"));
+        assert!(legacy.to_string().contains("reinstall"));
+
+        let mut incompatible = LocalJamStoreV2::new().snapshot_bytes();
+        incompatible[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let incompatible = open_error(incompatible);
+        assert!(matches!(
+            incompatible,
+            DurableStoreOpenErrorV2::IncompatibleSnapshot { found_abi: 1 }
+        ));
+        assert!(incompatible.to_string().contains("reset the store"));
+        assert!(incompatible.to_string().contains("reinstall"));
+
+        let corrupt = open_error(b"VSS2\x02\x00truncated".to_vec());
+        assert!(matches!(
+            corrupt,
+            DurableStoreOpenErrorV2::InvalidSnapshot(_)
+        ));
+        assert!(corrupt.to_string().contains("reset the store"));
+        assert!(corrupt.to_string().contains("reinstall"));
     }
 
     #[test]

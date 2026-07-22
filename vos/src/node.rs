@@ -93,7 +93,10 @@ pub enum V2RaftNodeRegistrationError<E> {
 #[cfg(all(feature = "storage", feature = "network"))]
 impl<E: core::fmt::Debug> core::fmt::Display for V2RaftNodeRegistrationError<E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "cannot register Raft VOS v2 root tree: {self:?}")
+        match self {
+            Self::Open(error) => write!(f, "cannot register Raft VOS v2 root tree: {error}"),
+            _ => write!(f, "cannot register Raft VOS v2 root tree: {self:?}"),
+        }
     }
 }
 
