@@ -2638,6 +2638,15 @@ fn apply<S: GuestAccumulateStoreV2>(
     {
         return Ok(rejected(AccumulationRejectionV2::WrongProgram));
     }
+    for imported in &work.imported_actors {
+        if !tree
+            .store_ref()
+            .program_available(imported.program)
+            .map_err(GuestAccumulateError::Storage)?
+        {
+            return Ok(rejected(AccumulationRejectionV2::WrongProgram));
+        }
+    }
     let Some(actor) =
         tree_get_wire::<_, ActorGenesisV2>(&tree, &StateKeyV2::ActorDescriptor(work.target))?
     else {
@@ -5992,6 +6001,33 @@ mod tests {
                 input: work.input_id(),
                 duplicate: true,
             }
+        );
+    }
+
+    #[test]
+    fn apply_requires_every_imported_actor_program_to_remain_available() {
+        let mut store = MemStore::default();
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let work = linear_work(initial, install.resulting_state_root.unwrap());
+        let transition = linear_transition(&work, b"after");
+        store.programs.remove(&program());
+
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work,
+                    transition,
+                    provided_blobs: Vec::new(),
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::WrongProgram)
+        );
+        assert_eq!(
+            store, before,
+            "missing canonical actor code must stage no service changes"
         );
     }
 
