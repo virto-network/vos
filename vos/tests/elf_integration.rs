@@ -7460,6 +7460,7 @@ fn clerk_ledger_two_bank_federation() {
     use vos::actors::client::ClientError;
     use vos::network::{Network, NetworkConfig, derive_node_prefix};
     use vos::node::{AgentConfig, Consistency, VosNode};
+    use vos::IntraCap;
 
     // ── Load ELFs ───────────────────────────────────────────────
     let registry_path = format!(
@@ -7612,6 +7613,7 @@ fn clerk_ledger_two_bank_federation() {
     // gate (and is refused there) rather than bouncing as Unreachable.
     node_a.register_at_id(
         AgentConfig::new(ledger_blob.clone())
+            .with_name("clerk-a")
             .with_consistency(Consistency::Local)
             .network_reachable()
             .persist(&dir_a),
@@ -7643,6 +7645,7 @@ fn clerk_ledger_two_bank_federation() {
     );
     node_b.register_at_id(
         AgentConfig::new(ledger_blob)
+            .with_name("clerk-b")
             .with_consistency(Consistency::Local)
             .network_reachable()
             .persist(&dir_b),
@@ -7654,6 +7657,8 @@ fn clerk_ledger_two_bank_federation() {
     // banks submitting vouchers, so it opts out of confinement too.
     node_b.register_at_id(
         AgentConfig::new(clerk_bridge_blob)
+            .with_name("clerk-bridge-b")
+            .with_intra_caps(vec![IntraCap::parse("clerk-b:admin").unwrap()])
             .with_consistency(Consistency::Local)
             .network_reachable()
             .persist(&dir_b),
@@ -9737,7 +9742,7 @@ fn clerk_ledger_two_bank_federation() {
     );
     assert_eq!(
         vos::block_on(bridge_actor.anchor_reset(
-            &mut &node_b,
+            &mut local_admin(&node_b),
             b"bank-a".to_vec(),
             wedge_before,
         ))
@@ -9745,8 +9750,12 @@ fn clerk_ledger_two_bank_federation() {
         BridgeStatus::Ok,
     );
     assert_eq!(
-        vos::block_on(bridge_actor.anchor_reset(&mut &node_b, b"bank-z".to_vec(), wedge_before))
-            .expect("invoke anchor_reset unknown"),
+        vos::block_on(bridge_actor.anchor_reset(
+            &mut local_admin(&node_b),
+            b"bank-z".to_vec(),
+            wedge_before,
+        ))
+        .expect("invoke anchor_reset unknown"),
         BridgeStatus::UnknownPeer,
     );
     assert_eq!(
