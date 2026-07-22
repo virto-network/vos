@@ -542,6 +542,141 @@ fn age_gate_v2_elf() -> Option<Vec<u8>> {
     }
 }
 
+fn public_example_root_config(
+    binary: &str,
+    actor: ActorId,
+    consistency: ConsistencyModeV2,
+) -> Option<LocalRootTreeConfigV2> {
+    let Some(service_elf) = service_elf() else {
+        return None;
+    };
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../examples/actors/target/riscv64em-javm/release")
+        .join(format!("{binary}.elf"));
+    let actor_elf = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            eprintln!(
+                "skipping: build the public {binary} example with `just build-examples` ({})",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let service_pvm = vos::v2::transpile_service_elf(&service_elf).unwrap();
+    let service_program = ProgramId::of_pvm(&service_pvm);
+    let actor_pvm = grey_transpiler::link_elf(&actor_elf).unwrap();
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let schemas = vos::metadata::raw_section_from_elf(&actor_elf).expect("example metadata");
+    let metadata = vos::metadata::decode(&schemas).expect("valid example metadata");
+    let role_policies = PackageRolePoliciesV2::from_metadata(&metadata)
+        .unwrap()
+        .encode();
+    let public_key = format!("physical-public-example-{binary}").into_bytes();
+    let package = VosPackageV2 {
+        manifest: PackageManifestV2 {
+            name: metadata.actor_name.clone(),
+            version: "2.0.0".into(),
+            service_abi: vos::v2::ABI_VERSION,
+            snapshot_version: vos::v2::SNAPSHOT_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            service_program,
+            actor_program,
+            crdt: metadata.crdt,
+            external_actors: vec![],
+            interfaces_hash: artifact_hash(b"interfaces", &[]),
+            role_policies_hash: artifact_hash(b"role-policies", &role_policies),
+            schemas_hash: artifact_hash(b"schemas", &schemas),
+        },
+        actor_pvm,
+        generated_interfaces: vec![],
+        role_policies,
+        schemas,
+        diagnostics: None,
+        deployment_signature: vos::v2::DeploymentSignatureV2 {
+            producer: ProducerId::of_public_key(&public_key),
+            public_key,
+            signature: vec![1],
+        },
+    };
+    package.validate().unwrap();
+    assert_eq!(
+        package.manifest.crdt,
+        consistency == ConsistencyModeV2::Crdt
+    );
+    let deployment = package.deployment_id();
+    Some(LocalRootTreeConfigV2 {
+        service_pvm,
+        package,
+        service: ServiceIdentityV2 {
+            space: vos::v2::SpaceId([151; 32]),
+            root_service: RootServiceId(actor.0),
+            deployment,
+            service_program,
+            service_abi: vos::v2::ABI_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        },
+        root_actor: actor,
+        actor_name: metadata.actor_name,
+        consistency,
+        initial_state: vec![],
+        owned_actors: vec![],
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([152; 32]),
+            authenticator: vec![153],
+        },
+        refine_gas: 1_000_000_000,
+        accumulate_gas: 5_000_000_000,
+    })
+}
+
+fn invoke_public_example(
+    service: &mut LocalRootTreeServiceV2<FailableCommittedImages>,
+    actor: ActorId,
+    invocation: InvocationId,
+    logical_timeslot: u64,
+    method: &str,
+    message: Msg,
+) -> Value {
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&message.encode());
+    let committed = service
+        .invoke(LocalWorkRequestV2 {
+            invocation,
+            workflow_step: 0,
+            logical_timeslot,
+            target: actor,
+            method: method.into(),
+            arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        })
+        .expect("public example executes through physical Refine and Accumulate");
+    let reply = committed
+        .published
+        .reply
+        .as_ref()
+        .expect("public example returns a reply");
+    let value = if reply.result.is_empty() {
+        Value::Unit
+    } else {
+        Value::try_decode(&reply.result).expect("public example returns a canonical value")
+    };
+    if let Some(publication) = committed.publication.as_ref() {
+        service
+            .acknowledge_publication(publication)
+            .expect("public example publication acknowledgement commits");
+    }
+    value
+}
+
 fn actor_pvm(result: u64) -> Vec<u8> {
     let mut assembler = grey_transpiler::assembler::Assembler::new();
     assembler
@@ -713,6 +848,41 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
     assert_eq!(
         transition.reply.as_ref().map(|reply| reply.call_id),
         Some(work.invocation.root_reply_id())
+    );
+}
+
+#[test]
+fn public_counter_example_runs_end_to_end_through_the_generic_service() {
+    let actor = ActorId([154; 32]);
+    let Some(config) = public_example_root_config("v2_counter", actor, ConsistencyModeV2::Local)
+    else {
+        return;
+    };
+    let mut service = LocalRootTreeServiceV2::open(config, FailableCommittedImages::default())
+        .expect("public counter installs through physical Accumulate");
+
+    assert_eq!(
+        invoke_public_example(
+            &mut service,
+            actor,
+            InvocationId([155; 32]),
+            1,
+            "increment",
+            Msg::new("increment").with("by", 5u64),
+        ),
+        Value::U64(5)
+    );
+    assert_eq!(
+        invoke_public_example(
+            &mut service,
+            actor,
+            InvocationId([156; 32]),
+            2,
+            "value",
+            Msg::new("value"),
+        ),
+        Value::U64(5),
+        "ordinary Rust state persists between separately accumulated calls"
     );
 }
 
@@ -1798,6 +1968,141 @@ fn two_node_crdt_roots_exchange_guest_owned_causal_state() {
     node_b.shutdown();
     assert!(node_a.collect().into_iter().all(|result| result.is_ok()));
     assert!(node_b.collect().into_iter().all(|result| result.is_ok()));
+}
+
+#[test]
+fn public_shared_board_example_converges_through_guest_owned_crdt_sync() {
+    let actor = ActorId([157; 32]);
+    let Some(config) =
+        public_example_root_config("v2_shared_board", actor, ConsistencyModeV2::Crdt)
+    else {
+        return;
+    };
+    let mut left = LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
+        .expect("first public board replica installs through physical Accumulate");
+    let mut right = LocalRootTreeServiceV2::open(config, FailableCommittedImages::default())
+        .expect("second public board replica installs through physical Accumulate");
+
+    assert_eq!(
+        invoke_public_example(
+            &mut left,
+            actor,
+            InvocationId([158; 32]),
+            1,
+            "add_task",
+            Msg::new("add_task")
+                .with("id", 1u64)
+                .with("text", "write".to_string()),
+        ),
+        Value::Unit
+    );
+    assert_eq!(
+        invoke_public_example(
+            &mut left,
+            actor,
+            InvocationId([159; 32]),
+            2,
+            "insert_note",
+            Msg::new("insert_note")
+                .with("index", 0u32)
+                .with("text", "A".to_string()),
+        ),
+        Value::Unit
+    );
+    assert_eq!(
+        invoke_public_example(
+            &mut right,
+            actor,
+            InvocationId([160; 32]),
+            1,
+            "add_task",
+            Msg::new("add_task")
+                .with("id", 2u64)
+                .with("text", "review".to_string()),
+        ),
+        Value::Unit
+    );
+    assert_eq!(
+        invoke_public_example(
+            &mut right,
+            actor,
+            InvocationId([161; 32]),
+            2,
+            "insert_note",
+            Msg::new("insert_note")
+                .with("index", 0u32)
+                .with("text", "B".to_string()),
+        ),
+        Value::Unit
+    );
+
+    let left_branch = left
+        .crdt_sync_envelope()
+        .expect("left board exports its causal branch")
+        .expect("left board has causal state");
+    right
+        .sync_finalized_crdt(left_branch)
+        .expect("right board imports the left branch through physical Accumulate");
+    let merged = right
+        .crdt_sync_envelope()
+        .expect("right board exports both branches")
+        .expect("right board has merged causal state");
+    left.sync_finalized_crdt(merged)
+        .expect("left board imports the right branch through physical Accumulate");
+    assert_eq!(
+        left.crdt_sync_envelope().unwrap().unwrap().advertised_heads,
+        right
+            .crdt_sync_envelope()
+            .unwrap()
+            .unwrap()
+            .advertised_heads,
+        "both replicas retain the same concurrent frontier"
+    );
+
+    assert_eq!(
+        invoke_public_example(
+            &mut left,
+            actor,
+            InvocationId([162; 32]),
+            3,
+            "edit_count",
+            Msg::new("edit_count"),
+        ),
+        Value::I64(4),
+        "Map/List and Text edits from both branches contribute to Counter"
+    );
+    let left_read = left
+        .crdt_sync_envelope()
+        .expect("left board exports its read workflow")
+        .expect("left board retains causal state");
+    right
+        .sync_finalized_crdt(left_read)
+        .expect("right board imports the post-merge workflow");
+    assert_eq!(
+        invoke_public_example(
+            &mut right,
+            actor,
+            InvocationId([163; 32]),
+            4,
+            "edit_count",
+            Msg::new("edit_count"),
+        ),
+        Value::I64(4)
+    );
+    let right_read = right
+        .crdt_sync_envelope()
+        .expect("right board exports its read workflow")
+        .expect("right board retains causal state");
+    left.sync_finalized_crdt(right_read)
+        .expect("left board imports the final workflow");
+    assert_eq!(
+        left.crdt_sync_envelope().unwrap().unwrap().advertised_heads,
+        right
+            .crdt_sync_envelope()
+            .unwrap()
+            .unwrap()
+            .advertised_heads
+    );
 }
 
 #[test]
