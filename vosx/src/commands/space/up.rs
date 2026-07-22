@@ -55,6 +55,153 @@ fn load_pinned_v2_service(path: Option<&Path>) -> anyhow::Result<Option<PinnedV2
     }))
 }
 
+fn role_authority_package_version(program: vos::v2::ProgramId) -> String {
+    format!("v2-service-{}", hex::encode(program.0))
+}
+
+/// Construct the one canonical authority package for this service ABI. Only
+/// the already-canonical actor PVM is bundled; the space root signs the exact
+/// package once, and the registry replicates those bytes to every peer.
+fn root_signed_role_authority_package(
+    pinned: &PinnedV2Service,
+    root: &libp2p::identity::Keypair,
+) -> anyhow::Result<vos::v2::VosPackageV2> {
+    use vos::v2::{V2Wire, artifact_hash};
+
+    let actor_pvm = crate::bundled::space_authority_pvm()
+        .ok_or_else(|| anyhow::anyhow!("vosx was built without the canonical space-authority PVM"))?
+        .to_vec();
+    javm::program::parse_blob(&actor_pvm)
+        .ok_or_else(|| anyhow::anyhow!("bundled space-authority PVM is invalid"))?;
+    let (schemas, schemas_len) =
+        vos::metadata::encode::<16384>(&space_authority::SpaceAuthorityMsg::META);
+    let schemas = schemas[..schemas_len].to_vec();
+    let metadata = vos::metadata::decode(&schemas)
+        .ok_or_else(|| anyhow::anyhow!("canonical space-authority metadata is invalid"))?;
+    let role_policies = vos::v2::PackageRolePoliciesV2::from_metadata(&metadata)?.encode();
+    let public_key = root.public().encode_protobuf();
+    let mut package = vos::v2::VosPackageV2 {
+        manifest: vos::v2::PackageManifestV2 {
+            name: vos::v2::ROLE_AUTHORITY_INSTANCE_V2.into(),
+            version: role_authority_package_version(pinned.program),
+            service_abi: vos::v2::ABI_VERSION,
+            snapshot_version: vos::v2::SNAPSHOT_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            service_program: pinned.program,
+            actor_program: vos::v2::ProgramId::of_pvm(&actor_pvm),
+            crdt: false,
+            external_actors: vec![],
+            interfaces_hash: artifact_hash(b"interfaces", &[]),
+            role_policies_hash: artifact_hash(b"role-policies", &role_policies),
+            schemas_hash: artifact_hash(b"schemas", &schemas),
+        },
+        actor_pvm,
+        generated_interfaces: vec![],
+        role_policies,
+        schemas,
+        diagnostics: None,
+        deployment_signature: vos::v2::DeploymentSignatureV2 {
+            producer: vos::v2::ProducerId::of_public_key(&public_key),
+            public_key,
+            signature: vec![0],
+        },
+    };
+    package.deployment_signature.signature = root
+        .sign(&package.signing_message())
+        .map_err(|error| anyhow::anyhow!("sign canonical space-authority package: {error}"))?;
+    package.validate()?;
+    Ok(package)
+}
+
+/// On the creator/root node, publish and install the canonical authority as a
+/// Raft root before application roots are resolved. A joiner never authors a
+/// substitute package: it waits for the root-signed catalog rows to sync.
+fn ensure_v2_role_authority(
+    node: &VosNode,
+    space_id: [u8; 32],
+    pinned: &PinnedV2Service,
+) -> anyhow::Result<()> {
+    use crate::commands::space::common::{LocalOperatorInvoker, auto_replication_id};
+    use vos::v2::V2Wire;
+
+    let reg = RegistryRef::at(ServiceId::REGISTRY);
+    if vos::block_on(reg.agent(&mut &*node, vos::v2::ROLE_AUTHORITY_INSTANCE_V2.into()))
+        .map_err(|error| anyhow::anyhow!("query v2 role authority: {error}"))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let root_peer = vos::block_on(reg.root(&mut &*node))
+        .map_err(|error| anyhow::anyhow!("query space root for v2 authority: {error}"))?;
+    let operator_peer = node.operator_peer().map(<[u8]>::to_vec);
+    if root_peer.is_empty() || operator_peer.as_deref() != Some(root_peer.as_slice()) {
+        tracing::info!(
+            "v2 role authority is not installed locally; waiting for the space root's signed catalog rows"
+        );
+        return Ok(());
+    }
+    let root = crate::identity::load_or_create()?;
+    if libp2p::PeerId::from(root.public()).to_bytes() != root_peer {
+        anyhow::bail!("loaded operator key no longer matches the registry's immutable space root");
+    }
+    let package = root_signed_role_authority_package(pinned, &root)?;
+    let exact_package = package.encode();
+    let package_hash = blob_store::cache_put(&exact_package)
+        .map_err(|error| anyhow::anyhow!("cache canonical space-authority package: {error}"))?;
+    let program_name = package.manifest.name.clone();
+    let program_version = package.manifest.version.clone();
+    let existing =
+        vos::block_on(reg.program(&mut &*node, program_name.clone(), program_version.clone()))
+            .map_err(|error| anyhow::anyhow!("query canonical space-authority package: {error}"))?;
+    match existing {
+        Some(row) if row.hash == package_hash.0 => {}
+        Some(_) => anyhow::bail!(
+            "canonical authority tag {program_name}:{program_version} is pinned to different bytes"
+        ),
+        None => {
+            let mut operator = LocalOperatorInvoker::new(node);
+            let status = vos::block_on(reg.publish(
+                &mut operator,
+                program_name.clone(),
+                program_version.clone(),
+                package_hash.0.to_vec(),
+                Vec::new(),
+            ))
+            .map_err(|error| anyhow::anyhow!("publish canonical space-authority: {error}"))?;
+            if status != Status::Ok {
+                anyhow::bail!("publishing canonical space-authority returned status {status}");
+            }
+        }
+    }
+    let replication_id = auto_replication_id(
+        &space_id,
+        vos::v2::ROLE_AUTHORITY_INSTANCE_V2,
+        &package_hash.0,
+    );
+    let mut operator = LocalOperatorInvoker::new(node);
+    let status = vos::block_on(reg.install(
+        &mut operator,
+        vos::v2::ROLE_AUTHORITY_INSTANCE_V2.into(),
+        program_name,
+        program_version,
+        package_hash.0.to_vec(),
+        replication_id.to_vec(),
+        Consistency::Raft as u8,
+        false,
+        vos::registry::SyncFloor::Member,
+        Vec::new(),
+    ))
+    .map_err(|error| anyhow::anyhow!("install canonical space-authority: {error}"))?;
+    if !matches!(status, Status::Ok | Status::InstanceExists) {
+        anyhow::bail!("installing canonical space-authority returned status {status}");
+    }
+    tracing::info!(
+        deployment = %hex::encode(package.deployment_id().0),
+        "installed root-signed canonical v2 role authority"
+    );
+    Ok(())
+}
+
 pub fn run(args: Args) -> anyhow::Result<()> {
     // Trivalent positional (decision 1): an existing `.toml` recipe
     // (create-if-missing + genesis apply), a `vos1…` invite token
@@ -275,6 +422,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             &data_dir,
         )?;
         clear_pending_recipe(&entry.id)?;
+    }
+
+    if let Some(pinned) = pinned_v2_service.as_ref() {
+        ensure_v2_role_authority(&node, space_id, pinned)?;
     }
 
     // Node-local policy is now the single source of truth alongside the
@@ -1112,6 +1263,8 @@ fn spawn_installed_agents(
     let reg = RegistryRef::at(ServiceId::REGISTRY);
     let agents =
         vos::block_on(reg.agents(&mut &*node)).map_err(|e| anyhow::anyhow!("query agents: {e}"))?;
+    let root_peer_id = vos::block_on(reg.root(&mut &*node))
+        .map_err(|e| anyhow::anyhow!("query space root: {e}"))?;
 
     // Set of svc_ids the catalog knows about — used at the
     // end to sweep orphaned redbs into trash. We add to this
@@ -1139,8 +1292,12 @@ fn spawn_installed_agents(
     // requires membership are narrowed out on a non-member. The runtime
     // reconciler re-evaluates each pass, so a row spawns if a grant lands later.
     let is_member = node_is_member(node, &reg, local_prefix);
-    for a in &agents {
-        if !local_cfg.should_spawn(&a.instance_name) {
+    let mut spawn_rows = agents.iter().collect::<Vec<_>>();
+    spawn_rows.sort_by_key(|row| row.instance_name != vos::v2::ROLE_AUTHORITY_INSTANCE_V2);
+    for a in spawn_rows {
+        if a.instance_name != vos::v2::ROLE_AUTHORITY_INSTANCE_V2
+            && !local_cfg.should_spawn(&a.instance_name)
+        {
             tracing::debug!("skipping '{}' (not subscribed)", a.instance_name);
             continue;
         }
@@ -1188,6 +1345,7 @@ fn spawn_installed_agents(
             &agents,
             policies,
             pinned_v2_service,
+            &root_peer_id,
         )? {
             RowConfig::V2 {
                 config,
@@ -1399,6 +1557,130 @@ enum RowConfig {
     BadConsistency,
 }
 
+enum RoleAuthorityResolution {
+    Ready(vos::v2::RoleAuthorityBindingV2),
+    MissingBlob([u8; 32]),
+    MissingAgent,
+}
+
+fn package_requires_role_authority(package: &vos::v2::VosPackageV2) -> anyhow::Result<bool> {
+    use vos::v2::V2Wire;
+
+    let policies = vos::v2::PackageRolePoliciesV2::decode(&package.role_policies)
+        .map_err(|error| anyhow::anyhow!("decode generated role policies: {error}"))?;
+    Ok(policies.methods.iter().any(|method| !method.public))
+}
+
+fn validate_role_authority_deployment(
+    package: &vos::v2::VosPackageV2,
+    pinned: &PinnedV2Service,
+    root_peer_id: &[u8],
+    consistency: Consistency,
+) -> anyhow::Result<()> {
+    use vos::v2::V2Wire;
+
+    if consistency != Consistency::Raft {
+        anyhow::bail!(
+            "{} must use Raft consistency",
+            vos::v2::ROLE_AUTHORITY_INSTANCE_V2
+        );
+    }
+    let canonical_pvm = crate::bundled::space_authority_pvm().ok_or_else(|| {
+        anyhow::anyhow!("vosx was built without the canonical space-authority PVM")
+    })?;
+    if package.manifest.name != vos::v2::ROLE_AUTHORITY_INSTANCE_V2
+        || package.manifest.version != role_authority_package_version(pinned.program)
+        || package.actor_pvm != canonical_pvm
+    {
+        anyhow::bail!("installed space-authority is not the canonical platform deployment");
+    }
+    let deployment_key =
+        libp2p::identity::PublicKey::try_decode_protobuf(&package.deployment_signature.public_key)
+            .map_err(|error| anyhow::anyhow!("decode space-authority deployment key: {error}"))?;
+    if root_peer_id.is_empty() || libp2p::PeerId::from(deployment_key).to_bytes() != root_peer_id {
+        anyhow::bail!("space-authority package was not signed by the immutable space root");
+    }
+    let policies = vos::v2::PackageRolePoliciesV2::decode(&package.role_policies)
+        .map_err(|error| anyhow::anyhow!("decode space-authority policies: {error}"))?;
+    let mut methods = policies
+        .methods
+        .iter()
+        .map(|method| (method.method.as_str(), method.public, method.attested))
+        .collect::<Vec<_>>();
+    methods.sort_unstable();
+    if methods
+        != vec![
+            (vos::v2::ROLE_AUTHORITY_DECISION_METHOD_V2, true, false),
+            (vos::v2::ROLE_AUTHORITY_MUTATION_METHOD_V2, true, false),
+        ]
+    {
+        anyhow::bail!("space-authority package exposes a non-canonical method policy surface");
+    }
+    Ok(())
+}
+
+fn resolve_v2_role_authority(
+    space_id: [u8; 32],
+    installed_agents: &[vos::registry::AgentRow],
+    pinned: &PinnedV2Service,
+    root_peer_id: &[u8],
+) -> anyhow::Result<RoleAuthorityResolution> {
+    resolve_v2_role_authority_with(
+        space_id,
+        installed_agents,
+        pinned,
+        root_peer_id,
+        |program_hash| blob_store::cache_get(&BlobHash(program_hash)).map_err(Into::into),
+    )
+}
+
+fn resolve_v2_role_authority_with(
+    space_id: [u8; 32],
+    installed_agents: &[vos::registry::AgentRow],
+    pinned: &PinnedV2Service,
+    root_peer_id: &[u8],
+    mut load_package: impl FnMut([u8; 32]) -> anyhow::Result<Option<Vec<u8>>>,
+) -> anyhow::Result<RoleAuthorityResolution> {
+    let Some(row) = installed_agents
+        .iter()
+        .find(|row| row.instance_name == vos::v2::ROLE_AUTHORITY_INSTANCE_V2)
+    else {
+        return Ok(RoleAuthorityResolution::MissingAgent);
+    };
+    let Some(consistency) = consistency_from_u8(row.consistency) else {
+        anyhow::bail!(
+            "space-authority has unknown consistency {}",
+            row.consistency
+        );
+    };
+    let Some(exact_package) = load_package(row.program_hash)? else {
+        return Ok(RoleAuthorityResolution::MissingBlob(row.program_hash));
+    };
+    require_v2_catalog_artifact(&exact_package, vos::v2::ROLE_AUTHORITY_INSTANCE_V2)?;
+    let package =
+        validate_exact_v2_package(&exact_package, vos::v2::ROLE_AUTHORITY_INSTANCE_V2, pinned)?;
+    if package.manifest.name != row.program_name || package.manifest.version != row.program_version
+    {
+        anyhow::bail!("space-authority catalog row does not name its exact signed package");
+    }
+    validate_role_authority_deployment(&package, pinned, root_peer_id, consistency)?;
+    let space = vos::v2::SpaceId(space_id);
+    let root_service = v2_root_service_id(space, vos::v2::ROLE_AUTHORITY_INSTANCE_V2);
+    Ok(RoleAuthorityResolution::Ready(
+        vos::v2::RoleAuthorityBindingV2 {
+            service: vos::v2::ServiceIdentityV2 {
+                space,
+                root_service,
+                deployment: package.deployment_id(),
+                service_program: pinned.program,
+                service_abi: vos::v2::ABI_VERSION,
+                execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            },
+            actor: v2_root_actor_id(root_service, vos::v2::ROLE_AUTHORITY_INSTANCE_V2),
+        },
+    ))
+}
+
 /// Build the root-tree config for one registry row. Shared by the boot-time
 /// `spawn_installed_agents` scan and the runtime
 /// `reconcile_installed_agents` pass so both spawn identically.
@@ -1409,6 +1691,7 @@ fn agent_config_from_row(
     installed_agents: &[vos::registry::AgentRow],
     policies: &AgentPolicies,
     pinned_v2_service: Option<&PinnedV2Service>,
+    root_peer_id: &[u8],
 ) -> anyhow::Result<RowConfig> {
     let program_hash = BlobHash(a.program_hash);
     let artifact = match blob_store::cache_get(&program_hash)? {
@@ -1428,6 +1711,7 @@ fn agent_config_from_row(
         consistency,
         artifact,
         pinned_v2_service,
+        root_peer_id,
     )
 }
 
@@ -1452,6 +1736,7 @@ fn v2_config_from_row(
     consistency: Consistency,
     exact_package: Vec<u8>,
     pinned: Option<&PinnedV2Service>,
+    root_peer_id: &[u8],
 ) -> anyhow::Result<RowConfig> {
     let pinned = pinned.ok_or_else(|| {
         anyhow::anyhow!(
@@ -1461,6 +1746,13 @@ fn v2_config_from_row(
         )
     })?;
     let package = validate_exact_v2_package(&exact_package, &row.instance_name, pinned)?;
+    if package.manifest.name != row.program_name || package.manifest.version != row.program_version
+    {
+        anyhow::bail!(
+            "{} catalog row does not name its exact signed package",
+            row.instance_name
+        );
+    }
     validate_v2_consistency(&row.instance_name, &package, consistency)?;
     if policies.get(&row.instance_name).is_some_and(|policy| {
         policy.tick_ms.is_some() || !policy.intra_caps.is_empty() || policy.device_secret
@@ -1493,6 +1785,32 @@ fn v2_config_from_row(
     let root_service = v2_root_service_id(space, &row.instance_name);
     let root_actor = v2_root_actor_id(root_service, &row.instance_name);
     let deployment = package.deployment_id();
+    let is_role_authority = row.instance_name == vos::v2::ROLE_AUTHORITY_INSTANCE_V2;
+    let role_authority = if is_role_authority {
+        validate_role_authority_deployment(&package, pinned, root_peer_id, consistency)?;
+        None
+    } else if package_requires_role_authority(&package)? {
+        match resolve_v2_role_authority(space_id, installed_agents, pinned, root_peer_id)? {
+            RoleAuthorityResolution::Ready(binding) => Some(binding),
+            RoleAuthorityResolution::MissingBlob(program_hash) => {
+                return Ok(RowConfig::MissingBlob(program_hash));
+            }
+            RoleAuthorityResolution::MissingAgent => {
+                return Ok(RowConfig::Deferred(
+                    "canonical space-authority is not installed yet".into(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let initial_state = if is_role_authority {
+        space_authority::initial_state(space, root_peer_id.to_vec()).ok_or_else(|| {
+            anyhow::anyhow!("registry root is not a valid Ed25519 space-authority identity")
+        })?
+    } else {
+        vec![]
+    };
     let state_path = data_dir
         .join("v2-services")
         .join(format!("{}.image", hex::encode(root_service.0)));
@@ -1517,10 +1835,10 @@ fn v2_config_from_row(
                 Consistency::Raft => vos::v2::ConsistencyModeV2::Raft,
                 _ => unreachable!("v2 consistency was validated above"),
             },
-            initial_state: vec![],
+            initial_state,
             owned_actors: vec![],
             external_actors,
-            role_authority: None,
+            role_authority,
             install_authorization: vos::v2::AuthorizationEvidenceV2::SystemCapability {
                 capability: vos::v2::SystemCapabilityId(
                     vos::v2::Hash::digest(
@@ -2203,16 +2521,22 @@ fn reconcile_installed_agents(
     let reg = RegistryRef::at(ServiceId::REGISTRY);
     let agents =
         vos::block_on(reg.agents(&mut &*node)).map_err(|e| anyhow::anyhow!("query agents: {e}"))?;
+    let root_peer_id = vos::block_on(reg.root(&mut &*node))
+        .map_err(|e| anyhow::anyhow!("query space root: {e}"))?;
 
     // Whether this node is a space member, probed once for the whole pass; rows
     // whose sync floor requires membership are narrowed out below.
     let is_member = node_is_member(node, &reg, local_prefix);
     let mut spawned_this_pass = 0usize;
-    for a in &agents {
+    let mut spawn_rows = agents.iter().collect::<Vec<_>>();
+    spawn_rows.sort_by_key(|row| row.instance_name != vos::v2::ROLE_AUTHORITY_INSTANCE_V2);
+    for a in spawn_rows {
         if spawned_this_pass >= MAX_SPAWNS_PER_PASS {
             break;
         }
-        if !local_cfg.should_spawn(&a.instance_name) {
+        if a.instance_name != vos::v2::ROLE_AUTHORITY_INSTANCE_V2
+            && !local_cfg.should_spawn(&a.instance_name)
+        {
             continue;
         }
         let key = |note: RowNote| (a.instance_name.clone(), a.program_hash, note);
@@ -2300,6 +2624,7 @@ fn reconcile_installed_agents(
             &agents,
             policies,
             pinned_v2_service,
+            &root_peer_id,
         ) {
             Ok(RowConfig::V2 {
                 config,
@@ -2496,6 +2821,87 @@ mod tests {
     }
 
     #[test]
+    fn canonical_role_authority_is_root_signed_and_resolves_exactly() {
+        let mut assembler = grey_transpiler::assembler::Assembler::new();
+        assembler
+            .load_imm_64(grey_transpiler::assembler::Reg::A0, 0)
+            .ecalli(0);
+        let service_pvm = assembler.build();
+        let pinned = PinnedV2Service {
+            program: ProgramId::of_pvm(&service_pvm),
+            pvm: std::sync::Arc::new(service_pvm),
+        };
+        let root = Keypair::generate_ed25519();
+        let root_peer = libp2p::PeerId::from(root.public()).to_bytes();
+        let package = root_signed_role_authority_package(&pinned, &root).unwrap();
+        let repeated = root_signed_role_authority_package(&pinned, &root).unwrap();
+        assert_eq!(package.encode(), repeated.encode());
+        validate_role_authority_deployment(&package, &pinned, &root_peer, Consistency::Raft)
+            .unwrap();
+        assert!(
+            validate_role_authority_deployment(
+                &package,
+                &pinned,
+                &libp2p::PeerId::from(Keypair::generate_ed25519().public()).to_bytes(),
+                Consistency::Raft,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_role_authority_deployment(&package, &pinned, &root_peer, Consistency::Local,)
+                .is_err()
+        );
+
+        let exact_package = package.encode();
+        let program_hash = BlobHash::of(&exact_package).0;
+        let row = vos::registry::AgentRow {
+            instance_name: vos::v2::ROLE_AUTHORITY_INSTANCE_V2.into(),
+            program_hash,
+            program_name: package.manifest.name.clone(),
+            program_version: package.manifest.version.clone(),
+            replication_id: [91; 32],
+            consistency: Consistency::Raft as u8,
+            network_reachable: false,
+            sync_role: vos::registry::SyncFloor::Member,
+        };
+        let space_id = [92; 32];
+        let resolved = resolve_v2_role_authority_with(
+            space_id,
+            std::slice::from_ref(&row),
+            &pinned,
+            &root_peer,
+            |hash| Ok((hash == program_hash).then(|| exact_package.clone())),
+        )
+        .unwrap();
+        let RoleAuthorityResolution::Ready(binding) = resolved else {
+            panic!("root-signed authority did not resolve")
+        };
+        let space = vos::v2::SpaceId(space_id);
+        let root_service = v2_root_service_id(space, vos::v2::ROLE_AUTHORITY_INSTANCE_V2);
+        assert_eq!(binding.service.space, space);
+        assert_eq!(binding.service.root_service, root_service);
+        assert_eq!(binding.service.deployment, package.deployment_id());
+        assert_eq!(
+            binding.actor,
+            v2_root_actor_id(root_service, vos::v2::ROLE_AUTHORITY_INSTANCE_V2)
+        );
+    }
+
+    #[test]
+    fn only_generated_non_public_methods_require_the_role_authority() {
+        let mut assembler = grey_transpiler::assembler::Assembler::new();
+        assembler
+            .load_imm_64(grey_transpiler::assembler::Reg::A0, 0)
+            .ecalli(0);
+        let mut package = signed_v2_package(ProgramId::of_pvm(&assembler.build()), false);
+        assert!(!package_requires_role_authority(&package).unwrap());
+        let mut policies = PackageRolePoliciesV2::decode(&package.role_policies).unwrap();
+        policies.methods[0].public = false;
+        package.role_policies = policies.encode();
+        assert!(package_requires_role_authority(&package).unwrap());
+    }
+
+    #[test]
     fn legacy_catalog_rows_require_a_v2_rebuild_and_store_reset() {
         let error = require_v2_catalog_artifact(b"raw ELF fixture", "counter")
             .expect_err("raw artifacts must never enter the production runtime");
@@ -2539,6 +2945,7 @@ mod tests {
             Consistency::Raft,
             package.encode(),
             Some(&pinned),
+            &[],
         )
         .expect("a signed ordinary v2 package may select Raft");
         let RowConfig::V2 { config, .. } = resolved else {
@@ -2579,6 +2986,7 @@ mod tests {
             Consistency::Crdt,
             package.encode(),
             Some(&pinned),
+            &[],
         )
         .expect("a signed #[actor(crdt)] v2 package may select CRDT");
         let RowConfig::V2 { config, .. } = resolved else {

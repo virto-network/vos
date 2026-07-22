@@ -1,6 +1,4 @@
-//! Bundles the pre-built space-registry actor ELF into the vosx
-//! binary so `space new` / `space up <token>` work out of the box
-//! without `--registry`.
+//! Bundles pre-built platform actor artifacts into the vosx binary.
 //!
 //! Two source paths, tried in order:
 //!
@@ -37,9 +35,19 @@ fn main() {
         "`space new`/`space up <token>` will require --registry",
         "cd actors/space-registry && cargo actor",
     );
+    bundle_actor(
+        &manifest_dir,
+        &out_dir,
+        "space-authority",
+        "space_authority.pvm",
+        "bundled_space_authority.pvm",
+        "VOSX_BUNDLED_SPACE_AUTHORITY_PVM",
+        "v2 role-gated roots will remain pending",
+        "just refresh-bundled-authority",
+    );
 }
 
-/// Wire up one bundled actor ELF. Tries the working-tree dev path
+/// Wire up one bundled actor artifact. Tries the working-tree dev path
 /// first (live rebuilds win) and falls back to the shipped
 /// `blobs/<file>` (what `cargo package` ships from crates.io). If
 /// neither exists, writes an empty placeholder and prints a hint

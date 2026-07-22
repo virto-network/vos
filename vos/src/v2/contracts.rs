@@ -113,6 +113,9 @@ pub struct RoleAuthorityBindingV2 {
 
 pub const ROLE_AUTHORITY_MUTATION_METHOD_V2: &str = "mutate_role";
 pub const ROLE_AUTHORITY_DECISION_METHOD_V2: &str = "authorize_role";
+/// Reserved installed root name for the one canonical authority service in a
+/// space. Application manifests cannot choose a sibling authority by route.
+pub const ROLE_AUTHORITY_INSTANCE_V2: &str = "space-authority";
 
 /// Signed authority-state mutation. The canonical v2 wire bytes are the
 /// exact Ed25519 message verified by the authority actor, so a signature for

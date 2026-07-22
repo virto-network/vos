@@ -50,7 +50,7 @@ pub use contracts::{
     RoleAuthorityBindingV2, RoleAuthorityMutationV2, RoleAuthorizationClaimV2, ServiceGenesisV2,
     ServiceIdentityV2, ServiceInstallReceiptV2, SpaceRoleCredentialV2, TransitionV2,
     WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2, ROLE_AUTHORITY_DECISION_METHOD_V2,
-    ROLE_AUTHORITY_MUTATION_METHOD_V2,
+    ROLE_AUTHORITY_INSTANCE_V2, ROLE_AUTHORITY_MUTATION_METHOD_V2,
 };
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStoreV2, ProofVerificationV2, ReceiptVerificationV2,

@@ -6,20 +6,21 @@ categories = ["command-line-utilities", "network-programming", "wasm"]
 version = "0.1.0"
 edition = "2024"
 authors = ["Daniel Olano <daniel@olanod.com>"]
-# Ship the prebuilt space-registry blob inside the crate so
-# `cargo install vosx` from crates.io has the actor available
-# out of the box. The blob is regenerated from the local actor
-# tree by `just refresh-bundled-registry`.
+# Ship the prebuilt registry ELF and canonical authority PVM inside the crate
+# so `cargo install vosx` has its platform actors available out of the box.
+# Refresh them from the local actor tree with the corresponding just recipes.
 include = [
     "src/**/*",
     "tests/**/*",
     "build.rs",
     "Cargo.toml",
     "blobs/space_registry.elf",
+    "blobs/space_authority.pvm",
 ]
 
 [dependencies]
 vos = { path = "../vos", version = "0.1.0", features = ["std", "http", "storage", "network"] }
+space-authority = { path = "../actors/space-authority", version = "0.1.0", default-features = false }
 # `vosx zk pin` transpiles the provable ELF here and delegates the heavy
 # zkpvm measurement to the prover extension's `measure_catalog` handler, so
 # vosx pulls no zkpvm/stwo.
