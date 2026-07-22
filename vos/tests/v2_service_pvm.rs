@@ -64,12 +64,6 @@ struct AgeClaimFixture {
     adult: bool,
 }
 
-#[derive(vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize)]
-#[rkyv(crate = vos::rkyv)]
-struct PrivateAgeStateFixture {
-    age: u8,
-}
-
 enum IsAdultFixture {}
 
 impl AttestedMethod<AgeClaimFixture> for IsAdultFixture {
@@ -1002,7 +996,6 @@ fn public_private_age_and_gate_examples_produce_then_verify_one_committed_packag
         return;
     };
     producer_config.actor_name = "private-age".into();
-    producer_config.initial_state = PrivateAgeStateFixture { age: 21 }.encode();
     let source_binding = vos::v2::ExternalActorBindingV2 {
         name: "private-age".into(),
         service: producer_config.service.clone(),

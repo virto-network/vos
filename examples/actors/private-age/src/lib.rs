@@ -18,8 +18,9 @@ pub struct PrivateAge {
 
 #[messages]
 impl PrivateAge {
-    fn new(age: u8) -> Self {
-        Self { age }
+    /// Keep the standalone package runnable from an empty root installation.
+    fn new() -> Self {
+        Self { age: 21 }
     }
 
     /// An ordinary method may coexist with attested methods.
