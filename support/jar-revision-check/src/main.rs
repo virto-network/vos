@@ -64,7 +64,23 @@ fn collect_dependency_files(
 fn validate_manifest(path: &Path, source: &str, errors: &mut Vec<String>) {
     for (index, line) in source.lines().enumerate() {
         let line = line.trim();
-        if line.starts_with('#') || !line.contains("jar.git") {
+        if line.starts_with('#') {
+            continue;
+        }
+        let direct_consumer = is_direct_jar_consumer(line);
+        if direct_consumer
+            && !line.contains("workspace = true")
+            && (!line.contains("https://github.com/olanod/jar.git")
+                || dependency_revision(line) != Some(EXPECTED))
+        {
+            errors.push(format!(
+                "{}:{} has a JAR consumer outside the pinned workspace revision",
+                path.display(),
+                index + 1,
+            ));
+            continue;
+        }
+        if !line.contains("jar.git") {
             continue;
         }
         if dependency_revision(line) != Some(EXPECTED) {
@@ -101,6 +117,36 @@ fn validate_lock(path: &Path, source: &str, errors: &mut Vec<String>) {
             ));
         }
     }
+    for package in source.split("[[package]]").skip(1) {
+        let name = package.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("name = \"")
+                .and_then(|tail| tail.strip_suffix('"'))
+        });
+        if !matches!(name, Some("javm" | "grey-transpiler")) {
+            continue;
+        }
+        let source_line = package
+            .lines()
+            .find(|line| line.trim().starts_with("source = \""))
+            .map(str::trim);
+        let expected =
+            format!("source = \"git+https://github.com/olanod/jar.git?rev={EXPECTED}#{EXPECTED}\"");
+        if source_line != Some(expected.as_str()) {
+            errors.push(format!(
+                "{} resolves {} outside the pinned JAR commit",
+                path.display(),
+                name.expect("matched JAR package name"),
+            ));
+        }
+    }
+}
+
+fn is_direct_jar_consumer(line: &str) -> bool {
+    let key = line.split_once('=').map(|(key, _)| key.trim());
+    matches!(key, Some("javm" | "grey-transpiler"))
+        || line.contains("package = \"javm\"")
+        || line.contains("package = \"grey-transpiler\"")
 }
 
 fn dependency_revision(line: &str) -> Option<&str> {
@@ -141,6 +187,36 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_direct_consumer_from_crates_io_or_another_fork() {
+        for dependency in [
+            "javm = \"0.4\"",
+            "grey-transpiler = { path = \"../jar/grey/crates/grey-transpiler\" }",
+            &format!(
+                "vm = {{ package = \"javm\", git = \"https://example.com/jar.git\", rev = \"{EXPECTED}\" }}"
+            ),
+        ] {
+            let mut errors = Vec::new();
+            validate_manifest(Path::new("Cargo.toml"), dependency, &mut errors);
+            assert_eq!(
+                errors.len(),
+                1,
+                "dependency unexpectedly accepted: {dependency}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_workspace_inherited_consumers() {
+        let mut errors = Vec::new();
+        validate_manifest(
+            Path::new("nested/Cargo.toml"),
+            "javm = { workspace = true, optional = true }\ngrey-transpiler = { workspace = true }",
+            &mut errors,
+        );
+        assert!(errors.is_empty());
+    }
+
+    #[test]
     fn accepts_the_consensus_revision() {
         let mut errors = Vec::new();
         validate_manifest(
@@ -170,6 +246,17 @@ mod tests {
         validate_lock(
             Path::new("Cargo.lock"),
             &format!("source = \"git+https://github.com/olanod/jar.git?rev={EXPECTED}#deadbeef\""),
+            &mut errors,
+        );
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn rejects_a_lock_that_resolves_javm_from_another_source() {
+        let mut errors = Vec::new();
+        validate_lock(
+            Path::new("Cargo.lock"),
+            "[[package]]\nname = \"javm\"\nversion = \"0.4.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"",
             &mut errors,
         );
         assert_eq!(errors.len(), 1);
