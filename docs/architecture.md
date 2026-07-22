@@ -73,6 +73,14 @@ registry; a joiner syncs the catalog rather than booting its own manifest,
 and each agent reaches a member only if that member's role clears the
 agent's sync floor.
 
+The daemon retains the invite bearer until both authorization layers accept
+the same evidence: the registry records the delegated redemption, then the
+canonical `space-authority` actor commits the holder grant through physical
+Accumulate. Restricted v2 calls use an invocation-scoped authority reply and
+its finalized accumulation receipt; a daemon-local role lookup is not a
+credential. An unredeemed bearer can be revoked by passing the exact `vos1…`
+token to `space invite <space> revoke`.
+
 Role-scoped sync is access control, not secrecy: every replica that holds
 state can leak it, and revocation never claws back already-synced data.
 Agents needing real confidentiality use the messenger's answer — an

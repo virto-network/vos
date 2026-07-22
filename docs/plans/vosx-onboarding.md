@@ -168,7 +168,7 @@ files listed in each item before editing them.
 ```
 vosx space new <name> [--recipe recipe.toml]     # create; recipe applied once on first up
 vosx space up <name | vos1-token | recipe.toml>  # THE command. join/redeem/apply as needed
-vosx space invite <space> [--role member|developer] [--expires 7d] [--bootnode <addr>] [list|revoke <prefix>]
+vosx space invite <space> [--role member|developer] [--expires 7d] [--bootnode <addr>] [list|revoke <token-or-prefix>]
 vosx space apply <space> <recipe.toml> [--diff] [--upgrade] # explicit reconcile
 vosx space export <space>                        # registry → round-trippable recipe (unchanged)
 vosx space down|list|info|forget|members|role|subs|… (unchanged)
@@ -362,7 +362,8 @@ heads, blob-fetches and spawns a missing program end-to-end.
   cleanly (`export | apply --diff` shows all-skips — make that a test).
 - `members.rs`: list invites (token_pub prefix, role, expiry, redeemed_by
   count, revoked); warn inline on multi-redeemed tokens (decision 6). Add
-  `space invite revoke <token_pub-prefix>` wiring `revoke_invite`.
+  `space invite revoke <vos1-token-or-recorded-prefix>` wiring
+  `revoke_invite`, so an offline token can be revoked before it has a row.
 
 **Wave 3 gate**: `just test` green (fresh guest/extension artifacts); `--help` for every touched verb
 reads coherently (no references to join/--manifest); manual smoke: `new

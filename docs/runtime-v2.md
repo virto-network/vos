@@ -142,9 +142,12 @@ also requires the credential authenticator to contain an
 space, holder, role, destination service and actor, method, generated policy,
 and invocation. An assertion cannot be replayed for a later invocation;
 unavailable receipt finality rejects the complete ingress or transition without
-staging writes. The registry authority producer and production install cutover
-remain separate from this validation path; no daemon-local signature is treated
-as a finalized authority receipt.
+staging writes. Production space startup installs and pins the signed canonical
+`space-authority` actor as its own root service. Root-signed role mutations and
+delegated invite redemptions run through that actor and the generic service;
+the joiner clears its pending bearer only after the authority's physical
+Accumulate commit publishes `Bool(true)`. No daemon-local signature or legacy
+registry lookup is treated as a finalized authority receipt.
 
 If the actor is suspended, the record survives restart and is consumed
 atomically with its eventual first slice; retry timeslots do not replace the

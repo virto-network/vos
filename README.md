@@ -105,6 +105,12 @@ authoritative and joiners sync agents from it. `space export`
 re-derives a recipe from the live registry; `space apply`
 reconciles a recipe against a running space.
 
+To cancel an offline bearer before first redemption, run
+`vosx space invite a revoke "<paste-the-vos1-token>"`. After a token has
+appeared in `space invite a list`, `revoke` also accepts its displayed
+`token_pub` prefix. Invite revocation blocks later redemptions but does not
+remove a role already granted; use `space role a revoke <peer-id>` for that.
+
 ## Writing an actor
 
 ```rust
