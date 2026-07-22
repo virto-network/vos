@@ -64,6 +64,12 @@ struct AgeClaimFixture {
     adult: bool,
 }
 
+#[derive(vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize)]
+#[rkyv(crate = vos::rkyv)]
+struct PrivateAgeStateFixture {
+    age: u8,
+}
+
 enum IsAdultFixture {}
 
 impl AttestedMethod<AgeClaimFixture> for IsAdultFixture {
@@ -970,6 +976,250 @@ fn public_workflow_example_resumes_root_and_child_after_cross_root_accumulate() 
 
     shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     assert!(router.join().unwrap().into_iter().all(|result| result.is_ok()));
+}
+
+#[test]
+fn public_private_age_and_gate_examples_produce_then_verify_one_committed_package() {
+    let producer_actor = ActorId([168; 32]);
+    let gate_actor = ActorId([169; 32]);
+    let Some(mut producer_config) = public_example_root_config(
+        "private_age",
+        producer_actor,
+        ConsistencyModeV2::Local,
+        vec![],
+    ) else {
+        return;
+    };
+    producer_config.actor_name = "private-age".into();
+    producer_config.initial_state = PrivateAgeStateFixture { age: 21 }.encode();
+    let source_binding = vos::v2::ExternalActorBindingV2 {
+        name: "private-age".into(),
+        service: producer_config.service.clone(),
+        actor: producer_actor,
+        producer: producer_config.package.deployment_signature.producer,
+        actor_deployment: producer_config.package.deployment_id(),
+        program: producer_config.package.manifest.actor_program,
+    };
+    let mut producer_service =
+        LocalRootTreeServiceV2::open(producer_config, FailableCommittedImages::default())
+            .expect("public private-age producer installs through physical Accumulate");
+
+    assert_eq!(
+        invoke_public_example(
+            &mut producer_service,
+            producer_actor,
+            InvocationId([170; 32]),
+            1,
+            "configured",
+            Msg::new("configured"),
+        ),
+        Value::Bool(true),
+        "the ordinary method reads the exact installed producer state"
+    );
+    let policy = producer_service
+        .actor_method_policy(producer_actor, "is_adult")
+        .unwrap()
+        .expect("the signed package contains the attested role policy");
+    assert!(policy.attested);
+    assert!(!policy.public);
+    assert_eq!(
+        policy.policy,
+        space_role_policy_hash(vos::SpaceRole::Member.as_u8()).unwrap()
+    );
+
+    let mut attested_arguments = vec![vos::value::TAG_DYNAMIC];
+    attested_arguments.extend_from_slice(
+        &Msg::new("is_adult")
+            .with("minimum_age", 18u8)
+            .encode(),
+    );
+    let request = |invocation, origin, authorization, imported_blobs| LocalWorkRequestV2 {
+        invocation,
+        workflow_step: 0,
+        logical_timeslot: 2,
+        target: producer_actor,
+        method: "is_adult".into(),
+        arguments: attested_arguments.clone(),
+        origin,
+        authorization,
+        causal_parent: None,
+        parent_call: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs,
+        proof_requested: true,
+    };
+    let before_denied = producer_service.store().snapshot();
+    let denied_request = request(
+        InvocationId([171; 32]),
+        Origin::Anonymous,
+        AuthorizationEvidenceV2::Public,
+        vec![],
+    );
+    let denied = producer_service.admit_ingress_with_blobs(&denied_request, vec![]);
+    assert!(matches!(
+        &denied,
+        Err(vos::v2::LocalRootTreeInvokeErrorV2::Rejected(
+            vos::v2::AccumulationRejectionV2::Unauthorized,
+        ))
+    ), "unexpected private-role rejection: {denied:?}");
+    assert!(
+        producer_service
+            .store()
+            .snapshot()
+            .same_service_state(&before_denied),
+        "failed private authorization cannot commit producer state"
+    );
+
+    let member = Origin::Member(SubjectId([172; 32]));
+    let credential = SpaceRoleCredentialV2 {
+        holder: member,
+        role: vos::SpaceRole::Member,
+        authenticator: b"public-example-private-member-witness".to_vec(),
+    };
+    let (authorization, witness) = credential.private_evidence(policy.policy);
+    let attested_request = request(
+        InvocationId([173; 32]),
+        member,
+        authorization,
+        vec![witness.reference.clone()],
+    );
+    assert!(
+        !producer_service
+            .admit_ingress_with_blobs(&attested_request, vec![witness])
+            .expect("guest Accumulate durably admits the private witness")
+    );
+    let proof_bytes = b"public private-age canonical proof".to_vec();
+    let mut proof_producer = CanonicalTestProofProducer {
+        proof: proof_bytes.clone(),
+        calls: 0,
+    };
+    let committed = producer_service
+        .invoke_admitted_attested(attested_request.invocation, &mut proof_producer)
+        .expect("proof is produced before the private-age transition commits");
+    assert_eq!(proof_producer.calls, 1);
+    let publication = committed
+        .publication
+        .as_ref()
+        .expect("the committed attestation remains recoverably publishable");
+    let committed_package = producer_service
+        .committed_attestation_package(publication)
+        .expect("the portable package is reconstructed only from committed guest state");
+    let delivery = committed_package
+        .reply
+        .attestation
+        .as_ref()
+        .expect("the committed producer reply carries its proof statement");
+    assert_eq!(delivery.statement.actor_program, source_binding.program);
+    let claim = <IsAdultFixture as AttestedMethod<AgeClaimFixture>>::decode_claim_wire(
+        &committed_package.reply.reply.result,
+    )
+    .expect("the public producer returned its canonical AgeClaim wire");
+    assert_eq!(
+        claim,
+        AgeClaimFixture {
+            minimum_age: 18,
+            adult: true,
+        }
+    );
+    let application_package = Attestation::<AgeClaimFixture, IsAdultFixture>::__from_runtime(
+        delivery.producer_name.clone(),
+        delivery.producer,
+        delivery.statement.clone(),
+        delivery.proof.trace,
+        claim,
+        committed_package.proof_blob.bytes.clone(),
+    )
+    .expect("the committed producer output becomes the typed portable term");
+    let application_package_bytes = application_package.to_portable_bytes();
+
+    let Some(mut gate_config) = public_example_root_config(
+        "v2_age_gate",
+        gate_actor,
+        ConsistencyModeV2::Local,
+        vec!["private-age".into()],
+    ) else {
+        return;
+    };
+    gate_config.actor_name = "age-gate".into();
+    gate_config.external_actors.push(source_binding.clone());
+    let mut gate_service =
+        LocalRootTreeServiceV2::open(gate_config, FailableCommittedImages::default())
+            .expect("the separate public gate installs its signed producer binding");
+    assert_eq!(
+        gate_service
+            .store_mut()
+            .import_blob(committed_package.proof_blob.bytes.clone()),
+        committed_package.proof_blob.reference
+    );
+    gate_service
+        .store_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            receipt: committed_package.reply.receipt.clone(),
+        });
+    gate_service
+        .store_mut()
+        .allow_proof(&ProofVerificationRequestV2 {
+            actor_program: source_binding.program,
+            execution_semantics: source_binding.service.execution_semantics,
+            statement: delivery.statement.commitment(),
+            trace: delivery.proof.trace,
+            proof_blob: delivery.proof.proof_blob.clone(),
+        });
+    assert_eq!(
+        invoke_public_example(
+            &mut gate_service,
+            gate_actor,
+            InvocationId([174; 32]),
+            3,
+            "admit",
+            Msg::new("admit").with(
+                "package",
+                Value::Bytes(application_package_bytes.clone()),
+            ),
+        ),
+        Value::Bool(true),
+        "the verifier consumes the already-produced package without invoking its producer"
+    );
+    assert_eq!(
+        invoke_public_example(
+            &mut gate_service,
+            gate_actor,
+            InvocationId([175; 32]),
+            4,
+            "admitted",
+            Msg::new("admitted"),
+        ),
+        Value::U64(1)
+    );
+
+    let mut replay_arguments = vec![vos::value::TAG_DYNAMIC];
+    replay_arguments.extend_from_slice(
+        &Msg::new("admit")
+            .with("package", Value::Bytes(application_package_bytes))
+            .encode(),
+    );
+    assert!(matches!(
+        gate_service.invoke(LocalWorkRequestV2 {
+            invocation: InvocationId([176; 32]),
+            workflow_step: 0,
+            logical_timeslot: 5,
+            target: gate_actor,
+            method: "admit".into(),
+            arguments: replay_arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        }),
+        Err(vos::v2::LocalRootTreeInvokeErrorV2::Rejected(
+            vos::v2::AccumulationRejectionV2::AttestationReplay,
+        ))
+    ));
 }
 
 #[test]
