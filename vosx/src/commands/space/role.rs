@@ -2,13 +2,11 @@
 //!
 //! Two grant scopes:
 //!
-//! - **Space-level**: `<peer> -> <SpaceRole>`. Applied as a
-//!   fallback by every actor via its [`SPACE_ROLE_MAP`]. The
-//!   common case.
-//! - **Actor-local** (M8, `--in <actor>`): `<peer, agent_name>
-//!   -> <actor's Role byte>`. Overrides the space-level mapping
-//!   for that specific actor. Useful for "Bob is a regular
-//!   Member but I need him to maintain dev-project".
+//! - **Space-level**: `<peer> -> <SpaceRole>`. When the canonical v2
+//!   authority is installed, the immutable space root commits the same typed
+//!   subject, role, and epoch there after the legacy registry mutation.
+//! - **Actor-local** (`--in <actor>`): legacy v1 raw role bytes. V2 packages
+//!   express authorization through generated space-role policies instead.
 //!
 //! Layout:
 //!
@@ -33,7 +31,9 @@
 
 use clap::Subcommand;
 use serde::Serialize;
-use vos::registry::{AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, Status};
+use vos::registry::{
+    AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, Status,
+};
 
 use crate::commands::space::client::DaemonClient;
 use crate::output;
@@ -48,7 +48,7 @@ pub enum RoleCommand {
         #[arg(long = "in", value_name = "ACTOR")]
         agent: Option<String>,
     },
-    /// Grant a role to a peer. Overwrites any existing grant.
+    /// Grant a role to a peer. V2 space-level grants require the root identity.
     Grant {
         /// Multibase-encoded libp2p PeerId (`12D3KooW…`) or
         /// the literal `me` for the operator's
@@ -164,10 +164,7 @@ fn grant(space: &str, peer_arg: &str, role_str: &str, agent: Option<&str>) -> an
     let peer_id = resolve_peer(peer_arg)?;
     DaemonClient::with_connect(space, |client| match agent {
         Some(name) => {
-            // Actor-local: parse role as a raw byte the registry
-            // stores opaquely. Operator looks up the discriminant
-            // in the actor's Role enum (v1 doesn't surface a
-            // name table).
+            // Actor-local raw role bytes are retained only for v1 actors.
             let role: u8 = role_str
                 .parse()
                 .map_err(|_| anyhow::anyhow!("actor-local role must be a 0..255 byte"))?;

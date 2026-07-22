@@ -274,11 +274,9 @@ pub enum SpaceCommand {
         command: Option<members::MembersCommand>,
     },
     /// Manage auth-role grants. Subcommands: list, grant, revoke.
-    /// Bare `space role <space>` lists. Registry-mutation handlers
-    /// are gated behind `AUTH_ROLE_ADMIN`; this is the table the
-    /// dispatch-layer gate consults. The space creator is
-    /// auto-enrolled as admin by `space new` via a signed
-    /// `grant_role` baked into the genesis DAG.
+    /// Bare `space role <space>` lists. When v2 is active, space-level
+    /// mutations are also committed to the root-signed canonical authority;
+    /// actor-local raw-byte grants remain a legacy v1 surface.
     Role {
         space: String,
         #[command(subcommand)]

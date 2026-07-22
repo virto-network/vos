@@ -90,6 +90,34 @@ fn encode_v2_invocation(
     .encode()
 }
 
+fn role_grant_mutation(
+    space: vos::v2::SpaceId,
+    peer_id: &[u8],
+    role: u8,
+    epoch: u64,
+) -> anyhow::Result<vos::v2::RoleAuthorityMutationV2> {
+    let role = vos::SpaceRole::from_u8(role)
+        .ok_or_else(|| anyhow::anyhow!("role {role} is not a canonical v2 space role"))?;
+    Ok(vos::v2::RoleAuthorityMutationV2::Grant {
+        space,
+        holder: vos::v2::Origin::Member(vos::v2::SubjectId::of_authenticated_peer(peer_id)),
+        role,
+        epoch,
+    })
+}
+
+fn role_revoke_mutation(
+    space: vos::v2::SpaceId,
+    peer_id: &[u8],
+    epoch: u64,
+) -> vos::v2::RoleAuthorityMutationV2 {
+    vos::v2::RoleAuthorityMutationV2::Revoke {
+        space,
+        holder: vos::v2::Origin::Member(vos::v2::SubjectId::of_authenticated_peer(peer_id)),
+        epoch,
+    }
+}
+
 impl DaemonClient {
     /// Resolve `query` to a space, read its endpoint file, and
     /// dial the running daemon. Errors fast if no daemon is
@@ -634,6 +662,10 @@ impl DaemonClient {
     // ── Auth grants ────────────────────────────────────
 
     pub fn grant_role(&self, peer_id: Vec<u8>, role: u8) -> anyhow::Result<Status> {
+        let has_v2_authority = self.has_v2_role_authority()?;
+        if has_v2_authority {
+            self.require_v2_role_authority_root()?;
+        }
         // Read the peer's current freshness epoch and sign `epoch + 1`
         // so the grant strictly post-dates any prior revoke — a replayed
         // stale-epoch grant can never resurrect a revoked role.
@@ -643,25 +675,105 @@ impl DaemonClient {
             "grant_role",
             &[&peer_id, &[role], &epoch.to_le_bytes()],
         )?;
-        vos::block_on(
-            self.registry()
-                .grant_role(&mut &self.node, peer_id, role, epoch, auth),
-        )
-        .map_err(|e| anyhow::anyhow!("registry.grant_role(): {e}"))
+        let status = vos::block_on(self.registry().grant_role(
+            &mut &self.node,
+            peer_id.clone(),
+            role,
+            epoch,
+            auth,
+        ))
+        .map_err(|e| anyhow::anyhow!("registry.grant_role(): {e}"))?;
+        if status == Status::Ok && has_v2_authority {
+            let mutation = role_grant_mutation(self.v2_space_id()?, &peer_id, role, epoch)?;
+            self.commit_v2_role_mutation(&mutation).map_err(|error| {
+                anyhow::anyhow!(
+                    "registry grant committed at epoch {epoch}, but v2 authority did not: {error}; retry the same grant"
+                )
+            })?;
+        }
+        Ok(status)
     }
 
     pub fn revoke_role(&self, peer_id: Vec<u8>) -> anyhow::Result<Status> {
+        let has_v2_authority = self.has_v2_role_authority()?;
+        if has_v2_authority {
+            self.require_v2_role_authority_root()?;
+        }
         let epoch = self.peer_epoch(peer_id.clone())? + 1;
         let auth = op_auth(
             &self.signer,
             "revoke_role",
             &[&peer_id, &epoch.to_le_bytes()],
         )?;
-        vos::block_on(
-            self.registry()
-                .revoke_role(&mut &self.node, peer_id, epoch, auth),
-        )
-        .map_err(|e| anyhow::anyhow!("registry.revoke_role(): {e}"))
+        let status = vos::block_on(self.registry().revoke_role(
+            &mut &self.node,
+            peer_id.clone(),
+            epoch,
+            auth,
+        ))
+        .map_err(|e| anyhow::anyhow!("registry.revoke_role(): {e}"))?;
+        if status == Status::Ok && has_v2_authority {
+            let mutation = role_revoke_mutation(self.v2_space_id()?, &peer_id, epoch);
+            self.commit_v2_role_mutation(&mutation).map_err(|error| {
+                anyhow::anyhow!(
+                    "registry revoke committed at epoch {epoch}, but v2 authority did not: {error}; retry the same revoke"
+                )
+            })?;
+        }
+        Ok(status)
+    }
+
+    fn has_v2_role_authority(&self) -> anyhow::Result<bool> {
+        Ok(self.agent(vos::v2::ROLE_AUTHORITY_INSTANCE_V2)?.is_some())
+    }
+
+    fn require_v2_role_authority_root(&self) -> anyhow::Result<()> {
+        let root = vos::block_on(self.registry().root(&mut &self.node))
+            .map_err(|error| anyhow::anyhow!("registry.root(): {error}"))?;
+        let signer = libp2p::PeerId::from(self.signer.public()).to_bytes();
+        if root.is_empty() || signer != root {
+            anyhow::bail!(
+                "v2 role mutations must be signed by this space's immutable root identity"
+            );
+        }
+        Ok(())
+    }
+
+    fn v2_space_id(&self) -> anyhow::Result<vos::v2::SpaceId> {
+        self.entry
+            .id_bytes()
+            .map(vos::v2::SpaceId)
+            .ok_or_else(|| anyhow::anyhow!("space ID is not canonical hex"))
+    }
+
+    fn commit_v2_role_mutation(
+        &self,
+        mutation: &vos::v2::RoleAuthorityMutationV2,
+    ) -> anyhow::Result<()> {
+        use vos::v2::V2Wire;
+
+        let mutation_bytes = mutation.encode();
+        let signature = self
+            .signer
+            .sign(&mutation_bytes)
+            .map_err(|error| anyhow::anyhow!("sign v2 role mutation: {error}"))?;
+        if signature.len() != vos::registry::OP_SIG_LEN {
+            anyhow::bail!("v2 role authority requires an Ed25519 root identity");
+        }
+        let target = self.resolve_target(vos::v2::ROLE_AUTHORITY_INSTANCE_V2)?;
+        if !self.v2_targets.lock().unwrap().contains_key(&target.0) {
+            anyhow::bail!("canonical space-authority package is unavailable to the CLI");
+        }
+        let reply = self.invoke_dyn(
+            target,
+            &vos::value::Msg::new(vos::v2::ROLE_AUTHORITY_MUTATION_METHOD_V2)
+                .with("mutation", mutation_bytes)
+                .with("signature", signature),
+        )?;
+        if reply.as_bool() != Some(true) {
+            anyhow::bail!("space-authority rejected the signed mutation");
+        }
+        Ok(())
     }
 
     /// Current freshness epoch for `peer_id` — read before signing a
@@ -853,5 +965,35 @@ mod tests {
         let decoded = vos::v2::RootTreeInvocationV2::decode(&encoded).unwrap();
 
         assert!(!decoded.proof_requested);
+    }
+
+    #[test]
+    fn registry_peer_roles_map_to_exact_authority_mutations() {
+        let space = vos::v2::SpaceId([0x51; 32]);
+        let peer = b"authenticated peer";
+        let grant =
+            role_grant_mutation(space, peer, vos::registry::AUTH_ROLE_DEVELOPER, 7).unwrap();
+        assert_eq!(
+            grant,
+            vos::v2::RoleAuthorityMutationV2::Grant {
+                space,
+                holder: vos::v2::Origin::Member(vos::v2::SubjectId::of_authenticated_peer(peer)),
+                role: vos::SpaceRole::Developer,
+                epoch: 7,
+            }
+        );
+        assert_eq!(
+            vos::v2::RoleAuthorityMutationV2::decode(&grant.encode()).unwrap(),
+            grant
+        );
+        assert_eq!(
+            role_revoke_mutation(space, peer, 8),
+            vos::v2::RoleAuthorityMutationV2::Revoke {
+                space,
+                holder: vos::v2::Origin::Member(vos::v2::SubjectId::of_authenticated_peer(peer)),
+                epoch: 8,
+            }
+        );
+        assert!(role_grant_mutation(space, peer, 255, 9).is_err());
     }
 }
