@@ -1293,6 +1293,14 @@ type SharedNetwork = Arc<Mutex<Option<Arc<crate::network::Network>>>>;
 #[cfg(feature = "network")]
 struct NodeService {
     invoke_routes: InvokeRoutes,
+    /// Live network + Raft-host table used when an inbound invoke reaches a
+    /// follower. The follower actor deliberately drops its reply after
+    /// `NotLeader`; dispatch then retries the exact request against the
+    /// worker's current leader.
+    #[cfg(all(feature = "network", feature = "storage"))]
+    shared_network: SharedNetwork,
+    #[cfg(all(feature = "network", feature = "storage"))]
+    raft_hosts: RaftHosts,
     /// Clone of the node's [`AgentNames`] reverse map, read by
     /// [`Self::dispatch_invoke`] to resolve the target's instance name
     /// for the actor-local grant probe — so an operator-written
@@ -1340,6 +1348,56 @@ const SYNC_FLOOR_TTL: Duration = Duration::from_secs(30);
 
 #[cfg(feature = "network")]
 impl NodeService {
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn raft_replication_for_target(&self, to: u32, to_unscoped: u32) -> Option<[u8; 32]> {
+        let hosts = self.raft_hosts.lock().ok()?;
+        hosts.get(&to).or_else(|| hosts.get(&to_unscoped)).copied()
+    }
+
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn raft_forward_destination(
+        status: &crate::network::RaftStatusReply,
+        local_prefix: u16,
+        target: u32,
+    ) -> Option<(u16, u32)> {
+        if status.role == crate::network::RaftRole::Leader {
+            return None;
+        }
+        let leader = status.leader_hint?;
+        if leader == local_prefix {
+            return None;
+        }
+        Some((leader, ((leader as u32) << 16) | (target & 0xFFFF)))
+    }
+
+    /// Retry an inbound request against the known leader after the local Raft
+    /// follower drops its reply. The leader authenticates the forwarding
+    /// daemon's noise identity, matching every other cross-node Raft forward;
+    /// application authority must therefore live in explicit payload evidence
+    /// when the forwarding node itself has no role.
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn forward_inbound_to_raft_leader(
+        &self,
+        from: u32,
+        target: u32,
+        chain: Vec<u32>,
+        replication_id: [u8; 32],
+        msg: Vec<u8>,
+    ) -> Option<Vec<u8>> {
+        let network = self.shared_network.lock().ok()?.clone()?;
+        let status = network.local_raft_status(&replication_id)?;
+        let (leader, to) = Self::raft_forward_destination(&status, network.local_prefix(), target)?;
+        let peer = network.peer_for_prefix(leader)?;
+        debug!(
+            from,
+            target, leader, "inbound invoke: forwarding raft write to leader"
+        );
+        network
+            .send_invoke(peer, from, to, chain, msg)
+            .recv_timeout(RAFT_FORWARD_TIMEOUT)
+            .ok()
+    }
+
     /// Sprint 2 auth lookup. Send a synchronous `peer_role` invoke
     /// to the local space-registry and surface the result as the
     /// `AUTH_ROLE_*` byte the gate compares against. Returns
@@ -1909,6 +1967,10 @@ impl crate::network::NetworkService for NodeService {
         let Some(tx) = tx else {
             return Vec::new();
         };
+        #[cfg(all(feature = "network", feature = "storage"))]
+        let raft_forward = self
+            .raft_replication_for_target(to, to_unscoped)
+            .map(|replication_id| (replication_id, chain.clone(), msg.clone()));
         let (reply_tx, reply_rx) = mpsc::channel();
         // libp2p noise verified the PeerId at connect time; the
         // multihash bytes are what the registry's grant table
@@ -2012,8 +2074,8 @@ impl crate::network::NetworkService for NodeService {
         // (5 min) so slow handlers like the dev extension's
         // `compile` (cargo + rustc) don't get cut off here while
         // the wire layer is still patient.
-        match reply_rx.recv_timeout(Duration::from_secs(300)).ok() {
-            Some(env) => {
+        match reply_rx.recv_timeout(Duration::from_secs(300)) {
+            Ok(env) => {
                 if env.first().copied() == Some(crate::actors::run::STATUS_FORBIDDEN) {
                     let peer_label = caller_peer_id
                         .as_ref()
@@ -2028,7 +2090,18 @@ impl crate::network::NetworkService for NodeService {
                 }
                 unwrap_invoke_envelope(&env).unwrap_or_default()
             }
-            None => Vec::new(),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                #[cfg(all(feature = "network", feature = "storage"))]
+                if let Some((replication_id, chain, msg)) = raft_forward {
+                    if let Some(reply) =
+                        self.forward_inbound_to_raft_leader(_from, to, chain, replication_id, msg)
+                    {
+                        return reply;
+                    }
+                }
+                Vec::new()
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Vec::new(),
         }
     }
 
@@ -2913,6 +2986,10 @@ impl VosNode {
         // trait's empty-reply defaults.
         let service = Arc::new(NodeService {
             invoke_routes: self.invoke_routes.clone(),
+            #[cfg(all(feature = "network", feature = "storage"))]
+            shared_network: self.shared_network.clone(),
+            #[cfg(all(feature = "network", feature = "storage"))]
+            raft_hosts: self.raft_hosts.clone(),
             agent_names: self.agent_names.clone(),
             agent_shutdown: self.agent_shutdown.clone(),
             agent_info: self.agent_info.clone(),
@@ -6670,7 +6747,7 @@ pub(crate) const AUTH_ROLE_ADMIN: u8 = 3;
 /// Wire-byte for the lowest grant tier (read / Member). Mirrors
 /// `space_registry::AUTH_ROLE_READONLY`; the floor that authorizes a
 /// peer to be served a private replica's sync data.
-#[cfg(all(feature = "network", feature = "storage"))]
+#[cfg(feature = "network")]
 pub(crate) const AUTH_ROLE_READONLY: u8 = 1;
 
 /// `node_role` reply byte for an enrolled Raft VOTER: the registry's
@@ -8471,6 +8548,7 @@ fn agent_forward_to_raft_leader(
     }
 }
 
+#[cfg(all(feature = "network", feature = "storage"))]
 async fn forward_to_raft_leader(
     fwd: &RaftFwd,
     extension_id: ServiceId,
@@ -11757,6 +11835,10 @@ mod tests {
 
         let service = NodeService {
             invoke_routes: Arc::new(Mutex::new(routes)),
+            #[cfg(all(feature = "network", feature = "storage"))]
+            shared_network: Arc::new(Mutex::new(None)),
+            #[cfg(all(feature = "network", feature = "storage"))]
+            raft_hosts: Arc::new(Mutex::new(HashMap::new())),
             agent_names: Arc::new(std::sync::RwLock::new(names)),
             agent_shutdown: Arc::new(Mutex::new(HashMap::new())),
             agent_info: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -12255,6 +12337,10 @@ mod tests {
     ) -> NodeService {
         NodeService {
             invoke_routes: routes,
+            #[cfg(all(feature = "network", feature = "storage"))]
+            shared_network: Arc::new(Mutex::new(None)),
+            #[cfg(all(feature = "network", feature = "storage"))]
+            raft_hosts: Arc::new(Mutex::new(HashMap::new())),
             agent_names: Arc::new(std::sync::RwLock::new(HashMap::new())),
             agent_shutdown: shutdown,
             agent_info: info,
@@ -12270,6 +12356,68 @@ mod tests {
             #[cfg(feature = "storage")]
             sync_floor_cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    #[test]
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn inbound_raft_forwarding_requires_a_distinct_known_leader() {
+        use crate::network::{RaftRole, RaftStatusReply};
+
+        let service = lifecycle_service(
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
+        );
+        let replication_id = [0xA5; 32];
+        service
+            .raft_hosts
+            .lock()
+            .unwrap()
+            .insert(0x3456, replication_id);
+
+        let status = |role, leader_hint| RaftStatusReply {
+            present: true,
+            role,
+            current_term: 3,
+            commit_index: 4,
+            last_log_index: 4,
+            members: vec![0x10, 0x20],
+            leader_hint,
+        };
+        let target = ServiceId::new(0x10, 0x3456).0;
+        assert_eq!(
+            service.raft_replication_for_target(target, target & 0xFFFF),
+            Some(replication_id),
+            "a prefix-scoped inbound target must resolve its unscoped Raft host",
+        );
+        assert_eq!(
+            NodeService::raft_forward_destination(
+                &status(RaftRole::Follower, Some(0x20)),
+                0x10,
+                target,
+            ),
+            Some((0x20, ServiceId::new(0x20, 0x3456).0)),
+        );
+        assert_eq!(
+            NodeService::raft_forward_destination(
+                &status(RaftRole::Leader, Some(0x10)),
+                0x10,
+                target,
+            ),
+            None,
+        );
+        assert_eq!(
+            NodeService::raft_forward_destination(
+                &status(RaftRole::Follower, Some(0x10)),
+                0x10,
+                target,
+            ),
+            None,
+        );
+        assert_eq!(
+            NodeService::raft_forward_destination(&status(RaftRole::Follower, None), 0x10, target,),
+            None,
+        );
     }
 
     /// The node-level `__stop` / `__describe`
