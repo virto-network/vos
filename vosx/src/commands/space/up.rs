@@ -20,7 +20,7 @@ use crate::commands::space::common::{
     consistency_from_u8, derive_hyperspace_id, instance_service_id, registry_replication_id,
     v2_root_actor_id, v2_root_service_id,
 };
-use crate::commands::space::{payload_codec, reconcile, subscriptions};
+use crate::commands::space::{reconcile, subscriptions};
 use crate::spaces_index;
 
 const PENDING_INVITE_FILE: &str = ".pending-invite.token";
@@ -349,7 +349,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         // waiting for the next daemon restart. `local_cfg` (loaded
         // above) is captured once; editing local.toml still needs a
         // restart to take effect.
-        let has_hyperspace = hyperspace.is_some();
         // A pending invite is redeemed from the same tick: each pass,
         // until the bootnode grants this node's key, re-parse the token
         // and invoke the bootnode's `redeem_invite`; clear the marker on
@@ -425,7 +424,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 &data_dir,
                 space_id,
                 local_prefix,
-                has_hyperspace,
                 &local_cfg,
                 &mut damped,
                 &mut boot_grace,
@@ -1191,19 +1189,6 @@ fn spawn_installed_agents(
             policies,
             pinned_v2_service,
         )? {
-            RowConfig::Ready(cfg) => {
-                let mut cfg = *cfg;
-                if let Some(members) = raft_members {
-                    cfg.members = members;
-                }
-                let svc_id = instance_service_id(&a.instance_name, local_prefix);
-                let id = node.register_at_id(cfg, svc_id);
-                tracing::info!(
-                    "agent '{}' as {id} ({})",
-                    a.instance_name,
-                    crate::commands::space::common::consistency_name(a.consistency),
-                );
-            }
             RowConfig::V2 {
                 config,
                 state_path,
@@ -1396,10 +1381,8 @@ fn spawn_program_blob_fetch(node: &VosNode, hash: [u8; 32], in_flight: &InFlight
 /// half of that design.
 const CHRONOS_FEED_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Outcome of resolving one registry `AgentRow` into a spawnable
-/// [`AgentConfig`].
+/// Outcome of resolving one registry `AgentRow` into a spawnable v2 root tree.
 enum RowConfig {
-    Ready(Box<AgentConfig>),
     V2 {
         config: Box<vos::v2::LocalRootTreeConfigV2>,
         state_path: PathBuf,
@@ -1416,9 +1399,7 @@ enum RowConfig {
     BadConsistency,
 }
 
-/// Build the `AgentConfig` for one registry row — blob lookup,
-/// transpile, persistence/replication wiring, init args, and
-/// on_start payloads. Shared by the boot-time
+/// Build the root-tree config for one registry row. Shared by the boot-time
 /// `spawn_installed_agents` scan and the runtime
 /// `reconcile_installed_agents` pass so both spawn identically.
 fn agent_config_from_row(
@@ -1437,74 +1418,29 @@ fn agent_config_from_row(
     let Some(consistency) = consistency_from_u8(a.consistency) else {
         return Ok(RowConfig::BadConsistency);
     };
-    if artifact.get(..4) == Some(b"VOSP") {
-        return v2_config_from_row(
-            data_dir,
-            space_id,
-            a,
-            installed_agents,
-            policies,
-            consistency,
-            artifact,
-            pinned_v2_service,
+    require_v2_catalog_artifact(&artifact, &a.instance_name)?;
+    v2_config_from_row(
+        data_dir,
+        space_id,
+        a,
+        installed_agents,
+        policies,
+        consistency,
+        artifact,
+        pinned_v2_service,
+    )
+}
+
+fn require_v2_catalog_artifact(artifact: &[u8], instance_name: &str) -> anyhow::Result<()> {
+    if artifact.get(..4) != Some(b"VOSP") {
+        anyhow::bail!(
+            "agent '{instance_name}' references a legacy raw ELF/PVM catalog artifact; VOS v2 \
+             is a clean break. Rebuild it with `vosx build --service-pvm \
+             <vos-service.pvm>`, publish the resulting signed .vos package, then reset/reinstall \
+             this actor's persisted store"
         );
     }
-    let blob = actor_blob_from_catalog(artifact, &a.instance_name)?;
-
-    let needs_persistence = matches!(
-        consistency,
-        Consistency::Local | Consistency::Crdt | Consistency::Raft
-    );
-    let needs_replication = matches!(consistency, Consistency::Crdt | Consistency::Raft);
-    let mut cfg = AgentConfig::new(blob)
-        .with_name(a.instance_name.clone())
-        .with_consistency(consistency);
-    if needs_persistence {
-        cfg = cfg.persist(data_dir);
-    }
-    if needs_replication {
-        cfg = cfg.with_replication_id(a.replication_id);
-    }
-    // A node-confined (Local/Ephemeral) agent opts out of the device gate so
-    // remote peers can reach it — the network-served bridges. No-op for
-    // Crdt/Raft (never confined).
-    if a.network_reachable {
-        cfg = cfg.network_reachable();
-    }
-    if !a.install_args.is_empty() {
-        cfg = cfg.with_storage(vec![(
-            vos::lifecycle::INIT_KEY.to_vec(),
-            a.install_args.clone(),
-        )]);
-    }
-
-    // on_start payloads (from recipe reconciliation) get
-    // dispatched on cold start. Stored as rkyv-encoded
-    // `Vec<Vec<u8>>` on the agent row.
-    match payload_codec::decode(&a.install_payloads) {
-        Ok(payloads) if !payloads.is_empty() => {
-            cfg = cfg.with_init_payloads(payloads);
-        }
-        Ok(_) => {}
-        Err(e) => {
-            tracing::warn!(
-                "agent '{}' has unparseable install_payloads, ignoring: {e}",
-                a.instance_name,
-            );
-        }
-    }
-
-    // Node-local recipe policy (never replicated): periodic `tick` cadence
-    // and the bounded outbound-relay caps.
-    if let Some(policy) = policies.get(&a.instance_name) {
-        if let Some(ms) = policy.tick_ms {
-            cfg = cfg.with_tick_ms(ms);
-        }
-        if !policy.intra_caps.is_empty() {
-            cfg = cfg.with_intra_caps(policy.intra_caps.clone());
-        }
-    }
-    Ok(RowConfig::Ready(Box::new(cfg)))
+    Ok(())
 }
 
 fn v2_config_from_row(
@@ -1833,32 +1769,6 @@ fn verify_v2_package_signature(
         anyhow::bail!("{instance_name} deployment signature is invalid");
     }
     Ok(())
-}
-
-/// Recover executable bytes from one content-addressed catalog artifact.
-///
-/// Resolve only artifacts that the legacy one-service-per-actor host may run.
-///
-/// A signed v2 package is a root-tree deployment input, not an actor blob for
-/// [`VosNode`]. Extracting its canonical actor PVM here would execute it in the
-/// native `RefinePayload`/`EffectLog` runtime and silently discard its pinned
-/// generic-service, deployment, and guest-Accumulate semantics. Fail closed
-/// until this daemon path installs the complete package through
-/// `vos-service.pvm`.
-fn actor_blob_from_catalog(artifact: Vec<u8>, instance_name: &str) -> anyhow::Result<Vec<u8>> {
-    if artifact.get(..4) == Some(b"VOSP") {
-        anyhow::bail!(
-            "{instance_name} is a VOS v2 package and cannot run in the legacy actor runtime; \
-             install it through the root-tree vos-service.pvm host"
-        );
-    }
-    if artifact.get(..3) == Some(b"JAR") {
-        javm::program::parse_blob(&artifact)
-            .ok_or_else(|| anyhow::anyhow!("{instance_name} canonical PVM is invalid"))?;
-        return Ok(artifact);
-    }
-    grey_transpiler::link_elf(&artifact)
-        .map_err(|error| anyhow::anyhow!("transpile legacy {instance_name}: {error:?}"))
 }
 
 /// Per-voter wait for a `RaftStatusReq` answer. Probes run on the
@@ -2293,7 +2203,6 @@ fn reconcile_installed_agents(
     data_dir: &std::path::Path,
     space_id: [u8; 32],
     local_prefix: u16,
-    has_hyperspace: bool,
     local_cfg: &crate::commands::space::subscriptions::LocalConfig,
     damped: &mut RowDamping,
     boot_grace: &mut BootGrace,
@@ -2301,7 +2210,7 @@ fn reconcile_installed_agents(
     policies: &AgentPolicies,
     pinned_v2_service: Option<&PinnedV2Service>,
 ) -> anyhow::Result<()> {
-    use vos::registry::{RegistryRef, Status};
+    use vos::registry::RegistryRef;
 
     let reg = RegistryRef::at(ServiceId::REGISTRY);
     let agents =
@@ -2404,37 +2313,6 @@ fn reconcile_installed_agents(
             policies,
             pinned_v2_service,
         ) {
-            Ok(RowConfig::Ready(cfg)) => {
-                let mut cfg = *cfg;
-                if let Some(members) = raft_members {
-                    cfg.members = members;
-                }
-                let id = node.register_at_id(cfg, svc_id);
-                spawned_this_pass += 1;
-                tracing::info!(
-                    "agent '{}' spawned at runtime as {id} ({})",
-                    a.instance_name,
-                    crate::commands::space::common::consistency_name(a.consistency),
-                );
-                if has_hyperspace {
-                    let hs_reg = RegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
-                    match vos::block_on(hs_reg.register_remote(
-                        &mut &*node,
-                        a.instance_name.clone(),
-                        local_prefix as u32,
-                    )) {
-                        Ok(Status::Ok) => {}
-                        Ok(other) => tracing::warn!(
-                            "hyperspace: register_remote('{}') returned status {other}",
-                            a.instance_name,
-                        ),
-                        Err(e) => tracing::warn!(
-                            "hyperspace: register_remote('{}') failed: {e}",
-                            a.instance_name,
-                        ),
-                    }
-                }
-            }
             Ok(RowConfig::V2 {
                 config,
                 state_path,
@@ -2630,14 +2508,15 @@ mod tests {
     }
 
     #[test]
-    fn signed_v2_packages_never_fall_through_to_the_legacy_actor_runtime() {
-        let error = actor_blob_from_catalog(b"VOSP\x02\0package".to_vec(), "counter")
-            .expect_err("v2 package must retain guest-owned service semantics");
+    fn legacy_catalog_rows_require_a_v2_rebuild_and_store_reset() {
+        let error = require_v2_catalog_artifact(b"raw ELF fixture", "counter")
+            .expect_err("raw artifacts must never enter the production runtime");
         assert!(
             error
                 .to_string()
-                .contains("cannot run in the legacy actor runtime")
+                .contains("Rebuild it with `vosx build --service-pvm")
         );
+        assert!(error.to_string().contains("reset/reinstall"));
     }
 
     #[test]

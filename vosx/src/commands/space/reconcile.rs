@@ -7,7 +7,7 @@
 //! space) and by the genesis apply that runs on a space's first
 //! `space up`:
 //!
-//! - Each `path = "…"` signed `.vos` package (or explicitly legacy ELF) gets
+//! - Each `path = "…"` signed `.vos` v2 package gets
 //!   blob-cached and published under its immutable program tag.
 //! - Each agent gets `install()`'d if no instance with that
 //!   `name` is already registered.
@@ -121,7 +121,7 @@ pub struct ExtensionDef {
 #[derive(Deserialize, Debug, Default)]
 pub struct AgentDef {
     pub name: String,
-    /// Path to the signed actor `.vos` package (or an explicitly legacy ELF)
+    /// Path to the signed actor `.vos` v2 package
     /// relative to the recipe file's directory. A hand-written recipe carries
     /// this; a `space export` output does not and instead carries
     /// `program_hash`, so `apply` resolves the blob by hash. Empty when absent.
@@ -218,14 +218,7 @@ fn default_consistency() -> String {
 /// Reject host-owned v1 lifecycle hooks before a signed v2 package reaches
 /// the cache, catalog, or node-local configuration. V2 initialization and
 /// scheduling are ordinary durable actor inputs owned by the generic service.
-pub(crate) fn validate_v2_recipe_lifecycle(
-    agent: &AgentDef,
-    is_v2_package: bool,
-) -> anyhow::Result<()> {
-    if !is_v2_package {
-        return Ok(());
-    }
-
+pub(crate) fn validate_v2_recipe_lifecycle(agent: &AgentDef) -> anyhow::Result<()> {
     let mut legacy_fields = Vec::new();
     if !agent.init.is_empty() {
         legacy_fields.push("init");
@@ -734,9 +727,8 @@ fn reconcile_one(
             &program_version,
             source_hash,
             artifact_bytes,
-            crate::commands::space::publish::ArtifactPolicy::LegacyRecipe,
         )?;
-    validate_v2_recipe_lifecycle(agent, package_metadata.is_some())?;
+    validate_v2_recipe_lifecycle(agent)?;
     let cached = blob_store::cache_put(&artifact_bytes)
         .map_err(|e| anyhow::anyhow!("cache blob for '{}': {e}", agent.name))?;
     debug_assert_eq!(cached, hash);
@@ -1227,12 +1219,11 @@ mod tests {
         "#;
         let agent: AgentDef = toml::from_str(source).expect("agent parses");
 
-        let error = validate_v2_recipe_lifecycle(&agent, true).unwrap_err();
+        let error = validate_v2_recipe_lifecycle(&agent).unwrap_err();
         let message = error.to_string();
         for field in ["init", "on_start", "tick_ms", "intra_caps", "device_secret"] {
             assert!(message.contains(&format!("`{field}`")), "{message}");
         }
-        assert!(validate_v2_recipe_lifecycle(&agent, false).is_ok());
     }
 
     #[test]

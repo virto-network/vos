@@ -1,11 +1,11 @@
-//! rkyv codec for `AgentRow::install_payloads`.
+//! Clean-break guard for `AgentRow::install_payloads`.
 //!
 //! The registry stores a single `Vec<u8>` per agent for any
 //! one-shot messages we should dispatch on cold start (set by
 //! the recipe reconciler — `space apply` or genesis apply — from
-//! a recipe's `[[agent.on_start]]` table). On the wire the natural
-//! shape is `Vec<Vec<u8>>`, so we rkyv-encode that and unpack it on
-//! the daemon side.
+//! a recipe's `[[agent.on_start]]` table). V2 rejects non-empty host-owned
+//! lifecycle payloads; this helper now accepts only the empty registry field
+//! while the catalog row schema is cut over.
 //!
 //! Convention: empty input ⇔ empty bytes. The registry treats
 //! `install_payloads.is_empty()` as "no on-start dispatch".
@@ -15,26 +15,13 @@
 /// `Vec` when there are no payloads so the registry row stays
 /// compact.
 pub fn encode(payloads: &[Vec<u8>]) -> anyhow::Result<Vec<u8>> {
-    if payloads.is_empty() {
-        return Ok(Vec::new());
+    if !payloads.is_empty() {
+        anyhow::bail!(
+            "VOS v2 does not encode host-owned on_start payloads; invoke initialization as typed \
+             durable actor work"
+        );
     }
-    Ok(
-        vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&payloads.to_vec())
-            .map_err(|e| anyhow::anyhow!("rkyv encode install_payloads: {e}"))?
-            .to_vec(),
-    )
-}
-
-/// Decode the `install_payloads` field back into the inner
-/// list. Empty input → empty list. Validation goes through
-/// `vos::Decode::try_decode`, so structurally invalid bytes
-/// surface as an error rather than panicking the daemon.
-pub fn decode(bytes: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
-    if bytes.is_empty() {
-        return Ok(Vec::new());
-    }
-    <Vec<Vec<u8>> as vos::Decode>::try_decode(bytes)
-        .ok_or_else(|| anyhow::anyhow!("rkyv decode install_payloads: invalid bytes"))
+    Ok(Vec::new())
 }
 
 #[cfg(test)]
@@ -42,26 +29,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_round_trips_to_empty_bytes() {
+    fn empty_payloads_encode_as_empty_bytes() {
         let bytes = encode(&[]).unwrap();
         assert!(bytes.is_empty());
-        let back = decode(&bytes).unwrap();
-        assert!(back.is_empty());
     }
 
     #[test]
-    fn nonempty_round_trips() {
+    fn nonempty_payloads_are_rejected() {
         let payloads = vec![b"hello".to_vec(), b"world".to_vec(), Vec::new()];
-        let bytes = encode(&payloads).unwrap();
-        assert!(!bytes.is_empty());
-        let back = decode(&bytes).unwrap();
-        assert_eq!(back, payloads);
-    }
-
-    #[test]
-    fn corrupt_bytes_error_rather_than_panic() {
-        // Random non-rkyv bytes shouldn't deserialize.
-        let bogus = vec![0xFFu8; 32];
-        assert!(decode(&bogus).is_err());
+        assert!(encode(&payloads).is_err());
     }
 }

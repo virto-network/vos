@@ -5,9 +5,10 @@
 > scheduler, local cross-root delivery/resume, and guest-owned CRDT
 > synchronization described here are present in the v2 conformance runtime.
 > The production node now opens signed `.vos` rows through the same root-tree
-> services. Signed v2 package and one-shot execution surfaces reject raw
-> artifacts. Existing raw registry rows remain an isolated legacy startup path
-> during the production-node cutover; regression actors are test fixtures.
+> services. Package publication, recipe reconciliation, one-shot execution,
+> and production catalog-row startup reject raw artifacts. Existing raw registry
+> rows fail with an actionable rebuild/reset error; regression actors remain
+> test fixtures.
 
 VOS v2 assigns one logical JAM service to a root actor and its owned child
 tree. The protocol-pinned `vos-service.pvm` is one generic program with the
@@ -331,8 +332,8 @@ but their log payload is the canonical `AccumulateRequestV2`, not an
 `EffectLog`. V2 CRDT rows serve point-fetched guest-exported causal packets;
 the receiver assembles complete ancestry and submits it to physical
 `SyncCrdt` Accumulate on the owning root thread. Native sync never writes or
-materializes v2 actor state. Legacy ELF/PVM rows continue on the old host only
-during this staged cutover.
+materializes v2 actor state. Raw ELF/PVM catalog rows are never started by the
+production daemon.
 
 This is a clean storage and wire break. A v1 store or package must be reset and
 reinstalled; there is no v1 decoder or migration in a v2 service.

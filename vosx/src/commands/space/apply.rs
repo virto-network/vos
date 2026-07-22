@@ -7,7 +7,7 @@
 //! into `local.toml`:
 //!
 //! - **Replicated half** → the registry, over `DaemonClient`: each
-//!   `[[agent]]`'s signed `.vos` package (or explicitly legacy ELF) is
+//!   `[[agent]]`'s signed `.vos` v2 package is
 //!   blob-cached + published under its immutable
 //!   program tag (if missing) and installed (if no instance exists).
 //!   The bytes reach the daemon through the shared content-addressed
@@ -235,7 +235,7 @@ fn preflight_one(
     // 1. Resolve the blob hash + program identity from either a source
     //    `path` (a hand-written recipe) or `program_hash` (a `space
     //    export` output, which carries no path). Path-based also yields
-    //    artifact bytes — needed to publish and to encode legacy init args; the
+    //    artifact bytes — needed to validate and publish the exact package; the
     //    hash-based form resolves against the already-published catalog,
     //    which is what makes `export | apply --diff` all-skips.
     let (program_name, program_version, explicit_program) = program_ref(agent)?;
@@ -254,9 +254,8 @@ fn preflight_one(
             &program_version,
             source_hash,
             bytes,
-            super::publish::ArtifactPolicy::LegacyRecipe,
         )?;
-        reconcile::validate_v2_recipe_lifecycle(agent, package_metadata.is_some())?;
+        reconcile::validate_v2_recipe_lifecycle(agent)?;
         let metadata = package_metadata
             .or_else(|| vos::metadata::raw_section_from_elf(&bytes));
         (hash.0, Some(bytes), metadata)
@@ -368,8 +367,8 @@ fn preflight_one(
         })?,
         None => SyncFloor::Member,
     };
-    // Installing a new instance needs the exact artifact. Legacy ELF recipes
-    // use it to encode init args; v2 packages admit no host-side init payload.
+    // Installing a new instance needs the exact signed package. V2 packages
+    // admit no host-side init payload.
     // The path-less `program_hash` form only supports the already-installed
     // (skip) path — the round-trip case.
     let Some(install_artifact_bytes) = &artifact_bytes else {
