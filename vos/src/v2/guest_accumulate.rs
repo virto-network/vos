@@ -577,6 +577,7 @@ fn admit_ingress<S: GuestAccumulateStoreV2>(
     };
     if policy.attested != ingress.proof_requested
         || !authorized_input(
+            header.service.space,
             ingress.origin,
             &ingress.authorization,
             &ingress.imported_blobs,
@@ -605,6 +606,7 @@ fn admit_ingress<S: GuestAccumulateStoreV2>(
             return Ok(rejected(AccumulationRejectionV2::Unauthorized));
         };
         if !witness.matches(&bytes)
+            || credential.space != header.service.space
             || credential.holder != ingress.origin
             || credential.role < required_role
             || *credential_commitment != credential.commitment()
@@ -2672,7 +2674,7 @@ fn apply<S: GuestAccumulateStoreV2>(
     else {
         return Ok(rejected(AccumulationRejectionV2::Unauthorized));
     };
-    if !authorized(work, &policy) {
+    if !authorized(header.service.space, work, &policy) {
         return Ok(rejected(AccumulationRejectionV2::Unauthorized));
     }
     let proof_required = policy.attested || work.proof_requested;
@@ -3523,8 +3525,13 @@ fn canonical_transition_shape(
         })
 }
 
-fn authorized(work: &super::WorkEnvelopeV2, policy: &MethodPolicyV2) -> bool {
+fn authorized(
+    expected_space: super::SpaceId,
+    work: &super::WorkEnvelopeV2,
+    policy: &MethodPolicyV2,
+) -> bool {
     authorized_input(
+        expected_space,
         work.origin,
         &work.authorization,
         &work.imported_blobs,
@@ -3534,6 +3541,7 @@ fn authorized(work: &super::WorkEnvelopeV2, policy: &MethodPolicyV2) -> bool {
 }
 
 fn authorized_input(
+    expected_space: super::SpaceId,
     origin: super::Origin,
     authorization: &AuthorizationEvidenceV2,
     imported_blobs: &[BlobRefV2],
@@ -3550,6 +3558,7 @@ fn authorized_input(
             .ok()
             .is_some_and(|credential| {
                 !policy.public
+                    && credential.space == expected_space
                     && credential.holder == origin
                     && space_role_for_policy(policy.policy)
                         .is_some_and(|required| credential.role >= required)
@@ -6197,10 +6206,28 @@ mod tests {
         let origin = super::super::Origin::Member(super::super::SubjectId([40; 32]));
 
         let developer = SpaceRoleCredentialV2 {
+            space: identity().space,
             holder: origin,
             role: crate::SpaceRole::Developer,
             authenticator: b"developer grant".to_vec(),
         };
+        let mut sibling_space = developer.clone();
+        sibling_space.space = super::super::SpaceId([99; 32]);
+        let mut cross_space_work = linear_work(initial.clone(), base);
+        cross_space_work.origin = origin;
+        cross_space_work.authorization = sibling_space.disclosed_evidence(required_policy);
+        let cross_space = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            transition: linear_transition(&cross_space_work, b"cross-space"),
+            work: cross_space_work,
+            provided_blobs: vec![],
+        });
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &cross_space).unwrap(),
+            rejected(AccumulationRejectionV2::Unauthorized)
+        );
+        assert_eq!(store, before);
+
         let mut admitted_work = linear_work(initial.clone(), base);
         admitted_work.origin = origin;
         admitted_work.authorization = developer.disclosed_evidence(required_policy);
@@ -6219,6 +6246,7 @@ mod tests {
         ));
 
         let guest = SpaceRoleCredentialV2 {
+            space: identity().space,
             holder: origin,
             role: crate::SpaceRole::Guest,
             authenticator: b"guest grant".to_vec(),
@@ -6284,6 +6312,7 @@ mod tests {
         };
 
         let guest = SpaceRoleCredentialV2 {
+            space: identity().space,
             holder: origin,
             role: crate::SpaceRole::Guest,
             authenticator: b"guest grant".to_vec(),
@@ -6320,6 +6349,7 @@ mod tests {
         assert!(!store.blobs.contains_key(&guest_witness.reference.hash));
 
         let member = SpaceRoleCredentialV2 {
+            space: identity().space,
             holder: origin,
             role: crate::SpaceRole::Member,
             authenticator: b"member grant".to_vec(),

@@ -1077,6 +1077,7 @@ fn public_private_age_and_gate_examples_produce_then_verify_one_committed_packag
 
     let member = Origin::Member(SubjectId([172; 32]));
     let credential = SpaceRoleCredentialV2 {
+        space: producer_service.identity().space,
         holder: member,
         role: vos::SpaceRole::Member,
         authenticator: b"public-example-private-member-witness".to_vec(),
@@ -6150,6 +6151,13 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let private_origin = Origin::Member(SubjectId([111; 32]));
     let private_policy = space_role_policy_hash(vos::SpaceRole::Member.as_u8()).unwrap();
     let private_credential = SpaceRoleCredentialV2 {
+        space: service
+            .accumulate_host()
+            .header()
+            .unwrap()
+            .unwrap()
+            .service
+            .space,
         holder: private_origin,
         role: vos::SpaceRole::Member,
         authenticator: b"private member credential".to_vec(),

@@ -4660,8 +4660,12 @@ where
             send_v2_status(request.reply, crate::actors::run::STATUS_FORBIDDEN, id);
             continue;
         }
-        let Some(authorization) =
-            v2_work_authorization(&request, &policy, &actor_routes)
+        let Some(authorization) = v2_work_authorization(
+            service.identity().space,
+            &request,
+            &policy,
+            &actor_routes,
+        )
         else {
             send_v2_status(request.reply, crate::actors::run::STATUS_FORBIDDEN, id);
             continue;
@@ -5693,6 +5697,7 @@ struct V2WorkAuthorization {
 }
 
 fn v2_work_authorization(
+    space: crate::v2::SpaceId,
     request: &InvokeRequest,
     policy: &crate::v2::MethodPolicyV2,
     actor_routes: &RwLock<HashMap<crate::v2::ActorId, u32>>,
@@ -5726,12 +5731,13 @@ fn v2_work_authorization(
     let role = crate::SpaceRole::from_u8(request.space_role?)?;
     let mut authenticated = crate::v2::Hash::digest(
         b"vos/node-space-role-authenticator/v2",
-        &[&authenticator, &[role as u8], &policy.policy.0],
+        &[&space.0, &authenticator, &[role as u8], &policy.policy.0],
     )
     .0
     .to_vec();
     authenticated.extend_from_slice(&request.space_role?.to_le_bytes());
     let credential = crate::v2::SpaceRoleCredentialV2 {
+        space,
         holder: origin,
         role,
         authenticator: authenticated,
@@ -9214,8 +9220,14 @@ mod tests {
             reply: ReplyChannel::Sync(reply),
             chain: Vec::new(),
         };
-        let authorization =
-            v2_work_authorization(&request, &policy, &RwLock::new(HashMap::new())).unwrap();
+        let space = crate::v2::SpaceId([6; 32]);
+        let authorization = v2_work_authorization(
+            space,
+            &request,
+            &policy,
+            &RwLock::new(HashMap::new()),
+        )
+        .unwrap();
         let crate::v2::AuthorizationEvidenceV2::PrivateCredential {
             policy: supplied_policy,
             credential_commitment,
@@ -9232,6 +9244,7 @@ mod tests {
         let credential =
             crate::v2::SpaceRoleCredentialV2::decode(&authorization.provided_blobs[0].bytes)
                 .unwrap();
+        assert_eq!(credential.space, space);
         assert_eq!(credential.holder, authorization.origin);
         assert_eq!(credential.role, crate::SpaceRole::Member);
 
@@ -9247,6 +9260,7 @@ mod tests {
             chain: Vec::new(),
         };
         let ordinary = v2_work_authorization(
+            space,
             &ordinary_request,
             &ordinary_policy,
             &RwLock::new(HashMap::new()),

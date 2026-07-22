@@ -133,8 +133,10 @@ guest validates its typed origin, authorization, actor, signed method policy,
 and every supplied blob before atomically importing those bytes and storing the
 queue record. An attested role credential is carried as a private witness blob;
 the durable ingress and later attestation statement expose only its reference
-and commitment. Refine runs only from that stored input. If the actor is
-suspended, the record survives restart and is consumed atomically with its
+and commitment. The credential wire and commitment include the exact
+`SpaceId`; Refine and guest Accumulate reject evidence issued for a sibling
+space before exposing its role to actor code. Refine runs only from that stored
+input. If the actor is suspended, the record survives restart and is consumed atomically with its
 eventual first slice; retry timeslots do not replace the originally admitted
 scheduling timeslot. A reply-only publication is acknowledged only after the
 consumer channel accepts it. For locally routed roots, a committed outbox publication is

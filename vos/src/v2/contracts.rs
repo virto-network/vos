@@ -90,11 +90,13 @@ pub enum AuthorizationEvidenceV2 {
 /// Canonical authenticated space grant used as disclosed authorization input
 /// or as the private witness of an attested call.
 ///
-/// `authenticator` is issued and checked by the platform credential provider;
-/// the generic service additionally binds the exact bytes to `holder`, the
-/// work origin, and the generated role-threshold policy.
+/// `authenticator` is owned by the platform credential provider, which must
+/// issue and validate it. The generic service additionally binds the exact
+/// credential bytes to `space`, `holder`, the work origin, and the generated
+/// role-threshold policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpaceRoleCredentialV2 {
+    pub space: SpaceId,
     pub holder: Origin,
     pub role: crate::SpaceRole,
     pub authenticator: Vec<u8>,
@@ -2269,6 +2271,7 @@ impl V2Wire for SpaceRoleCredentialV2 {
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
+        encoder.fixed(&self.space.0);
         encode_origin(&mut encoder, self.holder);
         encoder.u8(self.role.as_u8());
         encoder.bytes(&self.authenticator);
@@ -2276,6 +2279,7 @@ impl V2Wire for SpaceRoleCredentialV2 {
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let value = Self {
+            space: SpaceId(decoder.fixed()?),
             holder: decode_origin(decoder)?,
             role: crate::SpaceRole::from_u8(decoder.u8()?).ok_or(DecodeError::NonCanonical)?,
             authenticator: decoder.bytes()?,
@@ -4430,6 +4434,24 @@ mod tests {
             imported_blobs: vec![],
             proof_requested: false,
         }
+    }
+
+    #[test]
+    fn role_credential_wire_and_commitment_bind_the_space() {
+        let credential = SpaceRoleCredentialV2 {
+            space: SpaceId([31; 32]),
+            holder: Origin::Member(SubjectId([32; 32])),
+            role: crate::SpaceRole::Member,
+            authenticator: b"registry credential".to_vec(),
+        };
+        assert_eq!(
+            SpaceRoleCredentialV2::decode(&credential.encode()).unwrap(),
+            credential
+        );
+
+        let mut sibling = credential.clone();
+        sibling.space = SpaceId([33; 32]);
+        assert_ne!(sibling.commitment(), credential.commitment());
     }
 
     #[test]

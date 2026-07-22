@@ -647,7 +647,12 @@ impl ServicePvmV2 {
             first_await_ordinal: 0,
             message: work.arguments.clone(),
             origin: work.origin,
-            space_role: authorization_space_role(work.origin, &work.authorization, imports)?,
+            space_role: authorization_space_role(
+                work.service.space,
+                work.origin,
+                &work.authorization,
+                imports,
+            )?,
         }
         .encode();
         let mut kernel = InvocationKernel::new_with_dormant_programs(
@@ -874,6 +879,7 @@ fn imported_blob_bytes<'a>(
 }
 
 fn authorization_space_role(
+    expected_space: super::SpaceId,
     origin: super::Origin,
     authorization: &AuthorizationEvidenceV2,
     imports: &RefineImportsV2,
@@ -900,7 +906,8 @@ fn authorization_space_role(
     let credential = SpaceRoleCredentialV2::decode(bytes)
         .map_err(|_| ServicePvmErrorV2::InvalidAuthorization)?;
     let required = space_role_for_policy(policy).ok_or(ServicePvmErrorV2::InvalidAuthorization)?;
-    if credential.holder != origin
+    if credential.space != expected_space
+        || credential.holder != origin
         || credential.role < required
         || commitment != Hash::digest(b"vos/credential-commitment/v2", &[bytes])
     {
@@ -1367,6 +1374,7 @@ mod tests {
     fn disclosed_and_private_role_credentials_feed_the_same_actor_role() {
         let origin = super::super::Origin::Member(super::super::SubjectId([41; 32]));
         let credential = SpaceRoleCredentialV2 {
+            space: super::super::SpaceId([40; 32]),
             holder: origin,
             role: crate::SpaceRole::Developer,
             authenticator: b"signed space grant".to_vec(),
@@ -1375,7 +1383,12 @@ mod tests {
             super::super::space_role_policy_hash(crate::SpaceRole::Member.as_u8()).unwrap();
         let disclosed = credential.disclosed_evidence(policy);
         assert_eq!(
-            authorization_space_role(origin, &disclosed, &RefineImportsV2::default()),
+            authorization_space_role(
+                credential.space,
+                origin,
+                &disclosed,
+                &RefineImportsV2::default(),
+            ),
             Ok(Some(crate::SpaceRole::Developer.as_u8()))
         );
 
@@ -1385,13 +1398,22 @@ mod tests {
             blobs: vec![witness],
         };
         assert_eq!(
-            authorization_space_role(origin, &private, &imports),
+            authorization_space_role(credential.space, origin, &private, &imports),
             Ok(Some(crate::SpaceRole::Developer.as_u8()))
         );
 
         let other = super::super::Origin::Member(super::super::SubjectId([42; 32]));
         assert_eq!(
-            authorization_space_role(other, &private, &imports),
+            authorization_space_role(credential.space, other, &private, &imports),
+            Err(ServicePvmErrorV2::InvalidAuthorization)
+        );
+        assert_eq!(
+            authorization_space_role(
+                super::super::SpaceId([43; 32]),
+                origin,
+                &private,
+                &imports,
+            ),
             Err(ServicePvmErrorV2::InvalidAuthorization)
         );
     }
