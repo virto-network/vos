@@ -4948,6 +4948,66 @@ fn root_service_recovers_nested_call_timeout_after_expiration_restart() {
 }
 
 #[test]
+fn physical_guest_install_rejects_an_unavailable_actor_program() {
+    let Some(elf) = service_elf() else {
+        return;
+    };
+    let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
+    let actor_program = ProgramId::of_pvm(b"canonical actor bytes not imported into the service");
+    let initial_bytes = b"initial actor state".to_vec();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let mut seed_work = work(actor_program, initial.clone());
+    seed_work.service.service_program = ProgramId::of_pvm(&pvm);
+    let mut host = DurableJamStoreV2::open(FailableCommittedImages::default()).unwrap();
+    assert_eq!(host.import_blob(initial_bytes), initial);
+    let mut service = JamServiceV2::new(
+        pvm.clone(),
+        ProgramId::of_pvm(&pvm),
+        NoRefineProtocolHostV2,
+        host,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let genesis = ServiceGenesisV2 {
+        service: seed_work.service,
+        consistency: ConsistencyModeV2::Local,
+        actors: vec![ActorGenesisV2 {
+            actor: seed_work.target,
+            name: "root".into(),
+            parent: None,
+            producer: ProducerId([31; 32]),
+            deployment: seed_work.target_deployment,
+            program: actor_program,
+            initial_state: initial,
+            crdt: false,
+            methods: vec![MethodPolicyV2 {
+                method: "start".into(),
+                schema: Hash([32; 32]),
+                policy: public_policy_hash(),
+                public: true,
+                attested: false,
+            }],
+        }],
+        external_actors: vec![],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([34; 32]),
+            authenticator: vec![35],
+        },
+    };
+    service.accumulate_host_mut().allow_install(&genesis);
+    assert_eq!(
+        service
+            .accumulate(&AccumulateRequestV2::Install(genesis))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::WrongProgram)
+    );
+    assert_eq!(service.accumulate_host().commit_sequence(), 0);
+    assert!(service.accumulate_host().header().unwrap().is_none());
+}
+
+#[test]
 fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let Some(elf) = service_elf() else {
         return;

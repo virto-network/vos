@@ -190,6 +190,12 @@ fn upgrade_actor<S: GuestAccumulateStoreV2>(
     {
         return Ok(rejected(AccumulationRejectionV2::Unauthorized));
     }
+    if !store
+        .program_available(upgrade.replacement_program)
+        .map_err(GuestAccumulateError::Storage)?
+    {
+        return Ok(rejected(AccumulationRejectionV2::WrongProgram));
+    }
     let upgrade_hash = upgrade.hash();
     let upgrade_key = actor_upgrade_storage_key(upgrade_hash);
     if let Some(bytes) = read(store, &upgrade_key)? {
@@ -769,6 +775,12 @@ fn install<S: GuestAccumulateStoreV2>(
         return Ok(rejected(AccumulationRejectionV2::Unauthorized));
     }
     for actor in &genesis.actors {
+        if !store
+            .program_available(actor.program)
+            .map_err(GuestAccumulateError::Storage)?
+        {
+            return Ok(rejected(AccumulationRejectionV2::WrongProgram));
+        }
         if !blob_available(store, &actor.initial_state)? {
             return Ok(rejected(AccumulationRejectionV2::MissingBlob(
                 actor.initial_state.hash,
@@ -4368,8 +4380,15 @@ mod tests {
         ActorId([4; 32])
     }
 
+    const FIXTURE_ACTOR_PVM: &[u8] = b"fixture actor pvm";
+    const FIXTURE_REPLACEMENT_PVM: &[u8] = b"fixture replacement actor pvm";
+
     fn program() -> ProgramId {
-        ProgramId([5; 32])
+        ProgramId::of_pvm(FIXTURE_ACTOR_PVM)
+    }
+
+    fn replacement_program() -> ProgramId {
+        ProgramId::of_pvm(FIXTURE_REPLACEMENT_PVM)
     }
 
     fn external_bindings() -> Vec<super::super::ExternalActorBindingV2> {
@@ -4400,6 +4419,11 @@ mod tests {
         initial: &[u8],
     ) -> (BlobRefV2, ServiceInstallReceiptV2) {
         let initial = store.provide_blob(initial).unwrap();
+        assert_eq!(store.provide_program(FIXTURE_ACTOR_PVM).unwrap(), program());
+        assert_eq!(
+            store.provide_program(FIXTURE_REPLACEMENT_PVM).unwrap(),
+            replacement_program()
+        );
         let request = AccumulateRequestV2::Install(ServiceGenesisV2 {
             service: identity(),
             consistency,
@@ -4434,6 +4458,56 @@ mod tests {
         (initial, receipt)
     }
 
+    #[test]
+    fn install_requires_every_owned_actor_program_to_be_available() {
+        let mut store = MemStore::default();
+        let initial = store.provide_blob(b"state").unwrap();
+        let missing_program = ProgramId([99; 32]);
+        let mut genesis = ServiceGenesisV2 {
+            service: identity(),
+            consistency: ConsistencyModeV2::Local,
+            actors: vec![ActorGenesisV2 {
+                actor: actor(),
+                name: "root".into(),
+                parent: None,
+                producer: super::super::ProducerId([4; 32]),
+                deployment: identity().deployment,
+                program: missing_program,
+                initial_state: initial,
+                crdt: false,
+                methods: vec![MethodPolicyV2 {
+                    method: "set".into(),
+                    schema: Hash([6; 32]),
+                    policy: public_policy_hash(),
+                    public: true,
+                    attested: false,
+                }],
+            }],
+            external_actors: Vec::new(),
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: super::super::SystemCapabilityId([8; 32]),
+                authenticator: vec![9],
+            },
+        };
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Install(genesis.clone()),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::WrongProgram)
+        );
+        assert_eq!(store, before, "missing code must not initialize the store");
+
+        let pvm = b"available actor pvm";
+        genesis.actors[0].program = store.provide_program(pvm).unwrap();
+        assert!(matches!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Install(genesis)).unwrap(),
+            AccumulationResultV2::Installed(_)
+        ));
+    }
+
     fn store_header(store: &MemStore) -> StoreHeaderV2 {
         StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap()
     }
@@ -4445,7 +4519,7 @@ mod tests {
             expected_deployment: identity().deployment,
             expected_program: program(),
             replacement_deployment: DeploymentId([14; 32]),
-            replacement_program: ProgramId([15; 32]),
+            replacement_program: replacement_program(),
             producer: super::super::ProducerId([16; 32]),
             methods: vec![MethodPolicyV2 {
                 method: "get".into(),
@@ -4653,6 +4727,11 @@ mod tests {
     #[test]
     fn actor_upgrade_waits_for_peer_continuations_that_pin_its_program() {
         let mut store = MemStore::default();
+        assert_eq!(store.provide_program(FIXTURE_ACTOR_PVM).unwrap(), program());
+        assert_eq!(
+            store.provide_program(FIXTURE_REPLACEMENT_PVM).unwrap(),
+            replacement_program()
+        );
         let root_state = store.provide_blob(b"root").unwrap();
         let child_state = store.provide_blob(b"child").unwrap();
         let child = ActorId([7; 32]);
@@ -4776,6 +4855,17 @@ mod tests {
         assert_eq!(store, before);
 
         store.upgrade_allowlist.insert(upgrade.hash());
+        let mut missing = upgrade.clone();
+        missing.replacement_program = ProgramId([99; 32]);
+        store.upgrade_allowlist.insert(missing.hash());
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::UpgradeActor(missing))
+                .unwrap(),
+            rejected(AccumulationRejectionV2::WrongProgram)
+        );
+        assert_eq!(store, before);
+
         let mut stale = upgrade.clone();
         stale.base = ConsistencyBaseV2::Linear {
             revision: 1,
@@ -5908,6 +5998,7 @@ mod tests {
     #[test]
     fn accumulate_rejects_a_partial_root_tree_import() {
         let mut store = MemStore::default();
+        assert_eq!(store.provide_program(FIXTURE_ACTOR_PVM).unwrap(), program());
         let initial = store.provide_blob(b"before").unwrap();
         let child = ActorId([7; 32]);
         let request = AccumulateRequestV2::Install(ServiceGenesisV2 {
@@ -6031,6 +6122,7 @@ mod tests {
     #[test]
     fn disclosed_space_role_credentials_satisfy_generated_thresholds() {
         let mut store = MemStore::default();
+        assert_eq!(store.provide_program(FIXTURE_ACTOR_PVM).unwrap(), program());
         let initial = store.provide_blob(b"before").unwrap();
         let required_policy =
             super::super::space_role_policy_hash(crate::SpaceRole::Member.as_u8()).unwrap();
@@ -6114,6 +6206,7 @@ mod tests {
     #[test]
     fn private_role_witness_is_validated_and_staged_with_ingress() {
         let mut store = MemStore::default();
+        assert_eq!(store.provide_program(FIXTURE_ACTOR_PVM).unwrap(), program());
         let initial = store.provide_blob(b"before").unwrap();
         let required_policy =
             super::super::space_role_policy_hash(crate::SpaceRole::Member.as_u8()).unwrap();
