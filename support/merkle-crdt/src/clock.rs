@@ -99,36 +99,19 @@ impl<H: Hasher> MerkleClock<H> {
         &mut self,
         store: &S,
     ) -> Result<(), Error<S::Error>> {
-        if self.roots.len() <= 1 {
-            return Ok(());
-        }
-
         let candidates = self.roots.clone();
         let mut subsumed = BTreeSet::new();
-        let mut visited = BTreeSet::new();
-        let mut stack: Vec<_> = candidates.iter().cloned().collect();
-        let target_count = candidates.len();
 
-        while let Some(cid) = stack.pop() {
-            if !visited.insert(cid.clone()) {
-                continue;
-            }
-            let node = store.get(&cid)?.ok_or(Error::MissingNode)?;
-            if node.cid() != cid {
-                return Err(Error::InvalidCid);
-            }
-            for child in &node.children {
-                if candidates.contains(child) && subsumed.insert(child.clone()) {
-                    // Early exit: found all but one
-                    if subsumed.len() >= target_count - 1 {
-                        self.roots = candidates.difference(&subsumed).cloned().collect();
-                        return Ok(());
-                    }
+        // Use the same checked post-order walk as materialization. Besides
+        // finding candidate roots reachable from another root, this refuses a
+        // cyclic or corrupt ancestry instead of hiding it behind a visited
+        // set and publishing a compacted frontier.
+        for root in &candidates {
+            self.walk::<P, S, _>(root, store, |cid, _| {
+                if cid != root && candidates.contains(cid) {
+                    subsumed.insert(cid.clone());
                 }
-                if !visited.contains(child) {
-                    stack.push(child.clone());
-                }
-            }
+            })?;
         }
 
         self.roots = candidates.difference(&subsumed).cloned().collect();
@@ -148,6 +131,7 @@ impl<H: Hasher> MerkleClock<H> {
         S: Store<H, P>,
         F: FnMut(&Cid<H>, &DagNode<H, P>),
     {
+        let mut visiting = BTreeSet::new();
         let mut visited = BTreeSet::new();
         // None = enter (fetch + push children), Some(node) = exit (visit)
         #[allow(clippy::type_complexity)]
@@ -155,11 +139,16 @@ impl<H: Hasher> MerkleClock<H> {
 
         while let Some((cid, cached)) = stack.pop() {
             if let Some(node) = cached {
+                visiting.remove(&cid);
+                visited.insert(cid.clone());
                 visitor(&cid, &node);
                 continue;
             }
-            if !visited.insert(cid.clone()) {
+            if visited.contains(&cid) {
                 continue;
+            }
+            if !visiting.insert(cid.clone()) {
+                return Err(Error::InvalidDag);
             }
             let node = store.get(&cid)?.ok_or(Error::MissingNode)?;
             if node.cid() != cid {
@@ -169,6 +158,9 @@ impl<H: Hasher> MerkleClock<H> {
             // every child exits before its parent.
             stack.push((cid, Some(node.clone())));
             for child in node.children.iter().rev() {
+                if visiting.contains(child) {
+                    return Err(Error::InvalidDag);
+                }
                 if !visited.contains(child) {
                     stack.push((child.clone(), None));
                 }
@@ -251,5 +243,35 @@ mod tests {
             .walk(&third, &store, |cid, _| order.push(cid.clone()))
             .unwrap();
         assert_eq!(order, vec![first, second, third]);
+    }
+
+    struct CollidingHasher;
+
+    impl crate::Hasher for CollidingHasher {
+        type Output = [u8; 32];
+
+        fn hash(_data: &[u8]) -> Self::Output {
+            [0; 32]
+        }
+    }
+
+    #[test]
+    fn causal_walk_and_compaction_reject_a_content_addressed_cycle() {
+        let root = Cid::<CollidingHasher>([0; 32]);
+        let node = DagNode::new(1u64, [root.clone()].into_iter().collect());
+        assert_eq!(node.cid(), root);
+        let mut store = MemStore::new();
+        store.put(root.clone(), node).unwrap();
+        let mut clock = MerkleClock::<CollidingHasher>::new();
+        clock.add_roots([root.clone()]);
+
+        assert!(matches!(
+            clock.walk(&root, &store, |_, _| {}),
+            Err(Error::InvalidDag)
+        ));
+        assert!(matches!(
+            clock.compact_roots::<u64, _>(&store),
+            Err(Error::InvalidDag)
+        ));
     }
 }
