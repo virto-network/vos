@@ -538,6 +538,77 @@ fn expired_token_not_redeemed_and_non_member_cannot_sync() {
     );
 }
 
+/// A minted token is an offline bearer and therefore has no registry row yet.
+/// Revoking by the exact token must pre-create the grow-only revocation row;
+/// a later join attempt cannot redeem or cross the Member sync floor.
+#[test]
+fn unredeemed_token_can_be_revoked_before_join() {
+    let space = "rev";
+    let (data_a, cfg_a, _da, log_a) = boot_admin(space);
+    let stdout = vosx_ok(
+        data_a.path(),
+        cfg_a.path(),
+        &["space", "invite", space, "--role", "member"],
+    );
+    let token = stdout.lines().next().unwrap().trim().to_string();
+
+    let revoked = vosx_ok(
+        data_a.path(),
+        cfg_a.path(),
+        &["space", "invite", space, "revoke", &token],
+    );
+    assert!(
+        revoked.contains("revoked invite"),
+        "the exact offline token should be accepted as a revoke selector: {revoked}",
+    );
+    let prefix = revoked
+        .split_whitespace()
+        .nth(2)
+        .expect("revoke output contains the token prefix")
+        .trim_end_matches('…');
+    let repeated = vosx_ok(
+        data_a.path(),
+        cfg_a.path(),
+        &["space", "invite", space, "revoke", prefix],
+    );
+    assert!(
+        repeated.contains("revoked invite"),
+        "recorded-prefix revocation remains idempotent: {repeated}",
+    );
+    let invites = vosx_ok(
+        data_a.path(),
+        cfg_a.path(),
+        &["space", "invite", space, "list"],
+    );
+    assert!(
+        invites.contains("revoked"),
+        "revocation must be durable before any redemption:\n{invites}",
+    );
+
+    let data_b = TempDir::new("rev-b-data");
+    let cfg_b = TempDir::new("rev-b-config");
+    let log_b = data_b.path().join("daemon-b.stderr");
+    let _db = Daemon(spawn_up(data_b.path(), cfg_b.path(), &token, &log_b));
+    wait_for_endpoint(data_b.path(), &log_b, "B");
+
+    // Give the redeem loop and registry anti-entropy multiple passes. The
+    // grow-only revoked row must win regardless of arrival order, leaving B
+    // without A's genesis Admin row.
+    thread::sleep(Duration::from_secs(8));
+    let roles = vosx_ok(
+        data_b.path(),
+        cfg_b.path(),
+        &["space", "role", space, "list"],
+    );
+    assert!(
+        !roles.contains("admin"),
+        "a revoked invite must not grant Member sync access; got role list:\n{roles}\n\
+         B log:\n{}\nA log:\n{}",
+        fs::read_to_string(&log_b).unwrap_or_default(),
+        fs::read_to_string(&log_a).unwrap_or_default(),
+    );
+}
+
 /// Partition honesty (decision 6): the same token redeemed at two
 /// distinct nodes yields two grants, and `space members` flags the
 /// double-redemption rather than pretending to have prevented it.

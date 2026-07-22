@@ -35,7 +35,7 @@ pub enum InviteCommand {
     /// already granted by a redemption — use `space role revoke` for
     /// that.
     Revoke {
-        /// Hex prefix of the invite's `token_pub`.
+        /// Exact `vos1…` token, or a hex `token_pub` prefix from `invite list`.
         prefix: String,
     },
 }
@@ -114,28 +114,43 @@ fn list(space: &str) -> anyhow::Result<()> {
     })
 }
 
-/// `space invite <space> revoke <prefix>` — resolve the `token_pub`
-/// prefix against the invites table and flip its `revoked` flag.
-fn revoke(space: &str, prefix: &str) -> anyhow::Result<()> {
-    let prefix = prefix.to_ascii_lowercase();
+/// `space invite <space> revoke <selector>` — extract `token_pub` directly
+/// from an unredeemed offline token, or resolve a recorded row by prefix, and
+/// flip its grow-only `revoked` flag.
+fn revoke(space: &str, selector: &str) -> anyhow::Result<()> {
     DaemonClient::with_connect(space, |client| {
-        let invites = client.invites()?;
-        let matches: Vec<_> = invites
-            .iter()
-            .filter(|i| hex::encode(i.token_pub).starts_with(&prefix))
-            .collect();
-        let token_pub = match matches.as_slice() {
-            [] => anyhow::bail!(
-                "no invite token matches prefix '{prefix}' in space '{}' \
-                 (list them with `vosx space invite {} list`)",
-                client.entry.name,
-                client.entry.name,
-            ),
-            [one] => one.token_pub.to_vec(),
-            many => anyhow::bail!(
-                "prefix '{prefix}' matches {} invites — use a longer prefix",
-                many.len(),
-            ),
+        let token_pub = if selector.starts_with(token::TOKEN_HRP) {
+            let payload = token::parse(selector)?;
+            let space_id = client
+                .entry
+                .id_bytes()
+                .ok_or_else(|| anyhow::anyhow!("space id in index is not 32 bytes of hex"))?;
+            if payload.space_id != space_id {
+                anyhow::bail!(
+                    "invite token belongs to a different space; refusing to revoke it in '{}'",
+                    client.entry.name,
+                );
+            }
+            payload.token_pub.to_vec()
+        } else {
+            let prefix = selector.to_ascii_lowercase();
+            let invites = client.invites()?;
+            let matches: Vec<_> = invites
+                .iter()
+                .filter(|invite| hex::encode(invite.token_pub).starts_with(&prefix))
+                .collect();
+            match matches.as_slice() {
+                [] => anyhow::bail!(
+                    "no invite token matches prefix '{prefix}' in space '{}' \
+                     (pass the exact vos1… token to revoke it before first redemption)",
+                    client.entry.name,
+                ),
+                [one] => one.token_pub.to_vec(),
+                many => anyhow::bail!(
+                    "prefix '{prefix}' matches {} invites — use a longer prefix",
+                    many.len(),
+                ),
+            }
         };
         match client.revoke_invite(token_pub.clone())? {
             Status::Ok => {
