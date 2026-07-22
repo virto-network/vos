@@ -7700,7 +7700,7 @@ fn clerk_ledger_two_bank_federation() {
 
     // CRDT converges via gossipsub. Wait until each side can resolve
     // the other's clerk name before proceeding.
-    wait_for(
+    let converged = wait_for(
         || {
             let from_a =
                 vos::block_on(hs_a.resolve(&mut &node_a, "clerk-b".into(), prefix_a as u64))
@@ -7715,8 +7715,34 @@ fn clerk_ledger_two_bank_federation() {
             }
         },
         Duration::from_secs(15),
-    )
-    .expect("hyperspace registry CRDT convergence");
+    );
+    if converged.is_none() {
+        let a_clerk_a = vos::block_on(hs_a.resolve(
+            &mut &node_a,
+            "clerk-a".into(),
+            prefix_a as u64,
+        ));
+        let a_clerk_b = vos::block_on(hs_a.resolve(
+            &mut &node_a,
+            "clerk-b".into(),
+            prefix_a as u64,
+        ));
+        let b_clerk_a = vos::block_on(hs_b.resolve(
+            &mut &node_b,
+            "clerk-a".into(),
+            prefix_b as u64,
+        ));
+        let b_clerk_b = vos::block_on(hs_b.resolve(
+            &mut &node_b,
+            "clerk-b".into(),
+            prefix_b as u64,
+        ));
+        panic!(
+            "hyperspace registry CRDT convergence: A=({a_clerk_a:?}, {a_clerk_b:?}) \
+             B=({b_clerk_a:?}, {b_clerk_b:?}) expected=({}, {})",
+            clerk_a_id.0, clerk_b_id.0,
+        );
+    }
 
     // ── 1) Federation discovery sanity ──────────────────────────
     //

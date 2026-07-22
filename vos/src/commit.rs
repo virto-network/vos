@@ -983,20 +983,6 @@ mod crdt {
             self.root_bytes()
         }
 
-        fn needs_sync_reload(&self) -> bool {
-            // After our own `write_atomic`, the in-memory clock is set to the
-            // freshly-committed roots, which is exactly what we persisted — so
-            // an equal root set means the sync signal is the echo of our own
-            // commit and there is nothing to fold in. A genuine remote merge
-            // (the sync ticker's `insert_node` + `compact_roots`, or a follower
-            // applying the leader's entries) advances the persisted roots past
-            // our clock, so the sets differ and we reload to converge. This is
-            // conservative: it never skips a real merge (any divergence reloads),
-            // it only drops the redundant self-commit restart.
-            let persisted = load_clock(&self.db).unwrap_or_else(MerkleClock::new);
-            self.clock.roots() != persisted.roots()
-        }
-
         fn replay_logs(&self) -> Result<Vec<EffectLog>, CommitError> {
             // BFS from roots, collect all reachable nodes, then
             // topological sort so predecessors come before
@@ -1622,6 +1608,50 @@ mod tests {
         assert!(err.is_err(), "tampered node must fail CID check");
 
         let _ = std::fs::remove_dir_all(path_a.parent().unwrap());
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn crdt_peer_merge_still_requires_reload_after_local_commit() {
+        use crate::effect_log::{CrdtEvent, EffectLog};
+        use merkle_crdt::DagNode;
+
+        let path_a = temp_db_path("crdt_reload_race_a");
+        let path_b = temp_db_path("crdt_reload_race_b");
+        let mut a = CrdtCommit::open(&path_a, [1u8; 32]).unwrap();
+        let mut b = CrdtCommit::open(&path_b, [2u8; 32]).unwrap();
+
+        a.commit_with_log(b"a-state", &EffectLog::for_msg(b"a".to_vec()))
+            .unwrap();
+        b.commit_with_log(b"b-state-1", &EffectLog::for_msg(b"b-1".to_vec()))
+            .unwrap();
+
+        // Model the sync ticker: insert A's complete branch through a second
+        // strategy sharing B's database, then persist the merged frontier.
+        let mut sync = CrdtCommit::from_db_arc(b.db_arc(), [2u8; 32]);
+        let mut frontier = a.root_bytes();
+        while let Some(cid) = frontier.pop() {
+            let bytes = a.get_node_bytes(&cid).unwrap().unwrap();
+            sync.insert_node(&cid, &bytes).unwrap();
+            let node: DagNode<Blake2b, CrdtEvent> = DagNode::from_bytes(&bytes).unwrap();
+            frontier.extend(node.children.into_iter().map(|child| child.0));
+        }
+        sync.compact_roots().unwrap();
+
+        // A queued local dispatch can win the race with the sync notification.
+        // Its commit refreshes B's clock from disk and makes the in-memory and
+        // persisted frontiers equal, but B's materialized guest state still has
+        // not replayed A's event. The notification must therefore never be
+        // suppressed merely because the frontiers now compare equal.
+        b.commit_with_log(
+            b"b-state-2",
+            &EffectLog::for_msg(b"b-2-after-peer-merge".to_vec()),
+        )
+        .unwrap();
+        assert!(b.needs_sync_reload());
+
+        let _ = std::fs::remove_dir_all(path_a.parent().unwrap());
+        let _ = std::fs::remove_dir_all(path_b.parent().unwrap());
     }
 
     #[cfg(feature = "storage")]
