@@ -734,6 +734,7 @@ fn reconcile_one(
             &program_version,
             source_hash,
             artifact_bytes,
+            crate::commands::space::publish::ArtifactPolicy::LegacyRecipe,
         )?;
     validate_v2_recipe_lifecycle(agent, package_metadata.is_some())?;
     let cached = blob_store::cache_put(&artifact_bytes)

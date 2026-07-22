@@ -254,6 +254,7 @@ fn preflight_one(
             &program_version,
             source_hash,
             bytes,
+            super::publish::ArtifactPolicy::LegacyRecipe,
         )?;
         reconcile::validate_v2_recipe_lifecycle(agent, package_metadata.is_some())?;
         let metadata = package_metadata

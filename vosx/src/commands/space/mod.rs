@@ -180,8 +180,8 @@ pub enum SpaceCommand {
         #[arg(long)]
         upgrade: bool,
     },
-    /// Add a program (PVM blob) to the catalog with an
-    /// immutable `(name, version)` tag.
+    /// Add a signed `.vos` v2 package to the catalog with an immutable
+    /// `(name, version)` tag.
     ///
     /// Pass `--bundled <name>` to publish a program baked into this
     /// `vosx` binary (currently `dev-project`) under its fixed catalog
@@ -194,7 +194,7 @@ pub enum SpaceCommand {
         /// `name` or `name:version`. Bare `name` ⇒ `name:latest`.
         /// Omit when using `--bundled`.
         program_ref: Option<String>,
-        /// Blob source: file path, hash, ipfs:<cid>, or URL.
+        /// Signed `.vos` source: file path, hash, ipfs:<cid>, or URL.
         /// Omit when using `--bundled`.
         source: Option<String>,
         /// Publish a program bundled into `vosx` (e.g. `dev-project`)

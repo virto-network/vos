@@ -38,6 +38,12 @@ pub struct Args {
     pub bundled: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ArtifactPolicy {
+    SignedV2Only,
+    LegacyRecipe,
+}
+
 pub fn run(args: Args) -> anyhow::Result<()> {
     if let Some(name) = args.bundled.as_deref() {
         return run_bundled(&args.space, name);
@@ -55,8 +61,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let source = BlobSource::parse(&source);
     let (source_hash, bytes) =
         blob_store::resolve(&source).map_err(|e| anyhow::anyhow!("blob: {e}"))?;
-    let (hash, catalog_bytes, package_meta) =
-        canonical_program(&name, &version, source_hash, bytes)?;
+    let (hash, catalog_bytes, package_meta) = canonical_program(
+        &name,
+        &version,
+        source_hash,
+        bytes,
+        ArtifactPolicy::SignedV2Only,
+    )?;
     if hash != source_hash {
         blob_store::cache_put(&catalog_bytes)
             .map_err(|e| anyhow::anyhow!("cache canonical program artifact: {e}"))?;
@@ -88,9 +99,16 @@ pub(crate) fn canonical_program(
     version: &str,
     source_hash: BlobHash,
     bytes: Vec<u8>,
+    policy: ArtifactPolicy,
 ) -> anyhow::Result<(BlobHash, Vec<u8>, Option<Vec<u8>>)> {
     if bytes.get(..4) != Some(b"VOSP") {
-        return Ok((source_hash, bytes, None));
+        return match policy {
+            ArtifactPolicy::SignedV2Only => anyhow::bail!(
+                "catalog publishing accepts only signed .vos v2 packages; build the actor with \
+                 `vosx build --service-pvm <vos-service.pvm>` first"
+            ),
+            ArtifactPolicy::LegacyRecipe => Ok((source_hash, bytes, None)),
+        };
     }
     let package = VosPackageV2::decode(&bytes)
         .map_err(|error| anyhow::anyhow!("decode .vos v2 package: {error}"))?;
@@ -311,7 +329,14 @@ mod tests {
         let bytes = package.encode();
         let source_hash = BlobHash::of(&bytes);
         let (catalog_hash, catalog_bytes, metadata) =
-            canonical_program("counter", "2.0.0", source_hash, bytes.clone()).unwrap();
+            canonical_program(
+                "counter",
+                "2.0.0",
+                source_hash,
+                bytes.clone(),
+                ArtifactPolicy::SignedV2Only,
+            )
+            .unwrap();
 
         assert_eq!(catalog_hash, source_hash);
         assert_eq!(catalog_bytes, bytes);
@@ -325,7 +350,14 @@ mod tests {
         package.deployment_signature.signature[0] ^= 0xff;
         let bytes = package.encode();
         let source_hash = BlobHash::of(&bytes);
-        let error = canonical_program("counter", "2.0.0", source_hash, bytes).unwrap_err();
+        let error = canonical_program(
+            "counter",
+            "2.0.0",
+            source_hash,
+            bytes,
+            ArtifactPolicy::SignedV2Only,
+        )
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -339,6 +371,35 @@ mod tests {
         assert_ne!(
             Hash(package.deployment_id().0),
             Hash(BlobHash::of(&package.encode()).0)
+        );
+    }
+
+    #[test]
+    fn direct_publish_rejects_raw_artifacts_but_legacy_recipes_remain_isolated() {
+        let bytes = b"raw ELF fixture".to_vec();
+        let source_hash = BlobHash::of(&bytes);
+        assert!(
+            canonical_program(
+                "counter",
+                "2.0.0",
+                source_hash,
+                bytes.clone(),
+                ArtifactPolicy::SignedV2Only,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("only signed .vos v2 packages")
+        );
+        assert_eq!(
+            canonical_program(
+                "counter",
+                "2.0.0",
+                source_hash,
+                bytes.clone(),
+                ArtifactPolicy::LegacyRecipe,
+            )
+            .unwrap(),
+            (source_hash, bytes, None)
         );
     }
 }
