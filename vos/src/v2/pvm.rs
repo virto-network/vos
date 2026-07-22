@@ -20,8 +20,9 @@ use super::{
     ACCUMULATE_ENTRY_IC, ACTOR_IPC_BASE_PAGE, ACTOR_IPC_CAP_SLOT, AccumulationResultV2,
     ActorSliceInputV2, ActorTreeImportV2, AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2,
     CheckpointTokenV2, ContinuationSnapshotV2, CrdtChangeV2, Hash, ImportedBlobV2,
-    MAX_ROOT_TREE_ACTORS, ProgramId, REFINE_ENTRY_IC, RefineImportsV2, SpaceRoleCredentialV2,
-    TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2, space_role_for_policy,
+    MAX_ROOT_TREE_ACTORS, ProgramId, REFINE_ENTRY_IC, RefineImportsV2, RefineOutputV2,
+    SpaceRoleCredentialV2, TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
+    space_role_for_policy,
 };
 
 const MAX_ACTOR_IPC_PAGES: u32 = 1024;
@@ -93,6 +94,7 @@ pub enum ServicePvmErrorV2 {
     TooManyImportedActors,
     InvalidContinuation,
     ContinuationMismatch,
+    InvalidRefineOutput,
     SnapshotFailed,
     CheckpointTokenWriteFailed,
     ActorIpcExhausted,
@@ -1090,8 +1092,17 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
         };
         match result {
             KernelResult::Halt => {
-                let bytes = read_output(&kernel)?;
                 let gas_used = starting_gas.saturating_sub(kernel.active_gas());
+                let mut bytes = read_output(&kernel)?;
+                if suspension_work.is_some() {
+                    let mut refined = RefineOutputV2::decode(&bytes)
+                        .map_err(|_| ServicePvmErrorV2::InvalidRefineOutput)?;
+                    if refined.transition.gas != super::GasAccountingV2::default() {
+                        return Err(ServicePvmErrorV2::InvalidRefineOutput);
+                    }
+                    refined.transition.gas.refine_used = gas_used;
+                    bytes = refined.encode();
+                }
                 let trace = trace.map(|mut recorder| {
                     recorder.output(&bytes, gas_used, &exported_blobs);
                     recorder.finish()

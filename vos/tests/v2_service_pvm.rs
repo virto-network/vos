@@ -697,6 +697,10 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
     assert_eq!(transition.consumed_input, work.input_id());
     assert_eq!(transition.target_program, work.target_program);
     assert_eq!(transition.base, work.base);
+    assert_eq!(transition.gas.refine_used, output.gas_used);
+    assert!(transition.gas.refine_used > 0);
+    assert_eq!(transition.gas.proof_used, 0);
+    assert_eq!(transition.gas.accumulate_used, 0);
     assert_eq!(transition.writes.len(), 1);
     assert_eq!(transition.writes[0].actor, work.target);
     assert_eq!(transition.writes[0].key, vos::lifecycle::STATE_KEY_BYTES);
