@@ -811,6 +811,15 @@ fn install<S: GuestAccumulateStoreV2>(
                 .encode(),
             ),
         )?;
+        tree_apply(
+            &mut tree,
+            &StateKeyV2::RoleAuthority,
+            genesis
+                .role_authority
+                .as_ref()
+                .map(super::RoleAuthorityBindingV2::encode)
+                .as_deref(),
+        )?;
         for actor in &genesis.actors {
             tree_apply(
                 &mut tree,
@@ -4463,6 +4472,7 @@ mod tests {
                 }],
             }],
             external_actors: external_bindings(),
+            role_authority: None,
             authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: super::super::SystemCapabilityId([8; 32]),
                 authenticator: vec![9],
@@ -4502,6 +4512,7 @@ mod tests {
                 }],
             }],
             external_actors: Vec::new(),
+            role_authority: None,
             authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: super::super::SystemCapabilityId([8; 32]),
                 authenticator: vec![9],
@@ -4788,6 +4799,7 @@ mod tests {
                 },
             ],
             external_actors: external_bindings(),
+            role_authority: None,
             authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: super::super::SystemCapabilityId([8; 32]),
                 authenticator: vec![9],
@@ -6080,6 +6092,7 @@ mod tests {
                 },
             ],
             external_actors: external_bindings(),
+            role_authority: None,
             authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: super::super::SystemCapabilityId([8; 32]),
                 authenticator: vec![9],
@@ -6192,6 +6205,7 @@ mod tests {
                 }],
             }],
             external_actors: external_bindings(),
+            role_authority: None,
             authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: super::super::SystemCapabilityId([8; 32]),
                 authenticator: vec![9],
@@ -6295,6 +6309,7 @@ mod tests {
                 }],
             }],
             external_actors: external_bindings(),
+            role_authority: None,
             authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: super::super::SystemCapabilityId([8; 32]),
                 authenticator: vec![9],

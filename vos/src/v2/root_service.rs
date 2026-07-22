@@ -27,8 +27,8 @@ use super::{
     MethodPolicyV2, NoRefineProtocolHostV2, PackageError, PackageRolePoliciesV2, PreparedWorkV2,
     ProgramId, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
     ReceiptVerificationRequestV2, RefinedServiceOutputV2, ScheduleErrorV2, ServiceDispatchError,
-    ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, StoreHeaderV2, V2Wire, VosPackageV2,
-    WorkInputIdV2, WorkflowCheckpointV2,
+    RoleAuthorityBindingV2, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, StoreHeaderV2,
+    V2Wire, VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2,
 };
 
 #[cfg(feature = "storage")]
@@ -360,6 +360,7 @@ pub struct LocalRootTreeConfigV2 {
     /// state are instance data and therefore do not alter `DeploymentId`.
     pub owned_actors: Vec<OwnedActorInstallV2>,
     pub external_actors: Vec<ExternalActorBindingV2>,
+    pub role_authority: Option<RoleAuthorityBindingV2>,
     pub install_authorization: AuthorizationEvidenceV2,
     pub refine_gas: u64,
     pub accumulate_gas: u64,
@@ -376,6 +377,7 @@ pub enum LocalRootTreeConfigErrorV2 {
     InvalidConsistency,
     InvalidOwnedActorTree,
     InvalidExternalActorBindings,
+    InvalidRoleAuthority,
     TooManyOwnedActors,
     ReplicationDriverRequired,
     ZeroGas,
@@ -702,6 +704,7 @@ pub struct LocalRootTreeServiceV2<B> {
     genesis: ServiceGenesisV2,
     expected_actors: Vec<ActorGenesisV2>,
     expected_external_actors: Vec<ExternalActorBindingV2>,
+    expected_role_authority: Option<RoleAuthorityBindingV2>,
 }
 
 impl LocalRootTreeConfigV2 {
@@ -780,6 +783,15 @@ impl LocalRootTreeConfigV2 {
                 .any(|(binding, name)| binding.name != *name)
         {
             return Err(LocalRootTreeConfigErrorV2::InvalidExternalActorBindings);
+        }
+        if self.role_authority.as_ref().is_some_and(|authority| {
+            authority.service.space != self.service.space
+                || authority.service == self.service
+                || authority.service.service_abi != super::ABI_VERSION
+                || authority.service.execution_semantics != super::EXECUTION_SEMANTICS_ID
+                || authority.actor == ActorId::ZERO
+        }) {
+            return Err(LocalRootTreeConfigErrorV2::InvalidRoleAuthority);
         }
         if self.refine_gas == 0 || self.accumulate_gas == 0 {
             return Err(LocalRootTreeConfigErrorV2::ZeroGas);
@@ -908,6 +920,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             consistency: config.consistency,
             actors: expected_actors.clone(),
             external_actors: config.external_actors.clone(),
+            role_authority: config.role_authority.clone(),
             authorization: config.install_authorization,
         };
         service.accumulate_host_mut().allow_install(&genesis);
@@ -927,6 +940,7 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             genesis,
             expected_actors,
             expected_external_actors: config.external_actors,
+            expected_role_authority: config.role_authority,
         };
         root.ensure_installed().map_err(|error| match error {
             LocalRootTreeInvokeErrorV2::Service(error) => LocalRootTreeOpenErrorV2::Service(error),
@@ -1398,6 +1412,17 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         if external.as_ref().is_none_or(|directory| {
             directory.actors.as_slice() != self.expected_external_actors.as_slice()
         }) {
+            return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
+        }
+        let role_authority = self
+            .service
+            .accumulate_host()
+            .state_row(header.service_root, &StateKeyV2::RoleAuthority)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .map(|bytes| RoleAuthorityBindingV2::decode(&bytes))
+            .transpose()
+            .map_err(|_| LocalRootTreeInvokeErrorV2::ExistingActorMismatch)?;
+        if role_authority != self.expected_role_authority {
             return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
         }
         Ok(true)

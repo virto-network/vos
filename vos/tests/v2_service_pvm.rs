@@ -26,7 +26,7 @@ use vos::v2::{
     MethodPolicyV2, NoRefineProtocolHostV2, Origin, OwnedActorInstallV2, PackageManifestV2,
     PackageRolePoliciesV2, ProducerId, ProgramId, ProofCommitmentV2, ProofVerificationRequestV2,
     PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2,
-    RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RootServiceId,
+    RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RoleAuthorityBindingV2, RootServiceId,
     RootTreeIngressRecoveryV2, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2,
     ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, SpaceRoleCredentialV2, StateKeyV2,
     SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2,
@@ -403,6 +403,7 @@ fn workflow_root_configs() -> Option<(
             initial_state: vec![],
             owned_actors: vec![],
             external_actors,
+            role_authority: None,
             install_authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: SystemCapabilityId([104; 32]),
                 authenticator: vec![105],
@@ -493,6 +494,7 @@ fn crdt_root_config() -> Option<(LocalRootTreeConfigV2, ActorId)> {
         initial_state: vec![],
         owned_actors: vec![],
         external_actors: vec![],
+        role_authority: None,
         install_authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: SystemCapabilityId([119; 32]),
             authenticator: vec![120],
@@ -628,6 +630,7 @@ fn public_example_root_config(
         initial_state: vec![],
         owned_actors: vec![],
         external_actors: vec![],
+        role_authority: None,
         install_authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: SystemCapabilityId([152; 32]),
             authenticator: vec![153],
@@ -1279,6 +1282,14 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
     };
     let actor = ActorId([93; 32]);
     let child = ActorId([90; 32]);
+    let role_authority = RoleAuthorityBindingV2 {
+        service: ServiceIdentityV2 {
+            root_service: RootServiceId([97; 32]),
+            deployment: DeploymentId([98; 32]),
+            ..identity.clone()
+        },
+        actor: ActorId([99; 32]),
+    };
     let config = LocalRootTreeConfigV2 {
         service_pvm,
         package,
@@ -1294,6 +1305,7 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
             initial_state: vec![],
         }],
         external_actors: vec![],
+        role_authority: Some(role_authority.clone()),
         install_authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: SystemCapabilityId([94; 32]),
             authenticator: vec![95],
@@ -1313,6 +1325,12 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         .and_then(|bytes| ActorDirectoryV2::decode(&bytes).ok())
         .expect("guest Accumulate commits the complete actor directory");
     assert_eq!(directory.actors, vec![child, actor]);
+    let stored_authority = service
+        .store()
+        .state_row(header.service_root, &StateKeyV2::RoleAuthority)
+        .unwrap()
+        .and_then(|bytes| RoleAuthorityBindingV2::decode(&bytes).ok());
+    assert_eq!(stored_authority, Some(role_authority));
 
     let mut cycle = config.clone();
     cycle.owned_actors.push(OwnedActorInstallV2 {
@@ -1355,6 +1373,12 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
     let backend = service.into_backend();
     let mut mismatched = config.clone();
     mismatched.owned_actors[0].name = "other-child".into();
+    assert!(matches!(
+        LocalRootTreeServiceV2::open(mismatched, backend.clone()),
+        Err(vos::v2::LocalRootTreeOpenErrorV2::ExistingActorMismatch)
+    ));
+    let mut mismatched = config.clone();
+    mismatched.role_authority.as_mut().unwrap().actor = ActorId([100; 32]);
     assert!(matches!(
         LocalRootTreeServiceV2::open(mismatched, backend.clone()),
         Err(vos::v2::LocalRootTreeOpenErrorV2::ExistingActorMismatch)
@@ -3011,6 +3035,7 @@ fn same_tree_linear_calls_resume_the_exact_nested_stack() {
             },
         ],
         external_actors: vec![private_age_binding(&seed.service)],
+        role_authority: None,
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([63; 32]),
             authenticator: vec![64],
@@ -3821,6 +3846,7 @@ fn same_tree_causal_cycles_return_an_explicit_guest_error() {
             },
         ],
         external_actors: vec![],
+        role_authority: None,
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([83; 32]),
             authenticator: vec![84],
@@ -4002,6 +4028,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
             },
         ],
         external_actors: vec![private_age_binding(&work.service)],
+        role_authority: None,
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([46; 32]),
             authenticator: vec![1],
@@ -4755,6 +4782,7 @@ fn yielding_actor_restores_exactly_after_restart() {
             }],
         }],
         external_actors: vec![],
+        role_authority: None,
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([52; 32]),
             authenticator: vec![53],
@@ -5091,6 +5119,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             }],
         }],
         external_actors: vec![private_age_binding(&seed_work.service)],
+        role_authority: None,
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([52; 32]),
             authenticator: vec![53],
@@ -5644,6 +5673,7 @@ fn physical_guest_install_rejects_an_unavailable_actor_program() {
             }],
         }],
         external_actors: vec![],
+        role_authority: None,
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([34; 32]),
             authenticator: vec![35],
@@ -5729,6 +5759,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             },
         ],
         external_actors: vec![],
+        role_authority: None,
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([34; 32]),
             authenticator: vec![35],
@@ -6539,6 +6570,7 @@ fn physical_guest_accumulate_upgrades_only_an_idle_authorized_actor() {
             }],
         }],
         external_actors: vec![],
+        role_authority: None,
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: SystemCapabilityId([33; 32]),
             authenticator: vec![34],
@@ -6709,6 +6741,7 @@ fn physical_crdt_upgrade_syncs_its_canonical_program_and_visible_descriptor() {
             }],
         }],
         external_actors: vec![],
+        role_authority: None,
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: SystemCapabilityId([63; 32]),
             authenticator: vec![64],
@@ -6907,6 +6940,7 @@ fn physical_guest_verifies_consumed_attestations_and_rejects_replay() {
             }],
         }],
         external_actors: vec![source.clone()],
+        role_authority: None,
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([115; 32]),
             authenticator: vec![116],
@@ -7116,6 +7150,7 @@ fn age_gate_guest_emits_the_proof_requirement_and_accumulate_enforces_once() {
             ],
         }],
         external_actors: vec![source.clone()],
+        role_authority: None,
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([131; 32]),
             authenticator: vec![132],
@@ -7301,6 +7336,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             }],
         }],
         external_actors: vec![],
+        role_authority: None,
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([123; 32]),
             authenticator: vec![124],
@@ -7537,6 +7573,7 @@ fn raft_refuses_an_untraced_attested_apply_before_log_proposal() {
             }],
         }],
         external_actors: vec![],
+        role_authority: None,
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([133; 32]),
             authenticator: vec![134],
@@ -7708,6 +7745,7 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
             }],
         }],
         external_actors: vec![],
+        role_authority: None,
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([129; 32]),
             authenticator: vec![130],
@@ -7930,6 +7968,7 @@ fn physical_guest_accumulate_authenticates_cross_root_delivery() {
                     }],
                 }],
                 external_actors,
+                role_authority: None,
                 authorization: AuthorizationEvidenceV2::SystemCapability {
                     capability: vos::v2::SystemCapabilityId([65; 32]),
                     authenticator: vec![66],

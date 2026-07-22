@@ -1520,6 +1520,7 @@ fn v2_config_from_row(
             initial_state: vec![],
             owned_actors: vec![],
             external_actors,
+            role_authority: None,
             install_authorization: vos::v2::AuthorizationEvidenceV2::SystemCapability {
                 capability: vos::v2::SystemCapabilityId(
                     vos::v2::Hash::digest(

@@ -1186,6 +1186,7 @@ pub struct ServiceGenesisV2 {
     pub consistency: ConsistencyModeV2,
     pub actors: Vec<ActorGenesisV2>,
     pub external_actors: Vec<ExternalActorBindingV2>,
+    pub role_authority: Option<RoleAuthorityBindingV2>,
     pub authorization: AuthorizationEvidenceV2,
 }
 
@@ -2785,6 +2786,9 @@ impl V2Wire for ServiceGenesisV2 {
         e.u8(self.consistency as u8);
         e.list(&self.actors, encode_actor_genesis);
         e.list(&self.external_actors, encode_external_actor);
+        e.option(&self.role_authority, |e, authority| {
+            e.bytes(&authority.encode())
+        });
         encode_auth(&mut e, &self.authorization);
     }
 
@@ -2794,6 +2798,7 @@ impl V2Wire for ServiceGenesisV2 {
             consistency: ConsistencyModeV2::decode(d)?,
             actors: d.list(decode_actor_genesis)?,
             external_actors: d.list(decode_external_actor)?,
+            role_authority: d.option(|d| RoleAuthorityBindingV2::decode(&d.bytes()?))?,
             authorization: decode_auth(d)?,
         };
         validate_genesis(&value)?;
@@ -3520,6 +3525,15 @@ fn validate_genesis(value: &ServiceGenesisV2) -> Result<(), DecodeError> {
         {
             return Err(DecodeError::NonCanonical);
         }
+    }
+    if value.role_authority.as_ref().is_some_and(|authority| {
+        authority.service.space != value.service.space
+            || authority.service == value.service
+            || authority.service.service_abi != super::ABI_VERSION
+            || authority.service.execution_semantics != super::EXECUTION_SEMANTICS_ID
+            || authority.actor == ActorId::ZERO
+    }) {
+        return Err(DecodeError::NonCanonical);
     }
     match &value.authorization {
         AuthorizationEvidenceV2::SystemCapability { authenticator, .. }
@@ -5230,6 +5244,14 @@ mod tests {
 
     #[test]
     fn accumulate_request_wires_bind_install_and_apply_inputs() {
+        let role_authority = RoleAuthorityBindingV2 {
+            service: ServiceIdentityV2 {
+                root_service: RootServiceId([12; 32]),
+                deployment: DeploymentId([13; 32]),
+                ..service()
+            },
+            actor: ActorId([14; 32]),
+        };
         let genesis = ServiceGenesisV2 {
             service: service(),
             consistency: ConsistencyModeV2::Local,
@@ -5264,6 +5286,7 @@ mod tests {
                 },
             ],
             external_actors: vec![],
+            role_authority: Some(role_authority),
             authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: SystemCapabilityId([11; 32]),
                 authenticator: b"platform-authenticator".to_vec(),
@@ -5635,6 +5658,7 @@ mod tests {
                 methods: vec![],
             }],
             external_actors: vec![],
+            role_authority: None,
             authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: SystemCapabilityId([7; 32]),
                 authenticator: vec![1],
@@ -5665,6 +5689,25 @@ mod tests {
         assert_eq!(
             ServiceGenesisV2::decode(&genesis.encode()),
             Err(DecodeError::NonCanonical)
+        );
+
+        genesis.actors[0].parent = None;
+        genesis.role_authority = Some(RoleAuthorityBindingV2 {
+            service: genesis.service.clone(),
+            actor: ActorId([10; 32]),
+        });
+        assert_eq!(
+            ServiceGenesisV2::decode(&genesis.encode()),
+            Err(DecodeError::NonCanonical),
+            "a service cannot issue its own platform role assertions"
+        );
+
+        genesis.role_authority.as_mut().unwrap().service.root_service = RootServiceId([11; 32]);
+        genesis.role_authority.as_mut().unwrap().service.space = SpaceId([12; 32]);
+        assert_eq!(
+            ServiceGenesisV2::decode(&genesis.encode()),
+            Err(DecodeError::NonCanonical),
+            "an authority from a sibling space is not trusted"
         );
     }
 

@@ -15,7 +15,7 @@ use super::{
     WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 13;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 14;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -136,6 +136,9 @@ pub enum StateKeyV2 {
     ActorDirectory,
     /// Canonical install-time bindings to actors owned by other root trees.
     ExternalActorDirectory,
+    /// Immutable platform authority whose finalized replies may satisfy
+    /// generated space-role policies for this root tree.
+    RoleAuthority,
     /// Immutable package/policy descriptor from installation (or causal
     /// spawn). CRDT peers replay metadata upgrades from this common baseline
     /// instead of trusting whichever visible winner their tree has now.
@@ -177,6 +180,9 @@ impl V2Wire for StateKeyV2 {
             }
             Self::ExternalActorDirectory => {
                 e.u8(10);
+            }
+            Self::RoleAuthority => {
+                e.u8(13);
             }
             Self::ActorInstallDescriptor(actor) => {
                 e.u8(12);
@@ -268,6 +274,7 @@ impl V2Wire for StateKeyV2 {
                 invocation: InvocationId(d.fixed()?),
             }),
             12 => Ok(Self::ActorInstallDescriptor(ActorId(d.fixed()?))),
+            13 => Ok(Self::RoleAuthority),
             _ => Err(DecodeError::InvalidTag),
         }
     }
@@ -818,6 +825,10 @@ mod tests {
         assert_eq!(StateKeyV2::decode(&row.encode()).unwrap(), row);
         assert_eq!(StateKeyV2::decode(&policy.encode()).unwrap(), policy);
         assert_eq!(StateKeyV2::decode(&name.encode()).unwrap(), name);
+        assert_eq!(
+            StateKeyV2::decode(&StateKeyV2::RoleAuthority.encode()).unwrap(),
+            StateKeyV2::RoleAuthority
+        );
         assert_ne!(row.encode(), policy.encode());
         assert_ne!(row.encode(), name.encode());
 
