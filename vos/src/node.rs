@@ -868,6 +868,10 @@ pub struct VosNode {
     /// transport adapter for delivering a strict `RootTreeInvocationV2` wire
     /// to the service thread which owns that actor tree.
     v2_actor_routes: Arc<RwLock<HashMap<crate::v2::ActorId, u32>>>,
+    /// Local canonical actor → owning root-thread authorization endpoint.
+    /// Requests through this map execute the authority actor and return only
+    /// guest-committed receipt-bound assertions.
+    v2_role_authority_routes: V2RoleAuthorityRoutes,
     /// Per-process entropy and monotonic ordinal used when a host-side bound
     /// actor handle originates a new invocation. The resulting ID is encoded
     /// into the ingress wire, so network retries retain it exactly.
@@ -1083,6 +1087,16 @@ struct V2CrdtRootHooks {
     shared_network: SharedNetwork,
     observed_commit_sequence: Option<u64>,
 }
+
+struct V2RoleAssertionRequest {
+    authority: crate::v2::RoleAuthorityBindingV2,
+    claim: crate::v2::RoleAuthorizationClaimV2,
+    logical_timeslot: u64,
+    reply: mpsc::Sender<Option<crate::v2::AccumulatedRoleAssertionV2>>,
+}
+
+type V2RoleAuthorityRoutes =
+    Arc<RwLock<HashMap<crate::v2::ActorId, mpsc::Sender<V2RoleAssertionRequest>>>>;
 
 /// Shared invoke-route table. Cheap to clone and pass to threads.
 type InvokeRoutes = Arc<Mutex<HashMap<u32, mpsc::Sender<InvokeRequest>>>>;
@@ -2720,6 +2734,7 @@ impl VosNode {
             outbox_rx,
             invoke_routes: Arc::new(Mutex::new(HashMap::new())),
             v2_actor_routes: Arc::new(RwLock::new(HashMap::new())),
+            v2_role_authority_routes: Arc::new(RwLock::new(HashMap::new())),
             v2_invocation_seed: fresh_v2_invocation_seed(node_prefix),
             v2_invocation_sequence: AtomicU64::new(0),
             agent_names: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -3120,7 +3135,7 @@ impl VosNode {
             {
                 return Err(V2NodeRegistrationError::ActorRouteOccupied(actor));
             }
-            routes.extend(actor_ids.into_iter().map(|actor| (actor, id.0)));
+            routes.extend(actor_ids.iter().copied().map(|actor| (actor, id.0)));
         }
         let consistency = match service.consistency() {
             crate::v2::ConsistencyModeV2::Ephemeral => Consistency::Ephemeral,
@@ -3130,6 +3145,12 @@ impl VosNode {
         };
         let (inbox_tx, inbox_rx) = mpsc::channel();
         let (invoke_tx, invoke_rx) = mpsc::channel();
+        let (role_authority_tx, role_authority_rx) = mpsc::channel();
+        self.v2_role_authority_routes.write().unwrap().extend(
+            actor_ids
+                .into_iter()
+                .map(|actor| (actor, role_authority_tx.clone())),
+        );
         self.routes.insert(id.0, inbox_tx);
         self.invoke_routes.lock().unwrap().insert(id.0, invoke_tx);
         self.record_agent_name(id, Some(name.clone()));
@@ -3146,6 +3167,7 @@ impl VosNode {
         let shutdown = self.register_agent_shutdown(id);
         let activity = self.last_activity.clone();
         let actor_routes = self.v2_actor_routes.clone();
+        let role_authority_routes = self.v2_role_authority_routes.clone();
         let outbox = self.outbox_tx.clone();
         let join = thread::spawn(move || {
             v2_root_service_thread(
@@ -3153,8 +3175,10 @@ impl VosNode {
                 service,
                 inbox_rx,
                 invoke_rx,
+                role_authority_rx,
                 outbox,
                 actor_routes,
+                role_authority_routes,
                 proof_producer,
                 #[cfg(all(feature = "network", feature = "storage"))]
                 sync_hooks,
@@ -4497,13 +4521,90 @@ where
     }
 }
 
+const V2_ROLE_ASSERTION_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn handle_v2_role_assertion_request<B>(
+    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
+    request: V2RoleAssertionRequest,
+) where
+    B: crate::v2::CommittedImageStoreV2,
+{
+    use crate::v2::V2Wire;
+    use crate::Encode;
+
+    let result = (|| {
+        if request.authority.service != *service.identity()
+            || !service.owns_actor(request.authority.actor)?
+        {
+            return Err(crate::v2::LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication);
+        }
+        let policy = service
+            .actor_method_policy(
+                request.authority.actor,
+                crate::v2::ROLE_AUTHORITY_DECISION_METHOD_V2,
+            )?
+            .ok_or(crate::v2::LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication)?;
+        if !policy.public || policy.attested {
+            return Err(crate::v2::LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication);
+        }
+        let mut arguments = vec![crate::value::TAG_DYNAMIC];
+        arguments.extend_from_slice(
+            &crate::value::Msg::new(crate::v2::ROLE_AUTHORITY_DECISION_METHOD_V2)
+                .with("claim", request.claim.encode())
+                .encode(),
+        );
+        let work = crate::v2::LocalWorkRequestV2 {
+            invocation: request.claim.authority_invocation(),
+            workflow_step: 0,
+            logical_timeslot: request.logical_timeslot,
+            target: request.authority.actor,
+            method: crate::v2::ROLE_AUTHORITY_DECISION_METHOD_V2.into(),
+            arguments,
+            origin: crate::v2::Origin::System,
+            authorization: crate::v2::AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        };
+        match service.recover_ingress(&work)? {
+            crate::v2::RootTreeIngressRecoveryV2::Fresh => {
+                let committed = service.invoke(work)?;
+                let assertion = committed.role_assertion(request.claim, &request.authority);
+                if let Some(publication) = committed.publication.as_ref() {
+                    service.acknowledge_publication(publication)?;
+                }
+                assertion
+            }
+            crate::v2::RootTreeIngressRecoveryV2::PendingPublication {
+                publication,
+                logical_timeslot: _,
+            } => {
+                let assertion = service
+                    .recover_role_assertion(request.claim, &request.authority);
+                service.acknowledge_publication(&publication)?;
+                assertion
+            }
+            crate::v2::RootTreeIngressRecoveryV2::Completed { .. } => {
+                service.recover_role_assertion(request.claim, &request.authority)
+            }
+            _ => Err(crate::v2::LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication),
+        }
+    })();
+    let _ = request.reply.send(result.ok());
+}
+
 fn v2_root_service_thread<B>(
     id: ServiceId,
     mut service: crate::v2::LocalRootTreeServiceV2<B>,
     inbox_rx: mpsc::Receiver<Envelope>,
     invoke_rx: mpsc::Receiver<InvokeRequest>,
+    role_assertion_rx: mpsc::Receiver<V2RoleAssertionRequest>,
     outbox: mpsc::Sender<Envelope>,
     actor_routes: Arc<RwLock<HashMap<crate::v2::ActorId, u32>>>,
+    role_authority_routes: V2RoleAuthorityRoutes,
     mut proof_producer: V2ProofProducerSlot,
     #[cfg(all(feature = "network", feature = "storage"))] mut sync_hooks: Option<V2CrdtRootHooks>,
     shutdown: Arc<AtomicBool>,
@@ -4536,6 +4637,10 @@ where
         );
     }
     while !shutdown.load(Ordering::Relaxed) {
+        while let Ok(request) = role_assertion_rx.try_recv() {
+            *activity.lock().unwrap() = Instant::now();
+            handle_v2_role_assertion_request(&mut service, request);
+        }
         #[cfg(all(feature = "network", feature = "storage"))]
         if let Some(hooks) = sync_hooks.as_mut() {
             while let Ok(request) = hooks.sync_rx.try_recv() {
@@ -4661,15 +4766,21 @@ where
             continue;
         }
         let Some(authorization) = v2_work_authorization(
-            service.identity().space,
+            service.identity(),
+            service.role_authority(),
+            &ingress,
             &request,
             &policy,
             &actor_routes,
+            &role_authority_routes,
         )
         else {
             send_v2_status(request.reply, crate::actors::run::STATUS_FORBIDDEN, id);
             continue;
         };
+        if let Some(receipt) = authorization.finalized_receipt.as_ref() {
+            service.allow_finalized_receipt(receipt);
+        }
         let work = crate::v2::LocalWorkRequestV2 {
             invocation: ingress.invocation,
             workflow_step: 0,
@@ -4836,6 +4947,12 @@ where
         .write()
         .unwrap()
         .retain(|_, route| *route != id.0);
+    if let Ok(owned) = service.actor_ids() {
+        role_authority_routes
+            .write()
+            .unwrap()
+            .retain(|actor, _| !owned.contains(actor));
+    }
     AgentResult {
         id,
         panics: 0,
@@ -5694,30 +5811,35 @@ struct V2WorkAuthorization {
     evidence: crate::v2::AuthorizationEvidenceV2,
     imported_blobs: Vec<crate::v2::BlobRefV2>,
     provided_blobs: Vec<crate::v2::ImportedBlobV2>,
+    finalized_receipt: Option<crate::v2::AccumulationReceiptV2>,
 }
 
 fn v2_work_authorization(
-    space: crate::v2::SpaceId,
+    service: &crate::v2::ServiceIdentityV2,
+    authority: Option<&crate::v2::RoleAuthorityBindingV2>,
+    ingress: &crate::v2::RootTreeInvocationV2,
     request: &InvokeRequest,
     policy: &crate::v2::MethodPolicyV2,
     actor_routes: &RwLock<HashMap<crate::v2::ActorId, u32>>,
+    role_authority_routes: &V2RoleAuthorityRoutes,
 ) -> Option<V2WorkAuthorization> {
-    let (origin, authenticator) = match &request.caller {
-        crate::actors::Caller::Unauthenticated => (crate::v2::Origin::Anonymous, Vec::new()),
-        crate::actors::Caller::System => (crate::v2::Origin::System, Vec::new()),
-        crate::actors::Caller::Peer(peer) => (
+    use crate::v2::V2Wire;
+
+    let origin = match &request.caller {
+        crate::actors::Caller::Unauthenticated => crate::v2::Origin::Anonymous,
+        crate::actors::Caller::System => crate::v2::Origin::System,
+        crate::actors::Caller::Peer(peer) => {
             crate::v2::Origin::Member(crate::v2::SubjectId(
                 crate::v2::Hash::digest(b"vos/peer-subject/v2", &[peer]).0,
-            )),
-            peer.clone(),
-        ),
+            ))
+        }
         crate::actors::Caller::Actor(service) => {
             let actor = actor_routes
                 .read()
                 .ok()?
                 .iter()
                 .find_map(|(actor, route)| (*route == service.0).then_some(*actor))?;
-            (crate::v2::Origin::Actor(actor), actor.0.to_vec())
+            crate::v2::Origin::Actor(actor)
         }
     };
     if policy.public {
@@ -5726,22 +5848,52 @@ fn v2_work_authorization(
             evidence: crate::v2::AuthorizationEvidenceV2::Public,
             imported_blobs: Vec::new(),
             provided_blobs: Vec::new(),
+            finalized_receipt: None,
         });
     }
-    let role = crate::SpaceRole::from_u8(request.space_role?)?;
-    let mut authenticated = crate::v2::Hash::digest(
-        b"vos/node-space-role-authenticator/v2",
-        &[&space.0, &authenticator, &[role as u8], &policy.policy.0],
-    )
-    .0
-    .to_vec();
-    authenticated.extend_from_slice(&request.space_role?.to_le_bytes());
-    let credential = crate::v2::SpaceRoleCredentialV2 {
-        space,
+    if !matches!(origin, crate::v2::Origin::Member(_) | crate::v2::Origin::Actor(_)) {
+        return None;
+    }
+    let authority = authority?.clone();
+    let role = crate::v2::space_role_for_policy(policy.policy)?;
+    let claim = crate::v2::RoleAuthorizationClaimV2 {
+        space: service.space,
         holder: origin,
         role,
-        authenticator: authenticated,
+        audience: service.clone(),
+        invocation: ingress.invocation,
+        target: ingress.target,
+        method: ingress.method.clone(),
+        policy: policy.policy,
     };
+    let route = role_authority_routes
+        .read()
+        .ok()?
+        .get(&authority.actor)
+        .cloned()?;
+    let (reply, response) = mpsc::channel();
+    route
+        .send(V2RoleAssertionRequest {
+            authority: authority.clone(),
+            claim: claim.clone(),
+            logical_timeslot: ingress.logical_timeslot,
+            reply,
+        })
+        .ok()?;
+    let assertion = response
+        .recv_timeout(V2_ROLE_ASSERTION_TIMEOUT)
+        .ok()
+        .flatten()?;
+    if assertion.claim != claim || !assertion.matches_authority(&authority) {
+        return None;
+    }
+    let credential = crate::v2::SpaceRoleCredentialV2 {
+        space: service.space,
+        holder: origin,
+        role,
+        authenticator: assertion.encode(),
+    };
+    let finalized_receipt = Some(assertion.receipt.clone());
     if policy.attested {
         let (evidence, witness) = credential.private_evidence(policy.policy);
         Some(V2WorkAuthorization {
@@ -5749,6 +5901,7 @@ fn v2_work_authorization(
             evidence,
             imported_blobs: vec![witness.reference.clone()],
             provided_blobs: vec![witness],
+            finalized_receipt,
         })
     } else {
         Some(V2WorkAuthorization {
@@ -5756,6 +5909,7 @@ fn v2_work_authorization(
             evidence: credential.disclosed_evidence(policy.policy),
             imported_blobs: Vec::new(),
             provided_blobs: Vec::new(),
+            finalized_receipt,
         })
     }
 }
@@ -9214,18 +9368,95 @@ mod tests {
         let (reply, _rx) = mpsc::channel();
         let request = InvokeRequest {
             caller: crate::actors::Caller::Peer(b"authenticated peer".to_vec()),
-            space_role: Some(crate::SpaceRole::Member.as_u8()),
+            // The legacy caller-supplied byte is deliberately ignored. The
+            // generated policy and accumulated authority decision select the
+            // role threshold.
+            space_role: Some(crate::SpaceRole::Admin.as_u8()),
             actor_local_role: None,
             msg: vec![1],
             reply: ReplyChannel::Sync(reply),
             chain: Vec::new(),
         };
         let space = crate::v2::SpaceId([6; 32]);
-        let authorization = v2_work_authorization(
+        let service = crate::v2::ServiceIdentityV2 {
             space,
+            root_service: crate::v2::RootServiceId([8; 32]),
+            deployment: crate::v2::DeploymentId([9; 32]),
+            service_program: crate::v2::ProgramId([10; 32]),
+            service_abi: crate::v2::ABI_VERSION,
+            execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
+        };
+        let target = crate::v2::ActorId([11; 32]);
+        let ingress = crate::v2::RootTreeInvocationV2 {
+            invocation: crate::v2::InvocationId([12; 32]),
+            logical_timeslot: 13,
+            target,
+            method: "is_adult".into(),
+            arguments: vec![1],
+            proof_requested: true,
+        };
+        let authority = crate::v2::RoleAuthorityBindingV2 {
+            service: crate::v2::ServiceIdentityV2 {
+                root_service: crate::v2::RootServiceId([14; 32]),
+                deployment: crate::v2::DeploymentId([15; 32]),
+                service_program: crate::v2::ProgramId([16; 32]),
+                ..service.clone()
+            },
+            actor: crate::v2::ActorId([17; 32]),
+        };
+        let role_routes: V2RoleAuthorityRoutes = Arc::new(RwLock::new(HashMap::new()));
+        let (authority_tx, authority_rx) = mpsc::channel::<V2RoleAssertionRequest>();
+        role_routes
+            .write()
+            .unwrap()
+            .insert(authority.actor, authority_tx);
+        let authority_for_thread = authority.clone();
+        let authority_thread = thread::spawn(move || {
+            for sequence in 1..=2 {
+                let request = authority_rx.recv().unwrap();
+                assert_eq!(request.authority, authority_for_thread);
+                assert_eq!(request.claim.role, crate::SpaceRole::Member);
+                let reply = request.claim.authority_reply(request.authority.actor);
+                request
+                    .reply
+                    .send(Some(crate::v2::AccumulatedRoleAssertionV2 {
+                        receipt: crate::v2::AccumulationReceiptV2 {
+                            service: request.authority.service,
+                            accepted_transition: crate::v2::Hash([18; 32]),
+                            reply_commitment: Some(reply.commitment()),
+                            outbox_commitment: None,
+                            resulting_state_root: Some(crate::v2::Hash([19; 32])),
+                            resulting_crdt_heads: vec![],
+                            sequence,
+                            checkpoint: 0,
+                            consistency: crate::v2::ConsistencyModeV2::Local,
+                        },
+                        claim: request.claim,
+                    }))
+                    .unwrap();
+            }
+        });
+        assert!(
+            v2_work_authorization(
+                &service,
+                None,
+                &ingress,
+                &request,
+                &policy,
+                &RwLock::new(HashMap::new()),
+                &role_routes,
+            )
+            .is_none(),
+            "a role-gated service without a pinned authority fails closed"
+        );
+        let authorization = v2_work_authorization(
+            &service,
+            Some(&authority),
+            &ingress,
             &request,
             &policy,
             &RwLock::new(HashMap::new()),
+            &role_routes,
         )
         .unwrap();
         let crate::v2::AuthorizationEvidenceV2::PrivateCredential {
@@ -9247,9 +9478,15 @@ mod tests {
         assert_eq!(credential.space, space);
         assert_eq!(credential.holder, authorization.origin);
         assert_eq!(credential.role, crate::SpaceRole::Member);
+        let assertion = crate::v2::AccumulatedRoleAssertionV2::decode(&credential.authenticator)
+            .expect("the private witness carries the finalized authority assertion");
+        assert_eq!(assertion.receipt, authorization.finalized_receipt.unwrap());
 
         let mut ordinary_policy = policy;
         ordinary_policy.attested = false;
+        let mut ordinary_ingress = ingress;
+        ordinary_ingress.invocation = crate::v2::InvocationId([20; 32]);
+        ordinary_ingress.proof_requested = false;
         let (reply, _rx) = mpsc::channel();
         let ordinary_request = InvokeRequest {
             caller: crate::actors::Caller::Peer(b"authenticated peer".to_vec()),
@@ -9260,10 +9497,13 @@ mod tests {
             chain: Vec::new(),
         };
         let ordinary = v2_work_authorization(
-            space,
+            &service,
+            Some(&authority),
+            &ordinary_ingress,
             &ordinary_request,
             &ordinary_policy,
             &RwLock::new(HashMap::new()),
+            &role_routes,
         )
         .unwrap();
         assert!(matches!(
@@ -9272,6 +9512,8 @@ mod tests {
         ));
         assert!(ordinary.imported_blobs.is_empty());
         assert!(ordinary.provided_blobs.is_empty());
+        assert!(ordinary.finalized_receipt.is_some());
+        authority_thread.join().unwrap();
     }
 
     /// The extension-facing proof-blob CAS round trip: `EFFECT_BLOB_PUT`
