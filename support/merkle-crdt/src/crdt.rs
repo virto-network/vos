@@ -1,6 +1,7 @@
 use crate::sync::{self, AcceptAll, NodeValidator, SyncError};
-use crate::{Cid, DagNode, Encode, Error, Hasher, MerkleClock, Store};
+use crate::{Cid, DagNode, Encode, Error, Hasher, MerkleClock, ReplicaStore, Store};
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::vec;
 use alloc::vec::Vec;
 
 /// Trait for CRDT payloads carried by Merkle-CRDT nodes.
@@ -58,10 +59,21 @@ impl<H: Hasher, P: Payload, S: Store<H, P>> MerkleCrdt<H, P, S> {
     ///
     /// Returns the CID of the new node. Broadcast this CID to other replicas so they
     /// can sync (the *Broadcaster* component from the paper).
-    pub fn apply(&mut self, op: P) -> Result<Cid<H>, Error<S::Error>> {
+    pub fn apply(&mut self, op: P) -> Result<Cid<H>, Error<S::Error>>
+    where
+        S: ReplicaStore<H, P>,
+    {
         let mut staged_state = self.state.clone();
         P::apply(&mut staged_state, &op);
-        let cid = self.clock.record(op, &mut self.store)?;
+
+        let node = DagNode::new(op, self.clock.roots().clone());
+        let cid = node.cid();
+        let mut staged_clock = MerkleClock::new();
+        staged_clock.add_roots([cid.clone()]);
+        self.store
+            .commit(vec![(cid.clone(), node)], staged_clock.roots())?;
+
+        self.clock = staged_clock;
         self.state = staged_state;
         Ok(cid)
     }
@@ -77,7 +89,10 @@ impl<H: Hasher, P: Payload, S: Store<H, P>> MerkleCrdt<H, P, S> {
         &mut self,
         remote_root: &Cid<H>,
         remote: &R,
-    ) -> Result<(), SyncError<S::Error, R::Error>> {
+    ) -> Result<(), SyncError<S::Error, R::Error>>
+    where
+        S: ReplicaStore<H, P>,
+    {
         self.sync_validated(remote_root, remote, &AcceptAll)
     }
 
@@ -89,7 +104,10 @@ impl<H: Hasher, P: Payload, S: Store<H, P>> MerkleCrdt<H, P, S> {
         remote_root: &Cid<H>,
         remote: &R,
         validator: &V,
-    ) -> Result<(), SyncError<S::Error, R::Error>> {
+    ) -> Result<(), SyncError<S::Error, R::Error>>
+    where
+        S: ReplicaStore<H, P>,
+    {
         let missing = sync::fetch_missing(remote_root, &self.store, remote)?;
         if missing
             .iter()
@@ -116,24 +134,36 @@ impl<H: Hasher, P: Payload, S: Store<H, P>> MerkleCrdt<H, P, S> {
             return Err(SyncError::InvalidAuthor);
         }
 
-        // Store failures may leave an unreachable prefix for a backend using
-        // Store::put_batch's default. Logical state is unchanged, and retry
-        // safely finishes the ancestry. Transactional stores override the
-        // method and commit this batch atomically.
-        self.store.put_batch(missing).map_err(SyncError::Local)?;
-
-        let mut staged_clock = self.clock.clone();
-        staged_clock.add_roots([remote_root.clone()]);
-        staged_clock
-            .compact_roots::<P, S>(&self.store)
-            .map_err(map_local_error)?;
-        if !ancestry_is_valid::<H, P, S, V>(&staged_clock, &self.store, validator)
-            .map_err(map_local_error)?
-        {
-            return Err(SyncError::InvalidAuthor);
+        // Compute the new frontier and materialized state against the staged
+        // overlay before publishing any bytes. A missing remote root cannot
+        // be an ancestor of a complete local root, so only current roots
+        // reachable from the remote root are subsumed.
+        let remote_ancestry = collect_nodes_with_overlay(
+            core::iter::once(remote_root.clone()),
+            &self.store,
+            &overlay,
+        )
+        .map_err(map_local_error)?;
+        let current_ancestry =
+            collect_nodes_with_overlay(self.clock.roots().iter().cloned(), &self.store, &overlay)
+                .map_err(map_local_error)?;
+        let mut staged_roots = self.clock.roots().clone();
+        if !current_ancestry.contains_key(remote_root) {
+            staged_roots.retain(|root| !remote_ancestry.contains_key(root));
+            staged_roots.insert(remote_root.clone());
         }
+        let mut staged_clock = MerkleClock::new();
+        staged_clock.add_roots(staged_roots);
         let staged_state =
-            materialize::<H, P, S>(&staged_clock, &self.store).map_err(map_local_error)?;
+            materialize_with_overlay::<H, P, S>(&staged_clock, &self.store, &overlay)
+                .map_err(map_local_error)?;
+
+        // Nodes and their publishing roots share one durable transaction.
+        // On failure, neither can become visible and the exact sync is safe
+        // to retry.
+        self.store
+            .commit(missing, staged_clock.roots())
+            .map_err(SyncError::Local)?;
 
         self.clock = staged_clock;
         self.state = staged_state;
@@ -208,6 +238,26 @@ impl<H: Hasher, P: Payload, S: Store<H, P>> MerkleCrdt<H, P, S> {
             state,
         })
     }
+
+    /// Recover the exact atomically published replica from its durable store.
+    pub fn from_store(store: S) -> Result<Self, Error<S::Error>>
+    where
+        S: ReplicaStore<H, P>,
+    {
+        Self::from_store_validated(store, &AcceptAll)
+    }
+
+    /// Recover a durable replica while validating every reachable node.
+    pub fn from_store_validated<V: NodeValidator<H, P>>(
+        store: S,
+        validator: &V,
+    ) -> Result<Self, Error<S::Error>>
+    where
+        S: ReplicaStore<H, P>,
+    {
+        let roots = store.load_roots()?;
+        Self::from_roots_validated(store, roots, validator)
+    }
 }
 
 fn map_local_error<L, R>(error: Error<L>) -> SyncError<L, R> {
@@ -224,14 +274,44 @@ fn materialize<H: Hasher, P: Payload, S: Store<H, P>>(
     clock: &MerkleClock<H>,
     store: &S,
 ) -> Result<P::State, Error<S::Error>> {
+    materialize_with_overlay(clock, store, &BTreeMap::new())
+}
+
+fn materialize_with_overlay<H: Hasher, P: Payload, S: Store<H, P>>(
+    clock: &MerkleClock<H>,
+    store: &S,
+    overlay: &BTreeMap<Cid<H>, DagNode<H, P>>,
+) -> Result<P::State, Error<S::Error>> {
+    let nodes = collect_nodes_with_overlay(clock.roots().iter().cloned(), store, overlay)?;
+    let mut state = P::State::default();
+    let nodes = sync::topological_sort(nodes).ok_or(Error::InvalidDag)?;
+    for (_, node) in nodes {
+        P::apply(&mut state, &node.payload);
+    }
+    Ok(state)
+}
+
+fn collect_nodes_with_overlay<
+    H: Hasher,
+    P: Payload,
+    S: Store<H, P>,
+    I: IntoIterator<Item = Cid<H>>,
+>(
+    roots: I,
+    store: &S,
+    overlay: &BTreeMap<Cid<H>, DagNode<H, P>>,
+) -> Result<BTreeMap<Cid<H>, DagNode<H, P>>, Error<S::Error>> {
     let mut nodes: BTreeMap<Cid<H>, DagNode<H, P>> = BTreeMap::new();
     let mut visited = BTreeSet::new();
-    let mut stack: Vec<Cid<H>> = clock.roots().iter().cloned().collect();
+    let mut stack: Vec<Cid<H>> = roots.into_iter().collect();
     while let Some(cid) = stack.pop() {
         if !visited.insert(cid.clone()) {
             continue;
         }
-        let node = store.get(&cid)?.ok_or(Error::MissingNode)?;
+        let node = match overlay.get(&cid) {
+            Some(node) => node.clone(),
+            None => store.get(&cid)?.ok_or(Error::MissingNode)?,
+        };
         if node.cid() != cid {
             return Err(Error::InvalidCid);
         }
@@ -242,12 +322,7 @@ fn materialize<H: Hasher, P: Payload, S: Store<H, P>>(
         }
         nodes.insert(cid, node);
     }
-    let mut state = P::State::default();
-    let nodes = sync::topological_sort(nodes).ok_or(Error::InvalidDag)?;
-    for (_, node) in nodes {
-        P::apply(&mut state, &node.payload);
-    }
-    Ok(state)
+    Ok(nodes)
 }
 
 fn ancestry_is_valid<H: Hasher, P: Payload, S: Store<H, P>, V: NodeValidator<H, P>>(
@@ -310,7 +385,7 @@ fn ancestry_is_valid_with_overlay<H: Hasher, P: Payload, S: Store<H, P>, V: Node
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MemStore, Store};
+    use crate::{MemStore, ReplicaStore, Store};
 
     struct TestHasher;
     impl crate::Hasher for TestHasher {
@@ -394,6 +469,28 @@ mod tests {
 
         fn contains(&self, cid: &Cid<TestHasher>) -> Result<bool, Self::Error> {
             Ok(self.inner.contains(cid).unwrap())
+        }
+    }
+
+    impl ReplicaStore<TestHasher, CounterOp> for FailStore {
+        fn load_roots(&self) -> Result<BTreeSet<Cid<TestHasher>>, Self::Error> {
+            Ok(self.inner.load_roots().unwrap())
+        }
+
+        fn commit(
+            &mut self,
+            nodes: Vec<(Cid<TestHasher>, DagNode<TestHasher, CounterOp>)>,
+            roots: &BTreeSet<Cid<TestHasher>>,
+        ) -> Result<(), Self::Error> {
+            if let Some(remaining) = &mut self.writes_before_failure {
+                if nodes.len() > *remaining {
+                    *remaining = 0;
+                    return Err(InjectedError::Write);
+                }
+                *remaining -= nodes.len();
+            }
+            self.inner.commit(nodes, roots).unwrap();
+            Ok(())
         }
     }
 
@@ -505,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_sync_is_unpublished_and_safely_retryable() {
+    fn failed_sync_publishes_neither_nodes_nor_roots_and_is_retryable() {
         let mut remote: TestCrdt = MerkleCrdt::default();
         remote.apply(CounterOp(1)).unwrap();
         remote.apply(CounterOp(2)).unwrap();
@@ -520,6 +617,7 @@ mod tests {
         ));
         assert_eq!(*local.state(), 0, "partial nodes must not materialize");
         assert!(local.roots().is_empty(), "partial root must not publish");
+        assert!(local.store().inner.is_empty(), "node batch must be atomic");
 
         local.store_mut().writes_before_failure = None;
         local.sync(&root, remote.store()).unwrap();

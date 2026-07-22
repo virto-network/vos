@@ -3,10 +3,15 @@
 //! Stores DAG nodes in a redb table keyed by CID bytes. Each database
 //! file can hold the DAG for one actor (or one logical CRDT).
 
-use crate::{Cid, DagNode, Decode, Encode, Hasher, Store};
+use crate::{Cid, DagNode, Decode, Encode, Hasher, ReplicaStore, Store};
+use alloc::collections::BTreeSet;
+use alloc::vec::Vec;
 
 /// redb table: CID bytes → serialized DagNode.
 const DAG_TABLE: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("dag");
+const META_TABLE: redb::TableDefinition<&str, &[u8]> =
+    redb::TableDefinition::new("merkle_crdt_meta");
+const ROOTS_KEY: &str = "published_roots_v1";
 
 /// A merkle-crdt [`Store`] backed by a redb database.
 pub struct RedbStore<H: Hasher> {
@@ -154,6 +159,81 @@ where
     }
 }
 
+impl<H, P> ReplicaStore<H, P> for RedbStore<H>
+where
+    H: Hasher,
+    P: Encode + Decode + Clone,
+{
+    fn load_roots(&self) -> Result<BTreeSet<Cid<H>>, Self::Error> {
+        let txn = self.db.begin_read()?;
+        let table = match txn.open_table(META_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(BTreeSet::new()),
+            Err(error) => return Err(error.into()),
+        };
+        match table.get(ROOTS_KEY)? {
+            Some(value) => decode_roots::<H>(value.value()).ok_or(RedbStoreError::Decode),
+            None => Ok(BTreeSet::new()),
+        }
+    }
+
+    fn commit(
+        &mut self,
+        nodes: Vec<(Cid<H>, DagNode<H, P>)>,
+        roots: &BTreeSet<Cid<H>>,
+    ) -> Result<(), Self::Error> {
+        let root_bytes = encode_roots(roots);
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DAG_TABLE)?;
+            for (cid, node) in nodes {
+                let bytes = node.to_bytes();
+                table.insert(cid.as_ref(), bytes.as_slice())?;
+            }
+        }
+        {
+            let mut table = txn.open_table(META_TABLE)?;
+            table.insert(ROOTS_KEY, root_bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+}
+
+fn encode_roots<H: Hasher>(roots: &BTreeSet<Cid<H>>) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(
+        8usize.saturating_add(
+            roots
+                .len()
+                .saturating_mul(core::mem::size_of::<H::Output>()),
+        ),
+    );
+    bytes.extend_from_slice(&(roots.len() as u64).to_le_bytes());
+    for root in roots {
+        bytes.extend_from_slice(root.as_ref());
+    }
+    bytes
+}
+
+fn decode_roots<H: Hasher>(bytes: &[u8]) -> Option<BTreeSet<Cid<H>>> {
+    let count_bytes: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
+    let count = usize::try_from(u64::from_le_bytes(count_bytes)).ok()?;
+    let digest_len = core::mem::size_of::<H::Output>();
+    let expected = 8usize.checked_add(count.checked_mul(digest_len)?)?;
+    if bytes.len() != expected {
+        return None;
+    }
+    let mut position = 8;
+    let mut roots = BTreeSet::new();
+    for _ in 0..count {
+        let output = H::Output::decode_from(bytes, &mut position)?;
+        if !roots.insert(Cid(output)) {
+            return None;
+        }
+    }
+    (position == bytes.len()).then_some(roots)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,13 +284,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("test.redb");
 
-        {
+        let published_roots = {
             let store = RedbStore::<TestHash>::open(&db_path).unwrap();
             let mut crdt: MerkleCrdt<TestHash, AddItem, _> = MerkleCrdt::new(store);
             crdt.apply(AddItem("apple".into())).unwrap();
             crdt.apply(AddItem("banana".into())).unwrap();
             assert_eq!(crdt.state().len(), 2);
-        }
+            crdt.roots().clone()
+        };
 
         // Reopen — nodes should be persisted
         {
@@ -223,6 +304,14 @@ mod tests {
                 table.len().unwrap()
             };
             assert_eq!(node_count, 2, "2 nodes should be persisted");
+
+            let recovered: MerkleCrdt<TestHash, AddItem, _> =
+                MerkleCrdt::from_store(store).unwrap();
+            assert_eq!(recovered.roots(), &published_roots);
+            assert_eq!(
+                recovered.state(),
+                &BTreeSet::from([String::from("apple"), String::from("banana")])
+            );
         }
 
         let _ = std::fs::remove_dir_all(&dir);

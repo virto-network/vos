@@ -26,6 +26,7 @@
 //! - **Self-verifying**: content-addressed nodes can be fetched from untrusted sources
 //! - **Cryptographic deduplication**: identical events have identical CIDs
 //! - **Cryptographic causal ordering**: the DAG encodes happened-before relationships
+//! - **Crash-consistent publication**: replica stores commit nodes and active roots atomically
 //!
 //! ## Quick Example
 //!
@@ -88,7 +89,7 @@ pub use crdt::{MerkleCrdt, Payload};
 pub use encode::{Decode, Encode};
 pub use hasher::Hasher;
 pub use node::DagNode;
-pub use store::{MemStore, Store};
+pub use store::{MemStore, ReplicaStore, Store};
 pub use sync::{AcceptAll, NodeValidator};
 
 #[cfg(feature = "redb")]

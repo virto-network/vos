@@ -40,6 +40,9 @@ a purpose-built conflict-free construction.
 - **Content-authenticated** — fetched nodes are rejected when their bytes do
   not match the advertised CID; an application validator must separately
   authenticate authors and payload policy
+- **Crash-consistent publication** — a `ReplicaStore` commits new DAG nodes
+  and the root set that activates them in one transaction, so restart recovery
+  never observes half-published history
 - **Efficient sync** — only missing pieces are transferred, shared history is skipped
 - **`no_std`** — runs on embedded devices, WASM, or servers with zero required dependencies
 
@@ -91,6 +94,7 @@ assert_eq!(phone.state(), laptop.state());
 | `Hasher` | Pluggable hash function (SHA-256, BLAKE3, etc.) |
 | `Encode` | Deterministic serialization for content addressing |
 | `Store` | Where nodes live (memory, disk, IPFS, network) |
+| `ReplicaStore` | Atomic node + active-root persistence and restart recovery |
 | `Payload` | Your convergent CRDT operation or state join |
 | `MerkleClock` | Low-level DAG clock — tracks roots, records events, merges |
 | `MerkleCrdt` | High-level wrapper — clock + store + automatic state tracking |
