@@ -136,12 +136,23 @@ the durable ingress and later attestation statement expose only its reference
 and commitment. The credential wire and commitment include the exact
 `SpaceId`; Refine and guest Accumulate reject evidence issued for a sibling
 space before exposing its role to actor code. Refine runs only from that stored
-input. If the actor is suspended, the record survives restart and is consumed atomically with its
-eventual first slice; retry timeslots do not replace the originally admitted
-scheduling timeslot. A reply-only publication is acknowledged only after the
-consumer channel accepts it. For locally routed roots, a committed outbox publication is
-sent as `RootTreeTransportV2`, admitted through destination
-physical Accumulate, executed from the guest inbox, returned only after the
+input. When service genesis pins a `RoleAuthorityBindingV2`, guest Accumulate
+also requires the credential authenticator to contain an
+`AccumulatedRoleAssertionV2`. Its finalized authority reply binds the exact
+space, holder, role, destination service and actor, method, generated policy,
+and invocation. An assertion cannot be replayed for a later invocation;
+unavailable receipt finality rejects the complete ingress or transition without
+staging writes. The registry authority producer and production install cutover
+remain separate from this validation path; no daemon-local signature is treated
+as a finalized authority receipt.
+
+If the actor is suspended, the record survives restart and is consumed
+atomically with its eventual first slice; retry timeslots do not replace the
+originally admitted scheduling timeslot. A reply-only publication is
+acknowledged only after the consumer channel accepts it. For locally routed
+roots, a committed outbox publication is sent as `RootTreeTransportV2`,
+admitted through destination physical Accumulate, executed from the guest
+inbox, returned only after the
 callee's Refine/Accumulate commit, and injected at the caller's exact JAR
 snapshot boundary. The source outbox and callee reply publications are removed
 only after commitment-bound acknowledgements; retries recover their original

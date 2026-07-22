@@ -14,8 +14,9 @@ use vos::network::{Network, NetworkConfig, RaftRpcHandler, derive_node_prefix};
 use vos::node::VosNode;
 use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, WorkerConfig};
 use vos::v2::{
-    AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
-    AccumulationResultV2, ActorDirectoryV2, ActorGenesisV2, ActorId, ActorUpgradeV2, ActorWriteV2,
+    AccumulateRequestV2, AccumulatedReplyV2, AccumulatedRoleAssertionV2,
+    AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationResultV2, ActorDirectoryV2,
+    ActorGenesisV2, ActorId, ActorUpgradeV2, ActorWriteV2,
     AttestationDeliveryV2, AttestationVerificationV2, AuthorizationEvidenceV2, BlobRefV2, CallId,
     CommittedAccumulateBatchV2, CommittedAccumulateEntryV2, CommittedAccumulateLogV2,
     CommittedAttestationOutputV2, CommittedImageStoreV2, CommittedServiceSnapshotV2,
@@ -999,6 +1000,15 @@ fn public_private_age_and_gate_examples_produce_then_verify_one_committed_packag
         return;
     };
     producer_config.actor_name = "private-age".into();
+    let role_authority = RoleAuthorityBindingV2 {
+        service: ServiceIdentityV2 {
+            root_service: RootServiceId([180; 32]),
+            deployment: DeploymentId([181; 32]),
+            ..producer_config.service.clone()
+        },
+        actor: ActorId([182; 32]),
+    };
+    producer_config.role_authority = Some(role_authority.clone());
     let source_binding = vos::v2::ExternalActorBindingV2 {
         name: "private-age".into(),
         service: producer_config.service.clone(),
@@ -1079,11 +1089,44 @@ fn public_private_age_and_gate_examples_produce_then_verify_one_committed_packag
     );
 
     let member = Origin::Member(SubjectId([172; 32]));
+    let claim = vos::v2::RoleAuthorizationClaimV2 {
+        space: producer_service.identity().space,
+        holder: member,
+        role: vos::SpaceRole::Member,
+        audience: producer_service.identity().clone(),
+        invocation: InvocationId([173; 32]),
+        target: producer_actor,
+        method: "is_adult".into(),
+        policy: policy.policy,
+    };
+    let authority_receipt = AccumulationReceiptV2 {
+        service: role_authority.service.clone(),
+        accepted_transition: Hash::digest(
+            b"vos/test-role-authority-transition/v2",
+            &[&claim.encode()],
+        ),
+        reply_commitment: Some(claim.authority_reply(role_authority.actor).commitment()),
+        outbox_commitment: None,
+        resulting_state_root: Some(Hash([183; 32])),
+        resulting_crdt_heads: vec![],
+        sequence: 1,
+        checkpoint: 0,
+        consistency: ConsistencyModeV2::Local,
+    };
+    producer_service
+        .store_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            receipt: authority_receipt.clone(),
+        });
     let credential = SpaceRoleCredentialV2 {
         space: producer_service.identity().space,
         holder: member,
         role: vos::SpaceRole::Member,
-        authenticator: b"public-example-private-member-witness".to_vec(),
+        authenticator: AccumulatedRoleAssertionV2 {
+            claim,
+            receipt: authority_receipt,
+        }
+        .encode(),
     };
     let (authorization, witness) = credential.private_evidence(policy.policy);
     let attested_request = request(
