@@ -47,9 +47,9 @@ pub use contracts::{
     ImportedBlobV2, ImportedProgramV2, IngressEnvelopeV2, MessageRecordV2, MethodPolicyV2,
     ProofCommitmentV2, ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2,
     ReceiptVerificationRequestV2, RefineError, RefineImportsV2, RefineOutputV2, ReplyRecordV2,
-    RoleAuthorityBindingV2, RoleAuthorizationClaimV2, ServiceGenesisV2, ServiceIdentityV2,
-    ServiceInstallReceiptV2, SpaceRoleCredentialV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2,
-    WorkflowOperationV2,
+    RoleAuthorityBindingV2, RoleAuthorityMutationV2, RoleAuthorizationClaimV2, ServiceGenesisV2,
+    ServiceIdentityV2, ServiceInstallReceiptV2, SpaceRoleCredentialV2, TransitionV2,
+    WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
 };
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStoreV2, ProofVerificationV2, ReceiptVerificationV2,
