@@ -4119,12 +4119,15 @@ impl VosNode {
 
     /// Invoke an attested v2 method and decode only the complete package that
     /// guest Accumulate committed. A plain reply can never satisfy this path.
+    /// The default timeout is two minutes because canonical trace replay,
+    /// proof production, and guest Accumulate all complete before publication;
+    /// use [`Self::invoke_actor_attested_with_timeout`] to select another bound.
     pub fn invoke_actor_attested(
         &self,
         target: crate::v2::ActorId,
         arguments: Vec<u8>,
     ) -> Option<crate::actors::client::AttestedInvocationResult> {
-        self.invoke_actor_attested_with_timeout(target, arguments, Duration::from_secs(10))
+        self.invoke_actor_attested_with_timeout(target, arguments, Duration::from_secs(120))
     }
 
     /// Like [`Self::invoke_actor_attested`], with an explicit upper bound for
