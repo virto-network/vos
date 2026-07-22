@@ -11240,9 +11240,11 @@ fn probe_yield_mid_batch_delivers_all_mail() {
     // guest had not yet FETCHed before it suspended. The probe's `ping`
     // handler counts one message then yields, so three `ping`s queued in
     // a single tick are consumed one per tick — the un-fetched remainder
-    // must re-queue rather than evaporate. `seen` therefore ends at 3.
-    // Before the fix the second and third `ping` were dropped and `seen`
-    // stayed at 1.
+    // must re-queue rather than evaporate. The bounded cold-start hook also
+    // advances this fixture's shared counter once, so `seen` ends at 4:
+    // one start plus three delivered pings.
+    // Before the mail requeue fix the second and third `ping` were dropped
+    // and only the cold start plus first ping were visible (`seen == 2`).
     use vos::value::{Msg, TAG_DYNAMIC, Value};
     use vos::{Decode, Encode};
 
@@ -11272,8 +11274,8 @@ fn probe_yield_mid_batch_delivers_all_mail() {
         .as_u32()
         .expect("seen returns u32");
     assert_eq!(
-        seen, 3,
-        "all three pings must be delivered across ticks, not just the first"
+        seen, 4,
+        "the cold start and all three pings must execute across ticks"
     );
 }
 
