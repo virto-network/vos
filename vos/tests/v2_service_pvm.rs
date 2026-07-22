@@ -252,10 +252,35 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
 }
 
 fn service_elf() -> Option<Vec<u8>> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../services/vos-service/target/riscv64em-javm/release/vos_service.elf");
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let service_dir = manifest_dir.join("../services/vos-service");
+    let path = service_dir.join("target/riscv64em-javm/release/vos_service.elf");
     match std::fs::read(&path) {
-        Ok(bytes) => Some(bytes),
+        Ok(bytes) => {
+            let built_at = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .expect("read canonical service artifact modification time");
+            let inputs = [
+                manifest_dir.join("src"),
+                manifest_dir.join("Cargo.toml"),
+                manifest_dir.join("../Cargo.toml"),
+                manifest_dir.join("../Cargo.lock"),
+                service_dir.join("src"),
+                service_dir.join("Cargo.toml"),
+                service_dir.join("Cargo.lock"),
+                service_dir.join("riscv64em-javm.json"),
+                service_dir.join("rust-toolchain.toml"),
+            ];
+            if let Some(newer) = newer_build_input(&inputs, built_at) {
+                panic!(
+                    "canonical service artifact is stale: {} is newer than {}; rebuild with \
+                     `cd services/vos-service && cargo +nightly actor`",
+                    newer.display(),
+                    path.display(),
+                );
+            }
+            Some(bytes)
+        }
         Err(_) => {
             eprintln!(
                 "skipping: build the generic guest first with `cd services/vos-service && cargo +nightly actor` ({})",
@@ -264,6 +289,23 @@ fn service_elf() -> Option<Vec<u8>> {
             None
         }
     }
+}
+
+fn newer_build_input(inputs: &[PathBuf], built_at: std::time::SystemTime) -> Option<PathBuf> {
+    let mut pending = inputs.to_vec();
+    while let Some(path) = pending.pop() {
+        let metadata = std::fs::metadata(&path).ok()?;
+        if metadata.is_dir() {
+            let entries = std::fs::read_dir(&path).ok()?;
+            pending.extend(entries.filter_map(|entry| entry.ok().map(|entry| entry.path())));
+        } else if metadata
+            .modified()
+            .is_ok_and(|modified| modified > built_at)
+        {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn greeter_elf() -> Option<Vec<u8>> {
