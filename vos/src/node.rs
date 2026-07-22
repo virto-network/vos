@@ -4108,13 +4108,26 @@ impl VosNode {
 
     /// Originate a new host-side call to a canonical v2 actor identity. The
     /// adapter mints one typed invocation ID and places it in the strict ingress
-    /// wire before using the node's compatibility transport route.
+    /// wire before using the node's compatibility transport route. The default
+    /// timeout is two minutes because admission, physical Refine, guest-owned
+    /// Accumulate, and publication acknowledgement all precede the reply.
     pub fn invoke_actor(
         &self,
         target: crate::v2::ActorId,
         arguments: Vec<u8>,
     ) -> Option<Vec<u8>> {
-        self.invoke_actor_with_proof_mode(target, arguments, false)
+        self.invoke_actor_with_timeout(target, arguments, Duration::from_secs(120))
+    }
+
+    /// Like [`Self::invoke_actor`], with an explicit upper bound for the
+    /// complete canonical v2 ingress/Refine/Accumulate path.
+    pub fn invoke_actor_with_timeout(
+        &self,
+        target: crate::v2::ActorId,
+        arguments: Vec<u8>,
+        timeout: Duration,
+    ) -> Option<Vec<u8>> {
+        self.invoke_actor_with_proof_mode_and_timeout(target, arguments, false, timeout)
     }
 
     /// Invoke an attested v2 method and decode only the complete package that
@@ -4132,8 +4145,8 @@ impl VosNode {
 
     /// Like [`Self::invoke_actor_attested`], with an explicit upper bound for
     /// tracing, proof production, Raft ordering, guest Accumulate, and reply
-    /// publication. Heavy proof backends should not inherit the ordinary
-    /// ten-second request timeout accidentally.
+    /// publication. Heavy proof backends should not inherit the shorter
+    /// generic `ServiceId` request timeout accidentally.
     pub fn invoke_actor_attested_with_timeout(
         &self,
         target: crate::v2::ActorId,
@@ -4159,20 +4172,6 @@ impl VosNode {
             trace: attestation.proof.trace,
             proof: package.proof_blob.bytes,
         })
-    }
-
-    fn invoke_actor_with_proof_mode(
-        &self,
-        target: crate::v2::ActorId,
-        arguments: Vec<u8>,
-        proof_requested: bool,
-    ) -> Option<Vec<u8>> {
-        self.invoke_actor_with_proof_mode_and_timeout(
-            target,
-            arguments,
-            proof_requested,
-            Duration::from_secs(10),
-        )
     }
 
     fn invoke_actor_with_proof_mode_and_timeout(
