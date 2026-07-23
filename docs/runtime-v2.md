@@ -8,6 +8,13 @@
 > runs the legacy runtime while durable v2 scheduling and backend integration
 > are completed. Legacy node behavior is not evidence of v2 conformance.
 
+Before that production cutover, guest Install must authenticate
+`genesis.authorization` against consensus-authoritative deployment state, and
+`PROGRAM_LOOKUP` availability must be pinned to or imported from
+consensus-visible state rather than a node-local cache. A bounded reclamation
+or checkpoint plan for unreachable SMT and CRDT DAG nodes is also required
+before the engine stores production state.
+
 VOS v2 assigns one logical JAM service to a root actor and its owned child
 tree. The protocol-pinned `vos-service.pvm` is one generic program with the
 Gray Paper two-slot entry prologue: Refine begins at instruction counter 0 and
