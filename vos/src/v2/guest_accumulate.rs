@@ -12,7 +12,7 @@ use super::{
     ABI_VERSION, AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorId,
     AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2, CrdtChangeV2,
-    DedupRecordV2, EXECUTION_SEMANTICS_ID, Hash, MessageRecordV2, MethodPolicyV2,
+    DedupRecordV2, EXECUTION_SEMANTICS_ID, Hash, MessageRecordV2, MethodPolicyV2, ProgramId,
     PublishedEffectsV2, ServiceGenesisV2, ServiceInstallReceiptV2, ServiceStateTreeV2, StateKeyV2,
     StateTreeError, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2,
     crdt_change_storage_key, crdt_node_storage_key, dedup_storage_key, header_storage_key,
@@ -23,6 +23,9 @@ use super::{
 /// to ordinary JAM service storage.
 pub trait GuestAccumulateStoreV2: StateTreeStore {
     fn blob_available(&self, reference: &BlobRefV2) -> Result<bool, Self::Error>;
+
+    /// Whether exact canonical actor PVM bytes are available to this service.
+    fn program_available(&self, program: ProgramId) -> Result<bool, Self::Error>;
 
     /// Stage bytes in the content-addressed store and return their canonical
     /// VOS reference. The staged blob becomes visible only with this same
@@ -81,6 +84,12 @@ fn install<S: GuestAccumulateStoreV2>(
         return Ok(rejected(AccumulationRejectionV2::WrongExecutionSemantics));
     }
     for actor in &genesis.actors {
+        if !store
+            .program_available(actor.program)
+            .map_err(GuestAccumulateError::Storage)?
+        {
+            return Ok(rejected(AccumulationRejectionV2::WrongProgram));
+        }
         if !blob_available(store, &actor.initial_state)? {
             return Ok(rejected(AccumulationRejectionV2::MissingBlob(
                 actor.initial_state.hash,
@@ -235,6 +244,13 @@ fn apply<S: GuestAccumulateStoreV2>(
     }
 
     for imported in &work.imported_actors {
+        if !tree
+            .store_ref()
+            .program_available(imported.program)
+            .map_err(GuestAccumulateError::Storage)?
+        {
+            return Ok(rejected(AccumulationRejectionV2::WrongProgram));
+        }
         let Some(descriptor) = tree_get_wire::<_, ActorGenesisV2>(
             &tree,
             &StateKeyV2::ActorDescriptor(imported.actor),
@@ -782,6 +798,7 @@ mod tests {
     struct MemStore {
         rows: BTreeMap<Vec<u8>, Vec<u8>>,
         blobs: BTreeMap<Hash, Vec<u8>>,
+        programs: BTreeMap<ProgramId, Vec<u8>>,
         writes_before_failure: Option<usize>,
     }
 
@@ -824,6 +841,13 @@ mod tests {
             self.blobs.insert(reference.hash, bytes.to_vec());
             Ok(reference)
         }
+
+        fn program_available(&self, program: ProgramId) -> Result<bool, Self::Error> {
+            Ok(self
+                .programs
+                .get(&program)
+                .is_some_and(|pvm| ProgramId::of_pvm(pvm) == program))
+        }
     }
 
     fn identity() -> ServiceIdentityV2 {
@@ -840,8 +864,10 @@ mod tests {
         ActorId([4; 32])
     }
 
+    const FIXTURE_ACTOR_PVM: &[u8] = b"fixture actor pvm";
+
     fn program() -> ProgramId {
-        ProgramId([5; 32])
+        ProgramId::of_pvm(FIXTURE_ACTOR_PVM)
     }
 
     fn install_fixture(
@@ -850,6 +876,7 @@ mod tests {
         initial: &[u8],
     ) -> (BlobRefV2, ServiceInstallReceiptV2) {
         let initial = store.provide_blob(initial).unwrap();
+        store.programs.insert(program(), FIXTURE_ACTOR_PVM.to_vec());
         let request = AccumulateRequestV2::Install(ServiceGenesisV2 {
             service: identity(),
             consistency,
@@ -878,6 +905,41 @@ mod tests {
             panic!("install rejected")
         };
         (initial, receipt)
+    }
+
+    #[test]
+    fn install_requires_every_actor_program_to_be_available() {
+        let mut store = MemStore::default();
+        let initial = store.provide_blob(b"state").unwrap();
+        let genesis = ServiceGenesisV2 {
+            service: identity(),
+            consistency: ConsistencyModeV2::Local,
+            actors: vec![ActorGenesisV2 {
+                actor: actor(),
+                parent: None,
+                program: program(),
+                initial_state: initial,
+                crdt: false,
+                methods: vec![MethodPolicyV2 {
+                    method: "set".into(),
+                    schema: Hash([6; 32]),
+                    policy: Hash([7; 32]),
+                    public: true,
+                    attested: false,
+                }],
+            }],
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: super::super::SystemCapabilityId([8; 32]),
+                authenticator: vec![9],
+            },
+        };
+        let before = store.clone();
+
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Install(genesis)).unwrap(),
+            rejected(AccumulationRejectionV2::WrongProgram)
+        );
+        assert_eq!(store, before, "missing code must not initialize the store");
     }
 
     fn linear_work(initial: BlobRefV2, base_root: Hash) -> WorkEnvelopeV2 {
@@ -1035,6 +1097,29 @@ mod tests {
             rejected(AccumulationRejectionV2::Unauthorized)
         );
         assert_eq!(store, before);
+    }
+
+    #[test]
+    fn apply_requires_every_imported_actor_program_to_remain_available() {
+        let mut store = MemStore::default();
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let work = linear_work(initial, install.resulting_state_root.unwrap());
+        let transition = linear_transition(&work, b"after");
+        store.programs.remove(&program());
+        let before = store.clone();
+
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 { work, transition }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::WrongProgram)
+        );
+        assert_eq!(
+            store, before,
+            "missing canonical actor code must stage no service changes"
+        );
     }
 
     fn crdt_work(initial: BlobRefV2, invocation: u8, heads: Vec<Hash>) -> WorkEnvelopeV2 {

@@ -17,7 +17,8 @@ mod guest {
     use vos::v2::{
         AccumulateRequestV2, AccumulationRejectionV2, AccumulationResultV2, ActorSliceOutputV2,
         BlobRefV2, ContinuationChangeV2, GasAccountingV2, GuestAccumulateStoreV2, ReplyRecordV2,
-        StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2, execute_guest_accumulate,
+        ProgramId, StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2,
+        execute_guest_accumulate,
     };
 
     /// Upper bound for one nested actor transition in this foundation guest. This
@@ -261,6 +262,10 @@ mod guest {
             } else {
                 Err(JamStoreError::ProvideFailed)
             }
+        }
+
+        fn program_available(&self, program: ProgramId) -> Result<bool, Self::Error> {
+            Ok(hostcalls::program_available(&program.0) == error::HOST_OK)
         }
     }
 

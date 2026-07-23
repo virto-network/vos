@@ -97,6 +97,10 @@ pub const NOW_MS: u32 = 121;
 /// continues immediately after the source-level `.await`.
 pub const SUSPEND: u32 = 122;
 
+/// Query one canonical actor PVM by `ProgramId` inside the current Accumulate
+/// transaction. This is a VOS service capability, not a JAM protocol slot.
+pub const PROGRAM_LOOKUP: u32 = 127;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +114,7 @@ mod tests {
             BOOT_CONTEXT,
             NOW_MS,
             SUSPEND,
+            PROGRAM_LOOKUP,
         ];
         assert!(supplied.iter().all(|slot| !(1..=28).contains(slot)));
         for (index, slot) in supplied.iter().enumerate() {
@@ -137,6 +142,7 @@ mod tests {
             BOOT_CONTEXT as u8,
             NOW_MS as u8,
             SUSPEND as u8,
+            PROGRAM_LOOKUP as u8,
             crate::v2::ACTOR_IPC_CAP_SLOT,
         ];
         assert!(

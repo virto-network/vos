@@ -183,6 +183,13 @@ pub fn provide(hash: &[u8; 32], data: &[u8]) -> u64 {
     )
 }
 
+/// Probe the service-owned program cache for exact canonical actor PVM bytes.
+#[cfg(feature = "service")]
+#[inline]
+pub fn program_available(program: &[u8; 32]) -> u64 {
+    ecall1(hostcall::PROGRAM_LOOKUP, program.as_ptr() as u64)
+}
+
 /// Transfer to another service with a memo.
 #[cfg(feature = "service")]
 #[inline]
