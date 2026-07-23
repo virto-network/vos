@@ -8,13 +8,12 @@ use std::{collections::BTreeMap, path::PathBuf};
 use javm::kernel::InvocationKernel;
 use vos::v2::{
     AccumulateProtocolHostV2, AccumulateRequestV2, AccumulateTransactionV2, AccumulationEnvelopeV2,
-    AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AllowPublic,
-    AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2, DeploymentId,
-    GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
-    InMemoryServiceState, InvocationId, JamServiceV2, MethodPolicyV2, NoRefineProtocolHostV2,
-    Origin, ProgramId, PublishedEffectsV2, RefineImportsV2, ReplyRecordV2, RootServiceId,
-    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire,
-    WorkEnvelopeV2,
+    AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AuthorizationEvidenceV2,
+    BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2, DeploymentId, GasAccountingV2, Hash,
+    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId, JamServiceV2, MethodPolicyV2,
+    NoRefineProtocolHostV2, Origin, ProgramId, PublishedEffectsV2, RefineImportsV2, ReplyRecordV2,
+    RootServiceId, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2,
+    TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 use vos::{Decode, Encode, value::Msg};
 
@@ -411,7 +410,8 @@ fn yielding_actor_restores_exactly_after_restart() {
         return;
     };
     let service_pvm = grey_transpiler::link_elf(&service_elf).unwrap();
-    let service = ServicePvmV2::new(service_pvm.clone(), ProgramId::of_pvm(&service_pvm)).unwrap();
+    let service_program = ProgramId::of_pvm(&service_pvm);
+    let service = ServicePvmV2::new(service_pvm.clone(), service_program).unwrap();
     let actor = grey_transpiler::link_elf(&actor_elf).unwrap();
     let actor_program = ProgramId::of_pvm(&actor);
     let initial_state = Vec::new();
@@ -421,11 +421,49 @@ fn yielding_actor_restores_exactly_after_restart() {
     ping.extend_from_slice(&Msg::new("ping").encode());
     first_work.method = "ping".into();
     first_work.arguments = ping;
-    let mut committed =
-        InMemoryServiceState::new(first_work.service.clone(), ConsistencyModeV2::Local);
-    committed.install_actor(first_work.target, actor_program);
-    committed.make_blob_available(initial_state_ref.hash);
-    first_work.base = committed.current_base();
+    let mut host = DurableAccumulateHost::default();
+    host.preimages
+        .insert(initial_state_ref.hash.0, initial_state.clone());
+    host.programs.insert(actor_program.0, actor.clone());
+    let mut committed = JamServiceV2::new(
+        service_pvm,
+        service_program,
+        NoRefineProtocolHostV2,
+        host,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        service: first_work.service.clone(),
+        consistency: ConsistencyModeV2::Local,
+        actors: vec![ActorGenesisV2 {
+            actor: first_work.target,
+            parent: None,
+            program: actor_program,
+            initial_state: initial_state_ref.clone(),
+            crdt: false,
+            methods: vec![MethodPolicyV2 {
+                method: "ping".into(),
+                schema: Hash([32; 32]),
+                policy: Hash([33; 32]),
+                public: true,
+                attested: false,
+            }],
+        }],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([34; 32]),
+            authenticator: vec![35],
+        },
+    });
+    let installed = committed.accumulate(&install).unwrap();
+    let AccumulationResultV2::Installed(installed) = installed.result else {
+        panic!("guest install rejected")
+    };
+    first_work.base = ConsistencyBaseV2::Linear {
+        revision: 0,
+        state_root: installed.resulting_state_root.unwrap(),
+    };
     let first_imports = RefineImportsV2 {
         programs: vec![ImportedProgramV2 {
             program: actor_program,
@@ -486,35 +524,47 @@ fn yielding_actor_restores_exactly_after_restart() {
         .and_then(|write| write.value.clone())
         .expect("checkpoint commits the mutation before await");
     assert_eq!(u32::decode(&checkpoint_state), 1);
-    assert_eq!(
-        committed.row(first_work.target, vos::lifecycle::STATE_KEY_BYTES),
-        None
-    );
-    assert_eq!(committed.continuation(first_work.target), None);
     for artifact in &first_output.exported_blobs {
-        committed.make_blob_available(artifact.reference.hash);
+        committed
+            .accumulate_host_mut()
+            .preimages
+            .insert(artifact.reference.hash.0, artifact.bytes.clone());
     }
     let checkpoint_outcome = committed
-        .accumulate(&first_work, &first, &AllowPublic)
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: first_work.clone(),
+            transition: first.clone(),
+        }))
         .unwrap();
-    assert!(checkpoint_outcome.published.reply.is_none());
-    assert_eq!(
-        committed.row(first_work.target, vos::lifecycle::STATE_KEY_BYTES),
-        Some(checkpoint_state.as_slice())
-    );
-    assert_eq!(
-        committed.continuation(first_work.target),
-        Some(&first_continuation)
+    let AccumulationResultV2::Accepted {
+        receipt: checkpoint_receipt,
+        published,
+        duplicate,
+    } = checkpoint_outcome.result
+    else {
+        panic!("guest rejected the transition emitted by its own Refine entry")
+    };
+    assert!(!duplicate);
+    assert!(published.reply.is_none());
+    assert!(
+        committed
+            .accumulate_host()
+            .preimages
+            .values()
+            .any(|bytes| bytes == &checkpoint_state),
+        "guest Accumulate must durably record the checkpoint state"
     );
 
     // Simulate a process restart after Accumulate committed slice 0. Only
     // canonical programs, the committed state, and the continuation blob are
     // supplied to the next Refine invocation.
     let checkpoint_state_ref = BlobRefV2::of_bytes(&checkpoint_state);
-    committed.make_blob_available(checkpoint_state_ref.hash);
     let mut resumed_work = first_work.clone();
     resumed_work.workflow_step = 1;
-    resumed_work.base = committed.current_base();
+    resumed_work.base = ConsistencyBaseV2::Linear {
+        revision: checkpoint_receipt.sequence,
+        state_root: checkpoint_receipt.resulting_state_root.unwrap(),
+    };
     resumed_work.imported_actors[0].state = checkpoint_state_ref.clone();
     resumed_work.imported_actors[0].continuation = Some(first_continuation.clone());
     let mut resumed_blobs = vec![
@@ -580,19 +630,34 @@ fn yielding_actor_restores_exactly_after_restart() {
         1,
         "code before .await must not execute again"
     );
-    assert_eq!(
-        committed.continuation(first_work.target),
-        Some(&first_continuation),
-        "Refine cannot delete durable continuation state"
-    );
+    let committed_rows_before_resume = committed.accumulate_host().rows.clone();
     let completed = committed
-        .accumulate(&resumed_work, &resumed, &AllowPublic)
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: resumed_work,
+            transition: resumed.clone(),
+        }))
         .unwrap();
-    assert_eq!(completed.published.reply, resumed.reply);
-    assert_eq!(committed.continuation(first_work.target), None);
-    assert_eq!(
-        committed.row(first_work.target, vos::lifecycle::STATE_KEY_BYTES),
-        Some(resumed_state.as_slice())
+    let AccumulationResultV2::Accepted {
+        receipt,
+        published,
+        duplicate,
+    } = completed.result
+    else {
+        panic!("guest rejected its own resumed transition")
+    };
+    assert!(!duplicate);
+    assert_eq!(receipt.sequence, checkpoint_receipt.sequence + 1);
+    assert_eq!(published.reply, resumed.reply);
+    assert_ne!(
+        committed.accumulate_host().rows,
+        committed_rows_before_resume
+    );
+    assert!(
+        committed
+            .accumulate_host()
+            .preimages
+            .values()
+            .any(|bytes| bytes == resumed_state)
     );
 }
 

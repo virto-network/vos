@@ -10,7 +10,6 @@
 //! This is a clean boundary. None of the types in this module accept legacy
 //! `RefinePayload`, `EffectLog`, or continuation encodings.
 
-mod accumulate;
 mod continuation;
 mod contracts;
 mod guest_accumulate;
@@ -24,10 +23,6 @@ mod state_tree;
 mod storage;
 pub(crate) mod wire;
 
-pub use accumulate::{
-    AccumulateError, AccumulationOutcome, AccumulationValidator, AllowPublic, InMemoryServiceState,
-    PublishedEffects,
-};
 pub use continuation::ContinuationSnapshotV2;
 pub use contracts::{
     AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2,
@@ -82,8 +77,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0xbd, 0x77, 0xdf, 0x58, 0xbf, 0xb3, 0x99, 0xc2, 0xfa, 0x27, 0x70, 0xb6, 0xc7, 0x1e, 0xa0, 0xee,
-    0x6d, 0x9f, 0x5e, 0xbb, 0x49, 0x3d, 0xdc, 0x1e, 0xc8, 0x3f, 0x3d, 0x19, 0xde, 0x90, 0xb2, 0xd8,
+    0x8d, 0x5f, 0x61, 0xa0, 0x74, 0x75, 0x48, 0xf0, 0x06, 0xe9, 0x5e, 0x4e, 0x48, 0xc7, 0xac, 0x8a,
+    0x30, 0x84, 0x85, 0x83, 0x74, 0x56, 0xc4, 0x81, 0x2d, 0xd5, 0xd5, 0x4f, 0xfc, 0xfe, 0x9c, 0xaa,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.
