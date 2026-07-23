@@ -252,7 +252,8 @@ mod guest {
     impl GuestAccumulateStoreV2 for JamAccumulateStore {
         fn blob_available(&self, reference: &BlobRefV2) -> Result<bool, Self::Error> {
             let mut probe = [0u8; 1];
-            Ok(hostcalls::preimage_lookup(&reference.hash.0, &mut probe) == reference.len)
+            let available = hostcalls::preimage_lookup(&reference.hash.0, &mut probe);
+            Ok(available != error::HOST_NONE && available == reference.len)
         }
 
         fn provide_blob(&mut self, bytes: &[u8]) -> Result<BlobRefV2, Self::Error> {

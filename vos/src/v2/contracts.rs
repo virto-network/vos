@@ -1515,10 +1515,15 @@ fn encode_blob_ref(e: &mut Encoder<'_>, value: &BlobRefV2) {
 }
 
 fn decode_blob_ref(d: &mut Decoder<'_>) -> Result<BlobRefV2, DecodeError> {
-    Ok(BlobRefV2 {
-        hash: Hash(d.fixed()?),
-        len: d.u64()?,
-    })
+    let hash = Hash(d.fixed()?);
+    let len = d.u64()?;
+    // JAM uses u64::MAX as the missing-preimage sentinel. Keeping that value
+    // out of canonical references prevents absence from comparing equal to a
+    // claimed blob length at any host boundary.
+    if len == u64::MAX {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(BlobRefV2 { hash, len })
 }
 
 fn encode_imported_actor(e: &mut Encoder<'_>, value: &ImportedActorV2) {
@@ -1770,6 +1775,16 @@ mod tests {
         assert_eq!(
             WorkEnvelopeV2::decode(&old),
             Err(DecodeError::InvalidVersion)
+        );
+
+        let mut sentinel = value;
+        sentinel.imported_blobs.push(BlobRefV2 {
+            hash: Hash([42; 32]),
+            len: u64::MAX,
+        });
+        assert_eq!(
+            WorkEnvelopeV2::decode(&sentinel.encode()),
+            Err(DecodeError::NonCanonical)
         );
     }
 

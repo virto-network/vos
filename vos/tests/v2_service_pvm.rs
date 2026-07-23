@@ -756,6 +756,61 @@ fn physical_guest_install_rejects_an_unavailable_actor_program() {
 }
 
 #[test]
+fn physical_guest_rejects_the_missing_preimage_length_sentinel() {
+    let Some(elf) = service_elf() else {
+        return;
+    };
+    let pvm = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
+    let actor_pvm = b"available canonical actor bytes".to_vec();
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let seed_work = work(
+        actor_program,
+        BlobRefV2 {
+            hash: Hash([30; 32]),
+            len: u64::MAX,
+        },
+    );
+    let mut host = DurableAccumulateHost::default();
+    host.programs.insert(actor_program.0, actor_pvm);
+    let mut service = JamServiceV2::new(
+        pvm.clone(),
+        ProgramId::of_pvm(&pvm),
+        NoRefineProtocolHostV2,
+        host,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let genesis = ServiceGenesisV2 {
+        service: seed_work.service,
+        consistency: ConsistencyModeV2::Local,
+        actors: vec![ActorGenesisV2 {
+            actor: seed_work.target,
+            parent: None,
+            program: actor_program,
+            initial_state: seed_work.imported_actors[0].state.clone(),
+            crdt: false,
+            methods: vec![],
+        }],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([31; 32]),
+            authenticator: vec![32],
+        },
+    };
+
+    assert_eq!(
+        service
+            .accumulate(&AccumulateRequestV2::Install(genesis))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::NonCanonical)
+    );
+    assert_eq!(service.accumulate_host().commits, 0);
+    assert!(service.accumulate_host().rows.is_empty());
+    assert!(service.accumulate_host().preimages.is_empty());
+}
+
+#[test]
 fn malformed_guest_accumulate_returns_a_rejection_without_storage_effects() {
     let Some(elf) = service_elf() else {
         return;
