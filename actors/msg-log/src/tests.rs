@@ -6,6 +6,11 @@ fn log() -> MsgLog {
     MsgLog::new()
 }
 
+#[test]
+fn program_declares_crdt_storage() {
+    assert!(<MsgLog as vos::Actor>::CRDT);
+}
+
 /// Handler futures never await anything external, so a single
 /// poll with a no-op waker resolves them — no executor (or
 /// vos `std` feature) needed in this crate's unit tests.

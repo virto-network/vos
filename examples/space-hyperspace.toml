@@ -22,7 +22,7 @@ registry_blob = "../actors/space-registry/target/riscv64em-javm/release/space-re
 
 [[agent]]
 name = "counter"
-path = "actors/crdt-counter/target/riscv64em-javm/release/crdt-counter.elf"
+path = "actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf"
 consistency = "crdt"
 provides = ["counter", "demo-service"]
 on_start = [

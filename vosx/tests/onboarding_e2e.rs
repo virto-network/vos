@@ -148,7 +148,7 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
     let cfg_b = TempDir::new("b-config");
 
     // ── host A: create + boot + install a MEMBER-floor app agent ───
-    // (bundled dev-project) so B has something to spawn once it is a
+    // (the CRDT counter fixture) so B has something to spawn once it is a
     // member. Its sync floor defaults to `member`, so a node judged
     // non-member would narrow it out — exercising node_is_member's
     // node-key grant path.
@@ -213,7 +213,7 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
 
     // (3) B SPAWNS the Member-floor agent: node_is_member must recognize
     //     B's redeemed node-key grant, else node_meets_floor narrows
-    //     dev-project out and B logs "not spawned … sync floor is above".
+    //     crdt-counter out and B logs "not spawned … sync floor is above".
     //     A spawned agent opens its own per-node redb, so a redb in B's
     //     agents dir other than the registry's (00000000.redb) is the
     //     spawn signal — sync alone (the row) would not create it.
@@ -225,7 +225,7 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
         || spawned_app_agent(&agents_dir),
         || {
             format!(
-                "B synced dev-project's row but never SPAWNED it — node_is_member likely still \
+                "B synced crdt-counter's row but never SPAWNED it — node_is_member likely still \
                  ignores the redeemed node-key grant, so node_meets_floor narrowed the Member \
                  agent out. B log:\n{}",
                 fs::read_to_string(&log_b).unwrap_or_default(),
@@ -234,17 +234,21 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
     );
 
     // (4) The spawned agent is live + reachable on B — a real call
-    //     (list_branches, a no-arg read) returns rather than erroring.
+    //     (`get`, a no-arg read) returns rather than erroring.
     poll_until(
         30,
         || {
-            vosx(data_b.path(), cfg_b.path(), &["space", "call", space, "dev-project", "list_branches"])
-                .status
-                .success()
+            vosx(
+                data_b.path(),
+                cfg_b.path(),
+                &["space", "call", space, "crdt-counter", "get"],
+            )
+            .status
+            .success()
         },
         || {
             format!(
-                "a call to the spawned dev-project on B never succeeded. B log:\n{}",
+                "a call to the spawned crdt-counter on B never succeeded. B log:\n{}",
                 fs::read_to_string(&log_b).unwrap_or_default(),
             )
         },
@@ -253,7 +257,7 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
     // (5) Bare-restart re-attach: kill B and restart with `space up
     //     <name>` — no token, no manifest. The redemption already
     //     cleared the pending invite secret, so B re-boots from the index + synced
-    //     registry + local.toml alone and re-spawns dev-project. This is
+    //     registry + local.toml alone and re-spawns crdt-counter. This is
     //     the standing restart-bug fix under the onboarding flow.
     drop(daemon_b); // SIGKILL B's first daemon
     let restart_at = std::time::SystemTime::now();
@@ -272,16 +276,25 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
     );
     // Re-spawn is proven by the agent being reachable again (the redb
     // file persists on disk regardless, so its presence proves nothing);
-    // a successful call means B re-registered dev-project from the cached
+    // a successful call means B re-registered crdt-counter from the cached
     // registry row + blob with no token/manifest in play.
     poll_until(
         30,
         || {
-            vosx(data_b.path(), cfg_b.path(), &["space", "call", space, "dev-project", "list_branches"])
-                .status
-                .success()
+            vosx(
+                data_b.path(),
+                cfg_b.path(),
+                &["space", "call", space, "crdt-counter", "get"],
+            )
+            .status
+            .success()
         },
-        || format!("B didn't re-spawn dev-project after a bare `space up {space}` restart; log:\n{}", fs::read_to_string(&log_b2).unwrap_or_default()),
+        || {
+            format!(
+                "B didn't re-spawn crdt-counter after a bare `space up {space}` restart; log:\n{}",
+                fs::read_to_string(&log_b2).unwrap_or_default()
+            )
+        },
     );
 }
 
@@ -313,7 +326,7 @@ fn vosx_ok(data_home: &Path, config_home: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
-/// Boot host A (new + up) and install the bundled dev-project as a
+/// Boot host A (new + up) and install the CRDT counter fixture as a
 /// member-floor app agent. Returns (data_a, cfg_a, daemon_a, log_a).
 fn boot_admin(space: &str) -> (TempDir, TempDir, Daemon, PathBuf) {
     let data_a = TempDir::new("a-data");
@@ -322,15 +335,35 @@ fn boot_admin(space: &str) -> (TempDir, TempDir, Daemon, PathBuf) {
     let log_a = data_a.path().join("daemon-a.stderr");
     let daemon_a = Daemon(spawn_up(data_a.path(), cfg_a.path(), space, &log_a));
     wait_for_endpoint(data_a.path(), &log_a, "A");
+    let counter_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf");
+    assert!(
+        counter_elf.is_file(),
+        "build the onboarding CRDT fixture first: `cd examples/actors/crdt-counter && cargo actor`",
+    );
+    let counter_source = counter_elf.to_string_lossy().into_owned();
     vosx_ok(
         data_a.path(),
         cfg_a.path(),
-        &["space", "publish", space, "--bundled", "dev-project"],
+        &[
+            "space",
+            "publish",
+            space,
+            "crdt-counter:0.1.0",
+            &counter_source,
+        ],
     );
     vosx_ok(
         data_a.path(),
         cfg_a.path(),
-        &["space", "install", space, "dev-project:0.1.0"],
+        &[
+            "space",
+            "install",
+            space,
+            "crdt-counter:0.1.0",
+            "--consistency",
+            "crdt",
+        ],
     );
     (data_a, cfg_a, daemon_a, log_a)
 }
