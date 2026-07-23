@@ -1,5 +1,7 @@
 use alloc::{string::String, vec::Vec};
 
+const MAX_DECODE_ITEMS: usize = 1_000_000;
+
 /// Deterministic serialization for CID computation.
 ///
 /// Implementations must produce identical output for identical values.
@@ -134,17 +136,24 @@ impl_encode_tuple!(0 A, 1 B, 2 C, 3 D);
 // ── Decode impls ────────────────────────────────────────────────────
 
 fn take<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Option<&'a [u8]> {
-    if *pos + n > buf.len() {
-        return None;
-    }
-    let s = &buf[*pos..*pos + n];
-    *pos += n;
+    let end = pos.checked_add(n)?;
+    let s = buf.get(*pos..end)?;
+    *pos = end;
     Some(s)
 }
 
 fn read_u64(buf: &[u8], pos: &mut usize) -> Option<u64> {
     let b = take(buf, pos, 8)?;
     Some(u64::from_le_bytes(b.try_into().ok()?))
+}
+
+fn read_len(buf: &[u8], pos: &mut usize) -> Option<usize> {
+    usize::try_from(read_u64(buf, pos)?).ok()
+}
+
+fn read_count(buf: &[u8], pos: &mut usize) -> Option<usize> {
+    let count = read_len(buf, pos)?;
+    (count <= MAX_DECODE_ITEMS).then_some(count)
 }
 
 impl Decode for () {
@@ -184,7 +193,7 @@ impl<const N: usize> Decode for [u8; N] {
 
 impl Decode for String {
     fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
-        let len = read_u64(buf, pos)? as usize;
+        let len = read_len(buf, pos)?;
         let b = take(buf, pos, len)?;
         core::str::from_utf8(b).ok().map(String::from)
     }
@@ -192,8 +201,8 @@ impl Decode for String {
 
 impl<T: Decode> Decode for Vec<T> {
     fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
-        let count = read_u64(buf, pos)? as usize;
-        let mut v = Vec::with_capacity(count);
+        let count = read_count(buf, pos)?;
+        let mut v = Vec::with_capacity(count.min(buf.len().saturating_sub(*pos)));
         for _ in 0..count {
             v.push(T::decode_from(buf, pos)?);
         }
@@ -203,7 +212,7 @@ impl<T: Decode> Decode for Vec<T> {
 
 impl<T: Decode + Ord> Decode for alloc::collections::BTreeSet<T> {
     fn decode_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
-        let count = read_u64(buf, pos)? as usize;
+        let count = read_count(buf, pos)?;
         let mut s = alloc::collections::BTreeSet::new();
         for _ in 0..count {
             if !s.insert(T::decode_from(buf, pos)?) {
@@ -236,3 +245,29 @@ macro_rules! impl_decode_tuple {
 impl_decode_tuple!(0 A, 1 B);
 impl_decode_tuple!(0 A, 1 B, 2 C);
 impl_decode_tuple!(0 A, 1 B, 2 C, 3 D);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_overflow_is_rejected_without_panicking() {
+        let mut pos = usize::MAX;
+        assert_eq!(take(&[], &mut pos, 1), None);
+        assert_eq!(pos, usize::MAX);
+    }
+
+    #[test]
+    fn adversarial_string_length_is_rejected_without_panicking() {
+        assert_eq!(String::decode(&u64::MAX.to_le_bytes()), None);
+    }
+
+    #[test]
+    fn adversarial_vector_length_is_rejected_before_allocation() {
+        assert_eq!(Vec::<u8>::decode(&u64::MAX.to_le_bytes()), None);
+        assert_eq!(
+            Vec::<()>::decode(&((MAX_DECODE_ITEMS as u64) + 1).to_le_bytes()),
+            None
+        );
+    }
+}

@@ -123,6 +123,10 @@ impl<'a> Decoder<'a> {
         self.pos == self.bytes.len()
     }
 
+    pub(crate) fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
+
     pub(crate) fn take(&mut self, len: usize) -> Result<&'a [u8], DecodeError> {
         let end = self
             .pos
@@ -209,10 +213,40 @@ impl<'a> Decoder<'a> {
         if len > MAX_ITEMS {
             return Err(DecodeError::LimitExceeded);
         }
-        let mut values = Vec::with_capacity(len);
+        // Every successfully decoded item must consume input in consensus
+        // wires. Bound the eager reservation by the bytes actually present so
+        // a tiny envelope cannot force a `len * size_of::<T>()` allocation.
+        let mut values = Vec::with_capacity(len.min(self.remaining()));
         for _ in 0..len {
             values.push(decode(self)?);
         }
         Ok(values)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[allow(dead_code)]
+    struct LargeItem([u8; 256]);
+
+    #[test]
+    fn claimed_list_length_cannot_preallocate_beyond_input() {
+        let bytes = (MAX_ITEMS as u32).to_le_bytes();
+        let mut decoder = Decoder::new(&bytes);
+        let result = decoder.list(|decoder| {
+            decoder.u8()?;
+            Ok(LargeItem([0; 256]))
+        });
+        assert!(matches!(result, Err(DecodeError::Truncated)));
+    }
+
+    #[test]
+    fn claimed_list_length_still_obeys_item_limit() {
+        let bytes = ((MAX_ITEMS as u32) + 1).to_le_bytes();
+        let mut decoder = Decoder::new(&bytes);
+        let result: Result<Vec<u8>, _> = decoder.list(|decoder| decoder.u8());
+        assert_eq!(result, Err(DecodeError::LimitExceeded));
     }
 }
