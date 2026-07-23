@@ -184,6 +184,12 @@ pub struct ActorSliceOutputV2 {
 pub struct CheckpointTokenV2 {
     pub input: WorkInputIdV2,
     pub base: ConsistencyBaseV2,
+    /// Hash of the current work envelope. A restored service frame still
+    /// contains the envelope from the slice that created the checkpoint, so
+    /// the host must bind the resumed slice explicitly.
+    pub work_hash: Hash,
+    /// Causal height of `base` for a CRDT slice. Linear slices carry `None`.
+    pub base_causal_height: Option<u64>,
     /// Fresh allocator namespace installed after an exact CRDT resume.
     pub change: Option<CrdtDispatchV2>,
     pub expected: Option<Hash>,
@@ -887,27 +893,16 @@ impl V2Wire for ActorSliceOutputV2 {
                 .crdt_operations
                 .iter()
                 .any(|operation| operation.actor != value.actor || operation.payload.is_empty())
-            || value
-                .crdt_operations
-                .windows(2)
-                .any(|pair| {
-                    (
-                        pair[0].dispatch_ordinal,
-                        pair[0].ordinal,
-                    ) >= (
-                        pair[1].dispatch_ordinal,
-                        pair[1].ordinal,
-                    )
-                })
-            || value
-                .crdt_operations
-                .first()
-                .is_some_and(|first| {
-                    value
-                        .crdt_operations
-                        .iter()
-                        .any(|operation| operation.dispatch_ordinal != first.dispatch_ordinal)
-                })
+            || value.crdt_operations.windows(2).any(|pair| {
+                (pair[0].dispatch_ordinal, pair[0].ordinal)
+                    >= (pair[1].dispatch_ordinal, pair[1].ordinal)
+            })
+            || value.crdt_operations.first().is_some_and(|first| {
+                value
+                    .crdt_operations
+                    .iter()
+                    .any(|operation| operation.dispatch_ordinal != first.dispatch_ordinal)
+            })
             || (!value.crdt_operations.is_empty() && value.crdt_materialization.is_none())
             || (value.yielded
                 && value
@@ -1871,6 +1866,8 @@ fn encode_checkpoint_token(e: &mut Encoder<'_>, value: &CheckpointTokenV2) {
     e.fixed(&value.input.invocation.0);
     e.u64(value.input.workflow_step);
     encode_base(e, &value.base);
+    e.fixed(&value.work_hash.0);
+    e.option(&value.base_causal_height, |e, height| e.u64(*height));
     e.option(&value.change, |e, dispatch| {
         e.fixed(&dispatch.change.0);
         e.u32(dispatch.ordinal);
@@ -1886,6 +1883,8 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, Dec
             workflow_step: d.u64()?,
         },
         base: decode_base(d)?,
+        work_hash: Hash(d.fixed()?),
+        base_causal_height: d.option(Decoder::u64)?,
         change: d.option(|d| {
             Ok(CrdtDispatchV2 {
                 change: ChangeId(d.fixed()?),
@@ -1895,7 +1894,11 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, Dec
         expected: d.option(|d| d.fixed().map(Hash))?,
         replacement: d.option(decode_blob_ref)?,
     };
-    if value.change.is_some() != matches!(value.base, ConsistencyBaseV2::Crdt { .. }) {
+    let is_crdt = matches!(value.base, ConsistencyBaseV2::Crdt { .. });
+    if value.change.is_some() != is_crdt
+        || value.base_causal_height.is_some() != is_crdt
+        || value.change.is_some_and(|dispatch| dispatch.ordinal != 0)
+    {
         return Err(DecodeError::NonCanonical);
     }
     Ok(value)
@@ -2149,6 +2152,8 @@ mod tests {
                 revision: 3,
                 state_root: Hash([25; 32]),
             },
+            work_hash: Hash([27; 32]),
+            base_causal_height: None,
             change: None,
             expected: Some(Hash([26; 32])),
             replacement: Some(replacement),
@@ -2161,7 +2166,7 @@ mod tests {
         let mut mismatched_change = checkpoint.clone();
         mismatched_change.change = Some(CrdtDispatchV2 {
             change: ChangeId([27; 32]),
-            ordinal: 1,
+            ordinal: 0,
         });
         assert_eq!(
             CheckpointTokenV2::decode(&mismatched_change.encode()),
@@ -2172,9 +2177,17 @@ mod tests {
         crdt_checkpoint.base = ConsistencyBaseV2::Crdt {
             heads: vec![Hash([28; 32])],
         };
+        crdt_checkpoint.base_causal_height = Some(3);
         assert_eq!(
             CheckpointTokenV2::decode(&crdt_checkpoint.encode()).unwrap(),
             crdt_checkpoint
+        );
+
+        let mut nonzero_dispatch = crdt_checkpoint;
+        nonzero_dispatch.change.as_mut().unwrap().ordinal = 1;
+        assert_eq!(
+            CheckpointTokenV2::decode(&nonzero_dispatch.encode()),
+            Err(DecodeError::NonCanonical)
         );
 
         let mut invalid_yield = ActorSliceOutputV2 {

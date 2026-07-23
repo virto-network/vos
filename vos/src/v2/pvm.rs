@@ -279,6 +279,8 @@ impl ServicePvmV2 {
                 &CheckpointTokenV2 {
                     input: work.input_id(),
                     base: work.base.clone(),
+                    work_hash: work.hash(),
+                    base_causal_height: work.base_causal_height,
                     change: crdt_dispatch(&work, 0),
                     expected: Some(reference.hash),
                     replacement: None,
@@ -621,6 +623,8 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                             &CheckpointTokenV2 {
                                 input: work.input_id(),
                                 base: work.base.clone(),
+                                work_hash: work.hash(),
+                                base_causal_height: work.base_causal_height,
                                 change: crdt_dispatch(work, 0),
                                 expected,
                                 replacement: Some(artifact.reference.clone()),

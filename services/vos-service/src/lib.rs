@@ -122,19 +122,33 @@ mod guest {
 
         let mut consumed_input = work.input_id();
         let mut base = work.base.clone();
+        let mut work_hash = work.hash();
+        let mut base_causal_height = work.base_causal_height;
+        let mut change = CrdtChangeV2::derive_id(&work)
+            .map(|change| CrdtDispatchV2 { change, ordinal: 0 });
         let mut continuations = alloc::vec::Vec::new();
         let mut exported_blobs = alloc::vec::Vec::new();
         if let Some(checkpoint) = actor_output.checkpoint {
-            let expected_change = CrdtChangeV2::derive_id(&work)
-                .map(|change| CrdtDispatchV2 { change, ordinal: 0 });
-            if checkpoint.input.invocation != work.invocation
-                || !checkpoint.base.mode_compatible(work.consistency)
-                || checkpoint.change != expected_change
+            if checkpoint.input.invocation != work.invocation {
+                fail_closed();
+            }
+            if !checkpoint.base.mode_compatible(work.consistency) {
+                fail_closed();
+            }
+            let is_crdt = matches!(checkpoint.base, ConsistencyBaseV2::Crdt { .. });
+            if checkpoint.change.is_some() != is_crdt
+                || checkpoint.base_causal_height.is_some() != is_crdt
+                || checkpoint
+                    .change
+                    .is_some_and(|dispatch| dispatch.ordinal != 0)
             {
                 fail_closed();
             }
             consumed_input = checkpoint.input;
             base = checkpoint.base;
+            work_hash = checkpoint.work_hash;
+            base_causal_height = checkpoint.base_causal_height;
+            change = checkpoint.change;
             if let Some(replacement) = checkpoint.replacement.as_ref() {
                 exported_blobs.push(replacement.clone());
             }
@@ -154,7 +168,7 @@ mod guest {
             producer: work.target,
             result: actor_output.reply,
         });
-        let (writes, crdt_change, candidate_blobs) = match (&work.base, work.base_causal_height) {
+        let (writes, crdt_change, candidate_blobs) = match (&base, base_causal_height) {
             (ConsistencyBaseV2::Linear { .. }, None) => {
                 if !actor_output.crdt_operations.is_empty()
                     || actor_output.crdt_materialization.is_some()
@@ -170,7 +184,9 @@ mod guest {
                 let materialized = actor_output
                     .crdt_materialization
                     .unwrap_or_else(|| fail_closed());
-                let id = CrdtChangeV2::derive_id(&work).unwrap_or_else(|| fail_closed());
+                let id = change
+                    .map(|dispatch| dispatch.change)
+                    .unwrap_or_else(|| fail_closed());
                 if actor_output.crdt_operations.iter().any(|operation| {
                     operation.actor != work.target
                         || operation.dispatch_ordinal != 0
@@ -190,7 +206,7 @@ mod guest {
                     alloc::vec::Vec::new(),
                     Some(CrdtChangeV2 {
                         id,
-                        work_hash: work.hash(),
+                        work_hash,
                         causal_dependencies: heads.clone(),
                         causal_height,
                         operations: actor_output.crdt_operations,

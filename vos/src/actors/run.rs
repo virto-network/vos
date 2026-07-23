@@ -812,7 +812,14 @@ pub fn run_nested_actor_service<A: super::Actor>(
     let checkpoint = ctx.__take_checkpoint_v2();
     let new_state = actor.encode();
     let state_changed = input.state.is_empty() || new_state != input.state;
-    let (crdt_operations, crdt_materialization) = match input.change {
+    // A restored machine still owns the original `input` stack local. The
+    // resume token is the authority for the new slice identity and Context
+    // has already rebound the live allocator to it before post-await code ran.
+    let completed_change = checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.change)
+        .unwrap_or(input.change);
+    let (crdt_operations, crdt_materialization) = match completed_change {
         Some(change) => (
             crate::crdt::take_operations(input.actor, change)
                 .expect("nested CRDT actor must return its completed field operations"),
