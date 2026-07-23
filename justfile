@@ -27,6 +27,7 @@ build-wasm:
 # Build all PVM actors and agents (riscv64 targets, requires custom toolchain).
 build-pvm:
     cd examples; just build
+    cd tests/fixtures/legacy-v1/actors/crdt-counter; cargo +nightly actor
 
 # Build a single built-in PVM actor by name (e.g., just build-actor space-registry).
 build-actor name:

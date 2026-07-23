@@ -128,7 +128,7 @@ blake2b_simd = { version = "1", default-features = false }
 # pulls vos's own default features (std + http + storage + network)
 # via the test crate's own resolution so the integration tests can
 # `use vos::runtime::*` etc.
-crdt-counter = { path = "../examples/actors/crdt-counter", default-features = false }
+crdt-counter = { path = "../tests/fixtures/legacy-v1/actors/crdt-counter", default-features = false }
 # Storage-type pressure fixture — the e2e drives a #[storage] map far
 # past the guest heap through the typed `BigMapRef`.
 big-map = { path = "../examples/actors/big-map", default-features = false }

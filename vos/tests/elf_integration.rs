@@ -1553,7 +1553,7 @@ fn fetch_at_buf_size_boundary_delivers_message() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -1634,7 +1634,7 @@ fn fetch_over_buf_size_boundary_is_refused() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -1702,7 +1702,7 @@ fn crdt_counter_local_invoke_smoke() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let data = match std::fs::read(&counter_path) {
@@ -1737,7 +1737,7 @@ fn crdt_counter_init_payloads_dispatch() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let data = match std::fs::read(&counter_path) {
@@ -1835,7 +1835,7 @@ fn crdt_counter_converges_across_nodes_live() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -2246,7 +2246,7 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -2473,7 +2473,7 @@ fn crdt_counter_restart_replays_state_from_disk() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -2614,7 +2614,7 @@ fn crdt_counter_survives_corrupted_persisted_state() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -2853,7 +2853,7 @@ fn crdt_counter_survives_handler_panic_and_keeps_dispatching() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -2970,7 +2970,7 @@ fn crdt_counter_shutdown_under_active_load() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -3131,7 +3131,7 @@ fn crdt_counter_offline_node_catches_up_after_restart() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -3522,7 +3522,7 @@ fn crdt_read_only_get_does_not_append_dag_nodes() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -3676,7 +3676,7 @@ fn raft_counter_single_node_replays_log_after_restart() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -3823,7 +3823,7 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -4105,7 +4105,7 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -5942,7 +5942,7 @@ fn cross_space_bridge_forward_dispatches_to_local_target() {
         env!("CARGO_MANIFEST_DIR"),
     );
     let counter_path = format!(
-        "{}/../examples/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let registry_elf = match std::fs::read(&registry_path) {
