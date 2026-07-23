@@ -803,6 +803,8 @@ fn refine_protocol_call_is_pure(slot: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SYNTHETIC_SERVICE_GAS: u64 = 10_000_000;
     use grey_transpiler::assembler::Reg;
 
     fn emit_instruction(code: &mut Vec<u8>, bitmask: &mut Vec<u8>, bytes: &[u8]) {
@@ -871,7 +873,7 @@ mod tests {
         code[1..5].copy_from_slice(&(refine_body as i32).to_le_bytes());
         code[6..10].copy_from_slice(&((accumulate_body as i32) - 5).to_le_bytes());
 
-        grey_transpiler::emitter::build_service_program_with_args_pages(
+        let program = grey_transpiler::emitter::build_service_program_with_args_pages(
             &code,
             &bitmask,
             &[],
@@ -881,7 +883,12 @@ mod tests {
             0,
             4,
             SERVICE_ARGUMENT_PAGES_V2,
-        )
+        );
+        assert!(
+            parse_blob(&program).is_some(),
+            "synthetic service blob must remain parseable"
+        );
+        program
     }
 
     fn two_entry_program(refine_call: Option<u32>) -> Vec<u8> {
@@ -968,10 +975,18 @@ mod tests {
         let program = two_entry_program(None);
         let service = ServicePvmV2::new(program.clone(), ProgramId::of_pvm(&program)).unwrap();
         let first = service
-            .refine(b"work-envelope", 1_000_000, &NoRefineProtocolHostV2)
+            .refine(
+                b"work-envelope",
+                SYNTHETIC_SERVICE_GAS,
+                &NoRefineProtocolHostV2,
+            )
             .unwrap();
         let second = service
-            .refine(b"work-envelope", 1_000_000, &NoRefineProtocolHostV2)
+            .refine(
+                b"work-envelope",
+                SYNTHETIC_SERVICE_GAS,
+                &NoRefineProtocolHostV2,
+            )
             .unwrap();
         assert_eq!(first, second);
         assert_eq!(first.bytes, b"work-envelope");
@@ -982,7 +997,7 @@ mod tests {
         let program = two_entry_program(Some(crate::abi::hostcall::STORAGE_W));
         let service = ServicePvmV2::new(program.clone(), ProgramId::of_pvm(&program)).unwrap();
         assert_eq!(
-            service.refine(&[], 1_000_000, &NoRefineProtocolHostV2),
+            service.refine(&[], SYNTHETIC_SERVICE_GAS, &NoRefineProtocolHostV2),
             Err(ServicePvmErrorV2::ForbiddenRefineProtocolCall(
                 crate::abi::hostcall::STORAGE_W as u8,
             ))
@@ -1033,7 +1048,9 @@ mod tests {
         let mut host = RecordingAccumulateHost::default();
 
         let expected = accumulate_result(true);
-        let output = service.accumulate(&expected, 1_000_000, &mut host).unwrap();
+        let output = service
+            .accumulate(&expected, SYNTHETIC_SERVICE_GAS, &mut host)
+            .unwrap();
         assert_eq!(output.bytes, expected);
         assert_eq!(host.committed_calls, 1);
     }
@@ -1047,7 +1064,7 @@ mod tests {
         let prepared = accumulate_result(false);
         assert_eq!(
             service
-                .accumulate(&prepared, 1_000_000, &mut host)
+                .accumulate(&prepared, SYNTHETIC_SERVICE_GAS, &mut host)
                 .unwrap()
                 .bytes,
             prepared,
@@ -1057,7 +1074,7 @@ mod tests {
                 .encode();
         assert_eq!(
             service
-                .accumulate(&rejected, 1_000_000, &mut host)
+                .accumulate(&rejected, SYNTHETIC_SERVICE_GAS, &mut host)
                 .unwrap()
                 .bytes,
             rejected,
@@ -1071,7 +1088,7 @@ mod tests {
         let service = ServicePvmV2::new(panicking.clone(), ProgramId::of_pvm(&panicking)).unwrap();
         let mut host = RecordingAccumulateHost::default();
         assert_eq!(
-            service.accumulate(&[], 1_000_000, &mut host),
+            service.accumulate(&[], SYNTHETIC_SERVICE_GAS, &mut host),
             Err(ServicePvmErrorV2::Panic)
         );
         assert_eq!(host.committed_calls, 0);
@@ -1081,7 +1098,7 @@ mod tests {
             ServicePvmV2::new(committing.clone(), ProgramId::of_pvm(&committing)).unwrap();
         host.reject_commit = true;
         assert_eq!(
-            service.accumulate(&accumulate_result(true), 1_000_000, &mut host),
+            service.accumulate(&accumulate_result(true), SYNTHETIC_SERVICE_GAS, &mut host),
             Err(ServicePvmErrorV2::AccumulateCommitRejected)
         );
         assert_eq!(host.committed_calls, 0);
