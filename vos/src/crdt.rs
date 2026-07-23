@@ -393,7 +393,10 @@ struct ListElement<T> {
     after: Option<OpId>,
     /// Lamport-style insertion order captured from the causal snapshot.
     /// Later insertions at the same anchor sort before older siblings;
-    /// concurrent insertions share a clock and tie-break by `OpId`.
+    /// concurrent insertions share a clock and tie-break by `OpId`. The clock
+    /// is assigned once by the originating operation and must be copied
+    /// verbatim during merge/replay; independently mutator-applying the same
+    /// operation against different local maxima is a divergent operation.
     logical_time: u64,
     value: T,
 }
