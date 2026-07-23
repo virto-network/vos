@@ -70,6 +70,7 @@ pub enum ServicePvmErrorV2 {
     ContinuationMismatch,
     SnapshotFailed,
     CheckpointTokenWriteFailed,
+    ActorInputTooLarge,
     ActorIpcExhausted,
     ActorIpcSetupFailed,
     InvalidVmLifecycle,
@@ -316,6 +317,9 @@ impl ServicePvmV2 {
             origin: work.origin,
         }
         .encode();
+        if actor_input.len() > super::ACTOR_SLICE_INPUT_MAX_BYTES {
+            return Err(ServicePvmErrorV2::ActorInputTooLarge);
+        }
         let mut kernel = InvocationKernel::new_with_dormant_programs(
             &self.program,
             arguments,
@@ -424,6 +428,9 @@ fn install_actor_ipc(
     kernel: &mut InvocationKernel,
     input: &[u8],
 ) -> Result<(u32, u32), ServicePvmErrorV2> {
+    if input.len() > super::ACTOR_SLICE_INPUT_MAX_BYTES {
+        return Err(ServicePvmErrorV2::ActorInputTooLarge);
+    }
     let input_len = u32::try_from(input.len()).map_err(|_| ServicePvmErrorV2::ActorIpcExhausted)?;
     let minimum_capacity = input
         .len()

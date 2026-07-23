@@ -761,10 +761,18 @@ pub fn run_nested_actor_service<A: super::Actor>(
     // SAFETY: MAP above established a readable DATA-cap range covering the
     // complete input. The service does not regain this cap until REPLY.
     let bytes = unsafe { core::slice::from_raw_parts(input_address as *const u8, input_len) };
-    let input = ActorSliceInputV2::decode(bytes).expect("invalid actor slice input");
-    let mut actor = lifecycle::load_or_create::<A>(Some(&input.state));
-    for state in &input.causal_states {
-        let other = lifecycle::load_or_create::<A>(Some(state));
+    let ActorSliceInputV2 {
+        actor: actor_id,
+        input: work_input,
+        change,
+        state,
+        causal_states,
+        message,
+        origin,
+    } = ActorSliceInputV2::decode(bytes).expect("invalid actor slice input");
+    let mut actor = lifecycle::load_or_create::<A>(Some(&state));
+    for causal_state in causal_states {
+        let other = lifecycle::load_or_create::<A>(Some(&causal_state));
         actor
             .__merge_crdt(&other)
             .expect("invalid concurrent CRDT actor materialization");
@@ -773,33 +781,33 @@ pub fn run_nested_actor_service<A: super::Actor>(
     // truncating ActorId. Nested v2 actors retain their complete typed identity
     // in Context and all v2 scheduler effects use that value.
     let mut ctx = super::Context::new(ServiceId(0));
-    ctx.__set_actor_id(input.actor);
-    ctx.__set_origin(input.origin);
+    ctx.__set_actor_id(actor_id);
+    ctx.__set_origin(origin);
 
     assert_eq!(
         A::CRDT,
-        input.change.is_some(),
+        change.is_some(),
         "actor CRDT metadata does not match the service consistency mode"
     );
-    let dispatch = match input.change {
+    let dispatch = match change {
         Some(change) => {
             let scoped_change =
-                crate::crdt::ChangeId::for_dispatch(change.change, input.actor, change.ordinal);
+                crate::crdt::ChangeId::for_dispatch(change.change, actor_id, change.ordinal);
             crate::crdt::with_change(scoped_change, || {
                 Ok(lifecycle::dispatch_one_with_invocation::<A>(
-                    &input.message,
+                    &message,
                     &mut actor,
                     &mut ctx,
-                    input.input.invocation,
+                    work_input.invocation,
                 ))
             })
             .expect("nested CRDT actor dispatch must establish one change scope")
         }
         None => lifecycle::dispatch_one_with_invocation::<A>(
-            &input.message,
+            &message,
             &mut actor,
             &mut ctx,
-            input.input.invocation,
+            work_input.invocation,
         ),
     };
     assert!(
@@ -811,31 +819,35 @@ pub fn run_nested_actor_service<A: super::Actor>(
     let reply = ctx.take_reply_bytes();
     let checkpoint = ctx.__take_checkpoint_v2();
     let new_state = actor.encode();
-    let state_changed = input.state.is_empty() || new_state != input.state;
-    // A restored machine still owns the original `input` stack local. The
+    let state_changed = state.is_empty() || new_state != state;
+    drop(actor);
+    drop(state);
+    drop(message);
+    // A restored machine still owns the original decoded slice locals. The
     // resume token is the authority for the new slice identity and Context
     // has already rebound the live allocator to it before post-await code ran.
     let completed_change = checkpoint
         .as_ref()
         .map(|checkpoint| checkpoint.change)
-        .unwrap_or(input.change);
-    let (crdt_operations, crdt_materialization) = match completed_change {
+        .unwrap_or(change);
+    let (crdt_operations, crdt_materialization, linear_state) = match completed_change {
         Some(change) => (
-            crate::crdt::take_operations(input.actor, change)
+            crate::crdt::take_operations(actor_id, change)
                 .expect("nested CRDT actor must return its completed field operations"),
-            Some(new_state.clone()),
+            Some(new_state),
+            None,
         ),
-        None => (alloc::vec::Vec::new(), None),
+        None => (
+            alloc::vec::Vec::new(),
+            None,
+            (!A::CRDT && state_changed).then_some(new_state),
+        ),
     };
     let writes = ctx
-        .__drain_actor_writes_v2(
-            input.actor,
-            super::storage::end_dispatch(),
-            (!A::CRDT && state_changed).then_some(new_state),
-        )
+        .__drain_actor_writes_v2(actor_id, super::storage::end_dispatch(), linear_state)
         .expect("nested actor emitted an unsupported v2 effect");
     let encoded = ActorSliceOutputV2 {
-        actor: input.actor,
+        actor: actor_id,
         writes,
         crdt_operations,
         crdt_materialization,

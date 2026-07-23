@@ -341,6 +341,41 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
 }
 
 #[test]
+fn nested_actor_input_is_bounded_before_entering_the_compact_guest_heap() {
+    let actor_elf = greeter_elf();
+    let actor = grey_transpiler::link_elf(&actor_elf).expect("canonical actor ELF transpiles");
+    let actor_program = ProgramId::of_pvm(&actor);
+    let state_bytes = vec![0; vos::v2::ACTOR_SLICE_INPUT_MAX_BYTES];
+    let state = BlobRefV2::of_bytes(&state_bytes);
+    let work = work(actor_program, state.clone());
+    let imports = RefineImportsV2 {
+        programs: vec![ImportedProgramV2 {
+            program: actor_program,
+            pvm: actor,
+        }],
+        blobs: vec![ImportedBlobV2 {
+            reference: state,
+            bytes: state_bytes,
+        }],
+    };
+    let service = ServicePvmV2::new(
+        CANONICAL_SERVICE_PVM.to_vec(),
+        vos::v2::VOS_SERVICE_PROGRAM_ID,
+    )
+    .expect("canonical service program");
+
+    assert_eq!(
+        service.refine_actor_tree(
+            &work.encode(),
+            &imports,
+            10_000_000,
+            &NoRefineProtocolHostV2,
+        ),
+        Err(ServicePvmErrorV2::ActorInputTooLarge)
+    );
+}
+
+#[test]
 fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     let service_elf = service_elf();
     let actor_elf = crdt_counter_v2_elf();

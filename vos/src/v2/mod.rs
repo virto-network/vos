@@ -78,8 +78,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0x3a, 0xd5, 0x5e, 0xfd, 0x23, 0x74, 0xe5, 0x3c, 0xad, 0x54, 0xdf, 0xb7, 0xbf, 0xd2, 0x1c, 0xfb,
-    0xfd, 0x0b, 0x27, 0x1f, 0x1b, 0x83, 0x38, 0x21, 0xb8, 0x13, 0x4d, 0x19, 0x78, 0x4e, 0xf4, 0xaa,
+    0x5d, 0x8d, 0x5f, 0x8b, 0xb8, 0x95, 0xc3, 0xce, 0x2c, 0x9f, 0x56, 0x90, 0xb8, 0x39, 0xbf, 0x65,
+    0x38, 0x0b, 0x30, 0x3c, 0x1d, 0x72, 0xb0, 0x10, 0x8e, 0x22, 0x74, 0x43, 0xde, 0x28, 0xbe, 0x99,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.
@@ -98,6 +98,13 @@ pub const ACTOR_IPC_CAP_SLOT: u8 = 90;
 pub const ACTOR_SAVED_ARGS_CAP_SLOT: u8 = 253;
 /// High virtual page kept outside transpiler-owned actor memory layouts.
 pub const ACTOR_IPC_BASE_PAGE: u32 = 0x000f_0000;
+/// Maximum encoded input handed to one nested application actor.
+///
+/// Application actors retain the compact 256 KiB heap while the generic
+/// service may receive multi-megabyte work envelopes. Bounding the owned
+/// decode before CALL keeps a wide CRDT frontier from becoming a deterministic
+/// nested-guest allocation trap.
+pub const ACTOR_SLICE_INPUT_MAX_BYTES: usize = 64 * 1024;
 /// Bounded stack window receiving a checkpoint token after snapshot capture.
 pub const CHECKPOINT_TOKEN_CAPACITY: usize = 4096;
 /// Marker passed in phi[10] so the canonical actor entry selects CALL/REPLY.

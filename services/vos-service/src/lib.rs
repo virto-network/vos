@@ -75,7 +75,10 @@ mod guest {
             fail_closed();
         }
 
-        if actor_input_len > actor_ipc_capacity || actor_ipc_capacity == 0 {
+        if actor_input_len > actor_ipc_capacity
+            || actor_input_len > vos::v2::ACTOR_SLICE_INPUT_MAX_BYTES
+            || actor_ipc_capacity == 0
+        {
             fail_closed();
         }
 
