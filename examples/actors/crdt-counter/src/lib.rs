@@ -2,11 +2,9 @@
 //! nodes via the merkle-CRDT machinery.
 //!
 //! Two messages:
-//!   - `inc()` increments the CRDT counter by one. The current
-//!     command-replay bridge applies each durable event in canonical
-//!     causal order, so the visible count supplies the operation ordinal.
-//!     The v2 operation-capture runtime replaces this bridge with
-//!     invocation-derived operation IDs.
+//!   - `inc()` increments the CRDT counter by one. Its operation id comes
+//!     from the stable invocation id supplied by the runtime, so concurrent
+//!     replicas keep both increments and replay remains idempotent.
 //!   - `get() -> u64` reports the current count (read-only →
 //!     no DAG node, see `crdt_commit_skips_unchanged_plain_commits`).
 //!
@@ -20,6 +18,17 @@ pub struct CrdtCounter {
     count: crdt::Counter,
 }
 
+impl CrdtCounter {
+    fn apply_increment(&mut self, invocation_id: InvocationId) {
+        let id = crdt::ChangeId::from(invocation_id).operation(0);
+        // Reapplying the same durable event is idempotent. A divergent reuse
+        // is a runtime invariant violation and must not silently mutate state.
+        if self.count.increment(id, 1).is_err() {
+            panic!("crdt-counter: divergent operation id");
+        }
+    }
+}
+
 #[messages]
 impl CrdtCounter {
     fn new() -> Self {
@@ -29,14 +38,8 @@ impl CrdtCounter {
     }
 
     #[msg]
-    async fn inc(&mut self) {
-        let current = self.count.value();
-        let id = crdt::ChangeId::derive(b"crdt-counter/inc", &current.to_le_bytes()).operation(0);
-        // Reapplying the same durable event is idempotent. A divergent reuse
-        // is a runtime invariant violation and must not silently mutate state.
-        if self.count.increment(id, 1).is_err() {
-            panic!("crdt-counter: divergent operation id");
-        }
+    async fn inc(&mut self, ctx: &mut Context<Self>) {
+        self.apply_increment(ctx.invocation_id());
         log::info!("crdt-counter: inc -> count={}", self.count.value());
     }
 
@@ -65,5 +68,21 @@ mod tests {
     #[test]
     fn program_declares_crdt_storage() {
         assert!(<CrdtCounter as vos::Actor>::CRDT);
+    }
+
+    #[test]
+    fn concurrent_increments_from_the_same_value_both_survive_merge() {
+        let mut left = CrdtCounter::new();
+        let mut right = CrdtCounter::new();
+        let mut left_ctx: Context<CrdtCounter> = Context::new(vos::actors::context::ServiceId(1));
+        let mut right_ctx: Context<CrdtCounter> = Context::new(vos::actors::context::ServiceId(1));
+        left_ctx.__set_invocation_id(InvocationId::derive(b"test-replica", b"left"));
+        right_ctx.__set_invocation_id(InvocationId::derive(b"test-replica", b"right"));
+
+        left.apply_increment(left_ctx.invocation_id());
+        right.apply_increment(right_ctx.invocation_id());
+        left.count.merge(&right.count).expect("counter merge");
+
+        assert_eq!(left.count.value(), 2);
     }
 }
