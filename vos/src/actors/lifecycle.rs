@@ -473,11 +473,33 @@ pub const TAG_DISPATCH_PREFIX: u8 = 0xFD;
 /// `yield_now` / `sleep` commit, not an in-flight query.
 #[cfg(feature = "pvm")]
 pub fn dispatch_one<A: Actor>(raw: &[u8], actor: &mut A, ctx: &mut Context<A>) -> DispatchResult {
+    dispatch_one_inner(raw, actor, ctx, None)
+}
+
+/// Dispatch one v2 actor slice with the invocation identity supplied by the
+/// generic service envelope rather than an actor-message prefix.
+#[cfg(feature = "pvm")]
+pub(crate) fn dispatch_one_with_invocation<A: Actor>(
+    raw: &[u8],
+    actor: &mut A,
+    ctx: &mut Context<A>,
+    invocation: crate::v2::InvocationId,
+) -> DispatchResult {
+    dispatch_one_inner(raw, actor, ctx, Some(invocation))
+}
+
+#[cfg(feature = "pvm")]
+fn dispatch_one_inner<A: Actor>(
+    raw: &[u8],
+    actor: &mut A,
+    ctx: &mut Context<A>,
+    invocation: Option<crate::v2::InvocationId>,
+) -> DispatchResult {
     // Reset the per-invocation forbidden flag so a prior refused
     // call doesn't poison this dispatch. Context lives across
     // continuation slices while one handler remains suspended.
     ctx.__reset_forbidden();
-    ctx.__set_invocation_id(crate::v2::InvocationId::ZERO);
+    ctx.__set_invocation_id(invocation.unwrap_or(crate::v2::InvocationId::ZERO));
 
     // Strip the current caller + invocation prefix first. A distinct tag keeps
     // the legacy six-byte prefix unambiguous: old messages whose first 32
@@ -558,5 +580,65 @@ pub fn dispatch_one<A: Actor>(raw: &[u8], actor: &mut A, ctx: &mut Context<A>) -
                 DispatchResult::Continue
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "pvm"))]
+mod tests {
+    use super::*;
+    use crate::actors::{
+        auth::{NO_ROLES_MAP, NoRoles},
+        codec::Encode as _,
+        context::ServiceId,
+    };
+
+    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    struct InvocationProbe {
+        seen: [u8; 32],
+    }
+
+    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    struct ProbeMessage(u8);
+
+    impl FromDynamic for ProbeMessage {
+        fn from_dynamic(_: &super::super::value::Msg) -> Option<Self> {
+            None
+        }
+    }
+
+    impl Actor for InvocationProbe {
+        type Error = ();
+        type Message = ProbeMessage;
+        type Role = NoRoles;
+
+        const DEFAULT_ROLE: Self::Role = NoRoles::Any;
+        const SPACE_ROLE_MAP: super::super::auth::SpaceRoleMap<Self::Role> = NO_ROLES_MAP;
+
+        fn create() -> Self {
+            Self { seen: [0; 32] }
+        }
+
+        fn dispatch(&mut self, _: Self::Message, ctx: &mut Context<Self>) -> RunResult<bool> {
+            self.seen = ctx.invocation_id().0;
+            RunResult::Complete(false)
+        }
+    }
+
+    #[test]
+    fn actor_slice_dispatch_preserves_envelope_invocation() {
+        let invocation = crate::v2::InvocationId::derive(b"actor-slice", b"invocation");
+        let mut actor = InvocationProbe::create();
+        let mut ctx = Context::new(ServiceId(0));
+
+        let result = dispatch_one_with_invocation(
+            &ProbeMessage(1).encode(),
+            &mut actor,
+            &mut ctx,
+            invocation,
+        );
+
+        assert!(matches!(result, DispatchResult::Continue));
+        assert_eq!(actor.seen, invocation.0);
+        assert_eq!(ctx.invocation_id(), invocation);
     }
 }

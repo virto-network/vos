@@ -130,6 +130,8 @@ pub struct RefineImportsV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorSliceInputV2 {
     pub actor: ActorId,
+    /// Stable identity of the work item that is executing this actor slice.
+    pub invocation: InvocationId,
     pub state: Vec<u8>,
     /// Canonical generated actor-message bytes.
     pub message: Vec<u8>,
@@ -533,6 +535,7 @@ impl V2Wire for ActorSliceInputV2 {
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
         e.fixed(&self.actor.0);
+        e.fixed(&self.invocation.0);
         e.bytes(&self.state);
         e.bytes(&self.message);
         encode_origin(&mut e, self.origin);
@@ -541,6 +544,7 @@ impl V2Wire for ActorSliceInputV2 {
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         Ok(Self {
             actor: ActorId(d.fixed()?),
+            invocation: InvocationId(d.fixed()?),
             state: d.bytes()?,
             message: d.bytes()?,
             origin: decode_origin(d)?,
@@ -1071,6 +1075,7 @@ mod tests {
     fn actor_slice_wires_round_trip_and_bind_writes_to_the_actor() {
         let input = ActorSliceInputV2 {
             actor: ActorId([21; 32]),
+            invocation: InvocationId([23; 32]),
             state: b"before".to_vec(),
             message: b"message".to_vec(),
             origin: Origin::Actor(ActorId([22; 32])),

@@ -773,7 +773,12 @@ pub fn run_nested_actor_service<A: super::Actor>(
     ctx.__set_actor_id(input.actor);
     ctx.__set_origin(input.origin);
 
-    let dispatch = lifecycle::dispatch_one::<A>(&input.message, &mut actor, &mut ctx);
+    let dispatch = lifecycle::dispatch_one_with_invocation::<A>(
+        &input.message,
+        &mut actor,
+        &mut ctx,
+        input.invocation,
+    );
     assert!(
         !matches!(dispatch, DispatchResult::Skipped),
         "actor message did not match the canonical program ABI"

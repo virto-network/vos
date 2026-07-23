@@ -286,6 +286,7 @@ impl ServicePvmV2 {
         let target_state = imported_blob_bytes(imports, &target.state)?;
         let actor_input = ActorSliceInputV2 {
             actor: work.target,
+            invocation: work.invocation,
             state: target_state.to_vec(),
             message: work.arguments.clone(),
             origin: work.origin,
