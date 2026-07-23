@@ -2503,8 +2503,16 @@ mod tests {
         // Replay logs match A's history.
         let logs = cc_b.replay_logs().unwrap();
         assert_eq!(logs.len(), 2);
-        assert_eq!(logs[0], log1);
-        assert_eq!(logs[1], log2);
+        assert_eq!(logs[0].msg, log1.msg);
+        assert_eq!(logs[1].msg, log2.msg);
+        assert_eq!(
+            logs[0].invocation_id(),
+            crate::effect_log::CrdtEvent::invocation_id_for(rep_id, 0),
+        );
+        assert_eq!(
+            logs[1].invocation_id(),
+            crate::effect_log::CrdtEvent::invocation_id_for(rep_id, 1),
+        );
 
         // Roots match too.
         let cc_a =

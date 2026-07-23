@@ -157,6 +157,17 @@ pub struct CommitReceipt {
 }
 
 pub trait CommitStrategy: Send {
+    /// Stable identity to expose to the next handler dispatch, when the
+    /// strategy already owns a durable invocation namespace.
+    ///
+    /// CRDT returns the identity of its next `(replica_origin, seq)` event so
+    /// live execution and causal replay derive identical operation IDs.
+    /// Strategies whose v2 work envelope is not production-wired yet return
+    /// `None`; the host supplies a process-local unique fallback.
+    fn pending_invocation_id(&self) -> Option<crate::v2::InvocationId> {
+        None
+    }
+
     /// Return previously-persisted state, if any.
     ///
     /// `None` means "fresh start" — the host constructs the actor
@@ -926,6 +937,13 @@ mod crdt {
     }
 
     impl CommitStrategy for CrdtCommit {
+        fn pending_invocation_id(&self) -> Option<crate::v2::InvocationId> {
+            Some(CrdtEvent::invocation_id_for(
+                self.replica_origin,
+                self.next_seq,
+            ))
+        }
+
         fn restore(&mut self) -> Option<Vec<u8>> {
             // last_state was populated on open; re-load is not needed.
             if self.last_state.is_empty() {
@@ -1107,6 +1125,19 @@ mod crdt {
             // case a separate process touched the file.
             self.next_seq = load_next_seq(&self.db).unwrap_or(self.next_seq);
 
+            if append_node {
+                let log = delta.log.expect("append_node implies a log");
+                let expected = CrdtEvent::invocation_id_for(self.replica_origin, self.next_seq);
+                if log.invocation_id() != crate::v2::InvocationId::ZERO
+                    && log.invocation_id() != expected
+                {
+                    return Err(CommitError::Config(
+                        "CRDT dispatch invocation no longer matches the durable event sequence"
+                            .into(),
+                    ));
+                }
+            }
+
             // Compute the new DAG node (if any) off-transaction so
             // the write txn is short. Wrap the EffectLog in a
             // CrdtEvent stamped with our origin + the next seq so
@@ -1253,10 +1284,10 @@ mod crdt {
     /// node that lists it. A node with 0 children is an origin and
     /// is emitted first.
     ///
-    /// Returns just the inner [`EffectLog`]s — the runtime's
-    /// replay path consumes those directly. The wrapping
-    /// [`CrdtEvent::origin`] / `seq` stays on disk; it's metadata
-    /// for CID stability, not for handler execution.
+    /// Returns just the inner [`EffectLog`]s — the runtime's replay path
+    /// consumes those directly. [`CrdtEvent::new`] /
+    /// [`CrdtEvent::from_bytes`] have already reconstructed the stable
+    /// handler-visible invocation identity from `origin` and `seq`.
     fn topological_order(
         mut nodes: BTreeMap<Cid<Blake2b>, DagNode<Blake2b, CrdtEvent>>,
     ) -> Vec<EffectLog> {
@@ -1366,9 +1397,14 @@ mod tests {
 
             let replay = cc.replay_logs().unwrap();
             assert_eq!(replay.len(), 3);
-            assert_eq!(replay[0], logs[0]);
-            assert_eq!(replay[1], logs[1]);
-            assert_eq!(replay[2], logs[2]);
+            for (seq, (replayed, original)) in replay.iter().zip(&logs).enumerate() {
+                assert_eq!(replayed.msg, original.msg);
+                assert_eq!(replayed.replies, original.replies);
+                assert_eq!(
+                    replayed.invocation_id(),
+                    crate::effect_log::CrdtEvent::invocation_id_for([0u8; 32], seq as u64),
+                );
+            }
         }
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

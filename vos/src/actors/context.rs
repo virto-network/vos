@@ -17,6 +17,11 @@ pub struct Context<A: Actor> {
     actor_id: Option<crate::v2::ActorId>,
     stop_requested: bool,
 
+    /// Stable identity of the handler invocation currently being
+    /// dispatched. CRDT hosts derive this from the durable event identity
+    /// before the guest runs and reconstruct the same value during replay.
+    invocation_id: crate::v2::InvocationId,
+
     /// Identity of whoever invoked the handler currently running.
     /// `Unauthenticated` by default until per-invoke plumbing
     /// overwrites it from the [`InvokeRequest`].
@@ -86,6 +91,7 @@ impl<A: Actor> Context<A> {
             id,
             actor_id: None,
             stop_requested: false,
+            invocation_id: crate::v2::InvocationId::ZERO,
             caller: Caller::Unauthenticated,
             origin: crate::v2::Origin::Anonymous,
             space_role: None,
@@ -120,6 +126,24 @@ impl<A: Actor> Context<A> {
     #[doc(hidden)]
     pub fn __set_actor_id(&mut self, actor: crate::v2::ActorId) {
         self.actor_id = Some(actor);
+    }
+
+    /// Stable identity of the currently-running handler invocation.
+    ///
+    /// Use this as the change identity for CRDT operations so concurrent
+    /// invocations from the same causal state remain distinct while replaying
+    /// the same durable invocation remains idempotent.
+    pub fn invocation_id(&self) -> crate::v2::InvocationId {
+        self.invocation_id
+    }
+
+    /// Set the identity for the next handler dispatch.
+    ///
+    /// This is a host/macro integration hook; application handlers should
+    /// only read [`Self::invocation_id`].
+    #[doc(hidden)]
+    pub fn __set_invocation_id(&mut self, invocation_id: crate::v2::InvocationId) {
+        self.invocation_id = invocation_id;
     }
 
     /// Who invoked the currently-running handler. The host writes
@@ -1211,6 +1235,15 @@ mod tests {
         // populate the slot safe.
         let ctx: Context<TestActor> = Context::new(ServiceId(7));
         assert_eq!(ctx.caller(), &Caller::Unauthenticated);
+        assert_eq!(ctx.invocation_id(), crate::v2::InvocationId::ZERO);
+    }
+
+    #[test]
+    fn context_invocation_id_round_trips_through_host_hook() {
+        let mut ctx: Context<TestActor> = Context::new(ServiceId(7));
+        let invocation = crate::v2::InvocationId::derive(b"test", b"dispatch");
+        ctx.__set_invocation_id(invocation);
+        assert_eq!(ctx.invocation_id(), invocation);
     }
 
     #[test]
