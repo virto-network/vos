@@ -59,7 +59,14 @@ pub use roles::{CLERK_SETTLE_SPACE_ROLE_MAP, ClerkSettleRole};
 /// Return type for the venue handlers. `#[repr(u8)]` keeps the wire bytes
 /// stable — reordering variants breaks any peer running an older build.
 #[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq,
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
 )]
 #[rkyv(crate = vos::rkyv)]
 #[repr(u8)]

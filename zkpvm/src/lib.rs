@@ -245,7 +245,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::Blake2bChip, // OPTIONAL — gated by !side_note.blake2b_calls.is_empty()
     &chips::Blake2bBoundaryChip, // proves the memory-page Merkle blake2b compressions
     &chips::MemoryChip,
-    &chips::MemoryPageChip, // per-page boundary writes/reads + leaf hashes
+    &chips::MemoryPageChip,   // per-page boundary writes/reads + leaf hashes
     &chips::MemoryMerkleChip, // Merkle merge rows
     &chips::MemoryRootBoundaryChip, // root sink (bound to public roots)
     &chips::RegisterMemoryChip,
@@ -257,14 +257,14 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::RangeMultiplicity256,
     &chips::BitwiseLookupChip,
     &chips::PowerOfTwoChip,
-    &chips::PopcountChip,           // per-byte popcount lookup table
-    &chips::BitcountChip,           // per-byte (lz, tz) lookup table
+    &chips::PopcountChip,                    // per-byte popcount lookup table
+    &chips::BitcountChip,                    // per-byte (lz, tz) lookup table
     &chips::ByteToBitsChip, // per-byte 8-bit decomposition lookup table (dormant until consumers are added)
     &chips::MulChip,        // consumer of MultiplicationLookup
-    &chips::BitwiseChip, // consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
-    &chips::CompareChip, // consumer of CompareLookup, producer of Range256 lookups
-    &chips::DivRemChip,  // consumer of DivRemLookup
-    &chips::RistrettoChip, // OPTIONAL precompile, gated by activity.ristretto
+    &chips::BitwiseChip,    // consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
+    &chips::CompareChip,    // consumer of CompareLookup, producer of Range256 lookups
+    &chips::DivRemChip,     // consumer of DivRemLookup
+    &chips::RistrettoChip,  // OPTIONAL precompile, gated by activity.ristretto
     &chips::RistrettoEcallChip, // OPTIONAL, gated by activity.ristretto_ecall
     &chips::RistrettoCombTableChip, // OPTIONAL, gated by activity.ristretto_comb
     &chips::RistrettoFixedBaseConsumerChip, // OPTIONAL, gated by activity.ristretto_comb
@@ -596,9 +596,7 @@ pub use stwo::core::pcs::PcsConfig;
 // The side-note-FREE deployer verifier lives in the `zkpvm-verifier` crate
 // (`verify_standalone`) — no_std, no prover deps.
 #[cfg(feature = "prover")]
-pub use verify::{
-    DEFAULT_MAX_LOG_SIZE, verify, verify_chain, verify_with_pcs_policy,
-};
+pub use verify::{DEFAULT_MAX_LOG_SIZE, verify, verify_chain, verify_with_pcs_policy};
 // Advanced verify surface (max-log-size / options / explicit components)
 // and the OODS reconstruction the recursion path consumes.
 #[doc(hidden)]

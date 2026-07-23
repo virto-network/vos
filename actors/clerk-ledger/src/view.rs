@@ -22,8 +22,8 @@ use cipher_clerk::ids::{
 };
 use cipher_clerk::state::{LedgerState, Oracle, PendingStatus};
 use cipher_clerk::state_root::{
-    account_leaf_content, composite_root_from_subroots, external_id_key,
-    external_id_leaf_content, pending_leaf_content, transfer_leaf_content, voided_leaf_content,
+    account_leaf_content, composite_root_from_subroots, external_id_key, external_id_leaf_content,
+    pending_leaf_content, transfer_leaf_content, voided_leaf_content,
 };
 use cipher_clerk::types::{Account as CcAccount, Journal as CcJournal, Transfer as CcTransfer};
 use vos::storage::CommittedMap;
@@ -131,18 +131,17 @@ impl LedgerState for LedgerView<'_> {
 
     fn mark_transfer_voided(&mut self, id: &CcTransferId, _o: &mut dyn Oracle) {
         let content = voided_leaf_content(&id.0);
-        self.voided_transfers.insert_with_leaf(&id.0, &1u8, &content);
+        self.voided_transfers
+            .insert_with_leaf(&id.0, &1u8, &content);
     }
 
     fn pending_status(&self, id: &CcTransferId, _o: &mut dyn Oracle) -> Option<PendingStatus> {
-        self.pending_statuses
-            .get(&id.0)
-            .map(|status| match status {
-                PENDING_STATUS_PENDING => PendingStatus::Pending,
-                PENDING_STATUS_POSTED => PendingStatus::Posted,
-                PENDING_STATUS_VOIDED => PendingStatus::Voided,
-                _ => unreachable!("PendingStatusEntry.status only stored via mark_pending_status"),
-            })
+        self.pending_statuses.get(&id.0).map(|status| match status {
+            PENDING_STATUS_PENDING => PendingStatus::Pending,
+            PENDING_STATUS_POSTED => PendingStatus::Posted,
+            PENDING_STATUS_VOIDED => PendingStatus::Voided,
+            _ => unreachable!("PendingStatusEntry.status only stored via mark_pending_status"),
+        })
     }
 
     fn mark_pending_status(
@@ -157,6 +156,7 @@ impl LedgerState for LedgerView<'_> {
             PendingStatus::Voided => PENDING_STATUS_VOIDED,
         };
         let content = pending_leaf_content(&id.0, val);
-        self.pending_statuses.insert_with_leaf(&id.0, &val, &content);
+        self.pending_statuses
+            .insert_with_leaf(&id.0, &val, &content);
     }
 }

@@ -84,8 +84,17 @@ pub struct AgentRow {
 /// "member" | "private"` in manifests/`install`), ordered from most
 /// open to most restricted, so `<` means "more open".
 #[derive(
-    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq,
-    PartialOrd, Ord, Hash,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
 )]
 #[rkyv(crate = rkyv)]
 #[repr(u8)]
@@ -332,9 +341,7 @@ pub struct InvitePage {
 // ── Result codes ─────────────────────────────────────────────────
 
 /// Status returned by a mutation handler. `Ok` is always `0`.
-#[derive(
-    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq,
-)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[rkyv(crate = rkyv)]
 #[repr(u8)]
 pub enum Status {
@@ -638,7 +645,10 @@ fn catalog_op_canonical(msg: &Msg) -> Option<Vec<u8>> {
         "register_extension_meta" => {
             let instance_name = a.get_str("instance_name")?;
             let blob = a.get_bytes("blob")?;
-            canonical_op_bytes("register_extension_meta", &[instance_name.as_bytes(), &blob])
+            canonical_op_bytes(
+                "register_extension_meta",
+                &[instance_name.as_bytes(), &blob],
+            )
         }
         _ => return None,
     };
@@ -761,8 +771,13 @@ impl RegistryRef {
         version: String,
     ) -> Result<Option<ProgramRow>, ClientError> {
         decode_opt(
-            self.call(inv, Msg::new("program").with("name", name).with("version", version))
-                .await?,
+            self.call(
+                inv,
+                Msg::new("program")
+                    .with("name", name)
+                    .with("version", version),
+            )
+            .await?,
         )
     }
 
@@ -786,7 +801,10 @@ impl RegistryRef {
         inv: &mut I,
         name: String,
     ) -> Result<Vec<u8>, ClientError> {
-        decode_bytes(self.call(inv, Msg::new("meta_for_instance").with("name", name)).await?)
+        decode_bytes(
+            self.call(inv, Msg::new("meta_for_instance").with("name", name))
+                .await?,
+        )
     }
 
     /// One page of the member roster (nodes then identities). Prefer
@@ -845,7 +863,9 @@ impl RegistryRef {
         inv: &mut I,
         peer_id: Vec<u8>,
     ) -> Result<u8, ClientError> {
-        let v = self.call(inv, Msg::new("peer_role").with("peer_id", peer_id)).await?;
+        let v = self
+            .call(inv, Msg::new("peer_role").with("peer_id", peer_id))
+            .await?;
         v.as_u8()
             .ok_or_else(|| ClientError::UnexpectedReply(alloc::format!("{v:?}")))
     }
@@ -855,7 +875,9 @@ impl RegistryRef {
         inv: &mut I,
         peer_id: Vec<u8>,
     ) -> Result<u64, ClientError> {
-        let v = self.call(inv, Msg::new("peer_epoch").with("peer_id", peer_id)).await?;
+        let v = self
+            .call(inv, Msg::new("peer_epoch").with("peer_id", peer_id))
+            .await?;
         v.as_u64()
             .ok_or_else(|| ClientError::UnexpectedReply(alloc::format!("{v:?}")))
     }
@@ -865,12 +887,10 @@ impl RegistryRef {
     /// enrollment is non-secret membership metadata. Used to decide
     /// whether this node is a space member before spawning agents
     /// whose sync floor requires membership.
-    pub async fn node_role<I: Invoker>(
-        &self,
-        inv: &mut I,
-        prefix: u64,
-    ) -> Result<u8, ClientError> {
-        let v = self.call(inv, Msg::new("node_role").with("prefix", prefix)).await?;
+    pub async fn node_role<I: Invoker>(&self, inv: &mut I, prefix: u64) -> Result<u8, ClientError> {
+        let v = self
+            .call(inv, Msg::new("node_role").with("prefix", prefix))
+            .await?;
         v.as_u8()
             .ok_or_else(|| ClientError::UnexpectedReply(alloc::format!("{v:?}")))
     }
@@ -943,7 +963,10 @@ impl RegistryRef {
         inv: &mut I,
         root: Vec<u8>,
     ) -> Result<Status, ClientError> {
-        decode_rkyv(self.call(inv, Msg::new("set_root").with("root", root)).await?)
+        decode_rkyv(
+            self.call(inv, Msg::new("set_root").with("root", root))
+                .await?,
+        )
     }
 
     /// Anchor this space's `space_id` (first-write-wins). The daemon
@@ -956,7 +979,10 @@ impl RegistryRef {
         inv: &mut I,
         space_id: Vec<u8>,
     ) -> Result<Status, ClientError> {
-        decode_rkyv(self.call(inv, Msg::new("set_space_id").with("space_id", space_id)).await?)
+        decode_rkyv(
+            self.call(inv, Msg::new("set_space_id").with("space_id", space_id))
+                .await?,
+        )
     }
 
     /// This space's anchored `space_id`, or empty if never set.
@@ -1153,7 +1179,9 @@ impl RegistryRef {
         decode_rkyv(
             self.call(
                 inv,
-                Msg::new("remove_node").with("prefix", prefix).with("auth", auth),
+                Msg::new("remove_node")
+                    .with("prefix", prefix)
+                    .with("auth", auth),
             )
             .await?,
         )
@@ -1373,7 +1401,9 @@ impl RegistryRef {
         decode_rkyv(
             self.call(
                 inv,
-                Msg::new("invites").with("after", after).with("budget", budget),
+                Msg::new("invites")
+                    .with("after", after)
+                    .with("budget", budget),
             )
             .await?,
         )
@@ -1467,7 +1497,10 @@ mod tests {
             .with("from_hash", alloc::vec![7u8; 32]);
         assert_eq!(
             catalog_op_canonical(&m).unwrap(),
-            canonical_op_bytes("upgrade", &[b"msg-x-log", b"p", b"2", &[5u8; 32], &[7u8; 32]]),
+            canonical_op_bytes(
+                "upgrade",
+                &[b"msg-x-log", b"p", b"2", &[5u8; 32], &[7u8; 32]]
+            ),
         );
     }
 
@@ -1509,7 +1542,10 @@ mod tests {
         let decoded = <Msg as crate::Decode>::try_decode(&signed[1..]).unwrap();
         let auths = decoded.args.0.iter().filter(|(k, _)| k == "auth").count();
         assert_eq!(auths, 1, "exactly one auth arg after signing");
-        assert_eq!(decoded.args.get_bytes("auth").unwrap(), alloc::vec![0xABu8; 70]);
+        assert_eq!(
+            decoded.args.get_bytes("auth").unwrap(),
+            alloc::vec![0xABu8; 70]
+        );
     }
 
     #[test]

@@ -1713,10 +1713,8 @@ fn handle_req_resp(
                         let svc = service.get().cloned();
                         let response_tx = response_tx.clone();
                         tokio::task::spawn_blocking(move || {
-                            let blob =
-                                svc.and_then(|s| s.get_program_blob(Some(peer), &hash));
-                            let _ = response_tx
-                                .send((channel, Frame::ProgramBlobReply { blob }));
+                            let blob = svc.and_then(|s| s.get_program_blob(Some(peer), &hash));
+                            let _ = response_tx.send((channel, Frame::ProgramBlobReply { blob }));
                         });
                     }
                     Frame::RaftAppendReq {
@@ -2148,7 +2146,11 @@ impl SyncRateLimiter {
 
     /// Record a `FetchProgramBlob` from `peer` against its own tighter budget.
     fn allow_program_blob(&mut self, peer: PeerId) -> bool {
-        Self::charge(&mut self.program_blob, peer, MAX_PROGRAM_BLOB_FETCHES_PER_WINDOW)
+        Self::charge(
+            &mut self.program_blob,
+            peer,
+            MAX_PROGRAM_BLOB_FETCHES_PER_WINDOW,
+        )
     }
 
     /// Fixed-window charge against a per-peer counter map: reset a peer's count

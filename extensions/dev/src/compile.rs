@@ -131,11 +131,7 @@ fn log_outcome_stderr(o: &CompileOutcome) {
 ///     `intent.ok=0`) so its history survives;
 ///   * recording itself broke (transport / malformed source_commit) →
 ///     `ok=false`, `error`, no `build_commit`.
-pub async fn compile_and_record(
-    ctx: &mut DevCtx,
-    project_id: u32,
-    source_commit: Vec<u8>,
-) -> Args {
+pub async fn compile_and_record(ctx: &mut DevCtx, project_id: u32, source_commit: Vec<u8>) -> Args {
     let outcome = compile_project(ctx, project_id, source_commit.clone()).await;
     log_outcome_stderr(&outcome);
 

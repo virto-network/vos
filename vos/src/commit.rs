@@ -493,9 +493,7 @@ mod local {
             }
             let txn = self.db.begin_write()?;
             {
-                if state_changed
-                    && let Some(state) = state
-                {
+                if state_changed && let Some(state) = state {
                     let mut table = txn.open_table(STATE_TABLE)?;
                     table.insert(STATE_KEY, state)?;
                 }
@@ -1169,9 +1167,7 @@ mod crdt {
             let txn = self.db.begin_write()?;
             {
                 let mut state_table = txn.open_table(STATE_TABLE)?;
-                if state_changed
-                    && let Some(state) = state
-                {
+                if state_changed && let Some(state) = state {
                     state_table.insert(STATE_KEY, state)?;
                 }
                 state_table.insert(ROOTS_KEY, roots_bytes.as_slice())?;
@@ -1205,9 +1201,7 @@ mod crdt {
                 self.clock.add_roots(core::iter::once(cid));
             }
             self.next_seq = next_seq_after;
-            if state_changed
-                && let Some(state) = state
-            {
+            if state_changed && let Some(state) = state {
                 self.last_state = state.to_vec();
             }
             Ok(CommitReceipt { node_appended })

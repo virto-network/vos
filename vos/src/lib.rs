@@ -164,9 +164,9 @@ pub mod pvm_image;
 pub use actors::InvokeError;
 pub use actors::init;
 pub use actors::lifecycle;
-pub use actors::storage;
 #[cfg(feature = "pvm")]
 pub use actors::run_refine;
+pub use actors::storage;
 pub use actors::value;
 pub use actors::{
     Actor, ActorHandle, ActorReference, Ask, Caller, ClientError, Context, Extension, ExtensionCtx,

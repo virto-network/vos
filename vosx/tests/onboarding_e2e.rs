@@ -40,7 +40,12 @@ impl TempDir {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        p.push(format!("vosx-onb-{}-{}-{}", std::process::id(), label, nanos));
+        p.push(format!(
+            "vosx-onb-{}-{}-{}",
+            std::process::id(),
+            label,
+            nanos
+        ));
         fs::create_dir_all(&p).expect("create tmpdir");
         TempDir(p)
     }
@@ -166,7 +171,10 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
         .expect("invite prints the token first")
         .trim()
         .to_string();
-    assert!(token.starts_with("vos1"), "expected a vos1… token, got: {token}");
+    assert!(
+        token.starts_with("vos1"),
+        "expected a vos1… token, got: {token}"
+    );
 
     // ── host B: literally `space up <token>` — join + redeem + sync ─
     let log_b = data_b.path().join("daemon-b.stderr");
@@ -198,7 +206,11 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
     poll_until(
         40,
         || {
-            let o = vosx(data_b.path(), cfg_b.path(), &["space", "role", space, "list"]);
+            let o = vosx(
+                data_b.path(),
+                cfg_b.path(),
+                &["space", "role", space, "list"],
+            );
             o.status.success() && String::from_utf8_lossy(&o.stdout).contains("admin")
         },
         || {
@@ -272,7 +284,12 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
                 .and_then(|m| m.modified().ok())
                 .is_some_and(|mt| mt >= restart_at)
         },
-        || format!("B didn't re-attach after a bare restart; log:\n{}", fs::read_to_string(&log_b2).unwrap_or_default()),
+        || {
+            format!(
+                "B didn't re-attach after a bare restart; log:\n{}",
+                fs::read_to_string(&log_b2).unwrap_or_default()
+            )
+        },
     );
     // Re-spawn is proven by the agent being reachable again (the redb
     // file persists on disk regardless, so its presence proves nothing);
@@ -402,7 +419,15 @@ fn expired_token_not_redeemed_and_non_member_cannot_sync() {
     let stdout = vosx_ok(
         data_a.path(),
         cfg_a.path(),
-        &["space", "invite", space, "--role", "member", "--expires", "1"],
+        &[
+            "space",
+            "invite",
+            space,
+            "--role",
+            "member",
+            "--expires",
+            "1",
+        ],
     );
     let token = stdout.lines().next().unwrap().trim().to_string();
     thread::sleep(Duration::from_secs(2));
@@ -416,15 +441,28 @@ fn expired_token_not_redeemed_and_non_member_cannot_sync() {
     // The daemon recognizes the token as expired and refuses to redeem.
     poll_until(
         20,
-        || fs::read_to_string(&log_b).unwrap_or_default().contains("expired"),
-        || format!("B never logged the token as expired; log:\n{}", fs::read_to_string(&log_b).unwrap_or_default()),
+        || {
+            fs::read_to_string(&log_b)
+                .unwrap_or_default()
+                .contains("expired")
+        },
+        || {
+            format!(
+                "B never logged the token as expired; log:\n{}",
+                fs::read_to_string(&log_b).unwrap_or_default()
+            )
+        },
     );
 
     // And because it never became a member, the Member-gated registry is
     // never served to it: give sync a generous window, then assert its
     // role list still lacks A's admin grant (it started empty).
     thread::sleep(Duration::from_secs(6));
-    let roles = vosx_ok(data_b.path(), cfg_b.path(), &["space", "role", space, "list"]);
+    let roles = vosx_ok(
+        data_b.path(),
+        cfg_b.path(),
+        &["space", "role", space, "list"],
+    );
     assert!(
         !roles.contains("admin"),
         "a non-member must NOT sync the Member-gated registry; got role list:\n{roles}",

@@ -301,7 +301,8 @@ impl TracingPvm {
         // makes `RegWrite` the whole register-file delta. Verify rather
         // than assume: a second changed index would be silently lost.
         if let Some(i) = reg_write {
-            if let Some(j) = ((i + 1)..PVM_REGISTER_COUNT).find(|&j| regs_before[j] != regs_after[j])
+            if let Some(j) =
+                ((i + 1)..PVM_REGISTER_COUNT).find(|&j| regs_before[j] != regs_after[j])
             {
                 panic!(
                     "step at ts {} changed registers {i} and {j}: a compact \

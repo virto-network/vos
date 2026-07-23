@@ -78,8 +78,6 @@ fn ensure_built() {
     }
 }
 
-
-
 // ── Tiny temp-dir helper ─────────────────────────────────────────────
 
 struct TempDir(PathBuf);
@@ -261,7 +259,6 @@ path = "{ai_so}"
     manifest_path
 }
 
-
 // ── The test ────────────────────────────────────────────────────────
 
 /// Drive `vosx ai generate` through the daemon — now the metadata-driven
@@ -362,7 +359,3 @@ fn strip_ansi(s: &str) -> String {
     }
     out
 }
-
-
-
-

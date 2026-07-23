@@ -101,10 +101,7 @@ mod tests {
     struct Echo;
 
     impl Refine for Echo {
-        fn refine(
-            work: &WorkEnvelopeV2,
-            _: &RefineImportsV2,
-        ) -> Result<TransitionV2, RefineError> {
+        fn refine(work: &WorkEnvelopeV2, _: &RefineImportsV2) -> Result<TransitionV2, RefineError> {
             Ok(TransitionV2 {
                 service: work.service.clone(),
                 consumed_input: work.input_id(),

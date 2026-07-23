@@ -687,8 +687,10 @@ mod imp {
         // measure the RistrettoChip + Range256 table cost only, without the
         // always-on memory / register boundary machinery (whose Phase Z0 closing
         // binding rejects step-less traces).
-        let components: &[&'static dyn zkpvm::harness::MachineProverComponent] =
-            &[&zkpvm::chips::RangeMultiplicity256, &zkpvm::chips::RistrettoChip];
+        let components: &[&'static dyn zkpvm::harness::MachineProverComponent] = &[
+            &zkpvm::chips::RangeMultiplicity256,
+            &zkpvm::chips::RistrettoChip,
+        ];
         let t = Instant::now();
         let proof = zkpvm::prove_with_explicit_components(&mut side_note, config, components)
             .expect("soundness-complete chain prove failed");

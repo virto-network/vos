@@ -47,8 +47,15 @@ use super::{Core, FixedKey, decode_or_panic, overlay_load, overlay_store};
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Ref {
     Empty,
-    Leaf { key: Vec<u8>, hash: [u8; 32] },
-    Branch { level: u16, prefix: Vec<u8>, hash: [u8; 32] },
+    Leaf {
+        key: Vec<u8>,
+        hash: [u8; 32],
+    },
+    Branch {
+        level: u16,
+        prefix: Vec<u8>,
+        hash: [u8; 32],
+    },
 }
 
 const REF_EMPTY: u8 = 0;
@@ -370,10 +377,7 @@ impl<K: FixedKey, V: Encode + Decode> CommittedMap<K, V> {
     /// key-set changed (fresh insert / real removal).
     fn update_tree(&mut self, kb: &[u8], leaf: Option<[u8; 32]>) -> bool {
         let p = self.params();
-        let chain = self
-            .chain
-            .take()
-            .unwrap_or_else(|| state::empty_chain(&p));
+        let chain = self.chain.take().unwrap_or_else(|| state::empty_chain(&p));
         let (mut count, _, top) = self.read_root();
 
         // Walk down to the slot the key occupies (or diverges from),
@@ -413,10 +417,7 @@ impl<K: FixedKey, V: Encode + Decode> CommittedMap<K, V> {
                         match leaf {
                             Some(hash) => {
                                 changed = false;
-                                replacement = Some(Ref::Leaf {
-                                    key: k2,
-                                    hash,
-                                });
+                                replacement = Some(Ref::Leaf { key: k2, hash });
                             }
                             None => {
                                 count -= 1;

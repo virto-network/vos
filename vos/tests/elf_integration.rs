@@ -2793,7 +2793,8 @@ fn invoke_with_oversized_external_reply_does_not_corrupt_caller() {
         invokes_clone.fetch_add(1, Ordering::Relaxed);
         Some(vos::runtime::ExternalInvokeReply::done(vec![
             0u8;
-            vos::lifecycle::BUF_SIZE + 1_000
+            vos::lifecycle::BUF_SIZE
+                + 1_000
         ]))
     }));
 
@@ -4779,7 +4780,9 @@ fn raft_join_req_wire_path_grows_cluster_via_libp2p() {
     // change_membership, B becomes a voter.
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use vos::network::{Network, NetworkConfig, NetworkService, RaftJoinResult, derive_node_prefix};
+    use vos::network::{
+        Network, NetworkConfig, NetworkService, RaftJoinResult, derive_node_prefix,
+    };
     use vos::raft::{RaftWorker, Role, WorkerConfig};
 
     // A's inbound `RaftJoinReq` is admission-gated on a `NetworkService`
@@ -5660,11 +5663,7 @@ fn registry_authority_survives_state_blob_drift() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "vos_reg_drift_{}_{}",
-        std::process::id(),
-        stamp
-    ));
+    let dir = std::env::temp_dir().join(format!("vos_reg_drift_{}_{}", std::process::id(), stamp));
     std::fs::create_dir_all(&dir).unwrap();
 
     let root_key = SigningKey::from_bytes(&[13u8; 32]);
@@ -5838,10 +5837,8 @@ fn members_pager_terminates_one_row_at_a_time() {
     }
     for seed in [0x41u8, 0x42, 0x43] {
         let pk = vec![seed; 32];
-        let canonical = canonical_op_bytes(
-            "add_identity",
-            &[&pk, &[PROOF_KIND_MERKLE_INCLUSION], &[]],
-        );
+        let canonical =
+            canonical_op_bytes("add_identity", &[&pk, &[PROOF_KIND_MERKLE_INCLUSION], &[]]);
         let auth = pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes());
         assert_eq!(
             vos::block_on(reg.add_identity(
@@ -5858,10 +5855,8 @@ fn members_pager_terminates_one_row_at_a_time() {
     // The empty key is refused outright — it is not an identity, and
     // it is the pager's phase-start sentinel.
     {
-        let canonical = canonical_op_bytes(
-            "add_identity",
-            &[&[], &[PROOF_KIND_MERKLE_INCLUSION], &[]],
-        );
+        let canonical =
+            canonical_op_bytes("add_identity", &[&[], &[PROOF_KIND_MERKLE_INCLUSION], &[]]);
         let auth = pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes());
         assert_eq!(
             vos::block_on(reg.add_identity(
@@ -5883,7 +5878,11 @@ fn members_pager_terminates_one_row_at_a_time() {
     let mut seen = Vec::new();
     for _ in 0..12 {
         let page = vos::block_on(reg.members(&mut &node, kind, key.clone(), 1)).expect("members");
-        seen.extend(page.members.iter().map(|m| (m.kind, m.key.clone(), m.prefix)));
+        seen.extend(
+            page.members
+                .iter()
+                .map(|m| (m.kind, m.key.clone(), m.prefix)),
+        );
         if !page.more {
             break;
         }
@@ -6276,13 +6275,8 @@ fn clerk_ledger_bootstrap_and_create_account() {
     // is an opaque user tag — pick 1 for the test.
     let registrar = Keypair::generate();
     let journal = JournalId::random();
-    let status = vos::block_on(ledger.bootstrap(
-        &mut &node,
-        journal.0,
-        registrar.public.0,
-        1u32,
-    ))
-    .expect("invoke bootstrap");
+    let status = vos::block_on(ledger.bootstrap(&mut &node, journal.0, registrar.public.0, 1u32))
+        .expect("invoke bootstrap");
     assert_eq!(status, Status::Ok);
 
     // Post-bootstrap: state_root returns a 32-byte SMT root that
@@ -7129,8 +7123,7 @@ fn voucher_check_allowlist_coverage() {
         let mut sn = cursor.side_note(a, b);
         let proof = zkpvm::prove_canonical(&mut sn, &VOUCHER_CHECK_CANONICAL_PROFILE)
             .unwrap_or_else(|e| panic!("prove_canonical seg {i} [{a},{b}): {e:?}"));
-        let c =
-            zkpvm::recursion_pcs::commitment_bytes(&zkpvm::program_commitment_of_proof(&proof));
+        let c = zkpvm::recursion_pcs::commitment_bytes(&zkpvm::program_commitment_of_proof(&proof));
         eprintln!(
             "seg {i:3} steps={:7} combs={} commitment={} in_allowlist={}",
             b - a,
@@ -7199,7 +7192,9 @@ fn voucher_check_chain_accept_path() {
     .expect("prove_chain_segments over the conservation transition");
     eprintln!("proved {} canonical segments", segments.len());
 
-    let allowlist: Vec<u8> = vc_pin.allowlist_concat().expect("catalog allowlist decodes");
+    let allowlist: Vec<u8> = vc_pin
+        .allowlist_concat()
+        .expect("catalog allowlist decodes");
     let io_public = cipher_clerk::voucher::proof::public_bytes(&public);
 
     // Honest chain: verifies against the catalog allowlist + the io-binding.
@@ -7697,23 +7692,13 @@ fn clerk_ledger_two_bank_federation() {
     let ledger_b = ClerkLedgerRef::at(clerk_b_id);
     let ts: u64 = 2_000_000;
     assert_eq!(
-        vos::block_on(ledger_a.bootstrap(
-            &mut &node_a,
-            journal_a.0,
-            registrar_a.public.0,
-            1u32,
-        ))
-        .expect("ledger_a bootstrap"),
+        vos::block_on(ledger_a.bootstrap(&mut &node_a, journal_a.0, registrar_a.public.0, 1u32,))
+            .expect("ledger_a bootstrap"),
         Status::Ok
     );
     assert_eq!(
-        vos::block_on(ledger_b.bootstrap(
-            &mut &node_b,
-            journal_b.0,
-            registrar_b.public.0,
-            1u32,
-        ))
-        .expect("ledger_b bootstrap"),
+        vos::block_on(ledger_b.bootstrap(&mut &node_b, journal_b.0, registrar_b.public.0, 1u32,))
+            .expect("ledger_b bootstrap"),
         Status::Ok
     );
 
@@ -7802,14 +7787,14 @@ fn clerk_ledger_two_bank_federation() {
     // caller, bypasses the ACL) returns None, not a stale hit
     // propagated through some shared state. (clerk-ledger has
     // Consistency::Local, no replication.)
-    let bob_on_a = vos::block_on(ledger_a.account(&mut &node_a, bob_id))
-        .expect("local account(bob) on A");
+    let bob_on_a =
+        vos::block_on(ledger_a.account(&mut &node_a, bob_id)).expect("local account(bob) on A");
     assert!(
         bob_on_a.is_none(),
         "bob must NOT appear on A — confidential ledger state is per-bank"
     );
-    let alice_on_b = vos::block_on(ledger_b.account(&mut &node_b, alice_id))
-        .expect("local account(alice) on B");
+    let alice_on_b =
+        vos::block_on(ledger_b.account(&mut &node_b, alice_id)).expect("local account(alice) on B");
     assert!(
         alice_on_b.is_none(),
         "alice must NOT appear on B — confidential ledger state is per-bank"
@@ -9169,8 +9154,9 @@ fn clerk_ledger_two_bank_federation() {
             .require("voucher-check")
             .expect("catalog pins voucher-check")
             .clone();
-        let allowlist_bytes: Vec<u8> =
-            vc_pin.allowlist_concat().expect("catalog allowlist decodes");
+        let allowlist_bytes: Vec<u8> = vc_pin
+            .allowlist_concat()
+            .expect("catalog allowlist decodes");
 
         // Wire bank B's bridge to the prover + trusted allowlist.
         // `set_prover` is legal post-bootstrap (idempotent in identical
@@ -9558,11 +9544,7 @@ fn clerk_ledger_two_bank_federation() {
     );
     assert!(
         matches!(
-            vos::block_on(bridge_actor.anchor_reset(
-                &mut &node_a,
-                b"bank-a".to_vec(),
-                [0u8; 32],
-            )),
+            vos::block_on(bridge_actor.anchor_reset(&mut &node_a, b"bank-a".to_vec(), [0u8; 32],)),
             Err(ClientError::Forbidden)
         ),
         "cross-node anchor_reset from an ungranted peer must be Forbidden"
@@ -9601,12 +9583,8 @@ fn clerk_ledger_two_bank_federation() {
         "a non-chaining voucher wedges the channel (F2 fails closed)"
     );
     assert_eq!(
-        vos::block_on(bridge_actor.anchor_reset(
-            &mut &node_b,
-            b"bank-a".to_vec(),
-            wedge_before,
-        ))
-        .expect("invoke anchor_reset"),
+        vos::block_on(bridge_actor.anchor_reset(&mut &node_b, b"bank-a".to_vec(), wedge_before,))
+            .expect("invoke anchor_reset"),
         BridgeStatus::Ok,
     );
     assert_eq!(
@@ -9615,13 +9593,9 @@ fn clerk_ledger_two_bank_federation() {
         BridgeStatus::UnknownPeer,
     );
     assert_eq!(
-        vos::block_on(bridge_actor.submit_voucher(
-            &mut &node_b,
-            wedge_bytes,
-            b"bank-a".to_vec(),
-        ))
-        .expect("resubmit after anchor_reset")
-        .status,
+        vos::block_on(bridge_actor.submit_voucher(&mut &node_b, wedge_bytes, b"bank-a".to_vec(),))
+            .expect("resubmit after anchor_reset")
+            .status,
         BridgeStatus::Ok,
         "anchor_reset re-anchors the channel so the voucher chains again"
     );
@@ -9719,8 +9693,11 @@ fn raft_clerk_ledger_operator_gate_under_leader_forward() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir_root =
-        std::env::temp_dir().join(format!("vos_raft_clerk_gate_{}_{}", std::process::id(), stamp));
+    let dir_root = std::env::temp_dir().join(format!(
+        "vos_raft_clerk_gate_{}_{}",
+        std::process::id(),
+        stamp
+    ));
     let dir_a = dir_root.join("a");
     let dir_b = dir_root.join("b");
     std::fs::create_dir_all(&dir_a).unwrap();
@@ -9913,8 +9890,10 @@ fn raft_clerk_ledger_operator_gate_under_leader_forward() {
     };
     let root_peer = peer_id_for(root_key.verifying_key().to_bytes());
     let grant_auth = |who: &[u8]| -> Vec<u8> {
-        let canonical =
-            canonical_op_bytes("grant_role", &[who, &[AUTH_ROLE_ADMIN], &1u64.to_le_bytes()]);
+        let canonical = canonical_op_bytes(
+            "grant_role",
+            &[who, &[AUTH_ROLE_ADMIN], &1u64.to_le_bytes()],
+        );
         let sig = root_key.sign(&canonical).to_bytes();
         pack_auth(&root_peer, &sig)
     };
@@ -9960,13 +9939,8 @@ fn raft_clerk_ledger_operator_gate_under_leader_forward() {
     // so each one exercises the cross-node caller attribution the grant
     // now satisfies.
     assert_eq!(
-        vos::block_on(ledger.bootstrap(
-            &mut &*follower_node,
-            journal.0,
-            registrar.public.0,
-            1u32,
-        ))
-        .expect("bootstrap routes"),
+        vos::block_on(ledger.bootstrap(&mut &*follower_node, journal.0, registrar.public.0, 1u32,))
+            .expect("bootstrap routes"),
         Status::Ok,
         "granted peer's bootstrap must pass the Operator gate"
     );
@@ -10111,7 +10085,10 @@ fn raft_clerk_ledger_operator_gate_under_leader_forward() {
         panics += r.panics;
     }
     let _ = std::fs::remove_dir_all(&dir_root);
-    assert_eq!(panics, 0, "actor panics during raft clerk gate test: {panics}");
+    assert_eq!(
+        panics, 0,
+        "actor panics during raft clerk gate test: {panics}"
+    );
 }
 
 /// S1 — `clerk-settle` bilateral settlement end-to-end under Raft.
@@ -10347,8 +10324,10 @@ fn raft_clerk_settle_bilateral_settlement() {
     };
     let root_peer = peer_id_for(root_key.verifying_key().to_bytes());
     let grant_auth = |who: &[u8]| -> Vec<u8> {
-        let canonical =
-            canonical_op_bytes("grant_role", &[who, &[AUTH_ROLE_ADMIN], &1u64.to_le_bytes()]);
+        let canonical = canonical_op_bytes(
+            "grant_role",
+            &[who, &[AUTH_ROLE_ADMIN], &1u64.to_le_bytes()],
+        );
         let sig = root_key.sign(&canonical).to_bytes();
         pack_auth(&root_peer, &sig)
     };
@@ -10450,7 +10429,10 @@ fn raft_clerk_settle_bilateral_settlement() {
         vos::block_on(ClerkSettleRef::at(id).settled_count(&mut &*node)).ok()
     };
     wait_for(
-        || (settled_on(&node_a, venue_a) == Some(1) && settled_on(&node_b, venue_b) == Some(1)).then_some(()),
+        || {
+            (settled_on(&node_a, venue_a) == Some(1) && settled_on(&node_b, venue_b) == Some(1))
+                .then_some(())
+        },
         Duration::from_secs(20),
     )
     .expect("the settled window replicates to both venue nodes");
@@ -10496,7 +10478,10 @@ fn raft_clerk_settle_bilateral_settlement() {
         panics += r.panics;
     }
     let _ = std::fs::remove_dir_all(&dir_root);
-    assert_eq!(panics, 0, "actor panics during raft clerk-settle test: {panics}");
+    assert_eq!(
+        panics, 0,
+        "actor panics during raft clerk-settle test: {panics}"
+    );
 }
 
 /// S6 — the multi-node, three-space settlement capstone.
@@ -10560,7 +10545,10 @@ fn multi_node_three_space_settlement_capstone() {
     let (Some(settle_elf), Some(bridge_elf), Some(registry_elf)) = (
         read_elf(mk_path("clerk-settle", "clerk_settle.elf"), "clerk-settle"),
         read_elf(mk_path("clerk-bridge", "clerk_bridge.elf"), "clerk-bridge"),
-        read_elf(mk_path("space-registry", "space_registry.elf"), "space-registry"),
+        read_elf(
+            mk_path("space-registry", "space_registry.elf"),
+            "space-registry",
+        ),
     ) else {
         return;
     };
@@ -10600,8 +10588,9 @@ fn multi_node_three_space_settlement_capstone() {
     let venue_rep = mk_rep(b"capstone/venue-settle");
 
     // ── Five networks, meshed via explicit dial chains + mDNS. ──
-    let kps: Vec<libp2p::identity::Keypair> =
-        (0..5).map(|_| libp2p::identity::Keypair::generate_ed25519()).collect();
+    let kps: Vec<libp2p::identity::Keypair> = (0..5)
+        .map(|_| libp2p::identity::Keypair::generate_ed25519())
+        .collect();
     let prefixes: Vec<u16> = kps
         .iter()
         .map(|k| derive_node_prefix(&libp2p::PeerId::from(k.public())))
@@ -10615,8 +10604,13 @@ fn multi_node_three_space_settlement_capstone() {
             }
         }
     }
-    let (pv_a, pv_b, pa1, pa2, pb1) =
-        (prefixes[0], prefixes[1], prefixes[2], prefixes[3], prefixes[4]);
+    let (pv_a, pv_b, pa1, pa2, pb1) = (
+        prefixes[0],
+        prefixes[1],
+        prefixes[2],
+        prefixes[3],
+        prefixes[4],
+    );
     let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
 
     let start_net = |kp: libp2p::identity::Keypair,
@@ -10654,7 +10648,8 @@ fn multi_node_three_space_settlement_capstone() {
     );
 
     // ── Register per node: shared hyperspace registry + space agent. ──
-    let settle_id = |prefix: u16| ServiceId(space_registry::instance_service_id("clerk-settle", prefix));
+    let settle_id =
+        |prefix: u16| ServiceId(space_registry::instance_service_id("clerk-settle", prefix));
     let bridge_a_id = ServiceId(space_registry::instance_service_id("bank-a-bridge", pa1));
     let bridge_b_id = ServiceId(space_registry::instance_service_id("bank-b-bridge", pb1));
     let venue_members = vec![pv_a, pv_b];
@@ -10758,7 +10753,11 @@ fn multi_node_three_space_settlement_capstone() {
         Duration::from_secs(30),
     )
     .expect("venue elects a stable leader");
-    let venue_leader_node: &VosNode = if venue_leader == pv_a { &node_va } else { &node_vb };
+    let venue_leader_node: &VosNode = if venue_leader == pv_a {
+        &node_va
+    } else {
+        &node_vb
+    };
     let leader_settle = settle_id(venue_leader);
     let follower_settle = settle_id(venue_follower);
 
@@ -10782,8 +10781,11 @@ fn multi_node_three_space_settlement_capstone() {
     let resolved_from_a2 = wait_for(
         || {
             let got = vos::block_on(
-                SpaceRegistryRef::at(ServiceId::HYPERSPACE_REGISTRY)
-                    .resolve(&mut &node_a2, "clerk-settle".into(), pa2 as u64),
+                SpaceRegistryRef::at(ServiceId::HYPERSPACE_REGISTRY).resolve(
+                    &mut &node_a2,
+                    "clerk-settle".into(),
+                    pa2 as u64,
+                ),
             )
             .ok()?;
             (got == leader_settle.0).then_some(got)
@@ -10916,12 +10918,20 @@ fn multi_node_three_space_settlement_capstone() {
     let add_commits = |a: &Amount, b: &Amount| -> Amount {
         Amount::from_point(&(a.to_point().unwrap() + b.to_point().unwrap()))
     };
-    let recv_a_bytes =
-        vos::block_on(bridge_a.window_net(&mut &node_a1, b"bank-b".to_vec(), DEMO_CURRENCY, WINDOW.0))
-            .expect("bridge-a window_net");
-    let recv_b_bytes =
-        vos::block_on(bridge_b.window_net(&mut &node_b1, b"bank-a".to_vec(), DEMO_CURRENCY, WINDOW.0))
-            .expect("bridge-b window_net");
+    let recv_a_bytes = vos::block_on(bridge_a.window_net(
+        &mut &node_a1,
+        b"bank-b".to_vec(),
+        DEMO_CURRENCY,
+        WINDOW.0,
+    ))
+    .expect("bridge-a window_net");
+    let recv_b_bytes = vos::block_on(bridge_b.window_net(
+        &mut &node_b1,
+        b"bank-a".to_vec(),
+        DEMO_CURRENCY,
+        WINDOW.0,
+    ))
+    .expect("bridge-b window_net");
     let recv_a = Amount(recv_a_bytes.try_into().expect("32-byte receiver term A"));
     let recv_b = Amount(recv_b_bytes.try_into().expect("32-byte receiver term B"));
     // Bank A issued C_ab; bank B issued C_ba (issuer terms the drivers keep).
@@ -10983,14 +10993,12 @@ fn multi_node_three_space_settlement_capstone() {
     // the driver must target the leader. (A claim that short-circuits before
     // the write — e.g. UnknownBank — could return from a follower; this one
     // is valid against the now-replicated banks, so it reaches the write.)
-    let follower_result = vos::block_on(
-        ClerkSettleRef::at(follower_settle).submit_claim(
-            &mut &node_a1,
-            claim_a.clone(),
-            1u32,
-            [0xA0u8; 32],
-        ),
-    );
+    let follower_result = vos::block_on(ClerkSettleRef::at(follower_settle).submit_claim(
+        &mut &node_a1,
+        claim_a.clone(),
+        1u32,
+        [0xA0u8; 32],
+    ));
     assert!(
         follower_result.is_err(),
         "a committing submit_claim to a venue follower must not succeed (no inbound forward); got {follower_result:?}"
@@ -11046,9 +11054,13 @@ fn multi_node_three_space_settlement_capstone() {
         &bank_b_clerk.secret,
     );
     assert_eq!(
-        vos::block_on(bridge_a.submit_voucher(&mut &node_a1, wedge_bytes.clone(), b"bank-b".to_vec()))
-            .expect("submit wedge voucher")
-            .status,
+        vos::block_on(bridge_a.submit_voucher(
+            &mut &node_a1,
+            wedge_bytes.clone(),
+            b"bank-b".to_vec()
+        ))
+        .expect("submit wedge voucher")
+        .status,
         BridgeStatus::VoucherInvalid,
         "a non-chaining voucher wedges the channel"
     );
@@ -11122,7 +11134,9 @@ fn probe_yield_mid_batch_delivers_all_mail() {
 /// Register a probe (parent) and a leaker (child) in `rt`, returning
 /// their service ids. The leaker's cold-start hook journals a write to
 /// its own row that the parent's dispatch absorbs when it asks it.
-fn probe_and_leaker(rt: &mut VosRuntime) -> (vos::abi::service::ServiceId, vos::abi::service::ServiceId) {
+fn probe_and_leaker(
+    rt: &mut VosRuntime,
+) -> (vos::abi::service::ServiceId, vos::abi::service::ServiceId) {
     let probe = transpile_actor(&example_elf("probe"));
     let leaker = transpile_actor(&example_elf("leaker"));
     let p_idx = rt.register_service_blob(probe);
@@ -11133,8 +11147,8 @@ fn probe_and_leaker(rt: &mut VosRuntime) -> (vos::abi::service::ServiceId, vos::
 }
 
 fn dynamic_msg(name: &str, child: u32) -> Vec<u8> {
-    use vos::value::{Msg, TAG_DYNAMIC};
     use vos::Encode;
+    use vos::value::{Msg, TAG_DYNAMIC};
     let encoded = Msg::new(name).with("child", child).encode();
     let mut p = vec![TAG_DYNAMIC];
     p.extend_from_slice(&encoded);
@@ -11210,8 +11224,12 @@ fn probe_ask_status_distinguishes_too_big_from_crash() {
         m.extend_from_slice(&enc);
         rt.send_to(probe, m);
         rt.run_blocking();
-        let reply = rt.take_last_reply(probe).expect("ask_small_buf produced no reply");
-        <Value as Decode>::decode(&reply).as_u8().expect("ask_small_buf returns u8")
+        let reply = rt
+            .take_last_reply(probe)
+            .expect("ask_small_buf produced no reply");
+        <Value as Decode>::decode(&reply)
+            .as_u8()
+            .expect("ask_small_buf returns u8")
     };
 
     assert_eq!(
@@ -11257,7 +11275,9 @@ fn task_gate_ask(
 ) -> vos::value::Value {
     rt.send_to(id, task_gate_dyn_msg(msg));
     rt.run_blocking();
-    let bytes = rt.take_last_reply(id).expect("dispatch must produce a reply");
+    let bytes = rt
+        .take_last_reply(id)
+        .expect("dispatch must produce a reply");
     // An empty reply is a Unit return — e.g. when a dispatch chained
     // into self-tick re-entries and the final tick's reply won.
     if bytes.is_empty() {
@@ -11394,7 +11414,8 @@ fn task_storage_reads_come_from_the_witness() {
     let sched_id = register_svc(&mut rt, transpile_actor(&sched_elf));
     let args = vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(vec![]));
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
-    rt.storage.write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
+    rt.storage
+        .write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
     let task_hash = rt.register_task_blob(tally_blob, witness_addr as u32, witness_cap as u32);
 
     // Tally's map rows live under `s/saved/v<key BE>` — write two into
@@ -11404,8 +11425,10 @@ fn task_storage_reads_come_from_the_witness() {
         key.extend_from_slice(&k.to_be_bytes());
         key
     };
-    rt.storage.write(sched_id, &row_key(7), &vos::Encode::encode(&100u64));
-    rt.storage.write(sched_id, &row_key(9), &vos::Encode::encode(&11u64));
+    rt.storage
+        .write(sched_id, &row_key(7), &vos::Encode::encode(&100u64));
+    rt.storage
+        .write(sched_id, &row_key(9), &vos::Encode::encode(&11u64));
 
     let run_with_keys = |rt: &mut VosRuntime, a: u64, b: u64, named: &[u64]| -> u64 {
         let task_msg = task_gate_dyn_msg(&Msg::new("add_saved").with("a", a).with("b", b));
@@ -11491,7 +11514,8 @@ fn task_invoke_live_equals_traced() {
     let sched_id = register_svc(&mut rt, transpile_actor(&sched_elf));
     let args = vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(vec![]));
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
-    rt.storage.write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
+    rt.storage
+        .write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
     let task_hash =
         rt.register_task_blob(tally_blob.clone(), witness_addr as u32, witness_cap as u32);
 
@@ -11509,20 +11533,32 @@ fn task_invoke_live_equals_traced() {
     assert_eq!(rt.panics, 0, "no guest may panic on the task path");
     assert_eq!(rt.work_result_rejects, 0, "no work-result may be rejected");
 
-    let status = task_gate_ask(&mut rt, sched_id, &Msg::new("task_status").with("id", task_id));
+    let status = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &Msg::new("task_status").with("id", task_id),
+    );
     assert_eq!(
         status.as_u32(),
         Some(vos::agent::TaskStatus::Done as u32),
         "add(5) is one-shot: the drive pass completes it"
     );
-    let live_state = task_gate_ask(&mut rt, sched_id, &Msg::new("task_state").with("id", task_id))
-        .as_bytes()
-        .expect("task_state replies bytes")
-        .to_vec();
-    let live_reply = task_gate_ask(&mut rt, sched_id, &Msg::new("task_reply").with("id", task_id))
-        .as_bytes()
-        .expect("task_reply replies bytes")
-        .to_vec();
+    let live_state = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &Msg::new("task_state").with("id", task_id),
+    )
+    .as_bytes()
+    .expect("task_state replies bytes")
+    .to_vec();
+    let live_reply = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &Msg::new("task_reply").with("id", task_id),
+    )
+    .as_bytes()
+    .expect("task_reply replies bytes")
+    .to_vec();
     assert!(!live_state.is_empty(), "add(5) changes the tally's state");
     let live_reply_value: Value = vos::Decode::decode(&live_reply);
     assert_eq!(live_reply_value, Value::U64(5));
@@ -11644,7 +11680,8 @@ fn task_suspension_resumes_through_task_record() {
     let sched_id = register_svc(&mut rt, transpile_actor(&sched_elf));
     let args = vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(vec![]));
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
-    rt.storage.write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
+    rt.storage
+        .write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
     let task_hash = rt.register_task_blob(tally_blob, witness_addr as u32, witness_cap as u32);
 
     let work_msg = task_gate_dyn_msg(&Msg::new("work"));
@@ -11662,16 +11699,24 @@ fn task_suspension_resumes_through_task_record() {
     assert_eq!(rt.panics, 0);
     assert_eq!(rt.work_result_rejects, 0);
 
-    let status = task_gate_ask(&mut rt, sched_id, &Msg::new("task_status").with("id", task_id));
+    let status = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &Msg::new("task_status").with("id", task_id),
+    );
     assert_eq!(
         status.as_u32(),
         Some(vos::agent::TaskStatus::Done as u32),
         "three drive passes (spawn + self-ticks) complete the job"
     );
-    let reply = task_gate_ask(&mut rt, sched_id, &Msg::new("task_reply").with("id", task_id))
-        .as_bytes()
-        .expect("task_reply replies bytes")
-        .to_vec();
+    let reply = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &Msg::new("task_reply").with("id", task_id),
+    )
+    .as_bytes()
+    .expect("task_reply replies bytes")
+    .to_vec();
     let reply_value: Value = vos::Decode::decode(&reply);
     assert_eq!(
         reply_value,
@@ -11810,13 +11855,11 @@ fn voucher_check_catalog_matches_pinned_constants() {
         "catalog profile drifted from VOUCHER_CHECK_CANONICAL_PROFILE"
     );
     assert_eq!(
-        pin.seg_steps,
-        CHAIN_SEG_STEPS as u64,
+        pin.seg_steps, CHAIN_SEG_STEPS as u64,
         "catalog seg_steps drifted from CHAIN_SEG_STEPS"
     );
     assert_eq!(
-        pin.page_budget,
-        VOUCHER_CHECK_PAGE_BUDGET as u64,
+        pin.page_budget, VOUCHER_CHECK_PAGE_BUDGET as u64,
         "catalog page_budget drifted from VOUCHER_CHECK_PAGE_BUDGET"
     );
     // The pinned witness address must match the live ELF symbol — cheap (symbol
@@ -11916,7 +11959,10 @@ fn storage_map_outgrows_guest_heap() {
     // Remove / replace round-trips (index + value rows stay coherent).
     assert_eq!(vos::block_on(map.remove(&mut &node, 12_345)).unwrap(), 1);
     assert_eq!(vos::block_on(map.remove(&mut &node, 12_345)).unwrap(), 0);
-    assert_eq!(vos::block_on(map.get(&mut &node, 12_345)).unwrap(), u64::MAX);
+    assert_eq!(
+        vos::block_on(map.get(&mut &node, 12_345)).unwrap(),
+        u64::MAX
+    );
     assert_eq!(vos::block_on(map.count(&mut &node)).unwrap(), 14_999);
     assert_eq!(vos::block_on(map.put(&mut &node, 12_345, 7)).unwrap(), 1);
     assert_eq!(vos::block_on(map.put(&mut &node, 12_345, 8)).unwrap(), 0);
@@ -11978,11 +12024,7 @@ fn clerk_ledger_capstone_ten_thousand_accounts() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "vos_capstone_{}_{}",
-        std::process::id(),
-        stamp
-    ));
+    let dir = std::env::temp_dir().join(format!("vos_capstone_{}_{}", std::process::id(), stamp));
     std::fs::create_dir_all(&dir).unwrap();
 
     let mut node = VosNode::with_prefix(0x00ad);
@@ -11996,13 +12038,8 @@ fn clerk_ledger_capstone_ten_thousand_accounts() {
 
     let registrar = Keypair::generate();
     let journal = JournalId::random();
-    let status = vos::block_on(ledger.bootstrap(
-        &mut &node,
-        journal.0,
-        registrar.public.0,
-        1,
-    ))
-    .expect("bootstrap");
+    let status = vos::block_on(ledger.bootstrap(&mut &node, journal.0, registrar.public.0, 1))
+        .expect("bootstrap");
     assert_eq!(status, Status::Ok);
 
     // ── Load 10k accounts, 8 signed creates per dispatch ────────
@@ -12080,13 +12117,9 @@ fn clerk_ledger_capstone_ten_thousand_accounts() {
     let root_before = vos::block_on(ledger.state_root(&mut &node)).expect("state_root");
     assert_eq!(root_before.len(), 32);
     let transfer_started = std::time::Instant::now();
-    let status = vos::block_on(ledger.apply_transfer(
-        &mut &node,
-        transfer_bytes,
-        openings_bytes,
-        ts + 7,
-    ))
-    .expect("apply_transfer");
+    let status =
+        vos::block_on(ledger.apply_transfer(&mut &node, transfer_bytes, openings_bytes, ts + 7))
+            .expect("apply_transfer");
     assert_eq!(status, Status::Ok, "transfer at 10k accounts must land");
     eprintln!(
         "capstone: transfer at {ACCOUNTS} accounts in {:?}",
@@ -12107,9 +12140,7 @@ fn clerk_ledger_capstone_ten_thousand_accounts() {
     // ── From-scratch rebuild over the raw persisted rows ────────
     // The actor's incremental root must equal cipher-clerk's
     // composite recomputed from nothing but the durable value rows.
-    let db = dir
-        .join("agents")
-        .join(format!("{:08x}.redb", ledger_id.0));
+    let db = dir.join("agents").join(format!("{:08x}.redb", ledger_id.0));
     let rows = vos::commit::read_kv_rows_at(&db).expect("read persisted rows");
     let cc = SmtParams {
         leaf_domain: b"cipher-clerk/smt/leaf/v1",
@@ -12199,11 +12230,7 @@ fn committed_map_anchors_with_smt_roots() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "vos_committed_{}_{}",
-        std::process::id(),
-        stamp
-    ));
+    let dir = std::env::temp_dir().join(format!("vos_committed_{}_{}", std::process::id(), stamp));
     std::fs::create_dir_all(&dir).unwrap();
 
     // Host-side reference: the fixture's map is CommittedMap<u64, u64>
@@ -12232,7 +12259,10 @@ fn committed_map_anchors_with_smt_roots() {
     let (node, id) = spawn(blob.clone());
     let counter = CommittedCounterRef::at(id);
     for (k, v) in [(5u64, 50u64), (1, 10), (9, 90)] {
-        assert_eq!(vos::block_on(counter.put(&mut &node, k, v)).expect("put"), 1);
+        assert_eq!(
+            vos::block_on(counter.put(&mut &node, k, v)).expect("put"),
+            1
+        );
     }
     assert_eq!(vos::block_on(counter.get(&mut &node, 1)).expect("get"), 10);
     assert_eq!(
@@ -12256,8 +12286,14 @@ fn committed_map_anchors_with_smt_roots() {
         "the committed root must survive a cold restart",
     );
     // Mutations keep chaining: an overwrite, a fresh insert, a remove.
-    assert_eq!(vos::block_on(counter.put(&mut &node, 5, 55)).expect("put"), 0);
-    assert_eq!(vos::block_on(counter.put(&mut &node, 2, 20)).expect("put"), 1);
+    assert_eq!(
+        vos::block_on(counter.put(&mut &node, 5, 55)).expect("put"),
+        0
+    );
+    assert_eq!(
+        vos::block_on(counter.put(&mut &node, 2, 20)).expect("put"),
+        1
+    );
     assert_eq!(vos::block_on(counter.del(&mut &node, 1)).expect("del"), 1);
     assert_eq!(
         vos::block_on(counter.root(&mut &node)).expect("root"),

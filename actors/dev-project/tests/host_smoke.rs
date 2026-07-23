@@ -169,7 +169,13 @@ fn invalid_inputs_rejected() {
     assert_eq!(bad_shape.status, STATUS_INVALID_INPUT);
 
     // Path forms we reject.
-    for bad in &["/abs.rs", "../escape.rs", "./local.rs", "a\\b.rs", "a/./b.rs"] {
+    for bad in &[
+        "/abs.rs",
+        "../escape.rs",
+        "./local.rs",
+        "a\\b.rs",
+        "a/./b.rs",
+    ] {
         let r = store::commit(
             &mut s,
             store::CommitInputs {
@@ -323,7 +329,10 @@ fn get_blob_roundtrip() {
     assert_eq!(row.hash.to_vec(), h);
 
     assert!(store::get_blob(&s, &[0xCCu8; HASH_BYTES]).is_none());
-    assert!(store::get_blob(&s, &[0u8; 5]).is_none(), "wrong length → None");
+    assert!(
+        store::get_blob(&s, &[0u8; 5]).is_none(),
+        "wrong length → None"
+    );
 }
 
 #[test]
@@ -353,12 +362,8 @@ fn working_change_open_put_commit_amend_dedups_log() {
 
     // 3. Five put_file_working calls.
     for i in 0..5 {
-        let status = store::put_file_working(
-            &mut s,
-            &change_id,
-            &format!("src/file_{i}.rs"),
-            &blobs[i],
-        );
+        let status =
+            store::put_file_working(&mut s, &change_id, &format!("src/file_{i}.rs"), &blobs[i]);
         assert_eq!(status, STATUS_OK, "put_file_working[{i}]");
     }
 
@@ -502,7 +507,11 @@ fn merge_fast_forwards_when_theirs_is_descendant() {
 
     let merge = store::merge(&mut s, "main", &b, &[], 3);
     assert_eq!(merge.status, STATUS_OK);
-    assert_eq!(&merge.hash[..], &b[..], "FF: branch should advance to theirs");
+    assert_eq!(
+        &merge.hash[..],
+        &b[..],
+        "FF: branch should advance to theirs"
+    );
     // No new commit row, just branch pointer moved.
     assert_eq!(s.commits.len(), 2);
 }
@@ -600,7 +609,14 @@ fn merge_records_conflict_then_subsequent_commit_resolves() {
     let _ours = commit_one_file(&mut s, "main", &base.hash, "src/lib.rs", b"// ours v1\n", 2);
 
     // theirs (off base): lib.rs v2 — same path, different content.
-    let theirs = commit_one_file(&mut s, "feature", &base.hash, "src/lib.rs", b"// theirs v1\n", 3);
+    let theirs = commit_one_file(
+        &mut s,
+        "feature",
+        &base.hash,
+        "src/lib.rs",
+        b"// theirs v1\n",
+        3,
+    );
 
     let merge = store::merge(&mut s, "main", &theirs, &[], 4);
     assert_eq!(merge.status, STATUS_OK);

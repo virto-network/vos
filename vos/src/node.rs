@@ -1445,7 +1445,7 @@ impl NodeService {
     /// never becomes an open cross-space CAS.
     fn program_hash_catalogued(&self, hash: &[u8; 32]) -> bool {
         use crate::actors::codec::{Decode, Encode};
-        use crate::value::{Msg, Value, TAG_DYNAMIC};
+        use crate::value::{Msg, TAG_DYNAMIC, Value};
         let msg = Msg::new("programs");
         let mut payload = Vec::with_capacity(1 + 64);
         payload.push(TAG_DYNAMIC);
@@ -1565,9 +1565,13 @@ impl NodeService {
         let Ok(info) = self.agent_info.read() else {
             return false;
         };
-        let entry = info
-            .get(&to)
-            .or_else(|| if to != to_unscoped { info.get(&to_unscoped) } else { None });
+        let entry = info.get(&to).or_else(|| {
+            if to != to_unscoped {
+                info.get(&to_unscoped)
+            } else {
+                None
+            }
+        });
         entry.is_some_and(|i| {
             // A `network_reachable` opt-out keeps an authoritative-but-
             // network-served single-node agent (an authoritative store, a
@@ -1852,9 +1856,9 @@ impl crate::network::NetworkService for NodeService {
         // and legitimately arrive over the network. Reuses the role bytes
         // already probed above; the floor lookup is cached.
         #[cfg(feature = "storage")]
-        let target_is_private = self
-            .agent_name_for(to_unscoped)
-            .is_some_and(|name| self.resolve_sync_floor(&name) == crate::registry::SyncFloor::Private);
+        let target_is_private = self.agent_name_for(to_unscoped).is_some_and(|name| {
+            self.resolve_sync_floor(&name) == crate::registry::SyncFloor::Private
+        });
         #[cfg(not(feature = "storage"))]
         let target_is_private = false;
         if target_is_private
@@ -3882,8 +3886,8 @@ fn agent_thread(
                     .map(|(key, _)| key.as_slice())
                     .collect();
                 if !state.is_empty()
-                    && let Err(e) =
-                        strategy.commit_rebuilt(&state, &rebuilt_rows(&runtime, svc_id, &host_seeded))
+                    && let Err(e) = strategy
+                        .commit_rebuilt(&state, &rebuilt_rows(&runtime, svc_id, &host_seeded))
                 {
                     let err = format!("post-replay commit failed: {e}");
                     error!(%id, "{err}");
@@ -7187,11 +7191,12 @@ mod tests {
         let victim = vec![0xBBu8; 38];
 
         // auth blob = signer_peer_id || ed25519_sig(canonical_op_bytes).
-        let auth_as = |key: &SigningKey, signer_peer: &[u8], op: &str, fields: &[&[u8]]| -> Vec<u8> {
-            let canonical = space_registry::canonical_op_bytes(op, fields);
-            let sig = key.sign(&canonical).to_bytes();
-            space_registry::pack_auth(signer_peer, &sig)
-        };
+        let auth_as =
+            |key: &SigningKey, signer_peer: &[u8], op: &str, fields: &[&[u8]]| -> Vec<u8> {
+                let canonical = space_registry::canonical_op_bytes(op, fields);
+                let sig = key.sign(&canonical).to_bytes();
+                space_registry::pack_auth(signer_peer, &sig)
+            };
 
         // A shared program the installs pin to.
         let prog = "p";
@@ -7347,12 +7352,17 @@ mod tests {
             let v: crate::value::Value = crate::Decode::decode(&bytes);
             v.as_u64().expect("peer_role returns an integer")
         };
-        let agent_reply = |inst: &str| invoke(Msg::new("agent").with("instance_name", inst.to_string()));
+        let agent_reply =
+            |inst: &str| invoke(Msg::new("agent").with("instance_name", inst.to_string()));
         let none_reply = agent_reply("does-not-exist"); // canonical `None` for this type
 
         // Positive controls: the root-signed ops survived replay —
         // proves the inject + replay pipeline is genuinely live.
-        assert_eq!(role_of(&victim), ADMIN as u64, "root-signed grant must apply on replay");
+        assert_eq!(
+            role_of(&victim),
+            ADMIN as u64,
+            "root-signed grant must apply on replay"
+        );
         assert_ne!(
             agent_reply("good"),
             none_reply,
@@ -9371,9 +9381,11 @@ mod tests {
             let sink = thread::spawn(move || {
                 if let Ok(req) = tgt_rx.recv() {
                     received_w.store(true, Ordering::Relaxed);
-                    let _ = req
-                        .reply
-                        .send(encode_invoke_envelope(STATUS_DONE, &[], &Value::U8(7).encode()));
+                    let _ = req.reply.send(encode_invoke_envelope(
+                        STATUS_DONE,
+                        &[],
+                        &Value::U8(7).encode(),
+                    ));
                 }
             });
             let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::from([(target.0, tgt_tx)])));
@@ -9387,8 +9399,7 @@ mod tests {
                     network_reachable: false,
                 },
             )])));
-            let mut service =
-                lifecycle_service(routes, Arc::new(Mutex::new(HashMap::new())), info);
+            let mut service = lifecycle_service(routes, Arc::new(Mutex::new(HashMap::new())), info);
             service.operator_peer = operator.map(|p| p.to_bytes());
             let mut payload = vec![TAG_DYNAMIC];
             payload.extend_from_slice(&Msg::new("history").encode());
@@ -9485,9 +9496,11 @@ mod tests {
             let sink = thread::spawn(move || {
                 if let Ok(req) = tgt_rx.recv() {
                     received_w.store(true, Ordering::Relaxed);
-                    let _ = req
-                        .reply
-                        .send(encode_invoke_envelope(STATUS_DONE, &[], &Value::U8(1).encode()));
+                    let _ = req.reply.send(encode_invoke_envelope(
+                        STATUS_DONE,
+                        &[],
+                        &Value::U8(1).encode(),
+                    ));
                 }
             });
             let names = Arc::new(std::sync::RwLock::new(HashMap::from([(
@@ -9567,7 +9580,10 @@ mod tests {
             );
             svc.raft_join_authorized(0x00ab)
         };
-        assert!(check(Some(NODE_ROLE_REPLY_VOTER)), "enrolled VOTER is admitted");
+        assert!(
+            check(Some(NODE_ROLE_REPLY_VOTER)),
+            "enrolled VOTER is admitted"
+        );
         assert!(!check(Some(0)), "an unenrolled prefix is refused");
         assert!(!check(Some(2)), "an OBSERVER is refused");
         assert!(!check(None), "an unreachable registry fails closed");
@@ -9658,11 +9674,8 @@ mod tests {
                     ),
                     _ => Value::U8(peer_role),
                 };
-                let reply = encode_invoke_envelope(
-                    crate::actors::run::STATUS_DONE,
-                    &[],
-                    &value.encode(),
-                );
+                let reply =
+                    encode_invoke_envelope(crate::actors::run::STATUS_DONE, &[], &value.encode());
                 let _ = req.reply.send(reply);
             }
         });
@@ -9693,7 +9706,10 @@ mod tests {
                 .insert("counter".to_string(), (SyncFloor::Member, Instant::now()));
             svc.sync_serve_allowed(Some(&peer), "counter")
         };
-        assert!(!check(AUTH_ROLE_NONE, 0), "a stranger is refused a Member replica");
+        assert!(
+            !check(AUTH_ROLE_NONE, 0),
+            "a stranger is refused a Member replica"
+        );
         assert!(check(AUTH_ROLE_READONLY, 0), "a granted member is served");
         assert!(
             check(AUTH_ROLE_NONE, NODE_ROLE_REPLY_VOTER),
@@ -9710,7 +9726,10 @@ mod tests {
             .write()
             .unwrap()
             .insert("counter".to_string(), (SyncFloor::Member, Instant::now()));
-        assert!(!svc.sync_serve_allowed(None, "counter"), "anonymous is refused Member");
+        assert!(
+            !svc.sync_serve_allowed(None, "counter"),
+            "anonymous is refused Member"
+        );
     }
 
     /// Program blobs require both space membership and a catalogued hash.
@@ -9732,8 +9751,7 @@ mod tests {
         std::fs::write(dir.join(proof_blob_filename(&hash)), &bytes).unwrap();
 
         let make = |peer_role, node_role, catalogued| {
-            let (routes, _reg) =
-                spawn_stub_blob_registry(peer_role, node_role, catalogued, hash);
+            let (routes, _reg) = spawn_stub_blob_registry(peer_role, node_role, catalogued, hash);
             let mut svc = lifecycle_service(
                 routes,
                 Arc::new(Mutex::new(HashMap::new())),
@@ -9789,7 +9807,10 @@ mod tests {
         assert!(!redeem_invite_is_expired(&before, Some(100)));
         assert!(redeem_invite_is_expired(&boundary, Some(100)));
         assert!(redeem_invite_is_expired(&malformed, Some(100)));
-        assert!(redeem_invite_is_expired(&before, None), "clock failure denies");
+        assert!(
+            redeem_invite_is_expired(&before, None),
+            "clock failure denies"
+        );
         assert!(!redeem_invite_is_expired(&Msg::new("programs"), Some(100)));
     }
 
@@ -10080,9 +10101,8 @@ mod tests {
         use std::sync::mpsc;
 
         let workspace = env!("CARGO_MANIFEST_DIR");
-        let elf_path = format!(
-            "{workspace}/../examples/actors/probe/target/riscv64em-javm/release/probe.elf"
-        );
+        let elf_path =
+            format!("{workspace}/../examples/actors/probe/target/riscv64em-javm/release/probe.elf");
         let Ok(elf) = std::fs::read(&elf_path) else {
             eprintln!("SKIP: probe ELF not built — run: just build-pvm");
             return;
@@ -10097,7 +10117,9 @@ mod tests {
         // transfer routed through the node's outbox.
         let external_target = ServiceId(0xEE00);
         let tell = {
-            let enc = Msg::new("tell_out").with("target", external_target.0).encode();
+            let enc = Msg::new("tell_out")
+                .with("target", external_target.0)
+                .encode();
             let mut m = vec![TAG_DYNAMIC];
             m.extend_from_slice(&enc);
             m
@@ -10122,8 +10144,19 @@ mod tests {
 
         // First attempt: the commit fails, so nothing may be routed.
         let mut fail = FailCommit;
-        let r = dispatch_once(&mut runtime, probe, &tx, probe, Some(tell.clone()), &mut fail, false);
-        assert!(r.is_err(), "the failing strategy must surface its commit error");
+        let r = dispatch_once(
+            &mut runtime,
+            probe,
+            &tx,
+            probe,
+            Some(tell.clone()),
+            &mut fail,
+            false,
+        );
+        assert!(
+            r.is_err(),
+            "the failing strategy must surface its commit error"
+        );
         assert!(
             rx.try_recv().is_err(),
             "a failed commit must route no external transfer"

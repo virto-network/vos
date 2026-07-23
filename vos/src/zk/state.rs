@@ -181,8 +181,7 @@ pub fn sparse_root_sorted<K: AsRef<[u8]>>(
     }
     let byte_idx = level / 8;
     let bit_idx = 7 - (level % 8);
-    let split =
-        sorted_leaves.partition_point(|(k, _)| (k.as_ref()[byte_idx] >> bit_idx) & 1 == 0);
+    let split = sorted_leaves.partition_point(|(k, _)| (k.as_ref()[byte_idx] >> bit_idx) & 1 == 0);
     let (left, right) = sorted_leaves.split_at(split);
     let l = sparse_root_sorted(p, left, level + 1, depth_from_leaf - 1, chain);
     let r = sparse_root_sorted(p, right, level + 1, depth_from_leaf - 1, chain);
@@ -286,7 +285,9 @@ impl BatchProof {
     /// removed key) and this proof's frontier.
     pub fn root<K: AsRef<[u8]>>(&self, p: &SmtParams, touched: &[(K, [u8; 32])]) -> [u8; 32] {
         debug_assert!(
-            touched.windows(2).all(|w| w[0].0.as_ref() < w[1].0.as_ref()),
+            touched
+                .windows(2)
+                .all(|w| w[0].0.as_ref() < w[1].0.as_ref()),
             "BatchProof::root requires touched sorted+deduped ascending by key"
         );
         let chain = empty_chain(p);
@@ -296,9 +297,7 @@ impl BatchProof {
 
     fn frontier_get(&self, level: usize, prefix: &[u8]) -> Option<[u8; 32]> {
         self.frontier
-            .binary_search_by(|n| {
-                (n.level as usize, n.prefix.as_slice()).cmp(&(level, prefix))
-            })
+            .binary_search_by(|n| (n.level as usize, n.prefix.as_slice()).cmp(&(level, prefix)))
             .ok()
             .map(|i| self.frontier[i].hash)
     }
@@ -534,8 +533,7 @@ mod tests {
 
         // Touch three present keys, one absent.
         let absent = key16(1_000);
-        let mut touched_keys: Vec<[u8; 16]> =
-            vec![leaves[3].0, leaves[40].0, leaves[63].0, absent];
+        let mut touched_keys: Vec<[u8; 16]> = vec![leaves[3].0, leaves[40].0, leaves[63].0, absent];
         touched_keys.sort_unstable();
         let key_refs: Vec<&[u8]> = touched_keys.iter().map(|k| k.as_slice()).collect();
         let proof = BatchProof::build(&CC, &leaves, &key_refs);

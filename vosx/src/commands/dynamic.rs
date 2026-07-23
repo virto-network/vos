@@ -200,8 +200,7 @@ fn messenger_register(client: &DaemonClient, target: &str, args: &[&str]) -> any
     let mls_pubkey_hex = reply_str
         .strip_prefix("mls_pubkey=")
         .ok_or_else(|| anyhow!("messenger register failed: {reply_str}"))?;
-    let mls_pubkey =
-        hex::decode(mls_pubkey_hex).map_err(|e| anyhow!("bad mls pubkey hex: {e}"))?;
+    let mls_pubkey = hex::decode(mls_pubkey_hex).map_err(|e| anyhow!("bad mls pubkey hex: {e}"))?;
 
     // 2. operator identity + the space id
     let keypair = crate::identity::load_or_create()?;
@@ -1241,8 +1240,7 @@ mod tests {
 
     #[test]
     fn apply_arg_at_file_reads_raw_bytes() {
-        let path =
-            std::env::temp_dir().join(format!("vosx-apply-arg-{}.bin", std::process::id()));
+        let path = std::env::temp_dir().join(format!("vosx-apply-arg-{}.bin", std::process::id()));
         std::fs::write(&path, [9u8, 8, 7]).unwrap();
         let arg = format!("data=@{}", path.display());
         // `@file` works regardless of schema (here: no schema at all).
@@ -1271,18 +1269,13 @@ mod tests {
         let msg = build_msg("x", Some(&m), &["tags=a,b c,d"]).unwrap();
         assert_eq!(
             msg.args.get("tags"),
-            Some(&Value::ListStr(vec![
-                "a".into(),
-                "b c".into(),
-                "d".into()
-            ]))
+            Some(&Value::ListStr(vec!["a".into(), "b c".into(), "d".into()]))
         );
     }
 
     #[test]
     fn render_reply_out_writes_bytes_raw() {
-        let path =
-            std::env::temp_dir().join(format!("vosx-out-bytes-{}.bin", std::process::id()));
+        let path = std::env::temp_dir().join(format!("vosx-out-bytes-{}.bin", std::process::id()));
         render_reply(
             Value::Bytes(vec![1, 2, 3, 0xff]),
             Some("[u8;4]"),
@@ -1296,8 +1289,7 @@ mod tests {
 
     #[test]
     fn render_reply_out_writes_text_for_non_bytes() {
-        let path =
-            std::env::temp_dir().join(format!("vosx-out-text-{}.txt", std::process::id()));
+        let path = std::env::temp_dir().join(format!("vosx-out-text-{}.txt", std::process::id()));
         render_reply(Value::Unit, None, Some(path.to_str().unwrap())).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "()\n");
         let _ = std::fs::remove_file(&path);
@@ -1337,7 +1329,10 @@ mod tests {
         assert_eq!(decode_stream_text(&mut carry, b"hello"), "hello");
         assert!(carry.is_empty());
         // A lone continuation byte 0x80 is genuinely invalid → U+FFFD, consumed.
-        assert_eq!(decode_stream_text(&mut carry, &[0x80, b'o', b'k']), "\u{FFFD}ok");
+        assert_eq!(
+            decode_stream_text(&mut carry, &[0x80, b'o', b'k']),
+            "\u{FFFD}ok"
+        );
         assert!(carry.is_empty());
     }
 

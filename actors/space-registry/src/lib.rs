@@ -52,11 +52,11 @@ pub const SERVICE_ID_RAW: u32 = 0;
 // verifier-side `verify_op_sig` (ed25519) stays here (below), consuming
 // the moved `ed25519_pubkey_from_peer_id`.
 pub use vos::registry::{
-    ActorAclPage, ActorAclRow, AgentRow, AuthGrantPage, AuthGrantRow, InvitePage, InviteRow,
-    MemberPage, MemberRow, ProgramRow, SPACE_ID_DOMAIN_TAG, Status, SyncFloor,
-    AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, BINDING_DOMAIN,
-    MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, NODE_ROLE_OBSERVER, NODE_ROLE_VOTER, OP_SIG_LEN,
-    PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, REGISTRY_OP_DOMAIN, binding_signed_bytes,
+    AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, ActorAclPage,
+    ActorAclRow, AgentRow, AuthGrantPage, AuthGrantRow, BINDING_DOMAIN, InvitePage, InviteRow,
+    MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, MemberPage, MemberRow, NODE_ROLE_OBSERVER,
+    NODE_ROLE_VOTER, OP_SIG_LEN, PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, ProgramRow,
+    REGISTRY_OP_DOMAIN, SPACE_ID_DOMAIN_TAG, Status, SyncFloor, binding_signed_bytes,
     canonical_op_bytes, ed25519_pubkey_from_peer_id, instance_service_id, pack_auth,
 };
 
@@ -553,7 +553,12 @@ impl SpaceRegistry {
     /// the program is published if the orchestrator prefers
     /// that order.
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn register_meta(&mut self, program_hash: Vec<u8>, blob: Vec<u8>, auth: Vec<u8>) -> Status {
+    async fn register_meta(
+        &mut self,
+        program_hash: Vec<u8>,
+        blob: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes("register_meta", &[&program_hash, &blob]),
             &auth,
@@ -564,7 +569,8 @@ impl SpaceRegistry {
             return Status::BadHash;
         };
         // Upsert: one point write, keyed by the program hash.
-        self.metas.insert(&program_hash, &MetaRow { program_hash, blob });
+        self.metas
+            .insert(&program_hash, &MetaRow { program_hash, blob });
         Status::Ok
     }
 
@@ -577,7 +583,10 @@ impl SpaceRegistry {
         let Some(program_hash) = bytes_to_32(&program_hash) else {
             return Vec::new();
         };
-        self.metas.get(&program_hash).map(|m| m.blob).unwrap_or_default()
+        self.metas
+            .get(&program_hash)
+            .map(|m| m.blob)
+            .unwrap_or_default()
     }
 
     /// Convenience join: find an installed agent by name, then
@@ -630,7 +639,10 @@ impl SpaceRegistry {
         auth: Vec<u8>,
     ) -> Status {
         if !self.authorize_op(
-            &canonical_op_bytes("register_extension_meta", &[instance_name.as_bytes(), &blob]),
+            &canonical_op_bytes(
+                "register_extension_meta",
+                &[instance_name.as_bytes(), &blob],
+            ),
             &auth,
         ) {
             return Status::Forbidden;
@@ -1092,10 +1104,7 @@ impl SpaceRegistry {
         auth: Vec<u8>,
     ) -> Status {
         if !self.authorize_op(
-            &canonical_op_bytes(
-                "add_identity",
-                &[&public_key, &[proof_kind], &proof_data],
-            ),
+            &canonical_op_bytes("add_identity", &[&public_key, &[proof_kind], &proof_data]),
             &auth,
         ) {
             return Status::Forbidden;
@@ -1160,11 +1169,24 @@ impl SpaceRegistry {
             let (page, more) = fill_page(&mut it, cap, PAGE_BYTE_BUDGET);
             if !page.is_empty() {
                 return if more {
-                    let next_key = page.last().map(|m| m.prefix.to_be_bytes().to_vec()).unwrap_or_default();
-                    MemberPage { members: page, next_kind: MEMBER_KIND_NODE, next_key, more: true }
+                    let next_key = page
+                        .last()
+                        .map(|m| m.prefix.to_be_bytes().to_vec())
+                        .unwrap_or_default();
+                    MemberPage {
+                        members: page,
+                        next_kind: MEMBER_KIND_NODE,
+                        next_key,
+                        more: true,
+                    }
                 } else {
                     // Nodes drained — the next page starts the identity phase.
-                    MemberPage { members: page, next_kind: MEMBER_KIND_IDENTITY, next_key: Vec::new(), more: true }
+                    MemberPage {
+                        members: page,
+                        next_kind: MEMBER_KIND_IDENTITY,
+                        next_key: Vec::new(),
+                        more: true,
+                    }
                 };
             }
             // No nodes in range: fall through into the identity phase now.
@@ -1175,8 +1197,7 @@ impl SpaceRegistry {
         // "start of the identity phase" sentinel the node phase hands
         // out (an identity whose original key round-tripped as an empty
         // cursor would restart the phase forever).
-        let skip: Option<[u8; 32]> = (after_kind == MEMBER_KIND_IDENTITY
-            && after_key.len() == 32)
+        let skip: Option<[u8; 32]> = (after_kind == MEMBER_KIND_IDENTITY && after_key.len() == 32)
             .then(|| {
                 let mut k = [0u8; 32];
                 k.copy_from_slice(&after_key);
@@ -1195,9 +1216,19 @@ impl SpaceRegistry {
         };
         let members = page.into_iter().map(|(_, m)| m).collect();
         if more {
-            MemberPage { members, next_kind: MEMBER_KIND_IDENTITY, next_key, more: true }
+            MemberPage {
+                members,
+                next_kind: MEMBER_KIND_IDENTITY,
+                next_key,
+                more: true,
+            }
         } else {
-            MemberPage { members, next_kind: 0, next_key: Vec::new(), more: false }
+            MemberPage {
+                members,
+                next_kind: 0,
+                next_key: Vec::new(),
+                more: false,
+            }
         }
     }
 
@@ -1228,7 +1259,13 @@ impl SpaceRegistry {
     /// (`grantor`) so [`effective_role`](Self::effective_role) can void
     /// the subtree if the delegator is later revoked.
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn grant_role(&mut self, peer_id: Vec<u8>, role: u8, epoch: u64, auth: Vec<u8>) -> Status {
+    async fn grant_role(
+        &mut self,
+        peer_id: Vec<u8>,
+        role: u8,
+        epoch: u64,
+        auth: Vec<u8>,
+    ) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes("grant_role", &[&peer_id, &[role], &epoch.to_le_bytes()]),
             &auth,
@@ -1326,7 +1363,11 @@ impl SpaceRegistry {
             .iter_from(&start)
             .filter(move |(k, _)| skip != Some(*k))
             .map(|(_, g)| g);
-        let (page, more) = fill_page(&mut raw, page_rows(budget).min(ROLE_PAGE_MAX_ROWS), PAGE_BYTE_BUDGET);
+        let (page, more) = fill_page(
+            &mut raw,
+            page_rows(budget).min(ROLE_PAGE_MAX_ROWS),
+            PAGE_BYTE_BUDGET,
+        );
         let next = if more {
             page.last().map(|g| g.peer_id.clone()).unwrap_or_default()
         } else {
@@ -1476,9 +1517,13 @@ impl SpaceRegistry {
         let epoch = expires_at;
         let key = peer_key(&peer_id);
         let supersedes = match self.auth_grants.get(&key) {
-            Some(cur) => {
-                grant_supersedes(epoch, &admin_peer_id, cur.epoch, &cur.grantor, &self.root_bytes())
-            }
+            Some(cur) => grant_supersedes(
+                epoch,
+                &admin_peer_id,
+                cur.epoch,
+                &cur.grantor,
+                &self.root_bytes(),
+            ),
             None => true,
         };
         if supersedes {
@@ -1539,11 +1584,16 @@ impl SpaceRegistry {
             .map(|(_, r)| r);
         let (page, more) = fill_page(&mut it, page_rows(budget), PAGE_BYTE_BUDGET);
         let next = if more {
-            page.last().map(|r| r.token_pub.to_vec()).unwrap_or_default()
+            page.last()
+                .map(|r| r.token_pub.to_vec())
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
-        InvitePage { invites: page, next }
+        InvitePage {
+            invites: page,
+            next,
+        }
     }
 
     // ── Actor-local ACLs (M4) ──────────────────────────────────
@@ -1571,7 +1621,12 @@ impl SpaceRegistry {
         if !self.authorize_op(
             &canonical_op_bytes(
                 "grant_actor_role",
-                &[&peer_id, agent_name.as_bytes(), &[role], &epoch.to_le_bytes()],
+                &[
+                    &peer_id,
+                    agent_name.as_bytes(),
+                    &[role],
+                    &epoch.to_le_bytes(),
+                ],
             ),
             &auth,
         ) {
@@ -1688,7 +1743,11 @@ impl SpaceRegistry {
             .iter_from(&start)
             .filter(move |(k, _)| skip != Some(*k))
             .map(|(_, a)| a);
-        let (page, more) = fill_page(&mut raw, page_rows(budget).min(ROLE_PAGE_MAX_ROWS), PAGE_BYTE_BUDGET);
+        let (page, more) = fill_page(
+            &mut raw,
+            page_rows(budget).min(ROLE_PAGE_MAX_ROWS),
+            PAGE_BYTE_BUDGET,
+        );
         let (next_peer, next_agent) = if more {
             page.last()
                 .map(|a| (a.peer_id.clone(), a.agent_name.clone()))
@@ -1980,7 +2039,11 @@ fn peer_key(peer_id: &[u8]) -> [u8; 32] {
 fn acl_key(peer_id: &[u8], agent_name: &str) -> [u8; 32] {
     vos::crypto::blake2b_hash::<32>(
         b"space-registry/acl-key/v1",
-        &[&(peer_id.len() as u32).to_be_bytes(), peer_id, agent_name.as_bytes()],
+        &[
+            &(peer_id.len() as u32).to_be_bytes(),
+            peer_id,
+            agent_name.as_bytes(),
+        ],
     )
 }
 
@@ -2335,7 +2398,16 @@ mod tests {
         let mut r = registry();
         let status = revoke_actor(&mut r, &[1], "x");
         assert_eq!(status, Status::Ok);
-        assert_eq!(dispatch(&mut r, ActorEpoch { peer_id: alloc::vec![1], agent_name: String::from("x") }), 1);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                ActorEpoch {
+                    peer_id: alloc::vec![1],
+                    agent_name: String::from("x")
+                }
+            ),
+            1
+        );
     }
 
     // ── multi-peer / multi-agent ─────────────────────────────────
@@ -2533,21 +2605,37 @@ mod tests {
                 auth: root_auth(
                     "install",
                     &[
-                        b"bridge", b"p", b"1", &hash, &rep, &[0u8], &[], &[], &[1u8],
+                        b"bridge",
+                        b"p",
+                        b"1",
+                        &hash,
+                        &rep,
+                        &[0u8],
+                        &[],
+                        &[],
+                        &[1u8],
                         &[SyncFloor::Member as u8],
                     ],
                 ),
             },
         );
         assert_eq!(st, Status::Ok);
-        let row = r.agents.iter().find(|a| a.instance_name == "bridge").unwrap();
+        let row = r
+            .agents
+            .iter()
+            .find(|a| a.instance_name == "bridge")
+            .unwrap();
         assert!(
             row.network_reachable,
             "install must persist network_reachable=true onto the AgentRow"
         );
         // The default install path stays confined.
         assert_eq!(install_at(&mut r, "counter", 2 /* Crdt */), Status::Ok);
-        let c = r.agents.iter().find(|a| a.instance_name == "counter").unwrap();
+        let c = r
+            .agents
+            .iter()
+            .find(|a| a.instance_name == "counter")
+            .unwrap();
         assert!(!c.network_reachable, "default install is confined");
     }
 
@@ -2588,14 +2676,26 @@ mod tests {
                 auth: root_auth(
                     "install",
                     &[
-                        b"secret", b"p", b"1", &hash, &rep, &[2u8], &[], &[], &[0u8],
+                        b"secret",
+                        b"p",
+                        b"1",
+                        &hash,
+                        &rep,
+                        &[2u8],
+                        &[],
+                        &[],
+                        &[0u8],
                         &[SyncFloor::Private as u8],
                     ],
                 ),
             },
         );
         assert_eq!(st, Status::Ok);
-        let row = r.agents.iter().find(|a| a.instance_name == "secret").unwrap();
+        let row = r
+            .agents
+            .iter()
+            .find(|a| a.instance_name == "secret")
+            .unwrap();
         assert_eq!(
             row.sync_role,
             SyncFloor::Private,
@@ -2604,7 +2704,11 @@ mod tests {
         // The default install path (install_at) records Member.
         assert_eq!(install_at(&mut r, "open", 2 /* Crdt */), Status::Ok);
         let o = r.agents.iter().find(|a| a.instance_name == "open").unwrap();
-        assert_eq!(o.sync_role, SyncFloor::Member, "default install floor is Member");
+        assert_eq!(
+            o.sync_role,
+            SyncFloor::Member,
+            "default install floor is Member"
+        );
     }
 
     #[test]
@@ -2666,7 +2770,15 @@ mod tests {
                 auth: root_auth(
                     "install",
                     &[
-                        b"plain", b"plain", b"1", &hash, &rep, &[2], &[], &[], &[0],
+                        b"plain",
+                        b"plain",
+                        b"1",
+                        &hash,
+                        &rep,
+                        &[2],
+                        &[],
+                        &[],
+                        &[0],
                         &[SyncFloor::Member as u8],
                     ],
                 ),
@@ -2797,7 +2909,12 @@ mod tests {
     /// the CLI does, so each grant/revoke for a peer is monotonically
     /// fresh.
     fn grant_space(r: &mut SpaceRegistry, peer: &[u8], role: u8) -> Status {
-        let epoch = dispatch(r, PeerEpoch { peer_id: peer.to_vec() }) + 1;
+        let epoch = dispatch(
+            r,
+            PeerEpoch {
+                peer_id: peer.to_vec(),
+            },
+        ) + 1;
         dispatch(
             r,
             GrantRole {
@@ -2811,7 +2928,12 @@ mod tests {
 
     /// Root-signed `revoke_role` dispatch — reads + bumps the epoch.
     fn revoke_space(r: &mut SpaceRegistry, peer: &[u8]) -> Status {
-        let epoch = dispatch(r, PeerEpoch { peer_id: peer.to_vec() }) + 1;
+        let epoch = dispatch(
+            r,
+            PeerEpoch {
+                peer_id: peer.to_vec(),
+            },
+        ) + 1;
         dispatch(
             r,
             RevokeRole {
@@ -2877,7 +2999,12 @@ mod tests {
         peer: &[u8],
         role: u8,
     ) -> Status {
-        let epoch = dispatch(r, PeerEpoch { peer_id: peer.to_vec() }) + 1;
+        let epoch = dispatch(
+            r,
+            PeerEpoch {
+                peer_id: peer.to_vec(),
+            },
+        ) + 1;
         let canonical = canonical_op_bytes("grant_role", &[peer, &[role], &epoch.to_le_bytes()]);
         let auth = pack_auth(
             &peer_id_for(&signer.verifying_key().to_bytes()),
@@ -2911,12 +3038,22 @@ mod tests {
             Status::Ok,
         );
         assert_eq!(
-            dispatch(&mut r, PeerRole { peer_id: b_peer.clone() }),
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: b_peer.clone()
+                }
+            ),
             AUTH_ROLE_DEVELOPER,
         );
         assert_eq!(revoke_space(&mut r, &a_peer), Status::Ok);
         assert_eq!(
-            dispatch(&mut r, PeerRole { peer_id: b_peer.clone() }),
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: b_peer.clone()
+                }
+            ),
             AUTH_ROLE_NONE,
             "revoking the delegator voids the delegated grant",
         );
@@ -2948,7 +3085,12 @@ mod tests {
             Status::Ok,
         );
         assert_eq!(
-            dispatch(&mut r, PeerRole { peer_id: b_peer.clone() }),
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: b_peer.clone()
+                }
+            ),
             AUTH_ROLE_ADMIN,
         );
         assert_eq!(
@@ -2956,7 +3098,12 @@ mod tests {
             Status::Ok,
         );
         assert_eq!(
-            dispatch(&mut r, PeerRole { peer_id: b_peer.clone() }),
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: b_peer.clone()
+                }
+            ),
             AUTH_ROLE_NONE,
             "a grantor cycle resolves to NONE instead of looping",
         );
@@ -2996,7 +3143,10 @@ mod tests {
         // Tampered signature → rejected.
         let mut bad_sig = sig;
         bad_sig[0] ^= 0xFF;
-        assert!(!verify_op_sig(&pid, &canonical, &bad_sig), "bad sig rejected");
+        assert!(
+            !verify_op_sig(&pid, &canonical, &bad_sig),
+            "bad sig rejected"
+        );
 
         // Different signer identity → rejected (sig doesn't match key).
         let other_key = SigningKey::from_bytes(&[9u8; 32]);
@@ -3038,16 +3188,16 @@ mod tests {
     /// delegated admin), packing the auth blob.
     fn auth_as(key: &SigningKey, op: &str, fields: &[&[u8]]) -> Vec<u8> {
         let sig = key.sign(&canonical_op_bytes(op, fields));
-        pack_auth(&peer_id_for(&key.verifying_key().to_bytes()), &sig.to_bytes())
+        pack_auth(
+            &peer_id_for(&key.verifying_key().to_bytes()),
+            &sig.to_bytes(),
+        )
     }
 
     /// Dispatch as `Caller::System` — the trusted caller CRDT replay
     /// uses, which clears the `#[msg(role)]` gate. Models the exact
     /// path a forged op merged via sync takes on an honest node.
-    fn dispatch_as_system<M>(
-        r: &mut SpaceRegistry,
-        msg: M,
-    ) -> <SpaceRegistry as Message<M>>::Output
+    fn dispatch_as_system<M>(r: &mut SpaceRegistry, msg: M) -> <SpaceRegistry as Message<M>>::Output
     where
         SpaceRegistry: Message<M>,
     {
@@ -3079,7 +3229,11 @@ mod tests {
                 auth,
             },
         );
-        assert_eq!(status, Status::Forbidden, "System caller can't bypass authorize_op");
+        assert_eq!(
+            status,
+            Status::Forbidden,
+            "System caller can't bypass authorize_op"
+        );
         assert_eq!(
             dispatch(&mut r, PeerRole { peer_id: attacker }),
             AUTH_ROLE_NONE,
@@ -3124,7 +3278,12 @@ mod tests {
         vos::actors::Actor::__init_storage(&mut r);
         assert!(dispatch(&mut r, Root).is_empty(), "no root before genesis");
         assert_eq!(
-            dispatch(&mut r, SetRoot { root: root_peer_id() }),
+            dispatch(
+                &mut r,
+                SetRoot {
+                    root: root_peer_id()
+                }
+            ),
             Status::Ok,
         );
         assert_eq!(dispatch(&mut r, Root), root_peer_id());
@@ -3149,16 +3308,29 @@ mod tests {
         vos::storage::mock::reset();
         let mut r = SpaceRegistry::new();
         vos::actors::Actor::__init_storage(&mut r);
-        assert!(dispatch(&mut r, SpaceId).is_empty(), "no space_id before anchor");
+        assert!(
+            dispatch(&mut r, SpaceId).is_empty(),
+            "no space_id before anchor"
+        );
         assert_eq!(
-            dispatch(&mut r, SetSpaceId { space_id: TEST_SPACE_ID.to_vec() }),
+            dispatch(
+                &mut r,
+                SetSpaceId {
+                    space_id: TEST_SPACE_ID.to_vec()
+                }
+            ),
             Status::Ok,
         );
         assert_eq!(dispatch(&mut r, SpaceId), TEST_SPACE_ID.to_vec());
         // A second set_space_id — e.g. a forged one merged via CRDT — is
         // refused; the anchored id is immutable.
         assert_eq!(
-            dispatch(&mut r, SetSpaceId { space_id: alloc::vec![0x11u8; 32] }),
+            dispatch(
+                &mut r,
+                SetSpaceId {
+                    space_id: alloc::vec![0x11u8; 32]
+                }
+            ),
             Status::Forbidden,
         );
         assert_eq!(dispatch(&mut r, SpaceId), TEST_SPACE_ID.to_vec());
@@ -3182,7 +3354,10 @@ mod tests {
             ),
             Status::Forbidden,
         );
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: victim }), AUTH_ROLE_NONE);
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: victim }),
+            AUTH_ROLE_NONE
+        );
     }
 
     #[test]
@@ -3243,7 +3418,10 @@ mod tests {
         assert_eq!(dispatch(&mut r, NodeRole { prefix: 5 }), 0, "not enrolled");
 
         // Root-signed enrollment of the same node succeeds.
-        let ok = root_auth("add_node", &[&5u32.to_le_bytes(), &node, &[NODE_ROLE_VOTER]]);
+        let ok = root_auth(
+            "add_node",
+            &[&5u32.to_le_bytes(), &node, &[NODE_ROLE_VOTER]],
+        );
         assert_eq!(
             dispatch(
                 &mut r,
@@ -3256,7 +3434,10 @@ mod tests {
             ),
             Status::Ok,
         );
-        assert_eq!(dispatch(&mut r, NodeRole { prefix: 5 }), NODE_ROLE_VOTER + 1);
+        assert_eq!(
+            dispatch(&mut r, NodeRole { prefix: 5 }),
+            NODE_ROLE_VOTER + 1
+        );
     }
 
     #[test]
@@ -3274,7 +3455,15 @@ mod tests {
             &attacker_key,
             "install",
             &[
-                b"evil", b"p", b"1", &hash, &rep, &[2u8], &[], &[], &[0u8],
+                b"evil",
+                b"p",
+                b"1",
+                &hash,
+                &rep,
+                &[2u8],
+                &[],
+                &[],
+                &[0u8],
                 &[SyncFloor::Member as u8],
             ],
         );
@@ -3295,7 +3484,8 @@ mod tests {
             },
         );
         assert_eq!(
-            status, Status::Forbidden,
+            status,
+            Status::Forbidden,
             "System caller can't bypass authorize_op for install",
         );
         assert!(
@@ -3317,11 +3507,7 @@ mod tests {
         let mut r = registry();
         let attacker_key = SigningKey::from_bytes(&[42u8; 32]);
         let hash = alloc::vec![7u8; 32];
-        let forged = auth_as(
-            &attacker_key,
-            "publish",
-            &[b"evil", b"1", &hash, &[0u8]],
-        );
+        let forged = auth_as(&attacker_key, "publish", &[b"evil", b"1", &hash, &[0u8]]);
         let status = dispatch_as_system(
             &mut r,
             Publish {
@@ -3470,7 +3656,10 @@ mod tests {
             ),
             Status::Forbidden,
         );
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: victim }), AUTH_ROLE_NONE);
+        assert_eq!(
+            dispatch(&mut r, PeerRole { peer_id: victim }),
+            AUTH_ROLE_NONE
+        );
     }
 
     // ── Replay-position-independent authority ──────────────────────
@@ -3489,7 +3678,12 @@ mod tests {
         assert_eq!(grant_space(&mut r, &bob, AUTH_ROLE_ADMIN), Status::Ok);
 
         let carol = alloc::vec![3, 3, 3];
-        let e = dispatch(&mut r, PeerEpoch { peer_id: carol.clone() }) + 1;
+        let e = dispatch(
+            &mut r,
+            PeerEpoch {
+                peer_id: carol.clone(),
+            },
+        ) + 1;
         let bob_grants_carol = auth_as(
             &bob_key,
             "grant_role",
@@ -3508,7 +3702,12 @@ mod tests {
             Status::Ok,
         );
         assert_eq!(
-            dispatch(&mut r, PeerRole { peer_id: carol.clone() }),
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: carol.clone()
+                }
+            ),
             AUTH_ROLE_ADMIN,
             "Carol is admin while her delegator Bob is",
         );
@@ -3543,12 +3742,22 @@ mod tests {
         let carol = alloc::vec![3, 3, 3];
         assert_eq!(grant_space(&mut r, &carol, AUTH_ROLE_ADMIN), Status::Ok);
         assert_eq!(
-            dispatch(&mut r, PeerRole { peer_id: carol.clone() }),
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: carol.clone()
+                }
+            ),
             AUTH_ROLE_ADMIN,
         );
 
         // Mallory re-grants Carol at a higher epoch (read + 1).
-        let e = dispatch(&mut r, PeerEpoch { peer_id: carol.clone() }) + 1;
+        let e = dispatch(
+            &mut r,
+            PeerEpoch {
+                peer_id: carol.clone(),
+            },
+        ) + 1;
         let capture = auth_as(
             &mallory_key,
             "grant_role",
@@ -3606,14 +3815,24 @@ mod tests {
             Status::Ok,
         );
         assert_eq!(
-            dispatch(&mut r, PeerRole { peer_id: bob.clone() }),
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: bob.clone()
+                }
+            ),
             AUTH_ROLE_ADMIN,
         );
 
         // root revokes Bob (reads epoch 1, bumps the high-water to 2).
         assert_eq!(revoke_space(&mut r, &bob), Status::Ok);
         assert_eq!(
-            dispatch(&mut r, PeerRole { peer_id: bob.clone() }),
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: bob.clone()
+                }
+            ),
             AUTH_ROLE_NONE,
         );
 
@@ -3631,7 +3850,12 @@ mod tests {
             Status::Ok,
         );
         assert_eq!(
-            dispatch(&mut r, PeerRole { peer_id: bob.clone() }),
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: bob.clone()
+                }
+            ),
             AUTH_ROLE_NONE,
             "a replayed stale-epoch grant can't resurrect the revoked role",
         );
@@ -3666,7 +3890,15 @@ mod tests {
         let install_auth = root_auth(
             "install",
             &[
-                b"res", b"p", b"1", &hash, &rep, &[2u8], &[], &[], &[0u8],
+                b"res",
+                b"p",
+                b"1",
+                &hash,
+                &rep,
+                &[2u8],
+                &[],
+                &[],
+                &[0u8],
                 &[SyncFloor::Member as u8],
             ],
         );
@@ -3722,7 +3954,15 @@ mod tests {
                     auth: root_auth(
                         "install",
                         &[
-                            b"res", b"p", b"1", &hash, &rep2, &[2u8], &[], &[], &[0u8],
+                            b"res",
+                            b"p",
+                            b"1",
+                            &hash,
+                            &rep2,
+                            &[2u8],
+                            &[],
+                            &[],
+                            &[0u8],
                             &[SyncFloor::Member as u8],
                         ],
                     ),
@@ -3771,7 +4011,15 @@ mod tests {
                     auth: root_auth(
                         "install",
                         &[
-                            b"app", b"p", b"1", &h1, &rep, &[2u8], &[], &[], &[0u8],
+                            b"app",
+                            b"p",
+                            b"1",
+                            &h1,
+                            &rep,
+                            &[2u8],
+                            &[],
+                            &[],
+                            &[0u8],
                             &[SyncFloor::Member as u8],
                         ],
                     ),
@@ -3857,7 +4105,12 @@ mod tests {
         let peer_id = node_peer_of(node);
         let invite_canon = canonical_op_bytes(
             "invite",
-            &[&TEST_SPACE_ID, &[role], &INVITE_EXPIRES.to_le_bytes(), &token_pub],
+            &[
+                &TEST_SPACE_ID,
+                &[role],
+                &INVITE_EXPIRES.to_le_bytes(),
+                &token_pub,
+            ],
         );
         let admin_sig = admin_key.sign(&invite_canon).to_bytes();
         let redeem_canon = canonical_op_bytes("redeem_invite", &[&token_pub, &peer_id]);
@@ -3907,12 +4160,20 @@ mod tests {
         let node = node_key(66);
         let peer = node_peer_of(&node);
         assert_eq!(
-            dispatch(&mut r, redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node)),
+            dispatch(
+                &mut r,
+                redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node)
+            ),
             Status::Ok,
             "root-minted invite redeems",
         );
         assert_eq!(
-            dispatch(&mut r, PeerRole { peer_id: peer.clone() }),
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: peer.clone()
+                }
+            ),
             AUTH_ROLE_READONLY,
             "redemption grants the token's role to the joining node",
         );
@@ -3928,10 +4189,21 @@ mod tests {
         let token = SigningKey::from_bytes(&[55u8; 32]);
         let node = node_key(66);
         assert_eq!(
-            dispatch(&mut r, redeem_msg(&root_key(), &token, AUTH_ROLE_DEVELOPER, &node)),
+            dispatch(
+                &mut r,
+                redeem_msg(&root_key(), &token, AUTH_ROLE_DEVELOPER, &node)
+            ),
             Status::Ok,
         );
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_DEVELOPER);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: node_peer_of(&node)
+                }
+            ),
+            AUTH_ROLE_DEVELOPER
+        );
     }
 
     #[test]
@@ -3942,10 +4214,21 @@ mod tests {
         let token = SigningKey::from_bytes(&[55u8; 32]);
         let node = node_key(66);
         assert_eq!(
-            dispatch(&mut r, redeem_msg(&root_key(), &token, AUTH_ROLE_ADMIN, &node)),
+            dispatch(
+                &mut r,
+                redeem_msg(&root_key(), &token, AUTH_ROLE_ADMIN, &node)
+            ),
             Status::Forbidden,
         );
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_NONE);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: node_peer_of(&node)
+                }
+            ),
+            AUTH_ROLE_NONE
+        );
     }
 
     #[test]
@@ -3956,7 +4239,15 @@ mod tests {
         let mut msg = redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node);
         msg.admin_sig[0] ^= 0xff;
         assert_eq!(dispatch(&mut r, msg), Status::Forbidden);
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_NONE);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: node_peer_of(&node)
+                }
+            ),
+            AUTH_ROLE_NONE
+        );
     }
 
     #[test]
@@ -3967,7 +4258,15 @@ mod tests {
         let mut msg = redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node);
         msg.redeem_sig[0] ^= 0xff;
         assert_eq!(dispatch(&mut r, msg), Status::Forbidden);
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_NONE);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: node_peer_of(&node)
+                }
+            ),
+            AUTH_ROLE_NONE
+        );
     }
 
     #[test]
@@ -3980,7 +4279,15 @@ mod tests {
         let mut msg = redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node);
         msg.node_sig[0] ^= 0xff;
         assert_eq!(dispatch(&mut r, msg), Status::Forbidden);
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_NONE);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: node_peer_of(&node)
+                }
+            ),
+            AUTH_ROLE_NONE
+        );
     }
 
     #[test]
@@ -3993,10 +4300,21 @@ mod tests {
         let token = SigningKey::from_bytes(&[55u8; 32]);
         let node = node_key(66);
         assert_eq!(
-            dispatch(&mut r, redeem_msg(&attacker, &token, AUTH_ROLE_READONLY, &node)),
+            dispatch(
+                &mut r,
+                redeem_msg(&attacker, &token, AUTH_ROLE_READONLY, &node)
+            ),
             Status::Forbidden,
         );
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_NONE);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: node_peer_of(&node)
+                }
+            ),
+            AUTH_ROLE_NONE
+        );
     }
 
     #[test]
@@ -4011,7 +4329,15 @@ mod tests {
         let mut msg = redeem_msg(&attacker, &token, AUTH_ROLE_READONLY, &node);
         msg.admin_peer_id = root_peer_id();
         assert_eq!(dispatch(&mut r, msg), Status::Forbidden);
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_NONE);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: node_peer_of(&node)
+                }
+            ),
+            AUTH_ROLE_NONE
+        );
     }
 
     #[test]
@@ -4030,7 +4356,12 @@ mod tests {
         let other_space: [u8; 32] = [0x11; 32]; // a sibling space's id
         let invite_canon = canonical_op_bytes(
             "invite",
-            &[&other_space, &[AUTH_ROLE_READONLY], &INVITE_EXPIRES.to_le_bytes(), &token_pub],
+            &[
+                &other_space,
+                &[AUTH_ROLE_READONLY],
+                &INVITE_EXPIRES.to_le_bytes(),
+                &token_pub,
+            ],
         );
         let redeem_canon = canonical_op_bytes("redeem_invite", &[&token_pub, &peer]);
         let msg = RedeemInvite {
@@ -4063,8 +4394,19 @@ mod tests {
         assert_eq!(grant_space(&mut r, &a2_peer, AUTH_ROLE_ADMIN), Status::Ok);
         let victim = node_key(90);
         let victim_peer = node_peer_of(&victim);
-        assert_eq!(grant_space_signed(&mut r, &a2, &victim_peer, AUTH_ROLE_ADMIN), Status::Ok);
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: victim_peer.clone() }), AUTH_ROLE_ADMIN);
+        assert_eq!(
+            grant_space_signed(&mut r, &a2, &victim_peer, AUTH_ROLE_ADMIN),
+            Status::Ok
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: victim_peer.clone()
+                }
+            ),
+            AUTH_ROLE_ADMIN
+        );
 
         // Attacker's forged redeem: valid token, target = victim_peer,
         // node_sig by the ATTACKER's key (not the victim's).
@@ -4074,7 +4416,12 @@ mod tests {
         let forge = |role: u8| -> RedeemInvite {
             let invite_canon = canonical_op_bytes(
                 "invite",
-                &[&TEST_SPACE_ID, &[role], &INVITE_EXPIRES.to_le_bytes(), &token_pub],
+                &[
+                    &TEST_SPACE_ID,
+                    &[role],
+                    &INVITE_EXPIRES.to_le_bytes(),
+                    &token_pub,
+                ],
             );
             let redeem_canon = canonical_op_bytes("redeem_invite", &[&token_pub, &victim_peer]);
             RedeemInvite {
@@ -4088,10 +4435,21 @@ mod tests {
                 node_sig: attacker.sign(&redeem_canon).to_bytes().to_vec(),
             }
         };
-        assert_eq!(dispatch(&mut r, forge(AUTH_ROLE_READONLY)), Status::Forbidden);
-        assert_eq!(dispatch_as_system(&mut r, forge(AUTH_ROLE_READONLY)), Status::Forbidden);
         assert_eq!(
-            dispatch(&mut r, PeerRole { peer_id: victim_peer }),
+            dispatch(&mut r, forge(AUTH_ROLE_READONLY)),
+            Status::Forbidden
+        );
+        assert_eq!(
+            dispatch_as_system(&mut r, forge(AUTH_ROLE_READONLY)),
+            Status::Forbidden
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: victim_peer
+                }
+            ),
             AUTH_ROLE_ADMIN,
             "victim's admin grant is untouched — no downgrade",
         );
@@ -4113,7 +4471,15 @@ mod tests {
             dispatch(&mut r, redeem_msg(&bob, &token, AUTH_ROLE_READONLY, &node)),
             Status::Ok,
         );
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: peer.clone() }), AUTH_ROLE_READONLY);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: peer.clone()
+                }
+            ),
+            AUTH_ROLE_READONLY
+        );
         assert_eq!(revoke_space(&mut r, &bob_peer), Status::Ok);
         assert_eq!(
             dispatch(&mut r, PeerRole { peer_id: peer }),
@@ -4132,16 +4498,29 @@ mod tests {
         let node = node_key(66);
         assert_eq!(revoke_invite(&mut r, &token_pub), Status::Ok);
         assert_eq!(
-            dispatch(&mut r, redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node)),
+            dispatch(
+                &mut r,
+                redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node)
+            ),
             Status::Forbidden,
         );
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_NONE);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: node_peer_of(&node)
+                }
+            ),
+            AUTH_ROLE_NONE
+        );
     }
 
     #[test]
     fn revoke_invite_is_idempotent_and_grow_only() {
         let mut r = registry();
-        let token_pub = SigningKey::from_bytes(&[55u8; 32]).verifying_key().to_bytes();
+        let token_pub = SigningKey::from_bytes(&[55u8; 32])
+            .verifying_key()
+            .to_bytes();
         assert_eq!(revoke_invite(&mut r, &token_pub), Status::Ok);
         assert_eq!(revoke_invite(&mut r, &token_pub), Status::Ok);
         let rows = invites_all(&mut r);
@@ -4156,7 +4535,9 @@ mod tests {
         // refused by authorize_op — it never marks the token revoked.
         let mut r = registry();
         let attacker = SigningKey::from_bytes(&[42u8; 32]);
-        let token_pub = SigningKey::from_bytes(&[55u8; 32]).verifying_key().to_bytes();
+        let token_pub = SigningKey::from_bytes(&[55u8; 32])
+            .verifying_key()
+            .to_bytes();
         let status = dispatch_as_system(
             &mut r,
             RevokeInvite {
@@ -4165,7 +4546,10 @@ mod tests {
             },
         );
         assert_eq!(status, Status::Forbidden);
-        assert!(invites_all(&mut r).is_empty(), "forged revoke marks nothing");
+        assert!(
+            invites_all(&mut r).is_empty(),
+            "forged revoke marks nothing"
+        );
     }
 
     #[test]
@@ -4180,20 +4564,45 @@ mod tests {
         let peer_a = node_peer_of(&node_a);
         let peer_b = node_peer_of(&node_b);
         assert_eq!(
-            dispatch(&mut r, redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node_a)),
+            dispatch(
+                &mut r,
+                redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node_a)
+            ),
             Status::Ok,
         );
         assert_eq!(
-            dispatch(&mut r, redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node_b)),
+            dispatch(
+                &mut r,
+                redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node_b)
+            ),
             Status::Ok,
         );
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: peer_a.clone() }), AUTH_ROLE_READONLY);
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: peer_b.clone() }), AUTH_ROLE_READONLY);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: peer_a.clone()
+                }
+            ),
+            AUTH_ROLE_READONLY
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: peer_b.clone()
+                }
+            ),
+            AUTH_ROLE_READONLY
+        );
         let rows = invites_all(&mut r);
         assert_eq!(rows.len(), 1);
         let mut expected = alloc::vec![peer_a, peer_b];
         expected.sort();
-        assert_eq!(rows[0].redeemed_by, expected, "both redeemers recorded, sorted");
+        assert_eq!(
+            rows[0].redeemed_by, expected,
+            "both redeemers recorded, sorted"
+        );
     }
 
     #[test]
@@ -4206,17 +4615,35 @@ mod tests {
         let node = node_key(66);
         let peer = node_peer_of(&node);
         assert_eq!(
-            dispatch(&mut r, redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node)),
+            dispatch(
+                &mut r,
+                redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node)
+            ),
             Status::Ok,
         );
         assert_eq!(
-            dispatch_as_system(&mut r, redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node)),
+            dispatch_as_system(
+                &mut r,
+                redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node)
+            ),
             Status::Ok,
         );
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: peer.clone() }), AUTH_ROLE_READONLY);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: peer.clone()
+                }
+            ),
+            AUTH_ROLE_READONLY
+        );
         let rows = invites_all(&mut r);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].redeemed_by, alloc::vec![peer], "replay doesn't duplicate the peer");
+        assert_eq!(
+            rows[0].redeemed_by,
+            alloc::vec![peer],
+            "replay doesn't duplicate the peer"
+        );
     }
 
     #[test]
@@ -4231,6 +4658,14 @@ mod tests {
         let captured = redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node);
         assert_eq!(revoke_invite(&mut r, &token_pub), Status::Ok);
         assert_eq!(dispatch_as_system(&mut r, captured), Status::Forbidden);
-        assert_eq!(dispatch(&mut r, PeerRole { peer_id: node_peer_of(&node) }), AUTH_ROLE_NONE);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: node_peer_of(&node)
+                }
+            ),
+            AUTH_ROLE_NONE
+        );
     }
 }

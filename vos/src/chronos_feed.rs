@@ -144,7 +144,10 @@ impl ChronosFeeder {
     /// voter; drives the clock + committee on the leader and posts this node's
     /// enrol/reveals when it's a voter.
     pub fn feed(&mut self, node: &mut VosNode, local_prefix: u16) {
-        let chronos_id = ServiceId(crate::registry::instance_service_id("chronos", local_prefix));
+        let chronos_id = ServiceId(crate::registry::instance_service_id(
+            "chronos",
+            local_prefix,
+        ));
         if !node.has_agent(chronos_id) {
             return; // chronos not installed in this space — nothing to feed
         }
@@ -276,7 +279,9 @@ impl ChronosFeeder {
         let n = sorted.len();
         let encoded = chronos::encode_committee(&sorted);
         let chronos = ChronosRef::at(chronos_id);
-        if let Ok(chronos::Status::Ok) = crate::block_on(chronos.set_committee(&mut &*node, encoded)) {
+        if let Ok(chronos::Status::Ok) =
+            crate::block_on(chronos.set_committee(&mut &*node, encoded))
+        {
             self.last_committee = Some(sorted);
             tracing::info!(voters = n, "chronos: committee updated from registry");
         }
@@ -394,7 +399,11 @@ impl ChronosFeeder {
                 };
                 self.fire_to_leader(node, peer, leader_chronos, payload);
             }
-            tracing::debug!(round = o.round, leader = is_leader, "chronos: posted committee reveal");
+            tracing::debug!(
+                round = o.round,
+                leader = is_leader,
+                "chronos: posted committee reveal"
+            );
         }
     }
 

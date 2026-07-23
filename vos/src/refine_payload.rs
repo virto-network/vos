@@ -137,13 +137,26 @@ pub fn anchor_for(state: Option<&[u8]>) -> (u8, [u8; 32]) {
 /// One side effect the host applies natively at commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
-    Write { key: Vec<u8>, value: Vec<u8> },
-    Transfer { target: u32, memo: Vec<u8> },
-    Provide { hash: [u8; 32], data: Vec<u8> },
-    New { code_hash: [u8; 32] },
+    Write {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Transfer {
+        target: u32,
+        memo: Vec<u8>,
+    },
+    Provide {
+        hash: [u8; 32],
+        data: Vec<u8>,
+    },
+    New {
+        code_hash: [u8; 32],
+    },
     /// Remove the row at `key`. Last-wins per key alongside Write.
     /// `Delete{STATE_KEY}` never decodes (see the module docs).
-    Delete { key: Vec<u8> },
+    Delete {
+        key: Vec<u8>,
+    },
 }
 
 /// A complete refine output ready to encode/decode.
@@ -320,9 +333,8 @@ impl RefinePayload {
                 state = Some(value.clone());
             }
         }
-        self.effects.retain(
-            |eff| !matches!(eff, Effect::Write { key: k, .. } if k.as_slice() == key),
-        );
+        self.effects
+            .retain(|eff| !matches!(eff, Effect::Write { key: k, .. } if k.as_slice() == key));
         state
     }
 

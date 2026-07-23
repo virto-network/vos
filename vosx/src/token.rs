@@ -59,7 +59,9 @@ const CHECKSUM_LEN: usize = 4;
 /// point — it is the bearer credential; treat the token string as
 /// sensitive (it is single-use and short-lived, but anyone holding it
 /// can redeem the role).
-#[derive(vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
 #[rkyv(crate = vos::rkyv)]
 pub struct InvitePayload {
     /// blake2b-256 space id — which space this token joins.
@@ -158,7 +160,9 @@ pub fn parse(token: &str) -> anyhow::Result<InvitePayload> {
     let (signed, checksum) = blob.split_at(blob.len() - CHECKSUM_LEN);
     let expected = vos::crypto::blake2b_hash::<32>(CHECKSUM_DOMAIN, &[signed]);
     if checksum != &expected[..CHECKSUM_LEN] {
-        return Err(anyhow!("invite token checksum mismatch (corrupted or truncated)"));
+        return Err(anyhow!(
+            "invite token checksum mismatch (corrupted or truncated)"
+        ));
     }
     if signed[0] != TOKEN_VERSION {
         return Err(anyhow!(
@@ -191,7 +195,10 @@ fn validate_role(role: u8) -> anyhow::Result<()> {
 /// `redeem_invite` canonical (`[token_pub, node_peer_id]`), binding the
 /// redemption to this node so the same token can't be re-pointed at a
 /// different peer-id after the fact.
-pub fn redeem_sig(payload: &InvitePayload, node_peer_id: &[u8]) -> anyhow::Result<[u8; OP_SIG_LEN]> {
+pub fn redeem_sig(
+    payload: &InvitePayload,
+    node_peer_id: &[u8],
+) -> anyhow::Result<[u8; OP_SIG_LEN]> {
     let token_kp = Keypair::ed25519_from_bytes(payload.token_secret)
         .map_err(|e| anyhow!("reconstruct invite token keypair: {e}"))?;
     let canon = canonical_op_bytes("redeem_invite", &[&payload.token_pub, node_peer_id]);
@@ -281,13 +288,24 @@ mod tests {
         assert_eq!(p.bootnodes, vec!["/ip4/1.2.3.4/tcp/9000".to_string()]);
         assert_eq!(p.role, AUTH_ROLE_READONLY);
         assert_eq!(p.expires_at, 2_000_000_000);
-        assert_eq!(p.admin_peer_id, libp2p::PeerId::from(op.public()).to_bytes());
+        assert_eq!(
+            p.admin_peer_id,
+            libp2p::PeerId::from(op.public()).to_bytes()
+        );
     }
 
     #[test]
     fn checksum_corruption_is_rejected() {
         let op = Keypair::generate_ed25519();
-        let token = mint(&op, sample_space_id(), "x".into(), vec![], AUTH_ROLE_READONLY, 1).unwrap();
+        let token = mint(
+            &op,
+            sample_space_id(),
+            "x".into(),
+            vec![],
+            AUTH_ROLE_READONLY,
+            1,
+        )
+        .unwrap();
         // Flip a character in the middle of the base58 body.
         let mut chars: Vec<char> = token.chars().collect();
         let mid = chars.len() / 2;
@@ -299,23 +317,52 @@ mod tests {
     #[test]
     fn admin_invites_are_rejected_on_mint_and_parse() {
         let op = Keypair::generate_ed25519();
-        let err = mint(&op, sample_space_id(), "x".into(), vec![], AUTH_ROLE_ADMIN, 1)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("member or developer"), "unexpected error: {err}");
+        let err = mint(
+            &op,
+            sample_space_id(),
+            "x".into(),
+            vec![],
+            AUTH_ROLE_ADMIN,
+            1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("member or developer"),
+            "unexpected error: {err}"
+        );
 
-        let token = mint(&op, sample_space_id(), "x".into(), vec![], AUTH_ROLE_READONLY, 1).unwrap();
+        let token = mint(
+            &op,
+            sample_space_id(),
+            "x".into(),
+            vec![],
+            AUTH_ROLE_READONLY,
+            1,
+        )
+        .unwrap();
         let mut payload = parse(&token).unwrap();
         payload.role = AUTH_ROLE_ADMIN;
         let forged = encode(&payload).unwrap();
         let err = parse(&forged).unwrap_err().to_string();
-        assert!(err.contains("member or developer"), "unexpected error: {err}");
+        assert!(
+            err.contains("member or developer"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
     fn wrong_version_byte_is_rejected() {
         let op = Keypair::generate_ed25519();
-        let token = mint(&op, sample_space_id(), "x".into(), vec![], AUTH_ROLE_READONLY, 1).unwrap();
+        let token = mint(
+            &op,
+            sample_space_id(),
+            "x".into(),
+            vec![],
+            AUTH_ROLE_READONLY,
+            1,
+        )
+        .unwrap();
         // Decode, bump the version byte, re-checksum, re-encode.
         let body58 = token.strip_prefix(TOKEN_HRP).unwrap();
         let blob = bs58::decode(body58).into_vec().unwrap();
@@ -326,7 +373,10 @@ mod tests {
         tampered.extend_from_slice(&checksum[..CHECKSUM_LEN]);
         let token2 = format!("{TOKEN_HRP}{}", bs58::encode(tampered).into_string());
         let err = parse(&token2).unwrap_err().to_string();
-        assert!(err.contains("version"), "expected a version error, got: {err}");
+        assert!(
+            err.contains("version"),
+            "expected a version error, got: {err}"
+        );
     }
 
     #[test]
@@ -364,7 +414,12 @@ mod tests {
         let other_space: [u8; 32] = [0x11; 32];
         let wrong_canon = canonical_op_bytes(
             "invite",
-            &[&other_space, &[role], &expires_at.to_le_bytes(), &p.token_pub],
+            &[
+                &other_space,
+                &[role],
+                &expires_at.to_le_bytes(),
+                &p.token_pub,
+            ],
         );
         assert!(!verify_op_sig(&p.admin_peer_id, &wrong_canon, &p.admin_sig));
 

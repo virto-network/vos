@@ -719,8 +719,10 @@ fn prove_verify_ristretto_isolated(side_note: &mut zkpvm::SideNote) -> bool {
         fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
         lifting_log_size: None,
     };
-    let components: &[&'static dyn zkpvm::harness::MachineProverComponent] =
-        &[&zkpvm::chips::RangeMultiplicity256, &zkpvm::chips::RistrettoChip];
+    let components: &[&'static dyn zkpvm::harness::MachineProverComponent] = &[
+        &zkpvm::chips::RangeMultiplicity256,
+        &zkpvm::chips::RistrettoChip,
+    ];
     let Ok(proof) = zkpvm::prove_with_explicit_components(side_note, config, components) else {
         return false;
     };
@@ -733,8 +735,14 @@ fn prove_verify_ristretto_isolated(side_note: &mut zkpvm::SideNote) -> bool {
         .iter()
         .map(|c| *c as &dyn zkpvm::harness::MachineComponent)
         .collect();
-    zkpvm::verify_with_explicit_components(proof, side_note, &verifier_components, components, &policy)
-        .is_ok()
+    zkpvm::verify_with_explicit_components(
+        proof,
+        side_note,
+        &verifier_components,
+        components,
+        &policy,
+    )
+    .is_ok()
 }
 
 /// Prove a single field-op row (add / sub / mul) in a balanced,
@@ -1224,8 +1232,10 @@ fn prove_ristretto_chip_closed_chain_input_output() {
     // the always-on memory + register boundary chips, whose Phase Z0 closing
     // binding rejects step-less traces by design (a step-less proof asserts
     // nothing about a program), so a chip-only chain must prove in isolation.
-    let components: &[&'static dyn zkpvm::harness::MachineProverComponent] =
-        &[&zkpvm::chips::RangeMultiplicity256, &zkpvm::chips::RistrettoChip];
+    let components: &[&'static dyn zkpvm::harness::MachineProverComponent] = &[
+        &zkpvm::chips::RangeMultiplicity256,
+        &zkpvm::chips::RistrettoChip,
+    ];
     let proof = zkpvm::prove_with_explicit_components(&mut side_note, config, components)
         .expect("closed chain should prove");
     let policy = zkpvm::PcsPolicy {

@@ -107,7 +107,14 @@ pub const DEMO_CURRENCY: u32 = 840;
 /// `#[repr(u8)]` keeps the wire bytes stable — reordering
 /// variants breaks any peer running an older build.
 #[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq,
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
 )]
 #[rkyv(crate = vos::rkyv)]
 #[repr(u8)]

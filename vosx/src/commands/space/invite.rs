@@ -261,7 +261,10 @@ mod tests {
 
     #[test]
     fn role_names_map_to_auth_codes() {
-        assert_eq!(role_from_name("member").unwrap(), (AUTH_ROLE_READONLY, "member"));
+        assert_eq!(
+            role_from_name("member").unwrap(),
+            (AUTH_ROLE_READONLY, "member")
+        );
         assert_eq!(role_from_name("Developer").unwrap().0, AUTH_ROLE_DEVELOPER);
         assert!(role_from_name("admin").is_err());
         assert!(role_from_name("wizard").is_err());

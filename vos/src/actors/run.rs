@@ -581,8 +581,8 @@ pub fn run_refine_service<A: super::Actor>() {
         // (empty-encoding) actor must carry genesis forward or its next
         // self-message iteration would AnchorMismatch and silently drop.
         let new_is_empty = new_state_bytes.is_empty();
-        let state_changed = anchor_kind == crate::refine_payload::ANCHOR_GENESIS
-            || new_hash != prior_state_hash;
+        let state_changed =
+            anchor_kind == crate::refine_payload::ANCHOR_GENESIS || new_hash != prior_state_hash;
 
         // Committed actors: recompute the composite AFTER the handler
         // (the field root rows are current through the overlay) and
@@ -599,10 +599,7 @@ pub fn run_refine_service<A: super::Actor>() {
         if next_kind == crate::refine_payload::ANCHOR_SMT_ROOT
             && (next_kind, next_anchor) != (anchor_kind, anchor)
         {
-            super::storage::store_raw(
-                lifecycle::COMMITTED_ROOT_KEY.to_vec(),
-                next_anchor.to_vec(),
-            );
+            super::storage::store_raw(lifecycle::COMMITTED_ROOT_KEY.to_vec(), next_anchor.to_vec());
         }
 
         let payload = ctx.drain_into_refine_payload(
@@ -689,8 +686,7 @@ pub fn run_task_service<A: super::Actor>(witness_ptr: *const u8, witness_cap: us
     let new_state_bytes = super::codec::Encode::encode(&actor);
     let reply_bytes = ctx.take_reply_bytes();
     let new_hash = crate::refine_payload::state_anchor(&new_state_bytes);
-    let state_changed =
-        anchor_kind == crate::refine_payload::ANCHOR_GENESIS || new_hash != anchor;
+    let state_changed = anchor_kind == crate::refine_payload::ANCHOR_GENESIS || new_hash != anchor;
     let payload = ctx.drain_into_refine_payload(
         anchor_kind,
         anchor,

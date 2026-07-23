@@ -161,7 +161,14 @@ pub struct FileEntry {
 /// The byte encoding matches the variant order so on-disk values
 /// stay stable; only append at the end if more kinds are added.
 #[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq,
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
 )]
 #[rkyv(crate = vos::rkyv)]
 #[repr(u8)]
@@ -910,7 +917,8 @@ pub mod store {
         }
 
         // True three-way merge.
-        let base_hash = common_ancestor(state, &ours_hash, &theirs_arr).unwrap_or([0u8; HASH_BYTES]);
+        let base_hash =
+            common_ancestor(state, &ours_hash, &theirs_arr).unwrap_or([0u8; HASH_BYTES]);
         let base_files = tree_at(state, &base_hash);
         let ours_files = tree_at(state, &ours_hash);
         let theirs_files = tree_at(state, &theirs_arr);

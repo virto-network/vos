@@ -163,7 +163,10 @@ fn messenger_pvm_mints_a_key_package() {
     // KEM), and the store snapshot back into rkyv state. The reply is the
     // KeyPackage hex-encoded for out-of-band transport.
     let hex = as_text(call(&mut rt, id, Msg::new("key_package")));
-    assert_eq!(rt.panics, 0, "guest panicked minting a KeyPackage in the PVM");
+    assert_eq!(
+        rt.panics, 0,
+        "guest panicked minting a KeyPackage in the PVM"
+    );
     assert!(
         hex.len() > 200 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
         "expected a hex-encoded KeyPackage, got {} chars: {:.48}…",
@@ -192,7 +195,11 @@ fn messenger_pvm_tick_does_not_panic() {
     send_tick(&mut rt, id);
     assert_eq!(rt.panics, 0, "tick trapped on the cold first dispatch");
     // After a prior mutating dispatch.
-    let _ = call(&mut rt, id, Msg::new("seed").with("seed_bytes", vec![7u8; 32]));
+    let _ = call(
+        &mut rt,
+        id,
+        Msg::new("seed").with("seed_bytes", vec![7u8; 32]),
+    );
     send_tick(&mut rt, id);
     assert_eq!(rt.panics, 0, "tick trapped after a committed dispatch");
 }
@@ -214,17 +221,27 @@ fn messenger_pvm_channel_survives_a_tick() {
     let (mut rt, id) = boot();
     provision(&mut rt, id, "alice");
     let _ = call(&mut rt, id, Msg::new("key_package")); // published_kp_count -> 1
-    let joined = as_text(call(&mut rt, id, Msg::new("join").with("channel", "general".to_string())));
+    let joined = as_text(call(
+        &mut rt,
+        id,
+        Msg::new("join").with("channel", "general".to_string()),
+    ));
     assert!(joined.contains("watching"), "join reply: {joined}");
 
     let before = as_text(call(&mut rt, id, Msg::new("status")));
-    assert!(before.contains("general"), "status before tick must list the channel: {before}");
+    assert!(
+        before.contains("general"),
+        "status before tick must list the channel: {before}"
+    );
 
     send_tick(&mut rt, id);
     assert_eq!(rt.panics, 0, "tick panicked");
 
     let after = as_text(call(&mut rt, id, Msg::new("status")));
-    assert!(after.contains("general"), "channel LOST after a tick: {after}");
+    assert!(
+        after.contains("general"),
+        "channel LOST after a tick: {after}"
+    );
 }
 
 /// `create` then `send` reach the full group path with no live registry by
@@ -247,7 +264,11 @@ fn messenger_pvm_create_via_external_resolve() {
         }
     }));
     provision(&mut rt, id, "alice");
-    let r = as_text(call(&mut rt, id, Msg::new("create").with("channel", "general".to_string())));
+    let r = as_text(call(
+        &mut rt,
+        id,
+        Msg::new("create").with("channel", "general".to_string()),
+    ));
     assert_eq!(rt.panics, 0, "guest trapped during create");
     assert!(r.contains("created"), "create did not succeed: {r}");
 
@@ -332,7 +353,10 @@ fn update_with_ctl_verdicts(verdicts: &[Status]) -> (String, u32) {
         id,
         Msg::new("create").with("channel", "general".to_string()),
     ));
-    assert!(created.contains("created"), "create did not succeed: {created}");
+    assert!(
+        created.contains("created"),
+        "create did not succeed: {created}"
+    );
 
     let reply = as_text(call(
         &mut rt,
@@ -361,8 +385,7 @@ fn messenger_pvm_commit_retries_after_epoch_taken() {
 #[test]
 fn messenger_pvm_commit_refuses_on_repeated_contention() {
     let Some(_) = messenger_elf() else { return };
-    let (reply, panics) =
-        update_with_ctl_verdicts(&[Status::EpochTaken, Status::EpochTaken]);
+    let (reply, panics) = update_with_ctl_verdicts(&[Status::EpochTaken, Status::EpochTaken]);
     assert_eq!(panics, 0, "guest trapped during the contended commit");
     assert!(
         reply.contains("contended"),

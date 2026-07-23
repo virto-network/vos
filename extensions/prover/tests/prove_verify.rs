@@ -38,15 +38,27 @@ fn manifest_codec_roundtrips() {
     // Legacy form: segment hashes preserved, entering root = unanchored sentinel.
     let blob = encode_chain_manifest(&hashes);
     let m = decode_chain_manifest(&blob).expect("legacy manifest must decode");
-    assert_eq!(m.segments, hashes, "encode→decode must preserve the segment order");
-    assert_eq!(m.initial_root, [0u8; 32], "legacy encode is unanchored (zero root)");
+    assert_eq!(
+        m.segments, hashes,
+        "encode→decode must preserve the segment order"
+    );
+    assert_eq!(
+        m.initial_root, [0u8; 32],
+        "legacy encode is unanchored (zero root)"
+    );
 
     // Anchored form: a non-zero entering root rides alongside the segments.
     let root = [0x11u8; 32];
     let anchored = encode_chain_manifest_anchored(root, &hashes);
     let ma = decode_chain_manifest(&anchored).expect("anchored manifest must decode");
-    assert_eq!(ma.segments, hashes, "anchored encode→decode must preserve the segment order");
-    assert_eq!(ma.initial_root, root, "anchored encode→decode must preserve the entering root");
+    assert_eq!(
+        ma.segments, hashes,
+        "anchored encode→decode must preserve the segment order"
+    );
+    assert_eq!(
+        ma.initial_root, root,
+        "anchored encode→decode must preserve the entering root"
+    );
 
     // Malformed: not a positive multiple of 32 carrying a root + ≥1 segment.
     assert!(

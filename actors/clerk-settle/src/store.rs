@@ -269,10 +269,22 @@ mod tests {
     ) -> (Vec<u8>, Vec<u8>) {
         let peer_net = Amount::from_point(&-my_net.to_point().unwrap());
         let mine = SettlementClaim::sign(
-            me.public, peer.public, USD, window.0, window.1, my_net, &me.secret,
+            me.public,
+            peer.public,
+            USD,
+            window.0,
+            window.1,
+            my_net,
+            &me.secret,
         );
         let theirs = SettlementClaim::sign(
-            peer.public, me.public, USD, window.0, window.1, peer_net, &peer.secret,
+            peer.public,
+            me.public,
+            USD,
+            window.0,
+            window.1,
+            peer_net,
+            &peer.secret,
         );
         (mine.to_bytes(), theirs.to_bytes())
     }
@@ -336,7 +348,10 @@ mod tests {
         let n = claim_a.len();
         claim_a[n - 1] ^= 0x01;
 
-        let banks = vec![bank_entry("bank-a", a.public.0), bank_entry("bank-b", b.public.0)];
+        let banks = vec![
+            bank_entry("bank-a", a.public.0),
+            bank_entry("bank-b", b.public.0),
+        ];
         let mut claims = Vec::new();
         assert_eq!(
             submit_claim(&banks, &mut claims, &[], claim_a, 3, [1u8; 32]),
@@ -349,7 +364,10 @@ mod tests {
     fn submit_claim_stores_and_replaces_until_settled() {
         let a = Keypair::generate();
         let b = Keypair::generate();
-        let banks = vec![bank_entry("bank-a", a.public.0), bank_entry("bank-b", b.public.0)];
+        let banks = vec![
+            bank_entry("bank-a", a.public.0),
+            bank_entry("bank-b", b.public.0),
+        ];
         let mut claims = Vec::new();
 
         let (claim1, _) = canceling_pair(&a, &b, WINDOW, commit(10, 7));
@@ -377,7 +395,10 @@ mod tests {
     fn settle_window_reconciles_canceling_pair_and_freezes() {
         let a = Keypair::generate();
         let b = Keypair::generate();
-        let banks = vec![bank_entry("bank-a", a.public.0), bank_entry("bank-b", b.public.0)];
+        let banks = vec![
+            bank_entry("bank-a", a.public.0),
+            bank_entry("bank-b", b.public.0),
+        ];
         let mut claims = Vec::new();
         let mut settled = Vec::new();
 
@@ -408,7 +429,9 @@ mod tests {
         assert_eq!(settled[0].outcome, Status::Ok as u8);
         // Direction-independent lookup.
         assert_eq!(
-            settlement_status(&banks, &settled, b"bank-b", b"bank-a", USD, WINDOW.0, WINDOW.1),
+            settlement_status(
+                &banks, &settled, b"bank-b", b"bank-a", USD, WINDOW.0, WINDOW.1
+            ),
             Status::Ok as u8
         );
 
@@ -439,7 +462,10 @@ mod tests {
     fn settle_window_reports_mismatch_without_freezing() {
         let a = Keypair::generate();
         let b = Keypair::generate();
-        let banks = vec![bank_entry("bank-a", a.public.0), bank_entry("bank-b", b.public.0)];
+        let banks = vec![
+            bank_entry("bank-a", a.public.0),
+            bank_entry("bank-b", b.public.0),
+        ];
         let mut claims = Vec::new();
         let mut settled = Vec::new();
 
@@ -486,7 +512,10 @@ mod tests {
     fn settle_window_missing_and_unknown() {
         let a = Keypair::generate();
         let b = Keypair::generate();
-        let banks = vec![bank_entry("bank-a", a.public.0), bank_entry("bank-b", b.public.0)];
+        let banks = vec![
+            bank_entry("bank-a", a.public.0),
+            bank_entry("bank-b", b.public.0),
+        ];
         let mut claims = Vec::new();
         let mut settled = Vec::new();
 
@@ -529,7 +558,10 @@ mod tests {
     fn claim_diagnostics_reports_stored_or_absent() {
         let a = Keypair::generate();
         let b = Keypair::generate();
-        let banks = vec![bank_entry("bank-a", a.public.0), bank_entry("bank-b", b.public.0)];
+        let banks = vec![
+            bank_entry("bank-a", a.public.0),
+            bank_entry("bank-b", b.public.0),
+        ];
         let mut claims = Vec::new();
 
         let (claim_ab, _) = canceling_pair(&a, &b, WINDOW, commit(10, 7));
@@ -538,27 +570,13 @@ mod tests {
             Status::Ok
         );
 
-        let present = claim_diagnostics(
-            &claims,
-            a.public.0,
-            b.public.0,
-            USD,
-            WINDOW.0,
-            WINDOW.1,
-        );
+        let present = claim_diagnostics(&claims, a.public.0, b.public.0, USD, WINDOW.0, WINDOW.1);
         assert!(present.present);
         assert_eq!(present.voucher_count, 5);
         assert_eq!(present.rk_set_hash, [0xEEu8; 32].to_vec());
 
         // A directional key with no stored claim.
-        let absent = claim_diagnostics(
-            &claims,
-            b.public.0,
-            a.public.0,
-            USD,
-            WINDOW.0,
-            WINDOW.1,
-        );
+        let absent = claim_diagnostics(&claims, b.public.0, a.public.0, USD, WINDOW.0, WINDOW.1);
         assert!(!absent.present);
     }
 
@@ -579,7 +597,10 @@ mod tests {
     fn settle_window_accepts_composed_issuer_minus_receiver_terms() {
         let a = Keypair::generate();
         let b = Keypair::generate();
-        let banks = vec![bank_entry("bank-a", a.public.0), bank_entry("bank-b", b.public.0)];
+        let banks = vec![
+            bank_entry("bank-a", a.public.0),
+            bank_entry("bank-b", b.public.0),
+        ];
         let mut claims = Vec::new();
         let mut settled = Vec::new();
 
@@ -599,12 +620,14 @@ mod tests {
         let net_a = add(&c_ab, &neg(&c_ba)); // issued c_ab, received c_ba
         let net_b = add(&c_ba, &neg(&c_ab)); // issued c_ba, received c_ab
 
-        let claim_a =
-            SettlementClaim::sign(a.public, b.public, USD, WINDOW.0, WINDOW.1, net_a, &a.secret)
-                .to_bytes();
-        let claim_b =
-            SettlementClaim::sign(b.public, a.public, USD, WINDOW.0, WINDOW.1, net_b, &b.secret)
-                .to_bytes();
+        let claim_a = SettlementClaim::sign(
+            a.public, b.public, USD, WINDOW.0, WINDOW.1, net_a, &a.secret,
+        )
+        .to_bytes();
+        let claim_b = SettlementClaim::sign(
+            b.public, a.public, USD, WINDOW.0, WINDOW.1, net_b, &b.secret,
+        )
+        .to_bytes();
         assert_eq!(
             submit_claim(&banks, &mut claims, &settled, claim_a, 2, [1u8; 32]),
             Status::Ok

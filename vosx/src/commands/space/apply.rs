@@ -28,13 +28,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use vos::registry::{SyncFloor, Status};
+use vos::registry::{Status, SyncFloor};
 
 use crate::blob_store;
 use crate::commands::space::client::DaemonClient;
 use crate::commands::space::common::{auto_replication_id, instance_service_id, parse_consistency};
 use crate::commands::space::reconcile::{
-    self, encode_init_args, encode_on_start_payloads, flatten, AgentDef, Recipe,
+    self, AgentDef, Recipe, encode_init_args, encode_on_start_payloads, flatten,
 };
 use crate::commands::space::subscriptions::{self, AgentLocal, ExtensionLocal, LocalConfig};
 use crate::output;
@@ -87,7 +87,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     DaemonClient::with_connect(&args.space, |client| {
         let data_dir = PathBuf::from(&client.entry.data_dir);
-        let report = apply_recipe(client, &recipe, &recipe_dir, &data_dir, args.diff, args.upgrade)?;
+        let report = apply_recipe(
+            client,
+            &recipe,
+            &recipe_dir,
+            &data_dir,
+            args.diff,
+            args.upgrade,
+        )?;
         emit(&client.entry.name, &report);
         Ok(())
     })
@@ -539,8 +546,9 @@ fn resolve_replication_id(
         Some("auto") | None => auto_replication_id(space_id, &agent.name, program_hash),
         Some("off") => [0u8; 32],
         Some(hex) => {
-            let v = hex::decode(hex.trim_start_matches("0x"))
-                .map_err(|_| anyhow::anyhow!("agent '{}': replication_id must be hex", agent.name))?;
+            let v = hex::decode(hex.trim_start_matches("0x")).map_err(|_| {
+                anyhow::anyhow!("agent '{}': replication_id must be hex", agent.name)
+            })?;
             if v.len() != 32 {
                 anyhow::bail!("agent '{}': replication_id must be 32 bytes", agent.name);
             }
@@ -636,7 +644,14 @@ fn emit(space: &str, report: &ApplyReport) {
         return;
     }
     let verb = if report.diff { "would " } else { "" };
-    println!("apply {space}{}", if report.diff { " (--diff, dry run)" } else { "" });
+    println!(
+        "apply {space}{}",
+        if report.diff {
+            " (--diff, dry run)"
+        } else {
+            ""
+        }
+    );
     for p in &report.published {
         println!("  {verb}publish {p}");
     }
@@ -792,7 +807,10 @@ mod tests {
         "#,
         );
         let out = project_node_local(&base, &m, Path::new("/recipes"));
-        assert_eq!(out, base, "an export recipe must not wipe existing node-local policy");
+        assert_eq!(
+            out, base,
+            "an export recipe must not wipe existing node-local policy"
+        );
     }
 
     #[test]

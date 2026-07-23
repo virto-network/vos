@@ -83,7 +83,12 @@ async fn fetch_branch_head(
     project_id: u32,
     branch: &str,
 ) -> Result<Option<Vec<u8>>, String> {
-    let reply = invoke(ctx, project_id, &Msg::new("head").with("branch", branch.to_string())).await?;
+    let reply = invoke(
+        ctx,
+        project_id,
+        &Msg::new("head").with("branch", branch.to_string()),
+    )
+    .await?;
     let bytes = value_bytes(reply, &format!("head('{branch}')"))?;
     Ok(if bytes.is_empty() { None } else { Some(bytes) })
 }
@@ -102,9 +107,11 @@ pub(crate) async fn resolve_context_head(
     if branch == "main" {
         return Err("project has no 'main' branch yet — commit source first".to_string());
     }
-    fetch_branch_head(ctx, project_id, "main").await?.ok_or_else(|| {
-        format!("project has no '{branch}' or 'main' branch yet — commit source first")
-    })
+    fetch_branch_head(ctx, project_id, "main")
+        .await?
+        .ok_or_else(|| {
+            format!("project has no '{branch}' or 'main' branch yet — commit source first")
+        })
 }
 
 /// One source file lifted out of the project's commit tree.
@@ -541,7 +548,10 @@ async fn put_blob(ctx: &mut AiCtx, project_id: u32, bytes: &[u8]) -> Result<Vec<
     .await?;
     let hash = value_bytes(reply, "put_blob")?;
     if hash.len() != 32 {
-        return Err(format!("put_blob returned hash of wrong length: {}", hash.len()));
+        return Err(format!(
+            "put_blob returned hash of wrong length: {}",
+            hash.len()
+        ));
     }
     Ok(hash)
 }
@@ -569,10 +579,16 @@ async fn put_file_working(
         Value::U32(s) => s as u8,
         Value::U64(s) => s as u8,
         Value::Bytes(b) if !b.is_empty() => b[0],
-        other => return Err(format!("put_file_working returned {other:?}, expected u8 status")),
+        other => {
+            return Err(format!(
+                "put_file_working returned {other:?}, expected u8 status"
+            ));
+        }
     };
     if status != dev_project::STATUS_OK {
-        return Err(format!("put_file_working rejected (path={path}): status={status}"));
+        return Err(format!(
+            "put_file_working rejected (path={path}): status={status}"
+        ));
     }
     Ok(())
 }

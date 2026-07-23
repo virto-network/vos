@@ -4,12 +4,12 @@
 //! performance measurement and fixture generation. They are gated behind the
 //! `prover` feature because they need the tracer and `javm` interpreter.
 
+use javm::PVM_REGISTER_COUNT;
 use javm::instruction::Opcode;
 use javm::interpreter::Interpreter;
-use javm::PVM_REGISTER_COUNT;
 
-use crate::core::tracing::TracingPvm;
 use crate::SideNote;
+use crate::core::tracing::TracingPvm;
 
 /// Generate a program with `n` sequential ADD64 instructions followed by Trap.
 /// Each ADD cycles through registers to avoid data hazards.

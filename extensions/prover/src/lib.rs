@@ -340,8 +340,10 @@ impl Prover {
         if allowlist.is_empty() || allowlist.len() % 32 != 0 {
             return 0;
         }
-        let allowlist: Vec<CommitmentHash> =
-            allowlist.chunks_exact(32).map(CommitmentHash::from).collect();
+        let allowlist: Vec<CommitmentHash> = allowlist
+            .chunks_exact(32)
+            .map(CommitmentHash::from)
+            .collect();
         // 1) Fetch the manifest (the single caller-supplied hash addresses it).
         let Some(manifest_bytes) = ctx.blob_get(hash, hint).await else {
             return 0;
@@ -355,7 +357,8 @@ impl Prover {
         // The entering-image anchor: segment 0 must start from the manifest's
         // declared entering root (skipped when the manifest is unanchored — the
         // all-zero sentinel). See `ChainManifest::initial_root`.
-        let expected_initial_root = (manifest.initial_root != UNANCHORED_ROOT).then_some(manifest.initial_root);
+        let expected_initial_root =
+            (manifest.initial_root != UNANCHORED_ROOT).then_some(manifest.initial_root);
         // 2) STREAM the chain: fetch each per-segment proof, verify it, and DROP
         //    it before fetching the next — so peak memory holds ~ONE proof
         //    regardless of chain length (a phone-class verifier can check a
@@ -797,8 +800,14 @@ pub fn measure_floors(
     let pvm_blob = pvm_blob.to_vec();
     let witness = witness.to_vec();
     run_on_large_stack(move || {
-        let mut stream =
-            trace_stream(&pvm_blob, &witness, witness_addr, seg_steps, page_budget, gas)?;
+        let mut stream = trace_stream(
+            &pvm_blob,
+            &witness,
+            witness_addr,
+            seg_steps,
+            page_budget,
+            gas,
+        )?;
         let mut floors = zkpvm::NaturalFloors::new();
         while stream.next_window().is_some() {
             floors.observe(&mut stream.side_note());
@@ -949,7 +958,11 @@ pub fn prove_blob(pvm_blob: &[u8], witness_bytes: &[u8], witness_addr: usize) ->
 /// Trace `pvm_blob`, injecting the opaque `witness_bytes` at `witness_addr`
 /// (empty = no injection; the actor uses its own default). `None` on any
 /// failure.
-fn trace_blob(pvm_blob: &[u8], witness_bytes: &[u8], witness_addr: usize) -> Option<zkpvm::SideNote> {
+fn trace_blob(
+    pvm_blob: &[u8],
+    witness_bytes: &[u8],
+    witness_addr: usize,
+) -> Option<zkpvm::SideNote> {
     if witness_bytes.is_empty() {
         zkpvm::actor::trace_blob(pvm_blob, TRACE_GAS)
     } else {
@@ -1181,7 +1194,10 @@ pub fn encode_chain_manifest(segment_hashes: &[[u8; 32]]) -> Vec<u8> {
 /// `initial_root`. Compute `initial_root` via `zkpvm::page_merkle::image_root`
 /// over the initial image the chain was traced from — equivalently, the first
 /// segment proof's `initial_state.memory_root`.
-pub fn encode_chain_manifest_anchored(initial_root: [u8; 32], segment_hashes: &[[u8; 32]]) -> Vec<u8> {
+pub fn encode_chain_manifest_anchored(
+    initial_root: [u8; 32],
+    segment_hashes: &[[u8; 32]],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 * (segment_hashes.len() + 1));
     out.extend_from_slice(&initial_root);
     for h in segment_hashes {
@@ -1207,7 +1223,10 @@ pub fn decode_chain_manifest(bytes: &[u8]) -> Option<ChainManifest> {
             h
         })
         .collect();
-    Some(ChainManifest { initial_root, segments })
+    Some(ChainManifest {
+        initial_root,
+        segments,
+    })
 }
 
 /// Verify a chain delivered as per-segment proof bytes against the
@@ -1243,7 +1262,13 @@ pub fn verify_chain_segments(
     // No entering-image anchor — the caller anchors the entering image
     // out-of-band (or not at all). Use [`verify_chain_segments_anchored`] to
     // reject a chain spliced onto a doctored initial image.
-    verify_chain_segments_anchored(allowlist_bytes, segment_blobs, None, public_bytes, return_bytes)
+    verify_chain_segments_anchored(
+        allowlist_bytes,
+        segment_blobs,
+        None,
+        public_bytes,
+        return_bytes,
+    )
 }
 
 /// [`verify_chain_segments`] plus the entering-image anchor: when
@@ -1359,9 +1384,7 @@ fn verify_one_segment(
         }
     }
     // 3. The final segment carries the guest's halt-bound io-hash.
-    if is_last
-        && proof.public_io_hash() != vos::zk::compute_io_hash(public_bytes, return_bytes)
-    {
+    if is_last && proof.public_io_hash() != vos::zk::compute_io_hash(public_bytes, return_bytes) {
         return None;
     }
     let final_state = proof.final_state.clone();
@@ -1393,7 +1416,11 @@ mod anchor_tests {
         let proof = prove_mobile(&mut sn).expect("prove tiny segment (MOBILE)");
         let commitment = proof.stark_proof.commitments[0];
         let root = proof.initial_state.memory_root;
-        (bincode::serialize(&proof).expect("encode proof"), commitment, root)
+        (
+            bincode::serialize(&proof).expect("encode proof"),
+            commitment,
+            root,
+        )
     }
 
     #[test]
@@ -1407,7 +1434,10 @@ mod anchor_tests {
                 .is_some()
         };
         assert!(verify(None), "no anchor must not reject (anchor is opt-in)");
-        assert!(verify(Some(root)), "the correct entering root must pass the anchor");
+        assert!(
+            verify(Some(root)),
+            "the correct entering root must pass the anchor"
+        );
         let mut wrong = root;
         wrong[0] ^= 0xFF;
         assert!(
@@ -1464,8 +1494,15 @@ mod test_trace {
         regs[0] = 100;
         regs[1] = 1;
         let mem = vec![0u8; 4 * 1024 * 1024];
-        let pvm =
-            Interpreter::new(code.clone(), bitmask.clone(), vec![], regs, mem.clone(), 10_000, 25);
+        let pvm = Interpreter::new(
+            code.clone(),
+            bitmask.clone(),
+            vec![],
+            regs,
+            mem.clone(),
+            10_000,
+            25,
+        );
         let mut tracing = TracingPvm::new(pvm);
         assert_eq!(tracing.run(), javm::ExitReason::Trap);
         SideNote::new(tracing.into_trace(), code, bitmask).with_memory(mem)
@@ -1557,7 +1594,10 @@ mod floors_tests {
                 // trace's, so whole-trace naturals dominate windowed floors.
                 let whole = zkpvm::canonical_profile_for(&full, n).expect("whole-trace floors");
                 for (i, (w, f)) in whole.iter().zip(&floors).enumerate() {
-                    assert!(w >= f, "chip {i}: whole-trace natural {w} < windowed floor {f}");
+                    assert!(
+                        w >= f,
+                        "chip {i}: whole-trace natural {w} < windowed floor {f}"
+                    );
                 }
 
                 // The property the tool exists for: same-shape windows prove
@@ -1568,9 +1608,9 @@ mod floors_tests {
                         let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
                         let proof = prove_canonical(&mut sn, &floors)
                             .expect("canonical prove under derived floors");
-                        zkpvm::recursion_pcs::commitment_bytes(
-                            &zkpvm::program_commitment_of_proof(&proof),
-                        )
+                        zkpvm::recursion_pcs::commitment_bytes(&zkpvm::program_commitment_of_proof(
+                            &proof,
+                        ))
                     })
                     .collect();
                 assert_eq!(
@@ -1628,15 +1668,17 @@ mod chain_stream_tests {
 
             let segments = prove_chain_segments(&blob, &[], 0, SEG_STEPS, 0, &floors)
                 .expect("collecting chain prove");
-            assert!(segments.len() >= 2, "the fixture must cut into a real chain");
+            assert!(
+                segments.len() >= 2,
+                "the fixture must cut into a real chain"
+            );
 
             let mut streamed: Vec<Vec<u8>> = Vec::new();
-            let root =
-                prove_chain_segments_with(&blob, &[], 0, SEG_STEPS, 0, &floors, |seg| {
-                    streamed.push(seg);
-                    Some(())
-                })
-                .expect("streaming chain prove");
+            let root = prove_chain_segments_with(&blob, &[], 0, SEG_STEPS, 0, &floors, |seg| {
+                streamed.push(seg);
+                Some(())
+            })
+            .expect("streaming chain prove");
 
             assert_eq!(
                 streamed, segments,
@@ -1709,7 +1751,11 @@ mod chain_stream_tests {
             // image_root(32) ++ n(u32 LE) ++ profile(u32 LE × n) ++ commitment(32)…
             let image_root: [u8; 32] = out[..32].try_into().unwrap();
             let n = u32::from_le_bytes(out[32..36].try_into().unwrap()) as usize;
-            assert_eq!(n, zkpvm::chip_idx::COUNT, "the derived profile is full-width");
+            assert_eq!(
+                n,
+                zkpvm::chip_idx::COUNT,
+                "the derived profile is full-width"
+            );
             let floors: Vec<u32> = (0..n)
                 .map(|i| u32::from_le_bytes(out[36 + 4 * i..40 + 4 * i].try_into().unwrap()))
                 .collect();
@@ -1729,16 +1775,13 @@ mod chain_stream_tests {
             // The reference: the compact-holder pipeline over the same
             // patched trace, mirroring the probe selection ({0, last} —
             // no ristretto, so every comb count is 0) and its dedup.
-            let full = zkpvm::actor::trace_blob_compact_with_patches(
-                &blob,
-                GAS,
-                &[(WADDR, &witness)],
-            )
-            .expect("compact-holder trace");
+            let full =
+                zkpvm::actor::trace_blob_compact_with_patches(&blob, GAS, &[(WADDR, &witness)])
+                    .expect("compact-holder trace");
             let bounds = zkpvm::segment::segment_bounds(full.num_steps(), SEG_STEPS);
             assert!(bounds.len() >= 2, "the fixture must cut into a real chain");
-            let floors_ref = zkpvm::canonical_profile_for_bounds_compact(&full, &bounds)
-                .expect("holder floors");
+            let floors_ref =
+                zkpvm::canonical_profile_for_bounds_compact(&full, &bounds).expect("holder floors");
             assert_eq!(
                 floors, floors_ref,
                 "streaming-derived floors must match the holder derivation"
@@ -1777,7 +1820,10 @@ mod chain_stream_tests {
                 None
             });
             assert_eq!(aborted, None, "a sink abort fails the whole chain prove");
-            assert_eq!(calls, 1, "the abort stops the chain after the aborting segment");
+            assert_eq!(
+                calls, 1,
+                "the abort stops the chain after the aborting segment"
+            );
             Some(())
         })
         .expect("large-stack test body");
@@ -1941,7 +1987,10 @@ mod job_tests {
         .expect("the pending job is advanced");
 
         assert_eq!(cb.status, JOB_DONE);
-        assert!(published.len() >= 2, "the fixture must cut into a real chain");
+        assert!(
+            published.len() >= 2,
+            "the fixture must cut into a real chain"
+        );
         assert_eq!(cb.segments as usize, published.len());
 
         let (data, done, error) = queue.poll(id);
@@ -1949,8 +1998,7 @@ mod job_tests {
         assert!(error.is_empty());
         let manifest =
             decode_chain_manifest(&data).expect("the job result is an anchored-manifest input");
-        let expected_hashes: Vec<[u8; 32]> =
-            (1..=published.len() as u8).map(|i| [i; 32]).collect();
+        let expected_hashes: Vec<[u8; 32]> = (1..=published.len() as u8).map(|i| [i; 32]).collect();
         assert_eq!(
             manifest.segments, expected_hashes,
             "the manifest lists the published hashes in chain order"
@@ -1995,12 +2043,19 @@ mod job_tests {
         assert_eq!(puts, 1, "the first refused publish aborts the chain");
         let (_, done, error) = queue.poll(id);
         assert!(done);
-        assert!(!error.is_empty(), "a failed publish reports through job_poll");
+        assert!(
+            !error.is_empty(),
+            "a failed publish reports through job_poll"
+        );
     }
 
     #[test]
     fn entering_root_rejects_empty_and_undecodable_chains() {
-        assert_eq!(segment_initial_root(&[]), None, "an empty chain has no entering root");
+        assert_eq!(
+            segment_initial_root(&[]),
+            None,
+            "an empty chain has no entering root"
+        );
         assert_eq!(
             segment_initial_root(&[vec![0xABu8; 16]]),
             None,

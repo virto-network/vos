@@ -1057,7 +1057,9 @@ mod tests {
         assert_eq!(RefineImportsV2::decode(&encoded).unwrap(), imports);
 
         let mut missing = imports.clone();
-        missing.blobs.retain(|blob| blob.reference != work.imported_blobs[0]);
+        missing
+            .blobs
+            .retain(|blob| blob.reference != work.imported_blobs[0]);
         assert_eq!(
             missing.validate_for(&work),
             Err(RefineError::MissingImport(work.imported_blobs[0].hash))

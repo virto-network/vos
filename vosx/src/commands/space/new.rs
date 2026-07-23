@@ -13,9 +13,9 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use vos::registry::{AUTH_ROLE_ADMIN, NODE_ROLE_VOTER, RegistryRef, Status};
 use vos::abi::service::ServiceId;
 use vos::node::{AgentConfig, Consistency, VosNode};
+use vos::registry::{AUTH_ROLE_ADMIN, NODE_ROLE_VOTER, RegistryRef, Status};
 
 use crate::blob_store::{self, BlobSource};
 use crate::commands::space::op_sign::op_auth;
@@ -190,7 +190,11 @@ pub(crate) fn scaffold(
     let grant_auth = op_auth(
         &operator_kp,
         "grant_role",
-        &[&operator_peer_id, &[AUTH_ROLE_ADMIN], &grant_epoch.to_le_bytes()],
+        &[
+            &operator_peer_id,
+            &[AUTH_ROLE_ADMIN],
+            &grant_epoch.to_le_bytes(),
+        ],
     )?;
     let status = vos::block_on(reg.grant_role(
         &mut &node,

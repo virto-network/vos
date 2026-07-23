@@ -775,7 +775,11 @@ impl BuiltInProverComponent for RistrettoChip {
             let pm = producer_mult.get(row_i).copied().unwrap_or(0);
             trace.fill_columns(row_i, BaseField::from(pm), Column::ProducerMultiplicity);
             let emission = if real_b && !out_b { pm } else { 0 };
-            trace.fill_columns(row_i, BaseField::from(emission), Column::ProducerEmissionMult);
+            trace.fill_columns(
+                row_i,
+                BaseField::from(emission),
+                Column::ProducerEmissionMult,
+            );
 
             // MulPartialSum[k] = Σ a[i]·b[j] for i+j=k.  Values can
             // exceed u8/u16 (up to 32 × 255² ≈ 2 million); fill via BaseField.
@@ -912,10 +916,8 @@ impl BuiltInProverComponent for RistrettoChip {
         let b_cols = crate::trace::original_base_column!(component_trace, Column::FieldB);
         let is_input_col = crate::trace::original_base_column!(component_trace, Column::IsInput);
         let is_output_col = crate::trace::original_base_column!(component_trace, Column::IsOutput);
-        let producer_emission_mult = crate::trace::original_base_column!(
-            component_trace,
-            Column::ProducerEmissionMult
-        );
+        let producer_emission_mult =
+            crate::trace::original_base_column!(component_trace, Column::ProducerEmissionMult);
         let one_packed =
             || stwo::prover::backend::simd::m31::PackedM31::broadcast(BaseField::from(1u32));
         for k in 0..32 {

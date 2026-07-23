@@ -169,8 +169,7 @@ struct BootContextHost {
 impl BootContextHost {
     fn new() -> Self {
         let mut device_id = [0u8; 32];
-        getrandom::getrandom(&mut device_id)
-            .expect("OS entropy for the BOOT_CONTEXT device_id");
+        getrandom::getrandom(&mut device_id).expect("OS entropy for the BOOT_CONTEXT device_id");
         Self {
             device_id,
             boot_epochs: HashMap::new(),
@@ -471,7 +470,8 @@ fn expected_anchor(
     storage: &ServiceStorage,
     svc_id: u32,
 ) -> (u8, [u8; 32]) {
-    if let Some(root) = journal.effective_read(storage, svc_id, crate::lifecycle::COMMITTED_ROOT_KEY)
+    if let Some(root) =
+        journal.effective_read(storage, svc_id, crate::lifecycle::COMMITTED_ROOT_KEY)
         && root.len() == 32
     {
         let mut anchor = [0u8; 32];
@@ -514,10 +514,7 @@ impl ServiceStorage {
     }
 
     pub fn read(&self, service: ServiceId, key: &[u8]) -> Option<&[u8]> {
-        self.data
-            .get(&service.0)?
-            .get(key)
-            .map(|v| v.as_slice())
+        self.data.get(&service.0)?.get(key).map(|v| v.as_slice())
     }
 
     pub fn write(&mut self, service: ServiceId, key: &[u8], value: &[u8]) {
@@ -552,14 +549,11 @@ impl ServiceStorage {
         service: ServiceId,
         prefix: &'a [u8],
     ) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + 'a {
-        self.data
-            .get(&service.0)
-            .into_iter()
-            .flat_map(move |rows| {
-                rows.range(prefix.to_vec()..)
-                    .take_while(move |(k, _)| k.starts_with(prefix))
-                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
-            })
+        self.data.get(&service.0).into_iter().flat_map(move |rows| {
+            rows.range(prefix.to_vec()..)
+                .take_while(move |(k, _)| k.starts_with(prefix))
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+        })
     }
 }
 
@@ -1910,7 +1904,10 @@ fn handle_task_hostcall(kernel: &mut InvocationKernel, call_id: u32) -> bool {
             let _ = std::io::stderr().flush();
         }
         other => {
-            error!(call_id = other, "task child: hostcall outside the refine-pure set");
+            error!(
+                call_id = other,
+                "task child: hostcall outside the refine-pure set"
+            );
             return false;
         }
     }
@@ -2024,7 +2021,10 @@ fn run_task_invoke(
     let payload = match RefinePayload::decode(&raw_output) {
         Some(p) if p.version == crate::refine_payload::REFINE_PAYLOAD_VERSION => p,
         _ => {
-            error!(parent_svc_id, "task child: halt output is not a v3 work-result");
+            error!(
+                parent_svc_id,
+                "task child: halt output is not a v3 work-result"
+            );
             journal.rollback_to(invoke_mark);
             return record_and_write_invoke(
                 caller,
@@ -2736,10 +2736,7 @@ mod tests {
             .expect("stored continuation authenticates")
             .expect("continuation is present");
         assert_eq!(loaded, snapshot);
-        for backend in [
-            PvmBackend::ForceInterpreter,
-            PvmBackend::ForceRecompiler,
-        ] {
+        for backend in [PvmBackend::ForceInterpreter, PvmBackend::ForceRecompiler] {
             // No live kernel is retained: each backend reconstructs the exact
             // machine solely from canonical code plus the persisted body.
             let mut restored = InvocationKernel::restore(&blob, &loaded, backend, None)
@@ -2873,8 +2870,7 @@ mod tests {
         ];
 
         // v2: state as an explicit field on the wire.
-        let v2_bytes =
-            refine_payload::encode_v2(&new_state, b"reply", &effects, false, false);
+        let v2_bytes = refine_payload::encode_v2(&new_state, b"reply", &effects, false, false);
 
         // v3: state as the final Write{STATE_KEY} + a verified anchor.
         let (anchor_kind, anchor) = anchor_for(Some(&prior_state));
@@ -2894,7 +2890,11 @@ mod tests {
 
         let run = |bytes: &[u8]| {
             let mut storage = ServiceStorage::new();
-            storage.write(ServiceId(svc), crate::lifecycle::STATE_KEY_BYTES, &prior_state);
+            storage.write(
+                ServiceId(svc),
+                crate::lifecycle::STATE_KEY_BYTES,
+                &prior_state,
+            );
             let mut journal = RefineJournal::default();
             let payload = RefinePayload::decode(bytes).expect("decodes");
             let absorbed =
@@ -3036,10 +3036,7 @@ mod tests {
         let rows: Vec<(&[u8], &[u8])> = storage.scan_prefix(svc, b"s/acct/").collect();
         assert_eq!(
             rows,
-            vec![
-                (&b"s/acct/a"[..], &b"1"[..]),
-                (&b"s/acct/b"[..], &b"2"[..]),
-            ],
+            vec![(&b"s/acct/a"[..], &b"1"[..]), (&b"s/acct/b"[..], &b"2"[..]),],
             "prefix scan must be key-ordered, prefix-bounded, and blind \
              to other services' rows"
         );
@@ -3143,7 +3140,11 @@ mod tests {
 
         // Existing state: genesis rejects.
         let mut seeded = ServiceStorage::new();
-        seeded.write(ServiceId(svc), crate::lifecycle::STATE_KEY_BYTES, b"present");
+        seeded.write(
+            ServiceId(svc),
+            crate::lifecycle::STATE_KEY_BYTES,
+            b"present",
+        );
         let err = absorb_work_result(&mut journal, &seeded, svc, RefinePayload::new())
             .expect_err("genesis against present state must reject");
         assert_eq!(err, WorkResultError::AnchorMismatch);
@@ -3164,7 +3165,11 @@ mod tests {
         // against any prior state.
         let svc = 5u32;
         let mut storage = ServiceStorage::new();
-        storage.write(ServiceId(svc), crate::lifecycle::STATE_KEY_BYTES, b"whatever");
+        storage.write(
+            ServiceId(svc),
+            crate::lifecycle::STATE_KEY_BYTES,
+            b"whatever",
+        );
         let mut journal = RefineJournal::default();
         let bytes = refine_payload::encode_v2(b"next", b"", &[], false, false);
         let payload = RefinePayload::decode(&bytes).unwrap();

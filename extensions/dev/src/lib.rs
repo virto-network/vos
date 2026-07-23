@@ -51,12 +51,7 @@ impl DevExtension {
     /// dynamic CLI surfaces as a non-zero exit). `project_id` is the
     /// dev-project instance's ServiceId, `commit` the source commit to build.
     #[msg(cli)]
-    async fn compile(
-        &mut self,
-        project_id: u32,
-        commit: Vec<u8>,
-        ctx: &mut Context<Self>,
-    ) -> Args {
+    async fn compile(&mut self, project_id: u32, commit: Vec<u8>, ctx: &mut Context<Self>) -> Args {
         compile::compile_and_record(ctx, project_id, commit).await
     }
 

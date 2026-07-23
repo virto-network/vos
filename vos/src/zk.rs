@@ -503,7 +503,10 @@ impl ProvableCatalog {
 
     /// A fresh empty catalog at the current version.
     pub fn new() -> Self {
-        ProvableCatalog { version: Self::VERSION, programs: alloc::vec::Vec::new() }
+        ProvableCatalog {
+            version: Self::VERSION,
+            programs: alloc::vec::Vec::new(),
+        }
     }
 
     /// Parse a catalog from a TOML string.
@@ -618,7 +621,10 @@ fn hex_digit(c: u8) -> Result<u8, CatalogError> {
         b'0'..=b'9' => Ok(c - b'0'),
         b'a'..=b'f' => Ok(c - b'a' + 10),
         b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => Err(CatalogError::Hex(alloc::format!("invalid hex digit {:?}", c as char))),
+        _ => Err(CatalogError::Hex(alloc::format!(
+            "invalid hex digit {:?}",
+            c as char
+        ))),
     }
 }
 
@@ -713,8 +719,14 @@ mod tests {
         let s = bytes_to_hex(&bytes);
         assert_eq!(s.len(), 64);
         assert_eq!(hex_to_32(&s).unwrap(), bytes);
-        assert!(hex_to_32("dead").is_err(), "short hex must error, not truncate");
-        assert!(hex_to_32(&"g".repeat(64)).is_err(), "non-hex digit must error");
+        assert!(
+            hex_to_32("dead").is_err(),
+            "short hex must error, not truncate"
+        );
+        assert!(
+            hex_to_32(&"g".repeat(64)).is_err(),
+            "non-hex digit must error"
+        );
     }
 
     #[cfg(feature = "std")]
@@ -743,13 +755,20 @@ mod tests {
         // Accessors decode the hex fields into the shapes verifiers consume.
         let p = back.require("voucher-check").expect("lookup");
         assert_eq!(p.commitments_bytes().unwrap(), vec![c0, c1]);
-        assert_eq!(p.allowlist_concat().unwrap().len(), 64, "allowlist is 32·N bytes");
+        assert_eq!(
+            p.allowlist_concat().unwrap().len(),
+            64,
+            "allowlist is 32·N bytes"
+        );
         assert_eq!(&p.allowlist_concat().unwrap()[..32], &c0);
         assert_eq!(p.unpatched_image_root_bytes().unwrap(), root);
 
         // Lookups and idempotent upsert.
         assert!(back.get("missing").is_none());
-        assert!(matches!(back.require("missing"), Err(CatalogError::NotFound(_))));
+        assert!(matches!(
+            back.require("missing"),
+            Err(CatalogError::NotFound(_))
+        ));
         cat.upsert(pin); // same name again → still one entry
         assert_eq!(cat.programs.len(), 1, "upsert is idempotent by name");
     }

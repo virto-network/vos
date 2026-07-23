@@ -236,21 +236,41 @@ mod prover {
             let ts = step.ts();
             ranges.clear();
             step_ranges(step, &mut ranges);
-            take_at(parts.blake2b_mem_ops, &mut cb, ts, |o| o.ts, |o| {
-                blake2b_op_ranges(o, &mut ranges)
-            });
-            take_at(parts.ristretto_mem_ops, &mut cr, ts, |o| o.ts, |o| {
-                ristretto_op_ranges(o, &mut ranges)
-            });
-            take_at(parts.ristretto_add_mem_ops, &mut ca, ts, |o| o.ts, |o| {
-                ristretto_add_op_ranges(o, &mut ranges)
-            });
-            take_at(parts.scalar_reduce_wide_mem_ops, &mut cw, ts, |o| o.ts, |o| {
-                scalar_reduce_wide_op_ranges(o, &mut ranges)
-            });
-            take_at(parts.scalar_binop_mem_ops, &mut cs, ts, |o| o.ts, |o| {
-                scalar_binop_op_ranges(o, &mut ranges)
-            });
+            take_at(
+                parts.blake2b_mem_ops,
+                &mut cb,
+                ts,
+                |o| o.ts,
+                |o| blake2b_op_ranges(o, &mut ranges),
+            );
+            take_at(
+                parts.ristretto_mem_ops,
+                &mut cr,
+                ts,
+                |o| o.ts,
+                |o| ristretto_op_ranges(o, &mut ranges),
+            );
+            take_at(
+                parts.ristretto_add_mem_ops,
+                &mut ca,
+                ts,
+                |o| o.ts,
+                |o| ristretto_add_op_ranges(o, &mut ranges),
+            );
+            take_at(
+                parts.scalar_reduce_wide_mem_ops,
+                &mut cw,
+                ts,
+                |o| o.ts,
+                |o| scalar_reduce_wide_op_ranges(o, &mut ranges),
+            );
+            take_at(
+                parts.scalar_binop_mem_ops,
+                &mut cs,
+                ts,
+                |o| o.ts,
+                |o| scalar_binop_op_ranges(o, &mut ranges),
+            );
 
             let (before, after) = cutter.feed(&ranges);
             bounds.extend(before);
@@ -713,12 +733,7 @@ mod prover {
         /// `ts < ts_lo`. Enumeration order mirrors [`replay_writes`]'s
         /// stream order (blake2b, ristretto, point-add, wide-reduce,
         /// scalar-binop); [`apply_writes`] sorts the batch by ts anyway.
-        fn drain_below(
-            &mut self,
-            parts: &ChainParts<'_>,
-            ts_lo: u64,
-            out: &mut Vec<PendingWrite>,
-        ) {
+        fn drain_below(&mut self, parts: &ChainParts<'_>, ts_lo: u64, out: &mut Vec<PendingWrite>) {
             drain_stream(
                 parts.blake2b_mem_ops,
                 &mut self.blake2b,
@@ -1004,19 +1019,17 @@ mod prover {
             let t = &mut self.tracer;
             Some(StepArrival {
                 step,
-                blake2b: pop_pair(&mut t.blake2b_records, &mut t.blake2b_mem_ops).map(
-                    |(r, m)| {
-                        (
-                            Blake2bCall {
-                                h: r.h,
-                                m: r.m,
-                                t: r.t,
-                                f: r.f,
-                            },
-                            m,
-                        )
-                    },
-                ),
+                blake2b: pop_pair(&mut t.blake2b_records, &mut t.blake2b_mem_ops).map(|(r, m)| {
+                    (
+                        Blake2bCall {
+                            h: r.h,
+                            m: r.m,
+                            t: r.t,
+                            f: r.f,
+                        },
+                        m,
+                    )
+                }),
                 ristretto: pop_pair(&mut t.ristretto_records, &mut t.ristretto_mem_ops),
                 ristretto_add: pop_pair(&mut t.ristretto_add_records, &mut t.ristretto_add_mem_ops),
                 scalar_reduce_wide: pop_pair(
@@ -1446,7 +1459,11 @@ mod tests {
             branch_target: 0,
             branch_taken: false,
             mem_read: None,
-            mem_write: write.map(|(address, size)| MemAccess { address, value: 0, size }),
+            mem_write: write.map(|(address, size)| MemAccess {
+                address,
+                value: 0,
+                size,
+            }),
             gas_after: 0,
             gas_charged: 0,
             next_pc: 0,
@@ -1567,7 +1584,12 @@ mod tests {
             .with_memory(vec![0u8; 4096])
             .with_jump_table(vec![2, 4]);
 
-        sn.blake2b_calls.push(Blake2bCall { h: [1; 8], m: [2; 16], t: 3, f: true });
+        sn.blake2b_calls.push(Blake2bCall {
+            h: [1; 8],
+            m: [2; 16],
+            t: 3,
+            f: true,
+        });
         sn.blake2b_mem_ops.push(Blake2bMemOp {
             h_ptr: 4090,
             m_ptr: 0x300,
@@ -1676,8 +1698,14 @@ mod tests {
         assert_eq!(via_cursor.blake2b_mem_ops, via_slice.blake2b_mem_ops);
         assert_eq!(via_cursor.ristretto_calls, via_slice.ristretto_calls);
         assert_eq!(via_cursor.ristretto_mem_ops, via_slice.ristretto_mem_ops);
-        assert_eq!(via_cursor.ristretto_add_calls, via_slice.ristretto_add_calls);
-        assert_eq!(via_cursor.ristretto_add_mem_ops, via_slice.ristretto_add_mem_ops);
+        assert_eq!(
+            via_cursor.ristretto_add_calls,
+            via_slice.ristretto_add_calls
+        );
+        assert_eq!(
+            via_cursor.ristretto_add_mem_ops,
+            via_slice.ristretto_add_mem_ops
+        );
         assert_eq!(
             via_cursor.scalar_reduce_wide_calls,
             via_slice.scalar_reduce_wide_calls
@@ -1687,9 +1715,18 @@ mod tests {
             via_slice.scalar_reduce_wide_mem_ops
         );
         assert_eq!(via_cursor.scalar_binop_calls, via_slice.scalar_binop_calls);
-        assert_eq!(via_cursor.scalar_binop_mem_ops, via_slice.scalar_binop_mem_ops);
-        assert_eq!(via_cursor.ristretto_comb_calls, via_slice.ristretto_comb_calls);
-        assert_eq!(via_cursor.ristretto_comb_counts, via_slice.ristretto_comb_counts);
+        assert_eq!(
+            via_cursor.scalar_binop_mem_ops,
+            via_slice.scalar_binop_mem_ops
+        );
+        assert_eq!(
+            via_cursor.ristretto_comb_calls,
+            via_slice.ristretto_comb_calls
+        );
+        assert_eq!(
+            via_cursor.ristretto_comb_counts,
+            via_slice.ristretto_comb_counts
+        );
         assert_eq!(via_cursor.range256_counts, via_slice.range256_counts);
     }
 
@@ -1870,9 +1907,7 @@ mod tests {
                     let ts = s.timestamp;
                     crate::segment::StepArrival {
                         step: s.to_compact(),
-                        blake2b: pair_at(&full.blake2b_calls, &full.blake2b_mem_ops, ts, |m| {
-                            m.ts
-                        }),
+                        blake2b: pair_at(&full.blake2b_calls, &full.blake2b_mem_ops, ts, |m| m.ts),
                         ristretto: pair_at(
                             &full.ristretto_calls,
                             &full.ristretto_mem_ops,

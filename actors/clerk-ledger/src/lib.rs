@@ -442,8 +442,12 @@ impl ClerkLedger {
         // pending_id is on file via the TransferNotFound code path.
         // Acceptable for v1: a caller able to name a specific
         // pending_id is already operator-adjacent.
-        let is_pending_finalize = transfer.flags.contains(TransferFlags::POST_PENDING_TRANSFER)
-            || transfer.flags.contains(TransferFlags::VOID_PENDING_TRANSFER);
+        let is_pending_finalize = transfer
+            .flags
+            .contains(TransferFlags::POST_PENDING_TRANSFER)
+            || transfer
+                .flags
+                .contains(TransferFlags::VOID_PENDING_TRANSFER);
         if !is_pending_finalize {
             let mut distinct_debits: Vec<CcAccountId> = Vec::new();
             for e in &transfer.entries {

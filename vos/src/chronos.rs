@@ -16,9 +16,7 @@ use alloc::vec::Vec;
 /// Return status of every chronos `#[msg]` handler. The `#[repr(u8)]`
 /// discriminants are wire-stable — reordering or renumbering variants shifts
 /// the rkyv archive bytes and breaks peer nodes running older builds.
-#[derive(
-    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq,
-)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[rkyv(crate = rkyv)]
 #[repr(u8)]
 pub enum Status {
@@ -193,8 +191,15 @@ impl ChronosRef {
         inv.invoke(self.target, payload).await
     }
 
-    pub async fn init<I: Invoker>(&self, inv: &mut I, domain: Vec<u8>) -> Result<Status, ClientError> {
-        decode_rkyv(self.call(inv, Msg::new("init").with("domain", domain)).await?)
+    pub async fn init<I: Invoker>(
+        &self,
+        inv: &mut I,
+        domain: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(inv, Msg::new("init").with("domain", domain))
+                .await?,
+        )
     }
 
     pub async fn now<I: Invoker>(&self, inv: &mut I) -> Result<u64, ClientError> {
@@ -210,8 +215,13 @@ impl ChronosRef {
         entropy: Vec<u8>,
     ) -> Result<AdvanceOutcome, ClientError> {
         decode_rkyv(
-            self.call(inv, Msg::new("advance").with("slot", slot).with("entropy", entropy))
-                .await?,
+            self.call(
+                inv,
+                Msg::new("advance")
+                    .with("slot", slot)
+                    .with("entropy", entropy),
+            )
+            .await?,
         )
     }
 
@@ -220,7 +230,10 @@ impl ChronosRef {
         inv: &mut I,
         voters: Vec<u8>,
     ) -> Result<Status, ClientError> {
-        decode_rkyv(self.call(inv, Msg::new("set_committee").with("voters", voters)).await?)
+        decode_rkyv(
+            self.call(inv, Msg::new("set_committee").with("voters", voters))
+                .await?,
+        )
     }
 
     pub async fn enrol_voter<I: Invoker>(
@@ -244,7 +257,10 @@ impl ChronosRef {
         decode_rkyv(self.call(inv, Msg::new("committee")).await?)
     }
 
-    pub async fn open_rounds<I: Invoker>(&self, inv: &mut I) -> Result<Vec<OpenRound>, ClientError> {
+    pub async fn open_rounds<I: Invoker>(
+        &self,
+        inv: &mut I,
+    ) -> Result<Vec<OpenRound>, ClientError> {
         decode_rkyv(self.call(inv, Msg::new("open_rounds")).await?)
     }
 

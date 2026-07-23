@@ -17,8 +17,8 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use vos::abi::service::ServiceId;
-use vos::registry::{AgentRow, MemberRow, ProgramRow, RegistryRef, Status};
 use vos::node::VosNode;
+use vos::registry::{AgentRow, MemberRow, ProgramRow, RegistryRef, Status};
 
 use crate::commands::space::common::instance_service_id;
 use crate::commands::space::endpoint;
@@ -365,7 +365,10 @@ impl DaemonClient {
             .network()
             .ok_or_else(|| anyhow::anyhow!("client has no network attached"))?;
         let peer = net.peer_for_prefix(self.daemon_prefix).ok_or_else(|| {
-            anyhow::anyhow!("daemon peer (prefix {:#06x}) not connected", self.daemon_prefix)
+            anyhow::anyhow!(
+                "daemon peer (prefix {:#06x}) not connected",
+                self.daemon_prefix
+            )
         })?;
         net.send_raft_status_req(peer, replication_id)
             .recv_timeout(invoke_timeout())
@@ -419,7 +422,11 @@ impl DaemonClient {
     /// schema-aware dynamic dispatch) resolves for agents installed off
     /// this program. Mirrors what the recipe reconciler does; empty
     /// `auth` is signed on relay by the daemon's operator key.
-    pub fn register_meta(&self, program_hash: Vec<u8>, meta_blob: Vec<u8>) -> anyhow::Result<Status> {
+    pub fn register_meta(
+        &self,
+        program_hash: Vec<u8>,
+        meta_blob: Vec<u8>,
+    ) -> anyhow::Result<Status> {
         vos::block_on(self.registry().register_meta(
             &mut &self.node,
             program_hash,
@@ -478,10 +485,13 @@ impl DaemonClient {
         // Compare-and-swap base: read the instance's live program hash so
         // the registry rejects this upgrade if the instance has moved on
         // (a replayed/superseded upgrade can't roll the version back).
-        let from_hash = vos::block_on(self.registry().agent(&mut &self.node, instance_name.clone()))
-            .map_err(|e| anyhow::anyhow!("registry.agent(): {e}"))?
-            .map(|row| row.program_hash.to_vec())
-            .ok_or_else(|| anyhow::anyhow!("upgrade: instance '{instance_name}' is not installed"))?;
+        let from_hash = vos::block_on(
+            self.registry()
+                .agent(&mut &self.node, instance_name.clone()),
+        )
+        .map_err(|e| anyhow::anyhow!("registry.agent(): {e}"))?
+        .map(|row| row.program_hash.to_vec())
+        .ok_or_else(|| anyhow::anyhow!("upgrade: instance '{instance_name}' is not installed"))?;
         vos::block_on(self.registry().upgrade(
             &mut &self.node,
             instance_name,
@@ -544,8 +554,11 @@ impl DaemonClient {
 
     pub fn remove_identity(&self, public_key: Vec<u8>) -> anyhow::Result<Status> {
         let auth = op_auth(&self.signer, "remove_identity", &[&public_key])?;
-        vos::block_on(self.registry().remove_identity(&mut &self.node, public_key, auth))
-            .map_err(|e| anyhow::anyhow!("registry.remove_identity(): {e}"))
+        vos::block_on(
+            self.registry()
+                .remove_identity(&mut &self.node, public_key, auth),
+        )
+        .map_err(|e| anyhow::anyhow!("registry.remove_identity(): {e}"))
     }
 
     // ── Auth grants ────────────────────────────────────
@@ -666,26 +679,42 @@ impl DaemonClient {
         let auth = op_auth(
             &self.signer,
             "grant_actor_role",
-            &[&peer_id, agent_name.as_bytes(), &[role], &epoch.to_le_bytes()],
+            &[
+                &peer_id,
+                agent_name.as_bytes(),
+                &[role],
+                &epoch.to_le_bytes(),
+            ],
         )?;
-        vos::block_on(
-            self.registry()
-                .grant_actor_role(&mut &self.node, peer_id, agent_name, role, epoch, auth),
-        )
+        vos::block_on(self.registry().grant_actor_role(
+            &mut &self.node,
+            peer_id,
+            agent_name,
+            role,
+            epoch,
+            auth,
+        ))
         .map_err(|e| anyhow::anyhow!("registry.grant_actor_role(): {e}"))
     }
 
-    pub fn revoke_actor_role(&self, peer_id: Vec<u8>, agent_name: String) -> anyhow::Result<Status> {
+    pub fn revoke_actor_role(
+        &self,
+        peer_id: Vec<u8>,
+        agent_name: String,
+    ) -> anyhow::Result<Status> {
         let epoch = self.actor_epoch(peer_id.clone(), agent_name.clone())? + 1;
         let auth = op_auth(
             &self.signer,
             "revoke_actor_role",
             &[&peer_id, agent_name.as_bytes(), &epoch.to_le_bytes()],
         )?;
-        vos::block_on(
-            self.registry()
-                .revoke_actor_role(&mut &self.node, peer_id, agent_name, epoch, auth),
-        )
+        vos::block_on(self.registry().revoke_actor_role(
+            &mut &self.node,
+            peer_id,
+            agent_name,
+            epoch,
+            auth,
+        ))
         .map_err(|e| anyhow::anyhow!("registry.revoke_actor_role(): {e}"))
     }
 

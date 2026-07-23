@@ -129,16 +129,21 @@ fn pin(args: PinArgs) -> Result<()> {
         .with_context(|| format!("read provable ELF {}", args.elf.display()))?;
     let blob = grey_transpiler::link_elf(&elf)
         .map_err(|e| anyhow!("transpile {}: {e:?}", args.elf.display()))?;
-    let waddr = witness_addr(&elf)
-        .with_context(|| format!("{} must export a resolved __VOS_WITNESS", args.elf.display()))?;
+    let waddr = witness_addr(&elf).with_context(|| {
+        format!(
+            "{} must export a resolved __VOS_WITNESS",
+            args.elf.display()
+        )
+    })?;
     let profile_arg = args.profile.as_ref().map(read_profile).transpose()?;
 
     // The witness drives the MEASURE path; the `--allowlist` re-pin path passes
     // an empty witness (the extension then returns only the entering root) and
     // records the supplied allowlist instead.
     let witness = match (&args.witness, &args.allowlist) {
-        (Some(path), _) => std::fs::read(path)
-            .with_context(|| format!("read witness {}", path.display()))?,
+        (Some(path), _) => {
+            std::fs::read(path).with_context(|| format!("read witness {}", path.display()))?
+        }
         (None, Some(_)) => Vec::new(),
         (None, None) => bail!(
             "--witness <FILE> is required to measure the commitment allowlist \
@@ -214,7 +219,9 @@ fn pin(args: PinArgs) -> Result<()> {
 
     let (image_root, profile, measured) = parse_measure_reply(reply)?;
     if profile.is_empty() {
-        bail!("prover measure_catalog echoed no profile — measurement failed. Check the daemon log.");
+        bail!(
+            "prover measure_catalog echoed no profile — measurement failed. Check the daemon log."
+        );
     }
 
     // With `--allowlist`, record the supplied commitments; otherwise use the
@@ -222,7 +229,10 @@ fn pin(args: PinArgs) -> Result<()> {
     let commitments: Vec<[u8; 32]> = match &args.allowlist {
         Some(list) => {
             let cs = parse_allowlist(list)?;
-            eprintln!("recorded {} supplied commitment(s) (proving skipped)", cs.len());
+            eprintln!(
+                "recorded {} supplied commitment(s) (proving skipped)",
+                cs.len()
+            );
             cs
         }
         None => measured,
@@ -305,7 +315,10 @@ fn parse_measure_reply(reply: Value) -> Result<([u8; 32], Vec<u32>, Vec<[u8; 32]
         );
     }
     if bytes.len() < 36 {
-        bail!("measure_catalog reply is {} bytes, shorter than root + profile length", bytes.len());
+        bail!(
+            "measure_catalog reply is {} bytes, shorter than root + profile length",
+            bytes.len()
+        );
     }
     let mut image_root = [0u8; 32];
     image_root.copy_from_slice(&bytes[..32]);
@@ -320,7 +333,10 @@ fn parse_measure_reply(reply: Value) -> Result<([u8; 32], Vec<u32>, Vec<[u8; 32]
         .collect();
     let rest = &bytes[floors_end..];
     if rest.len() % 32 != 0 {
-        bail!("measure_catalog commitments are {} bytes, not a multiple of 32", rest.len());
+        bail!(
+            "measure_catalog commitments are {} bytes, not a multiple of 32",
+            rest.len()
+        );
     }
     let commitments = rest
         .chunks_exact(32)
@@ -335,7 +351,11 @@ fn parse_measure_reply(reply: Value) -> Result<([u8; 32], Vec<u32>, Vec<[u8; 32]
 
 /// Serialize a profile in the format [`read_profile`] reads back.
 fn format_profile(profile: &[u32]) -> String {
-    profile.iter().map(u32::to_string).collect::<Vec<_>>().join(" ")
+    profile
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Parse a canonical profile file: unsigned integers separated by any of
@@ -351,9 +371,9 @@ fn read_profile(path: &PathBuf) -> Result<Vec<u32>> {
             if tok.is_empty() {
                 continue;
             }
-            let v: u32 = tok
-                .parse()
-                .with_context(|| format!("{}:{}: not a u32: {tok:?}", path.display(), lineno + 1))?;
+            let v: u32 = tok.parse().with_context(|| {
+                format!("{}:{}: not a u32: {tok:?}", path.display(), lineno + 1)
+            })?;
             out.push(v);
         }
     }

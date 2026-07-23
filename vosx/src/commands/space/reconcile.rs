@@ -26,10 +26,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use vos::registry::{ProgramRow, RegistryRef, Status};
 use vos::abi::service::ServiceId;
 use vos::init::{InitArgs, InitValue};
 use vos::node::{ExtensionConfig, VosNode};
+use vos::registry::{ProgramRow, RegistryRef, Status};
 use vos::value::Args;
 
 use crate::blob_store;
@@ -780,7 +780,12 @@ fn reconcile_one(
         // `.vos_meta` that overflows the registry guest's FETCH buffer) are
         // tolerated: log and move on, agent still spawns without a schema.
         // Empty `auth`: signed on relay by the daemon (operator key).
-        match vos::block_on(reg.register_meta(&mut &*node, program_hash.to_vec(), meta_blob, Vec::new())) {
+        match vos::block_on(reg.register_meta(
+            &mut &*node,
+            program_hash.to_vec(),
+            meta_blob,
+            Vec::new(),
+        )) {
             Ok(Status::Ok) => {
                 tracing::debug!("registered meta for {program_name}:{program_version}");
             }

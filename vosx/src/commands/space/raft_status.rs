@@ -9,8 +9,8 @@
 use crate::commands::space::client::DaemonClient;
 use crate::commands::space::common::consistency_name;
 use crate::output;
-use vos::network::{RaftRole, RaftStatusReply};
 use serde::Serialize;
+use vos::network::{RaftRole, RaftStatusReply};
 
 const RAFT_CONSISTENCY: u8 = 3;
 
@@ -71,9 +71,7 @@ pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
 
 fn print_text(instance: &str, daemon_prefix: u16, reply: &RaftStatusReply) {
     if !reply.present {
-        println!(
-            "{instance}: daemon (node {daemon_prefix:#06x}) is not running this Raft group"
-        );
+        println!("{instance}: daemon (node {daemon_prefix:#06x}) is not running this Raft group");
         return;
     }
     println!("agent      {instance}");
@@ -86,7 +84,11 @@ fn print_text(instance: &str, daemon_prefix: u16, reply: &RaftStatusReply) {
     );
     match reply.leader_hint {
         Some(p) => {
-            let here = if p == daemon_prefix { " (this node)" } else { "" };
+            let here = if p == daemon_prefix {
+                " (this node)"
+            } else {
+                ""
+            };
             println!("leader     {p:#06x}{here}");
         }
         None => println!("leader     unknown (election in flight)"),

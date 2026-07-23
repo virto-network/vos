@@ -500,12 +500,7 @@ fn verify_chain_standalone_shaped(
     // Each segment verifies standalone against the SAME program commitment:
     // no side note, and program identity is pinned across the whole chain.
     for proof in proofs {
-        verify_standalone_shaped(
-            proof.clone(),
-            preprocessed_commitment,
-            max_log_size,
-            policy,
-        )?;
+        verify_standalone_shaped(proof.clone(), preprocessed_commitment, max_log_size, policy)?;
     }
     Ok(proofs[proofs.len() - 1].final_state.memory_root)
 }

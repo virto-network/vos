@@ -266,28 +266,60 @@ fn incremental_composite_root_matches_full_rebuild() {
         );
     };
 
-    check(&mut m, &accounts, &transfers, &eids, &voided, &pending, "bootstrap");
+    check(
+        &mut m,
+        &accounts,
+        &transfers,
+        &eids,
+        &voided,
+        &pending,
+        "bootstrap",
+    );
 
     for byte in [0x07, 0x02, 0x0e, 0x0b] {
         m.view().put_account(mk_account(byte), &mut NoopOracle);
         accounts.push(mk_account(byte));
     }
     accounts.sort_by_key(|a| a.id.0);
-    check(&mut m, &accounts, &transfers, &eids, &voided, &pending, "account creation");
+    check(
+        &mut m,
+        &accounts,
+        &transfers,
+        &eids,
+        &voided,
+        &pending,
+        "account creation",
+    );
 
     // Overwrite one account (a balance-mutating transfer's effect).
     let mut updated = mk_account(0x02);
     updated.timestamp = 4242;
     m.view().put_account(updated.clone(), &mut NoopOracle);
     accounts[0] = updated;
-    check(&mut m, &accounts, &transfers, &eids, &voided, &pending, "account overwrite");
+    check(
+        &mut m,
+        &accounts,
+        &transfers,
+        &eids,
+        &voided,
+        &pending,
+        "account overwrite",
+    );
 
     for byte in [0x60, 0x21] {
         m.view().put_transfer(mk_transfer(byte), &mut NoopOracle);
         transfers.push(mk_transfer(byte));
     }
     transfers.sort_by_key(|t| t.id.0);
-    check(&mut m, &accounts, &transfers, &eids, &voided, &pending, "transfers");
+    check(
+        &mut m,
+        &accounts,
+        &transfers,
+        &eids,
+        &voided,
+        &pending,
+        "transfers",
+    );
 
     m.view()
         .mark_external_id(&CcExternalId([0xE1; 32]), &mut NoopOracle);
@@ -295,15 +327,37 @@ fn incremental_composite_root_matches_full_rebuild() {
     m.view()
         .mark_transfer_voided(&CcTransferId([0x21; 16]), &mut NoopOracle);
     voided.push([0x21; 16]);
-    m.view()
-        .mark_pending_status(&CcTransferId([0x60; 16]), PendingStatus::Pending, &mut NoopOracle);
+    m.view().mark_pending_status(
+        &CcTransferId([0x60; 16]),
+        PendingStatus::Pending,
+        &mut NoopOracle,
+    );
     pending.push(([0x60; 16], 0));
-    check(&mut m, &accounts, &transfers, &eids, &voided, &pending, "bookkeeping marks");
+    check(
+        &mut m,
+        &accounts,
+        &transfers,
+        &eids,
+        &voided,
+        &pending,
+        "bookkeeping marks",
+    );
 
-    m.view()
-        .mark_pending_status(&CcTransferId([0x60; 16]), PendingStatus::Posted, &mut NoopOracle);
+    m.view().mark_pending_status(
+        &CcTransferId([0x60; 16]),
+        PendingStatus::Posted,
+        &mut NoopOracle,
+    );
     pending[0].1 = 1;
-    check(&mut m, &accounts, &transfers, &eids, &voided, &pending, "pending transition");
+    check(
+        &mut m,
+        &accounts,
+        &transfers,
+        &eids,
+        &voided,
+        &pending,
+        "pending transition",
+    );
 
     assert_ne!(
         m.view().root(),

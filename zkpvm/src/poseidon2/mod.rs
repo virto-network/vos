@@ -666,7 +666,10 @@ mod simd_backend {
     }
 
     impl MerkleOpsLifted<P2MerkleHasher> for SimdBackend {
-        fn build_leaves(columns: &[&Col<Self, BaseField>], lifting_log_size: u32) -> Col<Self, P2Hash> {
+        fn build_leaves(
+            columns: &[&Col<Self, BaseField>],
+            lifting_log_size: u32,
+        ) -> Col<Self, P2Hash> {
             // Move the (SIMD-packed) trace columns to CPU once at the merkle
             // boundary, then run the scalar leaf hash ROW-PARALLEL. This is the
             // same algorithm as `<CpuBackend as MerkleOpsLifted>::build_leaves`
@@ -693,10 +696,7 @@ mod simd_backend {
     /// `P2MerkleHasher`, so every per-row pass is a `par_iter`. Bit-identical to
     /// the serial `CpuBackend` path (`poseidon2_canonical_segment` + the
     /// `*_simd_matches_cpu` test pin this).
-    fn build_leaves_row_parallel(
-        columns: &[Vec<BaseField>],
-        lifting_log_size: u32,
-    ) -> Vec<P2Hash> {
+    fn build_leaves_row_parallel(columns: &[Vec<BaseField>], lifting_log_size: u32) -> Vec<P2Hash> {
         if columns.is_empty() {
             return alloc::vec![P2MerkleHasher::default().finalize()];
         }

@@ -102,12 +102,7 @@ impl AiExtension {
     /// job queue. The `vosx` generic job driver polls + streams; a scripted
     /// caller polls `job_poll` and releases with `job_release`.
     #[msg(job, cli)]
-    async fn generate(
-        &mut self,
-        prompt: String,
-        max_tokens: u32,
-        _ctx: &mut Context<Self>,
-    ) -> u64 {
+    async fn generate(&mut self, prompt: String, max_tokens: u32, _ctx: &mut Context<Self>) -> u64 {
         let inner = self.inner();
         runtime::begin_generate(&inner, prompt, max_tokens)
     }
@@ -145,7 +140,15 @@ impl AiExtension {
             Err(msg) => return runtime::begin_failed(&inner, msg),
         };
         let full_prompt = actor_change::build_prompt(&files, &prompt);
-        runtime::begin_actor_change(&inner, full_prompt, max_tokens, project, branch, base_commit, apply)
+        runtime::begin_actor_change(
+            &inner,
+            full_prompt,
+            max_tokens,
+            project,
+            branch,
+            base_commit,
+            apply,
+        )
     }
 
     /// Reserved `job_poll`: drain a generation's newly-decoded tokens as the

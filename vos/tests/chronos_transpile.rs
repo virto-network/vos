@@ -13,8 +13,7 @@
 #[test]
 fn chronos_actor_elf_transpiles() {
     let workspace = env!("CARGO_MANIFEST_DIR");
-    let path =
-        format!("{workspace}/../actors/chronos/target/riscv64em-javm/release/chronos.elf");
+    let path = format!("{workspace}/../actors/chronos/target/riscv64em-javm/release/chronos.elf");
     let elf = match std::fs::read(&path) {
         Ok(d) => d,
         Err(_) => {

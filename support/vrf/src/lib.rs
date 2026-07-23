@@ -270,7 +270,11 @@ mod tests {
         let (sk, pk) = keypair_from_seed(&SEED_A);
         let proof = prove(&sk, &pk, ALPHA);
         let beta = verify(&pk, ALPHA, &proof).expect("a valid proof must verify");
-        assert_eq!(beta, output(&proof), "verify must return the proof's output");
+        assert_eq!(
+            beta,
+            output(&proof),
+            "verify must return the proof's output"
+        );
     }
 
     #[test]
@@ -290,7 +294,10 @@ mod tests {
             gamma: other_gamma,
             ..proof
         };
-        assert!(verify(&pk, ALPHA, &bad2).is_none(), "tampered gamma must fail");
+        assert!(
+            verify(&pk, ALPHA, &bad2).is_none(),
+            "tampered gamma must fail"
+        );
     }
 
     #[test]

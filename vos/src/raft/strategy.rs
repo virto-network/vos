@@ -292,9 +292,7 @@ impl CommitStrategy for RaftCommit {
             let new_last_applied = self.meta.commit_index;
             let txn = self.db.begin_write()?;
             {
-                if state_changed
-                    && let Some(state) = state
-                {
+                if state_changed && let Some(state) = state {
                     let mut state_table = txn.open_table(STATE_TABLE)?;
                     state_table.insert(STATE_KEY, state)?;
                 }
@@ -323,9 +321,7 @@ impl CommitStrategy for RaftCommit {
                 self.meta.write_host_fields_in_txn(&txn)?;
             }
             txn.commit()?;
-            if state_changed
-                && let Some(state) = state
-            {
+            if state_changed && let Some(state) = state {
                 self.last_state = state.to_vec();
             }
             return Ok(CommitReceipt {
@@ -354,9 +350,9 @@ impl CommitStrategy for RaftCommit {
                 let propose_timeout = Duration::from_millis(self.cfg.propose_timeout_ms);
                 let handle = worker.handler();
                 let idx = handle.propose(payload).map_err(|e| match e {
-                    ProposeError::NotLeader => CommitError::Config(
-                        "raft commit: this replica is not the leader".into(),
-                    ),
+                    ProposeError::NotLeader => {
+                        CommitError::Config("raft commit: this replica is not the leader".into())
+                    }
                     ProposeError::Storage(inner) => inner,
                 })?;
                 // Drain apply notifications until the worker

@@ -604,7 +604,14 @@ fn dev_compile(daemon: &Daemon, name: &str) {
     let (pid, commit) = dyn_target(daemon, name, "main");
     run_cli(
         daemon,
-        &["dev", "compile", &pid, &commit, "--space", &daemon.space_name],
+        &[
+            "dev",
+            "compile",
+            &pid,
+            &commit,
+            "--space",
+            &daemon.space_name,
+        ],
         "dev compile",
     );
 }
@@ -614,7 +621,14 @@ fn dev_compile_capture(daemon: &Daemon, name: &str) -> (i32, String, String) {
     let (pid, commit) = dyn_target(daemon, name, "main");
     run_cli_capture(
         daemon,
-        &["dev", "compile", &pid, &commit, "--space", &daemon.space_name],
+        &[
+            "dev",
+            "compile",
+            &pid,
+            &commit,
+            "--space",
+            &daemon.space_name,
+        ],
         "dev compile",
     )
 }
@@ -646,7 +660,10 @@ fn dyn_publish_target(daemon: &Daemon, name: &str) -> (String, String) {
     let client = TestClient::connect(daemon.data_dir());
     let sid = client.resolve_instance(name);
     let head = hex::encode(current_head(&client, sid, "builds"));
-    (format!("project_id={}", sid.0), format!("build_commit={head}"))
+    (
+        format!("project_id={}", sid.0),
+        format!("build_commit={head}"),
+    )
 }
 
 // ── The test ────────────────────────────────────────────────────────
@@ -1328,8 +1345,8 @@ fn dev_show_tree_and_file() {
         Value::Bytes(b) => b,
         other => panic!("get_blob returned {other:?}"),
     };
-    let blob = <dev_project::BlobObject as Decode>::try_decode(&blob_bytes)
-        .expect("decode BlobObject");
+    let blob =
+        <dev_project::BlobObject as Decode>::try_decode(&blob_bytes).expect("decode BlobObject");
     let file_text = String::from_utf8(blob.bytes).expect("source is utf-8");
     assert!(
         file_text.contains("pub struct Counter"),

@@ -263,8 +263,11 @@ mod tests {
             let m = vos::value::Msg::new(name).with("root", vec![0xAAu8; 38]);
             let mut msg = vec![vos::value::TAG_DYNAMIC];
             msg.extend_from_slice(&m.encode());
-            let event =
-                vos::effect_log::CrdtEvent::new([0u8; 32], 0, vos::effect_log::EffectLog::for_msg(msg));
+            let event = vos::effect_log::CrdtEvent::new(
+                [0u8; 32],
+                0,
+                vos::effect_log::EffectLog::for_msg(msg),
+            );
             let payload = event.to_bytes();
             let mut node = (payload.len() as u64).to_le_bytes().to_vec();
             node.extend_from_slice(&payload);
@@ -298,8 +301,11 @@ mod tests {
             let m = vos::value::Msg::new("set_space_id").with("space_id", value.to_vec());
             let mut msg = vec![vos::value::TAG_DYNAMIC];
             msg.extend_from_slice(&m.encode());
-            let event =
-                vos::effect_log::CrdtEvent::new([0u8; 32], 0, vos::effect_log::EffectLog::for_msg(msg));
+            let event = vos::effect_log::CrdtEvent::new(
+                [0u8; 32],
+                0,
+                vos::effect_log::EffectLog::for_msg(msg),
+            );
             let payload = event.to_bytes();
             let mut node = (payload.len() as u64).to_le_bytes().to_vec();
             node.extend_from_slice(&payload);
@@ -310,7 +316,10 @@ mod tests {
         let space_id = [0x5au8; 32];
         let v = genesis_node_validator(space_id);
         // The genuine anchor (this space's id) is accepted — CID irrelevant.
-        assert!(v(&[1u8; 32], &set_space_id_node(&space_id)), "genuine space_id accepted");
+        assert!(
+            v(&[1u8; 32], &set_space_id_node(&space_id)),
+            "genuine space_id accepted"
+        );
         // A forged set_space_id carrying a sibling space's id (or a bogus
         // one) is rejected at ingest — so a member can't grind a concurrent
         // node that sorts first on replay and poisons the anchor.

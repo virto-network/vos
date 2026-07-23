@@ -8,7 +8,10 @@
 
 use clap::Subcommand;
 
-use vos::registry::{MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, NODE_ROLE_OBSERVER, NODE_ROLE_VOTER, PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, Status};
+use vos::registry::{
+    MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, NODE_ROLE_OBSERVER, NODE_ROLE_VOTER,
+    PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, Status,
+};
 
 use serde::Serialize;
 
@@ -81,7 +84,10 @@ pub(crate) fn print_invites(space: &str, invites: &[vos::registry::InviteRow]) {
             n,
         );
     }
-    for inv in invites.iter().filter(|i| i.redeemed_by.len() > 1 && !i.revoked) {
+    for inv in invites
+        .iter()
+        .filter(|i| i.redeemed_by.len() > 1 && !i.revoked)
+    {
         let short: String = hex::encode(inv.token_pub).chars().take(16).collect();
         println!(
             "warning: token {short}… was redeemed by {} nodes — revoke it with \

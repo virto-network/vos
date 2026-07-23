@@ -91,7 +91,11 @@ impl Inner {
 /// Register + begin a plain streaming generation job. Returns the new
 /// job id for `job_poll` / `job_release`.
 pub(crate) fn begin_generate(inner: &Arc<Inner>, prompt: String, max_tokens: u32) -> u64 {
-    let id = inner.jobs.lock().expect("jobs mutex poisoned in begin_generate").begin();
+    let id = inner
+        .jobs
+        .lock()
+        .expect("jobs mutex poisoned in begin_generate")
+        .begin();
     spawn_worker(inner, id, prompt, max_tokens, false);
     id
 }
@@ -110,7 +114,11 @@ pub(crate) fn begin_actor_change(
     base_commit: Vec<u8>,
     apply: bool,
 ) -> u64 {
-    let id = inner.jobs.lock().expect("jobs mutex poisoned in begin_actor_change").begin();
+    let id = inner
+        .jobs
+        .lock()
+        .expect("jobs mutex poisoned in begin_actor_change")
+        .begin();
     if apply {
         inner.apply.lock().expect("apply mutex poisoned").insert(
             id,
@@ -133,7 +141,10 @@ pub(crate) fn begin_actor_change(
 /// before any generation starts — the driver polls once, sees the
 /// error, and exits non-zero.
 pub(crate) fn begin_failed(inner: &Arc<Inner>, msg: String) -> u64 {
-    let mut jobs = inner.jobs.lock().expect("jobs mutex poisoned in begin_failed");
+    let mut jobs = inner
+        .jobs
+        .lock()
+        .expect("jobs mutex poisoned in begin_failed");
     let id = jobs.begin();
     jobs.fail(id, msg);
     id
@@ -183,7 +194,10 @@ fn run_generate_worker(inner: Arc<Inner>, id: u64, prompt: String, max_tokens: u
         // Hand the results to the apply record; `job_poll` finalizes
         // (parse + commit + terminal) with the `Context` a worker lacks.
         // If the record vanished (released mid-flight) just terminalize.
-        let mut applies = inner.apply.lock().expect("apply mutex poisoned in worker finish");
+        let mut applies = inner
+            .apply
+            .lock()
+            .expect("apply mutex poisoned in worker finish");
         if let Some(st) = applies.get_mut(&id) {
             st.full_text = full_text;
             st.outcome_err = result.err().map(|e| format!("{e:#}"));
@@ -199,7 +213,10 @@ fn run_generate_worker(inner: Arc<Inner>, id: u64, prompt: String, max_tokens: u
 
 /// Finish or fail job `id` in the queue directly (non-apply path).
 fn terminal_direct(inner: &Inner, id: u64, result: anyhow::Result<()>) {
-    let mut jobs = inner.jobs.lock().expect("jobs mutex poisoned in worker finish");
+    let mut jobs = inner
+        .jobs
+        .lock()
+        .expect("jobs mutex poisoned in worker finish");
     match result {
         Ok(()) => jobs.finish(id),
         Err(e) => {
@@ -228,7 +245,11 @@ pub(crate) async fn maybe_finalize_apply(inner: &Inner, ctx: &mut AiCtx, id: u64
     let Some(state) = state else { return };
 
     if let Some(err) = state.outcome_err {
-        inner.jobs.lock().expect("jobs mutex poisoned").fail(id, err);
+        inner
+            .jobs
+            .lock()
+            .expect("jobs mutex poisoned")
+            .fail(id, err);
         return;
     }
 
@@ -268,7 +289,11 @@ pub(crate) fn poll_generation(inner: &Inner, id: u64) -> Vec<u8> {
 /// clears any lingering apply record (a release before finalize cancels
 /// the write-back rather than orphaning the record).
 pub(crate) fn release_generation(inner: &Inner, id: u64) -> bool {
-    inner.apply.lock().expect("apply mutex poisoned").remove(&id);
+    inner
+        .apply
+        .lock()
+        .expect("apply mutex poisoned")
+        .remove(&id);
     inner
         .jobs
         .lock()

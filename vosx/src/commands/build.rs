@@ -35,8 +35,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     if actor_pvm.is_empty() {
         bail!("{} produced an empty PVM", args.program.display());
     }
-    javm::program::parse_blob(&actor_pvm)
-        .ok_or_else(|| anyhow!("invalid canonical actor PVM"))?;
+    javm::program::parse_blob(&actor_pvm).ok_or_else(|| anyhow!("invalid canonical actor PVM"))?;
 
     let actor_metadata = (!is_pvm).then(|| vos::metadata::from_elf(&input)).flatten();
     if args.crdt && actor_metadata.as_ref().is_some_and(|meta| !meta.crdt) {

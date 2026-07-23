@@ -22,8 +22,7 @@ fn settle_elf_transpiles_to_pvm() {
         }
     };
 
-    let blob = grey_transpiler::link_elf(&elf)
-        .expect("grey-transpile settle.elf to PVM bytecode");
+    let blob = grey_transpiler::link_elf(&elf).expect("grey-transpile settle.elf to PVM bytecode");
     assert!(!blob.is_empty(), "transpiled PVM blob is empty");
     eprintln!(
         "settle.elf transpiled OK: {} ELF bytes -> {} PVM-blob bytes",

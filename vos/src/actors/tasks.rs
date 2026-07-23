@@ -41,9 +41,7 @@ pub enum Child {
 
 /// Where a task is in its lifecycle. Wire-stable discriminants.
 #[repr(u8)]
-#[derive(
-    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq,
-)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatus {
     /// Spawned (or retried) and not yet driven.
     Idle = 0,
@@ -149,9 +147,7 @@ impl TaskRecord {
 
 /// The parent's task table. Embed as an rkyv field of the parent
 /// actor; spawn from handlers, drive from a tick handler.
-#[derive(
-    rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Default, PartialEq,
-)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct Tasks {
     next_id: u64,
     records: Vec<(u64, TaskRecord)>,

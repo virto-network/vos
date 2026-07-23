@@ -521,9 +521,7 @@ impl<T: PartialEq> List<T> {
                     .elements
                     .get(right)
                     .map_or(0, |element| element.logical_time);
-                right_time
-                    .cmp(&left_time)
-                    .then_with(|| left.cmp(right))
+                right_time.cmp(&left_time).then_with(|| left.cmp(right))
             });
         }
 
@@ -731,10 +729,7 @@ mod tests {
 
     #[test]
     fn change_ids_frame_variable_length_inputs() {
-        assert_ne!(
-            ChangeId::derive(b"ab", b"c"),
-            ChangeId::derive(b"a", b"bc")
-        );
+        assert_ne!(ChangeId::derive(b"ab", b"c"), ChangeId::derive(b"a", b"bc"));
     }
 
     #[test]

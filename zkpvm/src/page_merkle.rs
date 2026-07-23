@@ -613,7 +613,8 @@ pub fn boundary_blake2b_calls(
         k[208] = c.f as u8;
         k
     };
-    let mut index: alloc::collections::BTreeMap<[u8; 209], usize> = alloc::collections::BTreeMap::new();
+    let mut index: alloc::collections::BTreeMap<[u8; 209], usize> =
+        alloc::collections::BTreeMap::new();
     let mut unique = Vec::new();
     let mut mults: Vec<u32> = Vec::new();
     for c in calls {
@@ -975,7 +976,11 @@ mod tests {
         for c in &raw {
             *counts.entry(key(c)).or_default() += 1;
         }
-        assert_eq!(counts.len(), calls.len(), "every distinct raw call survives");
+        assert_eq!(
+            counts.len(),
+            calls.len(),
+            "every distinct raw call survives"
+        );
         for (c, &m) in calls.iter().zip(&mults) {
             assert_eq!(counts.get(&key(c)), Some(&m), "multiplicity mismatch");
         }
@@ -1032,7 +1037,11 @@ mod tests {
             for w in c.m {
                 v.extend(w.to_le_bytes().map(|b| BaseField::from(b as u32)));
             }
-            v.extend(c.t.to_le_bytes()[..8].iter().map(|&b| BaseField::from(b as u32)));
+            v.extend(
+                c.t.to_le_bytes()[..8]
+                    .iter()
+                    .map(|&b| BaseField::from(b as u32)),
+            );
             v.push(BaseField::from(c.f as u32));
             v.extend(replay(c).map(|b| BaseField::from(b as u32)));
             <Blake2bCompressionLookupElements as Relation<BaseField, SecureField>>::combine(
@@ -1041,13 +1050,19 @@ mod tests {
             )
             .inverse()
         };
-        let consumed = raw.iter().map(&inv_denom).fold(SecureField::default(), |a, f| a + f);
+        let consumed = raw
+            .iter()
+            .map(&inv_denom)
+            .fold(SecureField::default(), |a, f| a + f);
         let produced = calls
             .iter()
             .zip(&mults)
             .map(|(c, &m)| inv_denom(c) * BaseField::from(m))
             .fold(SecureField::default(), |a, f| a + f);
-        assert_eq!(produced, consumed, "deduped productions must cancel the consumptions");
+        assert_eq!(
+            produced, consumed,
+            "deduped productions must cancel the consumptions"
+        );
 
         let forged = calls
             .iter()

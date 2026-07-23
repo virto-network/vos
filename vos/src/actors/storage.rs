@@ -403,8 +403,7 @@ impl Core {
 }
 
 fn decode_or_panic<T: Decode>(bytes: &[u8], what: &str) -> T {
-    T::try_decode(bytes)
-        .unwrap_or_else(|| panic!("corrupt {what} row — decode failed"))
+    T::try_decode(bytes).unwrap_or_else(|| panic!("corrupt {what} row — decode failed"))
 }
 
 /// Stamp the unit rkyv impls a handle needs to sit inside a derived
@@ -734,8 +733,7 @@ impl<K: FixedKey, V: Encode + Decode> StorageMap<K, V> {
             (fresh, split)
         });
         if let Some((split_key, upper)) = split {
-            let new_page =
-                self.with_meta(|m| meta::split_insert(m, slot, &split_key, K::WIDTH));
+            let new_page = self.with_meta(|m| meta::split_insert(m, slot, &split_key, K::WIDTH));
             overlay_store(self.page_row(new_page), Some(upper));
         }
         if fresh {
@@ -1206,7 +1204,11 @@ mod tests {
         replay(); // stale materialization
         mock::reset(); // clear_service wipes the whole keyspace
         replay(); // replay from empty
-        assert_eq!(stored_len(), 2, "clear-before-replay rebuilds the true length");
+        assert_eq!(
+            stored_len(),
+            2,
+            "clear-before-replay rebuilds the true length"
+        );
         assert_eq!(
             mock::snapshot(),
             canonical,
@@ -1243,7 +1245,10 @@ mod tests {
         sorted.sort();
         assert_eq!(keys, sorted, "drain is key-ordered");
         assert_eq!(
-            drained.iter().filter(|(k, _)| keys.iter().filter(|k2| **k2 == k.as_slice()).count() > 1).count(),
+            drained
+                .iter()
+                .filter(|(k, _)| keys.iter().filter(|k2| **k2 == k.as_slice()).count() > 1)
+                .count(),
             0,
             "one effect per touched key"
         );

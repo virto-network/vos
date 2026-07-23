@@ -183,7 +183,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .with_name(vos::node::REGISTRY_AGENT_NAME)
         .with_consistency(Consistency::Crdt)
         .with_replication_id(replication_id)
-        .with_node_validator(crate::commands::space::common::genesis_node_validator(space_id))
+        .with_node_validator(crate::commands::space::common::genesis_node_validator(
+            space_id,
+        ))
         .persist(&data_dir);
     let id = node.register_at_id(cfg, ServiceId::REGISTRY);
 
@@ -240,7 +242,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // half) and projects its node-local half into `local.toml`, then
     // clears the marker so a later bare `space up` doesn't re-apply.
     if !entry.pending_recipe.is_empty() {
-        genesis_apply(&mut node, &entry.pending_recipe, local_prefix, &space_id, &data_dir)?;
+        genesis_apply(
+            &mut node,
+            &entry.pending_recipe,
+            local_prefix,
+            &space_id,
+            &data_dir,
+        )?;
         clear_pending_recipe(&entry.id)?;
     }
 
@@ -256,7 +264,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // Register node-local `.so` extensions from `local.toml`, returning
     // each one's effective relay caps for the endpoint descriptor
     // (`space describe` / `space caps`).
-    let extension_caps = register_extensions_from_local(&mut node, &local_cfg, &data_dir, local_prefix)?;
+    let extension_caps =
+        register_extensions_from_local(&mut node, &local_cfg, &data_dir, local_prefix)?;
 
     // Spawn every installed agent recorded in the registry.
     // Each gets a deterministic per-node ServiceId so its redb
@@ -324,9 +333,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         let mut boot_grace = BootGrace::new();
         // Program-blob fetches in flight, shared with the background fetch
         // tasks the reconcile pass spawns for uncached rows.
-        let in_flight: InFlightBlobs = std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashSet::new(),
-        ));
+        let in_flight: InFlightBlobs =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let mut query_warned = false;
         let mut last_pass = std::time::Instant::now();
         // chronos clock/randomness feed (`vos::chronos_feed::ChronosFeeder`): a
@@ -881,7 +889,6 @@ fn build_network_for_daemon(
     }))
 }
 
-
 /// Node-local per-agent policy from the recipe (never replicated): the
 /// periodic `tick_ms` and the parsed `intra_caps` relay bound.
 #[derive(Default, Clone)]
@@ -907,7 +914,13 @@ fn agent_policies_from_local(cfg: &subscriptions::LocalConfig) -> anyhow::Result
         }
         let tick_ms = a.tick_ms.filter(|ms| *ms > 0);
         if tick_ms.is_some() || !intra_caps.is_empty() {
-            map.insert(name.clone(), AgentLocalPolicy { tick_ms, intra_caps });
+            map.insert(
+                name.clone(),
+                AgentLocalPolicy {
+                    tick_ms,
+                    intra_caps,
+                },
+            );
         }
     }
     Ok(map)
@@ -931,7 +944,12 @@ fn device_secret_agents_from_local(cfg: &subscriptions::LocalConfig) -> Vec<Stri
 /// that bypasses the auth gate). Idempotent: the agent persists the seed in
 /// its Local redb, so a re-send on a later boot is a no-op. Best-effort — a
 /// failure to seed is logged, not fatal.
-fn provision_device_seeds(node: &VosNode, agents: &[String], data_dir: &std::path::Path, daemon_prefix: u16) {
+fn provision_device_seeds(
+    node: &VosNode,
+    agents: &[String],
+    data_dir: &std::path::Path,
+    daemon_prefix: u16,
+) {
     for name in agents {
         let svc_id = crate::commands::space::common::instance_service_id(name, daemon_prefix);
         let seed = match load_or_mint_device_seed(data_dir, svc_id) {
@@ -958,7 +976,10 @@ fn provision_device_seeds(node: &VosNode, agents: &[String], data_dir: &std::pat
 
 /// Load an agent's 32-byte device seed from its node-local sidecar, minting
 /// fresh OS entropy (persisted `0600`) on first boot.
-fn load_or_mint_device_seed(data_dir: &std::path::Path, svc_id: ServiceId) -> anyhow::Result<Vec<u8>> {
+fn load_or_mint_device_seed(
+    data_dir: &std::path::Path,
+    svc_id: ServiceId,
+) -> anyhow::Result<Vec<u8>> {
     let dir = data_dir.join("agents");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{:08x}.seed", svc_id.0));
@@ -969,7 +990,8 @@ fn load_or_mint_device_seed(data_dir: &std::path::Path, svc_id: ServiceId) -> an
         tracing::warn!(?path, "device seed sidecar has wrong length; re-minting");
     }
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).map_err(|e| anyhow::anyhow!("OS entropy for device seed: {e}"))?;
+    getrandom::getrandom(&mut seed)
+        .map_err(|e| anyhow::anyhow!("OS entropy for device seed: {e}"))?;
     write_secret_file(&path, &seed)?;
     Ok(seed.to_vec())
 }
@@ -1045,8 +1067,8 @@ fn spawn_installed_agents(
     has_hyperspace: bool,
     policies: &AgentPolicies,
 ) -> anyhow::Result<()> {
-    use vos::registry::{RegistryRef, Status};
     use std::collections::HashSet;
+    use vos::registry::{RegistryRef, Status};
 
     let local_cfg = crate::commands::space::subscriptions::load(data_dir).unwrap_or_default();
     if local_cfg.is_filtering() {
