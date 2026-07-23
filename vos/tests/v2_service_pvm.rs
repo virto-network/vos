@@ -386,6 +386,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     };
     let mut host = DurableAccumulateHost::default();
     host.preimages.insert(initial.hash.0, initial_bytes);
+    host.programs.insert(actor_program.0, actor_pvm.clone());
     let mut service = JamServiceV2::new(
         service_pvm.clone(),
         ProgramId::of_pvm(&service_pvm),
