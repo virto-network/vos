@@ -15,6 +15,25 @@ consensus-visible state rather than a node-local cache. A bounded reclamation
 or checkpoint plan for unreachable SMT and CRDT DAG nodes is also required
 before the engine stores production state.
 
+The CRDT checkpoint is a consensus feature, not a local cache optimization.
+Before cutover it must:
+
+- bind a complete, CID-verified causal frontier and every actor
+  materialization needed to resume from it;
+- verify full ancestry once while ingesting untrusted DAG blocks, then let
+  activation walk only the bounded suffix after the latest retained
+  checkpoint;
+- retain every head referenced by a suspended continuation or in-flight work
+  envelope, even when a newer checkpoint exists;
+- prune DAG nodes, completeness metadata, and stale SMT interior nodes only
+  after the checkpoint and all referenced blobs are durably available under
+  the selected Local, Raft, or CRDT availability rule; and
+- detect a missing or malicious parent before marking a checkpoint complete.
+
+Until that lands, CRDT activation deliberately revalidates complete ancestry.
+This is sound but O(history), so the current CRDT engine remains a conformance
+path rather than a production-state path.
+
 VOS v2 assigns one logical JAM service to a root actor and its owned child
 tree. The protocol-pinned `vos-service.pvm` is one generic program with the
 Gray Paper two-slot entry prologue: Refine begins at instruction counter 0 and
