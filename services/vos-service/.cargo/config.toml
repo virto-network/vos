@@ -1,3 +1,8 @@
+[build]
+# Remap the complete repository, including the sibling `vos` path dependency.
+# `-Zremap-cwd-prefix` alone covers only this service package.
+rustc-wrapper = "./rustc-remap.sh"
+
 [target.riscv64em-javm]
 rustflags = [
     "-Zunstable-options",
@@ -7,10 +12,6 @@ rustflags = [
     "-Aunused-attributes",
     # Canonical service identity must not depend on its checkout directory.
     "-Zremap-cwd-prefix=.",
-    # Cargo derives crate metadata from absolute path-package identities.
-    # Override it after Cargo's generated value so symbol hashes and linker
-    # ordering remain stable when this protocol program is built elsewhere.
-    "-Cmetadata=vos-service-v2",
 ]
 
 [alias]
