@@ -1594,17 +1594,17 @@ fn fetch_at_buf_size_boundary_delivers_message() {
     // while trailing padding would break it.
     //
     // The guest FETCH buffer is BUF_SIZE. `node.invoke` wraps every
-    // inbox payload with a 6-byte Unauthenticated caller prefix
-    // (TAG_CALLER_PREFIX + 5 flag bytes — see `wrap_with_unauthenticated_prefix`),
-    // so the WIRE item the guest fetches is `6 + payload`. Size the payload so
+    // inbox payload with a 38-byte dispatch prefix (tag + five caller/role
+    // bytes + InvocationId — see `wrap_with_unauthenticated_prefix`), so the
+    // WIRE item the guest fetches is `38 + payload`. Size the payload so
     // that wrapped item is EXACTLY BUF_SIZE — the exact-fit boundary that
     // `fetch_raw` must accept (`n == buf.len()`) rather than reject as
     // truncated. (A payload whose wrapped item would EXCEED BUF_SIZE is
     // genuinely undeliverable through the fixed guest buffer;
     // `node::send_if_deliverable` refuses it with a `warn!` rather than
     // silently dropping it — see `fetch_over_buf_size_boundary_is_refused`.)
-    const CALLER_PREFIX_LEN: usize = 6;
-    let target = vos::lifecycle::BUF_SIZE - CALLER_PREFIX_LEN; // wrapped wire item == BUF_SIZE
+    const DISPATCH_PREFIX_LEN: usize = 38;
+    let target = vos::lifecycle::BUF_SIZE - DISPATCH_PREFIX_LEN; // wrapped wire item == BUF_SIZE
     let m = Msg::new("inc");
     let encoded = m.encode();
     let pad_len = target - 1 - encoded.len();
@@ -1615,7 +1615,7 @@ fn fetch_at_buf_size_boundary_delivers_message() {
     assert_eq!(
         payload.len(),
         target,
-        "payload sized so the 6-byte-wrapped wire item lands on the BUF_SIZE boundary"
+        "payload sized so the dispatch-wrapped wire item lands on the BUF_SIZE boundary"
     );
 
     // Use `node.invoke` rather than node.outbox_sender so the
@@ -1668,11 +1668,11 @@ fn fetch_over_buf_size_boundary_is_refused() {
     let id = node.register(AgentConfig::new(counter_blob));
     let counter = CrdtCounterRef::at(id);
 
-    // One byte OVER the boundary: with the 6-byte caller-prefix wrap the wire
+    // One byte OVER the boundary: with the 38-byte dispatch-prefix wrap the wire
     // item is BUF_SIZE + 1, which the guest's fixed FETCH buffer cannot
     // hold — send_if_deliverable refuses it.
-    const CALLER_PREFIX_LEN: usize = 6;
-    let target = vos::lifecycle::BUF_SIZE - CALLER_PREFIX_LEN + 1; // wrapped wire item == BUF_SIZE + 1
+    const DISPATCH_PREFIX_LEN: usize = 38;
+    let target = vos::lifecycle::BUF_SIZE - DISPATCH_PREFIX_LEN + 1; // wrapped wire item == BUF_SIZE + 1
     let m = Msg::new("inc");
     let encoded = m.encode();
     let pad_len = target - 1 - encoded.len();

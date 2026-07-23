@@ -40,6 +40,7 @@ pub type CallerPrefix = [u8; 5];
 /// replayed as System historically; keeping that default preserves
 /// their behavior).
 pub const CALLER_SYSTEM: CallerPrefix = [1, 0, 0, 0, 0];
+const INVOCATION_ID_EXTENSION: u8 = 0x01;
 
 /// Default size cap for a single `ctx.ask` reply, in bytes.
 ///
@@ -100,6 +101,11 @@ pub struct EffectLog {
     /// to the reply they rode with. Empty for dispatches whose invokes
     /// produced no effects (and for every ask reply).
     pub invoke_effects: Vec<InvokeEffects>,
+    /// Invocation identity supplied to the handler. New logs carry it in a
+    /// trailing extension so every replay strategy restores it exactly.
+    /// Legacy CRDT logs reconstruct it from the enclosing
+    /// [`CrdtEvent`]'s `(origin, seq)`.
+    invocation_id: crate::v2::InvocationId,
 }
 
 impl EffectLog {
@@ -112,6 +118,7 @@ impl EffectLog {
             anchor: [0u8; 32],
             caller_prefix: CALLER_SYSTEM,
             invoke_effects: Vec::new(),
+            invocation_id: crate::v2::InvocationId::ZERO,
         }
     }
 
@@ -127,6 +134,16 @@ impl EffectLog {
     /// by the host alongside the anchor, before the log commits.
     pub fn set_caller_prefix(&mut self, prefix: CallerPrefix) {
         self.caller_prefix = prefix;
+    }
+
+    /// Record the stable identity the guest observed for this dispatch.
+    pub fn set_invocation_id(&mut self, invocation_id: crate::v2::InvocationId) {
+        self.invocation_id = invocation_id;
+    }
+
+    /// Stable invocation identity reconstructed for dispatch or replay.
+    pub fn invocation_id(&self) -> crate::v2::InvocationId {
+        self.invocation_id
     }
 
     /// Append the next reply captured during dispatch.
@@ -162,12 +179,13 @@ impl EffectLog {
     /// [anchor_kind:u8][anchor:32B][caller_prefix:5B]
     /// [n_invoke_effects:u64 LE]
     /// ( [reply_idx:u64 LE][svc_id:u32 LE][len:u64 LE][effects] )*
+    /// [INVOCATION_ID_EXTENSION:u8][invocation_id:32B]
     /// ```
     ///
-    /// The invoke-effects section is a trailing extension: it is
-    /// omitted entirely when empty, and decoders treat its absence as
-    /// empty — logs recorded before the section existed keep their
-    /// CIDs and replay with their historical semantics.
+    /// Both trailing sections are omitted when empty/zero, and decoders treat
+    /// their absence as legacy defaults. When an invocation id is present the
+    /// invoke-effect count is emitted even when zero, keeping the extension
+    /// boundary unambiguous.
     ///
     /// The encoding is deterministic and unambiguous, so two
     /// replicas observing the same dispatch produce the same bytes
@@ -186,7 +204,7 @@ impl EffectLog {
         buf.push(self.anchor_kind);
         buf.extend_from_slice(&self.anchor);
         buf.extend_from_slice(&self.caller_prefix);
-        if !self.invoke_effects.is_empty() {
+        if !self.invoke_effects.is_empty() || self.invocation_id != crate::v2::InvocationId::ZERO {
             buf.extend_from_slice(&(self.invoke_effects.len() as u64).to_le_bytes());
             for rec in &self.invoke_effects {
                 buf.extend_from_slice(&rec.reply_idx.to_le_bytes());
@@ -194,6 +212,10 @@ impl EffectLog {
                 buf.extend_from_slice(&(rec.effects.len() as u64).to_le_bytes());
                 buf.extend_from_slice(&rec.effects);
             }
+        }
+        if self.invocation_id != crate::v2::InvocationId::ZERO {
+            buf.push(INVOCATION_ID_EXTENSION);
+            buf.extend_from_slice(self.invocation_id.as_bytes());
         }
         buf
     }
@@ -217,41 +239,62 @@ impl EffectLog {
             replies.push(take(bytes, &mut pos, len)?.to_vec());
         }
 
-        let (anchor_kind, anchor, caller_prefix, invoke_effects) = if pos == bytes.len() {
-            (ANCHOR_UNRECORDED, [0u8; 32], CALLER_SYSTEM, Vec::new())
-        } else {
-            let kind = *bytes.get(pos)?;
-            pos += 1;
-            let mut anchor = [0u8; 32];
-            anchor.copy_from_slice(take(bytes, &mut pos, 32)?);
-            let mut prefix = [0u8; 5];
-            prefix.copy_from_slice(take(bytes, &mut pos, 5)?);
-            // Trailing invoke-effects section; absent = empty (logs
-            // recorded before the section existed keep their CIDs).
-            let effects = if pos == bytes.len() {
-                Vec::new()
+        let (anchor_kind, anchor, caller_prefix, invoke_effects, invocation_id) =
+            if pos == bytes.len() {
+                (
+                    ANCHOR_UNRECORDED,
+                    [0u8; 32],
+                    CALLER_SYSTEM,
+                    Vec::new(),
+                    crate::v2::InvocationId::ZERO,
+                )
             } else {
-                let n = read_u64(bytes, &mut pos)? as usize;
-                let mut records = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let reply_idx = read_u64(bytes, &mut pos)?;
-                    let svc_bytes = take(bytes, &mut pos, 4)?;
-                    let svc_id = u32::from_le_bytes(svc_bytes.try_into().ok()?);
-                    let len = read_u64(bytes, &mut pos)? as usize;
-                    let effects = take(bytes, &mut pos, len)?.to_vec();
-                    records.push(InvokeEffects {
-                        reply_idx,
-                        svc_id,
-                        effects,
-                    });
-                }
-                if pos != bytes.len() {
-                    return None;
-                }
-                records
+                let kind = *bytes.get(pos)?;
+                pos += 1;
+                let mut anchor = [0u8; 32];
+                anchor.copy_from_slice(take(bytes, &mut pos, 32)?);
+                let mut prefix = [0u8; 5];
+                prefix.copy_from_slice(take(bytes, &mut pos, 5)?);
+                // Trailing invoke-effects section; absent = empty (logs
+                // recorded before the section existed keep their CIDs).
+                let (effects, invocation_id) = if pos == bytes.len() {
+                    (Vec::new(), crate::v2::InvocationId::ZERO)
+                } else {
+                    let n = read_u64(bytes, &mut pos)? as usize;
+                    if n > bytes.len().saturating_sub(pos) / 20 {
+                        return None;
+                    }
+                    let mut records = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let reply_idx = read_u64(bytes, &mut pos)?;
+                        let svc_bytes = take(bytes, &mut pos, 4)?;
+                        let svc_id = u32::from_le_bytes(svc_bytes.try_into().ok()?);
+                        let len = read_u64(bytes, &mut pos)? as usize;
+                        let effects = take(bytes, &mut pos, len)?.to_vec();
+                        records.push(InvokeEffects {
+                            reply_idx,
+                            svc_id,
+                            effects,
+                        });
+                    }
+                    let invocation_id = if pos == bytes.len() {
+                        crate::v2::InvocationId::ZERO
+                    } else {
+                        if *bytes.get(pos)? != INVOCATION_ID_EXTENSION {
+                            return None;
+                        }
+                        pos += 1;
+                        let mut invocation_id = [0u8; 32];
+                        invocation_id.copy_from_slice(take(bytes, &mut pos, 32)?);
+                        crate::v2::InvocationId::new(invocation_id)
+                    };
+                    if pos != bytes.len() {
+                        return None;
+                    }
+                    (records, invocation_id)
+                };
+                (kind, anchor, prefix, effects, invocation_id)
             };
-            (kind, anchor, prefix, effects)
-        };
         Some(Self {
             msg,
             replies,
@@ -259,6 +302,7 @@ impl EffectLog {
             anchor,
             caller_prefix,
             invoke_effects,
+            invocation_id,
         })
     }
 }
@@ -276,9 +320,10 @@ impl EffectLog {
 /// so a replicated DAG round-trips through any replica without
 /// re-numbering.
 ///
-/// Replay reads `event.log` and feeds it through the runtime
-/// exactly as the originating replica did; `origin` and `seq` are
-/// metadata for the merkle layer, not visible to handlers.
+/// Replay reads `event.log` and feeds it through the runtime exactly as the
+/// originating replica did. The handler-visible [`crate::v2::InvocationId`] is
+/// deterministically reconstructed from `origin` and `seq`, so replay observes
+/// the same CRDT operation identity as the live dispatch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CrdtEvent {
     /// Replica id of the producer — typically the CRDT
@@ -302,9 +347,23 @@ pub struct CrdtEvent {
 pub const CRDT_EVENT_VERSION: u8 = 1;
 
 impl CrdtEvent {
+    /// Handler-visible identity corresponding to one durable CRDT event.
+    pub fn invocation_id_for(origin: [u8; 32], seq: u64) -> crate::v2::InvocationId {
+        let mut nonce = [0u8; 40];
+        nonce[..32].copy_from_slice(&origin);
+        nonce[32..].copy_from_slice(&seq.to_le_bytes());
+        crate::v2::InvocationId::derive(b"vos/crdt-event/v2", &nonce)
+    }
+
+    /// Handler-visible identity corresponding to this event.
+    pub fn invocation_id(&self) -> crate::v2::InvocationId {
+        Self::invocation_id_for(self.origin, self.seq)
+    }
+
     /// Build a fresh event tagged with the producing replica's
     /// id and a freshly allocated `seq`.
-    pub fn new(origin: [u8; 32], seq: u64, log: EffectLog) -> Self {
+    pub fn new(origin: [u8; 32], seq: u64, mut log: EffectLog) -> Self {
+        log.set_invocation_id(Self::invocation_id_for(origin, seq));
         Self { origin, seq, log }
     }
 
@@ -343,7 +402,11 @@ impl CrdtEvent {
         origin.copy_from_slice(&bytes[1..33]);
         let seq = u64::from_le_bytes(bytes[33..41].try_into().ok()?);
         let log = EffectLog::from_bytes(&bytes[41..])?;
-        Some(Self { origin, seq, log })
+        let expected = Self::invocation_id_for(origin, seq);
+        if log.invocation_id() != crate::v2::InvocationId::ZERO && log.invocation_id() != expected {
+            return None;
+        }
+        Some(Self::new(origin, seq, log))
     }
 }
 
@@ -630,6 +693,43 @@ mod tests {
         let bytes = log.to_bytes();
         let decoded = EffectLog::from_bytes(&bytes).expect("decode");
         assert_eq!(decoded, log);
+    }
+
+    #[test]
+    fn crdt_event_roundtrip_restores_handler_invocation_identity() {
+        let event = CrdtEvent::new([0xA5; 32], 17, EffectLog::for_msg(b"increment".to_vec()));
+        let expected = CrdtEvent::invocation_id_for([0xA5; 32], 17);
+        assert_eq!(event.invocation_id(), expected);
+        assert_eq!(event.log.invocation_id(), expected);
+
+        let decoded = CrdtEvent::from_bytes(&event.to_bytes()).expect("decode event");
+        assert_eq!(decoded, event);
+        assert_eq!(decoded.log.invocation_id(), expected);
+    }
+
+    #[test]
+    fn invocation_extension_roundtrips_and_legacy_zero_stays_omitted() {
+        let legacy = EffectLog::for_msg(b"legacy".to_vec());
+        let legacy_bytes = legacy.to_bytes();
+
+        let mut current = legacy.clone();
+        let invocation = crate::v2::InvocationId::derive(b"test", b"raft-replay");
+        current.set_invocation_id(invocation);
+        let current_bytes = current.to_bytes();
+
+        assert!(current_bytes.len() > legacy_bytes.len());
+        assert_eq!(
+            EffectLog::from_bytes(&legacy_bytes)
+                .expect("legacy decode")
+                .invocation_id(),
+            crate::v2::InvocationId::ZERO,
+        );
+        assert_eq!(
+            EffectLog::from_bytes(&current_bytes)
+                .expect("current decode")
+                .invocation_id(),
+            invocation,
+        );
     }
 
     #[test]

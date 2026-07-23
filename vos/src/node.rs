@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 #[cfg(feature = "network")]
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -2023,6 +2023,7 @@ fn replay_dag_into_runtime(
         // it) and detects nothing.
         let recorded_anchor = (log.anchor_kind, log.anchor);
         let recorded_caller = log.caller_prefix;
+        let recorded_invocation = log.invocation_id();
         let _ = runtime.take_dispatch_anchor(svc_id);
         // Replayed dispatches populate the same per-dispatch delta
         // trackers real dispatches do; nothing commits them during
@@ -2053,7 +2054,10 @@ fn replay_dag_into_runtime(
         if msg.is_empty() {
             runtime.send_to(svc_id, Vec::new());
         } else {
-            runtime.send_to(svc_id, encode_replay_payload(&recorded_caller, &msg));
+            runtime.send_to(
+                svc_id,
+                encode_replay_payload(&recorded_caller, recorded_invocation, &msg),
+            );
         }
         runtime.run_blocking();
         // External transfers emitted during replay had their
@@ -4190,13 +4194,14 @@ fn handle_invoke_request(
         }
     }
     let dispatch_caller_prefix = caller_prefix_bytes(&req);
+    let invocation_id = next_dispatch_invocation_id(strategy, svc_id);
     if recording_enabled {
         runtime.begin_recording(req.msg.clone());
     }
     // Wrap the dispatch payload with a caller-info header so the PVM
     // agent can populate Context::caller and role bytes from the caller info.
-    // Format: see lifecycle::TAG_CALLER_PREFIX.
-    let payload = encode_caller_prefix(&req);
+    // Format: see lifecycle::TAG_DISPATCH_PREFIX.
+    let payload = encode_caller_prefix(&req, invocation_id);
     send_if_deliverable(runtime, svc_id, payload);
 
     // Drive to quiescence, buffering external transfers as we go. The
@@ -4232,6 +4237,7 @@ fn handle_invoke_request(
         let mut log = runtime.finish_recording().expect("recording was started");
         log.set_anchor(anchor.0, anchor.1);
         log.set_caller_prefix(dispatch_caller_prefix);
+        log.set_invocation_id(invocation_id);
         strategy.commit(&crate::commit::AgentDelta {
             writes: &writes,
             anchor,
@@ -4378,10 +4384,15 @@ fn forbidden_envelope() -> Vec<u8> {
 /// emits a trusted-System prefix so the role
 /// check passes during replay — original authorisation is
 /// implicit in the fact the log was committed.
-fn encode_replay_payload(prefix: &crate::effect_log::CallerPrefix, msg: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(6 + msg.len());
-    out.push(crate::actors::lifecycle::TAG_CALLER_PREFIX);
+fn encode_replay_payload(
+    prefix: &crate::effect_log::CallerPrefix,
+    invocation_id: crate::v2::InvocationId,
+    msg: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(38 + msg.len());
+    out.push(crate::actors::lifecycle::TAG_DISPATCH_PREFIX);
     out.extend_from_slice(prefix);
+    out.extend_from_slice(invocation_id.as_bytes());
     out.extend_from_slice(msg);
     out
 }
@@ -4393,14 +4404,15 @@ fn encode_replay_payload(prefix: &crate::effect_log::CallerPrefix, msg: &[u8]) -
 /// trustworthy origin (external libp2p Tells set
 /// attacker-controlled `from` fields), so the wrap *always*
 /// uses Unauthenticated regardless of `env.from`.
-fn wrap_with_unauthenticated_prefix(msg: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(6 + msg.len());
-    out.push(crate::actors::lifecycle::TAG_CALLER_PREFIX);
+fn wrap_with_unauthenticated_prefix(msg: &[u8], invocation_id: crate::v2::InvocationId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(38 + msg.len());
+    out.push(crate::actors::lifecycle::TAG_DISPATCH_PREFIX);
     out.push(0); // trust_flag = external (Unauthenticated)
     out.push(0); // has_space_role
     out.push(0); // space byte (unused)
     out.push(0); // has_actor_local_role
     out.push(0); // actor_local byte (unused)
+    out.extend_from_slice(invocation_id.as_bytes());
     out.extend_from_slice(msg);
     out
 }
@@ -4457,20 +4469,22 @@ fn drive_capturing_external(
 /// Wrap the request's message bytes with a caller-info header so the
 /// PVM agent can populate `Context::caller` and the role bytes from caller info.
 ///
-/// Layout (6 bytes header + original message):
+/// Layout (38 bytes header + original message):
 ///
-///   [0] TAG_CALLER_PREFIX (0xFE)
+///   [0] TAG_DISPATCH_PREFIX (0xFD)
 ///   [1] trust_flag: 1 iff caller is System/Actor (intra-process)
 ///   [2] has_space_role: 0 / 1
 ///   [3] space_role byte
 ///   [4] has_actor_local_role: 0 / 1
 ///   [5] actor_local_role byte
-///   [6..] original message bytes
-fn encode_caller_prefix(req: &InvokeRequest) -> Vec<u8> {
+///   [6..38] stable InvocationId
+///   [38..] original message bytes
+fn encode_caller_prefix(req: &InvokeRequest, invocation_id: crate::v2::InvocationId) -> Vec<u8> {
     let prefix = caller_prefix_bytes(req);
-    let mut out = Vec::with_capacity(6 + req.msg.len());
-    out.push(crate::actors::lifecycle::TAG_CALLER_PREFIX);
+    let mut out = Vec::with_capacity(38 + req.msg.len());
+    out.push(crate::actors::lifecycle::TAG_DISPATCH_PREFIX);
     out.extend_from_slice(&prefix);
+    out.extend_from_slice(invocation_id.as_bytes());
     out.extend_from_slice(&req.msg);
     out
 }
@@ -4496,6 +4510,29 @@ fn caller_prefix_bytes(req: &InvokeRequest) -> crate::effect_log::CallerPrefix {
         has_actor_local,
         actor_local_byte,
     ]
+}
+
+/// Allocate the identity visible to one live handler dispatch.
+///
+/// CRDT strategies return the exact identity of the durable event they will
+/// append, which is stable across retry and reconstructible during replay.
+/// Other production paths still await the v2 WorkEnvelope cutover, so they use
+/// a process-local monotone fallback. Those histories never merge as CRDT
+/// branches; the fallback exists so ordinary handlers still receive a distinct
+/// typed invocation identity in this staging runtime.
+fn next_dispatch_invocation_id(
+    strategy: &dyn crate::commit::CommitStrategy,
+    svc_id: ServiceId,
+) -> crate::v2::InvocationId {
+    static NEXT_FALLBACK_INVOCATION: AtomicU64 = AtomicU64::new(1);
+
+    strategy.pending_invocation_id().unwrap_or_else(|| {
+        let sequence = NEXT_FALLBACK_INVOCATION.fetch_add(1, Ordering::Relaxed);
+        let mut nonce = [0u8; 12];
+        nonce[..4].copy_from_slice(&svc_id.0.to_le_bytes());
+        nonce[4..].copy_from_slice(&sequence.to_le_bytes());
+        crate::v2::InvocationId::derive(b"vos/host-dispatch/v2", &nonce)
+    })
 }
 
 /// INVOKE. Used by the cross-thread invoke path so a yielded child on
@@ -4587,6 +4624,7 @@ fn dispatch_once(
     strategy: &mut dyn crate::commit::CommitStrategy,
     recording_enabled: bool,
 ) -> Result<(), crate::commit::CommitError> {
+    let invocation_id = next_dispatch_invocation_id(strategy, svc_id);
     let recorded = recording_enabled
         && if let Some(payload) = msg.as_ref() {
             runtime.begin_recording(payload.clone());
@@ -4627,7 +4665,7 @@ fn dispatch_once(
         let payload = if payload.is_empty() {
             payload
         } else {
-            wrap_with_unauthenticated_prefix(&payload)
+            wrap_with_unauthenticated_prefix(&payload, invocation_id)
         };
         send_if_deliverable(runtime, svc_id, payload);
     }
@@ -4650,6 +4688,7 @@ fn dispatch_once(
         // (empty msg) carry no prefix and replay as raw empties, so the
         // recorded prefix is unused for them.
         log.set_caller_prefix([0, 0, 0, 0, 0]);
+        log.set_invocation_id(invocation_id);
         strategy.commit(&crate::commit::AgentDelta {
             writes: &writes,
             anchor,
@@ -7704,9 +7743,9 @@ mod tests {
 
     // ── Tell-path forgery defense (C1 regression test) ───────
     //
-    // The M7 caller-prefix protocol is the host's mechanism for
-    // asserting "this dispatch is from <Caller>"; the PVM strips
-    // the leading 6-byte header and trusts it. If any path
+    // The dispatch-prefix protocol is the host's mechanism for asserting
+    // "this dispatch is from <Caller> under <InvocationId>"; the PVM strips
+    // the leading 38-byte header and trusts it. If any path
     // sends inbox-sourced bytes to the runtime *without* the
     // host's wrap, an attacker can prepend their own forged
     // header — flipping trust_flag=1 turns Caller::System on
@@ -7721,14 +7760,15 @@ mod tests {
     fn wrap_with_unauthenticated_prefix_layout() {
         // Inbox / Tell dispatch path must use the safe-default
         // wrap: trust_flag=0 (Unauthenticated), no role bytes.
-        // Bytes 0..6 are the fixed-shape header; the original
+        // Bytes 0..38 are the fixed-shape header; the original
         // payload trails verbatim.
         let inner = b"some-msg-bytes";
-        let wrapped = wrap_with_unauthenticated_prefix(inner);
+        let invocation = crate::v2::InvocationId::derive(b"test", b"inbox");
+        let wrapped = wrap_with_unauthenticated_prefix(inner, invocation);
         assert_eq!(
             wrapped[0],
-            crate::actors::lifecycle::TAG_CALLER_PREFIX,
-            "header must start with TAG_CALLER_PREFIX",
+            crate::actors::lifecycle::TAG_DISPATCH_PREFIX,
+            "header must start with TAG_DISPATCH_PREFIX",
         );
         assert_eq!(
             wrapped[1], 0,
@@ -7742,7 +7782,12 @@ mod tests {
             "role flags / bytes are all zero in the safe-default wrap",
         );
         assert_eq!(
-            &wrapped[6..],
+            &wrapped[6..38],
+            invocation.as_bytes(),
+            "dispatch prefix carries the stable invocation id",
+        );
+        assert_eq!(
+            &wrapped[38..],
             &inner[..],
             "inner payload trails the header verbatim",
         );
@@ -7756,12 +7801,18 @@ mod tests {
         // decode as CALLER_SYSTEM, their historical replay identity.
         let inner = b"logged-msg";
         let recorded: crate::effect_log::CallerPrefix = [0, 1, 3, 0, 0];
-        let wrapped = encode_replay_payload(&recorded, inner);
-        assert_eq!(wrapped[0], crate::actors::lifecycle::TAG_CALLER_PREFIX);
+        let invocation = crate::v2::InvocationId::derive(b"test", b"replay");
+        let wrapped = encode_replay_payload(&recorded, invocation, inner);
+        assert_eq!(wrapped[0], crate::actors::lifecycle::TAG_DISPATCH_PREFIX);
         assert_eq!(&wrapped[1..6], &recorded[..]);
-        assert_eq!(&wrapped[6..], &inner[..]);
+        assert_eq!(&wrapped[6..38], invocation.as_bytes());
+        assert_eq!(&wrapped[38..], &inner[..]);
 
-        let legacy = encode_replay_payload(&crate::effect_log::CALLER_SYSTEM, inner);
+        let legacy = encode_replay_payload(
+            &crate::effect_log::CALLER_SYSTEM,
+            crate::v2::InvocationId::ZERO,
+            inner,
+        );
         assert_eq!(legacy[1], 1, "legacy logs replay as trusted-System");
     }
 
@@ -7770,31 +7821,31 @@ mod tests {
         // Attacker crafts a Tell payload that *itself* starts
         // with TAG_CALLER_PREFIX and a forged trust_flag=1
         // (System). After the host wraps it with the safe
-        // default, the attacker's bytes start at offset 6 — the
+        // default, the attacker's bytes start at offset 38 — the
         // PVM's dispatch_one only strips one prefix, so the
         // attacker's bytes go to the Msg decoder, NOT to a
         // second caller-set. dispatch_one is single-pass, so
         // confirming the wrap puts the attacker's prefix at
-        // offset 6 is sufficient to prove the forgery is
+        // offset 38 is sufficient to prove the forgery is
         // neutralised.
         let forged: Vec<u8> = std::iter::once(crate::actors::lifecycle::TAG_CALLER_PREFIX)
             .chain([1, 0, 0, 0, 0])
             .chain(b"would-be-admin-call".iter().copied())
             .collect();
-        let wrapped = wrap_with_unauthenticated_prefix(&forged);
-        // Host's prefix at 0..6, attacker's bytes start at 6.
+        let wrapped = wrap_with_unauthenticated_prefix(&forged, crate::v2::InvocationId::ZERO);
+        // Host's prefix at 0..38, attacker's bytes start at 38.
         assert_eq!(wrapped[1], 0, "outer trust_flag must be 0");
         assert_eq!(
-            wrapped[6],
+            wrapped[38],
             crate::actors::lifecycle::TAG_CALLER_PREFIX,
             "attacker's prefix byte is preserved inside as msg \
              content — dispatch_one is single-pass so this byte \
              gets treated as the first byte of the inner Msg, not \
              as another caller-prefix to strip",
         );
-        // The forged trust_flag=1 byte sits at offset 7, where
+        // The forged trust_flag=1 byte sits at offset 39, where
         // it can only be decoded as part of a malformed Msg.
-        assert_eq!(wrapped[7], 1);
+        assert_eq!(wrapped[39], 1);
     }
 
     #[test]

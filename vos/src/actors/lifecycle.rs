@@ -450,6 +450,20 @@ pub fn invoke_hash_with_rows(
 /// its previous value.
 pub const TAG_CALLER_PREFIX: u8 = 0xFE;
 
+/// Versioned dispatch prefix carrying both authorization data and the stable
+/// invocation identity visible through [`Context::invocation_id`].
+///
+/// Layout:
+///
+///   raw[0] = TAG_DISPATCH_PREFIX (0xFD)
+///   raw[1..6] = the legacy five-byte caller prefix
+///   raw[6..38] = InvocationId
+///   raw[38..] = the original message
+///
+/// [`TAG_CALLER_PREFIX`] remains accepted for stored legacy inputs, but all
+/// current host dispatch and replay paths emit this prefix.
+pub const TAG_DISPATCH_PREFIX: u8 = 0xFD;
+
 /// Dispatch a single message to the actor.
 ///
 /// Decodes raw bytes to `A::Message` and calls `actor.dispatch()` once.
@@ -463,11 +477,12 @@ pub fn dispatch_one<A: Actor>(raw: &[u8], actor: &mut A, ctx: &mut Context<A>) -
     // call doesn't poison this dispatch. Context lives across
     // invocations on the warm-restart path.
     ctx.__reset_forbidden();
+    ctx.__set_invocation_id(crate::v2::InvocationId::ZERO);
 
-    // Strip the M7 caller-info prefix if present. The host
-    // packs the caller's role bytes here so the macro-emitted
-    // role check can run without an extra hostcall.
-    let raw = if raw.len() >= 6 && raw[0] == TAG_CALLER_PREFIX {
+    // Strip the current caller + invocation prefix first. A distinct tag keeps
+    // the legacy six-byte prefix unambiguous: old messages whose first 32
+    // payload bytes happen to exist must never be mistaken for an identity.
+    let raw = if raw.len() >= 38 && raw[0] == TAG_DISPATCH_PREFIX {
         use super::auth::Caller;
         let trust_flag = raw[1];
         let has_space = raw[2] != 0;
@@ -487,6 +502,32 @@ pub fn dispatch_one<A: Actor>(raw: &[u8], actor: &mut A, ctx: &mut Context<A>) -
                 None
             },
         );
+        let mut invocation_id = [0u8; 32];
+        invocation_id.copy_from_slice(&raw[6..38]);
+        ctx.__set_invocation_id(crate::v2::InvocationId::new(invocation_id));
+        &raw[38..]
+    // Stored v1 logs and older embedders may still carry only caller data.
+    } else if raw.len() >= 6 && raw[0] == TAG_CALLER_PREFIX {
+        use super::auth::Caller;
+        let trust_flag = raw[1];
+        let has_space = raw[2] != 0;
+        let space_byte = raw[3];
+        let has_actor_local = raw[4] != 0;
+        let actor_local_byte = raw[5];
+        ctx.set_caller(if trust_flag == 1 {
+            Caller::System
+        } else {
+            Caller::Unauthenticated
+        });
+        ctx.set_caller_roles(
+            if has_space { Some(space_byte) } else { None },
+            if has_actor_local {
+                Some(actor_local_byte)
+            } else {
+                None
+            },
+        );
+        ctx.__set_invocation_id(crate::v2::InvocationId::ZERO);
         &raw[6..]
     } else {
         raw
