@@ -18,6 +18,7 @@ use vos::v2::{
 use vos::{Decode, Encode, value::Msg};
 
 const CANONICAL_SERVICE_PVM: &[u8] = include_bytes!("../../services/vos-service/vos-service.pvm");
+const SERVICE_BUILD_CONFIG: &str = include_str!("../../services/vos-service/.cargo/config.toml");
 
 fn service_elf() -> Option<Vec<u8>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -53,10 +54,18 @@ fn canonical_service_artifact_matches_a_fresh_build() {
         return;
     };
     let fresh = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
-    assert_eq!(
-        fresh, CANONICAL_SERVICE_PVM,
-        "fresh vos-service build differs from the protocol-pinned artifact"
+    assert!(
+        fresh == CANONICAL_SERVICE_PVM,
+        "fresh vos-service build differs: fresh ProgramId {:?}, committed ProgramId {:?}",
+        ProgramId::of_pvm(&fresh),
+        ProgramId::of_pvm(CANONICAL_SERVICE_PVM)
     );
+}
+
+#[test]
+fn canonical_service_build_pins_path_independent_crate_identity() {
+    assert!(SERVICE_BUILD_CONFIG.contains("-Zremap-cwd-prefix=."));
+    assert!(SERVICE_BUILD_CONFIG.contains("-Cmetadata=vos-service-v2"));
 }
 
 fn greeter_elf() -> Option<Vec<u8>> {

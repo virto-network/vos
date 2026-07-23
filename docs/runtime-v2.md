@@ -65,9 +65,11 @@ cargo run -p vosx -- service-pvm \
   --out target/vos-service.pvm
 ```
 
-The guest build remaps its checkout directory. The v2 service integration
-gate transpiles a fresh ELF and requires byte identity with the committed PVM,
-in addition to checking its pinned `ProgramId` and GP entry layout.
+The guest build remaps its checkout directory and pins Rust crate metadata so
+path-derived symbol hashes cannot perturb the linked program. The v2 service
+integration gate transpiles a fresh ELF and requires byte identity with the
+committed PVM, in addition to checking its pinned `ProgramId` and GP entry
+layout.
 
 This is a clean storage and wire break. A v1 store or package must be reset and
 reinstalled; there is no v1 decoder or migration in a v2 service.
