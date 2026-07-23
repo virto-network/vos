@@ -82,9 +82,11 @@ impl InvocationId {
     /// Derive a stable invocation identifier from an application namespace and
     /// caller-provided nonce.
     pub fn derive(namespace: &[u8], nonce: &[u8]) -> Self {
+        let namespace_len = (namespace.len() as u64).to_le_bytes();
+        let nonce_len = (nonce.len() as u64).to_le_bytes();
         Self(crate::crypto::blake2b_hash::<32>(
             b"vos/invocation/v2",
-            &[namespace, nonce],
+            &[&namespace_len, namespace, &nonce_len, nonce],
         ))
     }
 
@@ -127,6 +129,14 @@ mod tests {
         assert_eq!(invocation.call_id(3), invocation.call_id(3));
         assert_ne!(invocation.call_id(3), invocation.call_id(4));
         assert_eq!(invocation.root_reply_id().0, invocation.0);
+    }
+
+    #[test]
+    fn invocation_ids_frame_variable_length_inputs() {
+        assert_ne!(
+            InvocationId::derive(b"ab", b"c"),
+            InvocationId::derive(b"a", b"bc")
+        );
     }
 
     #[test]
