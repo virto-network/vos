@@ -196,8 +196,10 @@ pub enum Caller {
     /// bootstrap (which grants the operator their initial admin
     /// role *before* any libp2p connection exists), internal
     /// host probes, and other embedder-controlled entry points
-    /// land here. It still needs an explicit platform capability or role;
-    /// originating inside the daemon is not authorization.
+    /// land here. Treated as trusted by `has_role` until the v2
+    /// authority service replaces bootstrap/replay calls with
+    /// explicit capabilities; external peers cannot synthesize
+    /// this variant.
     System,
     /// libp2p peer, identity verified by noise at connect time.
     /// The carried bytes are the peer's multihash encoding (the
@@ -227,7 +229,9 @@ impl Caller {
     /// True iff the caller is trusted by virtue of originating
     /// inside the daemon process — [`Self::System`] (host-
     /// initiated) or [`Self::Actor`] (intra-system invoke).
-    /// This classifies origin only. It deliberately grants no role.
+    /// `Context::has_role` short-circuits these variants to
+    /// `true` until internal callers are migrated to explicit
+    /// authority capabilities.
     pub const fn is_trusted(&self) -> bool {
         matches!(self, Self::System | Self::Actor(_))
     }
