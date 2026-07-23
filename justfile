@@ -29,12 +29,16 @@ build-pvm:
     cd examples; just build
     cd tests/fixtures/legacy-v1/actors/crdt-counter; cargo +nightly actor
 
+# Build the protocol-pinned generic VOS service guest.
+build-vos-service:
+    cd services/vos-service; cargo +nightly actor
+
 # Build a single built-in PVM actor by name (e.g., just build-actor space-registry).
 build-actor name:
     cd actors/{{name}}; cargo +nightly actor
 
 # Build all generated artifacts consumed by the test suite.
-build-test-artifacts: build-extensions build-pvm build-actors build-voucher-check
+build-test-artifacts: build-extensions build-pvm build-vos-service build-actors build-voucher-check
     cargo build
 
 # Build all built-in actors used by host tests.
@@ -139,6 +143,7 @@ check-all:
         -A clippy::manual_async_fn
     cargo test --workspace --lib
     just build-pvm
+    cargo test -p vos --test v2_service_pvm canonical_service_artifact -- --nocapture
 
 # Lint with clippy.
 lint:

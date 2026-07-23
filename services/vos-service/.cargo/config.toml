@@ -5,6 +5,8 @@ rustflags = [
     "-Zcrate-attr=no_main",
     "-Aduplicate-macro-attributes",
     "-Aunused-attributes",
+    # Canonical service identity must not depend on its checkout directory.
+    "-Zremap-cwd-prefix=.",
 ]
 
 [alias]

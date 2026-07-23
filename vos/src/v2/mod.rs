@@ -77,6 +77,15 @@ pub const SNAPSHOT_VERSION: u16 = 2;
 /// Attestation statement version required by runtime v2.
 pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 
+/// Program identity of the canonical [`vos-service.pvm`](../../../services/vos-service/vos-service.pvm).
+///
+/// This is protocol infrastructure, not a locally derived cache key. A fresh
+/// service build must match both the committed bytes and this identity.
+pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
+    0x5d, 0xde, 0x13, 0x90, 0x0f, 0x0a, 0x7a, 0x30, 0x90, 0xa8, 0x4f, 0x25, 0xbe, 0x7d, 0xc1, 0xe1,
+    0xe3, 0xc0, 0x57, 0x01, 0x78, 0xd0, 0x04, 0x2c, 0x01, 0xd8, 0x0d, 0x8d, 0x93, 0x0e, 0xc2, 0x2a,
+]);
+
 /// Gray Paper instruction counter for the service Refine entry.
 pub const REFINE_ENTRY_IC: u32 = 0;
 /// Gray Paper instruction counter for the service Accumulate entry.

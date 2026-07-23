@@ -18,6 +18,8 @@ use vos::v2::{
 };
 use vos::{Decode, Encode, value::Msg};
 
+const CANONICAL_SERVICE_PVM: &[u8] = include_bytes!("../../services/vos-service/vos-service.pvm");
+
 fn service_elf() -> Option<Vec<u8>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../services/vos-service/target/riscv64em-javm/release/vos_service.elf");
@@ -31,6 +33,31 @@ fn service_elf() -> Option<Vec<u8>> {
             None
         }
     }
+}
+
+#[test]
+fn canonical_service_artifact_has_the_protocol_identity() {
+    assert_eq!(
+        ProgramId::of_pvm(CANONICAL_SERVICE_PVM),
+        vos::v2::VOS_SERVICE_PROGRAM_ID
+    );
+    ServicePvmV2::new(
+        CANONICAL_SERVICE_PVM.to_vec(),
+        vos::v2::VOS_SERVICE_PROGRAM_ID,
+    )
+    .expect("committed service PVM has the canonical Refine/Accumulate entries");
+}
+
+#[test]
+fn canonical_service_artifact_matches_a_fresh_build() {
+    let Some(elf) = service_elf() else {
+        return;
+    };
+    let fresh = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
+    assert_eq!(
+        fresh, CANONICAL_SERVICE_PVM,
+        "fresh vos-service build differs from the protocol-pinned artifact"
+    );
 }
 
 fn greeter_elf() -> Option<Vec<u8>> {
