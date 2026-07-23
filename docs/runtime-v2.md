@@ -1,11 +1,12 @@
 # VOS runtime v2 contract
 
-> Implementation status: the versioned contracts, conformance service, package
-> tooling, actor APIs, and CRDT primitives described here are present. The
-> production node still contains the legacy native journal executor while the
-> generic `vos-service.pvm`, exact JAR backend restoration, and durable
-> scheduler integration are completed. Legacy host behavior is not evidence of
-> v2 conformance.
+> Implementation status: the versioned contracts, guest service state tree,
+> canonical `vos-service.pvm` Refine/Accumulate entries, package tooling, actor
+> APIs, and CRDT primitives described here are present. The local v2 harness
+> executes both phases through that PVM and commits only an accepted guest
+> result; it has no native transition-apply shortcut. The production node still
+> runs the legacy runtime while durable v2 scheduling and backend integration
+> are completed. Legacy node behavior is not evidence of v2 conformance.
 
 VOS v2 assigns one logical JAM service to a root actor and its owned child
 tree. The protocol-pinned `vos-service.pvm` is one generic program with the
