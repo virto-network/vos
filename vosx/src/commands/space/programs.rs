@@ -11,6 +11,7 @@ struct ProgramView<'a> {
     name: &'a str,
     version: &'a str,
     hash: String,
+    crdt: bool,
 }
 
 pub fn run(space: &str) -> anyhow::Result<()> {
@@ -23,6 +24,7 @@ pub fn run(space: &str) -> anyhow::Result<()> {
                     name: &p.name,
                     version: &p.version,
                     hash: hex::encode(p.hash),
+                    crdt: p.crdt,
                 })
                 .collect();
             output::print_json(&view);
@@ -32,13 +34,14 @@ pub fn run(space: &str) -> anyhow::Result<()> {
             println!("no programs in catalog. publish one with `vosx space publish`.");
             return Ok(());
         }
-        println!("{:<20}  {:<12}  HASH", "NAME", "VERSION");
+        println!("{:<20}  {:<12}  {:<5}  HASH", "NAME", "VERSION", "CRDT");
         for p in &programs {
             let short_hash: String = hex::encode(p.hash).chars().take(12).collect();
             println!(
-                "{:<20}  {:<12}  {short_hash}…",
+                "{:<20}  {:<12}  {:<5}  {short_hash}…",
                 truncate(&p.name, 20),
                 truncate(&p.version, 12),
+                if p.crdt { "yes" } else { "no" },
             );
         }
         Ok(())

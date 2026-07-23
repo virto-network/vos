@@ -42,6 +42,7 @@ fn print_recipe(
         println!("name    = {:?}", p.name);
         println!("version = {:?}", p.version);
         println!("hash    = {:?}", hex::encode(p.hash));
+        println!("crdt    = {}", p.crdt);
         println!();
     }
 

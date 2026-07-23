@@ -396,11 +396,21 @@ impl DaemonClient {
     // operator key it loaded at boot, so the signature is the operator's
     // regardless of whether the CLI or a keyless PVM agent drove the op.
     // See `space_registry`'s signed-registry-ops note.
-    pub fn publish(&self, name: String, version: String, hash: Vec<u8>) -> anyhow::Result<Status> {
-        vos::block_on(
-            self.registry()
-                .publish(&mut &self.node, name, version, hash, Vec::new()),
-        )
+    pub fn publish(
+        &self,
+        name: String,
+        version: String,
+        hash: Vec<u8>,
+        crdt: bool,
+    ) -> anyhow::Result<Status> {
+        vos::block_on(self.registry().publish(
+            &mut &self.node,
+            name,
+            version,
+            hash,
+            crdt,
+            Vec::new(),
+        ))
         .map_err(|e| anyhow::anyhow!("registry.publish(): {e}"))
     }
 

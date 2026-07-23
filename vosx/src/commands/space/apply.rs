@@ -216,6 +216,8 @@ struct PreparedAgent {
     program_name: String,
     program_version: String,
     hash: [u8; 32],
+    /// Signed catalog capability copied from the compiled actor metadata.
+    crdt: bool,
     elf_bytes: Option<Vec<u8>>,
     needs_publish: bool,
     action: ApplyAction,
@@ -259,6 +261,10 @@ fn preflight_one(
             agent.name,
         );
     };
+    let crdt = elf_bytes
+        .as_deref()
+        .and_then(vos::metadata::from_elf)
+        .is_some_and(|meta| meta.crdt);
 
     // Resolve the instance first. An unchanged instance is already at the
     // requested content and does not need a synthetic catalog rewrite.
@@ -272,6 +278,7 @@ fn preflight_one(
             program_name,
             program_version,
             hash,
+            crdt,
             elf_bytes,
             needs_publish: false,
             action: ApplyAction::Skip,
@@ -292,6 +299,7 @@ fn preflight_one(
             program_name,
             program_version,
             hash,
+            crdt,
             elf_bytes,
             needs_publish: false,
             action: ApplyAction::VersionRequired,
@@ -299,7 +307,12 @@ fn preflight_one(
     }
 
     let needs_publish = match client.program(&program_name, &program_version)? {
-        Some(p) if p.hash == hash => false,
+        Some(p) if p.hash == hash && p.crdt == crdt => false,
+        Some(p) if p.hash == hash => anyhow::bail!(
+            "agent '{}': program {program_name}:{program_version} has the same bytes but a \
+             different signed CRDT capability; publish it under a new version",
+            agent.name,
+        ),
         Some(_) => anyhow::bail!(
             "agent '{}': program {program_name}:{program_version} is already pinned to a \
              different blob; choose a new explicit version",
@@ -324,6 +337,7 @@ fn preflight_one(
             program_name,
             program_version,
             hash,
+            crdt,
             elf_bytes,
             needs_publish,
             action: if upgrade {
@@ -371,6 +385,7 @@ fn preflight_one(
         program_name,
         program_version,
         hash,
+        crdt,
         elf_bytes,
         needs_publish,
         action: ApplyAction::Install {
@@ -394,6 +409,7 @@ fn execute_one(
             plan.program_name.clone(),
             plan.program_version.clone(),
             plan.hash.to_vec(),
+            plan.crdt,
         )? {
             Status::Ok => {
                 if let Some(bytes) = &plan.elf_bytes {

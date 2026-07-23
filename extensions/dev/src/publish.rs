@@ -150,12 +150,16 @@ pub async fn publish(
     // be in the local cache. If it's not, the operator has manually
     // garbage-collected — surface a clean "not found" rather than
     // a silent missing-bytes install.
-    if !blob_cache_path(&registry_hash).exists() {
-        return HashResult {
-            status: PUBLISH_STATUS_BLOB_NOT_FOUND,
-            hash: Vec::new(),
-        };
-    }
+    let artifact = match fs::read(blob_cache_path(&registry_hash)) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return HashResult {
+                status: PUBLISH_STATUS_BLOB_NOT_FOUND,
+                hash: Vec::new(),
+            };
+        }
+    };
+    let crdt = vos::metadata::from_elf(&artifact).is_some_and(|meta| meta.crdt);
 
     // ── 4. Register the program in the catalog. The catalog only
     //    needs the (name, version, hash) row — the actual bytes
@@ -167,7 +171,7 @@ pub async fn publish(
     //    The CLI surfaces specific codes (tag conflict, bad
     //    hash) so the operator gets actionable diagnostics
     //    rather than a flat "rejected".
-    match registry_publish(ctx, &name, &version, &registry_hash).await {
+    match registry_publish(ctx, &name, &version, &registry_hash, crdt).await {
         Ok(s) if s == STATUS_OK => {}
         Ok(s) => {
             log::warn!("dev: registry.publish returned status {s}");
@@ -261,11 +265,13 @@ async fn registry_publish(
     name: &str,
     version: &str,
     hash: &[u8],
+    crdt: bool,
 ) -> Result<u8, u8> {
     let msg = Msg::new("publish")
         .with("name", name.to_string())
         .with("version", version.to_string())
-        .with("hash", hash.to_vec());
+        .with("hash", hash.to_vec())
+        .with("crdt", crdt);
     let raw = ctx
         .ask_dispatch(ServiceId(REGISTRY_ID), &dyn_payload(&msg))
         .await
