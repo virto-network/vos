@@ -206,10 +206,14 @@ impl<A: Actor> Context<A> {
 
     /// True iff the caller's effective role satisfies `required`
     /// — i.e. `>=` in the actor's role hierarchy.
-    /// System and actor origins do not bypass this check. Internal callers
-    /// must carry an explicit actor grant or platform capability just like
-    /// any other origin.
+    /// System and actor origins temporarily bypass this check because the
+    /// legacy bootstrap and replay paths cannot carry role bytes. The v2
+    /// authority cutover removes this compatibility boundary only after
+    /// those callers carry explicit platform capabilities.
     pub fn has_role(&self, required: A::Role) -> bool {
+        if self.caller.is_trusted() {
+            return true;
+        }
         self.caller_role().is_some_and(|r| r >= required)
     }
 
@@ -1388,17 +1392,17 @@ mod tests {
     }
 
     #[test]
-    fn intra_system_actor_caller_requires_an_explicit_role() {
+    fn intra_system_actor_caller_is_trusted_during_legacy_bootstrap() {
         let ctx: Context<FixtureActor> = fixture_ctx_with(Caller::Actor(ServiceId(99)), None, None);
-        assert!(!ctx.has_role(FixtureRole::Maintainer));
-        assert_eq!(ctx.ensure_role(FixtureRole::Maintainer), Err(Forbidden));
+        assert!(ctx.has_role(FixtureRole::Maintainer));
+        assert_eq!(ctx.ensure_role(FixtureRole::Maintainer), Ok(()));
     }
 
     #[test]
-    fn system_caller_requires_an_explicit_role() {
+    fn system_caller_is_trusted_during_legacy_bootstrap() {
         let ctx: Context<FixtureActor> = fixture_ctx_with(Caller::System, None, None);
-        assert!(!ctx.has_role(FixtureRole::Maintainer));
-        assert_eq!(ctx.ensure_role(FixtureRole::Maintainer), Err(Forbidden));
+        assert!(ctx.has_role(FixtureRole::Maintainer));
+        assert_eq!(ctx.ensure_role(FixtureRole::Maintainer), Ok(()));
     }
 
     #[test]
