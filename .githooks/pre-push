@@ -23,3 +23,7 @@ if grep -q 'found to be present in multiple build targets' "$LOG"; then
     echo "  use \`cargo rustc --lib --crate-type bin\` (see examples/actors/*/.cargo/config.toml)."
     exit 1
 fi
+
+echo "→ pre-push: physical v2 service-PVM gate"
+just build-v2-pvm-test-artifacts
+cargo test -p vos --test v2_service_pvm --quiet -- --test-threads=1

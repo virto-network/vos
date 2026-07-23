@@ -1,7 +1,10 @@
 //! Physical generic-service PVM integration gate.
 //!
-//! Build the guest first with:
-//! `cd services/vos-service && cargo +nightly actor`.
+//! Build the service and actor guests first with:
+//! `just build-v2-pvm-test-artifacts`.
+//!
+//! Missing guests are hard failures: these tests are a consensus-path gate,
+//! not optional smoke tests.
 
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -21,19 +24,30 @@ const CANONICAL_SERVICE_PVM: &[u8] = include_bytes!("../../services/vos-service/
 const SERVICE_BUILD_CONFIG: &str = include_str!("../../services/vos-service/.cargo/config.toml");
 const SERVICE_RUSTC_WRAPPER: &str = include_str!("../../services/vos-service/rustc-remap.sh");
 
-fn service_elf() -> Option<Vec<u8>> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../services/vos-service/target/riscv64em-javm/release/vos_service.elf");
-    match std::fs::read(&path) {
-        Ok(bytes) => Some(bytes),
-        Err(_) => {
-            eprintln!(
-                "skipping: build the generic guest first with `cd services/vos-service && cargo +nightly actor` ({})",
-                path.display()
-            );
-            None
-        }
-    }
+fn required_elf(relative_path: &str, build_command: &str) -> Vec<u8> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative_path);
+    std::fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "required guest ELF is unavailable at {}: {error}\nbuild it with `{build_command}`",
+            path.display()
+        )
+    })
+}
+
+#[test]
+#[should_panic(expected = "required guest ELF is unavailable")]
+fn missing_required_guest_is_a_hard_failure() {
+    required_elf(
+        "tests/fixtures/definitely-missing-v2-guest.elf",
+        "just build-v2-pvm-test-artifacts",
+    );
+}
+
+fn service_elf() -> Vec<u8> {
+    required_elf(
+        "../services/vos-service/target/riscv64em-javm/release/vos_service.elf",
+        "just build-v2-pvm-test-artifacts",
+    )
 }
 
 #[test]
@@ -51,9 +65,7 @@ fn canonical_service_artifact_has_the_protocol_identity() {
 
 #[test]
 fn canonical_service_artifact_matches_a_fresh_build() {
-    let Some(elf) = service_elf() else {
-        return;
-    };
+    let elf = service_elf();
     let fresh = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     assert!(
         fresh == CANONICAL_SERVICE_PVM,
@@ -71,50 +83,25 @@ fn canonical_service_build_pins_path_independent_crate_identity() {
     assert!(SERVICE_RUSTC_WRAPPER.contains("--remap-path-prefix=$repository_root=vos-source"));
 }
 
-fn greeter_elf() -> Option<Vec<u8>> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../examples/actors/greeter/target/riscv64em-javm/release/greeter.elf");
-    match std::fs::read(&path) {
-        Ok(bytes) => Some(bytes),
-        Err(_) => {
-            eprintln!(
-                "skipping: build the actor first with `cd examples/actors/greeter && cargo +nightly actor` ({})",
-                path.display()
-            );
-            None
-        }
-    }
+fn greeter_elf() -> Vec<u8> {
+    required_elf(
+        "../examples/actors/greeter/target/riscv64em-javm/release/greeter.elf",
+        "just build-v2-pvm-test-artifacts",
+    )
 }
 
-fn probe_elf() -> Option<Vec<u8>> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../examples/actors/probe/target/riscv64em-javm/release/probe.elf");
-    match std::fs::read(&path) {
-        Ok(bytes) => Some(bytes),
-        Err(_) => {
-            eprintln!(
-                "skipping: build the actor first with `cd examples/actors/probe && cargo +nightly actor` ({})",
-                path.display()
-            );
-            None
-        }
-    }
+fn probe_elf() -> Vec<u8> {
+    required_elf(
+        "../examples/actors/probe/target/riscv64em-javm/release/probe.elf",
+        "just build-v2-pvm-test-artifacts",
+    )
 }
 
-fn crdt_counter_v2_elf() -> Option<Vec<u8>> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+fn crdt_counter_v2_elf() -> Vec<u8> {
+    required_elf(
         "tests/fixtures/crdt-counter-v2/target/riscv64em-javm/release/crdt_counter_v2_fixture.elf",
-    );
-    match std::fs::read(&path) {
-        Ok(bytes) => Some(bytes),
-        Err(_) => {
-            eprintln!(
-                "skipping: build the v2 CRDT fixture with `cd vos/tests/fixtures/crdt-counter-v2 && cargo +nightly actor` ({})",
-                path.display()
-            );
-            None
-        }
-    }
+        "just build-v2-pvm-test-artifacts",
+    )
 }
 
 fn actor_pvm(result: u64) -> Vec<u8> {
@@ -302,12 +289,8 @@ impl AccumulateProtocolHostV2 for DurableAccumulateHost {
 
 #[test]
 fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
-    let Some(elf) = service_elf() else {
-        return;
-    };
-    let Some(actor_elf) = greeter_elf() else {
-        return;
-    };
+    let elf = service_elf();
+    let actor_elf = greeter_elf();
     let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let service = ServicePvmV2::new(pvm.clone(), ProgramId::of_pvm(&pvm))
         .expect("generic service has the GP IC0/IC5 entries");
@@ -359,9 +342,8 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
 
 #[test]
 fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
-    let (Some(service_elf), Some(actor_elf)) = (service_elf(), crdt_counter_v2_elf()) else {
-        return;
-    };
+    let service_elf = service_elf();
+    let actor_elf = crdt_counter_v2_elf();
     let service_pvm = vos::v2::transpile_service_elf(&service_elf).unwrap();
     let actor_pvm = grey_transpiler::link_elf(&actor_elf).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
@@ -548,9 +530,8 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
 
 #[test]
 fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
-    let (Some(service_elf), Some(actor_elf)) = (service_elf(), crdt_counter_v2_elf()) else {
-        return;
-    };
+    let service_elf = service_elf();
+    let actor_elf = crdt_counter_v2_elf();
     let service_pvm = vos::v2::transpile_service_elf(&service_elf).unwrap();
     let actor_pvm = grey_transpiler::link_elf(&actor_elf).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
@@ -708,9 +689,7 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
 
 #[test]
 fn canonical_guest_rejects_a_nested_actor_without_the_reply_abi() {
-    let Some(elf) = service_elf() else {
-        return;
-    };
+    let elf = service_elf();
     let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let service = ServicePvmV2::new(pvm.clone(), ProgramId::of_pvm(&pvm)).unwrap();
     let actor = actor_pvm(0);
@@ -742,9 +721,7 @@ fn canonical_guest_rejects_a_nested_actor_without_the_reply_abi() {
 
 #[test]
 fn actor_tree_refuses_to_replay_a_continuation_from_pc_zero() {
-    let Some(elf) = service_elf() else {
-        return;
-    };
+    let elf = service_elf();
     let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let service = ServicePvmV2::new(pvm.clone(), ProgramId::of_pvm(&pvm)).unwrap();
     let actor = actor_pvm(0);
@@ -787,9 +764,8 @@ fn actor_tree_refuses_to_replay_a_continuation_from_pc_zero() {
 
 #[test]
 fn yielding_actor_restores_exactly_after_restart() {
-    let (Some(service_elf), Some(actor_elf)) = (service_elf(), probe_elf()) else {
-        return;
-    };
+    let service_elf = service_elf();
+    let actor_elf = probe_elf();
     let service_pvm = vos::v2::transpile_service_elf(&service_elf).unwrap();
     let service_program = ProgramId::of_pvm(&service_pvm);
     let service = ServicePvmV2::new(service_pvm.clone(), service_program).unwrap();
@@ -1050,9 +1026,7 @@ fn yielding_actor_restores_exactly_after_restart() {
 
 #[test]
 fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
-    let Some(elf) = service_elf() else {
-        return;
-    };
+    let elf = service_elf();
     let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let actor_pvm = b"canonical actor bytes".to_vec();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
@@ -1182,9 +1156,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
 
 #[test]
 fn physical_guest_install_rejects_an_unavailable_actor_program() {
-    let Some(elf) = service_elf() else {
-        return;
-    };
+    let elf = service_elf();
     let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let actor_program = ProgramId::of_pvm(b"canonical actor bytes not imported into the service");
     let initial_bytes = b"initial actor state".to_vec();
@@ -1237,9 +1209,7 @@ fn physical_guest_install_rejects_an_unavailable_actor_program() {
 
 #[test]
 fn physical_guest_rejects_the_missing_preimage_length_sentinel() {
-    let Some(elf) = service_elf() else {
-        return;
-    };
+    let elf = service_elf();
     let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let actor_pvm = b"available canonical actor bytes".to_vec();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
@@ -1292,9 +1262,7 @@ fn physical_guest_rejects_the_missing_preimage_length_sentinel() {
 
 #[test]
 fn malformed_guest_accumulate_returns_a_rejection_without_storage_effects() {
-    let Some(elf) = service_elf() else {
-        return;
-    };
+    let elf = service_elf();
     let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let service = ServicePvmV2::new(pvm.clone(), ProgramId::of_pvm(&pvm)).unwrap();
     let mut host = DurableAccumulateHost::default();

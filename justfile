@@ -33,12 +33,18 @@ build-pvm:
 build-vos-service:
     cd services/vos-service; cargo +nightly actor
 
+# Build every guest consumed by the physical v2 service-PVM gate.
+build-v2-pvm-test-artifacts: build-vos-service
+    cd examples/actors/greeter; cargo +nightly actor
+    cd examples/actors/probe; cargo +nightly actor
+    cd vos/tests/fixtures/crdt-counter-v2; cargo +nightly actor
+
 # Build a single built-in PVM actor by name (e.g., just build-actor space-registry).
 build-actor name:
     cd actors/{{name}}; cargo +nightly actor
 
 # Build all generated artifacts consumed by the test suite.
-build-test-artifacts: build-extensions build-pvm build-vos-service build-actors build-voucher-check
+build-test-artifacts: build-extensions build-pvm build-v2-pvm-test-artifacts build-actors build-voucher-check
     cargo build
 
 # Build all built-in actors used by host tests.
@@ -143,7 +149,8 @@ check-all:
         -A clippy::manual_async_fn
     cargo test --workspace --lib
     just build-pvm
-    cargo test -p vos --test v2_service_pvm canonical_service_artifact -- --nocapture
+    just build-v2-pvm-test-artifacts
+    cargo test -p vos --test v2_service_pvm -- --nocapture --test-threads=1
 
 # Lint with clippy.
 lint:
