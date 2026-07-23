@@ -484,6 +484,11 @@ fn encode_optional_op_id(id: Option<OpId>) -> Vec<u8> {
 /// Multi-value register. The visible value is selected deterministically by
 /// operation id; concurrent alternatives remain available through
 /// [`conflicts`](Self::conflicts).
+///
+/// Replicated fields start with [`Default::default`] and are assigned through
+/// [`set`](Self::set). Replacing the whole field would discard its
+/// runtime-assigned field identity, so `Value` deliberately has no public
+/// value-taking constructor.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone)]
 #[rkyv(crate = rkyv)]
 pub struct Value<T> {
@@ -510,10 +515,6 @@ impl<T> Field for Value<T> {
 }
 
 impl<T> Value<T> {
-    pub fn new(value: T) -> Result<Self, Error> {
-        Ok(Self::new_with_id(next_operation()?, value))
-    }
-
     #[doc(hidden)]
     pub fn new_with_id(id: OpId, value: T) -> Self {
         let mut this = Self::default();
@@ -1499,6 +1500,37 @@ mod tests {
             take_operations(actor, dispatch),
             Err(Error::NoCompletedChange)
         );
+    }
+
+    #[test]
+    fn value_set_and_followup_mutation_emit_contiguous_operations() {
+        let actor = crate::v2::ActorId([4; 32]);
+        let change = crate::v2::ChangeId([7; 32]);
+        let dispatch = crate::v2::CrdtDispatchV2 { change, ordinal: 0 };
+        let scoped = ChangeId::for_dispatch(change, actor, dispatch.ordinal);
+        let mut title = Value::default();
+        let mut edits = Counter::default();
+        Field::__vos_init(&mut title, "Board", "title");
+        Field::__vos_init(&mut edits, "Board", "edits");
+
+        with_change(scoped, || {
+            title.set(String::from("ready"))?;
+            edits.increment(1)
+        })
+        .unwrap();
+        let operations = take_operations(actor, dispatch).unwrap();
+
+        assert_eq!(
+            operations
+                .iter()
+                .map(|operation| operation.ordinal)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(operations[0].field, field_tag("Board", "title"));
+        assert_eq!(operations[1].field, field_tag("Board", "edits"));
+        assert_eq!(title.get().map(String::as_str), Some("ready"));
+        assert_eq!(edits.value(), 1);
     }
 
     #[test]
