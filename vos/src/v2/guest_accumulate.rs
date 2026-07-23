@@ -778,14 +778,23 @@ fn validate_continuation_change<S: GuestAccumulateStoreV2>(
     let Some(replacement) = change.replacement.as_ref() else {
         return Ok(None);
     };
-    let bytes = match store
-        .load_blob(replacement)
-        .map_err(GuestAccumulateError::Storage)?
-    {
+    let candidate = envelope
+        .provided_blobs
+        .binary_search_by_key(&replacement.hash, |blob| blob.reference.hash)
+        .ok()
+        .filter(|index| envelope.provided_blobs[*index].reference == *replacement)
+        .map(|index| envelope.provided_blobs[index].bytes.clone());
+    let bytes = match candidate {
         Some(bytes) => bytes,
-        None => {
-            return Ok(Some(AccumulationRejectionV2::MissingBlob(replacement.hash)));
-        }
+        None => match store
+            .load_blob(replacement)
+            .map_err(GuestAccumulateError::Storage)?
+        {
+            Some(bytes) => bytes,
+            None => {
+                return Ok(Some(AccumulationRejectionV2::MissingBlob(replacement.hash)));
+            }
+        },
     };
     if BlobRefV2::of_bytes(&bytes) != *replacement {
         return Err(GuestAccumulateError::CorruptStore);
@@ -1421,7 +1430,11 @@ mod tests {
             kernel_snapshot: vec![1],
         }
         .encode();
-        let continuation = store.provide_blob(&continuation_bytes).unwrap();
+        let continuation = BlobRefV2::of_bytes(&continuation_bytes);
+        assert!(
+            !store.blobs.contains_key(&continuation.hash),
+            "candidate continuation must not already exist in service storage"
+        );
         let mut checkpoint = linear_transition(&first_work, b"checkpoint");
         checkpoint.reply = None;
         checkpoint.continuations.push(ContinuationChangeV2 {
@@ -1479,7 +1492,10 @@ mod tests {
             &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                 work: first_work.clone(),
                 transition: checkpoint,
-                provided_blobs: Vec::new(),
+                provided_blobs: vec![ImportedBlobV2 {
+                    reference: continuation.clone(),
+                    bytes: continuation_bytes,
+                }],
             }),
         )
         .unwrap();
