@@ -133,13 +133,21 @@ pub struct ActorSliceInputV2 {
     pub actor: ActorId,
     /// Canonical identity of the workflow slice executing this actor.
     pub input: WorkInputIdV2,
-    /// Stable identity allocated by the generic service for this complete
-    /// execution slice. Present only for an explicitly CRDT service.
-    pub change: Option<ChangeId>,
+    /// Batch identity and scheduler dispatch ordinal allocated by the generic
+    /// service. Present only for an explicitly CRDT service.
+    pub change: Option<CrdtDispatchV2>,
     pub state: Vec<u8>,
     /// Canonical generated actor-message bytes.
     pub message: Vec<u8>,
     pub origin: Origin,
+}
+
+/// Unique operation-allocation namespace for one actor dispatch inside a CRDT
+/// execution slice. A scheduler must never reuse `ordinal` within one change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrdtDispatchV2 {
+    pub change: ChangeId,
+    pub ordinal: u32,
 }
 
 /// Actor-produced result returned through the same IPC DATA capability.
@@ -162,6 +170,8 @@ pub struct ActorSliceOutputV2 {
 pub struct CheckpointTokenV2 {
     pub input: WorkInputIdV2,
     pub base: ConsistencyBaseV2,
+    /// Fresh allocator namespace installed after an exact CRDT resume.
+    pub change: Option<CrdtDispatchV2>,
     pub expected: Option<Hash>,
     pub replacement: Option<BlobRefV2>,
 }
@@ -246,8 +256,11 @@ pub struct ActorWriteV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrdtOperationV2 {
     pub actor: ActorId,
+    /// Scheduler order of this actor dispatch within the complete slice.
+    pub dispatch_ordinal: u32,
     /// Generated stable field tag, independent of the field's source order.
     pub field: Hash,
+    /// Mutation emission order within the actor dispatch.
     pub ordinal: u32,
     pub id: OperationId,
     pub payload: Vec<u8>,
@@ -297,6 +310,10 @@ pub enum WorkflowOperationV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrdtChangeV2 {
     pub id: ChangeId,
+    /// Exact immutable work envelope whose deterministic execution emitted
+    /// this change. A retry reuses those bytes; changing the causal base is a
+    /// new logical work item, not a retry.
+    pub work_hash: Hash,
     pub causal_dependencies: Vec<Hash>,
     pub causal_height: u64,
     pub operations: Vec<CrdtOperationV2>,
@@ -306,7 +323,7 @@ pub struct CrdtChangeV2 {
 
 impl CrdtChangeV2 {
     pub fn derive_id(work: &WorkEnvelopeV2) -> Option<ChangeId> {
-        let ConsistencyBaseV2::Crdt { heads } = &work.base else {
+        let ConsistencyBaseV2::Crdt { .. } = &work.base else {
             return None;
         };
         let mut bytes = Vec::new();
@@ -316,7 +333,6 @@ impl CrdtChangeV2 {
         e.fixed(&work.target.0);
         e.fixed(&work.invocation.0);
         e.u64(work.workflow_step);
-        e.list(heads, |e, head| e.fixed(&head.0));
         Some(ChangeId(
             Hash::digest(b"vos/crdt-change-id/v2", &[&bytes]).0,
         ))
@@ -746,7 +762,10 @@ impl V2Wire for ActorSliceInputV2 {
         e.fixed(&self.actor.0);
         e.fixed(&self.input.invocation.0);
         e.u64(self.input.workflow_step);
-        e.option(&self.change, |e, change| e.fixed(&change.0));
+        e.option(&self.change, |e, dispatch| {
+            e.fixed(&dispatch.change.0);
+            e.u32(dispatch.ordinal);
+        });
         e.bytes(&self.state);
         e.bytes(&self.message);
         encode_origin(&mut e, self.origin);
@@ -759,7 +778,12 @@ impl V2Wire for ActorSliceInputV2 {
                 invocation: InvocationId(d.fixed()?),
                 workflow_step: d.u64()?,
             },
-            change: d.option(|d| d.fixed().map(ChangeId))?,
+            change: d.option(|d| {
+                Ok(CrdtDispatchV2 {
+                    change: ChangeId(d.fixed()?),
+                    ordinal: d.u32()?,
+                })
+            })?,
             state: d.bytes()?,
             message: d.bytes()?,
             origin: decode_origin(d)?,
@@ -872,6 +896,7 @@ impl V2Wire for CrdtChangeV2 {
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
         e.fixed(&self.id.0);
+        e.fixed(&self.work_hash.0);
         e.list(&self.causal_dependencies, |e, dependency| {
             e.fixed(&dependency.0)
         });
@@ -887,6 +912,7 @@ impl V2Wire for CrdtChangeV2 {
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let value = Self {
             id: ChangeId(d.fixed()?),
+            work_hash: Hash(d.fixed()?),
             causal_dependencies: d.list(|d| d.fixed().map(Hash))?,
             causal_height: d.u64()?,
             operations: d.list(decode_crdt_op)?,
@@ -899,7 +925,13 @@ impl V2Wire for CrdtChangeV2 {
             })?,
         };
         ensure_sorted_unique(&value.causal_dependencies, |hash| hash.0)?;
-        ensure_sorted_unique(&value.operations, |operation| operation.id.0)?;
+        ensure_sorted_unique(&value.operations, |operation| {
+            (
+                operation.actor.0,
+                operation.dispatch_ordinal,
+                operation.ordinal,
+            )
+        })?;
         ensure_sorted_unique(&value.materializations, |materialization| {
             materialization.actor.0
         })?;
@@ -907,9 +939,12 @@ impl V2Wire for CrdtChangeV2 {
             || value.operations.iter().any(|operation| {
                 operation.payload.is_empty()
                     || operation.id
-                        != value
-                            .id
-                            .operation(operation.actor, operation.field, operation.ordinal)
+                        != value.id.operation(
+                            operation.actor,
+                            operation.dispatch_ordinal,
+                            operation.field,
+                            operation.ordinal,
+                        )
             })
             || value.workflow.windows(2).any(|pair| {
                 workflow_operation_bytes(&pair[0]) >= workflow_operation_bytes(&pair[1])
@@ -1280,6 +1315,7 @@ fn validate_accumulation_envelope(value: &AccumulationEnvelopeV2) -> Result<(), 
             if value.work.consistency == ConsistencyModeV2::Crdt
                 && value.transition.writes.is_empty()
                 && Some(change.id) == CrdtChangeV2::derive_id(&value.work)
+                && change.work_hash == value.work.hash()
                 && change.causal_dependencies.as_slice() == heads.as_slice()
                 && change.workflow == value.transition.workflow_operations() =>
         {
@@ -1584,6 +1620,7 @@ fn decode_write(d: &mut Decoder<'_>) -> Result<ActorWriteV2, DecodeError> {
 
 fn encode_crdt_op(e: &mut Encoder<'_>, value: &CrdtOperationV2) {
     e.fixed(&value.actor.0);
+    e.u32(value.dispatch_ordinal);
     e.fixed(&value.field.0);
     e.u32(value.ordinal);
     e.fixed(&value.id.0);
@@ -1593,6 +1630,7 @@ fn encode_crdt_op(e: &mut Encoder<'_>, value: &CrdtOperationV2) {
 fn decode_crdt_op(d: &mut Decoder<'_>) -> Result<CrdtOperationV2, DecodeError> {
     Ok(CrdtOperationV2 {
         actor: ActorId(d.fixed()?),
+        dispatch_ordinal: d.u32()?,
         field: Hash(d.fixed()?),
         ordinal: d.u32()?,
         id: OperationId(d.fixed()?),
@@ -1658,20 +1696,34 @@ fn encode_checkpoint_token(e: &mut Encoder<'_>, value: &CheckpointTokenV2) {
     e.fixed(&value.input.invocation.0);
     e.u64(value.input.workflow_step);
     encode_base(e, &value.base);
+    e.option(&value.change, |e, dispatch| {
+        e.fixed(&dispatch.change.0);
+        e.u32(dispatch.ordinal);
+    });
     e.option(&value.expected, |e, hash| e.fixed(&hash.0));
     e.option(&value.replacement, encode_blob_ref);
 }
 
 fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, DecodeError> {
-    Ok(CheckpointTokenV2 {
+    let value = CheckpointTokenV2 {
         input: WorkInputIdV2 {
             invocation: InvocationId(d.fixed()?),
             workflow_step: d.u64()?,
         },
         base: decode_base(d)?,
+        change: d.option(|d| {
+            Ok(CrdtDispatchV2 {
+                change: ChangeId(d.fixed()?),
+                ordinal: d.u32()?,
+            })
+        })?,
         expected: d.option(|d| d.fixed().map(Hash))?,
         replacement: d.option(decode_blob_ref)?,
-    })
+    };
+    if value.change.is_some() != matches!(value.base, ConsistencyBaseV2::Crdt { .. }) {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(value)
 }
 
 fn decode_continuation_change(d: &mut Decoder<'_>) -> Result<ContinuationChangeV2, DecodeError> {
@@ -1734,7 +1786,7 @@ fn decode_proof(d: &mut Decoder<'_>) -> Result<ProofCommitmentV2, DecodeError> {
     Ok(value)
 }
 
-fn ensure_sorted_unique<T>(values: &[T], key: impl Fn(&T) -> [u8; 32]) -> Result<(), DecodeError> {
+fn ensure_sorted_unique<T, K: Ord>(values: &[T], key: impl Fn(&T) -> K) -> Result<(), DecodeError> {
     if values.windows(2).any(|pair| key(&pair[0]) >= key(&pair[1])) {
         return Err(DecodeError::NonCanonical);
     }
@@ -1873,7 +1925,10 @@ mod tests {
                 invocation: InvocationId([23; 32]),
                 workflow_step: 7,
             },
-            change: Some(ChangeId([23; 32])),
+            change: Some(CrdtDispatchV2 {
+                change: ChangeId([23; 32]),
+                ordinal: 4,
+            }),
             state: b"before".to_vec(),
             message: b"message".to_vec(),
             origin: Origin::Actor(ActorId([22; 32])),
@@ -1914,12 +1969,32 @@ mod tests {
                 revision: 3,
                 state_root: Hash([25; 32]),
             },
+            change: None,
             expected: Some(Hash([26; 32])),
             replacement: Some(replacement),
         };
         assert_eq!(
             CheckpointTokenV2::decode(&checkpoint.encode()).unwrap(),
             checkpoint
+        );
+
+        let mut mismatched_change = checkpoint.clone();
+        mismatched_change.change = Some(CrdtDispatchV2 {
+            change: ChangeId([27; 32]),
+            ordinal: 1,
+        });
+        assert_eq!(
+            CheckpointTokenV2::decode(&mismatched_change.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut crdt_checkpoint = mismatched_change;
+        crdt_checkpoint.base = ConsistencyBaseV2::Crdt {
+            heads: vec![Hash([28; 32])],
+        };
+        assert_eq!(
+            CheckpointTokenV2::decode(&crdt_checkpoint.encode()).unwrap(),
+            crdt_checkpoint
         );
 
         let mut invalid_yield = ActorSliceOutputV2 {
@@ -2134,13 +2209,15 @@ mod tests {
             writes: vec![],
             crdt_change: Some(CrdtChangeV2 {
                 id: change_id,
+                work_hash: work.hash(),
                 causal_dependencies: vec![Hash([31; 32])],
                 causal_height: 4,
                 operations: vec![CrdtOperationV2 {
                     actor: work.target,
+                    dispatch_ordinal: 0,
                     field,
                     ordinal: 0,
-                    id: change_id.operation(work.target, field, 0),
+                    id: change_id.operation(work.target, 0, field, 0),
                     payload: b"counter +1".to_vec(),
                 }],
                 workflow: vec![WorkflowOperationV2::Consumed(work.input_id())],
@@ -2170,6 +2247,18 @@ mod tests {
             Err(DecodeError::NonCanonical)
         );
 
+        let mut bad_work_hash = envelope.clone();
+        bad_work_hash
+            .transition
+            .crdt_change
+            .as_mut()
+            .unwrap()
+            .work_hash = Hash([98; 32]);
+        assert_eq!(
+            AccumulationEnvelopeV2::decode(&bad_work_hash.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+
         let mut missing_workflow_reply = envelope;
         missing_workflow_reply.transition.reply = Some(ReplyRecordV2 {
             call_id: CallId([44; 32]),
@@ -2178,6 +2267,85 @@ mod tests {
         });
         assert_eq!(
             AccumulationEnvelopeV2::decode(&missing_workflow_reply.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn crdt_change_identity_is_stable_but_retries_require_exact_work_bytes() {
+        let mut first = work();
+        first.consistency = ConsistencyModeV2::Crdt;
+        first.base = ConsistencyBaseV2::Crdt {
+            heads: vec![Hash([41; 32])],
+        };
+        let mut different_base = first.clone();
+        different_base.base = ConsistencyBaseV2::Crdt {
+            heads: vec![Hash([42; 32])],
+        };
+
+        assert_eq!(
+            CrdtChangeV2::derive_id(&first),
+            CrdtChangeV2::derive_id(&different_base),
+            "one logical workflow step retains its change identity"
+        );
+        assert_ne!(
+            first.hash(),
+            different_base.hash(),
+            "changing the causal base is not an exact retry"
+        );
+    }
+
+    #[test]
+    fn crdt_operations_are_encoded_in_emission_order_not_hash_order() {
+        let mut work = work();
+        work.consistency = ConsistencyModeV2::Crdt;
+        work.base = ConsistencyBaseV2::Crdt { heads: vec![] };
+        let change = CrdtChangeV2::derive_id(&work).unwrap();
+        let first_field = Hash([51; 32]);
+        let first_id = change.operation(work.target, 0, first_field, 0);
+        let (second_field, second_id) = (0u16..=u16::MAX)
+            .find_map(|nonce| {
+                let mut bytes = [0u8; 32];
+                bytes[..2].copy_from_slice(&nonce.to_le_bytes());
+                let field = Hash(bytes);
+                let id = change.operation(work.target, 0, field, 1);
+                (id < first_id).then_some((field, id))
+            })
+            .expect("a descending hash-order fixture exists");
+        let operations = vec![
+            CrdtOperationV2 {
+                actor: work.target,
+                dispatch_ordinal: 0,
+                field: first_field,
+                ordinal: 0,
+                id: first_id,
+                payload: vec![1],
+            },
+            CrdtOperationV2 {
+                actor: work.target,
+                dispatch_ordinal: 0,
+                field: second_field,
+                ordinal: 1,
+                id: second_id,
+                payload: vec![2],
+            },
+        ];
+        assert!(operations[0].id > operations[1].id);
+        let value = CrdtChangeV2 {
+            id: change,
+            work_hash: work.hash(),
+            causal_dependencies: vec![],
+            causal_height: 1,
+            operations,
+            workflow: vec![WorkflowOperationV2::Consumed(work.input_id())],
+            materializations: vec![],
+        };
+        assert_eq!(CrdtChangeV2::decode(&value.encode()).unwrap(), value);
+
+        let mut reordered = value;
+        reordered.operations.swap(0, 1);
+        assert_eq!(
+            CrdtChangeV2::decode(&reordered.encode()),
             Err(DecodeError::NonCanonical)
         );
     }

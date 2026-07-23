@@ -16,8 +16,9 @@ mod guest {
     use vos::abi::{error, pvm::hostcalls};
     use vos::v2::{
         AccumulateRequestV2, AccumulationRejectionV2, AccumulationResultV2, ActorSliceOutputV2,
-        BlobRefV2, ContinuationChangeV2, GasAccountingV2, GuestAccumulateStoreV2, ReplyRecordV2,
-        ProgramId, StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2,
+        BlobRefV2, ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2, GasAccountingV2,
+        GuestAccumulateStoreV2, ProgramId, ReplyRecordV2, StateTreeStore, TransitionV2, V2Wire,
+        WorkEnvelopeV2,
         execute_guest_accumulate,
     };
 
@@ -124,8 +125,11 @@ mod guest {
         let mut continuations = alloc::vec::Vec::new();
         let mut exported_blobs = alloc::vec::Vec::new();
         if let Some(checkpoint) = actor_output.checkpoint {
+            let expected_change = CrdtChangeV2::derive_id(&work)
+                .map(|change| CrdtDispatchV2 { change, ordinal: 0 });
             if checkpoint.input.invocation != work.invocation
                 || !checkpoint.base.mode_compatible(work.consistency)
+                || checkpoint.change != expected_change
             {
                 fail_closed();
             }

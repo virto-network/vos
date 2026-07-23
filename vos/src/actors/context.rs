@@ -710,12 +710,26 @@ impl<A: Actor> Context<A> {
                 let token_len = usize::try_from(token_len)
                     .expect("checkpoint token length exceeds guest usize");
                 assert!(token_len <= token.len(), "checkpoint token exceeds buffer");
-                self.checkpoint = Some(
-                    <crate::v2::CheckpointTokenV2 as crate::v2::V2Wire>::decode(
-                        &token[..token_len],
-                    )
-                    .expect("invalid v2 checkpoint token"),
-                );
+                let checkpoint = <crate::v2::CheckpointTokenV2 as crate::v2::V2Wire>::decode(
+                    &token[..token_len],
+                )
+                .expect("invalid v2 checkpoint token");
+                if resume_kind == 1 {
+                    match (A::CRDT, checkpoint.change) {
+                        (true, Some(dispatch)) => {
+                            let actor = self.actor_id.expect("v2 actor identity is installed");
+                            crate::crdt::rebind_change(crate::crdt::ChangeId::for_dispatch(
+                                dispatch.change,
+                                actor,
+                                dispatch.ordinal,
+                            ))
+                            .expect("restored CRDT actor has an active change scope");
+                        }
+                        (false, None) => {}
+                        _ => panic!("checkpoint CRDT mode does not match actor metadata"),
+                    }
+                }
+                self.checkpoint = Some(checkpoint);
                 resume_kind == 1
             } else {
                 crate::abi::pvm::hostcalls::suspend() == 1

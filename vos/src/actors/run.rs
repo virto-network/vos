@@ -775,15 +775,19 @@ pub fn run_nested_actor_service<A: super::Actor>(
         "actor CRDT metadata does not match the service consistency mode"
     );
     let dispatch = match input.change {
-        Some(change) => crate::crdt::with_change(crate::crdt::ChangeId(change.0), || {
-            Ok(lifecycle::dispatch_one_with_invocation::<A>(
-                &input.message,
-                &mut actor,
-                &mut ctx,
-                input.input.invocation,
-            ))
-        })
-        .expect("nested CRDT actor dispatch must establish one change scope"),
+        Some(change) => {
+            let scoped_change =
+                crate::crdt::ChangeId::for_dispatch(change.change, input.actor, change.ordinal);
+            crate::crdt::with_change(scoped_change, || {
+                Ok(lifecycle::dispatch_one_with_invocation::<A>(
+                    &input.message,
+                    &mut actor,
+                    &mut ctx,
+                    input.input.invocation,
+                ))
+            })
+            .expect("nested CRDT actor dispatch must establish one change scope")
+        }
         None => lifecycle::dispatch_one_with_invocation::<A>(
             &input.message,
             &mut actor,

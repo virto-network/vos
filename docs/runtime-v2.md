@@ -85,3 +85,17 @@ choosing the same visible value; counter increments, list and text operations
 merge without dropping a DAG branch. Constraints such as uniqueness,
 overdraft prevention or irreversible global ordering require Raft or a
 purpose-built conflict-free construction.
+
+One workflow slice derives one CRDT `ChangeId` from its stable service, actor,
+`InvocationId`, and workflow step—not from its observed heads. The change also
+commits the complete `WorkEnvelopeV2` hash. An exact retry therefore reuses the
+original envelope bytes, including its causal base; changing that base is new
+work and must not masquerade as a retry of the old input.
+
+Within a change, the scheduler assigns every actor execution a unique dispatch
+ordinal. Field operations are canonical in `(ActorId, dispatch ordinal,
+operation ordinal)` emission order; their hashed `OperationId` is a dedup key,
+not an ordering key. A continuation resume carries the new dispatch namespace
+in its checkpoint token and resets the restored actor-local allocator before
+post-await guest code executes. This prevents both stale pre-await change IDs
+and repeated ordinal-zero allocation when an actor is dispatched again.

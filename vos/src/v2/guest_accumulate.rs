@@ -537,6 +537,7 @@ fn validate_crdt<S: GuestAccumulateStoreV2>(
     };
     if !transition.writes.is_empty()
         || Some(change.id) != CrdtChangeV2::derive_id(work)
+        || change.work_hash != work.hash()
         || change.causal_dependencies.as_slice() != heads.as_slice()
         || change.workflow != transition.workflow_operations()
     {
@@ -1627,6 +1628,7 @@ mod tests {
             writes: Vec::new(),
             crdt_change: Some(CrdtChangeV2 {
                 id: change_id,
+                work_hash: work.hash(),
                 causal_dependencies: match &work.base {
                     ConsistencyBaseV2::Crdt { heads } => heads.clone(),
                     _ => unreachable!(),
@@ -1634,9 +1636,10 @@ mod tests {
                 causal_height: height,
                 operations: vec![CrdtOperationV2 {
                     actor: actor(),
+                    dispatch_ordinal: 0,
                     field,
                     ordinal: 0,
-                    id: OperationId(change_id.operation(actor(), field, 0).0),
+                    id: OperationId(change_id.operation(actor(), 0, field, 0).0),
                     payload: vec![1],
                 }],
                 workflow: Vec::new(),

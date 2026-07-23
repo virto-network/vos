@@ -366,6 +366,7 @@ impl InMemoryServiceState {
                 };
                 if !transition.writes.is_empty()
                     || Some(change.id) != CrdtChangeV2::derive_id(work)
+                    || change.work_hash != work.hash()
                     || change.workflow != transition.workflow_operations()
                 {
                     return Err(AccumulateError::InvalidWorkflowTransition);
@@ -776,13 +777,15 @@ mod tests {
         let change_id = CrdtChangeV2::derive_id(&work).unwrap();
         let operation = CrdtOperationV2 {
             actor,
+            dispatch_ordinal: 0,
             field: Hash([25; 32]),
             ordinal: 0,
-            id: change_id.operation(actor, Hash([25; 32]), 0),
+            id: change_id.operation(actor, 0, Hash([25; 32]), 0),
             payload: b"increment".to_vec(),
         };
         let change = CrdtChangeV2 {
             id: change_id,
+            work_hash: work.hash(),
             causal_dependencies: vec![left],
             causal_height: 1,
             operations: vec![operation],

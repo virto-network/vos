@@ -33,11 +33,11 @@ pub use contracts::{
     AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2,
     AccumulationResultV2, ActorGenesisV2, ActorSliceInputV2, ActorSliceOutputV2, ActorWriteV2,
     AuthorizationEvidenceV2, BlobRefV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationChangeV2, CrdtChangeV2, CrdtMaterializationV2, CrdtOperationV2, GasAccountingV2,
-    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, MessageRecordV2, MethodPolicyV2,
-    ProofCommitmentV2, PublishedEffectsV2, RefineError, RefineImportsV2, ReplyRecordV2,
-    ServiceGenesisV2, ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2,
-    WorkInputIdV2, WorkflowOperationV2,
+    ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2, CrdtMaterializationV2, CrdtOperationV2,
+    GasAccountingV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, MessageRecordV2,
+    MethodPolicyV2, ProofCommitmentV2, PublishedEffectsV2, RefineError, RefineImportsV2,
+    ReplyRecordV2, ServiceGenesisV2, ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2,
+    WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
 };
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStoreV2, execute_guest_accumulate,
@@ -82,8 +82,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0x58, 0x2a, 0x7b, 0xa8, 0x05, 0xdf, 0x31, 0x00, 0x83, 0xd3, 0x5f, 0x93, 0x79, 0x51, 0x58, 0x2d,
-    0x7a, 0x67, 0xb5, 0xe9, 0x11, 0x7b, 0x93, 0xeb, 0x5f, 0xbc, 0x19, 0x1b, 0xb5, 0xdf, 0x15, 0xf5,
+    0xbd, 0x77, 0xdf, 0x58, 0xbf, 0xb3, 0x99, 0xc2, 0xfa, 0x27, 0x70, 0xb6, 0xc7, 0x1e, 0xa0, 0xee,
+    0x6d, 0x9f, 0x5e, 0xbb, 0x49, 0x3d, 0xdc, 0x1e, 0xc8, 0x3f, 0x3d, 0x19, 0xde, 0x90, 0xb2, 0xd8,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.

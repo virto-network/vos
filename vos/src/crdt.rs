@@ -68,6 +68,21 @@ impl ChangeId {
             ordinal,
         }
     }
+
+    /// Derive the actor-local allocator namespace for one scheduler dispatch.
+    /// The outer v2 change remains the batch identity; this scoped identifier
+    /// prevents actor re-entry from reusing `(change, ordinal)` in field state.
+    #[doc(hidden)]
+    pub fn for_dispatch(
+        change: crate::v2::ChangeId,
+        actor: crate::v2::ActorId,
+        dispatch_ordinal: u32,
+    ) -> Self {
+        Self(crate::crypto::blake2b_hash::<32>(
+            b"vos/crdt-actor-dispatch/v2",
+            &[&change.0, &actor.0, &dispatch_ordinal.to_le_bytes()],
+        ))
+    }
 }
 
 impl From<crate::v2::InvocationId> for ChangeId {
@@ -144,6 +159,38 @@ pub fn with_change<R>(change: ChangeId, f: impl FnOnce() -> Result<R, Error>) ->
     }
     let _reset = Reset;
     f()
+}
+
+/// Replace the allocator namespace restored inside a suspended actor VM.
+///
+/// A JAR snapshot intentionally preserves the active Rust stack, including
+/// this scope. The resume token names the new execution slice, so resumption
+/// must reset both its change identity and operation ordinal before the guest
+/// executes any post-await mutation.
+#[doc(hidden)]
+pub fn rebind_change(change: ChangeId) -> Result<(), Error> {
+    #[cfg(feature = "std")]
+    {
+        CHANGE_SCOPE.with(|scope| rebind_change_in(scope.borrow_mut().as_mut(), change))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        // SAFETY: PVM guests are single-threaded and resume one actor at a
+        // flushed protocol boundary.
+        let scope = unsafe { &mut *CHANGE_SCOPE.0.get() };
+        rebind_change_in(scope.as_mut(), change)
+    }
+}
+
+fn rebind_change_in(scope: Option<&mut ChangeScope>, change: ChangeId) -> Result<(), Error> {
+    let scope = scope.ok_or(Error::NoChangeScope)?;
+    scope.change = change;
+    scope.next_ordinal = 0;
+    // Per-dispatch operation capture belongs to this same scope. When that
+    // capture is enabled, its pending buffer must also be cleared here: the
+    // pre-await operations were finalized by the checkpoint fork and must not
+    // leak into the resumed slice.
+    Ok(())
 }
 
 #[cfg(feature = "std")]
@@ -938,6 +985,38 @@ mod tests {
         let mut value = Value::default();
         with_change(change(4), || value.set("ready")).unwrap();
         assert_eq!(value.visible_id(), Some(change(4).operation(0)));
+    }
+
+    #[test]
+    fn restored_scope_rebinds_before_post_await_mutations() {
+        let mut counter = Counter::default();
+        with_change(change(1), || {
+            counter.increment(1)?;
+            rebind_change(change(2))?;
+            counter.increment(1)?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            counter.operations.keys().copied().collect::<Vec<_>>(),
+            vec![change(1).operation(0), change(2).operation(0)]
+        );
+        assert_eq!(counter.value(), 2);
+    }
+
+    #[test]
+    fn scheduler_dispatches_have_distinct_actor_local_namespaces() {
+        let batch = crate::v2::ChangeId([9; 32]);
+        let actor = crate::v2::ActorId([8; 32]);
+        assert_ne!(
+            ChangeId::for_dispatch(batch, actor, 0),
+            ChangeId::for_dispatch(batch, actor, 1)
+        );
+        assert_ne!(
+            ChangeId::for_dispatch(batch, actor, 0),
+            ChangeId::for_dispatch(batch, crate::v2::ActorId([7; 32]), 0)
+        );
     }
 
     #[test]

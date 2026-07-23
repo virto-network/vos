@@ -111,10 +111,22 @@ impl InvocationId {
 
 impl ChangeId {
     /// Stable operation identity within one atomically batched CRDT change.
-    pub fn operation(self, actor: ActorId, field: Hash, ordinal: u32) -> OperationId {
+    pub fn operation(
+        self,
+        actor: ActorId,
+        dispatch_ordinal: u32,
+        field: Hash,
+        operation_ordinal: u32,
+    ) -> OperationId {
         OperationId(crate::crypto::blake2b_hash::<32>(
             b"vos/crdt-operation-id/v2",
-            &[&self.0, &actor.0, &field.0, &ordinal.to_le_bytes()],
+            &[
+                &self.0,
+                &actor.0,
+                &dispatch_ordinal.to_le_bytes(),
+                &field.0,
+                &operation_ordinal.to_le_bytes(),
+            ],
         ))
     }
 }

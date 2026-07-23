@@ -16,8 +16,8 @@ use javm::vm_pool::{MAX_CODE_CAPS, VmState};
 use super::{
     ACCUMULATE_ENTRY_IC, ACTOR_IPC_BASE_PAGE, ACTOR_IPC_CAP_SLOT, AccumulationResultV2,
     ActorSliceInputV2, BlobRefV2, CheckpointTokenV2, ContinuationSnapshotV2, CrdtChangeV2,
-    ImportedBlobV2, ProgramId, REFINE_ENTRY_IC, RefineImportsV2, TARGET_ACTOR_HANDLE_SLOT, V2Wire,
-    WorkEnvelopeV2,
+    CrdtDispatchV2, ImportedBlobV2, ProgramId, REFINE_ENTRY_IC, RefineImportsV2,
+    TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
 };
 
 const MAX_ACTOR_IPC_PAGES: u32 = 1024;
@@ -267,6 +267,7 @@ impl ServicePvmV2 {
                 &CheckpointTokenV2 {
                     input: work.input_id(),
                     base: work.base.clone(),
+                    change: crdt_dispatch(&work, 0),
                     expected: Some(reference.hash),
                     replacement: None,
                 },
@@ -289,7 +290,7 @@ impl ServicePvmV2 {
         let actor_input = ActorSliceInputV2 {
             actor: work.target,
             input: work.input_id(),
-            change: CrdtChangeV2::derive_id(&work),
+            change: crdt_dispatch(&work, 0),
             state: target_state.to_vec(),
             message: work.arguments.clone(),
             origin: work.origin,
@@ -466,6 +467,10 @@ fn install_actor_ipc(
     Ok((input_len, capacity))
 }
 
+fn crdt_dispatch(work: &WorkEnvelopeV2, ordinal: u32) -> Option<CrdtDispatchV2> {
+    CrdtChangeV2::derive_id(work).map(|change| CrdtDispatchV2 { change, ordinal })
+}
+
 fn imported_blob_bytes<'a>(
     imports: &'a RefineImportsV2,
     reference: &BlobRefV2,
@@ -590,6 +595,7 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                             &CheckpointTokenV2 {
                                 input: work.input_id(),
                                 base: work.base.clone(),
+                                change: crdt_dispatch(work, 0),
                                 expected,
                                 replacement: Some(artifact.reference.clone()),
                             },
