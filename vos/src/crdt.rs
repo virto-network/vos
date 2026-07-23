@@ -32,9 +32,11 @@ impl ChangeId {
     }
 
     pub fn derive(namespace: &[u8], nonce: &[u8]) -> Self {
+        let namespace_len = (namespace.len() as u64).to_le_bytes();
+        let nonce_len = (nonce.len() as u64).to_le_bytes();
         Self(crate::crypto::blake2b_hash::<32>(
             b"vos/crdt-change/v2",
-            &[namespace, nonce],
+            &[&namespace_len, namespace, &nonce_len, nonce],
         ))
     }
 
@@ -722,6 +724,14 @@ mod tests {
         b.merge(&a).unwrap();
         assert_eq!(a.value(), 5);
         assert_eq!(b.value(), 5);
+    }
+
+    #[test]
+    fn change_ids_frame_variable_length_inputs() {
+        assert_ne!(
+            ChangeId::derive(b"ab", b"c"),
+            ChangeId::derive(b"a", b"bc")
+        );
     }
 
     #[test]
