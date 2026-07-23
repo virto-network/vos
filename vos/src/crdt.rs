@@ -76,6 +76,7 @@ pub struct OpId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     DivergentOperation(OpId),
+    LogicalClockOverflow,
     IndexOutOfBounds,
 }
 
@@ -85,6 +86,7 @@ impl core::fmt::Display for Error {
             Self::DivergentOperation(id) => {
                 write!(f, "CRDT operation {id:?} has divergent contents")
             }
+            Self::LogicalClockOverflow => f.write_str("CRDT logical clock overflow"),
             Self::IndexOutOfBounds => f.write_str("CRDT sequence index is out of bounds"),
         }
     }
@@ -386,8 +388,11 @@ impl<T: Ord + Clone + PartialEq> Set<T> {
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[rkyv(crate = rkyv)]
 struct ListElement<T> {
-    id: OpId,
     after: Option<OpId>,
+    /// Lamport-style insertion order captured from the causal snapshot.
+    /// Later insertions at the same anchor sort before older siblings;
+    /// concurrent insertions share a clock and tie-break by `OpId`.
+    logical_time: u64,
     value: T,
 }
 
@@ -433,18 +438,23 @@ impl<T: PartialEq> List<T> {
             .copied()
             .ok_or(Error::IndexOutOfBounds)?;
         self.removed.insert(id);
-        Ok(self.elements[&id].value.clone())
+        self.elements
+            .get(&id)
+            .map(|element| element.value.clone())
+            .ok_or(Error::IndexOutOfBounds)
     }
 
     pub fn get(&self, index: usize) -> Option<&T> {
         let ids = self.visible_ids();
-        ids.get(index).map(|id| &self.elements[id].value)
+        ids.get(index)
+            .and_then(|id| self.elements.get(id))
+            .map(|element| &element.value)
     }
 
     pub fn iter(&self) -> alloc::vec::IntoIter<&T> {
         self.visible_ids()
             .into_iter()
-            .map(|id| &self.elements[&id].value)
+            .filter_map(|id| self.elements.get(&id).map(|element| &element.value))
             .collect::<Vec<_>>()
             .into_iter()
     }
@@ -465,7 +475,22 @@ impl<T: PartialEq> List<T> {
                 Err(Error::DivergentOperation(id))
             };
         }
-        self.elements.insert(id, ListElement { id, after, value });
+        let logical_time = self
+            .elements
+            .values()
+            .map(|element| element.logical_time)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(Error::LogicalClockOverflow)?;
+        self.elements.insert(
+            id,
+            ListElement {
+                after,
+                logical_time,
+                value,
+            },
+        );
         Ok(())
     }
 
@@ -478,33 +503,53 @@ impl<T: PartialEq> List<T> {
 
     fn ordered_ids(&self) -> Vec<OpId> {
         let mut children: BTreeMap<Option<OpId>, Vec<OpId>> = BTreeMap::new();
-        for element in self.elements.values() {
-            children.entry(element.after).or_default().push(element.id);
+        for (id, element) in &self.elements {
+            children.entry(element.after).or_default().push(*id);
         }
+        for ids in children.values_mut() {
+            ids.sort_by(|left, right| {
+                let left_time = self
+                    .elements
+                    .get(left)
+                    .map_or(0, |element| element.logical_time);
+                let right_time = self
+                    .elements
+                    .get(right)
+                    .map_or(0, |element| element.logical_time);
+                right_time
+                    .cmp(&left_time)
+                    .then_with(|| left.cmp(right))
+            });
+        }
+
         let mut result = Vec::with_capacity(self.elements.len());
         let mut visited = BTreeSet::new();
-        fn append(
+        fn append_descendants(
             parent: Option<OpId>,
             children: &BTreeMap<Option<OpId>, Vec<OpId>>,
             visited: &mut BTreeSet<OpId>,
             result: &mut Vec<OpId>,
         ) {
+            let mut pending = Vec::new();
             if let Some(ids) = children.get(&parent) {
-                for id in ids {
-                    if visited.insert(*id) {
-                        result.push(*id);
-                        append(Some(*id), children, visited, result);
+                pending.extend(ids.iter().rev().copied());
+            }
+            while let Some(id) = pending.pop() {
+                if visited.insert(id) {
+                    result.push(id);
+                    if let Some(ids) = children.get(&Some(id)) {
+                        pending.extend(ids.iter().rev().copied());
                     }
                 }
             }
         }
-        append(None, &children, &mut visited, &mut result);
+        append_descendants(None, &children, &mut visited, &mut result);
         // Invalid/dangling ancestry remains deterministic and visible for
         // diagnostics; complete Merkle ancestry normally makes this empty.
         for id in self.elements.keys() {
             if visited.insert(*id) {
                 result.push(*id);
-                append(Some(*id), &children, &mut visited, &mut result);
+                append_descendants(Some(*id), &children, &mut visited, &mut result);
             }
         }
         result
@@ -723,6 +768,50 @@ mod tests {
         ta.merge(&tb).unwrap();
         tb.merge(&ta).unwrap();
         assert_eq!(ta.as_string(), tb.as_string());
+    }
+
+    #[test]
+    fn sequential_list_and_text_inserts_preserve_requested_positions() {
+        let mut list = List::default();
+        list.push(change(1).operation(0), 'A').unwrap();
+        list.push(change(1).operation(1), 'C').unwrap();
+        list.insert(1, change(2).operation(0), 'B').unwrap();
+        list.insert(0, change(3).operation(0), 'Z').unwrap();
+        assert_eq!(
+            list.iter().copied().collect::<Vec<_>>(),
+            vec!['Z', 'A', 'B', 'C']
+        );
+
+        let mut text = Text::default();
+        text.insert(0, change(4), "AC").unwrap();
+        text.insert(1, change(5), "B").unwrap();
+        text.insert(0, change(6), "Z").unwrap();
+        assert_eq!(text.as_string(), "ZABC");
+    }
+
+    #[test]
+    fn long_sequential_list_walk_is_iterative() {
+        const ELEMENTS: u64 = 50_000;
+        let mut list = List::default();
+        let mut after = None;
+        for logical_time in 1..=ELEMENTS {
+            let mut change = [0u8; 32];
+            change[..8].copy_from_slice(&logical_time.to_le_bytes());
+            let id = ChangeId(change).operation(0);
+            list.elements.insert(
+                id,
+                ListElement {
+                    after,
+                    logical_time,
+                    value: logical_time,
+                },
+            );
+            after = Some(id);
+        }
+
+        let ordered = list.ordered_ids();
+        assert_eq!(ordered.len(), ELEMENTS as usize);
+        assert_eq!(ordered.last(), after.as_ref());
     }
 
     #[test]
