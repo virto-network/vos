@@ -11,10 +11,9 @@ use vos::v2::{
     AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AuthorizationEvidenceV2,
     BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2, DeploymentId, GasAccountingV2, Hash,
     ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId, JamServiceV2, MethodPolicyV2,
-    NoRefineProtocolHostV2, Origin, ProgramId, PublishedEffectsV2, RefineImportsV2, ReplyRecordV2,
-    RefineOutputV2,
-    RootServiceId, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2,
-    TransitionV2, V2Wire, WorkEnvelopeV2,
+    NoRefineProtocolHostV2, Origin, ProgramId, PublishedEffectsV2, RefineImportsV2, RefineOutputV2,
+    ReplyRecordV2, RootServiceId, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
+    ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 use vos::{Decode, Encode, value::Msg};
 
@@ -54,7 +53,7 @@ fn canonical_service_artifact_matches_a_fresh_build() {
     let Some(elf) = service_elf() else {
         return;
     };
-    let fresh = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
+    let fresh = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     assert!(
         fresh == CANONICAL_SERVICE_PVM,
         "fresh vos-service build differs: fresh ProgramId {:?}, committed ProgramId {:?}",
@@ -306,7 +305,7 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
     let Some(actor_elf) = greeter_elf() else {
         return;
     };
-    let pvm = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
+    let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let service = ServicePvmV2::new(pvm.clone(), ProgramId::of_pvm(&pvm))
         .expect("generic service has the GP IC0/IC5 entries");
     let actor = grey_transpiler::link_elf(&actor_elf).expect("canonical actor ELF transpiles");
@@ -360,7 +359,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     let (Some(service_elf), Some(actor_elf)) = (service_elf(), crdt_counter_v2_elf()) else {
         return;
     };
-    let service_pvm = grey_transpiler::link_elf(&service_elf).unwrap();
+    let service_pvm = vos::v2::transpile_service_elf(&service_elf).unwrap();
     let actor_pvm = grey_transpiler::link_elf(&actor_elf).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_bytes = Vec::new();
@@ -549,7 +548,7 @@ fn canonical_guest_rejects_a_nested_actor_without_the_reply_abi() {
     let Some(elf) = service_elf() else {
         return;
     };
-    let pvm = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
+    let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let service = ServicePvmV2::new(pvm.clone(), ProgramId::of_pvm(&pvm)).unwrap();
     let actor = actor_pvm(0);
     let actor_program = ProgramId::of_pvm(&actor);
@@ -583,7 +582,7 @@ fn actor_tree_refuses_to_replay_a_continuation_from_pc_zero() {
     let Some(elf) = service_elf() else {
         return;
     };
-    let pvm = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
+    let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let service = ServicePvmV2::new(pvm.clone(), ProgramId::of_pvm(&pvm)).unwrap();
     let actor = actor_pvm(0);
     let actor_program = ProgramId::of_pvm(&actor);
@@ -628,7 +627,7 @@ fn yielding_actor_restores_exactly_after_restart() {
     let (Some(service_elf), Some(actor_elf)) = (service_elf(), probe_elf()) else {
         return;
     };
-    let service_pvm = grey_transpiler::link_elf(&service_elf).unwrap();
+    let service_pvm = vos::v2::transpile_service_elf(&service_elf).unwrap();
     let service_program = ProgramId::of_pvm(&service_pvm);
     let service = ServicePvmV2::new(service_pvm.clone(), service_program).unwrap();
     let actor = grey_transpiler::link_elf(&actor_elf).unwrap();
@@ -891,7 +890,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let Some(elf) = service_elf() else {
         return;
     };
-    let pvm = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
+    let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let actor_pvm = b"canonical actor bytes".to_vec();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_bytes = b"initial actor state".to_vec();
@@ -1023,7 +1022,7 @@ fn physical_guest_install_rejects_an_unavailable_actor_program() {
     let Some(elf) = service_elf() else {
         return;
     };
-    let pvm = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
+    let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let actor_program = ProgramId::of_pvm(b"canonical actor bytes not imported into the service");
     let initial_bytes = b"initial actor state".to_vec();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
@@ -1078,7 +1077,7 @@ fn physical_guest_rejects_the_missing_preimage_length_sentinel() {
     let Some(elf) = service_elf() else {
         return;
     };
-    let pvm = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
+    let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let actor_pvm = b"available canonical actor bytes".to_vec();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let seed_work = work(
@@ -1133,7 +1132,7 @@ fn malformed_guest_accumulate_returns_a_rejection_without_storage_effects() {
     let Some(elf) = service_elf() else {
         return;
     };
-    let pvm = grey_transpiler::link_elf(&elf).expect("generic service ELF transpiles");
+    let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let service = ServicePvmV2::new(pvm.clone(), ProgramId::of_pvm(&pvm)).unwrap();
     let mut host = DurableAccumulateHost::default();
 

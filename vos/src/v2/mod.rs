@@ -31,9 +31,8 @@ pub use contracts::{
     ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2, CrdtMaterializationV2, CrdtOperationV2,
     GasAccountingV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, MessageRecordV2,
     MethodPolicyV2, ProofCommitmentV2, PublishedEffectsV2, RefineError, RefineImportsV2,
-    RefineOutputV2,
-    ReplyRecordV2, ServiceGenesisV2, ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2,
-    WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
+    RefineOutputV2, ReplyRecordV2, ServiceGenesisV2, ServiceIdentityV2, ServiceInstallReceiptV2,
+    TransitionV2, WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
 };
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStoreV2, execute_guest_accumulate,
@@ -49,7 +48,8 @@ pub use package::{
 #[cfg(feature = "std")]
 pub use pvm::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, NoRefineProtocolHostV2,
-    RefineProtocolHostV2, ServicePvmErrorV2, ServicePvmOutputV2, ServicePvmV2,
+    RefineProtocolHostV2, SERVICE_ARGUMENT_PAGES_V2, ServicePvmErrorV2, ServicePvmOutputV2,
+    ServicePvmV2, transpile_service_elf,
 };
 #[cfg(feature = "std")]
 pub use service::{
@@ -124,9 +124,9 @@ impl ServiceFunction {
 
 /// Revision shared by JAVM, the transpiler, proof tracer, verifier, and fuzz
 /// targets. `just check-jar-revisions` verifies that every manifest uses it.
-pub const JAR_REVISION: &str = "0e958f98d5b51ed78fbd39a1591b29c04d6cca00";
+pub const JAR_REVISION: &str = "66065e3808d43d86b3506ee2e79d8ee6768caa16";
 
 /// Consensus-visible execution semantics. Changing interpreter/recompiler or
 /// trace behavior requires a new identifier even if the public Rust API did
 /// not change.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-73355df-semantics-v2\0");
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-66065e3-semantics-v3\0");

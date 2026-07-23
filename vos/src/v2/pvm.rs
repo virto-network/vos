@@ -25,6 +25,18 @@ const MIN_ACTOR_OUTPUT_HEADROOM: usize = 16 * javm::PVM_PAGE_SIZE as usize;
 const RESULT_WHAT: u64 = u64::MAX - 1;
 const ACTOR_STACK_OBJECT_CAP: u64 = 65;
 
+/// Canonical generic-service argument window. Refine inputs and guest-owned
+/// Accumulate requests may contain a complete continuation or CRDT batch, so
+/// the infrastructure PVM deliberately opts into more than the transpiler's
+/// one-page application default while retaining the standard slot-0 DATA ABI.
+pub const SERVICE_ARGUMENT_PAGES_V2: u32 = 2048;
+
+/// Transpile the protocol infrastructure ELF with the v2 standard argument
+/// window. Application actor ELFs continue to use `grey_transpiler::link_elf`.
+pub fn transpile_service_elf(elf: &[u8]) -> Result<Vec<u8>, grey_transpiler::TranspileError> {
+    grey_transpiler::link_elf_with_argument_pages(elf, SERVICE_ARGUMENT_PAGES_V2)
+}
+
 /// Result of one completed service-PVM execution slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServicePvmOutputV2 {
@@ -727,6 +739,14 @@ fn handle_mechanical_call(slot: u8, kernel: &mut InvocationKernel) -> Option<[u6
 
 fn validate_service_entries(program: &[u8]) -> Result<(), ServicePvmErrorV2> {
     let parsed = parse_blob(program).ok_or(ServicePvmErrorV2::InvalidProgram)?;
+    let argument_cap = parsed
+        .caps
+        .iter()
+        .find(|cap| cap.cap_index == 0 && cap.cap_type == CapEntryType::Data)
+        .ok_or(ServicePvmErrorV2::InvalidServiceEntries)?;
+    if argument_cap.page_count < SERVICE_ARGUMENT_PAGES_V2 {
+        return Err(ServicePvmErrorV2::InvalidServiceEntries);
+    }
     let code_cap = parsed
         .caps
         .iter()
@@ -847,7 +867,17 @@ mod tests {
         code[1..5].copy_from_slice(&(refine_body as i32).to_le_bytes());
         code[6..10].copy_from_slice(&((accumulate_body as i32) - 5).to_le_bytes());
 
-        grey_transpiler::emitter::build_service_program(&code, &bitmask, &[], &[], &[], 1, 0, 4)
+        grey_transpiler::emitter::build_service_program_with_args_pages(
+            &code,
+            &bitmask,
+            &[],
+            &[],
+            &[],
+            1,
+            0,
+            4,
+            SERVICE_ARGUMENT_PAGES_V2,
+        )
     }
 
     fn two_entry_program(refine_call: Option<u32>) -> Vec<u8> {
@@ -966,6 +996,28 @@ mod tests {
         let actor = grey_transpiler::assembler::Assembler::new().build();
         assert!(matches!(
             ServicePvmV2::new(actor.clone(), ProgramId::of_pvm(&actor)),
+            Err(ServicePvmErrorV2::InvalidServiceEntries)
+        ));
+    }
+
+    #[test]
+    fn service_rejects_an_argument_window_too_small_for_v2_wires() {
+        let mut code = vec![40, 10, 0, 0, 0, 40, 15, 0, 0, 0];
+        let mut bitmask = vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        emit_halt(&mut code, &mut bitmask);
+        emit_halt(&mut code, &mut bitmask);
+        let program = grey_transpiler::emitter::build_service_program(
+            &code,
+            &bitmask,
+            &[],
+            &[],
+            &[],
+            1,
+            0,
+            4,
+        );
+        assert!(matches!(
+            ServicePvmV2::new(program.clone(), ProgramId::of_pvm(&program)),
             Err(ServicePvmErrorV2::InvalidServiceEntries)
         ));
     }
