@@ -131,13 +131,16 @@ fn ecall_compress(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
     // SAFETY: hostcall trap into BLAKE2B_COMPRESS. The host reads
     // 128 bytes from `m_ptr` and writes 64 bytes back through
     // `h_ptr`, sizes that match the borrowed `[u8; 64]` / `[u8; 128]`
-    // we just took the pointers of. `nostack` — we don't touch SP.
+    // we just took the pointers of. JAR resumes protocol calls with
+    // two result words in φ[7]/φ[8], so both pointer registers are
+    // clobbered after the host has used them. `nostack` — we don't
+    // touch SP.
     unsafe {
         core::arch::asm!(
             "ecall",
             in("t0") ECALL_BLAKE2B_COMPRESS as u64,
-            in("a0") h_ptr,
-            in("a1") m_ptr,
+            inlateout("a0") h_ptr => _,
+            inlateout("a1") m_ptr => _,
             in("a2") t_low,
             in("a3") f_flag,
             in("t2") f_flag, // φ[7] convention for f

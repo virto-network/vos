@@ -150,6 +150,10 @@ fn _management_ecall(a0: u64, a1: u64, a2: u64, a3: u64, op: u64, refs: u64) -> 
             "csrw 0x800, zero",
             "ecall",
             inlateout("a0") a0 => ret,
+            // Dynamic JAR management operations are dispatched
+            // synchronously by the kernel and return only through φ[7].
+            // Unlike suspended protocol calls, they do not inject a
+            // second result into φ[8], so a1 remains input-only here.
             in("a1") a1,
             in("a2") a2,
             in("a3") a3,
