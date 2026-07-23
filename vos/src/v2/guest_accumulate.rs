@@ -241,7 +241,7 @@ fn apply<S: GuestAccumulateStoreV2>(
     if transition.base != work.base {
         return Ok(rejected(AccumulationRejectionV2::TransitionBaseMismatch));
     }
-    if !canonical_transition_shape(work.target, transition) {
+    if !canonical_transition_shape(work, transition) {
         return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
     if let Some(rejection) = validate_base(tree.store_ref(), &header, &work.base)? {
@@ -611,11 +611,14 @@ fn write_crdt_change<S: GuestAccumulateStoreV2>(
     write(store, &crdt_change_storage_key(change.id), Some(&cid.0))
 }
 
-fn canonical_transition_shape(target: ActorId, transition: &super::TransitionV2) -> bool {
+fn canonical_transition_shape(
+    work: &super::WorkEnvelopeV2,
+    transition: &super::TransitionV2,
+) -> bool {
     let writes = transition.writes.iter().map(|write| {
         let mut key = write.actor.0.to_vec();
         key.extend_from_slice(&write.key);
-        (write.actor == target && !write.key.is_empty(), key)
+        (write.actor == work.target && !write.key.is_empty(), key)
     });
     let mut previous = None;
     for (valid, key) in writes {
@@ -627,10 +630,13 @@ fn canonical_transition_shape(target: ActorId, transition: &super::TransitionV2)
     is_sorted_unique_by(&transition.continuations, |change| change.actor.0)
         && is_sorted_unique_by(&transition.inbox, |message| message.call_id.0)
         && is_sorted_unique_by(&transition.outbox, |message| message.call_id.0)
-        && transition
-            .reply
-            .as_ref()
-            .is_none_or(|reply| reply.producer == target)
+        && transition.reply.as_ref().is_none_or(|reply| {
+            reply.producer == work.target
+                && reply.call_id
+                    == work
+                        .parent_call
+                        .unwrap_or_else(|| work.invocation.root_reply_id())
+        })
 }
 
 fn authorized(work: &super::WorkEnvelopeV2, policy: &MethodPolicyV2) -> bool {
@@ -723,6 +729,17 @@ fn validate_continuation_change<S: GuestAccumulateStoreV2>(
     };
     if snapshot.validate_checkpoint_for(work).is_err() {
         return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
+    if let Some(call) = snapshot.pending_call {
+        let matching = envelope
+            .transition
+            .outbox
+            .iter()
+            .filter(|message| message.call_id == call && message.from == work.target)
+            .count();
+        if matching != 1 {
+            return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
     }
     Ok(None)
 }
@@ -1275,6 +1292,26 @@ mod tests {
     }
 
     #[test]
+    fn reply_is_bound_to_the_invocation_call_id() {
+        let mut store = MemStore::default();
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let work = linear_work(initial, install.resulting_state_root.unwrap());
+        let mut transition = linear_transition(&work, b"after");
+        transition.reply.as_mut().unwrap().call_id = super::super::CallId([200; 32]);
+        let before = store.clone();
+
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 { work, transition }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        assert_eq!(store, before);
+    }
+
+    #[test]
     fn continuation_slices_are_guest_bound_to_one_workflow_identity_and_next_step() {
         let mut store = MemStore::default();
         let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
@@ -1322,6 +1359,27 @@ mod tests {
             rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
         );
         assert_eq!(store, before_wrong);
+
+        let mut waiting_snapshot = ContinuationSnapshotV2::decode(&continuation_bytes).unwrap();
+        waiting_snapshot.pending_call = Some(first_work.invocation.call_id(0));
+        let waiting_bytes = waiting_snapshot.encode();
+        let waiting = store.provide_blob(&waiting_bytes).unwrap();
+        let mut missing_outbox = checkpoint.clone();
+        missing_outbox.continuations[0].replacement = Some(waiting.clone());
+        missing_outbox.exported_blobs[0] = waiting;
+        let before_missing_outbox = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: first_work.clone(),
+                    transition: missing_outbox,
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        assert_eq!(store, before_missing_outbox);
 
         let first = execute_guest_accumulate(
             &mut store,
