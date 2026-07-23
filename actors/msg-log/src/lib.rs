@@ -67,6 +67,8 @@ pub enum Status {
     InvalidInput = 1,
     /// The body exceeded [`MAX_BODY_BYTES`].
     BodyTooLarge = 2,
+    /// An operation identifier was reused with divergent contents.
+    OperationConflict = 3,
 }
 
 impl Status {
@@ -77,6 +79,7 @@ impl Status {
             0 => Some(Self::Ok),
             1 => Some(Self::InvalidInput),
             2 => Some(Self::BodyTooLarge),
+            3 => Some(Self::OperationConflict),
             _ => None,
         }
     }
@@ -88,6 +91,7 @@ impl core::fmt::Display for Status {
             Status::Ok => "ok",
             Status::InvalidInput => "invalid input",
             Status::BodyTooLarge => "body too large",
+            Status::OperationConflict => "operation conflict",
         })
     }
 }
@@ -95,21 +99,22 @@ impl core::fmt::Display for Status {
 // ── Actor ─────────────────────────────────────────────────────────
 
 #[actor(
+    crdt,
     role = MsgLogRole,
     default_role = MsgLogRole::Reader,
     space_role_map = MSG_LOG_SPACE_ROLE_MAP
 )]
 pub struct MsgLog {
-    /// Sorted by `(lamport, id)` — the channel's convergent
-    /// total order.
-    envelopes: Vec<EnvelopeRow>,
+    /// Content-addressed envelopes. Reads impose the stable
+    /// `(lamport, id)` presentation order.
+    envelopes: crdt::Map<[u8; 32], EnvelopeRow>,
 }
 
 #[messages]
 impl MsgLog {
     pub fn new() -> Self {
         Self {
-            envelopes: Vec::new(),
+            envelopes: crdt::Map::default(),
         }
     }
 
@@ -148,27 +153,23 @@ impl MsgLog {
             None => return Status::InvalidInput,
         };
         let id = envelope_id(kind, epoch, lamport, ts_ms, &to_hint, &body);
-        let pos = match self
-            .envelopes
-            .binary_search_by(|e| sort_key(e.lamport, &e.id, lamport, &id))
-        {
-            Ok(_) => return Status::Ok,
-            Err(p) => p,
+        let row = EnvelopeRow {
+            id,
+            // `post` accepts only App envelopes (checked above).
+            kind: EnvelopeKind::App,
+            epoch,
+            lamport,
+            ts_ms,
+            to_hint,
+            body,
         };
-        self.envelopes.insert(
-            pos,
-            EnvelopeRow {
-                id,
-                // `post` accepts only App envelopes (checked above).
-                kind: EnvelopeKind::App,
-                epoch,
-                lamport,
-                ts_ms,
-                to_hint,
-                body,
-            },
-        );
-        Status::Ok
+        match self
+            .envelopes
+            .insert(crdt::ChangeId::new(id).operation(0), id, row)
+        {
+            Ok(()) => Status::Ok,
+            Err(_) => Status::OperationConflict,
+        }
     }
 
     /// Page envelopes strictly after the `(after_lamport,
@@ -184,8 +185,13 @@ impl MsgLog {
             Some(h) => h,
             None => return Vec::new(),
         };
-        let start = match self
+        let mut envelopes: Vec<_> = self
             .envelopes
+            .iter()
+            .map(|(_, envelope)| envelope)
+            .collect();
+        envelopes.sort_by(|a, b| sort_key(a.lamport, &a.id, b.lamport, &b.id));
+        let start = match envelopes
             .binary_search_by(|e| sort_key(e.lamport, &e.id, after_lamport, &after_id))
         {
             Ok(i) => i + 1,
@@ -195,8 +201,8 @@ impl MsgLog {
         let mut out = Vec::new();
         let mut budget = HISTORY_BYTE_BUDGET;
         let mut idx = start;
-        while idx < self.envelopes.len() && out.len() < max_rows {
-            let row = &self.envelopes[idx];
+        while idx < envelopes.len() && out.len() < max_rows {
+            let row = envelopes[idx];
             // Fixed fields ≈ 96 bytes per row in the archive;
             // body dominates.
             let cost = 96 + row.body.len();
@@ -213,9 +219,15 @@ impl MsgLog {
     /// Cheap poll target: row count + highest lamport stamp.
     #[msg]
     async fn stats(&self) -> LogStats {
+        let max_lamport = self
+            .envelopes
+            .iter()
+            .map(|(_, envelope)| envelope.lamport)
+            .max()
+            .unwrap_or(0);
         LogStats {
             count: self.envelopes.len() as u64,
-            max_lamport: self.envelopes.last().map_or(0, |e| e.lamport),
+            max_lamport,
         }
     }
 }
