@@ -443,12 +443,22 @@ impl SpaceRegistry {
 
     /// Add a program to the catalog. Tags are immutable — if
     /// `(name, version)` already exists, returns
-    /// `Status::TagConflict` unless the existing hash matches
-    /// (idempotent re-publish).
+    /// `Status::TagConflict` unless the existing hash and CRDT
+    /// capability match (idempotent re-publish).
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn publish(&mut self, name: String, version: String, hash: Vec<u8>, auth: Vec<u8>) -> Status {
+    async fn publish(
+        &mut self,
+        name: String,
+        version: String,
+        hash: Vec<u8>,
+        crdt: bool,
+        auth: Vec<u8>,
+    ) -> Status {
         if !self.authorize_op(
-            &canonical_op_bytes("publish", &[name.as_bytes(), version.as_bytes(), &hash]),
+            &canonical_op_bytes(
+                "publish",
+                &[name.as_bytes(), version.as_bytes(), &hash, &[crdt as u8]],
+            ),
             &auth,
         ) {
             return Status::Forbidden;
@@ -461,7 +471,7 @@ impl SpaceRegistry {
             let cur = &self.programs[idx];
             let cmp = compare_program(&cur.name, &cur.version, &name, &version);
             if cmp == 0 {
-                if cur.hash == hash {
+                if cur.hash == hash && cur.crdt == crdt {
                     return Status::Ok;
                 }
                 return Status::TagConflict;
@@ -477,6 +487,7 @@ impl SpaceRegistry {
                 name,
                 version,
                 hash,
+                crdt,
             },
         );
         Status::Ok
@@ -692,31 +703,24 @@ impl SpaceRegistry {
         };
 
         // Verify program exists with the claimed hash.
-        let mut found = false;
+        let mut program_crdt = None;
         let mut pi = 0usize;
         while pi < self.programs.len() {
             let p = &self.programs[pi];
             if p.name == program_name && p.version == program_version && p.hash == program_hash {
-                found = true;
+                program_crdt = Some(p.crdt);
                 break;
             }
             pi += 1;
         }
-        if !found {
+        let Some(program_crdt) = program_crdt else {
             return Status::ProgramNotFound;
-        }
+        };
 
-        // CRDT is a source-level opt-in. Missing or legacy metadata describes
-        // an ordinary actor and cannot silently select different semantics.
-        if consistency == 2 {
-            let crdt_enabled = self
-                .metas
-                .get(&program_hash)
-                .and_then(|row| vos::metadata::decode(&row.blob))
-                .is_some_and(|meta| meta.crdt);
-            if !crdt_enabled {
-                return Status::CrdtOptInRequired;
-            }
+        // CRDT is an immutable, signed package capability. Schema metadata is
+        // best-effort transport and must never decide replication semantics.
+        if consistency == 2 && !program_crdt {
+            return Status::CrdtOptInRequired;
         }
 
         let mut idx = 0usize;
@@ -850,7 +854,7 @@ impl SpaceRegistry {
         };
 
         // Verify the target program exists.
-        let mut found = false;
+        let mut program_crdt = None;
         let mut pi = 0usize;
         while pi < self.programs.len() {
             let p = &self.programs[pi];
@@ -858,14 +862,14 @@ impl SpaceRegistry {
                 && p.version == new_program_version
                 && p.hash == new_program_hash
             {
-                found = true;
+                program_crdt = Some(p.crdt);
                 break;
             }
             pi += 1;
         }
-        if !found {
+        let Some(program_crdt) = program_crdt else {
             return Status::ProgramNotFound;
-        }
+        };
 
         let mut idx = 0usize;
         while idx < self.agents.len() {
@@ -878,12 +882,7 @@ impl SpaceRegistry {
                     return Status::StaleUpgrade;
                 }
                 if self.agents[idx].consistency == 2 {
-                    let crdt_enabled = self
-                        .metas
-                        .get(&new_program_hash)
-                        .and_then(|row| vos::metadata::decode(&row.blob))
-                        .is_some_and(|meta| meta.crdt);
-                    if !crdt_enabled {
+                    if !program_crdt {
                         return Status::CrdtOptInRequired;
                     }
                 }
@@ -2418,32 +2417,6 @@ mod tests {
         rep
     }
 
-    fn register_crdt_meta(r: &mut SpaceRegistry, hash: &[u8]) {
-        const META: vos::metadata::ActorMeta = vos::metadata::ActorMeta {
-            actor_name: "TestCrdt",
-            messages: &[],
-            constructor: &[],
-            kind: 0,
-            caps: &[],
-            cli_methods: &[],
-            doc: "",
-            crdt: true,
-        };
-        let (buf, len) = vos::metadata::encode::<128>(&META);
-        let blob = buf[..len].to_vec();
-        assert_eq!(
-            dispatch(
-                r,
-                RegisterMeta {
-                    program_hash: hash.to_vec(),
-                    blob: blob.clone(),
-                    auth: root_auth("register_meta", &[hash, &blob]),
-                },
-            ),
-            Status::Ok,
-        );
-    }
-
     /// Publish a throwaway program (idempotent for the same hash)
     /// and install `name` at `consistency` with a fresh
     /// `replication_id`, returning the status.
@@ -2455,13 +2428,11 @@ mod tests {
                 name: String::from("p"),
                 version: String::from("1"),
                 hash: hash.clone(),
-                auth: root_auth("publish", &[b"p", b"1", &hash]),
+                crdt: true,
+                auth: root_auth("publish", &[b"p", b"1", &hash, &[1u8]]),
             },
         );
         assert!(pub_status == Status::Ok, "program publish must succeed");
-        if consistency == 2 {
-            register_crdt_meta(r, &hash);
-        }
         let rep = fresh_rep_id();
         dispatch(
             r,
@@ -2538,7 +2509,8 @@ mod tests {
                     name: String::from("p"),
                     version: String::from("1"),
                     hash: hash.clone(),
-                    auth: root_auth("publish", &[b"p", b"1", &hash]),
+                    crdt: true,
+                    auth: root_auth("publish", &[b"p", b"1", &hash, &[1u8]]),
                 },
             ),
             Status::Ok
@@ -2593,13 +2565,13 @@ mod tests {
                     name: String::from("p"),
                     version: String::from("1"),
                     hash: hash.clone(),
-                    auth: root_auth("publish", &[b"p", b"1", &hash]),
+                    crdt: true,
+                    auth: root_auth("publish", &[b"p", b"1", &hash, &[1u8]]),
                 },
             ),
             Status::Ok
         );
         let rep = fresh_rep_id();
-        register_crdt_meta(&mut r, &hash);
         let st = dispatch(
             &mut r,
             Install {
@@ -2646,7 +2618,33 @@ mod tests {
                     name: String::from("plain"),
                     version: String::from("1"),
                     hash: hash.clone(),
-                    auth: root_auth("publish", &[b"plain", b"1", &hash]),
+                    crdt: false,
+                    auth: root_auth("publish", &[b"plain", b"1", &hash, &[0u8]]),
+                },
+            ),
+            Status::Ok,
+        );
+        // Even a later schema side-channel row claiming CRDT cannot alter
+        // the signed catalog capability.
+        const META: vos::metadata::ActorMeta = vos::metadata::ActorMeta {
+            actor_name: "ForgedCrdtClaim",
+            messages: &[],
+            constructor: &[],
+            kind: 0,
+            caps: &[],
+            cli_methods: &[],
+            doc: "",
+            crdt: true,
+        };
+        let (buf, len) = vos::metadata::encode::<128>(&META);
+        let blob = buf[..len].to_vec();
+        assert_eq!(
+            dispatch(
+                &mut r,
+                RegisterMeta {
+                    program_hash: hash.clone(),
+                    blob: blob.clone(),
+                    auth: root_auth("register_meta", &[&hash, &blob]),
                 },
             ),
             Status::Ok,
@@ -2676,6 +2674,27 @@ mod tests {
         );
         assert_eq!(status, Status::CrdtOptInRequired);
         assert!(r.agents.is_empty(), "a rejected install must not add a row");
+    }
+
+    #[test]
+    fn publish_signature_binds_crdt_capability() {
+        let mut r = registry();
+        let hash = alloc::vec![4u8; 32];
+        let auth_for_plain = root_auth("publish", &[b"p", b"1", &hash, &[0u8]]);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                Publish {
+                    name: String::from("p"),
+                    version: String::from("1"),
+                    hash,
+                    crdt: true,
+                    auth: auth_for_plain,
+                },
+            ),
+            Status::Forbidden,
+        );
+        assert!(r.programs.is_empty());
     }
 
     #[test]
@@ -3298,13 +3317,18 @@ mod tests {
         let mut r = registry();
         let attacker_key = SigningKey::from_bytes(&[42u8; 32]);
         let hash = alloc::vec![7u8; 32];
-        let forged = auth_as(&attacker_key, "publish", &[b"evil", b"1", &hash]);
+        let forged = auth_as(
+            &attacker_key,
+            "publish",
+            &[b"evil", b"1", &hash, &[0u8]],
+        );
         let status = dispatch_as_system(
             &mut r,
             Publish {
                 name: String::from("evil"),
                 version: String::from("1"),
                 hash,
+                crdt: false,
                 auth: forged,
             },
         );
@@ -3634,10 +3658,10 @@ mod tests {
                 name: String::from("p"),
                 version: String::from("1"),
                 hash: hash.clone(),
-                auth: root_auth("publish", &[b"p", b"1", &hash]),
+                crdt: true,
+                auth: root_auth("publish", &[b"p", b"1", &hash, &[1u8]]),
             },
         );
-        register_crdt_meta(&mut r, &hash);
         let rep = alloc::vec![5u8; 32];
         let install_auth = root_auth(
             "install",
@@ -3724,12 +3748,11 @@ mod tests {
                     name: String::from("p"),
                     version: String::from(v),
                     hash: h.clone(),
-                    auth: root_auth("publish", &[b"p", v.as_bytes(), h]),
+                    crdt: true,
+                    auth: root_auth("publish", &[b"p", v.as_bytes(), h, &[1u8]]),
                 },
             );
         }
-        register_crdt_meta(&mut r, &h1);
-        register_crdt_meta(&mut r, &h2);
         let rep = alloc::vec![8u8; 32];
         assert_eq!(
             dispatch(

@@ -137,8 +137,8 @@ pub struct AgentDef {
     #[serde(default)]
     pub program_hash: Option<String>,
     /// `ephemeral` / `local` / `crdt` / `raft`. Defaults to
-    /// `crdt` for replicated actors; recipes that omit this
-    /// for one-off services typically want `ephemeral`.
+    /// `local`; CRDT replication is an explicit source and
+    /// deployment opt-in.
     #[serde(default = "default_consistency")]
     pub consistency: String,
     /// Opt a network-served but node-confined (`local`/`ephemeral`) agent OUT
@@ -211,7 +211,7 @@ pub struct OnStartMsg {
 }
 
 fn default_consistency() -> String {
-    "crdt".to_string()
+    "local".to_string()
 }
 
 /// Resolve an extension's `.so` path against the recipe dir,
@@ -681,6 +681,7 @@ fn reconcile_one(
     })?;
     let hash = blob_store::cache_put(&elf_bytes)
         .map_err(|e| anyhow::anyhow!("cache blob for '{}': {e}", agent.name))?;
+    let crdt = vos::metadata::from_elf(&elf_bytes).is_some_and(|meta| meta.crdt);
 
     // 2. Ensure published. Treat the agent's `name` as the
     //    program name; recipes don't carry per-program
@@ -691,9 +692,15 @@ fn reconcile_one(
         vos::block_on(reg.program(&mut &*node, program_name.clone(), program_version.clone()))
             .map_err(|e| anyhow::anyhow!("registry.program('{program_name}'): {e}"))?;
     let program_hash = match existing {
-        Some(p) if p.hash == hash.0 => {
+        Some(p) if p.hash == hash.0 && p.crdt == crdt => {
             tracing::debug!("{program_name}:{program_version} already published");
             p.hash
+        }
+        Some(p) if p.hash == hash.0 => {
+            anyhow::bail!(
+                "recipe's '{program_name}:{program_version}' has the same bytes but a different \
+                 signed CRDT capability than the catalog. Publish it under a new version."
+            );
         }
         Some(_) => {
             // Tag pinned to a different blob — recipe's blob
@@ -717,6 +724,7 @@ fn reconcile_one(
                 program_name.clone(),
                 program_version.clone(),
                 hash.0.to_vec(),
+                crdt,
                 Vec::new(),
             ))
             .map_err(|e| anyhow::anyhow!("registry.publish('{program_name}'): {e}"))?;
@@ -1167,6 +1175,7 @@ mod tests {
             name    = "counter"
             version = "recipe"
             hash    = "deadbeef"
+            crdt    = true
 
             [[agent]]
             name           = "counter"
@@ -1220,6 +1229,19 @@ mod tests {
             !m.agents[0].network_reachable,
             "network_reachable is confined (false) by default"
         );
+    }
+
+    #[test]
+    fn omitted_consistency_defaults_to_local() {
+        let m: Recipe = toml::from_str(
+            r#"
+                [[agent]]
+                name = "counter"
+                path = "counter.elf"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(m.agents[0].consistency, "local");
     }
 
     #[test]

@@ -28,6 +28,10 @@ pub struct ProgramRow {
     pub name: String,
     pub version: String,
     pub hash: [u8; 32],
+    /// Whether the immutable program was explicitly built as
+    /// `#[actor(crdt)]`. This is part of the signed catalog publication,
+    /// rather than inferred from the best-effort schema side channel.
+    pub crdt: bool,
 }
 
 /// One row in the agent (installed-instance) table.
@@ -366,8 +370,8 @@ pub enum Status {
     /// live program hash no longer matches the `from_hash` the op was
     /// authored against.
     StaleUpgrade = 11,
-    /// CRDT consistency was requested for a program that was not compiled
-    /// with `#[actor(crdt)]`, or whose v2 metadata is unavailable.
+    /// CRDT consistency was requested for a catalog entry whose signed
+    /// publication does not declare `#[actor(crdt)]`.
     CrdtOptInRequired = 12,
 }
 
@@ -563,7 +567,11 @@ fn catalog_op_canonical(msg: &Msg) -> Option<Vec<u8>> {
             let name = a.get_str("name")?;
             let version = a.get_str("version")?;
             let hash = a.get_bytes("hash")?;
-            canonical_op_bytes("publish", &[name.as_bytes(), version.as_bytes(), &hash])
+            let crdt = a.get_bool("crdt")?;
+            canonical_op_bytes(
+                "publish",
+                &[name.as_bytes(), version.as_bytes(), &hash, &[crdt as u8]],
+            )
         }
         "unpublish" => {
             let name = a.get_str("name")?;
@@ -962,6 +970,7 @@ impl RegistryRef {
         name: String,
         version: String,
         hash: Vec<u8>,
+        crdt: bool,
         auth: Vec<u8>,
     ) -> Result<Status, ClientError> {
         decode_rkyv(
@@ -971,6 +980,7 @@ impl RegistryRef {
                     .with("name", name)
                     .with("version", version)
                     .with("hash", hash)
+                    .with("crdt", crdt)
                     .with("auth", auth),
             )
             .await?,
@@ -1414,10 +1424,11 @@ mod tests {
         let m = Msg::new("publish")
             .with("name", "p")
             .with("version", "1")
-            .with("hash", alloc::vec![7u8; 32]);
+            .with("hash", alloc::vec![7u8; 32])
+            .with("crdt", true);
         assert_eq!(
             catalog_op_canonical(&m).unwrap(),
-            canonical_op_bytes("publish", &[b"p", b"1", &[7u8; 32]]),
+            canonical_op_bytes("publish", &[b"p", b"1", &[7u8; 32], &[1]]),
         );
 
         let m = Msg::new("unpublish").with("name", "p").with("version", "1");

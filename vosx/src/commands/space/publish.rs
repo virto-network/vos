@@ -55,7 +55,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let source = BlobSource::parse(&source);
     let (source_hash, bytes) =
         blob_store::resolve(&source).map_err(|e| anyhow::anyhow!("blob: {e}"))?;
-    let (hash, program_bytes, package_meta) =
+    let (hash, program_bytes, package_meta, crdt) =
         canonical_program(&name, &version, source_hash, bytes)?;
     if hash != source_hash {
         blob_store::cache_put(&program_bytes)
@@ -63,7 +63,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
 
     DaemonClient::with_connect(&args.space, |client| {
-        let status = client.publish(name.clone(), version.clone(), hash.0.to_vec())?;
+        let status = client.publish(name.clone(), version.clone(), hash.0.to_vec(), crdt)?;
         match status {
             Status::Ok => {
                 if let Some(meta) = package_meta.as_deref() {
@@ -88,9 +88,10 @@ fn canonical_program(
     version: &str,
     source_hash: BlobHash,
     bytes: Vec<u8>,
-) -> anyhow::Result<(BlobHash, Vec<u8>, Option<Vec<u8>>)> {
+) -> anyhow::Result<(BlobHash, Vec<u8>, Option<Vec<u8>>, bool)> {
     if bytes.get(..4) != Some(b"VOSP") {
-        return Ok((source_hash, bytes, None));
+        let crdt = vos::metadata::from_elf(&bytes).is_some_and(|meta| meta.crdt);
+        return Ok((source_hash, bytes, None, crdt));
     }
     let package = VosPackageV2::decode(&bytes)
         .map_err(|error| anyhow::anyhow!("decode .vos v2 package: {error}"))?;
@@ -114,7 +115,12 @@ fn canonical_program(
         anyhow::bail!("deployment signature is invalid");
     }
     let hash = BlobHash::of(&package.actor_pvm);
-    Ok((hash, package.actor_pvm, Some(package.schemas)))
+    Ok((
+        hash,
+        package.actor_pvm,
+        Some(package.schemas),
+        package.manifest.crdt,
+    ))
 }
 
 /// Catalog identity + ELF resolver for each bundled program. The tuple
@@ -144,6 +150,7 @@ fn run_bundled(space: &str, bundled_name: &str) -> anyhow::Result<()> {
     })?;
     let cached_hash =
         blob_store::cache_put(elf).map_err(|e| anyhow::anyhow!("cache {bundled_name}: {e}"))?;
+    let crdt = vos::metadata::from_elf(elf).is_some_and(|meta| meta.crdt);
 
     DaemonClient::with_connect(space, |client| {
         let already_present = match client.program(prog_name, version)? {
@@ -153,7 +160,13 @@ fn run_bundled(space: &str, bundled_name: &str) -> anyhow::Result<()> {
                     anyhow::bail!(
                         "{prog_name}:{version} already exists with a different hash ({on_disk}); \
                          bundled blob has hash {cached_hash}. Tags are immutable — bump the \
-                         version, or unpublish first."
+                        version, or unpublish first."
+                    );
+                }
+                if existing.crdt != crdt {
+                    anyhow::bail!(
+                        "{prog_name}:{version} already exists with a different signed CRDT \
+                         capability. Tags are immutable — bump the version, or unpublish first."
                     );
                 }
                 true
@@ -163,6 +176,7 @@ fn run_bundled(space: &str, bundled_name: &str) -> anyhow::Result<()> {
                     prog_name.to_string(),
                     version.to_string(),
                     cached_hash.0.to_vec(),
+                    crdt,
                 )?;
                 match status {
                     Status::Ok => {}

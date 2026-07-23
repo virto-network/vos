@@ -7230,9 +7230,15 @@ mod tests {
                 .with("name", prog.to_string())
                 .with("version", ver.to_string())
                 .with("hash", hash.clone())
+                .with("crdt", true)
                 .with(
                     "auth",
-                    auth_as(&root_key, &root_peer, "publish", &[prog.as_bytes(), ver.as_bytes(), &hash]),
+                    auth_as(
+                        &root_key,
+                        &root_peer,
+                        "publish",
+                        &[prog.as_bytes(), ver.as_bytes(), &hash, &[1u8]],
+                    ),
                 ),
         );
         let ops = [
@@ -9588,11 +9594,14 @@ mod tests {
                     Some("node_role") => Value::U8(node_role),
                     Some("programs") => Value::Bytes(
                         catalogued
-                            .then(|| vec![crate::registry::ProgramRow {
-                                name: "program".into(),
-                                version: "1".into(),
-                                hash,
-                            }])
+                            .then(|| {
+                                vec![crate::registry::ProgramRow {
+                                    name: "program".into(),
+                                    version: "1".into(),
+                                    hash,
+                                    crdt: false,
+                                }]
+                            })
                             .unwrap_or_default()
                             .encode(),
                     ),
