@@ -15,8 +15,9 @@ first accepted slice. Its logical timeslot is an explicit harness input;
 production integration must bind that value to the consensus JAM timeslot
 rather than accept a caller-selected value. Actor-side cross-root CALL now
 emits a durable outbox row and captures the exact pending protocol boundary.
-Durable outbox transport and draining, plus recovery orchestration around the
-local scheduler, remain staged work.
+For linear services the guest-owned workflow row reconstructs every later
+slice after restart without a process-local copy of the original request.
+Durable outbox transport and automatic draining remain staged work.
 
 Guest Accumulate can admit a receipt-bound reply for an existing pending-call
 continuation. It reloads the committed continuation and outbox row, binds the
@@ -31,7 +32,9 @@ envelope is bounded by `CHECKPOINT_TOKEN_CAPACITY`; larger application results
 must use a content-addressed blob reference once the transport API exposes
 that result form. This path is currently linear-only: CRDT services reject an
 awaited reply until consumption of the pending outbox row is represented by
-the built-in workflow CRDT.
+the built-in workflow CRDT. The actor-side resume branch already rebinds and
+resets the restored CRDT operation allocator, so enabling that future
+consumption path cannot reuse the pre-await change namespace.
 
 Before that production cutover, guest Install must authenticate
 `genesis.authorization` against consensus-authoritative deployment state, and
@@ -94,7 +97,12 @@ at PC 0. Suspended actors are non-reentrant; later messages remain queued.
 Every await is a durable slice boundary. Effects before it may commit even if a
 later slice fails, so multi-await handlers have saga semantics. Same-tree calls
 may execute inline. Cross-root calls always use durable outbox/inbox rows and a
-`CallId` derived from `(InvocationId, await ordinal)`.
+`CallId` derived from `(InvocationId, await ordinal)`. A compact copy of the
+authenticated parent call is bound into the workflow identity and every exact
+continuation. It retains caller/callee, deadline and parent linkage after the
+step-0 inbox row is consumed, so later awaits preserve cycle and inherited
+deadline checks without resurrecting that row. Await ordinals live in the
+captured actor machine and therefore advance across successive restarts.
 
 ## Packages and identity
 
