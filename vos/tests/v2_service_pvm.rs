@@ -830,10 +830,19 @@ fn yielding_actor_restores_exactly_after_restart() {
         Err(ScheduleErrorV2::InvalidWorkflowStep(first_work.invocation)),
         "a continuation cannot resume under a different caller identity"
     );
+    let mut alternate_arguments = resume_request.clone();
+    alternate_arguments.arguments = b"ignored resume arguments".to_vec();
+    let alternate = LocalWorkSchedulerV2::prepare(&restarted, alternate_arguments)
+        .expect("dead resume arguments are canonicalized");
     let prepared = LocalWorkSchedulerV2::prepare(&restarted, resume_request)
         .expect("scheduler reconstructs the exact next continuation slice");
+    assert_eq!(
+        alternate, prepared,
+        "resume retries cannot mint divergent work identities from dead arguments"
+    );
     let resumed_work = prepared.work;
     let resumed_imports = prepared.imports;
+    assert!(resumed_work.arguments.is_empty());
     assert_eq!(
         resumed_work.base,
         ConsistencyBaseV2::Linear {

@@ -151,7 +151,11 @@ impl LocalWorkSchedulerV2 {
             target: request.target,
             target_program: descriptor.program,
             method: request.method,
-            arguments: request.arguments,
+            arguments: if request.workflow_step == 0 {
+                request.arguments
+            } else {
+                Vec::new()
+            },
             origin: request.origin,
             authorization: request.authorization,
             causal_parent: request.causal_parent,
