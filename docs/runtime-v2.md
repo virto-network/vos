@@ -19,12 +19,26 @@ injection of the committed reply into the caller's exact pending protocol
 boundary remain staged work. Until that path lands, the canonical Refine entry
 does not emit a durable outbox message or a pending-call continuation.
 
+Guest Accumulate can admit a receipt-bound reply for an existing pending-call
+continuation. It reloads the committed continuation and outbox row, binds the
+call, caller invocation, await ordinal and producer, rejects replies admitted
+at or after the call deadline, asks the host to verify the exact external
+receipt and its service's ownership of that producer, and consumes the outbox
+only in the accepted resumed transition. The local harness uses an explicit
+receipt-and-producer allowlist for conformance. Actor-side CALL emission,
+transport, and injection of this admitted reply into the exact saved protocol
+boundary remain the next staged step. This admission path is currently
+linear-only: CRDT services reject an awaited reply until consumption of the
+pending outbox row is represented by the built-in workflow CRDT.
+
 Before that production cutover, guest Install must authenticate
 `genesis.authorization` against consensus-authoritative deployment state, and
 `PROGRAM_LOOKUP` availability must be pinned to or imported from
-consensus-visible state rather than a node-local cache. A bounded reclamation
-or checkpoint plan for unreachable SMT and CRDT DAG nodes is also required
-before the engine stores production state.
+consensus-visible state rather than a node-local cache. `RECEIPT_VERIFY` must
+likewise use consensus-authoritative receipt finality rather than the local
+conformance allowlist. A bounded reclamation or checkpoint plan for
+unreachable SMT and CRDT DAG nodes is also required before the engine stores
+production state.
 
 The CRDT checkpoint is a consensus feature, not a local cache optimization.
 Before cutover it must:
