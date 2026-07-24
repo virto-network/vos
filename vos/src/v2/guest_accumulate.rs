@@ -949,9 +949,11 @@ fn contains_cycle(messages: &[MessageRecordV2]) -> bool {
 }
 
 /// Validate stable call IDs against both new and committed workflow rows, then
-/// walk each new outbound call through its causal parents. A child call must
-/// originate at its parent's recipient, cannot extend a parent deadline, and
-/// cannot target an actor already present in its causal caller chain.
+/// walk each new outbound call through its causal parents. Every message
+/// written by an actor transition must identify that actor as its sender. A
+/// child call must originate at its parent's recipient, cannot extend a parent
+/// deadline, and cannot target an actor already present in its causal caller
+/// chain.
 fn validate_durable_messages<S: StateTreeStore>(
     tree: &ServiceStateTreeV2<'_, S>,
     work: &super::WorkEnvelopeV2,
@@ -959,9 +961,10 @@ fn validate_durable_messages<S: StateTreeStore>(
 ) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
     let mut staged = BTreeMap::<super::CallId, MessageRecordV2>::new();
     for message in transition.inbox.iter().chain(&transition.outbox) {
-        if message
-            .deadline_timeslot
-            .is_some_and(|deadline| work.logical_timeslot >= deadline)
+        if message.from != work.target
+            || message
+                .deadline_timeslot
+                .is_some_and(|deadline| work.logical_timeslot >= deadline)
         {
             return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
         }
@@ -1684,7 +1687,7 @@ mod tests {
         let root = receipt.resulting_state_root.unwrap();
         let caller = ActorId([40; 32]);
         let peer = ActorId([41; 32]);
-        let incoming = message(42, caller, actor(), None, Some(10));
+        let incoming = message(42, actor(), actor(), None, Some(10));
 
         let mut valid_work = linear_work(initial.clone(), root);
         valid_work.invocation = InvocationId([43; 32]);
@@ -1730,7 +1733,7 @@ mod tests {
             reject(message(
                 45,
                 actor(),
-                caller,
+                actor(),
                 Some(incoming.call_id),
                 Some(9),
             )),
@@ -1750,6 +1753,28 @@ mod tests {
             )),
             rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
         );
+
+        let mut store = MemStore::default();
+        let (initial, receipt) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let work = linear_work(initial, receipt.resulting_state_root.unwrap());
+        let mut forged_sender = linear_transition(&work, b"must-not-commit");
+        forged_sender
+            .inbox
+            .push(message(48, caller, actor(), None, Some(9)));
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work,
+                    transition: forged_sender,
+                    provided_blobs: Vec::new(),
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        assert_eq!(store, before);
 
         let mut store = MemStore::default();
         let (initial, receipt) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");

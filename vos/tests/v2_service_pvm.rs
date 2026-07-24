@@ -1053,7 +1053,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         call_id,
         caller_invocation,
         await_ordinal: 0,
-        from: ActorId([71; 32]),
+        from: work.target,
         to: work.target,
         parent: None,
         payload: work.arguments.clone(),
