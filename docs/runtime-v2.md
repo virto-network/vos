@@ -17,7 +17,26 @@ rather than accept a caller-selected value. Actor-side cross-root CALL now
 emits a durable outbox row and captures the exact pending protocol boundary.
 For linear services the guest-owned workflow row reconstructs every later
 slice after restart without a process-local copy of the original request.
-Durable outbox transport and automatic draining remain staged work.
+
+The local linear-service transport is also guest-owned end to end. An accepted
+actor slice stores a recoverable publication row whose receipt commits the
+complete canonical outbox. After restart, transport selects a message from
+that publication and destination Accumulate verifies receipt finality,
+producer ownership, full-outbox membership, deadline and the exact current
+destination base before atomically inserting the inbox. A stable delivery
+identity excludes that changing base, so a retry after inbox execution is
+still an idempotent duplicate. Guest delivery records retain the admission
+timeslot and consumed bit; the local scheduler scans them after restart and
+drains runnable inbox rows through Refine plus Accumulate at an explicit later
+logical timeslot. Publication removal is a separate guest Accumulate
+acknowledgement performed only after the external consumer is durably
+committed.
+
+This is still a conformance orchestrator, not production network routing.
+Automatic node outbox routing, recovery of reply publications back to the
+original source service, and CRDT delivery/reply consumption remain staged.
+Acknowledging a publication containing several effects is the transport
+host's responsibility only after every required consumer has accepted it.
 
 Guest Accumulate can admit a receipt-bound reply for an existing pending-call
 continuation. It reloads the committed continuation and outbox row, binds the
@@ -41,9 +60,12 @@ Before that production cutover, guest Install must authenticate
 `PROGRAM_LOOKUP` availability must be pinned to or imported from
 consensus-visible state rather than a node-local cache. `RECEIPT_VERIFY` must
 likewise use consensus-authoritative receipt finality rather than the local
-conformance allowlist. A bounded reclamation or checkpoint plan for
-unreachable SMT and CRDT DAG nodes is also required before the engine stores
-production state.
+conformance allowlist, and delivery timeslots must come from the JAM slot.
+Production routing must recover and retry guest publication/delivery rows
+rather than maintain a second native message ledger. A bounded reclamation or
+checkpoint plan for unreachable SMT and CRDT DAG nodes, plus completed
+delivery/deduplication bookkeeping, is also required before the engine stores
+production state; pruning must not weaken retry safety.
 
 The CRDT checkpoint is a consensus feature, not a local cache optimization.
 Before cutover it must:
