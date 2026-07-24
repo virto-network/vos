@@ -15,12 +15,14 @@ use super::{
     ServiceStateTreeV2, StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError,
 };
 
-/// Recoverable committed image of a local v2 service account.
+/// Cloneable in-memory image of a committed local v2 service account.
 ///
 /// Rows include the guest-owned header, authenticated state nodes, receipts,
 /// deduplication records, and CRDT DAG nodes. Blobs and programs contain exact
-/// bytes keyed by their canonical identities. The snapshot contains no
-/// in-flight transaction state.
+/// bytes keyed by their canonical identities. This type has no durable wire or
+/// disk representation; it supports deterministic harness reconstruction only.
+/// A persistent backend remains part of the production cutover work. The
+/// snapshot contains no in-flight transaction state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LocalJamStoreSnapshotV2 {
     rows: BTreeMap<Vec<u8>, Vec<u8>>,
@@ -75,15 +77,18 @@ impl LocalJamStoreV2 {
         }
     }
 
-    /// Restore exactly one previously committed service-account image.
+    /// Reopen one caller-held in-memory service-account image.
+    ///
+    /// This does not read durable storage or survive process termination.
     pub fn from_snapshot(snapshot: LocalJamStoreSnapshotV2) -> Self {
         Self {
             committed: snapshot,
         }
     }
 
-    /// Capture only committed state. An active Accumulate transaction is owned
-    /// by the service invocation and cannot be observed through this object.
+    /// Clone only committed state for in-process reconstruction. An active
+    /// Accumulate transaction is owned by the service invocation and cannot be
+    /// observed through this object.
     pub fn snapshot(&self) -> LocalJamStoreSnapshotV2 {
         self.committed.clone()
     }
@@ -155,8 +160,8 @@ impl LocalJamStoreV2 {
 
     /// Make exact canonical actor code available to guest Accumulate.
     ///
-    /// Program availability is part of the recoverable service image so a
-    /// process restart cannot turn a previously valid deployment into a
+    /// Program availability is part of the cloned service image, so reopening
+    /// that complete image cannot turn a previously valid deployment into a
     /// node-local cache miss.
     pub fn import_program(&mut self, pvm: Vec<u8>) -> ProgramId {
         let program = ProgramId::of_pvm(&pvm);
@@ -380,7 +385,7 @@ mod tests {
             Some(b"canonical actor program".as_slice())
         );
 
-        let restarted = LocalJamStoreV2::from_snapshot(store.snapshot());
-        assert_eq!(restarted, store);
+        let reopened = LocalJamStoreV2::from_snapshot(store.snapshot());
+        assert_eq!(reopened, store);
     }
 }

@@ -661,7 +661,7 @@ fn actor_tree_refuses_to_replay_a_continuation_from_pc_zero() {
 }
 
 #[test]
-fn yielding_actor_restores_exactly_after_restart() {
+fn yielding_actor_restores_exactly_from_committed_snapshot() {
     let service_elf = service_elf();
     let actor_elf = probe_elf();
     let service_pvm = vos::v2::transpile_service_elf(&service_elf).unwrap();
@@ -817,24 +817,24 @@ fn yielding_actor_restores_exactly_after_restart() {
         "guest Accumulate must durably record the checkpoint state"
     );
 
-    // Simulate a process restart after Accumulate committed slice 0. The
-    // scheduler must recover the exact program, actor state, and continuation
-    // from the committed service image rather than from this test's locals.
-    let restarted = LocalJamStoreV2::from_snapshot(committed.accumulate_host().snapshot());
+    // Reconstruct the runtime from an in-memory committed snapshot after
+    // Accumulate commits slice 0. The scheduler must recover the exact program,
+    // actor state, and continuation rather than use this test's local values.
+    let reopened = LocalJamStoreV2::from_snapshot(committed.accumulate_host().snapshot());
     let mut resume_request = request;
     resume_request.workflow_step = 1;
     let mut changed_identity = resume_request.clone();
     changed_identity.origin = Origin::System;
     assert_eq!(
-        LocalWorkSchedulerV2::prepare(&restarted, changed_identity),
+        LocalWorkSchedulerV2::prepare(&reopened, changed_identity),
         Err(ScheduleErrorV2::InvalidWorkflowStep(first_work.invocation)),
         "a continuation cannot resume under a different caller identity"
     );
     let mut alternate_arguments = resume_request.clone();
     alternate_arguments.arguments = b"ignored resume arguments".to_vec();
-    let alternate = LocalWorkSchedulerV2::prepare(&restarted, alternate_arguments)
+    let alternate = LocalWorkSchedulerV2::prepare(&reopened, alternate_arguments)
         .expect("dead resume arguments are canonicalized");
-    let prepared = LocalWorkSchedulerV2::prepare(&restarted, resume_request)
+    let prepared = LocalWorkSchedulerV2::prepare(&reopened, resume_request)
         .expect("scheduler reconstructs the exact next continuation slice");
     assert_eq!(
         alternate, prepared,
@@ -859,11 +859,11 @@ fn yielding_actor_restores_exactly_after_restart() {
         service_pvm,
         service_program,
         NoRefineProtocolHostV2,
-        restarted,
+        reopened,
         100_000_000,
         5_000_000_000,
     )
-    .expect("restart reopens the canonical service PVM over committed state");
+    .expect("snapshot reopens the canonical service PVM over committed state");
 
     let resumed_output = service
         .refine_actor_tree_with_backend(
@@ -1119,18 +1119,18 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         "a read-only duplicate transaction must not commit"
     );
 
-    let restarted = LocalJamStoreV2::from_snapshot(service.accumulate_host().snapshot());
+    let reopened = LocalJamStoreV2::from_snapshot(service.accumulate_host().snapshot());
     let mut queued = request.clone();
     queued.invocation = InvocationId([99; 32]);
     assert_eq!(
-        LocalWorkSchedulerV2::prepare(&restarted, queued),
+        LocalWorkSchedulerV2::prepare(&reopened, queued),
         Err(ScheduleErrorV2::ActorBusy(work.target))
     );
 
     let mut resume = request;
     resume.workflow_step = 1;
-    let resumed = LocalWorkSchedulerV2::prepare(&restarted, resume)
-        .expect("restart reconstructs the next exact continuation slice");
+    let resumed = LocalWorkSchedulerV2::prepare(&reopened, resume)
+        .expect("snapshot reconstructs the next exact continuation slice");
     assert_eq!(
         resumed.work.base,
         ConsistencyBaseV2::Linear {
@@ -1145,7 +1145,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     assert_eq!(
         resumed.imports.blobs.len(),
         2,
-        "state and continuation bytes are both imported after restart"
+        "state and continuation bytes are both imported after snapshot reopen"
     );
 }
 
