@@ -16,10 +16,10 @@ mod guest {
     use vos::abi::{error, pvm::hostcalls};
     use vos::v2::{
         AccumulateRequestV2, AccumulationRejectionV2, AccumulationResultV2, ActorSliceOutputV2,
-        BlobRefV2, ConsistencyBaseV2, ContinuationChangeV2, CrdtChangeV2, CrdtMaterializationV2,
-        CrdtDispatchV2, GasAccountingV2, GuestAccumulateStoreV2, ImportedBlobV2, ProgramId,
-        RefineOutputV2, ReplyRecordV2, StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2,
-        execute_guest_accumulate,
+        BlobRefV2, ConsistencyBaseV2, ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2,
+        CrdtMaterializationV2, GasAccountingV2, GuestAccumulateStoreV2, ImportedBlobV2,
+        MessageRecordV2, ProgramId, RefineOutputV2, ReplyRecordV2, StateTreeStore, TransitionV2,
+        V2Wire, WorkEnvelopeV2, execute_guest_accumulate,
     };
 
     /// Upper bound for one nested actor transition in this foundation guest. This
@@ -123,12 +123,50 @@ mod guest {
             fail_closed();
         }
 
+        let outbox = actor_output
+            .outbox
+            .iter()
+            .map(|call| MessageRecordV2 {
+                call_id: work.invocation.call_id(call.await_ordinal),
+                caller_invocation: work.invocation,
+                await_ordinal: call.await_ordinal,
+                from: work.target,
+                to: call.to,
+                parent: work.parent_call,
+                payload: call.payload.clone(),
+                authorization: call.authorization.clone(),
+                deadline_timeslot: call.deadline_timeslot,
+            })
+            .collect::<alloc::vec::Vec<_>>();
+        match actor_output.checkpoint.as_ref() {
+            Some(checkpoint) if checkpoint.replacement.is_some() => {
+                if !actor_output.yielded {
+                    fail_closed();
+                }
+                match checkpoint.pending_call {
+                    Some(pending) if outbox.len() == 1 && outbox[0].call_id == pending => {}
+                    None if outbox.is_empty() => {}
+                    _ => fail_closed(),
+                }
+            }
+            Some(_) => {
+                if actor_output.yielded || !outbox.is_empty() {
+                    fail_closed();
+                }
+            }
+            None => {
+                if actor_output.yielded || !outbox.is_empty() {
+                    fail_closed();
+                }
+            }
+        }
+
         let mut consumed_input = work.input_id();
         let mut base = work.base.clone();
         let mut work_hash = work.hash();
         let mut base_causal_height = work.base_causal_height;
-        let mut change = CrdtChangeV2::derive_id(&work)
-            .map(|change| CrdtDispatchV2 { change, ordinal: 0 });
+        let mut change =
+            CrdtChangeV2::derive_id(&work).map(|change| CrdtDispatchV2 { change, ordinal: 0 });
         let mut continuations = alloc::vec::Vec::new();
         let mut exported_blobs = alloc::vec::Vec::new();
         if let Some(checkpoint) = actor_output.checkpoint {
@@ -236,7 +274,7 @@ mod guest {
             crdt_change,
             continuations,
             inbox: alloc::vec::Vec::new(),
-            outbox: alloc::vec::Vec::new(),
+            outbox,
             reply,
             exported_blobs,
             gas: GasAccountingV2::default(),

@@ -82,6 +82,12 @@ pub fn ecall2_pair(id: u32, a0: u64, a1: u64) -> [u64; 2] {
     _ecall_pair(id as u64, a0, a1, 0, 0, 0, VOS_OBJECT_CAP)
 }
 
+/// Invoke a four-argument hostcall and preserve both result registers.
+#[inline(always)]
+pub fn ecall4_pair(id: u32, a0: u64, a1: u64, a2: u64, a3: u64) -> [u64; 2] {
+    _ecall_pair(id as u64, a0, a1, a2, a3, 0, VOS_OBJECT_CAP)
+}
+
 /// Reference a slot in the current CNode for a dynamic JAR management call.
 pub const fn local_cap_ref(slot: u8) -> u32 {
     slot as u32

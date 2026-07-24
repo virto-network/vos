@@ -30,14 +30,14 @@ pub(crate) mod wire;
 pub use continuation::ContinuationSnapshotV2;
 pub use contracts::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
-    AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorSliceInputV2,
-    ActorSliceOutputV2, ActorWriteV2, AuthorizationEvidenceV2, BlobRefV2, CheckpointTokenV2,
-    ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2,
-    CrdtMaterializationV2, CrdtOperationV2, GasAccountingV2, ImportedActorV2, ImportedBlobV2,
-    ImportedProgramV2, MessageRecordV2, MethodPolicyV2, ProofCommitmentV2, PublishedEffectsV2,
-    ReceiptVerificationRequestV2, RefineError, RefineImportsV2, RefineOutputV2, ReplyRecordV2,
-    ServiceGenesisV2, ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2,
-    WorkInputIdV2, WorkflowOperationV2,
+    AccumulationRejectionV2, AccumulationResultV2, ActorCallRequestV2, ActorGenesisV2,
+    ActorSliceInputV2, ActorSliceOutputV2, ActorWriteV2, AuthorizationEvidenceV2, AwaitResumeV2,
+    BlobRefV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2,
+    CrdtChangeV2, CrdtDispatchV2, CrdtMaterializationV2, CrdtOperationV2, GasAccountingV2,
+    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, MessageRecordV2, MethodPolicyV2,
+    ProofCommitmentV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineError,
+    RefineImportsV2, RefineOutputV2, ReplyRecordV2, ServiceGenesisV2, ServiceIdentityV2,
+    ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
 };
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStoreV2, ReceiptVerificationV2, execute_guest_accumulate,
@@ -87,8 +87,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0xd3, 0x50, 0xa5, 0x8c, 0x7e, 0xfa, 0x22, 0x2d, 0x84, 0x66, 0x24, 0x2f, 0x4c, 0x2e, 0xd4, 0x1d,
-    0x7e, 0x27, 0xff, 0x7c, 0x19, 0xf0, 0x30, 0x71, 0xb8, 0x34, 0x5b, 0xb9, 0x58, 0xa1, 0x05, 0x9d,
+    0x0a, 0x90, 0xac, 0x01, 0x10, 0x89, 0xe3, 0x7b, 0x13, 0x83, 0xbb, 0x50, 0xb7, 0xb5, 0xc8, 0x21,
+    0xed, 0x34, 0x10, 0xbd, 0x2b, 0x6f, 0x8d, 0xb6, 0xfe, 0xfc, 0x0e, 0x94, 0xf5, 0xda, 0x49, 0x21,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.
@@ -116,6 +116,9 @@ pub const ACTOR_IPC_BASE_PAGE: u32 = 0x000f_0000;
 pub const ACTOR_SLICE_INPUT_MAX_BYTES: usize = 64 * 1024;
 /// Bounded stack window receiving a checkpoint token after snapshot capture.
 pub const CHECKPOINT_TOKEN_CAPACITY: usize = 4096;
+/// Register marker distinguishing an awaited-call suspension from an explicit
+/// scheduler yield at the shared SUSPEND capability.
+pub const AWAIT_SUSPEND_MAGIC: u64 = 0x564f_532d_4157_5432;
 /// Marker passed in phi[10] so the canonical actor entry selects CALL/REPLY.
 pub const NESTED_ACTOR_CALL_MAGIC: u64 = 0x564f_532d_4143_5432;
 

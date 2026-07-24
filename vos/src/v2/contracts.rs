@@ -169,6 +169,9 @@ pub struct ActorSliceOutputV2 {
     /// imported causal materialization. This is transported as a candidate
     /// blob; Refine never persists it directly.
     pub crdt_materialization: Option<Vec<u8>>,
+    /// Cross-root calls emitted by this slice. The owning service derives each
+    /// stable `CallId` from the work invocation and `await_ordinal`.
+    pub outbox: Vec<ActorCallRequestV2>,
     pub reply: Vec<u8>,
     pub yielded: bool,
     pub forbidden: bool,
@@ -194,6 +197,17 @@ pub struct CheckpointTokenV2 {
     pub change: Option<CrdtDispatchV2>,
     pub expected: Option<Hash>,
     pub replacement: Option<BlobRefV2>,
+    pub pending_call: Option<CallId>,
+}
+
+/// Actor-to-scheduler portion of a durable cross-root call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorCallRequestV2 {
+    pub await_ordinal: u64,
+    pub to: ActorId,
+    pub payload: Vec<u8>,
+    pub authorization: AuthorizationEvidenceV2,
+    pub deadline_timeslot: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,6 +360,14 @@ impl ReplyRecordV2 {
 pub struct AccumulatedReplyV2 {
     pub reply: ReplyRecordV2,
     pub receipt: AccumulationReceiptV2,
+}
+
+/// Payload injected into the exact suspended protocol-call buffer after the
+/// awaited result's accumulation receipt has been admitted as work input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwaitResumeV2 {
+    pub checkpoint: CheckpointTokenV2,
+    pub reply: ReplyRecordV2,
 }
 
 /// Exact public input passed to the platform's accumulation-receipt verifier.
@@ -928,6 +950,7 @@ impl V2Wire for ActorSliceOutputV2 {
         e.list(&self.writes, encode_write);
         e.list(&self.crdt_operations, encode_crdt_op);
         e.option(&self.crdt_materialization, |e, state| e.bytes(state));
+        e.list(&self.outbox, encode_actor_call);
         e.bytes(&self.reply);
         e.bool(self.yielded);
         e.bool(self.forbidden);
@@ -940,6 +963,7 @@ impl V2Wire for ActorSliceOutputV2 {
             writes: d.list(decode_write)?,
             crdt_operations: d.list(decode_crdt_op)?,
             crdt_materialization: d.option(Decoder::bytes)?,
+            outbox: d.list(decode_actor_call)?,
             reply: d.bytes()?,
             yielded: d.bool()?,
             forbidden: d.bool()?,
@@ -960,6 +984,11 @@ impl V2Wire for ActorSliceOutputV2 {
                     .iter()
                     .any(|operation| operation.dispatch_ordinal != first.dispatch_ordinal)
             })
+            || value
+                .outbox
+                .windows(2)
+                .any(|pair| pair[0].await_ordinal >= pair[1].await_ordinal)
+            || value.outbox.iter().any(|call| call.payload.is_empty())
             || (!value.crdt_operations.is_empty() && value.crdt_materialization.is_none())
             || (value.yielded
                 && value
@@ -983,6 +1012,27 @@ impl V2Wire for CheckpointTokenV2 {
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         decode_checkpoint_token(d)
+    }
+}
+
+impl V2Wire for AwaitResumeV2 {
+    const MAGIC: [u8; 4] = *b"VRS2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        encode_checkpoint_token(&mut e, &self.checkpoint);
+        encode_reply(&mut e, &self.reply);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            checkpoint: decode_checkpoint_token(d)?,
+            reply: decode_reply(d)?,
+        };
+        if value.checkpoint.pending_call != Some(value.reply.call_id) {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
     }
 }
 
@@ -1981,6 +2031,7 @@ fn encode_checkpoint_token(e: &mut Encoder<'_>, value: &CheckpointTokenV2) {
     });
     e.option(&value.expected, |e, hash| e.fixed(&hash.0));
     e.option(&value.replacement, encode_blob_ref);
+    e.option(&value.pending_call, |e, call| e.fixed(&call.0));
 }
 
 fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, DecodeError> {
@@ -2000,6 +2051,7 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, Dec
         })?,
         expected: d.option(|d| d.fixed().map(Hash))?,
         replacement: d.option(decode_blob_ref)?,
+        pending_call: d.option(|d| d.fixed().map(CallId))?,
     };
     let is_crdt = matches!(value.base, ConsistencyBaseV2::Crdt { .. });
     if value.change.is_some() != is_crdt
@@ -2009,6 +2061,24 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, Dec
         return Err(DecodeError::NonCanonical);
     }
     Ok(value)
+}
+
+fn encode_actor_call(e: &mut Encoder<'_>, value: &ActorCallRequestV2) {
+    e.u64(value.await_ordinal);
+    e.fixed(&value.to.0);
+    e.bytes(&value.payload);
+    encode_auth(e, &value.authorization);
+    e.option(&value.deadline_timeslot, |e, value| e.u64(*value));
+}
+
+fn decode_actor_call(d: &mut Decoder<'_>) -> Result<ActorCallRequestV2, DecodeError> {
+    Ok(ActorCallRequestV2 {
+        await_ordinal: d.u64()?,
+        to: ActorId(d.fixed()?),
+        payload: d.bytes()?,
+        authorization: decode_auth(d)?,
+        deadline_timeslot: d.option(Decoder::u64)?,
+    })
 }
 
 fn decode_continuation_change(d: &mut Decoder<'_>) -> Result<ContinuationChangeV2, DecodeError> {
@@ -2246,6 +2316,13 @@ mod tests {
             }],
             crdt_operations: vec![],
             crdt_materialization: None,
+            outbox: vec![ActorCallRequestV2 {
+                await_ordinal: 0,
+                to: ActorId([27; 32]),
+                payload: b"peer request".to_vec(),
+                authorization: AuthorizationEvidenceV2::Public,
+                deadline_timeslot: Some(30),
+            }],
             reply: b"ok".to_vec(),
             yielded: false,
             forbidden: false,
@@ -2278,6 +2355,7 @@ mod tests {
             change: None,
             expected: Some(Hash([26; 32])),
             replacement: Some(replacement),
+            pending_call: Some(InvocationId([24; 32]).call_id(3)),
         };
         assert_eq!(
             CheckpointTokenV2::decode(&checkpoint.encode()).unwrap(),
@@ -2316,6 +2394,7 @@ mod tests {
             writes: vec![],
             crdt_operations: vec![],
             crdt_materialization: None,
+            outbox: vec![],
             reply: vec![],
             yielded: true,
             forbidden: false,
@@ -2325,10 +2404,29 @@ mod tests {
             ActorSliceOutputV2::decode(&invalid_yield.encode()),
             Err(DecodeError::NonCanonical)
         );
-        invalid_yield.checkpoint = Some(checkpoint);
+        invalid_yield.checkpoint = Some(checkpoint.clone());
         assert_eq!(
             ActorSliceOutputV2::decode(&invalid_yield.encode()).unwrap(),
             invalid_yield
+        );
+
+        let resume = AwaitResumeV2 {
+            checkpoint: CheckpointTokenV2 {
+                replacement: None,
+                ..checkpoint.clone()
+            },
+            reply: ReplyRecordV2 {
+                call_id: checkpoint.pending_call.unwrap(),
+                producer: ActorId([28; 32]),
+                result: b"committed reply".to_vec(),
+            },
+        };
+        assert_eq!(AwaitResumeV2::decode(&resume.encode()).unwrap(), resume);
+        let mut mismatched = resume;
+        mismatched.reply.call_id = InvocationId([29; 32]).call_id(3);
+        assert_eq!(
+            AwaitResumeV2::decode(&mismatched.encode()),
+            Err(DecodeError::NonCanonical)
         );
     }
 

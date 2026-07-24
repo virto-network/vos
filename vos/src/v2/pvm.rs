@@ -15,8 +15,8 @@ use javm::vm_pool::{MAX_CODE_CAPS, VmState};
 
 use super::{
     ACCUMULATE_ENTRY_IC, ACTOR_IPC_BASE_PAGE, ACTOR_IPC_CAP_SLOT, AccumulationResultV2,
-    ActorSliceInputV2, BlobRefV2, CheckpointTokenV2, ContinuationSnapshotV2, CrdtChangeV2,
-    CrdtDispatchV2, ImportedBlobV2, ProgramId, REFINE_ENTRY_IC, RefineImportsV2,
+    ActorSliceInputV2, AwaitResumeV2, BlobRefV2, CheckpointTokenV2, ContinuationSnapshotV2,
+    CrdtChangeV2, CrdtDispatchV2, ImportedBlobV2, ProgramId, REFINE_ENTRY_IC, RefineImportsV2,
     TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
 };
 
@@ -275,20 +275,33 @@ impl ServicePvmV2 {
                 backend,
             )
             .map_err(|_| ServicePvmErrorV2::ContinuationMismatch)?;
-            let token_len = write_checkpoint_token(
-                &mut kernel,
-                &CheckpointTokenV2 {
-                    input: work.input_id(),
-                    base: work.base.clone(),
-                    work_hash: work.hash(),
-                    base_causal_height: work.base_causal_height,
-                    change: crdt_dispatch(&work, 0),
-                    expected: Some(reference.hash),
-                    replacement: None,
-                },
-            )?;
+            let checkpoint = CheckpointTokenV2 {
+                input: work.input_id(),
+                base: work.base.clone(),
+                work_hash: work.hash(),
+                base_causal_height: work.base_causal_height,
+                change: crdt_dispatch(&work, 0),
+                expected: Some(reference.hash),
+                replacement: None,
+                pending_call: continuation.pending_call,
+            };
+            let (resume_kind, payload_len) =
+                match (continuation.pending_call, work.awaited_reply.as_ref()) {
+                    (None, None) => (1, write_checkpoint_token(&mut kernel, &checkpoint)?),
+                    (Some(call), Some(awaited)) if awaited.reply.call_id == call => (
+                        2,
+                        write_await_resume(
+                            &mut kernel,
+                            &AwaitResumeV2 {
+                                checkpoint,
+                                reply: awaited.reply.clone(),
+                            },
+                        )?,
+                    ),
+                    _ => return Err(ServicePvmErrorV2::ContinuationMismatch),
+                };
             kernel
-                .resume_protocol_call(1, token_len)
+                .resume_protocol_call(resume_kind, payload_len)
                 .map_err(|_| ServicePvmErrorV2::InvalidProtocolResume)?;
             return run_refine_kernel(
                 kernel,
@@ -517,7 +530,20 @@ fn write_checkpoint_token(
     kernel: &mut InvocationKernel,
     token: &CheckpointTokenV2,
 ) -> Result<u64, ServicePvmErrorV2> {
-    let encoded = token.encode();
+    write_suspension_payload(kernel, &token.encode())
+}
+
+fn write_await_resume(
+    kernel: &mut InvocationKernel,
+    resume: &AwaitResumeV2,
+) -> Result<u64, ServicePvmErrorV2> {
+    write_suspension_payload(kernel, &resume.encode())
+}
+
+fn write_suspension_payload(
+    kernel: &mut InvocationKernel,
+    encoded: &[u8],
+) -> Result<u64, ServicePvmErrorV2> {
     let address = u32::try_from(kernel.active_reg(7))
         .map_err(|_| ServicePvmErrorV2::CheckpointTokenWriteFailed)?;
     let capacity = usize::try_from(kernel.active_reg(8))
@@ -536,7 +562,14 @@ fn write_checkpoint_token(
 fn capture_checkpoint(
     kernel: &mut InvocationKernel,
     work: &WorkEnvelopeV2,
-) -> Result<(ImportedBlobV2, KernelSnapshot), ServicePvmErrorV2> {
+) -> Result<(ImportedBlobV2, KernelSnapshot, Option<super::CallId>), ServicePvmErrorV2> {
+    let awaited = kernel.active_reg(10) == super::AWAIT_SUSPEND_MAGIC;
+    let await_ordinal = if awaited {
+        kernel.active_reg(9)
+    } else {
+        work.workflow_step
+    };
+    let pending_call = awaited.then(|| work.invocation.call_id(await_ordinal));
     let snapshot = kernel
         .snapshot()
         .map_err(|_| ServicePvmErrorV2::SnapshotFailed)?;
@@ -552,13 +585,13 @@ fn capture_checkpoint(
         checkpoint_step: work.workflow_step,
         actor: work.target,
         actor_program: work.target_program,
-        await_ordinal: work.workflow_step,
-        pending_call: None,
+        await_ordinal,
+        pending_call,
         kernel_snapshot: snapshot.to_bytes(),
     };
     let bytes = continuation.encode();
     let reference = BlobRefV2::of_bytes(&bytes);
-    Ok((ImportedBlobV2 { reference, bytes }, snapshot))
+    Ok((ImportedBlobV2 { reference, bytes }, snapshot, pending_call))
 }
 
 fn run_refine_kernel<H: RefineProtocolHostV2>(
@@ -609,7 +642,8 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                 }
                 if slot == crate::abi::hostcall::SUSPEND as u8 {
                     if let Some(work) = suspension_work {
-                        let (artifact, snapshot) = capture_checkpoint(&mut kernel, work)?;
+                        let (artifact, snapshot, pending_call) =
+                            capture_checkpoint(&mut kernel, work)?;
                         let (service_program, dormant) =
                             invocation_layout.ok_or(ServicePvmErrorV2::InvalidContinuation)?;
                         let mut finalization = InvocationKernel::restore_with_dormant_programs(
@@ -635,6 +669,7 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                                 change: crdt_dispatch(work, 0),
                                 expected,
                                 replacement: Some(artifact.reference.clone()),
+                                pending_call,
                             },
                         )?;
                         finalization

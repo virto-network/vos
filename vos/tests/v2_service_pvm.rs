@@ -955,6 +955,292 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
 }
 
 #[test]
+fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
+    let service_pvm = vos::v2::transpile_service_elf(&service_elf()).unwrap();
+    let service_program = ProgramId::of_pvm(&service_pvm);
+    let service = ServicePvmV2::new(service_pvm.clone(), service_program).unwrap();
+    let actor_elf = probe_elf();
+    let actor = grey_transpiler::link_elf(&actor_elf).unwrap();
+    let actor_program = ProgramId::of_pvm(&actor);
+    let initial_state = Vec::new();
+    let initial_state_ref = BlobRefV2::of_bytes(&initial_state);
+    let mut seed_work = work(actor_program, initial_state_ref.clone());
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("await_peer").encode());
+    seed_work.method = "await_peer".into();
+    seed_work.arguments = arguments;
+
+    let mut host = LocalJamStoreV2::default();
+    assert_eq!(host.import_blob(initial_state), initial_state_ref);
+    assert_eq!(host.import_program(actor), actor_program);
+    let mut committed = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        host,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let install = committed
+        .accumulate(&AccumulateRequestV2::Install(ServiceGenesisV2 {
+            service: seed_work.service.clone(),
+            consistency: ConsistencyModeV2::Local,
+            actors: vec![ActorGenesisV2 {
+                actor: seed_work.target,
+                parent: None,
+                program: actor_program,
+                initial_state: initial_state_ref,
+                crdt: false,
+                methods: vec![MethodPolicyV2 {
+                    method: "await_peer".into(),
+                    schema: Hash([32; 32]),
+                    policy: Hash([33; 32]),
+                    public: true,
+                    attested: false,
+                }],
+            }],
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: vos::v2::SystemCapabilityId([34; 32]),
+                authenticator: vec![35],
+            },
+        }))
+        .unwrap();
+    assert!(matches!(install.result, AccumulationResultV2::Installed(_)));
+    let request = LocalWorkRequestV2 {
+        invocation: seed_work.invocation,
+        workflow_step: 0,
+        logical_timeslot: seed_work.logical_timeslot,
+        target: seed_work.target,
+        method: seed_work.method,
+        arguments: seed_work.arguments,
+        origin: seed_work.origin,
+        authorization: seed_work.authorization,
+        causal_parent: seed_work.causal_parent,
+        parent_call: seed_work.parent_call,
+        awaited_reply: None,
+        imported_blobs: seed_work.imported_blobs,
+        proof_requested: seed_work.proof_requested,
+    };
+    let prepared = LocalWorkSchedulerV2::prepare(committed.accumulate_host(), request.clone())
+        .expect("scheduler reconstructs the initial actor slice");
+    let first_work = prepared.work;
+    let first_imports = prepared.imports;
+
+    let first_output = service
+        .refine_actor_tree_with_backend(
+            &first_work.encode(),
+            &first_imports,
+            100_000_000,
+            &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceInterpreter,
+        )
+        .unwrap();
+    assert_eq!(
+        service
+            .refine_actor_tree_with_backend(
+                &first_work.encode(),
+                &first_imports,
+                100_000_000,
+                &NoRefineProtocolHostV2,
+                javm::PvmBackend::ForceRecompiler,
+            )
+            .unwrap(),
+        first_output,
+        "both JAR backends must capture the same awaited-call boundary"
+    );
+    let first = RefineOutputV2::decode(&first_output.bytes)
+        .unwrap()
+        .transition;
+    assert!(first.reply.is_none());
+    assert_eq!(first.outbox.len(), 1);
+    let call_id = first_work.invocation.call_id(0);
+    assert_eq!(first.outbox[0].call_id, call_id);
+    assert_eq!(first.outbox[0].to, ActorId([44; 32]));
+    assert_eq!(first.outbox[0].deadline_timeslot, Some(100));
+    let first_continuation = first.continuations[0].replacement.clone().unwrap();
+    let continuation = ContinuationSnapshotV2::decode(&first_output.exported_blobs[0].bytes)
+        .expect("checkpoint exports the exact continuation envelope");
+    assert_eq!(continuation.await_ordinal, 0);
+    assert_eq!(continuation.pending_call, Some(call_id));
+    let checkpoint_state = first
+        .writes
+        .iter()
+        .find(|write| write.key == vos::lifecycle::STATE_KEY_BYTES)
+        .and_then(|write| write.value.clone())
+        .expect("pre-await mutation is part of the checkpoint transition");
+    assert_eq!(u32::decode(&checkpoint_state), 1);
+
+    let refined_first = RefineOutputV2::decode(&first_output.bytes).unwrap();
+    let mut first_candidate_blobs = refined_first.candidate_blobs;
+    first_candidate_blobs.extend(first_output.exported_blobs.clone());
+    first_candidate_blobs.sort_by_key(|blob| blob.reference.hash);
+    first_candidate_blobs.dedup();
+    let checkpointed = committed
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: first_work.clone(),
+            transition: first,
+            provided_blobs: first_candidate_blobs,
+        }))
+        .expect("checkpoint and durable outbox commit atomically");
+    assert!(matches!(
+        checkpointed.result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    let checkpoint_state_ref = BlobRefV2::of_bytes(&checkpoint_state);
+
+    // Reconstruct the service from committed state before the peer reply
+    // arrives. No live handler future or warm actor VM survives this boundary.
+    let reopened = LocalJamStoreV2::from_snapshot(committed.accumulate_host().snapshot());
+
+    let reply = ReplyRecordV2 {
+        call_id,
+        producer: ActorId([44; 32]),
+        result: vos::value::Value::U32(7).encode(),
+    };
+    let mut remote_service = first_work.service.clone();
+    remote_service.root_service = RootServiceId([45; 32]);
+    remote_service.deployment = DeploymentId([46; 32]);
+    let awaited_reply = AccumulatedReplyV2 {
+        receipt: AccumulationReceiptV2 {
+            service: remote_service,
+            accepted_transition: Hash([47; 32]),
+            reply_commitment: Some(reply.commitment()),
+            resulting_state_root: Some(Hash([48; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 3,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        },
+        reply,
+    };
+    let mut resume_request = request;
+    resume_request.workflow_step = 1;
+    resume_request.logical_timeslot = 2;
+    resume_request.awaited_reply = Some(awaited_reply.clone());
+    let prepared = LocalWorkSchedulerV2::prepare(&reopened, resume_request)
+        .expect("scheduler imports the committed state and exact continuation");
+    let resumed_work = prepared.work;
+    let resumed_imports = prepared.imports;
+    assert_eq!(resumed_work.imported_actors[0].state, checkpoint_state_ref);
+    assert_eq!(
+        resumed_work.imported_actors[0].continuation,
+        Some(first_continuation.clone())
+    );
+
+    let mut wrong_work = resumed_work.clone();
+    let wrong_reply = wrong_work.awaited_reply.as_mut().unwrap();
+    wrong_reply.reply.call_id = InvocationId([49; 32]).call_id(0);
+    wrong_reply.receipt.reply_commitment = Some(wrong_reply.reply.commitment());
+    assert_eq!(
+        service.refine_actor_tree_with_backend(
+            &wrong_work.encode(),
+            &resumed_imports,
+            100_000_000,
+            &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceInterpreter,
+        ),
+        Err(ServicePvmErrorV2::ContinuationMismatch),
+        "a different accumulated CallId cannot resume this machine"
+    );
+
+    let resumed_output = service
+        .refine_actor_tree_with_backend(
+            &resumed_work.encode(),
+            &resumed_imports,
+            100_000_000,
+            &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceInterpreter,
+        )
+        .unwrap();
+    assert_eq!(
+        service
+            .refine_actor_tree_with_backend(
+                &resumed_work.encode(),
+                &resumed_imports,
+                100_000_000,
+                &NoRefineProtocolHostV2,
+                javm::PvmBackend::ForceRecompiler,
+            )
+            .unwrap(),
+        resumed_output,
+        "both JAR backends must inject the same reply into the same snapshot"
+    );
+    let mut committed = JamServiceV2::new(
+        service_pvm,
+        service_program,
+        NoRefineProtocolHostV2,
+        reopened,
+        100_000_000,
+        5_000_000_000,
+    )
+    .expect("reopened state drives the same canonical service PVM");
+    let resumed = RefineOutputV2::decode(&resumed_output.bytes)
+        .unwrap()
+        .transition;
+    assert!(resumed.outbox.is_empty());
+    assert_eq!(resumed.continuations.len(), 1);
+    assert_eq!(
+        resumed.continuations[0].expected,
+        Some(first_continuation.hash)
+    );
+    assert_eq!(resumed.continuations[0].replacement, None);
+    let resumed_state = resumed
+        .writes
+        .iter()
+        .find(|write| write.key == vos::lifecycle::STATE_KEY_BYTES)
+        .and_then(|write| write.value.as_ref())
+        .expect("post-await state is returned by the original handler");
+    assert_eq!(
+        u32::decode(resumed_state),
+        8,
+        "pre-await code runs once and the committed reply is observed once"
+    );
+    assert_eq!(
+        resumed
+            .reply
+            .as_ref()
+            .map(|reply| vos::value::Value::decode(&reply.result)),
+        Some(vos::value::Value::U32(8))
+    );
+
+    committed
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            expected_producer: awaited_reply.reply.producer,
+            receipt: awaited_reply.receipt,
+        });
+    let completed = committed
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: resumed_work,
+            transition: resumed.clone(),
+            provided_blobs: vec![],
+        }))
+        .expect("guest Accumulate accepts the exact injected reply");
+    let AccumulationResultV2::Accepted {
+        published,
+        duplicate: false,
+        ..
+    } = completed.result
+    else {
+        panic!("guest rejected the completed await")
+    };
+    assert_eq!(published.reply, resumed.reply);
+    let header = committed.accumulate_host().header().unwrap().unwrap();
+    assert_eq!(
+        committed
+            .accumulate_host()
+            .state_row(header.service_root, &StateKeyV2::Outbox(call_id))
+            .unwrap(),
+        None,
+        "reply commit consumes the exact pending outbox"
+    );
+}
+
+#[test]
 fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let elf = service_elf();
     let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");

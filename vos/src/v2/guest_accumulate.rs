@@ -11,13 +11,13 @@ use alloc::vec::Vec;
 use super::{
     ABI_VERSION, AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorId,
-    AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationSnapshotV2, CrdtChangeV2, DedupRecordV2, EXECUTION_SEMANTICS_ID, Hash,
-    MessageRecordV2, MethodPolicyV2, ProgramId, PublishedEffectsV2, ReceiptVerificationRequestV2,
-    ServiceGenesisV2, ServiceInstallReceiptV2, ServiceStateTreeV2, StateKeyV2, StateTreeError,
-    StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2,
-    crdt_change_storage_key, crdt_node_storage_key, dedup_storage_key, header_storage_key,
-    receipt_storage_key,
+    AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2, CHECKPOINT_TOKEN_CAPACITY,
+    CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2,
+    DedupRecordV2, EXECUTION_SEMANTICS_ID, Hash, MessageRecordV2, MethodPolicyV2, ProgramId,
+    PublishedEffectsV2, ReceiptVerificationRequestV2, ServiceGenesisV2, ServiceInstallReceiptV2,
+    ServiceStateTreeV2, StateKeyV2, StateTreeError, StateTreeStore, StoreHeaderV2, StoreOpenError,
+    V2Wire, WorkflowCheckpointV2, crdt_change_storage_key, crdt_node_storage_key,
+    dedup_storage_key, header_storage_key, receipt_storage_key,
 };
 
 /// Extra content-addressed operations needed by guest Accumulate in addition
@@ -957,6 +957,28 @@ fn validate_awaited_reply<S: GuestAccumulateStoreV2>(
         || awaited.receipt.service.execution_semantics != EXECUTION_SEMANTICS_ID
         || awaited.receipt.service.root_service == work.service.root_service
     {
+        return Ok(Some(AccumulationRejectionV2::InvalidReceipt));
+    }
+    // Reject obviously oversized inline results before cloning or encoding
+    // attacker-controlled bytes. The full envelope carries additional fixed
+    // fields, so a result this large can never fit the injection window.
+    if awaited.reply.result.len() >= CHECKPOINT_TOKEN_CAPACITY {
+        return Ok(Some(AccumulationRejectionV2::InvalidReceipt));
+    }
+    let injection = AwaitResumeV2 {
+        checkpoint: CheckpointTokenV2 {
+            input: work.input_id(),
+            base: work.base.clone(),
+            work_hash: work.hash(),
+            base_causal_height: work.base_causal_height,
+            change: None,
+            expected: Some(current.hash),
+            replacement: None,
+            pending_call: Some(call),
+        },
+        reply: awaited.reply.clone(),
+    };
+    if injection.encode().len() > CHECKPOINT_TOKEN_CAPACITY {
         return Ok(Some(AccumulationRejectionV2::InvalidReceipt));
     }
     let request = ReceiptVerificationRequestV2 {
@@ -1900,6 +1922,40 @@ mod tests {
                 &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                     work: expired,
                     transition: expired_transition,
+                    provided_blobs: vec![],
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidReceipt)
+        );
+        assert_eq!(store, before);
+
+        let mut oversized = resume.clone();
+        {
+            let oversized_awaited = oversized.awaited_reply.as_mut().unwrap();
+            oversized_awaited.reply.result = vec![0; super::super::CHECKPOINT_TOKEN_CAPACITY - 1];
+            oversized_awaited.receipt.reply_commitment = Some(oversized_awaited.reply.commitment());
+        }
+        let injection = super::super::AwaitResumeV2 {
+            checkpoint: super::super::CheckpointTokenV2 {
+                input: oversized.input_id(),
+                base: oversized.base.clone(),
+                work_hash: oversized.hash(),
+                base_causal_height: oversized.base_causal_height,
+                change: None,
+                expected: Some(continuation.hash),
+                replacement: None,
+                pending_call: Some(call),
+            },
+            reply: oversized.awaited_reply.as_ref().unwrap().reply.clone(),
+        };
+        assert!(injection.encode().len() > super::super::CHECKPOINT_TOKEN_CAPACITY);
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: oversized,
+                    transition: completed.clone(),
                     provided_blobs: vec![],
                 }),
             )
