@@ -13,11 +13,10 @@ row, derive the callee invocation, origin, authorization and causal parent from
 that row, enforce its deadline, and consume it atomically with the callee's
 first accepted slice. Its logical timeslot is an explicit harness input;
 production integration must bind that value to the consensus JAM timeslot
-rather than accept a caller-selected value. Actor-side cross-root CALL
-dispatch, durable outbox transport and draining, recovery orchestration, and
-injection of the committed reply into the caller's exact pending protocol
-boundary remain staged work. Until that path lands, the canonical Refine entry
-does not emit a durable outbox message or a pending-call continuation.
+rather than accept a caller-selected value. Actor-side cross-root CALL now
+emits a durable outbox row and captures the exact pending protocol boundary.
+Durable outbox transport and draining, plus recovery orchestration around the
+local scheduler, remain staged work.
 
 Guest Accumulate can admit a receipt-bound reply for an existing pending-call
 continuation. It reloads the committed continuation and outbox row, binds the
@@ -25,11 +24,14 @@ call, caller invocation, await ordinal and producer, rejects replies admitted
 at or after the call deadline, asks the host to verify the exact external
 receipt and its service's ownership of that producer, and consumes the outbox
 only in the accepted resumed transition. The local harness uses an explicit
-receipt-and-producer allowlist for conformance. Actor-side CALL emission,
-transport, and injection of this admitted reply into the exact saved protocol
-boundary remain the next staged step. This admission path is currently
-linear-only: CRDT services reject an awaited reply until consumption of the
-pending outbox row is represented by the built-in workflow CRDT.
+receipt-and-producer allowlist for conformance. Refine injects an admitted
+reply into the exact saved protocol-call result buffer, so execution continues
+after the await rather than replaying the handler. The inline injection
+envelope is bounded by `CHECKPOINT_TOKEN_CAPACITY`; larger application results
+must use a content-addressed blob reference once the transport API exposes
+that result form. This path is currently linear-only: CRDT services reject an
+awaited reply until consumption of the pending outbox row is represented by
+the built-in workflow CRDT.
 
 Before that production cutover, guest Install must authenticate
 `genesis.authorization` against consensus-authoritative deployment state, and
