@@ -41,6 +41,16 @@ lost transport acknowledgement remains an idempotent duplicate after another
 restart or a later workflow slice. The callee publication is acknowledged only
 after the caller commit succeeds.
 
+The local host serializes the complete committed service image as canonical
+`LocalJamStoreSnapshotV2` bytes. Restore checks the current store header and
+recomputes every blob and program identity before exposing the image; in-flight
+transactions and process-local receipt policy are excluded. `DurableJamStoreV2`
+persists each candidate image through a `CommittedImageStoreV2` backend before
+swapping it into live state or returning published effects. A backend failure
+leaves the prior in-process image visible and permits an exact retry. The
+filesystem backend flushes a sibling candidate, atomically renames it over the
+committed image, then syncs the parent directory.
+
 This is still a conformance orchestrator, not production network routing.
 Automatic node discovery and outbox/reply routing, plus CRDT delivery/reply
 consumption, remain staged. Acknowledging a publication containing several
