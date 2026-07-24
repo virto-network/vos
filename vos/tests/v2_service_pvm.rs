@@ -2810,6 +2810,7 @@ fn finalized_outbox_is_delivered_and_restart_drained_through_guest_accumulate() 
         destination_publications[0].published.reply,
         Some(reply.clone())
     );
+    let reply_publication = destination_publications[0].clone();
 
     let retry =
         LocalTransportV2::deliver(&source, &mut destination, &publication, call, 2).unwrap();
@@ -2832,6 +2833,149 @@ fn finalized_outbox_is_delivered_and_restart_drained_through_guest_accumulate() 
             .unwrap()
             .is_some(),
         "publication acknowledgement does not erase the awaited-reply route"
+    );
+
+    // Reopen both roots before routing the reply. The caller invocation and
+    // exact continuation must be recovered exclusively from guest-owned
+    // service state; no warm handler or process-local return table survives.
+    let source_snapshot = source.accumulate_host().snapshot();
+    let mut source = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        LocalJamStoreV2::from_snapshot(source_snapshot),
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let destination_snapshot = destination.accumulate_host().snapshot();
+    let destination = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        LocalJamStoreV2::from_snapshot(destination_snapshot),
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+
+    let mut forged_reply_publication = reply_publication.clone();
+    forged_reply_publication
+        .published
+        .reply
+        .as_mut()
+        .unwrap()
+        .result = vos::value::Value::U32(99).encode();
+    let before_forged_reply = source.accumulate_host().snapshot();
+    assert!(matches!(
+        LocalTransportV2::resume_reply(&destination, &mut source, &forged_reply_publication, 4,),
+        Err(vos::v2::LocalTransportErrorV2::NonCanonicalPublication)
+    ));
+    assert!(
+        source
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before_forged_reply)
+    );
+
+    let before_expired_reply = source.accumulate_host().snapshot();
+    let expired_reply =
+        LocalTransportV2::resume_reply(&destination, &mut source, &reply_publication, 100);
+    assert!(
+        matches!(
+            &expired_reply,
+            Err(vos::v2::LocalTransportErrorV2::Schedule(
+                ScheduleErrorV2::DeadlineExpired(expired_call)
+            )) if *expired_call == call
+        ),
+        "unexpected expired-reply result: {expired_reply:?}"
+    );
+    assert!(
+        source
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before_expired_reply)
+    );
+
+    let resumed =
+        LocalTransportV2::resume_reply(&destination, &mut source, &reply_publication, 4).unwrap();
+    assert!(!resumed.duplicate);
+    assert_eq!(resumed.call, call);
+    assert_eq!(resumed.caller_invocation, InvocationId([84; 32]));
+    assert_eq!(
+        resumed.published.reply.as_ref().map(|reply| &reply.result),
+        Some(&vos::value::Value::U32(8).encode()),
+        "the restored caller continues after await without replaying its pre-await mutation"
+    );
+    let (reply_admission, admission_receipt) = source
+        .accumulate_host()
+        .reply_admission(call)
+        .unwrap()
+        .expect("guest Accumulate records the exact finalized reply admission");
+    assert_eq!(reply_admission.input.invocation, InvocationId([84; 32]));
+    assert_eq!(reply_admission.awaited_reply.reply, reply.clone());
+    assert_eq!(admission_receipt, resumed.receipt);
+    let source_header = source.accumulate_host().header().unwrap().unwrap();
+    assert!(
+        source
+            .accumulate_host()
+            .state_row(source_header.service_root, &StateKeyV2::Outbox(call))
+            .unwrap()
+            .is_none(),
+        "the reply route is consumed atomically with the exact resume"
+    );
+    let caller_publications = LocalTransportV2::pending_publications(&source).unwrap();
+    assert_eq!(caller_publications.len(), 1);
+    assert_eq!(caller_publications[0].published, resumed.published);
+
+    // Lose the transport acknowledgement and restart both roots again. The
+    // permanent guest-owned admission row, not the latest workflow row,
+    // classifies an exact retry even at a different transport timeslot.
+    let source_snapshot = source.accumulate_host().snapshot();
+    let mut source = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        LocalJamStoreV2::from_snapshot(source_snapshot),
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let destination_snapshot = destination.accumulate_host().snapshot();
+    let mut destination = JamServiceV2::new(
+        service_pvm,
+        service_program,
+        NoRefineProtocolHostV2,
+        LocalJamStoreV2::from_snapshot(destination_snapshot),
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let before_reply_retry = source.accumulate_host().snapshot();
+    let reply_retry =
+        LocalTransportV2::resume_reply(&destination, &mut source, &reply_publication, 5).unwrap();
+    assert!(reply_retry.duplicate);
+    assert_eq!(reply_retry.call, call);
+    assert_eq!(reply_retry.refine_gas_used, 0);
+    assert_eq!(reply_retry.accumulate_gas_used, 0);
+    assert!(
+        source
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before_reply_retry),
+        "an acknowledged reply retry never re-enters the suspended actor"
+    );
+
+    assert!(!LocalTransportV2::acknowledge(&mut destination, &reply_publication).unwrap());
+    assert!(
+        LocalTransportV2::pending_publications(&destination)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        LocalTransportV2::pending_publications(&source).unwrap(),
+        caller_publications,
+        "the caller's newly committed publication is independent of the callee acknowledgement"
     );
 }
 

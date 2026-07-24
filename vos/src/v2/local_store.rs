@@ -11,10 +11,10 @@ use alloc::vec::Vec;
 use javm::kernel::InvocationKernel;
 
 use super::{
-    AccumulateProtocolHostV2, AccumulateTransactionV2, BlobRefV2, DeliveryRecordV2,
-    MessageRecordV2, ProgramId, PublicationRecordV2, ReceiptVerificationRequestV2,
-    ServicePvmErrorV2, ServiceStateTreeV2, StateKeyV2, StateTreeStore, StoreHeaderV2,
-    StoreOpenError, V2Wire,
+    AccumulateProtocolHostV2, AccumulateTransactionV2, AccumulationReceiptV2, BlobRefV2,
+    DedupRecordV2, DeliveryRecordV2, MessageRecordV2, ProgramId, PublicationRecordV2,
+    ReceiptVerificationRequestV2, ReplyAdmissionRecordV2, ServicePvmErrorV2, ServiceStateTreeV2,
+    StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
 };
 
 /// Cloneable in-memory image of a committed local v2 service account.
@@ -47,6 +47,7 @@ pub enum LocalStoreReadErrorV2 {
     CorruptStateTree,
     CorruptPublication,
     CorruptDelivery,
+    CorruptReplyRoute,
 }
 
 impl core::fmt::Display for LocalStoreReadErrorV2 {
@@ -225,6 +226,60 @@ impl LocalJamStoreV2 {
             pending.push((delivery.call_id, delivery.logical_timeslot));
         }
         Ok(pending)
+    }
+
+    /// Load the caller-owned durable request which an accumulated reply must
+    /// consume. Absence means this service has no pending route for the call.
+    pub fn outbox_message(
+        &self,
+        call: super::CallId,
+    ) -> Result<Option<MessageRecordV2>, LocalStoreReadErrorV2> {
+        let Some(header) = self.header()? else {
+            return Ok(None);
+        };
+        self.state_row(header.service_root, &StateKeyV2::Outbox(call))?
+            .map(|bytes| {
+                let message = MessageRecordV2::decode(&bytes)
+                    .map_err(|_| LocalStoreReadErrorV2::CorruptReplyRoute)?;
+                if message.call_id != call {
+                    return Err(LocalStoreReadErrorV2::CorruptReplyRoute);
+                }
+                Ok(message)
+            })
+            .transpose()
+    }
+
+    /// Recover a previously committed reply admission and cross-check it
+    /// against the exact work-input dedup row written in the same guest
+    /// transaction.
+    pub fn reply_admission(
+        &self,
+        call: super::CallId,
+    ) -> Result<Option<(ReplyAdmissionRecordV2, AccumulationReceiptV2)>, LocalStoreReadErrorV2>
+    {
+        let Some(bytes) = self.row(&super::reply_admission_storage_key(call)) else {
+            return Ok(None);
+        };
+        let admission = ReplyAdmissionRecordV2::decode(bytes)
+            .map_err(|_| LocalStoreReadErrorV2::CorruptReplyRoute)?;
+        if admission.call_id != call {
+            return Err(LocalStoreReadErrorV2::CorruptReplyRoute);
+        }
+        let dedup_bytes = self
+            .row(&super::dedup_storage_key(admission.input))
+            .ok_or(LocalStoreReadErrorV2::CorruptReplyRoute)?;
+        let dedup = DedupRecordV2::decode(dedup_bytes)
+            .map_err(|_| LocalStoreReadErrorV2::CorruptReplyRoute)?;
+        let header = self
+            .header()?
+            .ok_or(LocalStoreReadErrorV2::CorruptReplyRoute)?;
+        if dedup.input != admission.input
+            || dedup.work_hash != admission.work_hash
+            || dedup.receipt.service != header.service
+        {
+            return Err(LocalStoreReadErrorV2::CorruptReplyRoute);
+        }
+        Ok(Some((admission, dedup.receipt)))
     }
 
     /// Make an installation input available to guest Accumulate. This is a

@@ -8,11 +8,11 @@
 use alloc::vec::Vec;
 
 use super::{
-    AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2,
-    AccumulationResultV2, CallId, JamServiceV2, LocalJamStoreV2, LocalStoreReadErrorV2,
-    LocalWorkSchedulerV2, NoRefineProtocolHostV2, PublicationAckV2, PublicationRecordV2,
-    PublishedEffectsV2, ReceiptVerificationRequestV2, ScheduleErrorV2, ServiceDispatchError,
-    V2Wire,
+    AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
+    AccumulationRejectionV2, AccumulationResultV2, CallId, InvocationId, JamServiceV2,
+    LocalJamStoreV2, LocalStoreReadErrorV2, LocalWorkSchedulerV2, NoRefineProtocolHostV2,
+    PublicationAckV2, PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
+    ScheduleErrorV2, ServiceDispatchError, V2Wire,
 };
 
 type LocalServiceV2 = JamServiceV2<NoRefineProtocolHostV2, LocalJamStoreV2>;
@@ -35,6 +35,17 @@ pub struct CommittedInboxSliceV2 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedReplyResumeV2 {
+    pub call: CallId,
+    pub caller_invocation: InvocationId,
+    pub receipt: AccumulationReceiptV2,
+    pub published: PublishedEffectsV2,
+    pub duplicate: bool,
+    pub refine_gas_used: u64,
+    pub accumulate_gas_used: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboxDrainOutcomeV2 {
     Committed(CommittedInboxSliceV2),
     Deferred {
@@ -50,6 +61,9 @@ pub enum LocalTransportErrorV2 {
     Service(ServiceDispatchError),
     Rejected(AccumulationRejectionV2),
     MissingMessage(CallId),
+    MissingReply,
+    MissingReplyRoute(CallId),
+    DivergentReply(CallId),
     NonCanonicalPublication,
     UnexpectedResult,
     TimeslotNotAfterAdmission {
@@ -109,21 +123,7 @@ impl LocalTransportV2 {
         call: CallId,
         logical_timeslot: u64,
     ) -> Result<CommittedDeliveryV2, LocalTransportErrorV2> {
-        let canonical = PublicationRecordV2::decode(&publication.encode())
-            .map_err(|_| LocalTransportErrorV2::NonCanonicalPublication)?;
-        let source_header = source
-            .accumulate_host()
-            .header()?
-            .ok_or(LocalTransportErrorV2::NonCanonicalPublication)?;
-        if canonical.receipt.service != source_header.service
-            || !source
-                .accumulate_host()
-                .pending_publications()?
-                .iter()
-                .any(|committed| committed == &canonical)
-        {
-            return Err(LocalTransportErrorV2::NonCanonicalPublication);
-        }
+        let canonical = committed_publication(source, publication)?;
         let message = canonical
             .published
             .outbox
@@ -161,6 +161,113 @@ impl LocalTransportV2 {
             }
             _ => Err(LocalTransportErrorV2::UnexpectedResult),
         }
+    }
+
+    /// Route one committed callee reply into the caller's exact suspended
+    /// machine. The caller invocation is recovered from its guest-owned
+    /// outbox; no process-local return table is trusted.
+    ///
+    /// A prior exact admission is returned as a duplicate from the permanent
+    /// reply-admission record. This remains possible after later workflow
+    /// slices overwrite the latest checkpoint.
+    pub fn resume_reply(
+        producer: &LocalServiceV2,
+        caller: &mut LocalServiceV2,
+        publication: &PublicationRecordV2,
+        logical_timeslot: u64,
+    ) -> Result<CommittedReplyResumeV2, LocalTransportErrorV2> {
+        let canonical = committed_publication(producer, publication)?;
+        let reply = canonical
+            .published
+            .reply
+            .clone()
+            .ok_or(LocalTransportErrorV2::MissingReply)?;
+        let awaited_reply = AccumulatedReplyV2 {
+            reply: reply.clone(),
+            receipt: canonical.receipt,
+        };
+        if let Some((admission, receipt)) =
+            caller.accumulate_host().reply_admission(reply.call_id)?
+        {
+            return if admission.awaited_reply == awaited_reply {
+                Ok(CommittedReplyResumeV2 {
+                    call: reply.call_id,
+                    caller_invocation: admission.input.invocation,
+                    receipt,
+                    published: PublishedEffectsV2::default(),
+                    duplicate: true,
+                    refine_gas_used: 0,
+                    accumulate_gas_used: 0,
+                })
+            } else {
+                Err(LocalTransportErrorV2::DivergentReply(reply.call_id))
+            };
+        }
+
+        let message = caller
+            .accumulate_host()
+            .outbox_message(reply.call_id)?
+            .ok_or(LocalTransportErrorV2::MissingReplyRoute(reply.call_id))?;
+        if message.to != reply.producer {
+            return Err(LocalTransportErrorV2::DivergentReply(reply.call_id));
+        }
+        if message
+            .deadline_timeslot
+            .is_some_and(|deadline| logical_timeslot >= deadline)
+        {
+            return Err(ScheduleErrorV2::DeadlineExpired(reply.call_id).into());
+        }
+        let caller_invocation = message.caller_invocation;
+        caller
+            .accumulate_host_mut()
+            .allow_receipt(&ReceiptVerificationRequestV2 {
+                expected_producer: reply.producer,
+                receipt: awaited_reply.receipt.clone(),
+            });
+        let prepared = LocalWorkSchedulerV2::prepare_resume(
+            caller.accumulate_host(),
+            caller_invocation,
+            logical_timeslot,
+            Some(awaited_reply.clone()),
+        )?;
+        let refined = caller.refine_actor_tree(&prepared.work, &prepared.imports)?;
+        let accumulated =
+            caller.accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: prepared.work,
+                transition: refined.transition,
+                provided_blobs: refined.exported_blobs,
+            }))?;
+        let (receipt, published) = match accumulated.result {
+            AccumulationResultV2::Accepted {
+                receipt,
+                published,
+                duplicate: false,
+            } => (receipt, published),
+            AccumulationResultV2::Rejected(rejection) => {
+                return Err(LocalTransportErrorV2::Rejected(rejection));
+            }
+            _ => return Err(LocalTransportErrorV2::UnexpectedResult),
+        };
+        let Some((admission, committed_receipt)) =
+            caller.accumulate_host().reply_admission(reply.call_id)?
+        else {
+            return Err(LocalTransportErrorV2::UnexpectedResult);
+        };
+        if admission.awaited_reply != awaited_reply
+            || admission.input.invocation != caller_invocation
+            || committed_receipt != receipt
+        {
+            return Err(LocalTransportErrorV2::UnexpectedResult);
+        }
+        Ok(CommittedReplyResumeV2 {
+            call: reply.call_id,
+            caller_invocation,
+            receipt,
+            published,
+            duplicate: false,
+            refine_gas_used: refined.gas_used,
+            accumulate_gas_used: accumulated.gas_used,
+        })
     }
 
     /// Drain every guest-admitted inbox row which is runnable after restart.
@@ -245,4 +352,26 @@ impl LocalTransportV2 {
             _ => Err(LocalTransportErrorV2::UnexpectedResult),
         }
     }
+}
+
+fn committed_publication(
+    source: &LocalServiceV2,
+    publication: &PublicationRecordV2,
+) -> Result<PublicationRecordV2, LocalTransportErrorV2> {
+    let canonical = PublicationRecordV2::decode(&publication.encode())
+        .map_err(|_| LocalTransportErrorV2::NonCanonicalPublication)?;
+    let source_header = source
+        .accumulate_host()
+        .header()?
+        .ok_or(LocalTransportErrorV2::NonCanonicalPublication)?;
+    if canonical.receipt.service != source_header.service
+        || !source
+            .accumulate_host()
+            .pending_publications()?
+            .iter()
+            .any(|committed| committed == &canonical)
+    {
+        return Err(LocalTransportErrorV2::NonCanonicalPublication);
+    }
+    Ok(canonical)
 }

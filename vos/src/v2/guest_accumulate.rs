@@ -15,11 +15,11 @@ use super::{
     CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2,
     DedupRecordV2, DeliveryEnvelopeV2, DeliveryRecordV2, EXECUTION_SEMANTICS_ID, Hash,
     MessageRecordV2, MethodPolicyV2, ProgramId, PublicationAckV2, PublicationRecordV2,
-    PublishedEffectsV2, ReceiptVerificationRequestV2, ServiceGenesisV2, ServiceInstallReceiptV2,
-    ServiceStateTreeV2, StateKeyV2, StateTreeError, StateTreeStore, StoreHeaderV2, StoreOpenError,
-    V2Wire, WorkflowCheckpointV2, crdt_change_storage_key, crdt_node_storage_key,
-    dedup_storage_key, delivery_storage_key, header_storage_key, publication_storage_key,
-    receipt_storage_key,
+    PublishedEffectsV2, ReceiptVerificationRequestV2, ReplyAdmissionRecordV2, ServiceGenesisV2,
+    ServiceInstallReceiptV2, ServiceStateTreeV2, StateKeyV2, StateTreeError, StateTreeStore,
+    StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2, crdt_change_storage_key,
+    crdt_node_storage_key, dedup_storage_key, delivery_storage_key, header_storage_key,
+    publication_storage_key, receipt_storage_key, reply_admission_storage_key,
 };
 
 /// Extra content-addressed operations needed by guest Accumulate in addition
@@ -396,18 +396,51 @@ fn apply<S: GuestAccumulateStoreV2>(
     if let Some(bytes) = read(store, &dedup_storage_key(work.input_id()))? {
         let record =
             DedupRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
-        return if record.input == work.input_id()
+        let exact_duplicate = record.input == work.input_id()
             && record.work_hash == work_hash
-            && record.transition_hash == transition_hash
+            && record.transition_hash == transition_hash;
+        if !exact_duplicate {
+            return Ok(rejected(AccumulationRejectionV2::DivergentDuplicate));
+        }
+        if let Some(awaited_reply) = work.awaited_reply.as_ref() {
+            let admission_bytes = read(
+                store,
+                &reply_admission_storage_key(awaited_reply.reply.call_id),
+            )?
+            .ok_or(GuestAccumulateError::CorruptStore)?;
+            let admission = ReplyAdmissionRecordV2::decode(&admission_bytes)
+                .map_err(|_| GuestAccumulateError::CorruptStore)?;
+            if admission.call_id != awaited_reply.reply.call_id
+                || admission.input != record.input
+                || admission.awaited_reply != *awaited_reply
+                || admission.work_hash != record.work_hash
+            {
+                return Err(GuestAccumulateError::CorruptStore);
+            }
+        }
+        return Ok(AccumulationResultV2::Accepted {
+            receipt: record.receipt,
+            published: PublishedEffectsV2::default(),
+            duplicate: true,
+        });
+    }
+    if let Some(awaited_reply) = work.awaited_reply.as_ref()
+        && let Some(admission_bytes) = read(
+            store,
+            &reply_admission_storage_key(awaited_reply.reply.call_id),
+        )?
+    {
+        let admission = ReplyAdmissionRecordV2::decode(&admission_bytes)
+            .map_err(|_| GuestAccumulateError::CorruptStore)?;
+        if admission.input == work.input_id()
+            && admission.awaited_reply == *awaited_reply
+            && admission.work_hash == work_hash
         {
-            Ok(AccumulationResultV2::Accepted {
-                receipt: record.receipt,
-                published: PublishedEffectsV2::default(),
-                duplicate: true,
-            })
-        } else {
-            Ok(rejected(AccumulationRejectionV2::DivergentDuplicate))
-        };
+            // This admission and its work-input dedup row are one atomic
+            // bookkeeping unit. An exact orphan indicates corrupt storage.
+            return Err(GuestAccumulateError::CorruptStore);
+        }
+        return Ok(rejected(AccumulationRejectionV2::DivergentDuplicate));
     }
 
     let mut tree = ServiceStateTreeV2::new(store, header.service_root);
@@ -746,6 +779,19 @@ fn apply<S: GuestAccumulateStoreV2>(
         &dedup_storage_key(work.input_id()),
         Some(&record.encode()),
     )?;
+    if let Some(awaited_reply) = work.awaited_reply.as_ref() {
+        let admission = ReplyAdmissionRecordV2 {
+            call_id: awaited_reply.reply.call_id,
+            input: work.input_id(),
+            awaited_reply: awaited_reply.clone(),
+            work_hash,
+        };
+        write(
+            store,
+            &reply_admission_storage_key(admission.call_id),
+            Some(&admission.encode()),
+        )?;
+    }
 
     let published = PublishedEffectsV2 {
         reply: transition.reply.clone(),
@@ -2295,6 +2341,12 @@ mod tests {
             transition: completed,
             provided_blobs: vec![],
         });
+        let AccumulateRequestV2::Apply(expected) = &apply else {
+            unreachable!()
+        };
+        let expected_awaited = expected.work.awaited_reply.clone().unwrap();
+        let expected_input = expected.work.input_id();
+        let expected_work_hash = expected.work.hash();
         let accepted = execute_guest_accumulate(&mut store, &apply).unwrap();
         assert!(matches!(
             accepted,
@@ -2306,6 +2358,18 @@ mod tests {
         let header = StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
         let tree = ServiceStateTreeV2::new(&mut store, header.service_root);
         assert_eq!(tree.get(&StateKeyV2::Outbox(call)).unwrap(), None);
+        drop(tree);
+        let admission = ReplyAdmissionRecordV2::decode(
+            store
+                .rows
+                .get(&reply_admission_storage_key(call))
+                .expect("reply admission commits with the resumed slice"),
+        )
+        .unwrap();
+        assert_eq!(admission.call_id, call);
+        assert_eq!(admission.input, expected_input);
+        assert_eq!(admission.awaited_reply, expected_awaited);
+        assert_eq!(admission.work_hash, expected_work_hash);
 
         assert!(matches!(
             execute_guest_accumulate(&mut store, &apply).unwrap(),
@@ -2314,6 +2378,24 @@ mod tests {
                 ..
             }
         ));
+
+        let mut missing_admission = store.clone();
+        missing_admission
+            .rows
+            .remove(&reply_admission_storage_key(call));
+        assert_eq!(
+            execute_guest_accumulate(&mut missing_admission, &apply),
+            Err(GuestAccumulateError::CorruptStore)
+        );
+
+        let mut orphaned_admission = store;
+        orphaned_admission
+            .rows
+            .remove(&dedup_storage_key(expected_input));
+        assert_eq!(
+            execute_guest_accumulate(&mut orphaned_admission, &apply),
+            Err(GuestAccumulateError::CorruptStore)
+        );
     }
 
     fn message(

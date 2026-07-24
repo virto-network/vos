@@ -10,11 +10,11 @@ use alloc::vec::Vec;
 
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 use super::{
-    AccumulationReceiptV2, ActorId, CallId, ConsistencyModeV2, Hash, InvocationId,
-    PublishedEffectsV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
+    AccumulatedReplyV2, AccumulationReceiptV2, ActorId, CallId, ConsistencyModeV2, Hash,
+    InvocationId, PublishedEffectsV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 3;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 4;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -23,6 +23,7 @@ const DEDUP_STORAGE_PREFIX: &[u8] = b"\0vos/v2/dedup/";
 const RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/receipt/";
 const PUBLICATION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/publication/";
 const DELIVERY_STORAGE_PREFIX: &[u8] = b"\0vos/v2/delivery/";
+const REPLY_ADMISSION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/reply-admission/";
 const CRDT_NODE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node/";
 const CRDT_CHANGE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-change/";
 
@@ -244,6 +245,17 @@ pub struct DeliveryRecordV2 {
     pub receipt: AccumulationReceiptV2,
 }
 
+/// Permanent identity of one finalized reply consumed at an exact await
+/// boundary. This lets transport recover from a lost acknowledgement even
+/// after the workflow has advanced to a later await.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyAdmissionRecordV2 {
+    pub call_id: CallId,
+    pub input: WorkInputIdV2,
+    pub awaited_reply: AccumulatedReplyV2,
+    pub work_hash: Hash,
+}
+
 /// Non-recursive workflow row covered by the service tree. Receipts live in
 /// the physical bookkeeping namespace because including their resulting root
 /// in this row would make the commitment circular.
@@ -396,6 +408,36 @@ impl V2Wire for DeliveryRecordV2 {
     }
 }
 
+impl V2Wire for ReplyAdmissionRecordV2 {
+    const MAGIC: [u8; 4] = *b"VRD2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.fixed(&self.call_id.0);
+        encode_input(&mut e, self.input);
+        e.bytes(&self.awaited_reply.encode());
+        e.fixed(&self.work_hash.0);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            call_id: CallId(d.fixed()?),
+            input: decode_input(d)?,
+            awaited_reply: AccumulatedReplyV2::decode(&d.bytes()?)?,
+            work_hash: Hash(d.fixed()?),
+        };
+        if value.call_id == CallId::ZERO
+            || value.input.invocation == InvocationId::ZERO
+            || value.input.workflow_step == 0
+            || value.awaited_reply.reply.call_id != value.call_id
+            || value.work_hash == Hash::ZERO
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
 pub const fn header_storage_key() -> &'static [u8] {
     HEADER_STORAGE_KEY
 }
@@ -420,6 +462,13 @@ pub(crate) const fn publication_storage_prefix() -> &'static [u8] {
 pub fn delivery_storage_key(call: CallId) -> Vec<u8> {
     let mut key = Vec::with_capacity(DELIVERY_STORAGE_PREFIX.len() + call.0.len());
     key.extend_from_slice(DELIVERY_STORAGE_PREFIX);
+    key.extend_from_slice(&call.0);
+    key
+}
+
+pub fn reply_admission_storage_key(call: CallId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(REPLY_ADMISSION_STORAGE_PREFIX.len() + call.0.len());
+    key.extend_from_slice(REPLY_ADMISSION_STORAGE_PREFIX);
     key.extend_from_slice(&call.0);
     key
 }
@@ -610,10 +659,13 @@ mod tests {
         let receipt = receipt_storage_key(input);
         let publication = publication_storage_key(input);
         let delivery = delivery_storage_key(CallId([4; 32]));
+        let reply_admission = reply_admission_storage_key(CallId([4; 32]));
         assert_ne!(dedup, receipt);
         assert_ne!(dedup, publication);
         assert_ne!(receipt, publication);
         assert_ne!(delivery, publication);
+        assert_ne!(reply_admission, delivery);
+        assert_ne!(reply_admission, publication);
         assert_ne!(dedup.as_slice(), header_storage_key());
         assert_ne!(crdt_node_storage_key(Hash([6; 32])), receipt);
         assert_ne!(
@@ -729,6 +781,52 @@ mod tests {
         bad_delivery.receipt.accepted_transition = Hash([31; 32]);
         assert_eq!(
             DeliveryRecordV2::decode(&bad_delivery.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn reply_admission_binds_call_input_reply_and_work() {
+        let caller_invocation = InvocationId([40; 32]);
+        let call = caller_invocation.call_id(3);
+        let reply = super::super::ReplyRecordV2 {
+            call_id: call,
+            producer: ActorId([41; 32]),
+            result: vec![42],
+        };
+        let mut remote = service(43);
+        remote.root_service = RootServiceId([44; 32]);
+        let record = ReplyAdmissionRecordV2 {
+            call_id: call,
+            input: WorkInputIdV2 {
+                invocation: caller_invocation,
+                workflow_step: 2,
+            },
+            awaited_reply: AccumulatedReplyV2 {
+                receipt: AccumulationReceiptV2 {
+                    service: remote,
+                    accepted_transition: Hash([45; 32]),
+                    reply_commitment: Some(reply.commitment()),
+                    outbox_commitment: None,
+                    resulting_state_root: Some(Hash([46; 32])),
+                    resulting_crdt_heads: vec![],
+                    sequence: 3,
+                    checkpoint: 0,
+                    consistency: ConsistencyModeV2::Local,
+                },
+                reply,
+            },
+            work_hash: Hash([47; 32]),
+        };
+        assert_eq!(
+            ReplyAdmissionRecordV2::decode(&record.encode()).unwrap(),
+            record
+        );
+
+        let mut step_zero = record;
+        step_zero.input.workflow_step = 0;
+        assert_eq!(
+            ReplyAdmissionRecordV2::decode(&step_zero.encode()),
             Err(DecodeError::NonCanonical)
         );
     }
