@@ -5,14 +5,15 @@
 //! apply [`super::TransitionV2`]: all validation and mutation semantics remain
 //! guest-owned at the IC-5 Accumulate entry.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use javm::kernel::InvocationKernel;
 
 use super::{
-    AccumulateProtocolHostV2, AccumulateTransactionV2, BlobRefV2, ProgramId, ServicePvmErrorV2,
-    ServiceStateTreeV2, StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError,
+    AccumulateProtocolHostV2, AccumulateTransactionV2, BlobRefV2, ProgramId,
+    ReceiptVerificationRequestV2, ServicePvmErrorV2, ServiceStateTreeV2, StateKeyV2,
+    StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
 };
 
 /// Cloneable in-memory image of a committed local v2 service account.
@@ -63,6 +64,7 @@ impl core::error::Error for LocalStoreReadErrorV2 {}
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LocalJamStoreV2 {
     committed: LocalJamStoreSnapshotV2,
+    receipt_allowlist: BTreeSet<super::Hash>,
 }
 
 impl LocalJamStoreV2 {
@@ -74,6 +76,7 @@ impl LocalJamStoreV2 {
                 programs: BTreeMap::new(),
                 commit_sequence: 0,
             },
+            receipt_allowlist: BTreeSet::new(),
         }
     }
 
@@ -83,6 +86,7 @@ impl LocalJamStoreV2 {
     pub fn from_snapshot(snapshot: LocalJamStoreSnapshotV2) -> Self {
         Self {
             committed: snapshot,
+            receipt_allowlist: BTreeSet::new(),
         }
     }
 
@@ -168,6 +172,14 @@ impl LocalJamStoreV2 {
         self.committed.programs.insert(program.0, pvm);
         program
     }
+
+    /// Configure the conformance host to accept one exact finalized receipt.
+    ///
+    /// Production hosts replace this process-local allowlist with the
+    /// consensus receipt/finality verifier required by the runtime cutover.
+    pub fn allow_receipt(&mut self, request: &ReceiptVerificationRequestV2) {
+        self.receipt_allowlist.insert(request.hash());
+    }
 }
 
 struct CommittedRows<'a>(&'a BTreeMap<Vec<u8>, Vec<u8>>);
@@ -187,6 +199,7 @@ impl StateTreeStore for CommittedRows<'_> {
 /// Private copy-on-write image for one physical IC-5 execution.
 pub struct LocalJamTransactionV2 {
     staged: LocalJamStoreSnapshotV2,
+    receipt_allowlist: BTreeSet<super::Hash>,
 }
 
 impl LocalJamTransactionV2 {
@@ -302,6 +315,19 @@ impl AccumulateTransactionV2 for LocalJamTransactionV2 {
                     0,
                 ])
             }
+            hostcall::RECEIPT_VERIFY => {
+                let bytes = Self::read_guest_bytes(kernel, registers[7], registers[8], slot)?;
+                let request = ReceiptVerificationRequestV2::decode(&bytes)
+                    .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?;
+                Ok([
+                    if self.receipt_allowlist.contains(&request.hash()) {
+                        error::HOST_OK
+                    } else {
+                        error::HOST_NONE
+                    },
+                    0,
+                ])
+            }
             _ => Err(ServicePvmErrorV2::AccumulateHostRejected(slot)),
         }
     }
@@ -313,6 +339,7 @@ impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
     fn begin(&mut self) -> Result<Self::Transaction, ServicePvmErrorV2> {
         Ok(LocalJamTransactionV2 {
             staged: self.committed.clone(),
+            receipt_allowlist: self.receipt_allowlist.clone(),
         })
     }
 

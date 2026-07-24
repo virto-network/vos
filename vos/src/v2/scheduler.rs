@@ -9,10 +9,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::{
-    ActorGenesisV2, ActorId, AuthorizationEvidenceV2, BlobRefV2, CallId, ConsistencyBaseV2,
-    ConsistencyModeV2, ContinuationSnapshotV2, DecodeError, ImportedActorV2, ImportedBlobV2,
-    ImportedProgramV2, InvocationId, LocalJamStoreV2, LocalStoreReadErrorV2, Origin,
-    RefineImportsV2, StateKeyV2, V2Wire, WorkEnvelopeV2, WorkflowCheckpointV2,
+    AccumulatedReplyV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2, BlobRefV2, CallId,
+    ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, DecodeError, ImportedActorV2,
+    ImportedBlobV2, ImportedProgramV2, InvocationId, LocalJamStoreV2, LocalStoreReadErrorV2,
+    Origin, RefineImportsV2, StateKeyV2, V2Wire, WorkEnvelopeV2, WorkflowCheckpointV2,
 };
 
 /// Caller-controlled portion of one local work item. The scheduler supplies
@@ -30,6 +30,7 @@ pub struct LocalWorkRequestV2 {
     pub authorization: AuthorizationEvidenceV2,
     pub causal_parent: Option<InvocationId>,
     pub parent_call: Option<CallId>,
+    pub awaited_reply: Option<AccumulatedReplyV2>,
     pub imported_blobs: Vec<BlobRefV2>,
     pub proof_requested: bool,
 }
@@ -119,6 +120,7 @@ impl LocalWorkSchedulerV2 {
                 authorization: message.authorization,
                 causal_parent: Some(message.caller_invocation),
                 parent_call: Some(message.call_id),
+                awaited_reply: None,
                 imported_blobs: Vec::new(),
                 proof_requested: false,
             },
@@ -209,6 +211,7 @@ impl LocalWorkSchedulerV2 {
             authorization: request.authorization,
             causal_parent: request.causal_parent,
             parent_call: request.parent_call,
+            awaited_reply: request.awaited_reply,
             consistency: header.consistency,
             base: ConsistencyBaseV2::Linear {
                 revision: header.revision,

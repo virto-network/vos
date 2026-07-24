@@ -13,10 +13,11 @@ use super::{
     AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorId,
     AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationSnapshotV2, CrdtChangeV2, DedupRecordV2, EXECUTION_SEMANTICS_ID, Hash,
-    MessageRecordV2, MethodPolicyV2, ProgramId, PublishedEffectsV2, ServiceGenesisV2,
-    ServiceInstallReceiptV2, ServiceStateTreeV2, StateKeyV2, StateTreeError, StateTreeStore,
-    StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2, crdt_change_storage_key,
-    crdt_node_storage_key, dedup_storage_key, header_storage_key, receipt_storage_key,
+    MessageRecordV2, MethodPolicyV2, ProgramId, PublishedEffectsV2, ReceiptVerificationRequestV2,
+    ServiceGenesisV2, ServiceInstallReceiptV2, ServiceStateTreeV2, StateKeyV2, StateTreeError,
+    StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2,
+    crdt_change_storage_key, crdt_node_storage_key, dedup_storage_key, header_storage_key,
+    receipt_storage_key,
 };
 
 /// Extra content-addressed operations needed by guest Accumulate in addition
@@ -36,6 +37,20 @@ pub trait GuestAccumulateStoreV2: StateTreeStore {
     /// VOS reference. The staged blob becomes visible only with this same
     /// Accumulate transaction.
     fn provide_blob(&mut self, bytes: &[u8]) -> Result<BlobRefV2, Self::Error>;
+
+    /// Validate that an external accumulation receipt is finalized and that
+    /// its service owns `request.expected_producer`.
+    fn verify_receipt(
+        &self,
+        request: &ReceiptVerificationRequestV2,
+    ) -> Result<ReceiptVerificationV2, Self::Error>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptVerificationV2 {
+    Valid,
+    Invalid,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +333,9 @@ fn apply<S: GuestAccumulateStoreV2>(
     if let Some(rejection) = validate_continuation_change(tree.store_ref(), envelope)? {
         return Ok(rejected(rejection));
     }
+    if let Some(rejection) = validate_awaited_reply(&tree, work)? {
+        return Ok(rejected(rejection));
+    }
 
     if let Some(rejection) = validate_durable_messages(&tree, work, transition)? {
         return Ok(rejected(rejection));
@@ -424,6 +442,11 @@ fn apply<S: GuestAccumulateStoreV2>(
         && let Some(call) = work.parent_call
     {
         tree_apply(&mut tree, &StateKeyV2::Inbox(call), None)?;
+    }
+    // A finalized reply consumes the caller's matching durable request in the
+    // same guest-owned transaction as the resumed actor state and dedup row.
+    if let Some(awaited) = work.awaited_reply.as_ref() {
+        tree_apply(&mut tree, &StateKeyV2::Outbox(awaited.reply.call_id), None)?;
     }
     for message in &transition.inbox {
         tree_apply(
@@ -565,6 +588,13 @@ fn validate_crdt<S: GuestAccumulateStoreV2>(
             .crdt_change
             .is_some()
             .then_some(AccumulationRejectionV2::InvalidConsistency));
+    }
+    // Consuming an existing outbox row must be represented by the built-in
+    // workflow CRDT before awaited replies can be merged safely. The current
+    // change payload records emitted workflow rows, not replicated deletion
+    // of a pending call, so fail closed until that operation is defined.
+    if work.awaited_reply.is_some() {
+        return Ok(Some(AccumulationRejectionV2::InvalidConsistency));
     }
     let Some(change) = transition.crdt_change.as_ref() else {
         return Ok(Some(AccumulationRejectionV2::InvalidConsistency));
@@ -872,6 +902,80 @@ fn validate_continuation_change<S: GuestAccumulateStoreV2>(
     Ok(None)
 }
 
+fn validate_awaited_reply<S: GuestAccumulateStoreV2>(
+    tree: &ServiceStateTreeV2<'_, S>,
+    work: &super::WorkEnvelopeV2,
+) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
+    let current = work
+        .imported_actors
+        .iter()
+        .find(|actor| actor.actor == work.target)
+        .and_then(|actor| actor.continuation.as_ref());
+    let Some(current) = current else {
+        return Ok(work
+            .awaited_reply
+            .is_some()
+            .then_some(AccumulationRejectionV2::InvalidWorkflowTransition));
+    };
+    let Some(bytes) = tree
+        .store_ref()
+        .load_blob(current)
+        .map_err(GuestAccumulateError::Storage)?
+    else {
+        return Ok(Some(AccumulationRejectionV2::MissingBlob(current.hash)));
+    };
+    if BlobRefV2::of_bytes(&bytes) != *current {
+        return Err(GuestAccumulateError::CorruptStore);
+    }
+    let snapshot = match ContinuationSnapshotV2::decode(&bytes) {
+        Ok(snapshot) if snapshot.validate_resume_for(work).is_ok() => snapshot,
+        _ => {
+            return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
+    };
+    let (call, awaited) = match (snapshot.pending_call, work.awaited_reply.as_ref()) {
+        (None, None) => return Ok(None),
+        (Some(call), Some(awaited)) if awaited.reply.call_id == call => (call, awaited),
+        _ => {
+            return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
+    };
+    let Some(message) = tree_get_wire::<_, MessageRecordV2>(tree, &StateKeyV2::Outbox(call))?
+    else {
+        return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+    };
+    if message.call_id != call
+        || message.caller_invocation != work.invocation
+        || message.await_ordinal != snapshot.await_ordinal
+        || message.from != work.target
+        || message.to != awaited.reply.producer
+        || message
+            .deadline_timeslot
+            .is_some_and(|deadline| work.logical_timeslot >= deadline)
+        || awaited.receipt.reply_commitment != Some(awaited.reply.commitment())
+        || awaited.receipt.service.service_abi != ABI_VERSION
+        || awaited.receipt.service.execution_semantics != EXECUTION_SEMANTICS_ID
+        || awaited.receipt.service.root_service == work.service.root_service
+    {
+        return Ok(Some(AccumulationRejectionV2::InvalidReceipt));
+    }
+    let request = ReceiptVerificationRequestV2 {
+        expected_producer: awaited.reply.producer,
+        receipt: awaited.receipt.clone(),
+    };
+    Ok(
+        match tree
+            .store_ref()
+            .verify_receipt(&request)
+            .map_err(GuestAccumulateError::Storage)?
+        {
+            ReceiptVerificationV2::Valid => None,
+            ReceiptVerificationV2::Invalid => Some(AccumulationRejectionV2::InvalidReceipt),
+            ReceiptVerificationV2::Unavailable => Some(AccumulationRejectionV2::ReceiptUnavailable),
+        },
+    )
+}
+
 fn referenced_blobs<'a>(
     work: &'a super::WorkEnvelopeV2,
     transition: &'a super::TransitionV2,
@@ -1098,6 +1202,7 @@ mod tests {
         rows: BTreeMap<Vec<u8>, Vec<u8>>,
         blobs: BTreeMap<Hash, Vec<u8>>,
         programs: BTreeMap<ProgramId, Vec<u8>>,
+        receipt_allowlist: BTreeSet<Hash>,
         writes_before_failure: Option<usize>,
     }
 
@@ -1154,6 +1259,17 @@ mod tests {
                 .programs
                 .get(&program)
                 .is_some_and(|pvm| ProgramId::of_pvm(pvm) == program))
+        }
+
+        fn verify_receipt(
+            &self,
+            request: &ReceiptVerificationRequestV2,
+        ) -> Result<ReceiptVerificationV2, Self::Error> {
+            Ok(if self.receipt_allowlist.contains(&request.hash()) {
+                ReceiptVerificationV2::Valid
+            } else {
+                ReceiptVerificationV2::Unavailable
+            })
         }
     }
 
@@ -1263,6 +1379,7 @@ mod tests {
             authorization: AuthorizationEvidenceV2::Public,
             causal_parent: None,
             parent_call: None,
+            awaited_reply: None,
             consistency: ConsistencyModeV2::Local,
             base: ConsistencyBaseV2::Linear {
                 revision: 0,
@@ -1655,6 +1772,187 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn awaited_reply_requires_a_finalized_receipt_and_consumes_the_outbox() {
+        let mut store = MemStore::default();
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let first_work = linear_work(initial, install.resulting_state_root.unwrap());
+        let peer = ActorId([44; 32]);
+        let call = first_work.invocation.call_id(0);
+        let mut payload = vec![crate::value::TAG_DYNAMIC];
+        payload.extend_from_slice(&crate::Encode::encode(&crate::value::Msg::new("set")));
+        let outbound = MessageRecordV2 {
+            call_id: call,
+            caller_invocation: first_work.invocation,
+            await_ordinal: 0,
+            from: first_work.target,
+            to: peer,
+            parent: None,
+            payload,
+            authorization: AuthorizationEvidenceV2::Public,
+            deadline_timeslot: Some(10),
+        };
+        let continuation_bytes = ContinuationSnapshotV2 {
+            snapshot_version: super::super::SNAPSHOT_VERSION,
+            jar_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            vos_abi: super::super::ABI_VERSION,
+            service: first_work.service.clone(),
+            invocation: first_work.invocation,
+            checkpoint_step: 0,
+            actor: first_work.target,
+            actor_program: first_work.target_program,
+            await_ordinal: 0,
+            pending_call: Some(call),
+            kernel_snapshot: vec![1],
+        }
+        .encode();
+        let continuation = BlobRefV2::of_bytes(&continuation_bytes);
+        let mut checkpoint = linear_transition(&first_work, b"checkpoint");
+        checkpoint.reply = None;
+        checkpoint.continuations.push(ContinuationChangeV2 {
+            actor: first_work.target,
+            expected: None,
+            replacement: Some(continuation.clone()),
+        });
+        checkpoint.outbox.push(outbound);
+        checkpoint.exported_blobs.push(continuation.clone());
+        let first = execute_guest_accumulate(
+            &mut store,
+            &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: first_work.clone(),
+                transition: checkpoint,
+                provided_blobs: vec![ImportedBlobV2 {
+                    reference: continuation.clone(),
+                    bytes: continuation_bytes,
+                }],
+            }),
+        )
+        .unwrap();
+        let AccumulationResultV2::Accepted { receipt, .. } = first else {
+            panic!("await checkpoint rejected")
+        };
+
+        let remote_reply = ReplyRecordV2 {
+            call_id: call,
+            producer: peer,
+            result: b"peer result".to_vec(),
+        };
+        let mut remote_service = first_work.service.clone();
+        remote_service.root_service = super::super::RootServiceId([45; 32]);
+        remote_service.deployment = super::super::DeploymentId([46; 32]);
+        let remote_receipt = AccumulationReceiptV2 {
+            service: remote_service,
+            accepted_transition: Hash([47; 32]),
+            reply_commitment: Some(remote_reply.commitment()),
+            resulting_state_root: Some(Hash([48; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 3,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        };
+        let awaited = super::super::AccumulatedReplyV2 {
+            reply: remote_reply,
+            receipt: remote_receipt,
+        };
+        let mut resume = first_work;
+        resume.workflow_step = 1;
+        resume.logical_timeslot = 2;
+        resume.base = ConsistencyBaseV2::Linear {
+            revision: receipt.sequence,
+            state_root: receipt.resulting_state_root.unwrap(),
+        };
+        resume.imported_actors[0].state = BlobRefV2::of_bytes(b"checkpoint");
+        resume.imported_actors[0].continuation = Some(continuation.clone());
+        resume.awaited_reply = Some(awaited.clone());
+        let mut completed = linear_transition(&resume, b"done");
+        completed.continuations.push(ContinuationChangeV2 {
+            actor: resume.target,
+            expected: Some(continuation.hash),
+            replacement: None,
+        });
+
+        let mut wrong_producer = resume.clone();
+        let wrong = wrong_producer.awaited_reply.as_mut().unwrap();
+        wrong.reply.producer = ActorId([49; 32]);
+        wrong.receipt.reply_commitment = Some(wrong.reply.commitment());
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: wrong_producer,
+                    transition: completed.clone(),
+                    provided_blobs: vec![],
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidReceipt)
+        );
+        assert_eq!(store, before);
+
+        let mut expired = resume.clone();
+        expired.logical_timeslot = 10;
+        let mut expired_transition = completed.clone();
+        expired_transition.consumed_input = expired.input_id();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: expired,
+                    transition: expired_transition,
+                    provided_blobs: vec![],
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidReceipt)
+        );
+        assert_eq!(store, before);
+
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: resume.clone(),
+                    transition: completed.clone(),
+                    provided_blobs: vec![],
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::ReceiptUnavailable)
+        );
+        assert_eq!(store, before);
+
+        let request = ReceiptVerificationRequestV2 {
+            expected_producer: awaited.reply.producer,
+            receipt: awaited.receipt,
+        };
+        store.receipt_allowlist.insert(request.hash());
+        let apply = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: resume,
+            transition: completed,
+            provided_blobs: vec![],
+        });
+        let accepted = execute_guest_accumulate(&mut store, &apply).unwrap();
+        assert!(matches!(
+            accepted,
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+        let header = StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
+        let tree = ServiceStateTreeV2::new(&mut store, header.service_root);
+        assert_eq!(tree.get(&StateKeyV2::Outbox(call)).unwrap(), None);
+
+        assert!(matches!(
+            execute_guest_accumulate(&mut store, &apply).unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: true,
+                ..
+            }
+        ));
+    }
+
     fn message(
         call: u8,
         from: ActorId,
@@ -1811,6 +2109,7 @@ mod tests {
             authorization: AuthorizationEvidenceV2::Public,
             causal_parent: None,
             parent_call: None,
+            awaited_reply: None,
             consistency: ConsistencyModeV2::Crdt,
             base: ConsistencyBaseV2::Crdt { heads },
             base_causal_height,
@@ -1926,6 +2225,40 @@ mod tests {
         };
         assert_eq!(receipt.resulting_crdt_heads, vec![next_cid]);
         assert_eq!(receipt.sequence, 2);
+    }
+
+    #[test]
+    fn crdt_awaited_reply_is_rejected_until_outbox_consumption_is_replicated() {
+        let mut store = MemStore::default();
+        let (initial, _) = install_fixture(&mut store, ConsistencyModeV2::Crdt, b"initial");
+        let mut work = crdt_work(initial, 22, Vec::new());
+        let reply = ReplyRecordV2 {
+            call_id: work.invocation.call_id(0),
+            producer: ActorId([44; 32]),
+            result: b"peer result".to_vec(),
+        };
+        let mut remote_service = work.service.clone();
+        remote_service.root_service = RootServiceId([45; 32]);
+        work.awaited_reply = Some(super::super::AccumulatedReplyV2 {
+            receipt: AccumulationReceiptV2 {
+                service: remote_service,
+                accepted_transition: Hash([46; 32]),
+                reply_commitment: Some(reply.commitment()),
+                resulting_state_root: None,
+                resulting_crdt_heads: vec![Hash([47; 32])],
+                sequence: 1,
+                checkpoint: 0,
+                consistency: ConsistencyModeV2::Crdt,
+            },
+            reply,
+        });
+        let transition = crdt_transition(&work, BlobRefV2::of_bytes(b"next"), 1);
+        let header = StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
+
+        assert_eq!(
+            validate_crdt(&store, &header, &work, &transition).unwrap(),
+            Some(AccumulationRejectionV2::InvalidConsistency)
+        );
     }
 
     #[test]

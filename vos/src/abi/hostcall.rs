@@ -97,6 +97,10 @@ pub const NOW_MS: u32 = 121;
 /// continues immediately after the source-level `.await`.
 pub const SUSPEND: u32 = 122;
 
+/// Validate an external service's exact accumulation receipt before a
+/// committed reply is admitted as continuation input. Accumulate-only.
+pub const RECEIPT_VERIFY: u32 = 125;
+
 /// Query one canonical actor PVM by `ProgramId` inside the current Accumulate
 /// transaction. This is a VOS service capability, not a JAM protocol slot.
 pub const PROGRAM_LOOKUP: u32 = 127;
@@ -114,6 +118,7 @@ mod tests {
             BOOT_CONTEXT,
             NOW_MS,
             SUSPEND,
+            RECEIPT_VERIFY,
             PROGRAM_LOOKUP,
         ];
         assert!(supplied.iter().all(|slot| !(1..=28).contains(slot)));
@@ -142,6 +147,7 @@ mod tests {
             BOOT_CONTEXT as u8,
             NOW_MS as u8,
             SUSPEND as u8,
+            RECEIPT_VERIFY as u8,
             PROGRAM_LOOKUP as u8,
             crate::v2::ACTOR_IPC_CAP_SLOT,
         ];

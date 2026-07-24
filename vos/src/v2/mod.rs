@@ -29,17 +29,18 @@ pub(crate) mod wire;
 
 pub use continuation::ContinuationSnapshotV2;
 pub use contracts::{
-    AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2,
-    AccumulationResultV2, ActorGenesisV2, ActorSliceInputV2, ActorSliceOutputV2, ActorWriteV2,
-    AuthorizationEvidenceV2, BlobRefV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2, CrdtMaterializationV2, CrdtOperationV2,
-    GasAccountingV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, MessageRecordV2,
-    MethodPolicyV2, ProofCommitmentV2, PublishedEffectsV2, RefineError, RefineImportsV2,
-    RefineOutputV2, ReplyRecordV2, ServiceGenesisV2, ServiceIdentityV2, ServiceInstallReceiptV2,
-    TransitionV2, WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
+    AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
+    AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorSliceInputV2,
+    ActorSliceOutputV2, ActorWriteV2, AuthorizationEvidenceV2, BlobRefV2, CheckpointTokenV2,
+    ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2,
+    CrdtMaterializationV2, CrdtOperationV2, GasAccountingV2, ImportedActorV2, ImportedBlobV2,
+    ImportedProgramV2, MessageRecordV2, MethodPolicyV2, ProofCommitmentV2, PublishedEffectsV2,
+    ReceiptVerificationRequestV2, RefineError, RefineImportsV2, RefineOutputV2, ReplyRecordV2,
+    ServiceGenesisV2, ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2,
+    WorkInputIdV2, WorkflowOperationV2,
 };
 pub use guest_accumulate::{
-    GuestAccumulateError, GuestAccumulateStoreV2, execute_guest_accumulate,
+    GuestAccumulateError, GuestAccumulateStoreV2, ReceiptVerificationV2, execute_guest_accumulate,
 };
 pub use identity::{
     ActorId, CallId, ChangeId, DeploymentId, Hash, InvocationId, OperationId, Origin, ProducerId,
@@ -86,8 +87,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0xb4, 0x12, 0xb2, 0x26, 0x8c, 0xc6, 0x7f, 0x28, 0xd2, 0x89, 0xdd, 0x24, 0x80, 0xb7, 0xcb, 0x9e,
-    0x5a, 0x2d, 0xd0, 0xa3, 0xa4, 0xb0, 0x5c, 0x47, 0xa2, 0x60, 0x90, 0x56, 0xca, 0x47, 0xd8, 0xe6,
+    0xd3, 0x50, 0xa5, 0x8c, 0x7e, 0xfa, 0x22, 0x2d, 0x84, 0x66, 0x24, 0x2f, 0x4c, 0x2e, 0xd4, 0x1d,
+    0x7e, 0x27, 0xff, 0x7c, 0x19, 0xf0, 0x30, 0x71, 0xb8, 0x34, 0x5b, 0xb9, 0x58, 0xa1, 0x05, 0x9d,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.

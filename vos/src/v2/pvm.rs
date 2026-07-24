@@ -702,12 +702,13 @@ fn install_actor_scheduler_caps(kernel: &mut InvocationKernel, actor_count: usiz
 
 fn install_accumulate_scheduler_caps(kernel: &mut InvocationKernel) {
     // Accumulate never executes actor calls or suspension. These supplied
-    // capabilities are deterministic hashing, mechanical VM support, and
-    // diagnostics only.
+    // capabilities are deterministic hashing, mechanical VM support,
+    // consensus-bound availability/finality lookups, and diagnostics.
     for slot in [
         crate::crypto::ECALL_BLAKE2B_COMPRESS as u8,
         crate::abi::hostcall::GROW_HEAP as u8,
         crate::abi::hostcall::DEBUG_WRITE as u8,
+        crate::abi::hostcall::RECEIPT_VERIFY as u8,
         crate::abi::hostcall::PROGRAM_LOOKUP as u8,
     ] {
         kernel

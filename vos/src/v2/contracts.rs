@@ -217,6 +217,10 @@ pub struct WorkEnvelopeV2 {
     pub authorization: AuthorizationEvidenceV2,
     pub causal_parent: Option<InvocationId>,
     pub parent_call: Option<CallId>,
+    /// Present only when restoring a continuation waiting on a committed
+    /// cross-root result. The reply is admitted by guest Accumulate before
+    /// Refine may inject it at the captured protocol-call boundary.
+    pub awaited_reply: Option<AccumulatedReplyV2>,
     pub consistency: ConsistencyModeV2,
     pub base: ConsistencyBaseV2,
     /// Maximum causal height among `base` heads. Present only for CRDT work;
@@ -334,6 +338,28 @@ impl ReplyRecordV2 {
         let mut bytes = Vec::new();
         encode_reply(&mut Encoder(&mut bytes), self);
         Hash::digest(b"vos/reply/v2", &[&bytes])
+    }
+}
+
+/// A reply released by another service only after its Accumulate commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccumulatedReplyV2 {
+    pub reply: ReplyRecordV2,
+    pub receipt: AccumulationReceiptV2,
+}
+
+/// Exact public input passed to the platform's accumulation-receipt verifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptVerificationRequestV2 {
+    /// The actor the finalized service must own. A receipt cannot authenticate
+    /// a reply merely by committing bytes that claim another actor as producer.
+    pub expected_producer: ActorId,
+    pub receipt: AccumulationReceiptV2,
+}
+
+impl ReceiptVerificationRequestV2 {
+    pub fn hash(&self) -> Hash {
+        Hash::digest(b"vos/receipt-verification/v2", &[&self.encode()])
     }
 }
 
@@ -564,6 +590,8 @@ pub enum AccumulationRejectionV2 {
     StorageFull,
     SequenceOverflow,
     NonCanonical,
+    ReceiptUnavailable,
+    InvalidReceipt,
 }
 
 impl AccumulationRejectionV2 {
@@ -578,6 +606,7 @@ impl AccumulationRejectionV2 {
                 | Self::ContinuationConflict(_)
                 | Self::StorageFull
                 | Self::ProofUnavailable
+                | Self::ReceiptUnavailable
         )
     }
 }
@@ -713,6 +742,7 @@ impl V2Wire for WorkEnvelopeV2 {
         encode_auth(&mut e, &self.authorization);
         e.option(&self.causal_parent, |e, id| e.fixed(&id.0));
         e.option(&self.parent_call, |e, id| e.fixed(&id.0));
+        e.option(&self.awaited_reply, |e, reply| e.bytes(&reply.encode()));
         e.u8(self.consistency as u8);
         encode_base(&mut e, &self.base);
         e.option(&self.base_causal_height, |e, height| e.u64(*height));
@@ -737,6 +767,10 @@ impl V2Wire for WorkEnvelopeV2 {
         let authorization = decode_auth(d)?;
         let causal_parent = d.option(|d| d.fixed().map(InvocationId))?;
         let parent_call = d.option(|d| d.fixed().map(CallId))?;
+        let awaited_reply = d.option(|d| AccumulatedReplyV2::decode(&d.bytes()?))?;
+        if awaited_reply.is_some() && workflow_step == 0 {
+            return Err(DecodeError::NonCanonical);
+        }
         let consistency = ConsistencyModeV2::decode(d)?;
         let base = decode_base(d)?;
         if !base.mode_compatible(consistency) {
@@ -783,6 +817,7 @@ impl V2Wire for WorkEnvelopeV2 {
             authorization,
             causal_parent,
             parent_call,
+            awaited_reply,
             consistency,
             base,
             base_causal_height,
@@ -1158,6 +1193,27 @@ impl V2Wire for MessageRecordV2 {
     }
 }
 
+impl V2Wire for AccumulatedReplyV2 {
+    const MAGIC: [u8; 4] = *b"VRP2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        encode_reply(&mut e, &self.reply);
+        e.bytes(&self.receipt.encode());
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            reply: decode_reply(d)?,
+            receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
+        };
+        if value.receipt.reply_commitment != Some(value.reply.commitment()) {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
 impl V2Wire for AccumulationReceiptV2 {
     const MAGIC: [u8; 4] = *b"VAR2";
 
@@ -1191,6 +1247,23 @@ impl V2Wire for AccumulationReceiptV2 {
             &value.resulting_crdt_heads,
         )?;
         Ok(value)
+    }
+}
+
+impl V2Wire for ReceiptVerificationRequestV2 {
+    const MAGIC: [u8; 4] = *b"VRV2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.fixed(&self.expected_producer.0);
+        e.bytes(&self.receipt.encode());
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
+            expected_producer: ActorId(d.fixed()?),
+            receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
+        })
     }
 }
 
@@ -1609,6 +1682,8 @@ fn encode_rejection(e: &mut Encoder<'_>, value: &AccumulationRejectionV2) {
         R::StorageFull => e.u8(21),
         R::SequenceOverflow => e.u8(22),
         R::NonCanonical => e.u8(23),
+        R::ReceiptUnavailable => e.u8(24),
+        R::InvalidReceipt => e.u8(25),
     }
 }
 
@@ -1642,6 +1717,8 @@ fn decode_rejection(d: &mut Decoder<'_>) -> Result<AccumulationRejectionV2, Deco
         21 => Ok(R::StorageFull),
         22 => Ok(R::SequenceOverflow),
         23 => Ok(R::NonCanonical),
+        24 => Ok(R::ReceiptUnavailable),
+        25 => Ok(R::InvalidReceipt),
         _ => Err(DecodeError::InvalidTag),
     }
 }
@@ -2041,6 +2118,7 @@ mod tests {
             authorization: AuthorizationEvidenceV2::Public,
             causal_parent: None,
             parent_call: None,
+            awaited_reply: None,
             consistency: ConsistencyModeV2::Local,
             base: ConsistencyBaseV2::Linear {
                 revision: 7,
@@ -2521,6 +2599,56 @@ mod tests {
         );
         assert!(AccumulationRejectionV2::StaleStateRoot.is_retryable());
         assert!(!AccumulationRejectionV2::DivergentDuplicate.is_retryable());
+    }
+
+    #[test]
+    fn accumulated_reply_binds_exact_reply_to_receipt() {
+        let reply = ReplyRecordV2 {
+            call_id: CallId([61; 32]),
+            producer: ActorId([62; 32]),
+            result: b"committed result".to_vec(),
+        };
+        let mut remote = service();
+        remote.root_service = RootServiceId([63; 32]);
+        let accumulated = AccumulatedReplyV2 {
+            receipt: AccumulationReceiptV2 {
+                service: remote,
+                accepted_transition: Hash([64; 32]),
+                reply_commitment: Some(reply.commitment()),
+                resulting_state_root: Some(Hash([65; 32])),
+                resulting_crdt_heads: vec![],
+                sequence: 7,
+                checkpoint: 1,
+                consistency: ConsistencyModeV2::Local,
+            },
+            reply,
+        };
+        assert_eq!(
+            AccumulatedReplyV2::decode(&accumulated.encode()).unwrap(),
+            accumulated
+        );
+        let request = ReceiptVerificationRequestV2 {
+            expected_producer: accumulated.reply.producer,
+            receipt: accumulated.receipt.clone(),
+        };
+        assert_eq!(
+            ReceiptVerificationRequestV2::decode(&request.encode()).unwrap(),
+            request
+        );
+
+        let mut mismatched = accumulated.clone();
+        mismatched.reply.result.push(0);
+        assert_eq!(
+            AccumulatedReplyV2::decode(&mismatched.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut initial = work();
+        initial.awaited_reply = Some(accumulated);
+        assert_eq!(
+            WorkEnvelopeV2::decode(&initial.encode()),
+            Err(DecodeError::NonCanonical)
+        );
     }
 
     #[test]

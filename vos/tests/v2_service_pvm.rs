@@ -8,14 +8,15 @@
 
 use std::path::PathBuf;
 use vos::v2::{
-    AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationResultV2, ActorGenesisV2, ActorId,
-    ActorWriteV2, AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, GasAccountingV2, Hash,
-    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId, JamServiceV2,
-    LocalJamStoreV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
-    NoRefineProtocolHostV2, Origin, ProgramId, PublishedEffectsV2, RefineImportsV2, RefineOutputV2,
-    ReplyRecordV2, RootServiceId, ScheduleErrorV2, ServiceGenesisV2, ServiceIdentityV2,
-    ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
+    AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
+    AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AuthorizationEvidenceV2,
+    BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2, ContinuationSnapshotV2,
+    DeploymentId, GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
+    InvocationId, JamServiceV2, LocalJamStoreV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
+    MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin, ProgramId, PublishedEffectsV2,
+    ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplyRecordV2, RootServiceId,
+    ScheduleErrorV2, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2,
+    StateKeyV2, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 use vos::{Decode, Encode, value::Msg};
 
@@ -133,6 +134,7 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
         authorization: AuthorizationEvidenceV2::Public,
         causal_parent: None,
         parent_call: None,
+        awaited_reply: None,
         consistency: ConsistencyModeV2::Local,
         base: ConsistencyBaseV2::Linear {
             revision: 0,
@@ -726,6 +728,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
         authorization: first_work.authorization,
         causal_parent: first_work.causal_parent,
         parent_call: first_work.parent_call,
+        awaited_reply: None,
         imported_blobs: first_work.imported_blobs,
         proof_requested: first_work.proof_requested,
     };
@@ -1015,6 +1018,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         authorization: seed_work.authorization.clone(),
         causal_parent: None,
         parent_call: None,
+        awaited_reply: None,
         imported_blobs: vec![],
         proof_requested: false,
     };
@@ -1317,6 +1321,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         authorization: delivered.work.authorization,
         causal_parent: delivered.work.causal_parent,
         parent_call: delivered.work.parent_call,
+        awaited_reply: None,
         imported_blobs: vec![],
         proof_requested: false,
     };
@@ -1387,6 +1392,241 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     };
     assert_eq!(duplicate_receipt, receipt);
     assert_eq!(duplicate_published, PublishedEffectsV2::default());
+
+    let caller_request = LocalWorkRequestV2 {
+        invocation: InvocationId([80; 32]),
+        workflow_step: 0,
+        logical_timeslot: 60,
+        target: seed_work.target,
+        method: seed_work.method,
+        arguments: seed_work.arguments,
+        origin: seed_work.origin,
+        authorization: seed_work.authorization,
+        causal_parent: None,
+        parent_call: None,
+        awaited_reply: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let caller = LocalWorkSchedulerV2::prepare(service.accumulate_host(), caller_request)
+        .expect("idle caller is schedulable");
+    let peer = ActorId([81; 32]);
+    let awaited_call = caller.work.invocation.call_id(0);
+    let continuation_bytes = ContinuationSnapshotV2 {
+        snapshot_version: vos::v2::SNAPSHOT_VERSION,
+        jar_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        vos_abi: vos::v2::ABI_VERSION,
+        service: caller.work.service.clone(),
+        invocation: caller.work.invocation,
+        checkpoint_step: 0,
+        actor: caller.work.target,
+        actor_program,
+        await_ordinal: 0,
+        pending_call: Some(awaited_call),
+        kernel_snapshot: vec![4],
+    }
+    .encode();
+    let continuation = BlobRefV2::of_bytes(&continuation_bytes);
+    let outbound = MessageRecordV2 {
+        call_id: awaited_call,
+        caller_invocation: caller.work.invocation,
+        await_ordinal: 0,
+        from: caller.work.target,
+        to: peer,
+        parent: None,
+        payload: caller.work.arguments.clone(),
+        authorization: AuthorizationEvidenceV2::Public,
+        deadline_timeslot: Some(90),
+    };
+    let checkpoint = TransitionV2 {
+        service: caller.work.service.clone(),
+        consumed_input: caller.work.input_id(),
+        target_program: caller.work.target_program,
+        base: caller.work.base.clone(),
+        writes: vec![ActorWriteV2 {
+            actor: caller.work.target,
+            key: vos::lifecycle::STATE_KEY_BYTES.to_vec(),
+            value: Some(b"awaiting reply state".to_vec()),
+        }],
+        crdt_change: None,
+        continuations: vec![ContinuationChangeV2 {
+            actor: caller.work.target,
+            expected: None,
+            replacement: Some(continuation.clone()),
+        }],
+        inbox: vec![],
+        outbox: vec![outbound],
+        reply: None,
+        exported_blobs: vec![continuation.clone()],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    let checkpointed = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: caller.work.clone(),
+            transition: checkpoint,
+            provided_blobs: vec![ImportedBlobV2 {
+                reference: continuation.clone(),
+                bytes: continuation_bytes,
+            }],
+        }))
+        .expect("guest commits the pending call and caller continuation");
+    let AccumulationResultV2::Accepted {
+        receipt: checkpoint_receipt,
+        duplicate: false,
+        ..
+    } = checkpointed.result
+    else {
+        panic!("guest rejected the pending call")
+    };
+
+    let remote_reply = ReplyRecordV2 {
+        call_id: awaited_call,
+        producer: peer,
+        result: b"remote result".to_vec(),
+    };
+    let mut remote_service = caller.work.service.clone();
+    remote_service.root_service = RootServiceId([82; 32]);
+    remote_service.deployment = DeploymentId([83; 32]);
+    let awaited = AccumulatedReplyV2 {
+        receipt: AccumulationReceiptV2 {
+            service: remote_service,
+            accepted_transition: Hash([84; 32]),
+            reply_commitment: Some(remote_reply.commitment()),
+            resulting_state_root: Some(Hash([85; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 1,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        },
+        reply: remote_reply,
+    };
+    let resume_request = LocalWorkRequestV2 {
+        invocation: caller.work.invocation,
+        workflow_step: 1,
+        logical_timeslot: 70,
+        target: caller.work.target,
+        method: caller.work.method,
+        arguments: b"ignored resume arguments".to_vec(),
+        origin: caller.work.origin,
+        authorization: caller.work.authorization,
+        causal_parent: caller.work.causal_parent,
+        parent_call: caller.work.parent_call,
+        awaited_reply: Some(awaited.clone()),
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let resume = LocalWorkSchedulerV2::prepare(service.accumulate_host(), resume_request)
+        .expect("scheduler binds the accumulated reply to the exact continuation");
+    let before_resume_header = service.accumulate_host().header().unwrap().unwrap();
+    let persisted_outbox = MessageRecordV2::decode(
+        &service
+            .accumulate_host()
+            .state_row(
+                before_resume_header.service_root,
+                &StateKeyV2::Outbox(awaited_call),
+            )
+            .unwrap()
+            .expect("pending outbox row remains committed"),
+    )
+    .unwrap();
+    assert_eq!(persisted_outbox.call_id, awaited_call);
+    assert_eq!(persisted_outbox.caller_invocation, resume.work.invocation);
+    assert_eq!(persisted_outbox.await_ordinal, 0);
+    assert_eq!(persisted_outbox.from, resume.work.target);
+    assert_eq!(persisted_outbox.to, awaited.reply.producer);
+    assert!(persisted_outbox.deadline_timeslot.unwrap() > resume.work.logical_timeslot);
+    assert_eq!(
+        awaited.receipt.reply_commitment,
+        Some(awaited.reply.commitment())
+    );
+    assert_eq!(awaited.receipt.service.service_abi, vos::v2::ABI_VERSION);
+    assert_eq!(
+        awaited.receipt.service.execution_semantics,
+        vos::v2::EXECUTION_SEMANTICS_ID
+    );
+    assert_ne!(
+        awaited.receipt.service.root_service,
+        resume.work.service.root_service
+    );
+    let completion = TransitionV2 {
+        service: resume.work.service.clone(),
+        consumed_input: resume.work.input_id(),
+        target_program: resume.work.target_program,
+        base: resume.work.base.clone(),
+        writes: vec![],
+        crdt_change: None,
+        continuations: vec![ContinuationChangeV2 {
+            actor: resume.work.target,
+            expected: Some(continuation.hash),
+            replacement: None,
+        }],
+        inbox: vec![],
+        outbox: vec![],
+        reply: None,
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    let apply_reply = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+        work: resume.work,
+        transition: completion,
+        provided_blobs: vec![],
+    });
+    let before_receipt = service.accumulate_host().snapshot();
+    assert_eq!(
+        service
+            .accumulate(&apply_reply)
+            .expect("unavailable receipt is a typed guest rejection")
+            .result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::ReceiptUnavailable)
+    );
+    assert!(
+        service
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before_receipt),
+        "an unavailable receipt leaves no guest storage trace"
+    );
+
+    service
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            expected_producer: awaited.reply.producer,
+            receipt: awaited.receipt,
+        });
+    let accepted = service
+        .accumulate(&apply_reply)
+        .expect("finalized reply resumes through physical guest Accumulate");
+    let AccumulationResultV2::Accepted {
+        receipt: accepted_receipt,
+        duplicate: false,
+        ..
+    } = accepted.result
+    else {
+        panic!("guest rejected the finalized reply")
+    };
+    let header = service.accumulate_host().header().unwrap().unwrap();
+    assert_eq!(
+        service
+            .accumulate_host()
+            .state_row(header.service_root, &StateKeyV2::Outbox(awaited_call))
+            .unwrap(),
+        None,
+        "accepted reply consumes the pending outbox atomically"
+    );
+    assert_eq!(
+        service
+            .accumulate(&apply_reply)
+            .expect("exact reply retry resolves through work dedup")
+            .result,
+        AccumulationResultV2::Accepted {
+            receipt: accepted_receipt,
+            published: PublishedEffectsV2::default(),
+            duplicate: true,
+        }
+    );
+    assert_eq!(checkpoint_receipt.sequence + 1, header.revision);
 }
 
 #[test]
