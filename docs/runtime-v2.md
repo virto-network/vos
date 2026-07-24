@@ -8,6 +8,17 @@
 > runs the legacy runtime while durable v2 scheduling and backend integration
 > are completed. Legacy node behavior is not evidence of v2 conformance.
 
+The local conformance scheduler can admit one guest-committed durable inbox
+row, derive the callee invocation, origin, authorization and causal parent from
+that row, enforce its deadline, and consume it atomically with the callee's
+first accepted slice. Its logical timeslot is an explicit harness input;
+production integration must bind that value to the consensus JAM timeslot
+rather than accept a caller-selected value. Actor-side cross-root CALL
+dispatch, durable outbox transport and draining, recovery orchestration, and
+injection of the committed reply into the caller's exact pending protocol
+boundary remain staged work. Until that path lands, the canonical Refine entry
+does not emit a durable outbox message or a pending-call continuation.
+
 Before that production cutover, guest Install must authenticate
 `genesis.authorization` against consensus-authoritative deployment state, and
 `PROGRAM_LOOKUP` availability must be pinned to or imported from
