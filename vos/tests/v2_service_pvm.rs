@@ -43,6 +43,27 @@ impl CommittedImageStoreV2 for FailableCommittedImages {
     }
 }
 
+type DurableTestService =
+    JamServiceV2<NoRefineProtocolHostV2, DurableJamStoreV2<FailableCommittedImages>>;
+
+fn restart_durable_service(
+    service: DurableTestService,
+    service_pvm: &[u8],
+    service_program: ProgramId,
+) -> DurableTestService {
+    let (_, host) = service.into_hosts();
+    let (_, backend) = host.into_parts();
+    JamServiceV2::new(
+        service_pvm.to_vec(),
+        service_program,
+        NoRefineProtocolHostV2,
+        DurableJamStoreV2::open(backend).expect("committed service image reopens"),
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap()
+}
+
 const CANONICAL_SERVICE_PVM: &[u8] = include_bytes!("../../services/vos-service/vos-service.pvm");
 const SERVICE_BUILD_CONFIG: &str = include_str!("../../services/vos-service/.cargo/config.toml");
 const SERVICE_RUSTC_WRAPPER: &str = include_str!("../../services/vos-service/rustc-remap.sh");
@@ -2636,7 +2657,7 @@ fn physical_guest_rejects_the_missing_preimage_length_sentinel() {
 }
 
 #[test]
-fn finalized_outbox_is_delivered_and_restart_drained_through_guest_accumulate() {
+fn finalized_outbox_is_durably_routed_across_service_restarts() {
     let service_pvm = vos::v2::transpile_service_elf(&service_elf()).unwrap();
     let service_program = ProgramId::of_pvm(&service_pvm);
     let actor_pvm = grey_transpiler::link_elf(&probe_elf()).unwrap();
@@ -2645,7 +2666,7 @@ fn finalized_outbox_is_delivered_and_restart_drained_through_guest_accumulate() 
     let initial_state_ref = BlobRefV2::of_bytes(&initial_state);
 
     let install_service = |identity: ServiceIdentityV2, actor: ActorId, method: &str| {
-        let mut host = LocalJamStoreV2::default();
+        let mut host = DurableJamStoreV2::open(FailableCommittedImages::default()).unwrap();
         assert_eq!(host.import_blob(initial_state.clone()), initial_state_ref);
         assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
         let mut service = JamServiceV2::new(
@@ -2749,31 +2770,13 @@ fn finalized_outbox_is_delivered_and_restart_drained_through_guest_accumulate() 
         }
     ));
 
-    let source_snapshot = source.accumulate_host().snapshot();
-    let mut source = JamServiceV2::new(
-        service_pvm.clone(),
-        service_program,
-        NoRefineProtocolHostV2,
-        LocalJamStoreV2::from_snapshot(source_snapshot),
-        100_000_000,
-        5_000_000_000,
-    )
-    .unwrap();
+    let mut source = restart_durable_service(source, &service_pvm, service_program);
     let publications = LocalTransportV2::pending_publications(&source).unwrap();
     assert_eq!(publications.len(), 1);
     let publication = publications[0].clone();
     assert_eq!(publication.published.outbox[0].call_id, call);
 
-    let destination_snapshot = destination.accumulate_host().snapshot();
-    let mut destination = JamServiceV2::new(
-        service_pvm.clone(),
-        service_program,
-        NoRefineProtocolHostV2,
-        LocalJamStoreV2::from_snapshot(destination_snapshot),
-        100_000_000,
-        5_000_000_000,
-    )
-    .unwrap();
+    let mut destination = restart_durable_service(destination, &service_pvm, service_program);
     let mut forged_publication = publication.clone();
     forged_publication.receipt.accepted_transition = Hash([95; 32]);
     let before_forged = destination.accumulate_host().snapshot();
@@ -2788,6 +2791,29 @@ fn finalized_outbox_is_delivered_and_restart_drained_through_guest_accumulate() 
             .same_service_state(&before_forged)
     );
 
+    let before_failed_delivery = destination.accumulate_host().snapshot();
+    let durable_before_failed_delivery = destination.accumulate_host().backend().image.clone();
+    destination
+        .accumulate_host_mut()
+        .backend_mut()
+        .fail_next_commit = true;
+    assert!(matches!(
+        LocalTransportV2::deliver(&source, &mut destination, &publication, call, 2),
+        Err(vos::v2::LocalTransportErrorV2::Service(
+            ServiceDispatchError::Pvm(ServicePvmErrorV2::AccumulateCommitRejected)
+        ))
+    ));
+    assert_eq!(
+        destination.accumulate_host().snapshot(),
+        before_failed_delivery,
+        "a failed destination commit cannot expose the admitted inbox"
+    );
+    assert_eq!(
+        destination.accumulate_host().backend().image,
+        durable_before_failed_delivery,
+        "a failed delivery retains the prior recovery image"
+    );
+
     let delivery =
         LocalTransportV2::deliver(&source, &mut destination, &publication, call, 2).unwrap();
     assert!(!delivery.duplicate);
@@ -2796,16 +2822,7 @@ fn finalized_outbox_is_delivered_and_restart_drained_through_guest_accumulate() 
         vec![(call, 2)]
     );
 
-    let admitted_snapshot = destination.accumulate_host().snapshot();
-    let mut destination = JamServiceV2::new(
-        service_pvm.clone(),
-        service_program,
-        NoRefineProtocolHostV2,
-        LocalJamStoreV2::from_snapshot(admitted_snapshot),
-        100_000_000,
-        5_000_000_000,
-    )
-    .unwrap();
+    let mut destination = restart_durable_service(destination, &service_pvm, service_program);
     let before_regressed_timeslot = destination.accumulate_host().snapshot();
     assert!(matches!(
         LocalTransportV2::drain_pending(&mut destination, 2),
@@ -2836,16 +2853,7 @@ fn finalized_outbox_is_delivered_and_restart_drained_through_guest_accumulate() 
     assert_eq!(reply.producer, destination_actor);
     assert_eq!(reply.result, vos::value::Value::U32(7).encode());
 
-    let drained_snapshot = destination.accumulate_host().snapshot();
-    let mut destination = JamServiceV2::new(
-        service_pvm.clone(),
-        service_program,
-        NoRefineProtocolHostV2,
-        LocalJamStoreV2::from_snapshot(drained_snapshot),
-        100_000_000,
-        5_000_000_000,
-    )
-    .unwrap();
+    let mut destination = restart_durable_service(destination, &service_pvm, service_program);
     assert!(
         destination
             .accumulate_host()
@@ -2887,26 +2895,8 @@ fn finalized_outbox_is_delivered_and_restart_drained_through_guest_accumulate() 
     // Reopen both roots before routing the reply. The caller invocation and
     // exact continuation must be recovered exclusively from guest-owned
     // service state; no warm handler or process-local return table survives.
-    let source_snapshot = source.accumulate_host().snapshot();
-    let mut source = JamServiceV2::new(
-        service_pvm.clone(),
-        service_program,
-        NoRefineProtocolHostV2,
-        LocalJamStoreV2::from_snapshot(source_snapshot),
-        100_000_000,
-        5_000_000_000,
-    )
-    .unwrap();
-    let destination_snapshot = destination.accumulate_host().snapshot();
-    let destination = JamServiceV2::new(
-        service_pvm.clone(),
-        service_program,
-        NoRefineProtocolHostV2,
-        LocalJamStoreV2::from_snapshot(destination_snapshot),
-        100_000_000,
-        5_000_000_000,
-    )
-    .unwrap();
+    let mut source = restart_durable_service(source, &service_pvm, service_program);
+    let destination = restart_durable_service(destination, &service_pvm, service_program);
 
     let mut forged_reply_publication = reply_publication.clone();
     forged_reply_publication
@@ -2946,6 +2936,26 @@ fn finalized_outbox_is_delivered_and_restart_drained_through_guest_accumulate() 
             .same_service_state(&before_expired_reply)
     );
 
+    let before_failed_resume = source.accumulate_host().snapshot();
+    let durable_before_failed_resume = source.accumulate_host().backend().image.clone();
+    source.accumulate_host_mut().backend_mut().fail_next_commit = true;
+    assert!(matches!(
+        LocalTransportV2::resume_reply(&destination, &mut source, &reply_publication, 4),
+        Err(vos::v2::LocalTransportErrorV2::Service(
+            ServiceDispatchError::Pvm(ServicePvmErrorV2::AccumulateCommitRejected)
+        ))
+    ));
+    assert_eq!(
+        source.accumulate_host().snapshot(),
+        before_failed_resume,
+        "a failed caller commit cannot expose reply admission or resumed effects"
+    );
+    assert_eq!(
+        source.accumulate_host().backend().image,
+        durable_before_failed_resume,
+        "a failed reply resume retains the prior caller recovery image"
+    );
+
     let resumed =
         LocalTransportV2::resume_reply(&destination, &mut source, &reply_publication, 4).unwrap();
     assert!(!resumed.duplicate);
@@ -2980,26 +2990,8 @@ fn finalized_outbox_is_delivered_and_restart_drained_through_guest_accumulate() 
     // Lose the transport acknowledgement and restart both roots again. The
     // permanent guest-owned admission row, not the latest workflow row,
     // classifies an exact retry even at a different transport timeslot.
-    let source_snapshot = source.accumulate_host().snapshot();
-    let mut source = JamServiceV2::new(
-        service_pvm.clone(),
-        service_program,
-        NoRefineProtocolHostV2,
-        LocalJamStoreV2::from_snapshot(source_snapshot),
-        100_000_000,
-        5_000_000_000,
-    )
-    .unwrap();
-    let destination_snapshot = destination.accumulate_host().snapshot();
-    let mut destination = JamServiceV2::new(
-        service_pvm,
-        service_program,
-        NoRefineProtocolHostV2,
-        LocalJamStoreV2::from_snapshot(destination_snapshot),
-        100_000_000,
-        5_000_000_000,
-    )
-    .unwrap();
+    let mut source = restart_durable_service(source, &service_pvm, service_program);
+    let mut destination = restart_durable_service(destination, &service_pvm, service_program);
     let before_reply_retry = source.accumulate_host().snapshot();
     let reply_retry =
         LocalTransportV2::resume_reply(&destination, &mut source, &reply_publication, 5).unwrap();
