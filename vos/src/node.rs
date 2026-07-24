@@ -6174,6 +6174,7 @@ fn agent_forward_to_raft_leader(
     }
 }
 
+#[cfg(all(feature = "network", feature = "storage"))]
 async fn forward_to_raft_leader(
     fwd: &RaftFwd,
     extension_id: ServiceId,
