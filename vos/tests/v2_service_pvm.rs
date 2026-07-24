@@ -12,10 +12,10 @@ use vos::v2::{
     ActorWriteV2, AuthorizationEvidenceV2, BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, GasAccountingV2, Hash,
     ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId, JamServiceV2,
-    LocalJamStoreV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MethodPolicyV2,
+    LocalJamStoreV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
     NoRefineProtocolHostV2, Origin, ProgramId, PublishedEffectsV2, RefineImportsV2, RefineOutputV2,
-    RootServiceId, ScheduleErrorV2, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
-    ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
+    ReplyRecordV2, RootServiceId, ScheduleErrorV2, ServiceGenesisV2, ServiceIdentityV2,
+    ServicePvmErrorV2, ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 use vos::{Decode, Encode, value::Msg};
 
@@ -124,6 +124,7 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
         },
         invocation: InvocationId([4; 32]),
         workflow_step: 0,
+        logical_timeslot: 1,
         target: ActorId([5; 32]),
         target_program: actor_program,
         method: "start".into(),
@@ -717,6 +718,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
     let request = LocalWorkRequestV2 {
         invocation: first_work.invocation,
         workflow_step: 0,
+        logical_timeslot: first_work.logical_timeslot,
         target: first_work.target,
         method: first_work.method,
         arguments: first_work.arguments,
@@ -1005,6 +1007,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let request = LocalWorkRequestV2 {
         invocation: seed_work.invocation,
         workflow_step: 0,
+        logical_timeslot: seed_work.logical_timeslot,
         target: seed_work.target,
         method: seed_work.method.clone(),
         arguments: seed_work.arguments.clone(),
@@ -1044,6 +1047,19 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     };
     let continuation_bytes = continuation.encode();
     let continuation_ref = BlobRefV2::of_bytes(&continuation_bytes);
+    let caller_invocation = InvocationId([70; 32]);
+    let call_id = caller_invocation.call_id(0);
+    let inbox = MessageRecordV2 {
+        call_id,
+        caller_invocation,
+        await_ordinal: 0,
+        from: ActorId([71; 32]),
+        to: work.target,
+        parent: None,
+        payload: work.arguments.clone(),
+        authorization: AuthorizationEvidenceV2::Public,
+        deadline_timeslot: Some(100),
+    };
     let transition = TransitionV2 {
         service: work.service.clone(),
         consumed_input: work.input_id(),
@@ -1060,7 +1076,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             expected: None,
             replacement: Some(continuation_ref.clone()),
         }],
-        inbox: vec![],
+        inbox: vec![inbox.clone()],
         outbox: vec![],
         reply: None,
         exported_blobs: vec![continuation_ref.clone()],
@@ -1120,6 +1136,14 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     );
 
     let reopened = LocalJamStoreV2::from_snapshot(service.accumulate_host().snapshot());
+    assert_eq!(
+        LocalWorkSchedulerV2::prepare_inbox(&reopened, call_id, 50),
+        Err(ScheduleErrorV2::ActorBusy(work.target))
+    );
+    assert_eq!(
+        LocalWorkSchedulerV2::prepare_inbox(&reopened, call_id, 100),
+        Err(ScheduleErrorV2::DeadlineExpired(call_id))
+    );
     let mut queued = request.clone();
     queued.invocation = InvocationId([99; 32]);
     assert_eq!(
@@ -1147,6 +1171,222 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         2,
         "state and continuation bytes are both imported after snapshot reopen"
     );
+
+    let resumed_transition = TransitionV2 {
+        service: resumed.work.service.clone(),
+        consumed_input: resumed.work.input_id(),
+        target_program: resumed.work.target_program,
+        base: resumed.work.base.clone(),
+        writes: vec![],
+        crdt_change: None,
+        continuations: vec![ContinuationChangeV2 {
+            actor: resumed.work.target,
+            expected: Some(
+                resumed.work.imported_actors[0]
+                    .continuation
+                    .as_ref()
+                    .unwrap()
+                    .hash,
+            ),
+            replacement: None,
+        }],
+        inbox: vec![],
+        outbox: vec![],
+        reply: None,
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    let completed = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: resumed.work,
+            transition: resumed_transition,
+            provided_blobs: vec![],
+        }))
+        .unwrap()
+        .result;
+    assert!(matches!(completed, AccumulationResultV2::Accepted { .. }));
+
+    let delivered = LocalWorkSchedulerV2::prepare_inbox(service.accumulate_host(), call_id, 50)
+        .expect("queued inbox becomes runnable only after the actor is idle");
+    assert_eq!(delivered.work.invocation, InvocationId::for_call(call_id));
+    assert_eq!(delivered.work.parent_call, Some(call_id));
+    assert_eq!(delivered.work.causal_parent, Some(caller_invocation));
+    assert_eq!(delivered.work.origin, Origin::Actor(inbox.from));
+    assert_eq!(delivered.work.authorization, inbox.authorization);
+
+    let mut expired_work = delivered.work.clone();
+    expired_work.logical_timeslot = 100;
+    let expired_transition = TransitionV2 {
+        service: expired_work.service.clone(),
+        consumed_input: expired_work.input_id(),
+        target_program: expired_work.target_program,
+        base: expired_work.base.clone(),
+        writes: vec![],
+        crdt_change: None,
+        continuations: vec![],
+        inbox: vec![],
+        outbox: vec![],
+        reply: Some(ReplyRecordV2 {
+            call_id,
+            producer: expired_work.target,
+            result: b"expired".to_vec(),
+        }),
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    let before_expired = service.accumulate_host().snapshot();
+    let expired = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: expired_work,
+            transition: expired_transition,
+            provided_blobs: vec![],
+        }))
+        .unwrap();
+    assert_eq!(
+        expired.result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::InvalidWorkflowTransition)
+    );
+    assert_eq!(service.accumulate_host().snapshot(), before_expired);
+
+    let delivery_continuation = ContinuationSnapshotV2 {
+        snapshot_version: vos::v2::SNAPSHOT_VERSION,
+        jar_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        vos_abi: vos::v2::ABI_VERSION,
+        service: delivered.work.service.clone(),
+        invocation: delivered.work.invocation,
+        checkpoint_step: 0,
+        actor: delivered.work.target,
+        actor_program,
+        await_ordinal: 0,
+        pending_call: None,
+        kernel_snapshot: vec![2],
+    };
+    let delivery_continuation_bytes = delivery_continuation.encode();
+    let delivery_continuation_ref = BlobRefV2::of_bytes(&delivery_continuation_bytes);
+    let delivery_checkpoint = TransitionV2 {
+        service: delivered.work.service.clone(),
+        consumed_input: delivered.work.input_id(),
+        target_program: delivered.work.target_program,
+        base: delivered.work.base.clone(),
+        writes: vec![],
+        crdt_change: None,
+        continuations: vec![ContinuationChangeV2 {
+            actor: delivered.work.target,
+            expected: None,
+            replacement: Some(delivery_continuation_ref.clone()),
+        }],
+        inbox: vec![],
+        outbox: vec![],
+        reply: None,
+        exported_blobs: vec![delivery_continuation_ref.clone()],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    let checkpointed = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: delivered.work.clone(),
+            transition: delivery_checkpoint,
+            provided_blobs: vec![ImportedBlobV2 {
+                reference: delivery_continuation_ref,
+                bytes: delivery_continuation_bytes,
+            }],
+        }))
+        .expect("guest atomically consumes the inbox and checkpoints the callee");
+    assert!(matches!(
+        checkpointed.result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        LocalWorkSchedulerV2::prepare_inbox(service.accumulate_host(), call_id, 51),
+        Err(ScheduleErrorV2::MissingInbox(call_id))
+    );
+
+    let delivery_request = LocalWorkRequestV2 {
+        invocation: delivered.work.invocation,
+        workflow_step: 1,
+        logical_timeslot: 51,
+        target: delivered.work.target,
+        method: delivered.work.method,
+        arguments: b"dead resume input".to_vec(),
+        origin: delivered.work.origin,
+        authorization: delivered.work.authorization,
+        causal_parent: delivered.work.causal_parent,
+        parent_call: delivered.work.parent_call,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let delivery_resume =
+        LocalWorkSchedulerV2::prepare(service.accumulate_host(), delivery_request)
+            .expect("callee resumes from workflow state after its inbox was consumed");
+    assert!(delivery_resume.work.arguments.is_empty());
+    let delivery_reply = ReplyRecordV2 {
+        call_id,
+        producer: delivery_resume.work.target,
+        result: b"durable inbox reply".to_vec(),
+    };
+    let delivery_completion = TransitionV2 {
+        service: delivery_resume.work.service.clone(),
+        consumed_input: delivery_resume.work.input_id(),
+        target_program: delivery_resume.work.target_program,
+        base: delivery_resume.work.base.clone(),
+        writes: vec![],
+        crdt_change: None,
+        continuations: vec![ContinuationChangeV2 {
+            actor: delivery_resume.work.target,
+            expected: Some(
+                delivery_resume.work.imported_actors[0]
+                    .continuation
+                    .as_ref()
+                    .unwrap()
+                    .hash,
+            ),
+            replacement: None,
+        }],
+        inbox: vec![],
+        outbox: vec![],
+        reply: Some(delivery_reply.clone()),
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    let delivery_apply = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+        work: delivery_resume.work,
+        transition: delivery_completion,
+        provided_blobs: vec![],
+    });
+    let delivered_result = service
+        .accumulate(&delivery_apply)
+        .expect("guest commits the resumed callee reply");
+    let AccumulationResultV2::Accepted {
+        receipt,
+        published,
+        duplicate,
+    } = delivered_result.result
+    else {
+        panic!("guest rejected the resumed callee")
+    };
+    assert!(!duplicate);
+    assert_eq!(published.reply, Some(delivery_reply.clone()));
+    assert_eq!(receipt.reply_commitment, Some(delivery_reply.commitment()));
+
+    let duplicate_delivery = service
+        .accumulate(&delivery_apply)
+        .expect("exact delivery retry resolves through dedup");
+    let AccumulationResultV2::Accepted {
+        receipt: duplicate_receipt,
+        published: duplicate_published,
+        duplicate: true,
+    } = duplicate_delivery.result
+    else {
+        panic!("guest did not deduplicate the resumed callee")
+    };
+    assert_eq!(duplicate_receipt, receipt);
+    assert_eq!(duplicate_published, PublishedEffectsV2::default());
 }
 
 #[test]

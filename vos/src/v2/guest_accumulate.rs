@@ -224,6 +224,9 @@ fn apply<S: GuestAccumulateStoreV2>(
     if !valid_workflow_input(&tree, work)? {
         return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
+    if !work_matches_durable_inbox(&tree, work)? {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
     if policy.attested || work.proof_requested {
         return Ok(rejected(if transition.proof.is_none() {
             AccumulationRejectionV2::MissingProof
@@ -316,7 +319,7 @@ fn apply<S: GuestAccumulateStoreV2>(
         return Ok(rejected(rejection));
     }
 
-    if let Some(rejection) = validate_durable_messages(&tree, transition)? {
+    if let Some(rejection) = validate_durable_messages(&tree, work, transition)? {
         return Ok(rejected(rejection));
     }
     if contains_cycle(&transition.outbox) {
@@ -413,6 +416,15 @@ fn apply<S: GuestAccumulateStoreV2>(
                 .as_deref(),
         )?;
     }
+    // The inbox row authorizes only the initial callee slice. Consume it in
+    // the same guest-owned update as actor writes, the continuation, effects,
+    // and dedup record. Later slices are authorized by the workflow checkpoint
+    // plus continuation and do not require the already-consumed inbox.
+    if work.workflow_step == 0
+        && let Some(call) = work.parent_call
+    {
+        tree_apply(&mut tree, &StateKeyV2::Inbox(call), None)?;
+    }
     for message in &transition.inbox {
         tree_apply(
             &mut tree,
@@ -468,6 +480,10 @@ fn apply<S: GuestAccumulateStoreV2>(
     let receipt = AccumulationReceiptV2 {
         service: header.service.clone(),
         accepted_transition: transition_hash,
+        reply_commitment: transition
+            .reply
+            .as_ref()
+            .map(super::ReplyRecordV2::commitment),
         resulting_state_root,
         resulting_crdt_heads,
         sequence,
@@ -731,6 +747,40 @@ fn authorized(work: &super::WorkEnvelopeV2, policy: &MethodPolicyV2) -> bool {
     }
 }
 
+fn work_matches_durable_inbox<S: StateTreeStore>(
+    tree: &ServiceStateTreeV2<'_, S>,
+    work: &super::WorkEnvelopeV2,
+) -> GuestResult<bool, S::Error> {
+    // Accumulate consumed the initial inbox atomically with the preceding
+    // checkpoint. Workflow identity and the continuation bind later slices.
+    if work.workflow_step != 0 {
+        return Ok(true);
+    }
+    let Some(call) = work.parent_call else {
+        return Ok(work.causal_parent.is_none());
+    };
+    let Some(message) = tree_get_wire::<_, MessageRecordV2>(tree, &StateKeyV2::Inbox(call))? else {
+        return Ok(false);
+    };
+    let method = if message.payload.first() == Some(&crate::value::TAG_DYNAMIC) {
+        <crate::value::Msg as crate::Decode>::try_decode(&message.payload[1..])
+            .map(|message| message.name)
+    } else {
+        None
+    };
+    Ok(message.call_id == call
+        && message.to == work.target
+        && work.invocation == super::InvocationId::for_call(call)
+        && work.causal_parent == Some(message.caller_invocation)
+        && work.origin == super::Origin::Actor(message.from)
+        && work.authorization == message.authorization
+        && work.arguments == message.payload
+        && message
+            .deadline_timeslot
+            .is_none_or(|deadline| work.logical_timeslot < deadline)
+        && method.as_deref() == Some(work.method.as_str()))
+}
+
 fn valid_workflow_input<S: StateTreeStore>(
     tree: &ServiceStateTreeV2<'_, S>,
     work: &super::WorkEnvelopeV2,
@@ -904,10 +954,17 @@ fn contains_cycle(messages: &[MessageRecordV2]) -> bool {
 /// cannot target an actor already present in its causal caller chain.
 fn validate_durable_messages<S: StateTreeStore>(
     tree: &ServiceStateTreeV2<'_, S>,
+    work: &super::WorkEnvelopeV2,
     transition: &super::TransitionV2,
 ) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
     let mut staged = BTreeMap::<super::CallId, MessageRecordV2>::new();
     for message in transition.inbox.iter().chain(&transition.outbox) {
+        if message
+            .deadline_timeslot
+            .is_some_and(|deadline| work.logical_timeslot >= deadline)
+        {
+            return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
         if staged.insert(message.call_id, message.clone()).is_some() {
             return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
         }
@@ -1194,6 +1251,7 @@ mod tests {
             service: identity(),
             invocation: InvocationId([10; 32]),
             workflow_step: 0,
+            logical_timeslot: 1,
             target: actor(),
             target_program: program(),
             method: "set".into(),
@@ -1601,12 +1659,19 @@ mod tests {
         parent: Option<super::super::CallId>,
         deadline_timeslot: Option<u64>,
     ) -> MessageRecordV2 {
+        let caller_invocation = InvocationId([call; 32]);
+        let await_ordinal = u64::from(call);
+        let mut payload = vec![crate::value::TAG_DYNAMIC];
+        payload.extend_from_slice(&crate::Encode::encode(&crate::value::Msg::new("set")));
         MessageRecordV2 {
-            call_id: super::super::CallId([call; 32]),
+            call_id: caller_invocation.call_id(await_ordinal),
+            caller_invocation,
+            await_ordinal,
             from,
             to,
             parent,
-            payload: vec![call],
+            payload,
+            authorization: AuthorizationEvidenceV2::Public,
             deadline_timeslot,
         }
     }
@@ -1712,6 +1777,7 @@ mod tests {
             service: identity(),
             invocation: InvocationId([invocation; 32]),
             workflow_step: 0,
+            logical_timeslot: 1,
             target: actor(),
             target_program: program(),
             method: "set".into(),

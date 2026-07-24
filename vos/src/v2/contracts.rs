@@ -205,6 +205,10 @@ pub struct WorkEnvelopeV2 {
     /// advances this value, so retries deduplicate without conflating later
     /// checkpoints with the first transition.
     pub workflow_step: u64,
+    /// Consensus-supplied JAM logical timeslot at which this work item is
+    /// scheduled. Durable deadlines are compared only to this input, never to
+    /// a wall clock.
+    pub logical_timeslot: u64,
     pub target: ActorId,
     pub target_program: ProgramId,
     pub method: String,
@@ -306,10 +310,13 @@ pub struct ContinuationChangeV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageRecordV2 {
     pub call_id: CallId,
+    pub caller_invocation: InvocationId,
+    pub await_ordinal: u64,
     pub from: ActorId,
     pub to: ActorId,
     pub parent: Option<CallId>,
     pub payload: Vec<u8>,
+    pub authorization: AuthorizationEvidenceV2,
     pub deadline_timeslot: Option<u64>,
 }
 
@@ -318,6 +325,16 @@ pub struct ReplyRecordV2 {
     pub call_id: CallId,
     pub producer: ActorId,
     pub result: Vec<u8>,
+}
+
+impl ReplyRecordV2 {
+    /// Commitment transported in the accumulation receipt before the reply is
+    /// released to a caller.
+    pub fn commitment(&self) -> Hash {
+        let mut bytes = Vec::new();
+        encode_reply(&mut Encoder(&mut bytes), self);
+        Hash::digest(b"vos/reply/v2", &[&bytes])
+    }
 }
 
 /// Fixed-schema workflow operations merged alongside application CRDT fields.
@@ -439,6 +456,8 @@ pub struct RefineOutputV2 {
 pub struct AccumulationReceiptV2 {
     pub service: ServiceIdentityV2,
     pub accepted_transition: Hash,
+    /// Direct commitment to the reply released only after this commit.
+    pub reply_commitment: Option<Hash>,
     pub resulting_state_root: Option<Hash>,
     pub resulting_crdt_heads: Vec<Hash>,
     pub sequence: u64,
@@ -685,6 +704,7 @@ impl V2Wire for WorkEnvelopeV2 {
         encode_service(&mut e, &self.service);
         e.fixed(&self.invocation.0);
         e.u64(self.workflow_step);
+        e.u64(self.logical_timeslot);
         e.fixed(&self.target.0);
         e.fixed(&self.target_program.0);
         e.string(&self.method);
@@ -705,6 +725,7 @@ impl V2Wire for WorkEnvelopeV2 {
         let service = decode_service(d)?;
         let invocation = InvocationId(d.fixed()?);
         let workflow_step = d.u64()?;
+        let logical_timeslot = d.u64()?;
         let target = ActorId(d.fixed()?);
         let target_program = ProgramId(d.fixed()?);
         let method = d.string()?;
@@ -753,6 +774,7 @@ impl V2Wire for WorkEnvelopeV2 {
             service,
             invocation,
             workflow_step,
+            logical_timeslot,
             target,
             target_program,
             method,
@@ -1143,6 +1165,7 @@ impl V2Wire for AccumulationReceiptV2 {
         let mut e = Encoder(out);
         encode_service(&mut e, &self.service);
         e.fixed(&self.accepted_transition.0);
+        e.option(&self.reply_commitment, |e, hash| e.fixed(&hash.0));
         e.option(&self.resulting_state_root, |e, h| e.fixed(&h.0));
         e.list(&self.resulting_crdt_heads, |e, h| e.fixed(&h.0));
         e.u64(self.sequence);
@@ -1154,6 +1177,7 @@ impl V2Wire for AccumulationReceiptV2 {
         let value = Self {
             service: decode_service(d)?,
             accepted_transition: Hash(d.fixed()?),
+            reply_commitment: d.option(|d| d.fixed().map(Hash))?,
             resulting_state_root: d.option(|d| d.fixed().map(Hash))?,
             resulting_crdt_heads: d.list(|d| d.fixed().map(Hash))?,
             sequence: d.u64()?,
@@ -1318,6 +1342,12 @@ impl V2Wire for AccumulationResultV2 {
                 let published = PublishedEffectsV2::decode(&d.bytes()?)?;
                 let duplicate = d.bool()?;
                 if duplicate && published != PublishedEffectsV2::default() {
+                    return Err(DecodeError::NonCanonical);
+                }
+                if !duplicate
+                    && published.reply.as_ref().map(ReplyRecordV2::commitment)
+                        != receipt.reply_commitment
+                {
                     return Err(DecodeError::NonCanonical);
                 }
                 Ok(Self::Accepted {
@@ -1914,22 +1944,34 @@ fn decode_continuation_change(d: &mut Decoder<'_>) -> Result<ContinuationChangeV
 
 fn encode_message(e: &mut Encoder<'_>, value: &MessageRecordV2) {
     e.fixed(&value.call_id.0);
+    e.fixed(&value.caller_invocation.0);
+    e.u64(value.await_ordinal);
     e.fixed(&value.from.0);
     e.fixed(&value.to.0);
     e.option(&value.parent, |e, id| e.fixed(&id.0));
     e.bytes(&value.payload);
+    encode_auth(e, &value.authorization);
     e.option(&value.deadline_timeslot, |e, value| e.u64(*value));
 }
 
 fn decode_message(d: &mut Decoder<'_>) -> Result<MessageRecordV2, DecodeError> {
-    Ok(MessageRecordV2 {
+    let value = MessageRecordV2 {
         call_id: CallId(d.fixed()?),
+        caller_invocation: InvocationId(d.fixed()?),
+        await_ordinal: d.u64()?,
         from: ActorId(d.fixed()?),
         to: ActorId(d.fixed()?),
         parent: d.option(|d| d.fixed().map(CallId))?,
         payload: d.bytes()?,
+        authorization: decode_auth(d)?,
         deadline_timeslot: d.option(Decoder::u64)?,
-    })
+    };
+    if value.payload.is_empty()
+        || value.call_id != value.caller_invocation.call_id(value.await_ordinal)
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(value)
 }
 
 fn encode_reply(e: &mut Encoder<'_>, value: &ReplyRecordV2) {
@@ -1990,6 +2032,7 @@ mod tests {
             service: service(),
             invocation: InvocationId([4; 32]),
             workflow_step: 0,
+            logical_timeslot: 5,
             target: ActorId([5; 32]),
             target_program: ProgramId([6; 32]),
             method: "increment".into(),
@@ -2245,6 +2288,42 @@ mod tests {
     }
 
     #[test]
+    fn durable_message_binds_call_identity_and_authorization() {
+        let caller_invocation = InvocationId([71; 32]);
+        let message = MessageRecordV2 {
+            call_id: caller_invocation.call_id(3),
+            caller_invocation,
+            await_ordinal: 3,
+            from: ActorId([72; 32]),
+            to: ActorId([73; 32]),
+            parent: Some(CallId([74; 32])),
+            payload: b"message".to_vec(),
+            authorization: AuthorizationEvidenceV2::Credential {
+                policy: Hash([75; 32]),
+                credential_commitment: Hash([76; 32]),
+                bytes: vec![77],
+            },
+            deadline_timeslot: Some(78),
+        };
+        assert_eq!(MessageRecordV2::decode(&message.encode()).unwrap(), message);
+
+        let mut wrong_ordinal = message;
+        wrong_ordinal.await_ordinal = 4;
+        assert_eq!(
+            MessageRecordV2::decode(&wrong_ordinal.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut empty_payload = wrong_ordinal;
+        empty_payload.await_ordinal = 3;
+        empty_payload.payload.clear();
+        assert_eq!(
+            MessageRecordV2::decode(&empty_payload.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
     fn accumulate_request_wires_bind_install_and_apply_inputs() {
         let genesis = ServiceGenesisV2 {
             service: service(),
@@ -2373,6 +2452,7 @@ mod tests {
         let receipt = AccumulationReceiptV2 {
             service: service(),
             accepted_transition: Hash([12; 32]),
+            reply_commitment: None,
             resulting_state_root: Some(Hash([13; 32])),
             resulting_crdt_heads: vec![],
             sequence: 4,
@@ -2387,6 +2467,38 @@ mod tests {
         assert_eq!(
             AccumulationResultV2::decode(&accepted.encode()).unwrap(),
             accepted
+        );
+
+        let reply = ReplyRecordV2 {
+            call_id: CallId([14; 32]),
+            producer: ActorId([15; 32]),
+            result: b"committed reply".to_vec(),
+        };
+        let mut reply_receipt = receipt.clone();
+        reply_receipt.reply_commitment = Some(reply.commitment());
+        let with_reply = AccumulationResultV2::Accepted {
+            receipt: reply_receipt,
+            published: PublishedEffectsV2 {
+                reply: Some(reply.clone()),
+                ..PublishedEffectsV2::default()
+            },
+            duplicate: false,
+        };
+        assert_eq!(
+            AccumulationResultV2::decode(&with_reply.encode()).unwrap(),
+            with_reply
+        );
+        let mismatched = AccumulationResultV2::Accepted {
+            receipt: receipt.clone(),
+            published: PublishedEffectsV2 {
+                reply: Some(reply),
+                ..PublishedEffectsV2::default()
+            },
+            duplicate: false,
+        };
+        assert_eq!(
+            AccumulationResultV2::decode(&mismatched.encode()),
+            Err(DecodeError::NonCanonical)
         );
 
         let duplicate = AccumulationResultV2::Accepted {
