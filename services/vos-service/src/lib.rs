@@ -373,6 +373,13 @@ mod guest {
     }
 
     impl GuestAccumulateStoreV2 for JamAccumulateStore {
+        fn authorize_install(
+            &self,
+            genesis: &vos::v2::ServiceGenesisV2,
+        ) -> Result<bool, Self::Error> {
+            Ok(hostcalls::verify_install_authorization(&genesis.encode()) == error::HOST_OK)
+        }
+
         fn blob_available(&self, reference: &BlobRefV2) -> Result<bool, Self::Error> {
             let mut probe = [0u8; 1];
             let available = hostcalls::preimage_lookup(&reference.hash.0, &mut probe);

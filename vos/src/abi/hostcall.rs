@@ -101,6 +101,10 @@ pub const SUSPEND: u32 = 122;
 /// committed reply is admitted as continuation input. Accumulate-only.
 pub const RECEIPT_VERIFY: u32 = 125;
 
+/// Authorize one exact canonical service genesis before an empty service
+/// account is initialized. Accumulate-only.
+pub const INSTALL_AUTH_VERIFY: u32 = 126;
+
 /// Query one canonical actor PVM by `ProgramId` inside the current Accumulate
 /// transaction. This is a VOS service capability, not a JAM protocol slot.
 pub const PROGRAM_LOOKUP: u32 = 127;
@@ -119,6 +123,7 @@ mod tests {
             NOW_MS,
             SUSPEND,
             RECEIPT_VERIFY,
+            INSTALL_AUTH_VERIFY,
             PROGRAM_LOOKUP,
         ];
         assert!(supplied.iter().all(|slot| !(1..=28).contains(slot)));
@@ -148,6 +153,7 @@ mod tests {
             NOW_MS as u8,
             SUSPEND as u8,
             RECEIPT_VERIFY as u8,
+            INSTALL_AUTH_VERIFY as u8,
             PROGRAM_LOOKUP as u8,
             crate::v2::ACTOR_IPC_CAP_SLOT,
         ];

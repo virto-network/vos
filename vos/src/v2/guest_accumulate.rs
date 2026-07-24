@@ -25,6 +25,10 @@ use super::{
 /// Extra content-addressed operations needed by guest Accumulate in addition
 /// to ordinary JAM service storage.
 pub trait GuestAccumulateStoreV2: StateTreeStore {
+    /// Authenticate the exact initial service tree and its supplied evidence
+    /// against platform deployment authority before a header exists.
+    fn authorize_install(&self, genesis: &ServiceGenesisV2) -> Result<bool, Self::Error>;
+
     fn blob_available(&self, reference: &BlobRefV2) -> Result<bool, Self::Error>;
 
     /// Whether exact canonical actor PVM bytes are available to this service.
@@ -108,6 +112,12 @@ fn install<S: GuestAccumulateStoreV2>(
     }
     if genesis.service.execution_semantics != EXECUTION_SEMANTICS_ID {
         return Ok(rejected(AccumulationRejectionV2::WrongExecutionSemantics));
+    }
+    if !store
+        .authorize_install(genesis)
+        .map_err(GuestAccumulateError::Storage)?
+    {
+        return Ok(rejected(AccumulationRejectionV2::Unauthorized));
     }
     for actor in &genesis.actors {
         if !store
@@ -1514,6 +1524,7 @@ mod tests {
         programs: BTreeMap<ProgramId, Vec<u8>>,
         receipt_allowlist: BTreeSet<Hash>,
         writes_before_failure: Option<usize>,
+        deny_install: bool,
     }
 
     impl StateTreeStore for MemStore {
@@ -1543,6 +1554,10 @@ mod tests {
     }
 
     impl GuestAccumulateStoreV2 for MemStore {
+        fn authorize_install(&self, _genesis: &ServiceGenesisV2) -> Result<bool, Self::Error> {
+            Ok(!self.deny_install)
+        }
+
         fn blob_available(&self, reference: &BlobRefV2) -> Result<bool, Self::Error> {
             Ok(self
                 .blobs
@@ -1638,6 +1653,46 @@ mod tests {
             panic!("install rejected")
         };
         (initial, receipt)
+    }
+
+    #[test]
+    fn install_authorization_is_checked_before_availability_or_state_writes() {
+        let mut store = MemStore {
+            deny_install: true,
+            ..MemStore::default()
+        };
+        let initial = BlobRefV2::of_bytes(b"unavailable state");
+        let genesis = ServiceGenesisV2 {
+            service: identity(),
+            consistency: ConsistencyModeV2::Local,
+            actors: vec![ActorGenesisV2 {
+                actor: actor(),
+                parent: None,
+                program: program(),
+                initial_state: initial,
+                crdt: false,
+                methods: vec![],
+            }],
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: super::super::SystemCapabilityId([8; 32]),
+                authenticator: vec![9],
+            },
+        };
+        let before = store.clone();
+
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Install(genesis.clone()),)
+                .unwrap(),
+            rejected(AccumulationRejectionV2::Unauthorized)
+        );
+        assert_eq!(store, before, "unauthorized genesis must stage nothing");
+
+        store.deny_install = false;
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Install(genesis)).unwrap(),
+            rejected(AccumulationRejectionV2::WrongProgram),
+            "availability is consulted only after authorization succeeds"
+        );
     }
 
     #[test]

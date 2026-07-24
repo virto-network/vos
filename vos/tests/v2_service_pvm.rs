@@ -13,11 +13,12 @@ use vos::v2::{
     BlobRefV2, CommittedImageStoreV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2,
     ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2, GasAccountingV2, Hash,
     ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2, InvocationId,
-    JamServiceV2, LocalJamStoreV2, LocalTransportV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
-    MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin, ProgramId, PublishedEffectsV2,
-    ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplyRecordV2, RootServiceId,
-    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
-    ServicePvmV2, StateKeyV2, TransitionV2, V2Wire, WorkEnvelopeV2,
+    JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2, LocalTransportV2, LocalWorkRequestV2,
+    LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
+    ProgramId, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2,
+    ReplyRecordV2, RootServiceId, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2,
+    ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, TransitionV2, V2Wire,
+    WorkEnvelopeV2,
 };
 use vos::{Decode, Encode, value::Msg};
 
@@ -62,6 +63,19 @@ fn restart_durable_service(
         5_000_000_000,
     )
     .unwrap()
+}
+
+fn authorize_install<A: LocalJamStoreHostV2>(
+    service: &mut JamServiceV2<NoRefineProtocolHostV2, A>,
+    request: &AccumulateRequestV2,
+) {
+    let AccumulateRequestV2::Install(genesis) = request else {
+        panic!("install authorization requires a genesis request")
+    };
+    service
+        .accumulate_host_mut()
+        .local_store_mut()
+        .allow_install(genesis);
 }
 
 const CANONICAL_SERVICE_PVM: &[u8] = include_bytes!("../../services/vos-service/vos-service.pvm");
@@ -315,7 +329,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
         }],
     };
     let mut host = LocalJamStoreV2::default();
-    assert_eq!(host.import_blob(initial_bytes), initial);
+    assert_eq!(host.import_blob(initial_bytes.clone()), initial);
     assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
     let mut service = JamServiceV2::new(
         service_pvm.clone(),
@@ -348,6 +362,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
             authenticator: vec![1],
         },
     });
+    authorize_install(&mut service, &install);
     assert!(matches!(
         service.accumulate(&install).unwrap().result,
         AccumulationResultV2::Installed(_)
@@ -541,6 +556,7 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
             authenticator: vec![1],
         },
     });
+    authorize_install(&mut service, &install);
     assert!(matches!(
         service.accumulate(&install).unwrap().result,
         AccumulationResultV2::Installed(_)
@@ -758,6 +774,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
             authenticator: vec![35],
         },
     });
+    authorize_install(&mut committed, &install);
     let installed = committed.accumulate(&install).unwrap();
     let AccumulationResultV2::Installed(installed) = installed.result else {
         panic!("guest install rejected")
@@ -1028,30 +1045,30 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
         5_000_000_000,
     )
     .unwrap();
-    let install = committed
-        .accumulate(&AccumulateRequestV2::Install(ServiceGenesisV2 {
-            service: seed_work.service.clone(),
-            consistency: ConsistencyModeV2::Local,
-            actors: vec![ActorGenesisV2 {
-                actor: seed_work.target,
-                parent: None,
-                program: actor_program,
-                initial_state: initial_state_ref,
-                crdt: false,
-                methods: vec![MethodPolicyV2 {
-                    method: "await_peer".into(),
-                    schema: Hash([32; 32]),
-                    policy: Hash([33; 32]),
-                    public: true,
-                    attested: false,
-                }],
+    let install_request = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        service: seed_work.service.clone(),
+        consistency: ConsistencyModeV2::Local,
+        actors: vec![ActorGenesisV2 {
+            actor: seed_work.target,
+            parent: None,
+            program: actor_program,
+            initial_state: initial_state_ref,
+            crdt: false,
+            methods: vec![MethodPolicyV2 {
+                method: "await_peer".into(),
+                schema: Hash([32; 32]),
+                policy: Hash([33; 32]),
+                public: true,
+                attested: false,
             }],
-            authorization: AuthorizationEvidenceV2::SystemCapability {
-                capability: vos::v2::SystemCapabilityId([34; 32]),
-                authenticator: vec![35],
-            },
-        }))
-        .unwrap();
+        }],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([34; 32]),
+            authenticator: vec![35],
+        },
+    });
+    authorize_install(&mut committed, &install_request);
+    let install = committed.accumulate(&install_request).unwrap();
     assert!(matches!(install.result, AccumulationResultV2::Installed(_)));
     let request = LocalWorkRequestV2 {
         invocation: seed_work.invocation,
@@ -1313,46 +1330,46 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
         5_000_000_000,
     )
     .unwrap();
-    let installed = committed
-        .accumulate(&AccumulateRequestV2::Install(ServiceGenesisV2 {
-            service: identity.clone(),
-            consistency: ConsistencyModeV2::Local,
-            actors: vec![
-                ActorGenesisV2 {
-                    actor: caller,
-                    parent: None,
-                    program: actor_program,
-                    initial_state: initial_state_ref.clone(),
-                    crdt: false,
-                    methods: vec![MethodPolicyV2 {
-                        method: "seed".into(),
-                        schema: Hash([31; 32]),
-                        policy: Hash([32; 32]),
-                        public: true,
-                        attested: false,
-                    }],
-                },
-                ActorGenesisV2 {
-                    actor: target,
-                    parent: Some(caller),
-                    program: actor_program,
-                    initial_state: initial_state_ref,
-                    crdt: false,
-                    methods: vec![MethodPolicyV2 {
-                        method: "await_two_peers".into(),
-                        schema: Hash([33; 32]),
-                        policy: Hash([34; 32]),
-                        public: true,
-                        attested: false,
-                    }],
-                },
-            ],
-            authorization: AuthorizationEvidenceV2::SystemCapability {
-                capability: vos::v2::SystemCapabilityId([35; 32]),
-                authenticator: vec![36],
+    let install_request = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        service: identity.clone(),
+        consistency: ConsistencyModeV2::Local,
+        actors: vec![
+            ActorGenesisV2 {
+                actor: caller,
+                parent: None,
+                program: actor_program,
+                initial_state: initial_state_ref.clone(),
+                crdt: false,
+                methods: vec![MethodPolicyV2 {
+                    method: "seed".into(),
+                    schema: Hash([31; 32]),
+                    policy: Hash([32; 32]),
+                    public: true,
+                    attested: false,
+                }],
             },
-        }))
-        .unwrap();
+            ActorGenesisV2 {
+                actor: target,
+                parent: Some(caller),
+                program: actor_program,
+                initial_state: initial_state_ref,
+                crdt: false,
+                methods: vec![MethodPolicyV2 {
+                    method: "await_two_peers".into(),
+                    schema: Hash([33; 32]),
+                    policy: Hash([34; 32]),
+                    public: true,
+                    attested: false,
+                }],
+            },
+        ],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([35; 32]),
+            authenticator: vec![36],
+        },
+    });
+    authorize_install(&mut committed, &install_request);
+    let installed = committed.accumulate(&install_request).unwrap();
     assert!(matches!(
         installed.result,
         AccumulationResultV2::Installed(_)
@@ -1850,7 +1867,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let initial = BlobRefV2::of_bytes(&initial_bytes);
     let seed_work = work(actor_program, initial.clone());
     let mut host = DurableJamStoreV2::open(FailableCommittedImages::default()).unwrap();
-    assert_eq!(host.import_blob(initial_bytes), initial);
+    assert_eq!(host.import_blob(initial_bytes.clone()), initial);
     assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
     let mut service = JamServiceV2::new(
         pvm.clone(),
@@ -1884,6 +1901,55 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             authenticator: vec![35],
         },
     });
+    assert_eq!(
+        service.accumulate(&install).unwrap().result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::Unauthorized)
+    );
+    assert_eq!(service.accumulate_host().commit_sequence(), 0);
+    assert_eq!(service.accumulate_host().row_count(), 0);
+    assert!(
+        service.accumulate_host().backend().image.is_none(),
+        "unauthorized genesis cannot create a durable recovery image"
+    );
+
+    authorize_install(&mut service, &install);
+    service = restart_durable_service(service, &pvm, ProgramId::of_pvm(&pvm));
+    assert_eq!(
+        service.accumulate(&install).unwrap().result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::Unauthorized),
+        "host authorization policy is not laundered through durable service state"
+    );
+    assert_eq!(service.accumulate_host().commit_sequence(), 0);
+    assert_eq!(
+        service.accumulate_host_mut().import_blob(initial_bytes),
+        initial
+    );
+    assert_eq!(
+        service
+            .accumulate_host_mut()
+            .import_program(actor_pvm.clone()),
+        actor_program
+    );
+    authorize_install(&mut service, &install);
+
+    let mut tampered_install = install.clone();
+    let AccumulateRequestV2::Install(tampered_genesis) = &mut tampered_install else {
+        unreachable!()
+    };
+    let AuthorizationEvidenceV2::SystemCapability { authenticator, .. } =
+        &mut tampered_genesis.authorization
+    else {
+        unreachable!()
+    };
+    authenticator.push(99);
+    assert_eq!(
+        service.accumulate(&tampered_install).unwrap().result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::Unauthorized),
+        "authorization is bound to every exact genesis byte"
+    );
+    assert_eq!(service.accumulate_host().commit_sequence(), 0);
+    assert_eq!(service.accumulate_host().row_count(), 0);
+
     let installed_output = service
         .accumulate(&install)
         .expect("guest install completes");
@@ -2592,11 +2658,10 @@ fn physical_guest_install_rejects_an_unavailable_actor_program() {
         },
     };
 
+    let install = AccumulateRequestV2::Install(genesis);
+    authorize_install(&mut service, &install);
     assert_eq!(
-        service
-            .accumulate(&AccumulateRequestV2::Install(genesis))
-            .unwrap()
-            .result,
+        service.accumulate(&install).unwrap().result,
         AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::WrongProgram)
     );
     assert_eq!(service.accumulate_host().commit_sequence(), 0);
@@ -2644,11 +2709,10 @@ fn physical_guest_rejects_the_missing_preimage_length_sentinel() {
         },
     };
 
+    let install = AccumulateRequestV2::Install(genesis);
+    authorize_install(&mut service, &install);
     assert_eq!(
-        service
-            .accumulate(&AccumulateRequestV2::Install(genesis))
-            .unwrap()
-            .result,
+        service.accumulate(&install).unwrap().result,
         AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::NonCanonical)
     );
     assert_eq!(service.accumulate_host().commit_sequence(), 0);
@@ -2678,30 +2742,30 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
             5_000_000_000,
         )
         .unwrap();
-        let installed = service
-            .accumulate(&AccumulateRequestV2::Install(ServiceGenesisV2 {
-                service: identity,
-                consistency: ConsistencyModeV2::Local,
-                actors: vec![ActorGenesisV2 {
-                    actor,
-                    parent: None,
-                    program: actor_program,
-                    initial_state: initial_state_ref.clone(),
-                    crdt: false,
-                    methods: vec![MethodPolicyV2 {
-                        method: method.into(),
-                        schema: Hash([91; 32]),
-                        policy: Hash([92; 32]),
-                        public: true,
-                        attested: false,
-                    }],
+        let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            service: identity,
+            consistency: ConsistencyModeV2::Local,
+            actors: vec![ActorGenesisV2 {
+                actor,
+                parent: None,
+                program: actor_program,
+                initial_state: initial_state_ref.clone(),
+                crdt: false,
+                methods: vec![MethodPolicyV2 {
+                    method: method.into(),
+                    schema: Hash([91; 32]),
+                    policy: Hash([92; 32]),
+                    public: true,
+                    attested: false,
                 }],
-                authorization: AuthorizationEvidenceV2::SystemCapability {
-                    capability: vos::v2::SystemCapabilityId([93; 32]),
-                    authenticator: vec![94],
-                },
-            }))
-            .unwrap();
+            }],
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: vos::v2::SystemCapabilityId([93; 32]),
+                authenticator: vec![94],
+            },
+        });
+        authorize_install(&mut service, &install);
+        let installed = service.accumulate(&install).unwrap();
         assert!(matches!(
             installed.result,
             AccumulationResultV2::Installed(_)

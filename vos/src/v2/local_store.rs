@@ -16,8 +16,8 @@ use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, AccumulationReceiptV2, BlobRefV2,
     DedupRecordV2, DeliveryRecordV2, MessageRecordV2, ProgramId, PublicationRecordV2,
-    ReceiptVerificationRequestV2, ReplyAdmissionRecordV2, ServicePvmErrorV2, ServiceStateTreeV2,
-    StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
+    ReceiptVerificationRequestV2, ReplyAdmissionRecordV2, ServiceGenesisV2, ServicePvmErrorV2,
+    ServiceStateTreeV2, StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
 };
 
 /// Cloneable in-memory image of a committed local v2 service account.
@@ -239,6 +239,7 @@ impl core::error::Error for LocalStoreReadErrorV2 {}
 pub struct LocalJamStoreV2 {
     committed: LocalJamStoreSnapshotV2,
     receipt_allowlist: BTreeSet<super::Hash>,
+    install_allowlist: BTreeSet<super::Hash>,
 }
 
 /// JAM storage host whose committed image is durable before IC-5 returns.
@@ -341,6 +342,7 @@ impl LocalJamStoreV2 {
                 commit_sequence: 0,
             },
             receipt_allowlist: BTreeSet::new(),
+            install_allowlist: BTreeSet::new(),
         }
     }
 
@@ -349,6 +351,7 @@ impl LocalJamStoreV2 {
         Self {
             committed: snapshot,
             receipt_allowlist: BTreeSet::new(),
+            install_allowlist: BTreeSet::new(),
         }
     }
 
@@ -566,6 +569,15 @@ impl LocalJamStoreV2 {
     pub fn allow_receipt(&mut self, request: &ReceiptVerificationRequestV2) {
         self.receipt_allowlist.insert(request.hash());
     }
+
+    /// Authorize one exact canonical genesis for physical guest Install.
+    ///
+    /// This conformance policy is process-local and deliberately excluded
+    /// from the recoverable service image. Production hosts implement the
+    /// same guest boundary from consensus-authoritative deployment state.
+    pub fn allow_install(&mut self, genesis: &ServiceGenesisV2) {
+        self.install_allowlist.insert(install_hash(genesis));
+    }
 }
 
 struct CommittedRows<'a>(&'a BTreeMap<Vec<u8>, Vec<u8>>);
@@ -586,6 +598,7 @@ impl StateTreeStore for CommittedRows<'_> {
 pub struct LocalJamTransactionV2 {
     staged: LocalJamStoreSnapshotV2,
     receipt_allowlist: BTreeSet<super::Hash>,
+    install_allowlist: BTreeSet<super::Hash>,
 }
 
 impl LocalJamTransactionV2 {
@@ -714,6 +727,19 @@ impl AccumulateTransactionV2 for LocalJamTransactionV2 {
                     0,
                 ])
             }
+            hostcall::INSTALL_AUTH_VERIFY => {
+                let bytes = Self::read_guest_bytes(kernel, registers[7], registers[8], slot)?;
+                let genesis = ServiceGenesisV2::decode(&bytes)
+                    .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?;
+                Ok([
+                    if self.install_allowlist.contains(&install_hash(&genesis)) {
+                        error::HOST_OK
+                    } else {
+                        error::HOST_WHAT
+                    },
+                    0,
+                ])
+            }
             _ => Err(ServicePvmErrorV2::AccumulateHostRejected(slot)),
         }
     }
@@ -726,6 +752,7 @@ impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
         Ok(LocalJamTransactionV2 {
             staged: self.committed.clone(),
             receipt_allowlist: self.receipt_allowlist.clone(),
+            install_allowlist: self.install_allowlist.clone(),
         })
     }
 
@@ -761,6 +788,13 @@ impl<B: CommittedImageStoreV2> AccumulateProtocolHostV2 for DurableJamStoreV2<B>
         self.local.committed = transaction.staged;
         Ok(())
     }
+}
+
+fn install_hash(genesis: &ServiceGenesisV2) -> super::Hash {
+    super::Hash::digest(
+        b"vos/service-install-authorization/v2",
+        &[&genesis.encode()],
+    )
 }
 
 #[cfg(test)]
