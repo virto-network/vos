@@ -59,6 +59,14 @@ Injected destination and caller commit failures expose neither an admitted
 inbox nor resumed reply effects; the exact envelopes remain retryable from the
 previous durable images.
 
+Guest Install is fail-closed on an exact-genesis authorization capability. It
+binds service/deployment identity, consistency mode, the complete actor tree,
+programs, initial states, method policies, and the supplied authorization
+evidence before consulting program or blob availability and before staging any
+service row. The local conformance host uses an explicit process-local
+allowlist which is excluded from durable service snapshots; reopening an empty
+store therefore requires authority to be established again.
+
 This is still a conformance orchestrator, not production network routing.
 Automatic node discovery and outbox/reply routing, plus CRDT delivery/reply
 consumption, remain staged. Acknowledging a publication containing several
@@ -82,12 +90,13 @@ the built-in workflow CRDT. The actor-side resume branch already rebinds and
 resets the restored CRDT operation allocator, so enabling that future
 consumption path cannot reuse the pre-await change namespace.
 
-Before that production cutover, guest Install must authenticate
-`genesis.authorization` against consensus-authoritative deployment state, and
-`PROGRAM_LOOKUP` availability must be pinned to or imported from
-consensus-visible state rather than a node-local cache. `RECEIPT_VERIFY` must
-likewise use consensus-authoritative receipt finality rather than the local
-conformance allowlist, and delivery timeslots must come from the JAM slot.
+Before that production cutover, the Install authorization capability must be
+backed by consensus-authoritative deployment state rather than the local
+conformance allowlist, and `PROGRAM_LOOKUP` availability must be pinned to or
+imported from consensus-visible state rather than a node-local cache.
+`RECEIPT_VERIFY` must likewise use consensus-authoritative receipt finality
+rather than its local conformance allowlist, and delivery timeslots must come
+from the JAM slot.
 Production routing must recover and retry guest publication, delivery and
 reply-admission rows rather than maintain a second native message ledger. A
 bounded reclamation or checkpoint plan for unreachable SMT and CRDT DAG nodes,
