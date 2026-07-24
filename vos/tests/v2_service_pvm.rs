@@ -10,16 +10,38 @@ use std::path::PathBuf;
 use vos::v2::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AuthorizationEvidenceV2,
-    BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2, ContinuationSnapshotV2,
-    DeploymentId, GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
-    InboxDrainOutcomeV2, InvocationId, JamServiceV2, LocalJamStoreV2, LocalTransportV2,
-    LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
-    NoRefineProtocolHostV2, Origin, ProgramId, PublishedEffectsV2, ReceiptVerificationRequestV2,
-    RefineImportsV2, RefineOutputV2, ReplyRecordV2, RootServiceId, ScheduleErrorV2,
-    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, TransitionV2,
-    V2Wire, WorkEnvelopeV2,
+    BlobRefV2, CommittedImageStoreV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2,
+    ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2, GasAccountingV2, Hash,
+    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2, InvocationId,
+    JamServiceV2, LocalJamStoreV2, LocalTransportV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
+    MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin, ProgramId, PublishedEffectsV2,
+    ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplyRecordV2, RootServiceId,
+    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
+    ServicePvmV2, StateKeyV2, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 use vos::{Decode, Encode, value::Msg};
+
+#[derive(Debug, Default)]
+struct FailableCommittedImages {
+    image: Option<Vec<u8>>,
+    fail_next_commit: bool,
+}
+
+impl CommittedImageStoreV2 for FailableCommittedImages {
+    type Error = ();
+
+    fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self.image.clone())
+    }
+
+    fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+        if std::mem::take(&mut self.fail_next_commit) {
+            return Err(());
+        }
+        self.image = Some(image.to_vec());
+        Ok(())
+    }
+}
 
 const CANONICAL_SERVICE_PVM: &[u8] = include_bytes!("../../services/vos-service/vos-service.pvm");
 const SERVICE_BUILD_CONFIG: &str = include_str!("../../services/vos-service/.cargo/config.toml");
@@ -1806,7 +1828,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let initial_bytes = b"initial actor state".to_vec();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
     let seed_work = work(actor_program, initial.clone());
-    let mut host = LocalJamStoreV2::default();
+    let mut host = DurableJamStoreV2::open(FailableCommittedImages::default()).unwrap();
     assert_eq!(host.import_blob(initial_bytes), initial);
     assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
     let mut service = JamServiceV2::new(
@@ -1940,6 +1962,26 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             bytes: continuation_bytes,
         }],
     });
+    let before_failed_commit = service.accumulate_host().snapshot();
+    let durable_before_failed_commit = service.accumulate_host().backend().image.clone();
+    service.accumulate_host_mut().backend_mut().fail_next_commit = true;
+    assert!(matches!(
+        service.accumulate(&apply),
+        Err(ServiceDispatchError::Pvm(
+            ServicePvmErrorV2::AccumulateCommitRejected
+        ))
+    ));
+    assert_eq!(
+        service.accumulate_host().snapshot(),
+        before_failed_commit,
+        "a failed durable commit cannot expose staged guest rows or blobs"
+    );
+    assert_eq!(
+        service.accumulate_host().backend().image,
+        durable_before_failed_commit,
+        "the previously durable image remains the recovery point"
+    );
+
     let applied_output = service.accumulate(&apply).expect("guest apply completes");
     let AccumulationResultV2::Accepted {
         receipt,
@@ -1984,7 +2026,14 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         "a read-only duplicate transaction must not commit"
     );
 
-    let reopened = LocalJamStoreV2::from_snapshot(service.accumulate_host().snapshot());
+    let persisted = service
+        .accumulate_host()
+        .backend()
+        .image
+        .clone()
+        .expect("the accepted guest transition is durable before it returns");
+    let reopened = LocalJamStoreV2::from_snapshot_bytes(&persisted)
+        .expect("canonical guest state survives a process-style restart");
     assert_eq!(
         LocalWorkSchedulerV2::prepare_inbox(&reopened, call_id, 50),
         Err(ScheduleErrorV2::ActorBusy(work.target))
