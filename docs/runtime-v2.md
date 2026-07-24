@@ -32,11 +32,20 @@ logical timeslot. Publication removal is a separate guest Accumulate
 acknowledgement performed only after the external consumer is durably
 committed.
 
+The local linear conformance path also routes a committed callee reply back to
+the caller service. It recovers the exact caller invocation from the
+guest-owned outbox, reconstructs the saved machine after restart, and submits
+the physical Refine result to guest Accumulate. A permanent reply-admission
+record binds the `CallId`, accumulated reply, work input and work hash, so a
+lost transport acknowledgement remains an idempotent duplicate after another
+restart or a later workflow slice. The callee publication is acknowledged only
+after the caller commit succeeds.
+
 This is still a conformance orchestrator, not production network routing.
-Automatic node outbox routing, recovery of reply publications back to the
-original source service, and CRDT delivery/reply consumption remain staged.
-Acknowledging a publication containing several effects is the transport
-host's responsibility only after every required consumer has accepted it.
+Automatic node discovery and outbox/reply routing, plus CRDT delivery/reply
+consumption, remain staged. Acknowledging a publication containing several
+effects is the transport host's responsibility only after every required
+consumer has accepted it.
 
 Guest Accumulate can admit a receipt-bound reply for an existing pending-call
 continuation. It reloads the committed continuation and outbox row, binds the
@@ -61,11 +70,12 @@ Before that production cutover, guest Install must authenticate
 consensus-visible state rather than a node-local cache. `RECEIPT_VERIFY` must
 likewise use consensus-authoritative receipt finality rather than the local
 conformance allowlist, and delivery timeslots must come from the JAM slot.
-Production routing must recover and retry guest publication/delivery rows
-rather than maintain a second native message ledger. A bounded reclamation or
-checkpoint plan for unreachable SMT and CRDT DAG nodes, plus completed
-delivery/deduplication bookkeeping, is also required before the engine stores
-production state; pruning must not weaken retry safety.
+Production routing must recover and retry guest publication, delivery and
+reply-admission rows rather than maintain a second native message ledger. A
+bounded reclamation or checkpoint plan for unreachable SMT and CRDT DAG nodes,
+plus completed delivery/deduplication/reply-admission bookkeeping, is also
+required before the engine stores production state; pruning must not weaken
+retry safety.
 
 The CRDT checkpoint is a consensus feature, not a local cache optimization.
 Before cutover it must:
