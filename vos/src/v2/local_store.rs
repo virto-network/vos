@@ -61,11 +61,22 @@ impl core::error::Error for LocalStoreReadErrorV2 {}
 /// and writes only that isolated image, and [`AccumulateProtocolHostV2::commit`]
 /// swaps it into visibility atomically. Dropping a transaction therefore
 /// discards every staged row and blob.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct LocalJamStoreV2 {
     committed: LocalJamStoreSnapshotV2,
     receipt_allowlist: BTreeSet<super::Hash>,
 }
+
+/// Store equality describes the recoverable service-account image. The local
+/// receipt allowlist is process-scoped host configuration and deliberately
+/// does not participate in snapshots or equality.
+impl PartialEq for LocalJamStoreV2 {
+    fn eq(&self, other: &Self) -> bool {
+        self.committed == other.committed
+    }
+}
+
+impl Eq for LocalJamStoreV2 {}
 
 impl LocalJamStoreV2 {
     pub const fn new() -> Self {
@@ -412,7 +423,10 @@ mod tests {
             Some(b"canonical actor program".as_slice())
         );
 
+        store.receipt_allowlist.insert(crate::v2::Hash([7; 32]));
         let reopened = LocalJamStoreV2::from_snapshot(store.snapshot());
+        assert!(reopened.receipt_allowlist.is_empty());
+        assert!(!store.receipt_allowlist.is_empty());
         assert_eq!(reopened, store);
     }
 }
