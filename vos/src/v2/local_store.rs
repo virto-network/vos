@@ -250,6 +250,39 @@ pub struct DurableJamStoreV2<B> {
     backend: B,
 }
 
+/// Access to the committed local conformance image carried by an Accumulate
+/// host.
+///
+/// Both the in-memory and durable hosts expose the same read-only scheduling
+/// view and process-local receipt policy. Transport remains orchestration
+/// only: every service-state mutation still crosses physical IC-5 and the
+/// host's [`AccumulateProtocolHostV2::commit`] boundary.
+pub trait LocalJamStoreHostV2 {
+    fn local_store(&self) -> &LocalJamStoreV2;
+
+    fn local_store_mut(&mut self) -> &mut LocalJamStoreV2;
+}
+
+impl LocalJamStoreHostV2 for LocalJamStoreV2 {
+    fn local_store(&self) -> &LocalJamStoreV2 {
+        self
+    }
+
+    fn local_store_mut(&mut self) -> &mut LocalJamStoreV2 {
+        self
+    }
+}
+
+impl<B> LocalJamStoreHostV2 for DurableJamStoreV2<B> {
+    fn local_store(&self) -> &LocalJamStoreV2 {
+        &self.local
+    }
+
+    fn local_store_mut(&mut self) -> &mut LocalJamStoreV2 {
+        &mut self.local
+    }
+}
+
 impl<B: CommittedImageStoreV2> DurableJamStoreV2<B> {
     pub fn open(mut backend: B) -> Result<Self, DurableStoreOpenErrorV2<B::Error>> {
         let local = match backend.load().map_err(DurableStoreOpenErrorV2::Backend)? {
