@@ -394,6 +394,10 @@ impl ServicePvmV2 {
                                 duplicate: false,
                                 ..
                             }
+                            | AccumulationResultV2::PublicationAcknowledged {
+                                duplicate: false,
+                                ..
+                            }
                     ) {
                         host.commit(transaction)?;
                     }
@@ -997,6 +1001,7 @@ mod tests {
             },
             accepted_transition: Hash([4; 32]),
             reply_commitment: None,
+            outbox_commitment: None,
             resulting_state_root: Some(Hash([5; 32])),
             resulting_crdt_heads: Vec::new(),
             sequence: 1,

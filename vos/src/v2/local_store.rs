@@ -11,9 +11,10 @@ use alloc::vec::Vec;
 use javm::kernel::InvocationKernel;
 
 use super::{
-    AccumulateProtocolHostV2, AccumulateTransactionV2, BlobRefV2, ProgramId,
-    ReceiptVerificationRequestV2, ServicePvmErrorV2, ServiceStateTreeV2, StateKeyV2,
-    StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
+    AccumulateProtocolHostV2, AccumulateTransactionV2, BlobRefV2, DeliveryRecordV2,
+    MessageRecordV2, ProgramId, PublicationRecordV2, ReceiptVerificationRequestV2,
+    ServicePvmErrorV2, ServiceStateTreeV2, StateKeyV2, StateTreeStore, StoreHeaderV2,
+    StoreOpenError, V2Wire,
 };
 
 /// Cloneable in-memory image of a committed local v2 service account.
@@ -44,6 +45,8 @@ impl LocalJamStoreSnapshotV2 {
 pub enum LocalStoreReadErrorV2 {
     InvalidHeader(StoreOpenError),
     CorruptStateTree,
+    CorruptPublication,
+    CorruptDelivery,
 }
 
 impl core::fmt::Display for LocalStoreReadErrorV2 {
@@ -163,6 +166,65 @@ impl LocalJamStoreV2 {
         ServiceStateTreeV2::new(&mut view, root)
             .get(key)
             .map_err(|_| LocalStoreReadErrorV2::CorruptStateTree)
+    }
+
+    /// Recover committed effects not yet acknowledged through guest
+    /// Accumulate. Physical row order is stable across snapshot reopen.
+    pub fn pending_publications(&self) -> Result<Vec<PublicationRecordV2>, LocalStoreReadErrorV2> {
+        let prefix = super::storage::publication_storage_prefix();
+        self.committed
+            .rows
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .map(|(key, bytes)| {
+                let publication = PublicationRecordV2::decode(bytes)
+                    .map_err(|_| LocalStoreReadErrorV2::CorruptPublication)?;
+                if super::publication_storage_key(publication.input).as_slice() != key.as_slice() {
+                    return Err(LocalStoreReadErrorV2::CorruptPublication);
+                }
+                Ok(publication)
+            })
+            .collect()
+    }
+
+    /// Recover finalized inbox admissions not yet consumed by actor
+    /// execution. The original admission timeslot is guest-owned physical
+    /// bookkeeping and survives a snapshot reopen.
+    pub fn pending_inbox_calls(&self) -> Result<Vec<(super::CallId, u64)>, LocalStoreReadErrorV2> {
+        let Some(header) = self.header()? else {
+            return Ok(Vec::new());
+        };
+        let prefix = super::storage::delivery_storage_prefix();
+        let mut pending = Vec::new();
+        for (key, bytes) in self
+            .committed
+            .rows
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+        {
+            let delivery = DeliveryRecordV2::decode(bytes)
+                .map_err(|_| LocalStoreReadErrorV2::CorruptDelivery)?;
+            if super::delivery_storage_key(delivery.call_id).as_slice() != key.as_slice()
+                || delivery.receipt.service != header.service
+                || delivery.receipt.consistency != header.consistency
+            {
+                return Err(LocalStoreReadErrorV2::CorruptDelivery);
+            }
+            if delivery.consumed {
+                continue;
+            }
+            let message = self
+                .state_row(header.service_root, &StateKeyV2::Inbox(delivery.call_id))?
+                .map(|bytes| MessageRecordV2::decode(&bytes))
+                .transpose()
+                .map_err(|_| LocalStoreReadErrorV2::CorruptDelivery)?
+                .ok_or(LocalStoreReadErrorV2::CorruptDelivery)?;
+            if message.call_id != delivery.call_id {
+                return Err(LocalStoreReadErrorV2::CorruptDelivery);
+            }
+            pending.push((delivery.call_id, delivery.logical_timeslot));
+        }
+        Ok(pending)
     }
 
     /// Make an installation input available to guest Accumulate. This is a

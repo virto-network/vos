@@ -11,16 +11,18 @@ use alloc::vec::Vec;
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 use super::{
     AccumulationReceiptV2, ActorId, CallId, ConsistencyModeV2, Hash, InvocationId,
-    ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
+    PublishedEffectsV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 2;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 3;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
 const HEADER_STORAGE_KEY: &[u8] = b"\0vos/v2/header";
 const DEDUP_STORAGE_PREFIX: &[u8] = b"\0vos/v2/dedup/";
 const RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/receipt/";
+const PUBLICATION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/publication/";
+const DELIVERY_STORAGE_PREFIX: &[u8] = b"\0vos/v2/delivery/";
 const CRDT_NODE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node/";
 const CRDT_CHANGE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-change/";
 
@@ -214,6 +216,34 @@ pub struct DedupRecordV2 {
     pub receipt: AccumulationReceiptV2,
 }
 
+/// Recoverable effects created by one committed actor slice. The host may
+/// expose them only after the surrounding service transaction commits, then
+/// removes the row through guest Accumulate acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationRecordV2 {
+    pub input: WorkInputIdV2,
+    pub receipt: AccumulationReceiptV2,
+    pub published: PublishedEffectsV2,
+}
+
+impl PublicationRecordV2 {
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(b"vos/publication/v2", &[&self.encode()])
+    }
+}
+
+/// Permanent delivery identity plus restart-drain state for one finalized
+/// cross-root message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryRecordV2 {
+    pub call_id: CallId,
+    pub logical_timeslot: u64,
+    pub consumed: bool,
+    pub retry_identity: Hash,
+    pub delivery_commitment: Hash,
+    pub receipt: AccumulationReceiptV2,
+}
+
 /// Non-recursive workflow row covered by the service tree. Receipts live in
 /// the physical bookkeeping namespace because including their resulting root
 /// in this row would make the commitment circular.
@@ -297,6 +327,75 @@ impl V2Wire for DedupRecordV2 {
     }
 }
 
+impl V2Wire for PublicationRecordV2 {
+    const MAGIC: [u8; 4] = *b"VPB2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        encode_input(&mut e, self.input);
+        e.bytes(&self.receipt.encode());
+        e.bytes(&self.published.encode());
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            input: decode_input(d)?,
+            receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
+            published: PublishedEffectsV2::decode(&d.bytes()?)?,
+        };
+        if value.input.invocation == InvocationId::ZERO
+            || value.receipt.checkpoint != value.input.workflow_step
+            || value.published == PublishedEffectsV2::default()
+            || value.receipt.reply_commitment
+                != value
+                    .published
+                    .reply
+                    .as_ref()
+                    .map(super::ReplyRecordV2::commitment)
+            || value.receipt.outbox_commitment
+                != super::MessageRecordV2::outbox_commitment(&value.published.outbox)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+impl V2Wire for DeliveryRecordV2 {
+    const MAGIC: [u8; 4] = *b"VDR2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.fixed(&self.call_id.0);
+        e.u64(self.logical_timeslot);
+        e.bool(self.consumed);
+        e.fixed(&self.retry_identity.0);
+        e.fixed(&self.delivery_commitment.0);
+        e.bytes(&self.receipt.encode());
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            call_id: CallId(d.fixed()?),
+            logical_timeslot: d.u64()?,
+            consumed: d.bool()?,
+            retry_identity: Hash(d.fixed()?),
+            delivery_commitment: Hash(d.fixed()?),
+            receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
+        };
+        if value.call_id == CallId::ZERO
+            || value.retry_identity == Hash::ZERO
+            || value.receipt.accepted_transition != value.delivery_commitment
+            || value.receipt.reply_commitment.is_some()
+            || value.receipt.outbox_commitment.is_some()
+            || value.receipt.checkpoint != 0
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
 pub const fn header_storage_key() -> &'static [u8] {
     HEADER_STORAGE_KEY
 }
@@ -307,6 +406,27 @@ pub fn dedup_storage_key(input: WorkInputIdV2) -> Vec<u8> {
 
 pub fn receipt_storage_key(input: WorkInputIdV2) -> Vec<u8> {
     input_storage_key(RECEIPT_STORAGE_PREFIX, input)
+}
+
+pub fn publication_storage_key(input: WorkInputIdV2) -> Vec<u8> {
+    input_storage_key(PUBLICATION_STORAGE_PREFIX, input)
+}
+
+#[cfg(feature = "std")]
+pub(crate) const fn publication_storage_prefix() -> &'static [u8] {
+    PUBLICATION_STORAGE_PREFIX
+}
+
+pub fn delivery_storage_key(call: CallId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(DELIVERY_STORAGE_PREFIX.len() + call.0.len());
+    key.extend_from_slice(DELIVERY_STORAGE_PREFIX);
+    key.extend_from_slice(&call.0);
+    key
+}
+
+#[cfg(feature = "std")]
+pub(crate) const fn delivery_storage_prefix() -> &'static [u8] {
+    DELIVERY_STORAGE_PREFIX
 }
 
 pub fn crdt_node_storage_key(cid: Hash) -> Vec<u8> {
@@ -412,8 +532,8 @@ mod tests {
 
     use super::*;
     use crate::v2::{
-        ABI_VERSION, ChangeId, DeploymentId, EXECUTION_SEMANTICS_ID, ProgramId, RootServiceId,
-        empty_state_root,
+        ABI_VERSION, ChangeId, DeploymentId, EXECUTION_SEMANTICS_ID, MessageRecordV2, ProgramId,
+        RootServiceId, empty_state_root,
     };
 
     fn service(byte: u8) -> ServiceIdentityV2 {
@@ -488,7 +608,12 @@ mod tests {
         };
         let dedup = dedup_storage_key(input);
         let receipt = receipt_storage_key(input);
+        let publication = publication_storage_key(input);
+        let delivery = delivery_storage_key(CallId([4; 32]));
         assert_ne!(dedup, receipt);
+        assert_ne!(dedup, publication);
+        assert_ne!(receipt, publication);
+        assert_ne!(delivery, publication);
         assert_ne!(dedup.as_slice(), header_storage_key());
         assert_ne!(crdt_node_storage_key(Hash([6; 32])), receipt);
         assert_ne!(
@@ -511,6 +636,7 @@ mod tests {
                 service: service(13),
                 accepted_transition: Hash([12; 32]),
                 reply_commitment: None,
+                outbox_commitment: None,
                 resulting_state_root: Some(Hash([14; 32])),
                 resulting_crdt_heads: vec![],
                 sequence: 9,
@@ -524,6 +650,85 @@ mod tests {
         divergent.receipt.checkpoint = 4;
         assert_eq!(
             DedupRecordV2::decode(&divergent.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn publication_and_delivery_rows_bind_committed_transport_state() {
+        let input = WorkInputIdV2 {
+            invocation: InvocationId([20; 32]),
+            workflow_step: 2,
+        };
+        let caller_invocation = InvocationId([21; 32]);
+        let message = MessageRecordV2 {
+            call_id: caller_invocation.call_id(0),
+            caller_invocation,
+            await_ordinal: 0,
+            from: ActorId([22; 32]),
+            to: ActorId([23; 32]),
+            parent: None,
+            payload: vec![1],
+            authorization: super::super::AuthorizationEvidenceV2::Public,
+            deadline_timeslot: Some(30),
+        };
+        let published = PublishedEffectsV2 {
+            outbox: vec![message.clone()],
+            ..PublishedEffectsV2::default()
+        };
+        let receipt = AccumulationReceiptV2 {
+            service: service(24),
+            accepted_transition: Hash([25; 32]),
+            reply_commitment: None,
+            outbox_commitment: MessageRecordV2::outbox_commitment(&published.outbox),
+            resulting_state_root: Some(Hash([26; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 4,
+            checkpoint: input.workflow_step,
+            consistency: ConsistencyModeV2::Local,
+        };
+        let publication = PublicationRecordV2 {
+            input,
+            receipt: receipt.clone(),
+            published,
+        };
+        assert_eq!(
+            PublicationRecordV2::decode(&publication.encode()).unwrap(),
+            publication
+        );
+        let mut bad_publication = publication;
+        bad_publication.published.outbox[0].payload.push(0);
+        assert_eq!(
+            PublicationRecordV2::decode(&bad_publication.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let delivery = DeliveryRecordV2 {
+            call_id: message.call_id,
+            logical_timeslot: 7,
+            consumed: false,
+            retry_identity: Hash([27; 32]),
+            delivery_commitment: Hash([28; 32]),
+            receipt: AccumulationReceiptV2 {
+                service: service(29),
+                accepted_transition: Hash([28; 32]),
+                reply_commitment: None,
+                outbox_commitment: None,
+                resulting_state_root: Some(Hash([30; 32])),
+                resulting_crdt_heads: vec![],
+                sequence: 5,
+                checkpoint: 0,
+                consistency: ConsistencyModeV2::Local,
+            },
+        };
+        assert_eq!(
+            DeliveryRecordV2::decode(&delivery.encode()).unwrap(),
+            delivery
+        );
+        let mut bad_delivery = delivery;
+        bad_delivery.receipt.accepted_transition = Hash([31; 32]);
+        assert_eq!(
+            DeliveryRecordV2::decode(&bad_delivery.encode()),
             Err(DecodeError::NonCanonical)
         );
     }

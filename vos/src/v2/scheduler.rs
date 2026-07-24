@@ -11,9 +11,9 @@ use alloc::vec::Vec;
 use super::{
     AccumulatedReplyV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2, BlobRefV2, CallId,
     CausalCallContextV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, DecodeError,
-    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId, LocalJamStoreV2,
-    LocalStoreReadErrorV2, Origin, RefineImportsV2, StateKeyV2, V2Wire, WorkEnvelopeV2,
-    WorkflowCheckpointV2,
+    DeliveryEnvelopeV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId,
+    LocalJamStoreV2, LocalStoreReadErrorV2, MessageRecordV2, Origin, RefineImportsV2, StateKeyV2,
+    V2Wire, WorkEnvelopeV2, WorkflowCheckpointV2,
 };
 
 /// Caller-controlled portion of one local work item. The scheduler supplies
@@ -67,6 +67,7 @@ pub enum ScheduleErrorV2 {
     InvalidInbox(CallId),
     DeadlineExpired(CallId),
     InvalidCausalContext,
+    InvalidDelivery,
     NonCanonicalImports,
 }
 
@@ -87,6 +88,37 @@ impl From<LocalStoreReadErrorV2> for ScheduleErrorV2 {
 pub struct LocalWorkSchedulerV2;
 
 impl LocalWorkSchedulerV2 {
+    /// Build the exact destination Accumulate input for one finalized
+    /// cross-root outbox record. This is read-only scheduling: the physical
+    /// service PVM independently verifies and commits the inbox.
+    pub fn prepare_delivery(
+        store: &LocalJamStoreV2,
+        logical_timeslot: u64,
+        message: MessageRecordV2,
+        source_outbox: Vec<MessageRecordV2>,
+        source_receipt: super::AccumulationReceiptV2,
+    ) -> Result<DeliveryEnvelopeV2, ScheduleErrorV2> {
+        let header = store.header()?.ok_or(ScheduleErrorV2::StoreUninitialized)?;
+        if header.consistency == ConsistencyModeV2::Crdt {
+            return Err(ScheduleErrorV2::UnsupportedConsistency(header.consistency));
+        }
+        let state_root = header
+            .state_root
+            .ok_or(ScheduleErrorV2::UnsupportedConsistency(header.consistency))?;
+        let envelope = DeliveryEnvelopeV2 {
+            service: header.service,
+            logical_timeslot,
+            base: ConsistencyBaseV2::Linear {
+                revision: header.revision,
+                state_root,
+            },
+            message,
+            source_outbox,
+            source_receipt,
+        };
+        DeliveryEnvelopeV2::decode(&envelope.encode()).map_err(|_| ScheduleErrorV2::InvalidDelivery)
+    }
+
     /// Reconstruct the next exact continuation slice from guest-committed
     /// workflow state. The host supplies only the consensus timeslot and, for
     /// an awaited call, the accumulated remote reply it received for

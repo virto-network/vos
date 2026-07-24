@@ -51,6 +51,12 @@ impl Probe {
         self.seen
     }
 
+    /// Deterministic cross-root peer used by the v2 durable transport gate.
+    #[msg]
+    async fn peer_value(&self) -> u32 {
+        7
+    }
+
     /// Two durable calls with mutations on both sides of the first resume.
     /// The v2 physical gate restarts the service before each continuation
     /// slice and proves await ordinals and causal authority survive exactly.

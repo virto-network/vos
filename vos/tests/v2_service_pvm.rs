@@ -12,11 +12,12 @@ use vos::v2::{
     AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AuthorizationEvidenceV2,
     BlobRefV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2, ContinuationSnapshotV2,
     DeploymentId, GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
-    InvocationId, JamServiceV2, LocalJamStoreV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
-    MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin, ProgramId, PublishedEffectsV2,
-    ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplyRecordV2, RootServiceId,
-    ScheduleErrorV2, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2,
-    StateKeyV2, TransitionV2, V2Wire, WorkEnvelopeV2,
+    InboxDrainOutcomeV2, InvocationId, JamServiceV2, LocalJamStoreV2, LocalTransportV2,
+    LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
+    NoRefineProtocolHostV2, Origin, ProgramId, PublishedEffectsV2, ReceiptVerificationRequestV2,
+    RefineImportsV2, RefineOutputV2, ReplyRecordV2, RootServiceId, ScheduleErrorV2,
+    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, TransitionV2,
+    V2Wire, WorkEnvelopeV2,
 };
 use vos::{Decode, Encode, value::Msg};
 
@@ -1112,6 +1113,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             service: remote_service,
             accepted_transition: Hash([47; 32]),
             reply_commitment: Some(reply.commitment()),
+            outbox_commitment: None,
             resulting_state_root: Some(Hash([48; 32])),
             resulting_crdt_heads: vec![],
             sequence: 3,
@@ -1475,6 +1477,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
             service: first_remote_service,
             accepted_transition: Hash([72; 32]),
             reply_commitment: Some(first_reply.commitment()),
+            outbox_commitment: None,
             resulting_state_root: Some(Hash([73; 32])),
             resulting_crdt_heads: vec![],
             sequence: 1,
@@ -1681,6 +1684,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
             service: second_remote_service,
             accepted_transition: Hash([76; 32]),
             reply_commitment: Some(second_reply.commitment()),
+            outbox_commitment: None,
             resulting_state_root: Some(Hash([77; 32])),
             resulting_crdt_heads: vec![],
             sequence: 1,
@@ -2338,6 +2342,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             service: remote_service,
             accepted_transition: Hash([84; 32]),
             reply_commitment: Some(remote_reply.commitment()),
+            outbox_commitment: None,
             resulting_state_root: Some(Hash([85; 32])),
             resulting_crdt_heads: vec![],
             sequence: 1,
@@ -2579,6 +2584,255 @@ fn physical_guest_rejects_the_missing_preimage_length_sentinel() {
     assert_eq!(service.accumulate_host().commit_sequence(), 0);
     assert_eq!(service.accumulate_host().row_count(), 0);
     assert_eq!(service.accumulate_host().blob_count(), 0);
+}
+
+#[test]
+fn finalized_outbox_is_delivered_and_restart_drained_through_guest_accumulate() {
+    let service_pvm = vos::v2::transpile_service_elf(&service_elf()).unwrap();
+    let service_program = ProgramId::of_pvm(&service_pvm);
+    let actor_pvm = grey_transpiler::link_elf(&probe_elf()).unwrap();
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_state = Vec::new();
+    let initial_state_ref = BlobRefV2::of_bytes(&initial_state);
+
+    let install_service = |identity: ServiceIdentityV2, actor: ActorId, method: &str| {
+        let mut host = LocalJamStoreV2::default();
+        assert_eq!(host.import_blob(initial_state.clone()), initial_state_ref);
+        assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
+        let mut service = JamServiceV2::new(
+            service_pvm.clone(),
+            service_program,
+            NoRefineProtocolHostV2,
+            host,
+            100_000_000,
+            5_000_000_000,
+        )
+        .unwrap();
+        let installed = service
+            .accumulate(&AccumulateRequestV2::Install(ServiceGenesisV2 {
+                service: identity,
+                consistency: ConsistencyModeV2::Local,
+                actors: vec![ActorGenesisV2 {
+                    actor,
+                    parent: None,
+                    program: actor_program,
+                    initial_state: initial_state_ref.clone(),
+                    crdt: false,
+                    methods: vec![MethodPolicyV2 {
+                        method: method.into(),
+                        schema: Hash([91; 32]),
+                        policy: Hash([92; 32]),
+                        public: true,
+                        attested: false,
+                    }],
+                }],
+                authorization: AuthorizationEvidenceV2::SystemCapability {
+                    capability: vos::v2::SystemCapabilityId([93; 32]),
+                    authenticator: vec![94],
+                },
+            }))
+            .unwrap();
+        assert!(matches!(
+            installed.result,
+            AccumulationResultV2::Installed(_)
+        ));
+        service
+    };
+
+    let source_identity = ServiceIdentityV2 {
+        root_service: RootServiceId([80; 32]),
+        deployment: DeploymentId([81; 32]),
+        service_program,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+    };
+    let destination_identity = ServiceIdentityV2 {
+        root_service: RootServiceId([82; 32]),
+        deployment: DeploymentId([83; 32]),
+        service_program,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+    };
+    let source_actor = ActorId([5; 32]);
+    let destination_actor = ActorId([44; 32]);
+    let mut source = install_service(source_identity, source_actor, "await_peer");
+    let destination = install_service(destination_identity, destination_actor, "peer_value");
+
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("await_peer").encode());
+    let source_work = LocalWorkSchedulerV2::prepare(
+        source.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([84; 32]),
+            workflow_step: 0,
+            logical_timeslot: 1,
+            target: source_actor,
+            method: "await_peer".into(),
+            arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    let refined = source
+        .refine_actor_tree(&source_work.work, &source_work.imports)
+        .unwrap();
+    assert_eq!(refined.transition.outbox.len(), 1);
+    let call = refined.transition.outbox[0].call_id;
+    let source_result = source
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: source_work.work,
+            transition: refined.transition,
+            provided_blobs: refined.exported_blobs,
+        }))
+        .unwrap();
+    assert!(matches!(
+        source_result.result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let source_snapshot = source.accumulate_host().snapshot();
+    let mut source = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        LocalJamStoreV2::from_snapshot(source_snapshot),
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let publications = LocalTransportV2::pending_publications(&source).unwrap();
+    assert_eq!(publications.len(), 1);
+    let publication = publications[0].clone();
+    assert_eq!(publication.published.outbox[0].call_id, call);
+
+    let destination_snapshot = destination.accumulate_host().snapshot();
+    let mut destination = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        LocalJamStoreV2::from_snapshot(destination_snapshot),
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let mut forged_publication = publication.clone();
+    forged_publication.receipt.accepted_transition = Hash([95; 32]);
+    let before_forged = destination.accumulate_host().snapshot();
+    assert!(matches!(
+        LocalTransportV2::deliver(&source, &mut destination, &forged_publication, call, 2,),
+        Err(vos::v2::LocalTransportErrorV2::NonCanonicalPublication)
+    ));
+    assert!(
+        destination
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before_forged)
+    );
+
+    let delivery =
+        LocalTransportV2::deliver(&source, &mut destination, &publication, call, 2).unwrap();
+    assert!(!delivery.duplicate);
+    assert_eq!(
+        destination.accumulate_host().pending_inbox_calls().unwrap(),
+        vec![(call, 2)]
+    );
+
+    let admitted_snapshot = destination.accumulate_host().snapshot();
+    let mut destination = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        LocalJamStoreV2::from_snapshot(admitted_snapshot),
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let before_regressed_timeslot = destination.accumulate_host().snapshot();
+    assert!(matches!(
+        LocalTransportV2::drain_pending(&mut destination, 2),
+        Err(vos::v2::LocalTransportErrorV2::TimeslotNotAfterAdmission {
+            call: rejected_call,
+            admitted_at: 2,
+            requested: 2,
+        }) if rejected_call == call
+    ));
+    assert!(
+        destination
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before_regressed_timeslot)
+    );
+
+    let drained = LocalTransportV2::drain_pending(&mut destination, 3).unwrap();
+    let [InboxDrainOutcomeV2::Committed(committed)] = drained.as_slice() else {
+        panic!("one durable inbox row must execute after restart")
+    };
+    assert_eq!(committed.call, call);
+    let reply = committed
+        .published
+        .reply
+        .as_ref()
+        .expect("the destination publishes its committed reply");
+    assert_eq!(reply.call_id, call);
+    assert_eq!(reply.producer, destination_actor);
+    assert_eq!(reply.result, vos::value::Value::U32(7).encode());
+
+    let drained_snapshot = destination.accumulate_host().snapshot();
+    let mut destination = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        LocalJamStoreV2::from_snapshot(drained_snapshot),
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    assert!(
+        destination
+            .accumulate_host()
+            .pending_inbox_calls()
+            .unwrap()
+            .is_empty()
+    );
+    let destination_publications = LocalTransportV2::pending_publications(&destination).unwrap();
+    assert_eq!(destination_publications.len(), 1);
+    assert_eq!(
+        destination_publications[0].published.reply,
+        Some(reply.clone())
+    );
+
+    let retry =
+        LocalTransportV2::deliver(&source, &mut destination, &publication, call, 2).unwrap();
+    assert!(
+        retry.duplicate,
+        "the stable delivery identity survives destination base advancement"
+    );
+
+    assert!(!LocalTransportV2::acknowledge(&mut source, &publication).unwrap());
+    assert!(
+        LocalTransportV2::pending_publications(&source)
+            .unwrap()
+            .is_empty()
+    );
+    let source_header = source.accumulate_host().header().unwrap().unwrap();
+    assert!(
+        source
+            .accumulate_host()
+            .state_row(source_header.service_root, &StateKeyV2::Outbox(call))
+            .unwrap()
+            .is_some(),
+        "publication acknowledgement does not erase the awaited-reply route"
+    );
 }
 
 #[test]

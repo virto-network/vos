@@ -343,6 +343,26 @@ pub struct MessageRecordV2 {
     pub deadline_timeslot: Option<u64>,
 }
 
+impl MessageRecordV2 {
+    pub fn commitment(&self) -> Hash {
+        let mut bytes = Vec::new();
+        encode_message(&mut Encoder(&mut bytes), self);
+        Hash::digest(b"vos/message/v2", &[&bytes])
+    }
+
+    /// Commitment carried by the source accumulation receipt. Delivery sends
+    /// the complete canonical outbox so destination Accumulate can verify
+    /// membership without trusting transport-selected message bytes.
+    pub fn outbox_commitment(messages: &[Self]) -> Option<Hash> {
+        if messages.is_empty() {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        Encoder(&mut bytes).list(messages, encode_message);
+        Some(Hash::digest(b"vos/outbox/v2", &[&bytes]))
+    }
+}
+
 /// Compact authenticated portion of a durable parent call retained after its
 /// inbox row is consumed at step 0.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -536,6 +556,10 @@ pub struct AccumulationReceiptV2 {
     pub accepted_transition: Hash,
     /// Direct commitment to the reply released only after this commit.
     pub reply_commitment: Option<Hash>,
+    /// Commitment to the complete canonical outbox released only after this
+    /// commit. A destination receives these exact records with the finalized
+    /// receipt and verifies membership inside guest Accumulate.
+    pub outbox_commitment: Option<Hash>,
     pub resulting_state_root: Option<Hash>,
     pub resulting_crdt_heads: Vec<Hash>,
     pub sequence: u64,
@@ -587,13 +611,60 @@ pub struct AccumulationEnvelopeV2 {
     pub provided_blobs: Vec<ImportedBlobV2>,
 }
 
-/// Physical IC-5 request. `PrepareAttested` is wire-reserved now so adding the
-/// proof-before-commit flow does not silently reinterpret an Apply payload.
+/// Authenticated cross-root admission input. This batch supports linear
+/// destination services; CRDT delivery remains staged with workflow-CRDT
+/// reply consumption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryEnvelopeV2 {
+    pub service: ServiceIdentityV2,
+    pub logical_timeslot: u64,
+    pub base: ConsistencyBaseV2,
+    pub message: MessageRecordV2,
+    pub source_outbox: Vec<MessageRecordV2>,
+    pub source_receipt: AccumulationReceiptV2,
+}
+
+impl DeliveryEnvelopeV2 {
+    /// Exact first-admission commitment, including the current destination
+    /// base which the accepted delivery advances.
+    pub fn commitment(&self) -> Hash {
+        Hash::digest(b"vos/delivery/v2", &[&self.encode()])
+    }
+
+    /// Stable retry identity of one finalized source message. The destination
+    /// base is deliberately excluded because inbox execution may advance it
+    /// before a transport retry reaches the same service.
+    pub fn retry_identity(&self) -> Hash {
+        let mut bytes = Vec::new();
+        let mut e = Encoder(&mut bytes);
+        encode_service(&mut e, &self.service);
+        e.u64(self.logical_timeslot);
+        e.bytes(&self.message.encode());
+        e.list(&self.source_outbox, |e, message| e.bytes(&message.encode()));
+        e.bytes(&self.source_receipt.encode());
+        Hash::digest(b"vos/delivery-retry/v2", &[&bytes])
+    }
+}
+
+/// Guest-owned acknowledgement that a committed publication reached its
+/// external consumer. Removal is another physical Accumulate transaction;
+/// native transport never deletes a recoverable publication row directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationAckV2 {
+    pub service: ServiceIdentityV2,
+    pub input: WorkInputIdV2,
+    pub publication: Hash,
+}
+
+/// Physical IC-5 request. Every mutation of service or transport bookkeeping
+/// remains guest-owned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccumulateRequestV2 {
     Install(ServiceGenesisV2),
     Apply(AccumulationEnvelopeV2),
     PrepareAttested(AccumulationEnvelopeV2),
+    Deliver(DeliveryEnvelopeV2),
+    AcknowledgePublication(PublicationAckV2),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -674,6 +745,10 @@ pub enum AccumulationResultV2 {
         duplicate: bool,
     },
     Prepared(AccumulationReceiptV2),
+    PublicationAcknowledged {
+        input: WorkInputIdV2,
+        duplicate: bool,
+    },
     Rejected(AccumulationRejectionV2),
 }
 
@@ -1314,6 +1389,7 @@ impl V2Wire for AccumulationReceiptV2 {
         encode_service(&mut e, &self.service);
         e.fixed(&self.accepted_transition.0);
         e.option(&self.reply_commitment, |e, hash| e.fixed(&hash.0));
+        e.option(&self.outbox_commitment, |e, hash| e.fixed(&hash.0));
         e.option(&self.resulting_state_root, |e, h| e.fixed(&h.0));
         e.list(&self.resulting_crdt_heads, |e, h| e.fixed(&h.0));
         e.u64(self.sequence);
@@ -1326,6 +1402,7 @@ impl V2Wire for AccumulationReceiptV2 {
             service: decode_service(d)?,
             accepted_transition: Hash(d.fixed()?),
             reply_commitment: d.option(|d| d.fixed().map(Hash))?,
+            outbox_commitment: d.option(|d| d.fixed().map(Hash))?,
             resulting_state_root: d.option(|d| d.fixed().map(Hash))?,
             resulting_crdt_heads: d.list(|d| d.fixed().map(Hash))?,
             sequence: d.u64()?,
@@ -1411,6 +1488,77 @@ impl V2Wire for AccumulationEnvelopeV2 {
     }
 }
 
+impl V2Wire for DeliveryEnvelopeV2 {
+    const MAGIC: [u8; 4] = *b"VDL2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        encode_service(&mut e, &self.service);
+        e.u64(self.logical_timeslot);
+        encode_base(&mut e, &self.base);
+        encode_message(&mut e, &self.message);
+        e.list(&self.source_outbox, encode_message);
+        e.bytes(&self.source_receipt.encode());
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            service: decode_service(d)?,
+            logical_timeslot: d.u64()?,
+            base: decode_base(d)?,
+            message: decode_message(d)?,
+            source_outbox: d.list(decode_message)?,
+            source_receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
+        };
+        ensure_sorted_unique(&value.source_outbox, |message| message.call_id.0)?;
+        if !matches!(value.base, ConsistencyBaseV2::Linear { .. })
+            || value
+                .source_outbox
+                .binary_search_by_key(&value.message.call_id, |message| message.call_id)
+                .ok()
+                .is_none_or(|index| value.source_outbox[index] != value.message)
+            || value.source_receipt.outbox_commitment
+                != MessageRecordV2::outbox_commitment(&value.source_outbox)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+impl V2Wire for PublicationAckV2 {
+    const MAGIC: [u8; 4] = *b"VPA2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        encode_service(&mut e, &self.service);
+        e.fixed(&self.input.invocation.0);
+        e.u64(self.input.workflow_step);
+        e.fixed(&self.publication.0);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            service: decode_service(d)?,
+            input: WorkInputIdV2 {
+                invocation: InvocationId(d.fixed()?),
+                workflow_step: d.u64()?,
+            },
+            publication: Hash(d.fixed()?),
+        };
+        if value.invocation_or_publication_is_zero() {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+impl PublicationAckV2 {
+    fn invocation_or_publication_is_zero(&self) -> bool {
+        self.input.invocation == InvocationId::ZERO || self.publication == Hash::ZERO
+    }
+}
+
 impl V2Wire for AccumulateRequestV2 {
     const MAGIC: [u8; 4] = *b"VAC2";
 
@@ -1429,6 +1577,14 @@ impl V2Wire for AccumulateRequestV2 {
                 e.u8(2);
                 e.bytes(&envelope.encode());
             }
+            Self::Deliver(envelope) => {
+                e.u8(3);
+                e.bytes(&envelope.encode());
+            }
+            Self::AcknowledgePublication(acknowledgement) => {
+                e.u8(4);
+                e.bytes(&acknowledgement.encode());
+            }
         }
     }
 
@@ -1437,6 +1593,10 @@ impl V2Wire for AccumulateRequestV2 {
             0 => Ok(Self::Install(ServiceGenesisV2::decode(&d.bytes()?)?)),
             1 => Ok(Self::Apply(AccumulationEnvelopeV2::decode(&d.bytes()?)?)),
             2 => Ok(Self::PrepareAttested(AccumulationEnvelopeV2::decode(
+                &d.bytes()?,
+            )?)),
+            3 => Ok(Self::Deliver(DeliveryEnvelopeV2::decode(&d.bytes()?)?)),
+            4 => Ok(Self::AcknowledgePublication(PublicationAckV2::decode(
                 &d.bytes()?,
             )?)),
             _ => Err(DecodeError::InvalidTag),
@@ -1492,6 +1652,12 @@ impl V2Wire for AccumulationResultV2 {
                 e.u8(2);
                 e.bytes(&receipt.encode());
             }
+            Self::PublicationAcknowledged { input, duplicate } => {
+                e.u8(4);
+                e.fixed(&input.invocation.0);
+                e.u64(input.workflow_step);
+                e.bool(*duplicate);
+            }
             Self::Rejected(rejection) => {
                 e.u8(3);
                 encode_rejection(&mut e, rejection);
@@ -1510,8 +1676,10 @@ impl V2Wire for AccumulationResultV2 {
                     return Err(DecodeError::NonCanonical);
                 }
                 if !duplicate
-                    && published.reply.as_ref().map(ReplyRecordV2::commitment)
+                    && (published.reply.as_ref().map(ReplyRecordV2::commitment)
                         != receipt.reply_commitment
+                        || MessageRecordV2::outbox_commitment(&published.outbox)
+                            != receipt.outbox_commitment)
                 {
                     return Err(DecodeError::NonCanonical);
                 }
@@ -1523,6 +1691,17 @@ impl V2Wire for AccumulationResultV2 {
             }
             2 => Ok(Self::Prepared(AccumulationReceiptV2::decode(&d.bytes()?)?)),
             3 => Ok(Self::Rejected(decode_rejection(d)?)),
+            4 => {
+                let input = WorkInputIdV2 {
+                    invocation: InvocationId(d.fixed()?),
+                    workflow_step: d.u64()?,
+                };
+                let duplicate = d.bool()?;
+                if input.invocation == InvocationId::ZERO {
+                    return Err(DecodeError::NonCanonical);
+                }
+                Ok(Self::PublicationAcknowledged { input, duplicate })
+            }
             _ => Err(DecodeError::InvalidTag),
         }
     }
@@ -2264,6 +2443,21 @@ mod tests {
         }
     }
 
+    fn message(byte: u8, await_ordinal: u64) -> MessageRecordV2 {
+        let caller_invocation = InvocationId([byte; 32]);
+        MessageRecordV2 {
+            call_id: caller_invocation.call_id(await_ordinal),
+            caller_invocation,
+            await_ordinal,
+            from: ActorId([byte.wrapping_add(1); 32]),
+            to: ActorId([byte.wrapping_add(2); 32]),
+            parent: None,
+            payload: vec![byte],
+            authorization: AuthorizationEvidenceV2::Public,
+            deadline_timeslot: Some(50),
+        }
+    }
+
     #[test]
     fn work_wire_is_strict_and_deterministic() {
         let value = work();
@@ -2714,6 +2908,7 @@ mod tests {
             service: service(),
             accepted_transition: Hash([12; 32]),
             reply_commitment: None,
+            outbox_commitment: None,
             resulting_state_root: Some(Hash([13; 32])),
             resulting_crdt_heads: vec![],
             sequence: 4,
@@ -2762,6 +2957,35 @@ mod tests {
             Err(DecodeError::NonCanonical)
         );
 
+        let mut outbox = vec![message(16, 0), message(17, 1)];
+        outbox.sort_by_key(|message| message.call_id);
+        let mut outbox_receipt = receipt.clone();
+        outbox_receipt.outbox_commitment = MessageRecordV2::outbox_commitment(&outbox);
+        let with_outbox = AccumulationResultV2::Accepted {
+            receipt: outbox_receipt,
+            published: PublishedEffectsV2 {
+                outbox: outbox.clone(),
+                ..PublishedEffectsV2::default()
+            },
+            duplicate: false,
+        };
+        assert_eq!(
+            AccumulationResultV2::decode(&with_outbox.encode()).unwrap(),
+            with_outbox
+        );
+        let mismatched_outbox = AccumulationResultV2::Accepted {
+            receipt: receipt.clone(),
+            published: PublishedEffectsV2 {
+                outbox,
+                ..PublishedEffectsV2::default()
+            },
+            duplicate: false,
+        };
+        assert_eq!(
+            AccumulationResultV2::decode(&mismatched_outbox.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+
         let duplicate = AccumulationResultV2::Accepted {
             receipt,
             published: PublishedEffectsV2::default(),
@@ -2785,6 +3009,102 @@ mod tests {
     }
 
     #[test]
+    fn delivery_wire_binds_complete_source_outbox_and_has_stable_retry_identity() {
+        let mut source_service = service();
+        source_service.root_service = RootServiceId([30; 32]);
+        let mut source_outbox = vec![message(31, 0), message(32, 1)];
+        source_outbox.sort_by_key(|message| message.call_id);
+        let first = source_outbox[0].clone();
+        let source_receipt = AccumulationReceiptV2 {
+            service: source_service,
+            accepted_transition: Hash([33; 32]),
+            reply_commitment: None,
+            outbox_commitment: MessageRecordV2::outbox_commitment(&source_outbox),
+            resulting_state_root: Some(Hash([34; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 8,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        };
+        let delivery = DeliveryEnvelopeV2 {
+            service: service(),
+            logical_timeslot: 9,
+            base: ConsistencyBaseV2::Linear {
+                revision: 3,
+                state_root: Hash([35; 32]),
+            },
+            message: first,
+            source_outbox,
+            source_receipt,
+        };
+        assert_eq!(
+            DeliveryEnvelopeV2::decode(&delivery.encode()).unwrap(),
+            delivery
+        );
+        assert_eq!(
+            AccumulateRequestV2::decode(&AccumulateRequestV2::Deliver(delivery.clone()).encode())
+                .unwrap(),
+            AccumulateRequestV2::Deliver(delivery.clone())
+        );
+
+        let mut later_base = delivery.clone();
+        later_base.base = ConsistencyBaseV2::Linear {
+            revision: 4,
+            state_root: Hash([36; 32]),
+        };
+        assert_eq!(later_base.retry_identity(), delivery.retry_identity());
+        assert_ne!(later_base.commitment(), delivery.commitment());
+
+        let mut missing_member = delivery.clone();
+        missing_member.message = message(37, 0);
+        assert_eq!(
+            DeliveryEnvelopeV2::decode(&missing_member.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut tampered_outbox = delivery.clone();
+        tampered_outbox.source_outbox[0].payload.push(0);
+        assert_eq!(
+            DeliveryEnvelopeV2::decode(&tampered_outbox.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut reordered = delivery;
+        reordered.source_outbox.swap(0, 1);
+        assert_eq!(
+            DeliveryEnvelopeV2::decode(&reordered.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn publication_acknowledgement_is_a_canonical_guest_request_and_result() {
+        let input = WorkInputIdV2 {
+            invocation: InvocationId([40; 32]),
+            workflow_step: 2,
+        };
+        let acknowledgement = PublicationAckV2 {
+            service: service(),
+            input,
+            publication: Hash([41; 32]),
+        };
+        let request = AccumulateRequestV2::AcknowledgePublication(acknowledgement);
+        assert_eq!(
+            AccumulateRequestV2::decode(&request.encode()).unwrap(),
+            request
+        );
+
+        let result = AccumulationResultV2::PublicationAcknowledged {
+            input,
+            duplicate: false,
+        };
+        assert_eq!(
+            AccumulationResultV2::decode(&result.encode()).unwrap(),
+            result
+        );
+    }
+
+    #[test]
     fn accumulated_reply_binds_exact_reply_to_receipt() {
         let reply = ReplyRecordV2 {
             call_id: CallId([61; 32]),
@@ -2798,6 +3118,7 @@ mod tests {
                 service: remote,
                 accepted_transition: Hash([64; 32]),
                 reply_commitment: Some(reply.commitment()),
+                outbox_commitment: None,
                 resulting_state_root: Some(Hash([65; 32])),
                 resulting_crdt_heads: vec![],
                 sequence: 7,

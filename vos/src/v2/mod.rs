@@ -25,6 +25,8 @@ mod scheduler;
 mod service;
 mod state_tree;
 mod storage;
+#[cfg(feature = "std")]
+mod transport;
 pub(crate) mod wire;
 
 pub use continuation::ContinuationSnapshotV2;
@@ -34,11 +36,11 @@ pub use contracts::{
     ActorSliceInputV2, ActorSliceOutputV2, ActorWriteV2, AuthorizationEvidenceV2, AwaitResumeV2,
     BlobRefV2, CausalCallContextV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2, CrdtMaterializationV2, CrdtOperationV2,
-    GasAccountingV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, MessageRecordV2,
-    MethodPolicyV2, ProofCommitmentV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
-    RefineError, RefineImportsV2, RefineOutputV2, ReplyRecordV2, ServiceGenesisV2,
-    ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2,
-    WorkflowOperationV2,
+    DeliveryEnvelopeV2, GasAccountingV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
+    MessageRecordV2, MethodPolicyV2, ProofCommitmentV2, PublicationAckV2, PublishedEffectsV2,
+    ReceiptVerificationRequestV2, RefineError, RefineImportsV2, RefineOutputV2, ReplyRecordV2,
+    ServiceGenesisV2, ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2,
+    WorkInputIdV2, WorkflowOperationV2,
 };
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStoreV2, ReceiptVerificationV2, execute_guest_accumulate,
@@ -70,9 +72,15 @@ pub use state_tree::{
     ServiceStateTreeV2, StateTreeError, StateTreeStore, empty_state_root, state_position,
 };
 pub use storage::{
-    DedupRecordV2, SERVICE_STORE_SCHEMA_VERSION, StateKeyV2, StoreHeaderV2, StoreOpenError,
-    WorkflowCheckpointV2, crdt_change_storage_key, crdt_node_storage_key, dedup_storage_key,
-    header_storage_key, receipt_storage_key,
+    DedupRecordV2, DeliveryRecordV2, PublicationRecordV2, SERVICE_STORE_SCHEMA_VERSION, StateKeyV2,
+    StoreHeaderV2, StoreOpenError, WorkflowCheckpointV2, crdt_change_storage_key,
+    crdt_node_storage_key, dedup_storage_key, delivery_storage_key, header_storage_key,
+    publication_storage_key, receipt_storage_key,
+};
+#[cfg(feature = "std")]
+pub use transport::{
+    CommittedDeliveryV2, CommittedInboxSliceV2, InboxDrainOutcomeV2, LocalTransportErrorV2,
+    LocalTransportV2,
 };
 pub use wire::{DecodeError, V2Wire};
 
@@ -88,8 +96,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0x5d, 0x29, 0x1e, 0xc5, 0x98, 0xe6, 0x28, 0xbb, 0x31, 0x0c, 0x17, 0xa9, 0xd3, 0xca, 0xe8, 0x7e,
-    0xbf, 0xb3, 0xe6, 0xc0, 0x5b, 0x7e, 0x43, 0xcd, 0x23, 0xd4, 0x60, 0x51, 0x78, 0x25, 0x1b, 0x77,
+    0x38, 0xd7, 0x28, 0x2d, 0x15, 0xc2, 0x75, 0xc2, 0x56, 0x00, 0xb8, 0xa5, 0xd1, 0xaa, 0x9a, 0xca,
+    0xb7, 0x6d, 0x2e, 0x43, 0x27, 0x91, 0x27, 0x5e, 0x85, 0xc3, 0x08, 0x30, 0xac, 0x66, 0xb1, 0x7f,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.
