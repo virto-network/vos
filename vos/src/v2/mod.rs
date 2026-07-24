@@ -50,7 +50,10 @@ pub use identity::{
     ProgramId, RootServiceId, SpaceId, SubjectId, SystemCapabilityId,
 };
 #[cfg(feature = "std")]
-pub use local_store::{LocalJamStoreSnapshotV2, LocalJamStoreV2, LocalStoreReadErrorV2};
+pub use local_store::{
+    CommittedImageStoreV2, DurableJamStoreV2, DurableStoreOpenErrorV2, FileCommittedImageStoreV2,
+    LocalJamStoreSnapshotV2, LocalJamStoreV2, LocalStoreReadErrorV2,
+};
 pub use package::{
     DeploymentSignatureV2, PackageDiagnosticsV2, PackageError, PackageManifestV2, VosPackageV2,
     artifact_hash,
