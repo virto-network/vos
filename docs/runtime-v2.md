@@ -51,6 +51,14 @@ leaves the prior in-process image visible and permits an exact retry. The
 filesystem backend flushes a sibling candidate, atomically renames it over the
 committed image, then syncs the parent directory.
 
+The local transport accepts either the in-memory host or this durable host
+without changing scheduling or service semantics. Its physical cross-root
+gate reopens both roots exclusively from committed backend bytes throughout
+delivery, inbox draining, reply resume, and publication acknowledgement.
+Injected destination and caller commit failures expose neither an admitted
+inbox nor resumed reply effects; the exact envelopes remain retryable from the
+previous durable images.
+
 This is still a conformance orchestrator, not production network routing.
 Automatic node discovery and outbox/reply routing, plus CRDT delivery/reply
 consumption, remain staged. Acknowledging a publication containing several
