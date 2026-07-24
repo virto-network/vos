@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 
 use javm::kernel::InvocationKernel;
 
+use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, AccumulationReceiptV2, BlobRefV2,
     DedupRecordV2, DeliveryRecordV2, MessageRecordV2, ProgramId, PublicationRecordV2,
@@ -21,10 +22,9 @@ use super::{
 ///
 /// Rows include the guest-owned header, authenticated state nodes, receipts,
 /// deduplication records, and CRDT DAG nodes. Blobs and programs contain exact
-/// bytes keyed by their canonical identities. This type has no durable wire or
-/// disk representation; it supports deterministic harness reconstruction only.
-/// A persistent backend remains part of the production cutover work. The
-/// snapshot contains no in-flight transaction state.
+/// bytes keyed by their canonical identities. Its strict v2 wire is the
+/// crash-recovery image persisted by a host. It contains no in-flight
+/// transaction or process-local verifier policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LocalJamStoreSnapshotV2 {
     rows: BTreeMap<Vec<u8>, Vec<u8>>,
@@ -39,6 +39,89 @@ impl LocalJamStoreSnapshotV2 {
     pub fn same_service_state(&self, other: &Self) -> bool {
         self.rows == other.rows && self.blobs == other.blobs && self.programs == other.programs
     }
+}
+
+impl V2Wire for LocalJamStoreSnapshotV2 {
+    const MAGIC: [u8; 4] = *b"VSS2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        encoder.u64(self.commit_sequence);
+        encoder.u32(self.rows.len() as u32);
+        for (key, value) in &self.rows {
+            encoder.bytes(key);
+            encoder.bytes(value);
+        }
+        encoder.u32(self.blobs.len() as u32);
+        for (hash, bytes) in &self.blobs {
+            encoder.fixed(hash);
+            encoder.bytes(bytes);
+        }
+        encoder.u32(self.programs.len() as u32);
+        for (program, pvm) in &self.programs {
+            encoder.fixed(program);
+            encoder.bytes(pvm);
+        }
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let commit_sequence = decoder.u64()?;
+        let rows = decode_byte_map(decoder)?;
+        let blobs = decode_content_map(decoder, |key, bytes| {
+            BlobRefV2::of_bytes(bytes).hash.0 == *key
+        })?;
+        let programs =
+            decode_content_map(decoder, |key, bytes| ProgramId::of_pvm(bytes).0 == *key)?;
+        if rows.is_empty() != (commit_sequence == 0) {
+            return Err(DecodeError::NonCanonical);
+        }
+        if !rows.is_empty() {
+            let header = rows
+                .get(super::header_storage_key())
+                .ok_or(DecodeError::NonCanonical)?;
+            StoreHeaderV2::open(header).map_err(|_| DecodeError::NonCanonical)?;
+        }
+        Ok(Self {
+            rows,
+            blobs,
+            programs,
+            commit_sequence,
+        })
+    }
+}
+
+fn decode_byte_map(decoder: &mut Decoder<'_>) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, DecodeError> {
+    let entries = decoder.list(|decoder| Ok((decoder.bytes()?, decoder.bytes()?)))?;
+    let mut result = BTreeMap::new();
+    let mut previous: Option<Vec<u8>> = None;
+    for (key, value) in entries {
+        if key.is_empty()
+            || value.is_empty()
+            || previous.as_ref().is_some_and(|previous| previous >= &key)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        previous = Some(key.clone());
+        result.insert(key, value);
+    }
+    Ok(result)
+}
+
+fn decode_content_map(
+    decoder: &mut Decoder<'_>,
+    valid: impl Fn(&[u8; 32], &[u8]) -> bool,
+) -> Result<BTreeMap<[u8; 32], Vec<u8>>, DecodeError> {
+    let entries = decoder.list(|decoder| Ok((decoder.fixed()?, decoder.bytes()?)))?;
+    let mut result = BTreeMap::new();
+    let mut previous = None;
+    for (key, bytes) in entries {
+        if previous.as_ref().is_some_and(|previous| previous >= &key) || !valid(&key, &bytes) {
+            return Err(DecodeError::NonCanonical);
+        }
+        previous = Some(key);
+        result.insert(key, bytes);
+    }
+    Ok(result)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,9 +178,7 @@ impl LocalJamStoreV2 {
         }
     }
 
-    /// Reopen one caller-held in-memory service-account image.
-    ///
-    /// This does not read durable storage or survive process termination.
+    /// Reopen one already-decoded committed service-account image.
     pub fn from_snapshot(snapshot: LocalJamStoreSnapshotV2) -> Self {
         Self {
             committed: snapshot,
@@ -105,11 +186,22 @@ impl LocalJamStoreV2 {
         }
     }
 
+    /// Restore one canonical committed image read from durable storage.
+    pub fn from_snapshot_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        LocalJamStoreSnapshotV2::decode(bytes).map(Self::from_snapshot)
+    }
+
     /// Clone only committed state for in-process reconstruction. An active
     /// Accumulate transaction is owned by the service invocation and cannot be
     /// observed through this object.
     pub fn snapshot(&self) -> LocalJamStoreSnapshotV2 {
         self.committed.clone()
+    }
+
+    /// Canonical crash-recovery image. Receipt allowlists are host policy and
+    /// deliberately remain outside persisted service state.
+    pub fn snapshot_bytes(&self) -> Vec<u8> {
+        self.committed.encode()
     }
 
     pub const fn commit_sequence(&self) -> u64 {
@@ -486,6 +578,19 @@ impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
 mod tests {
     use super::*;
 
+    fn valid_header() -> StoreHeaderV2 {
+        StoreHeaderV2::current(
+            super::super::ServiceIdentityV2 {
+                root_service: super::super::RootServiceId([2; 32]),
+                deployment: super::super::DeploymentId([3; 32]),
+                service_program: ProgramId([4; 32]),
+                service_abi: super::super::ABI_VERSION,
+                execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            },
+            super::super::ConsistencyModeV2::Local,
+        )
+    }
+
     #[test]
     fn snapshots_exclude_uncommitted_transactions() {
         let mut store = LocalJamStoreV2::new();
@@ -545,5 +650,61 @@ mod tests {
         assert!(reopened.receipt_allowlist.is_empty());
         assert!(!store.receipt_allowlist.is_empty());
         assert_eq!(reopened, store);
+    }
+
+    #[test]
+    fn committed_snapshot_wire_restores_and_rejects_identity_drift() {
+        let mut store = LocalJamStoreV2::new();
+        let blob = store.import_blob(b"continuation page".to_vec());
+        let program = store.import_program(b"canonical actor pvm".to_vec());
+        let mut transaction = store.begin().unwrap();
+        transaction.staged.rows.insert(
+            super::super::header_storage_key().to_vec(),
+            valid_header().encode(),
+        );
+        store.commit(transaction).unwrap();
+
+        store.receipt_allowlist.insert(crate::v2::Hash([7; 32]));
+        let bytes = store.snapshot_bytes();
+        assert_eq!(
+            bytes,
+            store.snapshot_bytes(),
+            "snapshot wire is deterministic"
+        );
+        let restarted = LocalJamStoreV2::from_snapshot_bytes(&bytes).unwrap();
+        assert_eq!(restarted, store);
+        assert!(restarted.receipt_allowlist.is_empty());
+        assert_eq!(restarted.blob(&blob), Some(b"continuation page".as_slice()));
+        assert_eq!(
+            restarted.program(program),
+            Some(b"canonical actor pvm".as_slice())
+        );
+
+        let mut corrupt_blob = store.snapshot();
+        corrupt_blob
+            .blobs
+            .insert(blob.hash.0, b"different bytes".to_vec());
+        assert_eq!(
+            LocalJamStoreSnapshotV2::decode(&corrupt_blob.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut corrupt_program = store.snapshot();
+        corrupt_program
+            .programs
+            .insert(program.0, b"different pvm".to_vec());
+        assert_eq!(
+            LocalJamStoreSnapshotV2::decode(&corrupt_program.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+
+        let mut missing_header = store.snapshot();
+        missing_header
+            .rows
+            .remove(super::super::header_storage_key());
+        assert_eq!(
+            LocalJamStoreSnapshotV2::decode(&missing_header.encode()),
+            Err(DecodeError::NonCanonical)
+        );
     }
 }
