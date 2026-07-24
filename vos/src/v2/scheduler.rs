@@ -10,9 +10,10 @@ use alloc::vec::Vec;
 
 use super::{
     AccumulatedReplyV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2, BlobRefV2, CallId,
-    ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, DecodeError, ImportedActorV2,
-    ImportedBlobV2, ImportedProgramV2, InvocationId, LocalJamStoreV2, LocalStoreReadErrorV2,
-    Origin, RefineImportsV2, StateKeyV2, V2Wire, WorkEnvelopeV2, WorkflowCheckpointV2,
+    CausalCallContextV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, DecodeError,
+    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId, LocalJamStoreV2,
+    LocalStoreReadErrorV2, Origin, RefineImportsV2, StateKeyV2, V2Wire, WorkEnvelopeV2,
+    WorkflowCheckpointV2,
 };
 
 /// Caller-controlled portion of one local work item. The scheduler supplies
@@ -30,6 +31,7 @@ pub struct LocalWorkRequestV2 {
     pub authorization: AuthorizationEvidenceV2,
     pub causal_parent: Option<InvocationId>,
     pub parent_call: Option<CallId>,
+    pub causal_context: Option<CausalCallContextV2>,
     pub awaited_reply: Option<AccumulatedReplyV2>,
     pub imported_blobs: Vec<BlobRefV2>,
     pub proof_requested: bool,
@@ -57,11 +59,14 @@ pub enum ScheduleErrorV2 {
     ActorBusy(ActorId),
     MissingContinuation(ActorId),
     InvalidContinuation(ActorId),
+    MissingAwaitedReply(CallId),
+    UnexpectedAwaitedReply(CallId),
     InvocationAlreadyCommitted(InvocationId),
     InvalidWorkflowStep(InvocationId),
     MissingInbox(CallId),
     InvalidInbox(CallId),
     DeadlineExpired(CallId),
+    InvalidCausalContext,
     NonCanonicalImports,
 }
 
@@ -82,6 +87,50 @@ impl From<LocalStoreReadErrorV2> for ScheduleErrorV2 {
 pub struct LocalWorkSchedulerV2;
 
 impl LocalWorkSchedulerV2 {
+    /// Reconstruct the next exact continuation slice from guest-committed
+    /// workflow state. The host supplies only the consensus timeslot and, for
+    /// an awaited call, the accumulated remote reply it received for
+    /// admission. No process-local copy of the original request is required.
+    pub fn prepare_resume(
+        store: &LocalJamStoreV2,
+        invocation: InvocationId,
+        logical_timeslot: u64,
+        awaited_reply: Option<AccumulatedReplyV2>,
+    ) -> Result<PreparedWorkV2, ScheduleErrorV2> {
+        let header = store.header()?.ok_or(ScheduleErrorV2::StoreUninitialized)?;
+        let workflow = decode_row::<WorkflowCheckpointV2>(
+            store,
+            header.service_root,
+            &StateKeyV2::Workflow(invocation),
+        )?
+        .ok_or(ScheduleErrorV2::InvalidWorkflowStep(invocation))?;
+        let workflow_step = workflow
+            .input
+            .workflow_step
+            .checked_add(1)
+            .ok_or(ScheduleErrorV2::InvalidWorkflowStep(invocation))?;
+        let template = workflow.resume_work;
+        Self::prepare(
+            store,
+            LocalWorkRequestV2 {
+                invocation,
+                workflow_step,
+                logical_timeslot,
+                target: template.target,
+                method: template.method,
+                arguments: Vec::new(),
+                origin: template.origin,
+                authorization: template.authorization,
+                causal_parent: template.causal_parent,
+                parent_call: template.parent_call,
+                causal_context: template.causal_context,
+                awaited_reply,
+                imported_blobs: template.imported_blobs,
+                proof_requested: template.proof_requested,
+            },
+        )
+    }
+
     /// Reconstruct initial target work from one committed durable inbox row.
     ///
     /// Actor identity, authorization, arguments, and causal identity all come
@@ -107,6 +156,7 @@ impl LocalWorkSchedulerV2 {
         }
         let method = dynamic_method(&message.payload)
             .ok_or(ScheduleErrorV2::InvalidInbox(message.call_id))?;
+        let causal_context = CausalCallContextV2::from(&message);
         Self::prepare(
             store,
             LocalWorkRequestV2 {
@@ -120,6 +170,7 @@ impl LocalWorkSchedulerV2 {
                 authorization: message.authorization,
                 causal_parent: Some(message.caller_invocation),
                 parent_call: Some(message.call_id),
+                causal_context: Some(causal_context),
                 awaited_reply: None,
                 imported_blobs: Vec::new(),
                 proof_requested: false,
@@ -211,6 +262,7 @@ impl LocalWorkSchedulerV2 {
             authorization: request.authorization,
             causal_parent: request.causal_parent,
             parent_call: request.parent_call,
+            causal_context: request.causal_context,
             awaited_reply: request.awaited_reply,
             consistency: header.consistency,
             base: ConsistencyBaseV2::Linear {
@@ -222,10 +274,31 @@ impl LocalWorkSchedulerV2 {
             imported_blobs: request.imported_blobs,
             proof_requested: request.proof_requested,
         };
+        match (
+            work.causal_context.as_ref(),
+            work.parent_call,
+            work.causal_parent,
+            work.origin,
+        ) {
+            (Some(context), Some(call), Some(parent), Origin::Actor(from))
+                if context.call_id == call
+                    && context.caller_invocation == parent
+                    && context.from == from
+                    && context.to == work.target => {}
+            (None, None, _, _) => {}
+            _ => return Err(ScheduleErrorV2::InvalidCausalContext),
+        }
+        if let Some(context) = work.causal_context.as_ref()
+            && context
+                .deadline_timeslot
+                .is_some_and(|deadline| work.logical_timeslot >= deadline)
+        {
+            return Err(ScheduleErrorV2::DeadlineExpired(context.call_id));
+        }
         if request.workflow_step != 0
             && workflow
                 .as_ref()
-                .is_none_or(|checkpoint| checkpoint.workflow_identity != work.workflow_identity())
+                .is_none_or(|checkpoint| !checkpoint.matches_resume_work(&work))
         {
             return Err(ScheduleErrorV2::InvalidWorkflowStep(request.invocation));
         }
@@ -273,6 +346,14 @@ impl LocalWorkSchedulerV2 {
             snapshot
                 .validate_resume_for(&work)
                 .map_err(|_| ScheduleErrorV2::InvalidContinuation(request.target))?;
+            match (snapshot.pending_call, work.awaited_reply.as_ref()) {
+                (None, None) => {}
+                (Some(call), None) => return Err(ScheduleErrorV2::MissingAwaitedReply(call)),
+                (Some(call), Some(reply)) if reply.reply.call_id == call => {}
+                (_, Some(reply)) => {
+                    return Err(ScheduleErrorV2::UnexpectedAwaitedReply(reply.reply.call_id));
+                }
+            }
         }
         imports
             .validate_for(&work)

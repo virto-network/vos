@@ -231,6 +231,10 @@ pub struct WorkEnvelopeV2 {
     pub authorization: AuthorizationEvidenceV2,
     pub causal_parent: Option<InvocationId>,
     pub parent_call: Option<CallId>,
+    /// Authenticated metadata for `parent_call`. Unlike the consumable inbox
+    /// row, this compact context survives every continuation slice so causal
+    /// cycle and inherited-deadline checks do not depend on deleted state.
+    pub causal_context: Option<CausalCallContextV2>,
     /// Present only when restoring a continuation waiting on a committed
     /// cross-root result. The reply is admitted by guest Accumulate before
     /// Refine may inject it at the captured protocol-call boundary.
@@ -277,6 +281,7 @@ impl WorkEnvelopeV2 {
         encode_auth(&mut e, &self.authorization);
         e.option(&self.causal_parent, |e, id| e.fixed(&id.0));
         e.option(&self.parent_call, |e, id| e.fixed(&id.0));
+        e.option(&self.causal_context, encode_causal_context);
         e.u8(self.consistency as u8);
         e.bool(self.proof_requested);
         Hash::digest(b"vos/workflow/v2", &[&bytes])
@@ -336,6 +341,31 @@ pub struct MessageRecordV2 {
     pub payload: Vec<u8>,
     pub authorization: AuthorizationEvidenceV2,
     pub deadline_timeslot: Option<u64>,
+}
+
+/// Compact authenticated portion of a durable parent call retained after its
+/// inbox row is consumed at step 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CausalCallContextV2 {
+    pub call_id: CallId,
+    pub caller_invocation: InvocationId,
+    pub from: ActorId,
+    pub to: ActorId,
+    pub parent: Option<CallId>,
+    pub deadline_timeslot: Option<u64>,
+}
+
+impl From<&MessageRecordV2> for CausalCallContextV2 {
+    fn from(message: &MessageRecordV2) -> Self {
+        Self {
+            call_id: message.call_id,
+            caller_invocation: message.caller_invocation,
+            from: message.from,
+            to: message.to,
+            parent: message.parent,
+            deadline_timeslot: message.deadline_timeslot,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -764,6 +794,7 @@ impl V2Wire for WorkEnvelopeV2 {
         encode_auth(&mut e, &self.authorization);
         e.option(&self.causal_parent, |e, id| e.fixed(&id.0));
         e.option(&self.parent_call, |e, id| e.fixed(&id.0));
+        e.option(&self.causal_context, encode_causal_context);
         e.option(&self.awaited_reply, |e, reply| e.bytes(&reply.encode()));
         e.u8(self.consistency as u8);
         encode_base(&mut e, &self.base);
@@ -789,6 +820,16 @@ impl V2Wire for WorkEnvelopeV2 {
         let authorization = decode_auth(d)?;
         let causal_parent = d.option(|d| d.fixed().map(InvocationId))?;
         let parent_call = d.option(|d| d.fixed().map(CallId))?;
+        let causal_context = d.option(decode_causal_context)?;
+        match (&causal_context, parent_call, causal_parent, origin) {
+            (Some(context), Some(call), Some(parent), Origin::Actor(from))
+                if context.call_id == call
+                    && context.caller_invocation == parent
+                    && context.from == from
+                    && context.to == target => {}
+            (None, None, _, _) => {}
+            _ => return Err(DecodeError::NonCanonical),
+        }
         let awaited_reply = d.option(|d| AccumulatedReplyV2::decode(&d.bytes()?))?;
         if awaited_reply.is_some() && workflow_step == 0 {
             return Err(DecodeError::NonCanonical);
@@ -839,6 +880,7 @@ impl V2Wire for WorkEnvelopeV2 {
             authorization,
             causal_parent,
             parent_call,
+            causal_context,
             awaited_reply,
             consistency,
             base,
@@ -2121,6 +2163,26 @@ fn decode_message(d: &mut Decoder<'_>) -> Result<MessageRecordV2, DecodeError> {
     Ok(value)
 }
 
+fn encode_causal_context(e: &mut Encoder<'_>, value: &CausalCallContextV2) {
+    e.fixed(&value.call_id.0);
+    e.fixed(&value.caller_invocation.0);
+    e.fixed(&value.from.0);
+    e.fixed(&value.to.0);
+    e.option(&value.parent, |e, id| e.fixed(&id.0));
+    e.option(&value.deadline_timeslot, |e, value| e.u64(*value));
+}
+
+fn decode_causal_context(d: &mut Decoder<'_>) -> Result<CausalCallContextV2, DecodeError> {
+    Ok(CausalCallContextV2 {
+        call_id: CallId(d.fixed()?),
+        caller_invocation: InvocationId(d.fixed()?),
+        from: ActorId(d.fixed()?),
+        to: ActorId(d.fixed()?),
+        parent: d.option(|d| d.fixed().map(CallId))?,
+        deadline_timeslot: d.option(Decoder::u64)?,
+    })
+}
+
 fn encode_reply(e: &mut Encoder<'_>, value: &ReplyRecordV2) {
     e.fixed(&value.call_id.0);
     e.fixed(&value.producer.0);
@@ -2188,6 +2250,7 @@ mod tests {
             authorization: AuthorizationEvidenceV2::Public,
             causal_parent: None,
             parent_call: None,
+            causal_context: None,
             awaited_reply: None,
             consistency: ConsistencyModeV2::Local,
             base: ConsistencyBaseV2::Linear {
@@ -2219,6 +2282,28 @@ mod tests {
         assert_eq!(
             WorkEnvelopeV2::decode(&old),
             Err(DecodeError::InvalidVersion)
+        );
+
+        let mut causal = value.clone();
+        let parent_invocation = InvocationId([40; 32]);
+        let parent_call = parent_invocation.call_id(2);
+        let parent_actor = ActorId([41; 32]);
+        causal.origin = Origin::Actor(parent_actor);
+        causal.causal_parent = Some(parent_invocation);
+        causal.parent_call = Some(parent_call);
+        causal.causal_context = Some(CausalCallContextV2 {
+            call_id: parent_call,
+            caller_invocation: parent_invocation,
+            from: parent_actor,
+            to: causal.target,
+            parent: None,
+            deadline_timeslot: Some(50),
+        });
+        assert_eq!(WorkEnvelopeV2::decode(&causal.encode()).unwrap(), causal);
+        causal.causal_context.as_mut().unwrap().to = ActorId([42; 32]);
+        assert_eq!(
+            WorkEnvelopeV2::decode(&causal.encode()),
+            Err(DecodeError::NonCanonical)
         );
 
         let mut sentinel = value;

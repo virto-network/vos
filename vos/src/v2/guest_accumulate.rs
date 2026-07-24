@@ -465,6 +465,7 @@ fn apply<S: GuestAccumulateStoreV2>(
     let workflow = WorkflowCheckpointV2 {
         input: work.input_id(),
         workflow_identity: work.workflow_identity(),
+        resume_work: work.clone(),
         work_hash,
         transition_hash,
     };
@@ -784,7 +785,11 @@ fn work_matches_durable_inbox<S: StateTreeStore>(
     // Accumulate consumed the initial inbox atomically with the preceding
     // checkpoint. Workflow identity and the continuation bind later slices.
     if work.workflow_step != 0 {
-        return Ok(true);
+        return Ok(work
+            .causal_context
+            .as_ref()
+            .and_then(|context| context.deadline_timeslot)
+            .is_none_or(|deadline| work.logical_timeslot < deadline));
     }
     let Some(call) = work.parent_call else {
         return Ok(work.causal_parent.is_none());
@@ -802,6 +807,7 @@ fn work_matches_durable_inbox<S: StateTreeStore>(
         && message.to == work.target
         && work.invocation == super::InvocationId::for_call(call)
         && work.causal_parent == Some(message.caller_invocation)
+        && work.causal_context == Some(super::CausalCallContextV2::from(&message))
         && work.origin == super::Origin::Actor(message.from)
         && work.authorization == message.authorization
         && work.arguments == message.payload
@@ -824,7 +830,7 @@ fn valid_workflow_input<S: StateTreeStore>(
         (step, Some(checkpoint), Some(_)) => {
             checkpoint.input.invocation == work.invocation
                 && checkpoint.input.workflow_step.checked_add(1) == Some(step)
-                && checkpoint.workflow_identity == work.workflow_identity()
+                && checkpoint.matches_resume_work(work)
         }
         _ => false,
     })
@@ -888,14 +894,13 @@ fn validate_continuation_change<S: GuestAccumulateStoreV2>(
     if snapshot.validate_checkpoint_for(work).is_err() {
         return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
-    if let Some(call) = snapshot.pending_call {
-        let matching = envelope
-            .transition
-            .outbox
-            .iter()
-            .filter(|message| message.call_id == call && message.from == work.target)
-            .count();
-        if matching != 1 {
+    match snapshot.pending_call {
+        Some(call)
+            if envelope.transition.outbox.len() == 1
+                && envelope.transition.outbox[0].call_id == call
+                && envelope.transition.outbox[0].from == work.target => {}
+        None => {}
+        _ => {
             return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
         }
     }
@@ -1109,13 +1114,15 @@ fn validate_durable_messages<S: StateTreeStore>(
     }
 
     for message in &transition.outbox {
-        let mut current = message.clone();
+        let mut current = super::CausalCallContextV2::from(message);
         let mut visited = BTreeSet::new();
         while let Some(parent_id) = current.parent {
             if !visited.insert(parent_id) || parent_id == message.call_id {
                 return Ok(Some(AccumulationRejectionV2::MessageCycle));
             }
-            let Some(parent) = lookup_message(tree, &staged, parent_id)? else {
+            let Some(parent) =
+                lookup_message(tree, &staged, work.causal_context.as_ref(), parent_id)?
+            else {
                 return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
             };
             if parent.to != current.from {
@@ -1140,16 +1147,22 @@ fn validate_durable_messages<S: StateTreeStore>(
 fn lookup_message<S: StateTreeStore>(
     tree: &ServiceStateTreeV2<'_, S>,
     staged: &BTreeMap<super::CallId, MessageRecordV2>,
+    retained: Option<&super::CausalCallContextV2>,
     call: super::CallId,
-) -> GuestResult<Option<MessageRecordV2>, S::Error> {
+) -> GuestResult<Option<super::CausalCallContextV2>, S::Error> {
     if let Some(message) = staged.get(&call) {
-        return Ok(Some(message.clone()));
+        return Ok(Some(super::CausalCallContextV2::from(message)));
+    }
+    if let Some(context) = retained.filter(|context| context.call_id == call) {
+        return Ok(Some(context.clone()));
     }
     let inbox = tree_get_wire::<_, MessageRecordV2>(tree, &StateKeyV2::Inbox(call))?;
     let outbox = tree_get_wire::<_, MessageRecordV2>(tree, &StateKeyV2::Outbox(call))?;
     match (inbox, outbox) {
         (Some(_), Some(_)) => Err(GuestAccumulateError::CorruptStore),
-        (Some(message), None) | (None, Some(message)) => Ok(Some(message)),
+        (Some(message), None) | (None, Some(message)) => {
+            Ok(Some(super::CausalCallContextV2::from(&message)))
+        }
         (None, None) => Ok(None),
     }
 }
@@ -1401,6 +1414,7 @@ mod tests {
             authorization: AuthorizationEvidenceV2::Public,
             causal_parent: None,
             parent_call: None,
+            causal_context: None,
             awaited_reply: None,
             consistency: ConsistencyModeV2::Local,
             base: ConsistencyBaseV2::Linear {
@@ -1627,6 +1641,7 @@ mod tests {
             actor_program: first_work.target_program,
             await_ordinal: 0,
             pending_call: None,
+            causal_context: first_work.causal_context.clone(),
             kernel_snapshot: vec![1],
         }
         .encode();
@@ -1825,6 +1840,7 @@ mod tests {
             actor_program: first_work.target_program,
             await_ordinal: 0,
             pending_call: Some(call),
+            causal_context: first_work.causal_context.clone(),
             kernel_snapshot: vec![1],
         }
         .encode();
@@ -1838,6 +1854,36 @@ mod tests {
         });
         checkpoint.outbox.push(outbound);
         checkpoint.exported_blobs.push(continuation.clone());
+
+        let mut orphaned_outbox = checkpoint.clone();
+        orphaned_outbox.outbox.push(message(
+            9,
+            first_work.target,
+            ActorId([45; 32]),
+            None,
+            Some(9),
+        ));
+        orphaned_outbox
+            .outbox
+            .sort_by_key(|message| message.call_id);
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: first_work.clone(),
+                    transition: orphaned_outbox,
+                    provided_blobs: vec![ImportedBlobV2 {
+                        reference: continuation.clone(),
+                        bytes: continuation_bytes.clone(),
+                    }],
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        assert_eq!(store, before);
+
         let first = execute_guest_accumulate(
             &mut store,
             &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
@@ -2165,6 +2211,7 @@ mod tests {
             authorization: AuthorizationEvidenceV2::Public,
             causal_parent: None,
             parent_call: None,
+            causal_context: None,
             awaited_reply: None,
             consistency: ConsistencyModeV2::Crdt,
             base: ConsistencyBaseV2::Crdt { heads },

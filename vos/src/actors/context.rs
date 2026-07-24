@@ -509,6 +509,7 @@ impl<A: Actor> Context<A> {
                         &response[..response_len],
                     )
                     .expect("invalid v2 accumulated reply");
+                    self.__rebind_checkpoint_change_v2(&resume.checkpoint);
                     self.checkpoint = Some(resume.checkpoint);
                     self.__clear_committed_checkpoint_effects_v2();
                     self.self_schedule = false;
@@ -821,19 +822,7 @@ impl<A: Actor> Context<A> {
                 )
                 .expect("invalid v2 checkpoint token");
                 if resume_kind == 1 {
-                    match (A::CRDT, checkpoint.change) {
-                        (true, Some(dispatch)) => {
-                            let actor = self.actor_id.expect("v2 actor identity is installed");
-                            crate::crdt::rebind_change(crate::crdt::ChangeId::for_dispatch(
-                                dispatch.change,
-                                actor,
-                                dispatch.ordinal,
-                            ))
-                            .expect("restored CRDT actor has an active change scope");
-                        }
-                        (false, None) => {}
-                        _ => panic!("checkpoint CRDT mode does not match actor metadata"),
-                    }
+                    self.__rebind_checkpoint_change_v2(&checkpoint);
                 }
                 self.checkpoint = Some(checkpoint);
                 resume_kind == 1
@@ -863,6 +852,22 @@ impl<A: Actor> Context<A> {
     #[doc(hidden)]
     pub fn __take_checkpoint_v2(&mut self) -> Option<crate::v2::CheckpointTokenV2> {
         self.checkpoint.take()
+    }
+
+    fn __rebind_checkpoint_change_v2(&self, checkpoint: &crate::v2::CheckpointTokenV2) {
+        match (A::CRDT, checkpoint.change) {
+            (true, Some(dispatch)) => {
+                let actor = self.actor_id.expect("v2 actor identity is installed");
+                crate::crdt::rebind_change(crate::crdt::ChangeId::for_dispatch(
+                    dispatch.change,
+                    actor,
+                    dispatch.ordinal,
+                ))
+                .expect("restored CRDT actor has an active change scope");
+            }
+            (false, None) => {}
+            _ => panic!("checkpoint CRDT mode does not match actor metadata"),
+        }
     }
 
     #[cfg(feature = "pvm")]
@@ -1409,6 +1414,81 @@ mod tests {
         ctx.__set_actor_id(actor);
         assert_eq!(ctx.actor_id(), Some(actor));
         assert_eq!(ctx.id(), ServiceId(0));
+    }
+
+    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    struct CrdtTestActor;
+
+    impl Actor for CrdtTestActor {
+        type Error = ();
+        type Message = TestMsg;
+        type Role = NoRoles;
+        const DEFAULT_ROLE: NoRoles = NoRoles::Any;
+        const SPACE_ROLE_MAP: crate::actors::auth::SpaceRoleMap<NoRoles> = NO_ROLES_MAP;
+        const CRDT: bool = true;
+
+        fn create() -> Self {
+            Self
+        }
+
+        fn dispatch(
+            &mut self,
+            _msg: TestMsg,
+            _ctx: &mut Context<Self>,
+        ) -> crate::actors::run::RunResult<bool> {
+            crate::actors::run::RunResult::Complete(true)
+        }
+    }
+
+    #[test]
+    fn await_resume_rebinds_crdt_change_and_resets_the_operation_ordinal() {
+        use crate::crdt::{Counter, Field};
+
+        let actor = crate::v2::ActorId([0x41; 32]);
+        let old = crate::v2::CrdtDispatchV2 {
+            change: crate::v2::ChangeId([0x42; 32]),
+            ordinal: 0,
+        };
+        let resumed = crate::v2::CrdtDispatchV2 {
+            change: crate::v2::ChangeId([0x43; 32]),
+            ordinal: 0,
+        };
+        let mut ctx: Context<CrdtTestActor> = Context::new(ServiceId(0));
+        ctx.__set_actor_id(actor);
+        let mut counter = Counter::default();
+        Field::__vos_init(&mut counter, "CrdtTestActor", "counter");
+        let token = crate::v2::CheckpointTokenV2 {
+            input: crate::v2::WorkInputIdV2 {
+                invocation: crate::v2::InvocationId([0x44; 32]),
+                workflow_step: 1,
+            },
+            base: crate::v2::ConsistencyBaseV2::Crdt { heads: vec![] },
+            work_hash: crate::v2::Hash([0x45; 32]),
+            base_causal_height: Some(0),
+            change: Some(resumed),
+            expected: Some(crate::v2::Hash([0x46; 32])),
+            replacement: None,
+            pending_call: Some(crate::v2::CallId([0x47; 32])),
+        };
+
+        crate::crdt::with_change(
+            crate::crdt::ChangeId::for_dispatch(old.change, actor, old.ordinal),
+            || {
+                counter.increment(1)?;
+                ctx.__rebind_checkpoint_change_v2(&token);
+                counter.increment(1)
+            },
+        )
+        .unwrap();
+        let operations = crate::crdt::take_operations(actor, resumed).unwrap();
+        assert_eq!(operations.len(), 1, "pre-await operations are discarded");
+        assert_eq!(operations[0].ordinal, 0);
+        assert_eq!(
+            operations[0].id,
+            resumed
+                .change
+                .operation(actor, resumed.ordinal, operations[0].field, 0)
+        );
     }
 
     // Richer fixture actor with a 3-tier Role enum — exercises

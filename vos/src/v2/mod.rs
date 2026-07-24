@@ -32,12 +32,13 @@ pub use contracts::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationRejectionV2, AccumulationResultV2, ActorCallRequestV2, ActorGenesisV2,
     ActorSliceInputV2, ActorSliceOutputV2, ActorWriteV2, AuthorizationEvidenceV2, AwaitResumeV2,
-    BlobRefV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2,
-    CrdtChangeV2, CrdtDispatchV2, CrdtMaterializationV2, CrdtOperationV2, GasAccountingV2,
-    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, MessageRecordV2, MethodPolicyV2,
-    ProofCommitmentV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineError,
-    RefineImportsV2, RefineOutputV2, ReplyRecordV2, ServiceGenesisV2, ServiceIdentityV2,
-    ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
+    BlobRefV2, CausalCallContextV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2,
+    ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2, CrdtMaterializationV2, CrdtOperationV2,
+    GasAccountingV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, MessageRecordV2,
+    MethodPolicyV2, ProofCommitmentV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
+    RefineError, RefineImportsV2, RefineOutputV2, ReplyRecordV2, ServiceGenesisV2,
+    ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2,
+    WorkflowOperationV2,
 };
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStoreV2, ReceiptVerificationV2, execute_guest_accumulate,
@@ -87,8 +88,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0x0a, 0x90, 0xac, 0x01, 0x10, 0x89, 0xe3, 0x7b, 0x13, 0x83, 0xbb, 0x50, 0xb7, 0xb5, 0xc8, 0x21,
-    0xed, 0x34, 0x10, 0xbd, 0x2b, 0x6f, 0x8d, 0xb6, 0xfe, 0xfc, 0x0e, 0x94, 0xf5, 0xda, 0x49, 0x21,
+    0x5d, 0x29, 0x1e, 0xc5, 0x98, 0xe6, 0x28, 0xbb, 0x31, 0x0c, 0x17, 0xa9, 0xd3, 0xca, 0xe8, 0x7e,
+    0xbf, 0xb3, 0xe6, 0xc0, 0x5b, 0x7e, 0x43, 0xcd, 0x23, 0xd4, 0x60, 0x51, 0x78, 0x25, 0x1b, 0x77,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.

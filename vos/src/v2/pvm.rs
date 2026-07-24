@@ -587,6 +587,7 @@ fn capture_checkpoint(
         actor_program: work.target_program,
         await_ordinal,
         pending_call,
+        causal_context: work.causal_context.clone(),
         kernel_snapshot: snapshot.to_bytes(),
     };
     let bytes = continuation.encode();

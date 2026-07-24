@@ -134,6 +134,7 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
         authorization: AuthorizationEvidenceV2::Public,
         causal_parent: None,
         parent_call: None,
+        causal_context: None,
         awaited_reply: None,
         consistency: ConsistencyModeV2::Local,
         base: ConsistencyBaseV2::Linear {
@@ -728,6 +729,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
         authorization: first_work.authorization,
         causal_parent: first_work.causal_parent,
         parent_call: first_work.parent_call,
+        causal_context: first_work.causal_context,
         awaited_reply: None,
         imported_blobs: first_work.imported_blobs,
         proof_requested: first_work.proof_requested,
@@ -1018,6 +1020,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
         authorization: seed_work.authorization,
         causal_parent: seed_work.causal_parent,
         parent_call: seed_work.parent_call,
+        causal_context: seed_work.causal_context,
         awaited_reply: None,
         imported_blobs: seed_work.imported_blobs,
         proof_requested: seed_work.proof_requested,
@@ -1241,6 +1244,556 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
 }
 
 #[test]
+fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
+    let service_pvm = vos::v2::transpile_service_elf(&service_elf()).unwrap();
+    let service_program = ProgramId::of_pvm(&service_pvm);
+    let service = ServicePvmV2::new(service_pvm.clone(), service_program).unwrap();
+    let actor = grey_transpiler::link_elf(&probe_elf()).unwrap();
+    let actor_program = ProgramId::of_pvm(&actor);
+    let initial_state = Vec::new();
+    let initial_state_ref = BlobRefV2::of_bytes(&initial_state);
+    let identity = work(actor_program, initial_state_ref.clone()).service;
+    let caller = ActorId([4; 32]);
+    let target = ActorId([5; 32]);
+
+    let mut host = LocalJamStoreV2::default();
+    assert_eq!(host.import_blob(initial_state), initial_state_ref);
+    assert_eq!(host.import_program(actor), actor_program);
+    let mut committed = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        host,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let installed = committed
+        .accumulate(&AccumulateRequestV2::Install(ServiceGenesisV2 {
+            service: identity.clone(),
+            consistency: ConsistencyModeV2::Local,
+            actors: vec![
+                ActorGenesisV2 {
+                    actor: caller,
+                    parent: None,
+                    program: actor_program,
+                    initial_state: initial_state_ref.clone(),
+                    crdt: false,
+                    methods: vec![MethodPolicyV2 {
+                        method: "seed".into(),
+                        schema: Hash([31; 32]),
+                        policy: Hash([32; 32]),
+                        public: true,
+                        attested: false,
+                    }],
+                },
+                ActorGenesisV2 {
+                    actor: target,
+                    parent: Some(caller),
+                    program: actor_program,
+                    initial_state: initial_state_ref,
+                    crdt: false,
+                    methods: vec![MethodPolicyV2 {
+                        method: "await_two_peers".into(),
+                        schema: Hash([33; 32]),
+                        policy: Hash([34; 32]),
+                        public: true,
+                        attested: false,
+                    }],
+                },
+            ],
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: vos::v2::SystemCapabilityId([35; 32]),
+                authenticator: vec![36],
+            },
+        }))
+        .unwrap();
+    assert!(matches!(
+        installed.result,
+        AccumulationResultV2::Installed(_)
+    ));
+
+    let mut payload = vec![vos::value::TAG_DYNAMIC];
+    payload.extend_from_slice(&Msg::new("await_two_peers").encode());
+    let caller_invocation = InvocationId([60; 32]);
+    let inbound_call = caller_invocation.call_id(0);
+    let inbound = MessageRecordV2 {
+        call_id: inbound_call,
+        caller_invocation,
+        await_ordinal: 0,
+        from: caller,
+        to: target,
+        parent: None,
+        payload: payload.clone(),
+        authorization: AuthorizationEvidenceV2::Public,
+        deadline_timeslot: Some(200),
+    };
+    let mut seed_payload = vec![vos::value::TAG_DYNAMIC];
+    seed_payload.extend_from_slice(&Msg::new("seed").encode());
+    let seed_request = LocalWorkRequestV2 {
+        invocation: InvocationId([61; 32]),
+        workflow_step: 0,
+        logical_timeslot: 1,
+        target: caller,
+        method: "seed".into(),
+        arguments: seed_payload,
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let seeded = LocalWorkSchedulerV2::prepare(committed.accumulate_host(), seed_request).unwrap();
+    let seed_transition = TransitionV2 {
+        service: seeded.work.service.clone(),
+        consumed_input: seeded.work.input_id(),
+        target_program: seeded.work.target_program,
+        base: seeded.work.base.clone(),
+        writes: vec![],
+        crdt_change: None,
+        continuations: vec![],
+        inbox: vec![inbound.clone()],
+        outbox: vec![],
+        reply: None,
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    let seeded = committed
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: seeded.work,
+            transition: seed_transition,
+            provided_blobs: vec![],
+        }))
+        .unwrap();
+    assert!(matches!(
+        seeded.result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let initial = LocalWorkSchedulerV2::prepare_inbox(committed.accumulate_host(), inbound_call, 2)
+        .expect("committed inbox reconstructs the initial callee slice");
+    assert_eq!(
+        initial.work.causal_context,
+        Some(vos::v2::CausalCallContextV2::from(&inbound))
+    );
+    let initial_output = service
+        .refine_actor_tree_with_backend(
+            &initial.work.encode(),
+            &initial.imports,
+            100_000_000,
+            &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceInterpreter,
+        )
+        .unwrap();
+    assert_eq!(
+        service
+            .refine_actor_tree_with_backend(
+                &initial.work.encode(),
+                &initial.imports,
+                100_000_000,
+                &NoRefineProtocolHostV2,
+                javm::PvmBackend::ForceRecompiler,
+            )
+            .unwrap(),
+        initial_output
+    );
+    let initial_refined = RefineOutputV2::decode(&initial_output.bytes).unwrap();
+    let initial_transition = initial_refined.transition;
+    let first_call = initial.work.invocation.call_id(0);
+    assert_eq!(initial_transition.outbox.len(), 1);
+    assert_eq!(initial_transition.outbox[0].call_id, first_call);
+    assert_eq!(initial_transition.outbox[0].parent, Some(inbound_call));
+    assert_eq!(initial_transition.outbox[0].to, ActorId([44; 32]));
+    let first_state = initial_transition
+        .writes
+        .iter()
+        .find(|write| write.key == vos::lifecycle::STATE_KEY_BYTES)
+        .and_then(|write| write.value.as_ref())
+        .unwrap();
+    assert_eq!(u32::decode(first_state), 1);
+    let first_continuation = initial_transition.continuations[0]
+        .replacement
+        .clone()
+        .unwrap();
+    let first_snapshot = ContinuationSnapshotV2::decode(
+        &initial_output
+            .exported_blobs
+            .iter()
+            .find(|blob| blob.reference == first_continuation)
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(first_snapshot.await_ordinal, 0);
+    assert_eq!(first_snapshot.pending_call, Some(first_call));
+    assert_eq!(first_snapshot.causal_context, initial.work.causal_context);
+    let mut first_blobs = initial_refined.candidate_blobs;
+    first_blobs.extend(initial_output.exported_blobs);
+    first_blobs.sort_by_key(|blob| blob.reference.hash);
+    first_blobs.dedup();
+    let checkpointed = committed
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: initial.work.clone(),
+            transition: initial_transition,
+            provided_blobs: first_blobs,
+        }))
+        .unwrap();
+    assert!(matches!(
+        checkpointed.result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    let header = committed.accumulate_host().header().unwrap().unwrap();
+    assert_eq!(
+        committed
+            .accumulate_host()
+            .state_row(header.service_root, &StateKeyV2::Inbox(inbound_call))
+            .unwrap(),
+        None,
+        "step 0 consumes the only live copy of the inbound inbox row"
+    );
+
+    let first_reply = ReplyRecordV2 {
+        call_id: first_call,
+        producer: ActorId([44; 32]),
+        result: vos::value::Value::U32(7).encode(),
+    };
+    let mut first_remote_service = identity.clone();
+    first_remote_service.root_service = RootServiceId([70; 32]);
+    first_remote_service.deployment = DeploymentId([71; 32]);
+    let first_awaited = AccumulatedReplyV2 {
+        receipt: AccumulationReceiptV2 {
+            service: first_remote_service,
+            accepted_transition: Hash([72; 32]),
+            reply_commitment: Some(first_reply.commitment()),
+            resulting_state_root: Some(Hash([73; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 1,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        },
+        reply: first_reply,
+    };
+
+    let reopened = LocalJamStoreV2::from_snapshot(committed.accumulate_host().snapshot());
+    assert_eq!(
+        LocalWorkSchedulerV2::prepare_resume(&reopened, initial.work.invocation, 3, None),
+        Err(ScheduleErrorV2::MissingAwaitedReply(first_call))
+    );
+    assert_eq!(
+        LocalWorkSchedulerV2::prepare_resume(
+            &reopened,
+            initial.work.invocation,
+            200,
+            Some(first_awaited.clone()),
+        ),
+        Err(ScheduleErrorV2::DeadlineExpired(inbound_call))
+    );
+    let mut wrong_first_reply = first_awaited.clone();
+    wrong_first_reply.reply.call_id = InvocationId([78; 32]).call_id(0);
+    wrong_first_reply.receipt.reply_commitment = Some(wrong_first_reply.reply.commitment());
+    assert_eq!(
+        LocalWorkSchedulerV2::prepare_resume(
+            &reopened,
+            initial.work.invocation,
+            3,
+            Some(wrong_first_reply.clone()),
+        ),
+        Err(ScheduleErrorV2::UnexpectedAwaitedReply(
+            wrong_first_reply.reply.call_id
+        ))
+    );
+    let first_resume = LocalWorkSchedulerV2::prepare_resume(
+        &reopened,
+        initial.work.invocation,
+        3,
+        Some(first_awaited.clone()),
+    )
+    .expect("guest-owned workflow state reconstructs the first resume");
+    assert_eq!(first_resume.work.workflow_step, 1);
+    assert_eq!(
+        first_resume.work.causal_context,
+        initial.work.causal_context
+    );
+    assert!(first_resume.work.arguments.is_empty());
+    let mut expired_resume_work = first_resume.work.clone();
+    expired_resume_work.logical_timeslot = 200;
+    let expired_resume_transition = TransitionV2 {
+        service: expired_resume_work.service.clone(),
+        consumed_input: expired_resume_work.input_id(),
+        target_program: expired_resume_work.target_program,
+        base: expired_resume_work.base.clone(),
+        writes: vec![],
+        crdt_change: None,
+        continuations: vec![],
+        inbox: vec![],
+        outbox: vec![],
+        reply: None,
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    let before_expired_resume = committed.accumulate_host().snapshot();
+    let expired_resume = committed
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: expired_resume_work,
+            transition: expired_resume_transition,
+            provided_blobs: vec![],
+        }))
+        .unwrap();
+    assert_eq!(
+        expired_resume.result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::InvalidWorkflowTransition)
+    );
+    assert_eq!(
+        committed.accumulate_host().snapshot(),
+        before_expired_resume,
+        "guest Accumulate must enforce the retained parent deadline after the inbox row is gone"
+    );
+    let first_resumed_output = service
+        .refine_actor_tree_with_backend(
+            &first_resume.work.encode(),
+            &first_resume.imports,
+            100_000_000,
+            &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceInterpreter,
+        )
+        .unwrap();
+    assert_eq!(
+        service
+            .refine_actor_tree_with_backend(
+                &first_resume.work.encode(),
+                &first_resume.imports,
+                100_000_000,
+                &NoRefineProtocolHostV2,
+                javm::PvmBackend::ForceRecompiler,
+            )
+            .unwrap(),
+        first_resumed_output
+    );
+    let first_resumed_refined = RefineOutputV2::decode(&first_resumed_output.bytes).unwrap();
+    let first_resumed_transition = first_resumed_refined.transition;
+    let second_call = initial.work.invocation.call_id(1);
+    assert_eq!(first_resumed_transition.outbox.len(), 1);
+    assert_eq!(first_resumed_transition.outbox[0].call_id, second_call);
+    assert_eq!(
+        first_resumed_transition.outbox[0].parent,
+        Some(inbound_call)
+    );
+    assert_eq!(first_resumed_transition.outbox[0].to, ActorId([45; 32]));
+    let second_state = first_resumed_transition
+        .writes
+        .iter()
+        .find(|write| write.key == vos::lifecycle::STATE_KEY_BYTES)
+        .and_then(|write| write.value.as_ref())
+        .unwrap();
+    assert_eq!(
+        u32::decode(second_state),
+        18,
+        "the first reply and the mutation before await 2 execute once"
+    );
+    let second_continuation = first_resumed_transition.continuations[0]
+        .replacement
+        .clone()
+        .unwrap();
+    assert_ne!(second_continuation, first_continuation);
+    let second_snapshot = ContinuationSnapshotV2::decode(
+        &first_resumed_output
+            .exported_blobs
+            .iter()
+            .find(|blob| blob.reference == second_continuation)
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(second_snapshot.await_ordinal, 1);
+    assert_eq!(second_snapshot.pending_call, Some(second_call));
+    assert_eq!(second_snapshot.causal_context, initial.work.causal_context);
+
+    let mut first_resume_blobs = first_resumed_refined.candidate_blobs;
+    first_resume_blobs.extend(first_resumed_output.exported_blobs);
+    first_resume_blobs.sort_by_key(|blob| blob.reference.hash);
+    first_resume_blobs.dedup();
+    let mut committed = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        reopened,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    committed
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            expected_producer: first_awaited.reply.producer,
+            receipt: first_awaited.receipt,
+        });
+    let second_checkpoint = committed
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: first_resume.work,
+            transition: first_resumed_transition,
+            provided_blobs: first_resume_blobs,
+        }))
+        .expect("retained causal context validates await 2 after inbox consumption");
+    assert!(matches!(
+        second_checkpoint.result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    let header = committed.accumulate_host().header().unwrap().unwrap();
+    assert_eq!(
+        committed
+            .accumulate_host()
+            .state_row(header.service_root, &StateKeyV2::Outbox(first_call))
+            .unwrap(),
+        None
+    );
+    assert!(
+        committed
+            .accumulate_host()
+            .state_row(header.service_root, &StateKeyV2::Outbox(second_call))
+            .unwrap()
+            .is_some()
+    );
+
+    let second_reply = ReplyRecordV2 {
+        call_id: second_call,
+        producer: ActorId([45; 32]),
+        result: vos::value::Value::U32(5).encode(),
+    };
+    let mut second_remote_service = identity;
+    second_remote_service.root_service = RootServiceId([74; 32]);
+    second_remote_service.deployment = DeploymentId([75; 32]);
+    let second_awaited = AccumulatedReplyV2 {
+        receipt: AccumulationReceiptV2 {
+            service: second_remote_service,
+            accepted_transition: Hash([76; 32]),
+            reply_commitment: Some(second_reply.commitment()),
+            resulting_state_root: Some(Hash([77; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 1,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        },
+        reply: second_reply,
+    };
+
+    let reopened = LocalJamStoreV2::from_snapshot(committed.accumulate_host().snapshot());
+    let second_resume = LocalWorkSchedulerV2::prepare_resume(
+        &reopened,
+        initial.work.invocation,
+        4,
+        Some(second_awaited.clone()),
+    )
+    .expect("guest-owned workflow state reconstructs the second resume");
+    assert_eq!(second_resume.work.workflow_step, 2);
+    assert_eq!(
+        second_resume.work.causal_context,
+        initial.work.causal_context
+    );
+    let completed_output = service
+        .refine_actor_tree_with_backend(
+            &second_resume.work.encode(),
+            &second_resume.imports,
+            100_000_000,
+            &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceInterpreter,
+        )
+        .unwrap();
+    assert_eq!(
+        service
+            .refine_actor_tree_with_backend(
+                &second_resume.work.encode(),
+                &second_resume.imports,
+                100_000_000,
+                &NoRefineProtocolHostV2,
+                javm::PvmBackend::ForceRecompiler,
+            )
+            .unwrap(),
+        completed_output
+    );
+    let completed_refined = RefineOutputV2::decode(&completed_output.bytes).unwrap();
+    let completed_transition = completed_refined.transition;
+    assert!(completed_transition.outbox.is_empty());
+    assert_eq!(
+        completed_transition.continuations[0].expected,
+        Some(second_continuation.hash)
+    );
+    assert_eq!(completed_transition.continuations[0].replacement, None);
+    let completed_state = completed_transition
+        .writes
+        .iter()
+        .find(|write| write.key == vos::lifecycle::STATE_KEY_BYTES)
+        .and_then(|write| write.value.as_ref())
+        .unwrap();
+    assert_eq!(u32::decode(completed_state), 23);
+    assert_eq!(
+        completed_transition
+            .reply
+            .as_ref()
+            .map(|reply| vos::value::Value::decode(&reply.result)),
+        Some(vos::value::Value::U32(23))
+    );
+
+    let mut committed = JamServiceV2::new(
+        service_pvm,
+        service_program,
+        NoRefineProtocolHostV2,
+        reopened,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    committed
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            expected_producer: second_awaited.reply.producer,
+            receipt: second_awaited.receipt,
+        });
+    let completed = committed
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: second_resume.work,
+            transition: completed_transition,
+            provided_blobs: completed_refined.candidate_blobs,
+        }))
+        .unwrap();
+    assert!(matches!(
+        completed.result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    let header = committed.accumulate_host().header().unwrap().unwrap();
+    assert_eq!(
+        committed
+            .accumulate_host()
+            .state_row(header.service_root, &StateKeyV2::Outbox(second_call))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        committed
+            .accumulate_host()
+            .state_row(header.service_root, &StateKeyV2::Continuation(target))
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
 fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let elf = service_elf();
     let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
@@ -1304,6 +1857,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         authorization: seed_work.authorization.clone(),
         causal_parent: None,
         parent_call: None,
+        causal_context: None,
         awaited_reply: None,
         imported_blobs: vec![],
         proof_requested: false,
@@ -1333,6 +1887,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         actor_program,
         await_ordinal: 0,
         pending_call: None,
+        causal_context: work.causal_context.clone(),
         kernel_snapshot: vec![1],
     };
     let continuation_bytes = continuation.encode();
@@ -1551,6 +2106,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         actor_program,
         await_ordinal: 0,
         pending_call: None,
+        causal_context: delivered.work.causal_context.clone(),
         kernel_snapshot: vec![2],
     };
     let delivery_continuation_bytes = delivery_continuation.encode();
@@ -1607,6 +2163,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         authorization: delivered.work.authorization,
         causal_parent: delivered.work.causal_parent,
         parent_call: delivered.work.parent_call,
+        causal_context: delivered.work.causal_context,
         awaited_reply: None,
         imported_blobs: vec![],
         proof_requested: false,
@@ -1690,6 +2247,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         authorization: seed_work.authorization,
         causal_parent: None,
         parent_call: None,
+        causal_context: None,
         awaited_reply: None,
         imported_blobs: vec![],
         proof_requested: false,
@@ -1709,6 +2267,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         actor_program,
         await_ordinal: 0,
         pending_call: Some(awaited_call),
+        causal_context: caller.work.causal_context.clone(),
         kernel_snapshot: vec![4],
     }
     .encode();
@@ -1798,6 +2357,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         authorization: caller.work.authorization,
         causal_parent: caller.work.causal_parent,
         parent_call: caller.work.parent_call,
+        causal_context: caller.work.causal_context,
         awaited_reply: Some(awaited.clone()),
         imported_blobs: vec![],
         proof_requested: false,

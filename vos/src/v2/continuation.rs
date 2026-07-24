@@ -8,7 +8,7 @@
 
 use alloc::vec::Vec;
 
-use super::contracts::{ServiceIdentityV2, WorkEnvelopeV2};
+use super::contracts::{CausalCallContextV2, ServiceIdentityV2, WorkEnvelopeV2};
 use super::identity::{ActorId, CallId, InvocationId, ProgramId};
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 
@@ -29,6 +29,9 @@ pub struct ContinuationSnapshotV2 {
     pub await_ordinal: u64,
     /// `None` for an explicit scheduler yield; `Some` for an awaited call.
     pub pending_call: Option<CallId>,
+    /// Durable causal authority retained after the step-0 inbox row is
+    /// consumed. Every resumed slice must carry this exact context.
+    pub causal_context: Option<CausalCallContextV2>,
     pub kernel_snapshot: Vec<u8>,
 }
 
@@ -65,6 +68,7 @@ impl ContinuationSnapshotV2 {
             || self.checkpoint_step != work.workflow_step
             || self.actor != work.target
             || self.actor_program != work.target_program
+            || self.causal_context != work.causal_context
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -80,6 +84,7 @@ impl ContinuationSnapshotV2 {
             || self.checkpoint_step.checked_add(1) != Some(work.workflow_step)
             || self.actor != work.target
             || self.actor_program != work.target_program
+            || self.causal_context != work.causal_context
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -102,6 +107,7 @@ impl V2Wire for ContinuationSnapshotV2 {
         e.fixed(&self.actor_program.0);
         e.u64(self.await_ordinal);
         e.option(&self.pending_call, |e, call| e.fixed(&call.0));
+        e.option(&self.causal_context, encode_causal_context);
         e.bytes(&self.kernel_snapshot);
     }
 
@@ -117,11 +123,32 @@ impl V2Wire for ContinuationSnapshotV2 {
             actor_program: ProgramId(d.fixed()?),
             await_ordinal: d.u64()?,
             pending_call: d.option(|d| d.fixed().map(CallId))?,
+            causal_context: d.option(decode_causal_context)?,
             kernel_snapshot: d.bytes()?,
         };
         value.validate()?;
         Ok(value)
     }
+}
+
+fn encode_causal_context(e: &mut Encoder<'_>, value: &CausalCallContextV2) {
+    e.fixed(&value.call_id.0);
+    e.fixed(&value.caller_invocation.0);
+    e.fixed(&value.from.0);
+    e.fixed(&value.to.0);
+    e.option(&value.parent, |e, call| e.fixed(&call.0));
+    e.option(&value.deadline_timeslot, |e, deadline| e.u64(*deadline));
+}
+
+fn decode_causal_context(d: &mut Decoder<'_>) -> Result<CausalCallContextV2, DecodeError> {
+    Ok(CausalCallContextV2 {
+        call_id: CallId(d.fixed()?),
+        caller_invocation: InvocationId(d.fixed()?),
+        from: ActorId(d.fixed()?),
+        to: ActorId(d.fixed()?),
+        parent: d.option(|d| d.fixed().map(CallId))?,
+        deadline_timeslot: d.option(Decoder::u64)?,
+    })
 }
 
 fn encode_service(e: &mut Encoder<'_>, value: &ServiceIdentityV2) {
@@ -176,6 +203,7 @@ mod tests {
             actor_program: ProgramId([6; 32]),
             await_ordinal: 3,
             pending_call: Some(invocation.call_id(3)),
+            causal_context: None,
             kernel_snapshot: b"canonical JAR kernel snapshot".to_vec(),
         }
     }
@@ -194,7 +222,8 @@ mod tests {
             origin: Origin::Anonymous,
             authorization: AuthorizationEvidenceV2::Public,
             causal_parent: None,
-            parent_call: snapshot.pending_call,
+            parent_call: None,
+            causal_context: None,
             awaited_reply: None,
             consistency: ConsistencyModeV2::Local,
             base: ConsistencyBaseV2::Linear {

@@ -51,6 +51,28 @@ impl Probe {
         self.seen
     }
 
+    /// Two durable calls with mutations on both sides of the first resume.
+    /// The v2 physical gate restarts the service before each continuation
+    /// slice and proves await ordinals and causal authority survive exactly.
+    #[msg]
+    async fn await_two_peers(&mut self, ctx: &mut Context<Self>) -> u32 {
+        self.seen += 1;
+        if let Ok(vos::value::Value::U32(value)) = ctx
+            .ask_actor(ActorId([44; 32]), &Msg::new("first_value"), Some(100))
+            .await
+        {
+            self.seen += value;
+        }
+        self.seen += 10;
+        if let Ok(vos::value::Value::U32(value)) = ctx
+            .ask_actor(ActorId([45; 32]), &Msg::new("second_value"), Some(100))
+            .await
+        {
+            self.seen += value;
+        }
+        self.seen
+    }
+
     /// Number of `ping`s delivered so far.
     #[msg]
     async fn seen(&self) -> u32 {
