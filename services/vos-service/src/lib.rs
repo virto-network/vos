@@ -266,10 +266,10 @@ mod guest {
             _ => fail_closed(),
         };
         let mut transition = TransitionV2 {
-            service: work.service,
+            service: work.service.clone(),
             consumed_input,
             target_program: work.target_program,
-            base,
+            base: base.clone(),
             writes,
             crdt_change,
             continuations,
@@ -280,7 +280,7 @@ mod guest {
             gas: GasAccountingV2::default(),
             proof: None,
         };
-        let workflow = transition.workflow_operations();
+        let workflow = transition.workflow_operations(&work);
         if let Some(change) = transition.crdt_change.as_mut() {
             change.workflow = workflow;
         }
