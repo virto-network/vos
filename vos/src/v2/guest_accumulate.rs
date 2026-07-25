@@ -8,7 +8,9 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
-use super::causal::{CausalFrontierError, load_causal_frontier};
+use super::causal::{
+    CausalFrontierError, CausalFrontierV2, CausalSelectionError, load_causal_frontier,
+};
 use super::{
     ABI_VERSION, AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorId,
@@ -508,9 +510,11 @@ fn apply<S: GuestAccumulateStoreV2>(
     if let Some(rejection) = validate_base(tree.store_ref(), &header, &work.base)? {
         return Ok(rejected(rejection));
     }
-    if let Some(rejection) = validate_crdt(tree.store_ref(), &header, work, transition)? {
-        return Ok(rejected(rejection));
-    }
+    let crdt_frontier = match validate_crdt(tree.store_ref(), &header, work, transition)? {
+        CrdtValidationV2::Linear => None,
+        CrdtValidationV2::Frontier(frontier) => Some(frontier),
+        CrdtValidationV2::Rejected(rejection) => return Ok(rejected(rejection)),
+    };
     if header.consistency != ConsistencyModeV2::Crdt && header.revision == u64::MAX {
         return Ok(rejected(AccumulationRejectionV2::SequenceOverflow));
     }
@@ -541,14 +545,12 @@ fn apply<S: GuestAccumulateStoreV2>(
             )));
         }
         if header.consistency == ConsistencyModeV2::Crdt {
-            let ConsistencyBaseV2::Crdt { heads } = &work.base else {
-                return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
-            };
-            let Some(expected) =
-                crdt_base_materializations(tree.store_ref(), &descriptor, imported.actor, heads)?
-            else {
-                return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
-            };
+            let frontier = crdt_frontier
+                .as_ref()
+                .ok_or(GuestAccumulateError::CorruptStore)?;
+            let expected = frontier
+                .actor_materializations(&descriptor)
+                .map_err(|CausalSelectionError::Corrupt| GuestAccumulateError::CorruptStore)?;
             let actual = core::iter::once(&imported.state)
                 .chain(imported.causal_states.iter())
                 .cloned()
@@ -864,30 +866,43 @@ fn validate_base<S: GuestAccumulateStoreV2>(
     })
 }
 
+enum CrdtValidationV2 {
+    Linear,
+    Frontier(CausalFrontierV2),
+    Rejected(AccumulationRejectionV2),
+}
+
 fn validate_crdt<S: GuestAccumulateStoreV2>(
     store: &S,
     header: &StoreHeaderV2,
     work: &super::WorkEnvelopeV2,
     transition: &super::TransitionV2,
-) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
+) -> GuestResult<CrdtValidationV2, S::Error> {
     if header.consistency != ConsistencyModeV2::Crdt {
-        return Ok(transition
-            .crdt_change
-            .is_some()
-            .then_some(AccumulationRejectionV2::InvalidConsistency));
+        return Ok(if transition.crdt_change.is_some() {
+            CrdtValidationV2::Rejected(AccumulationRejectionV2::InvalidConsistency)
+        } else {
+            CrdtValidationV2::Linear
+        });
     }
     // Consuming an existing outbox row must be represented by the built-in
     // workflow CRDT before awaited replies can be merged safely. The current
     // change payload records emitted workflow rows, not replicated deletion
     // of a pending call, so fail closed until that operation is defined.
     if work.awaited_reply.is_some() {
-        return Ok(Some(AccumulationRejectionV2::InvalidConsistency));
+        return Ok(CrdtValidationV2::Rejected(
+            AccumulationRejectionV2::InvalidConsistency,
+        ));
     }
     let Some(change) = transition.crdt_change.as_ref() else {
-        return Ok(Some(AccumulationRejectionV2::InvalidConsistency));
+        return Ok(CrdtValidationV2::Rejected(
+            AccumulationRejectionV2::InvalidConsistency,
+        ));
     };
     let ConsistencyBaseV2::Crdt { heads } = &work.base else {
-        return Ok(Some(AccumulationRejectionV2::InvalidConsistency));
+        return Ok(CrdtValidationV2::Rejected(
+            AccumulationRejectionV2::InvalidConsistency,
+        ));
     };
     if !transition.writes.is_empty()
         || Some(change.id) != CrdtChangeV2::derive_id(work)
@@ -895,11 +910,15 @@ fn validate_crdt<S: GuestAccumulateStoreV2>(
         || change.causal_dependencies.as_slice() != heads.as_slice()
         || change.workflow != transition.workflow_operations()
     {
-        return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+        return Ok(CrdtValidationV2::Rejected(
+            AccumulationRejectionV2::InvalidWorkflowTransition,
+        ));
     }
     if let Some(existing) = read(store, &crdt_change_storage_key(change.id))? {
         if existing.as_slice() != change.cid().0 {
-            return Ok(Some(AccumulationRejectionV2::DivergentDuplicate));
+            return Ok(CrdtValidationV2::Rejected(
+                AccumulationRejectionV2::DivergentDuplicate,
+            ));
         }
     }
     let frontier = match load_causal_frontier(heads, |cid| store.read(&crdt_node_storage_key(cid)))
@@ -909,7 +928,9 @@ fn validate_crdt<S: GuestAccumulateStoreV2>(
             return Err(GuestAccumulateError::Storage(error));
         }
         Err(CausalFrontierError::Missing(cid)) => {
-            return Ok(Some(AccumulationRejectionV2::MissingCausalDependency(cid)));
+            return Ok(CrdtValidationV2::Rejected(
+                AccumulationRejectionV2::MissingCausalDependency(cid),
+            ));
         }
         Err(CausalFrontierError::Corrupt) => return Err(GuestAccumulateError::CorruptStore),
     };
@@ -917,33 +938,11 @@ fn validate_crdt<S: GuestAccumulateStoreV2>(
     if work.base_causal_height != Some(max_height)
         || max_height.checked_add(1) != Some(change.causal_height)
     {
-        return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+        return Ok(CrdtValidationV2::Rejected(
+            AccumulationRejectionV2::InvalidWorkflowTransition,
+        ));
     }
-    Ok(None)
-}
-
-fn crdt_base_materializations<S: StateTreeStore>(
-    store: &S,
-    descriptor: &ActorGenesisV2,
-    actor: ActorId,
-    heads: &[Hash],
-) -> GuestResult<Option<Vec<BlobRefV2>>, S::Error> {
-    let frontier = match load_causal_frontier(heads, |cid| store.read(&crdt_node_storage_key(cid)))
-    {
-        Ok(frontier) => frontier,
-        Err(CausalFrontierError::Storage(error)) => {
-            return Err(GuestAccumulateError::Storage(error));
-        }
-        Err(CausalFrontierError::Missing(_)) => return Ok(None),
-        Err(CausalFrontierError::Corrupt) => return Err(GuestAccumulateError::CorruptStore),
-    };
-    match frontier.actor_materializations::<S::Error>(descriptor, actor) {
-        Ok(states) => Ok(Some(states)),
-        Err(CausalFrontierError::Corrupt) => Err(GuestAccumulateError::CorruptStore),
-        Err(CausalFrontierError::Storage(_) | CausalFrontierError::Missing(_)) => {
-            unreachable!("materialization selection performs no storage reads")
-        }
-    }
+    Ok(CrdtValidationV2::Frontier(frontier))
 }
 
 fn write_crdt_change<S: GuestAccumulateStoreV2>(
@@ -2899,10 +2898,10 @@ mod tests {
         let transition = crdt_transition(&work, BlobRefV2::of_bytes(b"next"), 1);
         let header = StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
 
-        assert_eq!(
+        assert!(matches!(
             validate_crdt(&store, &header, &work, &transition).unwrap(),
-            Some(AccumulationRejectionV2::InvalidConsistency)
-        );
+            CrdtValidationV2::Rejected(AccumulationRejectionV2::InvalidConsistency)
+        ));
     }
 
     #[test]

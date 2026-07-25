@@ -9,7 +9,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::Infallible;
 
-use super::causal::{CausalFrontierError, load_causal_frontier};
+use super::causal::{CausalFrontierError, CausalSelectionError, load_causal_frontier};
 use super::{
     AccumulatedReplyV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2, BlobRefV2, CallId,
     CausalCallContextV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, DecodeError,
@@ -63,6 +63,7 @@ pub enum ScheduleErrorV2 {
     InvalidContinuation(ActorId),
     MissingAwaitedReply(CallId),
     UnexpectedAwaitedReply(CallId),
+    CrdtAwaitUnsupported(CallId),
     InvocationAlreadyCommitted(InvocationId),
     InvalidWorkflowStep(InvocationId),
     MissingInbox(CallId),
@@ -230,9 +231,7 @@ impl LocalWorkSchedulerV2 {
         if descriptor.actor != request.target {
             return Err(ScheduleErrorV2::InvalidActorDescriptor(request.target));
         }
-        if descriptor.crdt != (header.consistency == ConsistencyModeV2::Crdt) {
-            return Err(ScheduleErrorV2::ActorConsistencyMismatch(request.target));
-        }
+        validate_actor_consistency(descriptor.crdt, header.consistency, request.target)?;
 
         let program_bytes = store
             .program(descriptor.program)
@@ -243,24 +242,13 @@ impl LocalWorkSchedulerV2 {
                 let heads = header.crdt_heads.clone();
                 let frontier = load_causal_frontier(&heads, |cid| {
                     Ok::<_, Infallible>(store.row(&crdt_node_storage_key(cid)).map(<[u8]>::to_vec))
-                });
-                let frontier = match frontier {
-                    Ok(frontier) => frontier,
-                    Err(CausalFrontierError::Missing(cid)) => {
-                        return Err(ScheduleErrorV2::MissingCausalDependency(cid));
-                    }
-                    Err(CausalFrontierError::Corrupt) => {
-                        return Err(ScheduleErrorV2::CorruptCausalDag);
-                    }
-                    Err(CausalFrontierError::Storage(error)) => match error {},
-                };
+                })
+                .map_err(schedule_causal_error)?;
                 let height = frontier.max_head_height;
                 let states = frontier
-                    .actor_materializations::<Infallible>(&descriptor, request.target)
+                    .actor_materializations(&descriptor)
                     .map_err(|error| match error {
-                        CausalFrontierError::Corrupt => ScheduleErrorV2::CorruptCausalDag,
-                        CausalFrontierError::Storage(error) => match error {},
-                        CausalFrontierError::Missing(_) => ScheduleErrorV2::CorruptCausalDag,
+                        CausalSelectionError::Corrupt => ScheduleErrorV2::CorruptCausalDag,
                     })?;
                 (ConsistencyBaseV2::Crdt { heads }, Some(height), states)
             } else {
@@ -282,9 +270,6 @@ impl LocalWorkSchedulerV2 {
                     alloc::vec![state],
                 )
             };
-        if states.is_empty() {
-            return Err(ScheduleErrorV2::CorruptCausalDag);
-        }
         let state = states.remove(0);
         let continuation_key = StateKeyV2::Continuation(request.target);
         let continuation = decode_row::<BlobRefV2>(store, header.service_root, &continuation_key)?;
@@ -416,19 +401,54 @@ impl LocalWorkSchedulerV2 {
             snapshot
                 .validate_resume_for(&work)
                 .map_err(|_| ScheduleErrorV2::InvalidContinuation(request.target))?;
-            match (snapshot.pending_call, work.awaited_reply.as_ref()) {
-                (None, None) => {}
-                (Some(call), None) => return Err(ScheduleErrorV2::MissingAwaitedReply(call)),
-                (Some(call), Some(reply)) if reply.reply.call_id == call => {}
-                (_, Some(reply)) => {
-                    return Err(ScheduleErrorV2::UnexpectedAwaitedReply(reply.reply.call_id));
-                }
-            }
+            validate_await_boundary(
+                header.consistency,
+                snapshot.pending_call,
+                work.awaited_reply.as_ref(),
+            )?;
         }
         imports
             .validate_for(&work)
             .map_err(|_| ScheduleErrorV2::NonCanonicalImports)?;
         Ok(PreparedWorkV2 { work, imports })
+    }
+}
+
+fn validate_actor_consistency(
+    actor_crdt: bool,
+    consistency: ConsistencyModeV2,
+    actor: ActorId,
+) -> Result<(), ScheduleErrorV2> {
+    if actor_crdt == (consistency == ConsistencyModeV2::Crdt) {
+        Ok(())
+    } else {
+        Err(ScheduleErrorV2::ActorConsistencyMismatch(actor))
+    }
+}
+
+fn schedule_causal_error(error: CausalFrontierError<Infallible>) -> ScheduleErrorV2 {
+    match error {
+        CausalFrontierError::Missing(cid) => ScheduleErrorV2::MissingCausalDependency(cid),
+        CausalFrontierError::Corrupt => ScheduleErrorV2::CorruptCausalDag,
+        CausalFrontierError::Storage(error) => match error {},
+    }
+}
+
+fn validate_await_boundary(
+    consistency: ConsistencyModeV2,
+    pending_call: Option<CallId>,
+    awaited_reply: Option<&AccumulatedReplyV2>,
+) -> Result<(), ScheduleErrorV2> {
+    if consistency == ConsistencyModeV2::Crdt
+        && let Some(call) = pending_call
+    {
+        return Err(ScheduleErrorV2::CrdtAwaitUnsupported(call));
+    }
+    match (pending_call, awaited_reply) {
+        (None, None) => Ok(()),
+        (Some(call), None) => Err(ScheduleErrorV2::MissingAwaitedReply(call)),
+        (Some(call), Some(reply)) if reply.reply.call_id == call => Ok(()),
+        (_, Some(reply)) => Err(ScheduleErrorV2::UnexpectedAwaitedReply(reply.reply.call_id)),
     }
 }
 
@@ -469,4 +489,44 @@ fn import_blob(
         },
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheduler_maps_consistency_causal_and_crdt_await_boundaries() {
+        let actor = ActorId([1; 32]);
+        assert_eq!(
+            validate_actor_consistency(false, ConsistencyModeV2::Crdt, actor),
+            Err(ScheduleErrorV2::ActorConsistencyMismatch(actor))
+        );
+        assert_eq!(
+            validate_actor_consistency(true, ConsistencyModeV2::Local, actor),
+            Err(ScheduleErrorV2::ActorConsistencyMismatch(actor))
+        );
+        assert!(validate_actor_consistency(true, ConsistencyModeV2::Crdt, actor).is_ok());
+        assert!(validate_actor_consistency(false, ConsistencyModeV2::Local, actor).is_ok());
+
+        let missing = super::super::Hash([2; 32]);
+        assert_eq!(
+            schedule_causal_error(CausalFrontierError::Missing(missing)),
+            ScheduleErrorV2::MissingCausalDependency(missing)
+        );
+        assert_eq!(
+            schedule_causal_error(CausalFrontierError::Corrupt),
+            ScheduleErrorV2::CorruptCausalDag
+        );
+
+        let call = CallId([3; 32]);
+        assert_eq!(
+            validate_await_boundary(ConsistencyModeV2::Crdt, Some(call), None),
+            Err(ScheduleErrorV2::CrdtAwaitUnsupported(call))
+        );
+        assert_eq!(
+            validate_await_boundary(ConsistencyModeV2::Local, Some(call), None),
+            Err(ScheduleErrorV2::MissingAwaitedReply(call))
+        );
+    }
 }

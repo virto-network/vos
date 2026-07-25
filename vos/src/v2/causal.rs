@@ -3,12 +3,17 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
-use super::{ActorGenesisV2, ActorId, BlobRefV2, CrdtChangeV2, Hash, V2Wire};
+use super::{ActorGenesisV2, BlobRefV2, CrdtChangeV2, Hash, V2Wire};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CausalFrontierError<E> {
     Storage(E),
     Missing(Hash),
+    Corrupt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CausalSelectionError {
     Corrupt,
 }
 
@@ -22,11 +27,10 @@ impl CausalFrontierV2 {
     /// Select the nearest actor materialization on every concurrent branch.
     /// Each selected state already incorporates the ancestry below it; Refine
     /// folds all returned alternatives inside the canonical actor PVM.
-    pub fn actor_materializations<E>(
+    pub fn actor_materializations(
         &self,
         descriptor: &ActorGenesisV2,
-        actor: ActorId,
-    ) -> Result<Vec<BlobRefV2>, CausalFrontierError<E>> {
+    ) -> Result<Vec<BlobRefV2>, CausalSelectionError> {
         if self.heads.is_empty() {
             return Ok(alloc::vec![descriptor.initial_state.clone()]);
         }
@@ -38,16 +42,16 @@ impl CausalFrontierV2 {
             if !visited.insert(cid) {
                 continue;
             }
-            let change = self.nodes.get(&cid).ok_or(CausalFrontierError::Corrupt)?;
+            let change = self.nodes.get(&cid).ok_or(CausalSelectionError::Corrupt)?;
             if let Some(materialization) = change
                 .materializations
                 .iter()
-                .find(|materialization| materialization.actor == actor)
+                .find(|materialization| materialization.actor == descriptor.actor)
             {
                 if let Some(existing) = frontier.get(&materialization.state.hash)
                     && existing != &materialization.state
                 {
-                    return Err(CausalFrontierError::Corrupt);
+                    return Err(CausalSelectionError::Corrupt);
                 }
                 frontier.insert(materialization.state.hash, materialization.state.clone());
             } else if change.causal_dependencies.is_empty() {
@@ -60,7 +64,7 @@ impl CausalFrontierV2 {
             }
         }
         if frontier.is_empty() {
-            return Err(CausalFrontierError::Corrupt);
+            return Err(CausalSelectionError::Corrupt);
         }
         Ok(frontier.into_values().collect())
     }
@@ -129,7 +133,7 @@ mod tests {
     use core::convert::Infallible;
 
     use super::*;
-    use crate::v2::{ChangeId, CrdtMaterializationV2};
+    use crate::v2::{ActorId, ChangeId, CrdtMaterializationV2};
 
     fn change(id: u8, parents: Vec<Hash>, height: u64, state: Option<u8>) -> CrdtChangeV2 {
         CrdtChangeV2 {
@@ -176,9 +180,7 @@ mod tests {
             crdt: true,
             methods: vec![],
         };
-        let states = frontier
-            .actor_materializations::<Infallible>(&descriptor, descriptor.actor)
-            .unwrap();
+        let states = frontier.actor_materializations(&descriptor).unwrap();
         assert_eq!(states.len(), 2);
         assert!(states.contains(&BlobRefV2::of_bytes(&[2])));
         assert!(states.contains(&BlobRefV2::of_bytes(&[3])));
