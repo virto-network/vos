@@ -29,6 +29,10 @@ pub struct AccumulatedServiceOutputV2 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceDispatchError {
     Pvm(ServicePvmErrorV2),
+    ServiceProgramMismatch {
+        expected: ProgramId,
+        declared: ProgramId,
+    },
     InvalidRefineOutput,
     InvalidAccumulateOutput,
 }
@@ -95,6 +99,7 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
         work: &WorkEnvelopeV2,
         imports: &RefineImportsV2,
     ) -> Result<RefinedServiceOutputV2, ServiceDispatchError> {
+        self.validate_service_program(work.service.service_program)?;
         let output = self
             .pvm
             .refine_actor_tree(&work.encode(), imports, self.refine_gas, &self.refine_host)
@@ -122,6 +127,7 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
         &mut self,
         request: &AccumulateRequestV2,
     ) -> Result<AccumulatedServiceOutputV2, ServiceDispatchError> {
+        self.validate_service_program(request.service().service_program)?;
         let output = self
             .pvm
             .accumulate(
@@ -136,5 +142,13 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
             result,
             gas_used: output.gas_used,
         })
+    }
+
+    fn validate_service_program(&self, declared: ProgramId) -> Result<(), ServiceDispatchError> {
+        let expected = self.program_id();
+        if declared != expected {
+            return Err(ServiceDispatchError::ServiceProgramMismatch { expected, declared });
+        }
+        Ok(())
     }
 }

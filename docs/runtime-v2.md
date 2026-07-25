@@ -63,9 +63,12 @@ Guest Install is fail-closed on an exact-genesis authorization capability. It
 binds service/deployment identity, consistency mode, the complete actor tree,
 programs, initial states, method policies, and the supplied authorization
 evidence before consulting program or blob availability and before staging any
-service row. The local conformance host uses an explicit process-local
-allowlist which is excluded from durable service snapshots; reopening an empty
-store therefore requires authority to be established again.
+service row. Before either physical entry runs, the platform dispatcher binds
+the declared service `ProgramId` to the canonical PVM selected for execution;
+the package validator pins that same protocol program. The local conformance
+host uses an explicit process-local allowlist which is excluded from durable
+service snapshots; reopening an empty store therefore requires authority to be
+established again.
 
 This is still a conformance orchestrator, not production network routing.
 Automatic node discovery and outbox/reply routing, plus CRDT delivery/reply
@@ -92,8 +95,10 @@ consumption path cannot reuse the pre-await change namespace.
 
 Before that production cutover, the Install authorization capability must be
 backed by consensus-authoritative deployment state rather than the local
-conformance allowlist, and `PROGRAM_LOOKUP` availability must be pinned to or
-imported from consensus-visible state rather than a node-local cache.
+conformance allowlist. That authority must bind the executing JAM service
+account and its current code identity to the exact genesis, not trust the
+genesis's self-declared identity. `PROGRAM_LOOKUP` availability must be pinned
+to or imported from consensus-visible state rather than a node-local cache.
 `RECEIPT_VERIFY` must likewise use consensus-authoritative receipt finality
 rather than its local conformance allowlist, and delivery timeslots must come
 from the JAM slot.

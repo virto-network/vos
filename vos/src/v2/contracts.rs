@@ -667,6 +667,22 @@ pub enum AccumulateRequestV2 {
     AcknowledgePublication(PublicationAckV2),
 }
 
+impl AccumulateRequestV2 {
+    /// Service identity whose physical account/program receives this request.
+    ///
+    /// Guest Accumulate validates this identity against committed state. The
+    /// platform dispatcher separately binds its `service_program` to the
+    /// canonical PVM selected for execution before entering the guest.
+    pub fn service(&self) -> &ServiceIdentityV2 {
+        match self {
+            Self::Install(genesis) => &genesis.service,
+            Self::Apply(envelope) | Self::PrepareAttested(envelope) => &envelope.work.service,
+            Self::Deliver(envelope) => &envelope.service,
+            Self::AcknowledgePublication(acknowledgement) => &acknowledgement.service,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PublishedEffectsV2 {
     pub reply: Option<ReplyRecordV2>,

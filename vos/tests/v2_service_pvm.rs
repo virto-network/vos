@@ -177,7 +177,7 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
         service: ServiceIdentityV2 {
             root_service: RootServiceId([1; 32]),
             deployment: DeploymentId([2; 32]),
-            service_program: ProgramId([3; 32]),
+            service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
             service_abi: vos::v2::ABI_VERSION,
             execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
         },
@@ -1879,6 +1879,17 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     )
     .unwrap();
 
+    let mut wrong_refine_service = seed_work.clone();
+    wrong_refine_service.service.service_program = ProgramId([3; 32]);
+    assert_eq!(
+        service.refine_actor_tree(&wrong_refine_service, &RefineImportsV2::default()),
+        Err(ServiceDispatchError::ServiceProgramMismatch {
+            expected: vos::v2::VOS_SERVICE_PROGRAM_ID,
+            declared: ProgramId([3; 32]),
+        }),
+        "platform dispatch must bind work to the PVM executing Refine"
+    );
+
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
         service: seed_work.service.clone(),
         consistency: ConsistencyModeV2::Local,
@@ -1901,6 +1912,23 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             authenticator: vec![35],
         },
     });
+    let mut wrong_service_program = install.clone();
+    let AccumulateRequestV2::Install(wrong_genesis) = &mut wrong_service_program else {
+        unreachable!()
+    };
+    wrong_genesis.service.service_program = ProgramId([3; 32]);
+    authorize_install(&mut service, &wrong_service_program);
+    assert_eq!(
+        service.accumulate(&wrong_service_program),
+        Err(ServiceDispatchError::ServiceProgramMismatch {
+            expected: vos::v2::VOS_SERVICE_PROGRAM_ID,
+            declared: ProgramId([3; 32]),
+        }),
+        "platform dispatch must bind genesis to the PVM executing Accumulate"
+    );
+    assert_eq!(service.accumulate_host().commit_sequence(), 0);
+    assert_eq!(service.accumulate_host().row_count(), 0);
+
     assert_eq!(
         service.accumulate(&install).unwrap().result,
         AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::Unauthorized)

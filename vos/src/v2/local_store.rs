@@ -322,8 +322,8 @@ impl<B> DerefMut for DurableJamStoreV2<B> {
 }
 
 /// Store equality describes the recoverable service-account image. The local
-/// receipt allowlist is process-scoped host configuration and deliberately
-/// does not participate in snapshots or equality.
+/// receipt and install allowlists are process-scoped host configuration and
+/// deliberately do not participate in snapshots or equality.
 impl PartialEq for LocalJamStoreV2 {
     fn eq(&self, other: &Self) -> bool {
         self.committed == other.committed
@@ -367,8 +367,8 @@ impl LocalJamStoreV2 {
         self.committed.clone()
     }
 
-    /// Canonical crash-recovery image. Receipt allowlists are host policy and
-    /// deliberately remain outside persisted service state.
+    /// Canonical crash-recovery image. Receipt and install allowlists are host
+    /// policy and deliberately remain outside persisted service state.
     pub fn snapshot_bytes(&self) -> Vec<u8> {
         self.committed.encode()
     }
