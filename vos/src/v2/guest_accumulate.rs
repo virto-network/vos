@@ -417,6 +417,7 @@ fn sync_crdt<S: GuestAccumulateStoreV2>(
         .iter()
         .map(|node| (node.change.cid(), &node.change))
         .collect::<BTreeMap<_, _>>();
+    let mut imported_nodes = BTreeSet::new();
     let mut changed = false;
     for node in &envelope.nodes {
         let cid = node.change.cid();
@@ -427,8 +428,13 @@ fn sync_crdt<S: GuestAccumulateStoreV2>(
             if existing != node.change.encode() {
                 return Err(GuestAccumulateError::CorruptStore);
             }
+            let receipt = read(store, &crdt_node_receipt_storage_key(cid))?
+                .ok_or(GuestAccumulateError::CorruptStore)?;
+            AccumulationReceiptV2::decode(&receipt)
+                .map_err(|_| GuestAccumulateError::CorruptStore)?;
         } else {
             changed = true;
+            imported_nodes.insert(cid);
             match store
                 .verify_receipt(&ReceiptVerificationRequestV2 {
                     expected_producer,
@@ -540,8 +546,11 @@ fn sync_crdt<S: GuestAccumulateStoreV2>(
         }
     }
     for node in &envelope.nodes {
-        write_crdt_change(store, &node.change, node.change.cid())?;
-        write_crdt_node_receipt(store, node.change.cid(), &node.receipt)?;
+        let cid = node.change.cid();
+        if imported_nodes.contains(&cid) {
+            write_crdt_change(store, &node.change, cid)?;
+            write_crdt_node_receipt(store, cid, &node.receipt)?;
+        }
     }
 
     let mut tree = ServiceStateTreeV2::new(store, header.service_root);
@@ -998,9 +1007,9 @@ fn apply<S: GuestAccumulateStoreV2>(
     if let Some(rejection) = validate_base(tree.store_ref(), &header, &work.base)? {
         return Ok(rejected(rejection));
     }
-    let crdt_frontier = match validate_crdt(tree.store_ref(), &header, work, transition)? {
+    let mut crdt_frontiers = match validate_crdt(tree.store_ref(), &header, work, transition)? {
         CrdtValidationV2::Linear => None,
-        CrdtValidationV2::Frontier(frontier) => Some(frontier),
+        CrdtValidationV2::Frontiers(frontiers) => Some(frontiers),
         CrdtValidationV2::Rejected(rejection) => return Ok(rejected(rejection)),
     };
     if header.consistency != ConsistencyModeV2::Crdt && header.revision == u64::MAX {
@@ -1033,9 +1042,10 @@ fn apply<S: GuestAccumulateStoreV2>(
             )));
         }
         if header.consistency == ConsistencyModeV2::Crdt {
-            let frontier = crdt_frontier
+            let frontier = &crdt_frontiers
                 .as_ref()
-                .ok_or(GuestAccumulateError::CorruptStore)?;
+                .ok_or(GuestAccumulateError::CorruptStore)?
+                .base;
             let expected = frontier
                 .actor_materializations(&descriptor)
                 .map_err(|CausalSelectionError::Corrupt| GuestAccumulateError::CorruptStore)?;
@@ -1232,6 +1242,7 @@ fn apply<S: GuestAccumulateStoreV2>(
         }
     }
 
+    let mut resulting_frontier = None;
     let (resulting_state_root, resulting_crdt_heads, sequence) =
         if header.consistency == ConsistencyModeV2::Crdt {
             let change = transition
@@ -1240,12 +1251,14 @@ fn apply<S: GuestAccumulateStoreV2>(
                 .expect("validated CRDT transition");
             let cid = change.cid();
             write_crdt_change(store, change, cid)?;
-            let mut heads = BTreeSet::from_iter(header.crdt_heads.iter().copied());
-            for dependency in &change.causal_dependencies {
-                heads.remove(dependency);
-            }
-            heads.insert(cid);
-            header.crdt_heads = heads.into_iter().collect();
+            let frontier = crdt_frontiers
+                .take()
+                .ok_or(GuestAccumulateError::CorruptStore)?
+                .union
+                .with_change(&header.crdt_heads, change.clone())
+                .ok_or(GuestAccumulateError::CorruptStore)?;
+            header.crdt_heads = frontier.canonical_heads();
+            resulting_frontier = Some(frontier);
             (None, header.crdt_heads.clone(), change.causal_height)
         } else {
             header.revision = header
@@ -1256,7 +1269,13 @@ fn apply<S: GuestAccumulateStoreV2>(
             (Some(header.service_root), Vec::new(), header.revision)
         };
     if header.consistency == ConsistencyModeV2::Crdt {
-        rematerialize_crdt_service(store, &mut header)?;
+        rematerialize_crdt_service(
+            store,
+            &mut header,
+            resulting_frontier
+                .as_ref()
+                .ok_or(GuestAccumulateError::CorruptStore)?,
+        )?;
     }
 
     let receipt = AccumulationReceiptV2 {
@@ -1367,9 +1386,14 @@ fn validate_base<S: GuestAccumulateStoreV2>(
     })
 }
 
+struct ValidatedCrdtFrontiersV2 {
+    base: CausalFrontierV2,
+    union: CausalFrontierV2,
+}
+
 enum CrdtValidationV2 {
     Linear,
-    Frontier(CausalFrontierV2),
+    Frontiers(ValidatedCrdtFrontiersV2),
     Rejected(AccumulationRejectionV2),
 }
 
@@ -1422,20 +1446,27 @@ fn validate_crdt<S: GuestAccumulateStoreV2>(
             ));
         }
     }
-    let frontier = match load_causal_frontier(heads, |cid| store.read(&crdt_node_storage_key(cid)))
-    {
-        Ok(frontier) => frontier,
-        Err(CausalFrontierError::Storage(error)) => {
-            return Err(GuestAccumulateError::Storage(error));
-        }
-        Err(CausalFrontierError::Missing(cid)) => {
-            return Ok(CrdtValidationV2::Rejected(
-                AccumulationRejectionV2::MissingCausalDependency(cid),
-            ));
-        }
-        Err(CausalFrontierError::Corrupt) => return Err(GuestAccumulateError::CorruptStore),
-    };
-    let max_height = frontier.max_head_height;
+    let mut union_heads = header.crdt_heads.clone();
+    union_heads.extend(heads.iter().copied());
+    union_heads.sort();
+    union_heads.dedup();
+    let union =
+        match load_causal_frontier(&union_heads, |cid| store.read(&crdt_node_storage_key(cid))) {
+            Ok(frontier) => frontier,
+            Err(CausalFrontierError::Storage(error)) => {
+                return Err(GuestAccumulateError::Storage(error));
+            }
+            Err(CausalFrontierError::Missing(cid)) => {
+                return Ok(CrdtValidationV2::Rejected(
+                    AccumulationRejectionV2::MissingCausalDependency(cid),
+                ));
+            }
+            Err(CausalFrontierError::Corrupt) => return Err(GuestAccumulateError::CorruptStore),
+        };
+    let base = union
+        .at_heads(heads)
+        .ok_or(GuestAccumulateError::CorruptStore)?;
+    let max_height = base.max_head_height;
     if work.base_causal_height != Some(max_height)
         || max_height.checked_add(1) != Some(change.causal_height)
     {
@@ -1443,7 +1474,10 @@ fn validate_crdt<S: GuestAccumulateStoreV2>(
             AccumulationRejectionV2::InvalidWorkflowTransition,
         ));
     }
-    Ok(CrdtValidationV2::Frontier(frontier))
+    Ok(CrdtValidationV2::Frontiers(ValidatedCrdtFrontiersV2 {
+        base,
+        union,
+    }))
 }
 
 fn write_crdt_change<S: GuestAccumulateStoreV2>(
@@ -1482,19 +1516,9 @@ fn write_crdt_node_receipt<S: StateTreeStore>(
 fn rematerialize_crdt_service<S: GuestAccumulateStoreV2>(
     store: &mut S,
     header: &mut StoreHeaderV2,
+    frontier: &CausalFrontierV2,
 ) -> GuestResult<(), S::Error> {
-    let frontier = match load_causal_frontier(&header.crdt_heads, |cid| {
-        store.read(&crdt_node_storage_key(cid))
-    }) {
-        Ok(frontier) => frontier,
-        Err(CausalFrontierError::Storage(error)) => {
-            return Err(GuestAccumulateError::Storage(error));
-        }
-        Err(CausalFrontierError::Missing(_) | CausalFrontierError::Corrupt) => {
-            return Err(GuestAccumulateError::CorruptStore);
-        }
-    };
-    let materialized = materialize_workflow_crdt(&frontier, &header.service)
+    let materialized = materialize_workflow_crdt(frontier, &header.service)
         .map_err(|_| GuestAccumulateError::CorruptStore)?;
     let mut tree = ServiceStateTreeV2::new(store, header.service_root);
     if !materialized_actors_exist(&tree, &materialized)? {
@@ -3640,6 +3664,7 @@ mod tests {
             for envelope in &envelopes {
                 replica.receipt_allowlist.insert(
                     ReceiptVerificationRequestV2 {
+                        expected_producer: actor(),
                         receipt: envelope.nodes[0].receipt.clone(),
                     }
                     .hash(),
@@ -3719,6 +3744,7 @@ mod tests {
         for (node, _) in &nodes {
             destination.receipt_allowlist.insert(
                 ReceiptVerificationRequestV2 {
+                    expected_producer: actor(),
                     receipt: node.receipt.clone(),
                 }
                 .hash(),
@@ -3837,6 +3863,29 @@ mod tests {
             materialized
         );
         drop(tree);
+
+        let stored_receipt = destination
+            .rows
+            .get(&crdt_node_receipt_storage_key(cid))
+            .unwrap()
+            .clone();
+        let mut alternate_receipt = sync.clone();
+        alternate_receipt.nodes[0].receipt.accepted_transition = Hash([97; 32]);
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut destination,
+                &AccumulateRequestV2::SyncCrdt(alternate_receipt),
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            destination.rows.get(&crdt_node_receipt_storage_key(cid)),
+            Some(&stored_receipt)
+        );
 
         let snapshot = destination.clone();
         assert!(matches!(

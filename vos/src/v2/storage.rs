@@ -270,6 +270,9 @@ pub struct WorkflowCheckpointV2 {
     /// from service storage while retaining stable workflow inputs.
     pub resume_work: WorkEnvelopeV2,
     pub work_hash: Hash,
+    /// Linear transitions store their transition hash. CRDT checkpoints store
+    /// the causal node CID so the row can be rebuilt from the DAG without the
+    /// outer transition wire.
     pub transition_hash: Hash,
 }
 

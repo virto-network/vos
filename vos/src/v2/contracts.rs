@@ -3420,6 +3420,7 @@ mod tests {
         let mut work = work();
         work.consistency = ConsistencyModeV2::Crdt;
         work.base = ConsistencyBaseV2::Crdt { heads: vec![] };
+        work.base_causal_height = Some(0);
         let change = CrdtChangeV2::derive_id(&work).unwrap();
         let first_field = Hash([51; 32]);
         let first_id = change.operation(work.target, 0, first_field, 0);

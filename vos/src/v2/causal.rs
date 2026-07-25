@@ -50,6 +50,74 @@ impl CausalFrontierV2 {
         nodes
     }
 
+    /// Restrict this already-validated DAG to the complete ancestry of a
+    /// causal snapshot. No storage is consulted and every requested head must
+    /// belong to the original frontier.
+    pub fn at_heads(&self, heads: &[Hash]) -> Option<Self> {
+        let mut nodes = BTreeMap::new();
+        let mut pending = heads.to_vec();
+        while let Some(cid) = pending.pop() {
+            if nodes.contains_key(&cid) {
+                continue;
+            }
+            let change = self.nodes.get(&cid)?.clone();
+            pending.extend(change.causal_dependencies.iter().copied());
+            nodes.insert(cid, change);
+        }
+        let max_head_height = heads
+            .iter()
+            .filter_map(|head| nodes.get(head))
+            .map(|change| change.causal_height)
+            .max()
+            .unwrap_or(0);
+        Some(Self {
+            heads: heads.to_vec(),
+            nodes,
+            max_head_height,
+        })
+    }
+
+    /// Extend one already-validated local DAG with an accepted change and
+    /// select the canonical union of the current heads and that change.
+    ///
+    /// This keeps Apply on one ancestry walk: validation loads the union of
+    /// the committed and observed frontiers, then staging adds the new node
+    /// in memory before materialization.
+    pub fn with_change(mut self, current_heads: &[Hash], change: CrdtChangeV2) -> Option<Self> {
+        let expected_height = change
+            .causal_dependencies
+            .iter()
+            .map(|dependency| self.nodes.get(dependency).map(|node| node.causal_height))
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)?;
+        if change.causal_height != expected_height {
+            return None;
+        }
+        let cid = change.cid();
+        if let Some(existing) = self.nodes.get(&cid)
+            && existing != &change
+        {
+            return None;
+        }
+        self.nodes.insert(cid, change);
+        self.heads = current_heads.to_vec();
+        self.heads.push(cid);
+        self.heads.sort();
+        self.heads.dedup();
+        self.heads = self.canonical_heads();
+        self.max_head_height = self
+            .heads
+            .iter()
+            .filter_map(|head| self.nodes.get(head))
+            .map(|node| node.causal_height)
+            .max()
+            .unwrap_or(0);
+        Some(self)
+    }
+
     pub fn contains_ancestor(&self, descendant: Hash, ancestor: Hash) -> bool {
         if descendant == ancestor {
             return true;
@@ -218,6 +286,10 @@ mod tests {
             load_causal_frontier(&heads, |cid| Ok::<_, Infallible>(nodes.get(&cid).cloned()))
                 .unwrap();
         assert_eq!(frontier.max_head_height, 2);
+        let left_only = frontier.at_heads(&[left_cid]).unwrap();
+        assert_eq!(left_only.canonical_heads(), vec![left_cid]);
+        assert_eq!(left_only.nodes_in_causal_order().len(), 2);
+
         let descriptor = ActorGenesisV2 {
             actor: ActorId([7; 32]),
             parent: None,
@@ -230,6 +302,12 @@ mod tests {
         assert_eq!(states.len(), 2);
         assert!(states.contains(&BlobRefV2::of_bytes(&[2])));
         assert!(states.contains(&BlobRefV2::of_bytes(&[3])));
+
+        let merged = change(4, heads.clone(), 3, Some(4));
+        let merged_cid = merged.cid();
+        let extended = frontier.with_change(&heads, merged).unwrap();
+        assert_eq!(extended.canonical_heads(), vec![merged_cid]);
+        assert_eq!(extended.max_head_height, 3);
 
         let missing = load_causal_frontier(&heads, |cid| {
             Ok::<_, Infallible>((cid != root_cid).then(|| nodes[&cid].clone()))
