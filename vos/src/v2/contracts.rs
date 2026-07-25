@@ -191,6 +191,11 @@ pub struct CheckpointTokenV2 {
     /// contains the envelope from the slice that created the checkpoint, so
     /// the host must bind the resumed slice explicitly.
     pub work_hash: Hash,
+    /// Current work envelope injected only when resuming an exact snapshot.
+    /// The restored service VM still holds the pre-suspension Rust frame, so
+    /// it must explicitly rebind that frame before emitting workflow state.
+    /// Initial step-0 checkpoint finalization carries `None`.
+    pub resume_work: Option<WorkEnvelopeV2>,
     /// Causal height of `base` for a CRDT slice. Linear slices carry `None`.
     pub base_causal_height: Option<u64>,
     /// Fresh allocator namespace installed after an exact CRDT resume.
@@ -2397,6 +2402,7 @@ fn encode_checkpoint_token(e: &mut Encoder<'_>, value: &CheckpointTokenV2) {
     e.u64(value.input.workflow_step);
     encode_base(e, &value.base);
     e.fixed(&value.work_hash.0);
+    e.option(&value.resume_work, |e, work| e.bytes(&work.encode()));
     e.option(&value.base_causal_height, |e, height| e.u64(*height));
     e.option(&value.change, |e, dispatch| {
         e.fixed(&dispatch.change.0);
@@ -2415,6 +2421,7 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, Dec
         },
         base: decode_base(d)?,
         work_hash: Hash(d.fixed()?),
+        resume_work: d.option(|d| WorkEnvelopeV2::decode(&d.bytes()?))?,
         base_causal_height: d.option(Decoder::u64)?,
         change: d.option(|d| {
             Ok(CrdtDispatchV2 {
@@ -2430,6 +2437,13 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, Dec
     if value.change.is_some() != is_crdt
         || value.base_causal_height.is_some() != is_crdt
         || value.change.is_some_and(|dispatch| dispatch.ordinal != 0)
+        || value.resume_work.as_ref().is_some_and(|work| {
+            work.input_id() != value.input
+                || work.base != value.base
+                || work.hash() != value.work_hash
+                || work.base_causal_height != value.base_causal_height
+                || CrdtChangeV2::derive_id(work) != value.change.map(|dispatch| dispatch.change)
+        })
     {
         return Err(DecodeError::NonCanonical);
     }
@@ -2782,6 +2796,7 @@ mod tests {
                 state_root: Hash([25; 32]),
             },
             work_hash: Hash([27; 32]),
+            resume_work: None,
             base_causal_height: None,
             change: None,
             expected: Some(Hash([26; 32])),
@@ -2791,6 +2806,28 @@ mod tests {
         assert_eq!(
             CheckpointTokenV2::decode(&checkpoint.encode()).unwrap(),
             checkpoint
+        );
+
+        let mut rebound_work = work();
+        rebound_work.invocation = checkpoint.input.invocation;
+        rebound_work.workflow_step = checkpoint.input.workflow_step;
+        rebound_work.base = checkpoint.base.clone();
+        let mut resumed_checkpoint = checkpoint.clone();
+        resumed_checkpoint.work_hash = rebound_work.hash();
+        resumed_checkpoint.resume_work = Some(rebound_work);
+        assert_eq!(
+            CheckpointTokenV2::decode(&resumed_checkpoint.encode()).unwrap(),
+            resumed_checkpoint
+        );
+        let mut mismatched_resume = resumed_checkpoint;
+        mismatched_resume
+            .resume_work
+            .as_mut()
+            .unwrap()
+            .workflow_step += 1;
+        assert_eq!(
+            CheckpointTokenV2::decode(&mismatched_resume.encode()),
+            Err(DecodeError::NonCanonical)
         );
 
         let mut mismatched_change = checkpoint.clone();

@@ -67,7 +67,7 @@ mod guest {
     ) -> OutputWindow {
         // SAFETY: JAM initializes a readable argument window at (a0, a1).
         let input = unsafe { core::slice::from_raw_parts(arguments, arguments_len) };
-        let work = WorkEnvelopeV2::decode(input).unwrap_or_else(|_| fail_closed());
+        let mut work = WorkEnvelopeV2::decode(input).unwrap_or_else(|_| fail_closed());
         if work.service.service_abi != vos::v2::ABI_VERSION
             || work.service.execution_semantics != vos::v2::EXECUTION_SEMANTICS_ID
             || !work.base.mode_compatible(work.consistency)
@@ -121,6 +121,29 @@ mod guest {
             ActorSliceOutputV2::decode(actor_output_bytes).unwrap_or_else(|_| fail_closed());
         if actor_output.actor != work.target || actor_output.forbidden {
             fail_closed();
+        }
+        if let Some(checkpoint) = actor_output.checkpoint.as_ref() {
+            if checkpoint.input != work.input_id() {
+                work = checkpoint
+                    .resume_work
+                    .clone()
+                    .unwrap_or_else(|| fail_closed());
+            } else if checkpoint
+                .resume_work
+                .as_ref()
+                .is_some_and(|resume_work| resume_work != &work)
+            {
+                fail_closed();
+            }
+            if checkpoint.input != work.input_id()
+                || checkpoint.base != work.base
+                || checkpoint.work_hash != work.hash()
+                || checkpoint.base_causal_height != work.base_causal_height
+                || checkpoint.change.map(|dispatch| dispatch.change)
+                    != CrdtChangeV2::derive_id(&work)
+            {
+                fail_closed();
+            }
         }
 
         let outbox = actor_output

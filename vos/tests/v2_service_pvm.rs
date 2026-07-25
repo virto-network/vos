@@ -706,6 +706,13 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
         second.transition.continuations[0].replacement, None,
         "the resumed slice consumes its durable continuation"
     );
+    assert_eq!(second.transition.consumed_input, second_work.input_id());
+    assert_eq!(second.transition.base, second_work.base);
+    assert_eq!(second_change.work_hash, second_work.hash());
+    assert_eq!(
+        second_change.workflow,
+        second.transition.workflow_operations(&second_work)
+    );
     let second_cid = second_change.cid();
     let accepted = service
         .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
@@ -716,7 +723,7 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
         .unwrap()
         .result;
     let AccumulationResultV2::Accepted { receipt, .. } = accepted else {
-        panic!("resumed CRDT slice rejected")
+        panic!("resumed CRDT slice rejected: {accepted:?}")
     };
     assert_eq!(receipt.resulting_crdt_heads, vec![second_cid]);
 }
