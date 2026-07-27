@@ -1183,6 +1183,16 @@ fn apply<S: GuestAccumulateStoreV2>(
         }
     }
     for candidate in &envelope.provided_blobs {
+        if transition
+            .proof
+            .as_ref()
+            .is_some_and(|proof| proof.proof_blob == candidate.reference)
+        {
+            // Proof bytes are staged after the guest has derived and checked
+            // the statement. They are still available before PROOF_VERIFY and
+            // remain part of this same atomic Accumulate transaction.
+            continue;
+        }
         let actual = tree
             .store_mut()
             .provide_blob(&candidate.bytes)
@@ -1375,6 +1385,21 @@ fn apply<S: GuestAccumulateStoreV2>(
             .statement;
         if proof.statement != statement.commitment() {
             return Ok(rejected(AccumulationRejectionV2::InvalidProof));
+        }
+        if let Ok(index) = envelope
+            .provided_blobs
+            .binary_search_by_key(&proof.proof_blob.hash, |blob| blob.reference.hash)
+        {
+            let candidate = &envelope.provided_blobs[index];
+            if candidate.reference != proof.proof_blob {
+                return Err(GuestAccumulateError::CorruptStore);
+            }
+            let actual = store
+                .provide_blob(&candidate.bytes)
+                .map_err(GuestAccumulateError::Storage)?;
+            if actual != candidate.reference {
+                return Err(GuestAccumulateError::CorruptStore);
+            }
         }
         let verification = ProofVerificationRequestV2 {
             actor_program: work.target_program,

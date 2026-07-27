@@ -2925,7 +2925,7 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
 
     let genesis = ServiceGenesisV2 {
         service: seed.service.clone(),
-        consistency: ConsistencyModeV2::Local,
+        consistency: ConsistencyModeV2::Raft,
         actors: vec![ActorGenesisV2 {
             actor: seed.target,
             parent: None,
@@ -2996,11 +2996,7 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
         consumed_input: prepared.work.input_id(),
         target_program: prepared.work.target_program,
         base: prepared.work.base.clone(),
-        writes: vec![ActorWriteV2 {
-            actor: prepared.work.target,
-            key: vos::lifecycle::STATE_KEY_BYTES.to_vec(),
-            value: Some(b"attested state".to_vec()),
-        }],
+        writes: vec![],
         crdt_change: None,
         continuations: vec![],
         inbox: vec![],
