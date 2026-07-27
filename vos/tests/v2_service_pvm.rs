@@ -100,6 +100,10 @@ impl TestCommittedLog {
     fn commit_before_next_proposal(&mut self, request: Vec<u8>) {
         self.before_next_proposal.push(request);
     }
+
+    fn committed_len(&self) -> usize {
+        self.shared.lock().unwrap().entries.len()
+    }
 }
 
 impl CommittedAccumulateLogV2 for TestCommittedLog {
@@ -3351,6 +3355,20 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
     let mut follower =
         ReplicatedJamServiceV2::new(follower_service, TestCommittedLog::new(shared_log, false));
 
+    let mut wrong_program = genesis.clone();
+    wrong_program.service.service_program = ProgramId([0xFF; 32]);
+    assert!(matches!(
+        leader.accumulate(&AccumulateRequestV2::Install(wrong_program)),
+        Err(vos::v2::ReplicatedServiceErrorV2::Dispatch(
+            ServiceDispatchError::ServiceProgramMismatch { .. }
+        ))
+    ));
+    assert_eq!(
+        leader.log().committed_len(),
+        0,
+        "a locally detectable service-program mismatch never enters Raft"
+    );
+
     assert!(matches!(
         leader
             .accumulate(&AccumulateRequestV2::Install(genesis))
@@ -3552,6 +3570,141 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
     );
     assert_eq!(leader.log_mut().applied_index().unwrap(), 4);
     assert_eq!(follower.log_mut().applied_index().unwrap(), 4);
+}
+
+#[test]
+fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
+    let elf = service_elf();
+    let service_pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
+    let service_program = ProgramId::of_pvm(&service_pvm);
+    let actor_pvm = actor_pvm(0);
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_bytes = b"raft failure classification".to_vec();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let seed = work(actor_program, initial.clone());
+    let genesis = ServiceGenesisV2 {
+        service: seed.service,
+        consistency: ConsistencyModeV2::Raft,
+        actors: vec![ActorGenesisV2 {
+            actor: seed.target,
+            parent: None,
+            program: actor_program,
+            initial_state: initial.clone(),
+            crdt: false,
+            methods: vec![MethodPolicyV2 {
+                method: "start".into(),
+                schema: Hash([0xD1; 32]),
+                policy: Hash([0xD2; 32]),
+                public: true,
+                attested: false,
+            }],
+        }],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([0xD3; 32]),
+            authenticator: vec![0xD4],
+        },
+    };
+
+    let mut poison_host = LocalJamStoreV2::default();
+    assert_eq!(poison_host.import_blob(initial_bytes.clone()), initial);
+    assert_eq!(poison_host.import_program(actor_pvm.clone()), actor_program);
+    poison_host.allow_install(&genesis);
+    let poison_log =
+        TestCommittedLog::new(Arc::new(Mutex::new(SharedCommittedLog::default())), true);
+    let poison_service = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        poison_host,
+        100_000_000,
+        9_000_000,
+    )
+    .unwrap();
+    let mut poisoned = ReplicatedJamServiceV2::new(poison_service, poison_log);
+    let poison_result = poisoned.accumulate(&AccumulateRequestV2::Install(genesis.clone()));
+    assert!(
+        matches!(
+            poison_result,
+            Err(vos::v2::ReplicatedServiceErrorV2::Dispatch(
+                ServiceDispatchError::Pvm(ServicePvmErrorV2::OutOfGas { .. })
+            ))
+        ),
+        "unexpected deterministic failure: {poison_result:?}"
+    );
+    assert_eq!(
+        poisoned.log_mut().applied_index().unwrap(),
+        1,
+        "a deterministic guest failure is recorded as an ordered no-op"
+    );
+    assert_eq!(
+        poisoned.catch_up().unwrap(),
+        0,
+        "the poisoned entry is not replayed forever"
+    );
+    assert!(
+        poisoned
+            .service()
+            .accumulate_host()
+            .header()
+            .unwrap()
+            .is_none()
+    );
+
+    let mut retry_host = DurableJamStoreV2::open(FailableCommittedImages {
+        image: None,
+        fail_next_commit: true,
+    })
+    .unwrap();
+    assert_eq!(retry_host.import_blob(initial_bytes), initial);
+    assert_eq!(retry_host.import_program(actor_pvm), actor_program);
+    retry_host.allow_install(&genesis);
+    let retry_log =
+        TestCommittedLog::new(Arc::new(Mutex::new(SharedCommittedLog::default())), true);
+    let retry_service = JamServiceV2::new(
+        service_pvm,
+        service_program,
+        NoRefineProtocolHostV2,
+        retry_host,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let mut retryable = ReplicatedJamServiceV2::new(retry_service, retry_log);
+    assert!(matches!(
+        retryable.accumulate(&AccumulateRequestV2::Install(genesis)),
+        Err(vos::v2::ReplicatedServiceErrorV2::Dispatch(
+            ServiceDispatchError::Pvm(ServicePvmErrorV2::AccumulateCommitRejected)
+        ))
+    ));
+    assert_eq!(
+        retryable.log_mut().applied_index().unwrap(),
+        0,
+        "a transient durable-host failure leaves the cursor for exact replay"
+    );
+    assert_eq!(retryable.log().committed_len(), 1);
+    assert!(
+        retryable
+            .service()
+            .accumulate_host()
+            .header()
+            .unwrap()
+            .is_none()
+    );
+    retryable
+        .service_mut()
+        .accumulate_host_mut()
+        .backend_mut()
+        .fail_next_commit = false;
+    assert_eq!(retryable.catch_up().unwrap(), 1);
+    assert_eq!(retryable.log_mut().applied_index().unwrap(), 1);
+    assert!(
+        retryable
+            .service()
+            .accumulate_host()
+            .header()
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]

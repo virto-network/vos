@@ -119,6 +119,23 @@ pub enum ServiceDispatchError {
     InvalidAccumulateOutput,
 }
 
+impl ServiceDispatchError {
+    /// Whether replaying the same committed request against the same service
+    /// program and gas schedule must reproduce this failure. Such an entry is
+    /// an ordered no-op: replicas advance past it after discarding the guest
+    /// staging transaction. A durable commit rejection remains retryable and
+    /// must leave the apply cursor untouched.
+    fn is_deterministic_accumulate_failure(&self) -> bool {
+        match self {
+            Self::Pvm(ServicePvmErrorV2::AccumulateCommitRejected) => false,
+            Self::Pvm(_) | Self::ServiceProgramMismatch { .. } | Self::InvalidAccumulateOutput => {
+                true
+            }
+            Self::InvalidRefineOutput => true,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ReplicatedServiceErrorV2<E> {
     Dispatch(ServiceDispatchError),
@@ -330,16 +347,25 @@ where
             }
             let request = AccumulateRequestV2::decode(&entry.request)
                 .map_err(|_| ReplicatedServiceErrorV2::InvalidCommittedLog)?;
-            let output = self
-                .service
-                .accumulate(&request)
-                .map_err(ReplicatedServiceErrorV2::Dispatch)?;
+            let outcome = self.service.accumulate(&request);
+            if let Err(error) = outcome.as_ref()
+                && !error.is_deterministic_accumulate_failure()
+            {
+                return Err(ReplicatedServiceErrorV2::Dispatch(*error));
+            }
             let service_image = self.service.accumulate_host().committed_service_image();
             self.log
                 .mark_applied(entry.index, &service_image)
                 .map_err(ReplicatedServiceErrorV2::Log)?;
+            let output = match outcome {
+                Ok(output) => Some(output),
+                Err(error) if is_captured => {
+                    return Err(ReplicatedServiceErrorV2::Dispatch(error));
+                }
+                Err(_) => None,
+            };
             if is_captured {
-                captured = Some(output);
+                captured = output;
             }
             cursor = entry.index;
             applied_entries += 1;
@@ -411,6 +437,9 @@ where
                 .map_err(ReplicatedServiceErrorV2::Dispatch);
         }
 
+        self.service
+            .validate_service_program(request.service().service_program)
+            .map_err(ReplicatedServiceErrorV2::Dispatch)?;
         let request_bytes = request.encode();
         let entry = self
             .log
