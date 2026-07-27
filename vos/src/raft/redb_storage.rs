@@ -50,6 +50,10 @@ pub(crate) const RAFT_APPLIED_STATE_V2: TableDefinition<u64, &[u8]> =
     TableDefinition::new("raft_applied_state_v2");
 const RAFT_APPLIED_STATE_V2_MARKER_INDEX: u64 = 0;
 const RAFT_APPLIED_STATE_V2_MARKER: &[u8] = b"VOS_RAFT_APPLIED_STATE_V2";
+/// Matches the worker's effective compaction hysteresis. Keeping a recent
+/// window lets a newly elected leader freeze an exact nearby boundary without
+/// retaining one complete service image for every request forever.
+pub(crate) const RAFT_APPLIED_STATE_V2_RETENTION: u64 = 16;
 
 /// Encode a `vos_raft::EntryKind<u16>` to its on-disk byte
 /// sequence. The leading byte is the kind tag; the rest is
@@ -444,6 +448,16 @@ pub(crate) fn write_applied_state_v2_in_txn(
         RAFT_APPLIED_STATE_V2_MARKER,
     )?;
     table.insert(index, state)?;
+    let prune_through = index.saturating_sub(RAFT_APPLIED_STATE_V2_RETENTION);
+    if prune_through > 0 {
+        let keys = table
+            .range(1..=prune_through)?
+            .map(|row| row.map(|(key, _)| key.value()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for key in keys {
+            table.remove(key)?;
+        }
+    }
     Ok(())
 }
 

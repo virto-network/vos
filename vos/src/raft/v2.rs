@@ -323,6 +323,11 @@ impl CommittedAccumulateLogV2 for RaftAccumulateLogV2 {
             service_image: service_image.to_vec(),
         }
         .encode();
+        CommittedServiceSnapshotV2::decode(&snapshot).map_err(|_| {
+            CommitError::Config(
+                "raft v2 applied service image exceeds the committed snapshot wire limits".into(),
+            )
+        })?;
         let transaction = self.db.begin_write()?;
         super::redb_storage::write_applied_state_v2_in_txn(&transaction, index, &snapshot)?;
         self.meta.last_applied = index;
@@ -484,6 +489,46 @@ mod tests {
             Some(0)
         );
         drop(storage);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn applied_service_image_history_is_bounded_without_worker_compaction() {
+        use redb::ReadableTable;
+
+        let (path, directory) = temp_path();
+        let db = Arc::new(Database::create(&path).unwrap());
+        let mut log = RaftAccumulateLogV2::from_db_arc(db.clone(), RaftConfig::default()).unwrap();
+        let total = super::super::redb_storage::RAFT_APPLIED_STATE_V2_RETENTION + 4;
+        for index in 1..=total {
+            let entry = log.propose(&request(index as u8).encode()).unwrap();
+            assert_eq!(entry.index, index);
+            log.mark_applied(entry.index, &service_image(index as u8))
+                .unwrap();
+        }
+        drop(log);
+
+        let transaction = db.begin_read().unwrap();
+        let table = transaction
+            .open_table(super::super::redb_storage::RAFT_APPLIED_STATE_V2)
+            .unwrap();
+        let keys = table
+            .iter()
+            .unwrap()
+            .map(|row| row.unwrap().0.value())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys.len() as u64,
+            super::super::redb_storage::RAFT_APPLIED_STATE_V2_RETENTION + 1,
+            "the marker plus only the recent exact-image window are retained"
+        );
+        assert_eq!(keys[0], 0);
+        assert_eq!(
+            keys[1],
+            total - super::super::redb_storage::RAFT_APPLIED_STATE_V2_RETENTION + 1
+        );
+        drop(table);
+        drop(transaction);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
