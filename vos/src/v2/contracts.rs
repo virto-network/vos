@@ -3126,6 +3126,27 @@ mod tests {
         });
         assert_eq!(AccumulateRequestV2::decode(&apply.encode()).unwrap(), apply);
 
+        let AccumulateRequestV2::Apply(mut mismatched_proof) = apply.clone() else {
+            unreachable!()
+        };
+        let proof_bytes = b"canonical proof bytes";
+        let proof_blob = BlobRefV2::of_bytes(proof_bytes);
+        mismatched_proof.transition.proof = Some(ProofCommitmentV2 {
+            statement: Hash([14; 32]),
+            trace: Hash([15; 32]),
+            proof_blob: proof_blob.clone(),
+            statement_version: super::super::ATTESTATION_STATEMENT_VERSION,
+        });
+        mismatched_proof.provided_blobs = vec![ImportedBlobV2 {
+            reference: proof_blob,
+            bytes: b"different proof bytes".to_vec(),
+        }];
+        assert_eq!(
+            AccumulateRequestV2::decode(&AccumulateRequestV2::Apply(mismatched_proof).encode()),
+            Err(DecodeError::NonCanonical),
+            "a content-mismatched proof cannot enter a canonical Raft request"
+        );
+
         let AccumulateRequestV2::Apply(mut divergent) = apply else {
             unreachable!()
         };

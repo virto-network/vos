@@ -65,11 +65,15 @@ statement from committed service state, the exact work and transition, and the
 installed method policy; the host does not reconstruct those public inputs.
 The proof producer receives that preparation together with the canonical
 service PVM and Refine imports, and the final Apply carries the proof bytes as
-a content-addressed blob. Guest Accumulate re-derives the statement, invokes
-`PROOF_VERIFY`, and commits or publishes the proof package only when that exact
-request is valid and available. Raft orders only the final proved Apply:
-preparation remains read-only, while followers stage the carried proof bytes
-and execute the same guest verifier gate before advancing their apply cursor.
+a content-addressed verifier/CAS input. Proof bytes do not enter the
+recoverable service image or its retained Raft snapshots; the committed
+publication stores only their content reference. Guest Accumulate re-derives
+the statement, invokes `PROOF_VERIFY`, and commits or publishes the proof
+package only when that exact request is valid and available. Raft orders only
+the final proved Apply: preparation remains read-only, while followers hydrate
+the verifier from the carried proof bytes and execute the same guest gate
+before advancing their apply cursor. An exact retry recovers the existing
+proof publication during preparation and does not propose another Apply.
 
 The local proof producer and proof-verification allowlist are conformance
 seams, not a production proof system. A production host must replace them with

@@ -50,9 +50,10 @@ pub(crate) const RAFT_APPLIED_STATE_V2: TableDefinition<u64, &[u8]> =
     TableDefinition::new("raft_applied_state_v2");
 const RAFT_APPLIED_STATE_V2_MARKER_INDEX: u64 = 0;
 const RAFT_APPLIED_STATE_V2_MARKER: &[u8] = b"VOS_RAFT_APPLIED_STATE_V2";
-/// Matches the worker's effective compaction hysteresis. Keeping a recent
-/// window lets a newly elected leader freeze an exact nearby boundary without
-/// retaining one complete service image for every request forever.
+/// Independent hard cap on post-apply images retained in addition to the
+/// marker row. The value currently matches the default worker compaction
+/// hysteresis, but pruning happens on every applied cursor advance—including
+/// single-node and follower operation—and does not depend on leader compaction.
 pub(crate) const RAFT_APPLIED_STATE_V2_RETENTION: u64 = 16;
 
 /// Encode a `vos_raft::EntryKind<u16>` to its on-disk byte
