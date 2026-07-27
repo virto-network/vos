@@ -2963,6 +2963,7 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
     else {
         panic!("attested service install failed")
     };
+    let installed_blob_count = service.accumulate_host().blob_count();
 
     let prepared = LocalWorkSchedulerV2::prepare(
         service.accumulate_host(),
@@ -3034,7 +3035,7 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
         "proof production failure cannot commit the prepared transition"
     );
 
-    let proof_bytes = b"canonical attestation proof".to_vec();
+    let proof_bytes = vec![0xA6; 1024 * 1024];
     let mut producer = CanonicalTestProofProducer {
         trace: Hash([0xA5; 32]),
         proof: proof_bytes.clone(),
@@ -3048,6 +3049,11 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
     assert_eq!(committed.preparation.receipt.sequence, 1);
     assert_eq!(committed.published.proof, Some(committed.proof.clone()));
     assert_eq!(service.accumulate_host().commit_sequence(), 2);
+    assert_eq!(
+        service.accumulate_host().blob_count(),
+        installed_blob_count,
+        "a megabyte proof remains outside the recoverable service image"
+    );
 
     let retried = service
         .accumulate_attested(envelope, &prepared.imports, &mut producer)
@@ -3062,6 +3068,7 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
         2,
         "the duplicate preparation neither reapplies nor commits"
     );
+    assert_eq!(service.accumulate_host().blob_count(), installed_blob_count);
 }
 
 #[test]
