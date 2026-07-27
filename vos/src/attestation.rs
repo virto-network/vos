@@ -751,10 +751,28 @@ mod tests {
             preparation
         );
 
+        let mut committed = preparation.clone();
+        committed.committed_proof = Some(ProofCommitmentV2 {
+            statement: committed.statement.commitment(),
+            trace: Hash([17; 32]),
+            proof_blob: BlobRefV2::of_bytes(b"committed proof"),
+            statement_version: crate::v2::ATTESTATION_STATEMENT_VERSION,
+        });
+        assert_eq!(
+            AttestationPreparationV2::decode(&committed.encode()).unwrap(),
+            committed
+        );
+
         let mut mismatched = preparation;
         mismatched.receipt.sequence += 1;
         assert_eq!(
             AttestationPreparationV2::decode(&mismatched.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+
+        committed.committed_proof.as_mut().unwrap().statement = Hash([18; 32]);
+        assert_eq!(
+            AttestationPreparationV2::decode(&committed.encode()),
             Err(DecodeError::NonCanonical)
         );
     }
