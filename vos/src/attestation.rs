@@ -7,9 +7,9 @@ use core::marker::PhantomData;
 
 use crate::v2::wire::{Decoder, Encoder};
 use crate::v2::{
-    AccumulationReceiptV2, ActorId, DecodeError, DeploymentId, Hash, InvocationId, MethodPolicyV2,
-    ProducerId, ProgramId, ProofVerificationRequestV2, RefineImportsV2, SpaceId, TransitionV2,
-    V2Wire, WorkEnvelopeV2,
+    AccumulationReceiptV2, ActorId, BlobRefV2, DecodeError, DeploymentId, Hash, InvocationId,
+    MethodPolicyV2, ProducerId, ProgramId, ProofCommitmentV2, ProofVerificationRequestV2,
+    RefineImportsV2, SpaceId, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +46,9 @@ pub struct AttestationStatementV3 {
 pub struct AttestationPreparationV2 {
     pub receipt: AccumulationReceiptV2,
     pub statement: AttestationStatementV3,
+    /// Existing proof publication for an exact already-committed input.
+    /// `None` means the transition still requires proof production and Apply.
+    pub committed_proof: Option<ProofCommitmentV2>,
 }
 
 impl AttestationPreparationV2 {
@@ -57,13 +60,23 @@ impl AttestationPreparationV2 {
     ) -> Result<Self, AttestationError> {
         let statement =
             AttestationStatementV3::for_transition(work, transition, policy, receipt.clone())?;
-        Ok(Self { receipt, statement })
+        Ok(Self {
+            receipt,
+            statement,
+            committed_proof: None,
+        })
     }
 
     pub fn validate(&self) -> Result<(), AttestationError> {
         self.statement.validate()?;
         if self.statement.accumulation_receipt != self.receipt {
             return Err(AttestationError::ReceiptMismatch);
+        }
+        if let Some(proof) = &self.committed_proof
+            && (proof.statement != self.statement.commitment()
+                || proof.statement_version != crate::v2::ATTESTATION_STATEMENT_VERSION)
+        {
+            return Err(AttestationError::InvalidProof);
         }
         Ok(())
     }
@@ -118,12 +131,41 @@ impl V2Wire for AttestationPreparationV2 {
         let mut encoder = Encoder(out);
         encoder.bytes(&self.receipt.encode());
         encoder.bytes(&self.statement.encode());
+        encoder.option(&self.committed_proof, |encoder, proof| {
+            encoder.fixed(&proof.statement.0);
+            encoder.fixed(&proof.trace.0);
+            encoder.fixed(&proof.proof_blob.hash.0);
+            encoder.u64(proof.proof_blob.len);
+            encoder.u16(proof.statement_version);
+        });
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let receipt = AccumulationReceiptV2::decode(&decoder.bytes()?)?;
+        let statement = AttestationStatementV3::decode(&decoder.bytes()?)?;
+        let committed_proof = decoder.option(|decoder| {
+            let proof = ProofCommitmentV2 {
+                statement: Hash(decoder.fixed()?),
+                trace: Hash(decoder.fixed()?),
+                proof_blob: BlobRefV2 {
+                    hash: Hash(decoder.fixed()?),
+                    len: decoder.u64()?,
+                },
+                statement_version: decoder.u16()?,
+            };
+            if proof.statement == Hash::ZERO
+                || proof.trace == Hash::ZERO
+                || proof.proof_blob.len == u64::MAX
+                || proof.statement_version != crate::v2::ATTESTATION_STATEMENT_VERSION
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+            Ok(proof)
+        })?;
         let value = Self {
-            receipt: AccumulationReceiptV2::decode(&decoder.bytes()?)?,
-            statement: AttestationStatementV3::decode(&decoder.bytes()?)?,
+            receipt,
+            statement,
+            committed_proof,
         };
         value.validate().map_err(|_| DecodeError::NonCanonical)?;
         Ok(value)
@@ -317,6 +359,14 @@ pub trait AttestationProofProducerV2 {
 /// publishes an application attestation package.
 pub trait AttestationProofHostV2 {
     fn make_proof_available(&mut self, request: &ProofVerificationRequestV2, proof: &[u8]) -> bool;
+
+    /// Recover an already-verified proof artifact for an idempotent retry.
+    /// Production hosts back this with their durable proof CAS; conformance
+    /// hosts may return `None` after a process restart and deterministically
+    /// reproduce the proof instead.
+    fn proof_bytes(&self, _reference: &BlobRefV2) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 impl V2Wire for AttestationStatementV3 {
@@ -672,6 +722,7 @@ mod tests {
         let preparation = AttestationPreparationV2 {
             receipt: package.statement.accumulation_receipt.clone(),
             statement: package.statement.clone(),
+            committed_proof: None,
         };
         assert_eq!(
             AttestationPreparationV2::decode(&preparation.encode()).unwrap(),

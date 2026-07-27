@@ -3041,13 +3041,27 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
         calls: 0,
     };
     let committed = service
-        .accumulate_attested(envelope, &prepared.imports, &mut producer)
+        .accumulate_attested(envelope.clone(), &prepared.imports, &mut producer)
         .expect("proof is available before guest Accumulate commits");
     assert_eq!(producer.calls, 1);
     assert_eq!(committed.proof_bytes, proof_bytes);
     assert_eq!(committed.preparation.receipt.sequence, 1);
-    assert_eq!(committed.published.proof, Some(committed.proof));
+    assert_eq!(committed.published.proof, Some(committed.proof.clone()));
     assert_eq!(service.accumulate_host().commit_sequence(), 2);
+
+    let retried = service
+        .accumulate_attested(envelope, &prepared.imports, &mut producer)
+        .expect("an exact retry recovers the committed proof publication");
+    assert_eq!(producer.calls, 1, "the cached proof is not regenerated");
+    assert_eq!(retried.proof, committed.proof);
+    assert_eq!(retried.proof_bytes, committed.proof_bytes);
+    assert_eq!(retried.published, committed.published);
+    assert_eq!(retried.accumulate_gas_used, 0);
+    assert_eq!(
+        service.accumulate_host().commit_sequence(),
+        2,
+        "the duplicate preparation neither reapplies nor commits"
+    );
 }
 
 #[test]
@@ -4062,16 +4076,13 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         proof: b"raft canonical proof".to_vec(),
         calls: 0,
     };
+    let envelope = AccumulationEnvelopeV2 {
+        work: prepared.work,
+        transition,
+        provided_blobs: vec![],
+    };
     let committed = leader
-        .accumulate_attested(
-            AccumulationEnvelopeV2 {
-                work: prepared.work,
-                transition,
-                provided_blobs: vec![],
-            },
-            &prepared.imports,
-            &mut producer,
-        )
+        .accumulate_attested(envelope.clone(), &prepared.imports, &mut producer)
         .expect("leader proves before proposing Apply");
     assert_eq!(producer.calls, 1);
     assert_eq!(committed.published.proof, Some(committed.proof.clone()));
@@ -4083,7 +4094,20 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
     else {
         panic!("the second Raft entry was not the proved Apply")
     };
-    assert_eq!(logged.transition.proof, Some(committed.proof));
+    assert_eq!(logged.transition.proof, Some(committed.proof.clone()));
+
+    let retried = leader
+        .accumulate_attested(envelope, &prepared.imports, &mut producer)
+        .expect("an exact retry resolves from the committed publication");
+    assert_eq!(producer.calls, 1, "the cached proof is reused");
+    assert_eq!(retried.proof, committed.proof);
+    assert_eq!(retried.proof_bytes, committed.proof_bytes);
+    assert_eq!(retried.accumulate_gas_used, 0);
+    assert_eq!(
+        shared_log.lock().unwrap().entries.len(),
+        2,
+        "a duplicate attestation never proposes another Apply"
+    );
 
     assert_eq!(follower.catch_up().unwrap(), 2);
     assert!(

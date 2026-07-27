@@ -654,11 +654,22 @@ impl AttestationProofHostV2 for LocalJamStoreV2 {
         self.allow_proof(request);
         true
     }
+
+    fn proof_bytes(&self, reference: &BlobRefV2) -> Option<Vec<u8>> {
+        self.proof_blobs
+            .get(&reference.hash.0)
+            .filter(|bytes| reference.matches(bytes))
+            .cloned()
+    }
 }
 
 impl<B> AttestationProofHostV2 for DurableJamStoreV2<B> {
     fn make_proof_available(&mut self, request: &ProofVerificationRequestV2, proof: &[u8]) -> bool {
         self.local.make_proof_available(request, proof)
+    }
+
+    fn proof_bytes(&self, reference: &BlobRefV2) -> Option<Vec<u8>> {
+        self.local.proof_bytes(reference)
     }
 }
 

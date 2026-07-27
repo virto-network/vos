@@ -1035,12 +1035,30 @@ fn apply<S: GuestAccumulateStoreV2>(
                 duplicate: true,
             },
             ApplyMode::PrepareAttested => {
-                let preparation = match AttestationPreparationV2::for_transition(
+                let mut preparation = match AttestationPreparationV2::for_transition(
                     work, transition, &policy, receipt,
                 ) {
                     Ok(preparation) => preparation,
                     Err(_) => return Ok(rejected(AccumulationRejectionV2::InvalidProof)),
                 };
+                let Some(bytes) = read(store, &publication_storage_key(work.input_id()))? else {
+                    return Err(GuestAccumulateError::CorruptStore);
+                };
+                let publication = PublicationRecordV2::decode(&bytes)
+                    .map_err(|_| GuestAccumulateError::CorruptStore)?;
+                let Some(proof) = publication.published.proof.clone() else {
+                    return Err(GuestAccumulateError::CorruptStore);
+                };
+                if publication.input != work.input_id()
+                    || publication.receipt != preparation.receipt
+                    || publication.published.reply != transition.reply
+                    || publication.published.outbox != transition.outbox
+                    || publication.published.exported_blobs != transition.exported_blobs
+                    || proof.statement != preparation.statement.commitment()
+                {
+                    return Err(GuestAccumulateError::CorruptStore);
+                }
+                preparation.committed_proof = Some(proof);
                 AccumulationResultV2::Prepared(preparation)
             }
         });

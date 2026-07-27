@@ -386,6 +386,15 @@ where
             }
             _ => return Err(AttestedServiceErrorV2::InvalidPreparation),
         };
+        if preparation.committed_proof.is_some() {
+            return self.recover_prepared_attestation(
+                envelope,
+                imports,
+                preparation,
+                producer,
+                prepared.gas_used,
+            );
+        }
 
         let proved = self
             .prove_prepared_attestation(envelope, imports, preparation, producer)
@@ -463,6 +472,59 @@ where
             proof_bytes: produced.proof,
         })
     }
+
+    fn recover_prepared_attestation<E, P: AttestationProofProducerV2>(
+        &mut self,
+        envelope: AccumulationEnvelopeV2,
+        imports: &RefineImportsV2,
+        preparation: AttestationPreparationV2,
+        producer: &mut P,
+        prepare_gas_used: u64,
+    ) -> Result<CommittedAttestationOutputV2, AttestedServiceErrorV2<E, P::Error>> {
+        let proof = preparation
+            .committed_proof
+            .clone()
+            .ok_or(AttestedServiceErrorV2::InvalidPreparation)?;
+        let proof_bytes = if let Some(bytes) = self.accumulate_host.proof_bytes(&proof.proof_blob) {
+            bytes
+        } else {
+            let reproduced = self
+                .prove_prepared_attestation(
+                    envelope.clone(),
+                    imports,
+                    preparation.clone(),
+                    producer,
+                )
+                .map_err(map_attestation_build_error)?;
+            if reproduced.proof != proof {
+                return Err(AttestedServiceErrorV2::CommitMismatch);
+            }
+            reproduced.proof_bytes
+        };
+        if !proof.proof_blob.matches(&proof_bytes) {
+            return Err(AttestedServiceErrorV2::CommitMismatch);
+        }
+        let published = PublishedEffectsV2 {
+            reply: envelope.transition.reply,
+            outbox: envelope.transition.outbox,
+            exported_blobs: envelope.transition.exported_blobs,
+            proof: Some(proof.clone()),
+        };
+        validate_committed_attestation(
+            &preparation.receipt,
+            &proof,
+            &preparation.receipt,
+            &published,
+        )?;
+        Ok(CommittedAttestationOutputV2 {
+            preparation,
+            proof,
+            proof_bytes,
+            published,
+            prepare_gas_used,
+            accumulate_gas_used: 0,
+        })
+    }
 }
 
 fn map_attestation_build_error<E, P>(
@@ -479,7 +541,7 @@ fn map_attestation_build_error<E, P>(
 }
 
 fn finish_committed_attestation<E, P>(
-    proved: ProvedAttestationV2,
+    mut proved: ProvedAttestationV2,
     prepare_gas_used: u64,
     committed: AccumulatedServiceOutputV2,
 ) -> Result<CommittedAttestationOutputV2, AttestedServiceErrorV2<E, P>> {
@@ -500,6 +562,7 @@ fn finish_committed_attestation<E, P>(
         &receipt,
         &published,
     )?;
+    proved.preparation.committed_proof = Some(proved.proof.clone());
     Ok(CommittedAttestationOutputV2 {
         preparation: proved.preparation,
         proof: proved.proof,
@@ -708,6 +771,15 @@ where
             }
             _ => return Err(AttestedServiceErrorV2::InvalidPreparation),
         };
+        if preparation.committed_proof.is_some() {
+            return self.service.recover_prepared_attestation(
+                envelope,
+                imports,
+                preparation,
+                producer,
+                prepared.gas_used,
+            );
+        }
         let proved = self
             .service
             .prove_prepared_attestation(envelope, imports, preparation, producer)

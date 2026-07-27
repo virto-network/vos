@@ -1045,6 +1045,7 @@ mod tests {
             AccumulationResultV2::Prepared(crate::attestation::AttestationPreparationV2 {
                 receipt,
                 statement,
+                committed_proof: None,
             })
         }
         .encode()
