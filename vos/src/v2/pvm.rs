@@ -51,11 +51,21 @@ pub struct ServicePvmOutputV2 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServicePvmErrorV2 {
     InvalidProgram,
+    /// Local allocation or JIT setup failed before guest execution began.
+    /// Replaying on this or another replica may succeed, so Raft must not
+    /// classify the entry as a deterministic guest no-op.
+    KernelResourceUnavailable,
     ProgramIdMismatch,
     InvalidServiceEntries,
     Panic,
-    OutOfGas { vm: u16, pc: u32 },
-    PageFault { vm: u16, address: u32 },
+    OutOfGas {
+        vm: u16,
+        pc: u32,
+    },
+    PageFault {
+        vm: u16,
+        address: u32,
+    },
     UnreadableOutput,
     ForbiddenRefineProtocolCall(u8),
     RefineHostRejected(u8),
@@ -176,7 +186,7 @@ impl ServicePvmV2 {
         host: &H,
     ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
         let mut kernel = InvocationKernel::new(&self.program, arguments, gas_limit)
-            .map_err(|_| ServicePvmErrorV2::InvalidProgram)?;
+            .map_err(map_kernel_initialization_error)?;
         install_refine_scheduler_caps(&mut kernel);
         run_refine_kernel(
             kernel,
@@ -347,7 +357,7 @@ impl ServicePvmV2 {
             &dormant,
             backend,
         )
-        .map_err(|_| ServicePvmErrorV2::InvalidProgram)?;
+        .map_err(map_kernel_initialization_error)?;
         let (actor_input_len, actor_ipc_capacity) = install_actor_ipc(&mut kernel, &actor_input)?;
         // The GP argument registers remain phi[7]/phi[8]. These two additional
         // invocation-setup values arrive as the third/fourth Rust ABI
@@ -377,7 +387,7 @@ impl ServicePvmV2 {
         host: &mut H,
     ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
         let mut kernel = InvocationKernel::new(&self.program, arguments, gas_limit)
-            .map_err(|_| ServicePvmErrorV2::InvalidProgram)?;
+            .map_err(map_kernel_initialization_error)?;
         kernel
             .vm_arena
             .vm_mut(kernel.active_vm)
@@ -445,6 +455,20 @@ impl ServicePvmV2 {
                 }
             }
         }
+    }
+}
+
+fn map_kernel_initialization_error(error: javm::kernel::KernelError) -> ServicePvmErrorV2 {
+    match error {
+        javm::kernel::KernelError::MemoryError
+        | javm::kernel::KernelError::OutOfMemory
+        | javm::kernel::KernelError::CompileError => ServicePvmErrorV2::KernelResourceUnavailable,
+        javm::kernel::KernelError::InvalidBlob
+        | javm::kernel::KernelError::OutOfGas
+        | javm::kernel::KernelError::TooManyCodeCaps
+        | javm::kernel::KernelError::CapTableFull
+        | javm::kernel::KernelError::ImportHandleUnavailable(_)
+        | javm::kernel::KernelError::TooManyVms => ServicePvmErrorV2::InvalidProgram,
     }
 }
 

@@ -173,18 +173,52 @@ pub enum ServiceDispatchError {
 
 impl ServiceDispatchError {
     /// Whether replaying the same committed request against the same service
-    /// program and gas schedule must reproduce this failure. Such an entry is
-    /// an ordered no-op: replicas advance past it after discarding the guest
-    /// staging transaction. A durable commit rejection remains retryable and
-    /// must leave the apply cursor untouched.
+    /// program and gas schedule must reproduce this failure. This is an
+    /// explicit allowlist: new host/JAR failure variants remain retryable until
+    /// their determinism is proved. A deterministic guest failure is an
+    /// ordered no-op; local allocation, JIT, host, and durable-commit failures
+    /// leave the apply cursor untouched.
     fn is_deterministic_accumulate_failure(&self) -> bool {
         match self {
-            Self::Pvm(ServicePvmErrorV2::AccumulateCommitRejected) => false,
-            Self::Pvm(_) | Self::ServiceProgramMismatch { .. } | Self::InvalidAccumulateOutput => {
-                true
-            }
-            Self::InvalidRefineOutput => true,
+            Self::Pvm(error) => matches!(
+                error,
+                ServicePvmErrorV2::InvalidProgram
+                    | ServicePvmErrorV2::Panic
+                    | ServicePvmErrorV2::OutOfGas { .. }
+                    | ServicePvmErrorV2::PageFault { .. }
+                    | ServicePvmErrorV2::UnreadableOutput
+                    | ServicePvmErrorV2::InvalidAccumulateOutput
+                    | ServicePvmErrorV2::InvalidProtocolResume
+                    | ServicePvmErrorV2::InvalidVmLifecycle
+            ),
+            Self::ServiceProgramMismatch { .. } | Self::InvalidAccumulateOutput => true,
+            Self::InvalidRefineOutput => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn deterministic_accumulate_failures_are_an_explicit_allowlist() {
+        assert!(
+            ServiceDispatchError::Pvm(ServicePvmErrorV2::OutOfGas { vm: 0, pc: 5 })
+                .is_deterministic_accumulate_failure()
+        );
+        assert!(
+            !ServiceDispatchError::Pvm(ServicePvmErrorV2::KernelResourceUnavailable)
+                .is_deterministic_accumulate_failure()
+        );
+        assert!(
+            !ServiceDispatchError::Pvm(ServicePvmErrorV2::AccumulateHostRejected(123))
+                .is_deterministic_accumulate_failure()
+        );
+        assert!(
+            !ServiceDispatchError::Pvm(ServicePvmErrorV2::AccumulateCommitRejected)
+                .is_deterministic_accumulate_failure()
+        );
     }
 }
 

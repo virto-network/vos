@@ -3855,8 +3855,18 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
     assert_eq!(poison_host.import_blob(initial_bytes.clone()), initial);
     assert_eq!(poison_host.import_program(actor_pvm.clone()), actor_program);
     poison_host.allow_install(&genesis);
-    let poison_log =
-        TestCommittedLog::new(Arc::new(Mutex::new(SharedCommittedLog::default())), true);
+    let poison_shared = Arc::new(Mutex::new(SharedCommittedLog::default()));
+    let poison_log = TestCommittedLog::new(poison_shared.clone(), true);
+    let mut poison_follower_host = LocalJamStoreV2::default();
+    assert_eq!(
+        poison_follower_host.import_blob(initial_bytes.clone()),
+        initial
+    );
+    assert_eq!(
+        poison_follower_host.import_program(actor_pvm.clone()),
+        actor_program
+    );
+    poison_follower_host.allow_install(&genesis);
     let poison_service = JamServiceV2::new(
         service_pvm.clone(),
         service_program,
@@ -3867,6 +3877,19 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
     )
     .unwrap();
     let mut poisoned = ReplicatedJamServiceV2::new(poison_service, poison_log);
+    let poison_follower_service = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        poison_follower_host,
+        100_000_000,
+        9_000_000,
+    )
+    .unwrap();
+    let mut poison_follower = ReplicatedJamServiceV2::new(
+        poison_follower_service,
+        TestCommittedLog::new(poison_shared, false),
+    );
     let poison_result = poisoned.accumulate(&AccumulateRequestV2::Install(genesis.clone()));
     assert!(
         matches!(
@@ -3886,6 +3909,20 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
         poisoned.catch_up().unwrap(),
         0,
         "the poisoned entry is not replayed forever"
+    );
+    assert_eq!(
+        poison_follower.catch_up().unwrap(),
+        1,
+        "a second replica classifies the same committed guest failure"
+    );
+    assert_eq!(poison_follower.log_mut().applied_index().unwrap(), 1);
+    assert!(
+        poisoned
+            .service()
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&poison_follower.service().accumulate_host().snapshot()),
+        "both replicas converge on the same ordered no-op"
     );
     assert!(
         poisoned
