@@ -260,6 +260,9 @@ impl core::error::Error for LocalStoreReadErrorV2 {}
 #[derive(Debug, Clone, Default)]
 pub struct LocalJamStoreV2 {
     committed: LocalJamStoreSnapshotV2,
+    /// Proof artifacts are verifier/CAS inputs, not consensus service state.
+    /// They are deliberately excluded from snapshots and equality.
+    proof_blobs: BTreeMap<[u8; 32], Vec<u8>>,
     proof_allowlist: BTreeSet<super::Hash>,
     receipt_allowlist: BTreeSet<super::Hash>,
     install_allowlist: BTreeSet<super::Hash>,
@@ -365,6 +368,7 @@ impl LocalJamStoreV2 {
                 programs: BTreeMap::new(),
                 commit_sequence: 0,
             },
+            proof_blobs: BTreeMap::new(),
             proof_allowlist: BTreeSet::new(),
             receipt_allowlist: BTreeSet::new(),
             install_allowlist: BTreeSet::new(),
@@ -375,6 +379,7 @@ impl LocalJamStoreV2 {
     pub fn from_snapshot(snapshot: LocalJamStoreSnapshotV2) -> Self {
         Self {
             committed: snapshot,
+            proof_blobs: BTreeMap::new(),
             proof_allowlist: BTreeSet::new(),
             receipt_allowlist: BTreeSet::new(),
             install_allowlist: BTreeSet::new(),
@@ -644,6 +649,8 @@ impl AttestationProofHostV2 for LocalJamStoreV2 {
         if !request.proof_blob.matches(proof) {
             return false;
         }
+        self.proof_blobs
+            .insert(request.proof_blob.hash.0, proof.to_vec());
         self.allow_proof(request);
         true
     }
@@ -704,6 +711,7 @@ impl StateTreeStore for CommittedRows<'_> {
 /// Private copy-on-write image for one physical IC-5 execution.
 pub struct LocalJamTransactionV2 {
     staged: LocalJamStoreSnapshotV2,
+    proof_blobs: BTreeMap<[u8; 32], Vec<u8>>,
     proof_allowlist: BTreeSet<super::Hash>,
     receipt_allowlist: BTreeSet<super::Hash>,
     install_allowlist: BTreeSet<super::Hash>,
@@ -827,8 +835,7 @@ impl AccumulateTransactionV2 for LocalJamTransactionV2 {
                 let request = ProofVerificationRequestV2::decode(&bytes)
                     .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?;
                 let proof_available = self
-                    .staged
-                    .blobs
+                    .proof_blobs
                     .get(&request.proof_blob.hash.0)
                     .is_some_and(|bytes| request.proof_blob.matches(bytes));
                 Ok([
@@ -877,6 +884,7 @@ impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
     fn begin(&mut self) -> Result<Self::Transaction, ServicePvmErrorV2> {
         Ok(LocalJamTransactionV2 {
             staged: self.committed.clone(),
+            proof_blobs: self.proof_blobs.clone(),
             proof_allowlist: self.proof_allowlist.clone(),
             receipt_allowlist: self.receipt_allowlist.clone(),
             install_allowlist: self.install_allowlist.clone(),
@@ -992,6 +1000,34 @@ mod tests {
             Some(b"canonical actor pvm".as_slice())
         );
         assert_eq!(store.row(b"staged"), None);
+    }
+
+    #[test]
+    fn proof_artifacts_never_enter_the_recoverable_service_image() {
+        let mut store = LocalJamStoreV2::new();
+        let proof = vec![0xA5; 1024 * 1024];
+        let proof_blob = BlobRefV2::of_bytes(&proof);
+        let request = ProofVerificationRequestV2 {
+            actor_program: ProgramId([1; 32]),
+            execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            statement: super::super::Hash([2; 32]),
+            trace: super::super::Hash([3; 32]),
+            proof_blob: proof_blob.clone(),
+        };
+        let before = store.snapshot_bytes();
+
+        assert!(store.make_proof_available(&request, &proof));
+        assert_eq!(store.snapshot_bytes(), before);
+        assert_eq!(store.blob_count(), 0);
+
+        let transaction = store.begin().unwrap();
+        assert_eq!(
+            transaction
+                .proof_blobs
+                .get(&proof_blob.hash.0)
+                .map(Vec::as_slice),
+            Some(proof.as_slice())
+        );
     }
 
     #[test]

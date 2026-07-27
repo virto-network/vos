@@ -567,8 +567,12 @@ where
             }
             let request = AccumulateRequestV2::decode(&entry.request)
                 .map_err(|_| ReplicatedServiceErrorV2::InvalidCommittedLog)?;
-            ensure_request_proof_available(self.service.accumulate_host_mut(), &request)
-                .map_err(|_| ReplicatedServiceErrorV2::ProofUnavailable)?;
+            // A committed request must reach the same guest-owned decision on
+            // every replica. Best-effort verifier/CAS hydration happens here,
+            // but failure is not a second cursor policy: physical Accumulate
+            // returns InvalidProof/ProofUnavailable and the ordered rejection
+            // advances like every other semantic no-op.
+            let _ = ensure_request_proof_available(self.service.accumulate_host_mut(), &request);
             let outcome = self.service.accumulate(&request);
             if let Err(error) = outcome.as_ref()
                 && !error.is_deterministic_accumulate_failure()
