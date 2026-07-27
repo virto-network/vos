@@ -555,7 +555,7 @@ where
 
 #[derive(Debug, Default)]
 pub struct AttestationReplayGuard {
-    seen: BTreeSet<(ActorId, InvocationId)>,
+    seen: BTreeSet<(SpaceId, DeploymentId, ActorId, InvocationId)>,
 }
 
 /// Verify an already-produced package. This path never invokes the producer.
@@ -587,7 +587,12 @@ pub fn verify_once<T: crate::Encode, M>(
     ) {
         return Err(AttestationError::InvalidProof);
     }
-    let key = (package.statement.actor, package.statement.invocation);
+    let key = (
+        package.statement.space,
+        package.statement.deployment,
+        package.statement.actor,
+        package.statement.invocation,
+    );
     if !replay.seen.insert(key) {
         return Err(AttestationError::Replay);
     }
@@ -676,6 +681,23 @@ mod tests {
                 &verifier,
             ),
             Err(AttestationError::Replay),
+        );
+
+        let mut other_service = package(21);
+        other_service.statement.space = SpaceId([16; 32]);
+        other_service.statement.accumulation_receipt.service.space = SpaceId([16; 32]);
+        assert_eq!(
+            verify_once(
+                other_service,
+                "private-age",
+                ProducerId([15; 32]),
+                &mut replay,
+                &verifier,
+            )
+            .unwrap()
+            .into_inner(),
+            21,
+            "the same actor/invocation bytes in another space are independent"
         );
 
         let mut tampered = package(21);
