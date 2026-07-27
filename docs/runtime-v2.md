@@ -59,6 +59,26 @@ Injected destination and caller commit failures expose neither an admitted
 inbox nor resumed reply effects; the exact envelopes remain retryable from the
 previous durable images.
 
+Attested linear slices use a read-only physical Accumulate preparation before
+proof production. The guest derives the predicted accumulation receipt and
+statement from committed service state, the exact work and transition, and the
+installed method policy; the host does not reconstruct those public inputs.
+The proof producer receives that preparation together with the canonical
+service PVM and Refine imports, and the final Apply carries the proof bytes as
+a content-addressed blob. Guest Accumulate re-derives the statement, invokes
+`PROOF_VERIFY`, and commits or publishes the proof package only when that exact
+request is valid and available. Raft orders only the final proved Apply:
+preparation remains read-only, while followers stage the carried proof bytes
+and execute the same guest verifier gate before advancing their apply cursor.
+
+The local proof producer and proof-verification allowlist are conformance
+seams, not a production proof system. A production host must replace them with
+the pinned prover/verifier implementation, and a later runtime slice must bind
+the proof trace to the observed canonical Refine execution rather than relying
+on the producer interface contract alone. There is still no attestation-only
+actor binary: proof production always receives the live actor program through
+the canonical Refine imports.
+
 CRDT anti-entropy also enters through physical Accumulate. A
 `CrdtSyncEnvelopeV2` carries advertised heads, canonical causal nodes, the
 content-addressed blobs they reference, and each node's finalized admission
@@ -114,7 +134,10 @@ genesis's self-declared identity. `PROGRAM_LOOKUP` availability must be pinned
 to or imported from consensus-visible state rather than a node-local cache.
 `RECEIPT_VERIFY` must likewise use consensus-authoritative receipt finality
 rather than its local conformance allowlist, and delivery timeslots must come
-from the JAM slot.
+from the JAM slot. `PROOF_VERIFY` must use the workspace-pinned verifier and
+execution-semantics identity rather than the local proof allowlist, and the
+canonical Refine trace must be bound into the generated proof before attested
+execution becomes a production path.
 Production routing must recover and retry guest publication, delivery and
 reply-admission rows rather than maintain a second native message ledger. A
 bounded reclamation or checkpoint plan for unreachable SMT and CRDT DAG nodes,
