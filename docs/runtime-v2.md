@@ -171,27 +171,31 @@ protocol boundary. Resume consumes the checkpoint, injects one result into its
 declared registers and continues at `resume_pc`. It never restarts the handler
 at PC 0. Suspended actors are non-reentrant; later messages remain queued.
 
-Raft orders canonical `AccumulateRequestV2` bytes, including every referenced
-continuation/blob byte required by that request. It does not replicate an
-`EffectLog` or a leader-produced post-state image. `ReplicatedJamServiceV2`
-waits for the request's log position to commit, then applies it through the
-physical service-PVM Accumulate entry before advancing the replica's applied
-cursor. Followers and a newly elected leader use the same catch-up path;
-replaying after a cursor-write failure is safe because guest deduplication sees
-the already committed workflow input.
+Raft orders canonical `AccumulateRequestV2` bytes. An `Apply` request carries
+the `AccumulationEnvelopeV2::provided_blobs` needed by that transition, while
+`Install` carries actor programs and initial state by content identity only.
+A joining replica therefore obtains installation artifacts from an
+authenticated pre-provisioning channel or an exact service snapshot; log-only
+cluster join is not supported. Raft does not replicate an `EffectLog` or a
+leader-produced post-state image. `ReplicatedJamServiceV2` waits for the
+request's log position to commit, then applies it through the physical
+service-PVM Accumulate entry before advancing the replica's applied cursor.
+Followers and a newly elected leader use the same catch-up path; replaying
+after a cursor-write failure is safe because guest deduplication sees the
+already committed workflow input.
 
 `RaftAccumulateLogV2` is the redb/`vos-raft` implementation of that boundary.
 In multi-replica mode it accepts writes only from the elected leader, waits for
 the worker's quorum-commit notification, then re-reads and verifies the exact
 committed request bytes. Its `last_applied` cursor advances separately and only
-after the local service image commits. Each cursor advance also records the
-canonical `LocalJamStoreSnapshotV2` image for that exact log index. Automatic
-compaction cannot cross this durable application cursor and freezes the matching
-image—not a newer mutable state row—into a `CommittedServiceSnapshotV2`.
-A lagging follower receives that envelope through Raft `InstallSnapshot`,
-checks that its bound index matches the installed snapshot metadata, durably
-replaces its physical service image, and only then advances `last_applied` and
-replays any surviving log tail.
+after the local service image commits. Each cursor advance records the canonical
+`LocalJamStoreSnapshotV2` image for that exact log index while retaining a
+bounded recent window. Automatic compaction cannot cross this durable
+application cursor and freezes the matching image—not a newer mutable state
+row—into a `CommittedServiceSnapshotV2`. A lagging follower receives that
+envelope through Raft `InstallSnapshot`, checks that its bound index matches the
+installed snapshot metadata, durably replaces its physical service image, and
+only then advances `last_applied` and replays any surviving log tail.
 
 Every await is a durable slice boundary. Effects before it may commit even if a
 later slice fails, so multi-await handlers have saga semantics. Same-tree calls

@@ -2,9 +2,9 @@
 //!
 //! The durable layer lives in [`log::RaftLog`] / [`log::RaftMeta`] on redb.
 //! [`v2::RaftAccumulateLogV2`] orders canonical JAM service requests and leaves
-//! their application to the guest Accumulate entry. The legacy agent runtime
-//! still uses the [`CommitStrategy`] implementation in [`strategy::RaftCommit`]
-//! until the production-node cutover is complete.
+//! their application to the guest Accumulate entry. The native actor state
+//! machine uses the separate [`CommitStrategy`] implementation in
+//! [`strategy::RaftCommit`].
 
 #[cfg(feature = "storage")]
 pub mod log;
