@@ -506,6 +506,25 @@ mod tests {
         assert_eq!(parsed.constructor[0].name, "start");
         assert_eq!(parsed.constructor[0].ty, "u32");
         assert_eq!(parsed.kind, 0);
+
+        assert!(
+            decode(&buf[..len - 1]).is_none(),
+            "a present policy section must contain every declared entry"
+        );
+        let mut wrong_count = buf[..len].to_vec();
+        let policy_count_offset = len - (2 + META.messages.len() * 2);
+        wrong_count[policy_count_offset..policy_count_offset + 2]
+            .copy_from_slice(&1u16.to_le_bytes());
+        assert!(
+            decode(&wrong_count).is_none(),
+            "policy count must match the signed message schema"
+        );
+        let mut trailing = buf[..len].to_vec();
+        trailing.push(0);
+        assert!(
+            decode(&trailing).is_none(),
+            "unknown policy-section bytes are not canonical metadata"
+        );
     }
 
     #[test]
@@ -1055,25 +1074,24 @@ mod decode {
         }
 
         // Per-message attestation policy. Old blobs end after `crdt`, leaving
-        // both fields at their deny-by-default values.
-        if pos < data.len()
-            && let Some(policy_count) = read_u16(data, &mut pos)
-        {
-            for i in 0..policy_count as usize {
-                let Some(&attested) = data.get(pos) else {
-                    break;
-                };
-                let Some(&space_role) = data.get(pos + 1) else {
-                    break;
-                };
+        // both fields at their legacy regular/public defaults.
+        if pos < data.len() {
+            let policy_count = read_u16(data, &mut pos)?;
+            if policy_count as usize != messages.len() {
+                return None;
+            }
+            for message in &mut messages {
+                let &attested = data.get(pos)?;
+                let &space_role = data.get(pos + 1)?;
                 pos += 2;
                 if attested > 1 || (space_role != u8::MAX && space_role > 3) {
                     return None;
                 }
-                if let Some(message) = messages.get_mut(i) {
-                    message.attested = attested == 1;
-                    message.space_role = (space_role != u8::MAX).then_some(space_role);
-                }
+                message.attested = attested == 1;
+                message.space_role = (space_role != u8::MAX).then_some(space_role);
+            }
+            if pos != data.len() {
+                return None;
             }
         }
 
