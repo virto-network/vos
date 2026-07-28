@@ -3043,6 +3043,54 @@ fn disclosed_role_credentials_require_authority_verification_in_physical_accumul
             .same_service_state(&before)
     );
 
+    let mut malformed_resume = work.clone();
+    malformed_resume.workflow_step = 1;
+    malformed_resume.authorization = RoleCredentialV2 {
+        holder: origin,
+        scope: Hash::ZERO,
+        space_role: Some(vos::SpaceRole::Developer),
+        actor_role: None,
+        authenticator: b"malformed authority grant".to_vec(),
+    }
+    .disclosed_evidence(policy);
+    let malformed_transition = TransitionV2 {
+        service: malformed_resume.service.clone(),
+        consumed_input: malformed_resume.input_id(),
+        target_program: malformed_resume.target_program,
+        base: malformed_resume.base.clone(),
+        writes: vec![],
+        crdt_change: None,
+        continuations: vec![],
+        inbox: vec![],
+        outbox: vec![],
+        reply: Some(ReplyRecordV2 {
+            call_id: malformed_resume.invocation.root_reply_id(),
+            producer: malformed_resume.target,
+            result: b"must not execute".to_vec(),
+        }),
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    let before_malformed = service.accumulate_host().snapshot();
+    assert_eq!(
+        service
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: malformed_resume,
+                transition: malformed_transition,
+                provided_blobs: vec![],
+            }))
+            .expect("malformed credential is a guest rejection, not a dispatch error")
+            .result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::Unauthorized)
+    );
+    assert!(
+        service
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before_malformed)
+    );
+
     let verification = RoleCredentialVerificationRequestV2::for_work(&work).unwrap();
     service
         .accumulate_host_mut()

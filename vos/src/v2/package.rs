@@ -244,6 +244,9 @@ pub fn method_role_policy_hash(space_role: Option<u8>, actor_role: Option<u8>) -
     if let Some(role) = space_role {
         crate::SpaceRole::from_u8(role)?;
     }
+    if actor_role == Some(u8::MAX) {
+        return None;
+    }
     if space_role.is_none() && actor_role.is_none() {
         return Some(public_policy_hash());
     }
@@ -258,19 +261,6 @@ pub fn method_role_policy_hash(space_role: Option<u8>, actor_role: Option<u8>) -
 
 pub fn space_role_policy_hash(required_role: u8) -> Option<Hash> {
     method_role_policy_hash(Some(required_role), None)
-}
-
-/// Recover the declared threshold from one of the four canonical v2 role
-/// predicates. Arbitrary hashes are not role policies.
-pub fn space_role_for_policy(policy: Hash) -> Option<crate::SpaceRole> {
-    [
-        crate::SpaceRole::Guest,
-        crate::SpaceRole::Member,
-        crate::SpaceRole::Developer,
-        crate::SpaceRole::Admin,
-    ]
-    .into_iter()
-    .find(|role| space_role_policy_hash(role.as_u8()) == Some(policy))
 }
 
 pub fn artifact_hash(kind: &[u8], bytes: &[u8]) -> Hash {
@@ -515,6 +505,11 @@ mod tests {
         assert_eq!(
             increment.policy,
             method_role_policy_hash(None, Some(3)).unwrap()
+        );
+        assert_eq!(
+            method_role_policy_hash(None, Some(u8::MAX)),
+            None,
+            "the metadata no-role sentinel is not a valid actor threshold"
         );
     }
 

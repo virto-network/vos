@@ -227,11 +227,15 @@ impl<A: Actor> Context<A> {
     /// capability just like any other origin.
     pub fn caller_role(&self) -> Option<A::Role> {
         if let Some(b) = self.actor_local_role {
-            return A::Role::from_byte(b);
+            let role = A::Role::from_byte(b)?;
+            return (b != u8::MAX && role.as_byte() == b).then_some(role);
         }
-        self.space_role
+        let role = self
+            .space_role
             .and_then(SpaceRole::from_u8)
-            .and_then(|sr| A::SPACE_ROLE_MAP.lookup(sr))
+            .and_then(|sr| A::SPACE_ROLE_MAP.lookup(sr))?;
+        let byte = role.as_byte();
+        (byte != u8::MAX && A::Role::from_byte(byte) == Some(role)).then_some(role)
     }
 
     /// True iff the caller's effective role satisfies `required`
@@ -244,7 +248,12 @@ impl<A: Actor> Context<A> {
         if self.caller.is_trusted() {
             return true;
         }
-        self.caller_role().is_some_and(|r| r >= required)
+        let required_byte = required.as_byte();
+        if required_byte == u8::MAX || A::Role::from_byte(required_byte) != Some(required) {
+            return false;
+        }
+        self.caller_role()
+            .is_some_and(|actual| actual >= required && actual.as_byte() >= required_byte)
     }
 
     /// True iff the authenticated space-wide grant directly satisfies the
@@ -1570,6 +1579,58 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum ReversedWireRole {
+        Low,
+        High,
+    }
+
+    impl RoleByte for ReversedWireRole {
+        fn from_byte(byte: u8) -> Option<Self> {
+            match byte {
+                0 => Some(Self::High),
+                1 => Some(Self::Low),
+                _ => None,
+            }
+        }
+
+        fn as_byte(self) -> u8 {
+            match self {
+                Self::Low => 1,
+                Self::High => 0,
+            }
+        }
+    }
+
+    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    struct ReversedWireActor;
+
+    impl Actor for ReversedWireActor {
+        type Error = ();
+        type Message = FixtureMsg;
+        type Role = ReversedWireRole;
+        const DEFAULT_ROLE: ReversedWireRole = ReversedWireRole::Low;
+        const SPACE_ROLE_MAP: crate::actors::auth::SpaceRoleMap<ReversedWireRole> =
+            crate::actors::auth::SpaceRoleMap {
+                admin: None,
+                developer: None,
+                member: None,
+                guest: None,
+            };
+
+        fn create() -> Self {
+            Self
+        }
+
+        fn dispatch(
+            &mut self,
+            _msg: FixtureMsg,
+            _ctx: &mut Context<Self>,
+        ) -> crate::actors::run::RunResult<bool> {
+            crate::actors::run::RunResult::Complete(true)
+        }
+    }
+
     fn fixture_ctx_with(
         caller: Caller,
         space_role: Option<u8>,
@@ -1729,5 +1790,19 @@ mod tests {
         assert!(!ctx.has_role_byte(FixtureRole::Maintainer.as_byte()));
         // Unknown discriminant → deny.
         assert!(!ctx.has_role_byte(99));
+    }
+
+    #[test]
+    fn non_monotone_role_byte_mappings_fail_closed() {
+        let mut ctx: Context<ReversedWireActor> = Context::new(ServiceId(1));
+        ctx.set_caller(Caller::Peer(alloc::vec![1]));
+        ctx.set_caller_roles(None, Some(ReversedWireRole::High.as_byte()));
+
+        assert_eq!(ctx.caller_role(), Some(ReversedWireRole::High));
+        assert!(
+            !ctx.has_role(ReversedWireRole::Low),
+            "Rust ordering must not authorize a threshold rejected by the wire ordering"
+        );
+        assert!(!ctx.has_role_byte(ReversedWireRole::Low.as_byte()));
     }
 }

@@ -258,7 +258,9 @@ impl Caller {
 /// must use the enum's `#[repr(u8)]` discriminant and preserve `Ord` ordering:
 /// if `left >= right`, `left.as_byte() >= right.as_byte()` must also hold.
 /// Generated method metadata and guest Accumulate rely on that canonical,
-/// monotone representation when they enforce actor-local thresholds.
+/// monotone representation when they enforce actor-local thresholds. Context
+/// role checks validate the byte round trip and both orderings and deny
+/// non-canonical mappings.
 ///
 /// Manually implementing the trait is straightforward — the
 /// `#[actor]` macro emits one automatically for the user's

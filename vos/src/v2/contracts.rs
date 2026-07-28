@@ -1627,6 +1627,8 @@ impl V2Wire for RoleCredentialV2 {
             authenticator: decoder.bytes()?,
         };
         if !matches!(value.holder, Origin::Member(_) | Origin::Actor(_))
+            || value.scope == Hash::ZERO
+            || value.actor_role == Some(u8::MAX)
             || (value.space_role.is_none() && value.actor_role.is_none())
             || value.authenticator.is_empty()
         {
@@ -3071,6 +3073,30 @@ mod tests {
             WorkEnvelopeV2::decode(&private.encode()),
             Err(DecodeError::NonCanonical),
             "private witnesses cannot be declared as persistent/shared work imports"
+        );
+    }
+
+    #[test]
+    fn role_credentials_reject_reserved_scope_and_role_values() {
+        let mut credential = RoleCredentialV2 {
+            holder: Origin::Member(SubjectId([44; 32])),
+            scope: Hash::ZERO,
+            space_role: Some(crate::SpaceRole::Member),
+            actor_role: None,
+            authenticator: b"signed grant".to_vec(),
+        };
+
+        assert_eq!(
+            RoleCredentialV2::decode(&credential.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+
+        credential.scope = Hash([45; 32]);
+        credential.space_role = None;
+        credential.actor_role = Some(u8::MAX);
+        assert_eq!(
+            RoleCredentialV2::decode(&credential.encode()),
+            Err(DecodeError::NonCanonical)
         );
     }
 

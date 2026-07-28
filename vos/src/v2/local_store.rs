@@ -790,6 +790,23 @@ impl LocalJamTransactionV2 {
             Err(ServicePvmErrorV2::AccumulateHostRejected(slot))
         }
     }
+
+    fn role_credential_verification_status(&self, bytes: &[u8]) -> u64 {
+        use crate::abi::error;
+
+        let Ok(request) = RoleCredentialVerificationRequestV2::decode(bytes) else {
+            // Guest-supplied verifier input is untrusted. A malformed request
+            // is an authorization denial, not a host failure: returning a
+            // hard error here would prevent a replicated apply cursor from
+            // advancing past a deterministically invalid entry.
+            return error::HOST_NONE;
+        };
+        if self.role_credential_allowlist.contains(&request.hash()) {
+            error::HOST_OK
+        } else {
+            error::HOST_NONE
+        }
+    }
 }
 
 impl AccumulateTransactionV2 for LocalJamTransactionV2 {
@@ -892,16 +909,7 @@ impl AccumulateTransactionV2 for LocalJamTransactionV2 {
             }
             hostcall::ROLE_CREDENTIAL_VERIFY => {
                 let bytes = Self::read_guest_bytes(kernel, registers[7], registers[8], slot)?;
-                let request = RoleCredentialVerificationRequestV2::decode(&bytes)
-                    .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?;
-                Ok([
-                    if self.role_credential_allowlist.contains(&request.hash()) {
-                        error::HOST_OK
-                    } else {
-                        error::HOST_NONE
-                    },
-                    0,
-                ])
+                Ok([self.role_credential_verification_status(&bytes), 0])
             }
             hostcall::RECEIPT_VERIFY => {
                 let bytes = Self::read_guest_bytes(kernel, registers[7], registers[8], slot)?;
@@ -1101,6 +1109,17 @@ mod tests {
         let reopened = LocalJamStoreV2::from_snapshot(store.snapshot());
         assert_eq!(reopened.private_witness(&reference), None);
         assert_eq!(reopened, store);
+    }
+
+    #[test]
+    fn malformed_role_verification_requests_are_clean_denials() {
+        let mut store = LocalJamStoreV2::new();
+        let transaction = store.begin().unwrap();
+
+        assert_eq!(
+            transaction.role_credential_verification_status(b"not a canonical request"),
+            crate::abi::error::HOST_NONE
+        );
     }
 
     #[test]

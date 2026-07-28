@@ -2946,7 +2946,7 @@ mod tests {
         );
         assert_eq!(store, before_replay);
 
-        let mut denied_work = linear_work(initial, base);
+        let mut denied_work = linear_work(initial.clone(), base);
         denied_work.origin = origin;
         let guest = RoleCredentialV2 {
             holder: origin,
@@ -2970,6 +2970,30 @@ mod tests {
         assert_eq!(
             execute_guest_accumulate(&mut store, &denied).unwrap(),
             rejected(AccumulationRejectionV2::Unauthorized)
+        );
+        assert_eq!(store, before);
+
+        let mut malformed_resume = linear_work(initial, base);
+        malformed_resume.workflow_step = 1;
+        malformed_resume.origin = origin;
+        let zero_scope = RoleCredentialV2 {
+            holder: origin,
+            scope: Hash::ZERO,
+            space_role: Some(crate::SpaceRole::Developer),
+            actor_role: None,
+            authenticator: b"malformed grant".to_vec(),
+        };
+        malformed_resume.authorization = zero_scope.disclosed_evidence(required_policy);
+        let malformed = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            transition: linear_transition(&malformed_resume, b"must not execute"),
+            work: malformed_resume,
+            provided_blobs: vec![],
+        });
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &malformed).unwrap(),
+            rejected(AccumulationRejectionV2::Unauthorized),
+            "a malformed resumed credential is a deterministic denial, not a host error"
         );
         assert_eq!(store, before);
     }

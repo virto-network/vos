@@ -9,7 +9,7 @@
 //! the data for the caller to handle. Higher-level code uses the same API
 //! regardless.
 
-#[cfg(feature = "pvm")]
+#[cfg(any(feature = "pvm", test))]
 use super::{
     Actor, Context,
     codec::Decode,
@@ -477,14 +477,14 @@ fn should_decode_legacy_dispatch_prefix(raw: &[u8], actor_slice: bool) -> bool {
 /// `INVOKE` hostcall, so there is no ask-replay loop and no actor
 /// snapshot — a `Yielded` result here always means a real
 /// `yield_now` / `sleep` commit, not an in-flight query.
-#[cfg(feature = "pvm")]
+#[cfg(any(feature = "pvm", test))]
 pub fn dispatch_one<A: Actor>(raw: &[u8], actor: &mut A, ctx: &mut Context<A>) -> DispatchResult {
     dispatch_one_inner(raw, actor, ctx, None)
 }
 
 /// Dispatch one v2 actor slice with the invocation identity supplied by the
 /// generic service envelope rather than an actor-message prefix.
-#[cfg(feature = "pvm")]
+#[cfg(any(feature = "pvm", test))]
 pub(crate) fn dispatch_one_with_invocation<A: Actor>(
     raw: &[u8],
     actor: &mut A,
@@ -494,7 +494,7 @@ pub(crate) fn dispatch_one_with_invocation<A: Actor>(
     dispatch_one_inner(raw, actor, ctx, Some(invocation))
 }
 
-#[cfg(feature = "pvm")]
+#[cfg(any(feature = "pvm", test))]
 fn dispatch_one_inner<A: Actor>(
     raw: &[u8],
     actor: &mut A,
@@ -595,7 +595,7 @@ fn dispatch_one_inner<A: Actor>(
     }
 }
 
-#[cfg(all(test, feature = "pvm"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::actors::{

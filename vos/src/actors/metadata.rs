@@ -446,7 +446,13 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
     let mut ar = 0usize;
     while ar < meta.messages.len() {
         buf[pos] = match meta.messages[ar].actor_role {
-            Some(role) => role,
+            Some(role) => {
+                assert!(
+                    role != u8::MAX,
+                    "actor role byte 255 is reserved for no role"
+                );
+                role
+            }
             None => u8::MAX,
         };
         pos += 1;
@@ -556,6 +562,34 @@ mod tests {
             decode(partial_actor_roles).is_none(),
             "a present actor-role section must contain every declared entry"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "actor role byte 255 is reserved for no role")]
+    fn actor_role_cannot_collide_with_the_none_sentinel() {
+        const META: ActorMeta = ActorMeta {
+            actor_name: "InvalidRole",
+            messages: &[MessageMeta {
+                name: "restricted",
+                is_query: false,
+                fields: &[],
+                returns: "()",
+                doc: "",
+                timeout_ms: 0,
+                mode: 0,
+                attested: false,
+                space_role: None,
+                actor_role: Some(u8::MAX),
+            }],
+            constructor: &[],
+            kind: 0,
+            caps: &[],
+            cli_methods: &[],
+            doc: "",
+            crdt: false,
+        };
+
+        let _ = encode::<128>(&META);
     }
 
     #[test]
