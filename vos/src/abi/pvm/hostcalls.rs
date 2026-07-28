@@ -209,6 +209,17 @@ pub fn verify_proof(request: &[u8]) -> u64 {
     )
 }
 
+/// Verify one disclosed role credential against the configured authority.
+#[cfg(feature = "service")]
+#[inline]
+pub fn verify_role_credential(request: &[u8]) -> u64 {
+    ecall2(
+        hostcall::ROLE_CREDENTIAL_VERIFY,
+        request.as_ptr() as u64,
+        request.len() as u64,
+    )
+}
+
 /// Probe the service-owned program cache for exact canonical actor PVM bytes.
 #[cfg(feature = "service")]
 #[inline]

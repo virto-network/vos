@@ -22,13 +22,17 @@ use vos::v2::{
     Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2, InvocationId,
     JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2, LocalTransportV2, LocalWorkRequestV2,
     LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
-    ProgramId, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2,
-    ReplicatedJamServiceV2, ReplyRecordV2, RootServiceId, ScheduleErrorV2, ServiceDispatchError,
-    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, SpaceRoleCredentialV2,
-    StateKeyV2, SubjectId, TransitionV2, V2Wire, WorkEnvelopeV2, public_policy_hash,
-    space_role_policy_hash,
+    PackageRolePoliciesV2, ProgramId, PublishedEffectsV2, ReceiptVerificationRequestV2,
+    RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RoleCredentialV2,
+    RoleCredentialVerificationRequestV2, RootServiceId, ScheduleErrorV2, ServiceDispatchError,
+    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId,
+    TransitionV2, V2Wire, WorkEnvelopeV2, public_policy_hash, space_role_policy_hash,
 };
 use vos::{Decode, Encode, value::Msg};
+
+fn role_policies(methods: Vec<MethodPolicyV2>) -> Vec<u8> {
+    PackageRolePoliciesV2 { methods }.encode()
+}
 
 #[derive(Debug, Default)]
 struct FailableCommittedImages {
@@ -368,6 +372,7 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
             reference: state,
             bytes: state_bytes,
         }],
+        private_blobs: vec![],
     };
 
     let output = service
@@ -417,6 +422,7 @@ fn nested_actor_input_is_bounded_before_entering_the_compact_guest_heap() {
             reference: state,
             bytes: state_bytes,
         }],
+        private_blobs: vec![],
     };
     let service = ServicePvmV2::new(
         CANONICAL_SERVICE_PVM.to_vec(),
@@ -474,13 +480,15 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
             program: actor_program,
             initial_state: initial.clone(),
             crdt: true,
-            methods: vec![MethodPolicyV2 {
+            role_policies: role_policies(vec![MethodPolicyV2 {
                 method: "increment".into(),
                 schema: Hash([44; 32]),
                 policy: public_policy_hash(),
                 public: true,
                 attested: false,
-            }],
+                space_role: None,
+                actor_role: None,
+            }]),
         }],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([46; 32]),
@@ -728,6 +736,7 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
             reference: initial.clone(),
             bytes: initial_bytes.clone(),
         }],
+        private_blobs: vec![],
     };
     let mut host = LocalJamStoreV2::default();
     assert_eq!(host.import_blob(initial_bytes), initial);
@@ -750,13 +759,15 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
             program: actor_program,
             initial_state: initial,
             crdt: true,
-            methods: vec![MethodPolicyV2 {
+            role_policies: role_policies(vec![MethodPolicyV2 {
                 method: "increment_around_yield".into(),
                 schema: Hash([50; 32]),
                 policy: public_policy_hash(),
                 public: true,
                 attested: false,
-            }],
+                space_role: None,
+                actor_role: None,
+            }]),
         }],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([52; 32]),
@@ -813,6 +824,7 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
             pvm: actor_pvm,
         }],
         blobs: first.exported_blobs,
+        private_blobs: vec![],
     };
     let second = service
         .refine_actor_tree(&second_work, &second_imports)
@@ -882,6 +894,7 @@ fn canonical_guest_rejects_a_nested_actor_without_the_reply_abi() {
             reference: state,
             bytes: state_bytes,
         }],
+        private_blobs: vec![],
     };
 
     assert_eq!(
@@ -925,6 +938,7 @@ fn actor_tree_refuses_to_replay_a_continuation_from_pc_zero() {
             pvm: actor,
         }],
         blobs,
+        private_blobs: vec![],
     };
 
     assert_eq!(
@@ -975,13 +989,15 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
             program: actor_program,
             initial_state: initial_state_ref.clone(),
             crdt: false,
-            methods: vec![MethodPolicyV2 {
+            role_policies: role_policies(vec![MethodPolicyV2 {
                 method: "ping".into(),
                 schema: Hash([32; 32]),
                 policy: public_policy_hash(),
                 public: true,
                 attested: false,
-            }],
+                space_role: None,
+                actor_role: None,
+            }]),
         }],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([34; 32]),
@@ -1268,13 +1284,15 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             program: actor_program,
             initial_state: initial_state_ref,
             crdt: false,
-            methods: vec![MethodPolicyV2 {
+            role_policies: role_policies(vec![MethodPolicyV2 {
                 method: "await_peer".into(),
                 schema: Hash([32; 32]),
                 policy: public_policy_hash(),
                 public: true,
                 attested: false,
-            }],
+                space_role: None,
+                actor_role: None,
+            }]),
         }],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([34; 32]),
@@ -1554,13 +1572,15 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
                 program: actor_program,
                 initial_state: initial_state_ref.clone(),
                 crdt: false,
-                methods: vec![MethodPolicyV2 {
+                role_policies: role_policies(vec![MethodPolicyV2 {
                     method: "seed".into(),
                     schema: Hash([31; 32]),
                     policy: public_policy_hash(),
                     public: true,
                     attested: false,
-                }],
+                    space_role: None,
+                    actor_role: None,
+                }]),
             },
             ActorGenesisV2 {
                 actor: target,
@@ -1568,13 +1588,15 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
                 program: actor_program,
                 initial_state: initial_state_ref,
                 crdt: false,
-                methods: vec![MethodPolicyV2 {
+                role_policies: role_policies(vec![MethodPolicyV2 {
                     method: "await_two_peers".into(),
                     schema: Hash([33; 32]),
                     policy: public_policy_hash(),
                     public: true,
                     attested: false,
-                }],
+                    space_role: None,
+                    actor_role: None,
+                }]),
             },
         ],
         authorization: AuthorizationEvidenceV2::SystemCapability {
@@ -2113,13 +2135,15 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             program: actor_program,
             initial_state: initial.clone(),
             crdt: false,
-            methods: vec![MethodPolicyV2 {
+            role_policies: role_policies(vec![MethodPolicyV2 {
                 method: "start".into(),
                 schema: Hash([32; 32]),
                 policy: public_policy_hash(),
                 public: true,
                 attested: false,
-            }],
+                space_role: None,
+                actor_role: None,
+            }]),
         }],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([34; 32]),
@@ -2324,6 +2348,8 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
                 policy: public_policy_hash(),
                 public: true,
                 attested: false,
+                space_role: None,
+                actor_role: None,
             },
             preparation.receipt.clone(),
         )
@@ -2913,6 +2939,124 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
 }
 
 #[test]
+fn disclosed_role_credentials_require_authority_verification_in_physical_accumulate() {
+    let elf = service_elf();
+    let service_pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
+    let service_program = ProgramId::of_pvm(&service_pvm);
+    let actor_pvm = b"canonical role-gated actor bytes".to_vec();
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_bytes = b"role-gated initial state".to_vec();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let mut work = work(actor_program, initial.clone());
+    work.service.service_program = service_program;
+    let origin = Origin::Member(SubjectId([0x81; 32]));
+    work.origin = origin;
+    let policy = space_role_policy_hash(vos::SpaceRole::Member.as_u8()).unwrap();
+
+    let genesis = ServiceGenesisV2 {
+        service: work.service.clone(),
+        consistency: ConsistencyModeV2::Local,
+        actors: vec![ActorGenesisV2 {
+            actor: work.target,
+            parent: None,
+            program: actor_program,
+            initial_state: initial.clone(),
+            crdt: false,
+            role_policies: role_policies(vec![MethodPolicyV2 {
+                method: work.method.clone(),
+                schema: Hash([0x82; 32]),
+                policy,
+                public: false,
+                attested: false,
+                space_role: Some(vos::SpaceRole::Member.as_u8()),
+                actor_role: None,
+            }]),
+        }],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([0x83; 32]),
+            authenticator: vec![0x84],
+        },
+    };
+    let install = AccumulateRequestV2::Install(genesis);
+    let mut host = LocalJamStoreV2::default();
+    assert_eq!(host.import_blob(initial_bytes), initial);
+    assert_eq!(host.import_program(actor_pvm), actor_program);
+    let mut service = JamServiceV2::new(
+        service_pvm,
+        service_program,
+        NoRefineProtocolHostV2,
+        host,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    authorize_install(&mut service, &install);
+    let AccumulationResultV2::Installed(installed) = service.accumulate(&install).unwrap().result
+    else {
+        panic!("role-gated service install failed")
+    };
+    work.base = ConsistencyBaseV2::Linear {
+        revision: 0,
+        state_root: installed.resulting_state_root.unwrap(),
+    };
+    let credential = RoleCredentialV2 {
+        holder: origin,
+        scope: work.authorization_scope(),
+        space_role: Some(vos::SpaceRole::Developer),
+        actor_role: None,
+        authenticator: b"authority signature over exact work scope".to_vec(),
+    };
+    work.authorization = credential.disclosed_evidence(policy);
+    let transition = TransitionV2 {
+        service: work.service.clone(),
+        consumed_input: work.input_id(),
+        target_program: work.target_program,
+        base: work.base.clone(),
+        writes: vec![],
+        crdt_change: None,
+        continuations: vec![],
+        inbox: vec![],
+        outbox: vec![],
+        reply: Some(ReplyRecordV2 {
+            call_id: work.invocation.root_reply_id(),
+            producer: work.target,
+            result: b"authorized".to_vec(),
+        }),
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    let apply = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+        work: work.clone(),
+        transition,
+        provided_blobs: vec![],
+    });
+    let before = service.accumulate_host().snapshot();
+    assert_eq!(
+        service.accumulate(&apply).unwrap().result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::Unauthorized)
+    );
+    assert!(
+        service
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before)
+    );
+
+    let verification = RoleCredentialVerificationRequestV2::for_work(&work).unwrap();
+    service
+        .accumulate_host_mut()
+        .allow_role_credential(&verification);
+    assert!(matches!(
+        service.accumulate(&apply).unwrap().result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn attested_driver_proves_before_guest_accumulate_commits() {
     let elf = service_elf();
     let service_pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
@@ -2924,10 +3068,14 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
     let mut seed = work(actor_program, initial.clone());
     seed.service.service_program = service_program;
     let private_origin = Origin::Member(SubjectId([0xA7; 32]));
+    seed.origin = private_origin;
+    seed.proof_requested = true;
     let private_policy = space_role_policy_hash(vos::SpaceRole::Member.as_u8()).unwrap();
-    let private_credential = SpaceRoleCredentialV2 {
+    let private_credential = RoleCredentialV2 {
         holder: private_origin,
-        role: vos::SpaceRole::Developer,
+        scope: seed.authorization_scope(),
+        space_role: Some(vos::SpaceRole::Developer),
+        actor_role: None,
         authenticator: b"authenticated private role grant".to_vec(),
     };
     let (private_authorization, private_witness) =
@@ -2942,13 +3090,15 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
             program: actor_program,
             initial_state: initial.clone(),
             crdt: false,
-            methods: vec![MethodPolicyV2 {
+            role_policies: role_policies(vec![MethodPolicyV2 {
                 method: seed.method.clone(),
                 schema: Hash([0xA1; 32]),
                 policy: private_policy,
                 public: false,
                 attested: true,
-            }],
+                space_role: Some(vos::SpaceRole::Member.as_u8()),
+                actor_role: None,
+            }]),
         }],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([0xA3; 32]),
@@ -2959,7 +3109,7 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
     let mut host = LocalJamStoreV2::default();
     assert_eq!(host.import_blob(initial_bytes), initial);
     assert_eq!(
-        host.import_blob(private_witness.bytes.clone()),
+        host.import_private_witness(private_witness.bytes.clone()),
         private_witness.reference
     );
     assert_eq!(host.import_program(actor_pvm), actor_program);
@@ -2994,7 +3144,7 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
             parent_call: None,
             causal_context: None,
             awaited_reply: None,
-            imported_blobs: vec![private_witness.reference.clone()],
+            imported_blobs: vec![],
             proof_requested: true,
         },
     )
@@ -3006,7 +3156,8 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
             state_root: installed.resulting_state_root.unwrap(),
         }
     );
-    assert!(prepared.imports.blobs.contains(&private_witness));
+    assert!(prepared.imports.private_blobs.contains(&private_witness));
+    assert!(!prepared.imports.blobs.contains(&private_witness));
     assert!(
         !prepared
             .work
@@ -3122,13 +3273,15 @@ fn physical_guest_install_rejects_an_unavailable_actor_program() {
             program: actor_program,
             initial_state: initial,
             crdt: false,
-            methods: vec![MethodPolicyV2 {
+            role_policies: role_policies(vec![MethodPolicyV2 {
                 method: "start".into(),
                 schema: Hash([32; 32]),
                 policy: public_policy_hash(),
                 public: true,
                 attested: false,
-            }],
+                space_role: None,
+                actor_role: None,
+            }]),
         }],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([34; 32]),
@@ -3179,7 +3332,7 @@ fn physical_guest_rejects_the_missing_preimage_length_sentinel() {
             program: actor_program,
             initial_state: seed_work.imported_actors[0].state.clone(),
             crdt: false,
-            methods: vec![],
+            role_policies: role_policies(vec![]),
         }],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([31; 32]),
@@ -3229,13 +3382,15 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
                 program: actor_program,
                 initial_state: initial_state_ref.clone(),
                 crdt: false,
-                methods: vec![MethodPolicyV2 {
+                role_policies: role_policies(vec![MethodPolicyV2 {
                     method: method.into(),
                     schema: Hash([91; 32]),
                     policy: public_policy_hash(),
                     public: true,
                     attested: false,
-                }],
+                    space_role: None,
+                    actor_role: None,
+                }]),
             }],
             authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: vos::v2::SystemCapabilityId([93; 32]),
@@ -3582,13 +3737,15 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             program: actor_program,
             initial_state: initial.clone(),
             crdt: false,
-            methods: vec![MethodPolicyV2 {
+            role_policies: role_policies(vec![MethodPolicyV2 {
                 method: "start".into(),
                 schema: Hash([121; 32]),
                 policy: public_policy_hash(),
                 public: true,
                 attested: false,
-            }],
+                space_role: None,
+                actor_role: None,
+            }]),
         }],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([123; 32]),
@@ -3867,13 +4024,15 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
             program: actor_program,
             initial_state: initial.clone(),
             crdt: false,
-            methods: vec![MethodPolicyV2 {
+            role_policies: role_policies(vec![MethodPolicyV2 {
                 method: "start".into(),
                 schema: Hash([0xD1; 32]),
                 policy: public_policy_hash(),
                 public: true,
                 attested: false,
-            }],
+                space_role: None,
+                actor_role: None,
+            }]),
         }],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([0xD3; 32]),
@@ -4040,13 +4199,15 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
             program: actor_program,
             initial_state: initial.clone(),
             crdt: false,
-            methods: vec![MethodPolicyV2 {
+            role_policies: role_policies(vec![MethodPolicyV2 {
                 method: "start".into(),
                 schema: Hash([131; 32]),
                 policy: public_policy_hash(),
                 public: true,
                 attested: true,
-            }],
+                space_role: None,
+                actor_role: None,
+            }]),
         }],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([133; 32]),
@@ -4216,13 +4377,15 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
             program: actor_program,
             initial_state: initial.clone(),
             crdt: false,
-            methods: vec![MethodPolicyV2 {
+            role_policies: role_policies(vec![MethodPolicyV2 {
                 method: "start".into(),
                 schema: Hash([127; 32]),
                 policy: public_policy_hash(),
                 public: true,
                 attested: false,
-            }],
+                space_role: None,
+                actor_role: None,
+            }]),
         }],
         authorization: AuthorizationEvidenceV2::SystemCapability {
             capability: vos::v2::SystemCapabilityId([129; 32]),

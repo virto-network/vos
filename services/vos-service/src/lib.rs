@@ -460,6 +460,13 @@ mod guest {
             })
         }
 
+        fn verify_role_credential(
+            &self,
+            request: &vos::v2::RoleCredentialVerificationRequestV2,
+        ) -> Result<bool, Self::Error> {
+            Ok(hostcalls::verify_role_credential(&request.encode()) == error::HOST_OK)
+        }
+
         fn program_available(&self, program: ProgramId) -> Result<bool, Self::Error> {
             Ok(hostcalls::program_available(&program.0) == error::HOST_OK)
         }

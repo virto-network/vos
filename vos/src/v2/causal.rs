@@ -296,7 +296,7 @@ mod tests {
             program: super::super::ProgramId([8; 32]),
             initial_state: BlobRefV2::of_bytes(b"initial"),
             crdt: true,
-            methods: vec![],
+            role_policies: super::super::PackageRolePoliciesV2 { methods: vec![] }.encode(),
         };
         let states = frontier.actor_materializations(&descriptor).unwrap();
         assert_eq!(states.len(), 2);

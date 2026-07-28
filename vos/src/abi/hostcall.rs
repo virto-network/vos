@@ -102,6 +102,10 @@ pub const SUSPEND: u32 = 122;
 /// Refine never receive this capability.
 pub const PROOF_VERIFY: u32 = 123;
 
+/// Verify a disclosed role credential against the platform authority and its
+/// invocation-specific scope. Accumulate-only.
+pub const ROLE_CREDENTIAL_VERIFY: u32 = 124;
+
 /// Validate an external service's exact accumulation receipt before a
 /// committed reply is admitted as continuation input. Accumulate-only.
 pub const RECEIPT_VERIFY: u32 = 125;
@@ -128,6 +132,7 @@ mod tests {
             NOW_MS,
             SUSPEND,
             PROOF_VERIFY,
+            ROLE_CREDENTIAL_VERIFY,
             RECEIPT_VERIFY,
             INSTALL_AUTH_VERIFY,
             PROGRAM_LOOKUP,
@@ -159,6 +164,7 @@ mod tests {
             NOW_MS as u8,
             SUSPEND as u8,
             PROOF_VERIFY as u8,
+            ROLE_CREDENTIAL_VERIFY as u8,
             RECEIPT_VERIFY as u8,
             INSTALL_AUTH_VERIFY as u8,
             PROGRAM_LOOKUP as u8,

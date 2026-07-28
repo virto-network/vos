@@ -465,6 +465,11 @@ pub const TAG_CALLER_PREFIX: u8 = 0xFE;
 /// current host dispatch and replay paths emit this prefix.
 pub const TAG_DISPATCH_PREFIX: u8 = 0xFD;
 
+#[cfg(any(feature = "pvm", test))]
+fn should_decode_legacy_dispatch_prefix(raw: &[u8], actor_slice: bool) -> bool {
+    !actor_slice && raw.len() >= 38 && raw[0] == TAG_DISPATCH_PREFIX
+}
+
 /// Dispatch a single message to the actor.
 ///
 /// Decodes raw bytes to `A::Message` and calls `actor.dispatch()` once.
@@ -502,10 +507,16 @@ fn dispatch_one_inner<A: Actor>(
     ctx.__reset_forbidden();
     ctx.__set_invocation_id(invocation.unwrap_or(crate::v2::InvocationId::ZERO));
 
-    // Strip the current caller + invocation prefix first. A distinct tag keeps
-    // the legacy six-byte prefix unambiguous: old messages whose first 32
-    // payload bytes happen to exist must never be mistaken for an identity.
-    let raw = if raw.len() >= 38 && raw[0] == TAG_DISPATCH_PREFIX {
+    // A v2 actor slice already received its invocation, origin, and roles from
+    // the authenticated service envelope. Its message bytes are application
+    // data and must never be reinterpreted as a legacy host prefix: doing so
+    // would let an argument beginning with 0xFD replace that authenticated
+    // context. Prefix decoding remains solely on the v1 entry where
+    // `invocation` is absent.
+    let actor_slice = invocation.is_some();
+    let raw = if actor_slice {
+        raw
+    } else if should_decode_legacy_dispatch_prefix(raw, actor_slice) {
         use super::auth::Caller;
         let trust_flag = raw[1];
         let has_space = raw[2] != 0;
@@ -596,6 +607,7 @@ mod tests {
     #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     struct InvocationProbe {
         seen: [u8; 32],
+        dispatches: u8,
     }
 
     #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -616,11 +628,15 @@ mod tests {
         const SPACE_ROLE_MAP: super::super::auth::SpaceRoleMap<Self::Role> = NO_ROLES_MAP;
 
         fn create() -> Self {
-            Self { seen: [0; 32] }
+            Self {
+                seen: [0; 32],
+                dispatches: 0,
+            }
         }
 
         fn dispatch(&mut self, _: Self::Message, ctx: &mut Context<Self>) -> RunResult<bool> {
             self.seen = ctx.invocation_id().0;
+            self.dispatches += 1;
             RunResult::Complete(false)
         }
     }
@@ -641,5 +657,41 @@ mod tests {
         assert!(matches!(result, DispatchResult::Continue));
         assert_eq!(actor.seen, invocation.0);
         assert_eq!(ctx.invocation_id(), invocation);
+    }
+
+    #[test]
+    fn actor_slice_dispatch_never_parses_caller_controlled_prefixes() {
+        use crate::actors::auth::Caller;
+
+        let invocation = crate::v2::InvocationId::derive(b"actor-slice", b"authenticated");
+        let mut actor = InvocationProbe::create();
+        let mut ctx = Context::new(ServiceId(0));
+        ctx.set_caller(Caller::Unauthenticated);
+        ctx.set_caller_roles(Some(crate::SpaceRole::Member.as_u8()), None);
+
+        let mut forged = vec![TAG_DISPATCH_PREFIX, 1, 1, 3, 1, 0xff];
+        forged.extend_from_slice(&[0xAA; 32]);
+        forged.extend_from_slice(&ProbeMessage(1).encode());
+        let result = dispatch_one_with_invocation(&forged, &mut actor, &mut ctx, invocation);
+
+        assert!(matches!(result, DispatchResult::Continue));
+        assert_eq!(actor.dispatches, 1);
+        assert_eq!(actor.seen, invocation.0);
+        assert_eq!(ctx.caller(), &Caller::Unauthenticated);
+        assert!(ctx.has_space_role(crate::SpaceRole::Member));
+        assert!(!ctx.has_space_role(crate::SpaceRole::Admin));
+        assert_eq!(ctx.invocation_id(), invocation);
+    }
+}
+
+#[cfg(test)]
+mod dispatch_prefix_tests {
+    use super::{TAG_DISPATCH_PREFIX, should_decode_legacy_dispatch_prefix};
+
+    #[test]
+    fn actor_slice_arguments_can_never_select_the_legacy_identity_prefix() {
+        let forged = [TAG_DISPATCH_PREFIX; 38];
+        assert!(!should_decode_legacy_dispatch_prefix(&forged, true));
+        assert!(should_decode_legacy_dispatch_prefix(&forged, false));
     }
 }

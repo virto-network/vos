@@ -254,6 +254,12 @@ impl Caller {
 /// they mean; the actor's own `Role` enum interprets them via this
 /// trait.
 ///
+/// The byte representation is part of the v2 package policy ABI. Implementors
+/// must use the enum's `#[repr(u8)]` discriminant and preserve `Ord` ordering:
+/// if `left >= right`, `left.as_byte() >= right.as_byte()` must also hold.
+/// Generated method metadata and guest Accumulate rely on that canonical,
+/// monotone representation when they enforce actor-local thresholds.
+///
 /// Manually implementing the trait is straightforward — the
 /// `#[actor]` macro emits one automatically for the user's
 /// `Role` enum (M6).

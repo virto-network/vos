@@ -86,16 +86,19 @@ pub enum AuthorizationEvidenceV2 {
     },
 }
 
-/// Canonical authenticated space grant used as disclosed authorization input
+/// Canonical authenticated role grant used as disclosed authorization input
 /// or as the private witness of an attested call.
 ///
 /// `authenticator` is issued and checked by the platform credential provider;
 /// the generic service additionally binds the exact bytes to `holder`, the
-/// work origin, and the generated role-threshold policy.
+/// invocation-specific authorization scope, and both generated role
+/// thresholds.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpaceRoleCredentialV2 {
+pub struct RoleCredentialV2 {
     pub holder: Origin,
-    pub role: crate::SpaceRole,
+    pub scope: Hash,
+    pub space_role: Option<crate::SpaceRole>,
+    pub actor_role: Option<u8>,
     pub authenticator: Vec<u8>,
 }
 
@@ -152,6 +155,10 @@ pub struct ImportedBlobV2 {
 pub struct RefineImportsV2 {
     pub programs: Vec<ImportedProgramV2>,
     pub blobs: Vec<ImportedBlobV2>,
+    /// Invocation-private witnesses supplied directly to Refine/proving.
+    /// These bytes are never work imports, Accumulate candidates, CRDT sync
+    /// payloads, or recoverable service-state blobs.
+    pub private_blobs: Vec<ImportedBlobV2>,
 }
 
 /// Input placed in the invocation-owned IPC DATA capability before the
@@ -174,6 +181,7 @@ pub struct ActorSliceInputV2 {
     /// Authenticated role recovered from the disclosed credential or private
     /// witness before entering the canonical actor PVM.
     pub space_role: Option<u8>,
+    pub actor_role: Option<u8>,
 }
 
 /// Unique operation-allocation namespace for one actor dispatch inside a CRDT
@@ -294,6 +302,30 @@ impl WorkEnvelopeV2 {
     /// authorization evidence, consistency base, and every import reference.
     pub fn hash(&self) -> Hash {
         Hash::digest(b"vos/work/v2", &[&self.encode()])
+    }
+
+    /// Intent that a role authority signs for one invocation.
+    ///
+    /// The consistency frontier and scheduler timeslot are excluded so stale
+    /// work may be rescheduled without minting a new credential. Actor,
+    /// deployment, invocation, method, arguments, origin, causal identity,
+    /// and proof mode are included, preventing a disclosed credential from
+    /// being replayed for another call or service.
+    pub fn authorization_scope(&self) -> Hash {
+        let mut bytes = Vec::new();
+        let mut e = Encoder(&mut bytes);
+        encode_service(&mut e, &self.service);
+        e.fixed(&self.invocation.0);
+        e.fixed(&self.target.0);
+        e.fixed(&self.target_program.0);
+        e.string(&self.method);
+        e.bytes(&self.arguments);
+        encode_origin(&mut e, self.origin);
+        e.option(&self.causal_parent, |e, id| e.fixed(&id.0));
+        e.option(&self.parent_call, |e, id| e.fixed(&id.0));
+        e.option(&self.causal_context, encode_causal_context);
+        e.bool(self.proof_requested);
+        Hash::digest(b"vos/authorization-scope/v2", &[&bytes])
     }
 
     /// Stable identity shared by every slice of one suspended workflow.
@@ -550,6 +582,46 @@ impl ProofVerificationRequestV2 {
     }
 }
 
+/// Consensus-authoritative verification input for one disclosed role
+/// credential. The authority checks the authenticator over the credential's
+/// invocation-specific scope; guest Accumulate separately checks the decoded
+/// holder and role thresholds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleCredentialVerificationRequestV2 {
+    pub service: ServiceIdentityV2,
+    pub actor: ActorId,
+    pub policy: Hash,
+    pub scope: Hash,
+    pub credential_commitment: Hash,
+    pub credential: Vec<u8>,
+}
+
+impl RoleCredentialVerificationRequestV2 {
+    pub fn hash(&self) -> Hash {
+        Hash::digest(b"vos/role-credential-verification/v2", &[&self.encode()])
+    }
+
+    pub fn for_work(work: &WorkEnvelopeV2) -> Option<Self> {
+        let AuthorizationEvidenceV2::Credential {
+            policy,
+            credential_commitment,
+            bytes,
+        } = &work.authorization
+        else {
+            return None;
+        };
+        let credential = RoleCredentialV2::decode(bytes).ok()?;
+        Some(Self {
+            service: work.service.clone(),
+            actor: work.target,
+            policy: *policy,
+            scope: credential.scope,
+            credential_commitment: *credential_commitment,
+            credential: bytes.clone(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionV2 {
     pub service: ServiceIdentityV2,
@@ -645,6 +717,8 @@ pub struct MethodPolicyV2 {
     pub policy: Hash,
     pub public: bool,
     pub attested: bool,
+    pub space_role: Option<u8>,
+    pub actor_role: Option<u8>,
 }
 
 /// One canonical actor installed into the root actor tree owned by a service.
@@ -657,7 +731,10 @@ pub struct ActorGenesisV2 {
     pub program: ProgramId,
     pub initial_state: BlobRefV2,
     pub crdt: bool,
-    pub methods: Vec<MethodPolicyV2>,
+    /// Exact canonical policy artifact retained from the signed deployment.
+    /// Guest Install decodes method rows from these bytes; callers cannot
+    /// supply an independent, weaker `methods` list.
+    pub role_policies: Vec<u8>,
 }
 
 /// Clean-break initialization accepted only by an empty v2 service store.
@@ -908,6 +985,10 @@ impl RefineImportsV2 {
                 .blobs
                 .windows(2)
                 .any(|pair| pair[0].reference.hash >= pair[1].reference.hash)
+            || self
+                .private_blobs
+                .windows(2)
+                .any(|pair| pair[0].reference.hash >= pair[1].reference.hash)
         {
             return Err(RefineError::NonCanonicalImports);
         }
@@ -920,6 +1001,28 @@ impl RefineImportsV2 {
             if !imported.reference.matches(&imported.bytes) {
                 return Err(RefineError::InvalidImport(imported.reference.hash));
             }
+        }
+        for imported in &self.private_blobs {
+            if !imported.reference.matches(&imported.bytes)
+                || self
+                    .blobs
+                    .binary_search_by_key(&imported.reference.hash, |blob| blob.reference.hash)
+                    .is_ok()
+            {
+                return Err(RefineError::InvalidImport(imported.reference.hash));
+            }
+        }
+        match &work.authorization {
+            AuthorizationEvidenceV2::PrivateCredential { witness, .. } => {
+                if self.private_blobs.len() != 1 {
+                    return Err(RefineError::NonCanonicalImports);
+                }
+                self.require_private_blob(witness)?;
+            }
+            _ if !self.private_blobs.is_empty() => {
+                return Err(RefineError::NonCanonicalImports);
+            }
+            _ => {}
         }
 
         let target = work
@@ -959,6 +1062,19 @@ impl RefineImportsV2 {
             .binary_search_by_key(&reference.hash, |blob| blob.reference.hash)
             .ok()
             .map(|index| &self.blobs[index])
+            .ok_or(RefineError::MissingImport(reference.hash))?;
+        if imported.reference != *reference {
+            return Err(RefineError::InvalidImport(reference.hash));
+        }
+        Ok(())
+    }
+
+    fn require_private_blob(&self, reference: &BlobRefV2) -> Result<(), RefineError> {
+        let imported = self
+            .private_blobs
+            .binary_search_by_key(&reference.hash, |blob| blob.reference.hash)
+            .ok()
+            .map(|index| &self.private_blobs[index])
             .ok_or(RefineError::MissingImport(reference.hash))?;
         if imported.reference != *reference {
             return Err(RefineError::InvalidImport(reference.hash));
@@ -1043,11 +1159,11 @@ impl V2Wire for WorkEnvelopeV2 {
         ensure_sorted_unique(&imported_actors, |actor| actor.actor.0)?;
         ensure_sorted_unique(&imported_blobs, |b| b.hash.0)?;
         if let AuthorizationEvidenceV2::PrivateCredential { witness, .. } = &authorization {
-            let present = imported_blobs
+            let leaked_into_public_imports = imported_blobs
                 .binary_search_by_key(&witness.hash, |blob| blob.hash)
                 .ok()
                 .is_some_and(|index| imported_blobs[index] == *witness);
-            if !proof_requested || !present {
+            if !proof_requested || witness.len == 0 || leaked_into_public_imports {
                 return Err(DecodeError::NonCanonical);
             }
         }
@@ -1104,6 +1220,10 @@ impl V2Wire for RefineImportsV2 {
             encode_blob_ref(e, &blob.reference);
             e.bytes(&blob.bytes);
         });
+        e.list(&self.private_blobs, |e, blob| {
+            encode_blob_ref(e, &blob.reference);
+            e.bytes(&blob.bytes);
+        });
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -1120,9 +1240,16 @@ impl V2Wire for RefineImportsV2 {
                     bytes: d.bytes()?,
                 })
             })?,
+            private_blobs: d.list(|d| {
+                Ok(ImportedBlobV2 {
+                    reference: decode_blob_ref(d)?,
+                    bytes: d.bytes()?,
+                })
+            })?,
         };
         ensure_sorted_unique(&value.programs, |program| program.program.0)?;
         ensure_sorted_unique(&value.blobs, |blob| blob.reference.hash.0)?;
+        ensure_sorted_unique(&value.private_blobs, |blob| blob.reference.hash.0)?;
         for program in &value.programs {
             if program.pvm.is_empty() || ProgramId::of_pvm(&program.pvm) != program.program {
                 return Err(DecodeError::NonCanonical);
@@ -1131,7 +1258,14 @@ impl V2Wire for RefineImportsV2 {
         if value
             .blobs
             .iter()
+            .chain(value.private_blobs.iter())
             .any(|blob| !blob.reference.matches(&blob.bytes))
+            || value.private_blobs.iter().any(|private| {
+                value
+                    .blobs
+                    .binary_search_by_key(&private.reference.hash, |blob| blob.reference.hash)
+                    .is_ok()
+            })
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -1156,6 +1290,7 @@ impl V2Wire for ActorSliceInputV2 {
         e.bytes(&self.message);
         encode_origin(&mut e, self.origin);
         e.option(&self.space_role, |e, role| e.u8(*role));
+        e.option(&self.actor_role, |e, role| e.u8(*role));
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -1181,6 +1316,7 @@ impl V2Wire for ActorSliceInputV2 {
                     .map(|_| role)
                     .ok_or(DecodeError::NonCanonical)
             })?,
+            actor_role: d.option(Decoder::u8)?,
         };
         if value.change.is_none() && !value.causal_states.is_empty() {
             return Err(DecodeError::NonCanonical);
@@ -1440,7 +1576,7 @@ impl V2Wire for BlobRefV2 {
     }
 }
 
-impl SpaceRoleCredentialV2 {
+impl RoleCredentialV2 {
     pub fn commitment(&self) -> Hash {
         Hash::digest(b"vos/credential-commitment/v2", &[&self.encode()])
     }
@@ -1468,23 +1604,30 @@ impl SpaceRoleCredentialV2 {
     }
 }
 
-impl V2Wire for SpaceRoleCredentialV2 {
+impl V2Wire for RoleCredentialV2 {
     const MAGIC: [u8; 4] = *b"VRC2";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
         encode_origin(&mut encoder, self.holder);
-        encoder.u8(self.role.as_u8());
+        encoder.fixed(&self.scope.0);
+        encoder.option(&self.space_role, |encoder, role| encoder.u8(role.as_u8()));
+        encoder.option(&self.actor_role, |encoder, role| encoder.u8(*role));
         encoder.bytes(&self.authenticator);
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let value = Self {
             holder: decode_origin(decoder)?,
-            role: crate::SpaceRole::from_u8(decoder.u8()?).ok_or(DecodeError::NonCanonical)?,
+            scope: Hash(decoder.fixed()?),
+            space_role: decoder.option(|decoder| {
+                crate::SpaceRole::from_u8(decoder.u8()?).ok_or(DecodeError::NonCanonical)
+            })?,
+            actor_role: decoder.option(Decoder::u8)?,
             authenticator: decoder.bytes()?,
         };
         if !matches!(value.holder, Origin::Member(_) | Origin::Actor(_))
+            || (value.space_role.is_none() && value.actor_role.is_none())
             || value.authenticator.is_empty()
         {
             return Err(DecodeError::NonCanonical);
@@ -1503,6 +1646,8 @@ impl V2Wire for MethodPolicyV2 {
         e.fixed(&self.policy.0);
         e.bool(self.public);
         e.bool(self.attested);
+        e.option(&self.space_role, |e, role| e.u8(*role));
+        e.option(&self.actor_role, |e, role| e.u8(*role));
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -1512,8 +1657,19 @@ impl V2Wire for MethodPolicyV2 {
             policy: Hash(d.fixed()?),
             public: d.bool()?,
             attested: d.bool()?,
+            space_role: d.option(|d| {
+                let role = d.u8()?;
+                crate::SpaceRole::from_u8(role)
+                    .map(|_| role)
+                    .ok_or(DecodeError::NonCanonical)
+            })?,
+            actor_role: d.option(Decoder::u8)?,
         };
-        if value.method.is_empty() {
+        if value.method.is_empty()
+            || value.public != (value.space_role.is_none() && value.actor_role.is_none())
+            || super::package::method_role_policy_hash(value.space_role, value.actor_role)
+                != Some(value.policy)
+        {
             return Err(DecodeError::NonCanonical);
         }
         Ok(value)
@@ -1641,6 +1797,41 @@ impl V2Wire for ProofVerificationRequestV2 {
             proof_blob: decode_blob_ref(d)?,
         };
         if value.statement == Hash::ZERO || value.trace == Hash::ZERO {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+impl V2Wire for RoleCredentialVerificationRequestV2 {
+    const MAGIC: [u8; 4] = *b"VCV2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        encode_service(&mut e, &self.service);
+        e.fixed(&self.actor.0);
+        e.fixed(&self.policy.0);
+        e.fixed(&self.scope.0);
+        e.fixed(&self.credential_commitment.0);
+        e.bytes(&self.credential);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            service: decode_service(d)?,
+            actor: ActorId(d.fixed()?),
+            policy: Hash(d.fixed()?),
+            scope: Hash(d.fixed()?),
+            credential_commitment: Hash(d.fixed()?),
+            credential: d.bytes()?,
+        };
+        if value.policy == Hash::ZERO
+            || value.scope == Hash::ZERO
+            || value.credential_commitment == Hash::ZERO
+            || value.credential.is_empty()
+            || Hash::digest(b"vos/credential-commitment/v2", &[&value.credential])
+                != value.credential_commitment
+        {
             return Err(DecodeError::NonCanonical);
         }
         Ok(value)
@@ -2005,13 +2196,7 @@ fn encode_actor_genesis(e: &mut Encoder<'_>, value: &ActorGenesisV2) {
     e.fixed(&value.program.0);
     encode_blob_ref(e, &value.initial_state);
     e.bool(value.crdt);
-    e.list(&value.methods, |e, method| {
-        e.string(&method.method);
-        e.fixed(&method.schema.0);
-        e.fixed(&method.policy.0);
-        e.bool(method.public);
-        e.bool(method.attested);
-    });
+    e.bytes(&value.role_policies);
 }
 
 fn decode_actor_genesis(d: &mut Decoder<'_>) -> Result<ActorGenesisV2, DecodeError> {
@@ -2021,22 +2206,9 @@ fn decode_actor_genesis(d: &mut Decoder<'_>) -> Result<ActorGenesisV2, DecodeErr
         program: ProgramId(d.fixed()?),
         initial_state: decode_blob_ref(d)?,
         crdt: d.bool()?,
-        methods: d.list(|d| {
-            Ok(MethodPolicyV2 {
-                method: d.string()?,
-                schema: Hash(d.fixed()?),
-                policy: Hash(d.fixed()?),
-                public: d.bool()?,
-                attested: d.bool()?,
-            })
-        })?,
+        role_policies: d.bytes()?,
     };
-    if value.methods.iter().any(|method| method.method.is_empty())
-        || value
-            .methods
-            .windows(2)
-            .any(|pair| pair[0].method >= pair[1].method)
-    {
+    if super::package::PackageRolePoliciesV2::decode(&value.role_policies).is_err() {
         return Err(DecodeError::NonCanonical);
     }
     Ok(value)
@@ -2754,6 +2926,10 @@ fn ensure_sorted_unique<T, K: Ord>(values: &[T], key: impl Fn(&T) -> K) -> Resul
 mod tests {
     use super::*;
 
+    fn role_policies(methods: Vec<MethodPolicyV2>) -> Vec<u8> {
+        super::super::PackageRolePoliciesV2 { methods }.encode()
+    }
+
     fn service() -> ServiceIdentityV2 {
         ServiceIdentityV2 {
             space: SpaceId([0; 32]),
@@ -2861,19 +3037,20 @@ mod tests {
         );
 
         let origin = Origin::Member(SubjectId([43; 32]));
-        let credential = SpaceRoleCredentialV2 {
+        let mut private = work();
+        private.origin = origin;
+        private.proof_requested = true;
+        let credential = RoleCredentialV2 {
             holder: origin,
-            role: crate::SpaceRole::Member,
+            scope: private.authorization_scope(),
+            space_role: Some(crate::SpaceRole::Member),
+            actor_role: None,
             authenticator: b"private role witness".to_vec(),
         };
         let policy =
             super::super::space_role_policy_hash(crate::SpaceRole::Member.as_u8()).unwrap();
         let (authorization, witness) = credential.private_evidence(policy);
-        let mut private = work();
-        private.origin = origin;
         private.authorization = authorization;
-        private.imported_blobs = vec![witness.reference.clone()];
-        private.proof_requested = true;
         assert_eq!(WorkEnvelopeV2::decode(&private.encode()).unwrap(), private);
         assert!(
             !private
@@ -2889,10 +3066,11 @@ mod tests {
             Err(DecodeError::NonCanonical)
         );
         private.proof_requested = true;
-        private.imported_blobs.clear();
+        private.imported_blobs = vec![witness.reference];
         assert_eq!(
             WorkEnvelopeV2::decode(&private.encode()),
-            Err(DecodeError::NonCanonical)
+            Err(DecodeError::NonCanonical),
+            "private witnesses cannot be declared as persistent/shared work imports"
         );
     }
 
@@ -2930,6 +3108,7 @@ mod tests {
         let imports = RefineImportsV2 {
             programs: vec![ImportedProgramV2 { program, pvm }],
             blobs,
+            private_blobs: vec![],
         };
         imports.validate_for(&work).unwrap();
         let encoded = imports.encode();
@@ -2969,6 +3148,7 @@ mod tests {
             message: b"message".to_vec(),
             origin: Origin::Actor(ActorId([22; 32])),
             space_role: Some(crate::SpaceRole::Developer.as_u8()),
+            actor_role: Some(7),
         };
         assert_eq!(ActorSliceInputV2::decode(&input.encode()).unwrap(), input);
 
@@ -3210,13 +3390,15 @@ mod tests {
                     program: ProgramId([6; 32]),
                     initial_state: BlobRefV2::of_bytes(b"root-state"),
                     crdt: false,
-                    methods: vec![MethodPolicyV2 {
+                    role_policies: role_policies(vec![MethodPolicyV2 {
                         method: "increment".into(),
                         schema: Hash([7; 32]),
-                        policy: Hash([8; 32]),
+                        policy: super::super::public_policy_hash(),
                         public: true,
                         attested: false,
-                    }],
+                        space_role: None,
+                        actor_role: None,
+                    }]),
                 },
                 ActorGenesisV2 {
                     actor: ActorId([9; 32]),
@@ -3224,7 +3406,7 @@ mod tests {
                     program: ProgramId([10; 32]),
                     initial_state: BlobRefV2::of_bytes(b"child-state"),
                     crdt: false,
-                    methods: vec![],
+                    role_policies: role_policies(vec![]),
                 },
             ],
             authorization: AuthorizationEvidenceV2::SystemCapability {
@@ -3323,7 +3505,7 @@ mod tests {
                 program: ProgramId([6; 32]),
                 initial_state: BlobRefV2::of_bytes(b"state"),
                 crdt: false,
-                methods: vec![],
+                role_policies: role_policies(vec![]),
             }],
             authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: SystemCapabilityId([7; 32]),

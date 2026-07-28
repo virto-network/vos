@@ -22,13 +22,13 @@ use super::{
     CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryEnvelopeV2, DeliveryRecordV2,
     EXECUTION_SEMANTICS_ID, Hash, MessageRecordV2, MethodPolicyV2, ProgramId,
     ProofVerificationRequestV2, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
-    ReceiptVerificationRequestV2, ReplyAdmissionRecordV2, ServiceGenesisV2,
-    ServiceInstallReceiptV2, ServiceStateTreeV2, SpaceRoleCredentialV2, StateKeyV2, StateTreeError,
-    StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire, WorkflowCheckpointV2,
-    WorkflowOperationV2, crdt_change_storage_key, crdt_node_receipt_storage_key,
-    crdt_node_storage_key, dedup_storage_key, delivery_storage_key, header_storage_key,
-    public_policy_hash, publication_storage_key, receipt_storage_key, reply_admission_storage_key,
-    space_role_for_policy,
+    ReceiptVerificationRequestV2, ReplyAdmissionRecordV2, RoleCredentialV2,
+    RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServiceInstallReceiptV2,
+    ServiceStateTreeV2, StateKeyV2, StateTreeError, StateTreeStore, StoreHeaderV2, StoreOpenError,
+    V2Wire, WorkflowCheckpointV2, WorkflowOperationV2, crdt_change_storage_key,
+    crdt_node_receipt_storage_key, crdt_node_storage_key, dedup_storage_key, delivery_storage_key,
+    header_storage_key, method_role_policy_hash, public_policy_hash, publication_storage_key,
+    receipt_storage_key, reply_admission_storage_key,
 };
 
 /// Extra content-addressed operations needed by guest Accumulate in addition
@@ -60,6 +60,14 @@ pub trait GuestAccumulateStoreV2: StateTreeStore {
         &self,
         request: &ProofVerificationRequestV2,
     ) -> Result<ProofVerificationV2, Self::Error>;
+
+    /// Verify the authority authenticator on one disclosed role credential.
+    /// The request is bound to the exact service, actor, policy, and
+    /// invocation-specific scope checked again by guest Accumulate.
+    fn verify_role_credential(
+        &self,
+        request: &RoleCredentialVerificationRequestV2,
+    ) -> Result<bool, Self::Error>;
 
     /// Validate that an external accumulation receipt is finalized and that
     /// its service owns `request.expected_producer`.
@@ -151,6 +159,9 @@ fn install<S: GuestAccumulateStoreV2>(
         return Ok(rejected(AccumulationRejectionV2::Unauthorized));
     }
     for actor in &genesis.actors {
+        if super::PackageRolePoliciesV2::decode(&actor.role_policies).is_err() {
+            return Ok(rejected(AccumulationRejectionV2::NonCanonical));
+        }
         if !store
             .program_available(actor.program)
             .map_err(GuestAccumulateError::Storage)?
@@ -173,7 +184,9 @@ fn install<S: GuestAccumulateStoreV2>(
                 &StateKeyV2::ActorDescriptor(actor.actor),
                 Some(&actor.encode()),
             )?;
-            for method in &actor.methods {
+            let policies = super::PackageRolePoliciesV2::decode(&actor.role_policies)
+                .map_err(|_| GuestAccumulateError::CorruptStore)?;
+            for method in &policies.methods {
                 tree_apply(
                     &mut tree,
                     &StateKeyV2::MethodPolicy {
@@ -1001,7 +1014,7 @@ fn apply<S: GuestAccumulateStoreV2>(
     else {
         return Ok(rejected(AccumulationRejectionV2::Unauthorized));
     };
-    if !authorized(work, &policy) {
+    if !authorized(work, &policy, tree.store_ref())? {
         return Ok(rejected(AccumulationRejectionV2::Unauthorized));
     }
     let proof_required = policy.attested || work.proof_requested;
@@ -1703,23 +1716,53 @@ fn canonical_transition_shape(
         })
 }
 
-fn authorized(work: &super::WorkEnvelopeV2, policy: &MethodPolicyV2) -> bool {
-    match &work.authorization {
+fn authorized<S: GuestAccumulateStoreV2>(
+    work: &super::WorkEnvelopeV2,
+    policy: &MethodPolicyV2,
+    store: &S,
+) -> GuestResult<bool, S::Error> {
+    if method_role_policy_hash(policy.space_role, policy.actor_role) != Some(policy.policy)
+        || policy.public != (policy.space_role.is_none() && policy.actor_role.is_none())
+    {
+        return Ok(false);
+    }
+    Ok(match &work.authorization {
         AuthorizationEvidenceV2::Public => policy.public && policy.policy == public_policy_hash(),
         AuthorizationEvidenceV2::Credential {
             policy: supplied_policy,
             credential_commitment,
             bytes,
-        } => SpaceRoleCredentialV2::decode(bytes)
-            .ok()
-            .is_some_and(|credential| {
-                !policy.public
-                    && credential.holder == work.origin
-                    && space_role_for_policy(policy.policy)
-                        .is_some_and(|required| credential.role >= required)
-                    && *supplied_policy == policy.policy
-                    && *credential_commitment == credential.commitment()
-            }),
+        } => {
+            let Ok(credential) = RoleCredentialV2::decode(bytes) else {
+                return Ok(false);
+            };
+            let Some(verification) = RoleCredentialVerificationRequestV2::for_work(work) else {
+                return Ok(false);
+            };
+            !policy.public
+                && credential.holder == work.origin
+                // Step zero binds the credential to the original arguments.
+                // Later slices omit those dead bytes; their unchanged
+                // authorization is pinned by the committed workflow identity
+                // and exact continuation checks below.
+                && (work.workflow_step != 0
+                    || credential.scope == work.authorization_scope())
+                && policy.space_role.is_none_or(|required| {
+                    credential
+                        .space_role
+                        .is_some_and(|actual| actual.as_u8() >= required)
+                })
+                && policy.actor_role.is_none_or(|required| {
+                    credential
+                        .actor_role
+                        .is_some_and(|actual| actual >= required)
+                })
+                && *supplied_policy == policy.policy
+                && *credential_commitment == credential.commitment()
+                && store
+                    .verify_role_credential(&verification)
+                    .map_err(GuestAccumulateError::Storage)?
+        }
         AuthorizationEvidenceV2::PrivateCredential {
             policy: supplied_policy,
             credential_commitment,
@@ -1727,23 +1770,19 @@ fn authorized(work: &super::WorkEnvelopeV2, policy: &MethodPolicyV2) -> bool {
         } => {
             !policy.public
                 && (policy.attested || work.proof_requested)
-                && space_role_for_policy(policy.policy).is_some()
+                && (policy.space_role.is_some() || policy.actor_role.is_some())
                 && matches!(
                     work.origin,
                     super::Origin::Member(_) | super::Origin::Actor(_)
                 )
                 && *supplied_policy == policy.policy
                 && *credential_commitment != Hash::ZERO
-                && work
-                    .imported_blobs
-                    .binary_search_by_key(&witness.hash, |blob| blob.hash)
-                    .ok()
-                    .is_some_and(|index| work.imported_blobs[index] == *witness)
+                && witness.len != 0
         }
         // A future statement version will bind platform authority keys. Until
         // then System is an identity class, never an authorization bypass.
         AuthorizationEvidenceV2::SystemCapability { .. } => false,
-    }
+    })
 }
 
 fn work_matches_durable_inbox<S: StateTreeStore>(
@@ -2197,6 +2236,10 @@ mod tests {
         ProgramId, ReplyRecordV2, RootServiceId, ServiceIdentityV2, TransitionV2, WorkEnvelopeV2,
     };
 
+    fn role_policies(methods: Vec<MethodPolicyV2>) -> Vec<u8> {
+        crate::v2::PackageRolePoliciesV2 { methods }.encode()
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum MemError {
         Injected,
@@ -2209,6 +2252,7 @@ mod tests {
         proof_blobs: BTreeMap<Hash, Vec<u8>>,
         programs: BTreeMap<ProgramId, Vec<u8>>,
         proof_allowlist: BTreeSet<Hash>,
+        role_credential_allowlist: BTreeSet<Hash>,
         receipt_allowlist: BTreeSet<Hash>,
         writes_before_failure: Option<usize>,
         deny_install: bool,
@@ -2284,6 +2328,13 @@ mod tests {
             )
         }
 
+        fn verify_role_credential(
+            &self,
+            request: &RoleCredentialVerificationRequestV2,
+        ) -> Result<bool, Self::Error> {
+            Ok(self.role_credential_allowlist.contains(&request.hash()))
+        }
+
         fn program_available(&self, program: ProgramId) -> Result<bool, Self::Error> {
             Ok(self
                 .programs
@@ -2340,13 +2391,15 @@ mod tests {
                 program: program(),
                 initial_state: initial.clone(),
                 crdt: consistency == ConsistencyModeV2::Crdt,
-                methods: vec![MethodPolicyV2 {
+                role_policies: role_policies(vec![MethodPolicyV2 {
                     method: "set".into(),
                     schema: Hash([6; 32]),
                     policy: public_policy_hash(),
                     public: true,
                     attested: false,
-                }],
+                    space_role: None,
+                    actor_role: None,
+                }]),
             }],
             authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: super::super::SystemCapabilityId([8; 32]),
@@ -2377,7 +2430,7 @@ mod tests {
                 program: program(),
                 initial_state: initial,
                 crdt: false,
-                methods: vec![],
+                role_policies: role_policies(vec![]),
             }],
             authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: super::super::SystemCapabilityId([8; 32]),
@@ -2414,13 +2467,15 @@ mod tests {
                 program: program(),
                 initial_state: initial,
                 crdt: false,
-                methods: vec![MethodPolicyV2 {
+                role_policies: role_policies(vec![MethodPolicyV2 {
                     method: "set".into(),
                     schema: Hash([6; 32]),
                     policy: public_policy_hash(),
                     public: true,
                     attested: false,
-                }],
+                    space_role: None,
+                    actor_role: None,
+                }]),
             }],
             authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: super::super::SystemCapabilityId([8; 32]),
@@ -2524,6 +2579,8 @@ mod tests {
             policy: public_policy_hash(),
             public: true,
             attested: false,
+            space_role: None,
+            actor_role: None,
         };
         assert_eq!(
             preparation,
@@ -2820,13 +2877,15 @@ mod tests {
                 program: program(),
                 initial_state: initial.clone(),
                 crdt: false,
-                methods: vec![MethodPolicyV2 {
+                role_policies: role_policies(vec![MethodPolicyV2 {
                     method: "set".into(),
                     schema: Hash([6; 32]),
                     policy: required_policy,
                     public: false,
                     attested: false,
-                }],
+                    space_role: Some(crate::SpaceRole::Member.as_u8()),
+                    actor_role: None,
+                }]),
             }],
             authorization: AuthorizationEvidenceV2::SystemCapability {
                 capability: super::super::SystemCapabilityId([8; 32]),
@@ -2841,14 +2900,21 @@ mod tests {
         let base = receipt.resulting_state_root.unwrap();
         let origin = super::super::Origin::Member(super::super::SubjectId([40; 32]));
 
-        let developer = SpaceRoleCredentialV2 {
-            holder: origin,
-            role: crate::SpaceRole::Developer,
-            authenticator: b"developer grant".to_vec(),
-        };
         let mut admitted_work = linear_work(initial.clone(), base);
         admitted_work.origin = origin;
+        let developer = RoleCredentialV2 {
+            holder: origin,
+            scope: admitted_work.authorization_scope(),
+            space_role: Some(crate::SpaceRole::Developer),
+            actor_role: None,
+            authenticator: b"developer grant".to_vec(),
+        };
         admitted_work.authorization = developer.disclosed_evidence(required_policy);
+        store.role_credential_allowlist.insert(
+            RoleCredentialVerificationRequestV2::for_work(&admitted_work)
+                .unwrap()
+                .hash(),
+        );
         let admitted = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             transition: linear_transition(&admitted_work, b"admitted"),
             work: admitted_work,
@@ -2863,14 +2929,38 @@ mod tests {
             }
         ));
 
-        let guest = SpaceRoleCredentialV2 {
-            holder: origin,
-            role: crate::SpaceRole::Guest,
-            authenticator: b"guest grant".to_vec(),
-        };
+        let mut replayed_work = linear_work(initial.clone(), base);
+        replayed_work.origin = origin;
+        replayed_work.invocation = super::super::InvocationId([0x52; 32]);
+        replayed_work.authorization = developer.disclosed_evidence(required_policy);
+        let replayed = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            transition: linear_transition(&replayed_work, b"replayed"),
+            work: replayed_work,
+            provided_blobs: vec![],
+        });
+        let before_replay = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &replayed).unwrap(),
+            rejected(AccumulationRejectionV2::Unauthorized),
+            "a valid credential for one invocation cannot authorize another"
+        );
+        assert_eq!(store, before_replay);
+
         let mut denied_work = linear_work(initial, base);
         denied_work.origin = origin;
+        let guest = RoleCredentialV2 {
+            holder: origin,
+            scope: denied_work.authorization_scope(),
+            space_role: Some(crate::SpaceRole::Guest),
+            actor_role: None,
+            authenticator: b"guest grant".to_vec(),
+        };
         denied_work.authorization = guest.disclosed_evidence(required_policy);
+        store.role_credential_allowlist.insert(
+            RoleCredentialVerificationRequestV2::for_work(&denied_work)
+                .unwrap()
+                .hash(),
+        );
         let denied = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             transition: linear_transition(&denied_work, b"denied"),
             work: denied_work,

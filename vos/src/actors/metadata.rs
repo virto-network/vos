@@ -44,6 +44,8 @@
 //! [policy_count:u16 LE]         (one entry per message, in order)
 //!   [attested:u8]               (0 = regular, 1 = proof required)
 //!   [space_role:u8]             (0xff = none, otherwise `SpaceRole`)
+//! [actor_role_count:u16 LE]      (one entry per message, in order)
+//!   [actor_role:u8]             (0xff = none, otherwise `Actor::Role`)
 //!   ...
 //! ```
 //!
@@ -103,6 +105,10 @@ pub struct MessageMeta {
     /// actor-local `role = ...` hierarchy. `None` leaves the method open to
     /// any otherwise-authorized origin.
     pub space_role: Option<u8>,
+    /// Actor-local role predicate declared with `#[msg(role = ...)]`.
+    /// The byte is the canonical monotone `RoleByte`/`#[repr(u8)]`
+    /// discriminant and is independently enforced from `space_role`.
+    pub actor_role: Option<u8>,
 }
 
 /// Actor descriptor — actor name, messages, and constructor params.
@@ -413,8 +419,8 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
     buf[pos] = meta.crdt as u8;
     pos += 1;
 
-    // Per-message attestation and direct space-role policy. Appended after the
-    // actor replication flag so all older metadata remains prefix-readable.
+    // Per-message attestation and direct space role policy. This is the
+    // original policy section and must remain byte-stable.
     let [lo, hi] = (meta.messages.len() as u16).to_le_bytes();
     buf[pos] = lo;
     buf[pos + 1] = hi;
@@ -428,6 +434,23 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         };
         pos += 2;
         ap += 1;
+    }
+
+    // Actor-local policy is its own append-only section. A decoder that knows
+    // only the original policy section can ignore this complete tail without
+    // losing alignment between messages.
+    let [lo, hi] = (meta.messages.len() as u16).to_le_bytes();
+    buf[pos] = lo;
+    buf[pos + 1] = hi;
+    pos += 2;
+    let mut ar = 0usize;
+    while ar < meta.messages.len() {
+        buf[pos] = match meta.messages[ar].actor_role {
+            Some(role) => role,
+            None => u8::MAX,
+        };
+        pos += 1;
+        ar += 1;
     }
 
     (buf, pos)
@@ -456,6 +479,7 @@ mod tests {
                     mode: 0,
                     attested: true,
                     space_role: Some(1),
+                    actor_role: None,
                 },
                 MessageMeta {
                     name: "status",
@@ -470,6 +494,7 @@ mod tests {
                     mode: 0,
                     attested: false,
                     space_role: None,
+                    actor_role: Some(2),
                 },
             ],
             constructor: &[FieldMeta {
@@ -502,6 +527,7 @@ mod tests {
         assert_eq!(parsed.messages[1].returns, "[u8;32]");
         assert!(!parsed.messages[1].attested);
         assert_eq!(parsed.messages[1].space_role, None);
+        assert_eq!(parsed.messages[1].actor_role, Some(2));
         assert_eq!(parsed.constructor.len(), 1);
         assert_eq!(parsed.constructor[0].name, "start");
         assert_eq!(parsed.constructor[0].ty, "u32");
@@ -512,7 +538,7 @@ mod tests {
             "a present policy section must contain every declared entry"
         );
         let mut wrong_count = buf[..len].to_vec();
-        let policy_count_offset = len - (2 + META.messages.len() * 2);
+        let policy_count_offset = len - (2 + META.messages.len()) - (2 + META.messages.len() * 2);
         wrong_count[policy_count_offset..policy_count_offset + 2]
             .copy_from_slice(&1u16.to_le_bytes());
         assert!(
@@ -522,8 +548,13 @@ mod tests {
         let mut trailing = buf[..len].to_vec();
         trailing.push(0);
         assert!(
-            decode(&trailing).is_none(),
-            "unknown policy-section bytes are not canonical metadata"
+            decode(&trailing).is_some(),
+            "older decoders ignore a future append-only metadata section"
+        );
+        let partial_actor_roles = &buf[..len - 1];
+        assert!(
+            decode(partial_actor_roles).is_none(),
+            "a present actor-role section must contain every declared entry"
         );
     }
 
@@ -558,8 +589,8 @@ mod tests {
         };
         let (buf, len) = encode::<128>(&META);
         assert!(decode(&buf[..len]).unwrap().crdt);
-        // Drop the appended policy count and the CRDT byte itself.
-        assert!(!decode(&buf[..len - 3]).unwrap().crdt);
+        // Drop both appended policy-section counts and the CRDT byte itself.
+        assert!(!decode(&buf[..len - 5]).unwrap().crdt);
     }
 
     #[test]
@@ -638,6 +669,7 @@ mod tests {
                     mode: 0,
                     attested: false,
                     space_role: None,
+                    actor_role: None,
                 },
                 MessageMeta {
                     name: "status",
@@ -649,6 +681,7 @@ mod tests {
                     mode: 0,
                     attested: false,
                     space_role: None,
+                    actor_role: None,
                 },
                 MessageMeta {
                     name: "internal_only",
@@ -660,6 +693,7 @@ mod tests {
                     mode: 0,
                     attested: false,
                     space_role: None,
+                    actor_role: None,
                 },
             ],
             constructor: &[],
@@ -766,6 +800,7 @@ mod tests {
                     mode: 1,
                     attested: false,
                     space_role: None,
+                    actor_role: None,
                 },
                 MessageMeta {
                     name: "status",
@@ -777,6 +812,7 @@ mod tests {
                     mode: 0,
                     attested: false,
                     space_role: None,
+                    actor_role: None,
                 },
             ],
             constructor: &[],
@@ -880,6 +916,8 @@ mod decode {
         pub attested: bool,
         /// Minimum direct space-wide role byte, if declared.
         pub space_role: Option<u8>,
+        /// Minimum actor-local role byte, if declared.
+        pub actor_role: Option<u8>,
     }
 
     /// Parsed actor metadata from binary metadata.
@@ -940,6 +978,7 @@ mod decode {
                 mode: 0,
                 attested: false,
                 space_role: None,
+                actor_role: None,
             });
         }
 
@@ -1090,9 +1129,26 @@ mod decode {
                 message.attested = attested == 1;
                 message.space_role = (space_role != u8::MAX).then_some(space_role);
             }
-            if pos != data.len() {
-                return None;
+
+            // Actor-local roles were added as a separate append-only section
+            // so the established two-byte policy entries remain aligned.
+            if pos < data.len() {
+                let actor_role_count =
+                    u16::from_le_bytes([*data.get(pos)?, *data.get(pos + 1)?]) as usize;
+                pos += 2;
+                if actor_role_count != messages.len() {
+                    return None;
+                }
+                for message in &mut messages {
+                    let &actor_role = data.get(pos)?;
+                    pos += 1;
+                    message.actor_role = (actor_role != u8::MAX).then_some(actor_role);
+                }
             }
+            // Future metadata sections are appended after this complete
+            // fixed-width policy section. Older decoders deliberately ignore
+            // that unknown tail; a present policy section itself remains
+            // all-or-nothing and count-checked above.
         }
 
         Some(ParsedMeta {

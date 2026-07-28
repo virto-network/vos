@@ -753,6 +753,7 @@ mod tests {
                     mode: 0,
                     attested: false,
                     space_role: None,
+                    actor_role: None,
                 },
                 ParsedMessage {
                     name: "reset".into(),
@@ -765,6 +766,7 @@ mod tests {
                     mode: 0,
                     attested: false,
                     space_role: None,
+                    actor_role: None,
                 },
             ],
             constructor: vec![],

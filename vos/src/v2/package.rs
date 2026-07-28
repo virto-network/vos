@@ -173,15 +173,13 @@ impl VosPackageV2 {
         initial_state: BlobRefV2,
     ) -> Result<ActorGenesisV2, PackageError> {
         self.validate()?;
-        let policies = PackageRolePoliciesV2::decode(&self.role_policies)
-            .map_err(|_| PackageError::InvalidRolePolicies)?;
         Ok(ActorGenesisV2 {
             actor,
             parent,
             program: self.manifest.actor_program,
             initial_state,
             crdt: self.manifest.crdt,
-            methods: policies.methods,
+            role_policies: self.role_policies.clone(),
         })
     }
 }
@@ -192,18 +190,16 @@ impl PackageRolePoliciesV2 {
             .messages
             .iter()
             .map(|message| {
-                let policy = match message.space_role {
-                    Some(role) => {
-                        space_role_policy_hash(role).ok_or(PackageError::InvalidRolePolicies)?
-                    }
-                    None => public_policy_hash(),
-                };
+                let policy = method_role_policy_hash(message.space_role, message.actor_role)
+                    .ok_or(PackageError::InvalidRolePolicies)?;
                 Ok(MethodPolicyV2 {
                     method: message.name.clone(),
                     schema: method_schema_hash(message),
                     policy,
-                    public: message.space_role.is_none(),
+                    public: message.space_role.is_none() && message.actor_role.is_none(),
                     attested: message.attested,
+                    space_role: message.space_role,
+                    actor_role: message.actor_role,
                 })
             })
             .collect::<Result<Vec<_>, PackageError>>()?;
@@ -240,15 +236,28 @@ pub fn public_policy_hash() -> Hash {
     Hash::digest(b"vos/public-policy/v2", &[])
 }
 
-/// Stable predicate for a direct `SpaceRole` threshold. Unknown role bytes
-/// are rejected instead of entering deployment identity.
+/// Stable predicate for the conjunction of direct space-wide and actor-local
+/// thresholds. Unknown space-role bytes are rejected before they can enter
+/// deployment identity; actor-role bytes are interpreted by the pinned actor
+/// program's `RoleByte` implementation.
+pub fn method_role_policy_hash(space_role: Option<u8>, actor_role: Option<u8>) -> Option<Hash> {
+    if let Some(role) = space_role {
+        crate::SpaceRole::from_u8(role)?;
+    }
+    if space_role.is_none() && actor_role.is_none() {
+        return Some(public_policy_hash());
+    }
+    let bytes = [
+        u8::from(space_role.is_some()),
+        space_role.unwrap_or_default(),
+        u8::from(actor_role.is_some()),
+        actor_role.unwrap_or_default(),
+    ];
+    Some(Hash::digest(b"vos/method-role-policy/v2", &[&bytes]))
+}
+
 pub fn space_role_policy_hash(required_role: u8) -> Option<Hash> {
-    crate::SpaceRole::from_u8(required_role).map(|_| {
-        Hash::digest(
-            b"vos/space-role-policy/v2",
-            &[core::slice::from_ref(&required_role)],
-        )
-    })
+    method_role_policy_hash(Some(required_role), None)
 }
 
 /// Recover the declared threshold from one of the four canonical v2 role
@@ -386,6 +395,7 @@ mod tests {
                 mode: 0,
                 attested: false,
                 space_role: None,
+                actor_role: None,
             },
             MessageMeta {
                 name: "is_positive",
@@ -397,6 +407,7 @@ mod tests {
                 mode: 0,
                 attested: true,
                 space_role: Some(crate::SpaceRole::Member as u8),
+                actor_role: Some(2),
             },
         ],
         constructor: &[],
@@ -476,8 +487,34 @@ mod tests {
         assert!(!is_positive.public);
         assert!(is_positive.attested);
         assert_eq!(
+            is_positive.space_role,
+            Some(crate::SpaceRole::Member.as_u8())
+        );
+        assert_eq!(is_positive.actor_role, Some(2));
+        assert_eq!(
             is_positive.policy,
-            space_role_policy_hash(crate::SpaceRole::Member as u8).unwrap()
+            method_role_policy_hash(Some(crate::SpaceRole::Member.as_u8()), Some(2)).unwrap()
+        );
+
+        let mut metadata = crate::metadata::decode(&package.schemas).unwrap();
+        let increment_meta = metadata
+            .messages
+            .iter_mut()
+            .find(|message| message.name == "increment")
+            .unwrap();
+        increment_meta.actor_role = Some(3);
+        let actor_local = PackageRolePoliciesV2::from_metadata(&metadata).unwrap();
+        let increment = actor_local
+            .methods
+            .iter()
+            .find(|method| method.method == "increment")
+            .unwrap();
+        assert!(!increment.public);
+        assert_eq!(increment.space_role, None);
+        assert_eq!(increment.actor_role, Some(3));
+        assert_eq!(
+            increment.policy,
+            method_role_policy_hash(None, Some(3)).unwrap()
         );
     }
 
@@ -502,7 +539,10 @@ mod tests {
         assert_eq!(genesis.actor, actor);
         assert_eq!(genesis.program, package.manifest.actor_program);
         assert_eq!(genesis.initial_state, state);
-        assert_eq!(genesis.methods, policies.methods);
+        assert_eq!(
+            PackageRolePoliciesV2::decode(&genesis.role_policies).unwrap(),
+            policies
+        );
     }
 
     #[test]

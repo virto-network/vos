@@ -18,9 +18,9 @@ use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, AccumulationReceiptV2, BlobRefV2,
     DedupRecordV2, DeliveryRecordV2, MessageRecordV2, ProgramId, ProofVerificationRequestV2,
-    PublicationRecordV2, ReceiptVerificationRequestV2, ReplyAdmissionRecordV2, ServiceGenesisV2,
-    ServicePvmErrorV2, ServiceStateTreeV2, StateKeyV2, StateTreeStore, StoreHeaderV2,
-    StoreOpenError, V2Wire,
+    PublicationRecordV2, ReceiptVerificationRequestV2, ReplyAdmissionRecordV2,
+    RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServicePvmErrorV2, ServiceStateTreeV2,
+    StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
 };
 
 /// Cloneable in-memory image of a committed local v2 service account.
@@ -263,16 +263,20 @@ pub struct LocalJamStoreV2 {
     /// Proof artifacts are verifier/CAS inputs, not consensus service state.
     /// They are deliberately excluded from snapshots and equality.
     proof_blobs: BTreeMap<[u8; 32], Vec<u8>>,
+    /// Private authorization witnesses are Refine/prover inputs only. They
+    /// never enter the recoverable service image or replica sync payloads.
+    private_witnesses: BTreeMap<[u8; 32], Vec<u8>>,
     proof_allowlist: BTreeSet<super::Hash>,
+    role_credential_allowlist: BTreeSet<super::Hash>,
     receipt_allowlist: BTreeSet<super::Hash>,
     install_allowlist: BTreeSet<super::Hash>,
 }
 
 /// JAM storage host whose committed image is durable before IC-5 returns.
 ///
-/// Proof, receipt, and install verifier configuration remains process-local.
-/// Only the complete service-account image crosses the
-/// [`CommittedImageStoreV2`] boundary.
+/// Proof/private-witness inputs and credential, receipt, and install verifier
+/// configuration remain process-local. Only the complete service-account
+/// image crosses the [`CommittedImageStoreV2`] boundary.
 pub struct DurableJamStoreV2<B> {
     local: LocalJamStoreV2,
     backend: B,
@@ -349,8 +353,9 @@ impl<B> DerefMut for DurableJamStoreV2<B> {
 }
 
 /// Store equality describes the recoverable service-account image. The local
-/// proof, receipt, and install allowlists are process-scoped host configuration
-/// and deliberately do not participate in snapshots or equality.
+/// proof/private-witness inputs and credential, receipt, and install
+/// allowlists are process-scoped host configuration and deliberately do not
+/// participate in snapshots or equality.
 impl PartialEq for LocalJamStoreV2 {
     fn eq(&self, other: &Self) -> bool {
         self.committed == other.committed
@@ -369,7 +374,9 @@ impl LocalJamStoreV2 {
                 commit_sequence: 0,
             },
             proof_blobs: BTreeMap::new(),
+            private_witnesses: BTreeMap::new(),
             proof_allowlist: BTreeSet::new(),
+            role_credential_allowlist: BTreeSet::new(),
             receipt_allowlist: BTreeSet::new(),
             install_allowlist: BTreeSet::new(),
         }
@@ -380,7 +387,9 @@ impl LocalJamStoreV2 {
         Self {
             committed: snapshot,
             proof_blobs: BTreeMap::new(),
+            private_witnesses: BTreeMap::new(),
             proof_allowlist: BTreeSet::new(),
+            role_credential_allowlist: BTreeSet::new(),
             receipt_allowlist: BTreeSet::new(),
             install_allowlist: BTreeSet::new(),
         }
@@ -607,6 +616,22 @@ impl LocalJamStoreV2 {
         reference
     }
 
+    /// Supply one invocation-private role witness to Refine/proving without
+    /// making it part of service state. Reopening a snapshot intentionally
+    /// drops this process-local input.
+    pub fn import_private_witness(&mut self, bytes: Vec<u8>) -> BlobRefV2 {
+        let reference = BlobRefV2::of_bytes(&bytes);
+        self.private_witnesses.insert(reference.hash.0, bytes);
+        reference
+    }
+
+    pub fn private_witness(&self, reference: &BlobRefV2) -> Option<&[u8]> {
+        self.private_witnesses
+            .get(&reference.hash.0)
+            .filter(|bytes| reference.matches(bytes))
+            .map(Vec::as_slice)
+    }
+
     /// Make exact canonical actor code available to guest Accumulate.
     ///
     /// Program availability is part of the cloned service image, so reopening
@@ -624,6 +649,12 @@ impl LocalJamStoreV2 {
     /// consensus-pinned proof verifier. It is excluded from persisted state.
     pub fn allow_proof(&mut self, request: &ProofVerificationRequestV2) {
         self.proof_allowlist.insert(request.hash());
+    }
+
+    /// Configure the conformance authority to accept one exact disclosed
+    /// role credential verification request.
+    pub fn allow_role_credential(&mut self, request: &RoleCredentialVerificationRequestV2) {
+        self.role_credential_allowlist.insert(request.hash());
     }
 
     /// Configure the conformance host to accept one exact finalized receipt.
@@ -724,6 +755,7 @@ pub struct LocalJamTransactionV2 {
     staged: LocalJamStoreSnapshotV2,
     proof_blobs: BTreeMap<[u8; 32], Vec<u8>>,
     proof_allowlist: BTreeSet<super::Hash>,
+    role_credential_allowlist: BTreeSet<super::Hash>,
     receipt_allowlist: BTreeSet<super::Hash>,
     install_allowlist: BTreeSet<super::Hash>,
 }
@@ -858,6 +890,19 @@ impl AccumulateTransactionV2 for LocalJamTransactionV2 {
                     0,
                 ])
             }
+            hostcall::ROLE_CREDENTIAL_VERIFY => {
+                let bytes = Self::read_guest_bytes(kernel, registers[7], registers[8], slot)?;
+                let request = RoleCredentialVerificationRequestV2::decode(&bytes)
+                    .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?;
+                Ok([
+                    if self.role_credential_allowlist.contains(&request.hash()) {
+                        error::HOST_OK
+                    } else {
+                        error::HOST_NONE
+                    },
+                    0,
+                ])
+            }
             hostcall::RECEIPT_VERIFY => {
                 let bytes = Self::read_guest_bytes(kernel, registers[7], registers[8], slot)?;
                 let request = ReceiptVerificationRequestV2::decode(&bytes)
@@ -897,6 +942,7 @@ impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
             staged: self.committed.clone(),
             proof_blobs: self.proof_blobs.clone(),
             proof_allowlist: self.proof_allowlist.clone(),
+            role_credential_allowlist: self.role_credential_allowlist.clone(),
             receipt_allowlist: self.receipt_allowlist.clone(),
             install_allowlist: self.install_allowlist.clone(),
         })
@@ -1039,6 +1085,22 @@ mod tests {
                 .map(Vec::as_slice),
             Some(proof.as_slice())
         );
+    }
+
+    #[test]
+    fn private_role_witnesses_never_enter_the_recoverable_service_image() {
+        let mut store = LocalJamStoreV2::new();
+        let witness = b"invocation-private credential witness".to_vec();
+        let before = store.snapshot_bytes();
+
+        let reference = store.import_private_witness(witness.clone());
+        assert_eq!(store.private_witness(&reference), Some(witness.as_slice()));
+        assert_eq!(store.snapshot_bytes(), before);
+        assert_eq!(store.blob_count(), 0);
+
+        let reopened = LocalJamStoreV2::from_snapshot(store.snapshot());
+        assert_eq!(reopened.private_witness(&reference), None);
+        assert_eq!(reopened, store);
     }
 
     #[test]

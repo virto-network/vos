@@ -903,6 +903,14 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! { None }
         };
+        let actor_role_meta = if let Some(role) = &role_expr {
+            // Actor role enums are wire discriminants (`#[repr(u8)]`). The
+            // metadata blob is a const, so it cannot call the non-const
+            // `RoleByte::as_byte` trait method used by runtime dispatch.
+            quote! { Some((#role) as u8) }
+        } else {
+            quote! { None }
+        };
         meta_messages.push(quote! {
             vos::metadata::MessageMeta {
                 name: #msg_name_str,
@@ -914,6 +922,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 mode: #mode_byte,
                 attested: #is_attested,
                 space_role: #space_role_meta,
+                actor_role: #actor_role_meta,
             }
         });
         if exposed_to_cli {

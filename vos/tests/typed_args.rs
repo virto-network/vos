@@ -41,7 +41,51 @@ mod fixture {
         pub tag: [u8; 32],
     }
 
-    #[actor]
+    #[derive(
+        vos::rkyv::Archive,
+        vos::rkyv::Serialize,
+        vos::rkyv::Deserialize,
+        Clone,
+        Copy,
+        Debug,
+        PartialEq,
+        Eq,
+        PartialOrd,
+        Ord,
+    )]
+    #[rkyv(crate = vos::rkyv)]
+    #[repr(u8)]
+    pub enum VaultRole {
+        Guest = 0,
+        Admin = 1,
+    }
+
+    impl vos::RoleByte for VaultRole {
+        fn from_byte(byte: u8) -> Option<Self> {
+            match byte {
+                0 => Some(Self::Guest),
+                1 => Some(Self::Admin),
+                _ => None,
+            }
+        }
+
+        fn as_byte(self) -> u8 {
+            self as u8
+        }
+    }
+
+    const VAULT_SPACE_ROLE_MAP: vos::SpaceRoleMap<VaultRole> = vos::SpaceRoleMap {
+        admin: Some(VaultRole::Admin),
+        developer: Some(VaultRole::Guest),
+        member: Some(VaultRole::Guest),
+        guest: Some(VaultRole::Guest),
+    };
+
+    #[actor(
+        role = VaultRole,
+        default_role = VaultRole::Guest,
+        space_role_map = VAULT_SPACE_ROLE_MAP
+    )]
     pub struct Vault;
 
     #[messages]
@@ -64,6 +108,11 @@ mod fixture {
         #[msg]
         fn deposit(&mut self, amount: u64) -> u64 {
             amount
+        }
+
+        #[msg(role = VaultRole::Admin)]
+        fn rotate_key(&mut self) -> bool {
+            true
         }
 
         /// Custom rkyv struct as an argument (G25).
@@ -186,6 +235,19 @@ fn attested_and_regular_method_policies_are_generated_together() {
         .expect("attested method metadata");
     assert!(meta.attested);
     assert_eq!(meta.space_role, Some(vos::SpaceRole::Member.as_u8()));
+
+    let actor_local = VaultMsg::from_msg(&Msg::new("rotate_key")).expect("actor-local message");
+    assert_eq!(
+        actor_local.required_role(),
+        Some(fixture::VaultRole::Admin as u8)
+    );
+    let meta = VaultMsg::META
+        .messages
+        .iter()
+        .find(|message| message.name == "rotate_key")
+        .expect("actor-local policy metadata");
+    assert_eq!(meta.space_role, None);
+    assert_eq!(meta.actor_role, Some(fixture::VaultRole::Admin as u8));
 }
 
 #[test]
@@ -209,6 +271,29 @@ fn attested_space_role_is_enforced_before_the_handler_runs() {
         vos::RunResult::Complete(false)
     ));
     assert!(!member_ctx.was_forbidden());
+}
+
+#[test]
+fn actor_local_role_is_emitted_and_enforced_before_the_handler_runs() {
+    let mut actor = <Vault as vos::Actor>::create();
+    let mut denied = vos::Context::new(ServiceId(7));
+    denied.set_caller_roles(None, Some(fixture::VaultRole::Guest as u8));
+    let message = VaultMsg::from_msg(&Msg::new("rotate_key")).expect("message");
+    assert!(matches!(
+        vos::Actor::dispatch(&mut actor, message, &mut denied),
+        vos::RunResult::Complete(false)
+    ));
+    assert!(denied.was_forbidden());
+
+    let mut actor = <Vault as vos::Actor>::create();
+    let mut allowed = vos::Context::new(ServiceId(7));
+    allowed.set_caller_roles(None, Some(fixture::VaultRole::Admin as u8));
+    let message = VaultMsg::from_msg(&Msg::new("rotate_key")).expect("message");
+    assert!(matches!(
+        vos::Actor::dispatch(&mut actor, message, &mut allowed),
+        vos::RunResult::Complete(false)
+    ));
+    assert!(!allowed.was_forbidden());
 }
 
 #[test]

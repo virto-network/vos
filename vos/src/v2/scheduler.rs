@@ -438,12 +438,26 @@ impl LocalWorkSchedulerV2 {
         for reference in &work.imported_blobs {
             import_blob(store, &mut blobs, reference)?;
         }
+        let private_blobs = match &work.authorization {
+            AuthorizationEvidenceV2::PrivateCredential { witness, .. } => {
+                let bytes = store
+                    .private_witness(witness)
+                    .ok_or(ScheduleErrorV2::MissingBlob(witness.hash))?
+                    .to_vec();
+                alloc::vec![ImportedBlobV2 {
+                    reference: witness.clone(),
+                    bytes,
+                }]
+            }
+            _ => Vec::new(),
+        };
         let imports = RefineImportsV2 {
             programs: alloc::vec![ImportedProgramV2 {
                 program: descriptor.program,
                 pvm: program_bytes,
             }],
             blobs: blobs.into_values().collect(),
+            private_blobs,
         };
 
         if let Some(reference) = continuation.as_ref() {
