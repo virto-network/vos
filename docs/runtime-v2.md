@@ -128,6 +128,11 @@ process-private host store and are supplied only to Refine/proving. They are
 not work imports, service-state blobs, durable service snapshots, or CRDT sync
 payloads. Before entering the actor PVM, Refine checks the holder, scope and
 complete role threshold and injects the authenticated roles into `Context`.
+Private credentials cannot use the disclosed-credential
+`ROLE_CREDENTIAL_VERIFY` hostcall because guest Accumulate intentionally
+cannot read their witness bytes. Their issuer/authenticator check is therefore
+part of Refine and is not consensus-authoritative until the canonical Refine
+trace and private-policy predicate are bound into the accepted proof.
 The local credential-verification allowlist is only a conformance stand-in.
 Production admission therefore remains gated on a consensus-authoritative
 issuer/verifier authenticating the exact scoped credential bytes, and on the
