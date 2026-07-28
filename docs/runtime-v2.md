@@ -107,20 +107,38 @@ established again.
 Actor metadata is also the source of installed method policy. `#[msg]`
 annotations produce one canonical schema and role-policy artifact; package
 validation derives the same artifact again and installation takes method rows
-only from those signed bytes. Public methods use one distinguished public
-predicate. Role-gated methods use one of the four canonical `SpaceRole`
-threshold predicates, so arbitrary policy hashes cannot be interpreted as
-roles.
+only from those signed bytes. The artifact records both space-wide and
+actor-local role requirements, and a method requiring both enforces their
+conjunction. Public methods use one distinguished public predicate; a method
+with either role annotation is never installed as public. The v2 actor dispatch
+also treats the work arguments only as application bytes. It cannot reinterpret
+a caller-provided legacy dispatch prefix and replace the origin or authenticated
+roles established by Refine.
 
-The conformance credential carrier binds its holder, role, authenticator,
-generated policy and exact byte commitment. Ordinary calls disclose those
-bytes. Attested calls carry only their content reference and commitment in the
-work wire while Refine/proving receives the bytes as an imported private
-witness. Before entering the actor PVM, Refine checks the holder and threshold
-and injects the authenticated role into `Context`; guest Accumulate separately
-checks the public policy inputs. The carrier's authenticator is not yet a
-consensus authority signature. Production admission therefore remains gated
-on the role-authority/receipt path authenticating the exact credential bytes.
+The conformance credential carrier binds its holder, invocation-scoped
+authorization scope, space and actor roles, authenticator, generated policy and
+exact byte commitment. The scope commits to the service and deployment
+identity, invocation, actor and program, method and arguments, origin, causal
+identity, and proof mode. A credential copied from one call therefore cannot
+authorize another invocation. Ordinary calls disclose those bytes and guest
+Accumulate additionally asks the host authority to verify the exact scoped
+credential before accepting them. Attested calls carry only their content
+reference and commitment in the work wire; the witness bytes live in a
+process-private host store and are supplied only to Refine/proving. They are
+not work imports, service-state blobs, durable service snapshots, or CRDT sync
+payloads. Before entering the actor PVM, Refine checks the holder, scope and
+complete role threshold and injects the authenticated roles into `Context`.
+The local credential-verification allowlist is only a conformance stand-in.
+Production admission therefore remains gated on a consensus-authoritative
+issuer/verifier authenticating the exact scoped credential bytes, and on the
+canonical Refine trace being bound into the proof for private credentials.
+
+The current legacy `vosx space publish` path does not activate this v2 Install
+entry. Production v2 installation must resolve a signature-verified `.vos`
+package, derive the exact `ActorGenesisV2` (including its canonical role-policy
+artifact) from those package bytes, and authorize that exact genesis. Passing
+an independently constructed genesis directly to guest Install is only a
+conformance seam.
 
 This is still a conformance orchestrator, not production network routing.
 Automatic node discovery and outbox/reply routing, plus CRDT delivery/reply
@@ -151,17 +169,19 @@ the pre-await change namespace.
 Before that production cutover, the Install authorization capability must be
 backed by consensus-authoritative deployment state rather than the local
 conformance allowlist. That authority must bind the executing JAM service
-account and its current code identity to the exact genesis, not trust the
-genesis's self-declared identity. `PROGRAM_LOOKUP` availability must be pinned
-to or imported from consensus-visible state rather than a node-local cache.
-`RECEIPT_VERIFY` must likewise use consensus-authoritative receipt finality
-rather than its local conformance allowlist, and delivery timeslots must come
-from the JAM slot. `PROOF_VERIFY` must use the workspace-pinned verifier and
-execution-semantics identity rather than the local proof allowlist, and the
-canonical Refine trace must be bound into the generated proof before attested
-execution becomes a production path. Replicated service identity must also
-bind the gas schedule before `OutOfGas` is treated as a deterministic
-cross-replica result.
+account and its current code identity to the exact signature-verified package
+and derived genesis, not trust the genesis's self-declared identity.
+`ROLE_CREDENTIAL_VERIFY` must use the consensus-authoritative role issuer
+rather than its local conformance allowlist. `PROGRAM_LOOKUP` availability
+must be pinned to or imported from consensus-visible state rather than a
+node-local cache. `RECEIPT_VERIFY` must likewise use
+consensus-authoritative receipt finality rather than its local conformance
+allowlist, and delivery timeslots must come from the JAM slot. `PROOF_VERIFY`
+must use the workspace-pinned verifier and execution-semantics identity rather
+than the local proof allowlist, and the canonical Refine trace must be bound
+into the generated proof before attested execution becomes a production path.
+Replicated service identity must also bind the gas schedule before `OutOfGas`
+is treated as a deterministic cross-replica result.
 Production routing must recover and retry guest publication, delivery and
 reply-admission rows rather than maintain a second native message ledger. A
 bounded reclamation or checkpoint plan for unreachable SMT and CRDT DAG nodes,
