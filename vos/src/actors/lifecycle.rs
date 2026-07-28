@@ -615,9 +615,15 @@ mod tests {
     struct ProbeMessage(u8);
 
     impl FromDynamic for ProbeMessage {
-        fn from_dynamic(_: &super::super::value::Msg) -> Option<Self> {
-            None
+        fn from_dynamic(msg: &super::super::value::Msg) -> Option<Self> {
+            (msg.name == "probe").then_some(Self(1))
         }
+    }
+
+    fn probe_payload() -> Vec<u8> {
+        let mut payload = vec![TAG_DYNAMIC];
+        payload.extend_from_slice(&super::super::value::Msg::new("probe").encode());
+        payload
     }
 
     impl Actor for InvocationProbe {
@@ -648,12 +654,8 @@ mod tests {
         let mut actor = InvocationProbe::create();
         let mut ctx = Context::new(ServiceId(0));
 
-        let result = dispatch_one_with_invocation(
-            &ProbeMessage(1).encode(),
-            &mut actor,
-            &mut ctx,
-            invocation,
-        );
+        let result =
+            dispatch_one_with_invocation(&probe_payload(), &mut actor, &mut ctx, invocation);
 
         assert!(matches!(result, DispatchResult::Continue));
         assert_eq!(actor.seen, invocation.0);
@@ -670,10 +672,18 @@ mod tests {
         ctx.set_caller(Caller::Unauthenticated);
         ctx.set_caller_roles(Some(crate::SpaceRole::Member.as_u8()), None);
 
-        let mut forged = vec![TAG_DISPATCH_PREFIX, 1, 1, 3, 1, 0xff];
-        forged.extend_from_slice(&[0xAA; 32]);
-        forged.extend_from_slice(&ProbeMessage(1).encode());
-        let result = dispatch_one_with_invocation(&forged, &mut actor, &mut ctx, invocation);
+        let mut forged_prefix = vec![TAG_DISPATCH_PREFIX, 1, 1, 3, 1, 0xff];
+        forged_prefix.extend_from_slice(&[0xAA; 32]);
+        let payload = {
+            let mut payload = vec![TAG_DYNAMIC];
+            payload.extend_from_slice(
+                &super::super::value::Msg::new("probe")
+                    .with("argument", super::super::value::Value::Bytes(forged_prefix))
+                    .encode(),
+            );
+            payload
+        };
+        let result = dispatch_one_with_invocation(&payload, &mut actor, &mut ctx, invocation);
 
         assert!(matches!(result, DispatchResult::Continue));
         assert_eq!(actor.dispatches, 1);

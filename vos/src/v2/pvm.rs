@@ -1168,7 +1168,7 @@ mod tests {
             ServiceIdentityV2,
         };
 
-        let receipt = AccumulationReceiptV2 {
+        let mut receipt = AccumulationReceiptV2 {
             service: ServiceIdentityV2 {
                 space: crate::v2::SpaceId([0; 32]),
                 root_service: RootServiceId([1; 32]),
@@ -1193,18 +1193,26 @@ mod tests {
                 duplicate: false,
             }
         } else {
+            let actor = crate::v2::ActorId([6; 32]);
+            let invocation = crate::v2::InvocationId([9; 32]);
+            let reply = crate::v2::ReplyRecordV2 {
+                call_id: invocation.root_reply_id(),
+                producer: actor,
+                result: vec![11; 4],
+            };
+            receipt.reply_commitment = Some(reply.commitment());
             let statement = crate::attestation::AttestationStatementV3 {
                 statement_version: crate::v2::ATTESTATION_STATEMENT_VERSION,
                 space: receipt.service.space,
-                actor: crate::v2::ActorId([6; 32]),
+                actor,
                 deployment: receipt.service.deployment,
                 actor_program: ProgramId([7; 32]),
                 method: "attested".into(),
                 schema: Hash([8; 32]),
-                invocation: crate::v2::InvocationId([9; 32]),
+                invocation,
                 before: crate::attestation::StateCommitmentV3::Linear(Hash([10; 32])),
                 after: crate::attestation::StateCommitmentV3::Linear(Hash([5; 32])),
-                claim_commitment: Hash([11; 32]),
+                claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&reply.result]),
                 input_commitment: Hash([12; 32]),
                 authorization_policy: Hash([13; 32]),
                 accumulation_receipt: receipt.clone(),
