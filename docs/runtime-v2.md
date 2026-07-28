@@ -104,6 +104,24 @@ host uses an explicit process-local allowlist which is excluded from durable
 service snapshots; reopening an empty store therefore requires authority to be
 established again.
 
+Actor metadata is also the source of installed method policy. `#[msg]`
+annotations produce one canonical schema and role-policy artifact; package
+validation derives the same artifact again and installation takes method rows
+only from those signed bytes. Public methods use one distinguished public
+predicate. Role-gated methods use one of the four canonical `SpaceRole`
+threshold predicates, so arbitrary policy hashes cannot be interpreted as
+roles.
+
+The conformance credential carrier binds its holder, role, authenticator,
+generated policy and exact byte commitment. Ordinary calls disclose those
+bytes. Attested calls carry only their content reference and commitment in the
+work wire while Refine/proving receives the bytes as an imported private
+witness. Before entering the actor PVM, Refine checks the holder and threshold
+and injects the authenticated role into `Context`; guest Accumulate separately
+checks the public policy inputs. The carrier's authenticator is not yet a
+consensus authority signature. Production admission therefore remains gated
+on the role-authority/receipt path authenticating the exact credential bytes.
+
 This is still a conformance orchestrator, not production network routing.
 Automatic node discovery and outbox/reply routing, plus CRDT delivery/reply
 consumption, remain staged. Acknowledging a publication containing several
@@ -141,7 +159,9 @@ rather than its local conformance allowlist, and delivery timeslots must come
 from the JAM slot. `PROOF_VERIFY` must use the workspace-pinned verifier and
 execution-semantics identity rather than the local proof allowlist, and the
 canonical Refine trace must be bound into the generated proof before attested
-execution becomes a production path.
+execution becomes a production path. Replicated service identity must also
+bind the gas schedule before `OutOfGas` is treated as a deterministic
+cross-replica result.
 Production routing must recover and retry guest publication, delivery and
 reply-admission rows rather than maintain a second native message ledger. A
 bounded reclamation or checkpoint plan for unreachable SMT and CRDT DAG nodes,
