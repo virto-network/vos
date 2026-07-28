@@ -9,7 +9,8 @@ use crate::v2::wire::{Decoder, Encoder};
 use crate::v2::{
     AccumulationReceiptV2, ActorId, BlobRefV2, DecodeError, DeploymentId, Hash, InvocationId,
     MethodPolicyV2, ProducerId, ProgramId, ProofCommitmentV2, ProofVerificationRequestV2,
-    RefineImportsV2, SpaceId, TransitionV2, V2Wire, WorkEnvelopeV2,
+    ReceiptVerificationRequestV2, ReceiptVerificationV2, RefineImportsV2, ServiceIdentityV2,
+    SpaceId, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,6 +266,7 @@ impl AttestationStatementV3 {
         if self.space != self.accumulation_receipt.service.space
             || self.deployment != self.accumulation_receipt.service.deployment
             || self.accumulation_receipt.accepted_transition == Hash::ZERO
+            || self.accumulation_receipt.reply_commitment.is_none()
         {
             return Err(AttestationError::ReceiptMismatch);
         }
@@ -485,6 +487,9 @@ impl<T, M> Attestation<T, M> {
             proof,
             _method: PhantomData,
         };
+        if package.producer_name.is_empty() || package.producer == ProducerId::ZERO {
+            return Err(AttestationError::WrongProducer);
+        }
         package.statement.validate()?;
         if package.statement.method != M::METHOD {
             return Err(AttestationError::WrongMethod);
@@ -588,6 +593,8 @@ pub enum AttestationError {
     WrongMethod,
     ClaimCommitmentMismatch,
     ReceiptMismatch,
+    InvalidReceipt,
+    ReceiptUnavailable,
     StateCommitmentMismatch,
     InvalidProof,
     Replay,
@@ -611,6 +618,22 @@ pub trait ProofVerifier {
         statement: Hash,
         proof: &[u8],
     ) -> bool;
+}
+
+/// Consensus-finality seam for the accumulation receipt embedded in a
+/// portable package. Actor proof verification alone is insufficient because
+/// the proof is constructed before Accumulate commits the transition.
+pub trait ReceiptVerifier {
+    fn verify_receipt(&self, request: &ReceiptVerificationRequestV2) -> ReceiptVerificationV2;
+}
+
+impl<F> ReceiptVerifier for F
+where
+    F: Fn(&ReceiptVerificationRequestV2) -> ReceiptVerificationV2,
+{
+    fn verify_receipt(&self, request: &ReceiptVerificationRequestV2) -> ReceiptVerificationV2 {
+        self(request)
+    }
 }
 
 impl<F> ProofVerifier for F
@@ -656,9 +679,11 @@ impl AttestationReplayStore for AttestationReplayGuard {
 
 /// Authenticated registry result for the producer name supplied to
 /// [`VerifyAttestationBuilder::from`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttestationSource {
+    pub service: ServiceIdentityV2,
     pub actor: ActorId,
+    pub actor_program: ProgramId,
     pub producer: ProducerId,
 }
 
@@ -679,14 +704,16 @@ where
 pub fn verify_once<T, M: AttestedMethod<T>>(
     package: Attestation<T, M>,
     expected_producer_name: &str,
-    expected_actor: ActorId,
-    expected_producer: ProducerId,
+    expected_source: &AttestationSource,
     replay: &mut impl AttestationReplayStore,
+    receipt_verifier: &impl ReceiptVerifier,
     verifier: &impl ProofVerifier,
 ) -> Result<Verified<T>, AttestationError> {
     if package.producer_name != expected_producer_name
-        || package.statement.actor != expected_actor
-        || package.producer != expected_producer
+        || package.statement.accumulation_receipt.service != expected_source.service
+        || package.statement.actor != expected_source.actor
+        || package.statement.actor_program != expected_source.actor_program
+        || package.producer != expected_source.producer
     {
         return Err(AttestationError::WrongProducer);
     }
@@ -700,6 +727,16 @@ pub fn verify_once<T, M: AttestedMethod<T>>(
     ) != package.statement.claim_commitment
     {
         return Err(AttestationError::ClaimCommitmentMismatch);
+    }
+    match receipt_verifier.verify_receipt(&ReceiptVerificationRequestV2 {
+        expected_producer: package.statement.actor,
+        receipt: package.statement.accumulation_receipt.clone(),
+    }) {
+        ReceiptVerificationV2::Valid => {}
+        ReceiptVerificationV2::Invalid => return Err(AttestationError::InvalidReceipt),
+        ReceiptVerificationV2::Unavailable => {
+            return Err(AttestationError::ReceiptUnavailable);
+        }
     }
     if !verifier.verify(
         package.statement.actor_program,
@@ -726,16 +763,23 @@ pub fn verify_once<T, M: AttestedMethod<T>>(
 
 /// Verifier-side dependencies. It deliberately contains no proof producer or
 /// invocation capability: verification cannot execute the source actor.
-pub struct VerificationContext<'a, R, V, S> {
+pub struct VerificationContext<'a, R, F, V, S> {
     resolver: &'a R,
+    receipt_verifier: &'a F,
     verifier: &'a V,
     replay: &'a mut S,
 }
 
-impl<'a, R, V, S> VerificationContext<'a, R, V, S> {
-    pub fn new(resolver: &'a R, verifier: &'a V, replay: &'a mut S) -> Self {
+impl<'a, R, F, V, S> VerificationContext<'a, R, F, V, S> {
+    pub fn new(
+        resolver: &'a R,
+        receipt_verifier: &'a F,
+        verifier: &'a V,
+        replay: &'a mut S,
+    ) -> Self {
         Self {
             resolver,
+            receipt_verifier,
             verifier,
             replay,
         }
@@ -744,10 +788,11 @@ impl<'a, R, V, S> VerificationContext<'a, R, V, S> {
     pub fn verify<T, M>(
         &mut self,
         package: Attestation<T, M>,
-    ) -> VerifyAttestationBuilder<'_, T, M, R, V, S> {
+    ) -> VerifyAttestationBuilder<'_, T, M, R, F, V, S> {
         VerifyAttestationBuilder {
             package,
             resolver: self.resolver,
+            receipt_verifier: self.receipt_verifier,
             verifier: self.verifier,
             replay: self.replay,
         }
@@ -756,22 +801,24 @@ impl<'a, R, V, S> VerificationContext<'a, R, V, S> {
 
 /// First verifier-builder state. Calling `from` is mandatory before the
 /// once-only verification operation becomes available.
-pub struct VerifyAttestationBuilder<'a, T, M, R, V, S> {
+pub struct VerifyAttestationBuilder<'a, T, M, R, F, V, S> {
     package: Attestation<T, M>,
     resolver: &'a R,
+    receipt_verifier: &'a F,
     verifier: &'a V,
     replay: &'a mut S,
 }
 
-impl<'a, T, M, R, V, S> VerifyAttestationBuilder<'a, T, M, R, V, S> {
+impl<'a, T, M, R, F, V, S> VerifyAttestationBuilder<'a, T, M, R, F, V, S> {
     pub fn from(
         self,
         producer_name: impl Into<String>,
-    ) -> VerifyAttestationFrom<'a, T, M, R, V, S> {
+    ) -> VerifyAttestationFrom<'a, T, M, R, F, V, S> {
         VerifyAttestationFrom {
             package: self.package,
             producer_name: producer_name.into(),
             resolver: self.resolver,
+            receipt_verifier: self.receipt_verifier,
             verifier: self.verifier,
             replay: self.replay,
         }
@@ -779,18 +826,20 @@ impl<'a, T, M, R, V, S> VerifyAttestationBuilder<'a, T, M, R, V, S> {
 }
 
 /// Builder state with an authenticated producer name ready to resolve.
-pub struct VerifyAttestationFrom<'a, T, M, R, V, S> {
+pub struct VerifyAttestationFrom<'a, T, M, R, F, V, S> {
     package: Attestation<T, M>,
     producer_name: String,
     resolver: &'a R,
+    receipt_verifier: &'a F,
     verifier: &'a V,
     replay: &'a mut S,
 }
 
-impl<T, M, R, V, S> VerifyAttestationFrom<'_, T, M, R, V, S>
+impl<T, M, R, F, V, S> VerifyAttestationFrom<'_, T, M, R, F, V, S>
 where
     M: AttestedMethod<T>,
     R: AttestationSourceResolver,
+    F: ReceiptVerifier,
     V: ProofVerifier,
     S: AttestationReplayStore,
 {
@@ -802,9 +851,9 @@ where
         verify_once(
             self.package,
             &self.producer_name,
-            source.actor,
-            source.producer,
+            &source,
             self.replay,
+            self.receipt_verifier,
             self.verifier,
         )
     }
@@ -816,7 +865,7 @@ mod tests {
     use alloc::vec;
 
     use crate::Encode;
-    use crate::v2::{ConsistencyModeV2, RootServiceId, ServiceIdentityV2};
+    use crate::v2::{ConsistencyModeV2, ReplyRecordV2, RootServiceId, ServiceIdentityV2};
 
     use super::*;
 
@@ -850,6 +899,13 @@ mod tests {
 
     fn package(claim: u64) -> Attestation<u64, Method> {
         let deployment = DeploymentId([3; 32]);
+        let invocation = InvocationId([10; 32]);
+        let actor = ActorId([7; 32]);
+        let reply = ReplyRecordV2 {
+            call_id: invocation.root_reply_id(),
+            producer: actor,
+            result: Method::claim_wire(&claim),
+        };
         let receipt = AccumulationReceiptV2 {
             service: ServiceIdentityV2 {
                 space: SpaceId([6; 32]),
@@ -860,7 +916,7 @@ mod tests {
                 execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
             },
             accepted_transition: Hash([4; 32]),
-            reply_commitment: None,
+            reply_commitment: Some(reply.commitment()),
             outbox_commitment: None,
             resulting_state_root: Some(Hash([5; 32])),
             resulting_crdt_heads: vec![],
@@ -871,12 +927,12 @@ mod tests {
         let statement = AttestationStatementV3 {
             statement_version: crate::v2::ATTESTATION_STATEMENT_VERSION,
             space: SpaceId([6; 32]),
-            actor: ActorId([7; 32]),
+            actor,
             deployment,
             actor_program: ProgramId([8; 32]),
             method: "is_adult".to_string(),
             schema: Hash([9; 32]),
-            invocation: InvocationId([10; 32]),
+            invocation,
             before: StateCommitmentV3::Linear(Hash([11; 32])),
             after: StateCommitmentV3::Linear(Hash([5; 32])),
             claim_commitment: Hash::digest(
@@ -897,6 +953,20 @@ mod tests {
         .unwrap()
     }
 
+    fn source() -> AttestationSource {
+        let package = package(0);
+        AttestationSource {
+            service: package.statement.accumulation_receipt.service.clone(),
+            actor: package.statement.actor,
+            actor_program: package.statement.actor_program,
+            producer: package.producer,
+        }
+    }
+
+    fn finalized(_: &ReceiptVerificationRequestV2) -> ReceiptVerificationV2 {
+        ReceiptVerificationV2::Valid
+    }
+
     #[test]
     fn verification_is_separate_tamper_evident_and_once_only() {
         let verifier = |_: ProgramId, _: Hash, _: Hash, proof: &[u8]| proof == [1];
@@ -905,9 +975,9 @@ mod tests {
             verify_once(
                 package(21),
                 "private-age",
-                ActorId([7; 32]),
-                ProducerId([15; 32]),
+                &source(),
                 &mut replay,
+                &finalized,
                 &verifier,
             )
             .unwrap()
@@ -918,9 +988,9 @@ mod tests {
             verify_once(
                 package(21),
                 "private-age",
-                ActorId([7; 32]),
-                ProducerId([15; 32]),
+                &source(),
                 &mut replay,
+                &finalized,
                 &verifier,
             ),
             Err(AttestationError::Replay),
@@ -929,13 +999,15 @@ mod tests {
         let mut other_service = package(21);
         other_service.statement.space = SpaceId([16; 32]);
         other_service.statement.accumulation_receipt.service.space = SpaceId([16; 32]);
+        let mut other_source = source();
+        other_source.service.space = SpaceId([16; 32]);
         assert_eq!(
             verify_once(
                 other_service,
                 "private-age",
-                ActorId([7; 32]),
-                ProducerId([15; 32]),
+                &other_source,
                 &mut replay,
+                &finalized,
                 &verifier,
             )
             .unwrap()
@@ -950,21 +1022,23 @@ mod tests {
             verify_once(
                 tampered,
                 "private-age",
-                ActorId([7; 32]),
-                ProducerId([15; 32]),
+                &source(),
                 &mut AttestationReplayGuard::default(),
+                &finalized,
                 &verifier,
             ),
             Err(AttestationError::ClaimCommitmentMismatch),
         );
 
+        let mut wrong_producer = source();
+        wrong_producer.producer = ProducerId([99; 32]);
         assert_eq!(
             verify_once(
                 package(22),
                 "private-age",
-                ActorId([7; 32]),
-                ProducerId([99; 32]),
+                &wrong_producer,
                 &mut AttestationReplayGuard::default(),
+                &finalized,
                 &verifier,
             ),
             Err(AttestationError::WrongProducer),
@@ -976,9 +1050,9 @@ mod tests {
             verify_once(
                 wrong_state,
                 "private-age",
-                ActorId([7; 32]),
-                ProducerId([15; 32]),
+                &source(),
                 &mut AttestationReplayGuard::default(),
+                &finalized,
                 &verifier,
             ),
             Err(AttestationError::StateCommitmentMismatch),
@@ -987,15 +1061,10 @@ mod tests {
 
     #[test]
     fn verifier_builder_resolves_the_source_and_never_needs_a_producer() {
-        let resolver = |name: &str| {
-            (name == "private-age").then_some(AttestationSource {
-                actor: ActorId([7; 32]),
-                producer: ProducerId([15; 32]),
-            })
-        };
+        let resolver = |name: &str| (name == "private-age").then(source);
         let verifier = |_: ProgramId, _: Hash, _: Hash, proof: &[u8]| proof == [1];
         let mut replay = AttestationReplayGuard::default();
-        let mut context = VerificationContext::new(&resolver, &verifier, &mut replay);
+        let mut context = VerificationContext::new(&resolver, &finalized, &verifier, &mut replay);
 
         let claim =
             crate::block_on(context.verify(package(25)).from("private-age").once()).unwrap();
@@ -1007,10 +1076,56 @@ mod tests {
         );
 
         let mut fresh_replay = AttestationReplayGuard::default();
-        let mut fresh_context = VerificationContext::new(&resolver, &verifier, &mut fresh_replay);
+        let mut fresh_context =
+            VerificationContext::new(&resolver, &finalized, &verifier, &mut fresh_replay);
         assert_eq!(
             crate::block_on(fresh_context.verify(package(26)).from("unknown-age").once(),),
             Err(AttestationError::WrongProducer),
+        );
+    }
+
+    #[test]
+    fn verification_requires_finality_and_the_current_resolved_deployment() {
+        let verifier = |_: ProgramId, _: Hash, _: Hash, proof: &[u8]| proof == [1];
+        let unavailable = |_: &ReceiptVerificationRequestV2| ReceiptVerificationV2::Unavailable;
+        assert_eq!(
+            verify_once(
+                package(28),
+                "private-age",
+                &source(),
+                &mut AttestationReplayGuard::default(),
+                &unavailable,
+                &verifier,
+            ),
+            Err(AttestationError::ReceiptUnavailable)
+        );
+
+        let invalid = |_: &ReceiptVerificationRequestV2| ReceiptVerificationV2::Invalid;
+        assert_eq!(
+            verify_once(
+                package(28),
+                "private-age",
+                &source(),
+                &mut AttestationReplayGuard::default(),
+                &invalid,
+                &verifier,
+            ),
+            Err(AttestationError::InvalidReceipt)
+        );
+
+        let mut redeployed = source();
+        redeployed.service.deployment = DeploymentId([99; 32]);
+        redeployed.actor_program = ProgramId([98; 32]);
+        assert_eq!(
+            verify_once(
+                package(28),
+                "private-age",
+                &redeployed,
+                &mut AttestationReplayGuard::default(),
+                &finalized,
+                &verifier,
+            ),
+            Err(AttestationError::WrongProducer)
         );
     }
 

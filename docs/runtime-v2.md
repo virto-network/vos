@@ -75,6 +75,18 @@ the verifier from the carried proof bytes and execute the same guest gate
 before advancing their apply cursor. An exact retry recovers the existing
 proof publication during preparation and does not propose another Apply.
 
+The application package is a portable typed `Attestation<T, M>`, not a bare
+claim. Its generated method marker binds the method and exact actor reply wire;
+the preview remains explicitly unverified. The verifier-only path resolves the
+named producer from an authenticated registry and pins the complete current
+service identity, actor, canonical actor program and typed `ProducerId`.
+It independently verifies both accumulation-receipt finality and the actor
+proof before admitting the `(space, deployment, actor, invocation)` replay
+key. Proof validity alone is insufficient because proof production precedes
+Accumulate; a transition that never committed must never become `Verified<T>`.
+The replay admission must be durable and atomic with any state change the
+verified claim authorizes.
+
 The local proof producer and proof-verification allowlist are conformance
 seams, not a production proof system. A production host must replace them with
 the pinned prover/verifier implementation, and a later runtime slice must bind

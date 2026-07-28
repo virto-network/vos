@@ -183,7 +183,7 @@ pub use attestation::{
     AttestationProofProducerV2, AttestationProofRequestV2, AttestationReplayGuard,
     AttestationReplayKey, AttestationReplayStore, AttestationSource, AttestationSourceResolver,
     AttestationStatementV3, AttestedMethod, ProducedAttestationProofV2, ProofVerifier,
-    StateCommitmentV3, VerificationContext, Verified, VerifyAttestationBuilder,
+    ReceiptVerifier, StateCommitmentV3, VerificationContext, Verified, VerifyAttestationBuilder,
     VerifyAttestationFrom, verify_once,
 };
 pub use v2::{ActorId, CallId, InvocationId, Origin, ProducerId, ProgramId, SubjectId};

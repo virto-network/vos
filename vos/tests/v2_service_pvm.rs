@@ -3303,10 +3303,7 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
             b"attested claim".to_vec(),
         )
         .expect("a committed reply becomes the portable typed package");
-    assert_eq!(
-        application_package.unverified_preview(),
-        b"attested claim"
-    );
+    assert_eq!(application_package.unverified_preview(), b"attested claim");
     assert_eq!(
         application_package.statement(),
         &committed.preparation.statement

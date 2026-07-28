@@ -21,7 +21,7 @@ use vos::abi::service::ServiceId;
 use vos::actors::client::{AttestationInvoker, AttestedInvocationResult, ClientError, Invoker};
 use vos::v2::{
     AccumulationReceiptV2, ActorId, ConsistencyModeV2, DeploymentId, Hash, InvocationId,
-    ProducerId, ProgramId, RootServiceId, ServiceIdentityV2, SpaceId,
+    ProducerId, ProgramId, ReplyRecordV2, RootServiceId, ServiceIdentityV2, SpaceId,
 };
 use vos::value::{Msg, Value};
 
@@ -169,9 +169,12 @@ mod fixture {
                 Gate
             }
 
+            /// Transport-only codec gate. Application authorization must call
+            /// the verifier path and consume `Verified<T>`, not this package.
             #[msg]
-            fn admit(&self, package: Attestation<Receipt, LastReceipt>) -> u64 {
-                package.unverified_preview().id
+            fn receive_package(&self, package: Attestation<Receipt, LastReceipt>) -> bool {
+                let _ = package;
+                true
             }
         }
     }
@@ -459,6 +462,13 @@ fn attested_receipt_result(claim: &Receipt) -> AttestedInvocationResult {
             .to_vec(),
     );
     let deployment = DeploymentId([3; 32]);
+    let invocation = InvocationId([10; 32]);
+    let actor = ActorId([7; 32]);
+    let reply = ReplyRecordV2 {
+        call_id: invocation.root_reply_id(),
+        producer: actor,
+        result: value.encode(),
+    };
     let receipt = AccumulationReceiptV2 {
         service: ServiceIdentityV2 {
             space: SpaceId([6; 32]),
@@ -469,7 +479,7 @@ fn attested_receipt_result(claim: &Receipt) -> AttestedInvocationResult {
             execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
         },
         accepted_transition: Hash([4; 32]),
-        reply_commitment: None,
+        reply_commitment: Some(reply.commitment()),
         outbox_commitment: None,
         resulting_state_root: Some(Hash([5; 32])),
         resulting_crdt_heads: vec![],
@@ -483,12 +493,12 @@ fn attested_receipt_result(claim: &Receipt) -> AttestedInvocationResult {
         statement: vos::AttestationStatementV3 {
             statement_version: vos::v2::ATTESTATION_STATEMENT_VERSION,
             space: SpaceId([6; 32]),
-            actor: ActorId([7; 32]),
+            actor,
             deployment,
             actor_program: ProgramId([8; 32]),
             method: "last_receipt".into(),
             schema: Hash([9; 32]),
-            invocation: InvocationId([10; 32]),
+            invocation,
             before: vos::StateCommitmentV3::Linear(Hash([11; 32])),
             after: vos::StateCommitmentV3::Linear(Hash([5; 32])),
             claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&value.encode()]),
@@ -652,13 +662,14 @@ fn portable_attestation_round_trips_as_a_generated_actor_argument() {
     let package = vos::block_on(VaultRef::at(ServiceId(5)).last_receipt(&mut producer)).unwrap();
 
     let mut gate_invoker = CapturingInvoker {
-        reply: Some(Value::U64(101)),
+        reply: Some(Value::Bool(true)),
         ..Default::default()
     };
-    let admitted =
-        vos::block_on(GateRef::at(ServiceId(6)).admit(&mut gate_invoker, package)).unwrap();
-    assert_eq!(admitted, 101);
-    let GateMsg::Admit(message) = GateMsg::from_msg(&gate_invoker.captured_msg()).unwrap();
+    let received =
+        vos::block_on(GateRef::at(ServiceId(6)).receive_package(&mut gate_invoker, package))
+            .unwrap();
+    assert!(received);
+    let GateMsg::ReceivePackage(message) = GateMsg::from_msg(&gate_invoker.captured_msg()).unwrap();
     assert_eq!(message.package.unverified_preview(), &claim);
 }
 
