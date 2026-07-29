@@ -70,7 +70,7 @@ pub use package::{
 pub use pvm::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, NoRefineProtocolHostV2,
     RefineProtocolHostV2, SERVICE_ARGUMENT_PAGES_V2, ServicePvmErrorV2, ServicePvmOutputV2,
-    ServicePvmV2, transpile_service_elf,
+    ServicePvmV2, transpile_service_elf, validate_actor_program_layout,
 };
 #[cfg(feature = "std")]
 pub use scheduler::{LocalWorkRequestV2, LocalWorkSchedulerV2, PreparedWorkV2, ScheduleErrorV2};
@@ -124,16 +124,25 @@ pub const ACCUMULATE_ENTRY_IC: u32 = 5;
 /// This is a JAR capability-table slot supplied at invocation setup, not a JAM
 /// protocol capability or hostcall number.
 pub const TARGET_ACTOR_HANDLE_SLOT: u8 = 144;
-/// Maximum actor programs in one root tree. JAR invocation layouts admit at
-/// most 64 code capabilities including the generic service itself.
-pub const MAX_ROOT_TREE_ACTORS: usize = 63;
+/// Maximum actor programs in one root tree.
+///
+/// The pinned JAR kernel owns one shared code-capability table with five
+/// entries. The generic VOS service consumes the first entry, leaving four
+/// application actors. This is a kernel limit, not a VOS wire-size limit.
+pub const MAX_ROOT_TREE_ACTORS: usize = 4;
+
+#[cfg(feature = "std")]
+const _: () = assert!(MAX_ROOT_TREE_ACTORS + 1 == javm::vm_pool::MAX_CODE_CAPS);
+
+/// Maximum UTF-8 byte length of one actor's parent-scoped name.
+pub const MAX_ACTOR_NAME_BYTES: usize = 128;
 
 /// First per-actor CALLABLE slot used for same-tree routes. The canonical
 /// actor directory index selects the exact slot in every actor CNode.
 pub const ACTOR_CALLABLE_BASE_SLOT: u8 = 128;
 
 /// Move-only DATA capability used for service↔actor slice input/output.
-/// Kept above the complete root HANDLE window (144..=206).
+/// Kept above the complete root HANDLE window (144..=147).
 pub const ACTOR_IPC_CAP_SLOT: u8 = 240;
 /// Temporary actor-CNode slot used while CALL owns the reserved IPC slot 0.
 pub const ACTOR_SAVED_ARGS_CAP_SLOT: u8 = 253;

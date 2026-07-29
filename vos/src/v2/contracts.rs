@@ -139,15 +139,15 @@ pub struct ImportedActorV2 {
 
 /// Exact root-tree member materialized into an actor's invocation-owned IPC
 /// input. Its canonical list index selects the CALLABLE slot granted by the
-/// generic service (`ACTOR_CALLABLE_BASE_SLOT + index`).
+/// generic service (`ACTOR_CALLABLE_BASE_SLOT + index`). This is deliberately
+/// directory metadata only: sibling state remains private until an authorized
+/// inline call actually enters that sibling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorTreeImportV2 {
     pub actor: ActorId,
     pub name: String,
     pub parent: Option<ActorId>,
     pub program: ProgramId,
-    pub state: Vec<u8>,
-    pub causal_states: Vec<Vec<u8>>,
     /// A suspended actor remains visible for name/ownership resolution but no
     /// new CALLABLE is granted until its exact continuation drains.
     pub suspended: bool,
@@ -193,8 +193,9 @@ pub struct ActorSliceInputV2 {
     /// Additional canonical CRDT frontier materializations. The generated
     /// actor merger folds these into `state` before the message is observed.
     pub causal_states: Vec<Vec<u8>>,
-    /// Complete canonical root-tree import. Actor code resolves typed names
-    /// and same-tree CALLABLE slots only from this authenticated input.
+    /// Complete canonical root-tree directory. Actor code resolves typed names
+    /// and same-tree CALLABLE slots only from this authenticated metadata.
+    /// Sibling state is not included.
     pub actor_tree: Vec<ActorTreeImportV2>,
     /// Canonical generated actor-message bytes.
     pub message: Vec<u8>,
@@ -1395,16 +1396,7 @@ impl V2Wire for ActorSliceInputV2 {
         else {
             return Err(DecodeError::NonCanonical);
         };
-        if self_import.suspended
-            || self_import.state != value.state
-            || self_import.causal_states != value.causal_states
-            || (value.change.is_none()
-                && (!value.causal_states.is_empty()
-                    || value
-                        .actor_tree
-                        .iter()
-                        .any(|actor| !actor.causal_states.is_empty())))
-        {
+        if self_import.suspended || (value.change.is_none() && !value.causal_states.is_empty()) {
             return Err(DecodeError::NonCanonical);
         }
         Ok(value)
@@ -1968,6 +1960,14 @@ impl V2Wire for ServiceGenesisV2 {
     }
 }
 
+impl ServiceGenesisV2 {
+    /// Validate the typed value before any installation-side availability
+    /// checks or state writes. Wire decoding calls the same validator.
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        validate_genesis(self)
+    }
+}
+
 impl V2Wire for AccumulationEnvelopeV2 {
     const MAGIC: [u8; 4] = *b"VAE2";
 
@@ -2318,6 +2318,7 @@ fn decode_actor_genesis(d: &mut Decoder<'_>) -> Result<ActorGenesisV2, DecodeErr
         role_policies: d.bytes()?,
     };
     if value.name.is_empty()
+        || value.name.len() > super::MAX_ACTOR_NAME_BYTES
         || super::package::PackageRolePoliciesV2::decode(&value.role_policies).is_err()
     {
         return Err(DecodeError::NonCanonical);
@@ -2343,10 +2344,11 @@ fn validate_genesis(value: &ServiceGenesisV2) -> Result<(), DecodeError> {
     let known: BTreeSet<_> = value.actors.iter().map(|actor| actor.actor).collect();
     let mut names = BTreeSet::new();
     for actor in &value.actors {
-        if value.consistency == ConsistencyModeV2::Crdt && !actor.crdt {
+        if actor.crdt != (value.consistency == ConsistencyModeV2::Crdt) {
             return Err(DecodeError::NonCanonical);
         }
         if actor.name.is_empty()
+            || actor.name.len() > super::MAX_ACTOR_NAME_BYTES
             || actor.parent == Some(actor.actor)
             || actor.parent.is_some_and(|parent| !known.contains(&parent))
             || !names.insert((actor.parent, actor.name.as_str()))
@@ -2393,6 +2395,7 @@ fn validate_imported_actor_tree(
     let mut names = BTreeSet::new();
     for actor in actors {
         if actor.name.is_empty()
+            || actor.name.len() > super::MAX_ACTOR_NAME_BYTES
             || actor.parent == Some(actor.actor)
             || actor.parent.is_some_and(|parent| !known.contains(&parent))
             || !names.insert((actor.parent, actor.name.as_str()))
@@ -2440,6 +2443,7 @@ fn validate_actor_slice_tree(actors: &[ActorTreeImportV2]) -> Result<(), DecodeE
     let mut names = BTreeSet::new();
     for actor in actors {
         if actor.name.is_empty()
+            || actor.name.len() > super::MAX_ACTOR_NAME_BYTES
             || actor.parent == Some(actor.actor)
             || actor.parent.is_some_and(|parent| !known.contains(&parent))
             || !names.insert((actor.parent, actor.name.as_str()))
@@ -2874,8 +2878,6 @@ fn encode_actor_tree_import(e: &mut Encoder<'_>, value: &ActorTreeImportV2) {
     e.string(&value.name);
     e.option(&value.parent, |e, parent| e.fixed(&parent.0));
     e.fixed(&value.program.0);
-    e.bytes(&value.state);
-    e.list(&value.causal_states, |e, state| e.bytes(state));
     e.bool(value.suspended);
 }
 
@@ -2885,11 +2887,12 @@ fn decode_actor_tree_import(d: &mut Decoder<'_>) -> Result<ActorTreeImportV2, De
         name: d.string()?,
         parent: d.option(|d| d.fixed().map(ActorId))?,
         program: ProgramId(d.fixed()?),
-        state: d.bytes()?,
-        causal_states: d.list(Decoder::bytes)?,
         suspended: d.bool()?,
     };
-    if value.name.is_empty() || value.parent == Some(value.actor) {
+    if value.name.is_empty()
+        || value.name.len() > super::MAX_ACTOR_NAME_BYTES
+        || value.parent == Some(value.actor)
+    {
         return Err(DecodeError::NonCanonical);
     }
     Ok(value)
@@ -3423,8 +3426,6 @@ mod tests {
                     name: "root".into(),
                     parent: None,
                     program: ProgramId([24; 32]),
-                    state: b"before".to_vec(),
-                    causal_states: vec![b"concurrent".to_vec()],
                     suspended: false,
                 },
                 ActorTreeImportV2 {
@@ -3432,8 +3433,6 @@ mod tests {
                     name: "child".into(),
                     parent: Some(ActorId([21; 32])),
                     program: ProgramId([25; 32]),
-                    state: b"child".to_vec(),
-                    causal_states: vec![],
                     suspended: false,
                 },
             ],
@@ -3798,7 +3797,7 @@ mod tests {
     }
 
     #[test]
-    fn genesis_rejects_cycles_and_plain_actors_in_crdt_services() {
+    fn genesis_rejects_invalid_consistency_names_and_cycles() {
         let mut genesis = ServiceGenesisV2 {
             service: service(),
             consistency: ConsistencyModeV2::Crdt,
@@ -3822,11 +3821,16 @@ mod tests {
         );
 
         genesis.consistency = ConsistencyModeV2::Local;
+        genesis.actors[0].crdt = true;
+        assert_eq!(genesis.validate(), Err(DecodeError::NonCanonical));
+
+        genesis.actors[0].crdt = false;
+        genesis.actors[0].name = "x".repeat(super::super::MAX_ACTOR_NAME_BYTES + 1);
+        assert_eq!(genesis.validate(), Err(DecodeError::NonCanonical));
+
+        genesis.actors[0].name = "root".into();
         genesis.actors[0].parent = Some(genesis.actors[0].actor);
-        assert_eq!(
-            ServiceGenesisV2::decode(&genesis.encode()),
-            Err(DecodeError::NonCanonical)
-        );
+        assert_eq!(genesis.validate(), Err(DecodeError::NonCanonical));
     }
 
     #[test]

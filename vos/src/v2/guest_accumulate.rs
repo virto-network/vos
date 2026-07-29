@@ -152,6 +152,9 @@ fn install<S: GuestAccumulateStoreV2>(
     if genesis.service.execution_semantics != EXECUTION_SEMANTICS_ID {
         return Ok(rejected(AccumulationRejectionV2::WrongExecutionSemantics));
     }
+    if genesis.validate().is_err() {
+        return Ok(rejected(AccumulationRejectionV2::NonCanonical));
+    }
     if !store
         .authorize_install(genesis)
         .map_err(GuestAccumulateError::Storage)?
@@ -2478,6 +2481,37 @@ mod tests {
             rejected(AccumulationRejectionV2::WrongProgram),
             "availability is consulted only after authorization succeeds"
         );
+    }
+
+    #[test]
+    fn typed_install_rejects_invalid_genesis_before_authority_or_availability() {
+        let mut store = MemStore {
+            deny_install: true,
+            ..MemStore::default()
+        };
+        let genesis = ServiceGenesisV2 {
+            service: identity(),
+            consistency: ConsistencyModeV2::Local,
+            actors: vec![ActorGenesisV2 {
+                actor: actor(),
+                name: String::new(),
+                parent: None,
+                program: program(),
+                initial_state: BlobRefV2::of_bytes(b"unavailable state"),
+                crdt: false,
+                role_policies: role_policies(vec![]),
+            }],
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: super::super::SystemCapabilityId([8; 32]),
+                authenticator: vec![9],
+            },
+        };
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Install(genesis)).unwrap(),
+            rejected(AccumulationRejectionV2::NonCanonical)
+        );
+        assert_eq!(store, before);
     }
 
     #[test]

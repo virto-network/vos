@@ -35,7 +35,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     if actor_pvm.is_empty() {
         bail!("{} produced an empty PVM", args.program.display());
     }
-    javm::program::parse_blob(&actor_pvm).ok_or_else(|| anyhow!("invalid canonical actor PVM"))?;
+    vos::v2::validate_actor_program_layout(&actor_pvm)
+        .map_err(|error| anyhow!("invalid canonical actor PVM capability layout: {error}"))?;
 
     let schemas = match args.schemas.as_deref() {
         Some(path) => std::fs::read(path).with_context(|| format!("read {}", path.display()))?,

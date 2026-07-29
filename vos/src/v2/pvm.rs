@@ -58,6 +58,7 @@ pub enum ServicePvmErrorV2 {
     KernelResourceUnavailable,
     ProgramIdMismatch,
     InvalidServiceEntries,
+    InvalidActorCapabilityLayout,
     Panic,
     OutOfGas {
         vm: u16,
@@ -265,6 +266,7 @@ impl ServicePvmV2 {
                 .ok()
                 .map(|index| &imports.programs[index])
                 .ok_or(ServicePvmErrorV2::InvalidRefineImports)?;
+            validate_actor_program_layout(&imported.pvm)?;
             let handle_slot = TARGET_ACTOR_HANDLE_SLOT
                 .checked_add(ordinal as u8)
                 .ok_or(ServicePvmErrorV2::TooManyImportedActors)?;
@@ -349,14 +351,6 @@ impl ServicePvmV2 {
                     name: actor.name.clone(),
                     parent: actor.parent,
                     program: actor.program,
-                    state: imported_blob_bytes(imports, &actor.state)?.to_vec(),
-                    causal_states: actor
-                        .causal_states
-                        .iter()
-                        .map(|reference| {
-                            imported_blob_bytes(imports, reference).map(<[u8]>::to_vec)
-                        })
-                        .collect::<Result<Vec<_>, ServicePvmErrorV2>>()?,
                     suspended: actor.continuation.is_some(),
                 })
             })
@@ -934,6 +928,26 @@ fn validate_service_entries(program: &[u8]) -> Result<(), ServicePvmErrorV2> {
     Ok(())
 }
 
+/// Reject actor manifests that occupy capability-table slots supplied by the
+/// VOS root-tree scheduler.
+///
+/// Slot 0 remains the actor's canonical argument DATA cap and is temporarily
+/// moved by the service around a nested CALL. The per-peer CALLABLE window and
+/// that temporary save slot must be empty in every application manifest.
+pub fn validate_actor_program_layout(program: &[u8]) -> Result<(), ServicePvmErrorV2> {
+    let parsed = parse_blob(program).ok_or(ServicePvmErrorV2::InvalidProgram)?;
+    let callable_end = super::ACTOR_CALLABLE_BASE_SLOT
+        .checked_add(MAX_ROOT_TREE_ACTORS as u8)
+        .ok_or(ServicePvmErrorV2::InvalidActorCapabilityLayout)?;
+    if parsed.caps.iter().any(|cap| {
+        (super::ACTOR_CALLABLE_BASE_SLOT..callable_end).contains(&cap.cap_index)
+            || cap.cap_index == super::ACTOR_SAVED_ARGS_CAP_SLOT
+    }) {
+        return Err(ServicePvmErrorV2::InvalidActorCapabilityLayout);
+    }
+    Ok(())
+}
+
 fn read_output(kernel: &InvocationKernel) -> Result<Vec<u8>, ServicePvmErrorV2> {
     let address =
         u32::try_from(kernel.active_reg(7)).map_err(|_| ServicePvmErrorV2::UnreadableOutput)?;
@@ -1296,6 +1310,80 @@ mod tests {
             ServicePvmV2::new(actor.clone(), ProgramId::of_pvm(&actor)),
             Err(ServicePvmErrorV2::InvalidServiceEntries)
         ));
+    }
+
+    #[test]
+    fn root_tree_actor_limit_matches_the_pinned_jar_kernel() {
+        assert_eq!(
+            MAX_ROOT_TREE_ACTORS + 1,
+            javm::vm_pool::MAX_CODE_CAPS,
+            "one shared JAR code-capability entry is consumed by the service",
+        );
+
+        let service = two_entry_program(None);
+        let actor = grey_transpiler::assembler::Assembler::new().build();
+        let actors = (0..MAX_ROOT_TREE_ACTORS)
+            .map(|ordinal| DormantProgram {
+                blob: actor.as_slice(),
+                handle_slot: TARGET_ACTOR_HANDLE_SLOT + ordinal as u8,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            InvocationKernel::new_with_dormant_programs(
+                &service,
+                &[],
+                SYNTHETIC_SERVICE_GAS,
+                &actors,
+                javm::PvmBackend::ForceInterpreter,
+            )
+            .is_ok()
+        );
+
+        let mut too_many = actors;
+        too_many.push(DormantProgram {
+            blob: actor.as_slice(),
+            handle_slot: TARGET_ACTOR_HANDLE_SLOT + MAX_ROOT_TREE_ACTORS as u8,
+        });
+        assert!(
+            InvocationKernel::new_with_dormant_programs(
+                &service,
+                &[],
+                SYNTHETIC_SERVICE_GAS,
+                &too_many,
+                javm::PvmBackend::ForceInterpreter,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn actor_manifests_cannot_occupy_scheduler_capability_slots() {
+        use javm::program::{CapManifestEntry, build_blob};
+
+        let actor = grey_transpiler::assembler::Assembler::new().build();
+        validate_actor_program_layout(&actor).unwrap();
+        let parsed = parse_blob(&actor).unwrap();
+        let mut caps = parsed.caps.clone();
+        caps.push(CapManifestEntry {
+            cap_index: super::super::ACTOR_CALLABLE_BASE_SLOT,
+            cap_type: CapEntryType::Data,
+            base_page: 0,
+            page_count: 0,
+            init_access: Access::RW,
+            data_offset: 0,
+            data_len: 0,
+        });
+        let invalid = build_blob(
+            parsed.header.memory_pages,
+            parsed.header.invoke_cap,
+            parsed.header.stack_top,
+            &caps,
+            parsed.data_section,
+        );
+        assert_eq!(
+            validate_actor_program_layout(&invalid),
+            Err(ServicePvmErrorV2::InvalidActorCapabilityLayout)
+        );
     }
 
     #[test]

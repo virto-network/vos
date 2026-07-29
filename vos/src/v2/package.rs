@@ -78,6 +78,7 @@ pub enum PackageError {
     InvalidRolePolicies,
     PolicySchemaMismatch,
     CrdtMetadataMismatch,
+    InvalidActorName,
     MissingSignature,
     ProducerIdMismatch,
 }
@@ -174,6 +175,9 @@ impl VosPackageV2 {
         initial_state: BlobRefV2,
     ) -> Result<ActorGenesisV2, PackageError> {
         self.validate()?;
+        if name.is_empty() || name.len() > super::MAX_ACTOR_NAME_BYTES {
+            return Err(PackageError::InvalidActorName);
+        }
         Ok(ActorGenesisV2 {
             actor,
             name,
@@ -421,7 +425,7 @@ mod tests {
     }
 
     fn package() -> VosPackageV2 {
-        let pvm = vec![1, 2, 3, 4];
+        let pvm = grey_transpiler::assembler::Assembler::new().build();
         let interfaces = b"interface".to_vec();
         let (schemas, policies) = schema_and_policies();
         VosPackageV2 {
@@ -541,6 +545,19 @@ mod tests {
         assert_eq!(
             PackageRolePoliciesV2::decode(&genesis.role_policies).unwrap(),
             policies
+        );
+        assert_eq!(
+            package.actor_genesis(actor, String::new(), None, state.clone()),
+            Err(PackageError::InvalidActorName)
+        );
+        assert_eq!(
+            package.actor_genesis(
+                actor,
+                "x".repeat(super::super::MAX_ACTOR_NAME_BYTES + 1),
+                None,
+                state,
+            ),
+            Err(PackageError::InvalidActorName)
         );
     }
 

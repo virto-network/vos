@@ -96,8 +96,9 @@ fn canonical_program(
     let package = VosPackageV2::decode(&bytes)
         .map_err(|error| anyhow::anyhow!("decode .vos v2 package: {error}"))?;
     package.validate()?;
-    javm::program::parse_blob(&package.actor_pvm)
-        .ok_or_else(|| anyhow::anyhow!("package actor PVM is invalid"))?;
+    vos::v2::validate_actor_program_layout(&package.actor_pvm).map_err(|error| {
+        anyhow::anyhow!("package actor PVM capability layout is invalid: {error}")
+    })?;
     if package.manifest.name != name || package.manifest.version != version {
         anyhow::bail!(
             "package identity is {}:{}, but publish requested {name}:{version}",

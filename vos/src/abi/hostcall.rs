@@ -175,7 +175,10 @@ mod tests {
                 .into_iter()
                 .all(|slot| !actor_handles.contains(&slot))
         );
-        assert_eq!(actor_handles.end - actor_handles.start, 63);
+        assert_eq!(
+            actor_handles.end - actor_handles.start,
+            crate::v2::MAX_ROOT_TREE_ACTORS as u8
+        );
         assert!(
             crate::v2::ACTOR_CALLABLE_BASE_SLOT
                 .checked_add(crate::v2::MAX_ROOT_TREE_ACTORS as u8 - 1)
