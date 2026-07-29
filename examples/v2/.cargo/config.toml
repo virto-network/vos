@@ -3,6 +3,7 @@ rustflags = [
     "-Zunstable-options",
     "-Zcrate-attr=no_std",
     "-Zcrate-attr=no_main",
+    "-Zremap-cwd-prefix=.",
     "-Aduplicate-macro-attributes",
     "-Aunused-attributes",
 ]
