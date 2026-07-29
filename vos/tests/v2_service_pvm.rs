@@ -16,17 +16,18 @@ use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, WorkerConfig};
 use vos::v2::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AuthorizationEvidenceV2,
-    BlobRefV2, CommittedAccumulateBatchV2, CommittedAccumulateEntryV2, CommittedAccumulateLogV2,
-    CommittedImageStoreV2, CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2, GasAccountingV2,
-    Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2, InvocationId,
-    JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2, LocalTransportV2, LocalWorkRequestV2,
-    LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
-    PackageRolePoliciesV2, ProducerId, ProgramId, PublishedEffectsV2, ReceiptVerificationRequestV2,
-    RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RoleCredentialV2,
-    RoleCredentialVerificationRequestV2, RootServiceId, ScheduleErrorV2, ServiceDispatchError,
-    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId,
-    TransitionV2, V2Wire, WorkEnvelopeV2, public_policy_hash, space_role_policy_hash,
+    BlobRefV2, CallId, CommittedAccumulateBatchV2, CommittedAccumulateEntryV2,
+    CommittedAccumulateLogV2, CommittedImageStoreV2, CommittedServiceSnapshotV2, ConsistencyBaseV2,
+    ConsistencyModeV2, ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId,
+    DurableJamStoreV2, GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
+    InboxDrainOutcomeV2, InvocationId, JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2,
+    LocalTransportV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
+    NoRefineProtocolHostV2, Origin, PackageRolePoliciesV2, ProducerId, ProgramId,
+    PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2,
+    ReplicatedJamServiceV2, ReplyRecordV2, RoleCredentialV2, RoleCredentialVerificationRequestV2,
+    RootServiceId, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2,
+    ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId, TransitionV2, V2Wire, WorkEnvelopeV2,
+    public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     AttestedMethod, Decode, Encode,
@@ -387,6 +388,36 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
     }
 }
 
+fn peer_reply(
+    service: &ServiceIdentityV2,
+    call_id: CallId,
+    value: u32,
+    discriminator: u8,
+) -> AccumulatedReplyV2 {
+    let reply = ReplyRecordV2 {
+        call_id,
+        producer: ActorId([44; 32]),
+        result: Value::U32(value).encode(),
+    };
+    let mut producer_service = service.clone();
+    producer_service.root_service = RootServiceId([discriminator; 32]);
+    producer_service.deployment = DeploymentId([discriminator.wrapping_add(1); 32]);
+    AccumulatedReplyV2 {
+        receipt: AccumulationReceiptV2 {
+            service: producer_service,
+            accepted_transition: Hash([discriminator.wrapping_add(2); 32]),
+            reply_commitment: Some(reply.commitment()),
+            outbox_commitment: None,
+            resulting_state_root: Some(Hash([discriminator.wrapping_add(3); 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 1,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        },
+        reply,
+    }
+}
+
 #[test]
 fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
     let elf = service_elf();
@@ -451,7 +482,7 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
 }
 
 #[test]
-fn same_tree_linear_call_aggregates_private_actor_effects_in_the_service_guest() {
+fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
     let actor_pvm = grey_transpiler::link_elf(&workflow_v2_elf()).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_bytes = Vec::new();
@@ -481,15 +512,35 @@ fn same_tree_linear_call_aggregates_private_actor_effects_in_the_service_guest()
                 program: actor_program,
                 initial_state: initial.clone(),
                 crdt: false,
-                role_policies: role_policies(vec![MethodPolicyV2 {
-                    method: "call_child".into(),
-                    schema: Hash([61; 32]),
-                    policy: public_policy_hash(),
-                    public: true,
-                    attested: false,
-                    space_role: None,
-                    actor_role: None,
-                }]),
+                role_policies: role_policies(vec![
+                    MethodPolicyV2 {
+                        method: "call_child".into(),
+                        schema: Hash([61; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                    MethodPolicyV2 {
+                        method: "root_child_await".into(),
+                        schema: Hash([65; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                    MethodPolicyV2 {
+                        method: "root_child_two_awaits".into(),
+                        schema: Hash([73; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                ]),
             },
             ActorGenesisV2 {
                 actor: child,
@@ -498,15 +549,35 @@ fn same_tree_linear_call_aggregates_private_actor_effects_in_the_service_guest()
                 program: actor_program,
                 initial_state: initial,
                 crdt: false,
-                role_policies: role_policies(vec![MethodPolicyV2 {
-                    method: "increment".into(),
-                    schema: Hash([62; 32]),
-                    policy: public_policy_hash(),
-                    public: true,
-                    attested: false,
-                    space_role: None,
-                    actor_role: None,
-                }]),
+                role_policies: role_policies(vec![
+                    MethodPolicyV2 {
+                        method: "child_await_peer".into(),
+                        schema: Hash([66; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                    MethodPolicyV2 {
+                        method: "child_two_awaits".into(),
+                        schema: Hash([74; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                    MethodPolicyV2 {
+                        method: "increment".into(),
+                        schema: Hash([62; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                ]),
             },
         ],
         authorization: AuthorizationEvidenceV2::SystemCapability {
@@ -562,6 +633,480 @@ fn same_tree_linear_call_aggregates_private_actor_effects_in_the_service_guest()
             .map(|reply| Value::decode(&reply.result)),
         Some(Value::U32(11))
     );
+
+    assert!(matches!(
+        service
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: scheduled.work,
+                transition: refined.transition,
+                provided_blobs: refined.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let invocation = InvocationId([67; 32]);
+    let mut nested_message = vec![vos::value::TAG_DYNAMIC];
+    nested_message.extend_from_slice(&Msg::new("root_child_await").encode());
+    let nested = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation,
+            workflow_step: 0,
+            logical_timeslot: 2,
+            target: seed.target,
+            method: "root_child_await".into(),
+            arguments: nested_message,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .expect("the completed inline invocation leaves both actors idle");
+    let runner = ServicePvmV2::new(
+        CANONICAL_SERVICE_PVM.to_vec(),
+        vos::v2::VOS_SERVICE_PROGRAM_ID,
+    )
+    .unwrap();
+    let first_bytes = runner
+        .refine_actor_tree_with_backend(
+            &nested.work.encode(),
+            &nested.imports,
+            1_000_000_000,
+            &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceInterpreter,
+        )
+        .expect("the child suspends inside the root's nested CALL");
+    assert_eq!(
+        runner
+            .refine_actor_tree_with_backend(
+                &nested.work.encode(),
+                &nested.imports,
+                1_000_000_000,
+                &NoRefineProtocolHostV2,
+                javm::PvmBackend::ForceRecompiler,
+            )
+            .unwrap(),
+        first_bytes,
+        "nested JAR checkpoints must be backend-independent"
+    );
+    let first_output = RefineOutputV2::decode(&first_bytes.bytes).unwrap();
+    let first = &first_output.transition;
+    assert!(first.reply.is_none());
+    assert_eq!(first.outbox.len(), 1);
+    let call_id = invocation.call_id(0);
+    assert_eq!(first.outbox[0].call_id, call_id);
+    assert_eq!(first.outbox[0].from, child);
+    assert_eq!(first.outbox[0].to, ActorId([44; 32]));
+    assert_eq!(first.outbox[0].deadline_timeslot, Some(100));
+    assert_eq!(
+        first
+            .continuations
+            .iter()
+            .map(|change| change.actor)
+            .collect::<Vec<_>>(),
+        vec![seed.target, child]
+    );
+    let continuation = first.continuations[0]
+        .replacement
+        .clone()
+        .expect("the complete nested machine stack is exported");
+    assert!(
+        first
+            .continuations
+            .iter()
+            .all(|change| change.expected.is_none()
+                && change.replacement.as_ref() == Some(&continuation))
+    );
+    assert_eq!(
+        first
+            .writes
+            .iter()
+            .map(|write| u32::decode(write.value.as_ref().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![21, 2],
+        "each pre-await mutation is materialized exactly once"
+    );
+    for artifact in first_output
+        .candidate_blobs
+        .iter()
+        .chain(first_bytes.exported_blobs.iter())
+    {
+        assert_eq!(
+            service
+                .accumulate_host_mut()
+                .import_blob(artifact.bytes.clone()),
+            artifact.reference
+        );
+    }
+
+    let mut forged_sender = first.clone();
+    forged_sender.outbox[0].from = seed.target;
+    assert_eq!(
+        service
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: nested.work.clone(),
+                transition: forged_sender,
+                provided_blobs: vec![],
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::InvalidWorkflowTransition),
+        "guest Accumulate binds the outbox sender to JAR's exact pending actor"
+    );
+
+    let mut incomplete_checkpoint = first.clone();
+    incomplete_checkpoint.continuations.pop();
+    assert_eq!(
+        service
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: nested.work.clone(),
+                transition: incomplete_checkpoint,
+                provided_blobs: vec![],
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::InvalidWorkflowTransition),
+        "guest Accumulate rejects a checkpoint that omits an active child"
+    );
+    let first_result = service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: nested.work,
+            transition: first.clone(),
+            provided_blobs: vec![],
+        }))
+        .unwrap()
+        .result;
+    assert!(
+        matches!(
+            first_result,
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ),
+        "complete nested checkpoint rejected: {first_result:?}"
+    );
+
+    let mut child_message = vec![vos::value::TAG_DYNAMIC];
+    child_message.extend_from_slice(&Msg::new("increment").with("amount", 1u32).encode());
+    let child_request = LocalWorkRequestV2 {
+        invocation: InvocationId([72; 32]),
+        workflow_step: 0,
+        logical_timeslot: 3,
+        target: child,
+        method: "increment".into(),
+        arguments: child_message,
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    assert_eq!(
+        LocalWorkSchedulerV2::prepare(service.accumulate_host(), child_request.clone()),
+        Err(ScheduleErrorV2::ActorBusy(child)),
+        "the active child is non-reentrant while its caller stack is suspended"
+    );
+
+    let persisted = service.accumulate_host().snapshot_bytes();
+    let restarted_store = LocalJamStoreV2::from_snapshot_bytes(&persisted)
+        .expect("the complete tree checkpoint survives a process restart");
+    let mut restarted = JamServiceV2::new(
+        CANONICAL_SERVICE_PVM.to_vec(),
+        vos::v2::VOS_SERVICE_PROGRAM_ID,
+        NoRefineProtocolHostV2,
+        restarted_store,
+        1_000_000_000,
+        1_000_000_000,
+    )
+    .unwrap();
+    let awaited_reply = peer_reply(&seed.service, call_id, 7, 68);
+    restarted
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            expected_producer: ActorId([44; 32]),
+            receipt: awaited_reply.receipt.clone(),
+        });
+    let resumed = LocalWorkSchedulerV2::prepare_resume(
+        restarted.accumulate_host(),
+        invocation,
+        3,
+        Some(awaited_reply),
+    )
+    .expect("the scheduler reconstructs the nested workflow from guest state");
+    assert!(
+        resumed
+            .work
+            .imported_actors
+            .iter()
+            .all(|actor| actor.continuation.as_ref() == Some(&continuation))
+    );
+    let resumed_bytes = runner
+        .refine_actor_tree_with_backend(
+            &resumed.work.encode(),
+            &resumed.imports,
+            1_000_000_000,
+            &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceInterpreter,
+        )
+        .expect("the reply resumes the child and then its suspended root caller");
+    assert_eq!(
+        runner
+            .refine_actor_tree_with_backend(
+                &resumed.work.encode(),
+                &resumed.imports,
+                1_000_000_000,
+                &NoRefineProtocolHostV2,
+                javm::PvmBackend::ForceRecompiler,
+            )
+            .unwrap(),
+        resumed_bytes,
+        "nested reply injection must be backend-independent"
+    );
+    let resumed_output = RefineOutputV2::decode(&resumed_bytes.bytes).unwrap();
+    let mut resumed_candidates = resumed_output.candidate_blobs.clone();
+    resumed_candidates.extend(resumed_bytes.exported_blobs.clone());
+    assert!(resumed_output.transition.outbox.is_empty());
+    assert_eq!(
+        resumed_output
+            .transition
+            .continuations
+            .iter()
+            .map(|change| (change.actor, change.expected, change.replacement.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (seed.target, Some(continuation.hash), None),
+            (child, Some(continuation.hash), None),
+        ]
+    );
+    assert_eq!(
+        resumed_output
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::U32(30))
+    );
+    assert_eq!(
+        resumed_output
+            .transition
+            .writes
+            .iter()
+            .map(|write| u32::decode(write.value.as_ref().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![30, 9]
+    );
+    assert!(matches!(
+        restarted
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: resumed.work,
+                transition: resumed_output.transition,
+                provided_blobs: resumed_candidates,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert!(
+        LocalWorkSchedulerV2::prepare(restarted.accumulate_host(), child_request).is_ok(),
+        "completion unlocks every actor from the exact suspended stack"
+    );
+
+    let second_invocation = InvocationId([75; 32]);
+    let mut twice_message = vec![vos::value::TAG_DYNAMIC];
+    twice_message.extend_from_slice(&Msg::new("root_child_two_awaits").encode());
+    let twice = LocalWorkSchedulerV2::prepare(
+        restarted.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: second_invocation,
+            workflow_step: 0,
+            logical_timeslot: 4,
+            target: seed.target,
+            method: "root_child_two_awaits".into(),
+            arguments: twice_message,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    let first_wait = restarted
+        .refine_actor_tree(&twice.work, &twice.imports)
+        .expect("the nested child reaches its first peer await");
+    let first_call = second_invocation.call_id(0);
+    assert_eq!(
+        first_wait
+            .transition
+            .outbox
+            .first()
+            .map(|message| message.call_id),
+        Some(first_call)
+    );
+    assert!(matches!(
+        restarted
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: twice.work,
+                transition: first_wait.transition,
+                provided_blobs: first_wait.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let persisted = restarted.accumulate_host().snapshot_bytes();
+    restarted = JamServiceV2::new(
+        CANONICAL_SERVICE_PVM.to_vec(),
+        vos::v2::VOS_SERVICE_PROGRAM_ID,
+        NoRefineProtocolHostV2,
+        LocalJamStoreV2::from_snapshot_bytes(&persisted).unwrap(),
+        1_000_000_000,
+        1_000_000_000,
+    )
+    .unwrap();
+    let first_reply = peer_reply(&seed.service, first_call, 1, 76);
+    restarted
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            expected_producer: ActorId([44; 32]),
+            receipt: first_reply.receipt.clone(),
+        });
+    let after_first = LocalWorkSchedulerV2::prepare_resume(
+        restarted.accumulate_host(),
+        second_invocation,
+        5,
+        Some(first_reply),
+    )
+    .unwrap();
+    let second_wait = restarted
+        .refine_actor_tree(&after_first.work, &after_first.imports)
+        .expect("the restored child advances to its second peer await");
+    let second_call = second_invocation.call_id(1);
+    assert_eq!(second_wait.transition.reply, None);
+    assert_eq!(second_wait.transition.outbox.len(), 1);
+    assert_eq!(second_wait.transition.outbox[0].call_id, second_call);
+    assert_ne!(first_call, second_call);
+    assert_eq!(
+        second_wait
+            .transition
+            .writes
+            .iter()
+            .map(|write| u32::decode(write.value.as_ref().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![40, 11],
+        "the first await resumes mid-stack without replaying pre-await code"
+    );
+    let second_continuation = second_wait.transition.continuations[0]
+        .replacement
+        .clone()
+        .expect("the second await replaces the first exact snapshot");
+    assert!(
+        second_wait
+            .transition
+            .continuations
+            .iter()
+            .all(|change| change.expected.is_some()
+                && change.replacement.as_ref() == Some(&second_continuation))
+    );
+    assert!(matches!(
+        restarted
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: after_first.work,
+                transition: second_wait.transition,
+                provided_blobs: second_wait.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let persisted = restarted.accumulate_host().snapshot_bytes();
+    restarted = JamServiceV2::new(
+        CANONICAL_SERVICE_PVM.to_vec(),
+        vos::v2::VOS_SERVICE_PROGRAM_ID,
+        NoRefineProtocolHostV2,
+        LocalJamStoreV2::from_snapshot_bytes(&persisted).unwrap(),
+        1_000_000_000,
+        1_000_000_000,
+    )
+    .unwrap();
+    let second_reply = peer_reply(&seed.service, second_call, 2, 80);
+    restarted
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            expected_producer: ActorId([44; 32]),
+            receipt: second_reply.receipt.clone(),
+        });
+    let after_second = LocalWorkSchedulerV2::prepare_resume(
+        restarted.accumulate_host(),
+        second_invocation,
+        6,
+        Some(second_reply),
+    )
+    .unwrap();
+    let finished = restarted
+        .refine_actor_tree(&after_second.work, &after_second.imports)
+        .expect("the second reply completes the original root handler");
+    assert!(finished.transition.outbox.is_empty());
+    assert_eq!(
+        finished
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::U32(53))
+    );
+    assert_eq!(
+        finished
+            .transition
+            .writes
+            .iter()
+            .map(|write| u32::decode(write.value.as_ref().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![53, 13],
+        "both await boundaries preserve the exact root and child locals"
+    );
+    assert!(matches!(
+        restarted
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: after_second.work,
+                transition: finished.transition,
+                provided_blobs: finished.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -2580,6 +3125,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         actor_program,
         await_ordinal: 0,
         pending_call: None,
+        pending_actor: None,
         causal_context: work.causal_context.clone(),
         suspended_actors: vec![work.target],
         kernel_snapshot: vec![1],
@@ -2883,6 +3429,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         actor_program,
         await_ordinal: 0,
         pending_call: None,
+        pending_actor: None,
         causal_context: delivered.work.causal_context.clone(),
         suspended_actors: vec![delivered.work.target],
         kernel_snapshot: vec![2],
@@ -3045,6 +3592,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         actor_program,
         await_ordinal: 0,
         pending_call: Some(awaited_call),
+        pending_actor: Some(caller.work.target),
         causal_context: caller.work.causal_context.clone(),
         suspended_actors: vec![caller.work.target],
         kernel_snapshot: vec![4],

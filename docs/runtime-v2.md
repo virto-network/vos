@@ -148,6 +148,16 @@ invocation-local Refine state, never native persistent service state. This
 preserves role-gated sibling-state isolation without changing JAR CALL/REPLY
 semantics or making the host the transition authority.
 
+An ordinary same-tree call executes through JAR `CALLABLE` and returns inline.
+The scheduler derives the active actor set from JAR's live call stack through
+the private channel, so application IPC cannot clear it; attempting to re-enter
+any active caller returns `InvokeError::Cycle`. Await ordinals are allocated
+across the complete inline actor tree and flow back through the minimal call
+result, preventing nested actors from deriving the same `CallId`. The
+checkpoint also records the exact active actor VM which issued an awaited call;
+the service and guest Accumulate both bind the durable outbox sender to that
+host-derived identity.
+
 Actor metadata is also the source of installed method policy. `#[msg]`
 annotations produce one canonical schema and role-policy artifact; package
 validation derives the same artifact again and installation takes method rows
@@ -201,8 +211,8 @@ an independently constructed genesis directly to guest Install is only a
 conformance seam.
 
 This is still a conformance orchestrator, not production network routing.
-Automatic node discovery and outbox/reply routing, plus CRDT delivery/reply
-consumption, remain staged. Acknowledging a publication containing several
+Automatic node discovery and CRDT delivery/reply consumption remain staged.
+Acknowledging a publication containing several
 effects is the transport host's responsibility only after every required
 consumer has accepted it.
 
@@ -296,7 +306,10 @@ PC, registers, heap bounds, gas and lifecycle, mutable capabilities, dirty
 page hashes, active/runnable scheduler state, nested call stack and the pending
 protocol boundary. Resume consumes the checkpoint, injects one result into its
 declared registers and continues at `resume_pc`. It never restarts the handler
-at PC 0. Suspended actors are non-reentrant; later messages remain queued.
+at PC 0. One continuation reference locks every actor in the captured nested
+stack; guest Accumulate rejects a partial lock or unlock. Suspended actors are
+non-reentrant, including children whose caller remains suspended, and later
+messages remain queued.
 
 Raft orders canonical `AccumulateRequestV2` bytes. An `Apply` request carries
 the `AccumulationEnvelopeV2::provided_blobs` needed by that transition, while
@@ -332,7 +345,8 @@ authenticated parent call is bound into the workflow identity and every exact
 continuation. It retains caller/callee, deadline and parent linkage after the
 step-0 inbox row is consumed, so later awaits preserve cycle and inherited
 deadline checks without resurrecting that row. Await ordinals live in the
-captured actor machine and therefore advance across successive restarts.
+captured actor machine, are shared by inline descendants, and therefore advance
+across successive restarts.
 
 ## Packages and identity
 
