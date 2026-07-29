@@ -984,10 +984,9 @@ impl<A: Actor> Context<A> {
     /// The value is rkyv-encoded and included in the refine output.
     #[doc(hidden)]
     pub fn __set_reply(&mut self, value: super::value::Value) {
-        // Don't store Unit replies — they carry no information
-        if matches!(value, super::value::Value::Unit) {
-            return;
-        }
+        // Unit is still a typed reply. Attested methods commit the exact
+        // encoded `Value`, so collapsing Unit to an empty byte slice would
+        // make the handler result disagree with its claim commitment.
         self.reply = Some(super::codec::Encode::encode(&value));
     }
 

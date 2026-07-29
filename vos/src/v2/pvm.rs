@@ -1210,6 +1210,7 @@ mod tests {
                 method: "attested".into(),
                 schema: Hash([8; 32]),
                 invocation,
+                reply_call: reply.call_id,
                 before: crate::attestation::StateCommitmentV3::Linear(Hash([10; 32])),
                 after: crate::attestation::StateCommitmentV3::Linear(Hash([5; 32])),
                 claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&reply.result]),

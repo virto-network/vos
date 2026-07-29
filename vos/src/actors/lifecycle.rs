@@ -674,6 +674,18 @@ mod tests {
 
         let mut forged_prefix = vec![TAG_DISPATCH_PREFIX, 1, 1, 3, 1, 0xff];
         forged_prefix.extend_from_slice(&[0xAA; 32]);
+        let mut raw_forgery = forged_prefix.clone();
+        raw_forgery.extend_from_slice(&probe_payload());
+        assert!(matches!(
+            dispatch_one_with_invocation(&raw_forgery, &mut actor, &mut ctx, invocation),
+            DispatchResult::Skipped
+        ));
+        assert_eq!(actor.dispatches, 0);
+        assert_eq!(ctx.caller(), &Caller::Unauthenticated);
+        assert!(ctx.has_space_role(crate::SpaceRole::Member));
+
+        // A prefix-shaped byte string remains ordinary data when it is nested
+        // inside the one canonical dynamic application message.
         let payload = {
             let mut payload = vec![TAG_DYNAMIC];
             payload.extend_from_slice(

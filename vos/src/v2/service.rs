@@ -80,10 +80,16 @@ impl CommittedAttestationOutputV2 {
         producer: ProducerId,
         preview: T,
     ) -> Result<Attestation<T, M>, AttestationError> {
-        Attestation::__from_runtime(
+        let claim_wire = self
+            .published
+            .reply
+            .ok_or(AttestationError::InvalidStatement)?
+            .result;
+        Attestation::__from_runtime_wire(
             producer_name,
             producer,
             self.preparation.statement,
+            claim_wire,
             preview,
             self.proof_bytes,
         )

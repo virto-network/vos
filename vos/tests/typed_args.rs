@@ -45,6 +45,22 @@ mod fixture {
         pub tag: [u8; 32],
     }
 
+    /// Zero-sized capability marker used to prove that `Option<T>` claim
+    /// encoding distinguishes `None` from `Some(T)` even when rkyv(T) is
+    /// empty.
+    #[derive(
+        vos::rkyv::Archive,
+        vos::rkyv::Serialize,
+        vos::rkyv::Deserialize,
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+    )]
+    #[rkyv(crate = vos::rkyv)]
+    pub struct MembershipToken;
+
     #[derive(
         vos::rkyv::Archive,
         vos::rkyv::Serialize,
@@ -105,6 +121,19 @@ mod fixture {
                 id: 1,
                 tag: [0u8; 32],
             }
+        }
+
+        #[msg(attested)]
+        fn optional_token(&self, issue: bool) -> Option<MembershipToken> {
+            issue.then_some(MembershipToken)
+        }
+
+        #[msg(attested)]
+        fn acknowledge(&mut self) {}
+
+        #[msg(attested)]
+        fn try_acknowledge(&mut self) -> Result<()> {
+            Ok(())
         }
 
         /// The same custom wire shape on a regular method, used to prove that
@@ -181,7 +210,7 @@ mod fixture {
 }
 
 use fixture::gate::{GateMsg, GateRef};
-use fixture::{Receipt, Vault, VaultMsg, VaultRef};
+use fixture::{MembershipToken, Receipt, Vault, VaultMsg, VaultRef};
 
 mod crdt_fixture {
     use vos::prelude::*;
@@ -310,6 +339,49 @@ fn attested_method_marker_binds_the_exact_committed_reply_wire() {
                 .expect("rkyv encode")
                 .to_vec()
         ),
+    );
+}
+
+#[test]
+fn attested_option_claims_tag_none_some_and_zero_sized_values() {
+    type Marker = fixture::OptionalToken;
+    let none = <Marker as vos::AttestedMethod<Option<MembershipToken>>>::claim_wire(&None);
+    let some = <Marker as vos::AttestedMethod<Option<MembershipToken>>>::claim_wire(&Some(
+        MembershipToken,
+    ));
+    assert_ne!(none, some);
+    assert_eq!(
+        <Marker as vos::AttestedMethod<Option<MembershipToken>>>::decode_claim_wire(&none),
+        Some(None)
+    );
+    assert_eq!(
+        <Marker as vos::AttestedMethod<Option<MembershipToken>>>::decode_claim_wire(&some),
+        Some(Some(MembershipToken))
+    );
+}
+
+#[test]
+fn attested_unit_methods_compile_and_commit_a_typed_unit_reply() {
+    let mut actor = <Vault as vos::Actor>::create();
+    let mut context = vos::Context::new(ServiceId(7));
+    let message = VaultMsg::from_msg(&Msg::new("acknowledge")).expect("unit message");
+    assert!(matches!(
+        vos::Actor::dispatch(&mut actor, message, &mut context),
+        vos::RunResult::Complete(false)
+    ));
+    assert_eq!(
+        <Value as vos::Decode>::decode(&context.take_reply_bytes()),
+        Value::Unit
+    );
+
+    let message = VaultMsg::from_msg(&Msg::new("try_acknowledge")).expect("result unit message");
+    assert!(matches!(
+        vos::Actor::dispatch(&mut actor, message, &mut context),
+        vos::RunResult::Complete(false)
+    ));
+    assert_eq!(
+        <Value as vos::Decode>::decode(&context.take_reply_bytes()),
+        Value::Unit
     );
 }
 
@@ -499,6 +571,7 @@ fn attested_receipt_result(claim: &Receipt) -> AttestedInvocationResult {
             method: "last_receipt".into(),
             schema: Hash([9; 32]),
             invocation,
+            reply_call: reply.call_id,
             before: vos::StateCommitmentV3::Linear(Hash([11; 32])),
             after: vos::StateCommitmentV3::Linear(Hash([5; 32])),
             claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&value.encode()]),

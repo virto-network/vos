@@ -687,10 +687,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // Detect `Option<T>` in the handler's return type (after
         // unwrapping `Result<T, E>` if applicable). When present,
-        // we serialize replies via rkyv into `Value::Bytes` —
-        // empty for `None`, populated for `Some(v)`. The
-        // generated client at the other end recognises this
-        // shape and turns it back into `Option<T>`.
+        // the canonical reply uses an explicit discriminant inside
+        // `Value::Bytes`: `[0]` for `None`, `[1] ++ rkyv(T)` for `Some`.
+        // The tag is required because rkyv encodes zero-sized values to zero
+        // bytes, so an empty/non-empty convention is not injective.
         let raw_ret = match &method.sig.output {
             ReturnType::Default => None,
             ReturnType::Type(_, ty) => Some(ty.as_ref().clone()),
@@ -729,8 +729,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // returned value into the `Value` we hand to
         // `ctx.__set_reply`. Three shapes, in order:
         //
-        // 1. `Option<T>` — match Some/None, rkyv-encode T into
-        //    `Value::Bytes` (empty for None).
+        // 1. `Option<T>` — match Some/None and emit the tagged canonical
+        //    `Value::Bytes` representation described above.
         // 2. Primitives / strings / `Vec<u8|u32|String>` — these
         //    all impl `Into<Value>` already, so `reply.into()`.
         // 3. Anything else — assume a user rkyv-able struct and
@@ -740,12 +740,15 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 {
                     let __reply = reply;
                     match __reply {
-                        None => vos::value::Value::Bytes(alloc::vec::Vec::new()),
+                        None => vos::value::Value::Bytes(alloc::vec![0]),
                         Some(v) => {
                             let bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&v)
                                 .expect("rkyv encode")
                                 .to_vec();
-                            vos::value::Value::Bytes(bytes)
+                            let mut tagged = alloc::vec::Vec::with_capacity(1 + bytes.len());
+                            tagged.push(1);
+                            tagged.extend_from_slice(&bytes);
+                            vos::value::Value::Bytes(tagged)
                         }
                     }
                 }
@@ -779,12 +782,15 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let claim_to_value = if option_inner.is_some() {
                 quote! {
                     match claim {
-                        None => vos::value::Value::Bytes(alloc::vec::Vec::new()),
+                        None => vos::value::Value::Bytes(alloc::vec![0]),
                         Some(value) => {
                             let bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(value)
                                 .expect("rkyv encode")
                                 .to_vec();
-                            vos::value::Value::Bytes(bytes)
+                            let mut tagged = alloc::vec::Vec::with_capacity(1 + bytes.len());
+                            tagged.push(1);
+                            tagged.extend_from_slice(&bytes);
+                            vos::value::Value::Bytes(tagged)
                         }
                     }
                 }
@@ -1449,11 +1455,13 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                             statement: __statement,
                             proof: __proof,
                         } = __inv.invoke_attested(self.target, __payload).await?;
+                        let __claim_wire = vos::Encode::encode(&#value_ident);
                         let __preview: #return_ty = (#decode)?;
-                        vos::Attestation::__from_runtime(
+                        vos::Attestation::__from_runtime_wire(
                             __producer_name,
                             __producer,
                             __statement,
+                            __claim_wire,
                             __preview,
                             __proof,
                         )
@@ -2099,17 +2107,27 @@ fn client_decode_body(
         return quote! { Ok(()) };
     };
 
-    // `Option<T>`: the actor encodes `None` as
-    // `Value::Bytes(empty)` (or `Value::Unit`) and `Some(v)` as
-    // `Value::Bytes(rkyv-encoded v)`. Mirror that on decode.
+    // `Option<T>`: the actor encodes `None` as `Value::Bytes([0])` and
+    // `Some(v)` as `Value::Bytes([1] ++ rkyv(v))`. The explicit tag keeps
+    // zero-sized values injective.
     if let Some(inner) = option_inner_type(ty) {
         return quote! {
             match #value_ident {
+                // Read-only compatibility for legacy v1 actors. Current
+                // encoders never emit these ambiguous shapes.
                 vos::value::Value::Unit => Ok(None),
                 vos::value::Value::Bytes(b) if b.is_empty() => Ok(None),
+                vos::value::Value::Bytes(b) if b.as_slice() == [0] => Ok(None),
                 vos::value::Value::Bytes(b) => {
-                    let mut av = vos::rkyv::util::AlignedVec::<16>::with_capacity(b.len());
-                    av.extend_from_slice(&b);
+                    let payload = if b.first() == Some(&1) {
+                        &b[1..]
+                    } else {
+                        // Legacy v1 `Some(T)` omitted the discriminant.
+                        b.as_slice()
+                    };
+                    let mut av =
+                        vos::rkyv::util::AlignedVec::<16>::with_capacity(payload.len());
+                    av.extend_from_slice(payload);
                     // The reply is peer-supplied and crosses a trust
                     // boundary (another node / space produced it), so it
                     // is validated rather than trusted: `rkyv::access`
@@ -2148,7 +2166,9 @@ fn client_decode_body(
 
     let ty_str = ty.to_token_stream().to_string().replace(' ', "");
     match ty_str.as_str() {
-        "()" => quote! { Ok(()) },
+        "()" => quote! {
+            Ok::<(), vos::actors::client::ClientError>(())
+        },
         "bool" => quote! {
             #value_ident.as_bool().ok_or_else(||
                 vos::actors::client::ClientError::UnexpectedReply(

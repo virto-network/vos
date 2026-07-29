@@ -711,13 +711,21 @@ fn decode_rkyv<T: crate::Decode>(value: Value) -> Result<T, ClientError> {
     }
 }
 
-/// Decode an `Option<T>` reply: `Unit` / empty `Bytes` → `None`, a
-/// populated `Bytes` → rkyv-decoded `Some`.
+/// Decode the current tagged `Option<T>` reply while retaining read-only
+/// compatibility with bundled legacy-v1 registry actors.
 fn decode_opt<T: crate::Decode>(value: Value) -> Result<Option<T>, ClientError> {
     match value {
         Value::Unit => Ok(None),
         Value::Bytes(b) if b.is_empty() => Ok(None),
-        Value::Bytes(b) => T::try_decode(&b).map(Some).ok_or(ClientError::Decode),
+        Value::Bytes(b) if b.as_slice() == [0] => Ok(None),
+        Value::Bytes(b) => {
+            let payload = if b.first() == Some(&1) {
+                &b[1..]
+            } else {
+                b.as_slice()
+            };
+            T::try_decode(payload).map(Some).ok_or(ClientError::Decode)
+        }
         other => Err(ClientError::UnexpectedReply(alloc::format!("{other:?}"))),
     }
 }

@@ -77,15 +77,28 @@ proof publication during preparation and does not propose another Apply.
 
 The application package is a portable typed `Attestation<T, M>`, not a bare
 claim. Its generated method marker binds the method and exact actor reply wire;
-the preview remains explicitly unverified. The verifier-only path resolves the
-named producer from an authenticated registry and pins the complete current
-service identity, actor, canonical actor program and typed `ProducerId`.
+the preview remains explicitly unverified. Portable decoding authenticates the
+supplied claim bytes before deserializing them and requires their canonical
+re-encoding to match, while generated `Option<T>` replies use an explicit
+None/Some tag so zero-sized values remain injective. The verifier-only path
+resolves the named producer and method from an authenticated registry and pins
+the complete current service identity, actor, canonical actor program, schema,
+authorization policy and typed `ProducerId`.
 It independently verifies both accumulation-receipt finality and the actor
-proof before admitting the `(space, deployment, actor, invocation)` replay
-key. Proof validity alone is insufficient because proof production precedes
-Accumulate; a transition that never committed must never become `Verified<T>`.
-The replay admission must be durable and atomic with any state change the
-verified claim authorizes.
+proof, and reconstructs the exact reply commitment from the statement's call
+ID, actor and authenticated claim wire, before admitting the
+`(space, deployment, actor, invocation)` replay key. Proof validity alone is
+insufficient because proof production precedes Accumulate; a transition that
+never committed must never become `Verified<T>`. The replay admission must be
+durable and atomic with any state change the verified claim authorizes.
+
+The statement's input commitment includes the full authorization scope, which
+cryptographically binds the typed origin without necessarily revealing a
+private member. A generic portable attestation is nevertheless not a bearer
+identity credential: a relying application that needs to associate the claim
+with a particular subject must include a suitable subject or unlinkable
+pseudonym in the typed claim, or verify an application-defined opening of that
+input commitment.
 
 The local proof producer and proof-verification allowlist are conformance
 seams, not a production proof system. A production host must replace them with
@@ -125,7 +138,9 @@ conjunction. Public methods use one distinguished public predicate; a method
 with either role annotation is never installed as public. The v2 actor dispatch
 also treats the work arguments only as application bytes. It cannot reinterpret
 a caller-provided legacy dispatch prefix and replace the origin or authenticated
-roles established by Refine.
+roles established by Refine. Application dispatch accepts only the canonical
+dynamic message frame; the former typed-enum fallback used a trusted-byte
+decoder and was remotely reachable, so it is not part of the v2 ABI.
 
 The conformance credential carrier binds its holder, invocation-scoped
 authorization scope, space and actor roles, authenticator, generated policy and
