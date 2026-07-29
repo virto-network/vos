@@ -80,6 +80,13 @@ build-settle:
 # Run all workspace tests and integration tests against freshly-built artifacts.
 test: build-test-artifacts
     cargo test --all -- --test-threads=1
+    just test-v2-examples
+
+# Build and test the concise runtime-v2 examples in their nested workspace.
+test-v2-examples:
+    cd examples/v2; cargo test --workspace
+    cd examples/v2; cargo +nightly actor -p v2-counter
+    cd examples/v2; cargo +nightly actor -p v2-shared-board
 
 # Run extension tests.
 test-extensions: build-extensions
@@ -151,6 +158,7 @@ check-all:
     just build-pvm
     just build-v2-pvm-test-artifacts
     cargo test -p vos --test v2_service_pvm -- --nocapture --test-threads=1
+    just test-v2-examples
 
 # Lint with clippy.
 lint:
@@ -164,6 +172,7 @@ fmt:
 clean:
     cargo clean
     try { cd examples; cargo clean } catch { }
+    try { cd examples/v2; cargo clean } catch { }
 
 # Install git hooks (.githooks/pre-commit, .githooks/pre-push).
 install-hooks:

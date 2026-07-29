@@ -17,6 +17,10 @@ pub struct Board {
     cached_summary: Option<String>,
 }
 
+fn bounded_note_index(index: u32, len: usize) -> usize {
+    core::cmp::min(index as usize, len)
+}
+
 #[messages]
 impl Board {
     fn new() -> Self {
@@ -51,8 +55,9 @@ impl Board {
 
     #[msg]
     fn insert_note(&mut self, index: u32, text: String) {
+        let index = bounded_note_index(index, self.notes.len());
         self.notes
-            .insert(index as usize, &text)
+            .insert(index, &text)
             .expect("one stable operation per slice");
         self.edits
             .increment(1)
@@ -117,5 +122,11 @@ mod tests {
             left_first.order.iter().copied().collect::<Vec<_>>(),
             right_first.order.iter().copied().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn note_index_past_the_end_appends() {
+        assert_eq!(bounded_note_index(u32::MAX, 4), 4);
+        assert_eq!(bounded_note_index(2, 4), 2);
     }
 }
