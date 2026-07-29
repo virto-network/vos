@@ -2831,7 +2831,8 @@ mod tests {
         else {
             panic!("install rejected")
         };
-        let work = linear_work(initial, installed.resulting_state_root.unwrap());
+        let root = installed.resulting_state_root.unwrap();
+        let work = linear_work(initial.clone(), root);
         let transition = linear_transition(&work, b"after");
         let before = store.clone();
         let result = execute_guest_accumulate(
@@ -2848,6 +2849,35 @@ mod tests {
             AccumulationResultV2::Rejected(AccumulationRejectionV2::WrongProgram)
         );
         assert_eq!(store, before, "partial-tree work must stage no writes");
+
+        let mut misnamed = linear_work(initial.clone(), root);
+        misnamed.imported_actors.push(ImportedActorV2 {
+            actor: child,
+            name: "forged-child".into(),
+            parent: Some(actor()),
+            program: program(),
+            state: initial,
+            causal_states: Vec::new(),
+            continuation: None,
+        });
+        let transition = linear_transition(&misnamed, b"after");
+        let result = execute_guest_accumulate(
+            &mut store,
+            &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: misnamed,
+                transition,
+                provided_blobs: Vec::new(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            AccumulationResultV2::Rejected(AccumulationRejectionV2::WrongProgram)
+        );
+        assert_eq!(
+            store, before,
+            "a forged actor name must stage no service writes"
+        );
     }
 
     #[test]

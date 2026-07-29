@@ -1787,7 +1787,7 @@ impl V2Wire for ActorDirectoryV2 {
         let value = Self {
             actors: d.list(|d| d.fixed().map(ActorId))?,
         };
-        if value.actors.is_empty() {
+        if value.actors.is_empty() || value.actors.len() > super::MAX_ROOT_TREE_ACTORS {
             return Err(DecodeError::NonCanonical);
         }
         ensure_sorted_unique(&value.actors, |actor| actor.0)?;
@@ -2326,7 +2326,7 @@ fn decode_actor_genesis(d: &mut Decoder<'_>) -> Result<ActorGenesisV2, DecodeErr
 }
 
 fn validate_genesis(value: &ServiceGenesisV2) -> Result<(), DecodeError> {
-    if value.actors.is_empty() {
+    if value.actors.is_empty() || value.actors.len() > super::MAX_ROOT_TREE_ACTORS {
         return Err(DecodeError::NonCanonical);
     }
     ensure_sorted_unique(&value.actors, |actor| actor.actor.0)?;
@@ -2385,7 +2385,7 @@ fn validate_imported_actor_tree(
     target: ActorId,
     target_program: ProgramId,
 ) -> Result<(), DecodeError> {
-    if actors.is_empty() {
+    if actors.is_empty() || actors.len() > super::MAX_ROOT_TREE_ACTORS {
         return Err(DecodeError::NonCanonical);
     }
     let known: BTreeSet<_> = actors.iter().map(|actor| actor.actor).collect();
@@ -2432,7 +2432,7 @@ fn validate_imported_actor_tree(
 }
 
 fn validate_actor_slice_tree(actors: &[ActorTreeImportV2]) -> Result<(), DecodeError> {
-    if actors.is_empty() {
+    if actors.is_empty() || actors.len() > super::MAX_ROOT_TREE_ACTORS {
         return Err(DecodeError::NonCanonical);
     }
     let known: BTreeSet<_> = actors.iter().map(|actor| actor.actor).collect();
@@ -3843,6 +3843,13 @@ mod tests {
             vec![],
             vec![ActorId([5; 32]), ActorId([4; 32])],
             vec![ActorId([4; 32]), ActorId([4; 32])],
+            (0..=super::super::MAX_ROOT_TREE_ACTORS)
+                .map(|index| {
+                    let mut actor = [0; 32];
+                    actor[24..].copy_from_slice(&(index as u64).to_be_bytes());
+                    ActorId(actor)
+                })
+                .collect(),
         ] {
             let invalid = ActorDirectoryV2 { actors };
             assert_eq!(

@@ -129,6 +129,16 @@ host uses an explicit process-local allowlist which is excluded from durable
 service snapshots; reopening an empty store therefore requires authority to be
 established again.
 
+Installation commits the canonical actor directory and each actor's
+parent-scoped name in guest-owned service state. Every Refine slice imports the
+exact code, state frontier and continuation status of all directory members;
+guest Accumulate rejects a partial or differently named tree. The infrastructure
+PVM instantiates at most 63 application actors (the remaining JAR code
+capability is the generic service) and grants only idle peers a directory-indexed
+JAR `CALLABLE`. At this boundary only the authenticated directory and
+capability layout are active; application-level inline nested execution and
+exact nested-machine suspension remain staged.
+
 Actor metadata is also the source of installed method policy. `#[msg]`
 annotations produce one canonical schema and role-policy artifact; package
 validation derives the same artifact again and installation takes method rows
