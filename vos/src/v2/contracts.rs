@@ -237,6 +237,19 @@ pub struct ActorCallResultV2 {
     pub checkpoint: Option<CheckpointTokenV2>,
 }
 
+/// Latest actor-local CRDT materialization produced by one or more inline
+/// dispatches in the same outer Refine slice.
+///
+/// `next_dispatch_ordinal` is owned by the generic service scheduler. It
+/// prevents a repeated call to one actor from reusing an operation namespace
+/// while keeping sibling state out of caller-visible IPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorCrdtStateV2 {
+    pub actor: ActorId,
+    pub state: Vec<u8>,
+    pub next_dispatch_ordinal: u32,
+}
+
 /// Opaque per-dispatch effects returned to the generic service VM after the
 /// root actor stack unwinds. Temporal order is execution order; the service
 /// guest canonicalizes the final transition.
@@ -295,10 +308,10 @@ pub struct ActorSliceOutputV2 {
     /// Concrete field operations emitted by one `#[actor(crdt)]` execution
     /// slice. Ordinary actors always leave this empty.
     pub crdt_operations: Vec<CrdtOperationV2>,
-    /// Canonical archived actor state after applying `crdt_operations` to the
-    /// imported causal materialization. This is transported as a candidate
-    /// blob; Refine never persists it directly.
-    pub crdt_materialization: Option<Vec<u8>>,
+    /// Final canonical materializations for the CRDT actors executed by this
+    /// subtree. An individual actor export contains exactly its own entry;
+    /// the generic service aggregates the final entry for every actor.
+    pub crdt_states: Vec<ActorCrdtStateV2>,
     /// Cross-root calls emitted by this slice. The owning service derives each
     /// stable `CallId` from the work invocation and `await_ordinal`.
     pub outbox: Vec<ActorCallRequestV2>,
@@ -1545,7 +1558,11 @@ impl V2Wire for ActorSliceOutputV2 {
         e.u64(self.next_await_ordinal);
         e.list(&self.writes, encode_write);
         e.list(&self.crdt_operations, encode_crdt_op);
-        e.option(&self.crdt_materialization, |e, state| e.bytes(state));
+        e.list(&self.crdt_states, |e, state| {
+            e.fixed(&state.actor.0);
+            e.bytes(&state.state);
+            e.u32(state.next_dispatch_ordinal);
+        });
         e.list(&self.outbox, encode_actor_call);
         e.bytes(&self.reply);
         e.bool(self.yielded);
@@ -1560,7 +1577,13 @@ impl V2Wire for ActorSliceOutputV2 {
             next_await_ordinal: d.u64()?,
             writes: d.list(decode_write)?,
             crdt_operations: d.list(decode_crdt_op)?,
-            crdt_materialization: d.option(Decoder::bytes)?,
+            crdt_states: d.list(|d| {
+                Ok(ActorCrdtStateV2 {
+                    actor: ActorId(d.fixed()?),
+                    state: d.bytes()?,
+                    next_dispatch_ordinal: d.u32()?,
+                })
+            })?,
             outbox: d.list(decode_actor_call)?,
             reply: d.bytes()?,
             yielded: d.bool()?,
@@ -1577,10 +1600,17 @@ impl V2Wire for ActorSliceOutputV2 {
                 .writes
                 .windows(2)
                 .any(|pair| pair[0].key >= pair[1].key)
-            || value
-                .crdt_operations
-                .iter()
-                .any(|operation| operation.actor != value.actor || operation.payload.is_empty())
+            || value.crdt_operations.iter().any(|operation| {
+                operation.payload.is_empty()
+                    || value
+                        .crdt_states
+                        .binary_search_by_key(&operation.actor, |state| state.actor)
+                        .ok()
+                        .is_none_or(|index| {
+                            operation.dispatch_ordinal
+                                >= value.crdt_states[index].next_dispatch_ordinal
+                        })
+            })
             || value.crdt_operations.windows(2).any(|pair| {
                 (pair[0].dispatch_ordinal, pair[0].ordinal)
                     >= (pair[1].dispatch_ordinal, pair[1].ordinal)
@@ -1599,7 +1629,15 @@ impl V2Wire for ActorSliceOutputV2 {
                 .outbox
                 .iter()
                 .any(|call| call.from != value.actor || call.payload.is_empty())
-            || (!value.crdt_operations.is_empty() && value.crdt_materialization.is_none())
+            || value
+                .crdt_states
+                .windows(2)
+                .any(|pair| pair[0].actor >= pair[1].actor)
+            || value
+                .crdt_states
+                .iter()
+                .any(|state| state.state.is_empty() || state.next_dispatch_ordinal == 0)
+            || (!value.crdt_operations.is_empty() && value.crdt_states.is_empty())
             || (value.yielded
                 && value
                     .checkpoint
@@ -3663,7 +3701,7 @@ mod tests {
                 value: Some(b"after".to_vec()),
             }],
             crdt_operations: vec![],
-            crdt_materialization: None,
+            crdt_states: vec![],
             outbox: vec![ActorCallRequestV2 {
                 await_ordinal: 7,
                 from: ActorId([21; 32]),
@@ -3680,6 +3718,43 @@ mod tests {
         assert_eq!(
             ActorSliceOutputV2::decode(&output.encode()).unwrap(),
             output
+        );
+
+        let change = ChangeId([31; 32]);
+        let field = Hash([32; 32]);
+        let crdt_output = ActorSliceOutputV2 {
+            actor: ActorId([21; 32]),
+            first_await_ordinal: 0,
+            next_await_ordinal: 0,
+            writes: vec![],
+            crdt_operations: vec![CrdtOperationV2 {
+                actor: ActorId([21; 32]),
+                dispatch_ordinal: 1,
+                field,
+                ordinal: 0,
+                id: change.operation(ActorId([21; 32]), 1, field, 0),
+                payload: vec![1],
+            }],
+            crdt_states: vec![ActorCrdtStateV2 {
+                actor: ActorId([21; 32]),
+                state: vec![2],
+                next_dispatch_ordinal: 2,
+            }],
+            outbox: vec![],
+            reply: vec![],
+            yielded: false,
+            forbidden: false,
+            checkpoint: None,
+        };
+        assert_eq!(
+            ActorSliceOutputV2::decode(&crdt_output.encode()).unwrap(),
+            crdt_output
+        );
+        let mut stale_dispatch = crdt_output;
+        stale_dispatch.crdt_states[0].next_dispatch_ordinal = 1;
+        assert_eq!(
+            ActorSliceOutputV2::decode(&stale_dispatch.encode()),
+            Err(DecodeError::NonCanonical)
         );
 
         let mut duplicate_write = output;
@@ -3772,7 +3847,7 @@ mod tests {
             next_await_ordinal: 7,
             writes: vec![],
             crdt_operations: vec![],
-            crdt_materialization: None,
+            crdt_states: vec![],
             outbox: vec![],
             reply: vec![],
             yielded: true,

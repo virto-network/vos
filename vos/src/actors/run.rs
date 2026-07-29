@@ -888,16 +888,27 @@ pub fn run_nested_actor_service<A: super::Actor>(
         .as_ref()
         .map(|checkpoint| checkpoint.change)
         .unwrap_or(change);
-    let (crdt_operations, crdt_materialization, linear_state) = match completed_change {
-        Some(change) => (
-            crate::crdt::take_operations(actor_id, change)
-                .expect("nested CRDT actor must return its completed field operations"),
-            Some(new_state),
-            None,
-        ),
-        None => (
+    let (crdt_operations, crdt_states, linear_state) = match (forbidden, completed_change) {
+        (true, _) => (alloc::vec::Vec::new(), alloc::vec::Vec::new(), None),
+        (false, Some(change)) => {
+            let next_dispatch_ordinal = change
+                .ordinal
+                .checked_add(1)
+                .expect("CRDT actor dispatch ordinal overflow");
+            (
+                crate::crdt::take_operations(actor_id, change)
+                    .expect("nested CRDT actor must return its completed field operations"),
+                alloc::vec![crate::v2::ActorCrdtStateV2 {
+                    actor: actor_id,
+                    state: new_state,
+                    next_dispatch_ordinal,
+                }],
+                None,
+            )
+        }
+        (false, None) => (
             alloc::vec::Vec::new(),
-            None,
+            alloc::vec::Vec::new(),
             (!A::CRDT && state_changed).then_some(new_state),
         ),
     };
@@ -912,7 +923,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
         next_await_ordinal,
         writes,
         crdt_operations,
-        crdt_materialization,
+        crdt_states,
         outbox,
         reply,
         yielded,

@@ -287,26 +287,27 @@ mod guest {
         });
         let (writes, crdt_change, candidate_blobs) = match (&base, base_causal_height) {
             (ConsistencyBaseV2::Linear { .. }, None) => {
-                if !actor_output.crdt_operations.is_empty()
-                    || actor_output.crdt_materialization.is_some()
+                if !actor_output.crdt_operations.is_empty() || !actor_output.crdt_states.is_empty()
                 {
                     fail_closed();
                 }
                 (actor_output.writes, None, alloc::vec::Vec::new())
             }
             (ConsistencyBaseV2::Crdt { heads }, Some(base_height)) => {
-                if !actor_output.writes.is_empty() {
+                if !actor_output.writes.is_empty()
+                    || actor_output.crdt_states.is_empty()
+                    || actor_output
+                        .crdt_states
+                        .iter()
+                        .any(|state| !imported(state.actor))
+                {
                     fail_closed();
                 }
-                let materialized = actor_output
-                    .crdt_materialization
-                    .unwrap_or_else(|| fail_closed());
                 let id = change
                     .map(|dispatch| dispatch.change)
                     .unwrap_or_else(|| fail_closed());
                 if actor_output.crdt_operations.iter().any(|operation| {
-                    operation.actor != work.target
-                        || operation.dispatch_ordinal != 0
+                    !imported(operation.actor)
                         || operation.id
                             != id.operation(
                                 operation.actor,
@@ -318,7 +319,24 @@ mod guest {
                     fail_closed();
                 }
                 let causal_height = base_height.checked_add(1).unwrap_or_else(|| fail_closed());
-                let reference = BlobRefV2::of_bytes(&materialized);
+                let mut candidates = BTreeMap::new();
+                let materializations = actor_output
+                    .crdt_states
+                    .into_iter()
+                    .map(|state| {
+                        let reference = BlobRefV2::of_bytes(&state.state);
+                        candidates
+                            .entry(reference.hash)
+                            .or_insert_with(|| ImportedBlobV2 {
+                                reference: reference.clone(),
+                                bytes: state.state,
+                            });
+                        CrdtMaterializationV2 {
+                            actor: state.actor,
+                            state: reference,
+                        }
+                    })
+                    .collect();
                 (
                     alloc::vec::Vec::new(),
                     Some(CrdtChangeV2 {
@@ -328,15 +346,9 @@ mod guest {
                         causal_height,
                         operations: actor_output.crdt_operations,
                         workflow: alloc::vec::Vec::new(),
-                        materializations: alloc::vec![CrdtMaterializationV2 {
-                            actor: work.target,
-                            state: reference.clone(),
-                        }],
+                        materializations,
                     }),
-                    alloc::vec![ImportedBlobV2 {
-                        reference,
-                        bytes: materialized,
-                    }],
+                    candidates.into_values().collect(),
                 )
             }
             _ => fail_closed(),
@@ -393,6 +405,9 @@ mod guest {
         };
         let mut root = None;
         let mut writes = BTreeMap::new();
+        let mut crdt_operations = alloc::vec::Vec::new();
+        let mut crdt_states = BTreeMap::new();
+        let mut next_crdt_dispatch = BTreeMap::new();
         let mut outbox = alloc::vec::Vec::new();
         let mut checkpoints = alloc::vec::Vec::new();
 
@@ -404,7 +419,7 @@ mod guest {
                 if output.actor == work.target
                     || !output.writes.is_empty()
                     || !output.crdt_operations.is_empty()
-                    || output.crdt_materialization.is_some()
+                    || !output.crdt_states.is_empty()
                     || !output.outbox.is_empty()
                     || !output.reply.is_empty()
                     || output.yielded
@@ -414,11 +429,36 @@ mod guest {
                 }
                 continue;
             }
-            if work.consistency == vos::v2::ConsistencyModeV2::Crdt
-                && output.actor != work.target
-            {
-                // Tree-wide CRDT aggregation is a separate protocol slice.
-                fail_closed();
+            match work.consistency {
+                vos::v2::ConsistencyModeV2::Crdt => {
+                    let [state] = output.crdt_states.as_slice() else {
+                        fail_closed();
+                    };
+                    let expected_next = next_crdt_dispatch
+                        .entry(output.actor)
+                        .or_insert(1u32);
+                    if !output.writes.is_empty()
+                        || (output.actor != work.target
+                            && (output.yielded || output.checkpoint.is_some()))
+                        || state.actor != output.actor
+                        || state.next_dispatch_ordinal != *expected_next
+                        || output.crdt_operations.iter().any(|operation| {
+                            operation.dispatch_ordinal.checked_add(1) != Some(*expected_next)
+                        })
+                    {
+                        fail_closed();
+                    }
+                    *expected_next = expected_next
+                        .checked_add(1)
+                        .unwrap_or_else(|| fail_closed());
+                    crdt_operations.extend(output.crdt_operations.iter().cloned());
+                    crdt_states.insert(output.actor, state.clone());
+                }
+                _ => {
+                    if !output.crdt_operations.is_empty() || !output.crdt_states.is_empty() {
+                        fail_closed();
+                    }
+                }
             }
             if let Some(checkpoint) = output.checkpoint.as_ref() {
                 checkpoints.push(checkpoint.clone());
@@ -461,6 +501,28 @@ mod guest {
             .into_iter()
             .map(|((actor, key), value)| vos::v2::ActorWriteV2 { actor, key, value })
             .collect();
+        crdt_operations.sort_by_key(|operation| {
+            (
+                operation.actor,
+                operation.dispatch_ordinal,
+                operation.ordinal,
+            )
+        });
+        if crdt_operations.windows(2).any(|pair| {
+            (
+                pair[0].actor,
+                pair[0].dispatch_ordinal,
+                pair[0].ordinal,
+            ) >= (
+                pair[1].actor,
+                pair[1].dispatch_ordinal,
+                pair[1].ordinal,
+            )
+        }) {
+            fail_closed();
+        }
+        root.crdt_operations = crdt_operations;
+        root.crdt_states = crdt_states.into_values().collect();
         root.outbox = outbox;
         root
     }

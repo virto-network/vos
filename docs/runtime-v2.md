@@ -151,6 +151,17 @@ service state. This preserves role-gated sibling-state isolation without
 changing JAR CALL/REPLY semantics or making the host the transition authority.
 
 An ordinary same-tree call executes through JAR `CALLABLE` and returns inline.
+For CRDT trees, the private scheduler channel also carries a host-owned
+per-actor dispatch ordinal and refreshes only that actor's private
+materialization after it returns. The service guest independently requires
+contiguous dispatch ordinals, aggregates operations in
+`(ActorId, dispatch ordinal, operation ordinal)` order, and content-addresses
+the final materialization of every actor reached by the slice. Repeated calls
+therefore cannot reuse an operation namespace, and no sibling state enters the
+caller-visible IPC page. A nested CRDT call must currently finish inline;
+suspending a nested CRDT stack remains fail-closed until causal-branch
+continuation rebinding lands.
+
 The scheduler derives the active actor set from JAR's live call stack through
 the private channel, so application IPC cannot clear it; attempting to re-enter
 any active caller returns `InvokeError::Cycle`. Await ordinals are allocated

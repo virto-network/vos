@@ -340,28 +340,68 @@ impl ActorRefineRuntimeV2 {
                     .and_then(|len| len.checked_add(bytes.len()))
                     .filter(|len| *len <= ACTOR_EFFECT_BATCH_MAX_BYTES)
                     .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
-                if let Some(write) = output
-                    .writes
-                    .iter()
-                    .find(|write| write.key.as_slice() == crate::lifecycle::STATE_KEY_BYTES)
-                {
-                    let state = write
-                        .value
-                        .as_ref()
-                        .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
-                    let private = self
-                        .private_inputs
-                        .get_mut(&actor)
-                        .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
-                    private.state = state.clone();
-                    private.causal_states.clear();
-                } else if let Some(state) = output.crdt_materialization.as_ref() {
-                    let private = self
-                        .private_inputs
-                        .get_mut(&actor)
-                        .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
-                    private.state = state.clone();
-                    private.causal_states.clear();
+                let private = self
+                    .private_inputs
+                    .get_mut(&actor)
+                    .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                match private.change {
+                    Some(_) if output.forbidden => {
+                        if !output.writes.is_empty()
+                            || !output.crdt_operations.is_empty()
+                            || !output.crdt_states.is_empty()
+                        {
+                            return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                        }
+                    }
+                    Some(dispatch) => {
+                        let [state] = output.crdt_states.as_slice() else {
+                            return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                        };
+                        let next_dispatch_ordinal = dispatch
+                            .ordinal
+                            .checked_add(1)
+                            .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                        if !output.writes.is_empty()
+                            || state.actor != actor
+                            || state.next_dispatch_ordinal != next_dispatch_ordinal
+                            || output.crdt_operations.iter().any(|operation| {
+                                operation.actor != actor
+                                    || operation.dispatch_ordinal != dispatch.ordinal
+                                    || operation.id
+                                        != dispatch.change.operation(
+                                            actor,
+                                            dispatch.ordinal,
+                                            operation.field,
+                                            operation.ordinal,
+                                        )
+                            })
+                        {
+                            return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                        }
+                        private.state = state.state.clone();
+                        private.causal_states.clear();
+                        private.change = Some(CrdtDispatchV2 {
+                            change: dispatch.change,
+                            ordinal: next_dispatch_ordinal,
+                        });
+                    }
+                    None => {
+                        if !output.crdt_operations.is_empty() || !output.crdt_states.is_empty() {
+                            return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                        }
+                        if let Some(write) = output
+                            .writes
+                            .iter()
+                            .find(|write| write.key.as_slice() == crate::lifecycle::STATE_KEY_BYTES)
+                        {
+                            let state = write
+                                .value
+                                .as_ref()
+                                .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                            private.state = state.clone();
+                            private.causal_states.clear();
+                        }
+                    }
                 }
                 if actor != self.target && !output.yielded {
                     if output

@@ -610,12 +610,6 @@ impl<A: Actor> Context<A> {
         if self.active_actor_mask & target_mask != 0 {
             return Some(super::run::Ask::ready_err(super::value::InvokeError::Cycle));
         }
-        if self.actor_change.is_some() {
-            return Some(super::run::Ask::ready_err(
-                super::value::InvokeError::NotFound,
-            ));
-        }
-
         let child_input = crate::v2::ActorSliceInputV2 {
             actor: target,
             first_await_ordinal: self.next_await_ordinal,
