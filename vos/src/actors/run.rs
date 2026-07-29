@@ -800,6 +800,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
     );
     let ActorPrivateInputV2 {
         actor: actor_id,
+        actor_tree,
         input: work_input,
         change,
         state,
@@ -816,7 +817,6 @@ pub fn run_nested_actor_service<A: super::Actor>(
     );
     let ActorSliceInputV2 {
         actor: _,
-        actor_tree,
         first_await_ordinal,
         message,
     } = input;
@@ -945,11 +945,21 @@ pub fn run_nested_actor_service<A: super::Actor>(
     );
 
     // SAFETY: the DATA cap is mapped RW over `capacity` bytes and `encoded`
-    // was bounds-checked. The owned decoded input no longer borrows this range.
+    // was bounds-checked. Scrubbing the complete window prevents this actor's
+    // longer input or output from being observed by the next sibling hop.
     unsafe {
+        core::ptr::write_bytes(input_address as *mut u8, 0, capacity);
         core::ptr::copy_nonoverlapping(encoded.as_ptr(), input_address as *mut u8, encoded.len());
     }
-    crate::abi::pvm::ecall::reply(encoded.len() as u64)
+    let encoded_len = encoded.len() as u64;
+    core::mem::forget(encoded);
+    // JAR REPLY never unwinds this Rust frame. Reset the actor-local arena
+    // only after every output byte is copied so a later legal CALL starts
+    // from the full deterministic heap instead of inheriting leaked frames.
+    unsafe {
+        crate::abi::pvm::alloc::reset_for_next_invocation();
+    }
+    crate::abi::pvm::ecall::reply(encoded_len)
 }
 
 #[cfg(feature = "service")]

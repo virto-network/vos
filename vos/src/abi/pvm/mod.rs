@@ -9,7 +9,7 @@
 // only when we're a no_std guest, never alongside std (which
 // brings its own allocator).
 #[cfg(not(feature = "std"))]
-mod alloc;
+pub(crate) mod alloc;
 
 pub mod ecall;
 pub mod hostcalls;

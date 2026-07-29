@@ -1885,9 +1885,10 @@ fn validate_continuation_change<S: GuestAccumulateStoreV2>(
         .and_then(|actor| actor.continuation.as_ref());
     let changes = &envelope.transition.continuations;
     if changes.is_empty() {
-        return Ok(current
-            .is_some()
-            .then_some(AccumulationRejectionV2::InvalidWorkflowTransition));
+        return Ok(
+            (current.is_some() || !envelope.transition.outbox.is_empty())
+                .then_some(AccumulationRejectionV2::InvalidWorkflowTransition),
+        );
     }
     let Some(target_change) = changes
         .binary_search_by_key(&work.target, |change| change.actor)
@@ -2180,12 +2181,13 @@ fn contains_cycle(messages: &[MessageRecordV2]) -> bool {
 }
 
 /// Validate stable call IDs against both new and committed workflow rows, then
-/// walk each new outbound call through its causal parents. Every message
-/// written by a root slice must identify the root as its sender; an outbound
-/// awaited call is separately bound to the exact active actor recorded by the
-/// JAR checkpoint. A child call must originate at its parent's recipient,
-/// cannot extend a parent deadline, and cannot target an actor already present
-/// in its causal caller chain.
+/// walk each new outbound call through its causal parents. A locally staged
+/// inbox row identifies the root slice as its sender; an outbound awaited call
+/// is separately bound to the exact active actor recorded by the JAR
+/// checkpoint. A nested sender may extend the root's exact authenticated
+/// parent call, but older child edges must originate at their parent recipient.
+/// No call may extend a parent deadline or target an actor already present in
+/// its causal caller chain.
 fn validate_durable_messages<S: StateTreeStore>(
     tree: &ServiceStateTreeV2<'_, S>,
     work: &super::WorkEnvelopeV2,
@@ -2228,6 +2230,7 @@ fn validate_durable_messages<S: StateTreeStore>(
     for message in &transition.outbox {
         let mut current = super::CausalCallContextV2::from(message);
         let mut visited = BTreeSet::new();
+        let mut first_parent = true;
         while let Some(parent_id) = current.parent {
             if !visited.insert(parent_id) || parent_id == message.call_id {
                 return Ok(Some(AccumulationRejectionV2::MessageCycle));
@@ -2237,7 +2240,11 @@ fn validate_durable_messages<S: StateTreeStore>(
             else {
                 return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
             };
-            if parent.to != current.from {
+            let crosses_inline_tree = first_parent
+                && work.parent_call == Some(parent_id)
+                && parent.to == work.target
+                && current.call_id == message.call_id;
+            if parent.to != current.from && !crosses_inline_tree {
                 return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
             }
             if let Some(parent_deadline) = parent.deadline_timeslot
@@ -2251,6 +2258,7 @@ fn validate_durable_messages<S: StateTreeStore>(
                 return Ok(Some(AccumulationRejectionV2::MessageCycle));
             }
             current = parent;
+            first_parent = false;
         }
     }
     Ok(None)
@@ -2688,6 +2696,63 @@ mod tests {
             gas: GasAccountingV2::default(),
             proof: None,
         }
+    }
+
+    fn awaiting_transition(
+        work: &WorkEnvelopeV2,
+        state: &[u8],
+        outgoing: MessageRecordV2,
+    ) -> (TransitionV2, ImportedBlobV2) {
+        assert_eq!(outgoing.call_id, work.invocation.call_id(0));
+        assert_eq!(outgoing.caller_invocation, work.invocation);
+        assert_eq!(outgoing.await_ordinal, 0);
+        let continuation_bytes = ContinuationSnapshotV2 {
+            snapshot_version: super::super::SNAPSHOT_VERSION,
+            jar_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            vos_abi: super::super::ABI_VERSION,
+            service: work.service.clone(),
+            invocation: work.invocation,
+            checkpoint_step: work.workflow_step,
+            actor: work.target,
+            actor_program: work.target_program,
+            await_ordinal: 0,
+            pending_call: Some(outgoing.call_id),
+            pending_actor: Some(outgoing.from),
+            causal_context: work.causal_context.clone(),
+            suspended_actors: vec![work.target],
+            kernel_snapshot: vec![1],
+        }
+        .encode();
+        let continuation = BlobRefV2::of_bytes(&continuation_bytes);
+        let mut transition = linear_transition(work, state);
+        transition.reply = None;
+        transition.continuations.push(ContinuationChangeV2 {
+            actor: work.target,
+            expected: None,
+            replacement: Some(continuation.clone()),
+        });
+        transition.outbox.push(outgoing);
+        transition.exported_blobs.push(continuation.clone());
+        (
+            transition,
+            ImportedBlobV2 {
+                reference: continuation,
+                bytes: continuation_bytes,
+            },
+        )
+    }
+
+    fn awaited_message(
+        work: &WorkEnvelopeV2,
+        to: ActorId,
+        parent: Option<super::super::CallId>,
+        deadline_timeslot: Option<u64>,
+    ) -> MessageRecordV2 {
+        let mut outgoing = message(0, work.target, to, parent, deadline_timeslot);
+        outgoing.call_id = work.invocation.call_id(0);
+        outgoing.caller_invocation = work.invocation;
+        outgoing.await_ordinal = 0;
+        outgoing
     }
 
     #[test]
@@ -3932,68 +3997,78 @@ mod tests {
 
         let mut valid_work = linear_work(initial.clone(), root);
         valid_work.invocation = InvocationId([43; 32]);
-        let mut valid = linear_transition(&valid_work, b"valid");
+        let outgoing = awaited_message(&valid_work, peer, Some(incoming.call_id), Some(9));
+        let (mut valid, valid_continuation) = awaiting_transition(&valid_work, b"valid", outgoing);
         valid.inbox.push(incoming.clone());
-        valid
-            .outbox
-            .push(message(44, actor(), peer, Some(incoming.call_id), Some(9)));
         let accepted = execute_guest_accumulate(
             &mut installed,
             &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                 work: valid_work,
                 transition: valid,
-                provided_blobs: Vec::new(),
+                provided_blobs: vec![valid_continuation],
             }),
         )
         .unwrap();
         assert!(matches!(accepted, AccumulationResultV2::Accepted { .. }));
 
-        let reject = |outgoing: MessageRecordV2| {
-            let mut store = MemStore::default();
-            let (initial, receipt) =
-                install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
-            let work = linear_work(initial, receipt.resulting_state_root.unwrap());
-            let mut transition = linear_transition(&work, b"must-not-commit");
-            transition.inbox.push(incoming.clone());
-            transition.outbox.push(outgoing);
-            let before = store.clone();
-            let result = execute_guest_accumulate(
-                &mut store,
-                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
-                    work,
-                    transition,
-                    provided_blobs: Vec::new(),
-                }),
-            )
-            .unwrap();
-            assert_eq!(store, before);
-            result
-        };
+        let reject =
+            |to: ActorId, parent: Option<super::super::CallId>, deadline_timeslot: Option<u64>| {
+                let mut store = MemStore::default();
+                let (initial, receipt) =
+                    install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+                let work = linear_work(initial, receipt.resulting_state_root.unwrap());
+                let outgoing = awaited_message(&work, to, parent, deadline_timeslot);
+                let (mut transition, continuation) =
+                    awaiting_transition(&work, b"must-not-commit", outgoing);
+                transition.inbox.push(incoming.clone());
+                let before = store.clone();
+                let result = execute_guest_accumulate(
+                    &mut store,
+                    &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                        work,
+                        transition,
+                        provided_blobs: vec![continuation],
+                    }),
+                )
+                .unwrap();
+                assert_eq!(store, before);
+                result
+            };
 
         assert_eq!(
-            reject(message(
-                45,
-                actor(),
-                actor(),
-                Some(incoming.call_id),
-                Some(9),
-            )),
+            reject(actor(), Some(incoming.call_id), Some(9)),
             rejected(AccumulationRejectionV2::MessageCycle)
         );
         assert_eq!(
-            reject(message(46, actor(), peer, Some(incoming.call_id), Some(11),)),
+            reject(peer, Some(incoming.call_id), Some(11)),
             rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
         );
         assert_eq!(
-            reject(message(
-                47,
-                actor(),
-                peer,
-                Some(super::super::CallId([99; 32])),
-                Some(9),
-            )),
+            reject(peer, Some(super::super::CallId([99; 32])), Some(9)),
             rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
         );
+
+        let mut store = MemStore::default();
+        let (initial, receipt) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let work = linear_work(initial, receipt.resulting_state_root.unwrap());
+        let mut no_checkpoint = linear_transition(&work, b"must-not-commit");
+        no_checkpoint
+            .outbox
+            .push(awaited_message(&work, peer, None, Some(9)));
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work,
+                    transition: no_checkpoint,
+                    provided_blobs: Vec::new(),
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        assert_eq!(store, before);
 
         let mut store = MemStore::default();
         let (initial, receipt) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
@@ -4034,6 +4109,53 @@ mod tests {
             )
             .unwrap(),
             rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+    }
+
+    #[test]
+    fn nested_sender_extends_the_authenticated_root_parent_chain() {
+        let mut store = MemStore::default();
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let root = install.resulting_state_root.unwrap();
+        let caller = ActorId([40; 32]);
+        let child = ActorId([41; 32]);
+        let peer = ActorId([42; 32]);
+        let incoming = message(43, caller, actor(), None, Some(10));
+        let root_with_inbox = {
+            let mut tree = ServiceStateTreeV2::new(&mut store, root);
+            tree_apply(
+                &mut tree,
+                &StateKeyV2::Inbox(incoming.call_id),
+                Some(&incoming.encode()),
+            )
+            .unwrap();
+            tree.root()
+        };
+
+        let mut work = linear_work(initial.clone(), root_with_inbox);
+        work.invocation = InvocationId([44; 32]);
+        work.origin = Origin::Actor(caller);
+        work.causal_parent = Some(incoming.caller_invocation);
+        work.parent_call = Some(incoming.call_id);
+        work.causal_context = Some(super::super::CausalCallContextV2::from(&incoming));
+        work.imported_actors.push(ImportedActorV2 {
+            actor: child,
+            name: "child".into(),
+            parent: Some(actor()),
+            program: program(),
+            state: initial,
+            causal_states: vec![],
+            continuation: None,
+        });
+        let mut outgoing = awaited_message(&work, peer, Some(incoming.call_id), Some(9));
+        outgoing.from = child;
+        let mut transition = linear_transition(&work, b"after");
+        transition.outbox.push(outgoing);
+        let tree = ServiceStateTreeV2::new(&mut store, root_with_inbox);
+        assert_eq!(
+            validate_durable_messages(&tree, &work, &transition).unwrap(),
+            None,
+            "the first durable edge may cross from the root's inbound call to its exact nested sender"
         );
     }
 

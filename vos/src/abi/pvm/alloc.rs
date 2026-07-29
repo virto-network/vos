@@ -90,6 +90,11 @@ impl FreeListHeap {
         }
         *unsafe { &mut *self.head.get() } = node;
     }
+
+    unsafe fn reset(&self) {
+        *unsafe { &mut *self.head.get() } = core::ptr::null_mut();
+        *unsafe { &mut *self.initialised.get() } = false;
+    }
 }
 
 unsafe impl GlobalAlloc for FreeListHeap {
@@ -227,3 +232,14 @@ unsafe impl GlobalAlloc for FreeListHeap {
 
 #[global_allocator]
 static HEAP: FreeListHeap = FreeListHeap::new();
+
+/// Reset the current actor VM's arena immediately before a non-returning JAR
+/// REPLY. No allocation may be read or dropped after this call.
+///
+/// # Safety
+///
+/// The caller must have copied every returned byte out of heap-backed values
+/// and must transfer control without unwinding.
+pub(crate) unsafe fn reset_for_next_invocation() {
+    unsafe { HEAP.reset() };
+}

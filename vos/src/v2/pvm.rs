@@ -8,7 +8,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use javm::cap::{Access, Cap, DataCap, ProtocolCap};
+use javm::cap::{Access, CallableCap, Cap, DataCap, ProtocolCap};
 use javm::kernel::{DispatchResult, DormantProgram, InvocationKernel, KernelResult};
 use javm::program::{CapEntryType, cap_data, parse_blob, parse_code_blob};
 use javm::snapshot::KernelSnapshot;
@@ -173,6 +173,7 @@ struct ActorRefineRuntimeV2 {
     actor_by_vm: Vec<Option<super::ActorId>>,
     private_inputs: BTreeMap<super::ActorId, ActorPrivateInputV2>,
     outputs: Vec<ActorSliceOutputV2>,
+    encoded_outputs_len: usize,
 }
 
 impl ActorRefineRuntimeV2 {
@@ -182,6 +183,7 @@ impl ActorRefineRuntimeV2 {
         space_role: Option<u8>,
         actor_role: Option<u8>,
     ) -> Result<Self, ServicePvmErrorV2> {
+        let actor_tree = actor_tree_from_work(work);
         let mut actor_by_vm = Vec::with_capacity(work.imported_actors.len() + 1);
         actor_by_vm.push(None);
         actor_by_vm.push(Some(work.target));
@@ -202,6 +204,7 @@ impl ActorRefineRuntimeV2 {
                 .collect::<Result<Vec<_>, _>>()?;
             let private = ActorPrivateInputV2 {
                 actor: actor.actor,
+                actor_tree: actor_tree.clone(),
                 input: work.input_id(),
                 change: crdt_dispatch(work, 0),
                 state,
@@ -221,6 +224,8 @@ impl ActorRefineRuntimeV2 {
             actor_by_vm,
             private_inputs,
             outputs: Vec::new(),
+            // V2 header plus the effect-batch list length.
+            encoded_outputs_len: 10,
         })
     }
 
@@ -324,11 +329,17 @@ impl ActorRefineRuntimeV2 {
                 let bytes = kernel
                     .read_data_cap_window(address, len)
                     .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
-                let output = ActorSliceOutputV2::decode(&bytes)
+                let mut output = ActorSliceOutputV2::decode(&bytes)
                     .map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
                 if output.actor != actor {
                     return Err(ServicePvmErrorV2::RefineHostRejected(slot));
                 }
+                self.encoded_outputs_len = self
+                    .encoded_outputs_len
+                    .checked_add(4)
+                    .and_then(|len| len.checked_add(bytes.len()))
+                    .filter(|len| *len <= ACTOR_EFFECT_BATCH_MAX_BYTES)
+                    .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
                 if let Some(write) = output
                     .writes
                     .iter()
@@ -352,16 +363,21 @@ impl ActorRefineRuntimeV2 {
                     private.state = state.clone();
                     private.causal_states.clear();
                 }
-                self.outputs.push(output);
-                if (ActorEffectBatchV2 {
-                    outputs: self.outputs.clone(),
-                })
-                .encode()
-                .len()
-                    > ACTOR_EFFECT_BATCH_MAX_BYTES
-                {
-                    return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                if actor != self.target && !output.yielded {
+                    if output
+                        .checkpoint
+                        .as_ref()
+                        .is_some_and(|checkpoint| checkpoint.replacement.is_some())
+                    {
+                        return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                    }
+                    // Completion control flows upward through the direct CALL
+                    // result. Only the entry actor exports it into the service
+                    // transition, so an older child's deletion token cannot
+                    // conflict with a later await in the same resumed slice.
+                    output.checkpoint = None;
                 }
+                self.outputs.push(output);
                 Ok(Some([crate::abi::error::HOST_OK, 0]))
             }
             _ => Ok(None),
@@ -513,6 +529,7 @@ impl ServicePvmV2 {
                 backend,
             )
             .map_err(|_| ServicePvmErrorV2::ContinuationMismatch)?;
+            reconcile_actor_callables(&mut kernel, &work)?;
             let checkpoint = CheckpointTokenV2 {
                 input: work.input_id(),
                 base: work.base.clone(),
@@ -558,22 +575,8 @@ impl ServicePvmV2 {
             );
         }
 
-        let actor_tree = work
-            .imported_actors
-            .iter()
-            .map(|actor| {
-                Ok(ActorTreeImportV2 {
-                    actor: actor.actor,
-                    name: actor.name.clone(),
-                    parent: actor.parent,
-                    program: actor.program,
-                    suspended: actor.continuation.is_some(),
-                })
-            })
-            .collect::<Result<Vec<_>, ServicePvmErrorV2>>()?;
         let actor_input = ActorSliceInputV2 {
             actor: work.target,
-            actor_tree,
             first_await_ordinal: 0,
             message: work.arguments.clone(),
         }
@@ -714,10 +717,107 @@ fn write_refine_protocol_bytes(kernel: &mut InvocationKernel, bytes: &[u8]) -> O
     let address = u32::try_from(kernel.active_reg(7)).ok()?;
     let capacity = usize::try_from(kernel.active_reg(8)).ok()?;
     let len = u64::try_from(bytes.len()).ok()?;
-    if bytes.len() <= capacity && !kernel.write_data_cap_window(address, bytes) {
+    if bytes.len() > capacity || !kernel.write_data_cap_window(address, bytes) {
         return None;
     }
     Some([len, 0])
+}
+
+fn actor_tree_from_work(work: &WorkEnvelopeV2) -> Vec<ActorTreeImportV2> {
+    work.imported_actors
+        .iter()
+        .map(|actor| ActorTreeImportV2 {
+            actor: actor.actor,
+            name: actor.name.clone(),
+            parent: actor.parent,
+            program: actor.program,
+        })
+        .collect()
+}
+
+fn actor_vm_index(work: &WorkEnvelopeV2, actor: super::ActorId) -> Option<u16> {
+    if actor == work.target {
+        return Some(1);
+    }
+    work.imported_actors
+        .iter()
+        .filter(|candidate| candidate.actor != work.target)
+        .position(|candidate| candidate.actor == actor)
+        .and_then(|index| u16::try_from(index).ok())
+        .and_then(|index| index.checked_add(2))
+}
+
+/// Restore reconstructs the exact captured CNodes, but actor availability is
+/// committed service state and may have changed while this workflow slept.
+/// Remove every snapshot-frozen CALLABLE and rebuild only the routes admitted
+/// by the current canonical actor directory.
+fn reconcile_actor_callables(
+    kernel: &mut InvocationKernel,
+    work: &WorkEnvelopeV2,
+) -> Result<(), ServicePvmErrorV2> {
+    let owned_continuation = work
+        .imported_actors
+        .iter()
+        .find(|actor| actor.actor == work.target)
+        .and_then(|actor| actor.continuation.as_ref());
+    for destination in &work.imported_actors {
+        let destination_vm = actor_vm_index(work, destination.actor)
+            .ok_or(ServicePvmErrorV2::InvalidContinuation)?;
+        for index in 0..work.imported_actors.len() {
+            let slot = super::ACTOR_CALLABLE_BASE_SLOT
+                .checked_add(index as u8)
+                .ok_or(ServicePvmErrorV2::InvalidContinuation)?;
+            kernel
+                .vm_arena
+                .vm_mut(destination_vm)
+                .cap_table
+                .drop_cap(slot);
+        }
+    }
+
+    for destination in &work.imported_actors {
+        let destination_vm = actor_vm_index(work, destination.actor)
+            .ok_or(ServicePvmErrorV2::InvalidContinuation)?;
+        for (source_index, source) in work.imported_actors.iter().enumerate() {
+            if source.actor == destination.actor
+                || source
+                    .continuation
+                    .as_ref()
+                    .is_some_and(|continuation| Some(continuation) != owned_continuation)
+            {
+                continue;
+            }
+            let source_vm =
+                actor_vm_index(work, source.actor).ok_or(ServicePvmErrorV2::InvalidContinuation)?;
+            let source_handle = TARGET_ACTOR_HANDLE_SLOT
+                .checked_add(
+                    u8::try_from(
+                        source_vm
+                            .checked_sub(1)
+                            .ok_or(ServicePvmErrorV2::InvalidContinuation)?,
+                    )
+                    .map_err(|_| ServicePvmErrorV2::InvalidContinuation)?,
+                )
+                .ok_or(ServicePvmErrorV2::InvalidContinuation)?;
+            let (vm_id, max_gas) = match kernel.vm_arena.vm(0).cap_table.get(source_handle) {
+                Some(Cap::Handle(handle)) => (handle.vm_id, handle.max_gas),
+                _ => return Err(ServicePvmErrorV2::InvalidContinuation),
+            };
+            let callable_slot = super::ACTOR_CALLABLE_BASE_SLOT
+                .checked_add(source_index as u8)
+                .ok_or(ServicePvmErrorV2::InvalidContinuation)?;
+            if kernel
+                .vm_arena
+                .vm_mut(destination_vm)
+                .cap_table
+                .set(callable_slot, Cap::Callable(CallableCap { vm_id, max_gas }))
+                .is_some()
+            {
+                return Err(ServicePvmErrorV2::InvalidContinuation);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn install_actor_ipc(

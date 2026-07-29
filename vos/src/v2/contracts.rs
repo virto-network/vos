@@ -148,9 +148,6 @@ pub struct ActorTreeImportV2 {
     pub name: String,
     pub parent: Option<ActorId>,
     pub program: ProgramId,
-    /// A suspended actor remains visible for name/ownership resolution but no
-    /// new CALLABLE is granted until its exact continuation drains.
-    pub suspended: bool,
 }
 
 /// Canonical code supplied to Refine. An ELF, JIT image, or proving artifact
@@ -184,10 +181,6 @@ pub struct RefineImportsV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorSliceInputV2 {
     pub actor: ActorId,
-    /// Complete canonical root-tree directory. Actor code resolves typed names
-    /// and same-tree CALLABLE slots only from this authenticated metadata.
-    /// Sibling state is not included.
-    pub actor_tree: Vec<ActorTreeImportV2>,
     /// First tree-wide await ordinal available to this actor and its inline
     /// descendants.
     pub first_await_ordinal: u64,
@@ -204,6 +197,10 @@ pub struct ActorSliceInputV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorPrivateInputV2 {
     pub actor: ActorId,
+    /// Complete host-derived root-tree directory. It shares no page with
+    /// caller-controlled actor IPC, so a nested caller cannot remap another
+    /// actor's directory-indexed CALLABLE slots.
+    pub actor_tree: Vec<ActorTreeImportV2>,
     /// Canonical identity of the workflow slice executing this actor.
     pub input: WorkInputIdV2,
     /// Batch identity and scheduler dispatch ordinal allocated by the generic
@@ -256,7 +253,7 @@ pub struct CrdtDispatchV2 {
     pub ordinal: u32,
 }
 
-impl ActorSliceInputV2 {
+impl ActorPrivateInputV2 {
     pub fn actor_import(&self, actor: ActorId) -> Option<&ActorTreeImportV2> {
         self.actor_tree
             .binary_search_by_key(&actor, |candidate| candidate.actor)
@@ -271,15 +268,16 @@ impl ActorSliceInputV2 {
             .map(|actor| actor.actor)
     }
 
-    /// Actor-local JAR CALLABLE slot for an idle same-tree peer. Self-calls
-    /// and suspended actors intentionally have no usable route.
+    /// Actor-local directory slot for a same-tree peer. Availability is
+    /// enforced by the live JAR CNode: the scheduler omits or revokes the
+    /// CALLABLE for suspended actors, including after snapshot restore.
     pub fn callable_slot(&self, actor: ActorId) -> Option<u8> {
         let index = self
             .actor_tree
             .binary_search_by_key(&actor, |candidate| candidate.actor)
             .ok()?;
         let imported = &self.actor_tree[index];
-        if imported.actor == self.actor || imported.suspended {
+        if imported.actor == self.actor {
             return None;
         }
         super::ACTOR_CALLABLE_BASE_SLOT.checked_add(index as u8)
@@ -1399,7 +1397,6 @@ impl V2Wire for ActorSliceInputV2 {
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
         e.fixed(&self.actor.0);
-        e.list(&self.actor_tree, encode_actor_tree_import);
         e.u64(self.first_await_ordinal);
         e.bytes(&self.message);
     }
@@ -1407,23 +1404,9 @@ impl V2Wire for ActorSliceInputV2 {
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let value = Self {
             actor: ActorId(d.fixed()?),
-            actor_tree: d.list(decode_actor_tree_import)?,
             first_await_ordinal: d.u64()?,
             message: d.bytes()?,
         };
-        ensure_sorted_unique(&value.actor_tree, |actor| actor.actor.0)?;
-        validate_actor_slice_tree(&value.actor_tree)?;
-        let Some(self_import) = value
-            .actor_tree
-            .binary_search_by_key(&value.actor, |actor| actor.actor)
-            .ok()
-            .map(|index| &value.actor_tree[index])
-        else {
-            return Err(DecodeError::NonCanonical);
-        };
-        if self_import.suspended {
-            return Err(DecodeError::NonCanonical);
-        }
         Ok(value)
     }
 }
@@ -1434,6 +1417,7 @@ impl V2Wire for ActorPrivateInputV2 {
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
         e.fixed(&self.actor.0);
+        e.list(&self.actor_tree, encode_actor_tree_import);
         e.fixed(&self.input.invocation.0);
         e.u64(self.input.workflow_step);
         e.option(&self.change, |e, dispatch| {
@@ -1451,6 +1435,7 @@ impl V2Wire for ActorPrivateInputV2 {
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let value = Self {
             actor: ActorId(d.fixed()?),
+            actor_tree: d.list(decode_actor_tree_import)?,
             input: WorkInputIdV2 {
                 invocation: InvocationId(d.fixed()?),
                 workflow_step: d.u64()?,
@@ -1473,8 +1458,17 @@ impl V2Wire for ActorPrivateInputV2 {
             })?,
             actor_role: d.option(Decoder::u8)?,
         };
-        let valid_actor_mask = (1u64 << super::MAX_ROOT_TREE_ACTORS) - 1;
-        if value.active_actor_mask == 0
+        ensure_sorted_unique(&value.actor_tree, |actor| actor.actor.0)?;
+        validate_actor_slice_tree(&value.actor_tree)?;
+        let Some(self_index) = value
+            .actor_tree
+            .binary_search_by_key(&value.actor, |actor| actor.actor)
+            .ok()
+        else {
+            return Err(DecodeError::NonCanonical);
+        };
+        let valid_actor_mask = (1u64 << value.actor_tree.len()) - 1;
+        if value.active_actor_mask & (1u64 << self_index) == 0
             || value.active_actor_mask & !valid_actor_mask != 0
             || (value.change.is_none() && !value.causal_states.is_empty())
         {
@@ -3039,7 +3033,6 @@ fn encode_actor_tree_import(e: &mut Encoder<'_>, value: &ActorTreeImportV2) {
     e.string(&value.name);
     e.option(&value.parent, |e, parent| e.fixed(&parent.0));
     e.fixed(&value.program.0);
-    e.bool(value.suspended);
 }
 
 fn decode_actor_tree_import(d: &mut Decoder<'_>) -> Result<ActorTreeImportV2, DecodeError> {
@@ -3048,7 +3041,6 @@ fn decode_actor_tree_import(d: &mut Decoder<'_>) -> Result<ActorTreeImportV2, De
         name: d.string()?,
         parent: d.option(|d| d.fixed().map(ActorId))?,
         program: ProgramId(d.fixed()?),
-        suspended: d.bool()?,
     };
     if value.name.is_empty()
         || value.name.len() > super::MAX_ACTOR_NAME_BYTES
@@ -3592,27 +3584,25 @@ mod tests {
     fn actor_slice_wires_round_trip_and_require_canonical_writes() {
         let input = ActorSliceInputV2 {
             actor: ActorId([21; 32]),
+            first_await_ordinal: 7,
+            message: b"message".to_vec(),
+        };
+        let private = ActorPrivateInputV2 {
+            actor: input.actor,
             actor_tree: vec![
                 ActorTreeImportV2 {
                     actor: ActorId([21; 32]),
                     name: "root".into(),
                     parent: None,
                     program: ProgramId([24; 32]),
-                    suspended: false,
                 },
                 ActorTreeImportV2 {
                     actor: ActorId([22; 32]),
                     name: "child".into(),
                     parent: Some(ActorId([21; 32])),
                     program: ProgramId([25; 32]),
-                    suspended: false,
                 },
             ],
-            first_await_ordinal: 7,
-            message: b"message".to_vec(),
-        };
-        let private = ActorPrivateInputV2 {
-            actor: input.actor,
             input: WorkInputIdV2 {
                 invocation: InvocationId([23; 32]),
                 workflow_step: 7,
@@ -3646,13 +3636,20 @@ mod tests {
                 .any(|window| window == private.state),
             "shared same-tree IPC must not disclose an actor materialization"
         );
+        assert!(
+            !input
+                .encode()
+                .windows(b"child".len())
+                .any(|window| window == b"child"),
+            "the route directory is host-authenticated private input, not caller-owned IPC"
+        );
         assert_eq!(
-            input.resolve_owned(Some(input.actor), "child"),
+            private.resolve_owned(Some(input.actor), "child"),
             Some(ActorId([22; 32]))
         );
-        assert_eq!(input.callable_slot(input.actor), None);
+        assert_eq!(private.callable_slot(input.actor), None);
         assert_eq!(
-            input.callable_slot(ActorId([22; 32])),
+            private.callable_slot(ActorId([22; 32])),
             Some(super::super::ACTOR_CALLABLE_BASE_SLOT + 1)
         );
 

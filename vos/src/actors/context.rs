@@ -579,8 +579,8 @@ impl<A: Actor> Context<A> {
                     )
                     .expect("invalid v2 accumulated reply");
                     self.__rebind_checkpoint_change_v2(&resume.checkpoint);
-                    self.checkpoint = Some(resume.checkpoint);
                     self.__clear_committed_checkpoint_effects_v2();
+                    self.checkpoint = Some(resume.checkpoint);
                     self.self_schedule = false;
                     super::run::Ask::ready(resume.reply.result)
                 }
@@ -605,13 +605,12 @@ impl<A: Actor> Context<A> {
             .actor_tree
             .binary_search_by_key(&target, |actor| actor.actor)
             .ok()?;
-        let imported = &self.actor_tree[index];
         let callable_slot = crate::v2::ACTOR_CALLABLE_BASE_SLOT.checked_add(index as u8)?;
         let target_mask = 1u64 << index;
         if self.active_actor_mask & target_mask != 0 {
             return Some(super::run::Ask::ready_err(super::value::InvokeError::Cycle));
         }
-        if imported.suspended || self.actor_change.is_some() {
+        if self.actor_change.is_some() {
             return Some(super::run::Ask::ready_err(
                 super::value::InvokeError::NotFound,
             ));
@@ -619,7 +618,6 @@ impl<A: Actor> Context<A> {
 
         let child_input = crate::v2::ActorSliceInputV2 {
             actor: target,
-            actor_tree: self.actor_tree.clone(),
             first_await_ordinal: self.next_await_ordinal,
             message: payload.to_vec(),
         };
@@ -634,6 +632,7 @@ impl<A: Actor> Context<A> {
         // SAFETY: this actor owns the mapped invocation IPC DATA capability.
         // It remains mapped until JAR CALL moves it to the child.
         unsafe {
+            core::ptr::write_bytes(address as *mut u8, 0, capacity);
             core::ptr::copy_nonoverlapping(encoded.as_ptr(), address as *mut u8, encoded.len());
         }
         let local_ipc = crate::abi::pvm::ecall::local_cap_ref(0);
@@ -655,9 +654,19 @@ impl<A: Actor> Context<A> {
             ));
         }
         // SAFETY: JAR returned and remapped the exclusive IPC cap to this VM.
-        let bytes =
-            unsafe { core::slice::from_raw_parts(address as *const u8, output_len as usize) };
-        let Ok(output) = <crate::v2::ActorCallResultV2 as crate::v2::V2Wire>::decode(bytes) else {
+        let decoded = {
+            // SAFETY: JAR returned and remapped the exclusive IPC cap to this
+            // VM. Decode owns every field before the shared page is scrubbed.
+            let bytes =
+                unsafe { core::slice::from_raw_parts(address as *const u8, output_len as usize) };
+            <crate::v2::ActorCallResultV2 as crate::v2::V2Wire>::decode(bytes)
+        };
+        // SAFETY: this VM owns the returned RW IPC capability. No bytes from
+        // this hop remain observable by a later sibling.
+        unsafe {
+            core::ptr::write_bytes(address as *mut u8, 0, capacity);
+        }
+        let Ok(output) = decoded else {
             return Some(super::run::Ask::ready_err(
                 super::value::InvokeError::Panicked,
             ));
@@ -692,6 +701,8 @@ impl<A: Actor> Context<A> {
                         super::value::InvokeError::Panicked,
                     ));
                 }
+                self.__rebind_checkpoint_change_v2(&checkpoint);
+                self.__clear_committed_checkpoint_effects_v2();
                 self.checkpoint = Some(checkpoint);
             }
             Some(super::run::Ask::ready(output.reply))
@@ -996,21 +1007,15 @@ impl<A: Actor> Context<A> {
                 .expect("invalid v2 checkpoint token");
                 if resume_kind == 1 {
                     self.__rebind_checkpoint_change_v2(&checkpoint);
+                    // The exact snapshot still contains the queues emitted by
+                    // the slice which installed this continuation.
+                    self.__clear_committed_checkpoint_effects_v2();
                 }
                 self.checkpoint = Some(checkpoint);
                 resume_kind == 1
             } else {
                 crate::abi::pvm::hostcalls::suspend() == 1
             };
-            if restored {
-                // The snapshot is taken before the suspension call observes
-                // a result, so it still contains the effect queues that the
-                // finalize fork emitted for the durable checkpoint. They are
-                // already committed when result `1` is injected. Drop only
-                // that checkpoint bookkeeping; actor memory and the handler
-                // future remain exactly as captured.
-                self.__clear_committed_checkpoint_effects_v2();
-            }
             self.self_schedule = !restored;
             super::run::Yield::after_checkpoint(restored)
         }
@@ -1051,6 +1056,7 @@ impl<A: Actor> Context<A> {
         self.pending_spawns.clear();
         self.pending_actor_calls.clear();
         self.reply = None;
+        self.checkpoint = None;
         let _ = super::storage::end_dispatch();
     }
 
