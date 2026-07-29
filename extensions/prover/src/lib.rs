@@ -1560,7 +1560,8 @@ mod test_trace {
                 data_len: 0,
             },
         ];
-        build_blob(4, 64, &caps, &code_data)
+        // This synthetic straight-line program never uses the stack.
+        build_blob(4, 64, 0, &caps, &code_data)
     }
 }
 
