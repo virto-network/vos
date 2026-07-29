@@ -1965,6 +1965,247 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
 }
 
 #[test]
+fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
+    let actor_elf = crdt_counter_v2_elf();
+    let actor_pvm = grey_transpiler::link_elf(&actor_elf).unwrap();
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_bytes = Vec::new();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let seed = work(actor_program, initial.clone());
+    let child = ActorId([36; 32]);
+
+    let mut host = LocalJamStoreV2::default();
+    assert_eq!(host.import_blob(initial_bytes), initial);
+    assert_eq!(host.import_program(actor_pvm), actor_program);
+    let mut service = JamServiceV2::new(
+        CANONICAL_SERVICE_PVM.to_vec(),
+        vos::v2::VOS_SERVICE_PROGRAM_ID,
+        NoRefineProtocolHostV2,
+        host,
+        1_000_000_000,
+        1_000_000_000,
+    )
+    .unwrap();
+    let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        service: seed.service.clone(),
+        consistency: ConsistencyModeV2::Crdt,
+        actors: vec![
+            ActorGenesisV2 {
+                actor: seed.target,
+                name: "root".into(),
+                parent: None,
+                program: actor_program,
+                initial_state: initial.clone(),
+                crdt: true,
+                role_policies: role_policies(vec![
+                    MethodPolicyV2 {
+                        method: "increment_child_twice".into(),
+                        schema: Hash([50; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                    MethodPolicyV2 {
+                        method: "call_yielding_child".into(),
+                        schema: Hash([55; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                ]),
+            },
+            ActorGenesisV2 {
+                actor: child,
+                name: "child".into(),
+                parent: Some(seed.target),
+                program: actor_program,
+                initial_state: initial,
+                crdt: true,
+                role_policies: role_policies(vec![
+                    MethodPolicyV2 {
+                        method: "increment".into(),
+                        schema: Hash([51; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                    MethodPolicyV2 {
+                        method: "increment_around_yield".into(),
+                        schema: Hash([56; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                ]),
+            },
+        ],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: vos::v2::SystemCapabilityId([52; 32]),
+            authenticator: vec![1],
+        },
+    });
+    authorize_install(&mut service, &install);
+    assert!(matches!(
+        service.accumulate(&install).unwrap().result,
+        AccumulationResultV2::Installed(_)
+    ));
+
+    let prepare = |store: &LocalJamStoreV2, invocation, timeslot, method: &str| {
+        let mut arguments = vec![vos::value::TAG_DYNAMIC];
+        arguments.extend_from_slice(&Msg::new(method).with("amount", 3u64).encode());
+        LocalWorkSchedulerV2::prepare(
+            store,
+            LocalWorkRequestV2 {
+                invocation,
+                workflow_step: 0,
+                logical_timeslot: timeslot,
+                target: seed.target,
+                method: method.into(),
+                arguments,
+                origin: Origin::Anonymous,
+                authorization: AuthorizationEvidenceV2::Public,
+                causal_parent: None,
+                parent_call: None,
+                causal_context: None,
+                awaited_reply: None,
+                imported_blobs: vec![],
+                proof_requested: false,
+            },
+        )
+        .unwrap()
+    };
+
+    let first = prepare(
+        service.accumulate_host(),
+        InvocationId([53; 32]),
+        1,
+        "increment_child_twice",
+    );
+    let runner = ServicePvmV2::new(
+        CANONICAL_SERVICE_PVM.to_vec(),
+        vos::v2::VOS_SERVICE_PROGRAM_ID,
+    )
+    .unwrap();
+    let interpreted = runner
+        .refine_actor_tree_with_backend(
+            &first.work.encode(),
+            &first.imports,
+            1_000_000_000,
+            &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceInterpreter,
+        )
+        .unwrap();
+    assert_eq!(
+        runner
+            .refine_actor_tree_with_backend(
+                &first.work.encode(),
+                &first.imports,
+                1_000_000_000,
+                &NoRefineProtocolHostV2,
+                javm::PvmBackend::ForceRecompiler,
+            )
+            .unwrap(),
+        interpreted,
+        "private CRDT dispatch allocation is backend-independent"
+    );
+    let refined = service
+        .refine_actor_tree(&first.work, &first.imports)
+        .unwrap();
+    let change = refined.transition.crdt_change.as_ref().unwrap();
+    assert_eq!(
+        change
+            .operations
+            .iter()
+            .map(|operation| (
+                operation.actor,
+                operation.dispatch_ordinal,
+                operation.ordinal
+            ))
+            .collect::<Vec<_>>(),
+        vec![(child, 0, 0), (child, 1, 0)]
+    );
+    let mut expected_actors = vec![seed.target, child];
+    expected_actors.sort_unstable();
+    assert_eq!(
+        change
+            .materializations
+            .iter()
+            .map(|materialization| materialization.actor)
+            .collect::<Vec<_>>(),
+        expected_actors
+    );
+    assert_eq!(
+        refined
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::I64(6))
+    );
+    assert!(matches!(
+        service
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: first.work,
+                transition: refined.transition,
+                provided_blobs: refined.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let second = prepare(
+        service.accumulate_host(),
+        InvocationId([54; 32]),
+        2,
+        "increment_child_twice",
+    );
+    let refined = service
+        .refine_actor_tree(&second.work, &second.imports)
+        .unwrap();
+    assert_eq!(
+        refined
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::I64(12)),
+        "the next slice privately imports the child's committed materialization"
+    );
+
+    let unsupported = prepare(
+        service.accumulate_host(),
+        InvocationId([57; 32]),
+        3,
+        "call_yielding_child",
+    );
+    let before = service.accumulate_host().snapshot();
+    assert!(matches!(
+        service.refine_actor_tree(&unsupported.work, &unsupported.imports),
+        Err(ServiceDispatchError::Pvm(ServicePvmErrorV2::Panic {
+            vm: 0,
+            ..
+        }))
+    ));
+    assert_eq!(
+        service.accumulate_host().snapshot(),
+        before,
+        "a nested CRDT suspension fails during pure Refine and leaves no service-state trace"
+    );
+}
+
+#[test]
 fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
     let service_elf = service_elf();
     let actor_elf = crdt_counter_v2_elf();
