@@ -1648,6 +1648,7 @@ mod tests {
             expected: Some(crate::v2::Hash([0x46; 32])),
             replacement: None,
             pending_call: Some(crate::v2::CallId([0x47; 32])),
+            pending_actor: Some(actor),
             previously_suspended: vec![actor],
             suspended: Vec::new(),
         };

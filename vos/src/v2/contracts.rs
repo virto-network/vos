@@ -335,6 +335,9 @@ pub struct CheckpointTokenV2 {
     pub expected: Option<Hash>,
     pub replacement: Option<BlobRefV2>,
     pub pending_call: Option<CallId>,
+    /// Exact actor VM which issued `pending_call`, derived from the live JAR
+    /// stack by the scheduler. `None` for an explicit yield.
+    pub pending_actor: Option<ActorId>,
     /// Actors locked by the continuation being replaced or deleted.
     pub previously_suspended: Vec<ActorId>,
     /// Exact actor stack locked by `replacement`. Empty when the workflow
@@ -3160,6 +3163,7 @@ fn encode_checkpoint_token(e: &mut Encoder<'_>, value: &CheckpointTokenV2) {
     e.option(&value.expected, |e, hash| e.fixed(&hash.0));
     e.option(&value.replacement, encode_blob_ref);
     e.option(&value.pending_call, |e, call| e.fixed(&call.0));
+    e.option(&value.pending_actor, |e, actor| e.fixed(&actor.0));
     e.list(&value.previously_suspended, |e, actor| e.fixed(&actor.0));
     e.list(&value.suspended, |e, actor| e.fixed(&actor.0));
 }
@@ -3183,6 +3187,7 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, Dec
         expected: d.option(|d| d.fixed().map(Hash))?,
         replacement: d.option(decode_blob_ref)?,
         pending_call: d.option(|d| d.fixed().map(CallId))?,
+        pending_actor: d.option(|d| d.fixed().map(ActorId))?,
         previously_suspended: d.list(|d| d.fixed().map(ActorId))?,
         suspended: d.list(|d| d.fixed().map(ActorId))?,
     };
@@ -3199,6 +3204,11 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, Dec
         })
         || value.expected.is_some() != !value.previously_suspended.is_empty()
         || value.replacement.is_some() != !value.suspended.is_empty()
+        || value.pending_call.is_some() != value.pending_actor.is_some()
+        || value.pending_actor.is_some_and(|actor| {
+            value.suspended.binary_search(&actor).is_err()
+                && value.previously_suspended.binary_search(&actor).is_err()
+        })
         || (value.previously_suspended.is_empty() && value.suspended.is_empty())
         || value
             .previously_suspended
@@ -3701,6 +3711,7 @@ mod tests {
             expected: Some(Hash([26; 32])),
             replacement: Some(replacement),
             pending_call: Some(InvocationId([24; 32]).call_id(3)),
+            pending_actor: Some(ActorId([23; 32])),
             previously_suspended: vec![ActorId([21; 32])],
             suspended: vec![ActorId([21; 32]), ActorId([23; 32])],
         };
@@ -3784,6 +3795,7 @@ mod tests {
         let resume = AwaitResumeV2 {
             checkpoint: CheckpointTokenV2 {
                 replacement: None,
+                previously_suspended: checkpoint.suspended.clone(),
                 suspended: vec![],
                 ..checkpoint.clone()
             },

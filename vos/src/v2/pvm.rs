@@ -523,6 +523,7 @@ impl ServicePvmV2 {
                 expected: Some(reference.hash),
                 replacement: None,
                 pending_call: continuation.pending_call,
+                pending_actor: continuation.pending_actor,
                 previously_suspended: continuation.suspended_actors.clone(),
                 suspended: Vec::new(),
             };
@@ -901,6 +902,7 @@ fn capture_checkpoint(
         ImportedBlobV2,
         KernelSnapshot,
         Option<super::CallId>,
+        Option<super::ActorId>,
         Vec<super::ActorId>,
     ),
     ServicePvmErrorV2,
@@ -919,6 +921,9 @@ fn capture_checkpoint(
         return Err(ServicePvmErrorV2::SnapshotFailed);
     }
     let suspended_actors = suspended_actor_stack(&snapshot, work)?;
+    let pending_actor = awaited
+        .then(|| actor_for_vm(snapshot.active_vm, work))
+        .transpose()?;
     let continuation = ContinuationSnapshotV2 {
         snapshot_version: super::SNAPSHOT_VERSION,
         jar_semantics: super::EXECUTION_SEMANTICS_ID,
@@ -930,6 +935,7 @@ fn capture_checkpoint(
         actor_program: work.target_program,
         await_ordinal,
         pending_call,
+        pending_actor,
         causal_context: work.causal_context.clone(),
         suspended_actors: suspended_actors.clone(),
         kernel_snapshot: snapshot.to_bytes(),
@@ -940,31 +946,38 @@ fn capture_checkpoint(
         ImportedBlobV2 { reference, bytes },
         snapshot,
         pending_call,
+        pending_actor,
         suspended_actors,
     ))
+}
+
+fn actor_for_vm(vm: u16, work: &WorkEnvelopeV2) -> Result<super::ActorId, ServicePvmErrorV2> {
+    if vm == 0 {
+        return Err(ServicePvmErrorV2::SnapshotFailed);
+    }
+    core::iter::once(work.target)
+        .chain(
+            work.imported_actors
+                .iter()
+                .filter(|actor| actor.actor != work.target)
+                .map(|actor| actor.actor),
+        )
+        .nth(vm.checked_sub(1).ok_or(ServicePvmErrorV2::SnapshotFailed)? as usize)
+        .ok_or(ServicePvmErrorV2::SnapshotFailed)
 }
 
 fn suspended_actor_stack(
     snapshot: &KernelSnapshot,
     work: &WorkEnvelopeV2,
 ) -> Result<Vec<super::ActorId>, ServicePvmErrorV2> {
-    let mut actors = Vec::with_capacity(work.imported_actors.len());
-    actors.push(work.target);
-    actors.extend(
-        work.imported_actors
-            .iter()
-            .filter(|actor| actor.actor != work.target)
-            .map(|actor| actor.actor),
-    );
     let mut suspended = snapshot
         .call_stack
         .iter()
         .map(|frame| frame.caller_vm_id)
         .chain(core::iter::once(snapshot.active_vm))
         .filter(|vm| *vm != 0)
-        .map(|vm| actors.get(vm.checked_sub(1)? as usize).copied())
-        .collect::<Option<Vec<_>>>()
-        .ok_or(ServicePvmErrorV2::SnapshotFailed)?;
+        .map(|vm| actor_for_vm(vm, work))
+        .collect::<Result<Vec<_>, _>>()?;
     suspended.sort_unstable();
     suspended.dedup();
     if suspended.is_empty() || suspended.binary_search(&work.target).is_err() {
@@ -1036,7 +1049,7 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                 }
                 if slot == crate::abi::hostcall::SUSPEND as u8 {
                     if let Some(work) = suspension_work {
-                        let (artifact, snapshot, pending_call, suspended) =
+                        let (artifact, snapshot, pending_call, pending_actor, suspended) =
                             capture_checkpoint(&mut kernel, work)?;
                         let (service_program, dormant) =
                             invocation_layout.ok_or(ServicePvmErrorV2::InvalidContinuation)?;
@@ -1065,6 +1078,7 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                                 expected,
                                 replacement: Some(artifact.reference.clone()),
                                 pending_call,
+                                pending_actor,
                                 previously_suspended: previously_suspended.clone(),
                                 suspended,
                             },

@@ -29,6 +29,9 @@ pub struct ContinuationSnapshotV2 {
     pub await_ordinal: u64,
     /// `None` for an explicit scheduler yield; `Some` for an awaited call.
     pub pending_call: Option<CallId>,
+    /// Exact actor VM which issued `pending_call`. Derived from JAR's active
+    /// machine at snapshot time, never from actor-provided IPC.
+    pub pending_actor: Option<ActorId>,
     /// Durable causal authority retained after the step-0 inbox row is
     /// consumed. Every resumed slice must carry this exact context.
     pub causal_context: Option<CausalCallContextV2>,
@@ -63,6 +66,10 @@ impl ContinuationSnapshotV2 {
             || self
                 .pending_call
                 .is_some_and(|call| call != self.invocation.call_id(self.await_ordinal))
+            || self.pending_call.is_some() != self.pending_actor.is_some()
+            || self
+                .pending_actor
+                .is_some_and(|actor| self.suspended_actors.binary_search(&actor).is_err())
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -117,6 +124,7 @@ impl V2Wire for ContinuationSnapshotV2 {
         e.fixed(&self.actor_program.0);
         e.u64(self.await_ordinal);
         e.option(&self.pending_call, |e, call| e.fixed(&call.0));
+        e.option(&self.pending_actor, |e, actor| e.fixed(&actor.0));
         e.option(&self.causal_context, encode_causal_context);
         e.list(&self.suspended_actors, |e, actor| e.fixed(&actor.0));
         e.bytes(&self.kernel_snapshot);
@@ -134,6 +142,7 @@ impl V2Wire for ContinuationSnapshotV2 {
             actor_program: ProgramId(d.fixed()?),
             await_ordinal: d.u64()?,
             pending_call: d.option(|d| d.fixed().map(CallId))?,
+            pending_actor: d.option(|d| d.fixed().map(ActorId))?,
             causal_context: d.option(decode_causal_context)?,
             suspended_actors: d.list(|d| d.fixed().map(ActorId))?,
             kernel_snapshot: d.bytes()?,
@@ -218,6 +227,7 @@ mod tests {
             actor_program: ProgramId([6; 32]),
             await_ordinal: 3,
             pending_call: Some(invocation.call_id(3)),
+            pending_actor: Some(ActorId([5; 32])),
             causal_context: None,
             suspended_actors: vec![ActorId([5; 32])],
             kernel_snapshot: b"canonical JAR kernel snapshot".to_vec(),

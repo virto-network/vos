@@ -1992,10 +1992,8 @@ fn validate_continuation_change<S: GuestAccumulateStoreV2>(
         Some(call)
             if envelope.transition.outbox.len() == 1
                 && envelope.transition.outbox[0].call_id == call
-                && work
-                    .imported_actors
-                    .binary_search_by_key(&envelope.transition.outbox[0].from, |actor| actor.actor)
-                    .is_ok() => {}
+                && next.as_ref().and_then(|snapshot| snapshot.pending_actor)
+                    == Some(envelope.transition.outbox[0].from) => {}
         None if envelope.transition.outbox.is_empty() => {}
         _ => {
             return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
@@ -2049,10 +2047,7 @@ fn validate_awaited_reply<S: GuestAccumulateStoreV2>(
     if message.call_id != call
         || message.caller_invocation != work.invocation
         || message.await_ordinal != snapshot.await_ordinal
-        || work
-            .imported_actors
-            .binary_search_by_key(&message.from, |actor| actor.actor)
-            .is_err()
+        || snapshot.pending_actor != Some(message.from)
         || message.to != awaited.reply.producer
         || message
             .deadline_timeslot
@@ -2081,6 +2076,7 @@ fn validate_awaited_reply<S: GuestAccumulateStoreV2>(
             expected: Some(current.hash),
             replacement: None,
             pending_call: Some(call),
+            pending_actor: snapshot.pending_actor,
             previously_suspended: snapshot.suspended_actors.clone(),
             suspended: Vec::new(),
         },
@@ -2185,21 +2181,33 @@ fn contains_cycle(messages: &[MessageRecordV2]) -> bool {
 
 /// Validate stable call IDs against both new and committed workflow rows, then
 /// walk each new outbound call through its causal parents. Every message
-/// written by an actor transition must identify that actor as its sender. A
-/// child call must originate at its parent's recipient, cannot extend a parent
-/// deadline, and cannot target an actor already present in its causal caller
-/// chain.
+/// written by a root slice must identify the root as its sender; an outbound
+/// awaited call is separately bound to the exact active actor recorded by the
+/// JAR checkpoint. A child call must originate at its parent's recipient,
+/// cannot extend a parent deadline, and cannot target an actor already present
+/// in its causal caller chain.
 fn validate_durable_messages<S: StateTreeStore>(
     tree: &ServiceStateTreeV2<'_, S>,
     work: &super::WorkEnvelopeV2,
     transition: &super::TransitionV2,
 ) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
+    if transition
+        .inbox
+        .iter()
+        .any(|message| message.from != work.target)
+        || transition.outbox.iter().any(|message| {
+            work.imported_actors
+                .binary_search_by_key(&message.from, |actor| actor.actor)
+                .is_err()
+        })
+    {
+        return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
     let mut staged = BTreeMap::<super::CallId, MessageRecordV2>::new();
     for message in transition.inbox.iter().chain(&transition.outbox) {
-        if message.from != work.target
-            || message
-                .deadline_timeslot
-                .is_some_and(|deadline| work.logical_timeslot >= deadline)
+        if message
+            .deadline_timeslot
+            .is_some_and(|deadline| work.logical_timeslot >= deadline)
         {
             return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
         }
@@ -3242,6 +3250,7 @@ mod tests {
             actor_program: first_work.target_program,
             await_ordinal: 0,
             pending_call: None,
+            pending_actor: None,
             causal_context: first_work.causal_context.clone(),
             suspended_actors: vec![first_work.target],
             kernel_snapshot: vec![1],
@@ -3442,6 +3451,7 @@ mod tests {
             actor_program: first_work.target_program,
             await_ordinal: 0,
             pending_call: Some(call),
+            pending_actor: Some(first_work.target),
             causal_context: first_work.causal_context.clone(),
             suspended_actors: vec![first_work.target],
             kernel_snapshot: vec![1],
@@ -3597,6 +3607,7 @@ mod tests {
                 expected: Some(continuation.hash),
                 replacement: None,
                 pending_call: Some(call),
+                pending_actor: Some(resume.target),
                 previously_suspended: vec![resume.target],
                 suspended: Vec::new(),
             },

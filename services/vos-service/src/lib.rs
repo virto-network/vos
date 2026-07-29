@@ -188,7 +188,10 @@ mod guest {
                     fail_closed();
                 }
                 match checkpoint.pending_call {
-                    Some(pending) if outbox.len() == 1 && outbox[0].call_id == pending => {}
+                    Some(pending)
+                        if outbox.len() == 1
+                            && outbox[0].call_id == pending
+                            && Some(outbox[0].from) == checkpoint.pending_actor => {}
                     None if outbox.is_empty() => {}
                     _ => fail_closed(),
                 }
