@@ -51,7 +51,8 @@ impl AttestedMethod<Vec<u8>> for StartMethod {
     }
 }
 
-fn role_policies(methods: Vec<MethodPolicyV2>) -> Vec<u8> {
+fn role_policies(mut methods: Vec<MethodPolicyV2>) -> Vec<u8> {
+    methods.sort_by(|left, right| left.method.cmp(&right.method));
     PackageRolePoliciesV2 { methods }.encode()
 }
 
@@ -455,7 +456,7 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
         .refine_actor_tree(
             &work.encode(),
             &imports,
-            10_000_000,
+            100_000_000,
             &NoRefineProtocolHostV2,
         )
         .expect("generic Refine completes");
@@ -489,6 +490,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
     let initial = BlobRefV2::of_bytes(&initial_bytes);
     let seed = work(actor_program, initial.clone());
     let child = ActorId([36; 32]);
+    let sibling = ActorId([37; 32]);
     let mut host = LocalJamStoreV2::default();
     assert_eq!(host.import_blob(initial_bytes), initial);
     assert_eq!(host.import_program(actor_pvm), actor_program);
@@ -540,6 +542,42 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
                         space_role: None,
                         actor_role: None,
                     },
+                    MethodPolicyV2 {
+                        method: "root_child_then_peer".into(),
+                        schema: Hash([81; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                    MethodPolicyV2 {
+                        method: "root_child_then_sibling".into(),
+                        schema: Hash([91; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                    MethodPolicyV2 {
+                        method: "call_child_repeatedly".into(),
+                        schema: Hash([82; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                    MethodPolicyV2 {
+                        method: "sibling_ipc_tail".into(),
+                        schema: Hash([83; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
                 ]),
             },
             ActorGenesisV2 {
@@ -547,7 +585,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
                 name: "child".into(),
                 parent: Some(seed.target),
                 program: actor_program,
-                initial_state: initial,
+                initial_state: initial.clone(),
                 crdt: false,
                 role_policies: role_policies(vec![
                     MethodPolicyV2 {
@@ -577,6 +615,43 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
                         space_role: None,
                         actor_role: None,
                     },
+                    MethodPolicyV2 {
+                        method: "wide_reply".into(),
+                        schema: Hash([84; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                ]),
+            },
+            ActorGenesisV2 {
+                actor: sibling,
+                name: "sibling".into(),
+                parent: Some(seed.target),
+                program: actor_program,
+                initial_state: initial,
+                crdt: false,
+                role_policies: role_policies(vec![
+                    MethodPolicyV2 {
+                        method: "child_await_peer".into(),
+                        schema: Hash([92; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                    MethodPolicyV2 {
+                        method: "ipc_tail".into(),
+                        schema: Hash([85; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
                 ]),
             },
         ],
@@ -586,10 +661,11 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
         },
     });
     authorize_install(&mut service, &install);
-    assert!(matches!(
-        service.accumulate(&install).unwrap().result,
-        AccumulationResultV2::Installed(_)
-    ));
+    let install_result = service.accumulate(&install).unwrap().result;
+    assert!(
+        matches!(install_result, AccumulationResultV2::Installed(_)),
+        "root-tree fixture install rejected: {install_result:?}"
+    );
 
     let mut message = vec![vos::value::TAG_DYNAMIC];
     message.extend_from_slice(&Msg::new("call_child").encode());
@@ -649,6 +725,55 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
         }
     ));
 
+    let mut scrub_message = vec![vos::value::TAG_DYNAMIC];
+    scrub_message.extend_from_slice(&Msg::new("sibling_ipc_tail").encode());
+    let scrub = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([86; 32]),
+            workflow_step: 0,
+            logical_timeslot: 2,
+            target: seed.target,
+            method: "sibling_ipc_tail".into(),
+            arguments: scrub_message,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    let scrubbed = service
+        .refine_actor_tree(&scrub.work, &scrub.imports)
+        .expect("a long sibling reply is followed by a short sibling call");
+    assert_eq!(
+        scrubbed
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::U8(0)),
+        "the next sibling cannot observe bytes beyond its own IPC input"
+    );
+    assert!(matches!(
+        service
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: scrub.work,
+                transition: scrubbed.transition,
+                provided_blobs: scrubbed.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
     let invocation = InvocationId([67; 32]);
     let mut nested_message = vec![vos::value::TAG_DYNAMIC];
     nested_message.extend_from_slice(&Msg::new("root_child_await").encode());
@@ -657,7 +782,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
         LocalWorkRequestV2 {
             invocation,
             workflow_step: 0,
-            logical_timeslot: 2,
+            logical_timeslot: 3,
             target: seed.target,
             method: "root_child_await".into(),
             arguments: nested_message,
@@ -802,7 +927,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
     let child_request = LocalWorkRequestV2 {
         invocation: InvocationId([72; 32]),
         workflow_step: 0,
-        logical_timeslot: 3,
+        logical_timeslot: 4,
         target: child,
         method: "increment".into(),
         arguments: child_message,
@@ -852,7 +977,17 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
             .work
             .imported_actors
             .iter()
+            .filter(|actor| actor.actor == seed.target || actor.actor == child)
             .all(|actor| actor.continuation.as_ref() == Some(&continuation))
+    );
+    assert!(
+        resumed
+            .work
+            .imported_actors
+            .iter()
+            .find(|actor| actor.actor == sibling)
+            .is_some_and(|actor| actor.continuation.is_none()),
+        "an idle sibling remains outside the suspended stack"
     );
     let resumed_bytes = runner
         .refine_actor_tree_with_backend(
@@ -1099,6 +1234,304 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
                 work: after_second.work,
                 transition: finished.transition,
                 provided_blobs: finished.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let chained_invocation = InvocationId([87; 32]);
+    let mut chained_message = vec![vos::value::TAG_DYNAMIC];
+    chained_message.extend_from_slice(&Msg::new("root_child_then_peer").encode());
+    let chained = LocalWorkSchedulerV2::prepare(
+        restarted.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: chained_invocation,
+            workflow_step: 0,
+            logical_timeslot: 7,
+            target: seed.target,
+            method: "root_child_then_peer".into(),
+            arguments: chained_message,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    let child_wait = restarted
+        .refine_actor_tree(&chained.work, &chained.imports)
+        .expect("the child reaches its await");
+    let child_call = chained_invocation.call_id(0);
+    assert_eq!(child_wait.transition.outbox[0].call_id, child_call);
+    assert_eq!(child_wait.transition.outbox[0].from, child);
+    assert!(matches!(
+        restarted
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: chained.work,
+                transition: child_wait.transition,
+                provided_blobs: child_wait.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let child_reply = peer_reply(&seed.service, child_call, 3, 88);
+    restarted
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            expected_producer: ActorId([44; 32]),
+            receipt: child_reply.receipt.clone(),
+        });
+    let after_child = LocalWorkSchedulerV2::prepare_resume(
+        restarted.accumulate_host(),
+        chained_invocation,
+        8,
+        Some(child_reply),
+    )
+    .unwrap();
+    let root_wait = restarted
+        .refine_actor_tree(&after_child.work, &after_child.imports)
+        .expect("the child completes and its root reaches a later await");
+    let root_call = chained_invocation.call_id(1);
+    assert_eq!(root_wait.transition.reply, None);
+    assert_eq!(root_wait.transition.outbox.len(), 1);
+    assert_eq!(root_wait.transition.outbox[0].call_id, root_call);
+    assert_eq!(root_wait.transition.outbox[0].from, seed.target);
+    assert_eq!(
+        root_wait
+            .transition
+            .writes
+            .iter()
+            .map(|write| u32::decode(write.value.as_ref().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![80, 17],
+        "the completed child's deletion token cannot replace the root's later checkpoint"
+    );
+    assert!(matches!(
+        restarted
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: after_child.work,
+                transition: root_wait.transition,
+                provided_blobs: root_wait.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let root_reply = peer_reply(&seed.service, root_call, 4, 89);
+    restarted
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            expected_producer: ActorId([44; 32]),
+            receipt: root_reply.receipt.clone(),
+        });
+    let after_root = LocalWorkSchedulerV2::prepare_resume(
+        restarted.accumulate_host(),
+        chained_invocation,
+        9,
+        Some(root_reply),
+    )
+    .unwrap();
+    let chained_done = restarted
+        .refine_actor_tree(&after_root.work, &after_root.imports)
+        .expect("the root resumes after its post-child await");
+    assert_eq!(
+        chained_done
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::U32(84))
+    );
+    assert!(matches!(
+        restarted
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: after_root.work,
+                transition: chained_done.transition,
+                provided_blobs: chained_done.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let mut repeated_message = vec![vos::value::TAG_DYNAMIC];
+    repeated_message.extend_from_slice(&Msg::new("call_child_repeatedly").encode());
+    let repeated = LocalWorkSchedulerV2::prepare(
+        restarted.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([90; 32]),
+            workflow_step: 0,
+            logical_timeslot: 10,
+            target: seed.target,
+            method: "call_child_repeatedly".into(),
+            arguments: repeated_message,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    let repeated_done = restarted
+        .refine_actor_tree(&repeated.work, &repeated.imports)
+        .expect("repeated legal CALLs reuse the callee arena");
+    assert_eq!(
+        repeated_done
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::U32(81))
+    );
+
+    let locked_invocation = InvocationId([93; 32]);
+    let mut locked_message = vec![vos::value::TAG_DYNAMIC];
+    locked_message.extend_from_slice(&Msg::new("root_child_then_sibling").encode());
+    let locked = LocalWorkSchedulerV2::prepare(
+        restarted.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: locked_invocation,
+            workflow_step: 0,
+            logical_timeslot: 11,
+            target: seed.target,
+            method: "root_child_then_sibling".into(),
+            arguments: locked_message,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    let locked_wait = restarted
+        .refine_actor_tree(&locked.work, &locked.imports)
+        .expect("the root and child suspend while the sibling is idle");
+    let locked_call = locked_invocation.call_id(0);
+    assert_eq!(locked_wait.transition.outbox[0].call_id, locked_call);
+    assert!(matches!(
+        restarted
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: locked.work,
+                transition: locked_wait.transition,
+                provided_blobs: locked_wait.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let sibling_invocation = InvocationId([94; 32]);
+    let mut sibling_message = vec![vos::value::TAG_DYNAMIC];
+    sibling_message.extend_from_slice(&Msg::new("child_await_peer").encode());
+    let sibling_work = LocalWorkSchedulerV2::prepare(
+        restarted.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: sibling_invocation,
+            workflow_step: 0,
+            logical_timeslot: 12,
+            target: sibling,
+            method: "child_await_peer".into(),
+            arguments: sibling_message,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .expect("the idle sibling may start another workflow");
+    let sibling_wait = restarted
+        .refine_actor_tree(&sibling_work.work, &sibling_work.imports)
+        .expect("the sibling independently suspends");
+    assert_eq!(sibling_wait.transition.outbox[0].from, sibling);
+    assert!(matches!(
+        restarted
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: sibling_work.work,
+                transition: sibling_wait.transition,
+                provided_blobs: sibling_wait.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let locked_reply = peer_reply(&seed.service, locked_call, 2, 95);
+    restarted
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            expected_producer: ActorId([44; 32]),
+            receipt: locked_reply.receipt.clone(),
+        });
+    let locked_resume = LocalWorkSchedulerV2::prepare_resume(
+        restarted.accumulate_host(),
+        locked_invocation,
+        13,
+        Some(locked_reply),
+    )
+    .unwrap();
+    let locked_done = restarted
+        .refine_actor_tree(&locked_resume.work, &locked_resume.imports)
+        .expect("resume reconciles CALLABLEs against current committed locks");
+    assert_eq!(
+        locked_done
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::U32(0)),
+        "a snapshot-frozen CALLABLE cannot enter a sibling locked by another workflow"
+    );
+    assert!(
+        locked_done
+            .transition
+            .writes
+            .iter()
+            .all(|write| write.actor != sibling)
+    );
+    assert!(matches!(
+        restarted
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: locked_resume.work,
+                transition: locked_done.transition,
+                provided_blobs: locked_done.exported_blobs,
             }))
             .unwrap()
             .result,

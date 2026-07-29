@@ -137,16 +137,18 @@ PVM instantiates at most four application actors: the pinned JAR kernel has one
 shared five-entry code-capability table and the generic service consumes one
 entry. It grants only idle peers a directory-indexed JAR `CALLABLE`.
 
-The shared CALL IPC contains directory metadata and the generated message, but
-no actor state or authenticated caller fields. A scheduler-supplied private
-capability binds state delivery to the currently active JAR VM and derives a
-nested `Origin::Actor` from the live call stack. Each actor exports its own
-canonical effects through a second scheduler capability; a parent sees only the
-child reply and checkpoint control flow, while the generic service guest
-canonicalizes the opaque effect batch into `TransitionV2`. These buffers are
-invocation-local Refine state, never native persistent service state. This
-preserves role-gated sibling-state isolation without changing JAR CALL/REPLY
-semantics or making the host the transition authority.
+The shared CALL IPC contains only the generated target identity, await ordinal
+and message. The canonical actor directory, actor state and authenticated
+caller fields arrive through a scheduler-supplied private capability bound to
+the currently active JAR VM; nested `Origin::Actor` is derived from the live
+call stack. The complete move-only IPC page is zeroed before and after every
+hop, so a shorter call cannot observe a prior sibling's tail bytes. Each actor
+exports its own canonical effects through a second scheduler capability; a
+parent sees only the child reply and checkpoint control flow, while the generic
+service guest canonicalizes the opaque effect batch into `TransitionV2`.
+These buffers are invocation-local Refine state, never native persistent
+service state. This preserves role-gated sibling-state isolation without
+changing JAR CALL/REPLY semantics or making the host the transition authority.
 
 An ordinary same-tree call executes through JAR `CALLABLE` and returns inline.
 The scheduler derives the active actor set from JAR's live call stack through
@@ -156,7 +158,12 @@ across the complete inline actor tree and flow back through the minimal call
 result, preventing nested actors from deriving the same `CallId`. The
 checkpoint also records the exact active actor VM which issued an awaited call;
 the service and guest Accumulate both bind the durable outbox sender to that
-host-derived identity.
+host-derived identity. On resume the host removes every snapshot-frozen
+`CALLABLE` and rebuilds routes from the current committed continuation set:
+actors owned by this continuation remain available after they unwind, while an
+actor locked by a different workflow cannot be entered through stale
+capability state. Completed child checkpoint tokens and already-committed
+effect queues are cleared before a parent can suspend again.
 
 Actor metadata is also the source of installed method policy. `#[msg]`
 annotations produce one canonical schema and role-policy artifact; package
@@ -346,7 +353,11 @@ continuation. It retains caller/callee, deadline and parent linkage after the
 step-0 inbox row is consumed, so later awaits preserve cycle and inherited
 deadline checks without resurrecting that row. Await ordinals live in the
 captured actor machine, are shared by inline descendants, and therefore advance
-across successive restarts.
+across successive restarts. Accumulate accepts a durable outbox row only beside
+the exact replacement checkpoint that names its `CallId` and host-derived
+sending actor. A nested sender may form the first causal edge below the root's
+authenticated inbound call; every older edge retains the ordinary
+parent-recipient equals child-sender rule.
 
 ## Packages and identity
 
