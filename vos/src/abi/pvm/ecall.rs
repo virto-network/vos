@@ -137,7 +137,7 @@ pub fn downgrade_cap(subject: u32, object: u32) -> bool {
 /// DATA capability. The four values become the callee's `phi[7..=10]`.
 #[inline(always)]
 pub fn call_cap(subject: u32, ipc_cap_slot: u8, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
-    _management_ecall(
+    _call_ecall(
         a0,
         a1,
         a2,
@@ -177,6 +177,37 @@ pub fn reply(_value: u64) -> ! {
 
 #[cfg(target_arch = "riscv64")]
 #[inline(always)]
+fn _call_ecall(a0: u64, a1: u64, a2: u64, a3: u64, op: u64, refs: u64) -> u64 {
+    let ret: u64;
+    let discarded_result1: u64;
+    // SAFETY: dynamic CALL suspends until the callee replies. The JAR kernel
+    // resumes the caller by injecting its result into phi[7] and a success
+    // status into phi[8], so both a0 and a1 are late outputs.
+    unsafe {
+        core::arch::asm!(
+            "csrw 0x800, zero",
+            "ecall",
+            inlateout("a0") a0 => ret,
+            inlateout("a1") a1 => discarded_result1,
+            in("a2") a2,
+            in("a3") a3,
+            in("a4") op,
+            in("a5") refs,
+            options(nostack),
+        );
+    }
+    let _ = discarded_result1;
+    ret
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+#[inline(always)]
+fn _call_ecall(_a0: u64, _a1: u64, _a2: u64, _a3: u64, op: u64, _refs: u64) -> u64 {
+    panic!("vos-abi JAR CALL requires RISC-V target (op={op})")
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
 fn _management_ecall(a0: u64, a1: u64, a2: u64, a3: u64, op: u64, refs: u64) -> u64 {
     let ret: u64;
     // SAFETY: CSR 0x800 is the transpiler marker for the GP dynamic `ecall`
@@ -186,10 +217,9 @@ fn _management_ecall(a0: u64, a1: u64, a2: u64, a3: u64, op: u64, refs: u64) -> 
             "csrw 0x800, zero",
             "ecall",
             inlateout("a0") a0 => ret,
-            // Dynamic JAR management operations are dispatched
-            // synchronously by the kernel and return only through φ[7].
-            // Unlike suspended protocol calls, they do not inject a
-            // second result into φ[8], so a1 remains input-only here.
+            // MAP/MOVE/COPY/DOWNGRADE are synchronous and return only through
+            // φ[7]. Dynamic CALL uses `_call_ecall` because it suspends and
+            // the kernel also injects a status into φ[8].
             in("a1") a1,
             in("a2") a2,
             in("a3") a3,
