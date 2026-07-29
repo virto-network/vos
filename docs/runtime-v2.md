@@ -142,6 +142,15 @@ roles established by Refine. Application dispatch accepts only the canonical
 dynamic message frame; the former typed-enum fallback used a trusted-byte
 decoder and was remotely reachable, so it is not part of the v2 ABI.
 
+This v2 cutover changes two application reply wires. `Option<T>` uses
+`Value::Bytes([0])` for `None` and `Value::Bytes([1] ++ rkyv(T))` for `Some`,
+including ordinary non-attested methods; generic HTTP clients therefore see
+the tagged bytes rather than the legacy empty/bare-rkyv representation. Void
+handlers now commit encoded `Value::Unit` rather than an empty result. The
+latter changes receipt reply commitments and is consensus-visible, so stores
+or receipts created under the earlier service `ProgramId` are not compatible
+with the repinned v2 service artifact.
+
 The conformance credential carrier binds its holder, invocation-scoped
 authorization scope, space and actor roles, authenticator, generated policy and
 exact byte commitment. The scope commits to the service and deployment

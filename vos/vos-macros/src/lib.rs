@@ -2363,7 +2363,11 @@ fn ref_arg_with(name: &syn::Ident, ty: &syn::Type) -> proc_macro2::TokenStream {
         return quote! {
             .with(
                 #name_str,
-                vos::value::Value::Bytes(#name.to_portable_bytes()),
+                vos::value::Value::Bytes(
+                    #name
+                        .to_portable_bytes()
+                        .expect("portable attestation exceeds the VOS wire limit"),
+                ),
             )
         };
     }
@@ -2386,11 +2390,34 @@ fn ref_arg_with(name: &syn::Ident, ty: &syn::Type) -> proc_macro2::TokenStream {
 }
 
 fn is_attestation_type(ty: &syn::Type) -> bool {
-    matches!(
-        ty,
-        syn::Type::Path(path)
-            if path.path.segments.last().is_some_and(|segment| segment.ident == "Attestation")
-    )
+    let syn::Type::Path(path) = ty else {
+        return false;
+    };
+    if path.qself.is_some() {
+        return false;
+    }
+    let segments = &path.path.segments;
+    let explicitly_vos = matches!(
+        (segments.first(), segments.last()),
+        (Some(first), Some(last))
+            if first.ident == "vos"
+                && last.ident == "Attestation"
+                && (segments.len() == 2 || segments.len() == 3)
+    );
+    if !explicitly_vos {
+        return false;
+    }
+    let Some(last) = segments.last() else {
+        return false;
+    };
+    let syn::PathArguments::AngleBracketed(arguments) = &last.arguments else {
+        return false;
+    };
+    arguments.args.len() == 2
+        && arguments
+            .args
+            .iter()
+            .all(|argument| matches!(argument, syn::GenericArgument::Type(_)))
 }
 
 /// Map a Rust type to the corresponding `InitArgs` accessor method.
@@ -2429,7 +2456,7 @@ fn to_pascal_case(s: &str) -> String {
 
 #[cfg(test)]
 mod doc_tests {
-    use super::first_doc_paragraph;
+    use super::{first_doc_paragraph, is_attestation_type};
 
     fn attrs(src: &str) -> Vec<syn::Attribute> {
         syn::parse_str::<syn::ItemStruct>(src).unwrap().attrs
@@ -2471,5 +2498,20 @@ mod doc_tests {
     fn block_comment_strips_star_and_stops_at_blank() {
         let a = attrs("/**\n * First line.\n * still first.\n *\n * Second para.\n */\nstruct X;");
         assert_eq!(first_doc_paragraph(&a), "First line. still first.");
+    }
+
+    #[test]
+    fn portable_attestation_detection_requires_the_vos_type_and_two_type_arguments() {
+        let ty = |source| syn::parse_str::<syn::Type>(source).unwrap();
+        assert!(is_attestation_type(&ty("vos::Attestation<Claim, Method>")));
+        assert!(is_attestation_type(&ty(
+            "vos::attestation::Attestation<Claim, Method>"
+        )));
+        assert!(!is_attestation_type(&ty("Attestation<Claim, Method>")));
+        assert!(!is_attestation_type(&ty(
+            "application::Attestation<Claim, Method>"
+        )));
+        assert!(!is_attestation_type(&ty("vos::Attestation<Claim>")));
+        assert!(!is_attestation_type(&ty("vos::Attestation")));
     }
 }

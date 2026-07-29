@@ -136,6 +136,11 @@ mod fixture {
             Ok(())
         }
 
+        #[msg(attested)]
+        fn scalar(&self) -> u64 {
+            7
+        }
+
         /// The same custom wire shape on a regular method, used to prove that
         /// ordinary and attested generated handles expose different types.
         #[msg]
@@ -201,7 +206,7 @@ mod fixture {
             /// Transport-only codec gate. Application authorization must call
             /// the verifier path and consume `Verified<T>`, not this package.
             #[msg]
-            fn receive_package(&self, package: Attestation<Receipt, LastReceipt>) -> bool {
+            fn receive_package(&self, package: vos::Attestation<Receipt, LastReceipt>) -> bool {
                 let _ = package;
                 true
             }
@@ -322,23 +327,57 @@ fn attested_and_regular_method_policies_are_generated_together() {
 }
 
 #[test]
-fn attested_method_marker_binds_the_exact_committed_reply_wire() {
-    let claim = Receipt {
-        id: 7,
-        tag: [9; 32],
+fn attested_dispatch_reply_wire_matches_claim_wire_for_every_return_shape() {
+    fn dispatch(actor: &mut Vault, context: &mut vos::Context<Vault>, message: Msg) -> Vec<u8> {
+        let message = VaultMsg::from_msg(&message).expect("typed message");
+        assert!(matches!(
+            vos::Actor::dispatch(actor, message, context),
+            vos::RunResult::Complete(false)
+        ));
+        context.take_reply_bytes()
+    }
+
+    let mut actor = <Vault as vos::Actor>::create();
+    let mut context = vos::Context::new(ServiceId(7));
+    context.set_caller_roles(Some(vos::SpaceRole::Member.as_u8()), None);
+
+    let receipt = Receipt {
+        id: 1,
+        tag: [0; 32],
     };
-    let wire = <fixture::LastReceipt as vos::AttestedMethod<Receipt>>::claim_wire(&claim);
     assert_eq!(
-        <fixture::LastReceipt as vos::AttestedMethod<Receipt>>::METHOD,
-        "last_receipt"
+        dispatch(&mut actor, &mut context, Msg::new("last_receipt")),
+        <fixture::LastReceipt as vos::AttestedMethod<Receipt>>::claim_wire(&receipt)
     );
     assert_eq!(
-        <Value as vos::Decode>::decode(&wire),
-        Value::Bytes(
-            vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&claim)
-                .expect("rkyv encode")
-                .to_vec()
+        dispatch(
+            &mut actor,
+            &mut context,
+            Msg::new("optional_token").with("issue", false)
         ),
+        <fixture::OptionalToken as vos::AttestedMethod<Option<MembershipToken>>>::claim_wire(&None)
+    );
+    assert_eq!(
+        dispatch(
+            &mut actor,
+            &mut context,
+            Msg::new("optional_token").with("issue", true)
+        ),
+        <fixture::OptionalToken as vos::AttestedMethod<Option<MembershipToken>>>::claim_wire(
+            &Some(MembershipToken)
+        )
+    );
+    assert_eq!(
+        dispatch(&mut actor, &mut context, Msg::new("acknowledge")),
+        <fixture::Acknowledge as vos::AttestedMethod<()>>::claim_wire(&())
+    );
+    assert_eq!(
+        dispatch(&mut actor, &mut context, Msg::new("try_acknowledge")),
+        <fixture::TryAcknowledge as vos::AttestedMethod<()>>::claim_wire(&())
+    );
+    assert_eq!(
+        dispatch(&mut actor, &mut context, Msg::new("scalar")),
+        <fixture::Scalar as vos::AttestedMethod<u64>>::claim_wire(&7)
     );
 }
 
@@ -400,7 +439,7 @@ fn attested_handle_returns_a_typed_package_not_a_bare_claim() {
     assert_eq!(package.unverified_preview(), &claim);
     assert_eq!(package.statement().method, "last_receipt");
     assert_eq!(package.producer(), ProducerId([15; 32]));
-    let portable = package.to_portable_bytes();
+    let portable = package.to_portable_bytes().unwrap();
     let decoded =
         vos::Attestation::<Receipt, fixture::LastReceipt>::from_portable_bytes(&portable).unwrap();
     assert_eq!(decoded.unverified_preview(), &claim);

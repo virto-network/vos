@@ -566,20 +566,29 @@ impl<T, M> Attestation<T, M> {
 
     /// Strict portable application package. The preview is encoded with the
     /// exact generated actor-reply codec, not a second generic serializer.
-    pub fn to_portable_bytes(&self) -> Vec<u8>
+    pub fn to_portable_bytes(&self) -> Result<Vec<u8>, AttestationError>
     where
         M: AttestedMethod<T>,
     {
+        let statement = self.statement.encode();
+        for field in [
+            self.producer_name.as_bytes(),
+            statement.as_slice(),
+            self.claim_wire.as_slice(),
+            self.proof.as_slice(),
+        ] {
+            validate_portable_field_len(field.len())?;
+        }
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"VAT3");
         bytes.extend_from_slice(&crate::v2::ABI_VERSION.to_le_bytes());
         let mut encoder = Encoder(&mut bytes);
         encoder.string(&self.producer_name);
         encoder.fixed(&self.producer.0);
-        encoder.bytes(&self.statement.encode());
+        encoder.bytes(&statement);
         encoder.bytes(&self.claim_wire);
         encoder.bytes(&self.proof);
-        bytes
+        Ok(bytes)
     }
 
     pub fn from_portable_bytes(bytes: &[u8]) -> Result<Self, AttestationError>
@@ -587,10 +596,13 @@ impl<T, M> Attestation<T, M> {
         M: AttestedMethod<T>,
     {
         let mut decoder = Decoder::new(bytes);
-        if decoder.take(4).map_err(invalid_package)? != b"VAT3"
-            || decoder.u16().map_err(invalid_package)? != crate::v2::ABI_VERSION
-        {
-            return Err(AttestationError::InvalidStatement);
+        if decoder.take(4).map_err(invalid_package)? != b"VAT3" {
+            return Err(AttestationError::InvalidPackage(DecodeError::InvalidTag));
+        }
+        if decoder.u16().map_err(invalid_package)? != crate::v2::ABI_VERSION {
+            return Err(AttestationError::InvalidPackage(
+                DecodeError::InvalidVersion,
+            ));
         }
         let producer_name = decoder.string().map_err(invalid_package)?;
         let producer = ProducerId(decoder.fixed().map_err(invalid_package)?);
@@ -604,7 +616,7 @@ impl<T, M> Attestation<T, M> {
             M::decode_claim_wire(&claim_wire).ok_or(AttestationError::ClaimCommitmentMismatch)?;
         let proof = decoder.bytes().map_err(invalid_package)?;
         if !decoder.exhausted() {
-            return Err(AttestationError::InvalidStatement);
+            return Err(AttestationError::InvalidPackage(DecodeError::TrailingBytes));
         }
         Self::__from_runtime_wire(
             producer_name,
@@ -617,8 +629,16 @@ impl<T, M> Attestation<T, M> {
     }
 }
 
-fn invalid_package(_: DecodeError) -> AttestationError {
-    AttestationError::InvalidStatement
+fn invalid_package(error: DecodeError) -> AttestationError {
+    AttestationError::InvalidPackage(error)
+}
+
+fn validate_portable_field_len(len: usize) -> Result<(), AttestationError> {
+    if len > crate::v2::wire::MAX_BYTES {
+        Err(AttestationError::InvalidPackage(DecodeError::LimitExceeded))
+    } else {
+        Ok(())
+    }
 }
 
 fn claim_reply_commitment(statement: &AttestationStatementV3, claim_wire: &[u8]) -> Hash {
@@ -656,6 +676,7 @@ pub enum AttestationError {
     CannotSuspend,
     WrongStatementVersion,
     InvalidStatement,
+    InvalidPackage(DecodeError),
     WrongProducer,
     WrongSource,
     WrongMethod,
@@ -1289,7 +1310,7 @@ mod tests {
     #[test]
     fn portable_package_round_trips_and_rejects_trailing_or_tampered_claims() {
         let package = package(27);
-        let bytes = package.to_portable_bytes();
+        let bytes = package.to_portable_bytes().unwrap();
         let decoded = Attestation::<u64, Method>::from_portable_bytes(&bytes).unwrap();
         assert_eq!(decoded.unverified_preview(), &27);
         assert_eq!(decoded.statement(), package.statement());
@@ -1298,7 +1319,7 @@ mod tests {
         trailing.push(0);
         assert!(matches!(
             Attestation::<u64, Method>::from_portable_bytes(&trailing),
-            Err(AttestationError::InvalidStatement)
+            Err(AttestationError::InvalidPackage(DecodeError::TrailingBytes))
         ));
 
         let mut tampered = bytes;
@@ -1313,7 +1334,7 @@ mod tests {
             "proof bytes are opaque until verification"
         );
 
-        let mut claim_tampered = package.to_portable_bytes();
+        let mut claim_tampered = package.to_portable_bytes().unwrap();
         let claim_wire = Method::claim_wire(&27);
         let claim_position = claim_tampered
             .windows(claim_wire.len())
@@ -1323,6 +1344,30 @@ mod tests {
         assert!(matches!(
             Attestation::<u64, Method>::from_portable_bytes(&claim_tampered),
             Err(AttestationError::ClaimCommitmentMismatch)
+        ));
+    }
+
+    #[test]
+    fn portable_package_preserves_wire_errors_and_bounds_encoding() {
+        assert_eq!(
+            validate_portable_field_len(crate::v2::wire::MAX_BYTES + 1),
+            Err(AttestationError::InvalidPackage(DecodeError::LimitExceeded))
+        );
+
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(b"VAT3");
+        oversized.extend_from_slice(&crate::v2::ABI_VERSION.to_le_bytes());
+        Encoder(&mut oversized).u32((crate::v2::wire::MAX_BYTES + 1) as u32);
+        assert!(matches!(
+            Attestation::<u64, Method>::from_portable_bytes(&oversized),
+            Err(AttestationError::InvalidPackage(DecodeError::LimitExceeded))
+        ));
+
+        let mut wrong_magic = package(27).to_portable_bytes().unwrap();
+        wrong_magic[0] ^= 1;
+        assert!(matches!(
+            Attestation::<u64, Method>::from_portable_bytes(&wrong_magic),
+            Err(AttestationError::InvalidPackage(DecodeError::InvalidTag))
         ));
     }
 
