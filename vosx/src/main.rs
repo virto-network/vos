@@ -196,6 +196,7 @@ fn main() {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+    commands::build::maybe_run_canonical_rustc_wrapper();
 
     // Pre-parser: peek argv and decide whether to enter the
     // dynamic-dispatch path before handing off to clap. clap's

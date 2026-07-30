@@ -159,6 +159,7 @@ rustflags = [
     "-Zunstable-options",
     "-Zcrate-attr=no_std",
     "-Zcrate-attr=no_main",
+    "-Zremap-cwd-prefix=.",
     "-Aduplicate-macro-attributes",
     "-Aunused-attributes",
 ]
@@ -202,6 +203,7 @@ mod tests {
     fn templates_inject_platform_crate_attributes() {
         assert!(CONFIG.contains("-Zcrate-attr=no_std"));
         assert!(CONFIG.contains("-Zcrate-attr=no_main"));
+        assert!(CONFIG.contains("-Zremap-cwd-prefix=."));
         assert!(!counter_source("x").contains("#![no_std]"));
         assert!(crdt_source("x").contains("#[actor(crdt)]"));
     }

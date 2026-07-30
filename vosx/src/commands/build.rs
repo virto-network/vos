@@ -1,5 +1,6 @@
 //! Build a canonical actor PVM and its signed `.vos` v2 package.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -8,6 +9,9 @@ use vos::v2::{
     DeploymentSignatureV2, PackageDiagnosticsV2, PackageManifestV2, PackageRolePoliciesV2,
     ProducerId, ProgramId, V2Wire, VosPackageV2, artifact_hash,
 };
+
+const RUSTC_WRAPPER_MODE: &str = "VOSX_CANONICAL_RUSTC_WRAPPER";
+const RUSTC_WRAPPER_SOURCE_ROOT: &str = "VOSX_CANONICAL_SOURCE_ROOT";
 
 pub struct Args {
     pub program: PathBuf,
@@ -139,16 +143,24 @@ fn resolve_program_input(input: &Path) -> anyhow::Result<PathBuf> {
     if !input.is_dir() {
         return Ok(input.to_path_buf());
     }
-    let manifest_path = input.join("Cargo.toml");
+    let project = std::fs::canonicalize(input)
+        .with_context(|| format!("resolve actor project {}", input.display()))?;
+    let manifest_path = project.join("Cargo.toml");
     let manifest = std::fs::read_to_string(&manifest_path)
         .with_context(|| format!("read actor manifest {}", manifest_path.display()))?;
     let package_name = package_name_from_manifest(&manifest)?;
-    let build_root = actor_build_root(input)?;
+    let build_root = std::fs::canonicalize(actor_build_root(&project)?)
+        .with_context(|| format!("resolve actor build root for {}", input.display()))?;
+    let source_root = canonical_source_root(&build_root);
     let mut command = Command::new("cargo");
     command.args(["+nightly", "actor"]);
-    if build_root != input {
+    if build_root != project {
         command.args(["-p", &package_name]);
     }
+    command
+        .env("RUSTC_WRAPPER", std::env::current_exe()?)
+        .env(RUSTC_WRAPPER_MODE, "1")
+        .env(RUSTC_WRAPPER_SOURCE_ROOT, &source_root);
     let status = command
         .current_dir(&build_root)
         .status()
@@ -169,6 +181,76 @@ fn resolve_program_input(input: &Path) -> anyhow::Result<PathBuf> {
         );
     }
     Ok(elf)
+}
+
+fn canonical_source_root(build_root: &Path) -> &Path {
+    build_root
+        .ancestors()
+        .find(|candidate| candidate.join(".git").exists())
+        .unwrap_or(build_root)
+}
+
+/// Cargo invokes the current `vosx` executable as a rustc wrapper while
+/// compiling canonical actors. Cargo's generated `-Cmetadata` includes local
+/// source paths before rustc sees remapping flags, so merely remapping paths is
+/// insufficient: identical worktrees can still produce different code and
+/// `ProgramId`s. Strip that generated value, install a protocol-stable one,
+/// and remap the complete source repository rather than only the actor member.
+pub fn maybe_run_canonical_rustc_wrapper() {
+    if std::env::var_os(RUSTC_WRAPPER_MODE).is_none() {
+        return;
+    }
+    let mut arguments = std::env::args_os().skip(1);
+    let Some(rustc) = arguments.next() else {
+        eprintln!("vosx canonical rustc wrapper: missing rustc executable");
+        std::process::exit(1);
+    };
+    let Some(source_root) = std::env::var_os(RUSTC_WRAPPER_SOURCE_ROOT) else {
+        eprintln!("vosx canonical rustc wrapper: missing source root");
+        std::process::exit(1);
+    };
+    let status = Command::new(rustc)
+        .args(canonical_rustc_arguments(arguments, &source_root))
+        .status();
+    match status {
+        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+        Err(error) => {
+            eprintln!("vosx canonical rustc wrapper: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn canonical_rustc_arguments(
+    arguments: impl IntoIterator<Item = OsString>,
+    source_root: &OsStr,
+) -> Vec<OsString> {
+    let mut arguments = arguments.into_iter().peekable();
+    let mut canonical = Vec::new();
+    while let Some(argument) = arguments.next() {
+        if argument == "-C"
+            && arguments
+                .peek()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.starts_with("metadata="))
+        {
+            arguments.next();
+            continue;
+        }
+        if argument
+            .to_str()
+            .is_some_and(|value| value.starts_with("-Cmetadata="))
+        {
+            continue;
+        }
+        canonical.push(argument);
+    }
+    canonical.push(OsString::from("-Cmetadata=vos-actor-v2"));
+    let mut remap = OsString::from("--remap-path-prefix=");
+    remap.push(source_root);
+    remap.push("=vos-source");
+    canonical.push(remap);
+    canonical
 }
 
 fn actor_build_root(project: &Path) -> anyhow::Result<PathBuf> {
@@ -210,6 +292,30 @@ fn read_optional(path: Option<&Path>) -> anyhow::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_wrapper_replaces_path_dependent_cargo_metadata() {
+        let arguments = [
+            "--crate-name",
+            "counter",
+            "-C",
+            "metadata=checkout-specific",
+            "-Cmetadata=also-checkout-specific",
+            "--emit=link",
+        ]
+        .map(OsString::from);
+        assert_eq!(
+            canonical_rustc_arguments(arguments, OsStr::new("/checkout")),
+            [
+                "--crate-name",
+                "counter",
+                "--emit=link",
+                "-Cmetadata=vos-actor-v2",
+                "--remap-path-prefix=/checkout=vos-source",
+            ]
+            .map(OsString::from)
+        );
+    }
 
     #[test]
     fn project_output_uses_the_cargo_package_name() {
