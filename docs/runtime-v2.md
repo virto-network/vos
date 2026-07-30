@@ -388,10 +388,11 @@ The legacy `VosNode` actor loader deliberately refuses `.vos` v2 packages. It
 cannot extract and run the actor PVM directly without violating the root-tree
 service boundary. Catalog rows containing those packages remain installed but
 are skipped by both boot and runtime reconciliation, so an unsupported v2 row
-cannot prevent the rest of a space from starting. Production daemon
-installation remains disabled until that loader drives the pinned
-`vos-service.pvm`; this explicit refusal replaces silent execution through
-`RefinePayload`/`EffectLog`.
+cannot prevent the rest of a space from starting. The package classification
+also precedes every legacy Raft seed, probe, or join action, so a skipped row
+cannot change quorum membership. Production daemon installation remains
+disabled until that loader drives the pinned `vos-service.pvm`; this explicit
+refusal replaces silent execution through `RefinePayload`/`EffectLog`.
 
 The infrastructure PVM is committed at
 `services/vos-service/vos-service.pvm`; its identity is

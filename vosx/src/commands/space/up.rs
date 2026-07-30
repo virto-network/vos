@@ -1122,6 +1122,17 @@ fn spawn_installed_agents(
             );
             continue;
         }
+        // Classify a cached v2 package before Raft preparation. Joining or
+        // seeding a legacy Raft group and then declining to spawn its worker
+        // can strand that group without quorum.
+        if row_catalog_support(&a)? == RowCatalogSupport::UnsupportedV2Package {
+            tracing::warn!(
+                "skipping agent '{}' — signed v2 packages require the root-tree \
+                 vos-service.pvm host, which this daemon does not install yet",
+                a.instance_name,
+            );
+            continue;
+        }
         // Raft rows resolve their member seed first — see the
         // runtime reconciler for the full rationale.
         let raft_members = if consistency_from_u8(a.consistency) == Some(Consistency::Raft) {
@@ -1352,6 +1363,35 @@ enum RowConfig {
     UnsupportedV2Package,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RowCatalogSupport {
+    MissingBlob,
+    LegacyHost,
+    UnsupportedV2Package,
+}
+
+/// Inspect the content-addressed artifact before any Raft membership action.
+///
+/// This deliberately does not parse/transpile legacy artifacts: that remains
+/// after Raft admission so deferred rows do not pay the expensive work every
+/// reconciliation pass. Recognizing the package magic is sufficient to keep
+/// unsupported v2 rows out of the legacy membership protocol.
+fn row_catalog_support(a: &vos::registry::AgentRow) -> anyhow::Result<RowCatalogSupport> {
+    let program_hash = BlobHash(a.program_hash);
+    let Some(artifact) = blob_store::cache_get(&program_hash)? else {
+        return Ok(RowCatalogSupport::MissingBlob);
+    };
+    Ok(catalog_artifact_support(&artifact))
+}
+
+fn catalog_artifact_support(artifact: &[u8]) -> RowCatalogSupport {
+    if artifact.get(..4) == Some(b"VOSP") {
+        RowCatalogSupport::UnsupportedV2Package
+    } else {
+        RowCatalogSupport::LegacyHost
+    }
+}
+
 /// Build the `AgentConfig` for one registry row — blob lookup,
 /// transpile, persistence/replication wiring, init args, and
 /// on_start payloads. Shared by the boot-time
@@ -1454,7 +1494,7 @@ fn actor_blob_from_catalog(
     artifact: Vec<u8>,
     instance_name: &str,
 ) -> anyhow::Result<CatalogActorArtifact> {
-    if artifact.get(..4) == Some(b"VOSP") {
+    if catalog_artifact_support(&artifact) == RowCatalogSupport::UnsupportedV2Package {
         return Ok(CatalogActorArtifact::UnsupportedV2Package);
     }
     if artifact.get(..3) == Some(b"JAR") {
@@ -1957,6 +1997,32 @@ fn reconcile_installed_agents(
             }
             continue;
         }
+        // This must run before `raft_members_for_row`: an unsupported v2 row
+        // must never seed or join a legacy Raft group whose worker cannot
+        // subsequently start. Already-running rows above avoid rereading
+        // their complete content-addressed artifact on every pass.
+        match row_catalog_support(&a) {
+            Ok(RowCatalogSupport::UnsupportedV2Package) => {
+                if damped.insert(key(RowNote::Failed)) {
+                    tracing::warn!(
+                        "skipping agent '{}' — signed v2 packages require the root-tree \
+                         vos-service.pvm host, which this daemon does not install yet",
+                        a.instance_name,
+                    );
+                }
+                continue;
+            }
+            Ok(RowCatalogSupport::MissingBlob | RowCatalogSupport::LegacyHost) => {}
+            Err(e) => {
+                if damped.insert(key(RowNote::Failed)) {
+                    tracing::warn!(
+                        "agent '{}' catalog preflight failed before Raft preparation: {e}",
+                        a.instance_name,
+                    );
+                }
+                continue;
+            }
+        }
         // Raft rows run the membership protocol BEFORE the
         // (expensive) transpile: a deferred row must not
         // re-transpile every 2 s, and the join handshake must only
@@ -2120,6 +2186,14 @@ mod tests {
 
     #[test]
     fn signed_v2_packages_are_skippable_without_becoming_legacy_executables() {
+        assert_eq!(
+            catalog_artifact_support(b"VOSP\x02\0package"),
+            RowCatalogSupport::UnsupportedV2Package,
+        );
+        assert_eq!(
+            catalog_artifact_support(b"JAR\0canonical"),
+            RowCatalogSupport::LegacyHost,
+        );
         assert_eq!(
             actor_blob_from_catalog(b"VOSP\x02\0package".to_vec(), "counter").unwrap(),
             CatalogActorArtifact::UnsupportedV2Package,
