@@ -330,7 +330,7 @@ impl LocalWorkSchedulerV2 {
                     } else {
                         let checkpoint = workflow
                             .as_ref()
-                            .expect("validated continuation has a workflow checkpoint");
+                            .ok_or(ScheduleErrorV2::InvalidWorkflowStep(request.invocation))?;
                         if !header.crdt_heads.iter().any(|head| {
                             current.contains_ancestor(*head, checkpoint.transition_hash)
                         }) {

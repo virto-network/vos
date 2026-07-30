@@ -2094,6 +2094,31 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
         AccumulationResultV2::Installed(_)
     ));
 
+    let missing_workflow = InvocationId([73; 32]);
+    assert_eq!(
+        LocalWorkSchedulerV2::prepare(
+            service.accumulate_host(),
+            LocalWorkRequestV2 {
+                invocation: missing_workflow,
+                workflow_step: 1,
+                logical_timeslot: 1,
+                target: seed.target,
+                method: "increment".into(),
+                arguments: vec![],
+                origin: Origin::Anonymous,
+                authorization: AuthorizationEvidenceV2::Public,
+                causal_parent: None,
+                parent_call: None,
+                causal_context: None,
+                awaited_reply: None,
+                imported_blobs: vec![],
+                proof_requested: false,
+            },
+        ),
+        Err(ScheduleErrorV2::InvalidWorkflowStep(missing_workflow)),
+        "a direct CRDT resume without a committed workflow row fails closed"
+    );
+
     let prepare = |store: &LocalJamStoreV2, invocation, timeslot, method: &str| {
         let mut arguments = vec![vos::value::TAG_DYNAMIC];
         arguments.extend_from_slice(&Msg::new(method).with("amount", 3u64).encode());
