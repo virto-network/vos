@@ -1442,8 +1442,9 @@ fn actor_blob_from_catalog(artifact: Vec<u8>, instance_name: &str) -> anyhow::Re
         ) {
             anyhow::bail!("{instance_name} deployment signature is invalid");
         }
-        javm::program::parse_blob(&package.actor_pvm)
-            .ok_or_else(|| anyhow::anyhow!("{instance_name} package actor PVM is invalid"))?;
+        vos::v2::validate_actor_program_layout(&package.actor_pvm).map_err(|error| {
+            anyhow::anyhow!("{instance_name} package actor PVM layout is invalid: {error}")
+        })?;
         return Ok(package.actor_pvm);
     }
     if artifact.get(..3) == Some(b"JAR") {
@@ -2095,7 +2096,104 @@ fn sweep_orphan_redbs(data_dir: &std::path::Path, live: &std::collections::HashS
 #[cfg(test)]
 mod tests {
     use super::*;
+    use javm::cap::Access;
+    use javm::program::{CapEntryType, CapManifestEntry, build_blob, parse_blob};
+    use libp2p::identity::Keypair;
+    use vos::metadata::ActorMeta;
     use vos::network::{RaftRole, RaftStatusReply};
+    use vos::v2::{
+        DeploymentSignatureV2, PackageManifestV2, PackageRolePoliciesV2, ProducerId, ProgramId,
+        V2Wire, VosPackageV2, artifact_hash,
+    };
+
+    const PACKAGE_META: ActorMeta = ActorMeta {
+        actor_name: "packaged",
+        messages: &[],
+        constructor: &[],
+        kind: 0,
+        caps: &[],
+        cli_methods: &[],
+        doc: "",
+        crdt: false,
+    };
+
+    fn signed_package_for(actor_pvm: Vec<u8>) -> VosPackageV2 {
+        let (buffer, length) = vos::metadata::encode::<512>(&PACKAGE_META);
+        let schemas = buffer[..length].to_vec();
+        let metadata = vos::metadata::decode(&schemas).unwrap();
+        let role_policies = PackageRolePoliciesV2::from_metadata(&metadata)
+            .unwrap()
+            .encode();
+        let interfaces = Vec::new();
+        let keypair = Keypair::generate_ed25519();
+        let public_key = keypair.public().encode_protobuf();
+        let mut package = VosPackageV2 {
+            manifest: PackageManifestV2 {
+                name: "packaged".into(),
+                version: "1.0.0".into(),
+                service_abi: vos::v2::ABI_VERSION,
+                snapshot_version: vos::v2::SNAPSHOT_VERSION,
+                execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+                service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+                actor_program: ProgramId::of_pvm(&actor_pvm),
+                crdt: false,
+                interfaces_hash: artifact_hash(b"interfaces", &interfaces),
+                role_policies_hash: artifact_hash(b"role-policies", &role_policies),
+                schemas_hash: artifact_hash(b"schemas", &schemas),
+            },
+            actor_pvm,
+            generated_interfaces: interfaces,
+            role_policies,
+            schemas,
+            diagnostics: None,
+            deployment_signature: DeploymentSignatureV2 {
+                producer: ProducerId::of_public_key(&public_key),
+                public_key,
+                signature: vec![0],
+            },
+        };
+        package.deployment_signature.signature = keypair.sign(&package.signing_message()).unwrap();
+        package
+    }
+
+    #[test]
+    fn package_install_uses_the_exact_canonical_actor_pvm() {
+        let actor_pvm = grey_transpiler::assembler::Assembler::new().build();
+        let package = signed_package_for(actor_pvm.clone());
+
+        assert_eq!(
+            actor_blob_from_catalog(package.encode(), "packaged").unwrap(),
+            actor_pvm
+        );
+    }
+
+    #[test]
+    fn package_install_rejects_reserved_actor_capability_slots() {
+        let actor_pvm = grey_transpiler::assembler::Assembler::new().build();
+        let parsed = parse_blob(&actor_pvm).unwrap();
+        let mut caps = parsed.caps.clone();
+        caps.push(CapManifestEntry {
+            cap_index: vos::v2::ACTOR_CALLABLE_BASE_SLOT,
+            cap_type: CapEntryType::Data,
+            base_page: 0,
+            page_count: 0,
+            init_access: Access::RW,
+            data_offset: 0,
+            data_len: 0,
+        });
+        let invalid = build_blob(
+            parsed.header.memory_pages,
+            parsed.header.invoke_cap,
+            parsed.header.stack_top,
+            &caps,
+            parsed.data_section,
+        );
+        let package = signed_package_for(invalid);
+
+        let error = actor_blob_from_catalog(package.encode(), "packaged").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("layout"), "{message}");
+    }
 
     #[test]
     fn agent_policies_come_from_local_toml() {

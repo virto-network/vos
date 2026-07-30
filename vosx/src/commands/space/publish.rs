@@ -266,6 +266,7 @@ mod tests {
             mode: 0,
             attested: false,
             space_role: None,
+            actor_role: None,
         }],
         constructor: &[],
         kind: 0,
@@ -297,7 +298,7 @@ mod tests {
                 service_abi: vos::v2::ABI_VERSION,
                 snapshot_version: vos::v2::SNAPSHOT_VERSION,
                 execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
-                service_program: ProgramId([7; 32]),
+                service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
                 actor_program: ProgramId::of_pvm(&actor_pvm),
                 crdt: false,
                 interfaces_hash: artifact_hash(b"interfaces", &interfaces),
@@ -324,12 +325,13 @@ mod tests {
         let package = signed_package();
         let bytes = package.encode();
         let source_hash = BlobHash::of(&bytes);
-        let (catalog_hash, catalog_bytes, metadata) =
+        let (catalog_hash, catalog_bytes, metadata, crdt) =
             canonical_program("counter", "2.0.0", source_hash, bytes.clone()).unwrap();
 
         assert_eq!(catalog_hash, source_hash);
         assert_eq!(catalog_bytes, bytes);
         assert_eq!(metadata, Some(package.schemas));
+        assert!(!crdt);
         assert_ne!(catalog_hash, BlobHash::of(&package.actor_pvm));
     }
 
