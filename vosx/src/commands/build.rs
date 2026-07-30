@@ -156,6 +156,10 @@ fn resolve_program_input(input: &Path) -> anyhow::Result<PathBuf> {
     let build_root = std::fs::canonicalize(actor_build_root(&project)?)
         .with_context(|| format!("resolve actor build root for {}", input.display()))?;
     let source_root = canonical_source_root(&build_root);
+    // Own the artifact location. Inheriting CARGO_TARGET_DIR or a configured
+    // target-dir and then reading build_root/target could sign an unrelated
+    // stale ELF even though Cargo successfully built fresh code elsewhere.
+    let target_dir = build_root.join("target");
     let mut command = Command::new("cargo");
     command.args(["+nightly", "actor"]);
     if build_root != project {
@@ -164,7 +168,8 @@ fn resolve_program_input(input: &Path) -> anyhow::Result<PathBuf> {
     command
         .env("RUSTC_WRAPPER", std::env::current_exe()?)
         .env(RUSTC_WRAPPER_MODE, "1")
-        .env(RUSTC_WRAPPER_SOURCE_ROOT, &source_root);
+        .env(RUSTC_WRAPPER_SOURCE_ROOT, &source_root)
+        .env("CARGO_TARGET_DIR", &target_dir);
     let status = command
         .current_dir(&build_root)
         .status()
@@ -175,8 +180,8 @@ fn resolve_program_input(input: &Path) -> anyhow::Result<PathBuf> {
             input.display()
         );
     }
-    let elf = build_root
-        .join("target/riscv64em-javm/release")
+    let elf = target_dir
+        .join("riscv64em-javm/release")
         .join(format!("{actor_target_name}.elf"));
     if !elf.is_file() {
         bail!(
