@@ -27,6 +27,11 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
+    let keypair = crate::identity::load_or_create()?;
+    run_with_signer(args, &keypair)
+}
+
+fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::Result<()> {
     let program = resolve_program_input(&args.program)?;
     let input = std::fs::read(&program).with_context(|| format!("read {}", program.display()))?;
     let is_pvm = program.extension().and_then(|x| x.to_str()) == Some("pvm");
@@ -84,7 +89,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let service_program = vos::v2::VOS_SERVICE_PROGRAM_ID;
     let actor_program = ProgramId::of_pvm(&actor_pvm);
 
-    let keypair = crate::identity::load_or_create()?;
     let public_key = keypair.public().encode_protobuf();
     let producer = ProducerId::of_public_key(&public_key);
     let mut package = VosPackageV2 {
@@ -293,6 +297,30 @@ fn read_optional(path: Option<&Path>) -> anyhow::Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "vosx-v2-build-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn canonical_wrapper_replaces_path_dependent_cargo_metadata() {
         let arguments = [
@@ -343,5 +371,71 @@ mod tests {
             root.join("target/riscv64em-javm/release")
                 .join(format!("{}.elf", "v2-counter".replace('-', "_")))
         );
+    }
+
+    #[test]
+    fn repeated_builds_emit_one_identical_actor_pvm_and_package() {
+        use vos::metadata::{ActorMeta, MessageMeta};
+
+        const META: ActorMeta = ActorMeta {
+            actor_name: "deterministic-counter",
+            messages: &[MessageMeta {
+                name: "value",
+                is_query: true,
+                fields: &[],
+                returns: "u64",
+                doc: "",
+                timeout_ms: 0,
+                mode: 0,
+                attested: false,
+                space_role: None,
+                actor_role: None,
+            }],
+            constructor: &[],
+            kind: 0,
+            caps: &[],
+            cli_methods: &[],
+            doc: "",
+            crdt: false,
+        };
+
+        let temp = TempDir::new("deterministic");
+        let actor_pvm = grey_transpiler::assembler::Assembler::new().build();
+        let (metadata, metadata_len) = vos::metadata::encode::<512>(&META);
+        std::fs::write(temp.0.join("actor.pvm"), &actor_pvm).unwrap();
+        std::fs::write(temp.0.join("actor.meta"), &metadata[..metadata_len]).unwrap();
+        let build_args = |out_dir| Args {
+            program: temp.0.join("actor.pvm"),
+            name: None,
+            version: "2.0.0".into(),
+            out_dir,
+            interfaces: None,
+            role_policies: None,
+            schemas: Some(temp.0.join("actor.meta")),
+            source_map: None,
+            include_elf: false,
+            crdt: false,
+        };
+        let first = temp.0.join("first");
+        let second = temp.0.join("second");
+        let signer = libp2p::identity::Keypair::generate_ed25519();
+
+        run_with_signer(build_args(first.clone()), &signer).unwrap();
+        run_with_signer(build_args(second.clone()), &signer).unwrap();
+
+        assert_eq!(
+            std::fs::read(first.join("deterministic-counter.pvm")).unwrap(),
+            actor_pvm,
+        );
+        assert_eq!(
+            std::fs::read(first.join("deterministic-counter.pvm")).unwrap(),
+            std::fs::read(second.join("deterministic-counter.pvm")).unwrap(),
+        );
+        assert_eq!(
+            std::fs::read(first.join("deterministic-counter.vos")).unwrap(),
+            std::fs::read(second.join("deterministic-counter.vos")).unwrap(),
+        );
+        assert!(!first.join("deterministic-counter.attestation.pvm").exists());
+        assert_eq!(std::fs::read_dir(first).unwrap().count(), 2);
     }
 }
