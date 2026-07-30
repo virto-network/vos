@@ -9,10 +9,10 @@
 //! either path, no in-tree reference for actor consumers to
 //! depend on.
 //!
-//! The wire ABI matches `zkpvm-precompiles`: ID 100, args
-//! `φ[10]=h_ptr (64B)`, `φ[11]=m_ptr (128B)`, `φ[12]=t_low`,
-//! `φ[7]=f` flag. When the zkpvm chip lands on master, the same
-//! actor binary lights up the chip path with no source changes.
+//! The JAR protocol ABI uses ID 100 with `φ[7]=h_ptr (64B)`,
+//! `φ[8]=m_ptr (128B)`, `φ[9]=t_low`, and `φ[10]=f`. When the
+//! zkpvm chip lands on master, the same actor binary lights up
+//! the chip path with no source changes.
 //!
 //! **ABI limit**: only the low 64 bits of the blake2b byte
 //! counter are passed (`t_low`). Inputs ≥ 2^64 bytes per hash

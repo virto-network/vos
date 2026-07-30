@@ -2842,13 +2842,38 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
         .and_then(|write| write.value.clone())
         .expect("checkpoint commits the mutation before await");
     assert_eq!(u32::decode(&checkpoint_state), 1);
-    let checkpoint_outcome = committed
-        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
-            work: first_work.clone(),
-            transition: first.clone(),
-            provided_blobs: first_candidate_blobs,
-        }))
-        .unwrap();
+    let checkpoint_request = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+        work: first_work.clone(),
+        transition: first.clone(),
+        provided_blobs: first_candidate_blobs,
+    });
+    let mut interpreted_host = committed.accumulate_host().clone();
+    let mut recompiled_host = interpreted_host.clone();
+    let interpreted_accumulate = service
+        .accumulate_with_backend(
+            &checkpoint_request.encode(),
+            5_000_000_000,
+            &mut interpreted_host,
+            javm::PvmBackend::ForceInterpreter,
+        )
+        .expect("the canonical Accumulate guest runs in the interpreter");
+    let recompiled_accumulate = service
+        .accumulate_with_backend(
+            &checkpoint_request.encode(),
+            5_000_000_000,
+            &mut recompiled_host,
+            javm::PvmBackend::ForceRecompiler,
+        )
+        .expect("the canonical Accumulate guest runs in the recompiler");
+    assert_eq!(
+        interpreted_accumulate, recompiled_accumulate,
+        "the physical IC-5 output and gas accounting are backend-independent"
+    );
+    assert_eq!(
+        interpreted_host, recompiled_host,
+        "both backends commit the same guest-owned service image"
+    );
+    let checkpoint_outcome = committed.accumulate(&checkpoint_request).unwrap();
     let AccumulationResultV2::Accepted {
         receipt: checkpoint_receipt,
         published,
