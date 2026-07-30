@@ -12,6 +12,26 @@ use vos::v2::{
 
 const RUSTC_WRAPPER_MODE: &str = "VOSX_CANONICAL_RUSTC_WRAPPER";
 const RUSTC_WRAPPER_SOURCE_ROOT: &str = "VOSX_CANONICAL_SOURCE_ROOT";
+const RUSTC_UNIT_METADATA_DOMAIN: &[u8] = b"vos/rustc-unit-metadata/v2";
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RustcUnitIdentity {
+    package_name: OsString,
+    package_version: OsString,
+    package_repository: OsString,
+    manifest_dir: Option<PathBuf>,
+}
+
+impl RustcUnitIdentity {
+    fn from_environment() -> Self {
+        Self {
+            package_name: std::env::var_os("CARGO_PKG_NAME").unwrap_or_default(),
+            package_version: std::env::var_os("CARGO_PKG_VERSION").unwrap_or_default(),
+            package_repository: std::env::var_os("CARGO_PKG_REPOSITORY").unwrap_or_default(),
+            manifest_dir: std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from),
+        }
+    }
+}
 
 pub struct Args {
     pub program: PathBuf,
@@ -218,8 +238,10 @@ pub fn maybe_run_canonical_rustc_wrapper() {
         eprintln!("vosx canonical rustc wrapper: missing source root");
         std::process::exit(1);
     };
+    let arguments = arguments.collect::<Vec<_>>();
+    let unit = RustcUnitIdentity::from_environment();
     let status = Command::new(rustc)
-        .args(canonical_rustc_arguments(arguments, &source_root))
+        .args(canonical_rustc_arguments(arguments, &source_root, &unit))
         .status();
     match status {
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
@@ -233,7 +255,10 @@ pub fn maybe_run_canonical_rustc_wrapper() {
 fn canonical_rustc_arguments(
     arguments: impl IntoIterator<Item = OsString>,
     source_root: &OsStr,
+    unit: &RustcUnitIdentity,
 ) -> Vec<OsString> {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    let metadata = canonical_rustc_unit_metadata(&arguments, source_root, unit);
     let mut arguments = arguments.into_iter().peekable();
     let mut canonical = Vec::new();
     while let Some(argument) = arguments.next() {
@@ -254,12 +279,151 @@ fn canonical_rustc_arguments(
         }
         canonical.push(argument);
     }
-    canonical.push(OsString::from("-Cmetadata=vos-actor-v2"));
+    canonical.push(OsString::from(format!("-Cmetadata={metadata}")));
     let mut remap = OsString::from("--remap-path-prefix=");
     remap.push(source_root);
     remap.push("=vos-source");
     canonical.push(remap);
     canonical
+}
+
+/// Derive rustc's crate disambiguator from stable Cargo-unit inputs.
+///
+/// Cargo's own metadata contains absolute path-package identities, so it
+/// cannot be used verbatim for canonical builds. A single replacement for
+/// every crate is also invalid: two versions or sources of the same crate
+/// would receive the same StableCrateId. This digest keeps the unit identity
+/// while normalizing checkout- and Cargo-home-dependent paths.
+fn canonical_rustc_unit_metadata(
+    arguments: &[OsString],
+    source_root: &OsStr,
+    unit: &RustcUnitIdentity,
+) -> String {
+    let source_root = Path::new(source_root);
+    let mut identity = Vec::new();
+    push_metadata_part(
+        &mut identity,
+        b"package-name",
+        unit.package_name.as_os_str(),
+    );
+    push_metadata_part(
+        &mut identity,
+        b"package-version",
+        unit.package_version.as_os_str(),
+    );
+    push_metadata_part(
+        &mut identity,
+        b"package-repository",
+        unit.package_repository.as_os_str(),
+    );
+    let package_source = unit
+        .manifest_dir
+        .as_deref()
+        .map(|manifest_dir| canonical_package_source(manifest_dir, source_root))
+        .unwrap_or_else(|| OsString::from("cargo-package-unknown"));
+    push_metadata_part(&mut identity, b"package-source", &package_source);
+
+    let mut arguments = arguments.iter().peekable();
+    while let Some(argument) = arguments.next() {
+        if argument == "-C"
+            && arguments
+                .peek()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| {
+                    value.starts_with("metadata=") || value.starts_with("extra-filename=")
+                })
+        {
+            arguments.next();
+            continue;
+        }
+        if argument.to_str().is_some_and(|value| {
+            value.starts_with("-Cmetadata=") || value.starts_with("-Cextra-filename=")
+        }) {
+            continue;
+        }
+        if argument == "--extern" {
+            if let Some(extern_crate) = arguments.next() {
+                let extern_crate = extern_crate.to_string_lossy();
+                let name = extern_crate
+                    .split_once('=')
+                    .map_or(extern_crate.as_ref(), |(name, _)| name);
+                push_metadata_part(&mut identity, b"rustc-extern", OsStr::new(name));
+            }
+            continue;
+        }
+        if let Some(extern_crate) = argument
+            .to_str()
+            .and_then(|value| value.strip_prefix("--extern="))
+        {
+            let name = extern_crate
+                .split_once('=')
+                .map_or(extern_crate, |(name, _)| name);
+            push_metadata_part(&mut identity, b"rustc-extern", OsStr::new(name));
+            continue;
+        }
+        let normalized =
+            normalize_rustc_argument(argument, source_root, unit.manifest_dir.as_deref());
+        push_metadata_part(&mut identity, b"rustc-argument", &normalized);
+    }
+
+    let hash = vos::crypto::blake2b_hash::<16>(RUSTC_UNIT_METADATA_DOMAIN, &[&identity]);
+    format!("vos-actor-v2-{}", hex::encode(hash))
+}
+
+fn push_metadata_part(output: &mut Vec<u8>, label: &[u8], value: &OsStr) {
+    push_metadata_bytes(output, label);
+    push_metadata_bytes(output, value.to_string_lossy().as_bytes());
+}
+
+fn push_metadata_bytes(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    output.extend_from_slice(value);
+}
+
+fn normalize_rustc_argument(
+    argument: &OsStr,
+    source_root: &Path,
+    manifest_dir: Option<&Path>,
+) -> OsString {
+    let mut value = argument.to_string_lossy().replace('\\', "/");
+    let source_root = source_root.to_string_lossy().replace('\\', "/");
+    if !source_root.is_empty() {
+        value = value.replace(&source_root, "vos-source");
+    }
+    if let Some(manifest_dir) = manifest_dir {
+        let manifest_dir = manifest_dir.to_string_lossy().replace('\\', "/");
+        if !manifest_dir.is_empty()
+            && Path::new(manifest_dir.as_str())
+                .strip_prefix(source_root.as_str())
+                .is_err()
+        {
+            value = value.replace(&manifest_dir, "vos-package");
+        }
+    }
+    OsString::from(value)
+}
+
+fn canonical_package_source(manifest_dir: &Path, source_root: &Path) -> OsString {
+    if let Ok(relative) = manifest_dir.strip_prefix(source_root) {
+        return OsString::from(format!(
+            "workspace/{}",
+            relative.to_string_lossy().replace('\\', "/")
+        ));
+    }
+
+    let normalized = manifest_dir.to_string_lossy().replace('\\', "/");
+    for marker in ["/registry/src/", "/git/checkouts/"] {
+        if let Some(index) = normalized.find(marker) {
+            // The suffix contains Cargo's stable registry/repository identity
+            // and package/checkout identity, but not CARGO_HOME.
+            return OsString::from(format!("cargo/{}", &normalized[index + marker.len()..]));
+        }
+    }
+
+    // Toolchain and unusual external path packages have no stable absolute
+    // location. Package name/version/repository and normalized rustc inputs
+    // still distinguish their compilation units without embedding that path.
+    OsString::from("external")
 }
 
 fn actor_build_root(project: &Path) -> anyhow::Result<PathBuf> {
@@ -336,6 +500,12 @@ mod tests {
 
     #[test]
     fn canonical_wrapper_replaces_path_dependent_cargo_metadata() {
+        let unit = RustcUnitIdentity {
+            package_name: "counter".into(),
+            package_version: "1.0.0".into(),
+            manifest_dir: Some("/checkout/actors/counter".into()),
+            ..Default::default()
+        };
         let arguments = [
             "--crate-name",
             "counter",
@@ -345,16 +515,81 @@ mod tests {
             "--emit=link",
         ]
         .map(OsString::from);
-        assert_eq!(
-            canonical_rustc_arguments(arguments, OsStr::new("/checkout")),
+        let canonical = canonical_rustc_arguments(arguments, OsStr::new("/checkout"), &unit);
+        assert_eq!(&canonical[..3], ["--crate-name", "counter", "--emit=link"]);
+        assert!(
+            canonical[3]
+                .to_string_lossy()
+                .starts_with("-Cmetadata=vos-actor-v2-")
+        );
+        assert_eq!(canonical[4], "--remap-path-prefix=/checkout=vos-source");
+    }
+
+    #[test]
+    fn canonical_metadata_is_checkout_independent() {
+        let arguments = |checkout: &str| {
             [
-                "--crate-name",
-                "counter",
-                "--emit=link",
-                "-Cmetadata=vos-actor-v2",
-                "--remap-path-prefix=/checkout=vos-source",
+                "--crate-name".into(),
+                "counter".into(),
+                format!("{checkout}/actors/counter/src/lib.rs").into(),
+                "--out-dir".into(),
+                format!("{checkout}/target/release/deps").into(),
+                "-Cmetadata=checkout-specific".into(),
+                format!("-Cextra-filename=-{}", checkout.trim_start_matches('/')).into(),
+                "--extern".into(),
+                format!("vos={checkout}/target/release/deps/libvos-checkout.rlib").into(),
+                "--cfg".into(),
+                "feature=\"default\"".into(),
             ]
-            .map(OsString::from)
+        };
+        let unit = |checkout: &str| RustcUnitIdentity {
+            package_name: "counter".into(),
+            package_version: "1.0.0".into(),
+            manifest_dir: Some(format!("{checkout}/actors/counter").into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            canonical_rustc_unit_metadata(
+                &arguments("/checkout-a"),
+                OsStr::new("/checkout-a"),
+                &unit("/checkout-a"),
+            ),
+            canonical_rustc_unit_metadata(
+                &arguments("/checkout-b"),
+                OsStr::new("/checkout-b"),
+                &unit("/checkout-b"),
+            ),
+        );
+    }
+
+    #[test]
+    fn canonical_metadata_distinguishes_cargo_units() {
+        let arguments = ["--crate-name", "shared", "src/lib.rs"].map(OsString::from);
+        let unit = |version: &str, source: &str| RustcUnitIdentity {
+            package_name: "shared".into(),
+            package_version: version.into(),
+            manifest_dir: Some(source.into()),
+            ..Default::default()
+        };
+        let metadata = |version: &str, source: &str| {
+            canonical_rustc_unit_metadata(
+                &arguments,
+                OsStr::new("/workspace"),
+                &unit(version, source),
+            )
+        };
+
+        assert_ne!(
+            metadata("1.0.0", "/cargo/registry/src/index/shared-1.0.0"),
+            metadata("2.0.0", "/cargo/registry/src/index/shared-2.0.0"),
+        );
+        assert_ne!(
+            metadata("1.0.0", "/cargo/registry/src/index-a/shared-1.0.0"),
+            metadata("1.0.0", "/cargo/registry/src/index-b/shared-1.0.0"),
+        );
+        assert_ne!(
+            metadata("1.0.0", "/workspace/one/shared"),
+            metadata("1.0.0", "/workspace/two/shared"),
         );
     }
 
