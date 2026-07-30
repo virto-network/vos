@@ -1178,6 +1178,13 @@ fn spawn_installed_agents(
                     a.consistency,
                 );
             }
+            RowConfig::UnsupportedV2Package => {
+                tracing::warn!(
+                    "skipping agent '{}' — signed v2 packages require the root-tree \
+                     vos-service.pvm host, which this daemon does not install yet",
+                    a.instance_name,
+                );
+            }
         }
     }
 
@@ -1339,6 +1346,10 @@ enum RowConfig {
     MissingBlob,
     /// Unrecognized consistency discriminant.
     BadConsistency,
+    /// Signed v2 packages cannot execute through the legacy actor host. Keep
+    /// the catalog row installed for the future v2 host, but never let it
+    /// prevent the rest of the space from booting.
+    UnsupportedV2Package,
 }
 
 /// Build the `AgentConfig` for one registry row — blob lookup,
@@ -1356,7 +1367,12 @@ fn agent_config_from_row(
         Some(b) => b,
         None => return Ok(RowConfig::MissingBlob),
     };
-    let blob = actor_blob_from_catalog(artifact, &a.instance_name)?;
+    let blob = match actor_blob_from_catalog(artifact, &a.instance_name)? {
+        CatalogActorArtifact::LegacyExecutable(blob) => blob,
+        CatalogActorArtifact::UnsupportedV2Package => {
+            return Ok(RowConfig::UnsupportedV2Package);
+        }
+    };
 
     let Some(consistency) = consistency_from_u8(a.consistency) else {
         return Ok(RowConfig::BadConsistency);
@@ -1428,19 +1444,26 @@ fn agent_config_from_row(
 /// generic-service, deployment, policy, and guest-Accumulate semantics. Fail
 /// closed until this daemon path installs the complete package through
 /// `vos-service.pvm`.
-fn actor_blob_from_catalog(artifact: Vec<u8>, instance_name: &str) -> anyhow::Result<Vec<u8>> {
+#[derive(Debug, Eq, PartialEq)]
+enum CatalogActorArtifact {
+    LegacyExecutable(Vec<u8>),
+    UnsupportedV2Package,
+}
+
+fn actor_blob_from_catalog(
+    artifact: Vec<u8>,
+    instance_name: &str,
+) -> anyhow::Result<CatalogActorArtifact> {
     if artifact.get(..4) == Some(b"VOSP") {
-        anyhow::bail!(
-            "{instance_name} is a VOS v2 package and cannot run in the legacy actor runtime; \
-             install it through the root-tree vos-service.pvm host"
-        );
+        return Ok(CatalogActorArtifact::UnsupportedV2Package);
     }
     if artifact.get(..3) == Some(b"JAR") {
         javm::program::parse_blob(&artifact)
             .ok_or_else(|| anyhow::anyhow!("{instance_name} canonical PVM is invalid"))?;
-        return Ok(artifact);
+        return Ok(CatalogActorArtifact::LegacyExecutable(artifact));
     }
     grey_transpiler::link_elf(&artifact)
+        .map(CatalogActorArtifact::LegacyExecutable)
         .map_err(|error| anyhow::anyhow!("transpile legacy {instance_name}: {error:?}"))
 }
 
@@ -2028,6 +2051,15 @@ fn reconcile_installed_agents(
                     );
                 }
             }
+            Ok(RowConfig::UnsupportedV2Package) => {
+                if damped.insert(key(RowNote::Failed)) {
+                    tracing::warn!(
+                        "skipping agent '{}' — signed v2 packages require the root-tree \
+                         vos-service.pvm host, which this daemon does not install yet",
+                        a.instance_name,
+                    );
+                }
+            }
             Err(e) => {
                 if damped.insert(key(RowNote::Failed)) {
                     tracing::warn!("agent '{}' failed to spawn: {e}", a.instance_name);
@@ -2087,13 +2119,10 @@ mod tests {
     use vos::network::{RaftRole, RaftStatusReply};
 
     #[test]
-    fn signed_v2_packages_never_fall_through_to_the_legacy_actor_runtime() {
-        let error = actor_blob_from_catalog(b"VOSP\x02\0package".to_vec(), "counter")
-            .expect_err("v2 package must retain guest-owned service semantics");
-        assert!(
-            error
-                .to_string()
-                .contains("cannot run in the legacy actor runtime")
+    fn signed_v2_packages_are_skippable_without_becoming_legacy_executables() {
+        assert_eq!(
+            actor_blob_from_catalog(b"VOSP\x02\0package".to_vec(), "counter").unwrap(),
+            CatalogActorArtifact::UnsupportedV2Package,
         );
     }
 
