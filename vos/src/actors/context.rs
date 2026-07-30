@@ -1725,10 +1725,6 @@ mod tests {
             name: name.into(),
             parent,
             program,
-            state: alloc::vec![],
-            causal_states: alloc::vec![],
-            next_crdt_ordinal: 0,
-            suspended: false,
         };
         let mut ctx: Context<TestActor> = Context::new(ServiceId(0));
         ctx.__set_actor_id(root);

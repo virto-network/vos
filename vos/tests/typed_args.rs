@@ -534,6 +534,30 @@ fn bound_handle_methods_do_not_take_an_invoker_argument() {
     assert_eq!(invoker.actor, Some(actor));
 }
 
+#[test]
+fn bound_attested_handles_bind_the_exact_supplied_claim_wire() {
+    use vos::ActorReference;
+
+    // `Option<MembershipToken>::Some` has the canonical payload `[1]`.
+    // rkyv accepts trailing bytes for the zero-sized token, so a generated
+    // handle must commit to the supplied Value wire before decoding rather
+    // than re-encoding the decoded preview.
+    let canonical = Value::Bytes(vec![1]);
+    let mut result = attested_value_result("optional_token", canonical);
+    result.value = Value::Bytes(vec![1, 0xaa]);
+
+    let mut invoker = MockAttestationInvoker {
+        result: Some(result),
+    };
+    let mut handle = VaultRef::bind(ActorId([7; 32]), &mut invoker);
+    assert!(matches!(
+        vos::block_on(handle.optional_token(true)),
+        Err(ClientError::InvalidAttestation(
+            vos::AttestationError::ClaimCommitmentMismatch
+        ))
+    ));
+}
+
 struct BoundMockInvoker {
     reply: Value,
     actor: Option<ActorId>,
@@ -583,6 +607,17 @@ impl AttestationInvoker for MockAttestationInvoker {
     fn invoke_attested(
         &mut self,
         _target: ServiceId,
+        _payload: Vec<u8>,
+    ) -> impl core::future::Future<
+        Output = core::result::Result<AttestedInvocationResult, ClientError>,
+    > + '_ {
+        let result = self.result.take().ok_or(ClientError::Unreachable);
+        async move { result }
+    }
+
+    fn invoke_actor_attested(
+        &mut self,
+        _target: ActorId,
         _payload: Vec<u8>,
     ) -> impl core::future::Future<
         Output = core::result::Result<AttestedInvocationResult, ClientError>,
@@ -649,6 +684,28 @@ fn attested_receipt_result(claim: &Receipt) -> AttestedInvocationResult {
         proof: vec![1],
         value,
     }
+}
+
+fn attested_value_result(method: &str, value: Value) -> AttestedInvocationResult {
+    use vos::Encode;
+
+    let mut result = attested_receipt_result(&Receipt {
+        id: 1,
+        tag: [0; 32],
+    });
+    result.statement.method = method.into();
+    result.statement.claim_commitment =
+        Hash::digest(b"vos/attestation-claim/v3", &[&value.encode()]);
+    result.statement.accumulation_receipt.reply_commitment = Some(
+        ReplyRecordV2 {
+            call_id: result.statement.reply_call,
+            producer: result.statement.actor,
+            result: value.encode(),
+        }
+        .commitment(),
+    );
+    result.value = value;
+    result
 }
 
 /// An `Invoker` that captures the encoded request payload (so the

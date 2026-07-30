@@ -1542,11 +1542,13 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                                 .invoke_attested(__service, __payload)
                                 .await?,
                         };
+                        let __claim_wire = vos::Encode::encode(&__value);
                         let __preview: #return_ty = (#decode)?;
-                        vos::Attestation::__from_runtime(
+                        vos::Attestation::__from_runtime_wire(
                             __producer_name,
                             __producer,
                             __statement,
+                            __claim_wire,
                             __preview,
                             __proof,
                         )
@@ -2166,7 +2168,9 @@ fn client_decode_body(
 ) -> proc_macro2::TokenStream {
     use quote::ToTokens;
     let Some(ty) = success_ty else {
-        return quote! { Ok(()) };
+        return quote! {
+            Ok::<(), vos::actors::client::ClientError>(())
+        };
     };
 
     // `Option<T>`: the actor encodes `None` as `Value::Bytes([0])` and
