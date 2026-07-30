@@ -1,4 +1,5 @@
 use vos::prelude::*;
+use vos::value::Value;
 
 #[actor(crdt)]
 pub struct CrdtCounterV2 {
