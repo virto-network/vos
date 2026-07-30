@@ -773,6 +773,29 @@ fn materialize_workflow_crdt(
     Ok(result)
 }
 
+#[cfg(feature = "std")]
+pub(super) fn materialized_continuations(
+    frontier: &super::causal::CausalFrontierV2,
+    service: &super::ServiceIdentityV2,
+) -> Result<BTreeMap<ActorId, Option<BlobRefV2>>, AccumulationRejectionV2> {
+    materialize_workflow_crdt(frontier, service).map(|materialized| {
+        materialized
+            .continuations
+            .into_iter()
+            .map(|(actor, values)| {
+                (
+                    actor,
+                    values
+                        .first()
+                        .expect("continuation frontier is never empty")
+                        .value
+                        .clone(),
+                )
+            })
+            .collect()
+    })
+}
+
 fn insert_causal_value<T>(
     frontier: &super::causal::CausalFrontierV2,
     values: &mut Vec<CausalValueV2<T>>,
@@ -4339,6 +4362,65 @@ mod tests {
         let materialized = materialize_workflow_crdt(&frontier, &identity()).unwrap();
         assert_eq!(materialized.outbox[&call].len(), 1);
         assert!(materialized.outbox[&call][0].value.is_none());
+    }
+
+    #[test]
+    fn causal_continuation_materialization_tracks_the_selected_frontier() {
+        let initial = BlobRefV2::of_bytes(b"initial");
+        let first_state = BlobRefV2::of_bytes(b"first state");
+        let first_continuation = BlobRefV2::of_bytes(b"first continuation");
+        let replacement = BlobRefV2::of_bytes(b"replacement continuation");
+        let first_work = crdt_work(initial, 27, vec![]);
+        let mut first = crdt_transition(&first_work, first_state.clone(), 1);
+        first.continuations.push(ContinuationChangeV2 {
+            actor: actor(),
+            expected: None,
+            replacement: Some(first_continuation.clone()),
+        });
+        let first_workflow = first.workflow_operations(&first_work);
+        first.crdt_change.as_mut().unwrap().workflow = first_workflow;
+        let first_change = first.crdt_change.unwrap();
+        let first_cid = first_change.cid();
+
+        let mut resumed_work = first_work;
+        resumed_work.workflow_step = 1;
+        resumed_work.base = ConsistencyBaseV2::Crdt {
+            heads: vec![first_cid],
+        };
+        resumed_work.base_causal_height = Some(1);
+        resumed_work.imported_actors[0].state = first_state;
+        resumed_work.imported_actors[0].continuation = Some(first_continuation.clone());
+        let mut resumed = crdt_transition(&resumed_work, BlobRefV2::of_bytes(b"second state"), 2);
+        resumed.continuations.push(ContinuationChangeV2 {
+            actor: actor(),
+            expected: Some(first_continuation.hash),
+            replacement: Some(replacement.clone()),
+        });
+        let resumed_workflow = resumed.workflow_operations(&resumed_work);
+        resumed.crdt_change.as_mut().unwrap().workflow = resumed_workflow;
+        let resumed_change = resumed.crdt_change.unwrap();
+        let resumed_cid = resumed_change.cid();
+        let nodes = BTreeMap::from([
+            (first_cid, first_change.encode()),
+            (resumed_cid, resumed_change.encode()),
+        ]);
+
+        let selected = load_causal_frontier(&[first_cid], |cid| {
+            Ok::<_, Infallible>(nodes.get(&cid).cloned())
+        })
+        .unwrap();
+        let current = load_causal_frontier(&[resumed_cid], |cid| {
+            Ok::<_, Infallible>(nodes.get(&cid).cloned())
+        })
+        .unwrap();
+        assert_eq!(
+            materialized_continuations(&selected, &identity()).unwrap()[&actor()],
+            Some(first_continuation)
+        );
+        assert_eq!(
+            materialized_continuations(&current, &identity()).unwrap()[&actor()],
+            Some(replacement)
+        );
     }
 
     #[test]

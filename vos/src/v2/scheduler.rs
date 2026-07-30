@@ -13,6 +13,7 @@ use super::causal::{
     CausalFrontierError, CausalFrontierV2, CausalSelectionError, load_causal_frontier,
 };
 use super::contracts::crdt_change_blob_references;
+use super::guest_accumulate::materialized_continuations;
 use super::{
     AccumulatedReplyV2, ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2,
     BlobRefV2, CallId, CausalCallContextV2, ConsistencyBaseV2, ConsistencyModeV2,
@@ -300,40 +301,24 @@ impl LocalWorkSchedulerV2 {
             return Err(ScheduleErrorV2::InvalidActorDescriptor(request.target));
         }
         validate_actor_consistency(descriptor.crdt, header.consistency, request.target)?;
-        let continuation_key = StateKeyV2::Continuation(request.target);
-        let continuation = decode_row::<BlobRefV2>(store, header.service_root, &continuation_key)?;
+        let root_continuation = if header.consistency == ConsistencyModeV2::Crdt {
+            None
+        } else {
+            decode_row::<BlobRefV2>(
+                store,
+                header.service_root,
+                &StateKeyV2::Continuation(request.target),
+            )?
+        };
         let workflow_key = StateKeyV2::Workflow(request.invocation);
         let workflow =
             decode_row::<WorkflowCheckpointV2>(store, header.service_root, &workflow_key)?;
-
-        match (
-            request.workflow_step,
-            continuation.as_ref(),
-            workflow.as_ref(),
-        ) {
-            (0, Some(_), _) => return Err(ScheduleErrorV2::ActorBusy(request.target)),
-            (0, None, Some(_)) => {
-                return Err(ScheduleErrorV2::InvocationAlreadyCommitted(
-                    request.invocation,
-                ));
-            }
-            (0, None, None) => {}
-            (_, None, _) => {
-                return Err(ScheduleErrorV2::MissingContinuation(request.target));
-            }
-            (step, Some(_), Some(checkpoint))
-                if checkpoint.input.invocation == request.invocation
-                    && checkpoint.input.workflow_step.checked_add(1) == Some(step) => {}
-            (_, Some(_), _) => {
-                return Err(ScheduleErrorV2::InvalidWorkflowStep(request.invocation));
-            }
-        }
 
         let program_bytes = store
             .program(descriptor.program)
             .ok_or(ScheduleErrorV2::MissingProgram(descriptor.program))?
             .to_vec();
-        let (base, base_causal_height, mut states, causal_frontier) =
+        let (base, base_causal_height, mut states, causal_frontier, causal_continuations) =
             if header.consistency == ConsistencyModeV2::Crdt {
                 let current = load_causal_frontier(&header.crdt_heads, |cid| {
                     Ok::<_, Infallible>(store.row(&crdt_node_storage_key(cid)).map(<[u8]>::to_vec))
@@ -366,11 +351,14 @@ impl LocalWorkSchedulerV2 {
                     .map_err(|error| match error {
                         CausalSelectionError::Corrupt => ScheduleErrorV2::CorruptCausalDag,
                     })?;
+                let continuations = materialized_continuations(&frontier, &header.service)
+                    .map_err(|_| ScheduleErrorV2::CorruptCausalDag)?;
                 (
                     ConsistencyBaseV2::Crdt { heads },
                     Some(height),
                     states,
                     Some(frontier),
+                    Some(continuations),
                 )
             } else {
                 let state_root = header
@@ -390,9 +378,38 @@ impl LocalWorkSchedulerV2 {
                     None,
                     alloc::vec![state],
                     None,
+                    None,
                 )
             };
         let state = states.remove(0);
+        let continuation = selected_continuation(
+            causal_continuations.as_ref(),
+            request.target,
+            root_continuation,
+        );
+
+        match (
+            request.workflow_step,
+            continuation.as_ref(),
+            workflow.as_ref(),
+        ) {
+            (0, Some(_), _) => return Err(ScheduleErrorV2::ActorBusy(request.target)),
+            (0, None, Some(_)) => {
+                return Err(ScheduleErrorV2::InvocationAlreadyCommitted(
+                    request.invocation,
+                ));
+            }
+            (0, None, None) => {}
+            (_, None, _) => {
+                return Err(ScheduleErrorV2::MissingContinuation(request.target));
+            }
+            (step, Some(_), Some(checkpoint))
+                if checkpoint.input.invocation == request.invocation
+                    && checkpoint.input.workflow_step.checked_add(1) == Some(step) => {}
+            (_, Some(_), _) => {
+                return Err(ScheduleErrorV2::InvalidWorkflowStep(request.invocation));
+            }
+        }
 
         let mut work = WorkEnvelopeV2 {
             service: header.service.clone(),
@@ -498,11 +515,20 @@ impl LocalWorkSchedulerV2 {
             let mut sibling_states =
                 actor_states(store, &header, &descriptor, causal_frontier.as_ref())?;
             let sibling_state = sibling_states.remove(0);
-            let sibling_continuation = decode_row::<BlobRefV2>(
-                store,
-                header.service_root,
-                &StateKeyV2::Continuation(actor),
-            )?;
+            let root_sibling_continuation = if causal_continuations.is_some() {
+                None
+            } else {
+                decode_row::<BlobRefV2>(
+                    store,
+                    header.service_root,
+                    &StateKeyV2::Continuation(actor),
+                )?
+            };
+            let sibling_continuation = selected_continuation(
+                causal_continuations.as_ref(),
+                actor,
+                root_sibling_continuation,
+            );
             work.imported_actors.push(ImportedActorV2 {
                 actor,
                 name: descriptor.name.clone(),
@@ -591,6 +617,17 @@ fn validate_actor_consistency(
         Ok(())
     } else {
         Err(ScheduleErrorV2::ActorConsistencyMismatch(actor))
+    }
+}
+
+fn selected_continuation(
+    causal_continuations: Option<&BTreeMap<ActorId, Option<BlobRefV2>>>,
+    actor: ActorId,
+    root_continuation: Option<BlobRefV2>,
+) -> Option<BlobRefV2> {
+    match causal_continuations {
+        Some(continuations) => continuations.get(&actor).cloned().flatten(),
+        None => root_continuation,
     }
 }
 
@@ -713,6 +750,32 @@ mod tests {
         assert_eq!(
             validate_await_boundary(Some(call), None),
             Err(ScheduleErrorV2::MissingAwaitedReply(call))
+        );
+    }
+
+    #[test]
+    fn selected_causal_continuations_override_the_later_merged_root() {
+        let actor = ActorId([4; 32]);
+        let branch = BlobRefV2::of_bytes(b"branch checkpoint");
+        let merged = BlobRefV2::of_bytes(b"later merged checkpoint");
+        let selected = BTreeMap::from([(actor, Some(branch.clone()))]);
+
+        assert_eq!(
+            selected_continuation(Some(&selected), actor, Some(merged.clone())),
+            Some(branch),
+            "a resumed slice imports the continuation from its selected causal branch"
+        );
+
+        let completed = BTreeMap::from([(actor, None)]);
+        assert_eq!(
+            selected_continuation(Some(&completed), actor, Some(merged.clone())),
+            None,
+            "branch-local completion must not resurrect a later root continuation"
+        );
+        assert_eq!(
+            selected_continuation(None, actor, Some(merged.clone())),
+            Some(merged),
+            "linear scheduling continues to read the current service root"
         );
     }
 }

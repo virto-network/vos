@@ -2034,6 +2034,15 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
                         space_role: None,
                         actor_role: None,
                     },
+                    MethodPolicyV2 {
+                        method: "increment_peer_then_yield".into(),
+                        schema: Hash([67; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
                 ]),
             },
             ActorGenesisV2 {
@@ -2451,6 +2460,127 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
             .map(|reply| Value::decode(&reply.result)),
         Some(Value::I64(25))
     );
+
+    // A reply is consumed by the resumed slice even when that slice creates a
+    // replacement continuation at an explicit yield. Consumption belongs to
+    // the incoming reply, not to the shape of the outgoing checkpoint.
+    let mut yield_arguments = vec![vos::value::TAG_DYNAMIC];
+    yield_arguments.extend_from_slice(
+        &Msg::new("increment_peer_then_yield")
+            .with("before", 2u64)
+            .with("after", 3u64)
+            .encode(),
+    );
+    let await_then_yield = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([68; 32]),
+            workflow_step: 0,
+            logical_timeslot: 6,
+            target: seed.target,
+            method: "increment_peer_then_yield".into(),
+            arguments: yield_arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    let awaiting = service
+        .refine_actor_tree(&await_then_yield.work, &await_then_yield.imports)
+        .expect("the first slice checkpoints at its peer await");
+    assert_eq!(awaiting.transition.outbox.len(), 1);
+    let first_call = awaiting.transition.outbox[0].call_id;
+    assert!(matches!(
+        service
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: await_then_yield.work.clone(),
+                transition: awaiting.transition,
+                provided_blobs: awaiting.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let reply = ReplyRecordV2 {
+        call_id: first_call,
+        producer: ActorId([44; 32]),
+        result: Value::U32(0).encode(),
+    };
+    let mut remote_service = await_then_yield.work.service.clone();
+    remote_service.root_service = RootServiceId([69; 32]);
+    remote_service.deployment = DeploymentId([70; 32]);
+    let awaited = AccumulatedReplyV2 {
+        receipt: AccumulationReceiptV2 {
+            service: remote_service,
+            accepted_transition: Hash([71; 32]),
+            reply_commitment: Some(reply.commitment()),
+            outbox_commitment: None,
+            resulting_state_root: Some(Hash([72; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 1,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        },
+        reply,
+    };
+    service
+        .accumulate_host_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            expected_producer: ActorId([44; 32]),
+            receipt: awaited.receipt.clone(),
+        });
+    let resumed = LocalWorkSchedulerV2::prepare_resume(
+        service.accumulate_host(),
+        await_then_yield.work.invocation,
+        7,
+        Some(awaited),
+    )
+    .unwrap();
+    let yielded = service
+        .refine_actor_tree(&resumed.work, &resumed.imports)
+        .expect("the resumed slice checkpoints again at its explicit yield");
+    assert!(yielded.transition.reply.is_none());
+    assert!(yielded.transition.outbox.is_empty());
+    assert!(
+        yielded
+            .transition
+            .continuations
+            .iter()
+            .any(|change| change.replacement.is_some())
+    );
+    assert!(
+        yielded
+            .transition
+            .crdt_change
+            .as_ref()
+            .unwrap()
+            .workflow
+            .contains(&WorkflowOperationV2::ConsumeOutbox(first_call))
+    );
+    assert!(matches!(
+        service
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: resumed.work,
+                transition: yielded.transition,
+                provided_blobs: yielded.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
 }
 
 #[test]

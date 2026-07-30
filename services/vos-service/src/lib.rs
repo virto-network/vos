@@ -207,13 +207,14 @@ mod guest {
                 }
             }
         }
-        let consumed_outbox = actor_output.checkpoint.as_ref().and_then(|checkpoint| {
-            checkpoint
-                .replacement
-                .is_none()
-                .then_some(checkpoint.pending_call)
-                .flatten()
-        });
+        // Consuming the reply which resumed this slice is independent of what
+        // the slice does next. It may complete, explicitly yield, or suspend
+        // at another await; all three must consume the incoming call exactly
+        // once.
+        let consumed_outbox = work
+            .awaited_reply
+            .as_ref()
+            .map(|reply| reply.reply.call_id);
 
         let mut consumed_input = work.input_id();
         let mut base = work.base.clone();

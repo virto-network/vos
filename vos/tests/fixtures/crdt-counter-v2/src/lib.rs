@@ -90,6 +90,26 @@ impl CrdtCounterV2 {
     }
 
     #[msg]
+    async fn increment_peer_then_yield(
+        &mut self,
+        before: u64,
+        after: u64,
+        ctx: &mut Context<Self>,
+    ) -> i64 {
+        self.count
+            .increment(before)
+            .expect("actor dispatch establishes a CRDT change scope");
+        let _ = ctx
+            .ask_actor(ActorId([44; 32]), &Msg::new("peer_value"), None)
+            .await;
+        self.count
+            .increment(after)
+            .expect("restored dispatch rebinds the CRDT change scope");
+        ctx.yield_now().await;
+        self.count.value()
+    }
+
+    #[msg]
     async fn increment_child_around_peer(
         &mut self,
         before: u64,
