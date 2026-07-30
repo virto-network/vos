@@ -384,6 +384,12 @@ and signatures but includes the authoritative manifest and PVM bytes.
 Registries store these bytes and never retranspile an ELF. JIT products,
 proving keys and traces are caches keyed by `ProgramId`.
 
+The legacy `VosNode` actor loader deliberately refuses `.vos` v2 packages. It
+cannot extract and run the actor PVM directly without violating the root-tree
+service boundary. Production daemon installation remains disabled until that
+loader drives the pinned `vos-service.pvm`; this explicit refusal replaces
+silent execution through `RefinePayload`/`EffectLog`.
+
 The infrastructure PVM is committed at
 `services/vos-service/vos-service.pvm`; its identity is
 `VOS_SERVICE_PROGRAM_ID`. To reproduce it, build and validate the guest:

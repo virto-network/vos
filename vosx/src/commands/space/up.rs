@@ -1420,32 +1420,20 @@ fn agent_config_from_row(
 
 /// Recover executable bytes from one content-addressed catalog artifact.
 ///
-/// Signed v2 packages are retained byte-for-byte by the registry/CAS and
-/// already contain the canonical actor PVM. Only pre-v2 infrastructure blobs
-/// may take the legacy ELF transpilation fallback.
+/// Resolve only artifacts that the legacy one-service-per-actor host may run.
+///
+/// A signed v2 package is a root-tree deployment input, not an actor blob for
+/// [`VosNode`]. Extracting its canonical actor PVM here would execute it in the
+/// native `RefinePayload`/`EffectLog` runtime and silently discard its pinned
+/// generic-service, deployment, policy, and guest-Accumulate semantics. Fail
+/// closed until this daemon path installs the complete package through
+/// `vos-service.pvm`.
 fn actor_blob_from_catalog(artifact: Vec<u8>, instance_name: &str) -> anyhow::Result<Vec<u8>> {
     if artifact.get(..4) == Some(b"VOSP") {
-        use vos::v2::{V2Wire, VosPackageV2};
-
-        let package = VosPackageV2::decode(&artifact)
-            .map_err(|error| anyhow::anyhow!("decode {instance_name} .vos package: {error}"))?;
-        package
-            .validate()
-            .map_err(|error| anyhow::anyhow!("validate {instance_name} .vos package: {error}"))?;
-        let public_key = libp2p::identity::PublicKey::try_decode_protobuf(
-            &package.deployment_signature.public_key,
-        )
-        .map_err(|error| anyhow::anyhow!("decode {instance_name} deployment key: {error}"))?;
-        if !public_key.verify(
-            &package.signing_message(),
-            &package.deployment_signature.signature,
-        ) {
-            anyhow::bail!("{instance_name} deployment signature is invalid");
-        }
-        vos::v2::validate_actor_program_layout(&package.actor_pvm).map_err(|error| {
-            anyhow::anyhow!("{instance_name} package actor PVM layout is invalid: {error}")
-        })?;
-        return Ok(package.actor_pvm);
+        anyhow::bail!(
+            "{instance_name} is a VOS v2 package and cannot run in the legacy actor runtime; \
+             install it through the root-tree vos-service.pvm host"
+        );
     }
     if artifact.get(..3) == Some(b"JAR") {
         javm::program::parse_blob(&artifact)
@@ -2096,103 +2084,17 @@ fn sweep_orphan_redbs(data_dir: &std::path::Path, live: &std::collections::HashS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use javm::cap::Access;
-    use javm::program::{CapEntryType, CapManifestEntry, build_blob, parse_blob};
-    use libp2p::identity::Keypair;
-    use vos::metadata::ActorMeta;
     use vos::network::{RaftRole, RaftStatusReply};
-    use vos::v2::{
-        DeploymentSignatureV2, PackageManifestV2, PackageRolePoliciesV2, ProducerId, ProgramId,
-        V2Wire, VosPackageV2, artifact_hash,
-    };
-
-    const PACKAGE_META: ActorMeta = ActorMeta {
-        actor_name: "packaged",
-        messages: &[],
-        constructor: &[],
-        kind: 0,
-        caps: &[],
-        cli_methods: &[],
-        doc: "",
-        crdt: false,
-    };
-
-    fn signed_package_for(actor_pvm: Vec<u8>) -> VosPackageV2 {
-        let (buffer, length) = vos::metadata::encode::<512>(&PACKAGE_META);
-        let schemas = buffer[..length].to_vec();
-        let metadata = vos::metadata::decode(&schemas).unwrap();
-        let role_policies = PackageRolePoliciesV2::from_metadata(&metadata)
-            .unwrap()
-            .encode();
-        let interfaces = Vec::new();
-        let keypair = Keypair::generate_ed25519();
-        let public_key = keypair.public().encode_protobuf();
-        let mut package = VosPackageV2 {
-            manifest: PackageManifestV2 {
-                name: "packaged".into(),
-                version: "1.0.0".into(),
-                service_abi: vos::v2::ABI_VERSION,
-                snapshot_version: vos::v2::SNAPSHOT_VERSION,
-                execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
-                service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
-                actor_program: ProgramId::of_pvm(&actor_pvm),
-                crdt: false,
-                interfaces_hash: artifact_hash(b"interfaces", &interfaces),
-                role_policies_hash: artifact_hash(b"role-policies", &role_policies),
-                schemas_hash: artifact_hash(b"schemas", &schemas),
-            },
-            actor_pvm,
-            generated_interfaces: interfaces,
-            role_policies,
-            schemas,
-            diagnostics: None,
-            deployment_signature: DeploymentSignatureV2 {
-                producer: ProducerId::of_public_key(&public_key),
-                public_key,
-                signature: vec![0],
-            },
-        };
-        package.deployment_signature.signature = keypair.sign(&package.signing_message()).unwrap();
-        package
-    }
 
     #[test]
-    fn package_install_uses_the_exact_canonical_actor_pvm() {
-        let actor_pvm = grey_transpiler::assembler::Assembler::new().build();
-        let package = signed_package_for(actor_pvm.clone());
-
-        assert_eq!(
-            actor_blob_from_catalog(package.encode(), "packaged").unwrap(),
-            actor_pvm
+    fn signed_v2_packages_never_fall_through_to_the_legacy_actor_runtime() {
+        let error = actor_blob_from_catalog(b"VOSP\x02\0package".to_vec(), "counter")
+            .expect_err("v2 package must retain guest-owned service semantics");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot run in the legacy actor runtime")
         );
-    }
-
-    #[test]
-    fn package_install_rejects_reserved_actor_capability_slots() {
-        let actor_pvm = grey_transpiler::assembler::Assembler::new().build();
-        let parsed = parse_blob(&actor_pvm).unwrap();
-        let mut caps = parsed.caps.clone();
-        caps.push(CapManifestEntry {
-            cap_index: vos::v2::ACTOR_CALLABLE_BASE_SLOT,
-            cap_type: CapEntryType::Data,
-            base_page: 0,
-            page_count: 0,
-            init_access: Access::RW,
-            data_offset: 0,
-            data_len: 0,
-        });
-        let invalid = build_blob(
-            parsed.header.memory_pages,
-            parsed.header.invoke_cap,
-            parsed.header.stack_top,
-            &caps,
-            parsed.data_section,
-        );
-        let package = signed_package_for(invalid);
-
-        let error = actor_blob_from_catalog(package.encode(), "packaged").unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("layout"), "{message}");
     }
 
     #[test]
