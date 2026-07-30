@@ -249,16 +249,15 @@ records an explicit workflow-CRDT outbox consumption, and post-await
 operations receive a fresh change/dispatch identity. The suspended heap
 continues against the materialization it originally observed; concurrent
 branches merge only after that resumed change commits.
-envelope is bounded by `CHECKPOINT_TOKEN_CAPACITY`; larger application results
-must use a content-addressed blob reference once the transport API exposes
-that result form. This path is currently linear-only: CRDT services reject an
-awaited reply until consumption of the pending outbox row is represented by
-the built-in workflow CRDT. The local scheduler reports this boundary as
-`CrdtAwaitUnsupported` when it encounters a CRDT continuation with a pending
-call, instead of preparing work which guest Accumulate must reject. The
-actor-side resume branch already rebinds and resets the restored CRDT
-operation allocator, so enabling that future consumption path cannot reuse
-the pre-await change namespace.
+The inline reply envelope is bounded by `CHECKPOINT_TOKEN_CAPACITY`; larger
+application results must use a content-addressed blob reference once the
+transport API exposes that result form. A resumed CRDT slice may complete,
+checkpoint at another await, or explicitly yield. In every case it records
+consumption of the admitted reply independently of the outgoing checkpoint
+shape, and binds any replacement continuation to the selected causal branch.
+The actor-side resume branch rebinds and resets the restored CRDT operation
+allocator, so post-await operations cannot reuse the pre-await change
+namespace.
 
 Before that production cutover, the Install authorization capability must be
 backed by consensus-authoritative deployment state rather than the local
