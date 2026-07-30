@@ -25,6 +25,23 @@ impl CycleV2 {
         0
     }
 
+    #[msg(space_role = SpaceRole::Member)]
+    fn member_only(&self) -> u32 {
+        99
+    }
+
+    #[msg]
+    async fn root_forbidden(&mut self, ctx: &mut Context<Self>) -> u32 {
+        let Ok(mut child) = ctx.child::<CycleV2Ref>("child").await else {
+            return 0;
+        };
+        match child.member_only().await {
+            Err(vos::ClientError::Forbidden) => 1,
+            Err(vos::ClientError::Call(CallError::Panicked)) => 2,
+            _ => 0,
+        }
+    }
+
     #[msg]
     async fn root_cycle(&mut self, ctx: &mut Context<Self>) -> u32 {
         let Ok(mut child) = ctx.child::<CycleV2Ref>("child").await else {

@@ -381,7 +381,8 @@ pub fn invoke_hash_with_rows(
     let n = crate::abi::pvm::hostcalls::invoke(&hash, &input, 0, &mut output) as usize;
 
     use super::run::{
-        STATUS_DONE, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED, STATUS_TOO_BIG, STATUS_YIELDED,
+        STATUS_DONE, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED,
+        STATUS_TOO_BIG, STATUS_YIELDED,
     };
 
     // Short output = error status byte only (no state/reply envelope)
@@ -427,6 +428,7 @@ pub fn invoke_hash_with_rows(
         STATUS_PANICKED => InvokeResult::Panicked,
         STATUS_NOT_FOUND => InvokeResult::NotFound,
         STATUS_OOG => InvokeResult::OutOfGas,
+        STATUS_FORBIDDEN => InvokeResult::Error(STATUS_FORBIDDEN),
         _ => InvokeResult::Done { state, reply },
     }
 }

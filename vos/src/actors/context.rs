@@ -482,6 +482,9 @@ impl<A: Actor> Context<A> {
                 InvokeResult::NotFound => super::run::Ask::ready_err(InvokeError::NotFound),
                 InvokeResult::OutOfGas => super::run::Ask::ready_err(InvokeError::OutOfGas),
                 InvokeResult::TooBig => super::run::Ask::ready_err(InvokeError::TooBig),
+                InvokeResult::Error(super::run::STATUS_FORBIDDEN) => {
+                    super::run::Ask::ready_err(InvokeError::Forbidden)
+                }
                 InvokeResult::Error(s) => super::run::Ask::ready_err(InvokeError::Unknown(s)),
             }
         }
@@ -677,10 +680,14 @@ impl<A: Actor> Context<A> {
         if output.actor != target
             || output.first_await_ordinal != self.next_await_ordinal
             || output.next_await_ordinal < output.first_await_ordinal
-            || output.forbidden
         {
             return Some(super::run::Ask::ready_err(
                 super::value::InvokeError::Panicked,
+            ));
+        }
+        if output.forbidden {
+            return Some(super::run::Ask::ready_err(
+                super::value::InvokeError::Forbidden,
             ));
         }
         if output.checkpoint.as_ref().is_some_and(|checkpoint| {

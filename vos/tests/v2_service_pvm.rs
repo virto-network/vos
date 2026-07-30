@@ -1610,15 +1610,26 @@ fn same_tree_causal_cycles_return_an_explicit_guest_error() {
                 program: actor_program,
                 initial_state: initial.clone(),
                 crdt: false,
-                role_policies: role_policies(vec![MethodPolicyV2 {
-                    method: "root_cycle".into(),
-                    schema: Hash([81; 32]),
-                    policy: public_policy_hash(),
-                    public: true,
-                    attested: false,
-                    space_role: None,
-                    actor_role: None,
-                }]),
+                role_policies: role_policies(vec![
+                    MethodPolicyV2 {
+                        method: "root_cycle".into(),
+                        schema: Hash([81; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                    MethodPolicyV2 {
+                        method: "root_forbidden".into(),
+                        schema: Hash([86; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                ]),
             },
             ActorGenesisV2 {
                 actor: child,
@@ -1627,15 +1638,26 @@ fn same_tree_causal_cycles_return_an_explicit_guest_error() {
                 program: actor_program,
                 initial_state: initial,
                 crdt: false,
-                role_policies: role_policies(vec![MethodPolicyV2 {
-                    method: "child_cycle".into(),
-                    schema: Hash([82; 32]),
-                    policy: public_policy_hash(),
-                    public: true,
-                    attested: false,
-                    space_role: None,
-                    actor_role: None,
-                }]),
+                role_policies: role_policies(vec![
+                    MethodPolicyV2 {
+                        method: "child_cycle".into(),
+                        schema: Hash([82; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                    MethodPolicyV2 {
+                        method: "member_only".into(),
+                        schema: Hash([87; 32]),
+                        policy: space_role_policy_hash(vos::SpaceRole::Member.as_u8()).unwrap(),
+                        public: false,
+                        attested: false,
+                        space_role: Some(vos::SpaceRole::Member.as_u8()),
+                        actor_role: None,
+                    },
+                ]),
             },
         ],
         authorization: AuthorizationEvidenceV2::SystemCapability {
@@ -1676,6 +1698,54 @@ fn same_tree_causal_cycles_return_an_explicit_guest_error() {
         .expect("A -> B -> A returns Cycle before re-entering A");
     assert!(refined.transition.outbox.is_empty());
     assert!(refined.transition.continuations.is_empty());
+    assert_eq!(
+        refined
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::U32(1))
+    );
+    assert!(matches!(
+        service
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: scheduled.work,
+                transition: refined.transition,
+                provided_blobs: refined.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let mut message = vec![vos::value::TAG_DYNAMIC];
+    message.extend_from_slice(&Msg::new("root_forbidden").encode());
+    let scheduled = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([88; 32]),
+            workflow_step: 0,
+            logical_timeslot: 2,
+            target: seed.target,
+            method: "root_forbidden".into(),
+            arguments: message,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    let refined = service
+        .refine_actor_tree(&scheduled.work, &scheduled.imports)
+        .expect("a same-tree role denial remains distinct from a child panic");
     assert_eq!(
         refined
             .transition

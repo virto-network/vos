@@ -15,6 +15,8 @@ pub enum InvokeError {
     Panicked,
     /// The target service was not found.
     NotFound,
+    /// The target's authorization policy denied the caller.
+    Forbidden,
     /// The call would re-enter an actor already active in this causal chain.
     Cycle,
     /// The target ran out of gas.
@@ -30,6 +32,7 @@ impl core::fmt::Display for InvokeError {
         match self {
             InvokeError::Panicked => write!(f, "invoke: child panicked"),
             InvokeError::NotFound => write!(f, "invoke: service not found"),
+            InvokeError::Forbidden => write!(f, "invoke: permission denied"),
             InvokeError::Cycle => write!(f, "invoke: causal actor-call cycle"),
             InvokeError::OutOfGas => write!(f, "invoke: out of gas"),
             InvokeError::TooBig => write!(f, "invoke: reply too big for caller buffer"),

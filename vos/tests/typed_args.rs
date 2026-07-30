@@ -535,6 +535,18 @@ fn bound_handle_methods_do_not_take_an_invoker_argument() {
 }
 
 #[test]
+fn bound_handles_preserve_authorization_denials() {
+    use vos::ActorReference;
+
+    let mut invoker = DeniedBoundInvoker;
+    let mut handle = VaultRef::bind(ActorId([7; 32]), &mut invoker);
+    assert!(matches!(
+        vos::block_on(handle.deposit(42)),
+        Err(ClientError::Forbidden)
+    ));
+}
+
+#[test]
 fn bound_attested_handles_bind_the_exact_supplied_claim_wire() {
     use vos::ActorReference;
 
@@ -561,6 +573,26 @@ fn bound_attested_handles_bind_the_exact_supplied_claim_wire() {
 struct BoundMockInvoker {
     reply: Value,
     actor: Option<ActorId>,
+}
+
+struct DeniedBoundInvoker;
+
+impl Invoker for DeniedBoundInvoker {
+    fn invoke(
+        &mut self,
+        _target: ServiceId,
+        _payload: Vec<u8>,
+    ) -> impl core::future::Future<Output = core::result::Result<Value, ClientError>> + '_ {
+        core::future::ready(Err(ClientError::Unreachable))
+    }
+
+    fn invoke_actor(
+        &mut self,
+        _target: ActorId,
+        _payload: Vec<u8>,
+    ) -> impl core::future::Future<Output = core::result::Result<Value, ClientError>> + '_ {
+        core::future::ready(Err(ClientError::from(vos::InvokeError::Forbidden)))
+    }
 }
 
 impl Invoker for BoundMockInvoker {

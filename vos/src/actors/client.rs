@@ -92,6 +92,7 @@ impl From<super::value::InvokeError> for ClientError {
     fn from(error: super::value::InvokeError) -> Self {
         match error {
             super::value::InvokeError::NotFound => Self::NotFound,
+            super::value::InvokeError::Forbidden => Self::Forbidden,
             super::value::InvokeError::Panicked => Self::Call(CallError::Panicked),
             super::value::InvokeError::Cycle => Self::Call(CallError::Cycle),
             super::value::InvokeError::OutOfGas => Self::Call(CallError::OutOfGas),
@@ -250,6 +251,14 @@ mod tests {
         assert!(matches!(
             ClientError::from(super::super::value::InvokeError::Cycle),
             ClientError::Call(CallError::Cycle)
+        ));
+    }
+
+    #[test]
+    fn authorization_denials_remain_typed_at_the_generated_handle_boundary() {
+        assert!(matches!(
+            ClientError::from(super::super::value::InvokeError::Forbidden),
+            ClientError::Forbidden
         ));
     }
 }
