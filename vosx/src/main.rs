@@ -96,9 +96,6 @@ enum Command {
         version: String,
         #[arg(long, default_value = "dist")]
         out_dir: PathBuf,
-        /// ProgramId of the protocol-pinned `vos-service.pvm`.
-        #[arg(long)]
-        service_program_id: String,
         #[arg(long)]
         interfaces: Option<PathBuf>,
         #[arg(long)]
@@ -267,7 +264,6 @@ fn main() {
             name,
             version,
             out_dir,
-            service_program_id,
             interfaces,
             role_policies,
             schemas,
@@ -280,7 +276,6 @@ fn main() {
                 name,
                 version,
                 out_dir,
-                service_program_id,
                 interfaces,
                 role_policies,
                 schemas,

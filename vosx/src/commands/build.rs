@@ -14,7 +14,6 @@ pub struct Args {
     pub name: Option<String>,
     pub version: String,
     pub out_dir: PathBuf,
-    pub service_program_id: String,
     pub interfaces: Option<PathBuf>,
     pub role_policies: Option<PathBuf>,
     pub schemas: Option<PathBuf>,
@@ -78,7 +77,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         None => generated_role_policies,
     };
     let source_map = read_optional(args.source_map.as_deref())?;
-    let service_program = ProgramId(parse_hash(&args.service_program_id)?);
+    let service_program = vos::v2::VOS_SERVICE_PROGRAM_ID;
     let actor_program = ProgramId::of_pvm(&actor_pvm);
 
     let keypair = crate::identity::load_or_create()?;
@@ -208,24 +207,9 @@ fn read_optional(path: Option<&Path>) -> anyhow::Result<Vec<u8>> {
         .map_err(Into::into)
 }
 
-fn parse_hash(value: &str) -> anyhow::Result<[u8; 32]> {
-    let bytes = hex::decode(value.trim_start_matches("0x"))
-        .map_err(|_| anyhow!("--service-program-id must be 64 hex characters"))?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow!("--service-program-id must be exactly 32 bytes"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn service_program_id_is_exact() {
-        assert_eq!(parse_hash(&"ab".repeat(32)).unwrap(), [0xab; 32]);
-        assert!(parse_hash("ab").is_err());
-        assert!(parse_hash("zz").is_err());
-    }
 
     #[test]
     fn project_output_uses_the_cargo_package_name() {
