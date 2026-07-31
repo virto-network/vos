@@ -27,7 +27,7 @@ use super::{
     PublishedEffectsV2, ReceiptVerificationRequestV2, ReplyAdmissionRecordV2, RoleCredentialV2,
     RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServiceInstallReceiptV2,
     ServiceStateTreeV2, StateKeyV2, StateTreeError, StateTreeStore, StoreHeaderV2, StoreOpenError,
-    V2Wire, WorkflowCheckpointV2, WorkflowOperationV2, call_expiration_storage_key,
+    V2Wire, WorkInputIdV2, WorkflowCheckpointV2, WorkflowOperationV2, call_expiration_storage_key,
     crdt_change_storage_key, crdt_node_receipt_storage_key, crdt_node_storage_key,
     dedup_storage_key, delivery_storage_key, header_storage_key, method_role_policy_hash,
     pending_call_deadline_storage_key, public_policy_hash, publication_storage_key,
@@ -1257,12 +1257,14 @@ fn apply_expiration_materialization<S: GuestAccumulateStoreV2>(
             Some(&accumulated.encode()),
         )?;
         write(store, &pending_call_deadline_storage_key(*call), None)?;
-        let workflow = materialized
-            .workflows
-            .get(&event.value.caller_invocation)
-            .and_then(|values| values.first())
-            .ok_or(GuestAccumulateError::CorruptStore)?;
-        write(store, &publication_storage_key(workflow.value.input), None)?;
+        // An expiration remains in every descendant CRDT materialization.
+        // Retire the publication for the checkpoint it actually consumed,
+        // never whichever later workflow value happens to be visible now.
+        let expired_input = WorkInputIdV2 {
+            invocation: event.value.caller_invocation,
+            workflow_step: event.value.checkpoint_step,
+        };
+        write(store, &publication_storage_key(expired_input), None)?;
     }
     Ok(())
 }
@@ -4856,11 +4858,17 @@ mod tests {
         resumed.imported_actors[0].state = state;
         resumed.imported_actors[0].continuation = Some(continuation.clone());
         resumed.awaited_timeout = Some(Box::new(accumulated));
+        let resumed_input = resumed.input_id();
         let mut completed = crdt_transition(&resumed, completed_state.clone(), 3);
         completed.continuations.push(ContinuationChangeV2 {
             actor: resumed.target,
             expected: Some(continuation.hash),
             replacement: None,
+        });
+        completed.reply = Some(ReplyRecordV2 {
+            call_id: resumed.invocation.root_reply_id(),
+            producer: resumed.target,
+            result: vec![23],
         });
         completed.crdt_change.as_mut().unwrap().workflow = completed.workflow_operations(&resumed);
         assert!(matches!(
@@ -4881,6 +4889,12 @@ mod tests {
                 ..
             }
         ));
+        assert!(
+            read(&destination, &publication_storage_key(resumed_input))
+                .unwrap()
+                .is_some(),
+            "rematerializing the historical timeout must not delete the resumed slice publication"
+        );
     }
 
     fn delivery(
