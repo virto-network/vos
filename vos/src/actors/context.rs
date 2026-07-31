@@ -549,13 +549,14 @@ impl<A: Actor> Context<A> {
             if self.actor_tree.iter().any(|actor| actor.actor == target) {
                 return super::run::Ask::ready_err(super::value::InvokeError::NotFound);
             }
-            if self
+            let Some(binding) = self
                 .external_actors
                 .iter()
-                .all(|actor| actor.actor != target)
-            {
+                .find(|actor| actor.actor == target)
+                .cloned()
+            else {
                 return super::run::Ask::ready_err(super::value::InvokeError::NotFound);
-            }
+            };
             let await_ordinal = self.next_await_ordinal;
             self.next_await_ordinal = self
                 .next_await_ordinal
@@ -565,6 +566,7 @@ impl<A: Actor> Context<A> {
                 .push(crate::v2::ActorCallRequestV2 {
                     await_ordinal,
                     from: self.actor_id.expect("v2 actor identity was checked"),
+                    to_service: binding.service,
                     to: target,
                     payload: payload.to_vec(),
                     authorization: crate::v2::AuthorizationEvidenceV2::Public,
@@ -648,13 +650,14 @@ impl<A: Actor> Context<A> {
                     crate::AttestationError::CannotSuspend,
                 )));
             }
-            if self
+            let Some(binding) = self
                 .external_actors
                 .iter()
-                .all(|actor| actor.actor != target)
-            {
+                .find(|actor| actor.actor == target)
+                .cloned()
+            else {
                 return super::client::AttestedAsk::ready(Err(ClientError::NotFound));
-            }
+            };
             let await_ordinal = self.next_await_ordinal;
             self.next_await_ordinal = self
                 .next_await_ordinal
@@ -664,6 +667,7 @@ impl<A: Actor> Context<A> {
                 .push(crate::v2::ActorCallRequestV2 {
                     await_ordinal,
                     from: self.actor_id.expect("v2 actor identity was checked"),
+                    to_service: binding.service,
                     to: target,
                     payload: payload.to_vec(),
                     authorization: crate::v2::AuthorizationEvidenceV2::Public,

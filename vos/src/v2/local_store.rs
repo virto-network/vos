@@ -462,6 +462,7 @@ impl LocalJamStoreV2 {
         self.committed
             .blobs
             .get(&reference.hash.0)
+            .or_else(|| self.proof_blobs.get(&reference.hash.0))
             .filter(|bytes| reference.matches(bytes))
             .map(Vec::as_slice)
     }

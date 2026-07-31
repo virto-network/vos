@@ -19,6 +19,11 @@ impl WorkflowV2 {
     }
 
     #[msg]
+    fn peer_value(&self) -> u32 {
+        7
+    }
+
+    #[msg]
     async fn call_child(&mut self, ctx: &mut Context<Self>) -> u32 {
         self.value += 10;
         if let Ok(mut child) = ctx.child::<WorkflowV2Ref>("child").await

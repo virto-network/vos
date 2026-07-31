@@ -1756,6 +1756,8 @@ mod tests {
                 statement_version: crate::v2::ATTESTATION_STATEMENT_VERSION,
                 space: receipt.service.space,
                 actor,
+                producer_name: "attested".into(),
+                producer: crate::v2::ProducerId([6; 32]),
                 deployment: receipt.service.deployment,
                 actor_program: ProgramId([7; 32]),
                 method: "attested".into(),

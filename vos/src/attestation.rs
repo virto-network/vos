@@ -25,6 +25,11 @@ pub struct AttestationStatementV3 {
     pub statement_version: u16,
     pub space: SpaceId,
     pub actor: ActorId,
+    pub producer_name: String,
+    /// Signature identity retained from the installed actor package. This is
+    /// guest-derived state and is part of the proof statement; a native host
+    /// cannot relabel a committed proof as another producer.
+    pub producer: ProducerId,
     pub deployment: DeploymentId,
     pub actor_program: ProgramId,
     pub method: String,
@@ -59,10 +64,18 @@ impl AttestationPreparationV2 {
         work: &WorkEnvelopeV2,
         transition: &TransitionV2,
         policy: &MethodPolicyV2,
+        producer_name: &str,
+        producer: ProducerId,
         receipt: AccumulationReceiptV2,
     ) -> Result<Self, AttestationError> {
-        let statement =
-            AttestationStatementV3::for_transition(work, transition, policy, receipt.clone())?;
+        let statement = AttestationStatementV3::for_transition(
+            work,
+            transition,
+            policy,
+            producer_name,
+            producer,
+            receipt.clone(),
+        )?;
         Ok(Self {
             receipt,
             statement,
@@ -189,6 +202,8 @@ impl AttestationStatementV3 {
         work: &WorkEnvelopeV2,
         transition: &TransitionV2,
         policy: &MethodPolicyV2,
+        producer_name: &str,
+        producer: ProducerId,
         receipt: AccumulationReceiptV2,
     ) -> Result<Self, AttestationError> {
         if work.service != transition.service
@@ -236,6 +251,8 @@ impl AttestationStatementV3 {
             statement_version: crate::v2::ATTESTATION_STATEMENT_VERSION,
             space: work.service.space,
             actor: work.target,
+            producer_name: producer_name.into(),
+            producer,
             deployment: work.service.deployment,
             actor_program: work.target_program,
             method: work.method.clone(),
@@ -269,6 +286,8 @@ impl AttestationStatementV3 {
             return Err(AttestationError::WrongStatementVersion);
         }
         if self.method.is_empty()
+            || self.producer_name.is_empty()
+            || self.producer == ProducerId::ZERO
             || self.reply_call == CallId::ZERO
             || self.accumulation_receipt.service.service_abi != crate::v2::ABI_VERSION
             || self.accumulation_receipt.service.execution_semantics
@@ -399,6 +418,8 @@ impl V2Wire for AttestationStatementV3 {
         encoder.u16(self.statement_version);
         encoder.fixed(&self.space.0);
         encoder.fixed(&self.actor.0);
+        encoder.string(&self.producer_name);
+        encoder.fixed(&self.producer.0);
         encoder.fixed(&self.deployment.0);
         encoder.fixed(&self.actor_program.0);
         encoder.string(&self.method);
@@ -418,6 +439,8 @@ impl V2Wire for AttestationStatementV3 {
             statement_version: decoder.u16()?,
             space: SpaceId(decoder.fixed()?),
             actor: ActorId(decoder.fixed()?),
+            producer_name: decoder.string()?,
+            producer: ProducerId(decoder.fixed()?),
             deployment: DeploymentId(decoder.fixed()?),
             actor_program: ProgramId(decoder.fixed()?),
             method: decoder.string()?,
@@ -535,7 +558,11 @@ impl<T, M> Attestation<T, M> {
             proof,
             _method: PhantomData,
         };
-        if package.producer_name.is_empty() || package.producer == ProducerId::ZERO {
+        if package.producer_name.is_empty()
+            || package.producer == ProducerId::ZERO
+            || package.producer_name != package.statement.producer_name
+            || package.producer != package.statement.producer
+        {
             return Err(AttestationError::WrongProducer);
         }
         package.statement.validate()?;
@@ -722,6 +749,7 @@ pub trait ProofVerifier {
         actor_program: ProgramId,
         execution_semantics: Hash,
         statement: Hash,
+        trace: Hash,
         proof: &[u8],
     ) -> bool;
 }
@@ -744,16 +772,17 @@ where
 
 impl<F> ProofVerifier for F
 where
-    F: Fn(ProgramId, Hash, Hash, &[u8]) -> bool,
+    F: Fn(ProgramId, Hash, Hash, Hash, &[u8]) -> bool,
 {
     fn verify(
         &self,
         actor_program: ProgramId,
         execution_semantics: Hash,
         statement: Hash,
+        trace: Hash,
         proof: &[u8],
     ) -> bool {
-        self(actor_program, execution_semantics, statement, proof)
+        self(actor_program, execution_semantics, statement, trace, proof)
     }
 }
 
@@ -820,7 +849,9 @@ pub fn verify_once<T, M: AttestedMethod<T>>(
     verifier: &impl ProofVerifier,
 ) -> Result<Verified<T>, AttestationError> {
     if package.producer_name != expected_producer_name
+        || package.producer_name != package.statement.producer_name
         || package.producer != expected_source.producer
+        || package.statement.producer != expected_source.producer
     {
         return Err(AttestationError::WrongProducer);
     }
@@ -868,6 +899,7 @@ pub fn verify_once<T, M: AttestedMethod<T>>(
             .service
             .execution_semantics,
         package.statement.commitment(),
+        package.trace,
         &package.proof,
     ) {
         return Err(AttestationError::InvalidProof);
@@ -1072,6 +1104,8 @@ mod tests {
             statement_version: crate::v2::ATTESTATION_STATEMENT_VERSION,
             space: SpaceId([6; 32]),
             actor,
+            producer_name: "private-age".to_string(),
+            producer: ProducerId([15; 32]),
             deployment,
             actor_program: ProgramId([8; 32]),
             method: "is_adult".to_string(),
@@ -1117,7 +1151,7 @@ mod tests {
 
     #[test]
     fn verification_is_separate_tamper_evident_and_once_only() {
-        let verifier = |_: ProgramId, _: Hash, _: Hash, proof: &[u8]| proof == [1];
+        let verifier = |_: ProgramId, _: Hash, _: Hash, _: Hash, proof: &[u8]| proof == [1];
         let mut replay = AttestationReplayGuard::default();
         assert_eq!(
             verify_once(
@@ -1208,11 +1242,36 @@ mod tests {
     }
 
     #[test]
+    fn portable_verification_authenticates_the_exact_proof_trace() {
+        let original = package(31);
+        let expected_trace = original.trace;
+        let mut tampered = original;
+        tampered.trace = Hash([99; 32]);
+        let transported =
+            Attestation::<u64, Method>::from_portable_bytes(&tampered.to_portable_bytes().unwrap())
+                .unwrap();
+        let verifier = move |_: ProgramId, _: Hash, _: Hash, trace: Hash, proof: &[u8]| {
+            trace == expected_trace && proof == [1]
+        };
+        assert_eq!(
+            verify_once(
+                transported,
+                "private-age",
+                &source(),
+                &mut AttestationReplayGuard::default(),
+                &finalized,
+                &verifier,
+            ),
+            Err(AttestationError::InvalidProof),
+        );
+    }
+
+    #[test]
     fn verifier_builder_resolves_the_source_and_never_needs_a_producer() {
         let resolver = |name: &str, method: &str| {
             (name == "private-age" && method == Method::METHOD).then(source)
         };
-        let verifier = |_: ProgramId, _: Hash, _: Hash, proof: &[u8]| proof == [1];
+        let verifier = |_: ProgramId, _: Hash, _: Hash, _: Hash, proof: &[u8]| proof == [1];
         let mut replay = AttestationReplayGuard::default();
         let mut context = VerificationContext::new(&resolver, &finalized, &verifier, &mut replay);
 
@@ -1236,7 +1295,7 @@ mod tests {
 
     #[test]
     fn verification_requires_finality_and_the_current_resolved_deployment() {
-        let verifier = |_: ProgramId, _: Hash, _: Hash, proof: &[u8]| proof == [1];
+        let verifier = |_: ProgramId, _: Hash, _: Hash, _: Hash, proof: &[u8]| proof == [1];
         let unavailable = |_: &ReceiptVerificationRequestV2| ReceiptVerificationV2::Unavailable;
         assert_eq!(
             verify_once(

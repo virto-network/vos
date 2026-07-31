@@ -384,6 +384,10 @@ pub struct CheckpointTokenV2 {
 pub struct ActorCallRequestV2 {
     pub await_ordinal: u64,
     pub from: ActorId,
+    /// Exact installed root service which owns `to`. The actor VM obtains
+    /// this identity from its authenticated external directory; transport
+    /// may not select a different root which happens to reuse the ActorId.
+    pub to_service: ServiceIdentityV2,
     pub to: ActorId,
     pub payload: Vec<u8>,
     pub authorization: AuthorizationEvidenceV2,
@@ -566,6 +570,9 @@ pub struct MessageRecordV2 {
     pub caller_invocation: InvocationId,
     pub await_ordinal: u64,
     pub from: ActorId,
+    /// Exact destination root committed by the caller's installed external
+    /// directory. Delivery must enter this service identity.
+    pub to_service: ServiceIdentityV2,
     pub to: ActorId,
     pub parent: Option<CallId>,
     pub payload: Vec<u8>,
@@ -661,7 +668,12 @@ impl AccumulatedReplyV2 {
             return Err(crate::AttestationError::ReceiptMismatch);
         }
         if let Some(attestation) = &self.attestation {
-            if attestation.producer_name.is_empty() {
+            if attestation.producer_name.is_empty()
+                || attestation.producer_name != attestation.statement.producer_name
+            {
+                return Err(crate::AttestationError::WrongProducer);
+            }
+            if attestation.producer != attestation.statement.producer {
                 return Err(crate::AttestationError::WrongProducer);
             }
             validate_attestation_delivery(
@@ -1162,6 +1174,9 @@ pub struct PublishedEffectsV2 {
     pub outbox: Vec<MessageRecordV2>,
     pub exported_blobs: Vec<BlobRefV2>,
     pub proof: Option<ProofCommitmentV2>,
+    /// Guest-derived, receipt-bound package metadata retained with the
+    /// publication so transport can recover an attested reply after restart.
+    pub attestation: Option<Box<AttestationDeliveryV2>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1906,6 +1921,7 @@ impl V2Wire for AwaitResumeV2 {
         if value.checkpoint.pending_call != Some(value.reply.call_id)
             || value.attestation.as_ref().is_some_and(|attestation| {
                 attestation.producer_name.is_empty()
+                    || attestation.producer_name != attestation.statement.producer_name
                     || validate_attestation_delivery(
                         &value.reply,
                         &attestation.statement.accumulation_receipt,
@@ -2659,6 +2675,12 @@ impl V2Wire for PublishedEffectsV2 {
         e.list(&self.outbox, encode_message);
         e.list(&self.exported_blobs, encode_blob_ref);
         e.option(&self.proof, encode_proof);
+        e.option(&self.attestation, |e, attestation| {
+            e.string(&attestation.producer_name);
+            e.fixed(&attestation.producer.0);
+            e.bytes(&attestation.statement.encode());
+            encode_proof(e, &attestation.proof);
+        });
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -2667,9 +2689,32 @@ impl V2Wire for PublishedEffectsV2 {
             outbox: d.list(decode_message)?,
             exported_blobs: d.list(decode_blob_ref)?,
             proof: d.option(decode_proof)?,
+            attestation: d.option(|d| {
+                Ok(Box::new(AttestationDeliveryV2 {
+                    producer_name: d.string()?,
+                    producer: ProducerId(d.fixed()?),
+                    statement: AttestationStatementV3::decode(&d.bytes()?)?,
+                    proof: decode_proof(d)?,
+                }))
+            })?,
         };
         ensure_sorted_unique(&value.outbox, |message| message.call_id.0)?;
         ensure_sorted_unique(&value.exported_blobs, |blob| blob.hash.0)?;
+        match (&value.proof, &value.attestation) {
+            (None, None) => {}
+            (Some(proof), Some(attestation))
+                if attestation.producer_name.is_empty()
+                    || attestation.producer == ProducerId::ZERO
+                    || attestation.producer_name != attestation.statement.producer_name
+                    || attestation.producer != attestation.statement.producer
+                    || proof.statement != attestation.statement.commitment()
+                    || &attestation.proof != proof =>
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+            (Some(_), Some(_)) => {}
+            _ => return Err(DecodeError::NonCanonical),
+        }
         Ok(value)
     }
 }
@@ -3562,6 +3607,7 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, Dec
 fn encode_actor_call(e: &mut Encoder<'_>, value: &ActorCallRequestV2) {
     e.u64(value.await_ordinal);
     e.fixed(&value.from.0);
+    encode_service(e, &value.to_service);
     e.fixed(&value.to.0);
     e.bytes(&value.payload);
     encode_auth(e, &value.authorization);
@@ -3573,6 +3619,7 @@ fn decode_actor_call(d: &mut Decoder<'_>) -> Result<ActorCallRequestV2, DecodeEr
     Ok(ActorCallRequestV2 {
         await_ordinal: d.u64()?,
         from: ActorId(d.fixed()?),
+        to_service: decode_service(d)?,
         to: ActorId(d.fixed()?),
         payload: d.bytes()?,
         authorization: decode_auth(d)?,
@@ -3594,6 +3641,7 @@ fn encode_message(e: &mut Encoder<'_>, value: &MessageRecordV2) {
     e.fixed(&value.caller_invocation.0);
     e.u64(value.await_ordinal);
     e.fixed(&value.from.0);
+    encode_service(e, &value.to_service);
     e.fixed(&value.to.0);
     e.option(&value.parent, |e, id| e.fixed(&id.0));
     e.bytes(&value.payload);
@@ -3608,6 +3656,7 @@ fn decode_message(d: &mut Decoder<'_>) -> Result<MessageRecordV2, DecodeError> {
         caller_invocation: InvocationId(d.fixed()?),
         await_ordinal: d.u64()?,
         from: ActorId(d.fixed()?),
+        to_service: decode_service(d)?,
         to: ActorId(d.fixed()?),
         parent: d.option(|d| d.fixed().map(CallId))?,
         payload: d.bytes()?,
@@ -3684,6 +3733,14 @@ fn ensure_external_actors_canonical(actors: &[ExternalActorBindingV2]) -> Result
     if actors.windows(2).any(|pair| pair[0].name >= pair[1].name) {
         return Err(DecodeError::NonCanonical);
     }
+    let mut actor_ids = actors
+        .iter()
+        .map(|binding| binding.actor)
+        .collect::<Vec<_>>();
+    actor_ids.sort_unstable();
+    if actor_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(DecodeError::NonCanonical);
+    }
     Ok(())
 }
 
@@ -3757,6 +3814,7 @@ mod tests {
             caller_invocation,
             await_ordinal,
             from: ActorId([byte.wrapping_add(1); 32]),
+            to_service: service(),
             to: ActorId([byte.wrapping_add(2); 32]),
             parent: None,
             payload: vec![byte],
@@ -4043,6 +4101,7 @@ mod tests {
             outbox: vec![ActorCallRequestV2 {
                 await_ordinal: 7,
                 from: ActorId([21; 32]),
+                to_service: service(),
                 to: ActorId([27; 32]),
                 payload: b"peer request".to_vec(),
                 authorization: AuthorizationEvidenceV2::Public,
@@ -4251,6 +4310,8 @@ mod tests {
             statement_version: super::super::ATTESTATION_STATEMENT_VERSION,
             space: receipt.service.space,
             actor,
+            producer_name: "private-age".into(),
+            producer: ProducerId([51; 32]),
             deployment: receipt.service.deployment,
             actor_program: ProgramId([45; 32]),
             method: "is_adult".into(),
@@ -4380,6 +4441,7 @@ mod tests {
             caller_invocation,
             await_ordinal: 3,
             from: ActorId([72; 32]),
+            to_service: service(),
             to: ActorId([73; 32]),
             parent: Some(CallId([74; 32])),
             payload: b"message".to_vec(),
@@ -4567,6 +4629,37 @@ mod tests {
         genesis.actors[0].name = "root".into();
         genesis.actors[0].parent = Some(genesis.actors[0].actor);
         assert_eq!(genesis.validate(), Err(DecodeError::NonCanonical));
+    }
+
+    #[test]
+    fn external_directory_rejects_duplicate_actor_identities() {
+        let actor = ActorId([21; 32]);
+        let directory = ExternalActorDirectoryV2 {
+            actors: vec![
+                ExternalActorBindingV2 {
+                    name: "first".into(),
+                    service: service(),
+                    actor,
+                    producer: ProducerId([22; 32]),
+                    program: ProgramId([23; 32]),
+                },
+                ExternalActorBindingV2 {
+                    name: "second".into(),
+                    service: ServiceIdentityV2 {
+                        root_service: RootServiceId([24; 32]),
+                        deployment: DeploymentId([25; 32]),
+                        ..service()
+                    },
+                    actor,
+                    producer: ProducerId([26; 32]),
+                    program: ProgramId([27; 32]),
+                },
+            ],
+        };
+        assert_eq!(
+            ExternalActorDirectoryV2::decode(&directory.encode()),
+            Err(DecodeError::NonCanonical)
+        );
     }
 
     #[test]

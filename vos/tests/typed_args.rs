@@ -700,6 +700,8 @@ fn attested_receipt_result(claim: &Receipt) -> AttestedInvocationResult {
             statement_version: vos::v2::ATTESTATION_STATEMENT_VERSION,
             space: SpaceId([6; 32]),
             actor,
+            producer_name: "private-vault".into(),
+            producer: ProducerId([15; 32]),
             deployment,
             actor_program: ProgramId([8; 32]),
             method: "last_receipt".into(),

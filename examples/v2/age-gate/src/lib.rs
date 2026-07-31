@@ -96,6 +96,8 @@ mod tests {
             statement_version: vos::v2::ATTESTATION_STATEMENT_VERSION,
             space: SpaceId([6; 32]),
             actor,
+            producer_name: "private-age".into(),
+            producer: ProducerId([15; 32]),
             deployment,
             actor_program: ProgramId([8; 32]),
             method: "is_adult".into(),
@@ -104,10 +106,7 @@ mod tests {
             reply_call,
             before: StateCommitmentV3::Linear(Hash([11; 32])),
             after: StateCommitmentV3::Linear(Hash([5; 32])),
-            claim_commitment: Hash::digest(
-                b"vos/attestation-claim/v3",
-                &[&claim_wire],
-            ),
+            claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&claim_wire]),
             input_commitment: Hash([13; 32]),
             authorization_policy: Hash([14; 32]),
             accumulation_receipt: receipt,
@@ -138,10 +137,9 @@ mod tests {
             (name == "private-age" && method == IsAdult::METHOD).then(|| source.clone())
         };
         let finalized = |_: &vos::v2::ReceiptVerificationRequestV2| ReceiptVerificationV2::Valid;
-        let verifier = |_: ProgramId, _: Hash, _: Hash, proof: &[u8]| proof == [1];
+        let verifier = |_: ProgramId, _: Hash, _: Hash, _: Hash, proof: &[u8]| proof == [1];
         let mut replay = AttestationReplayGuard::default();
-        let mut context =
-            VerificationContext::new(&resolver, &finalized, &verifier, &mut replay);
+        let mut context = VerificationContext::new(&resolver, &finalized, &verifier, &mut replay);
         let invocation = InvocationId([10; 32]);
 
         let claim = block_on(verify_age(&mut context, package(invocation))).unwrap();

@@ -6,7 +6,7 @@
 //! storage transaction boundary.
 
 use alloc::boxed::Box;
-use alloc::{string::String, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::attestation::{
     Attestation, AttestationError, AttestationPreparationV2, AttestationProofHostV2,
@@ -17,7 +17,7 @@ use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateProtocolHostV2, AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2,
     AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2, AttestationDeliveryV2,
-    CommittedServiceImageHostV2, ImportedBlobV2, LocalJamStoreSnapshotV2, ProducerId, ProgramId,
+    CommittedServiceImageHostV2, ImportedBlobV2, LocalJamStoreSnapshotV2, ProgramId,
     ProofCommitmentV2, ProofVerificationRequestV2, PublishedEffectsV2, RefineImportsV2,
     RefineOutputV2, RefineProtocolHostV2, ServiceImageInstallErrorV2, ServicePvmErrorV2,
     ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
@@ -54,14 +54,18 @@ impl CommittedAttestationOutputV2 {
     /// caller cannot observe a prepared or merely proved package.
     pub fn into_accumulated_reply(
         self,
-        producer_name: String,
-        producer: ProducerId,
     ) -> Result<(AccumulatedReplyV2, ImportedBlobV2), AttestationError> {
         let reply = self
             .published
             .reply
             .ok_or(AttestationError::InvalidStatement)?;
+        let delivery = self
+            .published
+            .attestation
+            .ok_or(AttestationError::InvalidStatement)?;
         if self.published.proof.as_ref() != Some(&self.proof)
+            || delivery.statement != self.preparation.statement
+            || delivery.proof != self.proof
             || !self.proof.proof_blob.matches(&self.proof_bytes)
         {
             return Err(AttestationError::InvalidProof);
@@ -73,12 +77,7 @@ impl CommittedAttestationOutputV2 {
         let accumulated = AccumulatedReplyV2 {
             reply,
             receipt: self.preparation.receipt,
-            attestation: Some(Box::new(AttestationDeliveryV2 {
-                producer_name,
-                producer,
-                statement: self.preparation.statement,
-                proof: self.proof,
-            })),
+            attestation: Some(delivery),
         };
         accumulated.validate()?;
         Ok((accumulated, proof_blob))
@@ -89,19 +88,21 @@ impl CommittedAttestationOutputV2 {
     /// decoded; prepare/proof output alone cannot construct this record.
     pub fn into_invocation_result(
         self,
-        producer_name: String,
-        producer: ProducerId,
     ) -> Result<crate::actors::client::AttestedInvocationResult, AttestationError> {
         let reply = self
             .published
             .reply
             .ok_or(AttestationError::InvalidStatement)?;
+        let delivery = self
+            .published
+            .attestation
+            .ok_or(AttestationError::InvalidStatement)?;
         let value = <crate::value::Value as crate::Decode>::try_decode(&reply.result)
             .ok_or(AttestationError::InvalidStatement)?;
         Ok(crate::actors::client::AttestedInvocationResult {
             value,
-            producer_name,
-            producer,
+            producer_name: delivery.producer_name,
+            producer: delivery.producer,
             statement: self.preparation.statement,
             trace: self.proof.trace,
             proof: self.proof_bytes,
@@ -113,18 +114,21 @@ impl CommittedAttestationOutputV2 {
     /// reply wire before the package can leave the runtime boundary.
     pub fn into_attestation<T, M: AttestedMethod<T>>(
         self,
-        producer_name: String,
-        producer: ProducerId,
         preview: T,
     ) -> Result<Attestation<T, M>, AttestationError> {
+        let delivery = self
+            .published
+            .attestation
+            .as_ref()
+            .ok_or(AttestationError::InvalidStatement)?;
         let claim_wire = self
             .published
             .reply
             .ok_or(AttestationError::InvalidStatement)?
             .result;
         Attestation::__from_runtime_wire(
-            producer_name,
-            producer,
+            delivery.producer_name.clone(),
+            delivery.producer,
             self.preparation.statement,
             self.proof.trace,
             claim_wire,
@@ -630,6 +634,12 @@ where
             outbox: envelope.transition.outbox,
             exported_blobs: envelope.transition.exported_blobs,
             proof: Some(proof.clone()),
+            attestation: Some(Box::new(AttestationDeliveryV2 {
+                producer_name: preparation.statement.producer_name.clone(),
+                producer: preparation.statement.producer,
+                statement: preparation.statement.clone(),
+                proof: proof.clone(),
+            })),
         };
         validate_committed_attestation(&preparation, &proof, &preparation.receipt, &published)?;
         Ok(CommittedAttestationOutputV2 {
@@ -696,6 +706,11 @@ fn validate_committed_attestation<E, P>(
     if preparation.validate().is_err()
         || committed_receipt != &preparation.receipt
         || published.proof.as_ref() != Some(proof)
+        || published.attestation.as_ref().is_none_or(|delivery| {
+            delivery.statement != preparation.statement
+                || delivery.proof != *proof
+                || delivery.producer != preparation.statement.producer
+        })
         || committed_receipt.reply_commitment != Some(reply.commitment())
         || preparation.statement.claim_commitment
             != super::Hash::digest(b"vos/attestation-claim/v3", &[&reply.result])

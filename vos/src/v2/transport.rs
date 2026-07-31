@@ -7,12 +7,15 @@
 
 use alloc::vec::Vec;
 
+use crate::attestation::{AttestationProofHostV2, AttestationProofProducerV2};
+
 use super::{
     AccumulateProtocolHostV2, AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2,
-    AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2, CallId, InvocationId,
-    JamServiceV2, LocalJamStoreHostV2, LocalStoreReadErrorV2, LocalWorkSchedulerV2,
-    NoRefineProtocolHostV2, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
-    ReceiptVerificationRequestV2, ScheduleErrorV2, ServiceDispatchError, V2Wire,
+    AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2, AttestedServiceErrorV2,
+    CallId, InvocationId, JamServiceV2, LocalJamStoreHostV2, LocalStoreReadErrorV2,
+    LocalWorkSchedulerV2, NoRefineProtocolHostV2, ProofVerificationRequestV2, PublicationAckV2,
+    PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2, ScheduleErrorV2,
+    ServiceDispatchError, V2Wire,
 };
 
 type LocalServiceV2<A> = JamServiceV2<NoRefineProtocolHostV2, A>;
@@ -64,6 +67,8 @@ pub enum LocalTransportErrorV2 {
     MissingReply,
     MissingReplyRoute(CallId),
     DivergentReply(CallId),
+    MissingAttestationProof(CallId),
+    InvalidAttestationProof(CallId),
     NonCanonicalPublication,
     UnexpectedResult,
     TimeslotNotAfterAdmission {
@@ -80,6 +85,18 @@ impl core::fmt::Display for LocalTransportErrorV2 {
 }
 
 impl core::error::Error for LocalTransportErrorV2 {}
+
+#[derive(Debug)]
+pub enum AttestedTransportErrorV2<E> {
+    Transport(LocalTransportErrorV2),
+    Attested(AttestedServiceErrorV2<ServiceDispatchError, E>),
+}
+
+impl<E> From<LocalTransportErrorV2> for AttestedTransportErrorV2<E> {
+    fn from(value: LocalTransportErrorV2) -> Self {
+        Self::Transport(value)
+    }
+}
 
 impl From<LocalStoreReadErrorV2> for LocalTransportErrorV2 {
     fn from(value: LocalStoreReadErrorV2) -> Self {
@@ -185,8 +202,8 @@ impl LocalTransportV2 {
         logical_timeslot: u64,
     ) -> Result<CommittedReplyResumeV2, LocalTransportErrorV2>
     where
-        P: LocalJamStoreHostV2,
-        C: LocalJamStoreHostV2 + AccumulateProtocolHostV2,
+        P: LocalJamStoreHostV2 + AttestationProofHostV2,
+        C: LocalJamStoreHostV2 + AccumulateProtocolHostV2 + AttestationProofHostV2,
     {
         let canonical = committed_publication(producer, publication)?;
         let reply = canonical
@@ -197,7 +214,7 @@ impl LocalTransportV2 {
         let awaited_reply = AccumulatedReplyV2 {
             reply: reply.clone(),
             receipt: canonical.receipt,
-            attestation: None,
+            attestation: canonical.published.attestation.clone(),
         };
         if let Some((admission, receipt)) = caller
             .accumulate_host()
@@ -234,6 +251,33 @@ impl LocalTransportV2 {
             return Err(ScheduleErrorV2::DeadlineExpired(reply.call_id).into());
         }
         let caller_invocation = message.caller_invocation;
+        if let Some(attestation) = awaited_reply.attestation.as_ref() {
+            let proof = producer
+                .accumulate_host()
+                .proof_bytes(&attestation.proof.proof_blob)
+                .ok_or(LocalTransportErrorV2::MissingAttestationProof(
+                    reply.call_id,
+                ))?;
+            let verification = ProofVerificationRequestV2 {
+                actor_program: attestation.statement.actor_program,
+                execution_semantics: attestation
+                    .statement
+                    .accumulation_receipt
+                    .service
+                    .execution_semantics,
+                statement: attestation.proof.statement,
+                trace: attestation.proof.trace,
+                proof_blob: attestation.proof.proof_blob.clone(),
+            };
+            if !caller
+                .accumulate_host_mut()
+                .make_proof_available(&verification, &proof)
+            {
+                return Err(LocalTransportErrorV2::InvalidAttestationProof(
+                    reply.call_id,
+                ));
+            }
+        }
         caller
             .accumulate_host_mut()
             .local_store_mut()
@@ -351,6 +395,94 @@ impl LocalTransportV2 {
                     return Err(LocalTransportErrorV2::Rejected(rejection));
                 }
                 _ => return Err(LocalTransportErrorV2::UnexpectedResult),
+            }
+        }
+        Ok(outcomes)
+    }
+
+    /// Drain authenticated inbox rows, producing a proof before guest
+    /// Accumulate whenever the caller selected an attested handle.
+    ///
+    /// Proof metadata is published by guest Accumulate from the installed
+    /// actor descriptor; the transport cannot supply a producer label.
+    pub fn drain_pending_attested<A, P>(
+        destination: &mut LocalServiceV2<A>,
+        logical_timeslot: u64,
+        proof_producer: &mut P,
+    ) -> Result<Vec<InboxDrainOutcomeV2>, AttestedTransportErrorV2<P::Error>>
+    where
+        A: LocalJamStoreHostV2 + AccumulateProtocolHostV2 + AttestationProofHostV2,
+        P: AttestationProofProducerV2,
+    {
+        let pending = destination
+            .accumulate_host()
+            .local_store()
+            .pending_inbox_calls()
+            .map_err(LocalTransportErrorV2::Store)?;
+        let mut outcomes = Vec::with_capacity(pending.len());
+        for (call, admitted_at) in pending {
+            if logical_timeslot <= admitted_at {
+                return Err(LocalTransportErrorV2::TimeslotNotAfterAdmission {
+                    call,
+                    admitted_at,
+                    requested: logical_timeslot,
+                }
+                .into());
+            }
+            let prepared = match LocalWorkSchedulerV2::prepare_inbox(
+                destination.accumulate_host().local_store(),
+                call,
+                logical_timeslot,
+            ) {
+                Ok(prepared) => prepared,
+                Err(
+                    reason @ (ScheduleErrorV2::ActorBusy(_) | ScheduleErrorV2::DeadlineExpired(_)),
+                ) => {
+                    outcomes.push(InboxDrainOutcomeV2::Deferred { call, reason });
+                    continue;
+                }
+                Err(error) => return Err(LocalTransportErrorV2::Schedule(error).into()),
+            };
+            let refined = destination
+                .refine_actor_tree(&prepared.work, &prepared.imports)
+                .map_err(LocalTransportErrorV2::Service)?;
+            let envelope = AccumulationEnvelopeV2 {
+                work: prepared.work,
+                transition: refined.transition,
+                provided_blobs: refined.exported_blobs,
+            };
+            if envelope.work.proof_requested {
+                let committed = destination
+                    .accumulate_attested(envelope, &prepared.imports, proof_producer)
+                    .map_err(AttestedTransportErrorV2::Attested)?;
+                outcomes.push(InboxDrainOutcomeV2::Committed(CommittedInboxSliceV2 {
+                    call,
+                    receipt: committed.preparation.receipt,
+                    published: committed.published,
+                    refine_gas_used: refined.gas_used,
+                    accumulate_gas_used: committed.accumulate_gas_used,
+                }));
+                continue;
+            }
+            let accumulated = destination
+                .accumulate(&AccumulateRequestV2::Apply(envelope))
+                .map_err(LocalTransportErrorV2::Service)?;
+            match accumulated.result {
+                AccumulationResultV2::Accepted {
+                    receipt,
+                    published,
+                    duplicate: false,
+                } => outcomes.push(InboxDrainOutcomeV2::Committed(CommittedInboxSliceV2 {
+                    call,
+                    receipt,
+                    published,
+                    refine_gas_used: refined.gas_used,
+                    accumulate_gas_used: accumulated.gas_used,
+                })),
+                AccumulationResultV2::Rejected(rejection) => {
+                    return Err(LocalTransportErrorV2::Rejected(rejection).into());
+                }
+                _ => return Err(LocalTransportErrorV2::UnexpectedResult.into()),
             }
         }
         Ok(outcomes)

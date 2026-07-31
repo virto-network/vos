@@ -5,6 +5,7 @@
 //! physical IC-5 entry halts successfully. Storage errors are therefore fatal
 //! rather than encoded rejections; trapping makes the host discard staging.
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
@@ -300,6 +301,9 @@ fn deliver<S: GuestAccumulateStoreV2>(
         }
     };
     if envelope.service != header.service {
+        return Ok(rejected(AccumulationRejectionV2::WrongService));
+    }
+    if envelope.message.to_service != header.service {
         return Ok(rejected(AccumulationRejectionV2::WrongService));
     }
     if header.service.service_abi != ABI_VERSION {
@@ -1113,7 +1117,12 @@ fn apply<S: GuestAccumulateStoreV2>(
             },
             ApplyMode::PrepareAttested => {
                 let mut preparation = match AttestationPreparationV2::for_transition(
-                    work, transition, &policy, receipt,
+                    work,
+                    transition,
+                    &policy,
+                    &actor.name,
+                    actor.producer,
+                    receipt,
                 ) {
                     Ok(preparation) => preparation,
                     Err(_) => return Ok(rejected(AccumulationRejectionV2::InvalidProof)),
@@ -1126,12 +1135,19 @@ fn apply<S: GuestAccumulateStoreV2>(
                 let Some(proof) = publication.published.proof.clone() else {
                     return Err(GuestAccumulateError::CorruptStore);
                 };
+                let Some(delivery) = publication.published.attestation.as_ref() else {
+                    return Err(GuestAccumulateError::CorruptStore);
+                };
                 if publication.input != work.input_id()
                     || publication.receipt != preparation.receipt
                     || publication.published.reply != transition.reply
                     || publication.published.outbox != transition.outbox
                     || publication.published.exported_blobs != transition.exported_blobs
                     || proof.statement != preparation.statement.commitment()
+                    || delivery.producer_name != actor.name
+                    || delivery.producer != actor.producer
+                    || delivery.statement != preparation.statement
+                    || delivery.proof != proof
                 {
                     return Err(GuestAccumulateError::CorruptStore);
                 }
@@ -1273,7 +1289,7 @@ fn apply<S: GuestAccumulateStoreV2>(
             || external_directory
                 .actors
                 .iter()
-                .all(|binding| binding.actor != message.to)
+                .all(|binding| binding.actor != message.to || binding.service != message.to_service)
         {
             return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
         }
@@ -1489,6 +1505,8 @@ fn apply<S: GuestAccumulateStoreV2>(
             work,
             transition,
             &policy,
+            &actor.name,
+            actor.producer,
             receipt.clone(),
         ) {
             Ok(preparation) => preparation,
@@ -1561,11 +1579,23 @@ fn apply<S: GuestAccumulateStoreV2>(
         write_crdt_node_receipt(store, change.cid(), &receipt)?;
     }
 
+    let published_attestation = match (preparation.as_ref(), attached_proof) {
+        (Some(preparation), Some(proof)) if mode == ApplyMode::Commit => {
+            Some(Box::new(super::AttestationDeliveryV2 {
+                producer_name: actor.name.clone(),
+                producer: actor.producer,
+                statement: preparation.statement.clone(),
+                proof: proof.clone(),
+            }))
+        }
+        _ => None,
+    };
     let published = PublishedEffectsV2 {
         reply: transition.reply.clone(),
         outbox: transition.outbox.clone(),
         exported_blobs: transition.exported_blobs.clone(),
         proof: attached_proof.cloned(),
+        attestation: published_attestation,
     };
     if mode == ApplyMode::Commit && published != PublishedEffectsV2::default() {
         let publication = PublicationRecordV2 {
@@ -2937,6 +2967,8 @@ mod tests {
                 &work,
                 &transition,
                 &policy,
+                "root",
+                super::super::ProducerId([4; 32]),
                 preparation.receipt.clone(),
             )
             .unwrap()
@@ -3670,6 +3702,11 @@ mod tests {
             caller_invocation: first_work.invocation,
             await_ordinal: 0,
             from: first_work.target,
+            to_service: external_bindings()
+                .into_iter()
+                .find(|binding| binding.actor == peer)
+                .unwrap()
+                .service,
             to: peer,
             parent: None,
             payload,
@@ -3959,11 +3996,17 @@ mod tests {
         let await_ordinal = u64::from(call);
         let mut payload = vec![crate::value::TAG_DYNAMIC];
         payload.extend_from_slice(&crate::Encode::encode(&crate::value::Msg::new("set")));
+        let to_service = external_bindings()
+            .into_iter()
+            .find(|binding| binding.actor == to)
+            .map(|binding| binding.service)
+            .unwrap_or_else(identity);
         MessageRecordV2 {
             call_id: caller_invocation.call_id(await_ordinal),
             caller_invocation,
             await_ordinal,
             from,
+            to_service,
             to,
             parent,
             payload,
@@ -4429,6 +4472,11 @@ mod tests {
             caller_invocation: first_work.invocation,
             await_ordinal: 0,
             from: actor(),
+            to_service: external_bindings()
+                .into_iter()
+                .find(|binding| binding.actor == ActorId([44; 32]))
+                .unwrap()
+                .service,
             to: ActorId([44; 32]),
             parent: None,
             payload: vec![1],

@@ -3699,6 +3699,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
         caller_invocation,
         await_ordinal: 0,
         from: caller,
+        to_service: identity.clone(),
         to: target,
         parent: None,
         payload: payload.clone(),
@@ -4396,6 +4397,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         caller_invocation,
         await_ordinal: 0,
         from: work.target,
+        to_service: work.service.clone(),
         to: work.target,
         parent: None,
         payload: work.arguments.clone(),
@@ -4470,6 +4472,8 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
                 space_role: None,
                 actor_role: None,
             },
+            "root",
+            ProducerId([53; 32]),
             preparation.receipt.clone(),
         )
         .unwrap()
@@ -4861,6 +4865,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         caller_invocation: caller.work.invocation,
         await_ordinal: 0,
         from: caller.work.target,
+        to_service: remote_service.clone(),
         to: peer,
         parent: None,
         payload: caller.work.arguments.clone(),
@@ -5396,7 +5401,7 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
     assert_eq!(producer.calls, 1);
     let invocation_result = committed
         .clone()
-        .into_invocation_result("attested-actor".into(), ProducerId([0xA8; 32]))
+        .into_invocation_result()
         .expect("committed proof output becomes the generated-handle transport");
     assert_eq!(
         invocation_result.value,
@@ -5404,13 +5409,11 @@ fn attested_driver_proves_before_guest_accumulate_commits() {
     );
     let application_package = committed
         .clone()
-        .into_attestation::<Vec<u8>, StartMethod>(
-            "attested-actor".into(),
-            ProducerId([0xA8; 32]),
-            b"attested claim".to_vec(),
-        )
+        .into_attestation::<Vec<u8>, StartMethod>(b"attested claim".to_vec())
         .expect("a committed reply becomes the portable typed package");
     assert_eq!(application_package.unverified_preview(), b"attested claim");
+    assert_eq!(application_package.producer(), ProducerId([53; 32]));
+    assert_eq!(committed.preparation.statement.producer_name, "root");
     assert_eq!(
         application_package.statement(),
         &committed.preparation.statement
@@ -5554,6 +5557,202 @@ fn physical_guest_rejects_the_missing_preimage_length_sentinel() {
 }
 
 #[test]
+fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
+    let actor_pvm = grey_transpiler::link_elf(&workflow_v2_elf()).unwrap();
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_bytes = Vec::new();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let service_program = vos::v2::VOS_SERVICE_PROGRAM_ID;
+    let source_identity = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([201; 32]),
+        root_service: RootServiceId([202; 32]),
+        deployment: DeploymentId([203; 32]),
+        service_program,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+    };
+    let destination_identity = ServiceIdentityV2 {
+        root_service: RootServiceId([204; 32]),
+        deployment: DeploymentId([205; 32]),
+        ..source_identity.clone()
+    };
+    let source_actor = ActorId([5; 32]);
+    let destination_actor = ActorId([44; 32]);
+    let destination_producer = ProducerId([98; 32]);
+
+    let install_service = |identity: ServiceIdentityV2,
+                           actor: ActorId,
+                           name: &str,
+                           method: &str,
+                           producer: ProducerId,
+                           external_actors: Vec<ExternalActorBindingV2>| {
+        let mut host = LocalJamStoreV2::default();
+        assert_eq!(host.import_blob(initial_bytes.clone()), initial);
+        assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
+        let mut service = JamServiceV2::new(
+            CANONICAL_SERVICE_PVM.to_vec(),
+            service_program,
+            NoRefineProtocolHostV2,
+            host,
+            1_000_000_000,
+            1_000_000_000,
+        )
+        .unwrap();
+        let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            external_actors,
+            service: identity,
+            consistency: ConsistencyModeV2::Local,
+            actors: vec![ActorGenesisV2 {
+                actor,
+                name: name.into(),
+                parent: None,
+                producer,
+                program: actor_program,
+                initial_state: initial.clone(),
+                crdt: false,
+                role_policies: role_policies(vec![MethodPolicyV2 {
+                    method: method.into(),
+                    schema: Hash([206; 32]),
+                    policy: public_policy_hash(),
+                    public: true,
+                    attested: false,
+                    space_role: None,
+                    actor_role: None,
+                }]),
+            }],
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: vos::v2::SystemCapabilityId([207; 32]),
+                authenticator: vec![208],
+            },
+        });
+        authorize_install(&mut service, &install);
+        assert!(matches!(
+            service.accumulate(&install).unwrap().result,
+            AccumulationResultV2::Installed(_)
+        ));
+        service
+    };
+
+    let mut source = install_service(
+        source_identity,
+        source_actor,
+        "workflow",
+        "root_await_attested_peer",
+        ProducerId([53; 32]),
+        vec![external_binding(
+            "private-age",
+            destination_identity.clone(),
+            destination_actor,
+            destination_producer,
+            actor_program,
+        )],
+    );
+    let mut destination = install_service(
+        destination_identity,
+        destination_actor,
+        "private-age",
+        "peer_value",
+        destination_producer,
+        vec![],
+    );
+
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("root_await_attested_peer").encode());
+    let prepared = LocalWorkSchedulerV2::prepare(
+        source.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([209; 32]),
+            workflow_step: 0,
+            logical_timeslot: 1,
+            target: source_actor,
+            method: "root_await_attested_peer".into(),
+            arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    let refined = source
+        .refine_actor_tree(&prepared.work, &prepared.imports)
+        .unwrap();
+    assert_eq!(refined.transition.outbox.len(), 1);
+    assert!(refined.transition.outbox[0].proof_requested);
+    let call = refined.transition.outbox[0].call_id;
+    assert!(matches!(
+        source
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: prepared.work,
+                transition: refined.transition,
+                provided_blobs: refined.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+
+    let source_publication = LocalTransportV2::pending_publications(&source)
+        .unwrap()
+        .pop()
+        .unwrap();
+    LocalTransportV2::deliver(&source, &mut destination, &source_publication, call, 2).unwrap();
+    let mut proof_producer = CanonicalTestProofProducer {
+        trace: Hash([210; 32]),
+        proof: b"peer-proof".to_vec(),
+        calls: 0,
+    };
+    let drained =
+        LocalTransportV2::drain_pending_attested(&mut destination, 3, &mut proof_producer).unwrap();
+    let [InboxDrainOutcomeV2::Committed(committed)] = drained.as_slice() else {
+        panic!("the attested destination did not commit its inbox slice")
+    };
+    assert_eq!(proof_producer.calls, 1);
+    let attestation = committed
+        .published
+        .attestation
+        .as_ref()
+        .expect("guest Accumulate publishes the receipt-bound attestation");
+    assert_eq!(attestation.producer_name, "private-age");
+    assert_eq!(attestation.producer, destination_producer);
+    assert_eq!(attestation.statement.producer, destination_producer);
+    assert_eq!(attestation.statement.producer_name, "private-age");
+
+    let reply_publication = LocalTransportV2::pending_publications(&destination)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let resumed =
+        LocalTransportV2::resume_reply(&destination, &mut source, &reply_publication, 4).unwrap();
+    assert_eq!(
+        resumed.published.reply.as_ref().map(|reply| &reply.result),
+        Some(&Value::Bool(true).encode()),
+        "the exact restored caller receives the proof package, not only the claim bytes"
+    );
+    let admission = source
+        .accumulate_host()
+        .reply_admission(call)
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(
+        admission
+            .awaited_reply
+            .attestation
+            .as_ref()
+            .map(|package| package.producer),
+        Some(destination_producer)
+    );
+}
+
+#[test]
 fn finalized_outbox_is_durably_routed_across_service_restarts() {
     let service_pvm = vos::v2::transpile_service_elf(&service_elf()).unwrap();
     let service_program = ProgramId::of_pvm(&service_pvm);
@@ -5645,11 +5844,17 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
         )],
     );
     let destination = install_service(
-        destination_identity,
+        destination_identity.clone(),
         destination_actor,
         "peer_value",
         vec![],
     );
+    let impostor_identity = ServiceIdentityV2 {
+        root_service: RootServiceId([96; 32]),
+        deployment: DeploymentId([97; 32]),
+        ..destination_identity
+    };
+    let impostor = install_service(impostor_identity, destination_actor, "peer_value", vec![]);
 
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
     arguments.extend_from_slice(&Msg::new("await_peer").encode());
@@ -5700,6 +5905,21 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
     assert_eq!(publication.published.outbox[0].call_id, call);
 
     let mut destination = restart_durable_service(destination, &service_pvm, service_program);
+    let mut impostor = restart_durable_service(impostor, &service_pvm, service_program);
+    let before_impostor = impostor.accumulate_host().snapshot();
+    assert!(matches!(
+        LocalTransportV2::deliver(&source, &mut impostor, &publication, call, 2),
+        Err(vos::v2::LocalTransportErrorV2::Rejected(
+            vos::v2::AccumulationRejectionV2::WrongService
+        ))
+    ));
+    assert!(
+        impostor
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before_impostor),
+        "an actor-id collision in another root cannot admit the bound message"
+    );
     let mut forged_publication = publication.clone();
     forged_publication.receipt.accepted_transition = Hash([95; 32]);
     let before_forged = destination.accumulate_host().snapshot();
