@@ -2,6 +2,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const EXPECTED: &str = "66065e3808d43d86b3506ee2e79d8ee6768caa16";
+const JAR_GIT: &str = "https://github.com/olanod/jar.git";
+const JAR_PACKAGES: &[&str] = &[
+    "javm",
+    "grey-transpiler",
+    "grey-crypto",
+    "grey-types",
+    "scale",
+    "scale-derive",
+];
 
 fn main() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -62,50 +71,100 @@ fn collect_dependency_files(
 }
 
 fn validate_manifest(path: &Path, source: &str, errors: &mut Vec<String>) {
-    for (index, line) in source.lines().enumerate() {
-        let line = line.trim();
-        if line.starts_with('#') || !line.contains("jar.git") {
-            continue;
+    let document = match source.parse::<toml::Value>() {
+        Ok(document) => document,
+        Err(error) => {
+            errors.push(format!("{} is not valid TOML: {error}", path.display()));
+            return;
         }
-        if dependency_revision(line) != Some(EXPECTED) {
-            errors.push(format!(
-                "{}:{} has an unpinned or different JAR revision",
-                path.display(),
-                index + 1,
-            ));
-        }
-        if line.contains("ssh://") {
-            errors.push(format!(
-                "{}:{} uses a non-reproducible SSH source URL",
-                path.display(),
-                index + 1,
-            ));
+    };
+    let Some(root) = document.as_table() else {
+        errors.push(format!("{} has no TOML root table", path.display()));
+        return;
+    };
+    validate_dependency_sections(path, root, errors);
+    if let Some(workspace) = root.get("workspace").and_then(toml::Value::as_table) {
+        validate_dependency_table(path, workspace.get("dependencies"), errors);
+    }
+    if let Some(targets) = root.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values().filter_map(toml::Value::as_table) {
+            validate_dependency_sections(path, target, errors);
         }
     }
 }
 
 fn validate_lock(path: &Path, source: &str, errors: &mut Vec<String>) {
-    for (index, line) in source.lines().enumerate() {
-        if !line.contains("/jar.git") {
-            continue;
+    let document = match source.parse::<toml::Value>() {
+        Ok(document) => document,
+        Err(error) => {
+            errors.push(format!("{} is not valid TOML: {error}", path.display()));
+            return;
         }
-        let requested = line
-            .split_once("?rev=")
-            .and_then(|(_, tail)| tail.split_once('#'));
-        if !matches!(requested, Some((revision, resolved)) if revision == EXPECTED && resolved.trim_end_matches('"') == EXPECTED)
+    };
+    let expected = format!("git+{JAR_GIT}?rev={EXPECTED}#{EXPECTED}");
+    let Some(packages) = document.get("package").and_then(toml::Value::as_array) else {
+        return;
+    };
+    for package in packages.iter().filter_map(toml::Value::as_table) {
+        let Some(name) = package.get("name").and_then(toml::Value::as_str) else {
+            continue;
+        };
+        if JAR_PACKAGES.contains(&name)
+            && package.get("source").and_then(toml::Value::as_str) != Some(expected.as_str())
         {
             errors.push(format!(
-                "{}:{} does not request and resolve the exact JAR commit",
+                "{} resolves JAR package {name} from a non-canonical source",
                 path.display(),
-                index + 1,
             ));
         }
     }
 }
 
-fn dependency_revision(line: &str) -> Option<&str> {
-    let (_, tail) = line.split_once("rev = \"")?;
-    tail.split_once('"').map(|(revision, _)| revision)
+fn validate_dependency_sections(
+    path: &Path,
+    table: &toml::map::Map<String, toml::Value>,
+    errors: &mut Vec<String>,
+) {
+    for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        validate_dependency_table(path, table.get(section), errors);
+    }
+}
+
+fn validate_dependency_table(
+    path: &Path,
+    dependencies: Option<&toml::Value>,
+    errors: &mut Vec<String>,
+) {
+    let Some(dependencies) = dependencies.and_then(toml::Value::as_table) else {
+        return;
+    };
+    for (alias, specification) in dependencies {
+        let package = specification
+            .as_table()
+            .and_then(|table| table.get("package"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or(alias);
+        if !JAR_PACKAGES.contains(&package) {
+            continue;
+        }
+        let valid = specification.as_table().is_some_and(|table| {
+            if table.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+                return table.get("git").is_none()
+                    && table.get("path").is_none()
+                    && table.get("registry").is_none();
+            }
+            table.get("git").and_then(toml::Value::as_str) == Some(JAR_GIT)
+                && table.get("rev").and_then(toml::Value::as_str) == Some(EXPECTED)
+                && table.get("path").is_none()
+                && table.get("registry").is_none()
+        });
+        if !valid {
+            errors.push(format!(
+                "{} dependency {alias} ({package}) must use the exact canonical JAR source and revision",
+                path.display(),
+            ));
+        }
+    }
 }
 
 fn validate_runtime_revision(path: &Path, source: &str, errors: &mut Vec<String>) {
@@ -134,10 +193,44 @@ mod tests {
         let mut errors = Vec::new();
         validate_manifest(
             Path::new("Cargo.toml"),
-            "javm = { git = \"https://github.com/olanod/jar.git\", rev = \"deadbeef\" }",
+            "[dependencies]\njavm = { git = \"https://github.com/olanod/jar.git\", rev = \"deadbeef\" }",
             &mut errors,
         );
         assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn rejects_path_registry_and_alternate_url_sources() {
+        for source in [
+            "[dependencies]\njavm = { path = \"../jar/grey/crates/javm\" }",
+            "[dependencies]\njavm = { version = \"0.4\", registry = \"crates-io\" }",
+            &format!(
+                "[dependencies]\njavm = {{ git = \"https://github.com/olanod/jar\", rev = \"{EXPECTED}\" }}"
+            ),
+        ] {
+            let mut errors = Vec::new();
+            validate_manifest(Path::new("Cargo.toml"), source, &mut errors);
+            assert_eq!(errors.len(), 1, "source unexpectedly accepted: {source}");
+        }
+    }
+
+    #[test]
+    fn checks_renamed_jar_packages_and_workspace_inheritance() {
+        let mut errors = Vec::new();
+        validate_manifest(
+            Path::new("Cargo.toml"),
+            "[dependencies]\nvm = { package = \"javm\", path = \"../javm\" }",
+            &mut errors,
+        );
+        assert_eq!(errors.len(), 1);
+
+        errors.clear();
+        validate_manifest(
+            Path::new("Cargo.toml"),
+            "[dependencies]\njavm = { workspace = true }",
+            &mut errors,
+        );
+        assert!(errors.is_empty());
     }
 
     #[test]
@@ -146,7 +239,7 @@ mod tests {
         validate_manifest(
             Path::new("Cargo.toml"),
             &format!(
-                "javm = {{ git = \"https://github.com/olanod/jar.git\", rev = \"{EXPECTED}\" }}"
+                "[dependencies]\njavm = {{ git = \"https://github.com/olanod/jar.git\", rev = \"{EXPECTED}\" }}"
             ),
             &mut errors,
         );
@@ -158,7 +251,7 @@ mod tests {
         let mut errors = Vec::new();
         validate_lock(
             Path::new("nested/Cargo.lock"),
-            "source = \"git+ssh://git@github.com/olanod/jar.git?rev=6db1168#6db1168\"",
+            "[[package]]\nname = \"javm\"\nversion = \"0.4.0\"\nsource = \"git+ssh://git@github.com/olanod/jar.git?rev=6db1168#6db1168\"",
             &mut errors,
         );
         assert_eq!(errors.len(), 1);
@@ -169,10 +262,24 @@ mod tests {
         let mut errors = Vec::new();
         validate_lock(
             Path::new("Cargo.lock"),
-            &format!("source = \"git+https://github.com/olanod/jar.git?rev={EXPECTED}#deadbeef\""),
+            &format!(
+                "[[package]]\nname = \"javm\"\nversion = \"0.4.0\"\nsource = \"git+https://github.com/olanod/jar.git?rev={EXPECTED}#deadbeef\""
+            ),
             &mut errors,
         );
         assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn rejects_registry_and_path_jar_packages_in_locks() {
+        for source in [
+            "[[package]]\nname = \"javm\"\nversion = \"0.4.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"",
+            "[[package]]\nname = \"javm\"\nversion = \"0.4.0\"",
+        ] {
+            let mut errors = Vec::new();
+            validate_lock(Path::new("Cargo.lock"), source, &mut errors);
+            assert_eq!(errors.len(), 1);
+        }
     }
 
     #[test]

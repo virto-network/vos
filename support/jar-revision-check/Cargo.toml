@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[dependencies]
+toml = "0.8"
+
 [[bin]]
 name = "jar-revision-check"
 path = "src/main.rs"
