@@ -378,7 +378,11 @@ stack; guest Accumulate rejects a partial lock or unlock. Suspended actors are
 non-reentrant, including children whose caller remains suspended, and later
 messages remain queued.
 
-Raft orders canonical `AccumulateRequestV2` bytes. An `Apply` request carries
+Raft orders canonical `AccumulateRequestV2` bytes together with the
+consensus-observed JAM slot for a time-dependent `ExpireCall`. The slot is
+part of the committed entry, so leader execution, follower catch-up, restart,
+and failover inject the identical IC-5 ambient input; a slotless replicated
+expiration is rejected before proposal. An `Apply` request carries
 the `AccumulationEnvelopeV2::provided_blobs` needed by that transition, while
 `Install` carries actor programs and initial state by content identity only.
 A joining replica therefore obtains installation artifacts from an
@@ -397,7 +401,7 @@ already committed workflow input.
 `RaftAccumulateLogV2` is the redb/`vos-raft` implementation of that boundary.
 In multi-replica mode it accepts writes only from the elected leader, waits for
 the worker's quorum-commit notification, then re-reads and verifies the exact
-committed request bytes. Its `last_applied` cursor advances separately and only
+committed request and time-provenance bytes. Its `last_applied` cursor advances separately and only
 after the local service image commits. Each cursor advance records the canonical
 `LocalJamStoreSnapshotV2` image for that exact log index while retaining a
 bounded recent window. Automatic compaction cannot cross this durable

@@ -17,21 +17,21 @@ use vos::network::RaftRpcHandler;
 use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, WorkerConfig};
 use vos::v2::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
-    AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2,
-    AuthorizationEvidenceV2, BlobRefV2, CallId, CommittedAccumulateBatchV2,
-    CommittedAccumulateEntryV2, CommittedAccumulateLogV2, CommittedImageStoreV2,
-    CommittedServiceImageHostV2, CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2,
-    ExternalActorBindingV2, GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2,
-    ImportedProgramV2, InboxDrainOutcomeV2, InvocationId, JamServiceV2, LocalJamStoreHostV2,
-    LocalJamStoreV2, LocalTransportV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2,
-    MethodPolicyV2, NoRefineProtocolHostV2, Origin, PackageRolePoliciesV2, ProducerId, ProgramId,
+    AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AuthorizationEvidenceV2,
+    BlobRefV2, CallId, CommittedAccumulateBatchV2, CommittedAccumulateEntryV2,
+    CommittedAccumulateLogV2, CommittedImageStoreV2, CommittedServiceImageHostV2,
+    CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2,
+    ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2, ExternalActorBindingV2,
+    GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2,
+    InvocationId, JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2, LocalTransportV2,
+    LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
+    NoRefineProtocolHostV2, Origin, PackageRolePoliciesV2, ProducerId, ProgramId,
     ProofArtifactStoreV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2,
-    RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RoleCredentialV2,
-    RoleCredentialVerificationRequestV2, RootServiceId, ScheduleErrorV2, ServiceDispatchError,
-    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId,
-    TransitionV2, V2Wire, WorkEnvelopeV2, WorkflowOperationV2, public_policy_hash,
-    space_role_policy_hash,
+    RefineOutputV2, ReplicatedJamServiceV2, ReplicatedServiceErrorV2, ReplyRecordV2,
+    RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId, ScheduleErrorV2,
+    ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2,
+    StateKeyV2, SubjectId, TransitionV2, V2Wire, WorkEnvelopeV2, WorkflowOperationV2,
+    public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     AttestedMethod, Decode, Encode,
@@ -211,7 +211,11 @@ impl TestCommittedLog {
 impl CommittedAccumulateLogV2 for TestCommittedLog {
     type Error = TestLogError;
 
-    fn propose(&mut self, request: &[u8]) -> Result<CommittedAccumulateEntryV2, Self::Error> {
+    fn propose_at(
+        &mut self,
+        request: &[u8],
+        logical_timeslot: Option<u64>,
+    ) -> Result<CommittedAccumulateEntryV2, Self::Error> {
         if !self.leader {
             return Err(TestLogError::NotLeader);
         }
@@ -220,12 +224,14 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
             let entry = CommittedAccumulateEntryV2 {
                 index: shared.entries.len() as u64 + 1,
                 request,
+                logical_timeslot: None,
             };
             shared.entries.push(entry);
         }
         let entry = CommittedAccumulateEntryV2 {
             index: shared.entries.len() as u64 + 1,
             request: request.to_vec(),
+            logical_timeslot,
         };
         shared.entries.push(entry.clone());
         Ok(entry)
@@ -3528,7 +3534,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
     let persisted_checkpoint = committed.accumulate_host().snapshot_bytes();
     let timeout_store = LocalJamStoreV2::from_snapshot_bytes(&persisted_checkpoint)
         .expect("the checkpoint image starts an independent timeout branch");
-    let mut timeout_service = JamServiceV2::new(
+    let timeout_jam = JamServiceV2::new(
         service_pvm.clone(),
         service_program,
         NoRefineProtocolHostV2,
@@ -3537,33 +3543,67 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
         5_000_000_000,
     )
     .unwrap();
+    let timeout_follower_store = LocalJamStoreV2::from_snapshot_bytes(&persisted_checkpoint)
+        .expect("the follower starts from the identical checkpoint image");
+    let timeout_follower_jam = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        timeout_follower_store,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let timeout_log = Arc::new(Mutex::new(SharedCommittedLog::default()));
+    let mut timeout_service = ReplicatedJamServiceV2::new(
+        timeout_jam,
+        TestCommittedLog::new(timeout_log.clone(), true),
+    );
+    let mut timeout_follower = ReplicatedJamServiceV2::new(
+        timeout_follower_jam,
+        TestCommittedLog::new(timeout_log, false),
+    );
     assert!(
-        LocalWorkSchedulerV2::prepare_due_call_expirations(timeout_service.accumulate_host(), 99,)
-            .unwrap()
-            .is_empty(),
+        LocalWorkSchedulerV2::prepare_due_call_expirations(
+            timeout_service.service().accumulate_host(),
+            99,
+        )
+        .unwrap()
+        .is_empty(),
         "a logical timeslot before the deadline cannot expire the call"
     );
-    let due =
-        LocalWorkSchedulerV2::prepare_due_call_expirations(timeout_service.accumulate_host(), 100)
-            .expect("durable deadline rows are restart-discoverable");
+    let due = LocalWorkSchedulerV2::prepare_due_call_expirations(
+        timeout_service.service().accumulate_host(),
+        100,
+    )
+    .expect("durable deadline rows are restart-discoverable");
     assert_eq!(due.len(), 1);
     let expiration = due.into_iter().next().unwrap();
     assert_eq!(expiration.timeout.caller_invocation, first_work.invocation);
-    let before_untrusted_expiration = timeout_service.accumulate_host().snapshot();
-    assert_eq!(
+    let before_untrusted_expiration = timeout_service.service().accumulate_host().snapshot();
+    assert!(matches!(
         timeout_service
             .accumulate(&AccumulateRequestV2::ExpireCall(expiration.clone()))
-            .expect("an untrusted direct proposal is rejected by the guest")
-            .result,
-        AccumulationResultV2::Rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
-    );
+            .unwrap_err(),
+        ReplicatedServiceErrorV2::LogicalTimeslotRequired
+    ));
+    assert_eq!(timeout_service.log().committed_len(), 0);
     assert_eq!(
-        timeout_service.accumulate_host().snapshot(),
+        timeout_service.service().accumulate_host().snapshot(),
         before_untrusted_expiration
     );
     let expired = timeout_service
         .accumulate_at(&AccumulateRequestV2::ExpireCall(expiration), 100)
-        .expect("physical guest Accumulate commits the timeout");
+        .expect("the Raft entry and physical guest Accumulate commit the timeout");
+    assert_eq!(timeout_follower.catch_up().unwrap(), 1);
+    assert!(
+        timeout_service
+            .service()
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&timeout_follower.service().accumulate_host().snapshot()),
+        "the follower replays the committed ambient JAM slot through IC-5"
+    );
     let AccumulationResultV2::CallExpired {
         timeout,
         duplicate: false,
@@ -3574,6 +3614,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
     assert_eq!(timeout.expiration.timeout.call_id, call_id);
     assert_eq!(
         timeout_service
+            .service()
             .accumulate_host()
             .outbox_message(call_id)
             .unwrap(),
@@ -3582,6 +3623,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
     );
     assert!(
         timeout_service
+            .service()
             .accumulate_host()
             .pending_call_deadlines()
             .unwrap()
@@ -3590,6 +3632,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
     );
     assert!(
         timeout_service
+            .service()
             .accumulate_host()
             .pending_publications()
             .unwrap()
@@ -3597,7 +3640,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
         "an undelivered publication is terminally retired with its timeout"
     );
 
-    let timeout_persisted = timeout_service.accumulate_host().snapshot_bytes();
+    let timeout_persisted = timeout_service.service().accumulate_host().snapshot_bytes();
     let timeout_restarted_store = LocalJamStoreV2::from_snapshot_bytes(&timeout_persisted)
         .expect("the expiration outcome survives a second process restart");
     let mut timeout_restarted_service = JamServiceV2::new(

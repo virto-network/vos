@@ -172,10 +172,13 @@ impl<E: core::fmt::Debug, P: core::fmt::Debug> core::fmt::Display for AttestedSe
 impl<E: core::fmt::Debug, P: core::fmt::Debug> core::error::Error for AttestedServiceErrorV2<E, P> {}
 
 /// One canonical Accumulate request whose Raft log position is committed.
+/// Time-dependent entries carry the consensus JAM slot observed by the
+/// proposer so every follower replays the identical IC-5 ambient input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommittedAccumulateEntryV2 {
     pub index: u64,
     pub request: Vec<u8>,
+    pub logical_timeslot: Option<u64>,
 }
 
 /// Committed application entries after one replica's apply cursor. Raft may
@@ -264,14 +267,23 @@ impl V2Wire for CommittedServiceSnapshotV2 {
 
 /// Raft boundary for the v2 service state machine.
 ///
-/// Implementations order the exact canonical request bytes and return from
-/// `propose` only after the named entry is quorum committed. They never apply
-/// actor state themselves: leaders and followers pass every returned entry to
-/// the same physical service PVM before advancing `applied_index`.
+/// Implementations order the exact canonical request and its optional trusted
+/// JAM-slot provenance, and return from `propose_at` only after the named entry
+/// is quorum committed. They never apply actor state themselves: leaders and
+/// followers pass every returned entry to the same physical service PVM before
+/// advancing `applied_index`.
 pub trait CommittedAccumulateLogV2 {
     type Error;
 
-    fn propose(&mut self, request: &[u8]) -> Result<CommittedAccumulateEntryV2, Self::Error>;
+    fn propose_at(
+        &mut self,
+        request: &[u8],
+        logical_timeslot: Option<u64>,
+    ) -> Result<CommittedAccumulateEntryV2, Self::Error>;
+
+    fn propose(&mut self, request: &[u8]) -> Result<CommittedAccumulateEntryV2, Self::Error> {
+        self.propose_at(request, None)
+    }
 
     fn committed_after(
         &mut self,
@@ -368,6 +380,8 @@ pub enum ReplicatedServiceErrorV2<E> {
     Log(E),
     ServiceImage(ServiceImageInstallErrorV2),
     ProofUnavailable,
+    LogicalTimeslotRequired,
+    UnexpectedLogicalTimeslot,
     InvalidCommittedLog,
 }
 
@@ -400,8 +414,9 @@ pub struct JamServiceV2<R, A> {
 
 /// Raft orchestration around the canonical generic service PVM.
 ///
-/// The log owns ordering only. It contains `AccumulateRequestV2` bytes rather
-/// than `EffectLog` commands or leader-produced state snapshots. Consequently
+/// The log owns ordering only. It contains `AccumulateRequestV2` bytes plus the
+/// trusted JAM slot required by time-dependent requests, rather than
+/// `EffectLog` commands or leader-produced state snapshots. Consequently
 /// failover and follower catch-up execute guest validation, deduplication, and
 /// storage mutation through the identical IC-5 entry used by the leader.
 pub struct ReplicatedJamServiceV2<R, A, L> {
@@ -829,19 +844,29 @@ where
         for entry in batch.entries {
             let is_captured = capture.is_some_and(|target| target.index == entry.index);
             if is_captured
-                && capture
-                    .is_some_and(|target| target.request.as_slice() != entry.request.as_slice())
+                && capture.is_some_and(|target| {
+                    target.request.as_slice() != entry.request.as_slice()
+                        || target.logical_timeslot != entry.logical_timeslot
+                })
             {
                 return Err(ReplicatedServiceErrorV2::InvalidCommittedLog);
             }
             let request = AccumulateRequestV2::decode(&entry.request)
                 .map_err(|_| ReplicatedServiceErrorV2::InvalidCommittedLog)?;
+            if matches!(request, AccumulateRequestV2::ExpireCall(_))
+                != entry.logical_timeslot.is_some()
+            {
+                return Err(ReplicatedServiceErrorV2::InvalidCommittedLog);
+            }
             // Proof hydration is a durable local precondition, not a guest
             // semantic decision. A failed side-CAS write must leave this entry
             // unapplied so exact catch-up can retry it.
             ensure_request_proof_available(self.service.accumulate_host_mut(), &request)
                 .map_err(|_| ReplicatedServiceErrorV2::ProofUnavailable)?;
-            let outcome = self.service.accumulate(&request);
+            let outcome = match entry.logical_timeslot {
+                Some(logical_timeslot) => self.service.accumulate_at(&request, logical_timeslot),
+                None => self.service.accumulate(&request),
+            };
             if let Err(error) = outcome.as_ref()
                 && !error.is_deterministic_accumulate_failure()
             {
@@ -942,7 +967,33 @@ where
         &mut self,
         request: &AccumulateRequestV2,
     ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
+        self.accumulate_ordered(request, None)
+    }
+
+    /// Quorum-order a time-dependent request together with the
+    /// consensus-authenticated JAM slot observed by the leader. The slot is
+    /// part of the replicated entry and is replayed identically by followers.
+    pub fn accumulate_at(
+        &mut self,
+        request: &AccumulateRequestV2,
+        logical_timeslot: u64,
+    ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
+        self.accumulate_ordered(request, Some(logical_timeslot))
+    }
+
+    fn accumulate_ordered(
+        &mut self,
+        request: &AccumulateRequestV2,
+        logical_timeslot: Option<u64>,
+    ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
         self.catch_up()?;
+        let expires_call = matches!(request, AccumulateRequestV2::ExpireCall(_));
+        if expires_call && logical_timeslot.is_none() {
+            return Err(ReplicatedServiceErrorV2::LogicalTimeslotRequired);
+        }
+        if !expires_call && logical_timeslot.is_some() {
+            return Err(ReplicatedServiceErrorV2::UnexpectedLogicalTimeslot);
+        }
         if matches!(request, AccumulateRequestV2::PrepareAttested(_)) {
             return self
                 .service
@@ -958,13 +1009,16 @@ where
         let request_bytes = request.encode();
         let entry = self
             .log
-            .propose(&request_bytes)
+            .propose_at(&request_bytes, logical_timeslot)
             .map_err(ReplicatedServiceErrorV2::Log)?;
         let applied = self
             .log
             .applied_index()
             .map_err(ReplicatedServiceErrorV2::Log)?;
-        if entry.index <= applied || entry.request != request_bytes {
+        if entry.index <= applied
+            || entry.request != request_bytes
+            || entry.logical_timeslot != logical_timeslot
+        {
             return Err(ReplicatedServiceErrorV2::InvalidCommittedLog);
         }
         self.apply_committed_after(applied, Some(&entry))?

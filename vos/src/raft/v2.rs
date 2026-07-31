@@ -2,8 +2,9 @@
 //!
 //! Unlike [`super::strategy::RaftCommit`], this adapter never serializes an
 //! `EffectLog` and never materializes actor state itself. The replicated data
-//! entry is one canonical `AccumulateRequestV2`; `ReplicatedJamServiceV2`
-//! executes committed entries through the physical service PVM and advances
+//! entry carries one canonical `AccumulateRequestV2` plus the authenticated
+//! JAM slot for time-dependent requests; `ReplicatedJamServiceV2` executes
+//! committed entries through the physical service PVM and advances
 //! `last_applied` only after that local service-image commit succeeds.
 
 use alloc::sync::Arc;
@@ -16,6 +17,7 @@ use std::time::{Duration, Instant};
 use redb::Database;
 
 use crate::commit::CommitError;
+use crate::v2::wire::{DecodeError, Decoder, Encoder};
 use crate::v2::{
     AccumulateRequestV2, CommittedAccumulateBatchV2, CommittedAccumulateEntryV2,
     CommittedAccumulateLogV2, CommittedServiceSnapshotV2, ImportedBlobV2, LocalJamStoreSnapshotV2,
@@ -26,6 +28,53 @@ use super::log::{LogEntry, RaftLog, RaftMeta};
 use super::strategy::RaftConfig;
 #[cfg(feature = "network")]
 use super::worker::{ProposeError, RaftWorker, WorkerHandle};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RaftAccumulatePayloadV2 {
+    request: Vec<u8>,
+    logical_timeslot: Option<u64>,
+}
+
+impl RaftAccumulatePayloadV2 {
+    fn from_request(request: &[u8], logical_timeslot: Option<u64>) -> Result<Self, CommitError> {
+        let decoded = AccumulateRequestV2::decode(request).map_err(|_| {
+            CommitError::Config("raft v2 entry is not a canonical AccumulateRequestV2".into())
+        })?;
+        if matches!(decoded, AccumulateRequestV2::ExpireCall(_)) != logical_timeslot.is_some() {
+            return Err(CommitError::Config(
+                "raft v2 time-dependent entry has invalid JAM-slot provenance".into(),
+            ));
+        }
+        Ok(Self {
+            request: request.to_vec(),
+            logical_timeslot,
+        })
+    }
+}
+
+impl V2Wire for RaftAccumulatePayloadV2 {
+    const MAGIC: [u8; 4] = *b"VRQ2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        encoder.bytes(&self.request);
+        encoder.option(&self.logical_timeslot, |encoder, slot| encoder.u64(*slot));
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let request = decoder.bytes()?;
+        let logical_timeslot = decoder.option(Decoder::u64)?;
+        let decoded =
+            AccumulateRequestV2::decode(&request).map_err(|_| DecodeError::NonCanonical)?;
+        if matches!(decoded, AccumulateRequestV2::ExpireCall(_)) != logical_timeslot.is_some() {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(Self {
+            request,
+            logical_timeslot,
+        })
+    }
+}
 
 enum RoleV2 {
     SingleNode,
@@ -108,9 +157,9 @@ impl RaftAccumulateLogV2 {
         Ok(())
     }
 
-    fn validate_request(bytes: &[u8]) -> Result<(), CommitError> {
-        AccumulateRequestV2::decode(bytes).map(|_| ()).map_err(|_| {
-            CommitError::Config("raft v2 entry is not a canonical AccumulateRequestV2".into())
+    fn decode_payload(bytes: &[u8]) -> Result<RaftAccumulatePayloadV2, CommitError> {
+        RaftAccumulatePayloadV2::decode(bytes).map_err(|_| {
+            CommitError::Config("raft v2 entry is not a canonical replicated request".into())
         })
     }
 
@@ -118,10 +167,11 @@ impl RaftAccumulateLogV2 {
         match super::redb_storage::decode_entry_kind(&entry.payload)? {
             vos_raft::EntryKind::Data { payload } if payload.is_empty() => Ok(None),
             vos_raft::EntryKind::Data { payload } => {
-                Self::validate_request(&payload)?;
+                let payload = Self::decode_payload(&payload)?;
                 Ok(Some(CommittedAccumulateEntryV2 {
                     index: entry.index,
-                    request: payload,
+                    request: payload.request,
+                    logical_timeslot: payload.logical_timeslot,
                 }))
             }
             vos_raft::EntryKind::ConfigChange { .. } => Ok(None),
@@ -150,13 +200,14 @@ impl RaftAccumulateLogV2 {
 
     fn propose_single(
         &mut self,
-        request: &[u8],
+        payload: &[u8],
     ) -> Result<CommittedAccumulateEntryV2, CommitError> {
+        let decoded = Self::decode_payload(payload)?;
         let cache = self.log.cache_snapshot();
         let result: Result<CommittedAccumulateEntryV2, CommitError> = (|| {
             let transaction = self.db.begin_write()?;
             let kind = vos_raft::EntryKind::Data {
-                payload: request.to_vec(),
+                payload: payload.to_vec(),
             };
             let on_disk = super::redb_storage::encode_entry_kind(&kind);
             let index = self
@@ -167,7 +218,8 @@ impl RaftAccumulateLogV2 {
             transaction.commit()?;
             Ok(CommittedAccumulateEntryV2 {
                 index,
-                request: request.to_vec(),
+                request: decoded.request,
+                logical_timeslot: decoded.logical_timeslot,
             })
         })();
         if let Err(error) = result {
@@ -181,13 +233,14 @@ impl RaftAccumulateLogV2 {
     }
 
     #[cfg(feature = "network")]
-    fn propose_multi(&mut self, request: &[u8]) -> Result<CommittedAccumulateEntryV2, CommitError> {
+    fn propose_multi(&mut self, payload: &[u8]) -> Result<CommittedAccumulateEntryV2, CommitError> {
+        let decoded = Self::decode_payload(payload)?;
         let RoleV2::Multi { worker, apply_rx } = &self.role else {
             unreachable!()
         };
         let index = worker
             .handler()
-            .propose(request.to_vec())
+            .propose(payload.to_vec())
             .map_err(|error| match error {
                 ProposeError::NotLeader => {
                     CommitError::Config("raft v2 proposal reached a non-leader replica".into())
@@ -220,7 +273,7 @@ impl RaftAccumulateLogV2 {
             }
         }
         let entry = self.committed_entry(index)?;
-        if entry.request != request {
+        if entry.request != decoded.request || entry.logical_timeslot != decoded.logical_timeslot {
             return Err(CommitError::Config(alloc::format!(
                 "raft v2 committed bytes at proposal index {index} changed"
             )));
@@ -232,12 +285,16 @@ impl RaftAccumulateLogV2 {
 impl CommittedAccumulateLogV2 for RaftAccumulateLogV2 {
     type Error = CommitError;
 
-    fn propose(&mut self, request: &[u8]) -> Result<CommittedAccumulateEntryV2, Self::Error> {
-        Self::validate_request(request)?;
+    fn propose_at(
+        &mut self,
+        request: &[u8],
+        logical_timeslot: Option<u64>,
+    ) -> Result<CommittedAccumulateEntryV2, Self::Error> {
+        let payload = RaftAccumulatePayloadV2::from_request(request, logical_timeslot)?.encode();
         match &self.role {
-            RoleV2::SingleNode => self.propose_single(request),
+            RoleV2::SingleNode => self.propose_single(&payload),
             #[cfg(feature = "network")]
-            RoleV2::Multi { .. } => self.propose_multi(request),
+            RoleV2::Multi { .. } => self.propose_multi(&payload),
         }
     }
 
@@ -349,8 +406,9 @@ mod tests {
     use super::super::redb_storage::RedbStorage;
     use super::*;
     use crate::v2::{
-        ABI_VERSION, DeploymentId, EXECUTION_SEMANTICS_ID, Hash, InvocationId, ProgramId,
-        PublicationAckV2, RootServiceId, ServiceIdentityV2, SpaceId, WorkInputIdV2,
+        ABI_VERSION, ActorId, CallExpirationEnvelopeV2, CallTimeoutV2, ConsistencyBaseV2,
+        DeploymentId, EXECUTION_SEMANTICS_ID, Hash, InvocationId, ProgramId, PublicationAckV2,
+        RootServiceId, ServiceIdentityV2, SpaceId, WorkInputIdV2,
     };
     use vos_raft::{Meta, Storage, WriteBatch};
 
@@ -369,6 +427,30 @@ mod tests {
                 workflow_step: 6,
             },
             publication: Hash([7; 32]),
+        })
+    }
+
+    fn expiration_request() -> AccumulateRequestV2 {
+        let service = request(1).service().clone();
+        let caller_invocation = InvocationId([9; 32]);
+        let await_ordinal = 2;
+        AccumulateRequestV2::ExpireCall(CallExpirationEnvelopeV2 {
+            service,
+            timeout: CallTimeoutV2 {
+                call_id: caller_invocation.call_id(await_ordinal),
+                caller_invocation,
+                caller_actor: ActorId([10; 32]),
+                checkpoint_step: 1,
+                await_ordinal,
+                deadline_timeslot: 50,
+                expired_at: 50,
+            },
+            base: ConsistencyBaseV2::Linear {
+                revision: 3,
+                state_root: Hash([11; 32]),
+            },
+            base_causal_height: None,
+            crdt_change: None,
         })
     }
 
@@ -428,6 +510,27 @@ mod tests {
             }
         );
         assert!(restarted.propose(b"not a v2 request").is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn replicated_timeout_payload_pins_the_ambient_jam_slot() {
+        let bytes = expiration_request().encode();
+        assert!(RaftAccumulatePayloadV2::from_request(&bytes, None).is_err());
+        assert!(RaftAccumulatePayloadV2::from_request(&request(1).encode(), Some(50)).is_err());
+
+        let (path, directory) = temp_path();
+        let mut log = RaftAccumulateLogV2::open(&path, RaftConfig::default()).unwrap();
+        let committed = log.propose_at(&bytes, Some(50)).unwrap();
+        assert_eq!(committed.request, bytes);
+        assert_eq!(committed.logical_timeslot, Some(50));
+        drop(log);
+
+        let mut restarted = RaftAccumulateLogV2::open(&path, RaftConfig::default()).unwrap();
+        assert_eq!(
+            restarted.committed_after(0).unwrap().entries,
+            vec![committed]
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
