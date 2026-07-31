@@ -88,6 +88,8 @@ test: build-test-artifacts
 test-v2-examples:
     cd examples/v2; cargo test --workspace
     cd examples/v2; cargo +nightly actor -p v2-counter
+    cd examples/v2; cargo +nightly actor -p v2-workflow
+    cd examples/v2; cargo +nightly actor -p v2-private-age
     cd examples/v2; cargo +nightly actor -p v2-shared-board
 
 # Run extension tests.

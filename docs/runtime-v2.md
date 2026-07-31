@@ -21,9 +21,13 @@ slice after restart without a process-local copy of the original request.
 The local linear-service transport is also guest-owned end to end. An accepted
 actor slice stores a recoverable publication row whose receipt commits the
 complete canonical outbox. After restart, transport selects a message from
-that publication and destination Accumulate verifies receipt finality,
+that publication. Each message commits the exact installed destination service
+identity as well as its ActorId; destination Accumulate rejects a different
+root which merely reuses that ActorId. It also verifies receipt finality,
 producer ownership, full-outbox membership, deadline and the exact current
-destination base before atomically inserting the inbox. A stable delivery
+destination base before atomically inserting the inbox. External directories
+reject duplicate ActorIds, so application resolution cannot collapse two
+service bindings onto one route. A stable delivery
 identity excludes that changing base, so a retry after inbox execution is
 still an idempotent duplicate. Guest delivery records retain the admission
 timeslot and consumed bit; the local scheduler scans them after restart and
@@ -40,6 +44,12 @@ record binds the `CallId`, accumulated reply, work input and work hash, so a
 lost transport acknowledgement remains an idempotent duplicate after another
 restart or a later workflow slice. The callee publication is acknowledged only
 after the caller commit succeeds.
+When the original message requests an attestation, the drain path performs
+read-only preparation, proof production and proved guest Accumulate rather
+than submitting an ordinary Apply. The recoverable publication retains the
+guest-derived producer name, `ProducerId`, statement and proof commitment;
+reply routing carries those exact fields and the content-addressed proof bytes
+into the restored caller.
 
 The local host serializes the complete committed service image as canonical
 `LocalJamStoreSnapshotV2` bytes. Restore checks the current store header and
@@ -61,8 +71,9 @@ previous durable images.
 
 Attested linear slices use a read-only physical Accumulate preparation before
 proof production. The guest derives the predicted accumulation receipt and
-statement from committed service state, the exact work and transition, and the
-installed method policy; the host does not reconstruct those public inputs.
+statement from committed service state, the exact work and transition, the
+installed method policy, and the installed actor's producer identity; the host
+does not reconstruct or relabel those public inputs.
 The proof producer receives that preparation together with the canonical
 service PVM and Refine imports, and the final Apply carries the proof bytes as
 a content-addressed verifier/CAS input. Proof bytes do not enter the
@@ -85,8 +96,9 @@ resolves the named producer and method from an authenticated registry and pins
 the complete current service identity, actor, canonical actor program, schema,
 authorization policy and typed `ProducerId`.
 It independently verifies both accumulation-receipt finality and the actor
-proof, and reconstructs the exact reply commitment from the statement's call
-ID, actor and authenticated claim wire, before admitting the
+proof against the statement commitment and the package's exact trace
+commitment. It also reconstructs the exact reply commitment from the
+statement's call ID, actor and authenticated claim wire, before admitting the
 `(space, deployment, actor, invocation)` replay key. Proof validity alone is
 insufficient because proof production precedes Accumulate; a transition that
 never committed must never become `Verified<T>`. The replay admission must be
@@ -102,9 +114,11 @@ input commitment.
 
 The local proof producer and proof-verification allowlist are conformance
 seams, not a production proof system. A production host must replace them with
-the pinned prover/verifier implementation, and a later runtime slice must bind
-the proof trace to the observed canonical Refine execution rather than relying
-on the producer interface contract alone. There is still no attestation-only
+the pinned prover/verifier implementation. Portable verification already
+passes the exact serialized trace as a proof public input; a production prover
+must additionally derive that trace from the observed canonical Refine
+execution rather than relying on the producer interface contract alone. There
+is still no attestation-only
 actor binary: proof production always receives the live actor program through
 the canonical Refine imports.
 
