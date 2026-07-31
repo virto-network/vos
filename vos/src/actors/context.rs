@@ -708,7 +708,8 @@ impl<A: Actor> Context<A> {
                         &response[..response_len],
                     )
                     .expect("invalid v2 accumulated attestation reply");
-                    self.__resume_checkpoint_v2(&resume.checkpoint);
+                    self.__rebind_checkpoint_change_v2(&resume.checkpoint);
+                    self.__clear_committed_checkpoint_effects_v2();
                     self.checkpoint = Some(resume.checkpoint);
                     self.self_schedule = false;
                     let Some(attestation) = resume.attestation else {
