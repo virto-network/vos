@@ -46,9 +46,12 @@ impl LocalJamStoreSnapshotV2 {
         self.rows == other.rows && self.blobs == other.blobs && self.programs == other.programs
     }
 
-    /// Proof blobs directly referenced by recoverable transport state.
-    /// Snapshot decoding uses this to reject an artifact bundle which would
-    /// strand a pending publication or an admitted attested reply.
+    /// Proof blobs required to finish pending transport work.
+    ///
+    /// Permanent reply-admission rows are replay markers, not pending work:
+    /// duplicate routing returns from the admission before reading proof
+    /// bytes. Retaining their proofs here would make every Raft snapshot grow
+    /// with the complete attested-reply history.
     pub(crate) fn referenced_proof_blobs(&self) -> Result<Vec<BlobRefV2>, DecodeError> {
         let mut references = Vec::new();
         let publication_prefix = super::storage::publication_storage_prefix();
@@ -66,20 +69,6 @@ impl LocalJamStoreSnapshotV2 {
             }
         }
 
-        let admission_prefix = super::storage::reply_admission_storage_prefix();
-        for (key, bytes) in self
-            .rows
-            .range(admission_prefix.to_vec()..)
-            .take_while(|(key, _)| key.starts_with(admission_prefix))
-        {
-            let admission = ReplyAdmissionRecordV2::decode(bytes)?;
-            if super::reply_admission_storage_key(admission.call_id).as_slice() != key.as_slice() {
-                return Err(DecodeError::NonCanonical);
-            }
-            if let Some(attestation) = admission.awaited_reply.attestation {
-                references.push(attestation.proof.proof_blob);
-            }
-        }
         references.sort_unstable_by_key(|reference| reference.hash);
         references.dedup();
         Ok(references)

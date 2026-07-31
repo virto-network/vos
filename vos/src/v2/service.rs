@@ -194,9 +194,10 @@ pub struct CommittedAccumulateBatchV2 {
 pub struct CommittedServiceSnapshotV2 {
     pub applied_index: u64,
     pub service_image: Vec<u8>,
-    /// Proof artifacts referenced by the service image remain outside its
-    /// consensus bytes, but must become durable before this snapshot cursor
-    /// is installed on another replica.
+    /// Proof artifacts required by pending publications remain outside the
+    /// service image, but must become durable before this snapshot cursor is
+    /// installed on another replica. Completed reply admissions do not retain
+    /// proof bytes because duplicate routing resolves from the admission row.
     pub proof_artifacts: Vec<ImportedBlobV2>,
 }
 

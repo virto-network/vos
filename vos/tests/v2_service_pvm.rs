@@ -6184,6 +6184,18 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
     assert_eq!(reply_admission.input.invocation, InvocationId([84; 32]));
     assert_eq!(reply_admission.awaited_reply.reply, reply.clone());
     assert_eq!(admission_receipt, resumed.receipt);
+    assert!(
+        CommittedServiceSnapshotV2::decode(
+            &CommittedServiceSnapshotV2 {
+                applied_index: 1,
+                service_image: source.accumulate_host().committed_service_image(),
+                proof_artifacts: vec![],
+            }
+            .encode(),
+        )
+        .is_ok(),
+        "a completed reply admission does not retain its proof in Raft snapshots"
+    );
     let source_header = source.accumulate_host().header().unwrap().unwrap();
     assert!(
         source

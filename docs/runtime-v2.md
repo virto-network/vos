@@ -378,10 +378,12 @@ application cursor and freezes the matching image—not a newer mutable state
 row—into a `CommittedServiceSnapshotV2`. A lagging follower receives that
 envelope through Raft `InstallSnapshot`, checks that its bound index matches the
 installed snapshot metadata, and durably hydrates the snapshot's separate
-content-addressed proof-artifact bundle before replacing its physical service
-image. Only then does it advance `last_applied` and replay any surviving log
-tail. A proof-CAS or service-image failure leaves the old image and cursor
-eligible for retry.
+content-addressed proof-artifact bundle for pending publications before
+replacing its physical service image. Completed reply admissions are permanent
+deduplication markers but do not retain proof bytes: their retry path resolves
+before proof lookup. Only after hydration does the follower advance
+`last_applied` and replay any surviving log tail. A proof-CAS or service-image
+failure leaves the old image and cursor eligible for retry.
 
 Every await is a durable slice boundary. Effects before it may commit even if a
 later slice fails, so multi-await handlers have saga semantics. Same-tree calls
