@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -23,13 +24,21 @@ fn main() {
         .expect("walk workspace dependency files");
 
     let mut errors = Vec::new();
+    let mut jar_package_names = JAR_PACKAGES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<BTreeSet<_>>();
+    for path in &manifests {
+        let source = fs::read_to_string(path).expect("read Cargo.toml");
+        collect_known_alias_targets(&source, &mut jar_package_names);
+    }
     for path in manifests {
         let source = fs::read_to_string(&path).expect("read Cargo.toml");
         validate_manifest(&path, &source, &mut errors);
     }
     for path in locks {
         let source = fs::read_to_string(&path).expect("read Cargo.lock");
-        validate_lock(&path, &source, &mut errors);
+        validate_lock(&path, &source, &jar_package_names, &mut errors);
     }
     let runtime_revision = root.join("vos/src/v2/mod.rs");
     let source = fs::read_to_string(&runtime_revision).expect("read VOS v2 runtime constants");
@@ -93,7 +102,12 @@ fn validate_manifest(path: &Path, source: &str, errors: &mut Vec<String>) {
     }
 }
 
-fn validate_lock(path: &Path, source: &str, errors: &mut Vec<String>) {
+fn validate_lock(
+    path: &Path,
+    source: &str,
+    jar_package_names: &BTreeSet<String>,
+    errors: &mut Vec<String>,
+) {
     let document = match source.parse::<toml::Value>() {
         Ok(document) => document,
         Err(error) => {
@@ -109,7 +123,7 @@ fn validate_lock(path: &Path, source: &str, errors: &mut Vec<String>) {
         let Some(name) = package.get("name").and_then(toml::Value::as_str) else {
             continue;
         };
-        if JAR_PACKAGES.contains(&name)
+        if jar_package_names.contains(name)
             && package.get("source").and_then(toml::Value::as_str) != Some(expected.as_str())
         {
             errors.push(format!(
@@ -144,25 +158,73 @@ fn validate_dependency_table(
             .and_then(|table| table.get("package"))
             .and_then(toml::Value::as_str)
             .unwrap_or(alias);
-        if !JAR_PACKAGES.contains(&package) {
+        let known_alias = JAR_PACKAGES.contains(&alias.as_str());
+        let known_package = JAR_PACKAGES.contains(&package);
+        if !known_alias && !known_package {
             continue;
         }
-        let valid = specification.as_table().is_some_and(|table| {
-            if table.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
-                return table.get("git").is_none()
+        let valid = (!known_alias || package == alias)
+            && specification.as_table().is_some_and(|table| {
+                if table.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+                    return table.get("git").is_none()
+                        && table.get("path").is_none()
+                        && table.get("registry").is_none();
+                }
+                table.get("git").and_then(toml::Value::as_str) == Some(JAR_GIT)
+                    && table.get("rev").and_then(toml::Value::as_str) == Some(EXPECTED)
                     && table.get("path").is_none()
-                    && table.get("registry").is_none();
-            }
-            table.get("git").and_then(toml::Value::as_str) == Some(JAR_GIT)
-                && table.get("rev").and_then(toml::Value::as_str) == Some(EXPECTED)
-                && table.get("path").is_none()
-                && table.get("registry").is_none()
-        });
+                    && table.get("registry").is_none()
+            });
         if !valid {
             errors.push(format!(
                 "{} dependency {alias} ({package}) must use the exact canonical JAR source and revision",
                 path.display(),
             ));
+        }
+    }
+}
+
+fn collect_known_alias_targets(source: &str, names: &mut BTreeSet<String>) {
+    let Ok(document) = source.parse::<toml::Value>() else {
+        return;
+    };
+    let Some(root) = document.as_table() else {
+        return;
+    };
+    collect_alias_targets_from_sections(root, names);
+    if let Some(workspace) = root.get("workspace").and_then(toml::Value::as_table) {
+        collect_alias_targets(workspace.get("dependencies"), names);
+    }
+    if let Some(targets) = root.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values().filter_map(toml::Value::as_table) {
+            collect_alias_targets_from_sections(target, names);
+        }
+    }
+}
+
+fn collect_alias_targets_from_sections(
+    table: &toml::map::Map<String, toml::Value>,
+    names: &mut BTreeSet<String>,
+) {
+    for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        collect_alias_targets(table.get(section), names);
+    }
+}
+
+fn collect_alias_targets(dependencies: Option<&toml::Value>, names: &mut BTreeSet<String>) {
+    let Some(dependencies) = dependencies.and_then(toml::Value::as_table) else {
+        return;
+    };
+    for (alias, specification) in dependencies {
+        if !JAR_PACKAGES.contains(&alias.as_str()) {
+            continue;
+        }
+        if let Some(package) = specification
+            .as_table()
+            .and_then(|table| table.get("package"))
+            .and_then(toml::Value::as_str)
+        {
+            names.insert(package.to_owned());
         }
     }
 }
@@ -187,6 +249,10 @@ fn validate_runtime_revision(path: &Path, source: &str, errors: &mut Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn known_packages() -> BTreeSet<String> {
+        JAR_PACKAGES.iter().map(|name| (*name).to_owned()).collect()
+    }
 
     #[test]
     fn rejects_other_and_unpinned_revisions() {
@@ -234,6 +300,26 @@ mod tests {
     }
 
     #[test]
+    fn known_alias_cannot_substitute_a_forked_package_identity() {
+        let manifest = "[dependencies]\njavm = { package = \"javm-fork\", path = \"../fork\" }";
+        let mut errors = Vec::new();
+        validate_manifest(Path::new("Cargo.toml"), manifest, &mut errors);
+        assert_eq!(errors.len(), 1);
+
+        let mut packages = known_packages();
+        collect_known_alias_targets(manifest, &mut packages);
+        assert!(packages.contains("javm-fork"));
+        errors.clear();
+        validate_lock(
+            Path::new("Cargo.lock"),
+            "[[package]]\nname = \"javm-fork\"\nversion = \"0.1.0\"",
+            &packages,
+            &mut errors,
+        );
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
     fn accepts_the_consensus_revision() {
         let mut errors = Vec::new();
         validate_manifest(
@@ -252,6 +338,7 @@ mod tests {
         validate_lock(
             Path::new("nested/Cargo.lock"),
             "[[package]]\nname = \"javm\"\nversion = \"0.4.0\"\nsource = \"git+ssh://git@github.com/olanod/jar.git?rev=6db1168#6db1168\"",
+            &known_packages(),
             &mut errors,
         );
         assert_eq!(errors.len(), 1);
@@ -265,6 +352,7 @@ mod tests {
             &format!(
                 "[[package]]\nname = \"javm\"\nversion = \"0.4.0\"\nsource = \"git+https://github.com/olanod/jar.git?rev={EXPECTED}#deadbeef\""
             ),
+            &known_packages(),
             &mut errors,
         );
         assert_eq!(errors.len(), 1);
@@ -277,7 +365,12 @@ mod tests {
             "[[package]]\nname = \"javm\"\nversion = \"0.4.0\"",
         ] {
             let mut errors = Vec::new();
-            validate_lock(Path::new("Cargo.lock"), source, &mut errors);
+            validate_lock(
+                Path::new("Cargo.lock"),
+                source,
+                &known_packages(),
+                &mut errors,
+            );
             assert_eq!(errors.len(), 1);
         }
     }
