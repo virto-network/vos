@@ -1429,6 +1429,7 @@ mod tests {
         encoder.string(&package.producer_name);
         encoder.fixed(&package.producer.0);
         encoder.bytes(&package.statement.encode());
+        encoder.fixed(&package.trace.0);
         encoder.bytes(&attacker_wire);
         encoder.bytes(&package.proof);
         assert!(matches!(

@@ -3105,6 +3105,27 @@ mod tests {
     }
 
     #[test]
+    fn apply_rejects_a_forged_external_actor_binding_without_state_trace() {
+        let mut store = MemStore::default();
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let mut work = linear_work(initial, install.resulting_state_root.unwrap());
+        work.external_actors[1].producer = super::super::ProducerId([99; 32]);
+        let transition = linear_transition(&work, b"forged");
+        let request = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work,
+            transition,
+            provided_blobs: Vec::new(),
+        });
+        let before = store.clone();
+
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &request).unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        assert_eq!(store, before);
+    }
+
+    #[test]
     fn accumulate_rejects_a_partial_root_tree_import() {
         let mut store = MemStore::default();
         let initial = store.provide_blob(b"before").unwrap();
@@ -3317,7 +3338,7 @@ mod tests {
         let required_policy =
             super::super::space_role_policy_hash(crate::SpaceRole::Member.as_u8()).unwrap();
         let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
-            external_actors: vec![],
+            external_actors: external_bindings(),
             service: identity(),
             consistency: ConsistencyModeV2::Local,
             actors: vec![ActorGenesisV2 {
