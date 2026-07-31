@@ -19,6 +19,8 @@ pub enum InvokeError {
     Forbidden,
     /// The call would re-enter an actor already active in this causal chain.
     Cycle,
+    /// The durable call reached its logical-timeslot deadline.
+    Timeout,
     /// The target ran out of gas.
     OutOfGas,
     /// The child's reply exceeded the caller's output buffer.
@@ -34,6 +36,7 @@ impl core::fmt::Display for InvokeError {
             InvokeError::NotFound => write!(f, "invoke: service not found"),
             InvokeError::Forbidden => write!(f, "invoke: permission denied"),
             InvokeError::Cycle => write!(f, "invoke: causal actor-call cycle"),
+            InvokeError::Timeout => write!(f, "invoke: logical-timeslot deadline expired"),
             InvokeError::OutOfGas => write!(f, "invoke: out of gas"),
             InvokeError::TooBig => write!(f, "invoke: reply too big for caller buffer"),
             InvokeError::Unknown(s) => write!(f, "invoke: unknown error (0x{s:02x})"),

@@ -16,8 +16,8 @@ use crate::attestation::AttestationProofHostV2;
 
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
-    AccumulateProtocolHostV2, AccumulateTransactionV2, AccumulationReceiptV2, BlobRefV2,
-    DedupRecordV2, DeliveryRecordV2, ImportedBlobV2, MessageRecordV2, ProgramId,
+    AccumulateProtocolHostV2, AccumulateTransactionV2, AccumulatedTimeoutV2, AccumulationReceiptV2,
+    BlobRefV2, DedupRecordV2, DeliveryRecordV2, ImportedBlobV2, MessageRecordV2, ProgramId,
     ProofVerificationRequestV2, PublicationRecordV2, ReceiptVerificationRequestV2,
     ReplyAdmissionRecordV2, RoleCredentialVerificationRequestV2, ServiceGenesisV2,
     ServicePvmErrorV2, ServiceStateTreeV2, StateKeyV2, StateTreeStore, StoreHeaderV2,
@@ -357,6 +357,7 @@ pub enum LocalStoreReadErrorV2 {
     CorruptPublication,
     CorruptDelivery,
     CorruptReplyRoute,
+    CorruptExpiration,
 }
 
 impl core::fmt::Display for LocalStoreReadErrorV2 {
@@ -692,6 +693,29 @@ impl LocalJamStoreV2 {
                 Ok(message)
             })
             .transpose()
+    }
+
+    /// Recover the exact guest-committed outcome for one expired durable
+    /// call. The row remains after continuation completion so retries can be
+    /// classified without reconstructing a process-local timer.
+    pub fn call_expiration(
+        &self,
+        call: super::CallId,
+    ) -> Result<Option<AccumulatedTimeoutV2>, LocalStoreReadErrorV2> {
+        self.row(&super::call_expiration_storage_key(call))
+            .map(AccumulatedTimeoutV2::decode)
+            .transpose()
+            .map_err(|_| LocalStoreReadErrorV2::CorruptExpiration)
+            .and_then(|timeout| {
+                if timeout
+                    .as_ref()
+                    .is_some_and(|timeout| timeout.expiration.timeout.call_id != call)
+                {
+                    Err(LocalStoreReadErrorV2::CorruptExpiration)
+                } else {
+                    Ok(timeout)
+                }
+            })
     }
 
     /// Recover a previously committed reply admission and cross-check it

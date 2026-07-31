@@ -429,7 +429,10 @@ pub struct WorkEnvelopeV2 {
     /// Present only after guest Accumulate atomically expires the pending
     /// cross-root outbox row at a consensus logical timeslot. The timeout is
     /// injected at the captured call boundary without replaying the handler.
-    pub awaited_timeout: Option<AccumulatedTimeoutV2>,
+    /// Heap-backed so the complete receipt-bound timeout does not enlarge
+    /// every workflow operation on the service PVM's bounded stack. The
+    /// canonical wire is unchanged.
+    pub awaited_timeout: Option<Box<AccumulatedTimeoutV2>>,
     pub consistency: ConsistencyModeV2,
     pub base: ConsistencyBaseV2,
     /// Maximum causal height among `base` heads. Present only for CRDT work;
@@ -1021,7 +1024,12 @@ impl TransitionV2 {
             work,
             work.awaited_reply
                 .as_ref()
-                .map(|awaited| awaited.reply.call_id),
+                .map(|awaited| awaited.reply.call_id)
+                .or_else(|| {
+                    work.awaited_timeout
+                        .as_ref()
+                        .map(|awaited| awaited.expiration.timeout.call_id)
+                }),
         )
     }
 
@@ -1550,7 +1558,8 @@ impl V2Wire for WorkEnvelopeV2 {
             _ => return Err(DecodeError::NonCanonical),
         }
         let awaited_reply = d.option(|d| AccumulatedReplyV2::decode(&d.bytes()?))?;
-        let awaited_timeout = d.option(|d| AccumulatedTimeoutV2::decode(&d.bytes()?))?;
+        let awaited_timeout =
+            d.option(|d| AccumulatedTimeoutV2::decode(&d.bytes()?).map(Box::new))?;
         if (awaited_reply.is_some() || awaited_timeout.is_some()) && workflow_step == 0
             || awaited_reply.is_some() && awaited_timeout.is_some()
         {

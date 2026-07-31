@@ -585,42 +585,48 @@ impl ServicePvmV2 {
                 previously_suspended: continuation.suspended_actors.clone(),
                 suspended: Vec::new(),
             };
-            let (resume_kind, payload_len) =
-                match (continuation.pending_call, work.awaited_reply.as_ref()) {
-                    (None, None) => (1, write_checkpoint_token(&mut kernel, &checkpoint)?),
-                    (Some(call), Some(awaited)) if awaited.reply.call_id == call => {
-                        let attestation = awaited
-                            .attestation
-                            .as_ref()
-                            .map(|attestation| {
-                                let proof_bytes =
-                                    imported_blob_bytes(imports, &attestation.proof.proof_blob)?;
-                                let (proof_offset, proof_len) =
-                                    stage_attestation_proof(&mut kernel, proof_bytes)?;
-                                Ok(alloc::boxed::Box::new(super::AttestationResumeV2 {
-                                    producer_name: attestation.producer_name.clone(),
-                                    producer: attestation.producer,
-                                    statement: attestation.statement.clone(),
-                                    proof: attestation.proof.clone(),
-                                    proof_offset,
-                                    proof_len,
-                                }))
-                            })
-                            .transpose()?;
-                        (
-                            2,
-                            write_await_resume(
-                                &mut kernel,
-                                &AwaitResumeV2 {
-                                    checkpoint,
-                                    reply: awaited.reply.clone(),
-                                    attestation,
-                                },
-                            )?,
-                        )
-                    }
-                    _ => return Err(ServicePvmErrorV2::ContinuationMismatch),
-                };
+            let (resume_kind, payload_len) = match (
+                continuation.pending_call,
+                work.awaited_reply.as_ref(),
+                work.awaited_timeout.as_ref(),
+            ) {
+                (None, None, None) => (1, write_checkpoint_token(&mut kernel, &checkpoint)?),
+                (Some(call), Some(awaited), None) if awaited.reply.call_id == call => {
+                    let attestation = awaited
+                        .attestation
+                        .as_ref()
+                        .map(|attestation| {
+                            let proof_bytes =
+                                imported_blob_bytes(imports, &attestation.proof.proof_blob)?;
+                            let (proof_offset, proof_len) =
+                                stage_attestation_proof(&mut kernel, proof_bytes)?;
+                            Ok(alloc::boxed::Box::new(super::AttestationResumeV2 {
+                                producer_name: attestation.producer_name.clone(),
+                                producer: attestation.producer,
+                                statement: attestation.statement.clone(),
+                                proof: attestation.proof.clone(),
+                                proof_offset,
+                                proof_len,
+                            }))
+                        })
+                        .transpose()?;
+                    (
+                        2,
+                        write_await_resume(
+                            &mut kernel,
+                            &AwaitResumeV2 {
+                                checkpoint,
+                                reply: awaited.reply.clone(),
+                                attestation,
+                            },
+                        )?,
+                    )
+                }
+                (Some(call), None, Some(timeout)) if timeout.expiration.timeout.call_id == call => {
+                    (3, write_checkpoint_token(&mut kernel, &checkpoint)?)
+                }
+                _ => return Err(ServicePvmErrorV2::ContinuationMismatch),
+            };
             kernel
                 .resume_protocol_call(resume_kind, payload_len)
                 .map_err(|_| ServicePvmErrorV2::InvalidProtocolResume)?;
@@ -723,6 +729,10 @@ impl ServicePvmV2 {
                                 ..
                             }
                             | AccumulationResultV2::PublicationAcknowledged {
+                                duplicate: false,
+                                ..
+                            }
+                            | AccumulationResultV2::CallExpired {
                                 duplicate: false,
                                 ..
                             }

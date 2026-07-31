@@ -17,11 +17,11 @@ mod guest {
     use vos::abi::{error, pvm::hostcalls};
     use vos::v2::{
         AccumulateRequestV2, AccumulationRejectionV2, AccumulationResultV2, ActorCallResultV2,
-        ActorEffectBatchV2, ActorSliceOutputV2, BlobRefV2, ConsistencyBaseV2,
-        ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2, CrdtMaterializationV2,
-        GasAccountingV2, GuestAccumulateStoreV2, ImportedBlobV2, MessageRecordV2, ProgramId,
-        RefineOutputV2, ReplyRecordV2, StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2,
-        execute_guest_accumulate,
+        ActorEffectBatchV2, ActorSliceOutputV2, BlobRefV2, ConsistencyBaseV2, ContinuationChangeV2,
+        CrdtChangeV2, CrdtDispatchV2, CrdtMaterializationV2, GasAccountingV2,
+        GuestAccumulateStoreV2, ImportedBlobV2, MessageRecordV2, ProgramId, RefineOutputV2,
+        ReplyRecordV2, StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2,
+        execute_canonical_guest_accumulate,
     };
 
     /// Upper bound for one nested actor transition in this foundation guest. This
@@ -216,7 +216,12 @@ mod guest {
         let consumed_outbox = work
             .awaited_reply
             .as_ref()
-            .map(|reply| reply.reply.call_id);
+            .map(|reply| reply.reply.call_id)
+            .or_else(|| {
+                work.awaited_timeout
+                    .as_ref()
+                    .map(|timeout| timeout.expiration.timeout.call_id)
+            });
 
         let mut consumed_input = work.input_id();
         let mut base = work.base.clone();
@@ -444,9 +449,7 @@ mod guest {
                     let [state] = output.crdt_states.as_slice() else {
                         fail_closed();
                     };
-                    let expected_next = next_crdt_dispatch
-                        .entry(output.actor)
-                        .or_insert(1u32);
+                    let expected_next = next_crdt_dispatch.entry(output.actor).or_insert(1u32);
                     if !output.writes.is_empty()
                         || state.actor != output.actor
                         || state.next_dispatch_ordinal != *expected_next
@@ -517,15 +520,8 @@ mod guest {
             )
         });
         if crdt_operations.windows(2).any(|pair| {
-            (
-                pair[0].actor,
-                pair[0].dispatch_ordinal,
-                pair[0].ordinal,
-            ) >= (
-                pair[1].actor,
-                pair[1].dispatch_ordinal,
-                pair[1].ordinal,
-            )
+            (pair[0].actor, pair[0].dispatch_ordinal, pair[0].ordinal)
+                >= (pair[1].actor, pair[1].dispatch_ordinal, pair[1].ordinal)
         }) {
             fail_closed();
         }
@@ -619,7 +615,7 @@ mod guest {
         // SAFETY: JAM initializes a readable argument window at (a0, a1).
         let input = unsafe { core::slice::from_raw_parts(arguments, arguments_len) };
         let result = match AccumulateRequestV2::decode(input) {
-            Ok(request) => execute_guest_accumulate(&mut JamAccumulateStore, &request)
+            Ok(request) => execute_canonical_guest_accumulate(&mut JamAccumulateStore, &request)
                 .unwrap_or_else(|_| fail_closed()),
             Err(_) => AccumulationResultV2::Rejected(AccumulationRejectionV2::NonCanonical),
         };

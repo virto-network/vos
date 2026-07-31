@@ -121,18 +121,30 @@ pub fn execute_guest_accumulate<S: GuestAccumulateStoreV2>(
         Ok(request) => request,
         Err(_) => return Ok(rejected(AccumulationRejectionV2::NonCanonical)),
     };
+    execute_canonical_guest_accumulate(store, &request)
+}
+
+/// Execute a request already accepted by the canonical v2 wire decoder.
+///
+/// The service guest owns that decoded value and transfers it here directly,
+/// avoiding a second full request allocation inside its bounded PVM heap.
+#[doc(hidden)]
+pub fn execute_canonical_guest_accumulate<S: GuestAccumulateStoreV2>(
+    store: &mut S,
+    request: &AccumulateRequestV2,
+) -> GuestResult<AccumulationResultV2, S::Error> {
     match request {
-        AccumulateRequestV2::Install(genesis) => install(store, &genesis),
-        AccumulateRequestV2::Apply(envelope) => apply(store, &envelope, ApplyMode::Commit),
+        AccumulateRequestV2::Install(genesis) => install(store, genesis),
+        AccumulateRequestV2::Apply(envelope) => apply(store, envelope, ApplyMode::Commit),
         AccumulateRequestV2::PrepareAttested(envelope) => {
-            apply(store, &envelope, ApplyMode::PrepareAttested)
+            apply(store, envelope, ApplyMode::PrepareAttested)
         }
-        AccumulateRequestV2::Deliver(envelope) => deliver(store, &envelope),
-        AccumulateRequestV2::ExpireCall(envelope) => expire_call(store, &envelope),
+        AccumulateRequestV2::Deliver(envelope) => deliver(store, envelope),
+        AccumulateRequestV2::ExpireCall(envelope) => expire_call(store, envelope),
         AccumulateRequestV2::AcknowledgePublication(acknowledgement) => {
-            acknowledge_publication(store, &acknowledgement)
+            acknowledge_publication(store, acknowledgement)
         }
-        AccumulateRequestV2::SyncCrdt(envelope) => sync_crdt(store, &envelope),
+        AccumulateRequestV2::SyncCrdt(envelope) => sync_crdt(store, envelope),
     }
 }
 
@@ -960,13 +972,26 @@ fn materialize_workflow_crdt(
                 }
                 WorkflowOperationV2::Continuation(change) => {
                     let values = result.continuations.entry(change.actor).or_default();
-                    let mut observed = values
-                        .iter()
-                        .filter(|event| frontier.contains_ancestor(cid, event.cid))
-                        .map(|event| event.value.as_ref().map(|reference| reference.hash));
-                    let expected = observed.next().unwrap_or(None);
-                    if observed.any(|value| value != expected) || change.expected != expected {
-                        return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+                    // Keep the first causal continuation explicit. Besides
+                    // avoiding an unnecessary ancestry walk, this preserves
+                    // the exact `None` predecessor required by a first
+                    // checkpoint before any branch can exist.
+                    if values.is_empty() {
+                        if change.expected.is_some() {
+                            return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+                        }
+                    } else {
+                        let mut observed = values
+                            .iter()
+                            .filter(|event| frontier.contains_ancestor(cid, event.cid))
+                            .map(|event| event.value.as_ref().map(|reference| reference.hash));
+                        let expected = observed.next().unwrap_or(None);
+                        if observed.any(|value| value != expected) {
+                            return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+                        }
+                        if change.expected != expected {
+                            return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+                        }
                     }
                     insert_causal_value(frontier, values, cid, change.replacement.clone());
                 }
@@ -2480,7 +2505,7 @@ fn validate_awaited_outcome<S: GuestAccumulateStoreV2>(
                     tree_get_wire::<_, MessageRecordV2>(tree, &StateKeyV2::Outbox(call))?.is_some()
                 }
             };
-            if committed != *awaited
+            if committed != **awaited
                 || awaited.validate().is_err()
                 || awaited.expiration.service != work.service
                 || awaited.expiration.timeout.caller_invocation != work.invocation
@@ -4533,7 +4558,7 @@ mod tests {
         };
         resume.imported_actors[0].state = BlobRefV2::of_bytes(b"checkpoint");
         resume.imported_actors[0].continuation = Some(continuation.clone());
-        resume.awaited_timeout = Some(timeout);
+        resume.awaited_timeout = Some(Box::new(timeout));
         let mut completed = linear_transition(&resume, b"after timeout");
         completed.continuations.push(ContinuationChangeV2 {
             actor: resume.target,

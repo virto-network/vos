@@ -2900,13 +2900,16 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
         }))
         .unwrap()
         .result;
-    assert!(matches!(
-        first_result,
-        AccumulationResultV2::Accepted {
-            duplicate: false,
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            first_result,
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ),
+        "first CRDT accumulation result: {first_result:?}"
+    );
 
     let mut second_work = first_work;
     second_work.workflow_step = 1;
@@ -3519,6 +3522,144 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
     ));
     let checkpoint_state_ref = BlobRefV2::of_bytes(&checkpoint_state);
 
+    // Fork from the committed checkpoint and prove that timeout is itself a
+    // durable guest transition before the exact machine is restored. A crash
+    // at either boundary must not replay code before `.await`.
+    let persisted_checkpoint = committed.accumulate_host().snapshot_bytes();
+    let timeout_store = LocalJamStoreV2::from_snapshot_bytes(&persisted_checkpoint)
+        .expect("the checkpoint image starts an independent timeout branch");
+    let mut timeout_service = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        timeout_store,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    assert_eq!(
+        LocalWorkSchedulerV2::prepare_call_expiration(
+            timeout_service.accumulate_host(),
+            first_work.invocation,
+            99,
+        ),
+        Ok(None),
+        "a logical timeslot before the deadline cannot expire the call"
+    );
+    let expiration = LocalWorkSchedulerV2::prepare_call_expiration(
+        timeout_service.accumulate_host(),
+        first_work.invocation,
+        100,
+    )
+    .expect("the committed checkpoint is a valid expiration candidate")
+    .expect("the deadline is due");
+    let expired = timeout_service
+        .accumulate(&AccumulateRequestV2::ExpireCall(expiration))
+        .expect("physical guest Accumulate commits the timeout");
+    let AccumulationResultV2::CallExpired {
+        timeout,
+        duplicate: false,
+    } = expired.result
+    else {
+        panic!("due call expiration was rejected")
+    };
+    assert_eq!(timeout.expiration.timeout.call_id, call_id);
+    assert_eq!(
+        timeout_service
+            .accumulate_host()
+            .outbox_message(call_id)
+            .unwrap(),
+        None,
+        "expiration atomically retires the live transport effect"
+    );
+
+    let timeout_persisted = timeout_service.accumulate_host().snapshot_bytes();
+    let timeout_restarted_store = LocalJamStoreV2::from_snapshot_bytes(&timeout_persisted)
+        .expect("the expiration outcome survives a second process restart");
+    let mut timeout_restarted_service = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        timeout_restarted_store,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let timed_out = LocalWorkSchedulerV2::prepare_timeout_resume(
+        timeout_restarted_service.accumulate_host(),
+        first_work.invocation,
+        100,
+    )
+    .expect("guest-owned expiration state is readable")
+    .expect("the exact suspended workflow is ready to resume");
+    assert_eq!(timed_out.work.awaited_timeout.as_deref(), Some(&timeout));
+    assert!(timed_out.work.awaited_reply.is_none());
+    let timed_out_output = service
+        .refine_actor_tree_with_backend(
+            &timed_out.work.encode(),
+            &timed_out.imports,
+            100_000_000,
+            &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceInterpreter,
+        )
+        .expect("the interpreter injects the committed timeout");
+    assert_eq!(
+        service
+            .refine_actor_tree_with_backend(
+                &timed_out.work.encode(),
+                &timed_out.imports,
+                100_000_000,
+                &NoRefineProtocolHostV2,
+                javm::PvmBackend::ForceRecompiler,
+            )
+            .expect("the recompiler injects the same committed timeout"),
+        timed_out_output
+    );
+    let timed_out_refined = RefineOutputV2::decode(&timed_out_output.bytes).unwrap();
+    let timed_out_transition = timed_out_refined.transition;
+    let timed_out_state = timed_out_transition
+        .writes
+        .iter()
+        .find(|write| write.key == vos::lifecycle::STATE_KEY_BYTES)
+        .and_then(|write| write.value.as_ref())
+        .expect("the timed-out handler returns its checkpointed state");
+    assert_eq!(
+        u32::decode(timed_out_state),
+        1,
+        "code before the timed-out await executes exactly once"
+    );
+    assert_eq!(
+        timed_out_transition
+            .reply
+            .as_ref()
+            .map(|reply| vos::value::Value::decode(&reply.result)),
+        Some(vos::value::Value::U32(1))
+    );
+    let timed_out_work = timed_out.work;
+    let completed_timeout = timeout_restarted_service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: timed_out_work,
+            transition: timed_out_transition,
+            provided_blobs: timed_out_refined.candidate_blobs,
+        }))
+        .expect("guest Accumulate accepts only the committed timeout outcome");
+    assert!(matches!(
+        completed_timeout.result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        LocalWorkSchedulerV2::prepare_timeout_resume(
+            timeout_restarted_service.accumulate_host(),
+            first_work.invocation,
+            101,
+        ),
+        Ok(None),
+        "the completed continuation cannot consume the timeout twice"
+    );
+
     // Reconstruct the service from committed state before the peer reply
     // arrives. No live handler future or warm actor VM survives this boundary.
     let reopened = LocalJamStoreV2::from_snapshot(committed.accumulate_host().snapshot());
@@ -3919,6 +4060,123 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
             .unwrap(),
         None,
         "step 0 consumes the only live copy of the inbound inbox row"
+    );
+
+    // A timeout may resume directly into another await. The new checkpoint
+    // must consume call 0 and publish call 1 in the same guest transaction;
+    // tying consumption to handler completion would wedge this saga.
+    let timeout_branch =
+        LocalJamStoreV2::from_snapshot_bytes(&committed.accumulate_host().snapshot_bytes())
+            .unwrap();
+    let mut timeout_service = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        timeout_branch,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let expiration = LocalWorkSchedulerV2::prepare_call_expiration(
+        timeout_service.accumulate_host(),
+        initial.work.invocation,
+        100,
+    )
+    .unwrap()
+    .expect("the first peer call is due");
+    assert!(matches!(
+        timeout_service
+            .accumulate(&AccumulateRequestV2::ExpireCall(expiration))
+            .unwrap()
+            .result,
+        AccumulationResultV2::CallExpired {
+            duplicate: false,
+            ..
+        }
+    ));
+    let timeout_resume = LocalWorkSchedulerV2::prepare_timeout_resume(
+        timeout_service.accumulate_host(),
+        initial.work.invocation,
+        100,
+    )
+    .unwrap()
+    .expect("the timed-out first await is resumable");
+    let timeout_output = service
+        .refine_actor_tree_with_backend(
+            &timeout_resume.work.encode(),
+            &timeout_resume.imports,
+            100_000_000,
+            &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceInterpreter,
+        )
+        .unwrap();
+    assert_eq!(
+        service
+            .refine_actor_tree_with_backend(
+                &timeout_resume.work.encode(),
+                &timeout_resume.imports,
+                100_000_000,
+                &NoRefineProtocolHostV2,
+                javm::PvmBackend::ForceRecompiler,
+            )
+            .unwrap(),
+        timeout_output
+    );
+    let timeout_refined = RefineOutputV2::decode(&timeout_output.bytes).unwrap();
+    let timeout_transition = timeout_refined.transition;
+    let second_timeout_call = initial.work.invocation.call_id(1);
+    assert_eq!(timeout_transition.outbox.len(), 1);
+    assert_eq!(timeout_transition.outbox[0].call_id, second_timeout_call);
+    let timeout_state = timeout_transition
+        .writes
+        .iter()
+        .find(|write| write.key == vos::lifecycle::STATE_KEY_BYTES)
+        .and_then(|write| write.value.as_ref())
+        .unwrap();
+    assert_eq!(
+        u32::decode(timeout_state),
+        11,
+        "the first timeout skips its value, then execution reaches await 2 exactly once"
+    );
+    let mut timeout_blobs = timeout_refined.candidate_blobs;
+    timeout_blobs.extend(timeout_output.exported_blobs);
+    timeout_blobs.sort_by_key(|blob| blob.reference.hash);
+    timeout_blobs.dedup();
+    let timeout_checkpoint = timeout_service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: timeout_resume.work,
+            transition: timeout_transition,
+            provided_blobs: timeout_blobs,
+        }))
+        .expect("timeout resume atomically replaces the awaited checkpoint");
+    assert!(
+        matches!(
+            timeout_checkpoint.result,
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ),
+        "timeout resume was rejected: {:?}",
+        timeout_checkpoint.result
+    );
+    let timeout_header = timeout_service.accumulate_host().header().unwrap().unwrap();
+    assert_eq!(
+        timeout_service
+            .accumulate_host()
+            .state_row(timeout_header.service_root, &StateKeyV2::Outbox(first_call))
+            .unwrap(),
+        None
+    );
+    assert!(
+        timeout_service
+            .accumulate_host()
+            .state_row(
+                timeout_header.service_root,
+                &StateKeyV2::Outbox(second_timeout_call),
+            )
+            .unwrap()
+            .is_some()
     );
 
     let first_reply = ReplyRecordV2 {

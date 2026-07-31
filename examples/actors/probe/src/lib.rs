@@ -71,7 +71,7 @@ impl Probe {
         }
         self.seen += 10;
         if let Ok(vos::value::Value::U32(value)) = ctx
-            .ask_actor(ActorId([45; 32]), &Msg::new("second_value"), Some(100))
+            .ask_actor(ActorId([45; 32]), &Msg::new("second_value"), Some(150))
             .await
         {
             self.seen += value;

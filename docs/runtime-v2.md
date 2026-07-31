@@ -17,6 +17,12 @@ rather than accept a caller-selected value. Actor-side cross-root CALL now
 emits a durable outbox row and captures the exact pending protocol boundary.
 For linear services the guest-owned workflow row reconstructs every later
 slice after restart without a process-local copy of the original request.
+It can also rediscover a suspended outbound call, submit one canonical
+`ExpireCall` request when the consensus logical timeslot reaches its recorded
+deadline, and reconstruct the exact timed-out resume after another restart.
+The committed outcome uses the deadline itself as `expired_at`, so hosts which
+first observe the due call in different later slots still derive identical
+bytes.
 
 The local linear-service transport is also guest-owned end to end. An accepted
 actor slice stores a recoverable publication row whose receipt commits the
@@ -266,6 +272,16 @@ records an explicit workflow-CRDT outbox consumption, and post-await
 operations receive a fresh change/dispatch identity. The suspended heap
 continues against the materialization it originally observed; concurrent
 branches merge only after that resumed change commits.
+
+A durable timeout follows the same boundary without fabricating a reply. Guest
+Accumulate verifies the exact outbox row, workflow checkpoint, pending actor,
+await ordinal and deadline before atomically removing the outbox and storing a
+receipt-bound `AccumulatedTimeoutV2`. Linear mode advances the revision; CRDT
+mode emits a workflow-only expiration node whose ID and receipt bind the exact
+caller actor and causal frontier. Refine restores the captured kernel and
+injects a typed `CallError::Timeout` at the original call boundary. The resumed
+slice consumes that outcome independently of whether it completes, yields, or
+immediately checkpoints at a later await.
 The inline reply envelope is bounded by `CHECKPOINT_TOKEN_CAPACITY`; larger
 application results must use a content-addressed blob reference once the
 transport API exposes that result form. A resumed CRDT slice may complete,
