@@ -298,6 +298,35 @@ impl LocalWorkSchedulerV2 {
         }))
     }
 
+    /// Rediscover every due timeout solely from guest-owned durable rows.
+    /// The returned envelopes remain read-only proposals until physical IC-5
+    /// Accumulate validates them against its trusted ambient JAM slot.
+    pub fn prepare_due_call_expirations(
+        store: &LocalJamStoreV2,
+        logical_timeslot: u64,
+    ) -> Result<Vec<CallExpirationEnvelopeV2>, ScheduleErrorV2> {
+        let mut due = Vec::new();
+        for deadline in store.pending_call_deadlines()? {
+            if logical_timeslot < deadline.deadline_timeslot {
+                continue;
+            }
+            let expiration =
+                Self::prepare_call_expiration(store, deadline.caller_invocation, logical_timeslot)?
+                    .ok_or(ScheduleErrorV2::InvalidWorkflowStep(
+                        deadline.caller_invocation,
+                    ))?;
+            if expiration.timeout.call_id != deadline.call_id
+                || expiration.timeout.deadline_timeslot != deadline.deadline_timeslot
+            {
+                return Err(ScheduleErrorV2::InvalidContinuation(
+                    expiration.timeout.caller_actor,
+                ));
+            }
+            due.push(expiration);
+        }
+        Ok(due)
+    }
+
     /// Reconstruct the next exact continuation slice from guest-committed
     /// workflow state. The host supplies only the consensus timeslot and, for
     /// an awaited call, the accumulated remote reply it received for
@@ -498,20 +527,29 @@ impl LocalWorkSchedulerV2 {
                     Ok::<_, Infallible>(store.row(&crdt_node_storage_key(cid)).map(<[u8]>::to_vec))
                 })
                 .map_err(schedule_causal_error)?;
-                let heads =
-                    if request.workflow_step == 0 {
-                        header.crdt_heads.clone()
-                    } else {
-                        let checkpoint = workflow
-                            .as_ref()
-                            .ok_or(ScheduleErrorV2::InvalidWorkflowStep(request.invocation))?;
-                        if !header.crdt_heads.iter().any(|head| {
-                            current.contains_ancestor(*head, checkpoint.transition_hash)
-                        }) {
-                            return Err(ScheduleErrorV2::CorruptCausalDag);
-                        }
-                        alloc::vec![checkpoint.transition_hash]
-                    };
+                let timeout_heads = request
+                    .awaited_timeout
+                    .as_ref()
+                    .map(|timeout| timeout.receipt.resulting_crdt_heads.as_slice());
+                let heads = selected_crdt_resume_heads(
+                    &header.crdt_heads,
+                    request.workflow_step,
+                    request.invocation,
+                    workflow
+                        .as_ref()
+                        .map(|checkpoint| checkpoint.transition_hash),
+                    timeout_heads,
+                )?;
+                if request.workflow_step != 0
+                    && heads.iter().any(|selected| {
+                        !header
+                            .crdt_heads
+                            .iter()
+                            .any(|head| current.contains_ancestor(*head, *selected))
+                    })
+                {
+                    return Err(ScheduleErrorV2::CorruptCausalDag);
+                }
                 let frontier = if heads == header.crdt_heads {
                     current
                 } else {
@@ -819,6 +857,27 @@ fn selected_continuation(
     }
 }
 
+fn selected_crdt_resume_heads(
+    current_heads: &[super::Hash],
+    workflow_step: u64,
+    invocation: InvocationId,
+    checkpoint_head: Option<super::Hash>,
+    timeout_heads: Option<&[super::Hash]>,
+) -> Result<Vec<super::Hash>, ScheduleErrorV2> {
+    if workflow_step == 0 {
+        return Ok(current_heads.to_vec());
+    }
+    if let Some(heads) = timeout_heads {
+        if heads.is_empty() {
+            return Err(ScheduleErrorV2::CorruptCausalDag);
+        }
+        return Ok(heads.to_vec());
+    }
+    checkpoint_head
+        .map(|head| alloc::vec![head])
+        .ok_or(ScheduleErrorV2::InvalidWorkflowStep(invocation))
+}
+
 fn schedule_causal_error(error: CausalFrontierError<Infallible>) -> ScheduleErrorV2 {
     match error {
         CausalFrontierError::Missing(cid) => ScheduleErrorV2::MissingCausalDependency(cid),
@@ -969,6 +1028,31 @@ mod tests {
             selected_continuation(None, actor, Some(merged.clone())),
             Some(merged),
             "linear scheduling continues to read the current service root"
+        );
+    }
+
+    #[test]
+    fn timeout_resume_descends_from_the_expiration_head() {
+        let invocation = InvocationId([9; 32]);
+        let checkpoint = super::super::Hash([10; 32]);
+        let expiration = super::super::Hash([11; 32]);
+        let merged = super::super::Hash([12; 32]);
+
+        assert_eq!(
+            selected_crdt_resume_heads(
+                &[merged],
+                1,
+                invocation,
+                Some(checkpoint),
+                Some(&[expiration]),
+            ),
+            Ok(vec![expiration]),
+            "the pre-expiration checkpoint still contains the outbox"
+        );
+        assert_eq!(
+            selected_crdt_resume_heads(&[merged], 1, invocation, Some(checkpoint), None),
+            Ok(vec![checkpoint]),
+            "ordinary reply resumes remain bound to their captured checkpoint"
         );
     }
 }

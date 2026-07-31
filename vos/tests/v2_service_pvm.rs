@@ -17,15 +17,15 @@ use vos::network::RaftRpcHandler;
 use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, WorkerConfig};
 use vos::v2::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
-    AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AuthorizationEvidenceV2,
-    BlobRefV2, CallId, CommittedAccumulateBatchV2, CommittedAccumulateEntryV2,
-    CommittedAccumulateLogV2, CommittedImageStoreV2, CommittedServiceImageHostV2,
-    CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2,
-    ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2, ExternalActorBindingV2,
-    GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2,
-    InvocationId, JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2, LocalTransportV2,
-    LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
-    NoRefineProtocolHostV2, Origin, PackageRolePoliciesV2, ProducerId, ProgramId,
+    AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2,
+    AuthorizationEvidenceV2, BlobRefV2, CallId, CommittedAccumulateBatchV2,
+    CommittedAccumulateEntryV2, CommittedAccumulateLogV2, CommittedImageStoreV2,
+    CommittedServiceImageHostV2, CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2,
+    ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2,
+    ExternalActorBindingV2, GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2,
+    ImportedProgramV2, InboxDrainOutcomeV2, InvocationId, JamServiceV2, LocalJamStoreHostV2,
+    LocalJamStoreV2, LocalTransportV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2,
+    MethodPolicyV2, NoRefineProtocolHostV2, Origin, PackageRolePoliciesV2, ProducerId, ProgramId,
     ProofArtifactStoreV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2,
     RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RoleCredentialV2,
     RoleCredentialVerificationRequestV2, RootServiceId, ScheduleErrorV2, ServiceDispatchError,
@@ -3537,24 +3537,32 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
         5_000_000_000,
     )
     .unwrap();
-    assert_eq!(
-        LocalWorkSchedulerV2::prepare_call_expiration(
-            timeout_service.accumulate_host(),
-            first_work.invocation,
-            99,
-        ),
-        Ok(None),
+    assert!(
+        LocalWorkSchedulerV2::prepare_due_call_expirations(timeout_service.accumulate_host(), 99,)
+            .unwrap()
+            .is_empty(),
         "a logical timeslot before the deadline cannot expire the call"
     );
-    let expiration = LocalWorkSchedulerV2::prepare_call_expiration(
-        timeout_service.accumulate_host(),
-        first_work.invocation,
-        100,
-    )
-    .expect("the committed checkpoint is a valid expiration candidate")
-    .expect("the deadline is due");
+    let due =
+        LocalWorkSchedulerV2::prepare_due_call_expirations(timeout_service.accumulate_host(), 100)
+            .expect("durable deadline rows are restart-discoverable");
+    assert_eq!(due.len(), 1);
+    let expiration = due.into_iter().next().unwrap();
+    assert_eq!(expiration.timeout.caller_invocation, first_work.invocation);
+    let before_untrusted_expiration = timeout_service.accumulate_host().snapshot();
+    assert_eq!(
+        timeout_service
+            .accumulate(&AccumulateRequestV2::ExpireCall(expiration.clone()))
+            .expect("an untrusted direct proposal is rejected by the guest")
+            .result,
+        AccumulationResultV2::Rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+    );
+    assert_eq!(
+        timeout_service.accumulate_host().snapshot(),
+        before_untrusted_expiration
+    );
     let expired = timeout_service
-        .accumulate(&AccumulateRequestV2::ExpireCall(expiration))
+        .accumulate_at(&AccumulateRequestV2::ExpireCall(expiration), 100)
         .expect("physical guest Accumulate commits the timeout");
     let AccumulationResultV2::CallExpired {
         timeout,
@@ -3571,6 +3579,22 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             .unwrap(),
         None,
         "expiration atomically retires the live transport effect"
+    );
+    assert!(
+        timeout_service
+            .accumulate_host()
+            .pending_call_deadlines()
+            .unwrap()
+            .is_empty(),
+        "expiration retires the restart deadline index atomically"
+    );
+    assert!(
+        timeout_service
+            .accumulate_host()
+            .pending_publications()
+            .unwrap()
+            .is_empty(),
+        "an undelivered publication is terminally retired with its timeout"
     );
 
     let timeout_persisted = timeout_service.accumulate_host().snapshot_bytes();
@@ -4086,7 +4110,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
     .expect("the first peer call is due");
     assert!(matches!(
         timeout_service
-            .accumulate(&AccumulateRequestV2::ExpireCall(expiration))
+            .accumulate_at(&AccumulateRequestV2::ExpireCall(expiration), 100)
             .unwrap()
             .result,
         AccumulationResultV2::CallExpired {

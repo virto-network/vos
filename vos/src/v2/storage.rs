@@ -14,7 +14,7 @@ use super::{
     InvocationId, PublishedEffectsV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 12;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 13;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -25,6 +25,7 @@ const PUBLICATION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/publication/";
 const DELIVERY_STORAGE_PREFIX: &[u8] = b"\0vos/v2/delivery/";
 const REPLY_ADMISSION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/reply-admission/";
 const CALL_EXPIRATION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/call-expiration/";
+const PENDING_CALL_DEADLINE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/pending-deadline/";
 const CRDT_NODE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node/";
 const CRDT_NODE_RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node-receipt/";
 const CRDT_CHANGE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-change/";
@@ -276,6 +277,16 @@ pub struct ReplyAdmissionRecordV2 {
     pub work_hash: Hash,
 }
 
+/// Enumerable guest-owned index for one deadline-bearing suspended call.
+/// The authoritative message and workflow remain in the state tree; this row
+/// only makes their identity rediscoverable after a process restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCallDeadlineV2 {
+    pub call_id: CallId,
+    pub caller_invocation: InvocationId,
+    pub deadline_timeslot: u64,
+}
+
 /// Non-recursive workflow row covered by the service tree. Receipts live in
 /// the physical bookkeeping namespace because including their resulting root
 /// in this row would make the commitment circular.
@@ -462,6 +473,29 @@ impl V2Wire for ReplyAdmissionRecordV2 {
     }
 }
 
+impl V2Wire for PendingCallDeadlineV2 {
+    const MAGIC: [u8; 4] = *b"VPD2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.fixed(&self.call_id.0);
+        e.fixed(&self.caller_invocation.0);
+        e.u64(self.deadline_timeslot);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            call_id: CallId(d.fixed()?),
+            caller_invocation: InvocationId(d.fixed()?),
+            deadline_timeslot: d.u64()?,
+        };
+        if value.call_id == CallId::ZERO || value.caller_invocation == InvocationId::ZERO {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
 pub const fn header_storage_key() -> &'static [u8] {
     HEADER_STORAGE_KEY
 }
@@ -504,6 +538,18 @@ pub fn call_expiration_storage_key(call: CallId) -> Vec<u8> {
     key.extend_from_slice(CALL_EXPIRATION_STORAGE_PREFIX);
     key.extend_from_slice(&call.0);
     key
+}
+
+pub fn pending_call_deadline_storage_key(call: CallId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(PENDING_CALL_DEADLINE_STORAGE_PREFIX.len() + call.0.len());
+    key.extend_from_slice(PENDING_CALL_DEADLINE_STORAGE_PREFIX);
+    key.extend_from_slice(&call.0);
+    key
+}
+
+#[cfg(feature = "std")]
+pub(crate) const fn pending_call_deadline_storage_prefix() -> &'static [u8] {
+    PENDING_CALL_DEADLINE_STORAGE_PREFIX
 }
 
 #[cfg(feature = "std")]
@@ -703,12 +749,17 @@ mod tests {
         let publication = publication_storage_key(input);
         let delivery = delivery_storage_key(CallId([4; 32]));
         let reply_admission = reply_admission_storage_key(CallId([4; 32]));
+        let expiration = call_expiration_storage_key(CallId([4; 32]));
+        let deadline = pending_call_deadline_storage_key(CallId([4; 32]));
         assert_ne!(dedup, receipt);
         assert_ne!(dedup, publication);
         assert_ne!(receipt, publication);
         assert_ne!(delivery, publication);
         assert_ne!(reply_admission, delivery);
         assert_ne!(reply_admission, publication);
+        assert_ne!(expiration, deadline);
+        assert_ne!(expiration, reply_admission);
+        assert_ne!(deadline, delivery);
         assert_ne!(dedup.as_slice(), header_storage_key());
         assert_ne!(crdt_node_storage_key(Hash([6; 32])), receipt);
         assert_ne!(
@@ -877,6 +928,27 @@ mod tests {
         step_zero.input.workflow_step = 0;
         assert_eq!(
             ReplyAdmissionRecordV2::decode(&step_zero.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn pending_deadline_row_binds_its_restart_identity() {
+        let invocation = InvocationId([50; 32]);
+        let deadline = PendingCallDeadlineV2 {
+            call_id: invocation.call_id(2),
+            caller_invocation: invocation,
+            deadline_timeslot: 99,
+        };
+        assert_eq!(
+            PendingCallDeadlineV2::decode(&deadline.encode()).unwrap(),
+            deadline
+        );
+
+        let mut invalid = deadline;
+        invalid.call_id = CallId::ZERO;
+        assert_eq!(
+            PendingCallDeadlineV2::decode(&invalid.encode()),
             Err(DecodeError::NonCanonical)
         );
     }

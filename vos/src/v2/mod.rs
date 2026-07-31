@@ -88,11 +88,12 @@ pub use state_tree::{
     ServiceStateTreeV2, StateTreeError, StateTreeStore, empty_state_root, state_position,
 };
 pub use storage::{
-    DedupRecordV2, DeliveryRecordV2, PublicationRecordV2, ReplyAdmissionRecordV2,
-    SERVICE_STORE_SCHEMA_VERSION, StateKeyV2, StoreHeaderV2, StoreOpenError, WorkflowCheckpointV2,
-    call_expiration_storage_key, crdt_change_storage_key, crdt_node_receipt_storage_key,
-    crdt_node_storage_key, dedup_storage_key, delivery_storage_key, header_storage_key,
-    publication_storage_key, receipt_storage_key, reply_admission_storage_key,
+    DedupRecordV2, DeliveryRecordV2, PendingCallDeadlineV2, PublicationRecordV2,
+    ReplyAdmissionRecordV2, SERVICE_STORE_SCHEMA_VERSION, StateKeyV2, StoreHeaderV2,
+    StoreOpenError, WorkflowCheckpointV2, call_expiration_storage_key, crdt_change_storage_key,
+    crdt_node_receipt_storage_key, crdt_node_storage_key, dedup_storage_key, delivery_storage_key,
+    header_storage_key, pending_call_deadline_storage_key, publication_storage_key,
+    receipt_storage_key, reply_admission_storage_key,
 };
 #[cfg(feature = "std")]
 pub use transport::{
@@ -113,8 +114,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0x8f, 0xbb, 0x2f, 0xe6, 0xce, 0x47, 0x6e, 0x2b, 0x79, 0x2c, 0x31, 0x63, 0xe8, 0xbb, 0x27, 0xb5,
-    0x49, 0x28, 0xec, 0xde, 0xb0, 0x9e, 0x06, 0x3a, 0x76, 0x7c, 0x6b, 0xaa, 0x54, 0xdc, 0x79, 0xc2,
+    0x4b, 0x10, 0x2e, 0x42, 0xce, 0xce, 0x35, 0xc7, 0x0e, 0x9c, 0x19, 0x2c, 0xdb, 0xf8, 0xd3, 0xa6,
+    0xd0, 0x6c, 0x35, 0xd2, 0xb8, 0x83, 0xf9, 0xa8, 0xa3, 0x13, 0x3a, 0x80, 0xdf, 0xf1, 0x13, 0x29,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.

@@ -24,6 +24,14 @@ pub fn now_ms() -> u64 {
     ecall0(hostcall::NOW_MS)
 }
 
+/// Read the consensus-authenticated logical timeslot supplied to the generic
+/// service's Accumulate entry. `HOST_NONE` means this invocation has no trusted
+/// slot observation and must not commit a time-dependent transition.
+#[inline]
+pub fn accumulation_timeslot() -> u64 {
+    ecall0(hostcall::ACCUMULATION_TIMESLOT)
+}
+
 /// Stop at an exact durable continuation boundary.
 ///
 /// Returns `0` to the refine fork that finalizes the current execution slice,

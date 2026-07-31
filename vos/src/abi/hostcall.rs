@@ -102,6 +102,14 @@ pub const BOOT_CONTEXT: u32 = 120;
 /// (sampled once at the raft leader and committed), never from this hostcall.
 pub const NOW_MS: u32 = 121;
 
+/// Consensus-authenticated logical timeslot observed by guest Accumulate.
+///
+/// Capability slots are phase-local: actor Refine uses slot 121 for the
+/// explicitly non-consensus [`NOW_MS`] seam, while the generic service's
+/// Accumulate entry receives this deterministic JAM-slot observation. The two
+/// capabilities are never installed in the same invocation.
+pub const ACCUMULATION_TIMESLOT: u32 = NOW_MS;
+
 /// Durable actor suspension boundary supplied by the VOS scheduler.
 ///
 /// Refine captures the complete nested JAVM kernel before this call observes

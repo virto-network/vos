@@ -671,6 +671,11 @@ mod guest {
     }
 
     impl GuestAccumulateStoreV2 for JamAccumulateStore {
+        fn logical_timeslot(&self) -> Result<Option<u64>, Self::Error> {
+            let timeslot = hostcalls::accumulation_timeslot();
+            Ok((timeslot != error::HOST_NONE).then_some(timeslot))
+        }
+
         fn authorize_install(
             &self,
             genesis: &vos::v2::ServiceGenesisV2,

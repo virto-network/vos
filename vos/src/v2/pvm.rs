@@ -136,6 +136,22 @@ pub trait AccumulateProtocolHostV2 {
 
     fn begin(&mut self) -> Result<Self::Transaction, ServicePvmErrorV2>;
 
+    /// Begin one transaction with an authenticated ambient JAM timeslot.
+    /// Hosts which do not implement the consensus-time seam reject attempts
+    /// to use it instead of silently dropping the observation.
+    fn begin_at(
+        &mut self,
+        logical_timeslot: Option<u64>,
+    ) -> Result<Self::Transaction, ServicePvmErrorV2> {
+        if logical_timeslot.is_some() {
+            Err(ServicePvmErrorV2::AccumulateHostRejected(
+                crate::abi::hostcall::ACCUMULATION_TIMESLOT as u8,
+            ))
+        } else {
+            self.begin()
+        }
+    }
+
     fn commit(&mut self, transaction: Self::Transaction) -> Result<(), ServicePvmErrorV2>;
 }
 
@@ -690,7 +706,25 @@ impl ServicePvmV2 {
         gas_limit: u64,
         host: &mut H,
     ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
-        self.accumulate_with_backend(arguments, gas_limit, host, javm::PvmBackend::Default)
+        self.accumulate_at_with_backend(arguments, gas_limit, host, None, javm::PvmBackend::Default)
+    }
+
+    /// Execute Accumulate with the consensus-authenticated JAM timeslot for
+    /// time-dependent requests such as durable call expiration.
+    pub fn accumulate_at<H: AccumulateProtocolHostV2>(
+        &self,
+        arguments: &[u8],
+        gas_limit: u64,
+        host: &mut H,
+        logical_timeslot: u64,
+    ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
+        self.accumulate_at_with_backend(
+            arguments,
+            gas_limit,
+            host,
+            Some(logical_timeslot),
+            javm::PvmBackend::Default,
+        )
     }
 
     /// Conformance variant of [`Self::accumulate`] selecting a JAR backend.
@@ -700,6 +734,17 @@ impl ServicePvmV2 {
         arguments: &[u8],
         gas_limit: u64,
         host: &mut H,
+        backend: javm::PvmBackend,
+    ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
+        self.accumulate_at_with_backend(arguments, gas_limit, host, None, backend)
+    }
+
+    fn accumulate_at_with_backend<H: AccumulateProtocolHostV2>(
+        &self,
+        arguments: &[u8],
+        gas_limit: u64,
+        host: &mut H,
+        logical_timeslot: Option<u64>,
         backend: javm::PvmBackend,
     ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
         let mut kernel =
@@ -712,7 +757,7 @@ impl ServicePvmV2 {
             .map_err(|_| ServicePvmErrorV2::InvalidVmLifecycle)?;
         install_accumulate_scheduler_caps(&mut kernel);
         kernel.set_entry_ic(ACCUMULATE_ENTRY_IC);
-        let mut transaction = host.begin()?;
+        let mut transaction = host.begin_at(logical_timeslot)?;
 
         loop {
             match kernel.run() {
@@ -1377,6 +1422,7 @@ fn install_accumulate_scheduler_caps(kernel: &mut InvocationKernel) {
         crate::abi::hostcall::RECEIPT_VERIFY as u8,
         crate::abi::hostcall::INSTALL_AUTH_VERIFY as u8,
         crate::abi::hostcall::PROGRAM_LOOKUP as u8,
+        crate::abi::hostcall::ACCUMULATION_TIMESLOT as u8,
     ] {
         kernel
             .vm_arena

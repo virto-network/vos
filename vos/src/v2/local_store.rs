@@ -358,6 +358,7 @@ pub enum LocalStoreReadErrorV2 {
     CorruptDelivery,
     CorruptReplyRoute,
     CorruptExpiration,
+    CorruptPendingDeadline,
 }
 
 impl core::fmt::Display for LocalStoreReadErrorV2 {
@@ -718,6 +719,45 @@ impl LocalJamStoreV2 {
             })
     }
 
+    /// Enumerate deadline-bearing suspended calls from guest-owned physical
+    /// bookkeeping. Every row is cross-checked against the authoritative
+    /// outbox before it is exposed to restart orchestration.
+    pub fn pending_call_deadlines(
+        &self,
+    ) -> Result<Vec<super::PendingCallDeadlineV2>, LocalStoreReadErrorV2> {
+        let Some(header) = self.header()? else {
+            return Ok(Vec::new());
+        };
+        let prefix = super::storage::pending_call_deadline_storage_prefix();
+        self.committed
+            .rows
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .map(|(key, bytes)| {
+                let deadline = super::PendingCallDeadlineV2::decode(bytes)
+                    .map_err(|_| LocalStoreReadErrorV2::CorruptPendingDeadline)?;
+                if super::pending_call_deadline_storage_key(deadline.call_id).as_slice()
+                    != key.as_slice()
+                {
+                    return Err(LocalStoreReadErrorV2::CorruptPendingDeadline);
+                }
+                let message = self
+                    .state_row(header.service_root, &StateKeyV2::Outbox(deadline.call_id))?
+                    .map(|bytes| MessageRecordV2::decode(&bytes))
+                    .transpose()
+                    .map_err(|_| LocalStoreReadErrorV2::CorruptPendingDeadline)?
+                    .ok_or(LocalStoreReadErrorV2::CorruptPendingDeadline)?;
+                if message.call_id != deadline.call_id
+                    || message.caller_invocation != deadline.caller_invocation
+                    || message.deadline_timeslot != Some(deadline.deadline_timeslot)
+                {
+                    return Err(LocalStoreReadErrorV2::CorruptPendingDeadline);
+                }
+                Ok(deadline)
+            })
+            .collect()
+    }
+
     /// Recover a previously committed reply admission and cross-check it
     /// against the exact work-input dedup row written in the same guest
     /// transaction.
@@ -936,6 +976,7 @@ impl StateTreeStore for CommittedRows<'_> {
 /// Private copy-on-write image for one physical IC-5 execution.
 pub struct LocalJamTransactionV2 {
     staged: LocalJamStoreSnapshotV2,
+    logical_timeslot: Option<u64>,
     proof_blobs: BTreeMap<[u8; 32], Vec<u8>>,
     proof_allowlist: BTreeSet<super::Hash>,
     role_credential_allowlist: BTreeSet<super::Hash>,
@@ -1002,6 +1043,9 @@ impl AccumulateTransactionV2 for LocalJamTransactionV2 {
         use crate::abi::{error, hostcall};
 
         match slot as u32 {
+            hostcall::ACCUMULATION_TIMESLOT => {
+                Ok([self.logical_timeslot.unwrap_or(error::HOST_NONE), 0])
+            }
             hostcall::STORAGE_R => {
                 let key = Self::read_guest_bytes(kernel, registers[7], registers[8], slot)?;
                 let Some(value) = self.staged.rows.get(&key) else {
@@ -1129,8 +1173,16 @@ impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
     type Transaction = LocalJamTransactionV2;
 
     fn begin(&mut self) -> Result<Self::Transaction, ServicePvmErrorV2> {
+        self.begin_at(None)
+    }
+
+    fn begin_at(
+        &mut self,
+        logical_timeslot: Option<u64>,
+    ) -> Result<Self::Transaction, ServicePvmErrorV2> {
         Ok(LocalJamTransactionV2 {
             staged: self.committed.clone(),
+            logical_timeslot,
             proof_blobs: self.proof_blobs.clone(),
             proof_allowlist: self.proof_allowlist.clone(),
             role_credential_allowlist: self.role_credential_allowlist.clone(),
@@ -1155,6 +1207,13 @@ impl<B: CommittedImageStoreV2> AccumulateProtocolHostV2 for DurableJamStoreV2<B>
 
     fn begin(&mut self) -> Result<Self::Transaction, ServicePvmErrorV2> {
         self.local.begin()
+    }
+
+    fn begin_at(
+        &mut self,
+        logical_timeslot: Option<u64>,
+    ) -> Result<Self::Transaction, ServicePvmErrorV2> {
+        self.local.begin_at(logical_timeslot)
     }
 
     fn commit(&mut self, mut transaction: Self::Transaction) -> Result<(), ServicePvmErrorV2> {

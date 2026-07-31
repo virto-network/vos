@@ -20,6 +20,12 @@ slice after restart without a process-local copy of the original request.
 It can also rediscover a suspended outbound call, submit one canonical
 `ExpireCall` request when the consensus logical timeslot reaches its recorded
 deadline, and reconstruct the exact timed-out resume after another restart.
+Deadline-bearing calls are indexed in guest-owned physical rows when their
+outbox entry commits and removed with reply admission or expiration, so this
+scan requires no process-local `InvocationId`. IC-5 independently reads an
+ambient Accumulate-only timeslot capability and rejects expiration when that
+trusted observation is absent or still before the deadline; the scheduler's
+due-time filter is only an orchestration convenience.
 The committed outcome uses the deadline itself as `expired_at`, so hosts which
 first observe the due call in different later slots still derive identical
 bytes.
@@ -40,7 +46,9 @@ timeslot and consumed bit; the local scheduler scans them after restart and
 drains runnable inbox rows through Refine plus Accumulate at an explicit later
 logical timeslot. Publication removal is a separate guest Accumulate
 acknowledgement performed only after the external consumer is durably
-committed.
+committed. The exception is an undelivered call which expires at its source:
+expiration atomically retires its publication and deadline index, and a later
+reply is classified terminally from the permanent expiration row.
 
 The local linear conformance path also routes a committed callee reply back to
 the caller service. It recovers the exact caller invocation from the
@@ -278,7 +286,9 @@ Accumulate verifies the exact outbox row, workflow checkpoint, pending actor,
 await ordinal and deadline before atomically removing the outbox and storing a
 receipt-bound `AccumulatedTimeoutV2`. Linear mode advances the revision; CRDT
 mode emits a workflow-only expiration node whose ID and receipt bind the exact
-caller actor and causal frontier. Refine restores the captured kernel and
+caller actor and causal frontier. A CRDT timeout resume selects that expiration
+node as its base rather than the earlier checkpoint which still contained the
+outbox. Refine restores the captured kernel and
 injects a typed `CallError::Timeout` at the original call boundary. The resumed
 slice consumes that outcome independently of whether it completes, yields, or
 immediately checkpoints at a later await.
@@ -302,7 +312,8 @@ rather than its local conformance allowlist. `PROGRAM_LOOKUP` availability
 must be pinned to or imported from consensus-visible state rather than a
 node-local cache. `RECEIPT_VERIFY` must likewise use
 consensus-authoritative receipt finality rather than its local conformance
-allowlist, and delivery timeslots must come from the JAM slot. `PROOF_VERIFY`
+allowlist, and every delivery, deadline, and expiration observation must come
+from the JAM slot. `PROOF_VERIFY`
 must use the workspace-pinned verifier and execution-semantics identity rather
 than the local proof allowlist, and the canonical Refine trace must be bound
 into the generated proof before attested execution becomes a production path.

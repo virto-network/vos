@@ -523,6 +523,31 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
         })
     }
 
+    /// Accumulate a time-dependent request against a consensus-authenticated
+    /// JAM logical timeslot. Ordinary requests should use [`Self::accumulate`].
+    pub fn accumulate_at(
+        &mut self,
+        request: &AccumulateRequestV2,
+        logical_timeslot: u64,
+    ) -> Result<AccumulatedServiceOutputV2, ServiceDispatchError> {
+        self.validate_service_program(request.service().service_program)?;
+        let output = self
+            .pvm
+            .accumulate_at(
+                &request.encode(),
+                self.accumulate_gas,
+                &mut self.accumulate_host,
+                logical_timeslot,
+            )
+            .map_err(ServiceDispatchError::Pvm)?;
+        let result = AccumulationResultV2::decode(&output.bytes)
+            .map_err(|_| ServiceDispatchError::InvalidAccumulateOutput)?;
+        Ok(AccumulatedServiceOutputV2 {
+            result,
+            gas_used: output.gas_used,
+        })
+    }
+
     fn validate_service_program(&self, declared: ProgramId) -> Result<(), ServiceDispatchError> {
         let expected = self.program_id();
         if declared != expected {

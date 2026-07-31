@@ -66,6 +66,7 @@ pub enum LocalTransportErrorV2 {
     MissingMessage(CallId),
     MissingReply,
     MissingReplyRoute(CallId),
+    CallExpired(CallId),
     DivergentReply(CallId),
     MissingAttestationProof(CallId),
     InvalidAttestationProof(CallId),
@@ -234,6 +235,15 @@ impl LocalTransportV2 {
             } else {
                 Err(LocalTransportErrorV2::DivergentReply(reply.call_id))
             };
+        }
+
+        if caller
+            .accumulate_host()
+            .local_store()
+            .call_expiration(reply.call_id)?
+            .is_some()
+        {
+            return Err(LocalTransportErrorV2::CallExpired(reply.call_id));
         }
 
         let message = caller

@@ -22,20 +22,25 @@ use super::{
     CallExpirationEnvelopeV2, CallTimeoutV2, CheckpointTokenV2, ConsistencyBaseV2,
     ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2, CrdtDispatchV2, CrdtSyncEnvelopeV2,
     DedupRecordV2, DeliveryEnvelopeV2, DeliveryRecordV2, EXECUTION_SEMANTICS_ID,
-    ExternalActorDirectoryV2, Hash, MessageRecordV2, MethodPolicyV2, ProgramId,
-    ProofVerificationRequestV2, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
-    ReceiptVerificationRequestV2, ReplyAdmissionRecordV2, RoleCredentialV2,
+    ExternalActorDirectoryV2, Hash, MessageRecordV2, MethodPolicyV2, PendingCallDeadlineV2,
+    ProgramId, ProofVerificationRequestV2, PublicationAckV2, PublicationRecordV2,
+    PublishedEffectsV2, ReceiptVerificationRequestV2, ReplyAdmissionRecordV2, RoleCredentialV2,
     RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServiceInstallReceiptV2,
     ServiceStateTreeV2, StateKeyV2, StateTreeError, StateTreeStore, StoreHeaderV2, StoreOpenError,
     V2Wire, WorkflowCheckpointV2, WorkflowOperationV2, call_expiration_storage_key,
     crdt_change_storage_key, crdt_node_receipt_storage_key, crdt_node_storage_key,
     dedup_storage_key, delivery_storage_key, header_storage_key, method_role_policy_hash,
-    public_policy_hash, publication_storage_key, receipt_storage_key, reply_admission_storage_key,
+    pending_call_deadline_storage_key, public_policy_hash, publication_storage_key,
+    receipt_storage_key, reply_admission_storage_key,
 };
 
 /// Extra content-addressed operations needed by guest Accumulate in addition
 /// to ordinary JAM service storage.
 pub trait GuestAccumulateStoreV2: StateTreeStore {
+    /// Consensus-authenticated ambient JAM slot for this Accumulate
+    /// invocation. `None` means time-dependent transitions are unavailable.
+    fn logical_timeslot(&self) -> Result<Option<u64>, Self::Error>;
+
     /// Authenticate the exact initial service tree and its supplied evidence
     /// against platform deployment authority before a header exists.
     fn authorize_install(&self, genesis: &ServiceGenesisV2) -> Result<bool, Self::Error>;
@@ -329,6 +334,13 @@ fn expire_call<S: GuestAccumulateStoreV2>(
         return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
     }
 
+    let observed_timeslot = store
+        .logical_timeslot()
+        .map_err(GuestAccumulateError::Storage)?;
+    if !observed_timeslot.is_some_and(|slot| slot >= envelope.timeout.deadline_timeslot) {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
+
     let expiration_key = call_expiration_storage_key(envelope.timeout.call_id);
     if let Some(bytes) = read(store, &expiration_key)? {
         let accumulated =
@@ -451,6 +463,12 @@ fn expire_call<S: GuestAccumulateStoreV2>(
         )?;
         tree.root()
     };
+    write(
+        store,
+        &pending_call_deadline_storage_key(envelope.timeout.call_id),
+        None,
+    )?;
+    write(store, &publication_storage_key(workflow.input), None)?;
 
     let (resulting_state_root, resulting_crdt_heads, sequence) =
         if let Some(change) = envelope.crdt_change.as_ref() {
@@ -1169,6 +1187,20 @@ fn apply_workflow_materialization<S: StateTreeStore>(
         }
         let value = visible.map(V2Wire::encode);
         tree_apply(tree, &StateKeyV2::Outbox(call), value.as_deref())?;
+        let deadline = visible.and_then(|message| {
+            message
+                .deadline_timeslot
+                .map(|deadline_timeslot| PendingCallDeadlineV2 {
+                    call_id: call,
+                    caller_invocation: message.caller_invocation,
+                    deadline_timeslot,
+                })
+        });
+        write(
+            tree.store_mut(),
+            &pending_call_deadline_storage_key(call),
+            deadline.as_ref().map(V2Wire::encode).as_deref(),
+        )?;
     }
     for (actor, values) in materialized.actor_states {
         require_actor(tree, actor)?;
@@ -1224,6 +1256,13 @@ fn apply_expiration_materialization<S: GuestAccumulateStoreV2>(
             &call_expiration_storage_key(*call),
             Some(&accumulated.encode()),
         )?;
+        write(store, &pending_call_deadline_storage_key(*call), None)?;
+        let workflow = materialized
+            .workflows
+            .get(&event.value.caller_invocation)
+            .and_then(|values| values.first())
+            .ok_or(GuestAccumulateError::CorruptStore)?;
+        write(store, &publication_storage_key(workflow.value.input), None)?;
     }
     Ok(())
 }
@@ -1729,6 +1768,18 @@ fn apply<S: GuestAccumulateStoreV2>(
     // same guest-owned transaction as the resumed actor state and dedup row.
     if let Some(awaited) = work.awaited_reply.as_ref() {
         tree_apply(&mut tree, &StateKeyV2::Outbox(awaited.reply.call_id), None)?;
+        write(
+            tree.store_mut(),
+            &pending_call_deadline_storage_key(awaited.reply.call_id),
+            None,
+        )?;
+    }
+    if let Some(awaited) = work.awaited_timeout.as_ref() {
+        write(
+            tree.store_mut(),
+            &pending_call_deadline_storage_key(awaited.expiration.timeout.call_id),
+            None,
+        )?;
     }
     for message in &transition.inbox {
         tree_apply(
@@ -1743,6 +1794,18 @@ fn apply<S: GuestAccumulateStoreV2>(
             &StateKeyV2::Outbox(message.call_id),
             Some(&message.encode()),
         )?;
+        if let Some(deadline_timeslot) = message.deadline_timeslot {
+            let deadline = PendingCallDeadlineV2 {
+                call_id: message.call_id,
+                caller_invocation: message.caller_invocation,
+                deadline_timeslot,
+            };
+            write(
+                tree.store_mut(),
+                &pending_call_deadline_storage_key(message.call_id),
+                Some(&deadline.encode()),
+            )?;
+        }
     }
     // `WorkEnvelopeV2` is intentionally complete and therefore large. Keep
     // the durable workflow value off the bounded service-PVM stack while its
@@ -2888,6 +2951,7 @@ mod tests {
         receipt_allowlist: BTreeSet<Hash>,
         writes_before_failure: Option<usize>,
         deny_install: bool,
+        logical_timeslot: Option<u64>,
     }
 
     impl StateTreeStore for MemStore {
@@ -2917,6 +2981,10 @@ mod tests {
     }
 
     impl GuestAccumulateStoreV2 for MemStore {
+        fn logical_timeslot(&self) -> Result<Option<u64>, Self::Error> {
+            Ok(self.logical_timeslot)
+        }
+
         fn authorize_install(&self, _genesis: &ServiceGenesisV2) -> Result<bool, Self::Error> {
             Ok(!self.deny_install)
         }
@@ -4496,6 +4564,27 @@ mod tests {
             crdt_change: None,
         };
 
+        let before_untrusted = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::ExpireCall(expiration.clone())
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        assert_eq!(store, before_untrusted);
+        store.logical_timeslot = Some(9);
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::ExpireCall(expiration.clone())
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        store.logical_timeslot = Some(10);
+
         let mut stale = expiration.clone();
         stale.base = work.base.clone();
         let before = store.clone();
@@ -4542,11 +4631,13 @@ mod tests {
         let mut divergent = expiration;
         divergent.timeout.deadline_timeslot = 11;
         divergent.timeout.expired_at = 11;
+        store.logical_timeslot = Some(11);
         assert_eq!(
             execute_guest_accumulate(&mut store, &AccumulateRequestV2::ExpireCall(divergent))
                 .unwrap(),
             rejected(AccumulationRejectionV2::DivergentDuplicate)
         );
+        store.logical_timeslot = Some(10);
         assert_eq!(store, committed);
 
         let mut resume = work.clone();
@@ -4630,11 +4721,11 @@ mod tests {
         let checkpoint_change = transition.crdt_change.clone().unwrap();
         let mut checkpoint_blobs = vec![
             ImportedBlobV2 {
-                reference: continuation,
+                reference: continuation.clone(),
                 bytes: continuation_bytes,
             },
             ImportedBlobV2 {
-                reference: state,
+                reference: state.clone(),
                 bytes: state_bytes,
             },
         ];
@@ -4680,6 +4771,7 @@ mod tests {
             base_causal_height: Some(1),
             crdt_change: Some(expiration_change.clone()),
         };
+        source.logical_timeslot = Some(20);
         let AccumulationResultV2::CallExpired {
             timeout: accumulated,
             duplicate: false,
@@ -4724,7 +4816,7 @@ mod tests {
             execute_guest_accumulate(
                 &mut destination,
                 &AccumulateRequestV2::SyncCrdt(CrdtSyncEnvelopeV2 {
-                    service: work.service,
+                    service: work.service.clone(),
                     advertised_heads: vec![expiration_cid],
                     nodes,
                     provided_blobs: checkpoint_blobs,
@@ -4751,6 +4843,44 @@ mod tests {
             .unwrap(),
             accumulated
         );
+
+        let completed_bytes = b"after CRDT timeout".to_vec();
+        let completed_state = BlobRefV2::of_bytes(&completed_bytes);
+        let mut resumed = work;
+        resumed.workflow_step = 1;
+        resumed.logical_timeslot = 20;
+        resumed.base = ConsistencyBaseV2::Crdt {
+            heads: vec![expiration_cid],
+        };
+        resumed.base_causal_height = Some(2);
+        resumed.imported_actors[0].state = state;
+        resumed.imported_actors[0].continuation = Some(continuation.clone());
+        resumed.awaited_timeout = Some(Box::new(accumulated));
+        let mut completed = crdt_transition(&resumed, completed_state.clone(), 3);
+        completed.continuations.push(ContinuationChangeV2 {
+            actor: resumed.target,
+            expected: Some(continuation.hash),
+            replacement: None,
+        });
+        completed.crdt_change.as_mut().unwrap().workflow = completed.workflow_operations(&resumed);
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut destination,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: resumed,
+                    transition: completed,
+                    provided_blobs: vec![ImportedBlobV2 {
+                        reference: completed_state,
+                        bytes: completed_bytes,
+                    }],
+                })
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
     }
 
     fn delivery(
