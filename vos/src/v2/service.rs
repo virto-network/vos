@@ -194,6 +194,10 @@ pub struct CommittedAccumulateBatchV2 {
 pub struct CommittedServiceSnapshotV2 {
     pub applied_index: u64,
     pub service_image: Vec<u8>,
+    /// Proof artifacts referenced by the service image remain outside its
+    /// consensus bytes, but must become durable before this snapshot cursor
+    /// is installed on another replica.
+    pub proof_artifacts: Vec<ImportedBlobV2>,
 }
 
 impl V2Wire for CommittedServiceSnapshotV2 {
@@ -203,17 +207,56 @@ impl V2Wire for CommittedServiceSnapshotV2 {
         let mut encoder = Encoder(out);
         encoder.u64(self.applied_index);
         encoder.bytes(&self.service_image);
+        encoder.list(&self.proof_artifacts, |encoder, artifact| {
+            encoder.fixed(&artifact.reference.hash.0);
+            encoder.u64(artifact.reference.len);
+            encoder.bytes(&artifact.bytes);
+        });
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let applied_index = decoder.u64()?;
         let service_image = decoder.bytes()?;
-        if applied_index == 0 || LocalJamStoreSnapshotV2::decode(&service_image).is_err() {
+        let proof_artifacts = decoder.list(|decoder| {
+            let reference = super::BlobRefV2 {
+                hash: super::Hash(decoder.fixed()?),
+                len: decoder.u64()?,
+            };
+            if reference.len == u64::MAX {
+                return Err(DecodeError::NonCanonical);
+            }
+            Ok(ImportedBlobV2 {
+                reference,
+                bytes: decoder.bytes()?,
+            })
+        })?;
+        let service_snapshot = LocalJamStoreSnapshotV2::decode(&service_image)?;
+        if applied_index == 0 {
             return Err(DecodeError::NonCanonical);
+        }
+        if proof_artifacts
+            .windows(2)
+            .any(|pair| pair[0].reference.hash >= pair[1].reference.hash)
+            || proof_artifacts
+                .iter()
+                .any(|artifact| !artifact.reference.matches(&artifact.bytes))
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        for reference in service_snapshot.referenced_proof_blobs()? {
+            let Ok(index) = proof_artifacts
+                .binary_search_by_key(&reference.hash, |artifact| artifact.reference.hash)
+            else {
+                return Err(DecodeError::NonCanonical);
+            };
+            if proof_artifacts[index].reference != reference {
+                return Err(DecodeError::NonCanonical);
+            }
         }
         Ok(Self {
             applied_index,
             service_image,
+            proof_artifacts,
         })
     }
 }
@@ -248,7 +291,12 @@ pub trait CommittedAccumulateLogV2 {
     /// Persist only after the service image for every application entry at or
     /// below `index` has committed locally. Replaying after a failed cursor
     /// write is safe because guest Accumulate deduplicates exact inputs.
-    fn mark_applied(&mut self, index: u64, service_image: &[u8]) -> Result<(), Self::Error>;
+    fn mark_applied(
+        &mut self,
+        index: u64,
+        service_image: &[u8],
+        proof_artifacts: &[ImportedBlobV2],
+    ) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -762,12 +810,11 @@ where
             }
             let request = AccumulateRequestV2::decode(&entry.request)
                 .map_err(|_| ReplicatedServiceErrorV2::InvalidCommittedLog)?;
-            // A committed request must reach the same guest-owned decision on
-            // every replica. Best-effort verifier/CAS hydration happens here,
-            // but failure is not a second cursor policy: physical Accumulate
-            // returns InvalidProof/ProofUnavailable and the ordered rejection
-            // advances like every other semantic no-op.
-            let _ = ensure_request_proof_available(self.service.accumulate_host_mut(), &request);
+            // Proof hydration is a durable local precondition, not a guest
+            // semantic decision. A failed side-CAS write must leave this entry
+            // unapplied so exact catch-up can retry it.
+            ensure_request_proof_available(self.service.accumulate_host_mut(), &request)
+                .map_err(|_| ReplicatedServiceErrorV2::ProofUnavailable)?;
             let outcome = self.service.accumulate(&request);
             if let Err(error) = outcome.as_ref()
                 && !error.is_deterministic_accumulate_failure()
@@ -775,8 +822,11 @@ where
                 return Err(ReplicatedServiceErrorV2::Dispatch(*error));
             }
             let service_image = self.service.accumulate_host().committed_service_image();
+            let proof_artifacts =
+                snapshot_proof_artifacts(self.service.accumulate_host(), &service_image)
+                    .map_err(|_| ReplicatedServiceErrorV2::ProofUnavailable)?;
             self.log
-                .mark_applied(entry.index, &service_image)
+                .mark_applied(entry.index, &service_image, &proof_artifacts)
                 .map_err(ReplicatedServiceErrorV2::Log)?;
             let output = match outcome {
                 Ok(output) => Some(output),
@@ -793,8 +843,11 @@ where
         }
         if batch.committed_index > cursor {
             let service_image = self.service.accumulate_host().committed_service_image();
+            let proof_artifacts =
+                snapshot_proof_artifacts(self.service.accumulate_host(), &service_image)
+                    .map_err(|_| ReplicatedServiceErrorV2::ProofUnavailable)?;
             self.log
-                .mark_applied(batch.committed_index, &service_image)
+                .mark_applied(batch.committed_index, &service_image, &proof_artifacts)
                 .map_err(ReplicatedServiceErrorV2::Log)?;
         }
         if capture.is_some() && captured.is_none() {
@@ -819,12 +872,25 @@ where
             if snapshot.applied_index <= applied {
                 return Err(ReplicatedServiceErrorV2::InvalidCommittedLog);
             }
+            for artifact in &snapshot.proof_artifacts {
+                if !self
+                    .service
+                    .accumulate_host_mut()
+                    .hydrate_snapshot_proof(artifact)
+                {
+                    return Err(ReplicatedServiceErrorV2::ProofUnavailable);
+                }
+            }
             self.service
                 .accumulate_host_mut()
                 .install_committed_service_image(&snapshot.service_image)
                 .map_err(ReplicatedServiceErrorV2::ServiceImage)?;
             self.log
-                .mark_applied(snapshot.applied_index, &snapshot.service_image)
+                .mark_applied(
+                    snapshot.applied_index,
+                    &snapshot.service_image,
+                    &snapshot.proof_artifacts,
+                )
                 .map_err(ReplicatedServiceErrorV2::Log)?;
             applied = snapshot.applied_index;
         }
@@ -921,6 +987,25 @@ where
             .map_err(AttestedServiceErrorV2::Service)?;
         finish_committed_attestation(proved, prepared.gas_used, committed)
     }
+}
+
+fn snapshot_proof_artifacts<A: AttestationProofHostV2>(
+    host: &A,
+    service_image: &[u8],
+) -> Result<Vec<ImportedBlobV2>, ()> {
+    let snapshot = LocalJamStoreSnapshotV2::decode(service_image).map_err(|_| ())?;
+    snapshot
+        .referenced_proof_blobs()
+        .map_err(|_| ())?
+        .into_iter()
+        .map(|reference| {
+            let bytes = host.proof_bytes(&reference).ok_or(())?;
+            if !reference.matches(&bytes) {
+                return Err(());
+            }
+            Ok(ImportedBlobV2 { reference, bytes })
+        })
+        .collect()
 }
 
 fn ensure_request_proof_available<A: AttestationProofHostV2>(

@@ -18,7 +18,8 @@ use redb::Database;
 use crate::commit::CommitError;
 use crate::v2::{
     AccumulateRequestV2, CommittedAccumulateBatchV2, CommittedAccumulateEntryV2,
-    CommittedAccumulateLogV2, CommittedServiceSnapshotV2, LocalJamStoreSnapshotV2, V2Wire,
+    CommittedAccumulateLogV2, CommittedServiceSnapshotV2, ImportedBlobV2, LocalJamStoreSnapshotV2,
+    V2Wire,
 };
 
 use super::log::{LogEntry, RaftLog, RaftMeta};
@@ -306,7 +307,12 @@ impl CommittedAccumulateLogV2 for RaftAccumulateLogV2 {
         Ok(Some(snapshot))
     }
 
-    fn mark_applied(&mut self, index: u64, service_image: &[u8]) -> Result<(), Self::Error> {
+    fn mark_applied(
+        &mut self,
+        index: u64,
+        service_image: &[u8],
+        proof_artifacts: &[ImportedBlobV2],
+    ) -> Result<(), Self::Error> {
         self.meta = RaftMeta::load(&self.db)?;
         if index < self.meta.last_applied || index > self.meta.commit_index {
             return Err(CommitError::Config(alloc::format!(
@@ -321,6 +327,7 @@ impl CommittedAccumulateLogV2 for RaftAccumulateLogV2 {
         let snapshot = CommittedServiceSnapshotV2 {
             applied_index: index,
             service_image: service_image.to_vec(),
+            proof_artifacts: proof_artifacts.to_vec(),
         }
         .encode();
         CommittedServiceSnapshotV2::decode(&snapshot).map_err(|_| {
@@ -384,6 +391,14 @@ mod tests {
         store.snapshot_bytes()
     }
 
+    fn proof_artifact(byte: u8) -> ImportedBlobV2 {
+        let bytes = vec![byte; 32];
+        ImportedBlobV2 {
+            reference: crate::v2::BlobRefV2::of_bytes(&bytes),
+            bytes,
+        }
+    }
+
     #[test]
     fn single_node_log_recovers_canonical_requests_and_apply_cursor() {
         let (path, directory) = temp_path();
@@ -400,7 +415,7 @@ mod tests {
             }
         );
         let service_image = LocalJamStoreSnapshotV2::default().encode();
-        log.mark_applied(1, &service_image).unwrap();
+        log.mark_applied(1, &service_image, &[]).unwrap();
         drop(log);
 
         let mut restarted = RaftAccumulateLogV2::open(&path, RaftConfig::default()).unwrap();
@@ -423,10 +438,16 @@ mod tests {
         let mut log = RaftAccumulateLogV2::from_db_arc(db.clone(), RaftConfig::default()).unwrap();
         let first = log.propose(&request(1).encode()).unwrap();
         let first_image = service_image(1);
-        log.mark_applied(first.index, &first_image).unwrap();
+        log.mark_applied(first.index, &first_image, &[]).unwrap();
         let second = log.propose(&request(2).encode()).unwrap();
         let second_image = service_image(2);
-        log.mark_applied(second.index, &second_image).unwrap();
+        let second_proof = proof_artifact(9);
+        log.mark_applied(
+            second.index,
+            &second_image,
+            core::slice::from_ref(&second_proof),
+        )
+        .unwrap();
         drop(log);
 
         let mut storage = RedbStorage::open(db).unwrap();
@@ -441,6 +462,7 @@ mod tests {
         .unwrap();
         assert_eq!(frozen.applied_index, first.index);
         assert_eq!(frozen.service_image, first_image);
+        assert!(frozen.proof_artifacts.is_empty());
 
         futures_executor::block_on(storage.commit_batch(WriteBatch {
             compact_to: Some((second.index, 0)),
@@ -453,6 +475,7 @@ mod tests {
         .unwrap();
         assert_eq!(frozen.applied_index, second.index);
         assert_eq!(frozen.service_image, second_image);
+        assert_eq!(frozen.proof_artifacts, vec![second_proof]);
         drop(storage);
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -463,7 +486,8 @@ mod tests {
         let db = Arc::new(Database::create(&path).unwrap());
         let mut log = RaftAccumulateLogV2::from_db_arc(db.clone(), RaftConfig::default()).unwrap();
         let entry = log.propose(&request(1).encode()).unwrap();
-        log.mark_applied(entry.index, &service_image(1)).unwrap();
+        log.mark_applied(entry.index, &service_image(1), &[])
+            .unwrap();
         drop(log);
 
         let transaction = db.begin_write().unwrap();
@@ -504,7 +528,7 @@ mod tests {
         for index in 1..=total {
             let entry = log.propose(&request(index as u8).encode()).unwrap();
             assert_eq!(entry.index, index);
-            log.mark_applied(entry.index, &service_image(index as u8))
+            log.mark_applied(entry.index, &service_image(index as u8), &[])
                 .unwrap();
         }
         drop(log);
@@ -541,6 +565,7 @@ mod tests {
         let snapshot = CommittedServiceSnapshotV2 {
             applied_index: 4,
             service_image: service_image.clone(),
+            proof_artifacts: vec![],
         };
         let mut storage = RedbStorage::open(db.clone()).unwrap();
         futures_executor::block_on(storage.commit_batch(WriteBatch {
@@ -561,7 +586,7 @@ mod tests {
         let mut log = RaftAccumulateLogV2::from_db_arc(db, RaftConfig::default()).unwrap();
         assert_eq!(log.applied_index().unwrap(), 0);
         assert_eq!(log.installed_snapshot_after(0).unwrap(), Some(snapshot));
-        log.mark_applied(4, &service_image).unwrap();
+        log.mark_applied(4, &service_image, &[]).unwrap();
         assert_eq!(log.applied_index().unwrap(), 4);
         assert_eq!(log.installed_snapshot_after(4).unwrap(), None);
         drop(log);
@@ -627,7 +652,7 @@ mod tests {
             }
         );
         let service_image = LocalJamStoreSnapshotV2::default().encode();
-        log.mark_applied(2, &service_image).unwrap();
+        log.mark_applied(2, &service_image, &[]).unwrap();
         assert_eq!(log.applied_index().unwrap(), 2);
 
         drop(log);

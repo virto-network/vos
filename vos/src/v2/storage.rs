@@ -497,6 +497,11 @@ pub fn reply_admission_storage_key(call: CallId) -> Vec<u8> {
 }
 
 #[cfg(feature = "std")]
+pub(crate) const fn reply_admission_storage_prefix() -> &'static [u8] {
+    REPLY_ADMISSION_STORAGE_PREFIX
+}
+
+#[cfg(feature = "std")]
 pub(crate) const fn delivery_storage_prefix() -> &'static [u8] {
     DELIVERY_STORAGE_PREFIX
 }

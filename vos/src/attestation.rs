@@ -8,7 +8,7 @@ use core::marker::PhantomData;
 use crate::v2::wire::{Decoder, Encoder};
 use crate::v2::{
     AccumulationReceiptV2, ActorId, BlobRefV2, CallId, DecodeError, DeploymentId, Hash,
-    InvocationId, MethodPolicyV2, ProducerId, ProgramId, ProofCommitmentV2,
+    ImportedBlobV2, InvocationId, MethodPolicyV2, ProducerId, ProgramId, ProofCommitmentV2,
     ProofVerificationRequestV2, ReceiptVerificationRequestV2, ReceiptVerificationV2,
     RefineImportsV2, ServiceIdentityV2, SpaceId, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
@@ -408,6 +408,11 @@ pub trait AttestationProofHostV2 {
     fn proof_bytes(&self, _reference: &BlobRefV2) -> Option<Vec<u8>> {
         None
     }
+
+    /// Durably hydrate one proof artifact before installing the service image
+    /// which references it. This does not grant a verification request; a
+    /// later committed Apply still supplies and verifies that exact request.
+    fn hydrate_snapshot_proof(&mut self, artifact: &ImportedBlobV2) -> bool;
 }
 
 impl V2Wire for AttestationStatementV3 {

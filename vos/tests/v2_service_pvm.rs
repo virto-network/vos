@@ -19,18 +19,19 @@ use vos::v2::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationResultV2, ActorGenesisV2, ActorId, ActorWriteV2, AuthorizationEvidenceV2,
     BlobRefV2, CallId, CommittedAccumulateBatchV2, CommittedAccumulateEntryV2,
-    CommittedAccumulateLogV2, CommittedImageStoreV2, CommittedServiceSnapshotV2, ConsistencyBaseV2,
-    ConsistencyModeV2, ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId,
-    DurableJamStoreV2, ExternalActorBindingV2, GasAccountingV2, Hash, ImportedActorV2,
-    ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2, InvocationId, JamServiceV2,
-    LocalJamStoreHostV2, LocalJamStoreV2, LocalTransportV2, LocalWorkRequestV2,
-    LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
-    PackageRolePoliciesV2, ProducerId, ProgramId, ProofArtifactStoreV2, PublishedEffectsV2,
-    ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2,
-    ReplyRecordV2, RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId,
-    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
-    ServicePvmV2, StateKeyV2, SubjectId, TransitionV2, V2Wire, WorkEnvelopeV2, WorkflowOperationV2,
-    public_policy_hash, space_role_policy_hash,
+    CommittedAccumulateLogV2, CommittedImageStoreV2, CommittedServiceImageHostV2,
+    CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2,
+    ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2, ExternalActorBindingV2,
+    GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2,
+    InvocationId, JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2, LocalTransportV2,
+    LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
+    NoRefineProtocolHostV2, Origin, PackageRolePoliciesV2, ProducerId, ProgramId,
+    ProofArtifactStoreV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2,
+    RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RoleCredentialV2,
+    RoleCredentialVerificationRequestV2, RootServiceId, ScheduleErrorV2, ServiceDispatchError,
+    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId,
+    TransitionV2, V2Wire, WorkEnvelopeV2, WorkflowOperationV2, public_policy_hash,
+    space_role_policy_hash,
 };
 use vos::{
     AttestedMethod, Decode, Encode,
@@ -64,6 +65,7 @@ struct FailableCommittedImages {
     image: Option<Vec<u8>>,
     proofs: BTreeMap<[u8; 32], Vec<u8>>,
     fail_next_commit: bool,
+    fail_next_proof_commit: bool,
 }
 
 #[derive(Debug)]
@@ -127,7 +129,7 @@ impl ProofArtifactStoreV2 for FailableCommittedImages {
     }
 
     fn commit_proof(&mut self, reference: &BlobRefV2, proof: &[u8]) -> Result<(), Self::Error> {
-        if !reference.matches(proof) {
+        if std::mem::take(&mut self.fail_next_proof_commit) || !reference.matches(proof) {
             return Err(());
         }
         match self.proofs.get(&reference.hash.0) {
@@ -178,6 +180,7 @@ struct TestCommittedLog {
     applied: u64,
     leader: bool,
     before_next_proposal: Vec<Vec<u8>>,
+    installed_snapshot: Option<CommittedServiceSnapshotV2>,
 }
 
 impl TestCommittedLog {
@@ -187,7 +190,13 @@ impl TestCommittedLog {
             applied: 0,
             leader,
             before_next_proposal: Vec::new(),
+            installed_snapshot: None,
         }
+    }
+
+    fn with_installed_snapshot(mut self, snapshot: CommittedServiceSnapshotV2) -> Self {
+        self.installed_snapshot = Some(snapshot);
+        self
     }
 
     fn commit_before_next_proposal(&mut self, request: Vec<u8>) {
@@ -245,7 +254,26 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
         Ok(self.applied)
     }
 
-    fn mark_applied(&mut self, index: u64, _service_image: &[u8]) -> Result<(), Self::Error> {
+    fn installed_snapshot_after(
+        &mut self,
+        applied_index: u64,
+    ) -> Result<Option<CommittedServiceSnapshotV2>, Self::Error> {
+        if applied_index != self.applied {
+            return Err(TestLogError::InvalidCursor);
+        }
+        Ok(self
+            .installed_snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.applied_index > applied_index)
+            .cloned())
+    }
+
+    fn mark_applied(
+        &mut self,
+        index: u64,
+        _service_image: &[u8],
+        _proof_artifacts: &[ImportedBlobV2],
+    ) -> Result<(), Self::Error> {
         let committed = self.shared.lock().unwrap().entries.len() as u64;
         if index < self.applied || index > committed {
             return Err(TestLogError::InvalidCursor);
@@ -6711,7 +6739,11 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
     assert_eq!(leader_host.import_blob(initial_bytes.clone()), initial);
     assert_eq!(leader_host.import_program(actor_pvm.clone()), actor_program);
     leader_host.allow_install(&genesis);
-    let mut follower_host = LocalJamStoreV2::default();
+    let mut follower_host = DurableJamStoreV2::open(FailableCommittedImages {
+        fail_next_proof_commit: true,
+        ..FailableCommittedImages::default()
+    })
+    .unwrap();
     assert_eq!(follower_host.import_blob(initial_bytes), initial);
     assert_eq!(follower_host.import_program(actor_pvm), actor_program);
     follower_host.allow_install(&genesis);
@@ -6727,7 +6759,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
     )
     .unwrap();
     let follower_service = JamServiceV2::new(
-        service_pvm,
+        service_pvm.clone(),
         service_program,
         NoRefineProtocolHostV2,
         follower_host,
@@ -6829,7 +6861,21 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         "a duplicate attestation never proposes another Apply"
     );
 
-    assert_eq!(follower.catch_up().unwrap(), 2);
+    assert!(matches!(
+        follower.catch_up(),
+        Err(vos::v2::ReplicatedServiceErrorV2::ProofUnavailable)
+    ));
+    assert_eq!(
+        follower.log_mut().applied_index().unwrap(),
+        1,
+        "a failed follower proof-CAS write leaves the proved Apply unapplied"
+    );
+    assert_eq!(
+        follower.catch_up().unwrap(),
+        1,
+        "the identical committed proof entry is retried after CAS recovery"
+    );
+    assert_eq!(follower.log_mut().applied_index().unwrap(), 2);
     assert!(
         leader
             .service()
@@ -6848,6 +6894,74 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
     assert_eq!(
         follower_publication.published.proof,
         logged.transition.proof
+    );
+
+    let snapshot_proofs = vec![ImportedBlobV2 {
+        reference: committed.proof.proof_blob.clone(),
+        bytes: committed.proof_bytes.clone(),
+    }];
+    let snapshot = CommittedServiceSnapshotV2 {
+        applied_index: 2,
+        service_image: leader.service().accumulate_host().committed_service_image(),
+        proof_artifacts: snapshot_proofs,
+    };
+    let mut missing_proof_snapshot = snapshot.clone();
+    missing_proof_snapshot.proof_artifacts.clear();
+    assert_eq!(
+        CommittedServiceSnapshotV2::decode(&missing_proof_snapshot.encode()),
+        Err(vos::v2::DecodeError::NonCanonical),
+        "a snapshot cannot omit an artifact referenced by its publication"
+    );
+    let snapshot_host = DurableJamStoreV2::open(FailableCommittedImages {
+        fail_next_proof_commit: true,
+        ..FailableCommittedImages::default()
+    })
+    .unwrap();
+    let snapshot_service = JamServiceV2::new(
+        service_pvm,
+        service_program,
+        NoRefineProtocolHostV2,
+        snapshot_host,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    let mut snapshot_follower = ReplicatedJamServiceV2::new(
+        snapshot_service,
+        TestCommittedLog::new(shared_log, false).with_installed_snapshot(snapshot),
+    );
+    assert!(matches!(
+        snapshot_follower.catch_up(),
+        Err(vos::v2::ReplicatedServiceErrorV2::ProofUnavailable)
+    ));
+    assert_eq!(snapshot_follower.log_mut().applied_index().unwrap(), 0);
+    assert!(
+        snapshot_follower
+            .service()
+            .accumulate_host()
+            .header()
+            .unwrap()
+            .is_none(),
+        "a snapshot is not installed before all proof artifacts are durable"
+    );
+    assert_eq!(snapshot_follower.catch_up().unwrap(), 0);
+    assert_eq!(snapshot_follower.log_mut().applied_index().unwrap(), 2);
+    assert_eq!(
+        snapshot_follower
+            .service()
+            .accumulate_host()
+            .proof_bytes(&committed.proof.proof_blob),
+        Some(committed.proof_bytes.clone())
+    );
+    assert!(
+        snapshot_follower
+            .service()
+            .accumulate_host()
+            .pending_publications()
+            .unwrap()
+            .iter()
+            .any(|publication| publication.input == input),
+        "the installed publication remains routable after snapshot-only catch-up"
     );
 }
 
@@ -6947,6 +7061,7 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
     let snapshot = CommittedServiceSnapshotV2 {
         applied_index: 1,
         service_image: source_image,
+        proof_artifacts: vec![],
     };
     let raft_config = RaftConfig {
         me: 0xBBBB,

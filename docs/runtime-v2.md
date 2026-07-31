@@ -360,6 +360,9 @@ cluster join is not supported. Raft does not replicate an `EffectLog` or a
 leader-produced post-state image. `ReplicatedJamServiceV2` waits for the
 request's log position to commit, then applies it through the physical
 service-PVM Accumulate entry before advancing the replica's applied cursor.
+For a proved Apply, durable proof-CAS hydration is a retryable local
+precondition: failure returns before guest execution and leaves that cursor on
+the committed entry for exact replay.
 Followers and a newly elected leader use the same catch-up path; replaying
 after a cursor-write failure is safe because guest deduplication sees the
 already committed workflow input.
@@ -374,8 +377,11 @@ bounded recent window. Automatic compaction cannot cross this durable
 application cursor and freezes the matching image—not a newer mutable state
 row—into a `CommittedServiceSnapshotV2`. A lagging follower receives that
 envelope through Raft `InstallSnapshot`, checks that its bound index matches the
-installed snapshot metadata, durably replaces its physical service image, and
-only then advances `last_applied` and replays any surviving log tail.
+installed snapshot metadata, and durably hydrates the snapshot's separate
+content-addressed proof-artifact bundle before replacing its physical service
+image. Only then does it advance `last_applied` and replay any surviving log
+tail. A proof-CAS or service-image failure leaves the old image and cursor
+eligible for retry.
 
 Every await is a durable slice boundary. Effects before it may commit even if a
 later slice fails, so multi-await handlers have saga semantics. Same-tree calls

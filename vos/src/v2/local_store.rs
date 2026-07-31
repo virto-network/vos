@@ -17,10 +17,11 @@ use crate::attestation::AttestationProofHostV2;
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, AccumulationReceiptV2, BlobRefV2,
-    DedupRecordV2, DeliveryRecordV2, MessageRecordV2, ProgramId, ProofVerificationRequestV2,
-    PublicationRecordV2, ReceiptVerificationRequestV2, ReplyAdmissionRecordV2,
-    RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServicePvmErrorV2, ServiceStateTreeV2,
-    StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
+    DedupRecordV2, DeliveryRecordV2, ImportedBlobV2, MessageRecordV2, ProgramId,
+    ProofVerificationRequestV2, PublicationRecordV2, ReceiptVerificationRequestV2,
+    ReplyAdmissionRecordV2, RoleCredentialVerificationRequestV2, ServiceGenesisV2,
+    ServicePvmErrorV2, ServiceStateTreeV2, StateKeyV2, StateTreeStore, StoreHeaderV2,
+    StoreOpenError, V2Wire,
 };
 
 /// Cloneable in-memory image of a committed local v2 service account.
@@ -43,6 +44,45 @@ impl LocalJamStoreSnapshotV2 {
     /// host-local count of completed transaction boundaries.
     pub fn same_service_state(&self, other: &Self) -> bool {
         self.rows == other.rows && self.blobs == other.blobs && self.programs == other.programs
+    }
+
+    /// Proof blobs directly referenced by recoverable transport state.
+    /// Snapshot decoding uses this to reject an artifact bundle which would
+    /// strand a pending publication or an admitted attested reply.
+    pub(crate) fn referenced_proof_blobs(&self) -> Result<Vec<BlobRefV2>, DecodeError> {
+        let mut references = Vec::new();
+        let publication_prefix = super::storage::publication_storage_prefix();
+        for (key, bytes) in self
+            .rows
+            .range(publication_prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(publication_prefix))
+        {
+            let publication = PublicationRecordV2::decode(bytes)?;
+            if super::publication_storage_key(publication.input).as_slice() != key.as_slice() {
+                return Err(DecodeError::NonCanonical);
+            }
+            if let Some(proof) = publication.published.proof {
+                references.push(proof.proof_blob);
+            }
+        }
+
+        let admission_prefix = super::storage::reply_admission_storage_prefix();
+        for (key, bytes) in self
+            .rows
+            .range(admission_prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(admission_prefix))
+        {
+            let admission = ReplyAdmissionRecordV2::decode(bytes)?;
+            if super::reply_admission_storage_key(admission.call_id).as_slice() != key.as_slice() {
+                return Err(DecodeError::NonCanonical);
+            }
+            if let Some(attestation) = admission.awaited_reply.attestation {
+                references.push(attestation.proof.proof_blob);
+            }
+        }
+        references.sort_unstable_by_key(|reference| reference.hash);
+        references.dedup();
+        Ok(references)
     }
 }
 
@@ -782,6 +822,20 @@ impl AttestationProofHostV2 for LocalJamStoreV2 {
             .filter(|bytes| reference.matches(bytes))
             .cloned()
     }
+
+    fn hydrate_snapshot_proof(&mut self, artifact: &ImportedBlobV2) -> bool {
+        if !artifact.reference.matches(&artifact.bytes) {
+            return false;
+        }
+        match self.proof_blobs.get(&artifact.reference.hash.0) {
+            Some(existing) => existing == &artifact.bytes,
+            None => {
+                self.proof_blobs
+                    .insert(artifact.reference.hash.0, artifact.bytes.clone());
+                true
+            }
+        }
+    }
 }
 
 impl<B: ProofArtifactStoreV2> AttestationProofHostV2 for DurableJamStoreV2<B> {
@@ -805,6 +859,18 @@ impl<B: ProofArtifactStoreV2> AttestationProofHostV2 for DurableJamStoreV2<B> {
                 .flatten()
                 .filter(|bytes| reference.matches(bytes))
         })
+    }
+
+    fn hydrate_snapshot_proof(&mut self, artifact: &ImportedBlobV2) -> bool {
+        if !artifact.reference.matches(&artifact.bytes)
+            || self
+                .backend
+                .commit_proof(&artifact.reference, &artifact.bytes)
+                .is_err()
+        {
+            return false;
+        }
+        self.local.hydrate_snapshot_proof(artifact)
     }
 }
 
