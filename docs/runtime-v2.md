@@ -77,8 +77,11 @@ does not reconstruct or relabel those public inputs.
 The proof producer receives that preparation together with the canonical
 service PVM and Refine imports, and the final Apply carries the proof bytes as
 a content-addressed verifier/CAS input. Proof bytes do not enter the
-recoverable service image or its retained Raft snapshots; the committed
-publication stores only their content reference. Guest Accumulate re-derives
+recoverable service image or its retained Raft snapshots. A durable host
+writes them to a separate content-addressed proof store before proved
+Accumulate can publish their commitment, so reply routing can refetch the
+exact bytes after the producer restarts; the committed publication stores
+only their content reference. Guest Accumulate re-derives
 the statement, invokes `PROOF_VERIFY`, and commits or publishes the proof
 package only when that exact request is valid and available. Raft orders only
 the final proved Apply: preparation remains read-only, while followers hydrate

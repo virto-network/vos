@@ -6,10 +6,12 @@
 //! Missing guests are hard failures: these tests are a consensus-path gate,
 //! not optional smoke tests.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use vos::attestation::{
-    AttestationProofProducerV2, AttestationProofRequestV2, ProducedAttestationProofV2,
+    AttestationProofHostV2, AttestationProofProducerV2, AttestationProofRequestV2,
+    ProducedAttestationProofV2,
 };
 use vos::network::RaftRpcHandler;
 use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, WorkerConfig};
@@ -23,12 +25,12 @@ use vos::v2::{
     ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2, InvocationId, JamServiceV2,
     LocalJamStoreHostV2, LocalJamStoreV2, LocalTransportV2, LocalWorkRequestV2,
     LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
-    PackageRolePoliciesV2, ProducerId, ProgramId, PublishedEffectsV2, ReceiptVerificationRequestV2,
-    RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2, ReplyRecordV2, RoleCredentialV2,
-    RoleCredentialVerificationRequestV2, RootServiceId, ScheduleErrorV2, ServiceDispatchError,
-    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId,
-    TransitionV2, V2Wire, WorkEnvelopeV2, WorkflowOperationV2, public_policy_hash,
-    space_role_policy_hash,
+    PackageRolePoliciesV2, ProducerId, ProgramId, ProofArtifactStoreV2, PublishedEffectsV2,
+    ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2,
+    ReplyRecordV2, RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId,
+    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
+    ServicePvmV2, StateKeyV2, SubjectId, TransitionV2, V2Wire, WorkEnvelopeV2, WorkflowOperationV2,
+    public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     AttestedMethod, Decode, Encode,
@@ -60,6 +62,7 @@ fn role_policies(mut methods: Vec<MethodPolicyV2>) -> Vec<u8> {
 #[derive(Debug, Default)]
 struct FailableCommittedImages {
     image: Option<Vec<u8>>,
+    proofs: BTreeMap<[u8; 32], Vec<u8>>,
     fail_next_commit: bool,
 }
 
@@ -109,6 +112,32 @@ impl CommittedImageStoreV2 for FailableCommittedImages {
         }
         self.image = Some(image.to_vec());
         Ok(())
+    }
+}
+
+impl ProofArtifactStoreV2 for FailableCommittedImages {
+    type Error = ();
+
+    fn load_proof(&self, reference: &BlobRefV2) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self
+            .proofs
+            .get(&reference.hash.0)
+            .filter(|bytes| reference.matches(bytes))
+            .cloned())
+    }
+
+    fn commit_proof(&mut self, reference: &BlobRefV2, proof: &[u8]) -> Result<(), Self::Error> {
+        if !reference.matches(proof) {
+            return Err(());
+        }
+        match self.proofs.get(&reference.hash.0) {
+            Some(existing) if existing != proof => Err(()),
+            Some(_) => Ok(()),
+            None => {
+                self.proofs.insert(reference.hash.0, proof.to_vec());
+                Ok(())
+            }
+        }
     }
 }
 
@@ -5586,7 +5615,7 @@ fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
                            method: &str,
                            producer: ProducerId,
                            external_actors: Vec<ExternalActorBindingV2>| {
-        let mut host = LocalJamStoreV2::default();
+        let mut host = DurableJamStoreV2::open(FailableCommittedImages::default()).unwrap();
         assert_eq!(host.import_blob(initial_bytes.clone()), initial);
         assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
         let mut service = JamServiceV2::new(
@@ -5724,7 +5753,17 @@ fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
     assert_eq!(attestation.producer, destination_producer);
     assert_eq!(attestation.statement.producer, destination_producer);
     assert_eq!(attestation.statement.producer_name, "private-age");
+    let proof_reference = attestation.proof.proof_blob.clone();
 
+    destination = restart_durable_service(destination, CANONICAL_SERVICE_PVM, service_program);
+    assert_eq!(
+        destination
+            .accumulate_host()
+            .proof_bytes(&proof_reference)
+            .as_deref(),
+        Some(b"peer-proof".as_slice()),
+        "the proved publication's side-CAS survives a producer restart"
+    );
     let reply_publication = LocalTransportV2::pending_publications(&destination)
         .unwrap()
         .pop()
@@ -6573,8 +6612,8 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
     );
 
     let mut retry_host = DurableJamStoreV2::open(FailableCommittedImages {
-        image: None,
         fail_next_commit: true,
+        ..FailableCommittedImages::default()
     })
     .unwrap();
     assert_eq!(retry_host.import_blob(initial_bytes), initial);
@@ -6945,8 +6984,8 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
         ProgramId::of_pvm(&service_pvm),
         NoRefineProtocolHostV2,
         DurableJamStoreV2::open(FailableCommittedImages {
-            image: None,
             fail_next_commit: true,
+            ..FailableCommittedImages::default()
         })
         .unwrap(),
         100_000_000,

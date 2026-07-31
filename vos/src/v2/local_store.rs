@@ -143,6 +143,20 @@ pub trait CommittedImageStoreV2 {
     fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error>;
 }
 
+/// Durable side-CAS for proof artifacts referenced by committed publications.
+///
+/// Proof bytes remain outside the consensus service image, but a successful
+/// proved Apply must not outlive the only copy needed to route its reply after
+/// restart. Implementations persist bytes by their authenticated [`BlobRefV2`]
+/// before guest Accumulate can publish the corresponding commitment.
+pub trait ProofArtifactStoreV2 {
+    type Error;
+
+    fn load_proof(&self, reference: &BlobRefV2) -> Result<Option<Vec<u8>>, Self::Error>;
+
+    fn commit_proof(&mut self, reference: &BlobRefV2, proof: &[u8]) -> Result<(), Self::Error>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceImageInstallErrorV2 {
     InvalidSnapshot,
@@ -200,6 +214,23 @@ impl FileCommittedImageStoreV2 {
         name.push(".v2-next");
         self.path.with_file_name(name)
     }
+
+    fn proof_directory(&self) -> PathBuf {
+        let mut name = self.path.file_name().unwrap_or_default().to_os_string();
+        name.push(".proofs");
+        self.path.with_file_name(name)
+    }
+
+    fn proof_path(&self, reference: &BlobRefV2) -> PathBuf {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut name = [0_u8; 64];
+        for (index, byte) in reference.hash.0.iter().copied().enumerate() {
+            name[index * 2] = HEX[usize::from(byte >> 4)];
+            name[index * 2 + 1] = HEX[usize::from(byte & 0x0f)];
+        }
+        self.proof_directory()
+            .join(std::str::from_utf8(&name).expect("lowercase hexadecimal is valid UTF-8"))
+    }
 }
 
 impl CommittedImageStoreV2 for FileCommittedImageStoreV2 {
@@ -229,6 +260,63 @@ impl CommittedImageStoreV2 for FileCommittedImageStoreV2 {
         drop(file);
         std::fs::rename(&temporary, &self.path)?;
         std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+}
+
+impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
+    type Error = std::io::Error;
+
+    fn load_proof(&self, reference: &BlobRefV2) -> Result<Option<Vec<u8>>, Self::Error> {
+        match std::fs::read(self.proof_path(reference)) {
+            Ok(bytes) if reference.matches(&bytes) => Ok(Some(bytes)),
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "proof artifact does not match its content address",
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn commit_proof(&mut self, reference: &BlobRefV2, proof: &[u8]) -> Result<(), Self::Error> {
+        use std::io::Write;
+
+        if !reference.matches(proof) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "proof artifact does not match its content address",
+            ));
+        }
+        let directory = self.proof_directory();
+        std::fs::create_dir_all(&directory)?;
+        if let Some(parent) = directory.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        let path = self.proof_path(reference);
+        match std::fs::read(&path) {
+            Ok(existing) if existing == proof => return Ok(()),
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "proof content address already contains different bytes",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        let temporary = path.with_extension("v2-next");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(proof)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &path)?;
+        std::fs::File::open(&directory)?.sync_all()?;
         Ok(())
     }
 }
@@ -274,9 +362,10 @@ pub struct LocalJamStoreV2 {
 
 /// JAM storage host whose committed image is durable before IC-5 returns.
 ///
-/// Proof/private-witness inputs and credential, receipt, and install verifier
-/// configuration remain process-local. Only the complete service-account
-/// image crosses the [`CommittedImageStoreV2`] boundary.
+/// Private-witness inputs and credential, receipt, and install verifier
+/// configuration remain process-local. Proof bytes use the backend's separate
+/// [`ProofArtifactStoreV2`] side-CAS and never enter the consensus service
+/// image.
 pub struct DurableJamStoreV2<B> {
     local: LocalJamStoreV2,
     backend: B,
@@ -695,13 +784,27 @@ impl AttestationProofHostV2 for LocalJamStoreV2 {
     }
 }
 
-impl<B> AttestationProofHostV2 for DurableJamStoreV2<B> {
+impl<B: ProofArtifactStoreV2> AttestationProofHostV2 for DurableJamStoreV2<B> {
     fn make_proof_available(&mut self, request: &ProofVerificationRequestV2, proof: &[u8]) -> bool {
+        if !request.proof_blob.matches(proof)
+            || self
+                .backend
+                .commit_proof(&request.proof_blob, proof)
+                .is_err()
+        {
+            return false;
+        }
         self.local.make_proof_available(request, proof)
     }
 
     fn proof_bytes(&self, reference: &BlobRefV2) -> Option<Vec<u8>> {
-        self.local.proof_bytes(reference)
+        self.local.proof_bytes(reference).or_else(|| {
+            self.backend
+                .load_proof(reference)
+                .ok()
+                .flatten()
+                .filter(|bytes| reference.matches(bytes))
+        })
     }
 }
 
@@ -1318,12 +1421,24 @@ mod tests {
             valid_header().encode(),
         );
         store.commit(transaction).unwrap();
+        let proof = b"durable proof side-CAS".to_vec();
+        let proof_blob = BlobRefV2::of_bytes(&proof);
+        let verification = ProofVerificationRequestV2 {
+            actor_program: ProgramId([41; 32]),
+            execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            statement: super::super::Hash([42; 32]),
+            trace: super::super::Hash([43; 32]),
+            proof_blob: proof_blob.clone(),
+        };
+        assert!(store.make_proof_available(&verification, &proof));
         let expected = store.snapshot();
         drop(store);
 
         let restarted = DurableJamStoreV2::open(FileCommittedImageStoreV2::new(&path)).unwrap();
         assert_eq!(restarted.snapshot(), expected);
+        assert_eq!(restarted.proof_bytes(&proof_blob), Some(proof));
         assert!(!path.with_file_name("service.v2.v2-next").exists());
+        assert!(path.with_file_name("service.v2.proofs").is_dir());
         drop(restarted);
 
         std::fs::write(&path, b"legacy-or-corrupt-image").unwrap();
