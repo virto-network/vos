@@ -361,6 +361,7 @@ mod tests {
             parent_call: None,
             causal_context: None,
             awaited_reply: None,
+            awaited_timeout: None,
             consistency: ConsistencyModeV2::Local,
             base: ConsistencyBaseV2::Linear {
                 revision: 8,

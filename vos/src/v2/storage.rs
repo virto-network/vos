@@ -14,7 +14,7 @@ use super::{
     InvocationId, PublishedEffectsV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 11;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 12;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -24,6 +24,7 @@ const RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/receipt/";
 const PUBLICATION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/publication/";
 const DELIVERY_STORAGE_PREFIX: &[u8] = b"\0vos/v2/delivery/";
 const REPLY_ADMISSION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/reply-admission/";
+const CALL_EXPIRATION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/call-expiration/";
 const CRDT_NODE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node/";
 const CRDT_NODE_RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-node-receipt/";
 const CRDT_CHANGE_STORAGE_PREFIX: &[u8] = b"\0vos/v2/crdt-change/";
@@ -492,6 +493,15 @@ pub fn delivery_storage_key(call: CallId) -> Vec<u8> {
 pub fn reply_admission_storage_key(call: CallId) -> Vec<u8> {
     let mut key = Vec::with_capacity(REPLY_ADMISSION_STORAGE_PREFIX.len() + call.0.len());
     key.extend_from_slice(REPLY_ADMISSION_STORAGE_PREFIX);
+    key.extend_from_slice(&call.0);
+    key
+}
+
+/// Guest-owned durable timeout outcome used to reconstruct an exact resume
+/// after process restart or CRDT synchronization.
+pub fn call_expiration_storage_key(call: CallId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(CALL_EXPIRATION_STORAGE_PREFIX.len() + call.0.len());
+    key.extend_from_slice(CALL_EXPIRATION_STORAGE_PREFIX);
     key.extend_from_slice(&call.0);
     key
 }

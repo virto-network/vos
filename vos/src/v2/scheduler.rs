@@ -15,13 +15,13 @@ use super::causal::{
 use super::contracts::crdt_change_blob_references;
 use super::guest_accumulate::materialized_continuations;
 use super::{
-    AccumulatedReplyV2, ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2,
-    BlobRefV2, CallId, CausalCallContextV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationSnapshotV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DecodeError, DeliveryEnvelopeV2,
-    ExternalActorDirectoryV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InvocationId,
-    LocalJamStoreV2, LocalStoreReadErrorV2, MessageRecordV2, Origin, RefineImportsV2, StateKeyV2,
-    V2Wire, WorkEnvelopeV2, WorkflowCheckpointV2, crdt_node_receipt_storage_key,
-    crdt_node_storage_key,
+    AccumulatedReplyV2, AccumulatedTimeoutV2, ActorDirectoryV2, ActorGenesisV2, ActorId,
+    AuthorizationEvidenceV2, BlobRefV2, CallId, CausalCallContextV2, ConsistencyBaseV2,
+    ConsistencyModeV2, ContinuationSnapshotV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DecodeError,
+    DeliveryEnvelopeV2, ExternalActorDirectoryV2, ImportedActorV2, ImportedBlobV2,
+    ImportedProgramV2, InvocationId, LocalJamStoreV2, LocalStoreReadErrorV2, MessageRecordV2,
+    Origin, RefineImportsV2, StateKeyV2, V2Wire, WorkEnvelopeV2, WorkflowCheckpointV2,
+    crdt_node_receipt_storage_key, crdt_node_storage_key,
 };
 
 /// Caller-controlled portion of one local work item. The scheduler supplies
@@ -41,6 +41,7 @@ pub struct LocalWorkRequestV2 {
     pub parent_call: Option<CallId>,
     pub causal_context: Option<CausalCallContextV2>,
     pub awaited_reply: Option<AccumulatedReplyV2>,
+    pub awaited_timeout: Option<AccumulatedTimeoutV2>,
     pub imported_blobs: Vec<BlobRefV2>,
     pub proof_requested: bool,
 }
@@ -223,6 +224,7 @@ impl LocalWorkSchedulerV2 {
                 parent_call: template.parent_call,
                 causal_context: template.causal_context,
                 awaited_reply,
+                awaited_timeout: None,
                 imported_blobs: template.imported_blobs,
                 proof_requested: template.proof_requested,
             },
@@ -270,6 +272,7 @@ impl LocalWorkSchedulerV2 {
                 parent_call: Some(message.call_id),
                 causal_context: Some(causal_context),
                 awaited_reply: None,
+                awaited_timeout: None,
                 imported_blobs: Vec::new(),
                 proof_requested: message.proof_requested,
             },
@@ -437,6 +440,7 @@ impl LocalWorkSchedulerV2 {
             parent_call: request.parent_call,
             causal_context: request.causal_context,
             awaited_reply: request.awaited_reply,
+            awaited_timeout: request.awaited_timeout,
             consistency: header.consistency,
             base,
             base_causal_height,

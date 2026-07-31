@@ -1523,6 +1523,7 @@ mod tests {
             parent_call: None,
             causal_context: None,
             awaited_reply: None,
+            awaited_timeout: None,
             consistency: super::super::ConsistencyModeV2::Local,
             base: super::super::ConsistencyBaseV2::Linear {
                 revision: 0,
