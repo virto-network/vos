@@ -22,7 +22,9 @@ registry_blob = "../../../actors/space-registry/target/riscv64em-javm/release/sp
 
 [[agent]]
 name = "counter"
-path = "actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf"
+# This is the explicit #[actor(crdt)] registry fixture, distinct from the
+# plain counter retained for v1 replay tests.
+path = "../v2/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter_v2.elf"
 consistency = "crdt"
 provides = ["counter", "demo-service"]
 on_start = [

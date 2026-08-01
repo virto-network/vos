@@ -25,7 +25,7 @@ build-wasm:
     cd examples/wasm/fetcher; cargo build --target wasm32-unknown-unknown --release
 
 # Build the public v2 actors and the legacy PVM regression fixtures.
-build-pvm: build-examples build-legacy-pvm-fixtures
+build-pvm: build-examples build-v2-registry-fixtures build-legacy-pvm-fixtures
 
 # Build the four public v2 examples (private-age + age-gate is one scenario).
 build-examples:
@@ -38,6 +38,10 @@ build-examples:
 # Build ELFs retained only by the old-host regression suite.
 build-legacy-pvm-fixtures:
     cd tests/fixtures/legacy-v1; just build
+
+# Build v2-only programs consumed by package/registry integration tests.
+build-v2-registry-fixtures:
+    cd tests/fixtures/v2/actors/crdt-counter; cargo +nightly actor
 
 # Build the protocol-pinned generic VOS service guest.
 build-vos-service:
