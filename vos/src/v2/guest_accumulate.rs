@@ -150,6 +150,9 @@ pub fn execute_canonical_guest_accumulate<S: GuestAccumulateStoreV2>(
             acknowledge_publication(store, acknowledgement)
         }
         AccumulateRequestV2::SyncCrdt(envelope) => sync_crdt(store, envelope),
+        // The wire is frozen before the guest-owned state mutation lands so
+        // mixed service binaries fail closed during the cutover.
+        AccumulateRequestV2::UpgradeActor(_) => Ok(rejected(AccumulationRejectionV2::NonCanonical)),
     }
 }
 
