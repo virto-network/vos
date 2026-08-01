@@ -374,6 +374,32 @@ operations, continuations, inbox/outbox rows and the receipt atomically.
 Replies, outbound calls and proof packages become visible only after that
 commit. A stale linear transition is rejected intact for rescheduling.
 
+## Owned child creation
+
+`Context::spawn::<R>(name, &initial_state)` is the only application-facing
+operation that creates an owned child. In this v2 slice it creates a
+same-package child: the typed initial state and reference must name the
+calling actor type, while guest Accumulate derives the child's program,
+deployment, producer and signed method policies from the authenticated parent
+descriptor. Actor source cannot choose or substitute any of those identities.
+The child `ActorId` is deterministically derived from the parent identity and
+UTF-8 name.
+
+Refine buffers the request and content-addresses the initial state. Accumulate
+then installs the child descriptor, method-policy rows, state row and sorted
+actor-directory membership in the same atomic transaction as the enclosing
+linear slice. Missing state, a duplicate parent-scoped name, an identity
+collision or the four-actor JAR ceiling rejects the complete transition. An
+exact retry resolves through the original input-deduplication receipt even
+though the accepted transition changed the directory.
+
+The returned handle identifies the future child but cannot execute it in the
+creating slice. Only a fresh Refine after the spawn commit can install its VM
+and CALLABLE. A continuation captured before the commit keeps its exact frozen
+program layout: the new directory member is authenticated work input on
+resume, but is not retrofitted into that older kernel. CRDT tree-membership
+operations and cross-package child creation remain staged and fail closed.
+
 ## Continuations
 
 An await checkpoint stores the exact nested kernel: each VM's program hash,
@@ -523,11 +549,11 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 16 and continuation snapshot version 5 are therefore a clean
+Store schema 17 and continuation snapshot version 5 are therefore a clean
 break from earlier experimental v2 images. They add exact actor-package
 identity to descriptors, work, checkpoints, transitions, upgrades, and
-cross-root proof bindings, plus the complete dormant actor-program layout to
-each continuation.
+cross-root proof bindings, the complete dormant actor-program layout to each
+continuation, and guest-owned atomic same-package child creation.
 
 ## CRDT boundary
 
