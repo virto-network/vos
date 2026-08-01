@@ -918,6 +918,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
         .__drain_actor_writes_v2(actor_id, super::storage::end_dispatch(), linear_state)
         .expect("nested actor emitted an unsupported v2 effect");
     let outbox = ctx.__drain_actor_calls_v2();
+    let spawns = ctx.__drain_actor_spawns_v2();
     let (first_await_ordinal, next_await_ordinal) = ctx.__await_ordinal_range_v2();
     let output = ActorSliceOutputV2 {
         actor: actor_id,
@@ -926,6 +927,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
         writes,
         crdt_operations,
         crdt_states,
+        spawns,
         outbox,
         reply,
         yielded,

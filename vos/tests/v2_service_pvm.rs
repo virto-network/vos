@@ -588,6 +588,196 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
 }
 
 #[test]
+fn same_package_child_spawn_commits_before_the_child_becomes_callable() {
+    let actor_pvm = grey_transpiler::link_elf(&workflow_v2_elf()).unwrap();
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_bytes = Vec::new();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let seed = work(actor_program, initial.clone());
+    let mut host = LocalJamStoreV2::default();
+    assert_eq!(host.import_blob(initial_bytes), initial);
+    assert_eq!(host.import_program(actor_pvm), actor_program);
+    let mut service = JamServiceV2::new(
+        CANONICAL_SERVICE_PVM.to_vec(),
+        vos::v2::VOS_SERVICE_PROGRAM_ID,
+        NoRefineProtocolHostV2,
+        host,
+        1_000_000_000,
+        1_000_000_000,
+    )
+    .unwrap();
+    let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        external_actors: vec![],
+        service: seed.service.clone(),
+        consistency: ConsistencyModeV2::Local,
+        actors: vec![ActorGenesisV2 {
+            actor: seed.target,
+            name: "root".into(),
+            parent: None,
+            producer: ProducerId([53; 32]),
+            deployment: seed.target_deployment,
+            program: actor_program,
+            initial_state: initial,
+            crdt: false,
+            role_policies: role_policies(vec![
+                MethodPolicyV2 {
+                    method: "increment".into(),
+                    schema: Hash([151; 32]),
+                    policy: public_policy_hash(),
+                    public: true,
+                    attested: false,
+                    space_role: None,
+                    actor_role: None,
+                },
+                MethodPolicyV2 {
+                    method: "spawn_child".into(),
+                    schema: Hash([152; 32]),
+                    policy: public_policy_hash(),
+                    public: true,
+                    attested: false,
+                    space_role: None,
+                    actor_role: None,
+                },
+            ]),
+        }],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([153; 32]),
+            authenticator: vec![154],
+        },
+    });
+    authorize_install(&mut service, &install);
+    assert!(matches!(
+        service.accumulate(&install).unwrap().result,
+        AccumulationResultV2::Installed(_)
+    ));
+
+    let mut spawn_arguments = vec![vos::value::TAG_DYNAMIC];
+    spawn_arguments.extend_from_slice(
+        &Msg::new("spawn_child")
+            .with("name", "worker")
+            .with("initial", 9u32)
+            .encode(),
+    );
+    let spawn_work = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([155; 32]),
+            workflow_step: 0,
+            logical_timeslot: 1,
+            target: seed.target,
+            method: "spawn_child".into(),
+            arguments: spawn_arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    let spawned = service
+        .refine_actor_tree(&spawn_work.work, &spawn_work.imports)
+        .expect("the canonical actor emits one child creation effect");
+    let child = ActorId::owned_child(seed.target, "worker");
+    assert_eq!(spawned.transition.spawns.len(), 1);
+    assert_eq!(spawned.transition.spawns[0].actor, child);
+    assert_eq!(spawned.transition.spawns[0].parent, seed.target);
+    assert_eq!(spawned.transition.spawns[0].name, "worker");
+    assert_eq!(
+        spawned
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::Bool(true))
+    );
+    let spawn_apply = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+        work: spawn_work.work,
+        transition: spawned.transition,
+        provided_blobs: spawned.exported_blobs,
+    });
+    assert!(matches!(
+        service.accumulate(&spawn_apply).unwrap().result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    let before_retry = service.accumulate_host().snapshot();
+    assert!(matches!(
+        service.accumulate(&spawn_apply).unwrap().result,
+        AccumulationResultV2::Accepted {
+            duplicate: true,
+            ..
+        }
+    ));
+    assert_eq!(service.accumulate_host().snapshot(), before_retry);
+
+    let mut increment_arguments = vec![vos::value::TAG_DYNAMIC];
+    increment_arguments.extend_from_slice(&Msg::new("increment").with("amount", 2u32).encode());
+    let child_work = LocalWorkSchedulerV2::prepare(
+        service.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([156; 32]),
+            workflow_step: 0,
+            logical_timeslot: 2,
+            target: child,
+            method: "increment".into(),
+            arguments: increment_arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .expect("the committed child is schedulable in the next slice");
+    let imported_child = child_work
+        .work
+        .imported_actors
+        .iter()
+        .find(|actor| actor.actor == child)
+        .unwrap();
+    assert_eq!(imported_child.parent, Some(seed.target));
+    assert_eq!(imported_child.name, "worker");
+    assert_eq!(imported_child.deployment, seed.target_deployment);
+    assert_eq!(imported_child.program, actor_program);
+    let child_result = service
+        .refine_actor_tree(&child_work.work, &child_work.imports)
+        .expect("a fresh Refine installs and executes the spawned child");
+    assert_eq!(
+        child_result
+            .transition
+            .reply
+            .as_ref()
+            .map(|reply| Value::decode(&reply.result)),
+        Some(Value::U32(11))
+    );
+    assert!(matches!(
+        service
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: child_work.work,
+                transition: child_result.transition,
+                provided_blobs: child_result.exported_blobs,
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
     let actor_pvm = grey_transpiler::link_elf(&workflow_v2_elf()).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
@@ -4117,6 +4307,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
         base: seeded.work.base.clone(),
         writes: vec![],
         crdt_change: None,
+        spawns: vec![],
         continuations: vec![],
         inbox: vec![inbound.clone()],
         outbox: vec![],
@@ -4414,6 +4605,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
         base: expired_resume_work.base.clone(),
         writes: vec![],
         crdt_change: None,
+        spawns: vec![],
         continuations: vec![],
         inbox: vec![],
         outbox: vec![],
@@ -4932,6 +5124,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             value: Some(b"committed actor state".to_vec()),
         }],
         crdt_change: None,
+        spawns: vec![],
         continuations: vec![ContinuationChangeV2 {
             actor: work.target,
             expected: None,
@@ -5126,6 +5319,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         base: resumed.work.base.clone(),
         writes: vec![],
         crdt_change: None,
+        spawns: vec![],
         continuations: vec![ContinuationChangeV2 {
             actor: resumed.work.target,
             expected: Some(
@@ -5172,6 +5366,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         base: expired_work.base.clone(),
         writes: vec![],
         crdt_change: None,
+        spawns: vec![],
         continuations: vec![],
         inbox: vec![],
         outbox: vec![],
@@ -5235,6 +5430,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         base: delivered.work.base.clone(),
         writes: vec![],
         crdt_change: None,
+        spawns: vec![],
         continuations: vec![ContinuationChangeV2 {
             actor: delivered.work.target,
             expected: None,
@@ -5303,6 +5499,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         base: delivery_resume.work.base.clone(),
         writes: vec![],
         crdt_change: None,
+        spawns: vec![],
         continuations: vec![ContinuationChangeV2 {
             actor: delivery_resume.work.target,
             expected: Some(
@@ -5429,6 +5626,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             value: Some(b"awaiting reply state".to_vec()),
         }],
         crdt_change: None,
+        spawns: vec![],
         continuations: vec![ContinuationChangeV2 {
             actor: caller.work.target,
             expected: None,
@@ -5538,6 +5736,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         base: resume.work.base.clone(),
         writes: vec![],
         crdt_change: None,
+        spawns: vec![],
         continuations: vec![ContinuationChangeV2 {
             actor: resume.work.target,
             expected: Some(continuation.hash),
@@ -5875,6 +6074,7 @@ fn disclosed_role_credentials_require_authority_verification_in_physical_accumul
         base: work.base.clone(),
         writes: vec![],
         crdt_change: None,
+        spawns: vec![],
         continuations: vec![],
         inbox: vec![],
         outbox: vec![],
@@ -5922,6 +6122,7 @@ fn disclosed_role_credentials_require_authority_verification_in_physical_accumul
         base: malformed_resume.base.clone(),
         writes: vec![],
         crdt_change: None,
+        spawns: vec![],
         continuations: vec![],
         inbox: vec![],
         outbox: vec![],
@@ -7038,6 +7239,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             value: Some(b"leader state".to_vec()),
         }],
         crdt_change: None,
+        spawns: vec![],
         continuations: vec![],
         inbox: vec![],
         outbox: vec![],
@@ -7068,6 +7270,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             value: Some(b"interleaved state".to_vec()),
         }],
         crdt_change: None,
+        spawns: vec![],
         continuations: vec![],
         inbox: vec![],
         outbox: vec![],
@@ -7158,6 +7361,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             value: Some(b"failover state".to_vec()),
         }],
         crdt_change: None,
+        spawns: vec![],
         continuations: vec![],
         inbox: vec![],
         outbox: vec![],

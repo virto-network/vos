@@ -162,6 +162,13 @@ mod guest {
             .writes
             .iter()
             .any(|write| !imported(write.actor))
+            || actor_output.spawns.iter().any(|spawn| {
+                !imported(spawn.parent)
+                    || imported(spawn.actor)
+                    || work.imported_actors.iter().any(|actor| {
+                        actor.parent == Some(spawn.parent) && actor.name == spawn.name
+                    })
+            })
             || actor_output.outbox.iter().any(|call| !imported(call.from))
         {
             fail_closed();
@@ -300,7 +307,7 @@ mod guest {
             producer: work.target,
             result: actor_output.reply,
         });
-        let (writes, crdt_change, candidate_blobs) = match (&base, base_causal_height) {
+        let (writes, crdt_change, mut candidate_blobs) = match (&base, base_causal_height) {
             (ConsistencyBaseV2::Linear { .. }, None) => {
                 if !actor_output.crdt_operations.is_empty() || !actor_output.crdt_states.is_empty()
                 {
@@ -310,6 +317,7 @@ mod guest {
             }
             (ConsistencyBaseV2::Crdt { heads }, Some(base_height)) => {
                 if !actor_output.writes.is_empty()
+                    || !actor_output.spawns.is_empty()
                     || actor_output.crdt_states.is_empty()
                     || actor_output
                         .crdt_states
@@ -368,6 +376,35 @@ mod guest {
             }
             _ => fail_closed(),
         };
+        let spawns = actor_output
+            .spawns
+            .into_iter()
+            .map(|spawn| {
+                let reference = BlobRefV2::of_bytes(&spawn.initial_state);
+                if !candidate_blobs
+                    .iter()
+                    .any(|candidate| candidate.reference == reference)
+                {
+                    candidate_blobs.push(ImportedBlobV2 {
+                        reference: reference.clone(),
+                        bytes: spawn.initial_state,
+                    });
+                }
+                vos::v2::ActorSpawnV2 {
+                    actor: spawn.actor,
+                    name: spawn.name,
+                    parent: spawn.parent,
+                    initial_state: reference,
+                }
+            })
+            .collect();
+        candidate_blobs.sort_by_key(|blob| blob.reference.hash);
+        if candidate_blobs
+            .windows(2)
+            .any(|pair| pair[0].reference.hash >= pair[1].reference.hash)
+        {
+            fail_closed();
+        }
         let mut transition = TransitionV2 {
             service: work.service.clone(),
             consumed_input,
@@ -375,6 +412,7 @@ mod guest {
             target_program: work.target_program,
             base: base.clone(),
             writes,
+            spawns,
             crdt_change,
             continuations,
             inbox: alloc::vec::Vec::new(),
@@ -424,6 +462,7 @@ mod guest {
         let mut crdt_operations = alloc::vec::Vec::new();
         let mut crdt_states = BTreeMap::new();
         let mut next_crdt_dispatch = BTreeMap::new();
+        let mut spawns = BTreeMap::new();
         let mut outbox = alloc::vec::Vec::new();
         let mut checkpoints = alloc::vec::Vec::new();
 
@@ -436,6 +475,7 @@ mod guest {
                     || !output.writes.is_empty()
                     || !output.crdt_operations.is_empty()
                     || !output.crdt_states.is_empty()
+                    || !output.spawns.is_empty()
                     || !output.outbox.is_empty()
                     || !output.reply.is_empty()
                     || output.yielded
@@ -474,6 +514,13 @@ mod guest {
             }
             if let Some(checkpoint) = output.checkpoint.as_ref() {
                 checkpoints.push(checkpoint.clone());
+            }
+            for spawn in &output.spawns {
+                if spawn.parent != output.actor
+                    || spawns.insert(spawn.actor, spawn.clone()).is_some()
+                {
+                    fail_closed();
+                }
             }
             for write in &output.writes {
                 writes.insert((write.actor, write.key.clone()), write.value.clone());
@@ -528,6 +575,7 @@ mod guest {
         }
         root.crdt_operations = crdt_operations;
         root.crdt_states = crdt_states.into_values().collect();
+        root.spawns = spawns.into_values().collect();
         root.outbox = outbox;
         root
     }

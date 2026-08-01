@@ -1617,9 +1617,22 @@ fn apply<S: GuestAccumulateStoreV2>(
         }
         return Ok(rejected(AccumulationRejectionV2::DivergentDuplicate));
     }
+    if mode == ApplyMode::Commit
+        && let Some(receipt) = duplicate_receipt.clone()
+    {
+        // The accepted transition may itself have grown the actor directory.
+        // Its guest-authenticated dedup row binds the complete old work and
+        // transition, so an exact retry must return before comparing those
+        // imports with the now-current tree.
+        return Ok(AccumulationResultV2::Accepted {
+            receipt,
+            published: PublishedEffectsV2::default(),
+            duplicate: true,
+        });
+    }
 
     let mut tree = ServiceStateTreeV2::new(store, header.service_root);
-    let Some(directory) =
+    let Some(mut directory) =
         tree_get_wire::<_, super::ActorDirectoryV2>(&tree, &StateKeyV2::ActorDirectory)?
     else {
         return Ok(rejected(AccumulationRejectionV2::WrongProgram));
@@ -1689,52 +1702,46 @@ fn apply<S: GuestAccumulateStoreV2>(
     }
 
     if let Some(receipt) = duplicate_receipt {
-        return Ok(match mode {
-            ApplyMode::Commit => AccumulationResultV2::Accepted {
-                receipt,
-                published: PublishedEffectsV2::default(),
-                duplicate: true,
-            },
-            ApplyMode::PrepareAttested => {
-                let mut preparation = match AttestationPreparationV2::for_transition(
-                    work,
-                    transition,
-                    &policy,
-                    &actor.name,
-                    actor.producer,
-                    receipt,
-                ) {
-                    Ok(preparation) => preparation,
-                    Err(_) => return Ok(rejected(AccumulationRejectionV2::InvalidProof)),
-                };
-                let Some(bytes) = read(store, &publication_storage_key(work.input_id()))? else {
-                    return Err(GuestAccumulateError::CorruptStore);
-                };
-                let publication = PublicationRecordV2::decode(&bytes)
-                    .map_err(|_| GuestAccumulateError::CorruptStore)?;
-                let Some(proof) = publication.published.proof.clone() else {
-                    return Err(GuestAccumulateError::CorruptStore);
-                };
-                let Some(delivery) = publication.published.attestation.as_ref() else {
-                    return Err(GuestAccumulateError::CorruptStore);
-                };
-                if publication.input != work.input_id()
-                    || publication.receipt != preparation.receipt
-                    || publication.published.reply != transition.reply
-                    || publication.published.outbox != transition.outbox
-                    || publication.published.exported_blobs != transition.exported_blobs
-                    || proof.statement != preparation.statement.commitment()
-                    || delivery.producer_name != actor.name
-                    || delivery.producer != actor.producer
-                    || delivery.statement != preparation.statement
-                    || delivery.proof != proof
-                {
-                    return Err(GuestAccumulateError::CorruptStore);
-                }
-                preparation.committed_proof = Some(proof);
-                AccumulationResultV2::Prepared(preparation)
-            }
-        });
+        if mode != ApplyMode::PrepareAttested {
+            return Err(GuestAccumulateError::CorruptStore);
+        }
+        let mut preparation = match AttestationPreparationV2::for_transition(
+            work,
+            transition,
+            &policy,
+            &actor.name,
+            actor.producer,
+            receipt,
+        ) {
+            Ok(preparation) => preparation,
+            Err(_) => return Ok(rejected(AccumulationRejectionV2::InvalidProof)),
+        };
+        let Some(bytes) = read(store, &publication_storage_key(work.input_id()))? else {
+            return Err(GuestAccumulateError::CorruptStore);
+        };
+        let publication =
+            PublicationRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
+        let Some(proof) = publication.published.proof.clone() else {
+            return Err(GuestAccumulateError::CorruptStore);
+        };
+        let Some(delivery) = publication.published.attestation.as_ref() else {
+            return Err(GuestAccumulateError::CorruptStore);
+        };
+        if publication.input != work.input_id()
+            || publication.receipt != preparation.receipt
+            || publication.published.reply != transition.reply
+            || publication.published.outbox != transition.outbox
+            || publication.published.exported_blobs != transition.exported_blobs
+            || proof.statement != preparation.statement.commitment()
+            || delivery.producer_name != actor.name
+            || delivery.producer != actor.producer
+            || delivery.statement != preparation.statement
+            || delivery.proof != proof
+        {
+            return Err(GuestAccumulateError::CorruptStore);
+        }
+        preparation.committed_proof = Some(proof);
+        return Ok(AccumulationResultV2::Prepared(preparation));
     }
 
     if transition.consumed_input != work.input_id() {
@@ -1841,6 +1848,54 @@ fn apply<S: GuestAccumulateStoreV2>(
             .ok_or(GuestAccumulateError::CorruptStore)?;
     if external_directory.actors != work.external_actors {
         return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
+
+    if header.consistency == ConsistencyModeV2::Crdt && !transition.spawns.is_empty() {
+        // Tree membership and package metadata need explicit causal
+        // operations before replicas may merge child creation safely.
+        return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
+    }
+    if directory
+        .actors
+        .len()
+        .saturating_add(transition.spawns.len())
+        > super::MAX_ROOT_TREE_ACTORS
+    {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
+    let mut spawned_names = BTreeSet::new();
+    let mut spawn_descriptors = Vec::with_capacity(transition.spawns.len());
+    for spawn in &transition.spawns {
+        let Some(parent) =
+            tree_get_wire::<_, ActorGenesisV2>(&tree, &StateKeyV2::ActorDescriptor(spawn.parent))?
+        else {
+            return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+        };
+        let existing_name = directory.actors.iter().try_fold(false, |found, actor| {
+            if found {
+                return Ok(true);
+            }
+            let descriptor =
+                tree_get_wire::<_, ActorGenesisV2>(&tree, &StateKeyV2::ActorDescriptor(*actor))?
+                    .ok_or(GuestAccumulateError::CorruptStore)?;
+            Ok::<_, GuestAccumulateError<S::Error>>(
+                descriptor.parent == Some(spawn.parent) && descriptor.name == spawn.name,
+            )
+        })?;
+        if spawn.actor != ActorId::owned_child(spawn.parent, &spawn.name)
+            || directory.actors.binary_search(&spawn.actor).is_ok()
+            || existing_name
+            || !spawned_names.insert((spawn.parent, spawn.name.clone()))
+        {
+            return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
+        let mut child = parent;
+        child.actor = spawn.actor;
+        child.name = spawn.name.clone();
+        child.parent = Some(spawn.parent);
+        child.initial_state = spawn.initial_state.clone();
+        child.crdt = false;
+        spawn_descriptors.push(child);
     }
 
     if let Some(rejection) = validate_continuation_change(tree.store_ref(), envelope)? {
@@ -1950,6 +2005,44 @@ fn apply<S: GuestAccumulateStoreV2>(
                 tree_apply(&mut tree, &key, actor_write.value.as_deref())?;
             }
         }
+    }
+    for (spawn, descriptor) in transition.spawns.iter().zip(&spawn_descriptors) {
+        let insert_at = match directory.actors.binary_search(&spawn.actor) {
+            Err(index) => index,
+            Ok(_) => {
+                return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+            }
+        };
+        directory.actors.insert(insert_at, spawn.actor);
+        tree_apply(
+            &mut tree,
+            &StateKeyV2::ActorDescriptor(spawn.actor),
+            Some(&descriptor.encode()),
+        )?;
+        let policies = super::PackageRolePoliciesV2::decode(&descriptor.role_policies)
+            .map_err(|_| GuestAccumulateError::CorruptStore)?;
+        for policy in policies.methods {
+            tree_apply(
+                &mut tree,
+                &StateKeyV2::MethodPolicy {
+                    actor: spawn.actor,
+                    method: policy.method.clone(),
+                },
+                Some(&policy.encode()),
+            )?;
+        }
+        tree_apply(
+            &mut tree,
+            &actor_state_key(header.consistency, spawn.actor),
+            Some(&spawn.initial_state.encode()),
+        )?;
+    }
+    if !transition.spawns.is_empty() {
+        tree_apply(
+            &mut tree,
+            &StateKeyV2::ActorDirectory,
+            Some(&directory.encode()),
+        )?;
     }
     for continuation in &transition.continuations {
         tree_apply(
@@ -2432,7 +2525,19 @@ fn canonical_transition_shape(
         }
         previous = Some(key);
     }
-    is_sorted_unique_by(&transition.continuations, |change| change.actor.0)
+    is_sorted_unique_by(&transition.spawns, |spawn| spawn.actor.0)
+        && transition.spawns.iter().all(|spawn| {
+            spawn.actor == ActorId::owned_child(spawn.parent, &spawn.name)
+                && work
+                    .imported_actors
+                    .binary_search_by_key(&spawn.parent, |actor| actor.actor)
+                    .is_ok()
+                && work
+                    .imported_actors
+                    .binary_search_by_key(&spawn.actor, |actor| actor.actor)
+                    .is_err()
+        })
+        && is_sorted_unique_by(&transition.continuations, |change| change.actor.0)
         && is_sorted_unique_by(&transition.inbox, |message| message.call_id.0)
         && is_sorted_unique_by(&transition.outbox, |message| message.call_id.0)
         && transition.reply.as_ref().is_none_or(|reply| {
@@ -2929,6 +3034,7 @@ fn referenced_blobs<'a>(
                 .chain(actor.continuation.iter())
         }))
         .chain(transition.exported_blobs.iter())
+        .chain(transition.spawns.iter().map(|spawn| &spawn.initial_state))
         .chain(
             transition
                 .continuations
@@ -3965,6 +4071,7 @@ mod tests {
                 value: Some(state.to_vec()),
             }],
             crdt_change: None,
+            spawns: Vec::new(),
             continuations: Vec::new(),
             inbox: Vec::new(),
             outbox: Vec::new(),
@@ -3977,6 +4084,244 @@ mod tests {
             gas: GasAccountingV2::default(),
             proof: None,
         }
+    }
+
+    #[test]
+    fn owned_child_spawn_is_atomic_deduplicated_and_guest_materialized() {
+        let mut store = MemStore::default();
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let work = linear_work(initial, install.resulting_state_root.unwrap());
+        let child = ActorId::owned_child(actor(), "child");
+        let child_bytes = b"child-state".to_vec();
+        let child_state = BlobRefV2::of_bytes(&child_bytes);
+        let mut transition = linear_transition(&work, b"after");
+        transition.spawns.push(super::super::ActorSpawnV2 {
+            actor: child,
+            name: "child".into(),
+            parent: actor(),
+            initial_state: child_state.clone(),
+        });
+        let envelope = AccumulationEnvelopeV2 {
+            work: work.clone(),
+            transition,
+            provided_blobs: vec![ImportedBlobV2 {
+                reference: child_state.clone(),
+                bytes: child_bytes,
+            }],
+        };
+
+        let before = store.clone();
+        let mut missing = envelope.clone();
+        missing.provided_blobs.clear();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Apply(missing)).unwrap(),
+            rejected(AccumulationRejectionV2::MissingBlob(child_state.hash))
+        );
+        assert_eq!(store, before, "a missing child state must stage nothing");
+
+        assert!(matches!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Apply(envelope.clone()))
+                .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+        let header = store_header(&store);
+        let tree = ServiceStateTreeV2::new(&mut store, header.service_root);
+        let directory =
+            tree_get_wire::<_, super::super::ActorDirectoryV2>(&tree, &StateKeyV2::ActorDirectory)
+                .unwrap()
+                .unwrap();
+        assert_eq!(directory.actors, {
+            let mut actors = vec![actor(), child];
+            actors.sort();
+            actors
+        });
+        let parent =
+            tree_get_wire::<_, ActorGenesisV2>(&tree, &StateKeyV2::ActorDescriptor(actor()))
+                .unwrap()
+                .unwrap();
+        let descriptor =
+            tree_get_wire::<_, ActorGenesisV2>(&tree, &StateKeyV2::ActorDescriptor(child))
+                .unwrap()
+                .unwrap();
+        assert_eq!(descriptor.actor, child);
+        assert_eq!(descriptor.parent, Some(actor()));
+        assert_eq!(descriptor.name, "child");
+        assert_eq!(descriptor.initial_state, child_state);
+        assert_eq!(descriptor.program, parent.program);
+        assert_eq!(descriptor.deployment, parent.deployment);
+        assert_eq!(descriptor.producer, parent.producer);
+        assert_eq!(descriptor.role_policies, parent.role_policies);
+        assert_eq!(
+            tree_get_wire::<_, BlobRefV2>(
+                &tree,
+                &StateKeyV2::ActorRow {
+                    actor: child,
+                    key: crate::actors::lifecycle::STATE_KEY_BYTES.to_vec(),
+                },
+            )
+            .unwrap(),
+            Some(child_state)
+        );
+        assert!(
+            tree_get_wire::<_, MethodPolicyV2>(
+                &tree,
+                &StateKeyV2::MethodPolicy {
+                    actor: child,
+                    method: "set".into(),
+                },
+            )
+            .unwrap()
+            .is_some()
+        );
+        drop(tree);
+
+        let before_retry = store.clone();
+        assert!(matches!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Apply(envelope)).unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: true,
+                ..
+            }
+        ));
+        assert_eq!(store, before_retry, "an exact retry must stage no writes");
+    }
+
+    #[test]
+    fn crdt_child_spawn_wire_is_rejected_without_mutation() {
+        let mut store = MemStore::default();
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Crdt, b"before");
+        assert!(install.resulting_crdt_heads.is_empty());
+        let work = crdt_work(initial, 11, vec![]);
+        let child_bytes = b"child-state".to_vec();
+        let child_state = BlobRefV2::of_bytes(&child_bytes);
+        let materialization_bytes = b"after".to_vec();
+        let materialization = BlobRefV2::of_bytes(&materialization_bytes);
+        let mut transition = crdt_transition(&work, materialization.clone(), 1);
+        transition.spawns.push(super::super::ActorSpawnV2 {
+            actor: ActorId::owned_child(actor(), "child"),
+            name: "child".into(),
+            parent: actor(),
+            initial_state: child_state.clone(),
+        });
+        let request = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work,
+            transition,
+            provided_blobs: vec![
+                ImportedBlobV2 {
+                    reference: child_state,
+                    bytes: child_bytes,
+                },
+                ImportedBlobV2 {
+                    reference: materialization,
+                    bytes: materialization_bytes,
+                },
+            ],
+        });
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &request).unwrap(),
+            rejected(AccumulationRejectionV2::NonCanonical)
+        );
+        assert_eq!(store, before);
+    }
+
+    #[test]
+    fn child_spawn_rejects_the_pinned_jar_tree_ceiling_atomically() {
+        let mut store = MemStore::default();
+        let initial = store.provide_blob(b"state").unwrap();
+        store.programs.insert(program(), FIXTURE_ACTOR_PVM.to_vec());
+        let policies = role_policies(vec![MethodPolicyV2 {
+            method: "set".into(),
+            schema: Hash([6; 32]),
+            policy: public_policy_hash(),
+            public: true,
+            attested: false,
+            space_role: None,
+            actor_role: None,
+        }]);
+        let actors = [
+            actor(),
+            ActorId([5; 32]),
+            ActorId([6; 32]),
+            ActorId([7; 32]),
+        ];
+        assert_eq!(actors.len(), super::super::MAX_ROOT_TREE_ACTORS);
+        let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            external_actors: external_bindings(),
+            service: identity(),
+            consistency: ConsistencyModeV2::Local,
+            actors: actors
+                .iter()
+                .enumerate()
+                .map(|(index, child)| ActorGenesisV2 {
+                    actor: *child,
+                    name: if index == 0 {
+                        "root".into()
+                    } else {
+                        alloc::format!("child-{index}")
+                    },
+                    parent: (index != 0).then_some(actor()),
+                    producer: super::super::ProducerId([4; 32]),
+                    deployment: identity().deployment,
+                    program: program(),
+                    initial_state: initial.clone(),
+                    crdt: false,
+                    role_policies: policies.clone(),
+                })
+                .collect(),
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: super::super::SystemCapabilityId([8; 32]),
+                authenticator: vec![9],
+            },
+        });
+        let AccumulationResultV2::Installed(receipt) =
+            execute_guest_accumulate(&mut store, &install).unwrap()
+        else {
+            panic!("four-actor fixture install rejected")
+        };
+        let mut work = linear_work(initial.clone(), receipt.resulting_state_root.unwrap());
+        work.imported_actors
+            .extend(
+                actors[1..]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, child)| ImportedActorV2 {
+                        actor: *child,
+                        name: alloc::format!("child-{}", index + 1),
+                        parent: Some(actor()),
+                        deployment: identity().deployment,
+                        program: program(),
+                        state: initial.clone(),
+                        causal_states: vec![],
+                        continuation: None,
+                    }),
+            );
+        let child_bytes = b"overflow-state".to_vec();
+        let child_state = BlobRefV2::of_bytes(&child_bytes);
+        let mut transition = linear_transition(&work, b"after");
+        transition.spawns.push(super::super::ActorSpawnV2 {
+            actor: ActorId::owned_child(actor(), "overflow"),
+            name: "overflow".into(),
+            parent: actor(),
+            initial_state: child_state.clone(),
+        });
+        let request = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work,
+            transition,
+            provided_blobs: vec![ImportedBlobV2 {
+                reference: child_state,
+                bytes: child_bytes,
+            }],
+        });
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &request).unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        assert_eq!(store, before);
     }
 
     fn awaiting_transition(
@@ -6018,6 +6363,7 @@ mod tests {
                     state: materialization,
                 }],
             }),
+            spawns: Vec::new(),
             continuations: Vec::new(),
             inbox: Vec::new(),
             outbox: Vec::new(),

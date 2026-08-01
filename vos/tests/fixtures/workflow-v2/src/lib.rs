@@ -19,6 +19,17 @@ impl WorkflowV2 {
     }
 
     #[msg]
+    async fn spawn_child(
+        &mut self,
+        ctx: &mut Context<Self>,
+        name: String,
+        initial: u32,
+    ) -> bool {
+        let child = Self { value: initial };
+        ctx.spawn::<WorkflowV2Ref>(name, &child).await.is_ok()
+    }
+
+    #[msg]
     fn peer_value(&self) -> u32 {
         7
     }

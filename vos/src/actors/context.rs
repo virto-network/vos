@@ -62,6 +62,8 @@ pub struct Context<A: Actor> {
     #[cfg(feature = "pvm")]
     pending_actor_calls: Vec<crate::v2::ActorCallRequestV2>,
     #[cfg(feature = "pvm")]
+    pending_actor_spawns: Vec<crate::v2::ActorSpawnRequestV2>,
+    #[cfg(feature = "pvm")]
     first_await_ordinal: u64,
     #[cfg(feature = "pvm")]
     next_await_ordinal: u64,
@@ -117,6 +119,8 @@ impl<A: Actor> Context<A> {
             pending_provides: Vec::new(),
             #[cfg(feature = "pvm")]
             pending_actor_calls: Vec::new(),
+            #[cfg(feature = "pvm")]
+            pending_actor_spawns: Vec::new(),
             #[cfg(feature = "pvm")]
             first_await_ordinal: 0,
             #[cfg(feature = "pvm")]
@@ -1106,16 +1110,71 @@ impl<A: Actor> Context<A> {
 
     /// Create and initialize an owned child. This is the only beginner API
     /// which creates a child; `actor` and `child` are resolution-only.
-    pub async fn spawn<'a, R, T>(
+    pub async fn spawn<'a, R>(
         &'a mut self,
         name: impl Into<alloc::string::String>,
-        init: &T,
+        init: &A,
     ) -> Result<R::Handle<'a, Self>, super::client::ClientError>
     where
         R: super::client::ActorReference + 'a,
-        T: super::codec::Encode,
     {
         let name = name.into();
+        if R::ACTOR_TYPE_NAME != A::TYPE_NAME {
+            return Err(super::client::ClientError::SpawnUnavailable);
+        }
+        if let Some(parent) = self.actor_id {
+            #[cfg(feature = "pvm")]
+            {
+                if A::CRDT
+                    || name.is_empty()
+                    || name.len() > crate::v2::MAX_ACTOR_NAME_BYTES
+                    || self
+                        .actor_tree
+                        .binary_search_by_key(&parent, |actor| actor.actor)
+                        .is_err()
+                    || self.actor_tree.len() + self.pending_actor_spawns.len()
+                        >= crate::v2::MAX_ROOT_TREE_ACTORS
+                    || self
+                        .actor_tree
+                        .iter()
+                        .any(|actor| actor.parent == Some(parent) && actor.name == name)
+                    || self
+                        .pending_actor_spawns
+                        .iter()
+                        .any(|spawn| spawn.parent == parent && spawn.name == name)
+                {
+                    return Err(super::client::ClientError::SpawnUnavailable);
+                }
+                let actor = crate::v2::ActorId::owned_child(parent, &name);
+                if self
+                    .actor_tree
+                    .iter()
+                    .any(|candidate| candidate.actor == actor)
+                    || self
+                        .pending_actor_spawns
+                        .iter()
+                        .any(|spawn| spawn.actor == actor)
+                {
+                    return Err(super::client::ClientError::SpawnUnavailable);
+                }
+                self.pending_actor_spawns
+                    .push(crate::v2::ActorSpawnRequestV2 {
+                        actor,
+                        name,
+                        parent,
+                        initial_state: init.encode(),
+                    });
+                // A fresh Refine invocation installs the new VM and CALLABLE
+                // after this slice commits. Invoking the returned identity in
+                // this same slice therefore reports NotFound deterministically.
+                return Ok(R::bind(actor, self));
+            }
+            #[cfg(not(feature = "pvm"))]
+            {
+                let _ = (parent, init);
+                return Err(super::client::ClientError::SpawnUnavailable);
+            }
+        }
         let request = super::value::Msg::new("spawn_child")
             .with("owner", self.id.0)
             .with("name", name)
@@ -1307,6 +1366,7 @@ impl<A: Actor> Context<A> {
         self.pending_provides.clear();
         self.pending_spawns.clear();
         self.pending_actor_calls.clear();
+        self.pending_actor_spawns.clear();
         self.reply = None;
         self.checkpoint = None;
         let _ = super::storage::end_dispatch();
@@ -1536,6 +1596,17 @@ impl<A: Actor> Context<A> {
     #[doc(hidden)]
     pub fn __drain_actor_calls_v2(&mut self) -> Vec<crate::v2::ActorCallRequestV2> {
         core::mem::take(&mut self.pending_actor_calls)
+    }
+
+    /// Drain same-package owned-child requests separately from actor writes.
+    /// Refine content-addresses each initial state and guest Accumulate derives
+    /// the child's package identity from its authenticated parent descriptor.
+    #[cfg(feature = "pvm")]
+    #[doc(hidden)]
+    pub fn __drain_actor_spawns_v2(&mut self) -> Vec<crate::v2::ActorSpawnRequestV2> {
+        let mut spawns = core::mem::take(&mut self.pending_actor_spawns);
+        spawns.sort_by_key(|spawn| spawn.actor);
+        spawns
     }
 
     #[cfg(feature = "pvm")]
@@ -1801,6 +1872,25 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct TestRef;
+
+    impl crate::actors::client::ActorReference for TestRef {
+        type Handle<'a, I: crate::actors::client::Invoker + 'a> = ();
+
+        fn bind<'a, I: crate::actors::client::Invoker + 'a>(
+            _target: crate::v2::ActorId,
+            _invoker: &'a mut I,
+        ) -> Self::Handle<'a, I> {
+        }
+
+        fn bind_service<'a, I: crate::actors::client::Invoker + 'a>(
+            _target: ServiceId,
+            _invoker: &'a mut I,
+        ) -> Self::Handle<'a, I> {
+        }
+    }
+
     #[test]
     fn context_new_defaults_caller_to_unauthenticated() {
         // Fresh Context starts with no caller — the host writes
@@ -1963,6 +2053,47 @@ mod tests {
             Some(sibling_child)
         );
         assert_eq!(ctx.resolve_owned_actor_v2(Some(root), "other"), None);
+    }
+
+    #[test]
+    fn v2_spawn_never_falls_back_to_the_legacy_registry_route() {
+        let mut ctx: Context<TestActor> = Context::new(ServiceId(0));
+        ctx.__set_actor_id(crate::v2::ActorId([1; 32]));
+
+        assert!(matches!(
+            crate::block_on(ctx.spawn::<TestRef>("child", &TestActor)),
+            Err(crate::ClientError::SpawnUnavailable)
+        ));
+    }
+
+    #[cfg(feature = "pvm")]
+    #[test]
+    fn v2_spawn_buffers_one_deterministic_same_package_child() {
+        let root = crate::v2::ActorId([1; 32]);
+        let mut ctx: Context<TestActor> = Context::new(ServiceId(0));
+        ctx.__set_actor_id(root);
+        ctx.actor_tree = alloc::vec![crate::v2::ActorTreeImportV2 {
+            actor: root,
+            name: "root".into(),
+            parent: None,
+            deployment: crate::v2::DeploymentId([8; 32]),
+            program: crate::v2::ProgramId([9; 32]),
+        }];
+
+        assert!(crate::block_on(ctx.spawn::<TestRef>("child", &TestActor)).is_ok());
+        assert!(matches!(
+            crate::block_on(ctx.spawn::<TestRef>("child", &TestActor)),
+            Err(crate::ClientError::SpawnUnavailable)
+        ));
+        let spawns = ctx.__drain_actor_spawns_v2();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(
+            spawns[0].actor,
+            crate::v2::ActorId::owned_child(root, "child")
+        );
+        assert_eq!(spawns[0].parent, root);
+        assert_eq!(spawns[0].name, "child");
+        assert_eq!(spawns[0].initial_state, TestActor.encode());
     }
 
     #[test]

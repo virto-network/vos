@@ -70,6 +70,8 @@ pub enum ClientError {
     NotFound,
     /// `Context::child` resolved an actor outside the caller's owned tree.
     NotOwnedChild,
+    /// The requested child cannot be staged in the current v2 actor slice.
+    SpawnUnavailable,
     /// The runtime returned an attestation package whose typed method, claim
     /// wire, or statement did not match the committed reply.
     InvalidAttestation(crate::AttestationError),
@@ -86,6 +88,10 @@ impl core::fmt::Display for ClientError {
             Self::Forbidden => write!(f, "permission denied: caller lacks the required role"),
             Self::NotFound => write!(f, "client: actor name was not found"),
             Self::NotOwnedChild => write!(f, "client: actor is not an owned child"),
+            Self::SpawnUnavailable => write!(
+                f,
+                "client: child creation is unavailable for this actor slice"
+            ),
             Self::InvalidAttestation(error) => write!(f, "client: {error}"),
             Self::Call(error) => write!(f, "client: {error}"),
         }
@@ -226,6 +232,11 @@ pub enum ActorTarget {
 /// actor identity to an invoker and returns a handle whose methods need no
 /// extra `ctx` argument.
 pub trait ActorReference: Copy {
+    /// Macro-stable source type label paired with the handle's message
+    /// surface. `Context::spawn` checks it against the initialized state type.
+    #[doc(hidden)]
+    const ACTOR_TYPE_NAME: &'static str = "";
+
     type Handle<'a, I: Invoker + 'a>: 'a
     where
         Self: 'a;

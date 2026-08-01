@@ -37,16 +37,17 @@ pub use contracts::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulatedTimeoutV2, AccumulationEnvelopeV2,
     AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2, ActorCallRequestV2,
     ActorCallResultV2, ActorCrdtStateV2, ActorDirectoryV2, ActorEffectBatchV2, ActorGenesisV2,
-    ActorPrivateInputV2, ActorSliceInputV2, ActorSliceOutputV2, ActorTreeImportV2, ActorUpgradeV2,
-    ActorWriteV2, AttestationDeliveryV2, AttestationResumeV2, AuthorizationEvidenceV2,
-    AwaitResumeV2, BlobRefV2, CallExpirationEnvelopeV2, CallTimeoutV2, CausalCallContextV2,
-    CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2, CrdtChangeV2,
-    CrdtDispatchV2, CrdtMaterializationV2, CrdtOperationV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2,
-    DeliveryEnvelopeV2, ExternalActorBindingV2, ExternalActorDirectoryV2, GasAccountingV2,
-    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, MessageRecordV2, MethodPolicyV2,
-    ProofCommitmentV2, ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2,
-    ReceiptVerificationRequestV2, RefineError, RefineImportsV2, RefineOutputV2, ReplyRecordV2,
-    RoleCredentialV2, RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServiceIdentityV2,
+    ActorPrivateInputV2, ActorSliceInputV2, ActorSliceOutputV2, ActorSpawnRequestV2, ActorSpawnV2,
+    ActorTreeImportV2, ActorUpgradeV2, ActorWriteV2, AttestationDeliveryV2, AttestationResumeV2,
+    AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2, CallExpirationEnvelopeV2, CallTimeoutV2,
+    CausalCallContextV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2,
+    ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2, CrdtMaterializationV2, CrdtOperationV2,
+    CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DeliveryEnvelopeV2, ExternalActorBindingV2,
+    ExternalActorDirectoryV2, GasAccountingV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
+    MessageRecordV2, MethodPolicyV2, ProofCommitmentV2, ProofVerificationRequestV2,
+    PublicationAckV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineError,
+    RefineImportsV2, RefineOutputV2, ReplyRecordV2, RoleCredentialV2,
+    RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServiceIdentityV2,
     ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
 };
 pub use guest_accumulate::{
@@ -115,8 +116,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0x5f, 0x26, 0xbe, 0x8b, 0x19, 0xce, 0xdb, 0x68, 0xd5, 0x13, 0xd2, 0x4e, 0xf0, 0xc0, 0x72, 0xe3,
-    0x82, 0x28, 0x88, 0x52, 0x3d, 0xc6, 0x31, 0x0f, 0xa7, 0xf9, 0x65, 0x00, 0x91, 0xa6, 0x72, 0xf1,
+    0x20, 0xb4, 0xa5, 0x72, 0xee, 0x78, 0xe5, 0x6f, 0xd5, 0xd5, 0x91, 0x40, 0x75, 0x51, 0x6d, 0x7c,
+    0x88, 0xa4, 0x56, 0x81, 0x4d, 0x51, 0x5f, 0x20, 0xf7, 0x5a, 0x0e, 0xfd, 0x24, 0x69, 0x0d, 0x78,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.

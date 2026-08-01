@@ -47,6 +47,13 @@ pub trait Actor: Sized + Encode + Decode {
     /// The message enum dispatched to this actor.
     type Message: super::value::FromDynamic;
 
+    /// Macro-stable source type label used to keep a typed child reference
+    /// paired with the state type being initialized. This is an API guard;
+    /// guest Accumulate remains the authority for the installed program and
+    /// policies.
+    #[doc(hidden)]
+    const TYPE_NAME: &'static str = "";
+
     /// The actor's own role hierarchy — the domain-specific tiers
     /// `#[msg(role = X)]` references and `ctx.ensure_role` checks
     /// against. Auto-derived to [`NoRoles`](super::auth::NoRoles)

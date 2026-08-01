@@ -277,6 +277,26 @@ pub struct ActorCrdtStateV2 {
     pub next_dispatch_ordinal: u32,
 }
 
+/// Actor-to-service request to create one same-package owned child. Refine
+/// content-addresses `initial_state` before placing the request in a
+/// transition; no actor can select a different program or policy surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorSpawnRequestV2 {
+    pub actor: ActorId,
+    pub name: String,
+    pub parent: ActorId,
+    pub initial_state: Vec<u8>,
+}
+
+/// Canonical child creation committed atomically with one linear actor slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorSpawnV2 {
+    pub actor: ActorId,
+    pub name: String,
+    pub parent: ActorId,
+    pub initial_state: BlobRefV2,
+}
+
 /// Opaque per-dispatch effects returned to the generic service VM after the
 /// root actor stack unwinds. Temporal order is execution order; the service
 /// guest canonicalizes the final transition.
@@ -339,6 +359,8 @@ pub struct ActorSliceOutputV2 {
     /// subtree. An individual actor export contains exactly its own entry;
     /// the generic service aggregates the final entry for every actor.
     pub crdt_states: Vec<ActorCrdtStateV2>,
+    /// Same-package owned children requested by actors executed in this slice.
+    pub spawns: Vec<ActorSpawnRequestV2>,
     /// Cross-root calls emitted by this slice. The owning service derives each
     /// stable `CallId` from the work invocation and `await_ordinal`.
     pub outbox: Vec<ActorCallRequestV2>,
@@ -974,6 +996,7 @@ pub struct TransitionV2 {
     pub target_program: ProgramId,
     pub base: ConsistencyBaseV2,
     pub writes: Vec<ActorWriteV2>,
+    pub spawns: Vec<ActorSpawnV2>,
     pub crdt_change: Option<CrdtChangeV2>,
     pub continuations: Vec<ContinuationChangeV2>,
     pub inbox: Vec<MessageRecordV2>,
@@ -1017,6 +1040,7 @@ impl TransitionV2 {
             target_program: self.target_program,
             base: self.base.clone(),
             writes: self.writes.clone(),
+            spawns: self.spawns.clone(),
             crdt_change: self.crdt_change.clone(),
             continuations: self.continuations.clone(),
             inbox: self.inbox.clone(),
@@ -1949,6 +1973,7 @@ impl V2Wire for ActorSliceOutputV2 {
             e.bytes(&state.state);
             e.u32(state.next_dispatch_ordinal);
         });
+        e.list(&self.spawns, encode_actor_spawn_request);
         e.list(&self.outbox, encode_actor_call);
         e.bytes(&self.reply);
         e.bool(self.yielded);
@@ -1970,6 +1995,7 @@ impl V2Wire for ActorSliceOutputV2 {
                     next_dispatch_ordinal: d.u32()?,
                 })
             })?,
+            spawns: d.list(decode_actor_spawn_request)?,
             outbox: d.list(decode_actor_call)?,
             reply: d.bytes()?,
             yielded: d.bool()?,
@@ -2019,6 +2045,16 @@ impl V2Wire for ActorSliceOutputV2 {
                 .crdt_states
                 .windows(2)
                 .any(|pair| pair[0].actor >= pair[1].actor)
+            || value
+                .spawns
+                .windows(2)
+                .any(|pair| pair[0].actor >= pair[1].actor)
+            || value.spawns.iter().any(|spawn| {
+                spawn.parent != value.actor
+                    || spawn.name.is_empty()
+                    || spawn.name.len() > super::MAX_ACTOR_NAME_BYTES
+                    || spawn.actor != ActorId::owned_child(spawn.parent, &spawn.name)
+            })
             || value
                 .crdt_states
                 .iter()
@@ -2124,6 +2160,7 @@ impl V2Wire for TransitionV2 {
         e.fixed(&self.target_program.0);
         encode_base(&mut e, &self.base);
         e.list(&self.writes, encode_write);
+        e.list(&self.spawns, encode_actor_spawn);
         e.option(&self.crdt_change, |e, change| e.bytes(&change.encode()));
         e.list(&self.continuations, encode_continuation_change);
         e.list(&self.inbox, encode_message);
@@ -2147,6 +2184,7 @@ impl V2Wire for TransitionV2 {
             target_program: ProgramId(d.fixed()?),
             base: decode_base(d)?,
             writes: d.list(decode_write)?,
+            spawns: d.list(decode_actor_spawn)?,
             crdt_change: d.option(|d| CrdtChangeV2::decode(&d.bytes()?))?,
             continuations: d.list(decode_continuation_change)?,
             inbox: d.list(decode_message)?,
@@ -2160,6 +2198,7 @@ impl V2Wire for TransitionV2 {
             },
             proof: d.option(decode_proof)?,
         };
+        ensure_sorted_unique(&result.spawns, |spawn| spawn.actor.0)?;
         ensure_sorted_unique(&result.exported_blobs, |b| b.hash.0)?;
         Ok(result)
     }
@@ -3396,6 +3435,7 @@ fn validate_accumulation_envelope(value: &AccumulationEnvelopeV2) -> Result<(), 
         (ConsistencyBaseV2::Crdt { heads }, Some(change))
             if value.work.consistency == ConsistencyModeV2::Crdt
                 && value.transition.writes.is_empty()
+                && value.transition.spawns.is_empty()
                 && Some(change.id) == CrdtChangeV2::derive_id(&value.work)
                 && change.work_hash == value.work.hash()
                 && change.causal_dependencies.as_slice() == heads.as_slice()
@@ -3439,6 +3479,7 @@ fn transition_blob_references(transition: &TransitionV2) -> impl Iterator<Item =
     transition
         .exported_blobs
         .iter()
+        .chain(transition.spawns.iter().map(|spawn| &spawn.initial_state))
         .chain(
             transition
                 .continuations
@@ -3835,6 +3876,45 @@ fn encode_write(e: &mut Encoder<'_>, value: &ActorWriteV2) {
     e.fixed(&value.actor.0);
     e.bytes(&value.key);
     e.option(&value.value, |e, value| e.bytes(value));
+}
+
+fn encode_actor_spawn_request(e: &mut Encoder<'_>, value: &ActorSpawnRequestV2) {
+    e.fixed(&value.actor.0);
+    e.string(&value.name);
+    e.fixed(&value.parent.0);
+    e.bytes(&value.initial_state);
+}
+
+fn decode_actor_spawn_request(d: &mut Decoder<'_>) -> Result<ActorSpawnRequestV2, DecodeError> {
+    Ok(ActorSpawnRequestV2 {
+        actor: ActorId(d.fixed()?),
+        name: d.string()?,
+        parent: ActorId(d.fixed()?),
+        initial_state: d.bytes()?,
+    })
+}
+
+fn encode_actor_spawn(e: &mut Encoder<'_>, value: &ActorSpawnV2) {
+    e.fixed(&value.actor.0);
+    e.string(&value.name);
+    e.fixed(&value.parent.0);
+    encode_blob_ref(e, &value.initial_state);
+}
+
+fn decode_actor_spawn(d: &mut Decoder<'_>) -> Result<ActorSpawnV2, DecodeError> {
+    let value = ActorSpawnV2 {
+        actor: ActorId(d.fixed()?),
+        name: d.string()?,
+        parent: ActorId(d.fixed()?),
+        initial_state: decode_blob_ref(d)?,
+    };
+    if value.name.is_empty()
+        || value.name.len() > super::MAX_ACTOR_NAME_BYTES
+        || value.actor != ActorId::owned_child(value.parent, &value.name)
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(value)
 }
 
 fn decode_write(d: &mut Decoder<'_>) -> Result<ActorWriteV2, DecodeError> {
@@ -4532,6 +4612,12 @@ mod tests {
             }],
             crdt_operations: vec![],
             crdt_states: vec![],
+            spawns: vec![ActorSpawnRequestV2 {
+                actor: ActorId::owned_child(ActorId([21; 32]), "worker"),
+                name: "worker".into(),
+                parent: ActorId([21; 32]),
+                initial_state: vec![],
+            }],
             outbox: vec![ActorCallRequestV2 {
                 await_ordinal: 7,
                 from: ActorId([21; 32]),
@@ -4550,6 +4636,12 @@ mod tests {
         assert_eq!(
             ActorSliceOutputV2::decode(&output.encode()).unwrap(),
             output
+        );
+        let mut wrong_spawn = output.clone();
+        wrong_spawn.spawns[0].actor = ActorId([99; 32]);
+        assert_eq!(
+            ActorSliceOutputV2::decode(&wrong_spawn.encode()),
+            Err(DecodeError::NonCanonical)
         );
 
         let change = ChangeId([31; 32]);
@@ -4572,6 +4664,7 @@ mod tests {
                 state: vec![2],
                 next_dispatch_ordinal: 2,
             }],
+            spawns: vec![],
             outbox: vec![],
             reply: vec![],
             yielded: false,
@@ -4680,6 +4773,7 @@ mod tests {
             writes: vec![],
             crdt_operations: vec![],
             crdt_states: vec![],
+            spawns: vec![],
             outbox: vec![],
             reply: vec![],
             yielded: true,
@@ -4839,6 +4933,7 @@ mod tests {
             },
             writes: vec![],
             crdt_change: None,
+            spawns: vec![],
             continuations: vec![],
             inbox: vec![],
             outbox: vec![],
@@ -4855,6 +4950,15 @@ mod tests {
         });
         assert_ne!(base.hash(), changed.hash());
         assert_ne!(base.commitment(), changed.commitment());
+
+        let mut spawned = changed.clone();
+        spawned.spawns.push(ActorSpawnV2 {
+            actor: ActorId::owned_child(ActorId([12; 32]), "child"),
+            name: "child".into(),
+            parent: ActorId([12; 32]),
+            initial_state: BlobRefV2::of_bytes(b"initial child state"),
+        });
+        assert_ne!(spawned.commitment(), changed.commitment());
 
         let mut proved = changed.clone();
         proved.proof = Some(ProofCommitmentV2 {
@@ -4968,6 +5072,7 @@ mod tests {
             base: work.base.clone(),
             writes: vec![],
             crdt_change: None,
+            spawns: vec![],
             continuations: vec![],
             inbox: vec![],
             outbox: vec![],
@@ -5544,6 +5649,7 @@ mod tests {
                     state: BlobRefV2::of_bytes(b"materialized-state"),
                 }],
             }),
+            spawns: vec![],
             continuations: vec![],
             inbox: vec![],
             outbox: vec![],

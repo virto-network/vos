@@ -15,7 +15,7 @@ use super::{
     WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 16;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 17;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
