@@ -1116,12 +1116,9 @@ impl<A: Actor> Context<A> {
         init: &A,
     ) -> Result<R::Handle<'a, Self>, super::client::ClientError>
     where
-        R: super::client::ActorReference + 'a,
+        R: super::client::ActorReferenceFor<A> + 'a,
     {
         let name = name.into();
-        if R::ACTOR_TYPE_NAME != A::TYPE_NAME {
-            return Err(super::client::ClientError::SpawnUnavailable);
-        }
         if let Some(parent) = self.actor_id {
             #[cfg(feature = "pvm")]
             {
@@ -1890,6 +1887,8 @@ mod tests {
         ) -> Self::Handle<'a, I> {
         }
     }
+
+    impl crate::actors::client::ActorReferenceFor<TestActor> for TestRef {}
 
     #[test]
     fn context_new_defaults_caller_to_unauthenticated() {

@@ -232,11 +232,6 @@ pub enum ActorTarget {
 /// actor identity to an invoker and returns a handle whose methods need no
 /// extra `ctx` argument.
 pub trait ActorReference: Copy {
-    /// Macro-stable source type label paired with the handle's message
-    /// surface. `Context::spawn` checks it against the initialized state type.
-    #[doc(hidden)]
-    const ACTOR_TYPE_NAME: &'static str = "";
-
     type Handle<'a, I: Invoker + 'a>: 'a
     where
         Self: 'a;
@@ -254,6 +249,13 @@ pub trait ActorReference: Copy {
         invoker: &'a mut I,
     ) -> Self::Handle<'a, I>;
 }
+
+/// Compile-time relationship between an actor state type and the generated
+/// reference exposing that actor's message surface. Keeping this as a marker
+/// trait, rather than an associated public type, permits application actors
+/// to remain private without losing type equality at `Context::spawn`.
+#[doc(hidden)]
+pub trait ActorReferenceFor<A: super::Actor>: ActorReference {}
 
 /// Generic spelling for a bound macro-generated actor handle.
 pub type ActorHandle<'a, R, I> = <R as ActorReference>::Handle<'a, I>;

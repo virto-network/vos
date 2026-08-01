@@ -535,6 +535,19 @@ fn bound_handle_methods_do_not_take_an_invoker_argument() {
 }
 
 #[test]
+fn generated_reference_is_bound_to_the_exact_actor_type() {
+    fn assert_reference_for<A, R>()
+    where
+        A: vos::Actor,
+        R: vos::actors::client::ActorReferenceFor<A>,
+    {
+    }
+
+    assert_reference_for::<Vault, VaultRef>();
+    assert_reference_for::<fixture::gate::Gate, GateRef>();
+}
+
+#[test]
 fn bound_handles_preserve_authorization_denials() {
     use vos::ActorReference;
 

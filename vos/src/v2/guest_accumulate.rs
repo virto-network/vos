@@ -1637,11 +1637,12 @@ fn apply<S: GuestAccumulateStoreV2>(
     else {
         return Ok(rejected(AccumulationRejectionV2::WrongProgram));
     };
-    if !directory
-        .actors
-        .iter()
-        .copied()
-        .eq(work.imported_actors.iter().map(|actor| actor.actor))
+    if duplicate_receipt.is_none()
+        && !directory
+            .actors
+            .iter()
+            .copied()
+            .eq(work.imported_actors.iter().map(|actor| actor.actor))
     {
         return Ok(rejected(AccumulationRejectionV2::WrongProgram));
     }
@@ -4389,7 +4390,20 @@ mod tests {
         let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
         let mut work = linear_work(initial, install.resulting_state_root.unwrap());
         work.proof_requested = true;
-        let transition = linear_transition(&work, b"after");
+        let child = ActorId::owned_child(actor(), "attested-child");
+        let child_bytes = b"attested-child-state".to_vec();
+        let child_state = BlobRefV2::of_bytes(&child_bytes);
+        let child_blob = ImportedBlobV2 {
+            reference: child_state.clone(),
+            bytes: child_bytes,
+        };
+        let mut transition = linear_transition(&work, b"after");
+        transition.spawns.push(super::super::ActorSpawnV2 {
+            actor: child,
+            name: "attested-child".into(),
+            parent: actor(),
+            initial_state: child_state,
+        });
         let before = store.clone();
         let mut staging = store.clone();
 
@@ -4398,7 +4412,7 @@ mod tests {
             &AccumulateRequestV2::PrepareAttested(AccumulationEnvelopeV2 {
                 work: work.clone(),
                 transition: transition.clone(),
-                provided_blobs: vec![],
+                provided_blobs: vec![child_blob.clone()],
             }),
         )
         .unwrap();
@@ -4449,13 +4463,18 @@ mod tests {
         };
         let mut proved_transition = transition.clone();
         proved_transition.proof = Some(proof.clone());
+        let mut provided_blobs = vec![
+            child_blob.clone(),
+            ImportedBlobV2 {
+                reference: proof_blob.clone(),
+                bytes: proof_bytes.clone(),
+            },
+        ];
+        provided_blobs.sort_by_key(|blob| blob.reference.hash);
         let request = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             work: work.clone(),
             transition: proved_transition.clone(),
-            provided_blobs: vec![ImportedBlobV2 {
-                reference: proof_blob.clone(),
-                bytes: proof_bytes.clone(),
-            }],
+            provided_blobs,
         });
         let unavailable = execute_guest_accumulate(&mut store.clone(), &request).unwrap();
         assert_eq!(
@@ -4477,7 +4496,22 @@ mod tests {
             panic!("valid proof was not accepted")
         };
         assert_eq!(receipt, preparation.receipt);
-        assert_eq!(published.proof, Some(proof));
+        assert_eq!(published.proof, Some(proof.clone()));
+
+        let recovered = execute_guest_accumulate(
+            &mut store,
+            &AccumulateRequestV2::PrepareAttested(AccumulationEnvelopeV2 {
+                work: work.clone(),
+                transition: transition.clone(),
+                provided_blobs: vec![child_blob.clone()],
+            }),
+        )
+        .unwrap();
+        let AccumulationResultV2::Prepared(recovered) = recovered else {
+            panic!("the exact attested retry was not recovered after its child spawn")
+        };
+        assert_eq!(recovered.receipt, preparation.receipt);
+        assert_eq!(recovered.committed_proof, Some(proof.clone()));
 
         let mut tampered = proved_transition;
         tampered.proof.as_mut().unwrap().statement = Hash([13; 32]);
@@ -4486,10 +4520,17 @@ mod tests {
             &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                 work,
                 transition: tampered,
-                provided_blobs: vec![ImportedBlobV2 {
-                    reference: proof_blob,
-                    bytes: proof_bytes,
-                }],
+                provided_blobs: {
+                    let mut blobs = vec![
+                        child_blob,
+                        ImportedBlobV2 {
+                            reference: proof_blob,
+                            bytes: proof_bytes,
+                        },
+                    ];
+                    blobs.sort_by_key(|blob| blob.reference.hash);
+                    blobs
+                },
             }),
         )
         .unwrap();

@@ -330,7 +330,6 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         impl #impl_generics vos::Actor for #name #ty_generics #where_clause {
             type Error = #error_ty;
             type Message = #msg_enum;
-            const TYPE_NAME: &'static str = stringify!(#name);
 
             // Per-agent ACL framework — sentinel defaults so
             // actors that haven't declared their own `Role` enum
@@ -1630,8 +1629,6 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         impl vos::actors::client::ActorReference for #ref_struct_name {
-            const ACTOR_TYPE_NAME: &'static str = stringify!(#actor_name);
-
             type Handle<'a, __I: vos::actors::client::Invoker + 'a> =
                 #handle_struct_name<'a, __I>;
 
@@ -1655,6 +1652,8 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
         }
+
+        impl vos::actors::client::ActorReferenceFor<#actor_name> for #ref_struct_name {}
     };
 
     // A transport extension (one with `handle_connection`) must have
