@@ -21,6 +21,8 @@ mod package;
 #[cfg(feature = "std")]
 mod pvm;
 #[cfg(feature = "std")]
+mod root_service;
+#[cfg(feature = "std")]
 mod scheduler;
 #[cfg(feature = "std")]
 mod service;
@@ -74,6 +76,11 @@ pub use pvm::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, NoRefineProtocolHostV2,
     RefineProtocolHostV2, RefineTraceV2, SERVICE_ARGUMENT_PAGES_V2, ServicePvmErrorV2,
     ServicePvmOutputV2, ServicePvmV2, transpile_service_elf, validate_actor_program_layout,
+};
+#[cfg(feature = "std")]
+pub use root_service::{
+    CommittedRootTreeSliceV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2,
+    LocalRootTreeInvokeErrorV2, LocalRootTreeOpenErrorV2, LocalRootTreeServiceV2,
 };
 #[cfg(feature = "std")]
 pub use scheduler::{LocalWorkRequestV2, LocalWorkSchedulerV2, PreparedWorkV2, ScheduleErrorV2};

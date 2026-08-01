@@ -24,14 +24,15 @@ use vos::v2::{
     ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2,
     ExternalActorBindingV2, GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2,
     ImportedProgramV2, InboxDrainOutcomeV2, InvocationId, JamServiceV2, LocalJamStoreHostV2,
-    LocalJamStoreV2, LocalTransportV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2,
-    MethodPolicyV2, NoRefineProtocolHostV2, Origin, PackageRolePoliciesV2, ProducerId, ProgramId,
-    ProofArtifactStoreV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2,
-    RefineOutputV2, ReplicatedJamServiceV2, ReplicatedServiceErrorV2, ReplyRecordV2,
-    RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId, ScheduleErrorV2,
-    ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2,
-    StateKeyV2, SubjectId, SystemCapabilityId, TransitionV2, V2Wire, WorkEnvelopeV2,
-    WorkflowOperationV2, public_policy_hash, space_role_policy_hash,
+    LocalJamStoreV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2, LocalRootTreeServiceV2,
+    LocalTransportV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
+    NoRefineProtocolHostV2, Origin, PackageManifestV2, PackageRolePoliciesV2, ProducerId,
+    ProgramId, ProofArtifactStoreV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
+    RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2, ReplicatedServiceErrorV2,
+    ReplyRecordV2, RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId,
+    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
+    ServicePvmV2, StateKeyV2, SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2,
+    WorkEnvelopeV2, WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     Decode, Encode,
@@ -585,6 +586,126 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
         transition.reply.as_ref().map(|reply| reply.call_id),
         Some(work.invocation.root_reply_id())
     );
+}
+
+#[test]
+fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
+    let actor_elf = greeter_elf();
+    let actor_pvm = grey_transpiler::link_elf(&actor_elf).expect("greeter transpiles");
+    let schemas = vos::metadata::raw_section_from_elf(&actor_elf).expect("greeter metadata");
+    let metadata = vos::metadata::decode(&schemas).expect("valid greeter metadata");
+    let policies = PackageRolePoliciesV2::from_metadata(&metadata)
+        .expect("greeter policies")
+        .encode();
+    let public_key = b"root-tree-host-test-key".to_vec();
+    let package = VosPackageV2 {
+        manifest: PackageManifestV2 {
+            name: metadata.actor_name.clone(),
+            version: "2.0.0".into(),
+            service_abi: vos::v2::ABI_VERSION,
+            snapshot_version: vos::v2::SNAPSHOT_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+            actor_program: ProgramId::of_pvm(&actor_pvm),
+            crdt: false,
+            interfaces_hash: artifact_hash(b"interfaces", &[]),
+            role_policies_hash: artifact_hash(b"role-policies", &policies),
+            schemas_hash: artifact_hash(b"schemas", &schemas),
+        },
+        actor_pvm,
+        generated_interfaces: vec![],
+        role_policies: policies,
+        schemas,
+        diagnostics: None,
+        deployment_signature: vos::v2::DeploymentSignatureV2 {
+            producer: ProducerId::of_public_key(&public_key),
+            public_key,
+            signature: vec![1],
+        },
+    };
+    package.validate().expect("package is internally canonical");
+    let deployment = package.deployment_id();
+    let identity = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([91; 32]),
+        root_service: RootServiceId([92; 32]),
+        deployment,
+        service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+    };
+    let actor = ActorId([93; 32]);
+    let config = LocalRootTreeConfigV2 {
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package,
+        service: identity,
+        root_actor: actor,
+        actor_name: metadata.actor_name,
+        consistency: ConsistencyModeV2::Local,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([94; 32]),
+            authenticator: vec![95],
+        },
+        refine_gas: 1_000_000_000,
+        accumulate_gas: 5_000_000_000,
+    };
+    let mut replicated_config = config.clone();
+    replicated_config.consistency = ConsistencyModeV2::Raft;
+    assert_eq!(
+        replicated_config.validate(),
+        Err(LocalRootTreeConfigErrorV2::ReplicationDriverRequired),
+        "the direct host must not claim Raft consistency without a replicated driver"
+    );
+
+    let mut service =
+        LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
+            .expect("fresh service installs through physical Accumulate");
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("start").encode());
+    let first = service
+        .invoke(LocalWorkRequestV2 {
+            invocation: InvocationId([96; 32]),
+            workflow_step: 0,
+            logical_timeslot: 1,
+            target: actor,
+            method: "start".into(),
+            arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        })
+        .expect("slice commits through physical Accumulate");
+    assert_eq!(
+        first.published.reply.as_ref().map(|reply| &reply.result),
+        Some(&Value::Unit.encode())
+    );
+    let publication = first
+        .publication
+        .expect("committed reply remains recoverable until acknowledgement");
+    assert_eq!(service.store().header().unwrap().unwrap().revision, 1);
+
+    let backend = service.into_backend();
+    let mut restarted = LocalRootTreeServiceV2::open(config.clone(), backend)
+        .expect("exact service image restores without reinstalling");
+    assert_eq!(restarted.store().header().unwrap().unwrap().revision, 1);
+    assert_eq!(
+        restarted.pending_publications().unwrap(),
+        vec![publication.clone()]
+    );
+    assert!(!restarted.acknowledge_publication(&publication).unwrap());
+
+    let backend = restarted.into_backend();
+    let restarted = LocalRootTreeServiceV2::open(config, backend)
+        .expect("acknowledged image restores through the same service identity");
+    assert!(restarted.pending_publications().unwrap().is_empty());
+    assert_eq!(restarted.store().header().unwrap().unwrap().revision, 1);
 }
 
 #[test]
