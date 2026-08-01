@@ -5674,9 +5674,9 @@ fn attested_driver_rejects_a_transition_not_produced_by_exact_refine() {
     let elf = service_elf();
     let service_pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let service_program = ProgramId::of_pvm(&service_pvm);
-    let actor_pvm = b"canonical attested actor bytes".to_vec();
+    let actor_pvm = grey_transpiler::link_elf(&greeter_elf()).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
-    let initial_bytes = b"attested initial state".to_vec();
+    let initial_bytes = Vec::new();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
     let mut seed = work(actor_program, initial.clone());
     seed.service.service_program = service_program;
@@ -5783,37 +5783,49 @@ fn attested_driver_rejects_a_transition_not_produced_by_exact_refine() {
             .any(|window| window == private_witness.bytes),
         "the work wire carries only the private witness commitment and content reference"
     );
-    let transition = TransitionV2 {
-        service: prepared.work.service.clone(),
-        consumed_input: prepared.work.input_id(),
-        target_program: prepared.work.target_program,
-        base: prepared.work.base.clone(),
-        writes: vec![],
-        crdt_change: None,
-        continuations: vec![],
-        inbox: vec![],
-        outbox: vec![],
-        reply: Some(ReplyRecordV2 {
-            call_id: prepared.work.invocation.root_reply_id(),
-            producer: prepared.work.target,
-            result: Value::Bytes(b"attested claim".to_vec()).encode(),
-        }),
-        exported_blobs: vec![],
-        gas: GasAccountingV2::default(),
-        proof: None,
-    };
-    let envelope = AccumulationEnvelopeV2 {
+    let refined = service
+        .refine_actor_tree(&prepared.work, &prepared.imports)
+        .expect("the executable actor produces a genuine Refine transition");
+    let genuine = AccumulationEnvelopeV2 {
         work: prepared.work,
-        transition,
-        provided_blobs: vec![],
+        transition: refined.transition,
+        provided_blobs: refined.exported_blobs,
     };
     let before = service.accumulate_host().snapshot();
-    let mut invalid = CanonicalTestProofProducer {
+    let mut control = CanonicalTestProofProducer {
         proof: vec![],
         calls: 0,
     };
     assert!(matches!(
-        service.accumulate_attested(envelope.clone(), &prepared.imports, &mut invalid),
+        service.accumulate_attested(genuine.clone(), &prepared.imports, &mut control),
+        Err(vos::v2::AttestedServiceErrorV2::InvalidProducedProof)
+    ));
+    assert_eq!(
+        control.calls, 1,
+        "the genuine Refine output reaches proof production"
+    );
+    assert!(
+        service
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&before),
+        "an empty proof cannot commit the genuine transition"
+    );
+
+    let mut forged = genuine;
+    forged
+        .transition
+        .reply
+        .as_mut()
+        .expect("the genuine completed actor slice has a reply")
+        .result
+        .push(0xff);
+    let mut invalid = CanonicalTestProofProducer {
+        proof: vec![1],
+        calls: 0,
+    };
+    assert!(matches!(
+        service.accumulate_attested(forged, &prepared.imports, &mut invalid),
         Err(vos::v2::AttestedServiceErrorV2::InvalidPreparation)
     ));
     assert_eq!(invalid.calls, 0);
