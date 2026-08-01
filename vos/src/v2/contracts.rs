@@ -480,6 +480,7 @@ impl WorkEnvelopeV2 {
         encode_service(&mut e, &self.service);
         e.fixed(&self.invocation.0);
         e.fixed(&self.target.0);
+        e.fixed(&self.target_deployment.0);
         e.fixed(&self.target_program.0);
         e.string(&self.method);
         e.bytes(&self.arguments);
@@ -4338,6 +4339,24 @@ mod tests {
         assert_eq!(
             RoleCredentialV2::decode(&credential.encode()),
             Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn package_only_upgrade_invalidates_the_previous_role_credential_scope() {
+        let before = work();
+        let before_scope = before.authorization_scope();
+
+        let mut after = before.clone();
+        after.target_deployment = DeploymentId([46; 32]);
+        after.imported_actors[0].deployment = after.target_deployment;
+
+        assert_eq!(after.target_program, before.target_program);
+        assert_ne!(after.target_deployment, before.target_deployment);
+        assert_ne!(
+            after.authorization_scope(),
+            before_scope,
+            "a credential signed for the old package must not authorize the same program under a new deployment"
         );
     }
 

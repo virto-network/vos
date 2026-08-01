@@ -836,6 +836,8 @@ impl AttestationReplayStore for AttestationReplayGuard {
 pub struct AttestationSource {
     pub service: ServiceIdentityV2,
     pub actor: ActorId,
+    /// Deployment identity of the current signature-verified actor package.
+    pub actor_deployment: DeploymentId,
     pub actor_program: ProgramId,
     pub producer: ProducerId,
     /// Schema and policy derived from the current signature-verified package
@@ -875,6 +877,7 @@ pub fn verify_once<T, M: AttestedMethod<T>>(
     }
     if package.statement.accumulation_receipt.service != expected_source.service
         || package.statement.actor != expected_source.actor
+        || package.statement.deployment != expected_source.actor_deployment
         || package.statement.actor_program != expected_source.actor_program
         || package.statement.schema != expected_source.schema
         || package.statement.authorization_policy != expected_source.authorization_policy
@@ -1157,6 +1160,7 @@ mod tests {
         AttestationSource {
             service: package.statement.accumulation_receipt.service.clone(),
             actor: package.statement.actor,
+            actor_deployment: package.statement.deployment,
             actor_program: package.statement.actor_program,
             producer: package.producer,
             schema: package.statement.schema,
@@ -1339,6 +1343,25 @@ mod tests {
                 &verifier,
             ),
             Err(AttestationError::InvalidReceipt)
+        );
+
+        let mut redeployed = source();
+        redeployed.actor_deployment = DeploymentId([100; 32]);
+        assert_eq!(
+            redeployed.actor_program,
+            package(28).statement.actor_program
+        );
+        assert_eq!(
+            verify_once(
+                package(28),
+                "private-age",
+                &redeployed,
+                &mut AttestationReplayGuard::default(),
+                &finalized,
+                &verifier,
+            ),
+            Err(AttestationError::WrongSource),
+            "the current package deployment is required even when its actor program is unchanged"
         );
 
         let mut redeployed = source();

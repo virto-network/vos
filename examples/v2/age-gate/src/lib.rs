@@ -128,6 +128,7 @@ mod tests {
         let source = AttestationSource {
             service: expected.statement().accumulation_receipt.service.clone(),
             actor: expected.statement().actor,
+            actor_deployment: expected.statement().deployment,
             actor_program: expected.statement().actor_program,
             producer: expected.producer(),
             schema: expected.statement().schema,
