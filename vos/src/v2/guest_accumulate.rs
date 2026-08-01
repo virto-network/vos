@@ -4871,6 +4871,7 @@ mod tests {
             result: vec![23],
         });
         completed.crdt_change.as_mut().unwrap().workflow = completed.workflow_operations(&resumed);
+        let completed_cid = completed.crdt_change.as_ref().unwrap().cid();
         assert!(matches!(
             execute_guest_accumulate(
                 &mut destination,
@@ -4878,8 +4879,36 @@ mod tests {
                     work: resumed,
                     transition: completed,
                     provided_blobs: vec![ImportedBlobV2 {
-                        reference: completed_state,
+                        reference: completed_state.clone(),
                         bytes: completed_bytes,
+                    }],
+                })
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+
+        // Apply a descendant after the resumed reply publication already
+        // exists. This rematerializes the historical expiration; the old
+        // implementation incorrectly selected the now-visible step-1
+        // workflow and deleted this publication during the descendant apply.
+        let later_bytes = b"later CRDT change".to_vec();
+        let later_state = BlobRefV2::of_bytes(&later_bytes);
+        let mut later_work = crdt_work(completed_state, 30, vec![completed_cid]);
+        later_work.base_causal_height = Some(3);
+        let later = crdt_transition(&later_work, later_state.clone(), 4);
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut destination,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: later_work,
+                    transition: later,
+                    provided_blobs: vec![ImportedBlobV2 {
+                        reference: later_state,
+                        bytes: later_bytes,
                     }],
                 })
             )
