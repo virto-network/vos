@@ -3729,7 +3729,9 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
     // directory, while JAR restoration still uses only the exact dormant
     // program layout captured by the continuation.
     let mut expanded = timed_out.clone();
-    let new_child = ActorId([0xe1; 32]);
+    // Sort before the existing target to prove current directory order does
+    // not renumber the VMs captured by the older continuation.
+    let new_child = ActorId([3; 32]);
     let new_child_state_bytes = b"late child state".to_vec();
     let new_child_state = BlobRefV2::of_bytes(&new_child_state_bytes);
     expanded
@@ -3766,7 +3768,12 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             javm::PvmBackend::ForceInterpreter,
         )
         .expect("a newer tree directory does not rewrite the suspended JAR layout");
-    assert_eq!(expanded_timeout, timed_out_output);
+    assert_eq!(expanded_timeout.bytes, timed_out_output.bytes);
+    assert_eq!(
+        expanded_timeout.exported_blobs,
+        timed_out_output.exported_blobs
+    );
+    assert_eq!(expanded_timeout.trace, timed_out_output.trace);
 
     let timed_out_refined = RefineOutputV2::decode(&timed_out_output.bytes).unwrap();
     let timed_out_transition = timed_out_refined.transition;

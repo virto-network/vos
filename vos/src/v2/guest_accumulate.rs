@@ -2651,6 +2651,30 @@ fn validate_continuation_change<S: GuestAccumulateStoreV2>(
         None
     };
 
+    if let (Some(current), Some(next)) = (current, next.as_ref()) {
+        let Some(bytes) = store
+            .load_blob(current)
+            .map_err(GuestAccumulateError::Storage)?
+        else {
+            return Ok(Some(AccumulationRejectionV2::MissingBlob(current.hash)));
+        };
+        if BlobRefV2::of_bytes(&bytes) != *current {
+            return Err(GuestAccumulateError::CorruptStore);
+        }
+        let previous = match ContinuationSnapshotV2::decode_metadata(&bytes) {
+            Ok(snapshot) if snapshot.validate_resume_for(work).is_ok() => snapshot,
+            _ => {
+                return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+            }
+        };
+        if previous.programs != next.programs {
+            // Restoring and checkpointing again cannot add, drop, reorder, or
+            // replace a VM in the invocation layout frozen by the old JAR
+            // snapshot, even if the complete current directory has changed.
+            return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+        }
+    }
+
     // The complete work import was already checked byte-for-byte against the
     // guest-owned tree. Actors carrying the target's current continuation are
     // therefore the authenticated previous lock set. The awaited-reply check
@@ -3694,6 +3718,7 @@ mod tests {
     #[test]
     fn actor_upgrade_waits_for_peer_continuations_that_pin_its_program() {
         let mut store = MemStore::default();
+        store.programs.insert(program(), FIXTURE_ACTOR_PVM.to_vec());
         let root_state = store.provide_blob(b"root").unwrap();
         let child_state = store.provide_blob(b"child").unwrap();
         let child = ActorId([7; 32]);

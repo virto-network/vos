@@ -366,6 +366,7 @@ pub struct ServicePvmV2 {
 /// transition itself.
 struct ActorRefineRuntimeV2 {
     target: super::ActorId,
+    program_layout: Vec<super::ContinuationProgramV2>,
     actor_by_vm: Vec<Option<super::ActorId>>,
     private_inputs: BTreeMap<super::ActorId, ActorPrivateInputV2>,
     outputs: Vec<ActorSliceOutputV2>,
@@ -378,20 +379,45 @@ impl ActorRefineRuntimeV2 {
         imports: &RefineImportsV2,
         space_role: Option<u8>,
         actor_role: Option<u8>,
+        captured_programs: Option<&[super::ContinuationProgramV2]>,
     ) -> Result<Self, ServicePvmErrorV2> {
-        let actor_tree = actor_tree_from_work(work);
-        let mut actor_by_vm = Vec::with_capacity(work.imported_actors.len() + 1);
+        let program_layout = captured_programs.map_or_else(
+            || {
+                work.imported_actors
+                    .iter()
+                    .map(|actor| super::ContinuationProgramV2 {
+                        actor: actor.actor,
+                        deployment: actor.deployment,
+                        program: actor.program,
+                    })
+                    .collect()
+            },
+            <[super::ContinuationProgramV2]>::to_vec,
+        );
+        let actor_tree = actor_tree_from_work(work)
+            .into_iter()
+            .filter(|actor| {
+                program_layout
+                    .binary_search_by_key(&actor.actor, |binding| binding.actor)
+                    .is_ok()
+            })
+            .collect::<Vec<_>>();
+        let mut actor_by_vm = Vec::with_capacity(program_layout.len() + 1);
         actor_by_vm.push(None);
         actor_by_vm.push(Some(work.target));
         actor_by_vm.extend(
-            work.imported_actors
+            program_layout
                 .iter()
                 .filter(|actor| actor.actor != work.target)
                 .map(|actor| Some(actor.actor)),
         );
 
         let mut private_inputs = BTreeMap::new();
-        for actor in &work.imported_actors {
+        for actor in work.imported_actors.iter().filter(|actor| {
+            program_layout
+                .binary_search_by_key(&actor.actor, |binding| binding.actor)
+                .is_ok()
+        }) {
             let state = imported_blob_bytes(imports, &actor.state)?.to_vec();
             let causal_states = actor
                 .causal_states
@@ -418,6 +444,7 @@ impl ActorRefineRuntimeV2 {
         }
         Ok(Self {
             target: work.target,
+            program_layout,
             actor_by_vm,
             private_inputs,
             outputs: Vec::new(),
@@ -470,11 +497,10 @@ impl ActorRefineRuntimeV2 {
                         let active_actor = self
                             .actor_for_vm(vm)
                             .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
-                        let index = self
-                            .private_inputs
-                            .keys()
-                            .position(|candidate| *candidate == active_actor)
-                            .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                        let index = private
+                            .actor_tree
+                            .binary_search_by_key(&active_actor, |candidate| candidate.actor)
+                            .map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
                         active_actor_mask |= 1u64 << index;
                     }
                     if active_actor_mask == 0 {
@@ -780,7 +806,6 @@ impl ServicePvmV2 {
             });
         }
         let (space_role, actor_role) = authorization_roles(&work, imports)?;
-        let actor_runtime = ActorRefineRuntimeV2::new(&work, imports, space_role, actor_role)?;
 
         if let Some(reference) = target.continuation.as_ref() {
             let bytes = imported_blob_bytes(imports, reference)?;
@@ -789,6 +814,13 @@ impl ServicePvmV2 {
             continuation
                 .validate_resume_for(&work)
                 .map_err(|_| ServicePvmErrorV2::ContinuationMismatch)?;
+            let actor_runtime = ActorRefineRuntimeV2::new(
+                &work,
+                imports,
+                space_role,
+                actor_role,
+                Some(&continuation.programs),
+            )?;
             let snapshot = KernelSnapshot::from_bytes(&continuation.kernel_snapshot)
                 .map_err(|_| ServicePvmErrorV2::InvalidContinuation)?;
             if snapshot.pending_call.slot != crate::abi::hostcall::SUSPEND as u8 {
@@ -835,7 +867,7 @@ impl ServicePvmV2 {
                 backend,
             )
             .map_err(|_| ServicePvmErrorV2::ContinuationMismatch)?;
-            reconcile_actor_callables(&mut kernel, &work)?;
+            reconcile_actor_callables(&mut kernel, &work, &continuation.programs)?;
             let checkpoint = CheckpointTokenV2 {
                 input: work.input_id(),
                 base: work.base.clone(),
@@ -918,6 +950,8 @@ impl ServicePvmV2 {
         if actor_input.len() > super::ACTOR_SLICE_INPUT_MAX_BYTES {
             return Err(ServicePvmErrorV2::ActorInputTooLarge);
         }
+        let actor_runtime =
+            ActorRefineRuntimeV2::new(&work, imports, space_role, actor_role, None)?;
         let mut kernel = InvocationKernel::new_with_dormant_programs(
             &self.program,
             arguments,
@@ -1122,13 +1156,17 @@ fn actor_tree_from_work(work: &WorkEnvelopeV2) -> Vec<ActorTreeImportV2> {
         .collect()
 }
 
-fn actor_vm_index(work: &WorkEnvelopeV2, actor: super::ActorId) -> Option<u16> {
-    if actor == work.target {
+fn continued_actor_vm_index(
+    programs: &[super::ContinuationProgramV2],
+    target: super::ActorId,
+    actor: super::ActorId,
+) -> Option<u16> {
+    if actor == target {
         return Some(1);
     }
-    work.imported_actors
+    programs
         .iter()
-        .filter(|candidate| candidate.actor != work.target)
+        .filter(|candidate| candidate.actor != target)
         .position(|candidate| candidate.actor == actor)
         .and_then(|index| u16::try_from(index).ok())
         .and_then(|index| index.checked_add(2))
@@ -1141,16 +1179,20 @@ fn actor_vm_index(work: &WorkEnvelopeV2, actor: super::ActorId) -> Option<u16> {
 fn reconcile_actor_callables(
     kernel: &mut InvocationKernel,
     work: &WorkEnvelopeV2,
+    programs: &[super::ContinuationProgramV2],
 ) -> Result<(), ServicePvmErrorV2> {
     let owned_continuation = work
         .imported_actors
         .iter()
         .find(|actor| actor.actor == work.target)
         .and_then(|actor| actor.continuation.as_ref());
-    for destination in &work.imported_actors {
-        let destination_vm = actor_vm_index(work, destination.actor)
+    // Only actors captured in the restored kernel have VMs and HANDLEs.
+    // Newly spawned directory members remain part of the authoritative work
+    // import, but cannot be retrofitted into an older JAR invocation layout.
+    for destination in programs {
+        let destination_vm = continued_actor_vm_index(programs, work.target, destination.actor)
             .ok_or(ServicePvmErrorV2::InvalidContinuation)?;
-        for index in 0..work.imported_actors.len() {
+        for index in 0..MAX_ROOT_TREE_ACTORS {
             let slot = super::ACTOR_CALLABLE_BASE_SLOT
                 .checked_add(index as u8)
                 .ok_or(ServicePvmErrorV2::InvalidContinuation)?;
@@ -1162,11 +1204,17 @@ fn reconcile_actor_callables(
         }
     }
 
-    for destination in &work.imported_actors {
-        let destination_vm = actor_vm_index(work, destination.actor)
+    for destination in programs {
+        let destination_vm = continued_actor_vm_index(programs, work.target, destination.actor)
             .ok_or(ServicePvmErrorV2::InvalidContinuation)?;
-        for (source_index, source) in work.imported_actors.iter().enumerate() {
-            if source.actor == destination.actor
+        for (source_index, source_binding) in programs.iter().enumerate() {
+            let source = work
+                .imported_actors
+                .binary_search_by_key(&source_binding.actor, |actor| actor.actor)
+                .ok()
+                .map(|index| &work.imported_actors[index])
+                .ok_or(ServicePvmErrorV2::InvalidContinuation)?;
+            if source_binding.actor == destination.actor
                 || source
                     .continuation
                     .as_ref()
@@ -1174,8 +1222,8 @@ fn reconcile_actor_callables(
             {
                 continue;
             }
-            let source_vm =
-                actor_vm_index(work, source.actor).ok_or(ServicePvmErrorV2::InvalidContinuation)?;
+            let source_vm = continued_actor_vm_index(programs, work.target, source_binding.actor)
+                .ok_or(ServicePvmErrorV2::InvalidContinuation)?;
             let source_handle = TARGET_ACTOR_HANDLE_SLOT
                 .checked_add(
                     u8::try_from(
@@ -1414,6 +1462,7 @@ fn write_suspension_payload(
 fn capture_checkpoint(
     kernel: &mut InvocationKernel,
     work: &WorkEnvelopeV2,
+    actor_runtime: &ActorRefineRuntimeV2,
 ) -> Result<
     (
         ImportedBlobV2,
@@ -1437,9 +1486,13 @@ fn capture_checkpoint(
     if snapshot.pending_call.slot != crate::abi::hostcall::SUSPEND as u8 {
         return Err(ServicePvmErrorV2::SnapshotFailed);
     }
-    let suspended_actors = suspended_actor_stack(&snapshot, work)?;
+    let suspended_actors = suspended_actor_stack(&snapshot, actor_runtime)?;
     let pending_actor = awaited
-        .then(|| actor_for_vm(snapshot.active_vm, work))
+        .then(|| {
+            actor_runtime
+                .actor_for_vm(snapshot.active_vm)
+                .ok_or(ServicePvmErrorV2::SnapshotFailed)
+        })
         .transpose()?;
     let continuation = ContinuationSnapshotV2 {
         snapshot_version: super::SNAPSHOT_VERSION,
@@ -1451,15 +1504,7 @@ fn capture_checkpoint(
         actor: work.target,
         actor_deployment: work.target_deployment,
         actor_program: work.target_program,
-        programs: work
-            .imported_actors
-            .iter()
-            .map(|actor| super::ContinuationProgramV2 {
-                actor: actor.actor,
-                deployment: actor.deployment,
-                program: actor.program,
-            })
-            .collect(),
+        programs: actor_runtime.program_layout.clone(),
         await_ordinal,
         pending_call,
         pending_actor,
@@ -1478,24 +1523,9 @@ fn capture_checkpoint(
     ))
 }
 
-fn actor_for_vm(vm: u16, work: &WorkEnvelopeV2) -> Result<super::ActorId, ServicePvmErrorV2> {
-    if vm == 0 {
-        return Err(ServicePvmErrorV2::SnapshotFailed);
-    }
-    core::iter::once(work.target)
-        .chain(
-            work.imported_actors
-                .iter()
-                .filter(|actor| actor.actor != work.target)
-                .map(|actor| actor.actor),
-        )
-        .nth(vm.checked_sub(1).ok_or(ServicePvmErrorV2::SnapshotFailed)? as usize)
-        .ok_or(ServicePvmErrorV2::SnapshotFailed)
-}
-
 fn suspended_actor_stack(
     snapshot: &KernelSnapshot,
-    work: &WorkEnvelopeV2,
+    actor_runtime: &ActorRefineRuntimeV2,
 ) -> Result<Vec<super::ActorId>, ServicePvmErrorV2> {
     let mut suspended = snapshot
         .call_stack
@@ -1503,11 +1533,15 @@ fn suspended_actor_stack(
         .map(|frame| frame.caller_vm_id)
         .chain(core::iter::once(snapshot.active_vm))
         .filter(|vm| *vm != 0)
-        .map(|vm| actor_for_vm(vm, work))
+        .map(|vm| {
+            actor_runtime
+                .actor_for_vm(vm)
+                .ok_or(ServicePvmErrorV2::SnapshotFailed)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     suspended.sort_unstable();
     suspended.dedup();
-    if suspended.is_empty() || suspended.binary_search(&work.target).is_err() {
+    if suspended.is_empty() || suspended.binary_search(&actor_runtime.target).is_err() {
         return Err(ServicePvmErrorV2::SnapshotFailed);
     }
     Ok(suspended)
@@ -1596,8 +1630,11 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                 }
                 if slot == crate::abi::hostcall::SUSPEND as u8 {
                     if let Some(work) = suspension_work {
+                        let runtime = actor_runtime
+                            .as_ref()
+                            .ok_or(ServicePvmErrorV2::InvalidContinuation)?;
                         let (artifact, snapshot, pending_call, pending_actor, suspended) =
-                            capture_checkpoint(&mut kernel, work)?;
+                            capture_checkpoint(&mut kernel, work, runtime)?;
                         let (service_program, dormant) =
                             invocation_layout.ok_or(ServicePvmErrorV2::InvalidContinuation)?;
                         let mut finalization = InvocationKernel::restore_with_dormant_programs(
@@ -1849,6 +1886,32 @@ mod tests {
 
     const SYNTHETIC_SERVICE_GAS: u64 = 10_000_000;
     use grey_transpiler::assembler::Reg;
+
+    #[test]
+    fn continued_vm_indices_ignore_later_directory_insertions() {
+        let target = super::super::ActorId([5; 32]);
+        let child = super::super::ActorId([9; 32]);
+        let programs = vec![
+            super::super::ContinuationProgramV2 {
+                actor: target,
+                deployment: super::super::DeploymentId([6; 32]),
+                program: ProgramId([7; 32]),
+            },
+            super::super::ContinuationProgramV2 {
+                actor: child,
+                deployment: super::super::DeploymentId([10; 32]),
+                program: ProgramId([11; 32]),
+            },
+        ];
+
+        assert_eq!(continued_actor_vm_index(&programs, target, target), Some(1));
+        assert_eq!(continued_actor_vm_index(&programs, target, child), Some(2));
+        assert_eq!(
+            continued_actor_vm_index(&programs, target, super::super::ActorId([3; 32])),
+            None,
+            "an actor inserted before the target in the current directory has no VM in the frozen kernel"
+        );
+    }
 
     #[test]
     fn disclosed_and_private_role_credentials_feed_the_same_actor_role() {

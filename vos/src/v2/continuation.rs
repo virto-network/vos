@@ -130,7 +130,7 @@ impl ContinuationSnapshotV2 {
             || self.actor_deployment != work.target_deployment
             || self.actor_program != work.target_program
             || self.causal_context != work.causal_context
-            || !program_layout_matches_checkpoint(&self.programs, work)
+            || !program_layout_matches_emitted_checkpoint(&self.programs, work)
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -234,7 +234,7 @@ impl ContinuationMetadataV2 {
             || self.actor_deployment != work.target_deployment
             || self.actor_program != work.target_program
             || self.causal_context != work.causal_context
-            || !program_layout_matches_checkpoint(&self.programs, work)
+            || !program_layout_matches_emitted_checkpoint(&self.programs, work)
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -357,6 +357,19 @@ fn program_layout_matches_checkpoint(
                     && binding.deployment == actor.deployment
                     && binding.program == actor.program
             })
+}
+
+fn program_layout_matches_emitted_checkpoint(
+    programs: &[ContinuationProgramV2],
+    work: &WorkEnvelopeV2,
+) -> bool {
+    if work.workflow_step == 0 {
+        program_layout_matches_checkpoint(programs, work)
+    } else {
+        // A resumed kernel retains the layout from its first checkpoint even
+        // if the current complete service directory gained actors meanwhile.
+        program_layout_matches_resume(programs, work)
+    }
 }
 
 fn program_layout_matches_resume(
@@ -559,6 +572,10 @@ mod tests {
         });
         snapshot.validate_resume_for(&work).unwrap();
 
+        let mut next_checkpoint = snapshot.clone();
+        next_checkpoint.checkpoint_step = work.workflow_step;
+        next_checkpoint.validate_checkpoint_for(&work).unwrap();
+
         work.imported_actors[0].program = ProgramId([12; 32]);
         assert_eq!(
             snapshot.validate_resume_for(&work),
@@ -568,9 +585,10 @@ mod tests {
 
     #[test]
     fn emitted_checkpoint_must_bind_every_imported_actor_program() {
-        let snapshot = snapshot();
+        let mut snapshot = snapshot();
+        snapshot.checkpoint_step = 0;
         let mut work = resume_work();
-        work.workflow_step = snapshot.checkpoint_step;
+        work.workflow_step = 0;
         snapshot.validate_checkpoint_for(&work).unwrap();
 
         work.imported_actors.push(ImportedActorV2 {
