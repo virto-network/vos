@@ -7675,6 +7675,7 @@ dependencies = [
  "javm",
  "libloading",
  "libp2p",
+ "libp2p-identity",
  "log",
  "merkle-crdt",
  "msg-ctl",

@@ -81,6 +81,7 @@ pub enum PackageError {
     InvalidActorName,
     MissingSignature,
     ProducerIdMismatch,
+    InvalidSignature,
 }
 
 impl core::fmt::Display for PackageError {
@@ -162,6 +163,25 @@ impl VosPackageV2 {
     /// Bytes covered by a deployment signature.
     pub fn signing_message(&self) -> [u8; 32] {
         self.deployment_id().0
+    }
+
+    /// Verify both the canonical package contents and the deployment
+    /// authority's cryptographic signature. Hosts must call this method before
+    /// authorizing guest-owned installation; [`Self::validate`] deliberately
+    /// remains the no-std structural validator used by package tooling.
+    #[cfg(feature = "std")]
+    pub fn verify_deployment_signature(&self) -> Result<(), PackageError> {
+        self.validate()?;
+        let public_key =
+            libp2p_identity::PublicKey::try_decode_protobuf(&self.deployment_signature.public_key)
+                .map_err(|_| PackageError::InvalidSignature)?;
+        if !public_key.verify(
+            &self.signing_message(),
+            &self.deployment_signature.signature,
+        ) {
+            return Err(PackageError::InvalidSignature);
+        }
+        Ok(())
     }
 
     /// Build the exact actor descriptor accepted by guest-owned installation.

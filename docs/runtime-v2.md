@@ -76,7 +76,8 @@ filesystem backend flushes a sibling candidate, atomically renames it over the
 committed image, then syncs the parent directory.
 
 `LocalRootTreeServiceV2` is the reusable single-writer ownership boundary for
-one root actor tree. Before opening storage it validates the package, exact
+one root actor tree. Before opening storage it cryptographically verifies the
+package deployment signature and validates the actor capability layout, exact
 service/deployment/program/ABI/semantics tuple, consistency choice, gas
 schedule, root descriptor, external bindings, and complete canonical genesis
 wire. A fresh image imports the canonical actor PVM and initial state, then
@@ -85,7 +86,11 @@ same service identity, consistency, installed root descriptor, actor program,
 and external directory; dynamically spawned children may already have grown
 the guest-owned actor directory. Ordinary calls are scheduled exclusively
 from committed guest state and run through physical Refine followed by
-physical Accumulate. Replies and outbox effects remain in the durable
+physical Accumulate. Before scheduling, a repeated direct invocation is
+matched against its guest-owned workflow checkpoint and input-deduplication
+record. An exact retry reattaches the committed receipt and any pending
+publication without executing the actor; divergent reuse of the invocation is
+rejected. Replies and outbox effects remain in the durable
 publication table until their exact commitment is acknowledged through
 physical Accumulate. This direct host rejects `Raft` consistency rather than
 claiming replication without a replicated driver, and rejects attested work

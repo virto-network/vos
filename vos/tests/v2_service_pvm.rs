@@ -24,15 +24,16 @@ use vos::v2::{
     ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2,
     ExternalActorBindingV2, GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2,
     ImportedProgramV2, InboxDrainOutcomeV2, InvocationId, JamServiceV2, LocalJamStoreHostV2,
-    LocalJamStoreV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2, LocalRootTreeServiceV2,
-    LocalTransportV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
-    NoRefineProtocolHostV2, Origin, PackageManifestV2, PackageRolePoliciesV2, ProducerId,
-    ProgramId, ProofArtifactStoreV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
-    RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2, ReplicatedServiceErrorV2,
-    ReplyRecordV2, RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId,
-    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
-    ServicePvmV2, StateKeyV2, SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2,
-    WorkEnvelopeV2, WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
+    LocalJamStoreV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2,
+    LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
+    MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin, PackageError,
+    PackageManifestV2, PackageRolePoliciesV2, ProducerId, ProgramId, ProofArtifactStoreV2,
+    PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2,
+    ReplicatedJamServiceV2, ReplicatedServiceErrorV2, ReplyRecordV2, RoleCredentialV2,
+    RoleCredentialVerificationRequestV2, RootServiceId, ScheduleErrorV2, ServiceDispatchError,
+    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId,
+    SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2, WorkflowOperationV2,
+    artifact_hash, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     Decode, Encode,
@@ -597,8 +598,9 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
     let policies = PackageRolePoliciesV2::from_metadata(&metadata)
         .expect("greeter policies")
         .encode();
-    let public_key = b"root-tree-host-test-key".to_vec();
-    let package = VosPackageV2 {
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let public_key = signer.public().encode_protobuf();
+    let mut package = VosPackageV2 {
         manifest: PackageManifestV2 {
             name: metadata.actor_name.clone(),
             version: "2.0.0".into(),
@@ -623,7 +625,12 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
             signature: vec![1],
         },
     };
-    package.validate().expect("package is internally canonical");
+    package.deployment_signature.signature = signer
+        .sign(&package.signing_message())
+        .expect("sign canonical deployment");
+    package
+        .verify_deployment_signature()
+        .expect("package signature is authentic");
     let deployment = package.deployment_id();
     let identity = ServiceIdentityV2 {
         space: vos::v2::SpaceId([91; 32]),
@@ -657,30 +664,72 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         Err(LocalRootTreeConfigErrorV2::ReplicationDriverRequired),
         "the direct host must not claim Raft consistency without a replicated driver"
     );
+    let mut forged_config = config.clone();
+    forged_config.package.deployment_signature.signature[0] ^= 0x80;
+    assert_eq!(
+        forged_config.validate(),
+        Err(LocalRootTreeConfigErrorV2::InvalidPackage(
+            PackageError::InvalidSignature
+        )),
+        "installation authority must be cryptographically authenticated"
+    );
+
+    let mut invalid_layout = config.clone();
+    let parsed = javm::program::parse_blob(&invalid_layout.package.actor_pvm)
+        .expect("canonical actor PVM parses");
+    let mut caps = parsed.caps.clone();
+    caps.push(javm::program::CapManifestEntry {
+        cap_index: vos::v2::ACTOR_CALLABLE_BASE_SLOT,
+        cap_type: javm::program::CapEntryType::Data,
+        base_page: 0,
+        page_count: 0,
+        init_access: javm::cap::Access::RW,
+        data_offset: 0,
+        data_len: 0,
+    });
+    invalid_layout.package.actor_pvm = javm::program::build_blob(
+        parsed.header.memory_pages,
+        parsed.header.invoke_cap,
+        parsed.header.stack_top,
+        &caps,
+        parsed.data_section,
+    );
+    invalid_layout.package.manifest.actor_program =
+        ProgramId::of_pvm(&invalid_layout.package.actor_pvm);
+    invalid_layout.package.deployment_signature.signature = signer
+        .sign(&invalid_layout.package.signing_message())
+        .expect("sign invalid-layout package for a focused layout check");
+    invalid_layout.service.deployment = invalid_layout.package.deployment_id();
+    assert_eq!(
+        invalid_layout.validate(),
+        Err(LocalRootTreeConfigErrorV2::InvalidActorProgramLayout),
+        "reserved scheduler capabilities must fail before installation"
+    );
 
     let mut service =
         LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
             .expect("fresh service installs through physical Accumulate");
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
     arguments.extend_from_slice(&Msg::new("start").encode());
+    let request = LocalWorkRequestV2 {
+        invocation: InvocationId([96; 32]),
+        workflow_step: 0,
+        logical_timeslot: 1,
+        target: actor,
+        method: "start".into(),
+        arguments,
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
     let first = service
-        .invoke(LocalWorkRequestV2 {
-            invocation: InvocationId([96; 32]),
-            workflow_step: 0,
-            logical_timeslot: 1,
-            target: actor,
-            method: "start".into(),
-            arguments,
-            origin: Origin::Anonymous,
-            authorization: AuthorizationEvidenceV2::Public,
-            causal_parent: None,
-            parent_call: None,
-            causal_context: None,
-            awaited_reply: None,
-            awaited_timeout: None,
-            imported_blobs: vec![],
-            proof_requested: false,
-        })
+        .invoke(request.clone())
         .expect("slice commits through physical Accumulate");
     assert_eq!(
         first.published.reply.as_ref().map(|reply| &reply.result),
@@ -688,6 +737,7 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
     );
     let publication = first
         .publication
+        .clone()
         .expect("committed reply remains recoverable until acknowledgement");
     assert_eq!(service.store().header().unwrap().unwrap().revision, 1);
 
@@ -699,6 +749,23 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         restarted.pending_publications().unwrap(),
         vec![publication.clone()]
     );
+    let recovered = restarted
+        .invoke(request.clone())
+        .expect("lost committed result reattaches after restart");
+    assert!(recovered.duplicate);
+    assert_eq!(recovered.refine_gas_used, 0);
+    assert_eq!(recovered.accumulate_gas_used, 0);
+    assert_eq!(recovered.input, first.input);
+    assert_eq!(recovered.receipt, first.receipt);
+    assert_eq!(recovered.published, first.published);
+    assert_eq!(recovered.publication, Some(publication.clone()));
+
+    let mut divergent = request;
+    divergent.arguments.push(0);
+    assert!(matches!(
+        restarted.invoke(divergent),
+        Err(LocalRootTreeInvokeErrorV2::DivergentInvocation)
+    ));
     assert!(!restarted.acknowledge_publication(&publication).unwrap());
 
     let backend = restarted.into_backend();

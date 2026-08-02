@@ -13,12 +13,12 @@ use alloc::vec::Vec;
 use super::{
     AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2,
     AccumulationResultV2, ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2,
-    BlobRefV2, CommittedImageStoreV2, ConsistencyModeV2, DurableJamStoreV2,
+    BlobRefV2, CommittedImageStoreV2, ConsistencyModeV2, DedupRecordV2, DurableJamStoreV2,
     DurableStoreOpenErrorV2, ExternalActorBindingV2, ExternalActorDirectoryV2, JamServiceV2,
     LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2, NoRefineProtocolHostV2,
     PackageError, ProgramId, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
     ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire,
-    VosPackageV2, WorkInputIdV2,
+    VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2, dedup_storage_key,
 };
 
 /// Complete immutable installation input for one locally hosted root tree.
@@ -44,6 +44,7 @@ pub struct LocalRootTreeConfigV2 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalRootTreeConfigErrorV2 {
     InvalidPackage(PackageError),
+    InvalidActorProgramLayout,
     InvalidGenesis,
     WrongDeployment,
     WrongServiceProgram,
@@ -83,6 +84,8 @@ pub enum LocalRootTreeInvokeErrorV2 {
     Rejected(AccumulationRejectionV2),
     UnexpectedResult,
     CorruptStore(LocalStoreReadErrorV2),
+    CorruptWorkflow,
+    DivergentInvocation,
     MissingPublication,
 }
 
@@ -120,8 +123,10 @@ impl LocalRootTreeConfigV2 {
         &self,
     ) -> Result<(ActorGenesisV2, ServiceGenesisV2), LocalRootTreeConfigErrorV2> {
         self.package
-            .validate()
+            .verify_deployment_signature()
             .map_err(LocalRootTreeConfigErrorV2::InvalidPackage)?;
+        super::validate_actor_program_layout(&self.package.actor_pvm)
+            .map_err(|_| LocalRootTreeConfigErrorV2::InvalidActorProgramLayout)?;
         if self.root_actor == ActorId::ZERO {
             return Err(LocalRootTreeConfigErrorV2::InvalidGenesis);
         }
@@ -181,6 +186,91 @@ impl LocalRootTreeConfigV2 {
 }
 
 impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
+    fn recover_committed_invocation(
+        &self,
+        request: &LocalWorkRequestV2,
+    ) -> Result<Option<CommittedRootTreeSliceV2>, LocalRootTreeInvokeErrorV2> {
+        let header = self
+            .service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        let Some(bytes) = self
+            .service
+            .accumulate_host()
+            .state_row(
+                header.service_root,
+                &StateKeyV2::Workflow(request.invocation),
+            )
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+        else {
+            return Ok(None);
+        };
+        let checkpoint = WorkflowCheckpointV2::decode(&bytes)
+            .map_err(|_| LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        let committed = &checkpoint.resume_work;
+        let exact_ingress = request.workflow_step == 0
+            && checkpoint.input.workflow_step == 0
+            && checkpoint.input.invocation == request.invocation
+            && committed.invocation == request.invocation
+            && committed.target == request.target
+            && committed.method == request.method
+            && committed.arguments == request.arguments
+            && committed.origin == request.origin
+            && committed.authorization == request.authorization
+            && committed.causal_parent == request.causal_parent
+            && committed.parent_call == request.parent_call
+            && committed.causal_context == request.causal_context
+            && request.awaited_reply.is_none()
+            && request.awaited_timeout.is_none()
+            && committed.imported_blobs == request.imported_blobs
+            && committed.proof_requested == request.proof_requested;
+        if !exact_ingress {
+            return Err(LocalRootTreeInvokeErrorV2::DivergentInvocation);
+        }
+
+        let dedup = self
+            .service
+            .accumulate_host()
+            .row(&dedup_storage_key(checkpoint.input))
+            .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)
+            .and_then(|bytes| {
+                DedupRecordV2::decode(bytes)
+                    .map_err(|_| LocalRootTreeInvokeErrorV2::CorruptWorkflow)
+            })?;
+        if dedup.input != checkpoint.input
+            || dedup.work_hash != checkpoint.work_hash
+            || dedup.receipt.service != self.identity
+        {
+            return Err(LocalRootTreeInvokeErrorV2::CorruptWorkflow);
+        }
+        let publication = self
+            .service
+            .accumulate_host()
+            .pending_publications()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .into_iter()
+            .find(|publication| publication.input == checkpoint.input);
+        if publication
+            .as_ref()
+            .is_some_and(|publication| publication.receipt != dedup.receipt)
+        {
+            return Err(LocalRootTreeInvokeErrorV2::CorruptWorkflow);
+        }
+        Ok(Some(CommittedRootTreeSliceV2 {
+            input: checkpoint.input,
+            receipt: dedup.receipt,
+            published: publication
+                .as_ref()
+                .map_or_else(PublishedEffectsV2::default, |row| row.published.clone()),
+            publication,
+            duplicate: true,
+            refine_gas_used: 0,
+            accumulate_gas_used: 0,
+        }))
+    }
+
     /// Open a committed service image or install a new root through physical
     /// Accumulate when the backing store is empty.
     pub fn open(
@@ -309,6 +399,9 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
     ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
         if request.proof_requested {
             return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
+        }
+        if let Some(committed) = self.recover_committed_invocation(&request)? {
+            return Ok(committed);
         }
         let prepared = LocalWorkSchedulerV2::prepare(self.service.accumulate_host(), request)
             .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
