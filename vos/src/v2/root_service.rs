@@ -10,17 +10,67 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2,
     AccumulationResultV2, ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2,
     BlobRefV2, CommittedImageStoreV2, ConsistencyModeV2, CrdtChangeV2, DedupRecordV2,
     DurableJamStoreV2, DurableStoreOpenErrorV2, ExternalActorBindingV2, ExternalActorDirectoryV2,
-    JamServiceV2, LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
-    NoRefineProtocolHostV2, PackageError, ProgramId, PublicationAckV2, PublicationRecordV2,
-    PublishedEffectsV2, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2,
-    StateKeyV2, V2Wire, VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key,
-    dedup_storage_key,
+    JamServiceV2, LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MethodPolicyV2,
+    NoRefineProtocolHostV2, PackageError, PackageRolePoliciesV2, ProgramId, PublicationAckV2,
+    PublicationRecordV2, PublishedEffectsV2, ScheduleErrorV2, ServiceDispatchError,
+    ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2, WorkInputIdV2,
+    WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
 };
+
+/// Strict host ingress for one direct invocation of a registered v2 root.
+///
+/// The payload remains the canonical actor message wire
+/// (`TAG_DYNAMIC ++ rkyv(Msg)`). This outer envelope preserves the full
+/// canonical actor identity and invocation identity until the root service
+/// constructs its [`super::WorkEnvelopeV2`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootTreeInvocationV2 {
+    pub invocation: super::InvocationId,
+    pub logical_timeslot: u64,
+    pub target: ActorId,
+    pub method: String,
+    pub arguments: Vec<u8>,
+    pub proof_requested: bool,
+}
+
+impl V2Wire for RootTreeInvocationV2 {
+    const MAGIC: [u8; 4] = *b"VRI2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        encoder.fixed(&self.invocation.0);
+        encoder.u64(self.logical_timeslot);
+        encoder.fixed(&self.target.0);
+        encoder.string(&self.method);
+        encoder.bytes(&self.arguments);
+        encoder.bool(self.proof_requested);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            invocation: super::InvocationId(decoder.fixed()?),
+            logical_timeslot: decoder.u64()?,
+            target: ActorId(decoder.fixed()?),
+            method: decoder.string()?,
+            arguments: decoder.bytes()?,
+            proof_requested: decoder.bool()?,
+        };
+        if value.invocation == super::InvocationId::ZERO
+            || value.target == ActorId::ZERO
+            || value.method.is_empty()
+            || value.arguments.is_empty()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
 
 /// Complete immutable installation input for one locally hosted root tree.
 ///
@@ -421,6 +471,37 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         self.service.accumulate_host_mut()
     }
 
+    /// Read one installed method policy from the canonical signed artifact
+    /// retained in guest-owned actor state.
+    pub fn root_method_policy(
+        &self,
+        method: &str,
+    ) -> Result<Option<MethodPolicyV2>, LocalRootTreeInvokeErrorV2> {
+        let header = self
+            .service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        let descriptor = self
+            .service
+            .accumulate_host()
+            .state_row(
+                header.service_root,
+                &StateKeyV2::ActorDescriptor(self.root_actor),
+            )
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .and_then(|bytes| ActorGenesisV2::decode(&bytes).ok())
+            .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        let policies = PackageRolePoliciesV2::decode(&descriptor.role_policies)
+            .map_err(|_| LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        Ok(policies
+            .methods
+            .binary_search_by(|candidate| candidate.method.as_str().cmp(method))
+            .ok()
+            .map(|index| policies.methods[index].clone()))
+    }
+
     /// Execute one ordinary slice. Attested work requires a configured proof
     /// producer and uses the separate proof-before-Accumulate path.
     pub fn invoke(
@@ -518,5 +599,56 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
         let (_, store) = self.service.into_hosts();
         let (_, backend) = store.into_parts();
         backend
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::InvocationId;
+    use super::*;
+
+    #[test]
+    fn root_tree_invocation_wire_is_strict_and_canonical() {
+        let invocation = RootTreeInvocationV2 {
+            invocation: InvocationId([1; 32]),
+            logical_timeslot: 7,
+            target: ActorId([2; 32]),
+            method: "increment".into(),
+            arguments: vec![crate::value::TAG_DYNAMIC, 3, 4],
+            proof_requested: false,
+        };
+        let encoded = invocation.encode();
+        assert_eq!(RootTreeInvocationV2::decode(&encoded).unwrap(), invocation);
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            RootTreeInvocationV2::decode(&trailing),
+            Err(DecodeError::TrailingBytes)
+        );
+
+        for invalid in [
+            RootTreeInvocationV2 {
+                invocation: InvocationId::ZERO,
+                ..invocation.clone()
+            },
+            RootTreeInvocationV2 {
+                target: ActorId::ZERO,
+                ..invocation.clone()
+            },
+            RootTreeInvocationV2 {
+                method: String::new(),
+                ..invocation.clone()
+            },
+            RootTreeInvocationV2 {
+                arguments: Vec::new(),
+                ..invocation.clone()
+            },
+        ] {
+            assert_eq!(
+                RootTreeInvocationV2::decode(&invalid.encode()),
+                Err(DecodeError::NonCanonical)
+            );
+        }
     }
 }
