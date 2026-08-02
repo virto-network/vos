@@ -589,16 +589,16 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
     );
 }
 
-#[test]
-fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
-    let actor_elf = greeter_elf();
-    let actor_pvm = grey_transpiler::link_elf(&actor_elf).expect("greeter transpiles");
-    let schemas = vos::metadata::raw_section_from_elf(&actor_elf).expect("greeter metadata");
-    let metadata = vos::metadata::decode(&schemas).expect("valid greeter metadata");
+fn signed_test_package(
+    actor_elf: &[u8],
+    signer: &libp2p::identity::Keypair,
+) -> (VosPackageV2, String) {
+    let actor_pvm = grey_transpiler::link_elf(actor_elf).expect("actor transpiles");
+    let schemas = vos::metadata::raw_section_from_elf(actor_elf).expect("actor metadata");
+    let metadata = vos::metadata::decode(&schemas).expect("valid actor metadata");
     let policies = PackageRolePoliciesV2::from_metadata(&metadata)
-        .expect("greeter policies")
+        .expect("actor policies")
         .encode();
-    let signer = libp2p::identity::Keypair::generate_ed25519();
     let public_key = signer.public().encode_protobuf();
     let mut package = VosPackageV2 {
         manifest: PackageManifestV2 {
@@ -609,7 +609,7 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
             execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
             service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
             actor_program: ProgramId::of_pvm(&actor_pvm),
-            crdt: false,
+            crdt: metadata.crdt,
             interfaces_hash: artifact_hash(b"interfaces", &[]),
             role_policies_hash: artifact_hash(b"role-policies", &policies),
             schemas_hash: artifact_hash(b"schemas", &schemas),
@@ -631,6 +631,14 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
     package
         .verify_deployment_signature()
         .expect("package signature is authentic");
+    (package, metadata.actor_name)
+}
+
+#[test]
+fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
+    let actor_elf = greeter_elf();
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&actor_elf, &signer);
     let deployment = package.deployment_id();
     let identity = ServiceIdentityV2 {
         space: vos::v2::SpaceId([91; 32]),
@@ -646,7 +654,7 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         package,
         service: identity,
         root_actor: actor,
-        actor_name: metadata.actor_name,
+        actor_name,
         consistency: ConsistencyModeV2::Local,
         initial_state: vec![],
         external_actors: vec![],
@@ -773,6 +781,79 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         .expect("acknowledged image restores through the same service identity");
     assert!(restarted.pending_publications().unwrap().is_empty());
     assert_eq!(restarted.store().header().unwrap().unwrap().revision, 1);
+}
+
+#[test]
+fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
+    let actor_elf = crdt_counter_v2_elf();
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&actor_elf, &signer);
+    let actor = ActorId([97; 32]);
+    let config = LocalRootTreeConfigV2 {
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        service: ServiceIdentityV2 {
+            space: vos::v2::SpaceId([98; 32]),
+            root_service: RootServiceId([99; 32]),
+            deployment: package.deployment_id(),
+            service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+            service_abi: vos::v2::ABI_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        },
+        package,
+        root_actor: actor,
+        actor_name,
+        consistency: ConsistencyModeV2::Crdt,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([100; 32]),
+            authenticator: vec![101],
+        },
+        refine_gas: 1_000_000_000,
+        accumulate_gas: 5_000_000_000,
+    };
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("increment").with("amount", 2u64).encode());
+    let request = LocalWorkRequestV2 {
+        invocation: InvocationId([102; 32]),
+        workflow_step: 0,
+        logical_timeslot: 1,
+        target: actor,
+        method: "increment".into(),
+        arguments,
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+
+    let mut service =
+        LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
+            .expect("fresh CRDT root installs through physical Accumulate");
+    let committed = service
+        .invoke(request.clone())
+        .expect("CRDT slice commits through physical Refine and Accumulate");
+    assert!(!committed.duplicate);
+    assert!(!committed.receipt.resulting_crdt_heads.is_empty());
+
+    let backend = service.into_backend();
+    let mut restarted = LocalRootTreeServiceV2::open(config, backend)
+        .expect("CRDT service image restores without reinstalling");
+    let recovered = restarted
+        .invoke(request)
+        .expect("normalized CRDT workflow reattaches to the admitted work");
+    assert!(recovered.duplicate);
+    assert_eq!(recovered.refine_gas_used, 0);
+    assert_eq!(recovered.accumulate_gas_used, 0);
+    assert_eq!(recovered.input, committed.input);
+    assert_eq!(recovered.receipt, committed.receipt);
+    assert_eq!(recovered.published, committed.published);
+    assert_eq!(recovered.publication, committed.publication);
 }
 
 #[test]

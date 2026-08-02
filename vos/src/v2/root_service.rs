@@ -13,12 +13,13 @@ use alloc::vec::Vec;
 use super::{
     AccumulateRequestV2, AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2,
     AccumulationResultV2, ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2,
-    BlobRefV2, CommittedImageStoreV2, ConsistencyModeV2, DedupRecordV2, DurableJamStoreV2,
-    DurableStoreOpenErrorV2, ExternalActorBindingV2, ExternalActorDirectoryV2, JamServiceV2,
-    LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2, NoRefineProtocolHostV2,
-    PackageError, ProgramId, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
-    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire,
-    VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2, dedup_storage_key,
+    BlobRefV2, CommittedImageStoreV2, ConsistencyModeV2, CrdtChangeV2, DedupRecordV2,
+    DurableJamStoreV2, DurableStoreOpenErrorV2, ExternalActorBindingV2, ExternalActorDirectoryV2,
+    JamServiceV2, LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
+    NoRefineProtocolHostV2, PackageError, ProgramId, PublicationAckV2, PublicationRecordV2,
+    PublishedEffectsV2, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2,
+    StateKeyV2, V2Wire, VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key,
+    dedup_storage_key,
 };
 
 /// Complete immutable installation input for one locally hosted root tree.
@@ -240,9 +241,38 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
                     .map_err(|_| LocalRootTreeInvokeErrorV2::CorruptWorkflow)
             })?;
         if dedup.input != checkpoint.input
-            || dedup.work_hash != checkpoint.work_hash
             || dedup.receipt.service != self.identity
+            || dedup.receipt.consistency != header.consistency
         {
+            return Err(LocalRootTreeInvokeErrorV2::CorruptWorkflow);
+        }
+        // Linear workflow rows retain the admitted work and transition hashes
+        // directly. A CRDT workflow row is reconstructed from its normalized
+        // DAG checkpoint, so authenticate the bridge through the checkpoint's
+        // content-addressed change: that node retains the admitted work hash
+        // and its CID is committed as a resulting receipt head.
+        let checkpoint_is_bound = if header.consistency == ConsistencyModeV2::Crdt {
+            let change = self
+                .service
+                .accumulate_host()
+                .row(&crdt_node_storage_key(checkpoint.transition_hash))
+                .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)
+                .and_then(|bytes| {
+                    CrdtChangeV2::decode(bytes)
+                        .map_err(|_| LocalRootTreeInvokeErrorV2::CorruptWorkflow)
+                })?;
+            change.cid() == checkpoint.transition_hash
+                && change.work_hash == dedup.work_hash
+                && dedup
+                    .receipt
+                    .resulting_crdt_heads
+                    .binary_search(&checkpoint.transition_hash)
+                    .is_ok()
+        } else {
+            checkpoint.work_hash == dedup.work_hash
+                && checkpoint.transition_hash == dedup.transition_commitment
+        };
+        if !checkpoint_is_bound {
             return Err(LocalRootTreeInvokeErrorV2::CorruptWorkflow);
         }
         let publication = self
