@@ -13,7 +13,7 @@ readme.workspace = true
 
 [features]
 default = ["std", "http", "storage", "network"]
-std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading", "dep:object", "dep:async-io", "dep:async-executor", "dep:futures-lite", "dep:futures-channel", "dep:futures-rustls", "dep:rustls-pemfile", "dep:getrandom", "dep:libp2p-identity"]
+std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading", "dep:object", "dep:async-io", "dep:async-executor", "dep:futures-lite", "dep:futures-channel", "dep:futures-rustls", "dep:rustls-pemfile", "dep:getrandom"]
 macros = ["dep:vos-macros"]
 pvm = []
 service = ["pvm"]
@@ -62,7 +62,6 @@ tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 libloading = { version = "0.8", optional = true }
-libp2p-identity = { version = "0.2", default-features = false, features = ["ed25519"], optional = true }
 # Host-side ELF symbol reader — locates a provable actor's `__VOS_WITNESS`
 # buffer address (`vos::zk::witness_addr`) so a caller can hand the host
 # prover the witness-injection offset. std-only.

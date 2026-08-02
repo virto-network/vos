@@ -28,14 +28,14 @@ use vos::v2::{
     ImportedProgramV2, InboxDrainOutcomeV2, InvocationId, JamServiceV2, LocalJamStoreHostV2,
     LocalJamStoreV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2,
     LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
-    MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin, PackageError,
-    PackageManifestV2, PackageRolePoliciesV2, ProducerId, ProgramId, ProofArtifactStoreV2,
-    PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2,
-    ReplicatedJamServiceV2, ReplicatedServiceErrorV2, ReplyRecordV2, RoleCredentialV2,
-    RoleCredentialVerificationRequestV2, RootServiceId, ScheduleErrorV2, ServiceDispatchError,
-    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId,
-    SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2, WorkflowOperationV2,
-    artifact_hash, public_policy_hash, space_role_policy_hash,
+    MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin, PackageManifestV2,
+    PackageRolePoliciesV2, ProducerId, ProgramId, ProofArtifactStoreV2, PublishedEffectsV2,
+    ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2,
+    ReplicatedServiceErrorV2, ReplyRecordV2, RoleCredentialV2, RoleCredentialVerificationRequestV2,
+    RootServiceId, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2,
+    ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId, SystemCapabilityId, TransitionV2,
+    V2Wire, VosPackageV2, WorkEnvelopeV2, WorkflowOperationV2, artifact_hash, public_policy_hash,
+    space_role_policy_hash,
 };
 use vos::{
     Decode, Encode,
@@ -664,9 +664,7 @@ fn signed_test_package(
     package.deployment_signature.signature = signer
         .sign(&package.signing_message())
         .expect("sign canonical deployment");
-    package
-        .verify_deployment_signature()
-        .expect("package signature is authentic");
+    package.validate().expect("package structure is canonical");
     (package, metadata.actor_name)
 }
 
@@ -712,9 +710,7 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
     forged_config.package.deployment_signature.signature[0] ^= 0x80;
     assert_eq!(
         forged_config.validate(),
-        Err(LocalRootTreeConfigErrorV2::InvalidPackage(
-            PackageError::InvalidSignature
-        )),
+        Err(LocalRootTreeConfigErrorV2::InvalidPackageSignature),
         "installation authority must be cryptographically authenticated"
     );
 

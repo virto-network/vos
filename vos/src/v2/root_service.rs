@@ -95,6 +95,8 @@ pub struct LocalRootTreeConfigV2 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalRootTreeConfigErrorV2 {
     InvalidPackage(PackageError),
+    InvalidPackageSignature,
+    PackageSignatureVerifierUnavailable,
     InvalidActorProgramLayout,
     InvalidGenesis,
     WrongDeployment,
@@ -169,13 +171,38 @@ pub struct LocalRootTreeServiceV2<B> {
     root_actor: ActorId,
 }
 
+fn verify_package_signature(package: &VosPackageV2) -> Result<(), LocalRootTreeConfigErrorV2> {
+    #[cfg(feature = "network")]
+    {
+        let public_key = libp2p::identity::PublicKey::try_decode_protobuf(
+            &package.deployment_signature.public_key,
+        )
+        .map_err(|_| LocalRootTreeConfigErrorV2::InvalidPackageSignature)?;
+        if !public_key.verify(
+            &package.signing_message(),
+            &package.deployment_signature.signature,
+        ) {
+            return Err(LocalRootTreeConfigErrorV2::InvalidPackageSignature);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "network"))]
+    {
+        // Signature verification must never degrade into the structural
+        // package check when the native verifier is unavailable.
+        let _ = package;
+        Err(LocalRootTreeConfigErrorV2::PackageSignatureVerifierUnavailable)
+    }
+}
+
 impl LocalRootTreeConfigV2 {
     fn installation(
         &self,
     ) -> Result<(ActorGenesisV2, ServiceGenesisV2), LocalRootTreeConfigErrorV2> {
         self.package
-            .verify_deployment_signature()
+            .validate()
             .map_err(LocalRootTreeConfigErrorV2::InvalidPackage)?;
+        verify_package_signature(&self.package)?;
         super::validate_actor_program_layout(&self.package.actor_pvm)
             .map_err(|_| LocalRootTreeConfigErrorV2::InvalidActorProgramLayout)?;
         if self.root_actor == ActorId::ZERO {

@@ -97,6 +97,10 @@ publication table until their exact commitment is acknowledged through
 physical Accumulate. This direct host rejects `Raft` consistency rather than
 claiming replication without a replicated driver, and rejects attested work
 until a proof producer is explicitly connected by a later host surface.
+The native signature check reuses the network host's pinned identity
+implementation; a `std` build without that verifier fails closed with
+`PackageSignatureVerifierUnavailable` rather than accepting a structural-only
+package check.
 
 `VosNode::register_v2_root_at_id` attaches that boundary without extracting
 the actor PVM into the legacy runtime. Its strict `RootTreeInvocationV2` keeps
