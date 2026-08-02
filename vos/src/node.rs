@@ -56,6 +56,22 @@ pub struct AgentResult {
     pub error: Option<String>,
 }
 
+/// Registration failures for one guest-owned v2 root service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V2NodeRegistrationError {
+    ServiceRouteOccupied(ServiceId),
+    ActorAlreadyRegistered(crate::v2::ActorId),
+    CorruptServiceStore,
+}
+
+impl std::fmt::Display for V2NodeRegistrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cannot register VOS v2 root service: {self:?}")
+    }
+}
+
+impl std::error::Error for V2NodeRegistrationError {}
+
 impl AgentResult {
     /// Did the agent finish cleanly (no PVM panics, no host errors)?
     pub fn is_ok(&self) -> bool {
@@ -733,14 +749,10 @@ impl ReplyChannel {
     /// Deliver `reply` to the waiting caller. Single-use for `Async` (a
     /// `oneshot` consumes its sender). A closed/canceled receiver — the caller
     /// already timed out or gave up — is ignored, never panics.
-    fn send(self, reply: Vec<u8>) {
+    fn send(self, reply: Vec<u8>) -> bool {
         match self {
-            ReplyChannel::Sync(tx) => {
-                let _ = tx.send(reply);
-            }
-            ReplyChannel::Async(tx) => {
-                let _ = tx.send(reply);
-            }
+            ReplyChannel::Sync(tx) => tx.send(reply).is_ok(),
+            ReplyChannel::Async(tx) => tx.send(reply).is_ok(),
         }
     }
 }
@@ -771,7 +783,7 @@ const MAX_PRODUCER_REPLY: usize = 8 * 1024 * 1024;
 /// cap; otherwise log and drop the channel so the caller gets a
 /// disconnect-shaped failure. Pulled out to share between
 /// `handle_invoke_request` and `extension_thread`.
-fn send_reply_capped(reply: ReplyChannel, bytes: Vec<u8>, svc_id: ServiceId) {
+fn send_reply_capped(reply: ReplyChannel, bytes: Vec<u8>, svc_id: ServiceId) -> bool {
     if bytes.len() > MAX_PRODUCER_REPLY {
         warn!(
             %svc_id,
@@ -780,8 +792,9 @@ fn send_reply_capped(reply: ReplyChannel, bytes: Vec<u8>, svc_id: ServiceId) {
             "reply exceeds producer-side cap; dropping channel",
         );
         drop(reply); // disconnect (Sync) / cancel (Async) → caller sees failure
+        false
     } else {
-        reply.send(bytes);
+        reply.send(bytes)
     }
 }
 
@@ -830,6 +843,15 @@ pub struct VosNode {
     /// at thread spawn time) freezes A's view of the world before
     /// B exists, breaking cross-agent invoke order-independent.
     invoke_routes: InvokeRoutes,
+    /// Canonical v2 actor identity to local host route. Unlike `ServiceId`,
+    /// this identity is preserved end-to-end in WorkEnvelopeV2 and never
+    /// truncated into the legacy 32-bit namespace.
+    v2_actor_routes: Arc<RwLock<HashMap<crate::v2::ActorId, u32>>>,
+    /// Per-process entropy and monotone ordinal for host-originated v2 work.
+    /// The seed prevents fallback invocation identities repeating after a
+    /// process restart.
+    v2_invocation_seed: [u8; 32],
+    v2_invocation_ordinal: AtomicU64,
     /// Reverse map `local_id → instance name`, populated at register
     /// time and read live by the auth path (the libp2p gate's
     /// actor-local probe and extension relays). Shared (cheap clone)
@@ -2433,6 +2455,9 @@ impl VosNode {
     /// Create a node with a specific network prefix.
     pub fn with_prefix(node_prefix: u16) -> Self {
         let (outbox_tx, outbox_rx) = mpsc::channel();
+        let mut v2_invocation_seed = [0_u8; 32];
+        getrandom::getrandom(&mut v2_invocation_seed)
+            .expect("OS entropy for v2 host invocation identities");
         Self {
             node_prefix,
             next_local: AtomicU16::new(1), // 0 is reserved for registry
@@ -2441,6 +2466,9 @@ impl VosNode {
             outbox_tx,
             outbox_rx,
             invoke_routes: Arc::new(Mutex::new(HashMap::new())),
+            v2_actor_routes: Arc::new(RwLock::new(HashMap::new())),
+            v2_invocation_seed,
+            v2_invocation_ordinal: AtomicU64::new(1),
             agent_names: Arc::new(std::sync::RwLock::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             agent_shutdown: Arc::new(Mutex::new(HashMap::new())),
@@ -2727,6 +2755,70 @@ impl VosNode {
     /// Caller is responsible for not double-registering.
     pub fn register_at_id(&mut self, config: AgentConfig, id: ServiceId) -> ServiceId {
         self.register_inner(config, id)
+    }
+
+    /// Attach one already-opened guest-owned v2 root tree to a local host
+    /// route. Direct public calls execute through the canonical service PVM;
+    /// this thread never applies actor writes or effects natively.
+    pub fn register_v2_root_at_id<B>(
+        &mut self,
+        name: impl Into<String>,
+        service: crate::v2::LocalRootTreeServiceV2<B>,
+        id: ServiceId,
+        network_reachable: bool,
+    ) -> Result<ServiceId, V2NodeRegistrationError>
+    where
+        B: crate::v2::CommittedImageStoreV2 + Send + 'static,
+    {
+        if self.routes.contains_key(&id.0)
+            || self.agent_info.read().unwrap().contains_key(&id.0)
+            || self.invoke_routes.lock().unwrap().contains_key(&id.0)
+        {
+            return Err(V2NodeRegistrationError::ServiceRouteOccupied(id));
+        }
+        let actor = service.root_actor();
+        let consistency = service
+            .store()
+            .header()
+            .map_err(|_| V2NodeRegistrationError::CorruptServiceStore)?
+            .ok_or(V2NodeRegistrationError::CorruptServiceStore)?
+            .consistency;
+        let consistency = match consistency {
+            crate::v2::ConsistencyModeV2::Ephemeral => Consistency::Ephemeral,
+            crate::v2::ConsistencyModeV2::Local => Consistency::Local,
+            crate::v2::ConsistencyModeV2::Raft => Consistency::Raft,
+            crate::v2::ConsistencyModeV2::Crdt => Consistency::Crdt,
+        };
+        {
+            let mut actors = self.v2_actor_routes.write().unwrap();
+            if actors.contains_key(&actor) {
+                return Err(V2NodeRegistrationError::ActorAlreadyRegistered(actor));
+            }
+            actors.insert(actor, id.0);
+        }
+        let name = name.into();
+        let (invoke_tx, invoke_rx) = mpsc::channel();
+        self.invoke_routes.lock().unwrap().insert(id.0, invoke_tx);
+        self.record_agent_name(id, Some(name.clone()));
+        self.agent_info.write().unwrap().insert(
+            id.0,
+            AgentInfo {
+                name: Some(name),
+                kind: crate::extension::ExtensionKind::Actor as u8,
+                serves_addr: None,
+                consistency: Some(consistency),
+                network_reachable,
+            },
+        );
+        let shutdown = self.register_agent_shutdown(id);
+        let activity = self.last_activity.clone();
+        let actor_routes = self.v2_actor_routes.clone();
+        self.agents.push(AgentHandle {
+            join: Some(thread::spawn(move || {
+                v2_root_service_thread(id, service, invoke_rx, actor_routes, shutdown, activity)
+            })),
+        });
+        Ok(id)
     }
 
     /// Register an agent and return its service ID.
@@ -3391,6 +3483,64 @@ impl VosNode {
         self.invoke_with_timeout(target, msg, Duration::from_secs(10))
     }
 
+    /// Invoke one canonical v2 actor through its registered root service.
+    /// The node allocates a boot-unique invocation identity and preserves the
+    /// full ActorId until guest Refine and Accumulate have both accepted it.
+    pub fn invoke_actor(
+        &self,
+        target: crate::v2::ActorId,
+        arguments: Vec<u8>,
+    ) -> Result<Vec<u8>, crate::actors::client::ClientError> {
+        use crate::Decode;
+
+        if arguments.first() != Some(&crate::value::TAG_DYNAMIC) {
+            return Err(crate::actors::client::ClientError::Decode);
+        }
+        let message = <crate::value::Msg as Decode>::try_decode(&arguments[1..])
+            .ok_or(crate::actors::client::ClientError::Decode)?;
+        let route = self
+            .v2_actor_routes
+            .read()
+            .map_err(|_| crate::actors::client::ClientError::Unreachable)?
+            .get(&target)
+            .copied()
+            .ok_or(crate::actors::client::ClientError::NotFound)?;
+        let tx = self
+            .invoke_routes
+            .lock()
+            .map_err(|_| crate::actors::client::ClientError::Unreachable)?
+            .get(&route)
+            .cloned()
+            .ok_or(crate::actors::client::ClientError::Unreachable)?;
+        let ordinal = self.v2_invocation_ordinal.fetch_add(1, Ordering::Relaxed);
+        let mut nonce = Vec::with_capacity(72);
+        nonce.extend_from_slice(&self.v2_invocation_seed);
+        nonce.extend_from_slice(&ordinal.to_le_bytes());
+        nonce.extend_from_slice(&target.0);
+        let ingress = crate::v2::RootTreeInvocationV2 {
+            invocation: crate::v2::InvocationId::derive(b"vos/node-root-invocation/v2", &nonce),
+            logical_timeslot: ordinal,
+            target,
+            method: message.name,
+            arguments,
+            proof_requested: false,
+        };
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(InvokeRequest {
+            caller: crate::actors::Caller::System,
+            space_role: None,
+            actor_local_role: None,
+            msg: crate::v2::V2Wire::encode(&ingress),
+            reply: ReplyChannel::Sync(reply_tx),
+            chain: Vec::new(),
+        })
+        .map_err(|_| crate::actors::client::ClientError::Unreachable)?;
+        let envelope = reply_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| crate::actors::client::ClientError::Unreachable)?;
+        decode_host_invoke_envelope(&envelope)
+    }
+
     /// Like [`invoke`](Self::invoke) but with an explicit timeout.
     ///
     /// Lookup order:
@@ -3570,6 +3720,163 @@ impl VosNode {
 impl Default for VosNode {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn v2_root_origin(
+    caller: &crate::actors::Caller,
+    actor_routes: &RwLock<HashMap<crate::v2::ActorId, u32>>,
+) -> Option<crate::v2::Origin> {
+    match caller {
+        crate::actors::Caller::Unauthenticated => Some(crate::v2::Origin::Anonymous),
+        crate::actors::Caller::System => Some(crate::v2::Origin::System),
+        crate::actors::Caller::Peer(peer) => Some(crate::v2::Origin::Member(crate::v2::SubjectId(
+            crate::crypto::blake2b::blake2b_hash::<32>(b"vos/member-subject/v2", &[peer]),
+        ))),
+        crate::actors::Caller::Actor(route) => actor_routes
+            .read()
+            .ok()?
+            .iter()
+            .find_map(|(actor, candidate)| (*candidate == route.0).then_some(*actor))
+            .map(crate::v2::Origin::Actor),
+    }
+}
+
+fn send_v2_status(reply: ReplyChannel, status: u8, id: ServiceId) {
+    let _ = send_reply_capped(reply, encode_invoke_envelope(status, &[], &[]), id);
+}
+
+fn v2_root_service_thread<B>(
+    id: ServiceId,
+    mut service: crate::v2::LocalRootTreeServiceV2<B>,
+    invoke_rx: mpsc::Receiver<InvokeRequest>,
+    actor_routes: Arc<RwLock<HashMap<crate::v2::ActorId, u32>>>,
+    shutdown: Arc<AtomicBool>,
+    activity: ActivityClock,
+) -> AgentResult
+where
+    B: crate::v2::CommittedImageStoreV2 + Send + 'static,
+{
+    use crate::{Decode, v2::V2Wire};
+
+    let mut error = None;
+    while !shutdown.load(Ordering::Relaxed) {
+        let req = match invoke_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(request) => request,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        *activity.lock().unwrap() = Instant::now();
+        let ingress = match crate::v2::RootTreeInvocationV2::decode(&req.msg) {
+            Ok(ingress) => ingress,
+            Err(_) => {
+                send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
+                continue;
+            }
+        };
+        if ingress.target != service.root_actor()
+            || ingress.arguments.first() != Some(&crate::value::TAG_DYNAMIC)
+        {
+            send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
+            continue;
+        }
+        let Some(message) = <crate::value::Msg as Decode>::try_decode(&ingress.arguments[1..])
+        else {
+            send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
+            continue;
+        };
+        if message.name != ingress.method {
+            send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
+            continue;
+        }
+        let policy = match service.root_method_policy(&ingress.method) {
+            Ok(Some(policy)) => policy,
+            Ok(None) => {
+                send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
+                continue;
+            }
+            Err(failure) => {
+                error!(%id, ?failure, "v2 root policy lookup failed");
+                send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                continue;
+            }
+        };
+        // This cutover admits only ordinary public methods. Role credentials
+        // and proof production must use their exact authority/attestation
+        // paths, never a synthetic System shortcut from the legacy runtime.
+        if !policy.public || policy.attested || ingress.proof_requested {
+            send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+            continue;
+        }
+        let Some(origin) = v2_root_origin(&req.caller, &actor_routes) else {
+            send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+            continue;
+        };
+        let result = service.invoke(crate::v2::LocalWorkRequestV2 {
+            invocation: ingress.invocation,
+            workflow_step: 0,
+            logical_timeslot: ingress.logical_timeslot,
+            target: ingress.target,
+            method: ingress.method,
+            arguments: ingress.arguments,
+            origin,
+            authorization: crate::v2::AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: Vec::new(),
+            proof_requested: false,
+        });
+        let committed = match result {
+            Ok(committed) => committed,
+            Err(crate::v2::LocalRootTreeInvokeErrorV2::Rejected(
+                crate::v2::AccumulationRejectionV2::Unauthorized,
+            )) => {
+                send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                continue;
+            }
+            Err(failure) => {
+                error!(%id, ?failure, "v2 root invocation failed");
+                send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                continue;
+            }
+        };
+        let Some(reply_record) = committed.published.reply.as_ref() else {
+            // A suspended cross-root workflow has committed its outbox and
+            // remains recoverable. The transport batch owns resume wiring;
+            // do not acknowledge or fabricate a reply here.
+            drop(req.reply);
+            continue;
+        };
+        let delivered = send_reply_capped(
+            req.reply,
+            encode_invoke_envelope(crate::STATUS_DONE, &[], &reply_record.result),
+            id,
+        );
+        let only_direct_reply = committed.published.outbox.is_empty()
+            && committed.published.exported_blobs.is_empty()
+            && committed.published.proof.is_none()
+            && committed.published.attestation.is_none();
+        if delivered && only_direct_reply {
+            if let Some(publication) = committed.publication.as_ref()
+                && let Err(failure) = service.acknowledge_publication(publication)
+            {
+                error!(%id, ?failure, "v2 root reply delivered but publication acknowledgement failed");
+                error = Some(format!("v2 publication acknowledgement failed: {failure}"));
+                break;
+            }
+        }
+    }
+    actor_routes
+        .write()
+        .unwrap()
+        .retain(|_, route| *route != id.0);
+    AgentResult {
+        id,
+        panics: 0,
+        error,
     }
 }
 
@@ -4579,6 +4886,41 @@ fn unwrap_invoke_envelope(envelope: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(envelope[reply_start..].to_vec())
+}
+
+fn decode_host_invoke_envelope(
+    envelope: &[u8],
+) -> Result<Vec<u8>, crate::actors::client::ClientError> {
+    use crate::actors::client::{CallError, ClientError};
+    use crate::actors::run::{
+        STATUS_DONE, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OOG, STATUS_PANICKED,
+        STATUS_YIELDED,
+    };
+    let Some(status) = envelope.first().copied() else {
+        return Err(ClientError::Unreachable);
+    };
+    match status {
+        STATUS_DONE | STATUS_YIELDED => {
+            if envelope.len() < 5 {
+                return Err(ClientError::Unreachable);
+            }
+            let state_len = u32::from_le_bytes(
+                envelope[1..5]
+                    .try_into()
+                    .map_err(|_| ClientError::Unreachable)?,
+            ) as usize;
+            let reply_start = 5_usize
+                .checked_add(state_len)
+                .filter(|offset| *offset <= envelope.len())
+                .ok_or(ClientError::Unreachable)?;
+            Ok(envelope[reply_start..].to_vec())
+        }
+        STATUS_FORBIDDEN => Err(ClientError::Forbidden),
+        STATUS_NOT_FOUND => Err(ClientError::NotFound),
+        STATUS_PANICKED => Err(ClientError::Call(CallError::Panicked)),
+        STATUS_OOG => Err(ClientError::Call(CallError::OutOfGas)),
+        other => Err(ClientError::Call(CallError::Unknown(other))),
+    }
 }
 
 /// Decode a cross-thread invoke envelope back into the
@@ -7890,7 +8232,11 @@ mod tests {
     #[test]
     fn send_reply_capped_passes_normal_payload() {
         let (tx, rx) = mpsc::channel();
-        send_reply_capped(ReplyChannel::Sync(tx), vec![0u8; 100], ServiceId(1));
+        assert!(send_reply_capped(
+            ReplyChannel::Sync(tx),
+            vec![0u8; 100],
+            ServiceId(1)
+        ));
         let received = rx.recv().expect("received");
         assert_eq!(received.len(), 100);
     }
@@ -7899,11 +8245,11 @@ mod tests {
     fn send_reply_capped_drops_oversized_payload() {
         let (tx, rx) = mpsc::channel();
         // One byte over the cap.
-        send_reply_capped(
+        assert!(!send_reply_capped(
             ReplyChannel::Sync(tx),
             vec![0u8; MAX_PRODUCER_REPLY + 1],
             ServiceId(1),
-        );
+        ));
         // Sender dropped without sending → recv yields Err(Disconnected).
         // External_invoke maps that to None, surfacing as
         // InvokeError::NotFound at the caller's PVM.
@@ -7911,6 +8257,35 @@ mod tests {
             rx.recv().is_err(),
             "tx should have been dropped without a send"
         );
+    }
+
+    #[test]
+    fn send_reply_reports_a_cancelled_consumer() {
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        assert!(!send_reply_capped(
+            ReplyChannel::Sync(tx),
+            vec![1, 2, 3],
+            ServiceId(1)
+        ));
+    }
+
+    #[test]
+    fn v2_host_envelopes_preserve_typed_failures() {
+        use crate::actors::client::{CallError, ClientError};
+
+        assert!(matches!(
+            decode_host_invoke_envelope(&encode_invoke_envelope(crate::STATUS_FORBIDDEN, &[], &[])),
+            Err(ClientError::Forbidden)
+        ));
+        assert!(matches!(
+            decode_host_invoke_envelope(&encode_invoke_envelope(crate::STATUS_NOT_FOUND, &[], &[])),
+            Err(ClientError::NotFound)
+        ));
+        assert!(matches!(
+            decode_host_invoke_envelope(&encode_invoke_envelope(crate::STATUS_PANICKED, &[], &[])),
+            Err(ClientError::Call(CallError::Panicked))
+        ));
     }
 
     #[test]

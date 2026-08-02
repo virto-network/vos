@@ -5,6 +5,7 @@
 //!
 //! Missing guests are hard failures: these tests are a consensus-path gate,
 //! not optional smoke tests.
+#![allow(unexpected_cfgs)]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -14,6 +15,7 @@ use vos::attestation::{
     ProducedAttestationProofV2,
 };
 use vos::network::RaftRpcHandler;
+use vos::node::{V2NodeRegistrationError, VosNode};
 use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, WorkerConfig};
 use vos::v2::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
@@ -37,8 +39,26 @@ use vos::v2::{
 };
 use vos::{
     Decode, Encode,
+    actors::{client::ClientError, context::ServiceId},
     value::{Msg, Value},
 };
+
+mod host_greeter_surface {
+    use vos::prelude::*;
+
+    #[actor]
+    pub struct Greeter;
+
+    #[messages]
+    impl Greeter {
+        fn new() -> Self {
+            Self
+        }
+
+        #[msg]
+        async fn start(&self, _ctx: &mut Context<Self>) {}
+    }
+}
 
 fn role_policies(mut methods: Vec<MethodPolicyV2>) -> Vec<u8> {
     methods.sort_by(|left, right| left.method.cmp(&right.method));
@@ -51,6 +71,22 @@ struct FailableCommittedImages {
     proofs: BTreeMap<[u8; 32], Vec<u8>>,
     fail_next_commit: bool,
     fail_next_proof_commit: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SharedCommittedImages(Arc<Mutex<Option<Vec<u8>>>>);
+
+impl CommittedImageStoreV2 for SharedCommittedImages {
+    type Error = ();
+
+    fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+
+    fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+        *self.0.lock().unwrap() = Some(image.to_vec());
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -781,6 +817,104 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         .expect("acknowledged image restores through the same service identity");
     assert!(restarted.pending_publications().unwrap().is_empty());
     assert_eq!(restarted.store().header().unwrap().unwrap().revision, 1);
+}
+
+#[test]
+fn node_routes_canonical_actor_ids_through_the_guest_owned_root_service() {
+    let actor_elf = greeter_elf();
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&actor_elf, &signer);
+    let actor = ActorId([103; 32]);
+    let config = LocalRootTreeConfigV2 {
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        service: ServiceIdentityV2 {
+            space: vos::v2::SpaceId([104; 32]),
+            root_service: RootServiceId([105; 32]),
+            deployment: package.deployment_id(),
+            service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+            service_abi: vos::v2::ABI_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        },
+        package,
+        root_actor: actor,
+        actor_name,
+        consistency: ConsistencyModeV2::Local,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([106; 32]),
+            authenticator: vec![107],
+        },
+        refine_gas: 1_000_000_000,
+        accumulate_gas: 5_000_000_000,
+    };
+    let backend = SharedCommittedImages::default();
+    let service = LocalRootTreeServiceV2::open(config.clone(), backend.clone())
+        .expect("signed root installs before node registration");
+    assert_eq!(
+        service
+            .root_method_policy("start")
+            .unwrap()
+            .map(|policy| (policy.public, policy.attested)),
+        Some((true, false))
+    );
+
+    let route = ServiceId::new(0, 0x3300);
+    let mut node = VosNode::new();
+    node.register_v2_root_at_id("greeter-v2", service, route, false)
+        .expect("canonical root route registers");
+
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("start").encode());
+    use vos::ActorReference;
+    let mut invoker = &node;
+    let mut handle = host_greeter_surface::GreeterRef::bind(actor, &mut invoker);
+    vos::block_on(handle.start())
+        .expect("bound ActorId handle crosses physical Refine and Accumulate");
+    assert!(matches!(
+        node.invoke_actor(ActorId([108; 32]), arguments.clone()),
+        Err(ClientError::NotFound)
+    ));
+
+    let malformed = vos::v2::RootTreeInvocationV2 {
+        invocation: InvocationId([109; 32]),
+        logical_timeslot: 2,
+        target: actor,
+        method: "other".into(),
+        arguments,
+        proof_requested: false,
+    };
+    assert!(
+        node.invoke(route, malformed.encode()).is_none(),
+        "the route rejects a method that does not match the canonical actor message"
+    );
+
+    let mut duplicate_config = config.clone();
+    duplicate_config.service.root_service = RootServiceId([110; 32]);
+    let duplicate =
+        LocalRootTreeServiceV2::open(duplicate_config, SharedCommittedImages::default())
+            .expect("independent service installs before duplicate-identity check");
+    assert!(matches!(
+        node.register_v2_root_at_id(
+            "duplicate-greeter-v2",
+            duplicate,
+            ServiceId::new(0, 0x3301),
+            false,
+        ),
+        Err(V2NodeRegistrationError::ActorAlreadyRegistered(found)) if found == actor
+    ));
+
+    let results = node.collect();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_ok());
+
+    let reopened = LocalRootTreeServiceV2::open(config, backend)
+        .expect("node-owned service state reopens from committed bytes");
+    assert_eq!(reopened.store().header().unwrap().unwrap().revision, 1);
+    assert!(
+        reopened.pending_publications().unwrap().is_empty(),
+        "the direct reply is acknowledged only after its channel accepts it"
+    );
 }
 
 #[test]

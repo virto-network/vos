@@ -4,9 +4,11 @@
 > canonical `vos-service.pvm` Refine/Accumulate entries, package tooling, actor
 > APIs, and CRDT primitives described here are present. The local v2 harness
 > executes both phases through that PVM and commits only an accepted guest
-> result; it has no native transition-apply shortcut. The production node still
-> runs the legacy runtime while durable v2 scheduling and backend integration
-> are completed. Legacy node behavior is not evidence of v2 conformance.
+> result; it has no native transition-apply shortcut. `VosNode` can now attach
+> an explicitly opened local v2 root and route ordinary public bound-handle
+> calls through it, but the production `vosx` installer still selects the
+> legacy runtime while authority, attestation, and durable effect routing are
+> connected. Legacy node behavior is not evidence of v2 conformance.
 
 The local conformance scheduler can admit one guest-committed durable inbox
 row, derive the callee invocation, origin, authorization and causal parent from
@@ -95,6 +97,19 @@ publication table until their exact commitment is acknowledged through
 physical Accumulate. This direct host rejects `Raft` consistency rather than
 claiming replication without a replicated driver, and rejects attested work
 until a proof producer is explicitly connected by a later host surface.
+
+`VosNode::register_v2_root_at_id` attaches that boundary without extracting
+the actor PVM into the legacy runtime. Its strict `RootTreeInvocationV2` keeps
+the full `ActorId`, `InvocationId`, method, arguments, proof mode, and logical
+timeslot intact until the service builds work from guest-owned state. The
+default host bound handle resolves `ActorId` directly rather than truncating it
+to a `ServiceId`. This first node cutover admits only ordinary methods whose
+signed installed policy is public and non-attested; protected or attested
+methods fail closed instead of inheriting the legacy trusted-System role
+bypass. A direct reply is acknowledged only after its waiting channel accepts
+the bytes. Outbox, proof, attestation, and suspended-workflow publications stay
+durable for the transport/authority integration batches. The host-generated
+logical timeslot is still a local admission ordinal, not a consensus JAM slot.
 
 The local transport accepts either the in-memory host or this durable host
 without changing scheduling or service semantics. Its physical cross-root
@@ -525,15 +540,17 @@ and signatures but includes the authoritative manifest and PVM bytes.
 Registries store these bytes and never retranspile an ELF. JIT products,
 proving keys and traces are caches keyed by `ProgramId`.
 
-The legacy `VosNode` actor loader deliberately refuses `.vos` v2 packages. It
+The legacy `AgentConfig` actor loader deliberately refuses `.vos` v2 packages. It
 cannot extract and run the actor PVM directly without violating the root-tree
 service boundary. Catalog rows containing those packages remain installed but
 are skipped by both boot and runtime reconciliation, so an unsupported v2 row
 cannot prevent the rest of a space from starting. The package classification
 also precedes every legacy Raft seed, probe, or join action, so a skipped row
 cannot change quorum membership. Production daemon installation remains
-disabled until that loader drives the pinned `vos-service.pvm`; this explicit
-refusal replaces silent execution through `RefinePayload`/`EffectLog`.
+disabled until that loader opens and registers the complete package through
+the pinned `vos-service.pvm`; the explicit local root-service API does not make
+catalog installation implicit. This refusal replaces silent execution through
+`RefinePayload`/`EffectLog`.
 
 The service identity retains the root package `DeploymentId` selected when
 the root tree is installed; it is the stable service/routing identity. Every
