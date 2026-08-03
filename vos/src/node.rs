@@ -2775,7 +2775,10 @@ impl VosNode {
         network_reachable: bool,
     ) -> Result<ServiceId, V2NodeRegistrationError>
     where
-        B: crate::v2::CommittedImageStoreV2 + Send + 'static,
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+            + Send
+            + 'static,
     {
         if self.routes.contains_key(&id.0)
             || self.agent_info.read().unwrap().contains_key(&id.0)
@@ -2793,8 +2796,7 @@ impl VosNode {
             &self.v2_logical_timeslot,
             header.admission_timeslot_high_water,
         )?;
-        let consistency = header.consistency;
-        let consistency = match consistency {
+        let consistency = match service.consistency() {
             crate::v2::ConsistencyModeV2::Ephemeral => Consistency::Ephemeral,
             crate::v2::ConsistencyModeV2::Local => Consistency::Local,
             crate::v2::ConsistencyModeV2::Raft => Consistency::Raft,
@@ -3815,11 +3817,19 @@ fn v2_root_service_thread<B>(
     activity: ActivityClock,
 ) -> AgentResult
 where
-    B: crate::v2::CommittedImageStoreV2 + Send + 'static,
+    B: crate::v2::CommittedImageStoreV2
+        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+        + Send
+        + 'static,
 {
     use crate::{Decode, v2::V2Wire};
 
     let mut error = None;
+    match service.catch_up() {
+        Ok(true) => {}
+        Ok(false) => info!(%id, "v2 Raft root is waiting for committed service genesis"),
+        Err(failure) => warn!(%id, ?failure, "v2 root-tree startup catch-up failed"),
+    }
     while !shutdown.load(Ordering::Relaxed) {
         let req = match invoke_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(request) => request,
@@ -3827,6 +3837,18 @@ where
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         *activity.lock().unwrap() = Instant::now();
+        match service.catch_up() {
+            Ok(true) => {}
+            Ok(false) => {
+                send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                continue;
+            }
+            Err(failure) => {
+                error!(%id, ?failure, "v2 root-tree catch-up failed");
+                send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                continue;
+            }
+        }
         let ingress = match crate::v2::RootTreeInvocationV2::decode(&req.msg) {
             Ok(ingress) => ingress,
             Err(_) => {

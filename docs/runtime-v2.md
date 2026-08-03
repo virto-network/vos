@@ -92,11 +92,16 @@ physical Accumulate. Before scheduling, a repeated direct invocation is
 matched against its guest-owned workflow checkpoint and input-deduplication
 record. An exact retry reattaches the committed receipt and any pending
 publication without executing the actor; divergent reuse of the invocation is
-rejected. Replies and outbox effects remain in the durable
-publication table until their exact commitment is acknowledged through
-physical Accumulate. This direct host rejects `Raft` consistency rather than
-claiming replication without a replicated driver, and rejects attested work
-until a proof producer is explicitly connected by a later host surface.
+rejected. Replies and outbox effects remain in the durable publication table
+until their exact commitment is acknowledged through physical Accumulate.
+The direct constructor rejects `Raft` consistency rather than claiming
+replication without a driver. `open_raft` composes the same owner with
+`ReplicatedJamServiceV2`: genesis, actor Apply, and publication
+acknowledgement enter the canonical Raft request log before IC-5 mutates the
+local service image. Followers catch up those exact requests and installed
+service snapshots; they never apply native actor commands. Attested work
+remains rejected until a proof producer is explicitly connected by a later
+host surface.
 Every native `std` host verifies the deployment's frozen libp2p-Ed25519 wire
 through its existing native crypto provider. Bare single-node hosts therefore
 retain the same authority check without requiring network transport or adding
