@@ -14,6 +14,7 @@
 //! `vos::block_on(reg.X(&mut &node))` boilerplate.
 
 use std::str::FromStr;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use vos::abi::service::ServiceId;
@@ -58,6 +59,50 @@ pub struct DaemonClient {
     /// file.
     pub endpoint: endpoint::Endpoint,
     daemon_prefix: u16,
+    /// V2 actor identities and signed method policies learned while resolving
+    /// an installed package name. Routes that are not v2 remain on the legacy
+    /// dynamic wire unchanged.
+    v2_targets: Mutex<std::collections::HashMap<u32, V2Target>>,
+}
+
+#[derive(Clone)]
+struct V2Target {
+    actor: vos::v2::ActorId,
+    methods: std::collections::HashMap<String, vos::v2::MethodPolicyV2>,
+}
+
+fn encode_v2_invocation(
+    target: &V2Target,
+    invocation: vos::v2::InvocationId,
+    msg: &vos::value::Msg,
+    arguments: Vec<u8>,
+) -> anyhow::Result<Vec<u8>> {
+    use vos::v2::V2Wire;
+
+    let policy = target
+        .methods
+        .get(&msg.name)
+        .ok_or_else(|| anyhow::anyhow!("v2 package has no method named '{}'", msg.name))?;
+    if policy.attested {
+        anyhow::bail!(
+            "attested method '{}' requires the proof-producing transport path, which space call does not attach yet",
+            msg.name,
+        );
+    }
+    if !policy.public {
+        anyhow::bail!(
+            "role-gated method '{}' requires an explicit v2 credential, which space call does not accept yet",
+            msg.name,
+        );
+    }
+    Ok(vos::v2::RootTreeInvocationV2 {
+        invocation,
+        target: target.actor,
+        method: msg.name.clone(),
+        arguments,
+        proof_requested: false,
+    }
+    .encode())
 }
 
 impl DaemonClient {
@@ -154,6 +199,7 @@ impl DaemonClient {
             entry,
             daemon_prefix: ep.prefix,
             endpoint: ep,
+            v2_targets: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -236,7 +282,14 @@ impl DaemonClient {
         }
         if let Some(agent) = self.agent(target)? {
             debug_assert_eq!(agent.instance_name, target);
-            return Ok(instance_service_id(target, self.daemon_prefix));
+            let route = instance_service_id(target, self.daemon_prefix);
+            if let Some(v2_target) = self.v2_target_for_agent(&agent)? {
+                self.v2_targets
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("v2 target cache is unavailable"))?
+                    .insert(route.0, v2_target);
+            }
+            return Ok(route);
         }
         // Not an installed agent — try the extension fallback.
         // `meta_for_instance` returns non-empty bytes for any
@@ -298,6 +351,26 @@ impl DaemonClient {
         payload.push(vos::value::TAG_DYNAMIC);
         payload.extend_from_slice(&encoded);
 
+        let v2_target = self
+            .v2_targets
+            .lock()
+            .map_err(|_| anyhow::anyhow!("v2 target cache is unavailable"))?
+            .get(&target.0)
+            .cloned();
+        let payload = if let Some(v2_target) = v2_target {
+            let mut nonce = [0; 32];
+            getrandom::getrandom(&mut nonce)
+                .map_err(|error| anyhow::anyhow!("mint v2 invocation ID: {error}"))?;
+            encode_v2_invocation(
+                &v2_target,
+                vos::v2::InvocationId::derive(b"vosx/daemon-invocation/v2", &nonce),
+                msg,
+                payload,
+            )?
+        } else {
+            payload
+        };
+
         self.node
             .invoke_with_timeout(target, payload, timeout)
             .ok_or_else(|| {
@@ -305,6 +378,43 @@ impl DaemonClient {
                     "daemon at {target} didn't reply within {timeout:?} (target unreachable or timed out)",
                 )
             })
+    }
+
+    fn v2_target_for_agent(&self, agent: &AgentRow) -> anyhow::Result<Option<V2Target>> {
+        use vos::v2::V2Wire;
+
+        let hash = crate::blob_store::BlobHash(agent.program_hash);
+        let Some(exact_package) = crate::blob_store::cache_get(&hash)? else {
+            return Ok(None);
+        };
+        if exact_package.get(..4) != Some(b"VOSP") {
+            return Ok(None);
+        }
+        let package = vos::v2::VosPackageV2::decode(&exact_package)
+            .map_err(|error| anyhow::anyhow!("decode installed v2 package: {error}"))?;
+        package
+            .validate()
+            .map_err(|error| anyhow::anyhow!("validate installed v2 package: {error}"))?;
+        if package.encode() != exact_package {
+            anyhow::bail!("installed v2 package wire is not canonical");
+        }
+        let policies = vos::v2::PackageRolePoliciesV2::decode(&package.role_policies)
+            .map_err(|error| anyhow::anyhow!("decode installed v2 policies: {error}"))?;
+        let space = vos::v2::SpaceId(
+            self.entry
+                .id_bytes()
+                .ok_or_else(|| anyhow::anyhow!("space ID is not canonical hex"))?,
+        );
+        let service =
+            crate::commands::space::common::v2_root_service_id(space, &agent.instance_name);
+        Ok(Some(V2Target {
+            actor: crate::commands::space::common::v2_root_actor_id(service, &agent.instance_name),
+            methods: policies
+                .methods
+                .into_iter()
+                .map(|policy| (policy.method.clone(), policy))
+                .collect(),
+        }))
     }
 
     /// Tear down the libp2p peer. Always call before exiting
@@ -740,5 +850,68 @@ impl DaemonClient {
             after_agent = page.next_agent;
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vos::v2::V2Wire;
+
+    fn target(method: &str, public: bool, attested: bool) -> V2Target {
+        let policy = vos::v2::MethodPolicyV2 {
+            method: method.to_string(),
+            schema: vos::v2::Hash([1; 32]),
+            policy: vos::v2::Hash([2; 32]),
+            public,
+            attested,
+            space_role: None,
+            actor_role: None,
+        };
+        V2Target {
+            actor: vos::v2::ActorId([0x41; 32]),
+            methods: [(method.to_string(), policy)].into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn v2_ingress_preserves_typed_identity_and_actor_message() {
+        let target = target("increment", true, false);
+        let invocation = vos::v2::InvocationId([0x17; 32]);
+        let msg = vos::value::Msg::new("increment").with("by", 3u64);
+        let mut arguments = vec![vos::value::TAG_DYNAMIC];
+        arguments.extend_from_slice(&vos::Encode::encode(&msg));
+
+        let encoded = encode_v2_invocation(&target, invocation, &msg, arguments.clone()).unwrap();
+        let decoded = vos::v2::RootTreeInvocationV2::decode(&encoded).unwrap();
+
+        assert_eq!(decoded.invocation, invocation);
+        assert_eq!(decoded.target, target.actor);
+        assert_eq!(decoded.method, "increment");
+        assert_eq!(decoded.arguments, arguments);
+        assert!(!decoded.proof_requested);
+    }
+
+    #[test]
+    fn staged_daemon_ingress_refuses_attested_and_role_gated_methods() {
+        let invocation = vos::v2::InvocationId([0x18; 32]);
+        let msg = vos::value::Msg::new("claim");
+        let arguments = vec![vos::value::TAG_DYNAMIC, 1];
+
+        let attested = encode_v2_invocation(
+            &target("claim", true, true),
+            invocation,
+            &msg,
+            arguments.clone(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(attested.contains("proof-producing transport"));
+
+        let protected =
+            encode_v2_invocation(&target("claim", false, false), invocation, &msg, arguments)
+                .unwrap_err()
+                .to_string();
+        assert!(protected.contains("explicit v2 credential"));
     }
 }
