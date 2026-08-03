@@ -119,9 +119,13 @@ the same transaction as each newly accepted slice, delivery, or timeout.
 Registration restores the node-wide allocator strictly above every opened
 root's high-water before publishing its route, so a process restart or
 backward wall-clock adjustment cannot issue a slot below committed local
-work. Exact duplicates do not advance or rewrite that committed floor. The
-default host bound handle resolves `ActorId` directly rather than truncating it
-to a `ServiceId`. This first node cutover admits only ordinary methods whose
+work. A Raft follower may register before genesis has committed; it has no
+header yet, and defers restoration until catch-up installs one. Every later
+catch-up restores the allocator again before the next ingress, covering a
+newer replicated high-water learned after registration. Exact duplicates do
+not advance or rewrite that committed floor. The default host bound handle
+resolves `ActorId` directly rather than truncating it to a `ServiceId`. This
+first node cutover admits only ordinary methods whose
 signed installed policy is public and non-attested; protected or attested
 methods fail closed instead of inheriting the legacy trusted-System role
 bypass. A direct reply is acknowledged only after its waiting channel accepts

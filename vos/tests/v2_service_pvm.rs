@@ -16,7 +16,7 @@ use vos::attestation::{
 };
 use vos::network::RaftRpcHandler;
 use vos::node::{V2NodeRegistrationError, VosNode};
-use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, WorkerConfig};
+use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, Role, WorkerConfig};
 use vos::v2::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
     AccumulationResultV2, ActorGenesisV2, ActorId, ActorUpgradeV2, ActorWriteV2,
@@ -26,16 +26,16 @@ use vos::v2::{
     ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2,
     ExternalActorBindingV2, GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2,
     ImportedProgramV2, InboxDrainOutcomeV2, InvocationId, JamServiceV2, LocalJamStoreHostV2,
-    LocalJamStoreV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2,
-    LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
-    MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin, PackageManifestV2,
-    PackageRolePoliciesV2, ProducerId, ProgramId, ProofArtifactStoreV2, PublishedEffectsV2,
-    ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2,
-    ReplicatedServiceErrorV2, ReplyRecordV2, RoleCredentialV2, RoleCredentialVerificationRequestV2,
-    RootServiceId, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2,
-    ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId, SystemCapabilityId, TransitionV2,
-    V2Wire, VosPackageV2, WorkEnvelopeV2, WorkflowOperationV2, artifact_hash, public_policy_hash,
-    space_role_policy_hash,
+    LocalJamStoreSnapshotV2, LocalJamStoreV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2,
+    LocalRootTreeInvokeErrorV2, LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2,
+    LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
+    PackageManifestV2, PackageRolePoliciesV2, ProducerId, ProgramId, ProofArtifactStoreV2,
+    PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2,
+    ReplicatedJamServiceV2, ReplicatedServiceErrorV2, ReplyRecordV2, RoleCredentialV2,
+    RoleCredentialVerificationRequestV2, RootServiceId, ScheduleErrorV2, ServiceDispatchError,
+    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId,
+    SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2, WorkflowOperationV2,
+    artifact_hash, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     Decode, Encode,
@@ -963,6 +963,166 @@ fn raft_root_tree_orders_genesis_apply_and_ack_through_physical_accumulate() {
     assert_eq!(retry.accumulate_gas_used, 0);
     assert!(retry.publication.is_none());
     drop(reopened);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn raft_follower_registers_before_genesis_and_restores_caught_up_admission_time() {
+    let actor_elf = greeter_elf();
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&actor_elf, &signer);
+    let actor = ActorId([119; 32]);
+    let config = LocalRootTreeConfigV2 {
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        service: ServiceIdentityV2 {
+            space: vos::v2::SpaceId([120; 32]),
+            root_service: RootServiceId([121; 32]),
+            deployment: package.deployment_id(),
+            service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+            service_abi: vos::v2::ABI_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        },
+        package,
+        root_actor: actor,
+        actor_name,
+        consistency: ConsistencyModeV2::Raft,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([122; 32]),
+            authenticator: vec![123],
+        },
+        refine_gas: 1_000_000_000,
+        accumulate_gas: 5_000_000_000,
+    };
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-root-follower-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+
+    // Build the leader's authoritative image with a floor deliberately ahead
+    // of wall time. The follower must learn this floor from catch-up, not from
+    // registration or its local clock.
+    let source_log_path = directory.join("source.redb");
+    let source_log = RaftAccumulateLogV2::open(&source_log_path, RaftConfig::default()).unwrap();
+    let mut source = LocalRootTreeServiceV2::open_raft(
+        config.clone(),
+        FailableCommittedImages::default(),
+        source_log,
+    )
+    .unwrap();
+    let committed_floor = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 60_000;
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("start").encode());
+    source
+        .invoke(LocalWorkRequestV2 {
+            invocation: InvocationId([124; 32]),
+            workflow_step: 0,
+            logical_timeslot: committed_floor,
+            target: actor,
+            method: "start".into(),
+            arguments: arguments.clone(),
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        })
+        .unwrap();
+    let source_image = source.store().snapshot_bytes();
+    drop(source.into_backend());
+    let mut source_log =
+        RaftAccumulateLogV2::open(&source_log_path, RaftConfig::default()).unwrap();
+    let source_index = source_log.applied_index().unwrap();
+    assert_eq!(source_index, 2);
+    drop(source_log);
+
+    // Start a real non-writable worker with no committed genesis. Opening the
+    // root returns an intentionally headerless service, which registration
+    // must retain until a leader snapshot arrives.
+    let follower_db = Arc::new(redb::Database::create(directory.join("follower.redb")).unwrap());
+    let raft_config = RaftConfig {
+        me: 0xBEEF,
+        members: vec![0xBEEF],
+        election_timeout_ms: (5_000, 6_000),
+        heartbeat_interval_ms: 100,
+        replication_id: [0xE2; 32],
+        propose_timeout_ms: 2_000,
+    };
+    let (apply_tx, apply_rx) = std::sync::mpsc::channel();
+    let worker = RaftWorker::spawn(
+        follower_db.clone(),
+        WorkerConfig {
+            me: raft_config.me,
+            members: raft_config.members.clone(),
+            replication_id: raft_config.replication_id,
+            election_timeout_ms: raft_config.election_timeout_ms,
+            heartbeat_interval_ms: raft_config.heartbeat_interval_ms,
+        },
+        None,
+        Some(apply_tx),
+    );
+    let worker_handle = worker.handler();
+    assert_eq!(worker_handle.role(), Role::Follower);
+    let follower_log =
+        RaftAccumulateLogV2::from_worker(follower_db, raft_config, worker, apply_rx).unwrap();
+    let backend = SharedCommittedImages::default();
+    let follower =
+        LocalRootTreeServiceV2::open_raft(config, backend.clone(), follower_log).unwrap();
+    assert!(follower.store().header().unwrap().is_none());
+
+    let route = ServiceId::new(0, 0x3400);
+    let mut node = VosNode::new();
+    node.register_v2_root_at_id("raft-follower-v2", follower, route, false)
+        .expect("a Raft follower may register while waiting for genesis");
+
+    let snapshot = CommittedServiceSnapshotV2 {
+        applied_index: source_index,
+        service_image: source_image,
+        proof_artifacts: vec![],
+    };
+    let installed =
+        worker_handle.install_snapshot(&[0xE2; 32], 0xCAFE, 1, source_index, 1, snapshot.encode());
+    assert_eq!(installed.term, 1);
+    let election_deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while worker_handle.role() != Role::Leader && std::time::Instant::now() < election_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert_eq!(worker_handle.role(), Role::Leader);
+
+    use vos::ActorReference;
+    let mut invoker = &node;
+    let mut handle = host_greeter_surface::GreeterRef::bind(actor, &mut invoker);
+    vos::block_on(handle.start()).expect("caught-up follower admits work after taking leadership");
+    let results = node.collect();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_ok());
+    drop(worker_handle);
+
+    let image = backend.0.lock().unwrap().clone().unwrap();
+    let restored = LocalJamStoreV2::from_snapshot(LocalJamStoreSnapshotV2::decode(&image).unwrap());
+    assert_eq!(
+        restored
+            .header()
+            .unwrap()
+            .unwrap()
+            .admission_timeslot_high_water,
+        committed_floor + 1,
+        "post-catch-up ingress must allocate strictly above the replicated floor"
+    );
     std::fs::remove_dir_all(directory).unwrap();
 }
 

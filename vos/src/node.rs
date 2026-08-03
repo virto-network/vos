@@ -2787,15 +2787,7 @@ impl VosNode {
             return Err(V2NodeRegistrationError::ServiceRouteOccupied(id));
         }
         let actor = service.root_actor();
-        let header = service
-            .store()
-            .header()
-            .map_err(|_| V2NodeRegistrationError::CorruptServiceStore)?
-            .ok_or(V2NodeRegistrationError::CorruptServiceStore)?;
-        restore_v2_logical_timeslot(
-            &self.v2_logical_timeslot,
-            header.admission_timeslot_high_water,
-        )?;
+        restore_v2_root_logical_timeslot(&service, &self.v2_logical_timeslot)?;
         let consistency = match service.consistency() {
             crate::v2::ConsistencyModeV2::Ephemeral => Consistency::Ephemeral,
             crate::v2::ConsistencyModeV2::Local => Consistency::Local,
@@ -3786,6 +3778,31 @@ fn restore_v2_logical_timeslot(
     Ok(())
 }
 
+/// Restore the node allocator from the service image currently visible after
+/// catch-up. A Raft follower may legitimately have no header until genesis is
+/// committed; every other root must already be installed at registration.
+fn restore_v2_root_logical_timeslot<B>(
+    service: &crate::v2::LocalRootTreeServiceV2<B>,
+    clock: &AtomicU64,
+) -> Result<bool, V2NodeRegistrationError>
+where
+    B: crate::v2::CommittedImageStoreV2
+        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+{
+    match service
+        .store()
+        .header()
+        .map_err(|_| V2NodeRegistrationError::CorruptServiceStore)?
+    {
+        Some(header) => {
+            restore_v2_logical_timeslot(clock, header.admission_timeslot_high_water)?;
+            Ok(true)
+        }
+        None if service.consistency() == crate::v2::ConsistencyModeV2::Raft => Ok(false),
+        None => Err(V2NodeRegistrationError::CorruptServiceStore),
+    }
+}
+
 /// Allocate a trusted, monotone local admission slot. The durable service
 /// high-water makes restart safe; wall time supplies a useful initial floor,
 /// and compare/exchange keeps concurrent service threads in one node-wide
@@ -3826,11 +3843,16 @@ where
 
     let mut error = None;
     match service.catch_up() {
-        Ok(true) => {}
+        Ok(true) => {
+            if let Err(failure) = restore_v2_root_logical_timeslot(&service, &logical_timeslot) {
+                error!(%id, ?failure, "v2 root-tree startup clock restoration failed");
+                error = Some(format!("v2 root-tree clock restoration failed: {failure}"));
+            }
+        }
         Ok(false) => info!(%id, "v2 Raft root is waiting for committed service genesis"),
         Err(failure) => warn!(%id, ?failure, "v2 root-tree startup catch-up failed"),
     }
-    while !shutdown.load(Ordering::Relaxed) {
+    while error.is_none() && !shutdown.load(Ordering::Relaxed) {
         let req = match invoke_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(request) => request,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -3838,7 +3860,15 @@ where
         };
         *activity.lock().unwrap() = Instant::now();
         match service.catch_up() {
-            Ok(true) => {}
+            Ok(true) => {
+                if let Err(failure) = restore_v2_root_logical_timeslot(&service, &logical_timeslot)
+                {
+                    error!(%id, ?failure, "v2 root-tree caught-up clock restoration failed");
+                    send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                    error = Some(format!("v2 root-tree clock restoration failed: {failure}"));
+                    break;
+                }
+            }
             Ok(false) => {
                 send_v2_status(req.reply, crate::STATUS_PANICKED, id);
                 continue;
