@@ -687,6 +687,9 @@ fn expire_call<S: GuestAccumulateStoreV2>(
             header.state_root = Some(header.service_root);
             (Some(header.service_root), Vec::new(), header.revision)
         };
+    header.admission_timeslot_high_water = header
+        .admission_timeslot_high_water
+        .max(observed_timeslot.expect("expiration timeslot was validated"));
     let receipt = AccumulationReceiptV2 {
         service: header.service.clone(),
         accepted_transition: envelope.commitment(),
@@ -866,6 +869,9 @@ fn deliver<S: GuestAccumulateStoreV2>(
         delivery_commitment,
         receipt: receipt.clone(),
     };
+    header.admission_timeslot_high_water = header
+        .admission_timeslot_high_water
+        .max(envelope.logical_timeslot);
     write(store, header_storage_key(), Some(&header.encode()))?;
     write(store, &delivery_key, Some(&record.encode()))?;
     Ok(AccumulationResultV2::Accepted {
@@ -2249,6 +2255,9 @@ fn apply<S: GuestAccumulateStoreV2>(
         transition_commitment,
         receipt: receipt.clone(),
     };
+    header.admission_timeslot_high_water = header
+        .admission_timeslot_high_water
+        .max(work.logical_timeslot);
     write(store, header_storage_key(), Some(&header.encode()))?;
     write(
         store,
@@ -5666,6 +5675,7 @@ mod tests {
         };
         timeout.validate().unwrap();
         let header = StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
+        assert_eq!(header.admission_timeslot_high_water, 10);
         let tree = ServiceStateTreeV2::new(&mut store, header.service_root);
         assert_eq!(tree.get(&StateKeyV2::Outbox(call)).unwrap(), None);
         assert_eq!(
@@ -6074,6 +6084,7 @@ mod tests {
         assert_eq!(receipt.accepted_transition, envelope.commitment());
         let admitted_header =
             StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
+        assert_eq!(admitted_header.admission_timeslot_high_water, 2);
         let tree = ServiceStateTreeV2::new(&mut store, admitted_header.service_root);
         assert_eq!(
             tree.get(&StateKeyV2::Inbox(incoming.call_id)).unwrap(),

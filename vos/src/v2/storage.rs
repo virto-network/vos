@@ -15,7 +15,7 @@ use super::{
     WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 17;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 18;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -45,6 +45,11 @@ pub struct StoreHeaderV2 {
     pub revision: u64,
     pub state_root: Option<Hash>,
     pub crdt_heads: Vec<Hash>,
+    /// Greatest trusted logical timeslot committed through this service
+    /// image. Native schedulers restore their node-wide allocator above this
+    /// floor before admitting new work, so process restart and wall-clock
+    /// rollback cannot backdate a later invocation.
+    pub admission_timeslot_high_water: u64,
     pub snapshot_version: u16,
 }
 
@@ -59,6 +64,7 @@ impl StoreHeaderV2 {
             state_root: (consistency != ConsistencyModeV2::Crdt)
                 .then(super::state_tree::empty_state_root),
             crdt_heads: Vec::new(),
+            admission_timeslot_high_water: 0,
             snapshot_version: super::SNAPSHOT_VERSION,
         }
     }
@@ -99,6 +105,7 @@ impl V2Wire for StoreHeaderV2 {
         e.u64(self.revision);
         e.option(&self.state_root, |e, root| e.fixed(&root.0));
         e.list(&self.crdt_heads, |e, head| e.fixed(&head.0));
+        e.u64(self.admission_timeslot_high_water);
         e.u16(self.snapshot_version);
     }
 
@@ -111,6 +118,7 @@ impl V2Wire for StoreHeaderV2 {
             revision: d.u64()?,
             state_root: d.option(|d| d.fixed().map(Hash))?,
             crdt_heads: d.list(|d| d.fixed().map(Hash))?,
+            admission_timeslot_high_water: d.u64()?,
             snapshot_version: d.u16()?,
         };
         ensure_hashes_sorted(&value.crdt_heads)?;
@@ -756,7 +764,8 @@ mod tests {
 
     #[test]
     fn current_linear_and_crdt_headers_round_trip() {
-        let linear = StoreHeaderV2::current(service(7), ConsistencyModeV2::Local);
+        let mut linear = StoreHeaderV2::current(service(7), ConsistencyModeV2::Local);
+        linear.admission_timeslot_high_water = 42;
         assert_eq!(StoreHeaderV2::open(&linear.encode()).unwrap(), linear);
         assert!(linear.state_root.is_some());
         assert_eq!(linear.service_root, linear.state_root.unwrap());
@@ -765,6 +774,7 @@ mod tests {
         assert_eq!(StoreHeaderV2::open(&crdt.encode()).unwrap(), crdt);
         assert_eq!(crdt.state_root, None);
         assert_eq!(crdt.revision, 0);
+        assert_eq!(crdt.admission_timeslot_high_water, 0);
         assert_eq!(crdt.service_root, empty_state_root());
     }
 

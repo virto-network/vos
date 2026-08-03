@@ -62,6 +62,7 @@ pub enum V2NodeRegistrationError {
     ServiceRouteOccupied(ServiceId),
     ActorAlreadyRegistered(crate::v2::ActorId),
     CorruptServiceStore,
+    LogicalTimeslotExhausted,
 }
 
 impl std::fmt::Display for V2NodeRegistrationError {
@@ -2783,12 +2784,16 @@ impl VosNode {
             return Err(V2NodeRegistrationError::ServiceRouteOccupied(id));
         }
         let actor = service.root_actor();
-        let consistency = service
+        let header = service
             .store()
             .header()
             .map_err(|_| V2NodeRegistrationError::CorruptServiceStore)?
-            .ok_or(V2NodeRegistrationError::CorruptServiceStore)?
-            .consistency;
+            .ok_or(V2NodeRegistrationError::CorruptServiceStore)?;
+        restore_v2_logical_timeslot(
+            &self.v2_logical_timeslot,
+            header.admission_timeslot_high_water,
+        )?;
+        let consistency = header.consistency;
         let consistency = match consistency {
             crate::v2::ConsistencyModeV2::Ephemeral => Consistency::Ephemeral,
             crate::v2::ConsistencyModeV2::Local => Consistency::Local,
@@ -3764,9 +3769,25 @@ fn v2_wall_timeslot() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-/// Allocate a trusted, monotone local admission slot. Wall time makes the
-/// counter restart-safe; compare/exchange keeps concurrent service threads in
-/// one node-wide order even when the wall clock has not advanced.
+/// Restore the node-wide allocator strictly above one service's committed
+/// admission floor. Registration calls this before publishing any route, and
+/// repeats it for every opened root, so the shared counter starts above the
+/// greatest durable high-water on the node.
+fn restore_v2_logical_timeslot(
+    clock: &AtomicU64,
+    committed_high_water: u64,
+) -> Result<(), V2NodeRegistrationError> {
+    let next = committed_high_water
+        .checked_add(1)
+        .ok_or(V2NodeRegistrationError::LogicalTimeslotExhausted)?;
+    clock.fetch_max(next, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Allocate a trusted, monotone local admission slot. The durable service
+/// high-water makes restart safe; wall time supplies a useful initial floor,
+/// and compare/exchange keeps concurrent service threads in one node-wide
+/// order even when the wall clock has not advanced.
 fn next_v2_logical_timeslot(clock: &AtomicU64) -> u64 {
     let wall = v2_wall_timeslot();
     let mut observed = clock.load(Ordering::Relaxed);
@@ -8288,6 +8309,19 @@ mod tests {
         let second = next_v2_logical_timeslot(&clock);
         assert_eq!(first, future);
         assert_eq!(second, future + 1);
+    }
+
+    #[test]
+    fn v2_admission_slots_restore_above_durable_high_water() {
+        let committed = v2_wall_timeslot().saturating_add(10_000);
+        let clock = AtomicU64::new(1);
+        restore_v2_logical_timeslot(&clock, committed).unwrap();
+        assert_eq!(next_v2_logical_timeslot(&clock), committed + 1);
+        assert_eq!(next_v2_logical_timeslot(&clock), committed + 2);
+        assert_eq!(
+            restore_v2_logical_timeslot(&clock, u64::MAX),
+            Err(V2NodeRegistrationError::LogicalTimeslotExhausted)
+        );
     }
 
     #[test]

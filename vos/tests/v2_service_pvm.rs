@@ -780,11 +780,29 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         .clone()
         .expect("committed reply remains recoverable until acknowledgement");
     assert_eq!(service.store().header().unwrap().unwrap().revision, 1);
+    assert_eq!(
+        service
+            .store()
+            .header()
+            .unwrap()
+            .unwrap()
+            .admission_timeslot_high_water,
+        1
+    );
 
     let backend = service.into_backend();
     let mut restarted = LocalRootTreeServiceV2::open(config.clone(), backend)
         .expect("exact service image restores without reinstalling");
     assert_eq!(restarted.store().header().unwrap().unwrap().revision, 1);
+    assert_eq!(
+        restarted
+            .store()
+            .header()
+            .unwrap()
+            .unwrap()
+            .admission_timeslot_high_water,
+        1
+    );
     assert_eq!(
         restarted.pending_publications().unwrap(),
         vec![publication.clone()]
@@ -801,6 +819,16 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
     assert_eq!(recovered.receipt, first.receipt);
     assert_eq!(recovered.published, first.published);
     assert_eq!(recovered.publication, Some(publication.clone()));
+    assert_eq!(
+        restarted
+            .store()
+            .header()
+            .unwrap()
+            .unwrap()
+            .admission_timeslot_high_water,
+        1,
+        "a duplicate retry retains the originally committed admission slot"
+    );
 
     let mut divergent = request;
     divergent.arguments.push(0);
@@ -847,7 +875,7 @@ fn node_routes_canonical_actor_ids_through_the_guest_owned_root_service() {
         accumulate_gas: 5_000_000_000,
     };
     let backend = SharedCommittedImages::default();
-    let service = LocalRootTreeServiceV2::open(config.clone(), backend.clone())
+    let mut service = LocalRootTreeServiceV2::open(config.clone(), backend.clone())
         .expect("signed root installs before node registration");
     assert_eq!(
         service
@@ -857,13 +885,50 @@ fn node_routes_canonical_actor_ids_through_the_guest_owned_root_service() {
         Some((true, false))
     );
 
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("start").encode());
+    let durable_floor = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 10_000;
+    let seeded = service
+        .invoke(LocalWorkRequestV2 {
+            invocation: InvocationId([111; 32]),
+            workflow_step: 0,
+            logical_timeslot: durable_floor,
+            target: actor,
+            method: "start".into(),
+            arguments: arguments.clone(),
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        })
+        .expect("seed a durable admission floor above the next wall-clock slot");
+    service
+        .acknowledge_publication(seeded.publication.as_ref().unwrap())
+        .unwrap();
+    assert_eq!(
+        service
+            .store()
+            .header()
+            .unwrap()
+            .unwrap()
+            .admission_timeslot_high_water,
+        durable_floor
+    );
+
     let route = ServiceId::new(0, 0x3300);
     let mut node = VosNode::new();
     node.register_v2_root_at_id("greeter-v2", service, route, false)
         .expect("canonical root route registers");
 
-    let mut arguments = vec![vos::value::TAG_DYNAMIC];
-    arguments.extend_from_slice(&Msg::new("start").encode());
     use vos::ActorReference;
     let mut invoker = &node;
     let mut handle = host_greeter_surface::GreeterRef::bind(actor, &mut invoker);
@@ -907,7 +972,12 @@ fn node_routes_canonical_actor_ids_through_the_guest_owned_root_service() {
 
     let reopened = LocalRootTreeServiceV2::open(config, backend)
         .expect("node-owned service state reopens from committed bytes");
-    assert_eq!(reopened.store().header().unwrap().unwrap().revision, 1);
+    let header = reopened.store().header().unwrap().unwrap();
+    assert_eq!(header.revision, 2);
+    assert!(
+        header.admission_timeslot_high_water > durable_floor,
+        "registration must restore the node allocator above durable work"
+    );
     assert!(
         reopened.pending_publications().unwrap().is_empty(),
         "the direct reply is acknowledged only after its channel accepts it"

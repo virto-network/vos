@@ -109,6 +109,12 @@ until the service builds work from guest-owned state. Logical time is not an
 external field: the node stamps a trusted, monotone admission slot at the
 scheduler boundary. Exact retries are reattached through the committed
 workflow and dedup records, which retain the original admitted slot. The
+guest-owned store header advances a durable admission-timeslot high-water in
+the same transaction as each newly accepted slice, delivery, or timeout.
+Registration restores the node-wide allocator strictly above every opened
+root's high-water before publishing its route, so a process restart or
+backward wall-clock adjustment cannot issue a slot below committed local
+work. Exact duplicates do not advance or rewrite that committed floor. The
 default host bound handle resolves `ActorId` directly rather than truncating it
 to a `ServiceId`. This first node cutover admits only ordinary methods whose
 signed installed policy is public and non-attested; protected or attested
@@ -594,7 +600,7 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 17 and continuation snapshot version 5 are therefore a clean
+Store schema 18 and continuation snapshot version 5 are therefore a clean
 break from earlier experimental v2 images. They add exact actor-package
 identity to descriptors, work, checkpoints, transitions, upgrades, and
 cross-root proof bindings, the complete dormant actor-program layout to each
