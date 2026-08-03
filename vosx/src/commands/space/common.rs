@@ -39,6 +39,34 @@ pub fn instance_service_id(instance_name: &str, prefix: u16) -> ServiceId {
     ServiceId(vos::registry::instance_service_id(instance_name, prefix))
 }
 
+/// Stable logical service identity for one installed v2 root tree.
+///
+/// The compatibility route used by the daemon remains node-local, while this
+/// identity is scoped to the space and survives process restarts and package
+/// upgrades.
+pub fn v2_root_service_id(space: vos::v2::SpaceId, instance: &str) -> vos::v2::RootServiceId {
+    vos::v2::RootServiceId(
+        vos::v2::Hash::digest(
+            b"vos/installed-root-service/v2",
+            &[&space.0, instance.as_bytes()],
+        )
+        .0,
+    )
+}
+
+/// Stable application identity of the root actor owned by an installed v2
+/// service. Deployment and program identities may change through an upgrade;
+/// the actor identity does not.
+pub fn v2_root_actor_id(service: vos::v2::RootServiceId, instance: &str) -> vos::v2::ActorId {
+    vos::v2::ActorId(
+        vos::v2::Hash::digest(
+            b"vos/installed-root-actor/v2",
+            &[&service.0, instance.as_bytes()],
+        )
+        .0,
+    )
+}
+
 /// Map a registry-stored `consistency` u8 to the host enum.
 /// `space_registry` defines the numeric assignments (Ephemeral
 /// = 0, Local = 1, Crdt = 2, Raft = 3); `vos::node::Consistency`
@@ -252,6 +280,29 @@ mod tests {
             let local = (id.0 & 0xFFFF) as u16;
             assert!(local >= 0x100 && local < 0x8000, "got 0x{local:04x}");
         }
+    }
+
+    #[test]
+    fn v2_root_tree_identity_is_stable_and_space_scoped() {
+        let first = v2_root_service_id(vos::v2::SpaceId([1; 32]), "counter");
+        let same = v2_root_service_id(vos::v2::SpaceId([1; 32]), "counter");
+        let other_space = v2_root_service_id(vos::v2::SpaceId([2; 32]), "counter");
+        let other_name = v2_root_service_id(vos::v2::SpaceId([1; 32]), "ledger");
+
+        assert_eq!(first, same);
+        assert_ne!(first, other_space);
+        assert_ne!(first, other_name);
+        assert_ne!(first, vos::v2::RootServiceId::ZERO);
+    }
+
+    #[test]
+    fn v2_root_actor_identity_is_stable_across_deployments() {
+        let service = v2_root_service_id(vos::v2::SpaceId([3; 32]), "counter");
+        let actor = v2_root_actor_id(service, "counter");
+
+        assert_eq!(actor, v2_root_actor_id(service, "counter"));
+        assert_ne!(actor, v2_root_actor_id(service, "counter-child"));
+        assert_ne!(actor, vos::v2::ActorId::ZERO);
     }
 
     #[test]

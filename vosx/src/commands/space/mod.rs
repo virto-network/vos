@@ -136,6 +136,10 @@ pub enum SpaceCommand {
         /// spaces.toml entry for this run.
         #[arg(long, value_name = "MULTIADDR")]
         connect: Vec<String>,
+        /// Exact protocol-pinned generic service PVM used by installed `.vos`
+        /// v2 packages. Without it, v2 rows remain installed but are skipped.
+        #[arg(long, value_name = "FILE")]
+        service_pvm: Option<PathBuf>,
     },
     /// Stop a running `space up` daemon by signalling its PID.
     /// SIGTERM by default (daemon flushes state, removes the
@@ -369,11 +373,13 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             once,
             listen,
             connect,
+            service_pvm,
         } => up::run(up::Args {
             query: space,
             once,
             listen,
             connect,
+            service_pvm,
         }),
         SpaceCommand::Down {
             space,

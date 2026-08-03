@@ -553,17 +553,20 @@ and signatures but includes the authoritative manifest and PVM bytes.
 Registries store these bytes and never retranspile an ELF. JIT products,
 proving keys and traces are caches keyed by `ProgramId`.
 
-The legacy `AgentConfig` actor loader deliberately refuses `.vos` v2 packages. It
-cannot extract and run the actor PVM directly without violating the root-tree
-service boundary. Catalog rows containing those packages remain installed but
-are skipped by both boot and runtime reconciliation, so an unsupported v2 row
-cannot prevent the rest of a space from starting. The package classification
-also precedes every legacy Raft seed, probe, or join action, so a skipped row
-cannot change quorum membership. Production daemon installation remains
-disabled until that loader opens and registers the complete package through
-the pinned `vos-service.pvm`; the explicit local root-service API does not make
-catalog installation implicit. This refusal replaces silent execution through
-`RefinePayload`/`EffectLog`.
+`space up --service-pvm <exact-vos-service.pvm>` recognizes signed `.vos`
+catalog artifacts and opens each ordinary Local deployment as one durable
+root-tree service. It verifies the package signature, capability layout, and
+protocol-pinned service `ProgramId`; it never extracts the actor PVM into the
+legacy runtime or retranspiles an ELF. Missing or invalid service artifacts
+skip only the affected row, so an installed package cannot prevent the rest of
+a space from starting. Package classification precedes every legacy Raft seed,
+probe, or join action, so a refused v2 row cannot change quorum membership.
+
+V2 Raft and CRDT rows remain fail-closed until their request-log and
+anti-entropy drivers are attached to the daemon. Attested and role-gated
+external calls likewise remain unavailable on this direct ingress; only
+ordinary public methods are admitted. Legacy ELF/PVM rows continue on the old
+host during this staged cutover.
 
 The service identity retains the root package `DeploymentId` selected when
 the root tree is installed; it is the stable service/routing identity. Every
