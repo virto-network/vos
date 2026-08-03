@@ -101,9 +101,23 @@ fn vosx(data_home: &Path, config_home: &Path, args: &[&str]) -> Output {
 
 /// Spawn a long-running `space up <arg>` daemon, logging to a file.
 fn spawn_up(data_home: &Path, config_home: &Path, arg: &str, log_path: &Path) -> Child {
+    spawn_up_with_service(data_home, config_home, arg, log_path, None)
+}
+
+fn spawn_up_with_service(
+    data_home: &Path,
+    config_home: &Path,
+    arg: &str,
+    log_path: &Path,
+    service_pvm: Option<&Path>,
+) -> Child {
     let log_file = fs::File::create(log_path).expect("create log");
-    Command::new(vosx_bin())
-        .args(["space", "up", arg])
+    let mut command = Command::new(vosx_bin());
+    command.args(["space", "up", arg]);
+    if let Some(path) = service_pvm {
+        command.arg("--service-pvm").arg(path);
+    }
+    command
         .env("XDG_DATA_HOME", data_home)
         .env("XDG_CONFIG_HOME", config_home)
         .env("RUST_LOG", "info")
@@ -310,6 +324,141 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
             format!(
                 "B didn't re-spawn crdt-counter after a bare `space up {space}` restart; log:\n{}",
                 fs::read_to_string(&log_b2).unwrap_or_default()
+            )
+        },
+    );
+}
+
+#[test]
+fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
+    let space = "v2-root";
+    let data = TempDir::new("v2-root-data");
+    let config = TempDir::new("v2-root-config");
+    let dist = TempDir::new("v2-root-dist");
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let actor_elf = workspace.join("examples/actors/target/riscv64em-javm/release/v2_counter.elf");
+    let service_pvm = workspace.join("services/vos-service/vos-service.pvm");
+    assert!(
+        actor_elf.is_file(),
+        "build the v2 daemon actor first: `cd examples/actors && cargo +nightly actor -p v2-counter`",
+    );
+    assert!(
+        service_pvm.is_file(),
+        "build the canonical service first: `just build-vos-service`",
+    );
+
+    let actor = actor_elf.to_string_lossy().into_owned();
+    let out = dist.path().to_string_lossy().into_owned();
+    vosx_ok(
+        data.path(),
+        config.path(),
+        &[
+            "build",
+            &actor,
+            "--name",
+            "counter",
+            "--version",
+            "0.1.0",
+            "--out-dir",
+            &out,
+        ],
+    );
+    let package = dist.path().join("counter.vos");
+    assert!(package.is_file(), "vosx build must emit the signed package");
+
+    vosx_ok(data.path(), config.path(), &["space", "new", space]);
+    let first_log = data.path().join("v2-root-first.stderr");
+    let first = Daemon(spawn_up_with_service(
+        data.path(),
+        config.path(),
+        space,
+        &first_log,
+        Some(&service_pvm),
+    ));
+    wait_for_endpoint(data.path(), &first_log, "v2-root-first");
+
+    let package_source = package.to_string_lossy().into_owned();
+    vosx_ok(
+        data.path(),
+        config.path(),
+        &["space", "publish", space, "counter:0.1.0", &package_source],
+    );
+    vosx_ok(
+        data.path(),
+        config.path(),
+        &[
+            "space",
+            "install",
+            space,
+            "counter:0.1.0",
+            "--consistency",
+            "local",
+        ],
+    );
+
+    poll_until(
+        30,
+        || {
+            let output = vosx(
+                data.path(),
+                config.path(),
+                &["space", "call", space, "counter", "value"],
+            );
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "U64(0)"
+        },
+        || {
+            format!(
+                "the daemon never attached the installed v2 root service; log:\n{}",
+                fs::read_to_string(&first_log).unwrap_or_default(),
+            )
+        },
+    );
+    let incremented = vosx_ok(
+        data.path(),
+        config.path(),
+        &["space", "call", space, "counter", "increment", "by=3"],
+    );
+    assert_eq!(incremented.trim(), "U64(3)");
+
+    drop(first);
+    let restart_at = std::time::SystemTime::now();
+    let second_log = data.path().join("v2-root-second.stderr");
+    let _second = Daemon(spawn_up_with_service(
+        data.path(),
+        config.path(),
+        space,
+        &second_log,
+        Some(&service_pvm),
+    ));
+    poll_until(
+        20,
+        || {
+            find_endpoint(data.path())
+                .and_then(|path| fs::metadata(path).ok())
+                .and_then(|metadata| metadata.modified().ok())
+                .is_some_and(|modified| modified >= restart_at)
+        },
+        || {
+            format!(
+                "the daemon did not reopen the v2 root service; log:\n{}",
+                fs::read_to_string(&second_log).unwrap_or_default(),
+            )
+        },
+    );
+    poll_until(
+        30,
+        || {
+            let output = vosx(
+                data.path(),
+                config.path(),
+                &["space", "call", space, "counter", "value"],
+            );
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "U64(3)"
+        },
+        || {
+            format!(
+                "the reopened v2 service did not retain its committed state; log:\n{}",
+                fs::read_to_string(&second_log).unwrap_or_default(),
             )
         },
     );

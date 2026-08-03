@@ -47,8 +47,12 @@ build-v2-registry-fixtures:
 build-vos-service:
     cd services/vos-service; cargo +nightly actor
 
+# Build the package/service pair consumed by the physical daemon-root test.
+build-v2-daemon-root-artifacts: build-vos-service
+    cd examples/actors; cargo +nightly actor -p v2-counter
+
 # Build every guest consumed by the physical v2 service-PVM gate.
-build-v2-pvm-test-artifacts: build-vos-service
+build-v2-pvm-test-artifacts: build-v2-daemon-root-artifacts
     cd tests/fixtures/legacy-v1/actors/greeter; cargo +nightly actor
     cd tests/fixtures/legacy-v1/actors/probe; cargo +nightly actor
     cd vos/tests/fixtures/crdt-counter-v2; cargo +nightly actor
@@ -114,6 +118,10 @@ test-extensions: build-extensions
 # Run the PVM/ELF e2e integration tests.
 test-pvm: build-test-artifacts
     cargo test -p vos --test elf_integration -- --nocapture --test-threads=1
+
+# Run the signed-package → daemon → durable-reopen acceptance path.
+test-v2-daemon-root: build-v2-daemon-root-artifacts
+    cargo test -p vosx --test onboarding_e2e signed_v2_package_runs_and_reopens_through_the_space_daemon -- --nocapture --test-threads=1
 
 # Run a single test by name.
 test-one name: build-extensions
