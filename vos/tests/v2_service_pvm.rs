@@ -89,6 +89,18 @@ impl CommittedImageStoreV2 for SharedCommittedImages {
     }
 }
 
+impl ProofArtifactStoreV2 for SharedCommittedImages {
+    type Error = ();
+
+    fn load_proof(&self, _reference: &BlobRefV2) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(None)
+    }
+
+    fn commit_proof(&mut self, _reference: &BlobRefV2, _proof: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct CanonicalTestProofProducer {
     proof: Vec<u8>,
@@ -701,11 +713,13 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
     };
     let mut replicated_config = config.clone();
     replicated_config.consistency = ConsistencyModeV2::Raft;
-    assert_eq!(
-        replicated_config.validate(),
-        Err(LocalRootTreeConfigErrorV2::ReplicationDriverRequired),
-        "the direct host must not claim Raft consistency without a replicated driver"
-    );
+    assert!(replicated_config.validate().is_ok());
+    assert!(matches!(
+        LocalRootTreeServiceV2::open(replicated_config, FailableCommittedImages::default()),
+        Err(vos::v2::LocalRootTreeOpenErrorV2::InvalidConfig(
+            LocalRootTreeConfigErrorV2::ReplicationDriverRequired
+        ))
+    ));
     let mut forged_config = config.clone();
     forged_config.package.deployment_signature.signature[0] ^= 0x80;
     assert_eq!(
@@ -843,6 +857,113 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         .expect("acknowledged image restores through the same service identity");
     assert!(restarted.pending_publications().unwrap().is_empty());
     assert_eq!(restarted.store().header().unwrap().unwrap().revision, 1);
+}
+
+#[test]
+fn raft_root_tree_orders_genesis_apply_and_ack_through_physical_accumulate() {
+    let actor_elf = greeter_elf();
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&actor_elf, &signer);
+    let actor = ActorId([113; 32]);
+    let config = LocalRootTreeConfigV2 {
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        service: ServiceIdentityV2 {
+            space: vos::v2::SpaceId([114; 32]),
+            root_service: RootServiceId([115; 32]),
+            deployment: package.deployment_id(),
+            service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+            service_abi: vos::v2::ABI_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        },
+        package,
+        root_actor: actor,
+        actor_name,
+        consistency: ConsistencyModeV2::Raft,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([116; 32]),
+            authenticator: vec![117],
+        },
+        refine_gas: 1_000_000_000,
+        accumulate_gas: 5_000_000_000,
+    };
+    assert!(matches!(
+        LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default()),
+        Err(vos::v2::LocalRootTreeOpenErrorV2::InvalidConfig(
+            LocalRootTreeConfigErrorV2::ReplicationDriverRequired
+        ))
+    ));
+
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-root-raft-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let log_path = directory.join("raft.redb");
+    let log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    let mut service =
+        LocalRootTreeServiceV2::open_raft(config.clone(), FailableCommittedImages::default(), log)
+            .expect("Raft root genesis is ordered through physical Accumulate");
+    assert_eq!(service.consistency(), ConsistencyModeV2::Raft);
+    assert_eq!(
+        service.store().header().unwrap().unwrap().consistency,
+        ConsistencyModeV2::Raft
+    );
+
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("start").encode());
+    let request = LocalWorkRequestV2 {
+        invocation: InvocationId([118; 32]),
+        workflow_step: 0,
+        logical_timeslot: 5,
+        target: actor,
+        method: "start".into(),
+        arguments,
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let committed = service
+        .invoke(request.clone())
+        .expect("actor Apply is ordered before guest execution");
+    let publication = committed.publication.clone().unwrap();
+    assert_eq!(
+        committed
+            .published
+            .reply
+            .as_ref()
+            .map(|reply| &reply.result),
+        Some(&Value::Unit.encode())
+    );
+    assert!(!service.acknowledge_publication(&publication).unwrap());
+
+    let backend = service.into_backend();
+    let mut log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    assert_eq!(log.applied_index().unwrap(), 3);
+    assert!(log.committed_after(3).unwrap().entries.is_empty());
+    let mut reopened = LocalRootTreeServiceV2::open_raft(config, backend, log)
+        .expect("root reopens at the durable Raft apply cursor");
+    assert!(reopened.catch_up().unwrap());
+    let retry = reopened
+        .invoke(request)
+        .expect("a lost result reattaches without another Refine or log entry");
+    assert!(retry.duplicate);
+    assert_eq!(retry.refine_gas_used, 0);
+    assert_eq!(retry.accumulate_gas_used, 0);
+    assert!(retry.publication.is_none());
+    drop(reopened);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
