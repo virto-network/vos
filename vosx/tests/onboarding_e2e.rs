@@ -335,6 +335,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
     let data = TempDir::new("v2-root-data");
     let config = TempDir::new("v2-root-config");
     let dist = TempDir::new("v2-root-dist");
+    let upgrade_dist = TempDir::new("v2-root-upgrade-dist");
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let actor_elf = workspace.join("examples/actors/target/riscv64em-javm/release/v2_counter.elf");
     let service_pvm = workspace.join("services/vos-service/vos-service.pvm");
@@ -365,6 +366,26 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
     );
     let package = dist.path().join("counter.vos");
     assert!(package.is_file(), "vosx build must emit the signed package");
+    let upgrade_out = upgrade_dist.path().to_string_lossy().into_owned();
+    vosx_ok(
+        data.path(),
+        config.path(),
+        &[
+            "build",
+            &actor,
+            "--name",
+            "counter",
+            "--version",
+            "0.2.0",
+            "--out-dir",
+            &upgrade_out,
+        ],
+    );
+    let upgrade_package = upgrade_dist.path().join("counter.vos");
+    assert!(
+        upgrade_package.is_file(),
+        "vosx build must emit the upgrade package",
+    );
 
     vosx_ok(data.path(), config.path(), &["space", "new", space]);
     let first_log = data.path().join("v2-root-first.stderr");
@@ -420,10 +441,54 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
     );
     assert_eq!(incremented.trim(), "U64(3)");
 
+    let endpoint_path = find_endpoint(data.path()).unwrap();
+    let service_data_dir = endpoint_path.parent().unwrap().to_path_buf();
+    let endpoint_body = fs::read_to_string(&endpoint_path).unwrap();
+    let endpoint: toml::Value = toml::from_str(&endpoint_body).unwrap();
+    let prefix = endpoint["prefix"].as_integer().unwrap() as u16;
+    let raw_route = format!(
+        "0x{:08x}",
+        vos::registry::instance_service_id("counter", prefix),
+    );
+    let raw_value = vosx_ok(
+        data.path(),
+        config.path(),
+        &["space", "call", space, &raw_route, "value"],
+    );
+    assert_eq!(raw_value.trim(), "U64(3)");
+
+    let described = vosx_ok(
+        data.path(),
+        config.path(),
+        &["space", "call", space, "counter", "describe"],
+    );
+    assert!(
+        described.contains("counter"),
+        "reserved host describe must bypass package method lookup: {described}",
+    );
+
+    let upgrade_source = upgrade_package.to_string_lossy().into_owned();
+    vosx_ok(
+        data.path(),
+        config.path(),
+        &["space", "publish", space, "counter:0.2.0", &upgrade_source],
+    );
+    let refused_upgrade = vosx(
+        data.path(),
+        config.path(),
+        &["space", "upgrade", space, "counter", "counter:0.2.0"],
+    );
+    assert!(!refused_upgrade.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused_upgrade.stderr).contains("guest-owned UpgradeActor"),
+        "v2 catalog upgrade must fail before mutating the registry: {}",
+        String::from_utf8_lossy(&refused_upgrade.stderr),
+    );
+
     drop(first);
     let restart_at = std::time::SystemTime::now();
     let second_log = data.path().join("v2-root-second.stderr");
-    let _second = Daemon(spawn_up_with_service(
+    let second = Daemon(spawn_up_with_service(
         data.path(),
         config.path(),
         space,
@@ -461,6 +526,94 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
                 fs::read_to_string(&second_log).unwrap_or_default(),
             )
         },
+    );
+
+    let old_image = fs::read_dir(service_data_dir.join("v2-services"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "image")
+        })
+        .expect("the first installation must own a durable v2 image");
+
+    vosx_ok(
+        data.path(),
+        config.path(),
+        &["space", "call", space, "counter", "stop"],
+    );
+    vosx_ok(
+        data.path(),
+        config.path(),
+        &["space", "uninstall", space, "counter"],
+    );
+    let fresh_replication_id = "22".repeat(32);
+    vosx_ok(
+        data.path(),
+        config.path(),
+        &[
+            "space",
+            "install",
+            space,
+            "counter:0.1.0",
+            "--consistency",
+            "local",
+            "--replication-id",
+            &fresh_replication_id,
+        ],
+    );
+
+    drop(second);
+    let reinstall_at = std::time::SystemTime::now();
+    let third_log = data.path().join("v2-root-third.stderr");
+    let _third = Daemon(spawn_up_with_service(
+        data.path(),
+        config.path(),
+        space,
+        &third_log,
+        Some(&service_pvm),
+    ));
+    poll_until(
+        20,
+        || {
+            find_endpoint(data.path())
+                .and_then(|path| fs::metadata(path).ok())
+                .and_then(|metadata| metadata.modified().ok())
+                .is_some_and(|modified| modified >= reinstall_at)
+        },
+        || {
+            format!(
+                "the daemon did not open the reinstalled v2 root; log:\n{}",
+                fs::read_to_string(&third_log).unwrap_or_default(),
+            )
+        },
+    );
+    poll_until(
+        30,
+        || {
+            let output = vosx(
+                data.path(),
+                config.path(),
+                &["space", "call", space, "counter", "value"],
+            );
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "U64(0)"
+        },
+        || {
+            format!(
+                "the fresh installation inherited old state or failed to start; log:\n{}",
+                fs::read_to_string(&third_log).unwrap_or_default(),
+            )
+        },
+    );
+    assert!(!old_image.exists(), "deleted installation remained active");
+    assert!(
+        service_data_dir
+            .join("trash")
+            .join("v2-services")
+            .join(old_image.file_name().unwrap())
+            .is_file(),
+        "deleted installation image was not moved to recoverable trash",
     );
 }
 
