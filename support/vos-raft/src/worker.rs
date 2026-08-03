@@ -96,6 +96,10 @@ pub enum ReadIndexError {
     ///
     /// [`Config::max_pending_reads`]: crate::Config::max_pending_reads
     Backpressure,
+    /// The caller's bounded read barrier expired before a current-term quorum
+    /// confirmation arrived. The worker removes the request from its pending
+    /// queue before returning this error.
+    TimedOut,
 }
 
 /// Reasons a [`WorkerHandle::change_membership`] can fail.
@@ -198,6 +202,7 @@ pub enum RaftMsg<N: NodeId> {
     /// `commit_index` after a heartbeat round to quorum confirms
     /// leadership at the current term.
     ReadIndex {
+        timeout: Option<Duration>,
         reply: oneshot::Sender<Result<u64, ReadIndexError>>,
     },
     /// Begin a membership change. Leader appends a joint
@@ -567,6 +572,9 @@ impl<N: NodeId> WorkerHandle<N> {
     /// 4. If the leader's pending-reads queue is at
     ///    [`Config::max_pending_reads`], resolves with
     ///    `Err(Backpressure)`.
+    /// 5. [`Self::read_index_with_timeout`] additionally removes the request
+    ///    from that queue and resolves with `Err(TimedOut)` when its worker
+    ///    clock deadline expires.
     ///
     /// Linearizability: a freshly-elected leader appends a
     /// no-op `Data` entry in its current term as part of
@@ -578,7 +586,28 @@ impl<N: NodeId> WorkerHandle<N> {
     pub async fn read_index(&self) -> Result<u64, ReadIndexError> {
         let (tx, rx) = oneshot::channel();
         self.inbox
-            .send(RaftMsg::ReadIndex { reply: tx })
+            .send(RaftMsg::ReadIndex {
+                timeout: None,
+                reply: tx,
+            })
+            .map_err(|_| ReadIndexError::NotLeader)?;
+        rx.await.unwrap_or(Err(ReadIndexError::NotLeader))
+    }
+
+    /// Request a linearizable-read index with a worker-owned timeout.
+    ///
+    /// Expiry is processed inside the worker loop, which removes the request
+    /// from `pending_read_index` before returning [`ReadIndexError::TimedOut`].
+    /// This is intentionally stronger than racing [`Self::read_index`] against
+    /// a caller-side timer: dropping only the receiving future would leave a
+    /// dead request consuming the worker's bounded queue.
+    pub async fn read_index_with_timeout(&self, timeout: Duration) -> Result<u64, ReadIndexError> {
+        let (tx, rx) = oneshot::channel();
+        self.inbox
+            .send(RaftMsg::ReadIndex {
+                timeout: Some(timeout),
+                reply: tx,
+            })
             .map_err(|_| ReadIndexError::NotLeader)?;
         rx.await.unwrap_or(Err(ReadIndexError::NotLeader))
     }
@@ -933,6 +962,12 @@ enum RpcOutcome<N: NodeId> {
 /// the main loop's `select!`.
 type RpcFut<N> = Pin<Box<dyn Future<Output = RpcOutcome<N>> + Send>>;
 
+struct PendingReadIndex<I> {
+    required_index: u64,
+    deadline: Option<I>,
+    reply: oneshot::Sender<Result<u64, ReadIndexError>>,
+}
+
 struct WorkerState<N, S, T, C, R, A>
 where
     N: NodeId,
@@ -958,12 +993,12 @@ where
     votes_received: BTreeSet<N>,
     leader: Option<LeaderState<N>>,
     /// In-flight `read_index` requests waiting for a quorum
-    /// confirmation. Each entry is `(read_index_at_request, reply)`
-    /// — the index becomes resolvable once
+    /// confirmation. The index becomes resolvable once
     /// `match_index_majority_floor >= read_index_at_request`
     /// (a quorum has acked at the current term, and that ack
-    /// landed at or after the request was queued).
-    pending_read_index: Vec<(u64, oneshot::Sender<Result<u64, ReadIndexError>>)>,
+    /// landed at or after the request was queued). Bounded requests carry a
+    /// worker-clock deadline and are removed when it expires.
+    pending_read_index: Vec<PendingReadIndex<C::Instant>>,
     /// Follower-side accumulator for an in-flight chunked
     /// `InstallSnapshot`. `None` between snapshot streams; `Some`
     /// while chunks are arriving for a particular `(last_included_index,
@@ -1304,7 +1339,12 @@ where
         // `clock.sleep_until(deadline)` returns C::Sleep — wrap
         // it with `.fuse()` so it's safe to poll past completion
         // (FuturesUnordered already hands us fused items).
-        let timer = state.clock.sleep_until(state.election_deadline).fuse();
+        let wake_deadline = state
+            .pending_read_index
+            .iter()
+            .filter_map(|pending| pending.deadline)
+            .fold(state.election_deadline, core::cmp::min);
+        let timer = state.clock.sleep_until(wake_deadline).fuse();
         futures_util::pin_mut!(timer);
 
         let next_inbox = inbox_rx.next().fuse();
@@ -1328,7 +1368,7 @@ where
                     }
                 }
                 _ = timer => {
-                    on_timer(&mut state, &mut pending).await;
+                    on_worker_timer(&mut state, &mut pending).await;
                 }
             }
         } else {
@@ -1343,7 +1383,7 @@ where
                     }
                 }
                 _ = timer => {
-                    on_timer(&mut state, &mut pending).await;
+                    on_worker_timer(&mut state, &mut pending).await;
                 }
                 outcome = next_pending => {
                     if let Some(o) = outcome {
@@ -1392,8 +1432,8 @@ async fn handle_msg<N, S, T, C, R, A>(
             let r = handle_propose(state, payload).await;
             let _ = reply.send(r);
         }
-        RaftMsg::ReadIndex { reply } => {
-            handle_read_index(state, pending, reply).await;
+        RaftMsg::ReadIndex { timeout, reply } => {
+            handle_read_index(state, pending, timeout, reply).await;
         }
         RaftMsg::ChangeMembership { new_members, reply } => {
             let r = handle_change_membership(state, new_members).await;
@@ -1468,6 +1508,28 @@ async fn on_timer<N, S, T, C, R, A>(
         Role::Leader => {
             let _ = send_heartbeats(state, pending).await;
         }
+    }
+}
+
+/// Handle the earliest worker deadline. Read-barrier deadlines share the
+/// worker's monotonic clock with elections, but expiring one must not trigger
+/// an early election or heartbeat. Only invoke `on_timer` when the actual
+/// election/heartbeat deadline is also due.
+async fn on_worker_timer<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
+    pending: &mut FuturesUnordered<RpcFut<N>>,
+) where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+    A: ApplySink,
+{
+    let now = state.clock.now();
+    expire_pending_reads(state, now);
+    if now >= state.election_deadline {
+        on_timer(state, pending).await;
     }
 }
 
@@ -2470,6 +2532,7 @@ where
 async fn handle_read_index<N, S, T, C, R, A>(
     state: &mut WorkerState<N, S, T, C, R, A>,
     pending: &mut FuturesUnordered<RpcFut<N>>,
+    timeout: Option<Duration>,
     reply: oneshot::Sender<Result<u64, ReadIndexError>>,
 ) where
     N: NodeId,
@@ -2510,7 +2573,12 @@ async fn handle_read_index<N, S, T, C, R, A>(
     {
         r = noop_idx;
     }
-    state.pending_read_index.push((r, reply));
+    let deadline = timeout.map(|timeout| state.clock.add(state.clock.now(), timeout));
+    state.pending_read_index.push(PendingReadIndex {
+        required_index: r,
+        deadline,
+        reply,
+    });
     // Trigger a fresh heartbeat round. The round's quorum-success
     // confirms we're still leader at the current term; the
     // resulting match_index advance fires
@@ -2536,13 +2604,41 @@ where
     let Some(mf) = state.match_index_majority_floor().await else {
         return;
     };
+    let now = state.clock.now();
     // Partition pending into resolvable + still-waiting.
     let mut still_waiting = Vec::new();
-    for (r, reply) in core::mem::take(&mut state.pending_read_index) {
-        if r <= mf {
-            let _ = reply.send(Ok(r));
+    for pending in core::mem::take(&mut state.pending_read_index) {
+        if pending.deadline.is_some_and(|deadline| deadline <= now) {
+            let _ = pending.reply.send(Err(ReadIndexError::TimedOut));
+        } else if pending.required_index <= mf {
+            let _ = pending.reply.send(Ok(pending.required_index));
         } else {
-            still_waiting.push((r, reply));
+            still_waiting.push(pending);
+        }
+    }
+    state.pending_read_index = still_waiting;
+}
+
+/// Remove every bounded read whose worker-clock deadline has elapsed. The
+/// sender is completed before the row is discarded, so callers observe a
+/// typed timeout and the queue slot is immediately reusable.
+fn expire_pending_reads<N, S, T, C, R, A>(
+    state: &mut WorkerState<N, S, T, C, R, A>,
+    now: C::Instant,
+) where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+    A: ApplySink,
+{
+    let mut still_waiting = Vec::new();
+    for pending in core::mem::take(&mut state.pending_read_index) {
+        if pending.deadline.is_some_and(|deadline| deadline <= now) {
+            let _ = pending.reply.send(Err(ReadIndexError::TimedOut));
+        } else {
+            still_waiting.push(pending);
         }
     }
     state.pending_read_index = still_waiting;
@@ -2559,8 +2655,8 @@ where
     R: Rng,
     A: ApplySink,
 {
-    for (_r, reply) in core::mem::take(&mut state.pending_read_index) {
-        let _ = reply.send(Err(ReadIndexError::LeaderStepped));
+    for pending in core::mem::take(&mut state.pending_read_index) {
+        let _ = pending.reply.send(Err(ReadIndexError::LeaderStepped));
     }
 }
 

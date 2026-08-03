@@ -292,16 +292,24 @@ impl CommittedAccumulateLogV2 for RaftAccumulateLogV2 {
                 Ok(self.meta.commit_index)
             }
             #[cfg(feature = "network")]
-            RoleV2::Multi { worker, .. } => worker.handler().read_index().map_err(|error| {
-                let reason = match error {
-                    ReadIndexError::NotLeader => "not leader",
-                    ReadIndexError::LeaderStepped => "leader stepped down",
-                    ReadIndexError::Backpressure => "backpressure",
-                };
-                CommitError::Config(alloc::format!(
-                    "raft v2 current-term read barrier failed: {reason}"
-                ))
-            }),
+            // Admission and proposal share one operator-visible liveness
+            // budget. The worker owns this deadline and removes the pending
+            // read on expiry, so an isolated leader cannot strand the root's
+            // sole service thread or leak read-barrier queue slots.
+            RoleV2::Multi { worker, .. } => worker
+                .handler()
+                .read_index(Duration::from_millis(self.cfg.propose_timeout_ms))
+                .map_err(|error| {
+                    let reason = match error {
+                        ReadIndexError::NotLeader => "not leader",
+                        ReadIndexError::LeaderStepped => "leader stepped down",
+                        ReadIndexError::Backpressure => "backpressure",
+                        ReadIndexError::TimedOut => "timed out",
+                    };
+                    CommitError::Config(alloc::format!(
+                        "raft v2 current-term read barrier failed: {reason}"
+                    ))
+                }),
         }
     }
 

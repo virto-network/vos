@@ -1284,6 +1284,79 @@ fn read_index_returns_leader_stepped_on_partition_step_down() {
     );
 }
 
+/// A bounded read barrier on an isolated leader must time out inside the
+/// worker, release its queue slot, and leave worker shutdown joinable. Racing
+/// an unbounded client future against a timer would fail the second call with
+/// Backpressure because the first dead request would still occupy the sole
+/// pending slot.
+#[test]
+fn bounded_read_index_cancels_on_partition_and_shutdown_remains_joinable() {
+    use vos_raft::ReadIndexError;
+
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+    let members = vec![1u16, 2, 3];
+    let mut workers: BTreeMap<u16, Worker<u16>> = BTreeMap::new();
+    for me in members.iter().copied() {
+        let mut config = cfg(me, members.clone());
+        config.max_pending_reads = 1;
+        let worker = Worker::spawn_with(
+            MemStorage::<u16>::new(),
+            transport.clone(),
+            config,
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        routes.lock().unwrap().insert(me, worker.handler());
+        workers.insert(me, worker);
+    }
+
+    wait_until(
+        || {
+            members
+                .iter()
+                .any(|member| workers[member].role() == Role::Leader)
+        },
+        Duration::from_secs(3),
+        "leader emerges before bounded-read partition",
+    );
+    let leader_id = *members
+        .iter()
+        .find(|member| workers[member].role() == Role::Leader)
+        .unwrap();
+    let leader = workers[&leader_id].handler();
+    transport.isolate(leader_id, &members);
+
+    let started = Instant::now();
+    for attempt in 0..2 {
+        let result = block_on(leader.read_index_with_timeout(Duration::from_millis(40)));
+        assert!(
+            matches!(result, Err(ReadIndexError::TimedOut)),
+            "attempt {attempt} must expire and release the only queue slot, got {result:?}"
+        );
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "bounded barriers must not strand the caller"
+    );
+    assert_eq!(
+        leader.role(),
+        Role::Leader,
+        "the partitioned leader stays leader"
+    );
+
+    let shutdown_started = Instant::now();
+    routes.lock().unwrap().clear();
+    for worker in workers.into_values() {
+        worker.shutdown();
+    }
+    assert!(
+        shutdown_started.elapsed() < Duration::from_secs(2),
+        "expired barriers must not prevent worker shutdown"
+    );
+}
+
 /// `read_index` returns `Backpressure` when the leader's
 /// pending-reads queue is full. Without this cap, an asymmetric
 /// partition (leader receives but heartbeats can't quorum-confirm)

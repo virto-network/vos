@@ -133,6 +133,8 @@ pub enum ReadIndexError {
     LeaderStepped,
     /// The worker's bounded pending-read queue is full.
     Backpressure,
+    /// The bounded barrier expired and was removed from the worker queue.
+    TimedOut,
 }
 
 impl core::fmt::Display for ReadIndexError {
@@ -141,6 +143,7 @@ impl core::fmt::Display for ReadIndexError {
             Self::NotLeader => write!(f, "raft read barrier: not leader"),
             Self::LeaderStepped => write!(f, "raft read barrier: leader stepped down"),
             Self::Backpressure => write!(f, "raft read barrier: backpressure"),
+            Self::TimedOut => write!(f, "raft read barrier: timed out"),
         }
     }
 }
@@ -331,12 +334,13 @@ impl WorkerHandle {
 
     /// Establish a current-term quorum barrier and return the committed index
     /// that a local state machine must apply through before serving ingress.
-    pub fn read_index(&self) -> Result<u64, ReadIndexError> {
-        match block_on(self.inner.read_index()) {
+    pub fn read_index(&self, timeout: std::time::Duration) -> Result<u64, ReadIndexError> {
+        match block_on(self.inner.read_index_with_timeout(timeout)) {
             Ok(index) => Ok(index),
             Err(vos_raft::ReadIndexError::NotLeader) => Err(ReadIndexError::NotLeader),
             Err(vos_raft::ReadIndexError::LeaderStepped) => Err(ReadIndexError::LeaderStepped),
             Err(vos_raft::ReadIndexError::Backpressure) => Err(ReadIndexError::Backpressure),
+            Err(vos_raft::ReadIndexError::TimedOut) => Err(ReadIndexError::TimedOut),
             // Keep the facade exhaustive when vos-raft grows a new variant.
             Err(_) => Err(ReadIndexError::LeaderStepped),
         }
