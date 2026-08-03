@@ -789,8 +789,10 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         restarted.pending_publications().unwrap(),
         vec![publication.clone()]
     );
+    let mut retry = request.clone();
+    retry.logical_timeslot = 9_999;
     let recovered = restarted
-        .invoke(request.clone())
+        .invoke(retry)
         .expect("lost committed result reattaches after restart");
     assert!(recovered.duplicate);
     assert_eq!(recovered.refine_gas_used, 0);
@@ -874,7 +876,6 @@ fn node_routes_canonical_actor_ids_through_the_guest_owned_root_service() {
 
     let malformed = vos::v2::RootTreeInvocationV2 {
         invocation: InvocationId([109; 32]),
-        logical_timeslot: 2,
         target: actor,
         method: "other".into(),
         arguments,

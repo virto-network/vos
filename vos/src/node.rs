@@ -852,6 +852,11 @@ pub struct VosNode {
     /// process restart.
     v2_invocation_seed: [u8; 32],
     v2_invocation_ordinal: AtomicU64,
+    /// Trusted local admission clock for v2 work. External ingress never
+    /// carries this value; the root-service thread stamps it immediately
+    /// before scheduling. It is seeded from wall time so a process restart
+    /// cannot reset durable deadline comparisons to one.
+    v2_logical_timeslot: Arc<AtomicU64>,
     /// Reverse map `local_id → instance name`, populated at register
     /// time and read live by the auth path (the libp2p gate's
     /// actor-local probe and extension relays). Shared (cheap clone)
@@ -2469,6 +2474,7 @@ impl VosNode {
             v2_actor_routes: Arc::new(RwLock::new(HashMap::new())),
             v2_invocation_seed,
             v2_invocation_ordinal: AtomicU64::new(1),
+            v2_logical_timeslot: Arc::new(AtomicU64::new(v2_wall_timeslot())),
             agent_names: Arc::new(std::sync::RwLock::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             agent_shutdown: Arc::new(Mutex::new(HashMap::new())),
@@ -2813,9 +2819,18 @@ impl VosNode {
         let shutdown = self.register_agent_shutdown(id);
         let activity = self.last_activity.clone();
         let actor_routes = self.v2_actor_routes.clone();
+        let logical_timeslot = self.v2_logical_timeslot.clone();
         self.agents.push(AgentHandle {
             join: Some(thread::spawn(move || {
-                v2_root_service_thread(id, service, invoke_rx, actor_routes, shutdown, activity)
+                v2_root_service_thread(
+                    id,
+                    service,
+                    invoke_rx,
+                    actor_routes,
+                    logical_timeslot,
+                    shutdown,
+                    activity,
+                )
             })),
         });
         Ok(id)
@@ -3519,7 +3534,6 @@ impl VosNode {
         nonce.extend_from_slice(&target.0);
         let ingress = crate::v2::RootTreeInvocationV2 {
             invocation: crate::v2::InvocationId::derive(b"vos/node-root-invocation/v2", &nonce),
-            logical_timeslot: ordinal,
             target,
             method: message.name,
             arguments,
@@ -3730,15 +3744,39 @@ fn v2_root_origin(
     match caller {
         crate::actors::Caller::Unauthenticated => Some(crate::v2::Origin::Anonymous),
         crate::actors::Caller::System => Some(crate::v2::Origin::System),
-        crate::actors::Caller::Peer(peer) => Some(crate::v2::Origin::Member(crate::v2::SubjectId(
-            crate::crypto::blake2b::blake2b_hash::<32>(b"vos/member-subject/v2", &[peer]),
-        ))),
+        crate::actors::Caller::Peer(peer) => Some(crate::v2::Origin::Member(
+            crate::actors::context::authenticated_peer_subject(peer),
+        )),
         crate::actors::Caller::Actor(route) => actor_routes
             .read()
             .ok()?
             .iter()
             .find_map(|(actor, candidate)| (*candidate == route.0).then_some(*actor))
             .map(crate::v2::Origin::Actor),
+    }
+}
+
+fn v2_wall_timeslot() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+/// Allocate a trusted, monotone local admission slot. Wall time makes the
+/// counter restart-safe; compare/exchange keeps concurrent service threads in
+/// one node-wide order even when the wall clock has not advanced.
+fn next_v2_logical_timeslot(clock: &AtomicU64) -> u64 {
+    let wall = v2_wall_timeslot();
+    let mut observed = clock.load(Ordering::Relaxed);
+    loop {
+        let admitted = observed.max(wall);
+        let next = admitted.saturating_add(1);
+        match clock.compare_exchange_weak(observed, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return admitted,
+            Err(actual) => observed = actual,
+        }
     }
 }
 
@@ -3751,6 +3789,7 @@ fn v2_root_service_thread<B>(
     mut service: crate::v2::LocalRootTreeServiceV2<B>,
     invoke_rx: mpsc::Receiver<InvokeRequest>,
     actor_routes: Arc<RwLock<HashMap<crate::v2::ActorId, u32>>>,
+    logical_timeslot: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
 ) -> AgentResult
@@ -3815,7 +3854,7 @@ where
         let result = service.invoke(crate::v2::LocalWorkRequestV2 {
             invocation: ingress.invocation,
             workflow_step: 0,
-            logical_timeslot: ingress.logical_timeslot,
+            logical_timeslot: next_v2_logical_timeslot(&logical_timeslot),
             target: ingress.target,
             method: ingress.method,
             arguments: ingress.arguments,
@@ -8239,6 +8278,28 @@ mod tests {
         ));
         let received = rx.recv().expect("received");
         assert_eq!(received.len(), 100);
+    }
+
+    #[test]
+    fn v2_admission_slots_are_node_owned_and_monotone() {
+        let future = v2_wall_timeslot().saturating_add(1_000);
+        let clock = AtomicU64::new(future);
+        let first = next_v2_logical_timeslot(&clock);
+        let second = next_v2_logical_timeslot(&clock);
+        assert_eq!(first, future);
+        assert_eq!(second, future + 1);
+    }
+
+    #[test]
+    fn v2_ingress_uses_the_canonical_peer_subject_identity() {
+        let peer = vec![0xaa, 0xbb, 0xcc];
+        let routes = RwLock::new(HashMap::new());
+        assert_eq!(
+            v2_root_origin(&crate::actors::Caller::Peer(peer.clone()), &routes),
+            Some(crate::v2::Origin::Member(
+                crate::actors::context::authenticated_peer_subject(&peer)
+            ))
+        );
     }
 
     #[test]

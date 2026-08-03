@@ -32,7 +32,6 @@ use super::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootTreeInvocationV2 {
     pub invocation: super::InvocationId,
-    pub logical_timeslot: u64,
     pub target: ActorId,
     pub method: String,
     pub arguments: Vec<u8>,
@@ -45,7 +44,6 @@ impl V2Wire for RootTreeInvocationV2 {
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
         encoder.fixed(&self.invocation.0);
-        encoder.u64(self.logical_timeslot);
         encoder.fixed(&self.target.0);
         encoder.string(&self.method);
         encoder.bytes(&self.arguments);
@@ -55,7 +53,6 @@ impl V2Wire for RootTreeInvocationV2 {
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let value = Self {
             invocation: super::InvocationId(decoder.fixed()?),
-            logical_timeslot: decoder.u64()?,
             target: ActorId(decoder.fixed()?),
             method: decoder.string()?,
             arguments: decoder.bytes()?,
@@ -96,7 +93,6 @@ pub struct LocalRootTreeConfigV2 {
 pub enum LocalRootTreeConfigErrorV2 {
     InvalidPackage(PackageError),
     InvalidPackageSignature,
-    PackageSignatureVerifierUnavailable,
     InvalidActorProgramLayout,
     InvalidGenesis,
     WrongDeployment,
@@ -171,28 +167,40 @@ pub struct LocalRootTreeServiceV2<B> {
     root_actor: ActorId,
 }
 
+fn verify_ed25519_signature(public_key_wire: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    // `.vos` v2 deployment keys are the canonical libp2p Ed25519 public-key
+    // protobuf: field 1 = key type 1, field 2 = exactly 32 key bytes. Decode
+    // this tiny frozen wire locally so a bare std host does not need the
+    // network stack (and so no host-only dependency enters canonical guests).
+    let Some(public_key) = public_key_wire
+        .strip_prefix(&[0x08, 0x01, 0x12, 0x20])
+        .and_then(|bytes| <&[u8; 32]>::try_from(bytes).ok())
+    else {
+        return false;
+    };
+    let provider = futures_rustls::rustls::crypto::ring::default_provider();
+    let Some(verifier) = provider
+        .signature_verification_algorithms
+        .mapping
+        .iter()
+        .find(|(scheme, _)| *scheme == futures_rustls::rustls::SignatureScheme::ED25519)
+        .and_then(|(_, algorithms)| algorithms.first())
+    else {
+        return false;
+    };
+    verifier
+        .verify_signature(public_key, message, signature)
+        .is_ok()
+}
+
 fn verify_package_signature(package: &VosPackageV2) -> Result<(), LocalRootTreeConfigErrorV2> {
-    #[cfg(feature = "network")]
-    {
-        let public_key = libp2p::identity::PublicKey::try_decode_protobuf(
-            &package.deployment_signature.public_key,
-        )
-        .map_err(|_| LocalRootTreeConfigErrorV2::InvalidPackageSignature)?;
-        if !public_key.verify(
-            &package.signing_message(),
-            &package.deployment_signature.signature,
-        ) {
-            return Err(LocalRootTreeConfigErrorV2::InvalidPackageSignature);
-        }
-        Ok(())
-    }
-    #[cfg(not(feature = "network"))]
-    {
-        // Signature verification must never degrade into the structural
-        // package check when the native verifier is unavailable.
-        let _ = package;
-        Err(LocalRootTreeConfigErrorV2::PackageSignatureVerifierUnavailable)
-    }
+    verify_ed25519_signature(
+        &package.deployment_signature.public_key,
+        &package.signing_message(),
+        &package.deployment_signature.signature,
+    )
+    .then_some(())
+    .ok_or(LocalRootTreeConfigErrorV2::InvalidPackageSignature)
 }
 
 impl LocalRootTreeConfigV2 {
@@ -304,6 +312,11 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
             && request.awaited_timeout.is_none()
             && committed.imported_blobs == request.imported_blobs
             && committed.proof_requested == request.proof_requested;
+        // Deliberately do not compare `logical_timeslot`: the node stamps a
+        // fresh trusted admission slot on every attempt. The authenticated
+        // checkpoint/dedup bridge below retains the original committed work
+        // hash (and therefore its original slot), so an exact retry reattaches
+        // that result while divergent invocation reuse is still rejected.
         if !exact_ingress {
             return Err(LocalRootTreeInvokeErrorV2::DivergentInvocation);
         }
@@ -631,6 +644,8 @@ impl<B: CommittedImageStoreV2> LocalRootTreeServiceV2<B> {
 
 #[cfg(test)]
 mod tests {
+    use ed25519_dalek::{Signer, SigningKey};
+
     use super::super::InvocationId;
     use super::*;
 
@@ -638,7 +653,6 @@ mod tests {
     fn root_tree_invocation_wire_is_strict_and_canonical() {
         let invocation = RootTreeInvocationV2 {
             invocation: InvocationId([1; 32]),
-            logical_timeslot: 7,
             target: ActorId([2; 32]),
             method: "increment".into(),
             arguments: vec![crate::value::TAG_DYNAMIC, 3, 4],
@@ -677,5 +691,33 @@ mod tests {
                 Err(DecodeError::NonCanonical)
             );
         }
+    }
+
+    #[test]
+    fn native_std_signature_verifier_does_not_require_network_transport() {
+        let signing = SigningKey::from_bytes(&[0x33; 32]);
+        let message = b"signed package identity";
+        let mut public_key_wire = vec![0x08, 0x01, 0x12, 0x20];
+        public_key_wire.extend_from_slice(signing.verifying_key().as_bytes());
+        let signature = signing.sign(message).to_bytes();
+        assert!(verify_ed25519_signature(
+            &public_key_wire,
+            message,
+            &signature
+        ));
+
+        let mut forged = signature;
+        forged[0] ^= 0x80;
+        assert!(!verify_ed25519_signature(
+            &public_key_wire,
+            message,
+            &forged
+        ));
+        public_key_wire.push(0);
+        assert!(!verify_ed25519_signature(
+            &public_key_wire,
+            message,
+            &signature
+        ));
     }
 }

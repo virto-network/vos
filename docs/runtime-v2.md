@@ -97,15 +97,18 @@ publication table until their exact commitment is acknowledged through
 physical Accumulate. This direct host rejects `Raft` consistency rather than
 claiming replication without a replicated driver, and rejects attested work
 until a proof producer is explicitly connected by a later host surface.
-The native signature check reuses the network host's pinned identity
-implementation; a `std` build without that verifier fails closed with
-`PackageSignatureVerifierUnavailable` rather than accepting a structural-only
-package check.
+Every native `std` host verifies the deployment's frozen libp2p-Ed25519 wire
+through its existing native crypto provider. Bare single-node hosts therefore
+retain the same authority check without requiring network transport or adding
+a host-only dependency to canonical riscv64 service and actor guests.
 
 `VosNode::register_v2_root_at_id` attaches that boundary without extracting
 the actor PVM into the legacy runtime. Its strict `RootTreeInvocationV2` keeps
-the full `ActorId`, `InvocationId`, method, arguments, proof mode, and logical
-timeslot intact until the service builds work from guest-owned state. The
+the full `ActorId`, `InvocationId`, method, arguments, and proof mode intact
+until the service builds work from guest-owned state. Logical time is not an
+external field: the node stamps a trusted, monotone admission slot at the
+scheduler boundary. Exact retries are reattached through the committed
+workflow and dedup records, which retain the original admitted slot. The
 default host bound handle resolves `ActorId` directly rather than truncating it
 to a `ServiceId`. This first node cutover admits only ordinary methods whose
 signed installed policy is public and non-attested; protected or attested
