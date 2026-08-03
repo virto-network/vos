@@ -105,6 +105,14 @@ fn encode_v2_invocation(
     .encode())
 }
 
+fn is_reserved_host_operation(method: &str) -> bool {
+    matches!(method, "__stop" | "__describe")
+}
+
+fn upgrade_uses_v2_package(from: &[u8], to: &[u8]) -> bool {
+    from.get(..4) == Some(b"VOSP") || to.get(..4) == Some(b"VOSP")
+}
+
 impl DaemonClient {
     /// Resolve `query` to a space, read its endpoint file, and
     /// dial the running daemon. Errors fast if no daemon is
@@ -278,17 +286,14 @@ impl DaemonClient {
         if let Some(hex) = target.strip_prefix("0x") {
             let raw = u32::from_str_radix(hex, 16)
                 .map_err(|e| anyhow::anyhow!("invalid 0x ServiceId '{target}': {e}"))?;
-            return Ok(ServiceId(raw));
+            let route = ServiceId(raw);
+            self.remember_v2_target_for_route(route)?;
+            return Ok(route);
         }
         if let Some(agent) = self.agent(target)? {
             debug_assert_eq!(agent.instance_name, target);
             let route = instance_service_id(target, self.daemon_prefix);
-            if let Some(v2_target) = self.v2_target_for_agent(&agent)? {
-                self.v2_targets
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("v2 target cache is unavailable"))?
-                    .insert(route.0, v2_target);
-            }
+            self.remember_v2_target(route, &agent)?;
             return Ok(route);
         }
         // Not an installed agent — try the extension fallback.
@@ -357,19 +362,20 @@ impl DaemonClient {
             .map_err(|_| anyhow::anyhow!("v2 target cache is unavailable"))?
             .get(&target.0)
             .cloned();
-        let payload = if let Some(v2_target) = v2_target {
-            let mut nonce = [0; 32];
-            getrandom::getrandom(&mut nonce)
-                .map_err(|error| anyhow::anyhow!("mint v2 invocation ID: {error}"))?;
-            encode_v2_invocation(
-                &v2_target,
-                vos::v2::InvocationId::derive(b"vosx/daemon-invocation/v2", &nonce),
-                msg,
-                payload,
-            )?
-        } else {
-            payload
-        };
+        let payload =
+            if let Some(v2_target) = v2_target.filter(|_| !is_reserved_host_operation(&msg.name)) {
+                let mut nonce = [0; 32];
+                getrandom::getrandom(&mut nonce)
+                    .map_err(|error| anyhow::anyhow!("mint v2 invocation ID: {error}"))?;
+                encode_v2_invocation(
+                    &v2_target,
+                    vos::v2::InvocationId::derive(b"vosx/daemon-invocation/v2", &nonce),
+                    msg,
+                    payload,
+                )?
+            } else {
+                payload
+            };
 
         self.node
             .invoke_with_timeout(target, payload, timeout)
@@ -378,6 +384,44 @@ impl DaemonClient {
                     "daemon at {target} didn't reply within {timeout:?} (target unreachable or timed out)",
                 )
             })
+    }
+
+    fn remember_v2_target(&self, route: ServiceId, agent: &AgentRow) -> anyhow::Result<()> {
+        if let Some(v2_target) = self.v2_target_for_agent(agent)? {
+            self.v2_targets
+                .lock()
+                .map_err(|_| anyhow::anyhow!("v2 target cache is unavailable"))?
+                .insert(route.0, v2_target);
+        }
+        Ok(())
+    }
+
+    /// Recover the typed identity behind a route-only advanced target.
+    ///
+    /// `ServiceId` is a node-local compatibility address, not the actor's
+    /// authenticated identity. Match its local slot against the replicated
+    /// catalog while retaining the caller-selected node prefix, then cache the
+    /// exact package identity just as name resolution does.
+    fn remember_v2_target_for_route(&self, route: ServiceId) -> anyhow::Result<()> {
+        let prefix = (route.0 >> 16) as u16;
+        let mut matched: Option<AgentRow> = None;
+        for agent in self.agents()? {
+            if instance_service_id(&agent.instance_name, prefix) != route {
+                continue;
+            }
+            if let Some(previous) = &matched {
+                anyhow::bail!(
+                    "ServiceId {route} is ambiguous between installed agents '{}' and '{}'",
+                    previous.instance_name,
+                    agent.instance_name,
+                );
+            }
+            matched = Some(agent);
+        }
+        if let Some(agent) = matched {
+            self.remember_v2_target(route, &agent)?;
+        }
+        Ok(())
     }
 
     fn v2_target_for_agent(&self, agent: &AgentRow) -> anyhow::Result<Option<V2Target>> {
@@ -405,8 +449,11 @@ impl DaemonClient {
                 .id_bytes()
                 .ok_or_else(|| anyhow::anyhow!("space ID is not canonical hex"))?,
         );
-        let service =
-            crate::commands::space::common::v2_root_service_id(space, &agent.instance_name);
+        let service = crate::commands::space::common::v2_root_service_id(
+            space,
+            &agent.instance_name,
+            agent.replication_id,
+        );
         Ok(Some(V2Target {
             actor: crate::commands::space::common::v2_root_actor_id(service, &agent.instance_name),
             methods: policies
@@ -595,20 +642,43 @@ impl DaemonClient {
         // Compare-and-swap base: read the instance's live program hash so
         // the registry rejects this upgrade if the instance has moved on
         // (a replayed/superseded upgrade can't roll the version back).
-        let from_hash = vos::block_on(
+        let from_hash: [u8; 32] = vos::block_on(
             self.registry()
                 .agent(&mut &self.node, instance_name.clone()),
         )
         .map_err(|e| anyhow::anyhow!("registry.agent(): {e}"))?
-        .map(|row| row.program_hash.to_vec())
+        .map(|row| row.program_hash)
         .ok_or_else(|| anyhow::anyhow!("upgrade: instance '{instance_name}' is not installed"))?;
+        let to_hash: [u8; 32] = program_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("upgrade: target program hash must be 32 bytes"))?;
+        let from_artifact = crate::blob_store::cache_get(&crate::blob_store::BlobHash(from_hash))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "upgrade: current program {} is absent from the local cache; refusing to mutate the catalog without classifying its runtime ABI",
+                    hex::encode(from_hash),
+                )
+            })?;
+        let to_artifact = crate::blob_store::cache_get(&crate::blob_store::BlobHash(to_hash))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "upgrade: target program {} is absent from the local cache; refusing to mutate the catalog without classifying its runtime ABI",
+                    hex::encode(to_hash),
+                )
+            })?;
+        if upgrade_uses_v2_package(&from_artifact, &to_artifact) {
+            anyhow::bail!(
+                "signed v2 package upgrades are not catalog mutations; guest-owned UpgradeActor support must land before this installation can be upgraded",
+            );
+        }
         vos::block_on(self.registry().upgrade(
             &mut &self.node,
             instance_name,
             program_name,
             program_version,
             program_hash,
-            from_hash,
+            from_hash.to_vec(),
             Vec::new(),
         ))
         .map_err(|e| anyhow::anyhow!("registry.upgrade(): {e}"))
@@ -913,5 +983,20 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(protected.contains("explicit v2 credential"));
+    }
+
+    #[test]
+    fn reserved_lifecycle_operations_bypass_actor_package_dispatch() {
+        assert!(is_reserved_host_operation("__stop"));
+        assert!(is_reserved_host_operation("__describe"));
+        assert!(!is_reserved_host_operation("stop"));
+        assert!(!is_reserved_host_operation("value"));
+    }
+
+    #[test]
+    fn catalog_upgrade_rejects_either_v2_endpoint() {
+        assert!(upgrade_uses_v2_package(b"VOSP\x02\0old", b"legacy"));
+        assert!(upgrade_uses_v2_package(b"legacy", b"VOSP\x02\0new"));
+        assert!(!upgrade_uses_v2_package(b"legacy-a", b"legacy-b"));
     }
 }

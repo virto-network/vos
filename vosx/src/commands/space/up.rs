@@ -1127,6 +1127,7 @@ fn spawn_installed_agents(
     // even for skipped agents (subscriptions filter, missing
     // blob, …) so we don't accidentally trash their state.
     let mut live_svc_ids: HashSet<u32> = HashSet::new();
+    let mut live_v2_services: HashSet<[u8; 32]> = HashSet::new();
     live_svc_ids.insert(ServiceId::REGISTRY.0);
     if has_hyperspace {
         // The hyperspace registry replica owns its own redb at
@@ -1138,6 +1139,14 @@ fn spawn_installed_agents(
     for a in agents.iter() {
         let svc_id = instance_service_id(&a.instance_name, local_prefix);
         live_svc_ids.insert(svc_id.0);
+        live_v2_services.insert(
+            v2_root_service_id(
+                vos::v2::SpaceId(space_id),
+                &a.instance_name,
+                a.replication_id,
+            )
+            .0,
+        );
     }
 
     // Contested raft bootstraps always defer at boot (their grace
@@ -1307,6 +1316,7 @@ fn spawn_installed_agents(
     // a future `--undo` (or just an `ls`) can recover the bytes
     // instead of finding orphans.
     sweep_orphan_redbs(data_dir, &live_svc_ids);
+    sweep_orphan_v2_services(data_dir, &live_v2_services);
 
     Ok(())
 }
@@ -1626,7 +1636,7 @@ fn v2_config_from_row(
     }
 
     let space = vos::v2::SpaceId(space_id);
-    let root_service = v2_root_service_id(space, &row.instance_name);
+    let root_service = v2_root_service_id(space, &row.instance_name, row.replication_id);
     let root_actor = v2_root_actor_id(root_service, &row.instance_name);
     let deployment = package.deployment_id();
     let state_path = data_dir
@@ -2411,6 +2421,62 @@ fn sweep_orphan_redbs(data_dir: &std::path::Path, live: &std::collections::HashS
     }
 }
 
+/// Move service images and proof side-CAS directories whose installation
+/// incarnation no longer exists in the registry into recoverable trash.
+///
+/// A v2 installation is keyed by `(space, name, replication_id)`. The
+/// registry forbids reusing a tombstoned replication id, so keeping an orphan
+/// in the active directory can only resurrect deleted state or collide with a
+/// later install. Both the image and its sibling `.image.proofs` directory use
+/// the root-service hash prefix and are swept together on the next daemon boot.
+fn sweep_orphan_v2_services(
+    data_dir: &std::path::Path,
+    live: &std::collections::HashSet<[u8; 32]>,
+) {
+    let services_dir = data_dir.join("v2-services");
+    let entries = match std::fs::read_dir(&services_dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    let trash = data_dir.join("trash").join("v2-services");
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Some(root_hex) = name_str.get(..64) else {
+            continue;
+        };
+        let suffix = &name_str[64..];
+        if !matches!(suffix, ".image" | ".image.proofs" | ".image.v2-next") {
+            continue;
+        }
+        let Ok(root_bytes) = hex::decode(root_hex) else {
+            continue;
+        };
+        let Ok(root_service) = <[u8; 32]>::try_from(root_bytes.as_slice()) else {
+            continue;
+        };
+        if live.contains(&root_service) {
+            continue;
+        }
+        if std::fs::create_dir_all(&trash).is_err() {
+            continue;
+        }
+        let destination = trash.join(name_str);
+        match std::fs::rename(entry.path(), &destination) {
+            Ok(()) => tracing::info!(
+                "moved orphan v2 service artifact to trash: {}",
+                destination.display(),
+            ),
+            Err(error) => tracing::warn!(
+                "failed to trash orphan v2 service artifact {}: {error}",
+                entry.path().display(),
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2500,6 +2566,48 @@ mod tests {
         // A `vos1…` token is never mistaken for a recipe.
         assert!(!is_recipe_path("vos1abc"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn orphan_v2_images_and_proofs_move_to_recoverable_trash() {
+        let dir = std::env::temp_dir().join(format!(
+            "vosx-v2-orphan-sweep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let services = dir.join("v2-services");
+        std::fs::create_dir_all(&services).unwrap();
+        let active = [0x31; 32];
+        let orphan = [0x42; 32];
+        let active_image = services.join(format!("{}.image", hex::encode(active)));
+        let orphan_image = services.join(format!("{}.image", hex::encode(orphan)));
+        let orphan_proofs = services.join(format!("{}.image.proofs", hex::encode(orphan)));
+        std::fs::write(&active_image, b"active").unwrap();
+        std::fs::write(&orphan_image, b"orphan").unwrap();
+        std::fs::create_dir_all(&orphan_proofs).unwrap();
+        std::fs::write(orphan_proofs.join("proof"), b"proof").unwrap();
+
+        sweep_orphan_v2_services(&dir, &[active].into_iter().collect());
+
+        assert!(active_image.is_file());
+        assert!(!orphan_image.exists());
+        assert!(!orphan_proofs.exists());
+        assert!(
+            dir.join("trash")
+                .join("v2-services")
+                .join(orphan_image.file_name().unwrap())
+                .is_file(),
+        );
+        assert!(
+            dir.join("trash")
+                .join("v2-services")
+                .join(orphan_proofs.file_name().unwrap())
+                .is_dir(),
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn status(role: RaftRole, members: Vec<u16>, leader_hint: Option<u16>) -> RaftStatusReply {

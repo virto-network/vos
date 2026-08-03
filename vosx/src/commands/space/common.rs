@@ -39,16 +39,22 @@ pub fn instance_service_id(instance_name: &str, prefix: u16) -> ServiceId {
     ServiceId(vos::registry::instance_service_id(instance_name, prefix))
 }
 
-/// Stable logical service identity for one installed v2 root tree.
+/// Stable logical service identity for one installed v2 root-tree incarnation.
 ///
-/// The compatibility route used by the daemon remains node-local, while this
-/// identity is scoped to the space and survives process restarts and package
-/// upgrades.
-pub fn v2_root_service_id(space: vos::v2::SpaceId, instance: &str) -> vos::v2::RootServiceId {
+/// The compatibility route used by the daemon remains node-local. The
+/// guest-owned identity is scoped to the space and registry installation, so
+/// it survives process restarts but a tombstoned name reinstalled with the
+/// required fresh replication id cannot inherit the deleted actor's state or
+/// deduplication history.
+pub fn v2_root_service_id(
+    space: vos::v2::SpaceId,
+    instance: &str,
+    replication_id: [u8; 32],
+) -> vos::v2::RootServiceId {
     vos::v2::RootServiceId(
         vos::v2::Hash::digest(
             b"vos/installed-root-service/v2",
-            &[&space.0, instance.as_bytes()],
+            &[&space.0, instance.as_bytes(), &replication_id],
         )
         .0,
     )
@@ -283,21 +289,23 @@ mod tests {
     }
 
     #[test]
-    fn v2_root_tree_identity_is_stable_and_space_scoped() {
-        let first = v2_root_service_id(vos::v2::SpaceId([1; 32]), "counter");
-        let same = v2_root_service_id(vos::v2::SpaceId([1; 32]), "counter");
-        let other_space = v2_root_service_id(vos::v2::SpaceId([2; 32]), "counter");
-        let other_name = v2_root_service_id(vos::v2::SpaceId([1; 32]), "ledger");
+    fn v2_root_tree_identity_is_stable_and_installation_scoped() {
+        let first = v2_root_service_id(vos::v2::SpaceId([1; 32]), "counter", [3; 32]);
+        let same = v2_root_service_id(vos::v2::SpaceId([1; 32]), "counter", [3; 32]);
+        let other_space = v2_root_service_id(vos::v2::SpaceId([2; 32]), "counter", [3; 32]);
+        let other_name = v2_root_service_id(vos::v2::SpaceId([1; 32]), "ledger", [3; 32]);
+        let reinstalled = v2_root_service_id(vos::v2::SpaceId([1; 32]), "counter", [4; 32]);
 
         assert_eq!(first, same);
         assert_ne!(first, other_space);
         assert_ne!(first, other_name);
+        assert_ne!(first, reinstalled);
         assert_ne!(first, vos::v2::RootServiceId::ZERO);
     }
 
     #[test]
     fn v2_root_actor_identity_is_stable_across_deployments() {
-        let service = v2_root_service_id(vos::v2::SpaceId([3; 32]), "counter");
+        let service = v2_root_service_id(vos::v2::SpaceId([3; 32]), "counter", [5; 32]);
         let actor = v2_root_actor_id(service, "counter");
 
         assert_eq!(actor, v2_root_actor_id(service, "counter"));

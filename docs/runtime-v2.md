@@ -561,12 +561,23 @@ legacy runtime or retranspiles an ELF. Missing or invalid service artifacts
 skip only the affected row, so an installed package cannot prevent the rest of
 a space from starting. Package classification precedes every legacy Raft seed,
 probe, or join action, so a refused v2 row cannot change quorum membership.
+The daemon derives the guest root-service identity and image path from the
+registry installation incarnation `(SpaceId, instance name, replication_id)`.
+Restarting the same installation reopens its exact image; uninstalling and
+reinstalling under the required fresh replication id creates a fresh actor and
+deduplication domain. On the next boot, images and proof side-CAS directories
+whose incarnation is no longer present move to recoverable trash.
 
 V2 Raft and CRDT rows remain fail-closed until their request-log and
 anti-entropy drivers are attached to the daemon. Attested and role-gated
 external calls likewise remain unavailable on this direct ingress; only
 ordinary public methods are admitted. Legacy ELF/PVM rows continue on the old
 host during this staged cutover.
+
+Registry-level `space upgrade` is rejected whenever either side is a signed v2
+package. A catalog pointer rewrite cannot update guest-owned descriptors or
+prove that a suspended actor is idle; v2 upgrades must enter through the
+guest-owned `UpgradeActor` protocol described above.
 
 The service identity retains the root package `DeploymentId` selected when
 the root tree is installed; it is the stable service/routing identity. Every
