@@ -3859,26 +3859,6 @@ where
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         *activity.lock().unwrap() = Instant::now();
-        match service.catch_up() {
-            Ok(true) => {
-                if let Err(failure) = restore_v2_root_logical_timeslot(&service, &logical_timeslot)
-                {
-                    error!(%id, ?failure, "v2 root-tree caught-up clock restoration failed");
-                    send_v2_status(req.reply, crate::STATUS_PANICKED, id);
-                    error = Some(format!("v2 root-tree clock restoration failed: {failure}"));
-                    break;
-                }
-            }
-            Ok(false) => {
-                send_v2_status(req.reply, crate::STATUS_PANICKED, id);
-                continue;
-            }
-            Err(failure) => {
-                error!(%id, ?failure, "v2 root-tree catch-up failed");
-                send_v2_status(req.reply, crate::STATUS_PANICKED, id);
-                continue;
-            }
-        }
         let ingress = match crate::v2::RootTreeInvocationV2::decode(&req.msg) {
             Ok(ingress) => ingress,
             Err(_) => {
@@ -3901,6 +3881,18 @@ where
             send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
             continue;
         }
+        // A role check is not a sufficient leadership gate: Raft exposes
+        // Leader before the promotion no-op reaches quorum. The service read
+        // barrier waits for that current-term entry and catches up the complete
+        // prior-term prefix before policy lookup or clock allocation.
+        let admission_floor = match service.prepare_admission_barrier() {
+            Ok(floor) => floor,
+            Err(failure) => {
+                error!(%id, ?failure, "v2 root-tree admission barrier failed");
+                send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                continue;
+            }
+        };
         let policy = match service.root_method_policy(&ingress.method) {
             Ok(Some(policy)) => policy,
             Ok(None) => {
@@ -3924,7 +3916,14 @@ where
             send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
             continue;
         };
-        let result = service.invoke(crate::v2::LocalWorkRequestV2 {
+        // Nothing catches up again between this allocation and the proposal.
+        if let Err(failure) = restore_v2_logical_timeslot(&logical_timeslot, admission_floor) {
+            error!(%id, ?failure, "v2 root-tree admission clock restoration failed");
+            send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+            error = Some(format!("v2 root-tree clock restoration failed: {failure}"));
+            break;
+        }
+        let result = service.invoke_after_admission_barrier(crate::v2::LocalWorkRequestV2 {
             invocation: ingress.invocation,
             workflow_step: 0,
             logical_timeslot: next_v2_logical_timeslot(&logical_timeslot),

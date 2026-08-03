@@ -30,7 +30,9 @@ pub use v2::RaftAccumulateLogV2;
 #[cfg(all(feature = "storage", feature = "network"))]
 pub use vos_transport::{VosTransport, VosTransportError};
 #[cfg(all(feature = "storage", feature = "network"))]
-pub use worker::{ChangeMembershipError, RaftWorker, Role, WorkerConfig, WorkerHandle};
+pub use worker::{
+    ChangeMembershipError, RaftWorker, ReadIndexError, Role, WorkerConfig, WorkerHandle,
+};
 
 /// Read the member set a replica's on-disk Raft db is anchored
 /// to, without spawning a worker. `Ok(None)` when the file

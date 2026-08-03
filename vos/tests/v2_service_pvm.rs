@@ -231,6 +231,7 @@ struct TestCommittedLog {
     shared: Arc<Mutex<SharedCommittedLog>>,
     applied: u64,
     leader: bool,
+    before_next_read_index: Vec<Vec<u8>>,
     before_next_proposal: Vec<Vec<u8>>,
     installed_snapshot: Option<CommittedServiceSnapshotV2>,
 }
@@ -241,6 +242,7 @@ impl TestCommittedLog {
             shared,
             applied: 0,
             leader,
+            before_next_read_index: Vec::new(),
             before_next_proposal: Vec::new(),
             installed_snapshot: None,
         }
@@ -255,6 +257,10 @@ impl TestCommittedLog {
         self.before_next_proposal.push(request);
     }
 
+    fn commit_before_next_read_index(&mut self, request: Vec<u8>) {
+        self.before_next_read_index.push(request);
+    }
+
     fn committed_len(&self) -> usize {
         self.shared.lock().unwrap().entries.len()
     }
@@ -262,6 +268,22 @@ impl TestCommittedLog {
 
 impl CommittedAccumulateLogV2 for TestCommittedLog {
     type Error = TestLogError;
+
+    fn leader_read_index(&mut self) -> Result<u64, Self::Error> {
+        if !self.leader {
+            return Err(TestLogError::NotLeader);
+        }
+        let mut shared = self.shared.lock().unwrap();
+        for request in core::mem::take(&mut self.before_next_read_index) {
+            let entry = CommittedAccumulateEntryV2 {
+                index: shared.entries.len() as u64 + 1,
+                request,
+                logical_timeslot: None,
+            };
+            shared.entries.push(entry);
+        }
+        Ok(shared.entries.len() as u64)
+    }
 
     fn propose_at(
         &mut self,
@@ -7956,12 +7978,85 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             .same_service_state(&follower.service().accumulate_host().snapshot())
     );
 
+    // Model leadership transfer with a prior-term application tail becoming
+    // committed together with the new leader's promotion no-op. The VOS read
+    // barrier must apply that tail before the node restores its admission
+    // clock and allocates the next slot.
+    let promotion_floor = 50_000;
+    let promotion_tail = LocalWorkSchedulerV2::prepare(
+        leader.service().accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId([123; 32]),
+            workflow_step: 0,
+            logical_timeslot: promotion_floor,
+            target: seed.target,
+            method: "start".into(),
+            arguments: seed.arguments.clone(),
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap()
+    .work;
+    let promotion_transition = TransitionV2 {
+        service: promotion_tail.service.clone(),
+        consumed_input: promotion_tail.input_id(),
+        target_deployment: promotion_tail.target_deployment,
+        target_program: promotion_tail.target_program,
+        base: promotion_tail.base.clone(),
+        writes: vec![ActorWriteV2 {
+            actor: promotion_tail.target,
+            key: vos::lifecycle::STATE_KEY_BYTES.to_vec(),
+            value: Some(b"prior-term state".to_vec()),
+        }],
+        crdt_change: None,
+        spawns: vec![],
+        continuations: vec![],
+        inbox: vec![],
+        outbox: vec![],
+        reply: Some(ReplyRecordV2 {
+            call_id: promotion_tail.invocation.root_reply_id(),
+            producer: promotion_tail.target,
+            result: b"prior-term reply".to_vec(),
+        }),
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    leader.log_mut().commit_before_next_read_index(
+        AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: promotion_tail,
+            transition: promotion_transition,
+            provided_blobs: vec![],
+        })
+        .encode(),
+    );
+    assert_eq!(leader.leadership_barrier_and_catch_up().unwrap(), 1);
+    let caught_up_header = leader
+        .service()
+        .accumulate_host()
+        .header()
+        .unwrap()
+        .unwrap();
+    assert_eq!(caught_up_header.revision, 1);
+    assert_eq!(
+        caught_up_header.admission_timeslot_high_water,
+        promotion_floor
+    );
+
     let first = LocalWorkSchedulerV2::prepare(
         leader.service().accumulate_host(),
         LocalWorkRequestV2 {
             invocation: InvocationId([125; 32]),
             workflow_step: 0,
-            logical_timeslot: 10,
+            logical_timeslot: promotion_floor + 1,
             target: seed.target,
             method: "start".into(),
             arguments: seed.arguments.clone(),
@@ -8052,8 +8147,8 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             .unwrap()
             .result,
         AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::StaleLinearWork {
-            expected_revision: 0,
-            actual_revision: 1,
+            expected_revision: 1,
+            actual_revision: 2,
         })
     ));
     assert_eq!(
@@ -8064,10 +8159,10 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             .unwrap()
             .unwrap()
             .revision,
-        1,
+        2,
         "the earlier committed request is applied before the caller's proposal"
     );
-    assert_eq!(follower.catch_up().unwrap(), 2);
+    assert_eq!(follower.catch_up().unwrap(), 3);
     assert!(
         leader
             .service()
@@ -8083,7 +8178,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
         LocalWorkRequestV2 {
             invocation: InvocationId([126; 32]),
             workflow_step: 0,
-            logical_timeslot: 11,
+            logical_timeslot: promotion_floor + 2,
             target: seed.target,
             method: "start".into(),
             arguments: seed.arguments,
@@ -8147,8 +8242,8 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             .snapshot()
             .same_service_state(&follower.service().accumulate_host().snapshot())
     );
-    assert_eq!(leader.log_mut().applied_index().unwrap(), 4);
-    assert_eq!(follower.log_mut().applied_index().unwrap(), 4);
+    assert_eq!(leader.log_mut().applied_index().unwrap(), 5);
+    assert_eq!(follower.log_mut().applied_index().unwrap(), 5);
 }
 
 #[test]

@@ -27,7 +27,7 @@ use crate::v2::{
 use super::log::{LogEntry, RaftLog, RaftMeta};
 use super::strategy::RaftConfig;
 #[cfg(feature = "network")]
-use super::worker::{ProposeError, RaftWorker, WorkerHandle};
+use super::worker::{ProposeError, RaftWorker, ReadIndexError, WorkerHandle};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RaftAccumulatePayloadV2 {
@@ -284,6 +284,26 @@ impl RaftAccumulateLogV2 {
 
 impl CommittedAccumulateLogV2 for RaftAccumulateLogV2 {
     type Error = CommitError;
+
+    fn leader_read_index(&mut self) -> Result<u64, Self::Error> {
+        match &self.role {
+            RoleV2::SingleNode => {
+                self.reload()?;
+                Ok(self.meta.commit_index)
+            }
+            #[cfg(feature = "network")]
+            RoleV2::Multi { worker, .. } => worker.handler().read_index().map_err(|error| {
+                let reason = match error {
+                    ReadIndexError::NotLeader => "not leader",
+                    ReadIndexError::LeaderStepped => "leader stepped down",
+                    ReadIndexError::Backpressure => "backpressure",
+                };
+                CommitError::Config(alloc::format!(
+                    "raft v2 current-term read barrier failed: {reason}"
+                ))
+            }),
+        }
+    }
 
     fn propose_at(
         &mut self,

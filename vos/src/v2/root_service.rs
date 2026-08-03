@@ -235,6 +235,19 @@ where
         }
     }
 
+    /// Establish the Raft current-term barrier and apply through it. Direct
+    /// services have no promotion boundary and are already authoritative.
+    fn admission_barrier(&mut self) -> Result<(), RootTreeDriverErrorV2> {
+        match self {
+            Self::Direct(_) => Ok(()),
+            #[cfg(feature = "storage")]
+            Self::Raft(service) => service
+                .leadership_barrier_and_catch_up()
+                .map(|_| ())
+                .map_err(RootTreeDriverErrorV2::Raft),
+        }
+    }
+
     fn is_writable(&self) -> bool {
         match self {
             Self::Direct(_) => true,
@@ -243,8 +256,8 @@ where
         }
     }
 
-    fn refine_actor_tree(
-        &mut self,
+    fn refine_actor_tree_after_barrier(
+        &self,
         work: &super::WorkEnvelopeV2,
         imports: &super::RefineImportsV2,
     ) -> Result<RefinedServiceOutputV2, RootTreeDriverErrorV2> {
@@ -254,7 +267,7 @@ where
                 .map_err(RootTreeDriverErrorV2::Direct),
             #[cfg(feature = "storage")]
             Self::Raft(service) => service
-                .refine_actor_tree(work, imports)
+                .refine_actor_tree_after_barrier(work, imports)
                 .map_err(RootTreeDriverErrorV2::Raft),
         }
     }
@@ -270,6 +283,21 @@ where
             #[cfg(feature = "storage")]
             Self::Raft(service) => service
                 .accumulate(request)
+                .map_err(RootTreeDriverErrorV2::Raft),
+        }
+    }
+
+    fn accumulate_after_barrier(
+        &mut self,
+        request: &AccumulateRequestV2,
+    ) -> Result<AccumulatedServiceOutputV2, RootTreeDriverErrorV2> {
+        match self {
+            Self::Direct(service) => service
+                .accumulate(request)
+                .map_err(RootTreeDriverErrorV2::Direct),
+            #[cfg(feature = "storage")]
+            Self::Raft(service) => service
+                .accumulate_after_barrier(request)
                 .map_err(RootTreeDriverErrorV2::Raft),
         }
     }
@@ -662,6 +690,45 @@ where
         self.ensure_installed()
     }
 
+    /// Establish the current-term admission barrier and return the durable
+    /// service high-water visible after applying through it. Node ingress must
+    /// restore and allocate its trusted timeslot from this value, then call
+    /// [`Self::invoke_after_admission_barrier`] without another catch-up.
+    pub(crate) fn prepare_admission_barrier(&mut self) -> Result<u64, LocalRootTreeInvokeErrorV2> {
+        self.service
+            .admission_barrier()
+            .map_err(RootTreeDriverErrorV2::into_invoke)?;
+        if !self.validate_installed()? {
+            if !self.service.is_writable() {
+                return Err(LocalRootTreeInvokeErrorV2::ServiceNotInstalled);
+            }
+            // Genesis installation, when this replica has just become the
+            // first writable leader, is ordered after the same barrier and
+            // before any actor admission slot exists. Use the no-catch-up path
+            // so the ordering remains one contiguous critical sequence.
+            let result = self
+                .service
+                .accumulate_after_barrier(&AccumulateRequestV2::Install(self.genesis.clone()))
+                .map_err(RootTreeDriverErrorV2::into_invoke)?;
+            match result.result {
+                AccumulationResultV2::Installed(_) => {}
+                AccumulationResultV2::Rejected(rejection) => {
+                    return Err(LocalRootTreeInvokeErrorV2::Rejected(rejection));
+                }
+                _ => return Err(LocalRootTreeInvokeErrorV2::UnexpectedResult),
+            }
+            if !self.validate_installed()? {
+                return Err(LocalRootTreeInvokeErrorV2::ServiceNotInstalled);
+            }
+        }
+        self.service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .map(|header| header.admission_timeslot_high_water)
+            .ok_or(LocalRootTreeInvokeErrorV2::ServiceNotInstalled)
+    }
+
     fn ensure_installed(&mut self) -> Result<bool, LocalRootTreeInvokeErrorV2> {
         self.service
             .catch_up()
@@ -794,7 +861,18 @@ where
         &mut self,
         request: LocalWorkRequestV2,
     ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
-        self.require_installed()?;
+        self.prepare_admission_barrier()?;
+        self.invoke_after_admission_barrier(request)
+    }
+
+    /// Execute ingress after [`Self::prepare_admission_barrier`] returned and
+    /// the caller allocated a slot above its high-water. This path performs no
+    /// catch-up before Refine or proposal, preserving the atomic ordering:
+    /// current-term barrier → catch-up → clock restore/allocation → proposal.
+    pub(crate) fn invoke_after_admission_barrier(
+        &mut self,
+        request: LocalWorkRequestV2,
+    ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
         if request.proof_requested {
             return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
         }
@@ -805,12 +883,12 @@ where
             .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
         let refined = self
             .service
-            .refine_actor_tree(&prepared.work, &prepared.imports)
+            .refine_actor_tree_after_barrier(&prepared.work, &prepared.imports)
             .map_err(RootTreeDriverErrorV2::into_invoke)?;
         let input = prepared.work.input_id();
         let accumulated = self
             .service
-            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            .accumulate_after_barrier(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                 work: prepared.work,
                 transition: refined.transition,
                 provided_blobs: refined.exported_blobs,

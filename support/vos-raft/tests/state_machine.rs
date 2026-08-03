@@ -25,9 +25,9 @@ use std::time::{Duration, Instant};
 
 use futures_executor::block_on;
 use vos_raft::{
-    AppendEntriesReq, AppendEntriesResp, Config, InstallSnapshotReq, InstallSnapshotResp,
-    MemStorage, PreVoteReq, PreVoteResp, RequestVoteReq, RequestVoteResp, Role, StdClock, StdRng,
-    Transport, Worker, WorkerHandle,
+    AppendEntriesReq, AppendEntriesResp, Config, InstallSnapshotReq, InstallSnapshotResp, LogEntry,
+    MemStorage, Meta, PreVoteReq, PreVoteResp, RequestVoteReq, RequestVoteResp, Role, StdClock,
+    StdRng, Storage, Transport, Worker, WorkerHandle, WriteBatch,
 };
 
 /// Inbox lookup. Each peer's `WorkerHandle` is registered here
@@ -1141,6 +1141,63 @@ fn read_index_resolves_after_quorum_confirmation() {
         matches!(r, Err(ReadIndexError::NotLeader)),
         "follower read_index must return NotLeader, got {r:?}",
     );
+}
+
+/// A promoted leader may expose `Role::Leader` before its promotion no-op has
+/// reached quorum. When its log already carries an uncommitted application
+/// entry from the prior term, `read_index` must wait through the no-op so the
+/// returned index commits that prior-term tail as part of the same prefix.
+#[test]
+fn read_index_commits_prior_term_application_tail_on_leadership_transfer() {
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+    let members = vec![1u16, 2, 3];
+    let mut workers: BTreeMap<u16, Worker<u16>> = BTreeMap::new();
+
+    for me in members.iter().copied() {
+        let mut storage = MemStorage::<u16>::new();
+        block_on(storage.commit_batch(WriteBatch {
+            appends: vec![LogEntry::data(1, 1, b"prior-term-application".to_vec())],
+            meta: Some(Meta {
+                current_term: 1,
+                voted_for: None,
+                commit_index: 0,
+                snap_last_index: 0,
+                snap_last_term: 0,
+            }),
+            ..Default::default()
+        }))
+        .unwrap();
+        let mut config = cfg(me, members.clone());
+        config.pre_vote = false;
+        config.election_timeout_ms = if me == 1 { (20, 25) } else { (400, 500) };
+        let worker = Worker::spawn_with(
+            storage,
+            transport.clone(),
+            config,
+            (),
+            StdClock,
+            StdRng::from_entropy(),
+        );
+        routes.lock().unwrap().insert(me, worker.handler());
+        workers.insert(me, worker);
+    }
+
+    wait_until(
+        || workers[&1].role() == Role::Leader,
+        Duration::from_secs(3),
+        "node with prior-term tail becomes leader",
+    );
+    let leader = workers[&1].handler();
+    let read_index =
+        block_on(leader.read_index()).expect("current-term read barrier reaches quorum");
+    assert_eq!(
+        read_index, 2,
+        "the barrier must include the current-term no-op above the prior-term application"
+    );
+    let snapshot = block_on(leader.snapshot()).unwrap();
+    assert!(snapshot.commit_index >= read_index);
+    assert_eq!(snapshot.last_log_index, 2);
 }
 
 /// `read_index` on a partitioned leader stalls until the

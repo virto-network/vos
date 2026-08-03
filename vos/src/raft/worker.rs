@@ -119,6 +119,34 @@ impl core::fmt::Display for ProposeError {
 }
 impl std::error::Error for ProposeError {}
 
+/// Reasons a linearizable Raft read barrier can fail.
+///
+/// The barrier is stronger than a lock-free [`WorkerHandle::role`] check: a
+/// newly promoted leader does not pass it until its current-term no-op is
+/// quorum committed, so every prior-term log entry before that no-op is also
+/// committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadIndexError {
+    /// This worker is not the current leader.
+    NotLeader,
+    /// Leadership changed before a quorum confirmed the current term.
+    LeaderStepped,
+    /// The worker's bounded pending-read queue is full.
+    Backpressure,
+}
+
+impl core::fmt::Display for ReadIndexError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotLeader => write!(f, "raft read barrier: not leader"),
+            Self::LeaderStepped => write!(f, "raft read barrier: leader stepped down"),
+            Self::Backpressure => write!(f, "raft read barrier: backpressure"),
+        }
+    }
+}
+
+impl std::error::Error for ReadIndexError {}
+
 /// Reasons a [`WorkerHandle::change_membership`] can fail.
 /// Mirrors `vos_raft::ChangeMembershipError` with vos's
 /// concrete [`CommitError`] storage type. New variants land
@@ -298,6 +326,19 @@ impl WorkerHandle {
             Err(_) => Err(ProposeError::Storage(CommitError::Config(
                 "raft propose: storage write failed".into(),
             ))),
+        }
+    }
+
+    /// Establish a current-term quorum barrier and return the committed index
+    /// that a local state machine must apply through before serving ingress.
+    pub fn read_index(&self) -> Result<u64, ReadIndexError> {
+        match block_on(self.inner.read_index()) {
+            Ok(index) => Ok(index),
+            Err(vos_raft::ReadIndexError::NotLeader) => Err(ReadIndexError::NotLeader),
+            Err(vos_raft::ReadIndexError::LeaderStepped) => Err(ReadIndexError::LeaderStepped),
+            Err(vos_raft::ReadIndexError::Backpressure) => Err(ReadIndexError::Backpressure),
+            // Keep the facade exhaustive when vos-raft grows a new variant.
+            Err(_) => Err(ReadIndexError::LeaderStepped),
         }
     }
 

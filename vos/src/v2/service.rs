@@ -276,6 +276,15 @@ impl V2Wire for CommittedServiceSnapshotV2 {
 pub trait CommittedAccumulateLogV2 {
     type Error;
 
+    /// Establish a current-leader quorum barrier and return the committed log
+    /// index that must be locally applied before admitting new work.
+    ///
+    /// A multi-node Raft implementation must not implement this as a role
+    /// check. Fresh leaders must wait for a current-term entry to commit so a
+    /// prior-term application tail cannot become visible after the caller has
+    /// already allocated an admission timeslot.
+    fn leader_read_index(&mut self) -> Result<u64, Self::Error>;
+
     fn propose_at(
         &mut self,
         request: &[u8],
@@ -983,12 +992,45 @@ where
             .map(|(applied_entries, _)| applied_entries)
     }
 
+    /// Confirm current-term leadership, then apply through the certified Raft
+    /// read index before the caller observes service state. The caller may
+    /// allocate an admission timeslot only after this returns and must use the
+    /// `*_after_barrier` methods below so no second catch-up can intervene.
+    pub fn leadership_barrier_and_catch_up(
+        &mut self,
+    ) -> Result<usize, ReplicatedServiceErrorV2<L::Error>> {
+        let read_index = self
+            .log
+            .leader_read_index()
+            .map_err(ReplicatedServiceErrorV2::Log)?;
+        let applied_entries = self.catch_up()?;
+        let applied = self
+            .log
+            .applied_index()
+            .map_err(ReplicatedServiceErrorV2::Log)?;
+        if applied < read_index {
+            return Err(ReplicatedServiceErrorV2::InvalidCommittedLog);
+        }
+        Ok(applied_entries)
+    }
+
     pub fn refine_actor_tree(
         &mut self,
         work: &WorkEnvelopeV2,
         imports: &RefineImportsV2,
     ) -> Result<RefinedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
         self.catch_up()?;
+        self.service
+            .refine_actor_tree(work, imports)
+            .map_err(ReplicatedServiceErrorV2::Dispatch)
+    }
+
+    #[cfg(feature = "storage")]
+    pub(crate) fn refine_actor_tree_after_barrier(
+        &self,
+        work: &WorkEnvelopeV2,
+        imports: &RefineImportsV2,
+    ) -> Result<RefinedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
         self.service
             .refine_actor_tree(work, imports)
             .map_err(ReplicatedServiceErrorV2::Dispatch)
@@ -1021,6 +1063,22 @@ where
         logical_timeslot: Option<u64>,
     ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
         self.catch_up()?;
+        self.accumulate_ordered_after_barrier(request, logical_timeslot)
+    }
+
+    #[cfg(feature = "storage")]
+    pub(crate) fn accumulate_after_barrier(
+        &mut self,
+        request: &AccumulateRequestV2,
+    ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
+        self.accumulate_ordered_after_barrier(request, None)
+    }
+
+    fn accumulate_ordered_after_barrier(
+        &mut self,
+        request: &AccumulateRequestV2,
+        logical_timeslot: Option<u64>,
+    ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
         let expires_call = matches!(request, AccumulateRequestV2::ExpireCall(_));
         if expires_call && logical_timeslot.is_none() {
             return Err(ReplicatedServiceErrorV2::LogicalTimeslotRequired);
