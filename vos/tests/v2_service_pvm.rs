@@ -23,19 +23,19 @@ use vos::v2::{
     ActorWriteV2, AuthorizationEvidenceV2, BlobRefV2, CallId, CommittedAccumulateBatchV2,
     CommittedAccumulateEntryV2, CommittedAccumulateLogV2, CommittedImageStoreV2,
     CommittedServiceImageHostV2, CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, DirectIngressV2, DurableJamStoreV2,
-    ExternalActorBindingV2, GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2,
-    ImportedProgramV2, InboxDrainOutcomeV2, InvocationId, JamServiceV2, LocalJamStoreHostV2,
-    LocalJamStoreSnapshotV2, LocalJamStoreV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2,
-    LocalRootTreeInvokeErrorV2, LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2,
-    LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
-    PackageManifestV2, PackageRolePoliciesV2, ProducerId, ProgramId, ProofArtifactStoreV2,
-    PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2,
-    ReplicatedJamServiceV2, ReplicatedServiceErrorV2, ReplyRecordV2, RoleCredentialV2,
-    RoleCredentialVerificationRequestV2, RootServiceId, ScheduleErrorV2, ServiceDispatchError,
-    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId,
-    SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2, WorkflowOperationV2,
-    artifact_hash, public_policy_hash, space_role_policy_hash,
+    ContinuationChangeV2, ContinuationSnapshotV2, CrdtChangeV2, DeploymentId, DirectIngressV2,
+    DurableJamStoreV2, ExternalActorBindingV2, GasAccountingV2, Hash, ImportedActorV2,
+    ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2, InvocationId, JamServiceV2,
+    LocalJamStoreHostV2, LocalJamStoreSnapshotV2, LocalJamStoreV2, LocalRootTreeConfigErrorV2,
+    LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2, LocalRootTreeServiceV2, LocalTransportV2,
+    LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
+    NoRefineProtocolHostV2, Origin, PackageManifestV2, PackageRolePoliciesV2, ProducerId,
+    ProgramId, ProofArtifactStoreV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
+    RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2, ReplicatedServiceErrorV2,
+    ReplyRecordV2, RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId,
+    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
+    ServicePvmV2, StateKeyV2, SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2,
+    WorkEnvelopeV2, WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     Decode, Encode,
@@ -1504,16 +1504,34 @@ fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
     assert!(!committed.duplicate);
     assert!(!committed.receipt.resulting_crdt_heads.is_empty());
 
-    let sync = service
+    let source_sync = service
         .crdt_sync_envelope()
         .expect("source causal frontier is readable")
         .expect("committed CRDT work exports a sync envelope");
     let mut replica =
         LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
             .expect("independent CRDT replica installs the same root tree");
+    let mut replica_request = request.clone();
+    replica_request.logical_timeslot = 2;
+    let replica_committed = replica
+        .invoke(replica_request.clone())
+        .expect("the exact logical invocation executes on an independent causal branch");
+    assert!(!replica_committed.duplicate);
+    let replica_sync = replica
+        .crdt_sync_envelope()
+        .expect("replica causal frontier is readable")
+        .expect("independently committed CRDT work exports a sync envelope");
+    assert!(
+        source_sync.nodes.iter().all(|left| replica_sync
+            .nodes
+            .iter()
+            .all(|right| left.change.cid() != right.change.cid())),
+        "independent scheduling slots and causal bases produce distinct physical DAG nodes"
+    );
+
     let before_untrusted_sync = replica.store().snapshot();
     assert!(matches!(
-        replica.sync_finalized_crdt(sync.clone()),
+        replica.sync_finalized_crdt(source_sync.clone()),
         Err(LocalRootTreeInvokeErrorV2::Rejected(
             vos::v2::AccumulationRejectionV2::ReceiptUnavailable
         ))
@@ -1523,7 +1541,7 @@ fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
         before_untrusted_sync,
         "a sync envelope must not authorize its own claimed receipts"
     );
-    for node in &sync.nodes {
+    for node in &source_sync.nodes {
         replica
             .store_mut()
             .allow_receipt(&ReceiptVerificationRequestV2 {
@@ -1534,34 +1552,78 @@ fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
                 receipt: node.receipt.clone(),
             });
     }
-    let synced = replica
-        .sync_finalized_crdt(sync)
+    let replica_synced = replica
+        .sync_finalized_crdt(source_sync)
         .expect("independently finalized causal nodes synchronize");
-    assert!(!synced.duplicate);
-    let replica_backend = replica.into_backend();
-    let mut replica = LocalRootTreeServiceV2::open(config.clone(), replica_backend)
-        .expect("synchronized replica reopens from its committed image");
-    let replicated_recovery = replica
+    assert!(!replica_synced.duplicate);
+    for node in &replica_sync.nodes {
+        service
+            .store_mut()
+            .allow_receipt(&ReceiptVerificationRequestV2 {
+                expected_producer: node
+                    .change
+                    .expected_producer()
+                    .expect("every exported workflow node names its producer"),
+                receipt: node.receipt.clone(),
+            });
+    }
+    let source_synced = service
+        .sync_finalized_crdt(replica_sync)
+        .expect("the source imports the independently finalized retry branch");
+    assert!(!source_synced.duplicate);
+    let source_header = service.store().header().unwrap().unwrap();
+    let replica_header = replica.store().header().unwrap().unwrap();
+    assert_eq!(
+        source_header.service_root, replica_header.service_root,
+        "both roots materialize the same canonical service state"
+    );
+    assert_eq!(
+        source_header.crdt_heads, replica_header.crdt_heads,
+        "both roots retain the same concurrent causal frontier"
+    );
+    assert_eq!(
+        service.crdt_sync_envelope().unwrap(),
+        replica.crdt_sync_envelope().unwrap(),
+        "both roots export every physical retry branch"
+    );
+
+    let source_recovery = service
         .invoke(request.clone())
-        .expect("synchronized dedup state reattaches the exact invocation");
-    assert!(replicated_recovery.duplicate);
-    assert_eq!(replicated_recovery.receipt, committed.receipt);
-    assert_eq!(replicated_recovery.refine_gas_used, 0);
-    assert_eq!(replicated_recovery.accumulate_gas_used, 0);
+        .expect("source dedup reattaches after branch convergence");
+    let replica_recovery = replica
+        .invoke(replica_request.clone())
+        .expect("replica dedup reattaches after branch convergence");
+    assert!(source_recovery.duplicate);
+    assert!(replica_recovery.duplicate);
+    assert_eq!(source_recovery.receipt, replica_recovery.receipt);
+    assert_eq!(source_recovery.refine_gas_used, 0);
+    assert_eq!(source_recovery.accumulate_gas_used, 0);
+    assert_eq!(replica_recovery.refine_gas_used, 0);
+    assert_eq!(replica_recovery.accumulate_gas_used, 0);
 
     let backend = service.into_backend();
-    let mut restarted = LocalRootTreeServiceV2::open(config, backend)
+    let replica_backend = replica.into_backend();
+    let mut restarted = LocalRootTreeServiceV2::open(config.clone(), backend)
         .expect("CRDT service image restores without reinstalling");
+    let mut restarted_replica = LocalRootTreeServiceV2::open(config, replica_backend)
+        .expect("converged replica restores without reinstalling");
     let recovered = restarted
         .invoke(request)
         .expect("normalized CRDT workflow reattaches to the admitted work");
+    let replica_recovered = restarted_replica
+        .invoke(replica_request)
+        .expect("replica reattaches the same canonical result after restart");
     assert!(recovered.duplicate);
+    assert!(replica_recovered.duplicate);
     assert_eq!(recovered.refine_gas_used, 0);
     assert_eq!(recovered.accumulate_gas_used, 0);
-    assert_eq!(recovered.input, committed.input);
-    assert_eq!(recovered.receipt, committed.receipt);
-    assert_eq!(recovered.published, committed.published);
-    assert_eq!(recovered.publication, committed.publication);
+    assert_eq!(replica_recovered.refine_gas_used, 0);
+    assert_eq!(replica_recovered.accumulate_gas_used, 0);
+    assert_eq!(recovered.input, source_recovery.input);
+    assert_eq!(recovered.receipt, source_recovery.receipt);
+    assert_eq!(recovered.published, source_recovery.published);
+    assert_eq!(recovered.publication, source_recovery.publication);
+    assert_eq!(recovered.receipt, replica_recovered.receipt);
 }
 
 #[test]
@@ -3926,10 +3988,11 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
             .contains(&WorkflowOperationV2::ConsumeOutbox(pending_call))
     );
     assert_eq!(resumed_change.operations.len(), 2);
+    let resumed_operation_scope = CrdtChangeV2::derive_operation_scope(&resumed.work).unwrap();
     assert!(resumed_change.operations.iter().all(|operation| {
         operation.ordinal == 0
             && operation.id
-                == resumed_change.id.operation(
+                == resumed_operation_scope.operation(
                     operation.actor,
                     operation.dispatch_ordinal,
                     operation.field,
@@ -4258,9 +4321,10 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
     let second_change = second.transition.crdt_change.as_ref().unwrap();
     assert_ne!(second_change.id, first_change_id);
     assert_eq!(second_change.operations.len(), 1);
+    let second_operation_scope = CrdtChangeV2::derive_operation_scope(&second_work).unwrap();
     assert_eq!(
         second_change.operations[0].id,
-        second_change.id.operation(
+        second_operation_scope.operation(
             second_work.target,
             second_change.operations[0].dispatch_ordinal,
             second_change.operations[0].field,

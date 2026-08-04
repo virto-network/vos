@@ -10,12 +10,12 @@ use alloc::vec::Vec;
 
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 use super::{
-    AccumulatedReplyV2, AccumulationReceiptV2, ActorId, CallId, ConsistencyModeV2, DeploymentId,
-    DirectIngressV2, Hash, InvocationId, ProgramId, PublishedEffectsV2, ServiceIdentityV2,
-    WorkEnvelopeV2, WorkInputIdV2,
+    AccumulatedReplyV2, AccumulationReceiptV2, ActorId, CallId, ConsistencyModeV2, CrdtChangeV2,
+    DeploymentId, DirectIngressV2, Hash, InvocationId, ProgramId, PublishedEffectsV2,
+    ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 20;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 21;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -534,8 +534,12 @@ impl V2Wire for IngressRecordV2 {
             consumed: d.bool()?,
             receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
         };
+        let accepted_transition = value.ingress.crdt_change.as_ref().map_or_else(
+            || value.ingress.commitment(),
+            CrdtChangeV2::receipt_commitment,
+        );
         if value.receipt.service != value.ingress.service
-            || value.receipt.accepted_transition != value.ingress.commitment()
+            || value.receipt.accepted_transition != accepted_transition
             || value.receipt.checkpoint != 0
         {
             return Err(DecodeError::NonCanonical);

@@ -1333,7 +1333,7 @@ fn install_actor_ipc(
 }
 
 fn crdt_dispatch(work: &WorkEnvelopeV2, ordinal: u32) -> Option<CrdtDispatchV2> {
-    CrdtChangeV2::derive_id(work).map(|change| CrdtDispatchV2 { change, ordinal })
+    CrdtChangeV2::derive_operation_scope(work).map(|change| CrdtDispatchV2 { change, ordinal })
 }
 
 fn imported_blob_bytes<'a>(

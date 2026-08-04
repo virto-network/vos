@@ -148,7 +148,7 @@ mod guest {
                 || checkpoint.work_hash != work.hash()
                 || checkpoint.base_causal_height != work.base_causal_height
                 || checkpoint.change.map(|dispatch| dispatch.change)
-                    != CrdtChangeV2::derive_id(&work)
+                    != CrdtChangeV2::derive_operation_scope(&work)
             {
                 fail_closed();
             }
@@ -234,8 +234,8 @@ mod guest {
         let mut base = work.base.clone();
         let mut work_hash = work.hash();
         let mut base_causal_height = work.base_causal_height;
-        let mut change =
-            CrdtChangeV2::derive_id(&work).map(|change| CrdtDispatchV2 { change, ordinal: 0 });
+        let mut change = CrdtChangeV2::derive_operation_scope(&work)
+            .map(|change| CrdtDispatchV2 { change, ordinal: 0 });
         let mut continuations = alloc::vec::Vec::new();
         let mut exported_blobs = alloc::vec::Vec::new();
         if let Some(checkpoint) = actor_output.checkpoint {
@@ -326,13 +326,13 @@ mod guest {
                 {
                     fail_closed();
                 }
-                let id = change
+                let operation_scope = change
                     .map(|dispatch| dispatch.change)
                     .unwrap_or_else(|| fail_closed());
                 if actor_output.crdt_operations.iter().any(|operation| {
                     !imported(operation.actor)
                         || operation.id
-                            != id.operation(
+                            != operation_scope.operation(
                                 operation.actor,
                                 operation.dispatch_ordinal,
                                 operation.field,
@@ -363,7 +363,7 @@ mod guest {
                 (
                     alloc::vec::Vec::new(),
                     Some(CrdtChangeV2 {
-                        id,
+                        id: CrdtChangeV2::derive_id_from_work_hash(work_hash),
                         work_hash,
                         causal_dependencies: heads.clone(),
                         causal_height,

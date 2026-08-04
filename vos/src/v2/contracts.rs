@@ -557,6 +557,60 @@ impl WorkEnvelopeV2 {
         }
         checkpoint
     }
+
+    /// Logical CRDT execution identity shared by independently scheduled
+    /// retries. Dynamic causal imports, the observed base, and the trusted
+    /// scheduling slot may differ; every caller-controlled input and exact
+    /// awaited outcome must remain identical.
+    pub fn matches_crdt_retry(&self, candidate: &Self) -> bool {
+        self.input_id() == candidate.input_id()
+            && self.workflow_identity() == candidate.workflow_identity()
+            && self.arguments == candidate.arguments
+            && self.awaited_reply == candidate.awaited_reply
+            && self.awaited_timeout == candidate.awaited_timeout
+            && self.imported_blobs == candidate.imported_blobs
+            && self.imported_actors.len() == candidate.imported_actors.len()
+            && self
+                .imported_actors
+                .iter()
+                .zip(&candidate.imported_actors)
+                .all(|(left, right)| {
+                    left.actor == right.actor
+                        && left.name == right.name
+                        && left.parent == right.parent
+                        && left.deployment == right.deployment
+                        && left.program == right.program
+                })
+    }
+
+    /// Stable operation-allocation identity for one logical CRDT slice.
+    /// Physical DAG nodes still bind the exact work hash, including the
+    /// trusted slot and observed causal base; actor operation IDs deliberately
+    /// omit only those scheduler-owned observations so concurrent retries do
+    /// not apply the same logical mutation twice.
+    pub fn crdt_retry_commitment(&self) -> Option<Hash> {
+        let ConsistencyBaseV2::Crdt { .. } = self.base else {
+            return None;
+        };
+        let mut normalized = self.clone();
+        normalized.logical_timeslot = 0;
+        // Await outcomes are consumed inputs, not durable resume
+        // instructions, and are already removed from the canonical workflow
+        // checkpoint. Divergent outcomes still produce divergent operations,
+        // materializations, or replies and are rejected during retry-branch
+        // comparison.
+        normalized.awaited_reply = None;
+        normalized.awaited_timeout = None;
+        normalized.base = ConsistencyBaseV2::Crdt { heads: Vec::new() };
+        normalized.base_causal_height = Some(0);
+        let empty = BlobRefV2::of_bytes(&[]);
+        for actor in &mut normalized.imported_actors {
+            actor.state = empty.clone();
+            actor.causal_states.clear();
+            actor.continuation = None;
+        }
+        Some(Hash::digest(b"vos/crdt-retry/v2", &[&normalized.encode()]))
+    }
 }
 
 /// Exactly-once identity of one consumable workflow slice.
@@ -749,8 +803,12 @@ pub struct AccumulatedTimeoutV2 {
 
 impl AccumulatedTimeoutV2 {
     pub fn validate(&self) -> Result<(), DecodeError> {
+        let accepted_transition = self.expiration.crdt_change.as_ref().map_or_else(
+            || self.expiration.commitment(),
+            CrdtChangeV2::receipt_commitment,
+        );
         if self.receipt.service != self.expiration.service
-            || self.receipt.accepted_transition != self.expiration.commitment()
+            || self.receipt.accepted_transition != accepted_transition
             || self.receipt.checkpoint != self.expiration.timeout.checkpoint_step
             || self.receipt.reply_commitment.is_some()
             || self.receipt.outbox_commitment.is_some()
@@ -888,12 +946,27 @@ pub struct CrdtIngressV2 {
 
 impl CrdtIngressV2 {
     /// Commitment shared by the admitted ingress record and its causal DAG
-    /// node. It binds every stable caller input while leaving causal ancestry
-    /// to the surrounding [`CrdtChangeV2`].
+    /// node. It binds the complete admission observation; causal ancestry is
+    /// additionally bound by the surrounding [`CrdtChangeV2`].
     pub fn commitment(&self) -> Hash {
         let mut bytes = Vec::new();
         encode_crdt_ingress(&mut Encoder(&mut bytes), self);
         Hash::digest(b"vos/crdt-ingress/v2", &[&bytes])
+    }
+
+    /// Stable caller intent shared by retries admitted at different trusted
+    /// slots. Only the scheduler-owned observation time may differ here;
+    /// causal ancestry lives on the containing change.
+    pub fn matches_retry(&self, candidate: &Self) -> bool {
+        self.service == candidate.service
+            && self.invocation == candidate.invocation
+            && self.target == candidate.target
+            && self.method == candidate.method
+            && self.arguments == candidate.arguments
+            && self.origin == candidate.origin
+            && self.authorization == candidate.authorization
+            && self.imported_blobs == candidate.imported_blobs
+            && self.proof_requested == candidate.proof_requested
     }
 }
 
@@ -902,8 +975,7 @@ impl CrdtIngressV2 {
 pub struct CrdtChangeV2 {
     pub id: ChangeId,
     /// Exact immutable work envelope whose deterministic execution emitted
-    /// this change. A retry reuses those bytes; changing the causal base is a
-    /// new logical work item, not a retry.
+    /// this physical causal branch.
     pub work_hash: Hash,
     pub causal_dependencies: Vec<Hash>,
     pub causal_height: u64,
@@ -917,20 +989,35 @@ impl CrdtChangeV2 {
         let ConsistencyBaseV2::Crdt { .. } = &work.base else {
             return None;
         };
+        Some(Self::derive_id_from_work_hash(work.hash()))
+    }
+
+    pub fn derive_id_from_work_hash(work_hash: Hash) -> ChangeId {
         let mut bytes = Vec::new();
         let mut e = Encoder(&mut bytes);
-        e.fixed(&work.service.root_service.0);
-        e.fixed(&work.service.deployment.0);
-        e.fixed(&work.target.0);
-        e.fixed(&work.invocation.0);
-        e.u64(work.workflow_step);
+        e.fixed(&work_hash.0);
+        ChangeId(Hash::digest(b"vos/crdt-change-id/v2", &[&bytes]).0)
+    }
+
+    /// Logical actor-operation namespace shared by independently scheduled
+    /// executions of the same invocation step. This is intentionally not the
+    /// physical DAG-node ID returned by [`Self::derive_id`].
+    pub fn derive_operation_scope(work: &WorkEnvelopeV2) -> Option<ChangeId> {
+        let retry = work.crdt_retry_commitment()?;
         Some(ChangeId(
-            Hash::digest(b"vos/crdt-change-id/v2", &[&bytes]).0,
+            Hash::digest(b"vos/crdt-operation-scope/v2", &[&retry.0]).0,
         ))
     }
 
     pub fn cid(&self) -> Hash {
         Hash::digest(b"vos/crdt-dag-node/v2", &[&self.encode()])
+    }
+
+    /// Receipt identity for one exact CRDT node. Unlike membership in a
+    /// later receipt's head set, this commitment cannot authenticate an
+    /// unrelated transition which merely retains this node as an ancestor.
+    pub fn receipt_commitment(&self) -> Hash {
+        Hash::digest(b"vos/crdt-transition/v2", &[&self.cid().0])
     }
 
     pub fn derive_expiration_id(
@@ -1085,6 +1172,9 @@ impl TransitionV2 {
     /// while independently requiring and validating the proof for attested
     /// methods.
     pub fn commitment(&self) -> Hash {
+        if let Some(change) = self.crdt_change.as_ref() {
+            return change.receipt_commitment();
+        }
         // Construct the projection directly. Cloning `self` first needlessly
         // allocates proof bytes in the guest before receipt construction; the
         // proof is explicitly outside this commitment and must not perturb
@@ -2418,16 +2508,22 @@ impl V2Wire for CrdtChangeV2 {
         ensure_sorted_unique(&value.materializations, |materialization| {
             materialization.actor.0
         })?;
+        let operation_scope = value.workflow.iter().find_map(|operation| match operation {
+            WorkflowOperationV2::Checkpoint(work) => Self::derive_operation_scope(work),
+            _ => None,
+        });
         if value.causal_height == 0
             || value.operations.iter().any(|operation| {
                 operation.payload.is_empty()
-                    || operation.id
-                        != value.id.operation(
-                            operation.actor,
-                            operation.dispatch_ordinal,
-                            operation.field,
-                            operation.ordinal,
-                        )
+                    || operation_scope.is_none_or(|scope| {
+                        operation.id
+                            != scope.operation(
+                                operation.actor,
+                                operation.dispatch_ordinal,
+                                operation.field,
+                                operation.ordinal,
+                            )
+                    })
             })
             || value.workflow.windows(2).any(|pair| {
                 workflow_operation_bytes(&pair[0]) >= workflow_operation_bytes(&pair[1])
@@ -4340,7 +4436,8 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, Dec
                 || work.base != value.base
                 || work.hash() != value.work_hash
                 || work.base_causal_height != value.base_causal_height
-                || CrdtChangeV2::derive_id(work) != value.change.map(|dispatch| dispatch.change)
+                || CrdtChangeV2::derive_operation_scope(work)
+                    != value.change.map(|dispatch| dispatch.change)
         })
         || value.expected.is_some() != !value.previously_suspended.is_empty()
         || value.replacement.is_some() != !value.suspended.is_empty()
@@ -5942,6 +6039,7 @@ mod tests {
         };
         work.base_causal_height = Some(3);
         let change_id = CrdtChangeV2::derive_id(&work).unwrap();
+        let operation_scope = CrdtChangeV2::derive_operation_scope(&work).unwrap();
         let field = Hash([32; 32]);
         let transition = TransitionV2 {
             service: work.service.clone(),
@@ -5960,7 +6058,7 @@ mod tests {
                     dispatch_ordinal: 0,
                     field,
                     ordinal: 0,
-                    id: change_id.operation(work.target, 0, field, 0),
+                    id: operation_scope.operation(work.target, 0, field, 0),
                     payload: b"counter +1".to_vec(),
                 }],
                 workflow: vec![WorkflowOperationV2::Checkpoint(work.workflow_checkpoint())],
@@ -6023,7 +6121,7 @@ mod tests {
     }
 
     #[test]
-    fn crdt_change_identity_is_stable_but_retries_require_exact_work_bytes() {
+    fn crdt_change_identity_distinguishes_physical_retry_branches() {
         let mut first = work();
         first.consistency = ConsistencyModeV2::Crdt;
         first.base = ConsistencyBaseV2::Crdt {
@@ -6034,15 +6132,29 @@ mod tests {
             heads: vec![Hash([42; 32])],
         };
 
-        assert_eq!(
+        assert_ne!(
             CrdtChangeV2::derive_id(&first),
             CrdtChangeV2::derive_id(&different_base),
-            "one logical workflow step retains its change identity"
+            "different physical causal branches need distinct DAG identities"
+        );
+        assert_eq!(
+            CrdtChangeV2::derive_operation_scope(&first),
+            CrdtChangeV2::derive_operation_scope(&different_base),
+            "logical retries must allocate the same idempotent CRDT operation IDs"
         );
         assert_ne!(
             first.hash(),
             different_base.hash(),
             "changing the causal base is not an exact retry"
+        );
+        assert!(
+            first.matches_crdt_retry(&different_base),
+            "the canonical materializer still recognizes the same logical invocation"
+        );
+        different_base.arguments.push(99);
+        assert!(
+            !first.matches_crdt_retry(&different_base),
+            "caller-controlled inputs are part of stable retry identity"
         );
     }
 
@@ -6053,14 +6165,15 @@ mod tests {
         work.base = ConsistencyBaseV2::Crdt { heads: vec![] };
         work.base_causal_height = Some(0);
         let change = CrdtChangeV2::derive_id(&work).unwrap();
+        let operation_scope = CrdtChangeV2::derive_operation_scope(&work).unwrap();
         let first_field = Hash([51; 32]);
-        let first_id = change.operation(work.target, 0, first_field, 0);
+        let first_id = operation_scope.operation(work.target, 0, first_field, 0);
         let (second_field, second_id) = (0u16..=u16::MAX)
             .find_map(|nonce| {
                 let mut bytes = [0u8; 32];
                 bytes[..2].copy_from_slice(&nonce.to_le_bytes());
                 let field = Hash(bytes);
-                let id = change.operation(work.target, 0, field, 1);
+                let id = operation_scope.operation(work.target, 0, field, 1);
                 (id < first_id).then_some((field, id))
             })
             .expect("a descending hash-order fixture exists");
