@@ -1266,6 +1266,7 @@ fn sync_crdt<S: GuestAccumulateStoreV2>(
 
     apply_expiration_materialization(store, &header.service, &materialized)?;
     apply_ingress_materialization(store, &materialized)?;
+    apply_dedup_materialization(store, &header.service, &materialized)?;
     let mut tree = ServiceStateTreeV2::new(store, header.service_root);
     apply_workflow_materialization(&mut tree, materialized)?;
     header.service_root = tree.root();
@@ -1493,7 +1494,11 @@ fn materialize_workflow_crdt(
             }
         }
     }
-    validate_strict_frontiers(result.ingresses.values())?;
+    // Concurrent admissions of the same stable InvocationId may have been
+    // stamped at different trusted slots or observed different causal bases.
+    // Their distinct operation IDs preserve both branches; the CID-sorted
+    // frontier selects one record deterministically. Execution checkpoints
+    // remain strict, so divergent duplicate actor executions are rejected.
     validate_strict_frontiers(result.workflows.values())?;
     validate_strict_frontiers(result.continuations.values())?;
     validate_strict_frontiers(result.replies.values())?;
@@ -1730,6 +1735,72 @@ fn apply_ingress_materialization<S: GuestAccumulateStoreV2>(
             &ingress_storage_key(*invocation),
             Some(&record.encode()),
         )?;
+    }
+    Ok(())
+}
+
+/// Reconstruct the service-level retry bridge for workflow checkpoints
+/// imported from the causal DAG. These rows are excluded from the state tree,
+/// so synchronizing only the checkpoint would leave failover unable to
+/// authenticate the already-committed result.
+fn apply_dedup_materialization<S: StateTreeStore>(
+    store: &mut S,
+    service: &super::ServiceIdentityV2,
+    materialized: &WorkflowMaterializationV2,
+) -> GuestResult<(), S::Error> {
+    for values in materialized.workflows.values() {
+        let event = values.first().expect("workflow frontier is never empty");
+        let checkpoint = &event.value;
+        let change_bytes = read(store, &crdt_node_storage_key(event.cid))?
+            .ok_or(GuestAccumulateError::CorruptStore)?;
+        let change =
+            CrdtChangeV2::decode(&change_bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
+        let receipt_bytes = read(store, &crdt_node_receipt_storage_key(event.cid))?
+            .ok_or(GuestAccumulateError::CorruptStore)?;
+        let receipt = AccumulationReceiptV2::decode(&receipt_bytes)
+            .map_err(|_| GuestAccumulateError::CorruptStore)?;
+        if change.cid() != event.cid
+            || checkpoint.transition_hash != event.cid
+            || receipt.service != *service
+            || receipt.consistency != ConsistencyModeV2::Crdt
+            || receipt.checkpoint != checkpoint.input.workflow_step
+            || receipt
+                .resulting_crdt_heads
+                .binary_search(&event.cid)
+                .is_err()
+        {
+            return Err(GuestAccumulateError::CorruptStore);
+        }
+        let dedup = DedupRecordV2 {
+            input: checkpoint.input,
+            // The DAG checkpoint normalizes scheduling-only imports, while
+            // the node itself retains the exact Refine work hash used by the
+            // source's dedup record.
+            work_hash: change.work_hash,
+            transition_commitment: receipt.accepted_transition,
+            receipt: receipt.clone(),
+        };
+        let dedup_key = dedup_storage_key(checkpoint.input);
+        if let Some(existing) = read(store, &dedup_key)? {
+            if DedupRecordV2::decode(&existing).map_err(|_| GuestAccumulateError::CorruptStore)?
+                != dedup
+            {
+                return Err(GuestAccumulateError::CorruptStore);
+            }
+        } else {
+            write(store, &dedup_key, Some(&dedup.encode()))?;
+        }
+        let receipt_key = receipt_storage_key(checkpoint.input);
+        if let Some(existing) = read(store, &receipt_key)? {
+            if AccumulationReceiptV2::decode(&existing)
+                .map_err(|_| GuestAccumulateError::CorruptStore)?
+                != receipt
+            {
+                return Err(GuestAccumulateError::CorruptStore);
+            }
+        } else {
+            write(store, &receipt_key, Some(&receipt.encode()))?;
+        }
     }
     Ok(())
 }
@@ -2960,9 +3031,7 @@ fn work_matches_durable_ingress<S: StateTreeStore>(
         return Ok(true);
     }
     let Some(bytes) = read(store, &ingress_storage_key(work.invocation))? else {
-        // Lower-level conformance callers may submit a complete WorkEnvelope
-        // directly. Production node ingress always admits through IC-5 first.
-        return Ok(true);
+        return Ok(false);
     };
     let record = IngressRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
     Ok(!record.consumed && record.ingress.matches_work(work))
@@ -4358,6 +4427,73 @@ mod tests {
         }
     }
 
+    /// Legacy unit fixtures construct complete work envelopes directly so
+    /// they can focus on a particular Apply rejection. Seed the exact
+    /// guest-owned admission prerequisite without advancing the causal base;
+    /// dedicated admission and physical-PVM tests exercise AdmitIngress.
+    fn seed_direct_ingress(store: &mut MemStore, work: &WorkEnvelopeV2) {
+        if work.workflow_step != 0 || work.parent_call.is_some() {
+            return;
+        }
+        let mut ingress = DirectIngressV2 {
+            service: work.service.clone(),
+            invocation: work.invocation,
+            logical_timeslot: work.logical_timeslot,
+            target: work.target,
+            method: work.method.clone(),
+            arguments: work.arguments.clone(),
+            origin: work.origin,
+            authorization: work.authorization.clone(),
+            imported_blobs: work.imported_blobs.clone(),
+            proof_requested: work.proof_requested,
+            base: work.base.clone(),
+            base_causal_height: work.base_causal_height,
+            crdt_change: None,
+        };
+        let (resulting_state_root, resulting_crdt_heads, sequence) = match &work.base {
+            ConsistencyBaseV2::Linear {
+                revision,
+                state_root,
+            } => (Some(*state_root), Vec::new(), *revision),
+            ConsistencyBaseV2::Crdt { heads } => {
+                let operation = ingress.crdt_operation();
+                let height = work.base_causal_height.unwrap_or(0) + 1;
+                let change = CrdtChangeV2 {
+                    id: CrdtChangeV2::derive_ingress_id(&operation, heads),
+                    work_hash: operation.commitment(),
+                    causal_dependencies: heads.clone(),
+                    causal_height: height,
+                    operations: Vec::new(),
+                    workflow: vec![WorkflowOperationV2::Ingress(operation)],
+                    materializations: Vec::new(),
+                };
+                let cid = change.cid();
+                ingress.crdt_change = Some(change);
+                (None, vec![cid], height)
+            }
+        };
+        let receipt = AccumulationReceiptV2 {
+            service: work.service.clone(),
+            accepted_transition: ingress.commitment(),
+            reply_commitment: None,
+            outbox_commitment: None,
+            resulting_state_root,
+            resulting_crdt_heads,
+            sequence,
+            checkpoint: 0,
+            consistency: work.consistency,
+        };
+        store.rows.insert(
+            ingress_storage_key(work.invocation),
+            IngressRecordV2 {
+                ingress,
+                consumed: false,
+                receipt,
+            }
+            .encode(),
+        );
+    }
+
     fn continuation_programs(work: &WorkEnvelopeV2) -> Vec<super::super::ContinuationProgramV2> {
         work.imported_actors
             .iter()
@@ -4420,6 +4556,7 @@ mod tests {
                 bytes: child_bytes,
             }],
         };
+        seed_direct_ingress(&mut store, &work);
 
         let before = store.clone();
         let mut missing = envelope.clone();
@@ -4796,6 +4933,25 @@ mod tests {
     }
 
     #[test]
+    fn direct_step_zero_apply_requires_a_guest_owned_ingress() {
+        let mut store = MemStore::default();
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let work = linear_work(initial, install.resulting_state_root.unwrap());
+        let request = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            transition: linear_transition(&work, b"must not execute"),
+            work,
+            provided_blobs: Vec::new(),
+        });
+        let before = store.clone();
+
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &request).unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        assert_eq!(store, before, "unadmitted work must stage no state");
+    }
+
+    #[test]
     fn crdt_direct_ingress_is_an_authenticated_syncable_workflow_node() {
         let mut source = MemStore::default();
         let mut destination = MemStore::default();
@@ -4891,11 +5047,124 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_crdt_ingress_retries_have_distinct_ids_and_converge() {
+        let mut left = MemStore::default();
+        let mut right = MemStore::default();
+        let mut destination = MemStore::default();
+        let (initial, _) = install_fixture(&mut left, ConsistencyModeV2::Crdt, b"before");
+        install_fixture(&mut right, ConsistencyModeV2::Crdt, b"before");
+        install_fixture(&mut destination, ConsistencyModeV2::Crdt, b"before");
+        let work = crdt_work(initial, 68, vec![]);
+
+        let make_ingress = |logical_timeslot| {
+            let mut ingress = DirectIngressV2 {
+                service: work.service.clone(),
+                invocation: work.invocation,
+                logical_timeslot,
+                target: work.target,
+                method: work.method.clone(),
+                arguments: work.arguments.clone(),
+                origin: work.origin,
+                authorization: work.authorization.clone(),
+                imported_blobs: work.imported_blobs.clone(),
+                proof_requested: work.proof_requested,
+                base: ConsistencyBaseV2::Crdt { heads: vec![] },
+                base_causal_height: Some(0),
+                crdt_change: None,
+            };
+            let operation = ingress.crdt_operation();
+            let change = CrdtChangeV2 {
+                id: CrdtChangeV2::derive_ingress_id(&operation, &[]),
+                work_hash: operation.commitment(),
+                causal_dependencies: vec![],
+                causal_height: 1,
+                operations: vec![],
+                workflow: vec![WorkflowOperationV2::Ingress(operation)],
+                materializations: vec![],
+            };
+            ingress.crdt_change = Some(change);
+            ingress
+        };
+        let left_ingress = make_ingress(11);
+        let right_ingress = make_ingress(12);
+        let left_change = left_ingress.crdt_change.clone().unwrap();
+        let right_change = right_ingress.crdt_change.clone().unwrap();
+        assert_ne!(left_change.id, right_change.id);
+        assert_ne!(left_change.cid(), right_change.cid());
+        assert_ne!(
+            CrdtChangeV2::derive_ingress_id(&left_ingress.crdt_operation(), &[]),
+            CrdtChangeV2::derive_ingress_id(&left_ingress.crdt_operation(), &[Hash([0x44; 32])]),
+            "the causal base is part of the ingress operation identity"
+        );
+
+        let admit = |store: &mut MemStore, ingress: DirectIngressV2| {
+            let AccumulationResultV2::IngressAdmitted {
+                receipt,
+                duplicate: false,
+                ..
+            } = execute_guest_accumulate(
+                store,
+                &AccumulateRequestV2::AdmitIngress(ingress.clone()),
+            )
+            .unwrap()
+            else {
+                panic!("CRDT ingress branch was not admitted")
+            };
+            (ingress.crdt_change.unwrap(), receipt)
+        };
+        let mut nodes = [
+            admit(&mut left, left_ingress),
+            admit(&mut right, right_ingress),
+        ]
+        .map(|(change, receipt)| super::super::CrdtSyncNodeV2 { change, receipt });
+        nodes.sort_by_key(|node| node.change.cid());
+        for node in &nodes {
+            destination.receipt_allowlist.insert(
+                ReceiptVerificationRequestV2 {
+                    expected_producer: actor(),
+                    receipt: node.receipt.clone(),
+                }
+                .hash(),
+            );
+        }
+        let advertised_heads = nodes.iter().map(|node| node.change.cid()).collect();
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut destination,
+                &AccumulateRequestV2::SyncCrdt(CrdtSyncEnvelopeV2 {
+                    service: identity(),
+                    advertised_heads,
+                    nodes: nodes.to_vec(),
+                    provided_blobs: vec![],
+                }),
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+        let restored = IngressRecordV2::decode(
+            destination
+                .rows
+                .get(&ingress_storage_key(work.invocation))
+                .unwrap(),
+        )
+        .unwrap();
+        let WorkflowOperationV2::Ingress(expected) = &nodes[0].change.workflow[0] else {
+            unreachable!()
+        };
+        assert_eq!(restored.ingress.logical_timeslot, expected.logical_timeslot);
+        assert!(!restored.consumed);
+    }
+
+    #[test]
     fn attestation_preparation_is_guest_derived_and_read_only() {
         let mut store = MemStore::default();
         let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
         let mut work = linear_work(initial, install.resulting_state_root.unwrap());
         work.proof_requested = true;
+        seed_direct_ingress(&mut store, &work);
         let child = ActorId::owned_child(actor(), "attested-child");
         let child_bytes = b"attested-child-state".to_vec();
         let child_state = BlobRefV2::of_bytes(&child_bytes);
@@ -5053,6 +5322,7 @@ mod tests {
         let root = install.resulting_state_root.unwrap();
         let work = linear_work(initial, root);
         let transition = linear_transition(&work, b"after");
+        seed_direct_ingress(&mut store, &work);
         let request = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             work: work.clone(),
             transition: transition.clone(),
@@ -5211,6 +5481,7 @@ mod tests {
         };
         let root = installed.resulting_state_root.unwrap();
         let work = linear_work(initial.clone(), root);
+        seed_direct_ingress(&mut store, &work);
         let transition = linear_transition(&work, b"after");
         let before = store.clone();
         let result = execute_guest_accumulate(
@@ -5265,6 +5536,7 @@ mod tests {
         let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
         let root = install.resulting_state_root.unwrap();
         let work = linear_work(initial, root);
+        seed_direct_ingress(&mut store, &work);
         let first = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             transition: linear_transition(&work, b"after"),
             work,
@@ -5275,6 +5547,7 @@ mod tests {
         let current_state = BlobRefV2::of_bytes(b"after");
         let mut stale_work = linear_work(current_state, root);
         stale_work.invocation = InvocationId([11; 32]);
+        seed_direct_ingress(&mut store, &stale_work);
         let candidate = ImportedBlobV2 {
             reference: BlobRefV2::of_bytes(b"must-not-stage"),
             bytes: b"must-not-stage".to_vec(),
@@ -5306,12 +5579,14 @@ mod tests {
             bytes: vec![1],
         };
         unauthorized.transition.consumed_input = unauthorized.work.input_id();
+        seed_direct_ingress(&mut store, &unauthorized.work);
+        let before_unauthorized = store.clone();
         assert_eq!(
             execute_guest_accumulate(&mut store, &AccumulateRequestV2::Apply(unauthorized))
                 .unwrap(),
             rejected(AccumulationRejectionV2::Unauthorized)
         );
-        assert_eq!(store, before);
+        assert_eq!(store, before_unauthorized);
     }
 
     #[test]
@@ -5320,6 +5595,7 @@ mod tests {
         let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
         let work = linear_work(initial, install.resulting_state_root.unwrap());
         let transition = linear_transition(&work, b"after");
+        seed_direct_ingress(&mut store, &work);
         store.programs.remove(&program());
         let before = store.clone();
 
@@ -5418,6 +5694,7 @@ mod tests {
             authenticator: b"developer grant".to_vec(),
         };
         admitted_work.authorization = developer.disclosed_evidence(required_policy);
+        seed_direct_ingress(&mut store, &admitted_work);
         store.role_credential_allowlist.insert(
             RoleCredentialVerificationRequestV2::for_work(&admitted_work)
                 .unwrap()
@@ -5441,6 +5718,7 @@ mod tests {
         replayed_work.origin = origin;
         replayed_work.invocation = super::super::InvocationId([0x52; 32]);
         replayed_work.authorization = developer.disclosed_evidence(required_policy);
+        seed_direct_ingress(&mut store, &replayed_work);
         let replayed = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             transition: linear_transition(&replayed_work, b"replayed"),
             work: replayed_work,
@@ -5464,6 +5742,7 @@ mod tests {
             authenticator: b"guest grant".to_vec(),
         };
         denied_work.authorization = guest.disclosed_evidence(required_policy);
+        seed_direct_ingress(&mut store, &denied_work);
         store.role_credential_allowlist.insert(
             RoleCredentialVerificationRequestV2::for_work(&denied_work)
                 .unwrap()
@@ -5511,6 +5790,7 @@ mod tests {
         let mut store = MemStore::default();
         let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
         let first_work = linear_work(initial, install.resulting_state_root.unwrap());
+        seed_direct_ingress(&mut store, &first_work);
         let continuation_bytes = ContinuationSnapshotV2 {
             snapshot_version: super::super::SNAPSHOT_VERSION,
             jar_semantics: super::super::EXECUTION_SEMANTICS_ID,
@@ -5699,6 +5979,7 @@ mod tests {
         let mut store = MemStore::default();
         let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
         let first_work = linear_work(initial, install.resulting_state_root.unwrap());
+        seed_direct_ingress(&mut store, &first_work);
         let peer = ActorId([44; 32]);
         let call = first_work.invocation.call_id(0);
         let mut payload = vec![crate::value::TAG_DYNAMIC];
@@ -6046,6 +6327,7 @@ mod tests {
         let mut store = MemStore::default();
         let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
         let work = linear_work(initial, install.resulting_state_root.unwrap());
+        seed_direct_ingress(&mut store, &work);
         let peer = ActorId([44; 32]);
         let call = work.invocation.call_id(0);
         let mut payload = vec![crate::value::TAG_DYNAMIC];
@@ -6252,6 +6534,7 @@ mod tests {
         let (initial, _) = install_fixture(&mut source, ConsistencyModeV2::Crdt, b"before");
         install_fixture(&mut destination, ConsistencyModeV2::Crdt, b"before");
         let work = crdt_work(initial, 29, vec![]);
+        seed_direct_ingress(&mut source, &work);
         let peer = ActorId([44; 32]);
         let call = work.invocation.call_id(0);
         let message = awaited_message(&work, peer, None, Some(20));
@@ -6465,6 +6748,7 @@ mod tests {
         let later_state = BlobRefV2::of_bytes(&later_bytes);
         let mut later_work = crdt_work(completed_state, 30, vec![completed_cid]);
         later_work.base_causal_height = Some(3);
+        seed_direct_ingress(&mut destination, &later_work);
         let later = crdt_transition(&later_work, later_state.clone(), 4);
         assert!(matches!(
             execute_guest_accumulate(
@@ -6675,6 +6959,7 @@ mod tests {
 
         let mut valid_work = linear_work(initial.clone(), root);
         valid_work.invocation = InvocationId([43; 32]);
+        seed_direct_ingress(&mut installed, &valid_work);
         let outgoing = awaited_message(&valid_work, peer, Some(incoming.call_id), Some(9));
         let (mut valid, valid_continuation) = awaiting_transition(&valid_work, b"valid", outgoing);
         valid.inbox.push(incoming.clone());
@@ -6695,6 +6980,7 @@ mod tests {
                 let (initial, receipt) =
                     install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
                 let work = linear_work(initial, receipt.resulting_state_root.unwrap());
+                seed_direct_ingress(&mut store, &work);
                 let outgoing = awaited_message(&work, to, parent, deadline_timeslot);
                 let (mut transition, continuation) =
                     awaiting_transition(&work, b"must-not-commit", outgoing);
@@ -6729,6 +7015,7 @@ mod tests {
         let mut store = MemStore::default();
         let (initial, receipt) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
         let work = linear_work(initial, receipt.resulting_state_root.unwrap());
+        seed_direct_ingress(&mut store, &work);
         let mut no_checkpoint = linear_transition(&work, b"must-not-commit");
         no_checkpoint
             .outbox
@@ -6751,6 +7038,7 @@ mod tests {
         let mut store = MemStore::default();
         let (initial, receipt) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
         let work = linear_work(initial, receipt.resulting_state_root.unwrap());
+        seed_direct_ingress(&mut store, &work);
         let mut forged_sender = linear_transition(&work, b"must-not-commit");
         forged_sender
             .inbox
@@ -6773,6 +7061,7 @@ mod tests {
         let mut store = MemStore::default();
         let (initial, receipt) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
         let work = linear_work(initial, receipt.resulting_state_root.unwrap());
+        seed_direct_ingress(&mut store, &work);
         let mut collision = linear_transition(&work, b"must-not-commit");
         collision.inbox.push(incoming.clone());
         collision.outbox.push(incoming);
@@ -7051,6 +7340,7 @@ mod tests {
         let (initial, _) = install_fixture(&mut store, ConsistencyModeV2::Crdt, b"initial");
         let materialized = BlobRefV2::of_bytes(b"one");
         let work = crdt_work(initial, 20, Vec::new());
+        seed_direct_ingress(&mut store, &work);
         let transition = crdt_transition(&work, materialized.clone(), 1);
         let cid = transition.crdt_change.as_ref().unwrap().cid();
         let accepted = execute_guest_accumulate(
@@ -7078,6 +7368,7 @@ mod tests {
 
         let next_materialized = BlobRefV2::of_bytes(b"two");
         let next_work = crdt_work(materialized, 21, vec![cid]);
+        seed_direct_ingress(&mut store, &next_work);
         let next = crdt_transition(&next_work, next_materialized.clone(), 2);
         let next_cid = next.crdt_change.as_ref().unwrap().cid();
         let accepted = execute_guest_accumulate(
@@ -7108,6 +7399,7 @@ mod tests {
         for (invocation, bytes) in [(30, b"left".as_slice()), (31, b"right".as_slice())] {
             let materialization = BlobRefV2::of_bytes(bytes);
             let work = crdt_work(initial.clone(), invocation, Vec::new());
+            seed_direct_ingress(&mut store, &work);
             let transition = crdt_transition(&work, materialization.clone(), 1);
             let cid = transition.crdt_change.as_ref().unwrap().cid();
             let result = execute_guest_accumulate(
@@ -7137,6 +7429,7 @@ mod tests {
         let mut work = crdt_work(state, 32, heads.clone());
         work.imported_actors[0].causal_states = states;
         work.base_causal_height = Some(1);
+        seed_direct_ingress(&mut store, &work);
         let merged = BlobRefV2::of_bytes(b"merged");
         let transition = crdt_transition(&work, merged.clone(), 2);
         let merged_cid = transition.crdt_change.as_ref().unwrap().cid();
@@ -7164,6 +7457,7 @@ mod tests {
             .remove(&crdt_node_storage_key(branches[0].0));
         let mut work = crdt_work(BlobRefV2::of_bytes(b"merged"), 33, vec![merged_cid]);
         work.base_causal_height = Some(2);
+        seed_direct_ingress(&mut incomplete, &work);
         let next = crdt_transition(&work, BlobRefV2::of_bytes(b"next"), 3);
         assert_eq!(
             execute_guest_accumulate(
@@ -7193,6 +7487,10 @@ mod tests {
 
         let left_work = crdt_work(initial.clone(), 70, vec![]);
         let right_work = crdt_work(initial, 71, vec![]);
+        seed_direct_ingress(&mut left_first, &left_work);
+        seed_direct_ingress(&mut left_first, &right_work);
+        seed_direct_ingress(&mut right_first, &left_work);
+        seed_direct_ingress(&mut right_first, &right_work);
         let left_state = BlobRefV2::of_bytes(b"left-branch");
         let right_state = BlobRefV2::of_bytes(b"right-branch");
         let left = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
@@ -7248,6 +7546,7 @@ mod tests {
             let mut source = MemStore::default();
             let (initial, _) = install_fixture(&mut source, ConsistencyModeV2::Crdt, b"before");
             let work = crdt_work(initial, invocation, vec![]);
+            seed_direct_ingress(&mut source, &work);
             let materialized = BlobRefV2::of_bytes(state_bytes);
             let transition = crdt_transition(&work, materialized.clone(), 1);
             let change = transition.crdt_change.clone().unwrap();
@@ -7401,6 +7700,7 @@ mod tests {
         install_fixture(&mut destination, ConsistencyModeV2::Crdt, b"before");
 
         let work = crdt_work(initial, 61, vec![]);
+        seed_direct_ingress(&mut source, &work);
         let materialized = BlobRefV2::of_bytes(b"synced-state");
         let transition = crdt_transition(&work, materialized.clone(), 1);
         let change = transition.crdt_change.clone().unwrap();
@@ -7492,6 +7792,17 @@ mod tests {
         );
         drop(tree);
 
+        assert_eq!(
+            destination.rows.get(&dedup_storage_key(work.input_id())),
+            source.rows.get(&dedup_storage_key(work.input_id())),
+            "sync must reconstruct the authenticated retry bridge"
+        );
+        assert_eq!(
+            destination.rows.get(&receipt_storage_key(work.input_id())),
+            source.rows.get(&receipt_storage_key(work.input_id())),
+            "the reconstructed dedup row must retain its exact receipt"
+        );
+
         let stored_receipt = destination
             .rows
             .get(&crdt_node_receipt_storage_key(cid))
@@ -7581,6 +7892,7 @@ mod tests {
         let (initial, install) =
             install_fixture(&mut committed, ConsistencyModeV2::Local, b"before");
         let work = linear_work(initial, install.resulting_state_root.unwrap());
+        seed_direct_ingress(&mut committed, &work);
         let request = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             transition: linear_transition(&work, b"after"),
             work,

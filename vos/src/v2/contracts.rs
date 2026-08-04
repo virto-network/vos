@@ -949,9 +949,7 @@ impl CrdtChangeV2 {
     pub fn derive_ingress_id(ingress: &CrdtIngressV2, heads: &[Hash]) -> ChangeId {
         let mut bytes = Vec::new();
         let mut e = Encoder(&mut bytes);
-        encode_service(&mut e, &ingress.service);
-        e.fixed(&ingress.invocation.0);
-        e.fixed(&ingress.target.0);
+        e.fixed(&ingress.commitment().0);
         e.list(heads, |e, head| e.fixed(&head.0));
         ChangeId(Hash::digest(b"vos/crdt-ingress-id/v2", &[&bytes]).0)
     }

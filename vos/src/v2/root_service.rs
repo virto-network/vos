@@ -20,9 +20,9 @@ use super::{
     JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2, LocalStoreReadErrorV2, LocalWorkRequestV2,
     LocalWorkSchedulerV2, MethodPolicyV2, NoRefineProtocolHostV2, PackageError,
     PackageRolePoliciesV2, ProgramId, ProofArtifactStoreV2, PublicationAckV2, PublicationRecordV2,
-    PublishedEffectsV2, ReceiptVerificationRequestV2, RefinedServiceOutputV2, ScheduleErrorV2,
-    ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2,
-    WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
+    PublishedEffectsV2, RefinedServiceOutputV2, ScheduleErrorV2, ServiceDispatchError,
+    ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2, WorkInputIdV2,
+    WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
 };
 
 #[cfg(feature = "storage")]
@@ -1023,6 +1023,9 @@ where
         &mut self,
         request: LocalWorkRequestV2,
     ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        if request.proof_requested {
+            return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
+        }
         self.prepare_admission_barrier()?;
         self.invoke_after_admission_barrier(request)
     }
@@ -1033,6 +1036,9 @@ where
         &mut self,
         request: LocalWorkRequestV2,
     ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        if request.proof_requested {
+            return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
+        }
         if let Some(committed) = self.recover_committed_invocation(&request)? {
             return Ok(committed);
         }
@@ -1046,6 +1052,9 @@ where
         &mut self,
         request: &LocalWorkRequestV2,
     ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        if request.proof_requested {
+            return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
+        }
         self.prepare_admission_barrier()?;
         self.admit_ingress_after_barrier(request)
     }
@@ -1054,6 +1063,9 @@ where
         &mut self,
         request: &LocalWorkRequestV2,
     ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        if request.proof_requested {
+            return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
+        }
         let ingress = direct_ingress_from_request(
             self.service.accumulate_host().local_store(),
             &self.identity,
@@ -1183,10 +1195,10 @@ where
             .map_err(LocalRootTreeInvokeErrorV2::Schedule)
     }
 
-    /// Import finalized peer nodes only through the canonical guest's
-    /// SyncCrdt Accumulate request. The local conformance harness supplies the
-    /// exact receipt-verification availability; all identity, ancestry, CID,
-    /// blob, and workflow validation remains guest-owned.
+    /// Import peer nodes only through the canonical guest's SyncCrdt
+    /// Accumulate request. Receipt finality must already be available from an
+    /// independent verifier configured on the host; the envelope never
+    /// authorizes its own receipts.
     pub fn sync_finalized_crdt(
         &mut self,
         envelope: CrdtSyncEnvelopeV2,
@@ -1196,18 +1208,6 @@ where
             return Err(LocalRootTreeInvokeErrorV2::Rejected(
                 AccumulationRejectionV2::InvalidConsistency,
             ));
-        }
-        for node in &envelope.nodes {
-            let expected_producer = node
-                .change
-                .expected_producer()
-                .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
-            self.service
-                .accumulate_host_mut()
-                .allow_receipt(&ReceiptVerificationRequestV2 {
-                    expected_producer,
-                    receipt: node.receipt.clone(),
-                });
         }
         let accumulated = self
             .service

@@ -18,12 +18,12 @@ use vos::network::RaftRpcHandler;
 use vos::node::{V2NodeRegistrationError, VosNode};
 use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, Role, WorkerConfig};
 use vos::v2::{
-    AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
-    AccumulationResultV2, ActorGenesisV2, ActorId, ActorUpgradeV2, ActorWriteV2,
-    AuthorizationEvidenceV2, BlobRefV2, CallId, CommittedAccumulateBatchV2,
+    AccumulateProtocolHostV2, AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2,
+    AccumulationReceiptV2, AccumulationResultV2, ActorGenesisV2, ActorId, ActorUpgradeV2,
+    ActorWriteV2, AuthorizationEvidenceV2, BlobRefV2, CallId, CommittedAccumulateBatchV2,
     CommittedAccumulateEntryV2, CommittedAccumulateLogV2, CommittedImageStoreV2,
     CommittedServiceImageHostV2, CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, DurableJamStoreV2,
+    ContinuationChangeV2, ContinuationSnapshotV2, DeploymentId, DirectIngressV2, DurableJamStoreV2,
     ExternalActorBindingV2, GasAccountingV2, Hash, ImportedActorV2, ImportedBlobV2,
     ImportedProgramV2, InboxDrainOutcomeV2, InvocationId, JamServiceV2, LocalJamStoreHostV2,
     LocalJamStoreSnapshotV2, LocalJamStoreV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2,
@@ -63,6 +63,109 @@ mod host_greeter_surface {
 fn role_policies(mut methods: Vec<MethodPolicyV2>) -> Vec<u8> {
     methods.sort_by(|left, right| left.method.cmp(&right.method));
     PackageRolePoliciesV2 { methods }.encode()
+}
+
+fn direct_linear_ingress(work: &WorkEnvelopeV2) -> AccumulateRequestV2 {
+    assert!(matches!(work.base, ConsistencyBaseV2::Linear { .. }));
+    AccumulateRequestV2::AdmitIngress(DirectIngressV2 {
+        service: work.service.clone(),
+        invocation: work.invocation,
+        logical_timeslot: work.logical_timeslot,
+        target: work.target,
+        method: work.method.clone(),
+        arguments: work.arguments.clone(),
+        origin: work.origin,
+        authorization: work.authorization.clone(),
+        imported_blobs: work.imported_blobs.clone(),
+        proof_requested: work.proof_requested,
+        base: work.base.clone(),
+        base_causal_height: work.base_causal_height,
+        crdt_change: None,
+    })
+}
+
+fn admit_linear_work<A>(
+    service: &mut JamServiceV2<NoRefineProtocolHostV2, A>,
+    work: &WorkEnvelopeV2,
+) where
+    A: AccumulateProtocolHostV2,
+{
+    let admitted = service
+        .accumulate(&direct_linear_ingress(work))
+        .unwrap()
+        .result;
+    assert!(
+        matches!(
+            admitted,
+            AccumulationResultV2::IngressAdmitted {
+                duplicate: false,
+                ..
+            }
+        ),
+        "direct test ingress was rejected: {admitted:?}"
+    );
+}
+
+fn request_from_work(work: &WorkEnvelopeV2) -> LocalWorkRequestV2 {
+    LocalWorkRequestV2 {
+        invocation: work.invocation,
+        workflow_step: work.workflow_step,
+        logical_timeslot: work.logical_timeslot,
+        target: work.target,
+        method: work.method.clone(),
+        arguments: work.arguments.clone(),
+        origin: work.origin,
+        authorization: work.authorization.clone(),
+        causal_parent: work.causal_parent,
+        parent_call: work.parent_call,
+        causal_context: work.causal_context.clone(),
+        awaited_reply: work.awaited_reply.clone(),
+        awaited_timeout: work.awaited_timeout.as_deref().cloned(),
+        imported_blobs: work.imported_blobs.clone(),
+        proof_requested: work.proof_requested,
+    }
+}
+
+fn admit_direct_request<A>(
+    service: &mut JamServiceV2<NoRefineProtocolHostV2, A>,
+    request: &LocalWorkRequestV2,
+) where
+    A: AccumulateProtocolHostV2 + LocalJamStoreHostV2,
+{
+    let service_identity = service
+        .accumulate_host()
+        .local_store()
+        .header()
+        .unwrap()
+        .unwrap()
+        .service;
+    let ingress = LocalWorkSchedulerV2::prepare_direct_ingress(
+        service.accumulate_host().local_store(),
+        &service_identity,
+        request,
+    )
+    .unwrap();
+    assert!(matches!(
+        service
+            .accumulate(&AccumulateRequestV2::AdmitIngress(ingress))
+            .unwrap()
+            .result,
+        AccumulationResultV2::IngressAdmitted {
+            duplicate: false,
+            ..
+        }
+    ));
+}
+
+fn admit_and_prepare<A>(
+    service: &mut JamServiceV2<NoRefineProtocolHostV2, A>,
+    request: LocalWorkRequestV2,
+) -> vos::v2::PreparedWorkV2
+where
+    A: AccumulateProtocolHostV2 + LocalJamStoreHostV2,
+{
+    admit_direct_request(service, &request);
+    LocalWorkSchedulerV2::prepare(service.accumulate_host().local_store(), request).unwrap()
 }
 
 #[derive(Debug, Default)]
@@ -804,6 +907,19 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         imported_blobs: vec![],
         proof_requested: false,
     };
+    let mut unsupported_attested = request.clone();
+    unsupported_attested.invocation = InvocationId([95; 32]);
+    unsupported_attested.proof_requested = true;
+    let before_attested = service.store().snapshot();
+    assert!(matches!(
+        service.invoke(unsupported_attested),
+        Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired)
+    ));
+    assert_eq!(
+        service.store().snapshot(),
+        before_attested,
+        "unsupported attested work must be rejected before ingress admission"
+    );
     assert!(
         !service
             .admit_ingress(&request)
@@ -1388,6 +1504,51 @@ fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
     assert!(!committed.duplicate);
     assert!(!committed.receipt.resulting_crdt_heads.is_empty());
 
+    let sync = service
+        .crdt_sync_envelope()
+        .expect("source causal frontier is readable")
+        .expect("committed CRDT work exports a sync envelope");
+    let mut replica =
+        LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
+            .expect("independent CRDT replica installs the same root tree");
+    let before_untrusted_sync = replica.store().snapshot();
+    assert!(matches!(
+        replica.sync_finalized_crdt(sync.clone()),
+        Err(LocalRootTreeInvokeErrorV2::Rejected(
+            vos::v2::AccumulationRejectionV2::ReceiptUnavailable
+        ))
+    ));
+    assert_eq!(
+        replica.store().snapshot(),
+        before_untrusted_sync,
+        "a sync envelope must not authorize its own claimed receipts"
+    );
+    for node in &sync.nodes {
+        replica
+            .store_mut()
+            .allow_receipt(&ReceiptVerificationRequestV2 {
+                expected_producer: node
+                    .change
+                    .expected_producer()
+                    .expect("every exported workflow node names its producer"),
+                receipt: node.receipt.clone(),
+            });
+    }
+    let synced = replica
+        .sync_finalized_crdt(sync)
+        .expect("independently finalized causal nodes synchronize");
+    assert!(!synced.duplicate);
+    let replica_backend = replica.into_backend();
+    let mut replica = LocalRootTreeServiceV2::open(config.clone(), replica_backend)
+        .expect("synchronized replica reopens from its committed image");
+    let replicated_recovery = replica
+        .invoke(request.clone())
+        .expect("synchronized dedup state reattaches the exact invocation");
+    assert!(replicated_recovery.duplicate);
+    assert_eq!(replicated_recovery.receipt, committed.receipt);
+    assert_eq!(replicated_recovery.refine_gas_used, 0);
+    assert_eq!(replicated_recovery.accumulate_gas_used, 0);
+
     let backend = service.into_backend();
     let mut restarted = LocalRootTreeServiceV2::open(config, backend)
         .expect("CRDT service image restores without reinstalling");
@@ -1495,6 +1656,7 @@ fn same_package_child_spawn_commits_before_the_child_becomes_callable() {
         },
     )
     .unwrap();
+    admit_linear_work(&mut service, &spawn_work.work);
     let spawned = service
         .refine_actor_tree(&spawn_work.work, &spawn_work.imports)
         .expect("the canonical actor emits one child creation effect");
@@ -1556,6 +1718,7 @@ fn same_package_child_spawn_commits_before_the_child_becomes_callable() {
         },
     )
     .expect("the committed child is schedulable in the next slice");
+    admit_linear_work(&mut service, &child_work.work);
     let imported_child = child_work
         .work
         .imported_actors
@@ -1808,6 +1971,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
         },
     )
     .unwrap();
+    admit_linear_work(&mut service, &scheduled.work);
     let refined = service
         .refine_actor_tree(&scheduled.work, &scheduled.imports)
         .expect("root calls its child through an ordinary JAR CALLABLE");
@@ -1867,6 +2031,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
         },
     )
     .unwrap();
+    admit_linear_work(&mut service, &scrub.work);
     let scrubbed = service
         .refine_actor_tree(&scrub.work, &scrub.imports)
         .expect("a long sibling reply is followed by a short sibling call");
@@ -1918,6 +2083,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
         },
     )
     .expect("the completed inline invocation leaves both actors idle");
+    admit_linear_work(&mut service, &nested.work);
     let runner = ServicePvmV2::new(
         CANONICAL_SERVICE_PVM.to_vec(),
         vos::v2::VOS_SERVICE_PROGRAM_ID,
@@ -2234,6 +2400,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
         },
     )
     .unwrap();
+    admit_linear_work(&mut restarted, &twice.work);
     let first_wait = restarted
         .refine_actor_tree(&twice.work, &twice.imports)
         .expect("the nested child reaches its first peer await");
@@ -2415,6 +2582,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
         },
     )
     .unwrap();
+    admit_linear_work(&mut restarted, &chained.work);
     let child_wait = restarted
         .refine_actor_tree(&chained.work, &chained.imports)
         .expect("the child reaches its await");
@@ -2546,6 +2714,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
         },
     )
     .unwrap();
+    admit_linear_work(&mut restarted, &repeated.work);
     let repeated_done = restarted
         .refine_actor_tree(&repeated.work, &repeated.imports)
         .expect("repeated legal CALLs reuse the callee arena");
@@ -2582,6 +2751,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
         },
     )
     .unwrap();
+    admit_linear_work(&mut restarted, &locked.work);
     let locked_wait = restarted
         .refine_actor_tree(&locked.work, &locked.imports)
         .expect("the root and child suspend while the sibling is idle");
@@ -2626,6 +2796,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
         },
     )
     .expect("the idle sibling may start another workflow");
+    admit_linear_work(&mut restarted, &sibling_work.work);
     let sibling_wait = restarted
         .refine_actor_tree(&sibling_work.work, &sibling_work.imports)
         .expect("the sibling independently suspends");
@@ -2851,6 +3022,7 @@ fn same_tree_causal_cycles_return_an_explicit_guest_error() {
         },
     )
     .unwrap();
+    admit_linear_work(&mut service, &scheduled.work);
     let refined = service
         .refine_actor_tree(&scheduled.work, &scheduled.imports)
         .expect("A -> B -> A returns Cycle before re-entering A");
@@ -2902,6 +3074,7 @@ fn same_tree_causal_cycles_return_an_explicit_guest_error() {
         },
     )
     .unwrap();
+    admit_linear_work(&mut service, &scheduled.work);
     let refined = service
         .refine_actor_tree(&scheduled.work, &scheduled.imports)
         .expect("a same-tree role denial remains distinct from a child panic");
@@ -2993,34 +3166,48 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
         AccumulationResultV2::Installed(_)
     ));
 
-    let scheduled = LocalWorkSchedulerV2::prepare(
-        service.accumulate_host(),
-        LocalWorkRequestV2 {
-            invocation: work.invocation,
-            workflow_step: 0,
-            logical_timeslot: work.logical_timeslot,
-            target: work.target,
-            method: work.method.clone(),
-            arguments: work.arguments.clone(),
-            origin: work.origin,
-            authorization: work.authorization.clone(),
-            causal_parent: None,
-            parent_call: None,
-            causal_context: None,
-            awaited_reply: None,
-            awaited_timeout: None,
-            imported_blobs: vec![],
-            proof_requested: false,
-        },
-    )
-    .expect("scheduler imports the empty CRDT frontier");
-    assert_eq!(scheduled.work, work);
+    let first_request = request_from_work(&work);
+    let mut right_template = work.clone();
+    right_template.invocation = InvocationId([47; 32]);
+    let mut right_message = vec![vos::value::TAG_DYNAMIC];
+    right_message.extend_from_slice(&Msg::new("increment").with("amount", 3u64).encode());
+    right_template.arguments = right_message;
+    let right_request = request_from_work(&right_template);
+    // Prepare both ingress nodes from the same empty frontier, then commit
+    // them before either actor Refine. Both actor slices therefore observe
+    // the same authenticated two-branch admission frontier.
+    let service_identity = service.accumulate_host().header().unwrap().unwrap().service;
+    let ingresses = [&first_request, &right_request].map(|request| {
+        LocalWorkSchedulerV2::prepare_direct_ingress(
+            service.accumulate_host(),
+            &service_identity,
+            request,
+        )
+        .unwrap()
+    });
+    for ingress in ingresses {
+        assert!(matches!(
+            service
+                .accumulate(&AccumulateRequestV2::AdmitIngress(ingress))
+                .unwrap()
+                .result,
+            AccumulationResultV2::IngressAdmitted {
+                duplicate: false,
+                ..
+            }
+        ));
+    }
+    let scheduled = LocalWorkSchedulerV2::prepare(service.accumulate_host(), first_request)
+        .expect("scheduler imports the authenticated CRDT ingress frontier");
+    let right_scheduled = LocalWorkSchedulerV2::prepare(service.accumulate_host(), right_request)
+        .expect("concurrent retry observes the same admitted frontier");
+    work = scheduled.work;
     let imports = scheduled.imports;
 
     let refined = service.refine_actor_tree(&work, &imports).unwrap();
     assert!(refined.transition.writes.is_empty());
     let change = refined.transition.crdt_change.as_ref().unwrap();
-    assert_eq!(change.causal_height, 1);
+    assert_eq!(change.causal_height, 2);
     assert_eq!(change.operations.len(), 1);
     assert_eq!(change.materializations.len(), 1);
     assert_eq!(refined.exported_blobs.len(), 1);
@@ -3076,16 +3263,17 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
         replica.accumulate(&install).unwrap().result,
         AccumulationResultV2::Installed(_)
     ));
-    replica
-        .accumulate_host_mut()
-        .allow_receipt(&ReceiptVerificationRequestV2 {
-            expected_producer: work.target,
-            receipt: receipt.clone(),
-        });
-    let sync = AccumulateRequestV2::SyncCrdt(
-        LocalWorkSchedulerV2::prepare_crdt_sync(service.accumulate_host())
-            .expect("source scheduler exports the authenticated causal DAG"),
-    );
+    let sync_envelope = LocalWorkSchedulerV2::prepare_crdt_sync(service.accumulate_host())
+        .expect("source scheduler exports the authenticated causal DAG");
+    for node in &sync_envelope.nodes {
+        replica
+            .accumulate_host_mut()
+            .allow_receipt(&ReceiptVerificationRequestV2 {
+                expected_producer: node.change.expected_producer().unwrap(),
+                receipt: node.receipt.clone(),
+            });
+    }
+    let sync = AccumulateRequestV2::SyncCrdt(sync_envelope);
     let synced = replica.accumulate(&sync).unwrap().result;
     assert!(matches!(
         synced,
@@ -3122,18 +3310,15 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     assert!(duplicate);
     assert_eq!(published, PublishedEffectsV2::default());
 
-    // Refine a concurrent sibling from the same empty causal base after the
-    // first branch has committed. CRDT Accumulate preserves both heads.
-    let mut right_work = work.clone();
-    right_work.invocation = InvocationId([47; 32]);
-    let mut right_message = vec![vos::value::TAG_DYNAMIC];
-    right_message.extend_from_slice(&Msg::new("increment").with("amount", 3u64).encode());
-    right_work.arguments = right_message;
-    let right_refined = service.refine_actor_tree(&right_work, &imports).unwrap();
+    // Refine the other admitted invocation from the same causal base after
+    // the first branch has committed. CRDT Accumulate preserves both heads.
+    let right_refined = service
+        .refine_actor_tree(&right_scheduled.work, &right_scheduled.imports)
+        .unwrap();
     let right_cid = right_refined.transition.crdt_change.as_ref().unwrap().cid();
     let right = service
         .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
-            work: right_work,
+            work: right_scheduled.work,
             transition: right_refined.transition.clone(),
             provided_blobs: right_refined.exported_blobs.clone(),
         }))
@@ -3151,8 +3336,8 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     // before the handler observes state, so 2 + 3 + 4 becomes 9.
     let mut merge_message = vec![vos::value::TAG_DYNAMIC];
     merge_message.extend_from_slice(&Msg::new("increment").with("amount", 4u64).encode());
-    let merge = LocalWorkSchedulerV2::prepare(
-        service.accumulate_host(),
+    let merge = admit_and_prepare(
+        &mut service,
         LocalWorkRequestV2 {
             invocation: InvocationId([48; 32]),
             workflow_step: 0,
@@ -3170,12 +3355,19 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
             imported_blobs: vec![],
             proof_requested: false,
         },
-    )
-    .expect("scheduler imports both concurrent CRDT heads");
+    );
     let merge_work = merge.work;
     let merge_imports = merge.imports;
-    assert_eq!(merge_work.base, ConsistencyBaseV2::Crdt { heads });
-    assert_eq!(merge_work.base_causal_height, Some(1));
+    let ConsistencyBaseV2::Crdt { heads: merge_heads } = &merge_work.base else {
+        unreachable!()
+    };
+    assert_eq!(
+        merge_heads.len(),
+        1,
+        "admission causally joins both branches"
+    );
+    assert_ne!(merge_heads, &heads);
+    assert_eq!(merge_work.base_causal_height, Some(3));
     assert_eq!(merge_work.imported_actors[0].causal_states.len(), 1);
     assert_eq!(merge_imports.blobs.len(), 2);
     let merged = service
@@ -3438,37 +3630,31 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
         "a direct CRDT resume without a committed workflow row fails closed"
     );
 
-    let prepare = |store: &LocalJamStoreV2, invocation, timeslot, method: &str| {
+    let request = |invocation, timeslot, method: &str| {
         let mut arguments = vec![vos::value::TAG_DYNAMIC];
         arguments.extend_from_slice(&Msg::new(method).with("amount", 3u64).encode());
-        LocalWorkSchedulerV2::prepare(
-            store,
-            LocalWorkRequestV2 {
-                invocation,
-                workflow_step: 0,
-                logical_timeslot: timeslot,
-                target: seed.target,
-                method: method.into(),
-                arguments,
-                origin: Origin::Anonymous,
-                authorization: AuthorizationEvidenceV2::Public,
-                causal_parent: None,
-                parent_call: None,
-                causal_context: None,
-                awaited_reply: None,
-                awaited_timeout: None,
-                imported_blobs: vec![],
-                proof_requested: false,
-            },
-        )
-        .unwrap()
+        LocalWorkRequestV2 {
+            invocation,
+            workflow_step: 0,
+            logical_timeslot: timeslot,
+            target: seed.target,
+            method: method.into(),
+            arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        }
     };
 
-    let first = prepare(
-        service.accumulate_host(),
-        InvocationId([53; 32]),
-        1,
-        "increment_child_twice",
+    let first = admit_and_prepare(
+        &mut service,
+        request(InvocationId([53; 32]), 1, "increment_child_twice"),
     );
     let runner = ServicePvmV2::new(
         CANONICAL_SERVICE_PVM.to_vec(),
@@ -3546,11 +3732,9 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
         }
     ));
 
-    let second = prepare(
-        service.accumulate_host(),
-        InvocationId([54; 32]),
-        2,
-        "increment_child_twice",
+    let second = admit_and_prepare(
+        &mut service,
+        request(InvocationId([54; 32]), 2, "increment_child_twice"),
     );
     let refined = service
         .refine_actor_tree(&second.work, &second.imports)
@@ -3576,50 +3760,66 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
             .with("parent_after", 13u64)
             .encode(),
     );
-    let around = LocalWorkSchedulerV2::prepare(
-        service.accumulate_host(),
-        LocalWorkRequestV2 {
-            invocation: InvocationId([59; 32]),
-            workflow_step: 0,
-            logical_timeslot: 3,
-            target: seed.target,
-            method: "increment_child_around_peer".into(),
-            arguments: around_arguments,
-            origin: Origin::Anonymous,
-            authorization: AuthorizationEvidenceV2::Public,
-            causal_parent: None,
-            parent_call: None,
-            causal_context: None,
-            awaited_reply: None,
-            awaited_timeout: None,
-            imported_blobs: vec![],
-            proof_requested: false,
-        },
-    )
-    .unwrap();
+    let around_request = LocalWorkRequestV2 {
+        invocation: InvocationId([59; 32]),
+        workflow_step: 0,
+        logical_timeslot: 3,
+        target: seed.target,
+        method: "increment_child_around_peer".into(),
+        arguments: around_arguments,
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
     let mut concurrent_arguments = vec![vos::value::TAG_DYNAMIC];
     concurrent_arguments.extend_from_slice(&Msg::new("increment").with("amount", 11u64).encode());
-    let concurrent = LocalWorkSchedulerV2::prepare(
-        service.accumulate_host(),
-        LocalWorkRequestV2 {
-            invocation: InvocationId([60; 32]),
-            workflow_step: 0,
-            logical_timeslot: 3,
-            target: seed.target,
-            method: "increment".into(),
-            arguments: concurrent_arguments,
-            origin: Origin::Anonymous,
-            authorization: AuthorizationEvidenceV2::Public,
-            causal_parent: None,
-            parent_call: None,
-            causal_context: None,
-            awaited_reply: None,
-            awaited_timeout: None,
-            imported_blobs: vec![],
-            proof_requested: false,
-        },
-    )
-    .unwrap();
+    let concurrent_request = LocalWorkRequestV2 {
+        invocation: InvocationId([60; 32]),
+        workflow_step: 0,
+        logical_timeslot: 3,
+        target: seed.target,
+        method: "increment".into(),
+        arguments: concurrent_arguments,
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let service_identity = service.accumulate_host().header().unwrap().unwrap().service;
+    let ingresses = [&around_request, &concurrent_request].map(|request| {
+        LocalWorkSchedulerV2::prepare_direct_ingress(
+            service.accumulate_host(),
+            &service_identity,
+            request,
+        )
+        .unwrap()
+    });
+    for ingress in ingresses {
+        assert!(matches!(
+            service
+                .accumulate(&AccumulateRequestV2::AdmitIngress(ingress))
+                .unwrap()
+                .result,
+            AccumulationResultV2::IngressAdmitted {
+                duplicate: false,
+                ..
+            }
+        ));
+    }
+    let around = LocalWorkSchedulerV2::prepare(service.accumulate_host(), around_request).unwrap();
+    let concurrent =
+        LocalWorkSchedulerV2::prepare(service.accumulate_host(), concurrent_request).unwrap();
     assert_eq!(around.work.base, concurrent.work.base);
     let around_refined = service
         .refine_actor_tree(&around.work, &around.imports)
@@ -3628,6 +3828,7 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
         .refine_actor_tree(&concurrent.work, &concurrent.imports)
         .expect("concurrent CRDT work refines from the same causal base");
     let checkpoint_change = around_refined.transition.crdt_change.as_ref().unwrap();
+    let checkpoint_height = checkpoint_change.causal_height;
     assert_eq!(checkpoint_change.operations.len(), 1);
     assert_eq!(checkpoint_change.operations[0].actor, child);
     assert_eq!(checkpoint_change.operations[0].ordinal, 0);
@@ -3712,7 +3913,7 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
             heads: vec![checkpoint_cid]
         }
     );
-    assert_eq!(resumed.work.base_causal_height, Some(2));
+    assert_eq!(resumed.work.base_causal_height, Some(checkpoint_height));
     assert!(resumed.work.imported_actors[0].causal_states.is_empty());
     let resumed_refined = service
         .refine_actor_tree(&resumed.work, &resumed.imports)
@@ -3774,8 +3975,8 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
 
     let mut merged_arguments = vec![vos::value::TAG_DYNAMIC];
     merged_arguments.extend_from_slice(&Msg::new("increment").with("amount", 1u64).encode());
-    let merged = LocalWorkSchedulerV2::prepare(
-        service.accumulate_host(),
+    let merged = admit_and_prepare(
+        &mut service,
         LocalWorkRequestV2 {
             invocation: InvocationId([66; 32]),
             workflow_step: 0,
@@ -3793,8 +3994,7 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
             imported_blobs: vec![],
             proof_requested: false,
         },
-    )
-    .expect("both post-checkpoint branches remain available for a later merge");
+    );
     assert_eq!(merged.work.imported_actors[0].causal_states.len(), 1);
     let merged_refined = service
         .refine_actor_tree(&merged.work, &merged.imports)
@@ -3818,8 +4018,8 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
             .with("after", 3u64)
             .encode(),
     );
-    let await_then_yield = LocalWorkSchedulerV2::prepare(
-        service.accumulate_host(),
+    let await_then_yield = admit_and_prepare(
+        &mut service,
         LocalWorkRequestV2 {
             invocation: InvocationId([68; 32]),
             workflow_step: 0,
@@ -3837,8 +4037,7 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
             imported_blobs: vec![],
             proof_requested: false,
         },
-    )
-    .unwrap();
+    );
     let awaiting = service
         .refine_actor_tree(&await_then_yield.work, &await_then_yield.imports)
         .expect("the first slice checkpoints at its peer await");
@@ -3953,17 +4152,6 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
     first_work.base = ConsistencyBaseV2::Crdt { heads: vec![] };
     first_work.base_causal_height = Some(0);
 
-    let first_imports = RefineImportsV2 {
-        programs: vec![ImportedProgramV2 {
-            program: actor_program,
-            pvm: actor_pvm.clone(),
-        }],
-        blobs: vec![ImportedBlobV2 {
-            reference: initial.clone(),
-            bytes: initial_bytes.clone(),
-        }],
-        private_blobs: vec![],
-    };
     let mut host = LocalJamStoreV2::default();
     assert_eq!(host.import_blob(initial_bytes), initial);
     assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
@@ -4010,6 +4198,10 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
         AccumulationResultV2::Installed(_)
     ));
 
+    let prepared = admit_and_prepare(&mut service, request_from_work(&first_work));
+    first_work = prepared.work;
+    let first_imports = prepared.imports;
+
     let first = service
         .refine_actor_tree(&first_work, &first_imports)
         .unwrap();
@@ -4018,6 +4210,7 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
     assert_eq!(first_change.operations.len(), 1);
     assert_eq!(first_change.operations[0].ordinal, 0);
     let first_change_id = first_change.id;
+    let first_change_height = first_change.causal_height;
     let first_cid = first_change.cid();
     let state = first_change.materializations[0].state.clone();
     let continuation = first.transition.continuations[0]
@@ -4048,7 +4241,7 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
     second_work.base = ConsistencyBaseV2::Crdt {
         heads: vec![first_cid],
     };
-    second_work.base_causal_height = Some(1);
+    second_work.base_causal_height = Some(first_change_height);
     second_work.imported_actors[0].state = state;
     second_work.imported_actors[0].continuation = Some(continuation);
     let second_imports = RefineImportsV2 {
@@ -4267,6 +4460,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
         .expect("scheduler reconstructs initial work from guest-owned state");
     first_work = prepared.work;
     let first_imports = prepared.imports;
+    admit_linear_work(&mut committed, &first_work);
     assert_eq!(
         first_work.base,
         ConsistencyBaseV2::Linear {
@@ -4590,6 +4784,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
         .expect("scheduler reconstructs the initial actor slice");
     let first_work = prepared.work;
     let first_imports = prepared.imports;
+    admit_linear_work(&mut committed, &first_work);
 
     let first_output = service
         .refine_actor_tree_with_backend(
@@ -5194,6 +5389,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
         proof_requested: false,
     };
     let seeded = LocalWorkSchedulerV2::prepare(committed.accumulate_host(), seed_request).unwrap();
+    admit_linear_work(&mut committed, &seeded.work);
     let seed_transition = TransitionV2 {
         service: seeded.work.service.clone(),
         consumed_input: seeded.work.input_id(),
@@ -5817,15 +6013,26 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
                 program: actor_program,
                 initial_state: initial.clone(),
                 crdt: false,
-                role_policies: role_policies(vec![MethodPolicyV2 {
-                    method: "start".into(),
-                    schema: Hash([32; 32]),
-                    policy: public_policy_hash(),
-                    public: true,
-                    attested: false,
-                    space_role: None,
-                    actor_role: None,
-                }]),
+                role_policies: role_policies(vec![
+                    MethodPolicyV2 {
+                        method: "start".into(),
+                        schema: Hash([32; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: false,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                    MethodPolicyV2 {
+                        method: "attested-start".into(),
+                        schema: Hash([32; 32]),
+                        policy: public_policy_hash(),
+                        public: true,
+                        attested: true,
+                        space_role: None,
+                        actor_role: None,
+                    },
+                ]),
             },
             ActorGenesisV2 {
                 actor: child,
@@ -6033,10 +6240,12 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         proof: None,
     };
 
-    let before_prepare = service.accumulate_host().snapshot();
     let mut proof_work = work.clone();
+    proof_work.invocation = InvocationId([0x33; 32]);
+    proof_work.method = "attested-start".into();
     proof_work.proof_requested = true;
     let mut proof_transition = transition.clone();
+    proof_transition.consumed_input = proof_work.input_id();
     proof_transition.continuations.clear();
     proof_transition.inbox.clear();
     proof_transition.exported_blobs.clear();
@@ -6045,7 +6254,20 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         producer: proof_work.target,
         result: b"attested result".to_vec(),
     });
-    let prepared_attestation = service
+    let proof_host = LocalJamStoreV2::from_snapshot(service.accumulate_host().snapshot());
+    let mut proof_service = JamServiceV2::new(
+        pvm.clone(),
+        ProgramId::of_pvm(&pvm),
+        NoRefineProtocolHostV2,
+        proof_host,
+        100_000_000,
+        5_000_000_000,
+    )
+    .unwrap();
+    admit_linear_work(&mut proof_service, &proof_work);
+    let before_prepare = proof_service.accumulate_host().snapshot();
+    let commit_sequence_before_prepare = proof_service.accumulate_host().commit_sequence();
+    let prepared_attestation = proof_service
         .accumulate(&AccumulateRequestV2::PrepareAttested(
             AccumulationEnvelopeV2 {
                 work: proof_work.clone(),
@@ -6072,7 +6294,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
                 schema: Hash([32; 32]),
                 policy: public_policy_hash(),
                 public: true,
-                attested: false,
+                attested: true,
                 space_role: None,
                 actor_role: None,
             },
@@ -6083,12 +6305,15 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         .unwrap()
     );
     assert!(
-        service
+        proof_service
             .accumulate_host()
             .snapshot()
             .same_service_state(&before_prepare)
     );
-    assert_eq!(service.accumulate_host().commit_sequence(), 1);
+    assert_eq!(
+        proof_service.accumulate_host().commit_sequence(),
+        commit_sequence_before_prepare
+    );
 
     let apply = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
         work: work.clone(),
@@ -6098,6 +6323,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
             bytes: continuation_bytes,
         }],
     });
+    admit_linear_work(&mut service, &work);
     let before_failed_commit = service.accumulate_host().snapshot();
     let durable_before_failed_commit = service.accumulate_host().backend().image.clone();
     service.accumulate_host_mut().backend_mut().fail_next_commit = true;
@@ -6131,7 +6357,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     assert_eq!(receipt.sequence, 1);
     assert_eq!(published.reply, transition.reply);
     assert!(service.accumulate_host().row_count() > installed_rows);
-    assert_eq!(service.accumulate_host().commit_sequence(), 2);
+    assert_eq!(service.accumulate_host().commit_sequence(), 3);
     let committed_state = BlobRefV2::of_bytes(b"committed actor state");
     assert_eq!(
         service.accumulate_host().blob(&committed_state),
@@ -6158,7 +6384,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     );
     assert_eq!(
         service.accumulate_host().commit_sequence(),
-        2,
+        3,
         "a read-only duplicate transaction must not commit"
     );
 
@@ -6466,6 +6692,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     };
     let caller = LocalWorkSchedulerV2::prepare(service.accumulate_host(), caller_request)
         .expect("idle caller is schedulable");
+    admit_linear_work(&mut service, &caller.work);
     let awaited_call = caller.work.invocation.call_id(0);
     let continuation_bytes = ContinuationSnapshotV2 {
         snapshot_version: vos::v2::SNAPSHOT_VERSION,
@@ -6989,7 +7216,10 @@ fn disclosed_role_credentials_require_authority_verification_in_physical_accumul
     });
     let before = service.accumulate_host().snapshot();
     assert_eq!(
-        service.accumulate(&apply).unwrap().result,
+        service
+            .accumulate(&direct_linear_ingress(&work))
+            .unwrap()
+            .result,
         AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::Unauthorized)
     );
     assert!(
@@ -7053,6 +7283,7 @@ fn disclosed_role_credentials_require_authority_verification_in_physical_accumul
     service
         .accumulate_host_mut()
         .allow_role_credential(&verification);
+    admit_linear_work(&mut service, &work);
     assert!(matches!(
         service.accumulate(&apply).unwrap().result,
         AccumulationResultV2::Accepted {
@@ -7177,6 +7408,7 @@ fn attested_driver_rejects_a_transition_not_produced_by_exact_refine() {
             .any(|window| window == private_witness.bytes),
         "the work wire carries only the private witness commitment and content reference"
     );
+    admit_linear_work(&mut service, &prepared.work);
     let refined = service
         .refine_actor_tree(&prepared.work, &prepared.imports)
         .expect("the executable actor produces a genuine Refine transition");
@@ -7471,6 +7703,7 @@ fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
         },
     )
     .unwrap();
+    admit_linear_work(&mut source, &prepared.work);
     let refined = source
         .refine_actor_tree(&prepared.work, &prepared.imports)
         .unwrap();
@@ -7700,6 +7933,7 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
         },
     )
     .unwrap();
+    admit_linear_work(&mut source, &source_work.work);
     let refined = source
         .refine_actor_tree(&source_work.work, &source_work.imports)
         .unwrap();
@@ -8152,6 +8386,16 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
         gas: GasAccountingV2::default(),
         proof: None,
     };
+    assert!(matches!(
+        leader
+            .accumulate(&direct_linear_ingress(&promotion_tail))
+            .unwrap()
+            .result,
+        AccumulationResultV2::IngressAdmitted {
+            duplicate: false,
+            ..
+        }
+    ));
     leader.log_mut().commit_before_next_read_index(
         AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             work: promotion_tail,
@@ -8226,6 +8470,18 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
     // before its own committed request instead of jumping the cursor past it.
     let mut prior = first.clone();
     prior.invocation = InvocationId([124; 32]);
+    for candidate in [&first, &prior] {
+        assert!(matches!(
+            leader
+                .accumulate(&direct_linear_ingress(candidate))
+                .unwrap()
+                .result,
+            AccumulationResultV2::IngressAdmitted {
+                duplicate: false,
+                ..
+            }
+        ));
+    }
     let prior_transition = TransitionV2 {
         service: prior.service.clone(),
         consumed_input: prior.input_id(),
@@ -8284,7 +8540,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
         2,
         "the earlier committed request is applied before the caller's proposal"
     );
-    assert_eq!(follower.catch_up().unwrap(), 3);
+    assert_eq!(follower.catch_up().unwrap(), 6);
     assert!(
         leader
             .service()
@@ -8344,6 +8600,16 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
     };
     assert!(matches!(
         follower
+            .accumulate(&direct_linear_ingress(&second))
+            .unwrap()
+            .result,
+        AccumulationResultV2::IngressAdmitted {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        follower
             .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                 work: second,
                 transition: second_transition,
@@ -8356,7 +8622,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             ..
         }
     ));
-    assert_eq!(leader.catch_up().unwrap(), 1);
+    assert_eq!(leader.catch_up().unwrap(), 2);
     assert!(
         leader
             .service()
@@ -8364,8 +8630,8 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             .snapshot()
             .same_service_state(&follower.service().accumulate_host().snapshot())
     );
-    assert_eq!(leader.log_mut().applied_index().unwrap(), 5);
-    assert_eq!(follower.log_mut().applied_index().unwrap(), 5);
+    assert_eq!(leader.log_mut().applied_index().unwrap(), 9);
+    assert_eq!(follower.log_mut().applied_index().unwrap(), 9);
 }
 
 #[test]
@@ -8655,6 +8921,16 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         },
     )
     .unwrap();
+    assert!(matches!(
+        leader
+            .accumulate(&direct_linear_ingress(&prepared.work))
+            .unwrap()
+            .result,
+        AccumulationResultV2::IngressAdmitted {
+            duplicate: false,
+            ..
+        }
+    ));
     let refined = leader
         .service()
         .refine_actor_tree(&prepared.work, &prepared.imports)
@@ -8676,11 +8952,11 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
     assert_eq!(committed.published.proof, Some(committed.proof.clone()));
 
     let entries = shared_log.lock().unwrap().entries.clone();
-    assert_eq!(entries.len(), 2, "PrepareAttested must not enter Raft");
+    assert_eq!(entries.len(), 3, "PrepareAttested must not enter Raft");
     let AccumulateRequestV2::Apply(logged) =
-        AccumulateRequestV2::decode(&entries[1].request).unwrap()
+        AccumulateRequestV2::decode(&entries[2].request).unwrap()
     else {
-        panic!("the second Raft entry was not the proved Apply")
+        panic!("the third Raft entry was not the proved Apply")
     };
     assert_eq!(logged.transition.proof, Some(committed.proof.clone()));
 
@@ -8693,7 +8969,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
     assert_eq!(retried.accumulate_gas_used, 0);
     assert_eq!(
         shared_log.lock().unwrap().entries.len(),
-        2,
+        3,
         "a duplicate attestation never proposes another Apply"
     );
 
@@ -8703,7 +8979,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
     ));
     assert_eq!(
         follower.log_mut().applied_index().unwrap(),
-        1,
+        2,
         "a failed follower proof-CAS write leaves the proved Apply unapplied"
     );
     assert_eq!(
@@ -8711,7 +8987,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         1,
         "the identical committed proof entry is retried after CAS recovery"
     );
-    assert_eq!(follower.log_mut().applied_index().unwrap(), 2);
+    assert_eq!(follower.log_mut().applied_index().unwrap(), 3);
     assert!(
         leader
             .service()
@@ -8737,7 +9013,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         bytes: committed.proof_bytes.clone(),
     }];
     let snapshot = CommittedServiceSnapshotV2 {
-        applied_index: 2,
+        applied_index: 3,
         service_image: leader.service().accumulate_host().committed_service_image(),
         proof_artifacts: snapshot_proofs,
     };
@@ -8781,7 +9057,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         "a snapshot is not installed before all proof artifacts are durable"
     );
     assert_eq!(snapshot_follower.catch_up().unwrap(), 0);
-    assert_eq!(snapshot_follower.log_mut().applied_index().unwrap(), 2);
+    assert_eq!(snapshot_follower.log_mut().applied_index().unwrap(), 3);
     assert_eq!(
         snapshot_follower
             .service()
