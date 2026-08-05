@@ -219,13 +219,16 @@ impl EffectLog {
     /// or uses a retired pre-anchor/pre-invoke-effects encoding.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut pos = 0;
-        let msg_len = read_u64(bytes, &mut pos)? as usize;
+        let msg_len = usize::try_from(read_u64(bytes, &mut pos)?).ok()?;
         let msg = take(bytes, &mut pos, msg_len)?.to_vec();
 
-        let n_replies = read_u64(bytes, &mut pos)? as usize;
+        let n_replies = usize::try_from(read_u64(bytes, &mut pos)?).ok()?;
+        if n_replies > bytes.len().saturating_sub(pos) / 8 {
+            return None;
+        }
         let mut replies = Vec::with_capacity(n_replies);
         for _ in 0..n_replies {
-            let len = read_u64(bytes, &mut pos)? as usize;
+            let len = usize::try_from(read_u64(bytes, &mut pos)?).ok()?;
             replies.push(take(bytes, &mut pos, len)?.to_vec());
         }
 
@@ -235,7 +238,7 @@ impl EffectLog {
         anchor.copy_from_slice(take(bytes, &mut pos, 32)?);
         let mut caller_prefix = [0u8; 5];
         caller_prefix.copy_from_slice(take(bytes, &mut pos, 5)?);
-        let n = read_u64(bytes, &mut pos)? as usize;
+        let n = usize::try_from(read_u64(bytes, &mut pos)?).ok()?;
         if n > bytes.len().saturating_sub(pos) / 20 {
             return None;
         }
@@ -244,7 +247,7 @@ impl EffectLog {
             let reply_idx = read_u64(bytes, &mut pos)?;
             let svc_bytes = take(bytes, &mut pos, 4)?;
             let svc_id = u32::from_le_bytes(svc_bytes.try_into().ok()?);
-            let len = read_u64(bytes, &mut pos)? as usize;
+            let len = usize::try_from(read_u64(bytes, &mut pos)?).ok()?;
             let effects = take(bytes, &mut pos, len)?.to_vec();
             invoke_effects.push(InvokeEffects {
                 reply_idx,
@@ -596,7 +599,7 @@ impl<'a> EffectCursor<'a> {
 }
 
 fn read_u64(buf: &[u8], pos: &mut usize) -> Option<u64> {
-    let end = *pos + 8;
+    let end = pos.checked_add(8)?;
     if end > buf.len() {
         return None;
     }
@@ -606,7 +609,7 @@ fn read_u64(buf: &[u8], pos: &mut usize) -> Option<u64> {
 }
 
 fn take<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Option<&'a [u8]> {
-    let end = *pos + n;
+    let end = pos.checked_add(n)?;
     if end > buf.len() {
         return None;
     }
@@ -769,6 +772,21 @@ mod tests {
                 "truncated at {cut} should fail",
             );
         }
+    }
+
+    #[test]
+    fn claimed_lengths_cannot_overflow_or_preallocate_beyond_input() {
+        assert!(EffectLog::from_bytes(&u64::MAX.to_le_bytes()).is_none());
+
+        let mut replies = Vec::new();
+        replies.extend_from_slice(&0u64.to_le_bytes());
+        replies.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(EffectLog::from_bytes(&replies).is_none());
+
+        let mut effects = EffectLog::for_msg(Vec::new()).to_bytes();
+        let count = effects.len() - 8;
+        effects[count..].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(EffectLog::from_bytes(&effects).is_none());
     }
 
     #[test]
