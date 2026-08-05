@@ -4241,6 +4241,7 @@ fn handle_v2_root_transport<B>(
             input,
             publication,
             call,
+            outbox,
             actor_routes,
             state,
         ),
@@ -4321,6 +4322,22 @@ fn queue_v2_root_publication<B>(
             to: ServiceId(route.route),
             payload: transport.encode(),
         });
+    }
+
+    // A direct caller channel is process-local. Do not expose its reply while
+    // the same publication still has durable outbox consumers: a crash in
+    // between would forget that ephemeral acceptance and leave the retained
+    // publication permanently unreclaimable. Remote replies also follow this
+    // ordering, keeping one uniform publication state machine.
+    let commitment = publication.commitment();
+    let calls_done = publication.published.outbox.iter().all(|message| {
+        state
+            .publication_progress
+            .get(&commitment)
+            .is_some_and(|progress| progress.accepted_calls.contains(&message.call_id))
+    });
+    if !calls_done {
+        return;
     }
 
     let Some(reply) = publication.published.reply.as_ref() else {
@@ -4405,6 +4422,7 @@ fn acknowledge_v2_root_publication<B>(
     input: crate::v2::WorkInputIdV2,
     commitment: crate::v2::Hash,
     call: crate::v2::CallId,
+    outbox: &mpsc::Sender<Envelope>,
     actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
     state: &mut V2RootThreadState,
 ) where
@@ -4458,6 +4476,10 @@ fn acknowledge_v2_root_publication<B>(
         .iter()
         .all(|message| progress.accepted_calls.contains(&message.call_id));
     let reply_done = publication.published.reply.is_none() || progress.reply_accepted;
+    if calls_done && !reply_done {
+        queue_v2_root_publication(id, service, &publication, outbox, actor_routes, state);
+        return;
+    }
     if calls_done && reply_done {
         match service.acknowledge_publication(&publication) {
             Ok(_) => {
