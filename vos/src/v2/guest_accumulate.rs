@@ -1357,6 +1357,11 @@ fn materialize_workflow_crdt(
     let mut result = WorkflowMaterializationV2::default();
     let mut ingress_identities = BTreeMap::<super::InvocationId, super::CrdtIngressV2>::new();
     let duplicate_executions = duplicate_crdt_executions(frontier)?;
+
+    // Reply admissions must retain every physical retry alternative so an
+    // already-materialized admission can be checked against the selected
+    // logical execution below. Do this before discarding retry losers from
+    // the materialization order.
     for (cid, change) in frontier.nodes_in_causal_order() {
         if let Some(awaited_reply) = change.awaited_reply.as_ref() {
             let Some(work) = change
@@ -1384,9 +1389,13 @@ fn materialize_workflow_crdt(
                     value: admission,
                 });
         }
-        if duplicate_executions.is_loser(cid) {
-            continue;
-        }
+    }
+
+    // Physical causal height cannot be used directly after retry collapse.
+    // A descendant may name the losing physical retry while the canonical
+    // winner sits on a taller concurrent base. Redirect that dependency to
+    // the winner and process the resulting logical DAG topologically.
+    for (cid, change) in duplicate_executions.materialization_order(frontier)? {
         let checkpoints = change
             .workflow
             .iter()
@@ -1720,6 +1729,81 @@ impl DuplicateCrdtExecutionsV2 {
                 .get(&(actor, hash))
                 .map_or(hash, |reference| reference.hash)
         })
+    }
+
+    fn canonical_cid(&self, cid: Hash) -> Hash {
+        self.canonical_by_loser.get(&cid).copied().unwrap_or(cid)
+    }
+
+    /// Return the selected physical nodes in logical causal order.
+    ///
+    /// Collapsing concurrent retries rewrites every edge to a discarded node
+    /// so it instead depends on the canonical winner. That winner can have a
+    /// greater physical causal height than the dependent node, so the normal
+    /// height order is insufficient after this rewrite.
+    fn materialization_order<'a>(
+        &self,
+        frontier: &'a super::causal::CausalFrontierV2,
+    ) -> Result<Vec<(Hash, &'a CrdtChangeV2)>, AccumulationRejectionV2> {
+        let selected = frontier
+            .nodes_in_causal_order()
+            .into_iter()
+            .filter(|(cid, _)| !self.is_loser(*cid))
+            .collect::<Vec<_>>();
+        let ranks = selected
+            .iter()
+            .enumerate()
+            .map(|(rank, (cid, _))| (*cid, rank))
+            .collect::<BTreeMap<_, _>>();
+        let selected_cids = ranks.keys().copied().collect::<BTreeSet<_>>();
+        let mut indegrees = BTreeMap::<Hash, usize>::new();
+        let mut dependents = BTreeMap::<Hash, Vec<Hash>>::new();
+
+        for (cid, change) in &selected {
+            let dependencies = change
+                .causal_dependencies
+                .iter()
+                .map(|dependency| self.canonical_cid(*dependency))
+                .collect::<BTreeSet<_>>();
+            if dependencies.contains(cid)
+                || dependencies
+                    .iter()
+                    .any(|dependency| !selected_cids.contains(dependency))
+            {
+                return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+            }
+            indegrees.insert(*cid, dependencies.len());
+            for dependency in dependencies {
+                dependents.entry(dependency).or_default().push(*cid);
+            }
+        }
+
+        let mut ready = indegrees
+            .iter()
+            .filter(|(_, degree)| **degree == 0)
+            .map(|(cid, _)| (ranks[cid], *cid))
+            .collect::<BTreeSet<_>>();
+        let mut ordered = Vec::with_capacity(selected.len());
+        while let Some((rank, cid)) = ready.pop_first() {
+            ordered.push(selected[rank]);
+            for dependent in dependents.get(&cid).into_iter().flatten() {
+                let degree = indegrees
+                    .get_mut(dependent)
+                    .ok_or(AccumulationRejectionV2::InvalidWorkflowTransition)?;
+                *degree = degree
+                    .checked_sub(1)
+                    .ok_or(AccumulationRejectionV2::InvalidWorkflowTransition)?;
+                if *degree == 0 {
+                    ready.insert((ranks[dependent], *dependent));
+                }
+            }
+        }
+        if ordered.len() != selected.len() {
+            // The physical DAG was already validated. Failure here means
+            // retry aliasing introduced a logical cycle.
+            return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+        }
+        Ok(ordered)
     }
 }
 
@@ -7764,57 +7848,72 @@ mod tests {
     #[test]
     fn descendant_of_a_discarded_retry_observes_the_canonical_checkpoint() {
         let initial = BlobRefV2::of_bytes(b"initial");
-        let mut left_work = crdt_work(initial.clone(), 18, vec![]);
-        let mut right_work = left_work.clone();
-        left_work.logical_timeslot = 1;
-        right_work.logical_timeslot = 2;
-        left_work.imported_actors[0].state = BlobRefV2::of_bytes(b"left base");
-        right_work.imported_actors[0].state = BlobRefV2::of_bytes(b"right base");
-
-        let left_state = BlobRefV2::of_bytes(b"left result");
-        let right_state = BlobRefV2::of_bytes(b"right result");
-        let left_continuation = BlobRefV2::of_bytes(b"left physical checkpoint");
-        let right_continuation = BlobRefV2::of_bytes(b"right physical checkpoint");
-        let mut left = crdt_transition(&left_work, left_state.clone(), 1);
-        let mut right = crdt_transition(&right_work, right_state.clone(), 1);
-        for (transition, work, continuation) in [
-            (&mut left, &left_work, &left_continuation),
-            (&mut right, &right_work, &right_continuation),
-        ] {
-            transition.continuations.push(ContinuationChangeV2 {
-                actor: actor(),
-                expected: None,
-                replacement: Some(continuation.clone()),
-            });
-            transition.exported_blobs.push(continuation.clone());
-            transition.crdt_change.as_mut().unwrap().workflow =
-                transition.workflow_operations(work);
-            transition.crdt_change.as_mut().unwrap().exported_blobs =
-                transition.exported_blobs.clone();
-        }
-
-        let left_change = left.crdt_change.unwrap();
-        let right_change = right.crdt_change.unwrap();
-        let (winner, loser, loser_work, loser_state, loser_continuation) =
-            if left_change.cid() < right_change.cid() {
-                (
-                    left_change,
-                    right_change,
-                    right_work,
-                    right_state,
-                    right_continuation,
-                )
-            } else {
-                (
-                    right_change,
-                    left_change,
-                    left_work,
-                    left_state,
-                    left_continuation,
-                )
-            };
-        let winner_cid = winner.cid();
+        let mut loser_work = crdt_work(initial.clone(), 18, vec![]);
+        loser_work.logical_timeslot = 1;
+        let loser_state = BlobRefV2::of_bytes(b"losing result");
+        let loser_continuation = BlobRefV2::of_bytes(b"losing physical checkpoint");
+        let mut loser = crdt_transition(&loser_work, loser_state.clone(), 1);
+        loser.continuations.push(ContinuationChangeV2 {
+            actor: actor(),
+            expected: None,
+            replacement: Some(loser_continuation.clone()),
+        });
+        loser.exported_blobs.push(loser_continuation.clone());
+        loser.crdt_change.as_mut().unwrap().workflow = loser.workflow_operations(&loser_work);
+        loser.crdt_change.as_mut().unwrap().exported_blobs = loser.exported_blobs.clone();
+        let loser = loser.crdt_change.unwrap();
         let loser_cid = loser.cid();
+
+        // Build an unrelated two-node causal base. The equivalent retry below
+        // is therefore physically height 3, while the loser's already-refined
+        // descendant is height 2.
+        let unrelated_one_state = BlobRefV2::of_bytes(b"unrelated one");
+        let unrelated_one_work = crdt_work(initial, 70, vec![]);
+        let unrelated_one = crdt_transition(&unrelated_one_work, unrelated_one_state.clone(), 1)
+            .crdt_change
+            .unwrap();
+        let unrelated_one_cid = unrelated_one.cid();
+        let mut unrelated_two_work = crdt_work(unrelated_one_state, 71, vec![unrelated_one_cid]);
+        unrelated_two_work.base_causal_height = Some(1);
+        let unrelated_two_state = BlobRefV2::of_bytes(b"unrelated two");
+        let unrelated_two = crdt_transition(&unrelated_two_work, unrelated_two_state.clone(), 2)
+            .crdt_change
+            .unwrap();
+        let unrelated_two_cid = unrelated_two.cid();
+
+        // CID order, not causal height, selects the canonical retry. Find a
+        // trusted scheduling slot whose height-3 physical retry wins over the
+        // height-1 branch above.
+        let winner_continuation = BlobRefV2::of_bytes(b"winning physical checkpoint");
+        let (winner_work, winner) = (2..=10_000)
+            .find_map(|logical_timeslot| {
+                let mut work = loser_work.clone();
+                work.logical_timeslot = logical_timeslot;
+                work.base = ConsistencyBaseV2::Crdt {
+                    heads: vec![unrelated_two_cid],
+                };
+                work.base_causal_height = Some(2);
+                work.imported_actors[0].state = unrelated_two_state.clone();
+                let mut transition =
+                    crdt_transition(&work, BlobRefV2::of_bytes(b"winning result"), 3);
+                transition.continuations.push(ContinuationChangeV2 {
+                    actor: actor(),
+                    expected: None,
+                    replacement: Some(winner_continuation.clone()),
+                });
+                transition.exported_blobs.push(winner_continuation.clone());
+                transition.crdt_change.as_mut().unwrap().workflow =
+                    transition.workflow_operations(&work);
+                transition.crdt_change.as_mut().unwrap().exported_blobs =
+                    transition.exported_blobs.clone();
+                let change = transition.crdt_change.unwrap();
+                (change.cid() < loser_cid).then_some((work, change))
+            })
+            .expect("a taller retry should eventually win the CID tie-break");
+        let winner_cid = winner.cid();
+        assert_eq!(winner.causal_height, 3);
+        assert!(winner_cid < loser_cid);
+        assert!(winner_work.matches_crdt_retry(&loser_work));
 
         // Resume before learning that this physical step-0 branch loses the
         // deterministic tie-break. Its step-1 node therefore descends the
@@ -7841,6 +7940,8 @@ mod tests {
         let resumed_cid = resumed_change.cid();
 
         let nodes = BTreeMap::from([
+            (unrelated_one_cid, unrelated_one.encode()),
+            (unrelated_two_cid, unrelated_two.encode()),
             (winner_cid, winner.encode()),
             (loser_cid, loser.encode()),
             (resumed_cid, resumed_change.encode()),
