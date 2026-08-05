@@ -15,7 +15,7 @@ use super::{
     ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 23;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 24;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -947,6 +947,7 @@ mod tests {
             call_id: caller_invocation.call_id(0),
             caller_invocation,
             await_ordinal: 0,
+            from_service: service(24),
             from: ActorId([22; 32]),
             to_service: service(23),
             to: ActorId([23; 32]),

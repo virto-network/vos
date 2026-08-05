@@ -660,6 +660,8 @@ pub struct MessageRecordV2 {
     pub call_id: CallId,
     pub caller_invocation: InvocationId,
     pub await_ordinal: u64,
+    /// Exact source root which committed this message in its outbox.
+    pub from_service: ServiceIdentityV2,
     pub from: ActorId,
     /// Exact destination root committed by the caller's installed external
     /// directory. Delivery must enter this service identity.
@@ -698,6 +700,7 @@ impl MessageRecordV2 {
 pub struct CausalCallContextV2 {
     pub call_id: CallId,
     pub caller_invocation: InvocationId,
+    pub from_service: ServiceIdentityV2,
     pub from: ActorId,
     pub to: ActorId,
     pub parent: Option<CallId>,
@@ -709,6 +712,7 @@ impl From<&MessageRecordV2> for CausalCallContextV2 {
         Self {
             call_id: message.call_id,
             caller_invocation: message.caller_invocation,
+            from_service: message.from_service.clone(),
             from: message.from,
             to: message.to,
             parent: message.parent,
@@ -1477,13 +1481,14 @@ impl DeliveryEnvelopeV2 {
     }
 
     /// Stable retry identity of one finalized source message. The destination
-    /// base is deliberately excluded because inbox execution may advance it
-    /// before a transport retry reaches the same service.
+    /// base and admission timeslot are deliberately excluded: inbox execution
+    /// may advance the base, and a trusted destination scheduler may allocate
+    /// a later slot, before a transport retry reaches the same service. The
+    /// first accepted slot remains durable in [`super::DeliveryRecordV2`].
     pub fn retry_identity(&self) -> Hash {
         let mut bytes = Vec::new();
         let mut e = Encoder(&mut bytes);
         encode_service(&mut e, &self.service);
-        e.u64(self.logical_timeslot);
         e.bytes(&self.message.encode());
         e.list(&self.source_outbox, |e, message| e.bytes(&message.encode()));
         e.bytes(&self.source_receipt.encode());
@@ -4017,7 +4022,7 @@ fn decode_rejection(d: &mut Decoder<'_>) -> Result<AccumulationRejectionV2, Deco
     }
 }
 
-fn encode_service(e: &mut Encoder<'_>, value: &ServiceIdentityV2) {
+pub(super) fn encode_service(e: &mut Encoder<'_>, value: &ServiceIdentityV2) {
     e.fixed(&value.space.0);
     e.fixed(&value.root_service.0);
     e.fixed(&value.deployment.0);
@@ -4026,7 +4031,7 @@ fn encode_service(e: &mut Encoder<'_>, value: &ServiceIdentityV2) {
     e.fixed(&value.execution_semantics.0);
 }
 
-fn decode_service(d: &mut Decoder<'_>) -> Result<ServiceIdentityV2, DecodeError> {
+pub(super) fn decode_service(d: &mut Decoder<'_>) -> Result<ServiceIdentityV2, DecodeError> {
     let value = ServiceIdentityV2 {
         space: SpaceId(d.fixed()?),
         root_service: RootServiceId(d.fixed()?),
@@ -4535,6 +4540,7 @@ fn encode_message(e: &mut Encoder<'_>, value: &MessageRecordV2) {
     e.fixed(&value.call_id.0);
     e.fixed(&value.caller_invocation.0);
     e.u64(value.await_ordinal);
+    encode_service(e, &value.from_service);
     e.fixed(&value.from.0);
     encode_service(e, &value.to_service);
     e.fixed(&value.to.0);
@@ -4550,6 +4556,7 @@ fn decode_message(d: &mut Decoder<'_>) -> Result<MessageRecordV2, DecodeError> {
         call_id: CallId(d.fixed()?),
         caller_invocation: InvocationId(d.fixed()?),
         await_ordinal: d.u64()?,
+        from_service: decode_service(d)?,
         from: ActorId(d.fixed()?),
         to_service: decode_service(d)?,
         to: ActorId(d.fixed()?),
@@ -4570,6 +4577,7 @@ fn decode_message(d: &mut Decoder<'_>) -> Result<MessageRecordV2, DecodeError> {
 fn encode_causal_context(e: &mut Encoder<'_>, value: &CausalCallContextV2) {
     e.fixed(&value.call_id.0);
     e.fixed(&value.caller_invocation.0);
+    encode_service(e, &value.from_service);
     e.fixed(&value.from.0);
     e.fixed(&value.to.0);
     e.option(&value.parent, |e, id| e.fixed(&id.0));
@@ -4580,6 +4588,7 @@ fn decode_causal_context(d: &mut Decoder<'_>) -> Result<CausalCallContextV2, Dec
     Ok(CausalCallContextV2 {
         call_id: CallId(d.fixed()?),
         caller_invocation: InvocationId(d.fixed()?),
+        from_service: decode_service(d)?,
         from: ActorId(d.fixed()?),
         to: ActorId(d.fixed()?),
         parent: d.option(|d| d.fixed().map(CallId))?,
@@ -4711,6 +4720,7 @@ mod tests {
             call_id: caller_invocation.call_id(await_ordinal),
             caller_invocation,
             await_ordinal,
+            from_service: service(),
             from: ActorId([byte.wrapping_add(1); 32]),
             to_service: service(),
             to: ActorId([byte.wrapping_add(2); 32]),
@@ -4752,6 +4762,7 @@ mod tests {
         causal.causal_context = Some(CausalCallContextV2 {
             call_id: parent_call,
             caller_invocation: parent_invocation,
+            from_service: service(),
             from: parent_actor,
             to: causal.target,
             parent: None,
@@ -5393,6 +5404,7 @@ mod tests {
             call_id: caller_invocation.call_id(3),
             caller_invocation,
             await_ordinal: 3,
+            from_service: service(),
             from: ActorId([72; 32]),
             to_service: service(),
             to: ActorId([73; 32]),
@@ -5908,6 +5920,7 @@ mod tests {
             revision: 4,
             state_root: Hash([36; 32]),
         };
+        later_base.logical_timeslot += 5;
         assert_eq!(later_base.retry_identity(), delivery.retry_identity());
         assert_ne!(later_base.commitment(), delivery.commitment());
 

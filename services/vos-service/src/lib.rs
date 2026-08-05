@@ -181,6 +181,7 @@ mod guest {
                 call_id: work.invocation.call_id(call.await_ordinal),
                 caller_invocation: work.invocation,
                 await_ordinal: call.await_ordinal,
+                from_service: work.service.clone(),
                 from: call.from,
                 to_service: call.to_service.clone(),
                 to: call.to,

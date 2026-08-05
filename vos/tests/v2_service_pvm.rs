@@ -5503,6 +5503,10 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
         call_id: inbound_call,
         caller_invocation,
         await_ordinal: 0,
+        from_service: ServiceIdentityV2 {
+            root_service: RootServiceId([59; 32]),
+            ..identity.clone()
+        },
         from: caller,
         to_service: identity.clone(),
         to: target,
@@ -6348,6 +6352,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         call_id,
         caller_invocation,
         await_ordinal: 0,
+        from_service: work.service.clone(),
         from: work.target,
         to_service: work.service.clone(),
         to: work.target,
@@ -6870,6 +6875,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         call_id: awaited_call,
         caller_invocation: caller.work.invocation,
         await_ordinal: 0,
+        from_service: caller.work.service.clone(),
         from: caller.work.target,
         to_service: remote_service.clone(),
         to: peer,

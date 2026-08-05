@@ -308,6 +308,7 @@ impl V2Wire for ContinuationSnapshotV2 {
 fn encode_causal_context(e: &mut Encoder<'_>, value: &CausalCallContextV2) {
     e.fixed(&value.call_id.0);
     e.fixed(&value.caller_invocation.0);
+    encode_service(e, &value.from_service);
     e.fixed(&value.from.0);
     e.fixed(&value.to.0);
     e.option(&value.parent, |e, call| e.fixed(&call.0));
@@ -318,6 +319,7 @@ fn decode_causal_context(d: &mut Decoder<'_>) -> Result<CausalCallContextV2, Dec
     Ok(CausalCallContextV2 {
         call_id: CallId(d.fixed()?),
         caller_invocation: InvocationId(d.fixed()?),
+        from_service: decode_service(d)?,
         from: ActorId(d.fixed()?),
         to: ActorId(d.fixed()?),
         parent: d.option(|d| d.fixed().map(CallId))?,

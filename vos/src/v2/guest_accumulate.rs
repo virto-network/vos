@@ -977,7 +977,6 @@ fn deliver<S: GuestAccumulateStoreV2>(
             return Err(GuestAccumulateError::CorruptStore);
         }
         return if record.call_id == envelope.message.call_id
-            && record.logical_timeslot == envelope.logical_timeslot
             && record.retry_identity == retry_identity
         {
             Ok(AccumulationResultV2::Accepted {
@@ -991,7 +990,8 @@ fn deliver<S: GuestAccumulateStoreV2>(
     }
 
     let source = &envelope.source_receipt.service;
-    if source.root_service == header.service.root_service
+    if envelope.message.from_service != *source
+        || source.root_service == header.service.root_service
         || source.service_abi != ABI_VERSION
         || source.execution_semantics != EXECUTION_SEMANTICS_ID
     {
@@ -4024,11 +4024,13 @@ fn validate_durable_messages<S: StateTreeStore>(
     if transition
         .inbox
         .iter()
-        .any(|message| message.from != work.target)
+        .any(|message| message.from != work.target || message.from_service != work.service)
         || transition.outbox.iter().any(|message| {
-            work.imported_actors
-                .binary_search_by_key(&message.from, |actor| actor.actor)
-                .is_err()
+            message.from_service != work.service
+                || work
+                    .imported_actors
+                    .binary_search_by_key(&message.from, |actor| actor.actor)
+                    .is_err()
         })
     {
         return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
@@ -6584,6 +6586,7 @@ mod tests {
             call_id: call,
             caller_invocation: first_work.invocation,
             await_ordinal: 0,
+            from_service: first_work.service.clone(),
             from: first_work.target,
             to_service: external_bindings()
                 .into_iter()
@@ -6890,6 +6893,7 @@ mod tests {
             call_id: caller_invocation.call_id(await_ordinal),
             caller_invocation,
             await_ordinal,
+            from_service: identity(),
             from,
             to_service,
             to,
@@ -6902,11 +6906,12 @@ mod tests {
     }
 
     fn source_receipt(outbox: &[MessageRecordV2]) -> AccumulationReceiptV2 {
-        let mut service = identity();
-        service.root_service = RootServiceId([90; 32]);
-        service.deployment = DeploymentId([91; 32]);
         AccumulationReceiptV2 {
-            service,
+            service: outbox
+                .first()
+                .expect("source receipt requires one message")
+                .from_service
+                .clone(),
             accepted_transition: Hash([92; 32]),
             reply_commitment: None,
             outbox_commitment: MessageRecordV2::outbox_commitment(outbox),
@@ -6932,6 +6937,7 @@ mod tests {
             call_id: call,
             caller_invocation: work.invocation,
             await_ordinal: 0,
+            from_service: work.service.clone(),
             from: work.target,
             to_service: external_bindings()
                 .into_iter()
@@ -7404,7 +7410,9 @@ mod tests {
         let (initial, _) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
         let header = StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
         let sender = ActorId([71; 32]);
-        let incoming = message(70, sender, actor(), None, Some(10));
+        let mut incoming = message(70, sender, actor(), None, Some(10));
+        incoming.from_service.root_service = RootServiceId([90; 32]);
+        incoming.from_service.deployment = DeploymentId([91; 32]);
         let source_outbox = vec![incoming.clone()];
         let source_receipt = source_receipt(&source_outbox);
         let envelope = delivery(&header, 2, incoming.clone(), source_receipt.clone());
@@ -7527,7 +7535,7 @@ mod tests {
         let current = StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
         let retry = delivery(
             &current,
-            envelope.logical_timeslot,
+            envelope.logical_timeslot + 10,
             incoming,
             envelope.source_receipt.clone(),
         );
@@ -7543,7 +7551,7 @@ mod tests {
         ));
 
         let mut divergent = envelope;
-        divergent.logical_timeslot += 1;
+        divergent.source_receipt.sequence += 1;
         assert_eq!(
             execute_guest_accumulate(&mut store, &AccumulateRequestV2::Deliver(divergent)).unwrap(),
             rejected(AccumulationRejectionV2::DivergentDuplicate)
@@ -8414,6 +8422,7 @@ mod tests {
             call_id: call,
             caller_invocation: first_work.invocation,
             await_ordinal: 0,
+            from_service: first_work.service.clone(),
             from: actor(),
             to_service: external_bindings()
                 .into_iter()
