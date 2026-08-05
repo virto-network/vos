@@ -78,6 +78,133 @@ impl V2Wire for RootTreeInvocationV2 {
     }
 }
 
+/// Canonical node-to-node wire for effects already committed by a source
+/// root service. Observation time is intentionally absent: the receiving
+/// node allocates a trusted logical timeslot only after its local admission
+/// barrier. The destination guest still authenticates the source receipt,
+/// full outbox membership, service identity, deadline and deduplication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootTreeTransportV2 {
+    OutboxDelivery {
+        publication: PublicationRecordV2,
+        message: super::MessageRecordV2,
+    },
+    Reply {
+        caller_invocation: super::InvocationId,
+        publication: PublicationRecordV2,
+    },
+    PublicationAccepted {
+        input: WorkInputIdV2,
+        publication: super::Hash,
+        call: super::CallId,
+    },
+}
+
+impl V2Wire for RootTreeTransportV2 {
+    const MAGIC: [u8; 4] = *b"VRT2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        match self {
+            Self::OutboxDelivery {
+                publication,
+                message,
+            } => {
+                encoder.u8(0);
+                encoder.bytes(&publication.encode());
+                encoder.bytes(&message.encode());
+            }
+            Self::Reply {
+                caller_invocation,
+                publication,
+            } => {
+                encoder.u8(1);
+                encoder.fixed(&caller_invocation.0);
+                encoder.bytes(&publication.encode());
+            }
+            Self::PublicationAccepted {
+                input,
+                publication,
+                call,
+            } => {
+                encoder.u8(2);
+                encoder.fixed(&input.invocation.0);
+                encoder.u64(input.workflow_step);
+                encoder.fixed(&publication.0);
+                encoder.fixed(&call.0);
+            }
+        }
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = match decoder.u8()? {
+            0 => Self::OutboxDelivery {
+                publication: PublicationRecordV2::decode(&decoder.bytes()?)?,
+                message: super::MessageRecordV2::decode(&decoder.bytes()?)?,
+            },
+            1 => Self::Reply {
+                caller_invocation: super::InvocationId(decoder.fixed()?),
+                publication: PublicationRecordV2::decode(&decoder.bytes()?)?,
+            },
+            2 => Self::PublicationAccepted {
+                input: WorkInputIdV2 {
+                    invocation: super::InvocationId(decoder.fixed()?),
+                    workflow_step: decoder.u64()?,
+                },
+                publication: super::Hash(decoder.fixed()?),
+                call: super::CallId(decoder.fixed()?),
+            },
+            _ => return Err(DecodeError::InvalidTag),
+        };
+        if !value.is_canonical() {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+impl RootTreeTransportV2 {
+    fn is_canonical(&self) -> bool {
+        match self {
+            Self::OutboxDelivery {
+                publication,
+                message,
+            } => {
+                publication.published.reply.is_none()
+                    && publication.published.proof.is_none()
+                    && publication.published.attestation.is_none()
+                    && message.from_service == publication.receipt.service
+                    && publication
+                        .published
+                        .outbox
+                        .binary_search_by_key(&message.call_id, |candidate| candidate.call_id)
+                        .ok()
+                        .is_some_and(|index| publication.published.outbox[index] == *message)
+            }
+            Self::Reply {
+                caller_invocation,
+                publication,
+            } => {
+                *caller_invocation != super::InvocationId::ZERO
+                    && publication.published.reply.is_some()
+                    && publication.published.outbox.is_empty()
+                    && publication.published.exported_blobs.is_empty()
+                    && publication.published.proof.is_none()
+                    && publication.published.attestation.is_none()
+            }
+            Self::PublicationAccepted {
+                input,
+                publication,
+                call,
+            } => {
+                input.invocation != super::InvocationId::ZERO
+                    && *publication != super::Hash::ZERO
+                    && *call != super::CallId::ZERO
+            }
+        }
+    }
+}
+
 fn direct_ingress_from_request(
     store: &LocalJamStoreV2,
     service: &ServiceIdentityV2,
@@ -186,6 +313,7 @@ pub enum LocalRootTreeInvokeErrorV2 {
     CorruptStore(LocalStoreReadErrorV2),
     CorruptWorkflow,
     DivergentInvocation,
+    DivergentReplay,
     MissingPublication,
     ServiceNotInstalled,
     ExistingServiceMismatch,
@@ -1224,6 +1352,122 @@ where
         self.execute_prepared_after_barrier(prepared)
     }
 
+    /// Make one receipt selected by an authenticated host transport available
+    /// to guest verification. This is verifier policy, not service state, and
+    /// therefore must only be called after the host has bound the source route
+    /// to `receipt.service`. Replicated roots require a consensus finality
+    /// verifier rather than this local authority seam.
+    pub(crate) fn authorize_finalized_receipt(
+        &mut self,
+        expected_producer: ActorId,
+        receipt: &AccumulationReceiptV2,
+    ) {
+        self.service
+            .accumulate_host_mut()
+            .local_store_mut()
+            .allow_receipt(&super::ReceiptVerificationRequestV2 {
+                expected_producer,
+                receipt: receipt.clone(),
+            });
+    }
+
+    /// Admit one authenticated source outbox member after the caller has
+    /// established the local admission barrier and allocated a trusted slot.
+    pub(crate) fn deliver_finalized_after_barrier(
+        &mut self,
+        logical_timeslot: u64,
+        message: super::MessageRecordV2,
+        source_outbox: Vec<super::MessageRecordV2>,
+        source_receipt: AccumulationReceiptV2,
+    ) -> Result<super::CommittedDeliveryV2, LocalRootTreeInvokeErrorV2> {
+        let call = message.call_id;
+        let delivery = LocalWorkSchedulerV2::prepare_delivery(
+            self.service.accumulate_host().local_store(),
+            logical_timeslot,
+            message,
+            source_outbox,
+            source_receipt,
+        )
+        .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        let accumulated = self
+            .service
+            .accumulate_after_barrier(&AccumulateRequestV2::Deliver(delivery))
+            .map_err(RootTreeDriverErrorV2::into_invoke)?;
+        match accumulated.result {
+            AccumulationResultV2::Accepted {
+                receipt,
+                published,
+                duplicate,
+            } if published == PublishedEffectsV2::default() => Ok(super::CommittedDeliveryV2 {
+                call,
+                receipt,
+                duplicate,
+                accumulate_gas_used: accumulated.gas_used,
+            }),
+            AccumulationResultV2::Rejected(rejection) => {
+                Err(LocalRootTreeInvokeErrorV2::Rejected(rejection))
+            }
+            _ => Err(LocalRootTreeInvokeErrorV2::UnexpectedResult),
+        }
+    }
+
+    /// Execute one already-admitted durable inbox row after a fresh trusted
+    /// scheduling barrier. Ordinary transport never invokes attested methods.
+    pub(crate) fn invoke_inbox_after_barrier(
+        &mut self,
+        call: super::CallId,
+        logical_timeslot: u64,
+    ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        let prepared = LocalWorkSchedulerV2::prepare_inbox(
+            self.service.accumulate_host().local_store(),
+            call,
+            logical_timeslot,
+        )
+        .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        if prepared.work.proof_requested {
+            return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
+        }
+        self.execute_prepared_after_barrier(prepared)
+    }
+
+    /// Resume the exact saved machine with one finalized ordinary reply.
+    pub(crate) fn resume_reply_after_barrier(
+        &mut self,
+        caller_invocation: super::InvocationId,
+        logical_timeslot: u64,
+        awaited_reply: super::AccumulatedReplyV2,
+    ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        let prepared = LocalWorkSchedulerV2::prepare_resume(
+            self.service.accumulate_host().local_store(),
+            caller_invocation,
+            logical_timeslot,
+            Some(awaited_reply),
+        )
+        .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        if prepared.work.proof_requested {
+            return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
+        }
+        self.execute_prepared_after_barrier(prepared)
+    }
+
+    /// Whether this exact reply already advanced the durable workflow. This
+    /// lets a lost transport acknowledgement be replayed without restoring or
+    /// executing the actor a second time.
+    pub(crate) fn reply_already_accumulated(
+        &self,
+        invocation: super::InvocationId,
+        reply: &super::AccumulatedReplyV2,
+    ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        let admission = self
+            .service
+            .accumulate_host()
+            .reply_admission(reply.reply.call_id)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?;
+        Ok(admission.is_some_and(|(admission, _)| {
+            admission.input.invocation == invocation && admission.awaited_reply == *reply
+        }))
+    }
+
     fn execute_prepared_after_barrier(
         &mut self,
         prepared: PreparedWorkV2,
@@ -1367,6 +1611,63 @@ where
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)
     }
 
+    /// Finalized cross-root calls still waiting in the guest-owned inbox.
+    pub(crate) fn pending_inbox_calls(
+        &self,
+    ) -> Result<Vec<(super::CallId, u64)>, LocalRootTreeInvokeErrorV2> {
+        self.service
+            .accumulate_host()
+            .pending_inbox_calls()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)
+    }
+
+    /// Recover the durable return route of a pending callee reply without
+    /// relying on process-local transport state.
+    pub(crate) fn publication_return_target(
+        &self,
+        publication: &PublicationRecordV2,
+    ) -> Result<Option<(ActorId, ServiceIdentityV2, super::InvocationId)>, LocalRootTreeInvokeErrorV2>
+    {
+        let Some(reply) = publication.published.reply.as_ref() else {
+            return Ok(None);
+        };
+        let checkpoint = self
+            .service
+            .accumulate_host()
+            .workflow_checkpoint(publication.input.invocation)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::DivergentReplay)?;
+        let work = &checkpoint.resume_work;
+        if checkpoint.input != publication.input || work.invocation != publication.input.invocation
+        {
+            return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
+        }
+        let Some(parent_call) = work.parent_call else {
+            return if reply.call_id == work.invocation.root_reply_id() {
+                Ok(None)
+            } else {
+                Err(LocalRootTreeInvokeErrorV2::DivergentReplay)
+            };
+        };
+        if parent_call != reply.call_id
+            || super::InvocationId::for_call(reply.call_id) != work.invocation
+        {
+            return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
+        }
+        match (
+            work.origin,
+            work.causal_parent,
+            work.causal_context.as_ref(),
+        ) {
+            (super::Origin::Actor(actor), Some(invocation), Some(context))
+                if context.from == actor && context.caller_invocation == invocation =>
+            {
+                Ok(Some((actor, context.from_service.clone(), invocation)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub fn pending_ingresses(&self) -> Result<Vec<DirectIngressV2>, LocalRootTreeInvokeErrorV2> {
         self.service
             .accumulate_host()
@@ -1430,6 +1731,82 @@ mod tests {
                 Err(DecodeError::NonCanonical)
             );
         }
+    }
+
+    #[test]
+    fn root_transport_is_canonical_and_carries_no_observation_time() {
+        let source = ServiceIdentityV2 {
+            space: super::super::SpaceId([1; 32]),
+            root_service: super::super::RootServiceId([2; 32]),
+            deployment: super::super::DeploymentId([3; 32]),
+            service_program: ProgramId([4; 32]),
+            service_abi: super::super::ABI_VERSION,
+            execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+        };
+        let destination = ServiceIdentityV2 {
+            root_service: super::super::RootServiceId([5; 32]),
+            ..source.clone()
+        };
+        let invocation = InvocationId([6; 32]);
+        let message = super::super::MessageRecordV2 {
+            call_id: invocation.call_id(0),
+            caller_invocation: invocation,
+            await_ordinal: 0,
+            from_service: source.clone(),
+            from: ActorId([7; 32]),
+            to_service: destination,
+            to: ActorId([8; 32]),
+            parent: None,
+            payload: vec![crate::value::TAG_DYNAMIC, 1],
+            authorization: AuthorizationEvidenceV2::Public,
+            proof_requested: false,
+            deadline_timeslot: Some(20),
+        };
+        let receipt = AccumulationReceiptV2 {
+            service: source,
+            accepted_transition: super::super::Hash([9; 32]),
+            reply_commitment: None,
+            outbox_commitment: super::super::MessageRecordV2::outbox_commitment(
+                core::slice::from_ref(&message),
+            ),
+            resulting_state_root: Some(super::super::Hash([10; 32])),
+            resulting_crdt_heads: Vec::new(),
+            sequence: 1,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        };
+        let publication = PublicationRecordV2 {
+            input: WorkInputIdV2 {
+                invocation,
+                workflow_step: 0,
+            },
+            receipt,
+            published: PublishedEffectsV2 {
+                outbox: vec![message.clone()],
+                ..PublishedEffectsV2::default()
+            },
+        };
+        let delivery = RootTreeTransportV2::OutboxDelivery {
+            publication: publication.clone(),
+            message: message.clone(),
+        };
+        assert_eq!(
+            RootTreeTransportV2::decode(&delivery.encode()).unwrap(),
+            delivery
+        );
+
+        let mut mismatched = message;
+        mismatched.payload.push(0);
+        assert_eq!(
+            RootTreeTransportV2::decode(
+                &RootTreeTransportV2::OutboxDelivery {
+                    publication,
+                    message: mismatched,
+                }
+                .encode()
+            ),
+            Err(DecodeError::NonCanonical)
+        );
     }
 
     #[test]
