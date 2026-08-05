@@ -1745,8 +1745,12 @@ impl DuplicateCrdtExecutionsV2 {
         &self,
         frontier: &'a super::causal::CausalFrontierV2,
     ) -> Result<Vec<(Hash, &'a CrdtChangeV2)>, AccumulationRejectionV2> {
-        let selected = frontier
-            .nodes_in_causal_order()
+        let physical_order = frontier.nodes_in_causal_order();
+        let physical_nodes = physical_order
+            .iter()
+            .map(|(cid, change)| (*cid, *change))
+            .collect::<BTreeMap<_, _>>();
+        let selected = physical_order
             .into_iter()
             .filter(|(cid, _)| !self.is_loser(*cid))
             .collect::<Vec<_>>();
@@ -1760,11 +1764,26 @@ impl DuplicateCrdtExecutionsV2 {
         let mut dependents = BTreeMap::<Hash, Vec<Hash>>::new();
 
         for (cid, change) in &selected {
-            let dependencies = change
-                .causal_dependencies
-                .iter()
-                .map(|dependency| self.canonical_cid(*dependency))
-                .collect::<BTreeSet<_>>();
+            let mut dependencies = BTreeSet::new();
+            let mut pending = change.causal_dependencies.clone();
+            let mut visited = BTreeSet::new();
+            while let Some(dependency) = pending.pop() {
+                if !visited.insert(dependency) {
+                    continue;
+                }
+                let canonical = self.canonical_cid(dependency);
+                dependencies.insert(canonical);
+                if self.is_loser(dependency) {
+                    // Contracting the loser edge must not discard the branch
+                    // that led to it. Lift every one of its physical causal
+                    // prerequisites into the selected logical DAG as well as
+                    // depending on its canonical retry representative.
+                    let discarded = physical_nodes
+                        .get(&dependency)
+                        .ok_or(AccumulationRejectionV2::InvalidWorkflowTransition)?;
+                    pending.extend(discarded.causal_dependencies.iter().copied());
+                }
+            }
             if dependencies.contains(cid)
                 || dependencies
                     .iter()
@@ -7961,6 +7980,176 @@ mod tests {
         );
         assert_eq!(materialized.actor_states[&actor()][0].value, final_state);
         assert_eq!(materialized.continuations[&actor()][0].value, None);
+    }
+
+    #[test]
+    fn discarded_retry_contraction_preserves_unique_physical_ancestors() {
+        let initial = BlobRefV2::of_bytes(b"initial");
+        let mut root_loser_work = crdt_work(initial.clone(), 80, vec![]);
+        root_loser_work.logical_timeslot = 1;
+        let root_call = root_loser_work.invocation.call_id(0);
+        let root_message = awaited_message(&root_loser_work, ActorId([81; 32]), None, Some(50));
+        let root_loser_state = BlobRefV2::of_bytes(b"root loser state");
+        let root_loser_continuation = BlobRefV2::of_bytes(b"root loser continuation");
+        let await_change = |work: &WorkEnvelopeV2,
+                            state: BlobRefV2,
+                            height: u64,
+                            continuation: BlobRefV2|
+         -> CrdtChangeV2 {
+            let mut transition = crdt_transition(work, state, height);
+            transition.continuations.push(ContinuationChangeV2 {
+                actor: actor(),
+                expected: None,
+                replacement: Some(continuation.clone()),
+            });
+            transition.outbox.push(root_message.clone());
+            transition.exported_blobs.push(continuation);
+            transition.crdt_change.as_mut().unwrap().workflow =
+                transition.workflow_operations(work);
+            transition.crdt_change.as_mut().unwrap().exported_blobs =
+                transition.exported_blobs.clone();
+            transition.crdt_change.unwrap()
+        };
+        let root_loser = await_change(
+            &root_loser_work,
+            root_loser_state.clone(),
+            1,
+            root_loser_continuation,
+        );
+        let root_loser_cid = root_loser.cid();
+
+        // Put the canonical retry on a taller, unrelated base so physical
+        // height would otherwise place the expiration before the checkpoint
+        // that owns its outbox.
+        let unrelated_one_state = BlobRefV2::of_bytes(b"unrelated one");
+        let unrelated_one_work = crdt_work(initial.clone(), 82, vec![]);
+        let unrelated_one = crdt_transition(&unrelated_one_work, unrelated_one_state.clone(), 1)
+            .crdt_change
+            .unwrap();
+        let unrelated_one_cid = unrelated_one.cid();
+        let mut unrelated_two_work = crdt_work(unrelated_one_state, 83, vec![unrelated_one_cid]);
+        unrelated_two_work.base_causal_height = Some(1);
+        let unrelated_two_state = BlobRefV2::of_bytes(b"unrelated two");
+        let unrelated_two = crdt_transition(&unrelated_two_work, unrelated_two_state.clone(), 2)
+            .crdt_change
+            .unwrap();
+        let unrelated_two_cid = unrelated_two.cid();
+        let mut unrelated_three_work = crdt_work(unrelated_two_state, 84, vec![unrelated_two_cid]);
+        unrelated_three_work.base_causal_height = Some(2);
+        let unrelated_three_state = BlobRefV2::of_bytes(b"unrelated three");
+        let unrelated_three =
+            crdt_transition(&unrelated_three_work, unrelated_three_state.clone(), 3)
+                .crdt_change
+                .unwrap();
+        let unrelated_three_cid = unrelated_three.cid();
+        let root_winner_continuation = BlobRefV2::of_bytes(b"root winner continuation");
+        let (root_winner_work, root_winner) = (2..=10_000)
+            .find_map(|logical_timeslot| {
+                let mut work = root_loser_work.clone();
+                work.logical_timeslot = logical_timeslot;
+                work.base = ConsistencyBaseV2::Crdt {
+                    heads: vec![unrelated_three_cid],
+                };
+                work.base_causal_height = Some(3);
+                work.imported_actors[0].state = unrelated_three_state.clone();
+                let change = await_change(
+                    &work,
+                    BlobRefV2::of_bytes(b"root winner state"),
+                    4,
+                    root_winner_continuation.clone(),
+                );
+                (change.cid() < root_loser_cid).then_some((work, change))
+            })
+            .expect("the height-4 root retry should eventually win by CID");
+        let root_winner_cid = root_winner.cid();
+        assert!(root_winner_work.matches_crdt_retry(&root_loser_work));
+
+        // A second logical execution is first refined on top of the losing
+        // root branch. Its independent retry wins on an empty base.
+        let mut child_loser_work = crdt_work(root_loser_state, 85, vec![root_loser_cid]);
+        child_loser_work.base_causal_height = Some(1);
+        let child_loser = crdt_transition(
+            &child_loser_work,
+            BlobRefV2::of_bytes(b"child loser state"),
+            2,
+        )
+        .crdt_change
+        .unwrap();
+        let child_loser_cid = child_loser.cid();
+        let (child_winner_work, child_winner) = (2..=10_000)
+            .find_map(|logical_timeslot| {
+                let mut work = child_loser_work.clone();
+                work.logical_timeslot = logical_timeslot;
+                work.base = ConsistencyBaseV2::Crdt { heads: vec![] };
+                work.base_causal_height = Some(0);
+                work.imported_actors[0].state = initial.clone();
+                let change = crdt_transition(&work, BlobRefV2::of_bytes(b"child winner state"), 1)
+                    .crdt_change
+                    .unwrap();
+                (change.cid() < child_loser_cid).then_some((work, change))
+            })
+            .expect("the independent child retry should eventually win by CID");
+        let child_winner_cid = child_winner.cid();
+        assert!(child_winner_work.matches_crdt_retry(&child_loser_work));
+
+        // This valid expiration physically descends root-loser through
+        // child-loser. Contracting only its direct child-loser edge would
+        // omit root-winner and schedule the expiration before its outbox.
+        let timeout = CallTimeoutV2 {
+            call_id: root_call,
+            caller_invocation: root_loser_work.invocation,
+            caller_actor: root_loser_work.target,
+            checkpoint_step: 0,
+            await_ordinal: 0,
+            deadline_timeslot: 50,
+            expired_at: 50,
+        };
+        let expiration = CrdtChangeV2 {
+            id: CrdtChangeV2::derive_expiration_id(
+                &root_loser_work.service,
+                &timeout,
+                &[child_loser_cid],
+            ),
+            work_hash: timeout.commitment(),
+            causal_dependencies: vec![child_loser_cid],
+            causal_height: 3,
+            operations: vec![],
+            workflow: vec![WorkflowOperationV2::ExpireCall(timeout.clone())],
+            materializations: vec![],
+            awaited_reply: None,
+            exported_blobs: vec![],
+        };
+        let expiration_cid = expiration.cid();
+        let nodes = BTreeMap::from([
+            (root_loser_cid, root_loser.encode()),
+            (root_winner_cid, root_winner.encode()),
+            (child_loser_cid, child_loser.encode()),
+            (child_winner_cid, child_winner.encode()),
+            (expiration_cid, expiration.encode()),
+            (unrelated_one_cid, unrelated_one.encode()),
+            (unrelated_two_cid, unrelated_two.encode()),
+            (unrelated_three_cid, unrelated_three.encode()),
+        ]);
+
+        // Each physical branch is valid by itself.
+        for heads in [
+            vec![expiration_cid],
+            vec![root_winner_cid, child_winner_cid],
+        ] {
+            let frontier =
+                load_causal_frontier(&heads, |cid| Ok::<_, Infallible>(nodes.get(&cid).cloned()))
+                    .unwrap();
+            materialize_workflow_crdt(&frontier, &identity()).unwrap();
+        }
+
+        let mut heads = vec![expiration_cid, root_winner_cid, child_winner_cid];
+        heads.sort();
+        let frontier =
+            load_causal_frontier(&heads, |cid| Ok::<_, Infallible>(nodes.get(&cid).cloned()))
+                .unwrap();
+        let materialized = materialize_workflow_crdt(&frontier, &identity()).unwrap();
+        assert_eq!(materialized.expirations[&root_call][0].value, timeout);
+        assert_eq!(materialized.outbox[&root_call][0].value, None);
     }
 
     #[test]
