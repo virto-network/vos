@@ -67,6 +67,26 @@ impl CrdtCounterV2 {
     }
 
     #[msg]
+    async fn increment_around_two_yields(
+        &mut self,
+        ctx: &mut Context<Self>,
+        amount: u64,
+    ) -> i64 {
+        self.count
+            .increment(amount)
+            .expect("actor dispatch establishes a CRDT change scope");
+        ctx.yield_now().await;
+        self.count
+            .increment(amount)
+            .expect("first restore rebinds its CRDT change scope");
+        ctx.yield_now().await;
+        self.count
+            .increment(amount)
+            .expect("second restore rebinds its CRDT change scope");
+        self.count.value()
+    }
+
+    #[msg]
     async fn increment_around_peer(
         &mut self,
         before: u64,

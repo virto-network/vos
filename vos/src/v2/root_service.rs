@@ -19,10 +19,10 @@ use super::{
     DurableJamStoreV2, DurableStoreOpenErrorV2, ExternalActorBindingV2, ExternalActorDirectoryV2,
     JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2, LocalStoreReadErrorV2, LocalWorkRequestV2,
     LocalWorkSchedulerV2, MethodPolicyV2, NoRefineProtocolHostV2, PackageError,
-    PackageRolePoliciesV2, ProgramId, ProofArtifactStoreV2, PublicationAckV2, PublicationRecordV2,
-    PublishedEffectsV2, RefinedServiceOutputV2, ScheduleErrorV2, ServiceDispatchError,
-    ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2, WorkInputIdV2,
-    WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
+    PackageRolePoliciesV2, PreparedWorkV2, ProgramId, ProofArtifactStoreV2, PublicationAckV2,
+    PublicationRecordV2, PublishedEffectsV2, RefinedServiceOutputV2, ScheduleErrorV2,
+    ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2,
+    WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
 };
 
 #[cfg(feature = "storage")]
@@ -514,6 +514,82 @@ where
         };
         let checkpoint = WorkflowCheckpointV2::decode(&bytes)
             .map_err(|_| LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        if header.consistency == ConsistencyModeV2::Crdt
+            && request.workflow_step == 0
+            && checkpoint.input.workflow_step != 0
+        {
+            let candidate = direct_ingress_from_request(
+                self.service.accumulate_host().local_store(),
+                &self.identity,
+                request,
+            )?;
+            let ingress = self
+                .service
+                .accumulate_host()
+                .ingress_record(request.invocation)
+                .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+                .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+            if !ingress.consumed || !ingress.ingress.matches_retry(&candidate) {
+                return Err(LocalRootTreeInvokeErrorV2::DivergentInvocation);
+            }
+            let input = WorkInputIdV2 {
+                invocation: request.invocation,
+                workflow_step: 0,
+            };
+            let dedup = self
+                .service
+                .accumulate_host()
+                .row(&dedup_storage_key(input))
+                .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)
+                .and_then(|bytes| {
+                    DedupRecordV2::decode(bytes)
+                        .map_err(|_| LocalRootTreeInvokeErrorV2::CorruptWorkflow)
+                })?;
+            let bound = dedup.receipt.service == self.identity
+                && dedup.receipt.consistency == ConsistencyModeV2::Crdt
+                && dedup.receipt.resulting_crdt_heads.iter().any(|cid| {
+                    self.service
+                        .accumulate_host()
+                        .row(&crdt_node_storage_key(*cid))
+                        .and_then(|bytes| CrdtChangeV2::decode(bytes).ok())
+                        .is_some_and(|change| {
+                            change.cid() == *cid
+                                && change.work_hash == dedup.work_hash
+                                && change.receipt_commitment() == dedup.transition_commitment
+                                && change.workflow.iter().any(|operation| {
+                                    matches!(operation, super::WorkflowOperationV2::Checkpoint(work)
+                                        if work.input_id() == input)
+                                })
+                        })
+                });
+            if !bound {
+                return Err(LocalRootTreeInvokeErrorV2::CorruptWorkflow);
+            }
+            let publication = self
+                .service
+                .accumulate_host()
+                .pending_publications()
+                .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+                .into_iter()
+                .find(|publication| publication.input == input);
+            if publication
+                .as_ref()
+                .is_some_and(|publication| publication.receipt != dedup.receipt)
+            {
+                return Err(LocalRootTreeInvokeErrorV2::CorruptWorkflow);
+            }
+            return Ok(Some(CommittedRootTreeSliceV2 {
+                input,
+                receipt: dedup.receipt,
+                published: publication
+                    .as_ref()
+                    .map_or_else(PublishedEffectsV2::default, |row| row.published.clone()),
+                publication,
+                duplicate: true,
+                refine_gas_used: 0,
+                accumulate_gas_used: 0,
+            }));
+        }
         let committed = &checkpoint.resume_work;
         let exact_ingress = request.workflow_step == 0
             && checkpoint.input.workflow_step == 0
@@ -1126,6 +1202,32 @@ where
         }
         let prepared = LocalWorkSchedulerV2::prepare(self.service.accumulate_host(), request)
             .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        self.execute_prepared_after_barrier(prepared)
+    }
+
+    /// Resume an explicit-yield checkpoint from guest-owned workflow state.
+    /// A checkpoint waiting on a durable call remains unavailable until the
+    /// authenticated reply/timeout orchestration supplies that outcome.
+    pub fn resume_yield(
+        &mut self,
+        invocation: super::InvocationId,
+        logical_timeslot: u64,
+    ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        self.prepare_admission_barrier()?;
+        let prepared = LocalWorkSchedulerV2::prepare_resume(
+            self.service.accumulate_host().local_store(),
+            invocation,
+            logical_timeslot,
+            None,
+        )
+        .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        self.execute_prepared_after_barrier(prepared)
+    }
+
+    fn execute_prepared_after_barrier(
+        &mut self,
+        prepared: PreparedWorkV2,
+    ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
         let refined = self
             .service
             .refine_actor_tree_after_barrier(&prepared.work, &prepared.imports)

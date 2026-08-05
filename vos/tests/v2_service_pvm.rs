@@ -1477,7 +1477,7 @@ fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
     };
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
     arguments.extend_from_slice(
-        &Msg::new("increment_around_yield")
+        &Msg::new("increment_around_two_yields")
             .with("amount", 2u64)
             .encode(),
     );
@@ -1486,7 +1486,7 @@ fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
         workflow_step: 0,
         logical_timeslot: 1,
         target: actor,
-        method: "increment_around_yield".into(),
+        method: "increment_around_two_yields".into(),
         arguments,
         origin: Origin::Anonymous,
         authorization: AuthorizationEvidenceV2::Public,
@@ -1508,10 +1508,6 @@ fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
     assert!(!committed.duplicate);
     assert!(!committed.receipt.resulting_crdt_heads.is_empty());
 
-    let source_sync = service
-        .crdt_sync_envelope()
-        .expect("source causal frontier is readable")
-        .expect("committed CRDT work exports a sync envelope");
     let mut replica =
         LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
             .expect("independent CRDT replica installs the same root tree");
@@ -1546,6 +1542,22 @@ fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
         committed.published.exported_blobs, replica_committed.published.exported_blobs,
         "each yielded retry captures its exact branch-local physical work frame"
     );
+    let source_resumed = service
+        .resume_yield(request.invocation, 3)
+        .expect("source resumes its physical retry branch before synchronization");
+    let replica_resumed = replica
+        .resume_yield(request.invocation, 4)
+        .expect("replica resumes the other physical retry branch before synchronization");
+    assert_eq!(source_resumed.input.workflow_step, 1);
+    assert_eq!(replica_resumed.input.workflow_step, 1);
+    assert_ne!(
+        source_resumed.published.exported_blobs, replica_resumed.published.exported_blobs,
+        "step-1 descendants retain their branch-local checkpoint frames"
+    );
+    let source_sync = service
+        .crdt_sync_envelope()
+        .expect("source causal frontier is readable")
+        .expect("committed CRDT descendants export a sync envelope");
     let replica_sync = replica
         .crdt_sync_envelope()
         .expect("replica causal frontier is readable")
@@ -1572,6 +1584,18 @@ fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
         source_execution.change.materializations, replica_execution.change.materializations,
         "the retry really executed over different causal actor state"
     );
+    assert!(source_sync.nodes.iter().any(|node| {
+        node.change.workflow.iter().any(|operation| {
+            matches!(operation, WorkflowOperationV2::Checkpoint(work)
+                if work.invocation == request.invocation && work.workflow_step == 1)
+        })
+    }));
+    assert!(replica_sync.nodes.iter().any(|node| {
+        node.change.workflow.iter().any(|operation| {
+            matches!(operation, WorkflowOperationV2::Checkpoint(work)
+                if work.invocation == request.invocation && work.workflow_step == 1)
+        })
+    }));
     assert!(
         source_sync.nodes.iter().all(|left| replica_sync
             .nodes

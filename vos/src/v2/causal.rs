@@ -264,6 +264,7 @@ mod tests {
                 })
                 .into_iter()
                 .collect(),
+            awaited_reply: None,
             exported_blobs: vec![],
         }
     }

@@ -982,6 +982,10 @@ pub struct CrdtChangeV2 {
     pub operations: Vec<CrdtOperationV2>,
     pub workflow: Vec<WorkflowOperationV2>,
     pub materializations: Vec<CrdtMaterializationV2>,
+    /// Finalized reply consumed by this slice, retained outside the
+    /// normalized workflow checkpoint. Replicas need the exact value to
+    /// reconstruct the permanent reply-admission row after DAG sync.
+    pub awaited_reply: Option<AccumulatedReplyV2>,
     /// Every blob made externally visible by this slice. In the current ABI
     /// these are exactly the replacement continuation snapshots. Keeping the
     /// set in the causal node makes the receipt authenticate the same effects
@@ -2485,6 +2489,7 @@ impl V2Wire for CrdtChangeV2 {
             e.fixed(&materialization.actor.0);
             encode_blob_ref(e, &materialization.state);
         });
+        e.option(&self.awaited_reply, |e, reply| e.bytes(&reply.encode()));
         e.list(&self.exported_blobs, encode_blob_ref);
     }
 
@@ -2502,6 +2507,7 @@ impl V2Wire for CrdtChangeV2 {
                     state: decode_blob_ref(d)?,
                 })
             })?,
+            awaited_reply: d.option(|d| AccumulatedReplyV2::decode(&d.bytes()?))?,
             exported_blobs: d.list(decode_blob_ref)?,
         };
         ensure_sorted_unique(&value.causal_dependencies, |hash| hash.0)?;
@@ -2530,6 +2536,18 @@ impl V2Wire for CrdtChangeV2 {
             WorkflowOperationV2::Checkpoint(work) => Self::derive_operation_scope(work),
             _ => None,
         });
+        let consumed_reply_call = value
+            .awaited_reply
+            .as_ref()
+            .map(|reply| reply.reply.call_id);
+        let consumed_outbox_calls = value
+            .workflow
+            .iter()
+            .filter_map(|operation| match operation {
+                WorkflowOperationV2::ConsumeOutbox(call) => Some(*call),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         if value.causal_height == 0
             || value.operations.iter().any(|operation| {
                 operation.payload.is_empty()
@@ -2544,6 +2562,7 @@ impl V2Wire for CrdtChangeV2 {
                     })
             })
             || value.exported_blobs != checkpoint_exports
+            || consumed_reply_call.is_some_and(|call| consumed_outbox_calls != [call])
             || value.workflow.windows(2).any(|pair| {
                 workflow_operation_bytes(&pair[0]) >= workflow_operation_bytes(&pair[1])
             })
@@ -3791,6 +3810,7 @@ fn validate_accumulation_envelope(value: &AccumulationEnvelopeV2) -> Result<(), 
                     .and_then(|height| height.checked_add(1))
                     == Some(change.causal_height)
                 && change.workflow == value.transition.workflow_operations(&value.work)
+                && change.awaited_reply == value.work.awaited_reply
                 && change.exported_blobs == value.transition.exported_blobs =>
         {
             Ok(())
@@ -6087,6 +6107,7 @@ mod tests {
                     actor: work.target,
                     state: BlobRefV2::of_bytes(b"materialized-state"),
                 }],
+                awaited_reply: None,
                 exported_blobs: vec![],
             }),
             spawns: vec![],
@@ -6226,6 +6247,7 @@ mod tests {
             operations,
             workflow: vec![WorkflowOperationV2::Checkpoint(work.clone())],
             materializations: vec![],
+            awaited_reply: None,
             exported_blobs: vec![],
         };
         assert_eq!(CrdtChangeV2::decode(&value.encode()).unwrap(), value);

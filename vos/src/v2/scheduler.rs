@@ -182,6 +182,7 @@ impl LocalWorkSchedulerV2 {
                 operations: Vec::new(),
                 workflow: alloc::vec![WorkflowOperationV2::Ingress(operation)],
                 materializations: Vec::new(),
+                awaited_reply: None,
                 exported_blobs: Vec::new(),
             });
         } else if !matches!(
@@ -360,6 +361,7 @@ impl LocalWorkSchedulerV2 {
                     operations: Vec::new(),
                     workflow: alloc::vec![WorkflowOperationV2::ExpireCall(timeout.clone())],
                     materializations: Vec::new(),
+                    awaited_reply: None,
                     exported_blobs: Vec::new(),
                 };
                 (

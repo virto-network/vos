@@ -370,6 +370,7 @@ mod guest {
                         operations: actor_output.crdt_operations,
                         workflow: alloc::vec::Vec::new(),
                         materializations,
+                        awaited_reply: work.awaited_reply.clone(),
                         exported_blobs: exported_blobs.clone(),
                     }),
                     candidates.into_values().collect(),

@@ -351,6 +351,15 @@ records an explicit workflow-CRDT outbox consumption, and post-await
 operations receive a fresh change/dispatch identity. The suspended heap
 continues against the materialization it originally observed; concurrent
 branches merge only after that resumed change commits.
+Independently scheduled retries remain as distinct physical DAG nodes, but a
+deterministic winner represents each logical workflow step during
+materialization. A descendant refined before synchronization may physically
+name a discarded retry node and its continuation blob; those identities are
+treated as aliases of the selected step, so later checkpoints do not lose
+their causal predecessor. Every reply-consuming node separately retains the
+finalized reply omitted from the normalized workflow checkpoint. Sync can
+therefore rebuild and canonicalize the permanent reply-admission and dedup
+rows for every historical step, not only the latest visible checkpoint.
 
 A durable timeout follows the same boundary without fabricating a reply. Guest
 Accumulate verifies the exact outbox row, workflow checkpoint, pending actor,
@@ -629,7 +638,7 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 20 and continuation snapshot version 5 are therefore a clean
+Store schema 23 and continuation snapshot version 5 are therefore a clean
 break from earlier experimental v2 images. They add exact actor-package
 identity to descriptors, work, checkpoints, transitions, upgrades, and
 cross-root proof bindings, the complete dormant actor-program layout to each

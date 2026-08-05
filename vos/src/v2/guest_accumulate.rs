@@ -1095,11 +1095,13 @@ struct WorkflowMaterializationV2 {
     ingresses: BTreeMap<super::InvocationId, Vec<CausalValueV2<super::CrdtIngressV2>>>,
     consumed_ingresses: BTreeSet<super::InvocationId>,
     workflows: BTreeMap<super::InvocationId, Vec<CausalValueV2<WorkflowCheckpointV2>>>,
+    dedup_workflows: Vec<CausalValueV2<WorkflowCheckpointV2>>,
     continuations: BTreeMap<ActorId, Vec<CausalValueV2<Option<BlobRefV2>>>>,
     inbox: BTreeMap<super::CallId, Vec<CausalValueV2<Option<MessageRecordV2>>>>,
     outbox: BTreeMap<super::CallId, Vec<CausalValueV2<Option<MessageRecordV2>>>>,
     expirations: BTreeMap<super::CallId, Vec<CausalValueV2<CallTimeoutV2>>>,
     replies: BTreeMap<super::CallId, Vec<CausalValueV2<super::ReplyRecordV2>>>,
+    reply_admissions: BTreeMap<super::CallId, Vec<CausalValueV2<ReplyAdmissionRecordV2>>>,
     actor_states: BTreeMap<ActorId, Vec<CausalValueV2<BlobRefV2>>>,
 }
 
@@ -1354,9 +1356,35 @@ fn materialize_workflow_crdt(
 ) -> Result<WorkflowMaterializationV2, AccumulationRejectionV2> {
     let mut result = WorkflowMaterializationV2::default();
     let mut ingress_identities = BTreeMap::<super::InvocationId, super::CrdtIngressV2>::new();
-    let duplicate_execution_losers = duplicate_crdt_execution_losers(frontier)?;
+    let duplicate_executions = duplicate_crdt_executions(frontier)?;
     for (cid, change) in frontier.nodes_in_causal_order() {
-        if duplicate_execution_losers.contains(&cid) {
+        if let Some(awaited_reply) = change.awaited_reply.as_ref() {
+            let Some(work) = change
+                .workflow
+                .iter()
+                .find_map(|operation| match operation {
+                    WorkflowOperationV2::Checkpoint(work) => Some(work),
+                    _ => None,
+                })
+            else {
+                return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+            };
+            let admission = ReplyAdmissionRecordV2 {
+                call_id: awaited_reply.reply.call_id,
+                input: work.input_id(),
+                awaited_reply: awaited_reply.clone(),
+                work_hash: change.work_hash,
+            };
+            result
+                .reply_admissions
+                .entry(admission.call_id)
+                .or_default()
+                .push(CausalValueV2 {
+                    cid,
+                    value: admission,
+                });
+        }
+        if duplicate_executions.is_loser(cid) {
             continue;
         }
         let checkpoints = change
@@ -1390,7 +1418,9 @@ fn materialize_workflow_crdt(
                     .get(&work.invocation)
                     .into_iter()
                     .flatten()
-                    .filter(|event| frontier.contains_ancestor(cid, event.cid))
+                    .filter(|event| {
+                        duplicate_executions.contains_ancestor(frontier, cid, event.cid)
+                    })
                     .collect::<Vec<_>>();
                 let valid_step = match (work.workflow_step, observed.as_slice()) {
                     (0, []) => true,
@@ -1413,8 +1443,13 @@ fn materialize_workflow_crdt(
                     // node CID is their canonical slice commitment.
                     transition_hash: cid,
                 };
+                result.dedup_workflows.push(CausalValueV2 {
+                    cid,
+                    value: checkpoint.clone(),
+                });
                 insert_causal_value(
                     frontier,
+                    &duplicate_executions,
                     result.workflows.entry(work.invocation).or_default(),
                     cid,
                     checkpoint,
@@ -1446,6 +1481,7 @@ fn materialize_workflow_crdt(
         for materialization in &change.materializations {
             insert_causal_value(
                 frontier,
+                &duplicate_executions,
                 result
                     .actor_states
                     .entry(materialization.actor)
@@ -1460,6 +1496,7 @@ fn materialize_workflow_crdt(
                     if let Some(call) = work.parent_call {
                         insert_causal_value(
                             frontier,
+                            &duplicate_executions,
                             result.inbox.entry(call).or_default(),
                             cid,
                             None,
@@ -1479,32 +1516,46 @@ fn materialize_workflow_crdt(
                     } else {
                         let mut observed = values
                             .iter()
-                            .filter(|event| frontier.contains_ancestor(cid, event.cid))
+                            .filter(|event| {
+                                duplicate_executions.contains_ancestor(frontier, cid, event.cid)
+                            })
                             .map(|event| event.value.as_ref().map(|reference| reference.hash));
                         let expected = observed.next().unwrap_or(None);
                         if observed.any(|value| value != expected) {
                             return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
                         }
-                        if change.expected != expected {
+                        if duplicate_executions
+                            .canonical_continuation(change.actor, change.expected)
+                            != expected
+                        {
                             return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
                         }
                     }
-                    insert_causal_value(frontier, values, cid, change.replacement.clone());
+                    insert_causal_value(
+                        frontier,
+                        &duplicate_executions,
+                        values,
+                        cid,
+                        change.replacement.clone(),
+                    );
                 }
                 WorkflowOperationV2::Inbox(message) => insert_causal_value(
                     frontier,
+                    &duplicate_executions,
                     result.inbox.entry(message.call_id).or_default(),
                     cid,
                     Some(message.clone()),
                 ),
                 WorkflowOperationV2::Outbox(message) => insert_causal_value(
                     frontier,
+                    &duplicate_executions,
                     result.outbox.entry(message.call_id).or_default(),
                     cid,
                     Some(message.clone()),
                 ),
                 WorkflowOperationV2::ConsumeOutbox(call) => insert_causal_value(
                     frontier,
+                    &duplicate_executions,
                     result.outbox.entry(*call).or_default(),
                     cid,
                     None,
@@ -1515,7 +1566,9 @@ fn materialize_workflow_crdt(
                         .get(&timeout.caller_invocation)
                         .into_iter()
                         .flatten()
-                        .filter(|event| frontier.contains_ancestor(cid, event.cid));
+                        .filter(|event| {
+                            duplicate_executions.contains_ancestor(frontier, cid, event.cid)
+                        });
                     let Some(workflow) = workflows.next() else {
                         return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
                     };
@@ -1527,7 +1580,9 @@ fn materialize_workflow_crdt(
                     let values = result.outbox.entry(timeout.call_id).or_default();
                     let mut observed = values
                         .iter()
-                        .filter(|event| frontier.contains_ancestor(cid, event.cid))
+                        .filter(|event| {
+                            duplicate_executions.contains_ancestor(frontier, cid, event.cid)
+                        })
                         .filter_map(|event| event.value.as_ref());
                     let Some(message) = observed.next() else {
                         return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
@@ -1540,9 +1595,10 @@ fn materialize_workflow_crdt(
                     {
                         return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
                     }
-                    insert_causal_value(frontier, values, cid, None);
+                    insert_causal_value(frontier, &duplicate_executions, values, cid, None);
                     insert_causal_value(
                         frontier,
+                        &duplicate_executions,
                         result.expirations.entry(timeout.call_id).or_default(),
                         cid,
                         timeout.clone(),
@@ -1550,6 +1606,7 @@ fn materialize_workflow_crdt(
                 }
                 WorkflowOperationV2::Reply(reply) => insert_causal_value(
                     frontier,
+                    &duplicate_executions,
                     result.replies.entry(reply.call_id).or_default(),
                     cid,
                     reply.clone(),
@@ -1564,6 +1621,7 @@ fn materialize_workflow_crdt(
                     }
                     insert_causal_value(
                         frontier,
+                        &duplicate_executions,
                         result.ingresses.entry(ingress.invocation).or_default(),
                         cid,
                         ingress.clone(),
@@ -1581,6 +1639,21 @@ fn materialize_workflow_crdt(
     validate_strict_frontiers(result.continuations.values())?;
     validate_strict_frontiers(result.replies.values())?;
     validate_strict_frontiers(result.expirations.values())?;
+    for admissions in result.reply_admissions.values_mut() {
+        admissions.sort_by_key(|event| (duplicate_executions.is_loser(event.cid), event.cid));
+        let Some(canonical) = admissions.first() else {
+            continue;
+        };
+        if duplicate_executions.is_loser(canonical.cid)
+            || admissions.iter().skip(1).any(|candidate| {
+                candidate.value.call_id != canonical.value.call_id
+                    || candidate.value.input != canonical.value.input
+                    || candidate.value.awaited_reply != canonical.value.awaited_reply
+            })
+        {
+            return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+        }
+    }
     for messages in result.inbox.values().chain(result.outbox.values()) {
         let mut visible = messages.iter().filter_map(|event| event.value.as_ref());
         if let Some(first) = visible.next()
@@ -1615,11 +1688,45 @@ fn validate_ingress_retry_frontiers<'a>(
 /// application operations and workflow effects materialize only once. Any
 /// caller-input or execution-result difference remains an invalid workflow
 /// transition rather than being hidden behind the CID tie-break.
-fn duplicate_crdt_execution_losers(
+#[derive(Default)]
+struct DuplicateCrdtExecutionsV2 {
+    canonical_by_loser: BTreeMap<Hash, Hash>,
+    continuation_aliases: BTreeMap<(ActorId, Hash), BlobRefV2>,
+}
+
+impl DuplicateCrdtExecutionsV2 {
+    fn is_loser(&self, cid: Hash) -> bool {
+        self.canonical_by_loser.contains_key(&cid)
+    }
+
+    /// Treat every physical retry loser as an alias of the selected node.
+    /// A later slice may have been refined before synchronization and hence
+    /// descend from that loser even though only the winner materializes.
+    fn contains_ancestor(
+        &self,
+        frontier: &super::causal::CausalFrontierV2,
+        descendant: Hash,
+        ancestor: Hash,
+    ) -> bool {
+        frontier.contains_ancestor(descendant, ancestor)
+            || self.canonical_by_loser.iter().any(|(loser, winner)| {
+                *winner == ancestor && frontier.contains_ancestor(descendant, *loser)
+            })
+    }
+
+    fn canonical_continuation(&self, actor: ActorId, expected: Option<Hash>) -> Option<Hash> {
+        expected.map(|hash| {
+            self.continuation_aliases
+                .get(&(actor, hash))
+                .map_or(hash, |reference| reference.hash)
+        })
+    }
+}
+
+fn duplicate_crdt_executions(
     frontier: &super::causal::CausalFrontierV2,
-) -> Result<BTreeSet<Hash>, AccumulationRejectionV2> {
-    let mut winners = BTreeMap::<WorkInputIdV2, (Hash, &CrdtChangeV2)>::new();
-    let mut losers = BTreeSet::new();
+) -> Result<DuplicateCrdtExecutionsV2, AccumulationRejectionV2> {
+    let mut groups = BTreeMap::<WorkInputIdV2, Vec<(Hash, &CrdtChangeV2)>>::new();
     for (cid, change) in frontier.nodes_in_causal_order() {
         let mut checkpoints = change
             .workflow
@@ -1634,34 +1741,73 @@ fn duplicate_crdt_execution_losers(
         if checkpoints.next().is_some() {
             return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
         }
-        let input = work.input_id();
-        let Some((winner_cid, winner)) = winners.get_mut(&input) else {
-            winners.insert(input, (cid, change));
+        groups
+            .entry(work.input_id())
+            .or_default()
+            .push((cid, change));
+    }
+
+    let mut result = DuplicateCrdtExecutionsV2::default();
+    for candidates in groups.values_mut() {
+        candidates.sort_by_key(|(cid, _)| *cid);
+        let Some(&(winner_cid, winner)) = candidates.first() else {
             continue;
         };
-        if work.proof_requested {
-            // A proof and portable attestation bind one exact physical
-            // receipt. Until the CRDT sync envelope carries the canonical
-            // publication/proof pair, independently proved retry branches
-            // cannot be collapsed without losing that binding.
-            return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
-        }
-        if !crdt_retry_execution_matches(winner, change) {
-            return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
-        }
-        if cid < *winner_cid {
-            losers.insert(*winner_cid);
-            *winner_cid = cid;
-            *winner = change;
-        } else {
-            losers.insert(cid);
+        for (index, &(loser_cid, loser)) in candidates.iter().enumerate().skip(1) {
+            if candidates[..index].iter().any(|(other_cid, _)| {
+                frontier.contains_ancestor(*other_cid, loser_cid)
+                    || frontier.contains_ancestor(loser_cid, *other_cid)
+            }) {
+                // A logical input is consumed once on any causal branch.
+                // Retry aliases are only meaningful for concurrent physical
+                // executions, never for a descendant replay of that input.
+                return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+            }
+            let proof_requested = winner
+                .workflow
+                .iter()
+                .find_map(|operation| match operation {
+                    WorkflowOperationV2::Checkpoint(work) => Some(work.proof_requested),
+                    _ => None,
+                });
+            if proof_requested != Some(false) || !crdt_retry_execution_matches(winner, loser) {
+                // A proof and portable attestation bind one exact physical
+                // receipt. Until the CRDT sync envelope carries the canonical
+                // publication/proof pair, independently proved retry branches
+                // cannot be collapsed without losing that binding.
+                return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+            }
+            result.canonical_by_loser.insert(loser_cid, winner_cid);
+            for (winner_change, loser_change) in winner.workflow.iter().zip(&loser.workflow) {
+                let (
+                    WorkflowOperationV2::Continuation(winner_change),
+                    WorkflowOperationV2::Continuation(loser_change),
+                ) = (winner_change, loser_change)
+                else {
+                    continue;
+                };
+                if let (Some(winner), Some(loser)) =
+                    (&winner_change.replacement, &loser_change.replacement)
+                    && winner != loser
+                {
+                    let key = (loser_change.actor, loser.hash);
+                    if result
+                        .continuation_aliases
+                        .insert(key, winner.clone())
+                        .is_some_and(|existing| existing != *winner)
+                    {
+                        return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
+                    }
+                }
+            }
         }
     }
-    Ok(losers)
+    Ok(result)
 }
 
 fn crdt_retry_execution_matches(left: &CrdtChangeV2, right: &CrdtChangeV2) -> bool {
-    left.operations.len() == right.operations.len()
+    left.awaited_reply == right.awaited_reply
+        && left.operations.len() == right.operations.len()
         && left
             .operations
             .iter()
@@ -1723,17 +1869,18 @@ pub(super) fn materialized_continuations(
 
 fn insert_causal_value<T>(
     frontier: &super::causal::CausalFrontierV2,
+    duplicate_executions: &DuplicateCrdtExecutionsV2,
     values: &mut Vec<CausalValueV2<T>>,
     cid: Hash,
     value: T,
 ) {
     if values
         .iter()
-        .any(|existing| frontier.contains_ancestor(existing.cid, cid))
+        .any(|existing| duplicate_executions.contains_ancestor(frontier, existing.cid, cid))
     {
         return;
     }
-    values.retain(|existing| !frontier.contains_ancestor(cid, existing.cid));
+    values.retain(|existing| !duplicate_executions.contains_ancestor(frontier, cid, existing.cid));
     values.push(CausalValueV2 { cid, value });
     values.sort_by_key(|event| event.cid);
 }
@@ -1932,8 +2079,7 @@ fn apply_dedup_materialization<S: StateTreeStore>(
     service: &super::ServiceIdentityV2,
     materialized: &WorkflowMaterializationV2,
 ) -> GuestResult<(), S::Error> {
-    for values in materialized.workflows.values() {
-        let event = values.first().expect("workflow frontier is never empty");
+    for event in &materialized.dedup_workflows {
         let checkpoint = &event.value;
         let change_bytes = read(store, &crdt_node_storage_key(event.cid))?
             .ok_or(GuestAccumulateError::CorruptStore)?;
@@ -2008,6 +2154,28 @@ fn apply_dedup_materialization<S: StateTreeStore>(
                     ),
                 )?;
             }
+        }
+    }
+    for admissions in materialized.reply_admissions.values() {
+        let canonical = &admissions
+            .first()
+            .expect("reply-admission candidates are never empty")
+            .value;
+        let key = reply_admission_storage_key(canonical.call_id);
+        if let Some(existing) = read(store, &key)? {
+            let existing = ReplyAdmissionRecordV2::decode(&existing)
+                .map_err(|_| GuestAccumulateError::CorruptStore)?;
+            if !admissions
+                .iter()
+                .any(|candidate| candidate.value == existing)
+            {
+                return Err(GuestAccumulateError::CorruptStore);
+            }
+            if existing != *canonical {
+                write(store, &key, Some(&canonical.encode()))?;
+            }
+        } else {
+            write(store, &key, Some(&canonical.encode()))?;
         }
     }
     Ok(())
@@ -3012,6 +3180,7 @@ fn validate_crdt<S: GuestAccumulateStoreV2>(
         || change.work_hash != work.hash()
         || change.causal_dependencies.as_slice() != heads.as_slice()
         || change.workflow != transition.workflow_operations(work)
+        || change.awaited_reply != work.awaited_reply
         || change.exported_blobs != transition.exported_blobs
         || change.operations.iter().any(|operation| {
             work.imported_actors
@@ -4722,6 +4891,7 @@ mod tests {
                     operations: Vec::new(),
                     workflow: vec![WorkflowOperationV2::Ingress(operation)],
                     materializations: Vec::new(),
+                    awaited_reply: None,
                     exported_blobs: Vec::new(),
                 };
                 let cid = change.cid();
@@ -5242,6 +5412,7 @@ mod tests {
             operations: vec![],
             workflow: vec![WorkflowOperationV2::Ingress(operation)],
             materializations: vec![],
+            awaited_reply: None,
             exported_blobs: vec![],
         };
         let cid = change.cid();
@@ -5350,6 +5521,7 @@ mod tests {
                 operations: vec![],
                 workflow: vec![WorkflowOperationV2::Ingress(operation)],
                 materializations: vec![],
+                awaited_reply: None,
                 exported_blobs: vec![],
             };
             ingress.crdt_change = Some(change);
@@ -5438,6 +5610,7 @@ mod tests {
             operations: vec![],
             workflow: vec![WorkflowOperationV2::Ingress(divergent_operation)],
             materializations: vec![],
+            awaited_reply: None,
             exported_blobs: vec![],
         });
         let (divergent_change, divergent_receipt) = admit(&mut divergent_source, divergent_ingress);
@@ -6935,6 +7108,7 @@ mod tests {
             operations: vec![],
             workflow: vec![WorkflowOperationV2::ExpireCall(timeout.clone())],
             materializations: vec![],
+            awaited_reply: None,
             exported_blobs: vec![],
         };
         let expiration = CallExpirationEnvelopeV2 {
@@ -7527,6 +7701,7 @@ mod tests {
                     actor: actor(),
                     state: materialization,
                 }],
+                awaited_reply: work.awaited_reply.clone(),
                 exported_blobs: Vec::new(),
             }),
             spawns: Vec::new(),
@@ -7584,6 +7759,320 @@ mod tests {
         let mut divergent = right_change.clone();
         divergent.operations[0].payload.push(99);
         assert!(!crdt_retry_execution_matches(left_change, &divergent));
+    }
+
+    #[test]
+    fn descendant_of_a_discarded_retry_observes_the_canonical_checkpoint() {
+        let initial = BlobRefV2::of_bytes(b"initial");
+        let mut left_work = crdt_work(initial.clone(), 18, vec![]);
+        let mut right_work = left_work.clone();
+        left_work.logical_timeslot = 1;
+        right_work.logical_timeslot = 2;
+        left_work.imported_actors[0].state = BlobRefV2::of_bytes(b"left base");
+        right_work.imported_actors[0].state = BlobRefV2::of_bytes(b"right base");
+
+        let left_state = BlobRefV2::of_bytes(b"left result");
+        let right_state = BlobRefV2::of_bytes(b"right result");
+        let left_continuation = BlobRefV2::of_bytes(b"left physical checkpoint");
+        let right_continuation = BlobRefV2::of_bytes(b"right physical checkpoint");
+        let mut left = crdt_transition(&left_work, left_state.clone(), 1);
+        let mut right = crdt_transition(&right_work, right_state.clone(), 1);
+        for (transition, work, continuation) in [
+            (&mut left, &left_work, &left_continuation),
+            (&mut right, &right_work, &right_continuation),
+        ] {
+            transition.continuations.push(ContinuationChangeV2 {
+                actor: actor(),
+                expected: None,
+                replacement: Some(continuation.clone()),
+            });
+            transition.exported_blobs.push(continuation.clone());
+            transition.crdt_change.as_mut().unwrap().workflow =
+                transition.workflow_operations(work);
+            transition.crdt_change.as_mut().unwrap().exported_blobs =
+                transition.exported_blobs.clone();
+        }
+
+        let left_change = left.crdt_change.unwrap();
+        let right_change = right.crdt_change.unwrap();
+        let (winner, loser, loser_work, loser_state, loser_continuation) =
+            if left_change.cid() < right_change.cid() {
+                (
+                    left_change,
+                    right_change,
+                    right_work,
+                    right_state,
+                    right_continuation,
+                )
+            } else {
+                (
+                    right_change,
+                    left_change,
+                    left_work,
+                    left_state,
+                    left_continuation,
+                )
+            };
+        let winner_cid = winner.cid();
+        let loser_cid = loser.cid();
+
+        // Resume before learning that this physical step-0 branch loses the
+        // deterministic tie-break. Its step-1 node therefore descends the
+        // loser CID and names the loser's content-addressed checkpoint.
+        let mut resumed_work = loser_work;
+        resumed_work.workflow_step = 1;
+        resumed_work.logical_timeslot = 3;
+        resumed_work.arguments.clear();
+        resumed_work.base = ConsistencyBaseV2::Crdt {
+            heads: vec![loser_cid],
+        };
+        resumed_work.base_causal_height = Some(1);
+        resumed_work.imported_actors[0].state = loser_state;
+        resumed_work.imported_actors[0].continuation = Some(loser_continuation.clone());
+        let final_state = BlobRefV2::of_bytes(b"descendant result");
+        let mut resumed = crdt_transition(&resumed_work, final_state.clone(), 2);
+        resumed.continuations.push(ContinuationChangeV2 {
+            actor: actor(),
+            expected: Some(loser_continuation.hash),
+            replacement: None,
+        });
+        resumed.crdt_change.as_mut().unwrap().workflow = resumed.workflow_operations(&resumed_work);
+        let resumed_change = resumed.crdt_change.unwrap();
+        let resumed_cid = resumed_change.cid();
+
+        let nodes = BTreeMap::from([
+            (winner_cid, winner.encode()),
+            (loser_cid, loser.encode()),
+            (resumed_cid, resumed_change.encode()),
+        ]);
+        let mut heads = vec![winner_cid, resumed_cid];
+        heads.sort();
+        let frontier =
+            load_causal_frontier(&heads, |cid| Ok::<_, Infallible>(nodes.get(&cid).cloned()))
+                .unwrap();
+        let materialized = materialize_workflow_crdt(&frontier, &identity()).unwrap();
+        assert_eq!(
+            materialized.workflows[&resumed_work.invocation][0]
+                .value
+                .input
+                .workflow_step,
+            1
+        );
+        assert_eq!(materialized.actor_states[&actor()][0].value, final_state);
+        assert_eq!(materialized.continuations[&actor()][0].value, None);
+    }
+
+    #[test]
+    fn causal_reply_input_rebuilds_the_permanent_admission() {
+        let mut store = MemStore::default();
+        let (initial, _) = install_fixture(&mut store, ConsistencyModeV2::Crdt, b"initial");
+        let first_state = BlobRefV2::of_bytes(b"waiting");
+        let continuation = BlobRefV2::of_bytes(b"continuation");
+        let first_work = crdt_work(initial, 29, vec![]);
+        let call = first_work.invocation.call_id(0);
+        let mut first = crdt_transition(&first_work, first_state.clone(), 1);
+        first.continuations.push(ContinuationChangeV2 {
+            actor: actor(),
+            expected: None,
+            replacement: Some(continuation.clone()),
+        });
+        first
+            .outbox
+            .push(message(31, actor(), ActorId([44; 32]), None, None));
+        first.outbox[0].call_id = call;
+        first.outbox[0].caller_invocation = first_work.invocation;
+        first.outbox[0].await_ordinal = 0;
+        first.exported_blobs.push(continuation.clone());
+        first.crdt_change.as_mut().unwrap().workflow = first.workflow_operations(&first_work);
+        first.crdt_change.as_mut().unwrap().exported_blobs = first.exported_blobs.clone();
+        let first_change = first.crdt_change.unwrap();
+        let first_cid = first_change.cid();
+
+        let reply = super::super::ReplyRecordV2 {
+            call_id: call,
+            producer: ActorId([44; 32]),
+            result: vec![7],
+        };
+        let awaited_reply = super::super::AccumulatedReplyV2 {
+            receipt: AccumulationReceiptV2 {
+                service: super::super::ServiceIdentityV2 {
+                    root_service: super::super::RootServiceId([45; 32]),
+                    ..identity()
+                },
+                accepted_transition: Hash([46; 32]),
+                reply_commitment: Some(reply.commitment()),
+                outbox_commitment: None,
+                resulting_state_root: Some(Hash([47; 32])),
+                resulting_crdt_heads: vec![],
+                sequence: 1,
+                checkpoint: 0,
+                consistency: ConsistencyModeV2::Local,
+            },
+            reply,
+            attestation: None,
+        };
+        let mut resumed_work = first_work;
+        resumed_work.workflow_step = 1;
+        resumed_work.logical_timeslot = 2;
+        resumed_work.arguments.clear();
+        resumed_work.awaited_reply = Some(awaited_reply.clone());
+        resumed_work.base = ConsistencyBaseV2::Crdt {
+            heads: vec![first_cid],
+        };
+        resumed_work.base_causal_height = Some(1);
+        resumed_work.imported_actors[0].state = first_state;
+        resumed_work.imported_actors[0].continuation = Some(continuation.clone());
+        let mut resumed = crdt_transition(
+            &resumed_work,
+            BlobRefV2::of_bytes(b"completed materialization"),
+            2,
+        );
+        resumed.continuations.push(ContinuationChangeV2 {
+            actor: actor(),
+            expected: Some(continuation.hash),
+            replacement: None,
+        });
+        resumed.crdt_change.as_mut().unwrap().workflow = resumed.workflow_operations(&resumed_work);
+        let resumed_transition = resumed.clone();
+        let resumed_change = resumed.crdt_change.unwrap();
+
+        let mut retry_work = resumed_work.clone();
+        retry_work.logical_timeslot = 3;
+        retry_work.imported_actors[0].state = BlobRefV2::of_bytes(b"other causal state");
+        let mut retry = crdt_transition(
+            &retry_work,
+            BlobRefV2::of_bytes(b"other completed materialization"),
+            2,
+        );
+        retry.continuations.push(ContinuationChangeV2 {
+            actor: actor(),
+            expected: Some(continuation.hash),
+            replacement: None,
+        });
+        retry.crdt_change.as_mut().unwrap().workflow = retry.workflow_operations(&retry_work);
+        let retry_transition = retry.clone();
+        let retry_change = retry.crdt_change.unwrap();
+
+        let receipt_for = |change: &CrdtChangeV2, checkpoint| AccumulationReceiptV2 {
+            service: identity(),
+            accepted_transition: change.receipt_commitment(),
+            reply_commitment: None,
+            outbox_commitment: MessageRecordV2::outbox_commitment(
+                &change
+                    .workflow
+                    .iter()
+                    .filter_map(|operation| match operation {
+                        WorkflowOperationV2::Outbox(message) => Some(message.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            resulting_state_root: None,
+            resulting_crdt_heads: vec![change.cid()],
+            sequence: change.causal_height,
+            checkpoint,
+            consistency: ConsistencyModeV2::Crdt,
+        };
+        let first_receipt = receipt_for(&first_change, 0);
+        let (canonical_work, canonical_transition, canonical_change, loser_work, loser_change) =
+            if resumed_change.cid() < retry_change.cid() {
+                (
+                    resumed_work,
+                    resumed_transition,
+                    resumed_change,
+                    retry_work,
+                    retry_change,
+                )
+            } else {
+                (
+                    retry_work,
+                    retry_transition,
+                    retry_change,
+                    resumed_work,
+                    resumed_change,
+                )
+            };
+        let canonical_cid = canonical_change.cid();
+        let loser_cid = loser_change.cid();
+        let canonical_receipt = receipt_for(&canonical_change, 1);
+        let loser_receipt = receipt_for(&loser_change, 1);
+        for (cid, change, receipt) in [
+            (first_cid, first_change, first_receipt),
+            (canonical_cid, canonical_change, canonical_receipt.clone()),
+            (loser_cid, loser_change, loser_receipt.clone()),
+        ] {
+            store
+                .rows
+                .insert(crdt_node_storage_key(cid), change.encode());
+            store
+                .rows
+                .insert(crdt_node_receipt_storage_key(cid), receipt.encode());
+        }
+        let input = canonical_work.input_id();
+        store.rows.insert(
+            dedup_storage_key(input),
+            DedupRecordV2 {
+                input,
+                work_hash: loser_work.hash(),
+                transition_commitment: loser_receipt.accepted_transition,
+                receipt: loser_receipt.clone(),
+            }
+            .encode(),
+        );
+        store
+            .rows
+            .insert(receipt_storage_key(input), loser_receipt.encode());
+        store.rows.insert(
+            reply_admission_storage_key(call),
+            ReplyAdmissionRecordV2 {
+                call_id: call,
+                input,
+                awaited_reply: awaited_reply.clone(),
+                work_hash: loser_work.hash(),
+            }
+            .encode(),
+        );
+        let nodes = store.rows.clone();
+        let mut heads = vec![canonical_cid, loser_cid];
+        heads.sort();
+        let frontier = load_causal_frontier(&heads, |cid| {
+            Ok::<_, Infallible>(nodes.get(&crdt_node_storage_key(cid)).cloned())
+        })
+        .unwrap();
+        let materialized = materialize_workflow_crdt(&frontier, &identity()).unwrap();
+        assert!(
+            materialized.workflows[&canonical_work.invocation][0]
+                .value
+                .resume_work
+                .awaited_reply
+                .is_none(),
+            "the checkpoint remains normalized"
+        );
+        apply_dedup_materialization(&mut store, &identity(), &materialized).unwrap();
+        let admission = ReplyAdmissionRecordV2::decode(
+            store.rows[&reply_admission_storage_key(call)].as_slice(),
+        )
+        .unwrap();
+        assert_eq!(admission.awaited_reply, awaited_reply);
+        assert_eq!(admission.input, canonical_work.input_id());
+        assert_eq!(admission.work_hash, canonical_work.hash());
+
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: canonical_work,
+                    transition: canonical_transition,
+                    provided_blobs: vec![],
+                }),
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted {
+                receipt,
+                duplicate: true,
+                ..
+            } if receipt == canonical_receipt
+        ));
     }
 
     #[test]
