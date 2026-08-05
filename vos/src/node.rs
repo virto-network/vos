@@ -2403,7 +2403,7 @@ fn sync_with_peer(
     // both write.
     let replica_origin = derive_replica_origin(rep_id, net.local_prefix());
     let mut cc =
-        CrdtCommit::from_db_arc_locked(slot.db.clone(), slot.commit_lock.clone(), replica_origin);
+        CrdtCommit::from_db_arc_locked(slot.db.clone(), slot.commit_lock.clone(), replica_origin)?;
     // Gate peer nodes through the replica's validator (the registry binds
     // the genesis set_root to its space_id) — this is the ingest point.
     cc.set_node_validator(slot.node_validator.clone());
@@ -5254,7 +5254,7 @@ fn build_agent_strategy(
                             replica_origin,
                         ),
                         None => crate::commit::CrdtCommit::from_db_arc(arc.clone(), replica_origin),
-                    };
+                    }?;
                     cc.set_node_validator(config.node_validator.clone());
                     return Ok(Box::new(cc));
                 }

@@ -69,6 +69,13 @@ use alloc::vec::Vec;
 /// Current wire version — what the guest framework emits.
 pub const REFINE_PAYLOAD_VERSION: u8 = 0x03;
 
+/// Retired v2 discriminator, permanently reserved at the runtime boundary.
+///
+/// Its payload is intentionally no longer decodable, but recognizing the
+/// leading byte prevents complete v2 results from falling through to the
+/// unrelated legacy status-envelope decoder.
+pub const RETIRED_REFINE_PAYLOAD_V2: u8 = 0x02;
+
 /// Flag bit: guest yielded; host should re-queue this service next tick.
 pub const FLAG_CONTINUE_NEXT: u8 = 0x01;
 
@@ -707,7 +714,7 @@ mod tests {
 
     #[test]
     fn v2_payloads_require_reset_and_reinstall() {
-        let legacy = [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let legacy = [RETIRED_REFINE_PAYLOAD_V2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert!(RefinePayload::decode(&legacy).is_none());
     }
 

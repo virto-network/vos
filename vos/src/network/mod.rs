@@ -2466,7 +2466,8 @@ mod tests {
                 slot_a.db.clone(),
                 slot_a.commit_lock.clone(),
                 rep_id,
-            );
+            )
+            .unwrap();
             cc_a.commit_with_log(b"v1", &log1).unwrap();
             cc_a.commit_with_log(b"v2", &log2).unwrap();
             assert_eq!(cc_a.root_bytes().len(), 1);
@@ -2491,7 +2492,8 @@ mod tests {
                     slot_b.db.clone(),
                     slot_b.commit_lock.clone(),
                     rep_id,
-                );
+                )
+                .ok()?;
                 if cc.root_bytes().is_empty() {
                     None
                 } else {
@@ -2518,7 +2520,8 @@ mod tests {
 
         // Roots match too.
         let cc_a =
-            CrdtCommit::from_db_arc_locked(slot_a.db.clone(), slot_a.commit_lock.clone(), rep_id);
+            CrdtCommit::from_db_arc_locked(slot_a.db.clone(), slot_a.commit_lock.clone(), rep_id)
+                .unwrap();
         assert_eq!(cc_a.root_bytes(), cc_b.root_bytes());
 
         let _ = node_a.collect();
@@ -2589,7 +2592,8 @@ mod tests {
             .cloned()
             .unwrap();
         let mut cc =
-            CrdtCommit::from_db_arc_locked(slot_for_writes.db, slot_for_writes.commit_lock, rep_id);
+            CrdtCommit::from_db_arc_locked(slot_for_writes.db, slot_for_writes.commit_lock, rep_id)
+                .unwrap();
         cc.commit_with_log(b"v1", &EffectLog::for_msg(b"first".to_vec()))
             .unwrap();
         cc.commit_with_log(b"v2", &EffectLog::for_msg(b"second".to_vec()))
@@ -2703,7 +2707,8 @@ mod tests {
             .cloned()
             .unwrap();
         let mut cc =
-            CrdtCommit::from_db_arc_locked(slot_for_writes.db, slot_for_writes.commit_lock, rep_id);
+            CrdtCommit::from_db_arc_locked(slot_for_writes.db, slot_for_writes.commit_lock, rep_id)
+                .unwrap();
         cc.commit_with_log(b"v1", &EffectLog::for_msg(b"secret".to_vec()))
             .unwrap();
         let root = cc.root_bytes()[0];

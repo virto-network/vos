@@ -476,8 +476,9 @@ fn expected_anchor(
     crate::refine_payload::anchor_for(effective)
 }
 
-/// Whether halt-output bytes claim to be a RefinePayload wire version
-/// the host knows. Used to distinguish "malformed payload — fail loud"
+/// Whether halt-output bytes claim to be a current or retired
+/// RefinePayload wire version. Used to distinguish "malformed or retired
+/// payload — fail loud"
 /// from "old-style `[status][state_len][state][reply]` envelope" when
 /// [`RefinePayload::decode`] returns `None`. Old-style envelopes lead
 /// with a status byte, and no reachable status collides: traps never
@@ -485,7 +486,11 @@ fn expected_anchor(
 /// head, and 0x03+ statuses only appear in sub-5-byte error envelopes
 /// the invoke path packs host-side.
 fn claims_refine_payload(bytes: &[u8]) -> bool {
-    bytes.first() == Some(&crate::refine_payload::REFINE_PAYLOAD_VERSION)
+    matches!(
+        bytes.first(),
+        Some(&crate::refine_payload::RETIRED_REFINE_PAYLOAD_V2)
+            | Some(&crate::refine_payload::REFINE_PAYLOAD_VERSION)
+    )
 }
 
 // --- Per-service storage ---
@@ -2665,6 +2670,13 @@ fn blob_hash(data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_v2_work_result_remains_reserved_and_fail_loud() {
+        let retired = [crate::refine_payload::RETIRED_REFINE_PAYLOAD_V2, 0, 0, 0, 0];
+        assert!(claims_refine_payload(&retired));
+        assert!(RefinePayload::decode(&retired).is_none());
+    }
 
     fn exact_resume_blob() -> Vec<u8> {
         use grey_transpiler::assembler::{Assembler, Reg};

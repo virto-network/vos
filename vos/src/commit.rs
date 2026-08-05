@@ -610,6 +610,16 @@ mod crdt {
     /// can't reuse a `seq` value across restarts.
     pub const NEXT_SEQ_KEY: &str = "crdt_next_seq";
 
+    /// Durable marker for the replay-log wire accepted by this runtime.
+    ///
+    /// Pre-marker stores may contain the retired, pre-anchor EffectLog wire.
+    /// Treating those nodes like hostile peer input would quarantine the whole
+    /// legitimate history and make an actor appear fresh after restart. The
+    /// marker lets open fail with the v2 clean-break instruction while current
+    /// stores can continue quarantining individual malformed peer nodes.
+    pub(super) const REPLAY_FORMAT_KEY: &str = "crdt_replay_format";
+    const REPLAY_FORMAT: &[u8] = b"VCR2";
+
     /// Merkle-CRDT commit strategy.
     ///
     /// On every `commit_with_log`, writes the actor's state, the new
@@ -664,11 +674,11 @@ mod crdt {
         /// choice because every replica in a group shares it.
         pub fn open(path: &std::path::Path, replica_origin: [u8; 32]) -> Result<Self, CommitError> {
             let db = alloc::sync::Arc::new(redb::Database::create(path)?);
-            Ok(Self::with_state(
+            Self::with_state(
                 db,
                 alloc::sync::Arc::new(std::sync::Mutex::new(())),
                 replica_origin,
-            ))
+            )
         }
 
         /// Build a `CrdtCommit` on a pre-opened, shared
@@ -682,7 +692,10 @@ mod crdt {
         /// lock; use [`from_db_arc_locked`](Self::from_db_arc_locked)
         /// when multiple `CrdtCommit`s over the same db need to
         /// serialize their writes (agent thread + sync ticker).
-        pub fn from_db_arc(db: alloc::sync::Arc<redb::Database>, replica_origin: [u8; 32]) -> Self {
+        pub fn from_db_arc(
+            db: alloc::sync::Arc<redb::Database>,
+            replica_origin: [u8; 32],
+        ) -> Result<Self, CommitError> {
             Self::with_state(
                 db,
                 alloc::sync::Arc::new(std::sync::Mutex::new(())),
@@ -700,7 +713,7 @@ mod crdt {
             db: alloc::sync::Arc<redb::Database>,
             commit_lock: alloc::sync::Arc<std::sync::Mutex<()>>,
             replica_origin: [u8; 32],
-        ) -> Self {
+        ) -> Result<Self, CommitError> {
             Self::with_state(db, commit_lock, replica_origin)
         }
 
@@ -708,11 +721,12 @@ mod crdt {
             db: alloc::sync::Arc<redb::Database>,
             commit_lock: alloc::sync::Arc<std::sync::Mutex<()>>,
             replica_origin: [u8; 32],
-        ) -> Self {
+        ) -> Result<Self, CommitError> {
+            ensure_replay_format(&db)?;
             let clock = load_clock(&db).unwrap_or_default();
             let last_state = load_state(&db).unwrap_or_default();
             let next_seq = load_next_seq(&db).unwrap_or(0);
-            Self {
+            Ok(Self {
                 db,
                 clock,
                 last_state,
@@ -720,7 +734,7 @@ mod crdt {
                 replica_origin,
                 next_seq,
                 node_validator: None,
-            }
+            })
         }
 
         /// Install a [`NodeValidator`](super::NodeValidator) that gates
@@ -1210,6 +1224,61 @@ mod crdt {
 
     // ── helpers ─────────────────────────────────────────────────────
 
+    fn ensure_replay_format(db: &redb::Database) -> Result<(), CommitError> {
+        use redb::ReadableTable;
+
+        let txn = db.begin_read()?;
+        let (marker, state_has_rows) = match txn.open_table(STATE_TABLE) {
+            Ok(table) => {
+                let marker = table
+                    .get(REPLAY_FORMAT_KEY)?
+                    .map(|value| value.value().to_vec());
+                let has_rows = table.iter()?.next().transpose()?.is_some();
+                (marker, has_rows)
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => (None, false),
+            Err(error) => return Err(error.into()),
+        };
+
+        if let Some(marker) = marker {
+            if marker == REPLAY_FORMAT {
+                return Ok(());
+            }
+            return Err(retired_replay_format());
+        }
+
+        let dag_has_rows = match txn.open_table(DAG_TABLE) {
+            Ok(table) => table.iter()?.next().transpose()?.is_some(),
+            Err(redb::TableError::TableDoesNotExist(_)) => false,
+            Err(error) => return Err(error.into()),
+        };
+        let kv_has_rows = match txn.open_table(KV_TABLE) {
+            Ok(table) => table.iter()?.next().transpose()?.is_some(),
+            Err(redb::TableError::TableDoesNotExist(_)) => false,
+            Err(error) => return Err(error.into()),
+        };
+        drop(txn);
+
+        if state_has_rows || dag_has_rows || kv_has_rows {
+            return Err(retired_replay_format());
+        }
+
+        let txn = db.begin_write()?;
+        {
+            let mut table = txn.open_table(STATE_TABLE)?;
+            table.insert(REPLAY_FORMAT_KEY, REPLAY_FORMAT)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    fn retired_replay_format() -> CommitError {
+        CommitError::Config(
+            "CRDT store uses a retired replay format; reset/reinstall this actor before opening it"
+                .into(),
+        )
+    }
+
     fn load_state(db: &redb::Database) -> Option<Vec<u8>> {
         let txn = db.begin_read().ok()?;
         let table = txn.open_table(STATE_TABLE).ok()?;
@@ -1406,6 +1475,43 @@ mod tests {
 
     #[cfg(feature = "storage")]
     #[test]
+    fn crdt_store_without_replay_format_requires_reset() {
+        use crate::effect_log::EffectLog;
+
+        let path = temp_db_path("crdt_retired_replay_format");
+        {
+            let mut cc = CrdtCommit::open(&path, [0u8; 32]).unwrap();
+            cc.commit_with_log(b"persisted", &EffectLog::for_msg(b"old".to_vec()))
+                .unwrap();
+        }
+
+        // A pre-Batch-37 database has state, roots, and DAG nodes but no
+        // replay-format marker. Removing it models that durable image while
+        // retaining a complete history that must not be mistaken for empty.
+        {
+            let db = redb::Database::open(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(STATE_TABLE).unwrap();
+                table.remove(crdt::REPLAY_FORMAT_KEY).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let error = match CrdtCommit::open(&path, [0u8; 32]) {
+            Ok(_) => panic!("retired CRDT history must not open as fresh state"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("reset/reinstall"),
+            "error must give the clean-break recovery action: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
     fn crdt_commit_reload_picks_up_external_writes() {
         // Two `CrdtCommit` instances share the same `Arc<redb::Database>`.
         // The "agent" half drives state forward; the "sync" half
@@ -1420,8 +1526,8 @@ mod tests {
         let path = temp_db_path("crdt_reload");
         let arc = alloc::sync::Arc::new(redb::Database::create(&path).unwrap());
 
-        let mut agent = CrdtCommit::from_db_arc(arc.clone(), [0u8; 32]);
-        let mut sync = CrdtCommit::from_db_arc(arc.clone(), [0u8; 32]);
+        let mut agent = CrdtCommit::from_db_arc(arc.clone(), [0u8; 32]).unwrap();
+        let mut sync = CrdtCommit::from_db_arc(arc.clone(), [0u8; 32]).unwrap();
 
         // Agent commits one log. After this, agent.clock has one root,
         // sync's clock is still empty (won't see it without reload).
