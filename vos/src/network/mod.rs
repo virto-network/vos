@@ -1597,7 +1597,17 @@ fn handle_req_resp(
                         );
                     }
                     Frame::Tell { from, to, payload } => {
-                        if inbox.send(InboundTell { from, to, payload }).is_err() {
+                        let claimed_prefix = (from >> 16) as u16;
+                        let authenticated_source =
+                            authenticated_tell_source(prefix_map, peer, from);
+                        if !authenticated_source {
+                            warn!(
+                                %peer,
+                                from,
+                                claimed_prefix = format!("{claimed_prefix:#06x}"),
+                                "network: rejected Tell with a spoofed source route"
+                            );
+                        } else if inbox.send(InboundTell { from, to, payload }).is_err() {
                             warn!(%peer, "network: local inbox closed; dropping inbound Tell");
                         }
                         let _ = swarm
@@ -2242,6 +2252,16 @@ fn record_prefix(map: &PrefixMap, prefix: u16, peer: PeerId) {
     }
 }
 
+fn authenticated_tell_source(map: &PrefixMap, peer: PeerId, from: u32) -> bool {
+    let claimed_prefix = (from >> 16) as u16;
+    claimed_prefix != 0
+        && map
+            .lock()
+            .ok()
+            .and_then(|prefixes| prefixes.get(&claimed_prefix).copied())
+            == Some(peer)
+}
+
 /// Derive the 16-bit `node_prefix` for this node from its libp2p
 /// peer ID. Computed as the first two bytes of `blake2b(peer_id
 /// bytes)` interpreted little-endian, giving a uniform u16.
@@ -2366,17 +2386,23 @@ mod tests {
 
         // A → B
         let target_b = net_a.peer_for_prefix(prefix_b).unwrap();
-        net_a.send_tell(target_b, 0xDEADBEEF, 0xCAFEBABE, b"hello B".to_vec());
+        let from_a = (u32::from(prefix_a) << 16) | 0xBEEF;
+        net_a.send_tell(target_b, from_a, 0xCAFEBABE, b"hello B".to_vec());
         let inbound = inbox_b_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("Tell to B");
-        assert_eq!(inbound.from, 0xDEADBEEF);
+        assert_eq!(inbound.from, from_a);
         assert_eq!(inbound.to, 0xCAFEBABE);
         assert_eq!(inbound.payload, b"hello B");
 
         // B → A (symmetric)
         let target_a = net_b.peer_for_prefix(prefix_a).unwrap();
-        net_b.send_tell(target_a, 1, 2, b"hello A".to_vec());
+        net_b.send_tell(
+            target_a,
+            (u32::from(prefix_b) << 16) | 1,
+            2,
+            b"hello A".to_vec(),
+        );
         let inbound = inbox_a_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("Tell to A");
@@ -2384,6 +2410,17 @@ mod tests {
 
         net_a.join();
         net_b.join();
+    }
+
+    #[test]
+    fn tell_source_route_is_bound_to_the_authenticated_peer_prefix() {
+        let owner = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let attacker = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let prefixes = Arc::new(Mutex::new(HashMap::from([(0xA11C, owner)])));
+        let owned_route = (u32::from(0xA11Cu16) << 16) | 7;
+        assert!(authenticated_tell_source(&prefixes, owner, owned_route));
+        assert!(!authenticated_tell_source(&prefixes, attacker, owned_route));
+        assert!(!authenticated_tell_source(&prefixes, owner, 7));
     }
 
     fn wait_for<T>(mut probe: impl FnMut() -> Option<T>, deadline: Duration) -> Option<T> {

@@ -10,12 +10,13 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use vos::attestation::{
     AttestationProofHostV2, AttestationProofProducerV2, AttestationProofRequestV2,
     ProducedAttestationProofV2,
 };
 use vos::network::RaftRpcHandler;
-use vos::node::{V2NodeRegistrationError, VosNode};
+use vos::node::{AgentResult, V2NodeRegistrationError, VosNode};
 use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, Role, WorkerConfig};
 use vos::v2::{
     AccumulateProtocolHostV2, AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2,
@@ -33,9 +34,10 @@ use vos::v2::{
     ProgramId, ProofArtifactStoreV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
     RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2, ReplicatedServiceErrorV2,
     ReplyRecordV2, RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId,
-    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
-    ServicePvmV2, StateKeyV2, SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2,
-    WorkEnvelopeV2, WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
+    RootTreeInvocationV2, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2,
+    ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId, SystemCapabilityId,
+    TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2, WorkflowOperationV2, artifact_hash,
+    public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     Decode, Encode,
@@ -1443,6 +1445,153 @@ fn node_routes_canonical_actor_ids_through_the_guest_owned_root_service() {
     assert!(
         reopened.pending_publications().unwrap().is_empty(),
         "the direct reply is acknowledged only after its channel accepts it"
+    );
+}
+
+#[test]
+fn node_routes_an_ordinary_cross_root_await_through_guest_accumulate() {
+    let actor_elf = probe_elf();
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&actor_elf, &signer);
+    let deployment = package.deployment_id();
+    let producer = package.deployment_signature.producer;
+    let program = package.manifest.actor_program;
+    let source_actor = ActorId([0xB1; 32]);
+    let destination_actor = ActorId([44; 32]);
+    let source_identity = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([0xB3; 32]),
+        root_service: RootServiceId([0xB4; 32]),
+        deployment,
+        service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+    };
+    let destination_identity = ServiceIdentityV2 {
+        root_service: RootServiceId([0xB5; 32]),
+        ..source_identity.clone()
+    };
+    let install_authorization = AuthorizationEvidenceV2::SystemCapability {
+        capability: SystemCapabilityId([0xB6; 32]),
+        authenticator: vec![0xB7],
+    };
+    let source_config = LocalRootTreeConfigV2 {
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package: package.clone(),
+        service: source_identity.clone(),
+        root_actor: source_actor,
+        actor_name: actor_name.clone(),
+        consistency: ConsistencyModeV2::Local,
+        initial_state: vec![],
+        external_actors: vec![external_binding(
+            "peer",
+            destination_identity.clone(),
+            destination_actor,
+            producer,
+            program,
+        )],
+        install_authorization: install_authorization.clone(),
+        refine_gas: 1_000_000_000,
+        accumulate_gas: 5_000_000_000,
+    };
+    let destination_config = LocalRootTreeConfigV2 {
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package,
+        service: destination_identity,
+        root_actor: destination_actor,
+        actor_name,
+        consistency: ConsistencyModeV2::Local,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization,
+        refine_gas: 1_000_000_000,
+        accumulate_gas: 5_000_000_000,
+    };
+    let source_backend = SharedCommittedImages::default();
+    let destination_backend = SharedCommittedImages::default();
+    let source = LocalRootTreeServiceV2::open(source_config.clone(), source_backend.clone())
+        .expect("source root installs");
+
+    let source_route = ServiceId::new(0, 0x3500);
+    let destination_route = ServiceId::new(0, 0x3501);
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("await_peer_without_deadline").encode());
+    let invocation = RootTreeInvocationV2 {
+        invocation: InvocationId([0xB8; 32]),
+        target: source_actor,
+        method: "await_peer_without_deadline".into(),
+        arguments,
+        proof_requested: false,
+    };
+    let invocation_bytes = invocation.encode();
+
+    // First run: the source commits its exact await checkpoint while the
+    // destination route is unavailable. Shutdown drops only the process-local
+    // waiting channel; the guest-owned publication remains recoverable.
+    let mut first_node = VosNode::new();
+    first_node
+        .register_v2_root_at_id("workflow-source-v2", source, source_route, false)
+        .unwrap();
+    let first_invoker = first_node.invoke_handle();
+    let first_invocation = invocation_bytes.clone();
+    let first_request = std::thread::spawn(move || {
+        first_invoker.invoke_with_timeout(source_route, first_invocation, Duration::from_secs(20))
+    });
+    // Physical Refine/Accumulate work can remain inside one root thread for
+    // longer than the router's ordinary 500 ms unit-test idle window.
+    first_node.run_until_idle(Duration::from_secs(3));
+    let first_results = first_node.collect();
+    assert_eq!(first_results.len(), 1);
+    assert!(first_results.iter().all(AgentResult::is_ok));
+    assert!(first_request.join().unwrap().is_none());
+
+    let source = LocalRootTreeServiceV2::open(source_config.clone(), source_backend.clone())
+        .expect("source root reopens with its suspended publication");
+    assert_eq!(source.pending_publications().unwrap().len(), 1);
+    let destination =
+        LocalRootTreeServiceV2::open(destination_config.clone(), destination_backend.clone())
+            .expect("destination root installs");
+
+    // Second run: the caller retries the exact InvocationId. The root
+    // reattaches it to the committed checkpoint without replaying PC 0, then
+    // the node redrives delivery and the finalized reply across both roots.
+    let mut node = VosNode::new();
+    node.register_v2_root_at_id("workflow-source-v2", source, source_route, false)
+        .unwrap();
+    node.register_v2_root_at_id(
+        "workflow-destination-v2",
+        destination,
+        destination_route,
+        false,
+    )
+    .unwrap();
+    let invoker = node.invoke_handle();
+    let request = std::thread::spawn(move || {
+        invoker.invoke_with_timeout(source_route, invocation_bytes, Duration::from_secs(20))
+    });
+    node.run_until_idle(Duration::from_secs(3));
+    let results = node.collect();
+    let reply = request.join().unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(AgentResult::is_ok));
+    let source = LocalRootTreeServiceV2::open(source_config, source_backend)
+        .expect("source root reopens after routed reply");
+    let destination = LocalRootTreeServiceV2::open(destination_config, destination_backend)
+        .expect("destination root reopens after routed reply");
+    assert!(
+        reply.is_some(),
+        "durable cross-root workflow returns to its original caller: {reply:?}"
+    );
+    let reply = reply.unwrap();
+    assert_eq!(reply, Value::U32(8).encode());
+
+    assert!(source.pending_publications().unwrap().is_empty());
+    assert!(destination.pending_publications().unwrap().is_empty());
+    assert!(
+        destination
+            .store()
+            .pending_inbox_calls()
+            .unwrap()
+            .is_empty()
     );
 }
 

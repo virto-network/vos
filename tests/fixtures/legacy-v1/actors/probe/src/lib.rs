@@ -51,6 +51,22 @@ impl Probe {
         self.seen
     }
 
+    /// Production-node transport probe. The older `await_peer` method pins a
+    /// small absolute slot for deterministic harness tests; a real node uses
+    /// its durable admission clock, so this route intentionally has no
+    /// deadline.
+    #[msg]
+    async fn await_peer_without_deadline(&mut self, ctx: &mut Context<Self>) -> u32 {
+        self.seen += 1;
+        if let Ok(vos::value::Value::U32(value)) = ctx
+            .ask_actor(ActorId([44; 32]), &Msg::new("peer_value"), None)
+            .await
+        {
+            self.seen += value;
+        }
+        self.seen
+    }
+
     /// Deterministic cross-root peer used by the v2 durable transport gate.
     #[msg]
     async fn peer_value(&self) -> u32 {
