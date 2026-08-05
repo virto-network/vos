@@ -4,11 +4,13 @@
 > canonical `vos-service.pvm` Refine/Accumulate entries, package tooling, actor
 > APIs, and CRDT primitives described here are present. The local v2 harness
 > executes both phases through that PVM and commits only an accepted guest
-> result; it has no native transition-apply shortcut. `VosNode` can now attach
-> an explicitly opened local v2 root and route ordinary public bound-handle
-> calls through it, but the production `vosx` installer still selects the
-> legacy runtime while authority, attestation, and durable effect routing are
-> connected. Legacy node behavior is not evidence of v2 conformance.
+> result; it has no native transition-apply shortcut. `VosNode` can attach an
+> explicitly opened Local v2 root and route ordinary public calls, durable
+> cross-root outbox delivery, inbox execution, exact reply resume, and restart
+> retries through it. Signed v2 catalog rows use this root service when the
+> daemon is started with the exact service PVM. Role-authorized, attested,
+> Raft, and CRDT network transport remain fail-closed. Legacy node behavior is
+> not evidence of v2 conformance.
 
 The local conformance scheduler can admit one guest-committed durable inbox
 row, derive the callee invocation, origin, authorization and causal parent from
@@ -37,12 +39,13 @@ The committed outcome uses the deadline itself as `expired_at`, so hosts which
 first observe the due call in different later slots still derive identical
 bytes.
 
-The local linear-service transport is also guest-owned end to end. An accepted
+The linear-service transport is also guest-owned end to end. An accepted
 actor slice stores a recoverable publication row whose receipt commits the
 complete canonical outbox. After restart, transport selects a message from
-that publication. Each message commits the exact installed destination service
-identity as well as its ActorId; destination Accumulate rejects a different
-root which merely reuses that ActorId. It also verifies receipt finality,
+that publication. Each message commits the exact source and installed
+destination service identities as well as both ActorIds; destination
+Accumulate rejects a different root which merely reuses either ActorId. It
+also verifies receipt finality,
 producer ownership, full-outbox membership, deadline and the exact current
 destination base before atomically inserting the inbox. External directories
 reject duplicate ActorIds, so application resolution cannot collapse two
@@ -57,7 +60,7 @@ committed. The exception is an undelivered call which expires at its source:
 expiration atomically retires its publication and deadline index, and a later
 reply is classified terminally from the permanent expiration row.
 
-The local linear conformance path also routes a committed callee reply back to
+The linear path also routes a committed callee reply back to
 the caller service. It recovers the exact caller invocation from the
 guest-owned outbox, reconstructs the saved machine after restart, and submits
 the physical Refine result to guest Accumulate. A permanent reply-admission
@@ -135,9 +138,23 @@ first node cutover admits only ordinary methods whose
 signed installed policy is public and non-attested; protected or attested
 methods fail closed instead of inheriting the legacy trusted-System role
 bypass. A direct reply is acknowledged only after its waiting channel accepts
-the bytes. Outbox, proof, attestation, and suspended-workflow publications stay
-durable for the transport/authority integration batches. The host-generated
-logical timeslot is still a local admission ordinal, not a consensus JAM slot.
+the bytes. Ordinary outbox and suspended-workflow publications are retried by
+the node transport until the destination guest has committed them. Proof and
+attestation publications stay durable but are not admitted by this ordinary
+node route. The host-generated logical timeslot is still a local admission
+ordinal, not a consensus JAM slot.
+
+`RootTreeTransportV2` is the canonical node wire for an ordinary publication,
+reply, or exact publication acknowledgement. It carries no observation slot:
+the receiving root first completes its admission barrier, restores the durable
+node-wide high-water, and allocates the slot locally. The sender and receiver
+both check the full `ServiceIdentityV2` committed in the message; a node route
+is usable only when its ActorId and service identity match a trusted directory
+binding. Across network links, the envelope source prefix must also belong to
+the authenticated peer, so peer-selected payload bytes cannot impersonate a
+different local route. The router is trusted for eventual delivery, not for
+safety: dropping an acknowledgement can delay reclamation, while guest-owned
+delivery, input, and reply-admission records prevent double execution.
 
 The local transport accepts either the in-memory host or this durable host
 without changing scheduling or service semantics. Its physical cross-root
@@ -330,8 +347,12 @@ artifact) from those package bytes, and authorize that exact genesis. Passing
 an independently constructed genesis directly to guest Install is only a
 conformance seam.
 
-This is still a conformance orchestrator, not production network routing.
-Automatic node discovery and production routing remain staged.
+The reusable local transport remains a conformance orchestrator. `VosNode`
+connects its ordinary Local subset to authenticated node envelopes, but
+automatic service discovery remains staged: external actor routes must come
+from a trusted registry or consensus directory, never from a received
+envelope. Raft and CRDT transport also remain staged until receipt finality
+and logical time come from their consensus domains.
 Acknowledging a publication containing several
 effects is the transport host's responsibility only after every required
 consumer has accepted it.
@@ -400,8 +421,9 @@ the canonical Refine trace committed by the proof request before attested
 execution becomes a production path.
 Replicated service identity must also bind the gas schedule before `OutOfGas`
 is treated as a deterministic cross-replica result.
-Production routing must recover and retry guest publication, delivery and
-reply-admission rows rather than maintain a second native message ledger. A
+Production Raft/CRDT routing must retain the Local path's rule of recovering
+and retrying guest publication, delivery and reply-admission rows rather than
+maintaining a second native message ledger. A
 bounded reclamation or checkpoint plan for unreachable SMT and CRDT DAG nodes,
 plus completed delivery/deduplication/reply-admission bookkeeping, is also
 required before the engine stores production state; pruning must not weaken
@@ -593,10 +615,15 @@ deduplication domain. On the next boot, images and proof side-CAS directories
 whose incarnation is no longer present move to recoverable trash.
 
 V2 Raft and CRDT rows remain fail-closed until their request-log and
-anti-entropy drivers are attached to the daemon. Attested and role-gated
-external calls likewise remain unavailable on this direct ingress; only
-ordinary public methods are admitted. Legacy ELF/PVM rows continue on the old
-host during this staged cutover.
+anti-entropy drivers are attached to the daemon. For Local roots, ordinary
+public cross-root calls are emitted as guest-owned publications, routed over
+canonical node envelopes, admitted through destination IC-5, and resumed from
+the caller's exact saved machine after the committed reply returns. The node
+periodically redrives pending publications, inboxes, and ingresses after
+restart; permanent guest deduplication makes a lost acknowledgement safe.
+Attested and role-gated external calls remain unavailable on this node route;
+they never fall back to an unproved or synthetic-System invocation. Legacy
+ELF/PVM rows continue on the old host during this staged cutover.
 
 Registry-level `space upgrade` is rejected whenever either side is a signed v2
 package. A catalog pointer rewrite cannot update guest-owned descriptors or
