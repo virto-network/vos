@@ -1074,6 +1074,17 @@ where
         self.accumulate_ordered_after_barrier(request, None)
     }
 
+    /// Quorum-order a slot-bound request after the caller has already
+    /// established the current-term read barrier and caught up through it.
+    #[cfg(feature = "storage")]
+    pub(crate) fn accumulate_at_after_barrier(
+        &mut self,
+        request: &AccumulateRequestV2,
+        logical_timeslot: u64,
+    ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
+        self.accumulate_ordered_after_barrier(request, Some(logical_timeslot))
+    }
+
     fn accumulate_ordered_after_barrier(
         &mut self,
         request: &AccumulateRequestV2,

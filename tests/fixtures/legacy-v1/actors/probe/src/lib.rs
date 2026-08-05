@@ -67,6 +67,25 @@ impl Probe {
         self.seen
     }
 
+    /// Node-driver timeout probe. The caller supplies a future trusted node
+    /// slot so the transport can prove restart-discoverable expiration rather
+    /// than relying on the fixed harness-only deadline above.
+    #[msg]
+    async fn await_peer_until(&mut self, ctx: &mut Context<Self>, deadline: u64) -> u32 {
+        self.seen += 1;
+        if let Ok(vos::value::Value::U32(value)) = ctx
+            .ask_actor(
+                ActorId([44; 32]),
+                &Msg::new("peer_value"),
+                Some(deadline),
+            )
+            .await
+        {
+            self.seen += value;
+        }
+        self.seen
+    }
+
     /// Deterministic cross-root peer used by the v2 durable transport gate.
     #[msg]
     async fn peer_value(&self) -> u32 {

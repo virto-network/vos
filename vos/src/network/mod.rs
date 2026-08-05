@@ -53,6 +53,9 @@ struct VosBehaviour {
 /// channel handed back by [`Network::take_inbox`].
 #[derive(Debug, Clone)]
 pub struct InboundTell {
+    /// Full Noise-authenticated remote identity. Route prefixes are only a
+    /// compact lookup hint and must never substitute for this identity.
+    pub peer: PeerId,
     pub from: u32,
     pub to: u32,
     pub payload: Vec<u8>,
@@ -603,9 +606,18 @@ enum OutboundReply {
 
 impl Network {
     /// Spin up the libp2p swarm on a dedicated thread.
-    pub fn start(config: NetworkConfig) -> Self {
+    pub fn start(mut config: NetworkConfig) -> Self {
         let peer_id = PeerId::from(config.keypair.public());
-        let local_prefix = config.local_prefix;
+        let local_prefix = derive_node_prefix(&peer_id);
+        if config.local_prefix != local_prefix {
+            warn!(
+                configured = format!("{:#06x}", config.local_prefix),
+                derived = format!("{local_prefix:#06x}"),
+                %peer_id,
+                "network: replacing an unauthenticated configured prefix with the PeerId-derived prefix"
+            );
+            config.local_prefix = local_prefix;
+        }
         let prefix_map: PrefixMap = Arc::new(Mutex::new(HashMap::new()));
         let listen_addrs: ListenAddrs = Arc::new(Mutex::new(Vec::new()));
         let service: Arc<OnceLock<Arc<dyn NetworkService>>> = Arc::new(OnceLock::new());
@@ -1588,7 +1600,7 @@ fn handle_req_resp(
             } => {
                 match request {
                     Frame::Hello { node_prefix } => {
-                        record_prefix(prefix_map, node_prefix, peer);
+                        record_authenticated_prefix(prefix_map, node_prefix, peer);
                         let _ = swarm.behaviour_mut().req_resp.send_response(
                             channel,
                             Frame::Hello {
@@ -1598,8 +1610,16 @@ fn handle_req_resp(
                     }
                     Frame::Tell { from, to, payload } => {
                         let claimed_prefix = (from >> 16) as u16;
-                        let authenticated_source =
-                            authenticated_tell_source(prefix_map, peer, from);
+                        // Canonical v2 root transport is bound again to the
+                        // full PeerId at the node bridge. Let a correctly
+                        // derived source through even when its 16-bit lookup
+                        // prefix collides; ordinary legacy Tell still relies
+                        // on the unambiguous prefix map.
+                        let authenticated_source = if payload.starts_with(b"VRT2") {
+                            claimed_prefix == derive_node_prefix(&peer)
+                        } else {
+                            authenticated_tell_source(prefix_map, peer, from)
+                        };
                         if !authenticated_source {
                             warn!(
                                 %peer,
@@ -1607,7 +1627,15 @@ fn handle_req_resp(
                                 claimed_prefix = format!("{claimed_prefix:#06x}"),
                                 "network: rejected Tell with a spoofed source route"
                             );
-                        } else if inbox.send(InboundTell { from, to, payload }).is_err() {
+                        } else if inbox
+                            .send(InboundTell {
+                                peer,
+                                from,
+                                to,
+                                payload,
+                            })
+                            .is_err()
+                        {
                             warn!(%peer, "network: local inbox closed; dropping inbound Tell");
                         }
                         let _ = swarm
@@ -2008,7 +2036,7 @@ fn handle_req_resp(
                 let pending = outbound_replies.remove(&request_id);
                 match (response, pending) {
                     (Frame::Hello { node_prefix }, _) => {
-                        record_prefix(prefix_map, node_prefix, peer);
+                        record_authenticated_prefix(prefix_map, node_prefix, peer);
                     }
                     (Frame::Ack, _) => {
                         debug!(%peer, "network: Tell ack received");
@@ -2231,24 +2259,36 @@ fn handle_gossipsub_event(
     }
 }
 
-fn record_prefix(map: &PrefixMap, prefix: u16, peer: PeerId) {
+fn record_authenticated_prefix(map: &PrefixMap, claimed_prefix: u16, peer: PeerId) {
+    let prefix = derive_node_prefix(&peer);
+    if claimed_prefix != prefix {
+        warn!(
+            claimed = format!("{claimed_prefix:#06x}"),
+            derived = format!("{prefix:#06x}"),
+            %peer,
+            "network: ignored a peer-declared prefix that does not match its authenticated PeerId"
+        );
+    }
     let mut m = match map.lock() {
         Ok(g) => g,
         Err(_) => return,
     };
-    match m.insert(prefix, peer) {
+    match m.get(&prefix).copied() {
         Some(prev) if prev == peer => {}
         Some(prev) => warn!(
             prefix = format!("{prefix:#06x}"),
             previous = %prev,
             current = %peer,
-            "network: prefix re-assigned to a different peer (collision?)",
+            "network: rejected a derived-prefix collision; existing owner retained",
         ),
-        None => info!(
-            prefix = format!("{prefix:#06x}"),
-            %peer,
-            "network: learned peer prefix",
-        ),
+        None => {
+            m.insert(prefix, peer);
+            info!(
+                prefix = format!("{prefix:#06x}"),
+                %peer,
+                "network: learned authenticated peer prefix",
+            );
+        }
     }
 }
 
@@ -2270,11 +2310,10 @@ fn authenticated_tell_source(map: &PrefixMap, peer: PeerId, from: u32) -> bool {
 /// in its top 16 bits; remote peers learn it via the [`Frame::Hello`]
 /// handshake on first contact.
 ///
-/// Collisions are possible (1 in 65 536 per peer pair) — they don't
-/// happen in practice for small networks but will need real
-/// addressing once a space grows past hyperspace-sized clusters.
-/// That's a concern for large clusters; for now we log a warning when the
-/// prefix map sees a collision.
+/// Zero is reserved for legacy/local routes and is deterministically remapped.
+/// Collisions remain possible, so security-sensitive protocols additionally
+/// bind the full authenticated [`PeerId`] and a collision never overwrites an
+/// existing prefix owner.
 pub fn derive_node_prefix(peer_id: &PeerId) -> u16 {
     let hash = blake2b_simd::Params::new()
         .hash_length(2)
@@ -2282,7 +2321,14 @@ pub fn derive_node_prefix(peer_id: &PeerId) -> u16 {
         .update(&peer_id.to_bytes())
         .finalize();
     let bytes = hash.as_bytes();
-    u16::from_le_bytes([bytes[0], bytes[1]])
+    normalize_node_prefix(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn normalize_node_prefix(prefix: u16) -> u16 {
+    match prefix {
+        0 => u16::MAX,
+        prefix => prefix,
+    }
 }
 
 #[cfg(test)]
@@ -2296,6 +2342,8 @@ mod tests {
         let p1 = derive_node_prefix(&pid);
         let p2 = derive_node_prefix(&pid);
         assert_eq!(p1, p2);
+        assert_ne!(p1, 0);
+        assert_eq!(normalize_node_prefix(0), u16::MAX);
     }
 
     #[test]
@@ -2331,8 +2379,8 @@ mod tests {
 
         let kp_a = identity::Keypair::generate_ed25519();
         let kp_b = identity::Keypair::generate_ed25519();
-        let prefix_a = 0xAAAA;
-        let prefix_b = 0xBBBB;
+        let prefix_a = derive_node_prefix(&PeerId::from(kp_a.public()));
+        let prefix_b = derive_node_prefix(&PeerId::from(kp_b.public()));
 
         let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
 
@@ -2394,6 +2442,7 @@ mod tests {
         assert_eq!(inbound.from, from_a);
         assert_eq!(inbound.to, 0xCAFEBABE);
         assert_eq!(inbound.payload, b"hello B");
+        assert_eq!(inbound.peer, net_a.peer_id());
 
         // B → A (symmetric)
         let target_a = net_b.peer_for_prefix(prefix_a).unwrap();
@@ -2407,6 +2456,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("Tell to A");
         assert_eq!(inbound.payload, b"hello A");
+        assert_eq!(inbound.peer, net_b.peer_id());
 
         net_a.join();
         net_b.join();
@@ -2421,6 +2471,28 @@ mod tests {
         assert!(authenticated_tell_source(&prefixes, owner, owned_route));
         assert!(!authenticated_tell_source(&prefixes, attacker, owned_route));
         assert!(!authenticated_tell_source(&prefixes, owner, 7));
+    }
+
+    #[test]
+    fn peer_declared_prefix_cannot_overwrite_an_authenticated_owner() {
+        let owner = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let attacker = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let owner_prefix = derive_node_prefix(&owner);
+        let prefixes = Arc::new(Mutex::new(HashMap::new()));
+
+        record_authenticated_prefix(&prefixes, owner_prefix, owner);
+        record_authenticated_prefix(&prefixes, owner_prefix, attacker);
+
+        assert_eq!(
+            prefixes.lock().unwrap().get(&owner_prefix).copied(),
+            Some(owner),
+            "a claimed collision must retain the first authenticated owner"
+        );
+        assert!(!authenticated_tell_source(
+            &prefixes,
+            attacker,
+            (u32::from(owner_prefix) << 16) | 7,
+        ));
     }
 
     fn wait_for<T>(mut probe: impl FnMut() -> Option<T>, deadline: Duration) -> Option<T> {
@@ -2801,11 +2873,13 @@ mod tests {
     fn gossipsub_head_announcement_hints_subscribers() {
         let kp_a = identity::Keypair::generate_ed25519();
         let kp_b = identity::Keypair::generate_ed25519();
+        let prefix_a = derive_node_prefix(&PeerId::from(kp_a.public()));
+        let prefix_b = derive_node_prefix(&PeerId::from(kp_b.public()));
         let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
 
         let net_a = Network::start(NetworkConfig {
             keypair: kp_a,
-            local_prefix: 0xA0A0,
+            local_prefix: prefix_a,
             listen: vec![listen_addr.clone()],
             bootstrap: vec![],
             auto_dial_mdns: true,
@@ -2819,7 +2893,7 @@ mod tests {
 
         let net_b = Network::start(NetworkConfig {
             keypair: kp_b,
-            local_prefix: 0xB0B0,
+            local_prefix: prefix_b,
             listen: vec![listen_addr],
             bootstrap: vec![a_dial],
             auto_dial_mdns: true,
@@ -2891,11 +2965,13 @@ mod tests {
 
         let kp_a = identity::Keypair::generate_ed25519();
         let kp_b = identity::Keypair::generate_ed25519();
+        let prefix_a = derive_node_prefix(&PeerId::from(kp_a.public()));
+        let prefix_b = derive_node_prefix(&PeerId::from(kp_b.public()));
         let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
 
         let net_a = Network::start(NetworkConfig {
             keypair: kp_a,
-            local_prefix: 0x0A0A,
+            local_prefix: prefix_a,
             listen: vec![listen_addr.clone()],
             bootstrap: vec![],
             auto_dial_mdns: true,
@@ -2909,7 +2985,7 @@ mod tests {
 
         let net_b = Network::start(NetworkConfig {
             keypair: kp_b,
-            local_prefix: 0x0B0B,
+            local_prefix: prefix_b,
             listen: vec![listen_addr],
             bootstrap: vec![a_dial],
             auto_dial_mdns: true,
@@ -2994,8 +3070,8 @@ mod tests {
 
         let kp_a = identity::Keypair::generate_ed25519();
         let kp_b = identity::Keypair::generate_ed25519();
-        let prefix_a = 0xAAAA;
-        let prefix_b = 0xBBBB;
+        let prefix_a = derive_node_prefix(&PeerId::from(kp_a.public()));
+        let prefix_b = derive_node_prefix(&PeerId::from(kp_b.public()));
 
         let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
 
@@ -3322,8 +3398,8 @@ mod tests {
 
         let kp_a = identity::Keypair::generate_ed25519();
         let kp_b = identity::Keypair::generate_ed25519();
-        let prefix_a = 0xAAAA;
-        let prefix_b = 0xBBBB;
+        let prefix_a = derive_node_prefix(&PeerId::from(kp_a.public()));
+        let prefix_b = derive_node_prefix(&PeerId::from(kp_b.public()));
         let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
 
         let net_a = Network::start(NetworkConfig {

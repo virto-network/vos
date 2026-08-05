@@ -171,6 +171,7 @@ impl RootTreeTransportV2 {
                 message,
             } => {
                 publication.published.reply.is_none()
+                    && publication.receipt.consistency == ConsistencyModeV2::Local
                     && publication.published.proof.is_none()
                     && publication.published.attestation.is_none()
                     && message.from_service == publication.receipt.service
@@ -186,6 +187,7 @@ impl RootTreeTransportV2 {
                 publication,
             } => {
                 *caller_invocation != super::InvocationId::ZERO
+                    && publication.receipt.consistency == ConsistencyModeV2::Local
                     && publication.published.reply.is_some()
                     && publication.published.outbox.is_empty()
                     && publication.published.exported_blobs.is_empty()
@@ -490,6 +492,22 @@ where
             #[cfg(feature = "storage")]
             Self::Raft(service) => service
                 .accumulate_after_barrier(request)
+                .map_err(RootTreeDriverErrorV2::Raft),
+        }
+    }
+
+    fn accumulate_at_after_barrier(
+        &mut self,
+        request: &AccumulateRequestV2,
+        logical_timeslot: u64,
+    ) -> Result<AccumulatedServiceOutputV2, RootTreeDriverErrorV2> {
+        match self {
+            Self::Direct(service) => service
+                .accumulate_at(request, logical_timeslot)
+                .map_err(RootTreeDriverErrorV2::Direct),
+            #[cfg(feature = "storage")]
+            Self::Raft(service) => service
+                .accumulate_at_after_barrier(request, logical_timeslot)
                 .map_err(RootTreeDriverErrorV2::Raft),
         }
     }
@@ -1450,6 +1468,59 @@ where
         self.execute_prepared_after_barrier(prepared)
     }
 
+    /// Commit every durable call whose deadline is at or before the trusted
+    /// ambient slot. Expiration itself is guest-owned and slot-authenticated;
+    /// this host method only discovers due rows and drives physical IC-5.
+    pub(crate) fn expire_due_calls_after_barrier(
+        &mut self,
+        logical_timeslot: u64,
+    ) -> Result<Vec<super::AccumulatedTimeoutV2>, LocalRootTreeInvokeErrorV2> {
+        let due = LocalWorkSchedulerV2::prepare_due_call_expirations(
+            self.service.accumulate_host().local_store(),
+            logical_timeslot,
+        )
+        .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        let mut expired = Vec::with_capacity(due.len());
+        for expiration in due {
+            let accumulated = self
+                .service
+                .accumulate_at_after_barrier(
+                    &AccumulateRequestV2::ExpireCall(expiration),
+                    logical_timeslot,
+                )
+                .map_err(RootTreeDriverErrorV2::into_invoke)?;
+            match accumulated.result {
+                AccumulationResultV2::CallExpired { timeout, .. } => expired.push(timeout),
+                AccumulationResultV2::Rejected(rejection) => {
+                    return Err(LocalRootTreeInvokeErrorV2::Rejected(rejection));
+                }
+                _ => return Err(LocalRootTreeInvokeErrorV2::UnexpectedResult),
+            }
+        }
+        Ok(expired)
+    }
+
+    /// Resume the exact saved machine after a guest-committed timeout.
+    pub(crate) fn resume_timeout_after_barrier(
+        &mut self,
+        invocation: super::InvocationId,
+        logical_timeslot: u64,
+    ) -> Result<Option<CommittedRootTreeSliceV2>, LocalRootTreeInvokeErrorV2> {
+        let Some(prepared) = LocalWorkSchedulerV2::prepare_timeout_resume(
+            self.service.accumulate_host().local_store(),
+            invocation,
+            logical_timeslot,
+        )
+        .map_err(LocalRootTreeInvokeErrorV2::Schedule)?
+        else {
+            return Ok(None);
+        };
+        if prepared.work.proof_requested {
+            return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
+        }
+        self.execute_prepared_after_barrier(prepared).map(Some)
+    }
+
     /// Whether this exact reply already advanced the durable workflow. This
     /// lets a lost transport acknowledgement be replayed without restoring or
     /// executing the actor a second time.
@@ -1618,6 +1689,19 @@ where
         self.service
             .accumulate_host()
             .pending_inbox_calls()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)
+    }
+
+    /// Earliest durable call deadline, used only to avoid an unnecessary
+    /// consensus barrier on every transport poll. The guest still decides
+    /// expiration against the separately authenticated ambient slot.
+    pub(crate) fn next_pending_call_deadline(
+        &self,
+    ) -> Result<Option<u64>, LocalRootTreeInvokeErrorV2> {
+        self.service
+            .accumulate_host()
+            .pending_call_deadlines()
+            .map(|deadlines| deadlines.into_iter().map(|row| row.deadline_timeslot).min())
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)
     }
 
@@ -1793,6 +1877,21 @@ mod tests {
         assert_eq!(
             RootTreeTransportV2::decode(&delivery.encode()).unwrap(),
             delivery
+        );
+
+        let mut replicated = delivery.clone();
+        let RootTreeTransportV2::OutboxDelivery {
+            publication: replicated_publication,
+            ..
+        } = &mut replicated
+        else {
+            unreachable!()
+        };
+        replicated_publication.receipt.consistency = ConsistencyModeV2::Raft;
+        assert_eq!(
+            RootTreeTransportV2::decode(&replicated.encode()),
+            Err(DecodeError::NonCanonical),
+            "ordinary node transport is Local-only on the wire"
         );
 
         let mut mismatched = message;

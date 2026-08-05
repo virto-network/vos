@@ -181,6 +181,25 @@ struct FailableCommittedImages {
 #[derive(Debug, Clone, Default)]
 struct SharedCommittedImages(Arc<Mutex<Option<Vec<u8>>>>);
 
+#[derive(Debug, Default)]
+struct SharedFailingImageState {
+    image: Option<Vec<u8>>,
+    commit_attempts: u64,
+    fail_at: Option<u64>,
+    failures: u64,
+}
+
+/// Shareable backend used to fail one exact durable commit after ownership has
+/// moved into a node root thread.
+#[derive(Debug, Clone, Default)]
+struct SharedFailingCommittedImages(Arc<Mutex<SharedFailingImageState>>);
+
+impl SharedFailingCommittedImages {
+    fn fail_at(&self, commit_attempt: u64) {
+        self.0.lock().unwrap().fail_at = Some(commit_attempt);
+    }
+}
+
 impl CommittedImageStoreV2 for SharedCommittedImages {
     type Error = ();
 
@@ -195,6 +214,38 @@ impl CommittedImageStoreV2 for SharedCommittedImages {
 }
 
 impl ProofArtifactStoreV2 for SharedCommittedImages {
+    type Error = ();
+
+    fn load_proof(&self, _reference: &BlobRefV2) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(None)
+    }
+
+    fn commit_proof(&mut self, _reference: &BlobRefV2, _proof: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+impl CommittedImageStoreV2 for SharedFailingCommittedImages {
+    type Error = ();
+
+    fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self.0.lock().unwrap().image.clone())
+    }
+
+    fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+        let mut state = self.0.lock().unwrap();
+        state.commit_attempts += 1;
+        if state.fail_at == Some(state.commit_attempts) {
+            state.fail_at = None;
+            state.failures += 1;
+            return Err(());
+        }
+        state.image = Some(image.to_vec());
+        Ok(())
+    }
+}
+
+impl ProofArtifactStoreV2 for SharedFailingCommittedImages {
     type Error = ();
 
     fn load_proof(&self, _reference: &BlobRefV2) -> Result<Option<Vec<u8>>, Self::Error> {
@@ -1590,6 +1641,163 @@ fn node_routes_an_ordinary_cross_root_await_through_guest_accumulate() {
         destination
             .store()
             .pending_inbox_calls()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn node_retries_a_direct_reply_publication_ack_after_the_caller_is_gone() {
+    let actor_elf = greeter_elf();
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&actor_elf, &signer);
+    let actor = ActorId([0xD1; 32]);
+    let config = LocalRootTreeConfigV2 {
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        service: ServiceIdentityV2 {
+            space: vos::v2::SpaceId([0xD2; 32]),
+            root_service: RootServiceId([0xD3; 32]),
+            deployment: package.deployment_id(),
+            service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+            service_abi: vos::v2::ABI_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        },
+        package,
+        root_actor: actor,
+        actor_name,
+        consistency: ConsistencyModeV2::Local,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([0xD4; 32]),
+            authenticator: vec![0xD5],
+        },
+        refine_gas: 1_000_000_000,
+        accumulate_gas: 5_000_000_000,
+    };
+    let backend = SharedFailingCommittedImages::default();
+    let service = LocalRootTreeServiceV2::open(config.clone(), backend.clone())
+        .expect("direct-reply root installs");
+    let installed_commits = backend.0.lock().unwrap().commit_attempts;
+    // Admission and Apply are the next two commits; fail the publication Ack
+    // after the reply has already reached and removed the direct caller.
+    backend.fail_at(installed_commits + 3);
+
+    let route = ServiceId::new(0, 0x3700);
+    let mut node = VosNode::new();
+    node.register_v2_root_at_id("direct-ack-retry-v2", service, route, false)
+        .unwrap();
+    use vos::ActorReference;
+    let mut invoker = &node;
+    let mut handle = host_greeter_surface::GreeterRef::bind(actor, &mut invoker);
+    vos::block_on(handle.start()).unwrap();
+
+    // The caller channel is already consumed. A periodic retry must classify
+    // its durable acceptance and retry only the failed acknowledgement.
+    node.run_until_idle(Duration::from_secs(2));
+    assert!(node.collect().iter().all(AgentResult::is_ok));
+    let state = backend.0.lock().unwrap();
+    assert_eq!(
+        state.failures, 1,
+        "commit attempts {}, pending failure {:?}",
+        state.commit_attempts, state.fail_at
+    );
+    drop(state);
+    let reopened = LocalRootTreeServiceV2::open(config, backend)
+        .expect("the acknowledgement retry is durably recoverable");
+    assert!(reopened.pending_publications().unwrap().is_empty());
+}
+
+#[test]
+fn node_expires_and_resumes_an_unreachable_durable_call() {
+    let actor_elf = probe_elf();
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&actor_elf, &signer);
+    let deployment = package.deployment_id();
+    let producer = package.deployment_signature.producer;
+    let program = package.manifest.actor_program;
+    let source_actor = ActorId([0xC1; 32]);
+    let destination_actor = ActorId([44; 32]);
+    let source_identity = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([0xC2; 32]),
+        root_service: RootServiceId([0xC3; 32]),
+        deployment,
+        service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+    };
+    let destination_identity = ServiceIdentityV2 {
+        root_service: RootServiceId([0xC4; 32]),
+        ..source_identity.clone()
+    };
+    let config = LocalRootTreeConfigV2 {
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package,
+        service: source_identity,
+        root_actor: source_actor,
+        actor_name,
+        consistency: ConsistencyModeV2::Local,
+        initial_state: vec![],
+        external_actors: vec![external_binding(
+            "peer",
+            destination_identity,
+            destination_actor,
+            producer,
+            program,
+        )],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([0xC5; 32]),
+            authenticator: vec![0xC6],
+        },
+        refine_gas: 1_000_000_000,
+        accumulate_gas: 5_000_000_000,
+    };
+    let backend = SharedCommittedImages::default();
+    let service = LocalRootTreeServiceV2::open(config.clone(), backend.clone())
+        .expect("timeout source root installs");
+    let route = ServiceId::new(0, 0x3600);
+    let deadline = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 1_000;
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(
+        &Msg::new("await_peer_until")
+            .with("deadline", deadline)
+            .encode(),
+    );
+    let invocation = RootTreeInvocationV2 {
+        invocation: InvocationId([0xC7; 32]),
+        target: source_actor,
+        method: "await_peer_until".into(),
+        arguments,
+        proof_requested: false,
+    };
+
+    let mut node = VosNode::new();
+    node.register_v2_root_at_id("timeout-source-v2", service, route, false)
+        .unwrap();
+    let invoker = node.invoke_handle();
+    let request = std::thread::spawn(move || {
+        invoker.invoke_with_timeout(route, invocation.encode(), Duration::from_secs(20))
+    });
+    node.run_until_idle(Duration::from_secs(4));
+    let results = node.collect();
+    let reply = request
+        .join()
+        .unwrap()
+        .expect("the node resumes the exact handler with CallError::Timeout");
+    assert_eq!(reply, Value::U32(1).encode());
+    assert!(results.iter().all(AgentResult::is_ok));
+
+    let reopened = LocalRootTreeServiceV2::open(config, backend)
+        .expect("timed-out source reopens from its durable image");
+    assert!(reopened.pending_publications().unwrap().is_empty());
+    assert!(
+        reopened
+            .store()
+            .pending_call_deadlines()
             .unwrap()
             .is_empty()
     );

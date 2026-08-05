@@ -72,6 +72,10 @@ pub enum V2NodeRegistrationError {
 struct V2ActorRoute {
     route: u32,
     service: crate::v2::ServiceIdentityV2,
+    consistency: crate::v2::ConsistencyModeV2,
+    /// Full Noise-authenticated libp2p PeerId bytes for remote routes.
+    /// Local routes never cross the network bridge and therefore use `None`.
+    authenticated_peer: Option<Vec<u8>>,
 }
 
 impl std::fmt::Display for V2NodeRegistrationError {
@@ -2686,10 +2690,29 @@ impl VosNode {
         let outbox_tx = self.outbox_tx.clone();
         let activity = self.last_activity.clone();
         let shutdown = self.shutdown.clone();
+        let v2_actor_routes = self.v2_actor_routes.clone();
         thread::spawn(move || {
             for tell in inbox_rx {
                 if shutdown.load(Ordering::Relaxed) {
                     break;
+                }
+                if tell.payload.starts_with(b"VRT2") {
+                    let peer = tell.peer.to_bytes();
+                    let authenticated = v2_actor_routes.read().ok().is_some_and(|routes| {
+                        routes.values().any(|route| {
+                            route.route == tell.from
+                                && route.consistency == crate::v2::ConsistencyModeV2::Local
+                                && route.authenticated_peer.as_deref() == Some(peer.as_slice())
+                        })
+                    });
+                    if !authenticated {
+                        warn!(
+                            peer = %tell.peer,
+                            from = tell.from,
+                            "node: rejected v2 root transport from an unbound authenticated peer"
+                        );
+                        continue;
+                    }
                 }
                 *activity.lock().unwrap() = Instant::now();
                 let env = Envelope {
@@ -2814,6 +2837,8 @@ impl VosNode {
                 V2ActorRoute {
                     route: id.0,
                     service: service_identity,
+                    consistency: service.consistency(),
+                    authenticated_peer: None,
                 },
             );
         }
@@ -2863,12 +2888,27 @@ impl VosNode {
         &self,
         actor: crate::v2::ActorId,
         service: crate::v2::ServiceIdentityV2,
+        consistency: crate::v2::ConsistencyModeV2,
         route: ServiceId,
+        authenticated_peer: Vec<u8>,
     ) -> Result<(), V2NodeRegistrationError> {
+        if authenticated_peer.is_empty() {
+            return Err(V2NodeRegistrationError::CorruptServiceStore);
+        }
+        #[cfg(feature = "network")]
+        {
+            let peer = libp2p::PeerId::from_bytes(&authenticated_peer)
+                .map_err(|_| V2NodeRegistrationError::CorruptServiceStore)?;
+            if route.node_prefix() != crate::network::derive_node_prefix(&peer) {
+                return Err(V2NodeRegistrationError::CorruptServiceStore);
+            }
+        }
         let mut routes = self.v2_actor_routes.write().unwrap();
         let candidate = V2ActorRoute {
             route: route.0,
             service,
+            consistency,
+            authenticated_peer: Some(authenticated_peer),
         };
         match routes.get(&actor) {
             Some(existing) if existing == &candidate => Ok(()),
@@ -3710,6 +3750,26 @@ impl VosNode {
         {
             let net = self.shared_network.lock().ok().and_then(|g| g.clone());
             if let Some(net) = net {
+                if envelope.payload.starts_with(b"VRT2") {
+                    let binding = self.v2_actor_routes.read().ok().and_then(|routes| {
+                        routes
+                            .values()
+                            .find(|route| {
+                                route.route == target.0
+                                    && route.consistency == crate::v2::ConsistencyModeV2::Local
+                            })
+                            .cloned()
+                    });
+                    let Some(peer) = binding
+                        .and_then(|binding| binding.authenticated_peer)
+                        .and_then(|bytes| libp2p::PeerId::from_bytes(&bytes).ok())
+                    else {
+                        warn!(%target, "node: no authenticated PeerId bound to remote v2 root");
+                        return;
+                    };
+                    net.send_tell(peer, envelope.from.0, envelope.to.0, envelope.payload);
+                    return;
+                }
                 let prefix = target.node_prefix();
                 if let Some(peer) = net.peer_for_prefix(prefix) {
                     net.send_tell(peer, envelope.from.0, envelope.to.0, envelope.payload);
@@ -4122,9 +4182,11 @@ fn handle_v2_root_transport<B>(
                 || message.authorization != crate::v2::AuthorizationEvidenceV2::Public
                 || source.as_ref().is_none_or(|source| {
                     source.route != envelope.from.0
+                        || source.consistency != crate::v2::ConsistencyModeV2::Local
                         || source.service != publication.receipt.service
                         || source.service != message.from_service
                 })
+                || publication.receipt.consistency != crate::v2::ConsistencyModeV2::Local
             {
                 warn!(%id, from = %envelope.from, call = ?message.call_id, "rejected unauthenticated or unsupported v2 delivery");
                 return;
@@ -4180,8 +4242,11 @@ fn handle_v2_root_transport<B>(
             };
             let producer = v2_actor_route(actor_routes, reply.producer);
             if producer.as_ref().is_none_or(|producer| {
-                producer.route != envelope.from.0 || producer.service != publication.receipt.service
-            }) {
+                producer.route != envelope.from.0
+                    || producer.consistency != crate::v2::ConsistencyModeV2::Local
+                    || producer.service != publication.receipt.service
+            }) || publication.receipt.consistency != crate::v2::ConsistencyModeV2::Local
+            {
                 warn!(%id, from = %envelope.from, call = ?reply.call_id, "rejected misrouted v2 reply");
                 return;
             }
@@ -4306,22 +4371,30 @@ fn queue_v2_root_publication<B>(
         warn!(%id, "ignored a publication owned by another v2 root");
         return;
     }
-    for message in &publication.published.outbox {
-        let Some(route) = v2_actor_route(actor_routes, message.to) else {
-            continue;
-        };
-        if route.service != message.to_service {
-            continue;
+    let local_transport = service.consistency() == crate::v2::ConsistencyModeV2::Local
+        && publication.receipt.consistency == crate::v2::ConsistencyModeV2::Local;
+    if local_transport {
+        for message in &publication.published.outbox {
+            let Some(route) = v2_actor_route(actor_routes, message.to) else {
+                continue;
+            };
+            if route.service != message.to_service
+                || route.consistency != crate::v2::ConsistencyModeV2::Local
+            {
+                continue;
+            }
+            let transport = crate::v2::RootTreeTransportV2::OutboxDelivery {
+                publication: publication.clone(),
+                message: message.clone(),
+            };
+            let _ = outbox.send(Envelope {
+                from: id,
+                to: ServiceId(route.route),
+                payload: transport.encode(),
+            });
         }
-        let transport = crate::v2::RootTreeTransportV2::OutboxDelivery {
-            publication: publication.clone(),
-            message: message.clone(),
-        };
-        let _ = outbox.send(Envelope {
-            from: id,
-            to: ServiceId(route.route),
-            payload: transport.encode(),
-        });
+    } else if !publication.published.outbox.is_empty() {
+        warn!(%id, "retained a non-Local outbox publication outside ordinary root transport");
     }
 
     // A direct caller channel is process-local. Do not expose its reply while
@@ -4344,6 +4417,18 @@ fn queue_v2_root_publication<B>(
         maybe_ack_v2_root_publication(id, service, publication, state);
         return;
     };
+    if state
+        .publication_progress
+        .get(&commitment)
+        .is_some_and(|progress| progress.reply_accepted)
+    {
+        // A direct caller may have accepted the reply just before a durable
+        // publication acknowledgement failed. The caller channel is already
+        // gone, so retries must drive the acknowledgement from durable
+        // publication state rather than trying to deliver the reply again.
+        maybe_ack_v2_root_publication(id, service, publication, state);
+        return;
+    }
     let mut accepted = false;
     if let Some(callers) = state.pending_callers.remove(&publication.input.invocation) {
         for caller in callers {
@@ -4356,8 +4441,10 @@ fn queue_v2_root_publication<B>(
     } else {
         match service.publication_return_target(publication) {
             Ok(Some((actor, caller_service, caller_invocation))) => {
-                if let Some(route) = v2_actor_route(actor_routes, actor) {
-                    if route.service != caller_service {
+                if local_transport && let Some(route) = v2_actor_route(actor_routes, actor) {
+                    if route.service != caller_service
+                        || route.consistency != crate::v2::ConsistencyModeV2::Local
+                    {
                         return;
                     }
                     let transport = crate::v2::RootTreeTransportV2::Reply {
@@ -4443,9 +4530,11 @@ fn acknowledge_v2_root_publication<B>(
         .iter()
         .find(|message| message.call_id == call)
     {
-        if v2_actor_route(actor_routes, message.to)
-            .is_some_and(|route| route.route == from.0 && route.service == message.to_service)
-        {
+        if v2_actor_route(actor_routes, message.to).is_some_and(|route| {
+            route.route == from.0
+                && route.consistency == crate::v2::ConsistencyModeV2::Local
+                && route.service == message.to_service
+        }) {
             progress.accepted_calls.insert(call);
         } else {
             return;
@@ -4463,7 +4552,9 @@ fn acknowledge_v2_root_publication<B>(
             .and_then(|(actor, service, _)| {
                 v2_actor_route(actor_routes, actor).filter(|route| route.service == service)
             });
-        if expected.is_none_or(|route| route.route != from.0) {
+        if expected.is_none_or(|route| {
+            route.route != from.0 || route.consistency != crate::v2::ConsistencyModeV2::Local
+        }) {
             return;
         }
         progress.reply_accepted = true;
@@ -4536,6 +4627,48 @@ fn retry_v2_root_transport<B>(
     match service.catch_up() {
         Ok(true) => {}
         Ok(false) | Err(_) => return,
+    }
+    let should_expire = service
+        .next_pending_call_deadline()
+        .ok()
+        .flatten()
+        .is_some_and(|deadline| {
+            logical_timeslot.load(Ordering::Relaxed) >= deadline || v2_wall_timeslot() >= deadline
+        });
+    if should_expire {
+        let expiration_slot = match prepare_v2_root_slot(service, logical_timeslot) {
+            Ok(slot) => slot,
+            Err(failure) => {
+                warn!(%id, ?failure, "could not allocate trusted v2 expiration slot");
+                return;
+            }
+        };
+        let expired = match service.expire_due_calls_after_barrier(expiration_slot) {
+            Ok(expired) => expired,
+            Err(failure) => {
+                warn!(%id, ?failure, "v2 durable call expiration failed");
+                return;
+            }
+        };
+        for timeout in expired {
+            let invocation = timeout.expiration.timeout.caller_invocation;
+            let resume_slot = match prepare_v2_root_slot(service, logical_timeslot) {
+                Ok(slot) => slot,
+                Err(failure) => {
+                    warn!(%id, ?failure, ?invocation, "could not allocate v2 timeout-resume slot");
+                    continue;
+                }
+            };
+            match service.resume_timeout_after_barrier(invocation, resume_slot) {
+                Ok(Some(committed)) => {
+                    publish_v2_root_slice(id, service, committed, None, outbox, actor_routes, state)
+                }
+                Ok(None) => {}
+                Err(failure) => {
+                    warn!(%id, ?failure, ?invocation, "v2 timed-out workflow resume failed")
+                }
+            }
+        }
     }
     if let Ok(publications) = service.pending_publications() {
         for publication in publications {
