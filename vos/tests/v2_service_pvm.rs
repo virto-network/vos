@@ -1476,13 +1476,17 @@ fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
         accumulate_gas: 5_000_000_000,
     };
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
-    arguments.extend_from_slice(&Msg::new("increment").with("amount", 2u64).encode());
+    arguments.extend_from_slice(
+        &Msg::new("increment_around_yield")
+            .with("amount", 2u64)
+            .encode(),
+    );
     let request = LocalWorkRequestV2 {
         invocation: InvocationId([102; 32]),
         workflow_step: 0,
         logical_timeslot: 1,
         target: actor,
-        method: "increment".into(),
+        method: "increment_around_yield".into(),
         arguments,
         origin: Origin::Anonymous,
         authorization: AuthorizationEvidenceV2::Public,
@@ -1511,16 +1515,63 @@ fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
     let mut replica =
         LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
             .expect("independent CRDT replica installs the same root tree");
+    let mut prior_arguments = vec![vos::value::TAG_DYNAMIC];
+    prior_arguments.extend_from_slice(&Msg::new("increment").with("amount", 5u64).encode());
+    replica
+        .invoke(LocalWorkRequestV2 {
+            invocation: InvocationId([103; 32]),
+            workflow_step: 0,
+            logical_timeslot: 1,
+            target: actor,
+            method: "increment".into(),
+            arguments: prior_arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        })
+        .expect("the replica establishes a different causal actor state");
     let mut replica_request = request.clone();
     replica_request.logical_timeslot = 2;
     let replica_committed = replica
         .invoke(replica_request.clone())
         .expect("the exact logical invocation executes on an independent causal branch");
     assert!(!replica_committed.duplicate);
+    assert_ne!(
+        committed.published.exported_blobs, replica_committed.published.exported_blobs,
+        "each yielded retry captures its exact branch-local physical work frame"
+    );
     let replica_sync = replica
         .crdt_sync_envelope()
         .expect("replica causal frontier is readable")
         .expect("independently committed CRDT work exports a sync envelope");
+    let source_execution = source_sync
+        .nodes
+        .iter()
+        .find(|node| {
+            node.change.workflow.iter().any(|operation| {
+                matches!(operation, WorkflowOperationV2::Checkpoint(work) if work.invocation == request.invocation)
+            })
+        })
+        .expect("source exports the yielded invocation node");
+    let replica_execution = replica_sync
+        .nodes
+        .iter()
+        .find(|node| {
+            node.change.workflow.iter().any(|operation| {
+                matches!(operation, WorkflowOperationV2::Checkpoint(work) if work.invocation == request.invocation)
+            })
+        })
+        .expect("replica exports the yielded invocation node");
+    assert_ne!(
+        source_execution.change.materializations, replica_execution.change.materializations,
+        "the retry really executed over different causal actor state"
+    );
     assert!(
         source_sync.nodes.iter().all(|left| replica_sync
             .nodes
@@ -1596,6 +1647,10 @@ fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
     assert!(source_recovery.duplicate);
     assert!(replica_recovery.duplicate);
     assert_eq!(source_recovery.receipt, replica_recovery.receipt);
+    assert_eq!(
+        source_recovery.published, replica_recovery.published,
+        "both roots recover the canonical continuation export, not their branch-local snapshot"
+    );
     assert_eq!(source_recovery.refine_gas_used, 0);
     assert_eq!(source_recovery.accumulate_gas_used, 0);
     assert_eq!(replica_recovery.refine_gas_used, 0);

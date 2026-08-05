@@ -1673,7 +1673,10 @@ fn crdt_retry_execution_matches(left: &CrdtChangeV2, right: &CrdtChangeV2) -> bo
                     && left.ordinal == right.ordinal
                     && left.payload == right.payload
             })
-        && left.materializations == right.materializations
+        // Materializations are branch-local snapshots of the causal state
+        // each replica observed. The stable operation payloads above are the
+        // idempotent logical effect; requiring the resulting blob references
+        // to match would reject a valid retry executed over another frontier.
         && left.workflow.len() == right.workflow.len()
         && left
             .workflow
@@ -1682,6 +1685,14 @@ fn crdt_retry_execution_matches(left: &CrdtChangeV2, right: &CrdtChangeV2) -> bo
             .all(|(left, right)| match (left, right) {
                 (WorkflowOperationV2::Checkpoint(left), WorkflowOperationV2::Checkpoint(right)) => {
                     left.matches_crdt_retry(right)
+                }
+                (
+                    WorkflowOperationV2::Continuation(left),
+                    WorkflowOperationV2::Continuation(right),
+                ) => {
+                    left.actor == right.actor
+                        && left.expected.is_some() == right.expected.is_some()
+                        && left.replacement.is_some() == right.replacement.is_some()
                 }
                 _ => left == right,
             })
@@ -1978,10 +1989,12 @@ fn apply_dedup_materialization<S: StateTreeStore>(
             let existing = PublicationRecordV2::decode(&existing)
                 .map_err(|_| GuestAccumulateError::CorruptStore)?;
             let expected_published = crdt_published_effects(&change)?;
-            if existing.input != checkpoint.input || existing.published != expected_published {
+            if existing.input != checkpoint.input
+                || !crdt_publication_matches_receipt(store, service, &existing)?
+            {
                 return Err(GuestAccumulateError::CorruptStore);
             }
-            if existing.receipt != receipt {
+            if existing.receipt != receipt || existing.published != expected_published {
                 write(
                     store,
                     &publication_key,
@@ -2000,12 +2013,33 @@ fn apply_dedup_materialization<S: StateTreeStore>(
     Ok(())
 }
 
+fn crdt_publication_matches_receipt<S: StateTreeStore>(
+    store: &S,
+    service: &super::ServiceIdentityV2,
+    publication: &PublicationRecordV2,
+) -> GuestResult<bool, S::Error> {
+    for cid in &publication.receipt.resulting_crdt_heads {
+        let Some(bytes) = read(store, &crdt_node_storage_key(*cid))? else {
+            continue;
+        };
+        let Ok(change) = CrdtChangeV2::decode(&bytes) else {
+            return Err(GuestAccumulateError::CorruptStore);
+        };
+        if change.cid() == *cid
+            && crdt_receipt_matches_change(service, &change, &publication.receipt)
+            && crdt_published_effects(&change)? == publication.published
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn crdt_published_effects<E>(
     change: &CrdtChangeV2,
 ) -> Result<PublishedEffectsV2, GuestAccumulateError<E>> {
     let mut reply = None;
     let mut outbox = Vec::new();
-    let mut exported_blobs = Vec::new();
     for operation in &change.workflow {
         match operation {
             WorkflowOperationV2::Reply(candidate) if reply.is_none() => {
@@ -2013,21 +2047,14 @@ fn crdt_published_effects<E>(
             }
             WorkflowOperationV2::Reply(_) => return Err(GuestAccumulateError::CorruptStore),
             WorkflowOperationV2::Outbox(message) => outbox.push(message.clone()),
-            WorkflowOperationV2::Continuation(continuation) => {
-                if let Some(replacement) = continuation.replacement.as_ref() {
-                    exported_blobs.push(replacement.clone());
-                }
-            }
             _ => {}
         }
     }
     outbox.sort_by_key(|message| message.call_id);
-    exported_blobs.sort_by_key(|reference| reference.hash);
-    exported_blobs.dedup();
     Ok(PublishedEffectsV2 {
         reply,
         outbox,
-        exported_blobs,
+        exported_blobs: change.exported_blobs.clone(),
         proof: None,
         attestation: None,
     })
@@ -2985,6 +3012,7 @@ fn validate_crdt<S: GuestAccumulateStoreV2>(
         || change.work_hash != work.hash()
         || change.causal_dependencies.as_slice() != heads.as_slice()
         || change.workflow != transition.workflow_operations(work)
+        || change.exported_blobs != transition.exported_blobs
         || change.operations.iter().any(|operation| {
             work.imported_actors
                 .binary_search_by_key(&operation.actor, |actor| actor.actor)
@@ -4694,6 +4722,7 @@ mod tests {
                     operations: Vec::new(),
                     workflow: vec![WorkflowOperationV2::Ingress(operation)],
                     materializations: Vec::new(),
+                    exported_blobs: Vec::new(),
                 };
                 let cid = change.cid();
                 ingress.crdt_change = Some(change);
@@ -5213,6 +5242,7 @@ mod tests {
             operations: vec![],
             workflow: vec![WorkflowOperationV2::Ingress(operation)],
             materializations: vec![],
+            exported_blobs: vec![],
         };
         let cid = change.cid();
         ingress.crdt_change = Some(change.clone());
@@ -5320,6 +5350,7 @@ mod tests {
                 operations: vec![],
                 workflow: vec![WorkflowOperationV2::Ingress(operation)],
                 materializations: vec![],
+                exported_blobs: vec![],
             };
             ingress.crdt_change = Some(change);
             ingress
@@ -5407,6 +5438,7 @@ mod tests {
             operations: vec![],
             workflow: vec![WorkflowOperationV2::Ingress(divergent_operation)],
             materializations: vec![],
+            exported_blobs: vec![],
         });
         let (divergent_change, divergent_receipt) = admit(&mut divergent_source, divergent_ingress);
         let mut conflict_nodes = vec![
@@ -6857,6 +6889,7 @@ mod tests {
         transition.outbox.push(message);
         transition.exported_blobs.push(continuation.clone());
         transition.crdt_change.as_mut().unwrap().workflow = transition.workflow_operations(&work);
+        transition.crdt_change.as_mut().unwrap().exported_blobs = transition.exported_blobs.clone();
         let checkpoint_change = transition.crdt_change.clone().unwrap();
         let mut checkpoint_blobs = vec![
             ImportedBlobV2 {
@@ -6902,6 +6935,7 @@ mod tests {
             operations: vec![],
             workflow: vec![WorkflowOperationV2::ExpireCall(timeout.clone())],
             materializations: vec![],
+            exported_blobs: vec![],
         };
         let expiration = CallExpirationEnvelopeV2 {
             service: work.service.clone(),
@@ -7493,6 +7527,7 @@ mod tests {
                     actor: actor(),
                     state: materialization,
                 }],
+                exported_blobs: Vec::new(),
             }),
             spawns: Vec::new(),
             continuations: Vec::new(),
@@ -7506,6 +7541,87 @@ mod tests {
         let workflow = transition.workflow_operations(&work);
         transition.crdt_change.as_mut().unwrap().workflow = workflow;
         transition
+    }
+
+    #[test]
+    fn crdt_retry_equivalence_ignores_branch_local_state_and_checkpoint_bytes() {
+        let left_work = crdt_work(BlobRefV2::of_bytes(b"left base"), 18, vec![]);
+        let mut right_work = left_work.clone();
+        right_work.logical_timeslot = 2;
+        right_work.base = ConsistencyBaseV2::Crdt {
+            heads: vec![Hash([19; 32])],
+        };
+        right_work.base_causal_height = Some(1);
+        right_work.imported_actors[0].state = BlobRefV2::of_bytes(b"right base");
+        right_work.imported_actors[0].causal_states = vec![BlobRefV2::of_bytes(b"concurrent")];
+
+        let left_snapshot = BlobRefV2::of_bytes(b"left physical work frame");
+        let right_snapshot = BlobRefV2::of_bytes(b"right physical work frame");
+        let mut left = crdt_transition(&left_work, BlobRefV2::of_bytes(b"left result"), 1);
+        let mut right = crdt_transition(&right_work, BlobRefV2::of_bytes(b"right result"), 2);
+        for (transition, snapshot) in [
+            (&mut left, left_snapshot.clone()),
+            (&mut right, right_snapshot.clone()),
+        ] {
+            transition.continuations.push(ContinuationChangeV2 {
+                actor: actor(),
+                expected: None,
+                replacement: Some(snapshot.clone()),
+            });
+            transition.exported_blobs.push(snapshot);
+        }
+        left.crdt_change.as_mut().unwrap().workflow = left.workflow_operations(&left_work);
+        left.crdt_change.as_mut().unwrap().exported_blobs = left.exported_blobs.clone();
+        right.crdt_change.as_mut().unwrap().workflow = right.workflow_operations(&right_work);
+        right.crdt_change.as_mut().unwrap().exported_blobs = right.exported_blobs.clone();
+
+        let left_change = left.crdt_change.as_ref().unwrap();
+        let right_change = right.crdt_change.as_ref().unwrap();
+        assert_ne!(left_change.materializations, right_change.materializations);
+        assert_ne!(left_change.exported_blobs, right_change.exported_blobs);
+        assert!(crdt_retry_execution_matches(left_change, right_change));
+
+        let mut divergent = right_change.clone();
+        divergent.operations[0].payload.push(99);
+        assert!(!crdt_retry_execution_matches(left_change, &divergent));
+    }
+
+    #[test]
+    fn crdt_apply_rejects_an_export_not_committed_by_the_causal_node() {
+        let mut store = MemStore::default();
+        let (initial, _) = install_fixture(&mut store, ConsistencyModeV2::Crdt, b"before");
+        let work = crdt_work(initial, 20, vec![]);
+        seed_direct_ingress(&mut store, &work);
+        let state_bytes = b"after".to_vec();
+        let state = BlobRefV2::of_bytes(&state_bytes);
+        let mut transition = crdt_transition(&work, state.clone(), 1);
+        let extra_bytes = b"host supplied extra export".to_vec();
+        let extra = BlobRefV2::of_bytes(&extra_bytes);
+        transition.exported_blobs.push(extra.clone());
+        let before = store.clone();
+
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work,
+                    transition,
+                    provided_blobs: vec![
+                        ImportedBlobV2 {
+                            reference: extra,
+                            bytes: extra_bytes,
+                        },
+                        ImportedBlobV2 {
+                            reference: state,
+                            bytes: state_bytes,
+                        },
+                    ],
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::NonCanonical)
+        );
+        assert_eq!(store, before);
     }
 
     #[test]
@@ -7581,8 +7697,10 @@ mod tests {
             expected: None,
             replacement: Some(first_continuation.clone()),
         });
+        first.exported_blobs.push(first_continuation.clone());
         let first_workflow = first.workflow_operations(&first_work);
         first.crdt_change.as_mut().unwrap().workflow = first_workflow;
+        first.crdt_change.as_mut().unwrap().exported_blobs = first.exported_blobs.clone();
         let first_change = first.crdt_change.unwrap();
         let first_cid = first_change.cid();
 
@@ -7600,8 +7718,10 @@ mod tests {
             expected: Some(first_continuation.hash),
             replacement: Some(replacement.clone()),
         });
+        resumed.exported_blobs.push(replacement.clone());
         let resumed_workflow = resumed.workflow_operations(&resumed_work);
         resumed.crdt_change.as_mut().unwrap().workflow = resumed_workflow;
+        resumed.crdt_change.as_mut().unwrap().exported_blobs = resumed.exported_blobs.clone();
         let resumed_change = resumed.crdt_change.unwrap();
         let resumed_cid = resumed_change.cid();
         let nodes = BTreeMap::from([
@@ -7923,11 +8043,15 @@ mod tests {
         let work = crdt_work(initial, 83, vec![]);
         let mut nodes = [b"left".as_slice(), b"right".as_slice()]
             .into_iter()
-            .map(|bytes| {
+            .enumerate()
+            .map(|(index, bytes)| {
                 let state = BlobRefV2::of_bytes(bytes);
-                let change = crdt_transition(&work, state.clone(), 1)
+                let mut change = crdt_transition(&work, state.clone(), 1)
                     .crdt_change
                     .unwrap();
+                if index == 1 {
+                    change.operations[0].payload.push(2);
+                }
                 let cid = change.cid();
                 let receipt = AccumulationReceiptV2 {
                     service: identity(),

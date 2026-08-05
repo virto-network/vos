@@ -982,6 +982,11 @@ pub struct CrdtChangeV2 {
     pub operations: Vec<CrdtOperationV2>,
     pub workflow: Vec<WorkflowOperationV2>,
     pub materializations: Vec<CrdtMaterializationV2>,
+    /// Every blob made externally visible by this slice. In the current ABI
+    /// these are exactly the replacement continuation snapshots. Keeping the
+    /// set in the causal node makes the receipt authenticate the same effects
+    /// both at the original commit and after DAG rematerialization.
+    pub exported_blobs: Vec<BlobRefV2>,
 }
 
 impl CrdtChangeV2 {
@@ -2480,6 +2485,7 @@ impl V2Wire for CrdtChangeV2 {
             e.fixed(&materialization.actor.0);
             encode_blob_ref(e, &materialization.state);
         });
+        e.list(&self.exported_blobs, encode_blob_ref);
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -2496,6 +2502,7 @@ impl V2Wire for CrdtChangeV2 {
                     state: decode_blob_ref(d)?,
                 })
             })?,
+            exported_blobs: d.list(decode_blob_ref)?,
         };
         ensure_sorted_unique(&value.causal_dependencies, |hash| hash.0)?;
         ensure_sorted_unique(&value.operations, |operation| {
@@ -2508,6 +2515,17 @@ impl V2Wire for CrdtChangeV2 {
         ensure_sorted_unique(&value.materializations, |materialization| {
             materialization.actor.0
         })?;
+        ensure_sorted_unique(&value.exported_blobs, |reference| reference.hash.0)?;
+        let mut checkpoint_exports = value
+            .workflow
+            .iter()
+            .filter_map(|operation| match operation {
+                WorkflowOperationV2::Continuation(change) => change.replacement.clone(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        checkpoint_exports.sort_by_key(|reference| reference.hash);
+        checkpoint_exports.dedup();
         let operation_scope = value.workflow.iter().find_map(|operation| match operation {
             WorkflowOperationV2::Checkpoint(work) => Self::derive_operation_scope(work),
             _ => None,
@@ -2525,6 +2543,7 @@ impl V2Wire for CrdtChangeV2 {
                             )
                     })
             })
+            || value.exported_blobs != checkpoint_exports
             || value.workflow.windows(2).any(|pair| {
                 workflow_operation_bytes(&pair[0]) >= workflow_operation_bytes(&pair[1])
             })
@@ -3771,7 +3790,8 @@ fn validate_accumulation_envelope(value: &AccumulationEnvelopeV2) -> Result<(), 
                     .base_causal_height
                     .and_then(|height| height.checked_add(1))
                     == Some(change.causal_height)
-                && change.workflow == value.transition.workflow_operations(&value.work) =>
+                && change.workflow == value.transition.workflow_operations(&value.work)
+                && change.exported_blobs == value.transition.exported_blobs =>
         {
             Ok(())
         }
@@ -3829,6 +3849,7 @@ pub(crate) fn crdt_change_blob_references(change: &CrdtChangeV2) -> Vec<&BlobRef
         .iter()
         .map(|materialization| &materialization.state)
         .collect::<Vec<_>>();
+    references.extend(change.exported_blobs.iter());
     for operation in &change.workflow {
         match operation {
             WorkflowOperationV2::Checkpoint(work) => {
@@ -6066,6 +6087,7 @@ mod tests {
                     actor: work.target,
                     state: BlobRefV2::of_bytes(b"materialized-state"),
                 }],
+                exported_blobs: vec![],
             }),
             spawns: vec![],
             continuations: vec![],
@@ -6204,6 +6226,7 @@ mod tests {
             operations,
             workflow: vec![WorkflowOperationV2::Checkpoint(work.clone())],
             materializations: vec![],
+            exported_blobs: vec![],
         };
         assert_eq!(CrdtChangeV2::decode(&value.encode()).unwrap(), value);
 
