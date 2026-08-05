@@ -5652,10 +5652,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
         call_id: inbound_call,
         caller_invocation,
         await_ordinal: 0,
-        from_service: ServiceIdentityV2 {
-            root_service: RootServiceId([59; 32]),
-            ..identity.clone()
-        },
+        from_service: identity.clone(),
         from: caller,
         to_service: identity.clone(),
         to: target,

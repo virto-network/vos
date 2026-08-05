@@ -6,8 +6,8 @@
 > executes both phases through that PVM and commits only an accepted guest
 > result; it has no native transition-apply shortcut. `VosNode` can attach an
 > explicitly opened Local v2 root and route ordinary public calls, durable
-> cross-root outbox delivery, inbox execution, exact reply resume, and restart
-> retries through it. Signed v2 catalog rows use this root service when the
+> cross-root outbox delivery, inbox execution, exact reply/timeout resume, and
+> restart retries through it. Signed v2 catalog rows use this root service when the
 > daemon is started with the exact service PVM. Role-authorized, attested,
 > Raft, and CRDT network transport remain fail-closed. Legacy node behavior is
 > not evidence of v2 conformance.
@@ -665,11 +665,15 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 23 and continuation snapshot version 5 are therefore a clean
+Store schema 24, continuation snapshot version 6, and platform ABI version 3
+are therefore a clean
 break from earlier experimental v2 images. They add exact actor-package
 identity to descriptors, work, checkpoints, transitions, upgrades, and
-cross-root proof bindings, the complete dormant actor-program layout to each
-continuation, and guest-owned atomic same-package child creation.
+cross-root proof bindings, bind durable messages and retained causal context to
+their exact source/destination services, retain the complete dormant
+actor-program layout in each continuation, and support guest-owned atomic
+same-package child creation. Actor and service guests must be rebuilt together;
+an ABI-2 artifact is rejected rather than interpreted as this wire.
 ## CRDT boundary
 
 Only `#[actor(crdt)]` packages may select CRDT consistency. Their replicated
