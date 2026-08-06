@@ -3507,6 +3507,14 @@ fn authorization_rejection<S: GuestAccumulateStoreV2>(
             if !structurally_authorized {
                 false
             } else if let (Some(_), Some(authority)) = (policy.space_role, authority) {
+                // A finalized space-authority assertion proves only the
+                // space role named by its claim. It cannot authenticate an
+                // actor-local role carried beside that claim. Mixed policies
+                // therefore remain fail-closed until the actor role has an
+                // independent verification input.
+                if credential.actor_role.is_some() {
+                    return Ok(Some(AccumulationRejectionV2::Unauthorized));
+                }
                 if let Some(rejection) = validate_pinned_role_assertion(
                     store,
                     authority,
@@ -6533,6 +6541,72 @@ mod tests {
             execute_guest_accumulate(&mut store, &malformed).unwrap(),
             rejected(AccumulationRejectionV2::Unauthorized),
             "a malformed resumed credential is a deterministic denial, not a host error"
+        );
+        assert_eq!(store, before);
+    }
+
+    #[test]
+    fn space_assertions_cannot_authenticate_actor_local_roles() {
+        let mut store = MemStore::default();
+        let initial = store.provide_blob(b"before").unwrap();
+        store.programs.insert(program(), FIXTURE_ACTOR_PVM.to_vec());
+        let required_policy =
+            method_role_policy_hash(Some(crate::SpaceRole::Member.as_u8()), Some(2)).unwrap();
+        let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            role_authority: Some(role_authority()),
+            external_actors: external_bindings(),
+            service: identity(),
+            consistency: ConsistencyModeV2::Local,
+            actors: vec![ActorGenesisV2 {
+                actor: actor(),
+                name: "root".into(),
+                parent: None,
+                producer: super::super::ProducerId([4; 32]),
+                deployment: identity().deployment,
+                program: program(),
+                initial_state: initial.clone(),
+                crdt: false,
+                role_policies: role_policies(vec![MethodPolicyV2 {
+                    method: "set".into(),
+                    schema: Hash([6; 32]),
+                    policy: required_policy,
+                    public: false,
+                    attested: false,
+                    space_role: Some(crate::SpaceRole::Member.as_u8()),
+                    actor_role: Some(2),
+                }]),
+            }],
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: super::super::SystemCapabilityId([8; 32]),
+                authenticator: vec![9],
+            },
+        });
+        let AccumulationResultV2::Installed(receipt) =
+            execute_guest_accumulate(&mut store, &install).unwrap()
+        else {
+            panic!("install rejected")
+        };
+        let origin = super::super::Origin::Member(super::super::SubjectId([40; 32]));
+        let mut work = linear_work(initial, receipt.resulting_state_root.unwrap());
+        work.origin = origin;
+        let mut credential = receipt_bound_role_credential(
+            &mut store,
+            &work,
+            crate::SpaceRole::Developer,
+            required_policy,
+        );
+        credential.actor_role = Some(2);
+        work.authorization = credential.disclosed_evidence(required_policy);
+        seed_direct_ingress(&mut store, &work);
+        let request = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            transition: linear_transition(&work, b"must not commit"),
+            work,
+            provided_blobs: vec![],
+        });
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &request).unwrap(),
+            rejected(AccumulationRejectionV2::Unauthorized)
         );
         assert_eq!(store, before);
     }

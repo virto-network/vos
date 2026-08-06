@@ -18,11 +18,12 @@ use javm::vm_pool::VmState;
 
 use super::{
     ACCUMULATE_ENTRY_IC, ACTOR_EFFECT_BATCH_MAX_BYTES, ACTOR_IPC_BASE_PAGE, ACTOR_IPC_CAP_SLOT,
-    ACTOR_PRIVATE_INPUT_MAX_BYTES, AccumulationResultV2, ActorEffectBatchV2, ActorPrivateInputV2,
-    ActorSliceInputV2, ActorSliceOutputV2, ActorTreeImportV2, AuthorizationEvidenceV2,
-    AwaitResumeV2, BlobRefV2, CheckpointTokenV2, ContinuationSnapshotV2, CrdtChangeV2,
-    CrdtDispatchV2, Hash, ImportedBlobV2, MAX_ROOT_TREE_ACTORS, Origin, ProgramId, REFINE_ENTRY_IC,
-    RefineImportsV2, RoleCredentialV2, TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
+    ACTOR_PRIVATE_INPUT_MAX_BYTES, AccumulatedRoleAssertionV2, AccumulationResultV2,
+    ActorEffectBatchV2, ActorPrivateInputV2, ActorSliceInputV2, ActorSliceOutputV2,
+    ActorTreeImportV2, AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2, CheckpointTokenV2,
+    ContinuationSnapshotV2, CrdtChangeV2, CrdtDispatchV2, Hash, ImportedBlobV2,
+    MAX_ROOT_TREE_ACTORS, Origin, ProgramId, REFINE_ENTRY_IC, RefineImportsV2, RoleCredentialV2,
+    TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
 };
 
 const MAX_ACTOR_IPC_PAGES: u32 = 1024;
@@ -1391,6 +1392,12 @@ fn authorization_roles(
     if credential.holder != work.origin
         || (work.workflow_step == 0 && credential.scope != work.authorization_scope())
         || commitment != Hash::digest(b"vos/credential-commitment/v2", &[bytes])
+        // Space-authority assertions do not authenticate actor-local roles.
+        // Reject the mixed shape before it can influence caller_role() in
+        // the provisional actor execution; guest Accumulate independently
+        // enforces the same rule at the commit boundary.
+        || (credential.actor_role.is_some()
+            && AccumulatedRoleAssertionV2::decode(&credential.authenticator).is_ok())
     {
         return Err(ServicePvmErrorV2::InvalidAuthorization);
     }
@@ -1985,6 +1992,47 @@ mod tests {
         );
         work.workflow_step = 0;
         work.arguments = vec![8];
+
+        let authority_actor = super::super::ActorId([10; 32]);
+        let claim = super::super::RoleAuthorizationClaimV2 {
+            space: work.service.space,
+            holder: origin,
+            role: crate::SpaceRole::Developer,
+            audience: work.service.clone(),
+            invocation: work.invocation,
+            scope: credential.scope,
+            target: work.target,
+            method: work.method.clone(),
+            policy,
+        };
+        let authority_service = super::super::ServiceIdentityV2 {
+            root_service: super::super::RootServiceId([11; 32]),
+            deployment: super::super::DeploymentId([12; 32]),
+            service_program: ProgramId([13; 32]),
+            ..work.service.clone()
+        };
+        let assertion = AccumulatedRoleAssertionV2 {
+            receipt: super::super::AccumulationReceiptV2 {
+                service: authority_service,
+                accepted_transition: Hash([14; 32]),
+                reply_commitment: Some(claim.authority_reply(authority_actor).commitment()),
+                outbox_commitment: None,
+                resulting_state_root: Some(Hash([15; 32])),
+                resulting_crdt_heads: vec![],
+                sequence: 1,
+                checkpoint: 0,
+                consistency: super::super::ConsistencyModeV2::Local,
+            },
+            claim,
+        };
+        let mut forged_actor_role = credential.clone();
+        forged_actor_role.authenticator = assertion.encode();
+        work.authorization = forged_actor_role.disclosed_evidence(policy);
+        assert_eq!(
+            authorization_roles(&work, &RefineImportsV2::default()),
+            Err(ServicePvmErrorV2::InvalidAuthorization),
+            "a space assertion must not populate handler-side caller_role()"
+        );
 
         let (private, witness) = credential.private_evidence(policy);
         work.authorization = private;
