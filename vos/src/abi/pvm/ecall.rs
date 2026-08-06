@@ -137,7 +137,21 @@ pub fn downgrade_cap(subject: u32, object: u32) -> bool {
 /// DATA capability. The four values become the callee's `phi[7..=10]`.
 #[inline(always)]
 pub fn call_cap(subject: u32, ipc_cap_slot: u8, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
-    _call_ecall(
+    call_cap_pair(subject, ipc_cap_slot, a0, a1, a2, a3)[0]
+}
+
+/// CALL a dynamically selected HANDLE/CALLABLE and preserve both the reply
+/// value and the JAR call status.
+#[inline(always)]
+pub fn call_cap_pair(
+    subject: u32,
+    ipc_cap_slot: u8,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+) -> [u64; 2] {
+    _call_ecall_pair(
         a0,
         a1,
         a2,
@@ -177,7 +191,7 @@ pub fn reply(_value: u64) -> ! {
 
 #[cfg(target_arch = "riscv64")]
 #[inline(always)]
-fn _call_ecall(a0: u64, a1: u64, a2: u64, a3: u64, op: u64, refs: u64) -> u64 {
+fn _call_ecall_pair(a0: u64, a1: u64, a2: u64, a3: u64, op: u64, refs: u64) -> [u64; 2] {
     let ret: u64;
     let discarded_result1: u64;
     // SAFETY: dynamic CALL suspends until the callee replies. The JAR kernel
@@ -196,13 +210,12 @@ fn _call_ecall(a0: u64, a1: u64, a2: u64, a3: u64, op: u64, refs: u64) -> u64 {
             options(nostack),
         );
     }
-    let _ = discarded_result1;
-    ret
+    [ret, discarded_result1]
 }
 
 #[cfg(not(target_arch = "riscv64"))]
 #[inline(always)]
-fn _call_ecall(_a0: u64, _a1: u64, _a2: u64, _a3: u64, op: u64, _refs: u64) -> u64 {
+fn _call_ecall_pair(_a0: u64, _a1: u64, _a2: u64, _a3: u64, op: u64, _refs: u64) -> [u64; 2] {
     panic!("vos-abi JAR CALL requires RISC-V target (op={op})")
 }
 

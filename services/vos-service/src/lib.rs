@@ -89,14 +89,18 @@ mod guest {
 
         prepare_actor_cnodes(&work);
 
-        let actor_output_len = ecall::call_cap(
+        let [actor_output_len, actor_status] = ecall::call_cap_pair(
             ecall::local_cap_ref(vos::v2::TARGET_ACTOR_HANDLE_SLOT),
             vos::v2::ACTOR_IPC_CAP_SLOT,
             vos::v2::ACTOR_IPC_BASE_PAGE as u64 * 4096,
             actor_input_len as u64,
             actor_ipc_capacity as u64,
             vos::v2::NESTED_ACTOR_CALL_MAGIC,
-        ) as usize;
+        );
+        if actor_status != 0 {
+            fail_closed();
+        }
+        let actor_output_len = actor_output_len as usize;
         restore_actor_cnodes(&work);
         if actor_output_len == 0 || actor_output_len > actor_ipc_capacity {
             fail_closed();
