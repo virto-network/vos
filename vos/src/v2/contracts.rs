@@ -112,6 +112,44 @@ pub struct RoleAuthorityBindingV2 {
     pub actor: ActorId,
 }
 
+/// Signed authority-state mutation. The canonical v2 wire bytes are the
+/// exact Ed25519 message verified by the authority actor, so a signature for
+/// one space, holder, role, epoch, or operation cannot be replayed as another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoleAuthorityMutationV2 {
+    Grant {
+        space: SpaceId,
+        holder: Origin,
+        role: crate::SpaceRole,
+        epoch: u64,
+    },
+    Revoke {
+        space: SpaceId,
+        holder: Origin,
+        epoch: u64,
+    },
+}
+
+impl RoleAuthorityMutationV2 {
+    pub fn space(&self) -> SpaceId {
+        match self {
+            Self::Grant { space, .. } | Self::Revoke { space, .. } => *space,
+        }
+    }
+
+    pub fn holder(&self) -> Origin {
+        match self {
+            Self::Grant { holder, .. } | Self::Revoke { holder, .. } => *holder,
+        }
+    }
+
+    pub fn epoch(&self) -> u64 {
+        match self {
+            Self::Grant { epoch, .. } | Self::Revoke { epoch, .. } => *epoch,
+        }
+    }
+}
+
 /// One invocation-scoped role decision produced by the space's pinned
 /// authority service.
 ///
@@ -146,7 +184,9 @@ impl RoleAuthorizationClaimV2 {
         ReplyRecordV2 {
             call_id: self.authority_invocation().root_reply_id(),
             producer: authority,
-            result: self.encode(),
+            // Generated actor methods returning `Vec<u8>` use the canonical
+            // dynamic actor ABI: the bytes are framed as `Value::Bytes`.
+            result: crate::Encode::encode(&crate::value::Value::Bytes(self.encode())),
         }
     }
 }
@@ -2679,6 +2719,59 @@ impl V2Wire for RoleAuthorityBindingV2 {
     }
 }
 
+impl V2Wire for RoleAuthorityMutationV2 {
+    const MAGIC: [u8; 4] = *b"VRM2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        match self {
+            Self::Grant {
+                space,
+                holder,
+                role,
+                epoch,
+            } => {
+                encoder.u8(0);
+                encoder.fixed(&space.0);
+                encode_origin(&mut encoder, *holder);
+                encoder.u8(role.as_u8());
+                encoder.u64(*epoch);
+            }
+            Self::Revoke {
+                space,
+                holder,
+                epoch,
+            } => {
+                encoder.u8(1);
+                encoder.fixed(&space.0);
+                encode_origin(&mut encoder, *holder);
+                encoder.u64(*epoch);
+            }
+        }
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = match decoder.u8()? {
+            0 => Self::Grant {
+                space: SpaceId(decoder.fixed()?),
+                holder: decode_origin(decoder)?,
+                role: crate::SpaceRole::from_u8(decoder.u8()?).ok_or(DecodeError::NonCanonical)?,
+                epoch: decoder.u64()?,
+            },
+            1 => Self::Revoke {
+                space: SpaceId(decoder.fixed()?),
+                holder: decode_origin(decoder)?,
+                epoch: decoder.u64()?,
+            },
+            _ => return Err(DecodeError::InvalidTag),
+        };
+        if value.epoch() == 0 || !matches!(value.holder(), Origin::Member(_) | Origin::Actor(_)) {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
 impl V2Wire for RoleAuthorizationClaimV2 {
     const MAGIC: [u8; 4] = *b"VCL2";
 
@@ -4900,6 +4993,44 @@ mod tests {
     }
 
     #[test]
+    fn authority_mutation_signature_bytes_bind_operation_and_epoch() {
+        let grant = RoleAuthorityMutationV2::Grant {
+            space: SpaceId([34; 32]),
+            holder: Origin::Member(SubjectId([35; 32])),
+            role: crate::SpaceRole::Developer,
+            epoch: 7,
+        };
+        assert_eq!(
+            RoleAuthorityMutationV2::decode(&grant.encode()).unwrap(),
+            grant
+        );
+
+        let revoke = RoleAuthorityMutationV2::Revoke {
+            space: grant.space(),
+            holder: grant.holder(),
+            epoch: grant.epoch(),
+        };
+        assert_ne!(grant.encode(), revoke.encode());
+
+        let mut next_epoch = grant.clone();
+        let RoleAuthorityMutationV2::Grant { epoch, .. } = &mut next_epoch else {
+            unreachable!()
+        };
+        *epoch += 1;
+        assert_ne!(grant.encode(), next_epoch.encode());
+
+        let invalid = RoleAuthorityMutationV2::Revoke {
+            space: SpaceId([34; 32]),
+            holder: Origin::System,
+            epoch: 1,
+        };
+        assert_eq!(
+            RoleAuthorityMutationV2::decode(&invalid.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
     fn accumulated_role_assertion_binds_authority_and_exact_invocation() {
         let audience = service();
         let authority = RoleAuthorityBindingV2 {
@@ -4938,6 +5069,15 @@ mod tests {
             },
             claim,
         };
+        let crate::value::Value::Bytes(result) =
+            <crate::value::Value as crate::Decode>::try_decode(
+                &assertion.claim.authority_reply(authority.actor).result,
+            )
+            .unwrap()
+        else {
+            panic!("authority actor reply must use the canonical bytes frame")
+        };
+        assert_eq!(result, assertion.claim.encode());
         assert!(assertion.matches_authority(&authority));
         assert_eq!(
             AccumulatedRoleAssertionV2::decode(&assertion.encode()).unwrap(),
