@@ -12,17 +12,18 @@ use alloc::vec::Vec;
 
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
-    AccumulateRequestV2, AccumulatedServiceOutputV2, AccumulationEnvelopeV2, AccumulationReceiptV2,
-    AccumulationRejectionV2, AccumulationResultV2, ActorDirectoryV2, ActorGenesisV2, ActorId,
-    AuthorizationEvidenceV2, BlobRefV2, CommittedImageStoreV2, ConsistencyModeV2,
-    ContinuationSnapshotV2, CrdtChangeV2, CrdtSyncEnvelopeV2, DedupRecordV2, DirectIngressV2,
-    DurableJamStoreV2, DurableStoreOpenErrorV2, ExternalActorBindingV2, ExternalActorDirectoryV2,
-    JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2, LocalStoreReadErrorV2, LocalWorkRequestV2,
-    LocalWorkSchedulerV2, MethodPolicyV2, NoRefineProtocolHostV2, PackageError,
-    PackageRolePoliciesV2, PreparedWorkV2, ProgramId, ProofArtifactStoreV2, PublicationAckV2,
-    PublicationRecordV2, PublishedEffectsV2, RefinedServiceOutputV2, RoleAuthorityBindingV2,
-    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire,
-    VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
+    AccumulateRequestV2, AccumulatedRoleAssertionV2, AccumulatedServiceOutputV2,
+    AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2,
+    ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2, BlobRefV2,
+    CommittedImageStoreV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2,
+    CrdtSyncEnvelopeV2, DedupRecordV2, DirectIngressV2, DurableJamStoreV2, DurableStoreOpenErrorV2,
+    ExternalActorBindingV2, ExternalActorDirectoryV2, JamServiceV2, LocalJamStoreHostV2,
+    LocalJamStoreV2, LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
+    MethodPolicyV2, NoRefineProtocolHostV2, PackageError, PackageRolePoliciesV2, PreparedWorkV2,
+    ProgramId, ProofArtifactStoreV2, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
+    RefinedServiceOutputV2, RoleAuthorityBindingV2, RoleAuthorizationClaimV2, ScheduleErrorV2,
+    ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2,
+    WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
 };
 
 #[cfg(feature = "storage")]
@@ -319,6 +320,7 @@ pub enum LocalRootTreeInvokeErrorV2 {
     DivergentInvocation,
     DivergentReplay,
     MissingPublication,
+    InvalidRoleAssertionPublication,
     ServiceNotInstalled,
     ExistingServiceMismatch,
     ExistingActorMismatch,
@@ -345,6 +347,48 @@ pub struct CommittedRootTreeSliceV2 {
     pub duplicate: bool,
     pub refine_gas_used: u64,
     pub accumulate_gas_used: u64,
+}
+
+impl CommittedRootTreeSliceV2 {
+    /// Extract the exact finalized role decision produced by a generic
+    /// authority service. Authority decisions are single-slice replies; any
+    /// suspension, outbox, exported artifact, or attestation side effect
+    /// makes the result ambiguous and therefore unusable as authorization.
+    pub fn role_assertion(
+        &self,
+        claim: RoleAuthorizationClaimV2,
+        authority: &RoleAuthorityBindingV2,
+    ) -> Result<AccumulatedRoleAssertionV2, LocalRootTreeInvokeErrorV2> {
+        let expected_reply = claim.authority_reply(authority.actor);
+        let valid = !self.duplicate
+            && self.input.invocation == claim.authority_invocation()
+            && self.input.workflow_step == 0
+            && self.receipt.service == authority.service
+            && self.receipt.checkpoint == 0
+            && self.receipt.reply_commitment == Some(expected_reply.commitment())
+            && self.receipt.outbox_commitment.is_none()
+            && self.published.reply.as_ref() == Some(&expected_reply)
+            && self.published.outbox.is_empty()
+            && self.published.exported_blobs.is_empty()
+            && self.published.proof.is_none()
+            && self.published.attestation.is_none()
+            && self.publication.as_ref().is_some_and(|publication| {
+                publication.input == self.input
+                    && publication.receipt == self.receipt
+                    && publication.published == self.published
+            });
+        if !valid {
+            return Err(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication);
+        }
+        let assertion = AccumulatedRoleAssertionV2 {
+            claim,
+            receipt: self.receipt.clone(),
+        };
+        if !assertion.matches_authority(authority) {
+            return Err(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication);
+        }
+        Ok(assertion)
+    }
 }
 
 /// Result of importing an authenticated causal delta through physical IC-5.
@@ -1855,6 +1899,117 @@ mod tests {
                 Err(DecodeError::NonCanonical)
             );
         }
+    }
+
+    fn committed_role_decision() -> (
+        RoleAuthorizationClaimV2,
+        RoleAuthorityBindingV2,
+        CommittedRootTreeSliceV2,
+    ) {
+        let authority = RoleAuthorityBindingV2 {
+            service: ServiceIdentityV2 {
+                space: super::super::SpaceId([30; 32]),
+                root_service: super::super::RootServiceId([31; 32]),
+                deployment: super::super::DeploymentId([32; 32]),
+                service_program: ProgramId([33; 32]),
+                service_abi: super::super::ABI_VERSION,
+                execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            },
+            actor: ActorId([34; 32]),
+        };
+        let claim = RoleAuthorizationClaimV2 {
+            space: authority.service.space,
+            holder: super::super::Origin::Member(super::super::SubjectId([35; 32])),
+            role: crate::SpaceRole::Member,
+            audience: ServiceIdentityV2 {
+                root_service: super::super::RootServiceId([36; 32]),
+                ..authority.service.clone()
+            },
+            invocation: InvocationId([37; 32]),
+            scope: super::super::Hash([38; 32]),
+            target: ActorId([39; 32]),
+            method: "restricted".into(),
+            policy: super::super::Hash([40; 32]),
+        };
+        let input = WorkInputIdV2 {
+            invocation: claim.authority_invocation(),
+            workflow_step: 0,
+        };
+        let reply = claim.authority_reply(authority.actor);
+        let receipt = AccumulationReceiptV2 {
+            service: authority.service.clone(),
+            accepted_transition: super::super::Hash([41; 32]),
+            reply_commitment: Some(reply.commitment()),
+            outbox_commitment: None,
+            resulting_state_root: Some(super::super::Hash([42; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 4,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        };
+        let published = PublishedEffectsV2 {
+            reply: Some(reply),
+            ..PublishedEffectsV2::default()
+        };
+        let publication = PublicationRecordV2 {
+            input,
+            receipt: receipt.clone(),
+            published: published.clone(),
+        };
+        (
+            claim,
+            authority,
+            CommittedRootTreeSliceV2 {
+                input,
+                receipt,
+                published,
+                publication: Some(publication),
+                duplicate: false,
+                refine_gas_used: 10,
+                accumulate_gas_used: 11,
+            },
+        )
+    }
+
+    #[test]
+    fn committed_authority_reply_extracts_a_receipt_bound_assertion() {
+        let (claim, authority, committed) = committed_role_decision();
+        assert_eq!(
+            committed.role_assertion(claim.clone(), &authority).unwrap(),
+            AccumulatedRoleAssertionV2 {
+                claim,
+                receipt: committed.receipt,
+            }
+        );
+    }
+
+    #[test]
+    fn role_assertion_rejects_non_atomic_or_unrecoverable_publications() {
+        let (claim, authority, committed) = committed_role_decision();
+
+        let mut suspended = committed.clone();
+        suspended.receipt.checkpoint = 1;
+        assert!(matches!(
+            suspended.role_assertion(claim.clone(), &authority),
+            Err(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication)
+        ));
+
+        let mut side_effecting = committed.clone();
+        side_effecting
+            .published
+            .exported_blobs
+            .push(BlobRefV2::of_bytes(b"artifact"));
+        assert!(matches!(
+            side_effecting.role_assertion(claim.clone(), &authority),
+            Err(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication)
+        ));
+
+        let mut unrecoverable = committed;
+        unrecoverable.publication = None;
+        assert!(matches!(
+            unrecoverable.role_assertion(claim, &authority),
+            Err(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication)
+        ));
     }
 
     #[test]
