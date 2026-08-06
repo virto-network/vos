@@ -5,7 +5,7 @@
 //! service PVM's physical IC-5 Accumulate entry.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::Infallible;
@@ -472,6 +472,25 @@ impl LocalWorkSchedulerV2 {
         };
         Self::prepare_resume_outcome(store, invocation, logical_timeslot, None, Some(timeout))
             .map(Some)
+    }
+
+    /// Rediscover workflows whose durable timeout outcome has committed but
+    /// whose exact continuation has not consumed it yet. This deliberately
+    /// walks expiration rows rather than deadline rows: expiration removes
+    /// the deadline atomically before host orchestration can resume the VM.
+    pub fn pending_timeout_resumes(
+        store: &LocalJamStoreV2,
+    ) -> Result<Vec<InvocationId>, ScheduleErrorV2> {
+        let mut pending = BTreeSet::new();
+        for timeout in store.call_expirations()? {
+            let invocation = timeout.expiration.timeout.caller_invocation;
+            if !pending.contains(&invocation)
+                && Self::prepare_timeout_resume(store, invocation, 0)?.is_some()
+            {
+                pending.insert(invocation);
+            }
+        }
+        Ok(pending.into_iter().collect())
     }
 
     fn prepare_resume_outcome(

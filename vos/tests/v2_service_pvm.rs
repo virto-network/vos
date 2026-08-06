@@ -1752,9 +1752,14 @@ fn node_expires_and_resumes_an_unreachable_durable_call() {
         refine_gas: 1_000_000_000,
         accumulate_gas: 5_000_000_000,
     };
-    let backend = SharedCommittedImages::default();
+    let backend = SharedFailingCommittedImages::default();
     let service = LocalRootTreeServiceV2::open(config.clone(), backend.clone())
         .expect("timeout source root installs");
+    let installed_commits = backend.0.lock().unwrap().commit_attempts;
+    // Admission, suspend, and expiration commit first. Fail the exact timeout
+    // resume commit once: the deadline row is already gone, so recovery must
+    // rediscover the durable expiration row independently on the next poll.
+    backend.fail_at(installed_commits + 4);
     let route = ServiceId::new(0, 0x3600);
     let deadline = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1782,14 +1787,19 @@ fn node_expires_and_resumes_an_unreachable_durable_call() {
     let request = std::thread::spawn(move || {
         invoker.invoke_with_timeout(route, invocation.encode(), Duration::from_secs(20))
     });
-    node.run_until_idle(Duration::from_secs(4));
+    node.run_until_idle(Duration::from_secs(10));
     let results = node.collect();
-    let reply = request
-        .join()
-        .unwrap()
-        .expect("the node resumes the exact handler with CallError::Timeout");
+    let reply = request.join().unwrap().unwrap_or_else(|| {
+        let state = backend.0.lock().unwrap();
+        panic!(
+            "the node did not resume the exact handler with CallError::Timeout: \
+             commit_attempts={}, failures={}, pending_failure={:?}",
+            state.commit_attempts, state.failures, state.fail_at
+        )
+    });
     assert_eq!(reply, Value::U32(1).encode());
     assert!(results.iter().all(AgentResult::is_ok));
+    assert_eq!(backend.0.lock().unwrap().failures, 1);
 
     let reopened = LocalRootTreeServiceV2::open(config, backend)
         .expect("timed-out source reopens from its durable image");
@@ -5475,6 +5485,11 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
         5_000_000_000,
     )
     .unwrap();
+    assert_eq!(
+        LocalWorkSchedulerV2::pending_timeout_resumes(timeout_restarted_service.accumulate_host()),
+        Ok(vec![first_work.invocation]),
+        "expiration outcomes remain enumerable after their deadline rows are gone"
+    );
     let timed_out = LocalWorkSchedulerV2::prepare_timeout_resume(
         timeout_restarted_service.accumulate_host(),
         first_work.invocation,
@@ -5598,6 +5613,12 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
         ),
         Ok(None),
         "the completed continuation cannot consume the timeout twice"
+    );
+    assert!(
+        LocalWorkSchedulerV2::pending_timeout_resumes(timeout_restarted_service.accumulate_host())
+            .unwrap()
+            .is_empty(),
+        "historical expiration rows do not requeue a completed workflow"
     );
 
     // Reconstruct the service from committed state before the peer reply

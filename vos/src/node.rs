@@ -37,6 +37,10 @@ pub struct Envelope {
     pub from: ServiceId,
     pub to: ServiceId,
     pub payload: Vec<u8>,
+    /// Exact authenticated peer for canonical v2 root transport. Inbound
+    /// network frames retain their Noise identity here; outbound frames pin
+    /// the peer selected from the claimed actor's trusted directory entry.
+    pub authenticated_peer: Option<Vec<u8>>,
 }
 
 /// Handle to a running agent thread.
@@ -2656,6 +2660,11 @@ impl VosNode {
     /// being collected).
     #[cfg(feature = "network")]
     pub fn attach_network(&mut self, network: crate::network::Network) {
+        assert_eq!(
+            self.node_prefix,
+            network.local_prefix(),
+            "VosNode prefix must match the authenticated network prefix"
+        );
         // Install the unified service first so any inbound frame
         // that arrives between now and the bridge starting gets
         // resolved against this node's tables (invoke_routes,
@@ -2719,6 +2728,7 @@ impl VosNode {
                     from: ServiceId(tell.from),
                     to: ServiceId(tell.to),
                     payload: tell.payload,
+                    authenticated_peer: Some(tell.peer.to_bytes()),
                 };
                 if outbox_tx.send(env).is_err() {
                     break;
@@ -3751,22 +3761,25 @@ impl VosNode {
             let net = self.shared_network.lock().ok().and_then(|g| g.clone());
             if let Some(net) = net {
                 if envelope.payload.starts_with(b"VRT2") {
-                    let binding = self.v2_actor_routes.read().ok().and_then(|routes| {
-                        routes
-                            .values()
-                            .find(|route| {
-                                route.route == target.0
-                                    && route.consistency == crate::v2::ConsistencyModeV2::Local
-                            })
-                            .cloned()
-                    });
-                    let Some(peer) = binding
-                        .and_then(|binding| binding.authenticated_peer)
-                        .and_then(|bytes| libp2p::PeerId::from_bytes(&bytes).ok())
-                    else {
-                        warn!(%target, "node: no authenticated PeerId bound to remote v2 root");
+                    let Some(peer_bytes) = envelope.authenticated_peer.as_deref() else {
+                        warn!(%target, "node: v2 root envelope omitted its exact destination peer");
                         return;
                     };
+                    let Some(peer) = libp2p::PeerId::from_bytes(peer_bytes).ok() else {
+                        warn!(%target, "node: v2 root envelope carried an invalid destination peer");
+                        return;
+                    };
+                    let bound = self.v2_actor_routes.read().ok().is_some_and(|routes| {
+                        routes.values().any(|route| {
+                            route.route == target.0
+                                && route.consistency == crate::v2::ConsistencyModeV2::Local
+                                && route.authenticated_peer.as_deref() == Some(peer_bytes)
+                        })
+                    });
+                    if !bound {
+                        warn!(%target, %peer, "node: v2 root envelope peer is not bound to its route");
+                        return;
+                    }
                     net.send_tell(peer, envelope.from.0, envelope.to.0, envelope.payload);
                     return;
                 }
@@ -3946,6 +3959,22 @@ fn v2_actor_route(
     actor: crate::v2::ActorId,
 ) -> Option<V2ActorRoute> {
     actor_routes.read().ok()?.get(&actor).cloned()
+}
+
+/// Resolve one claimed actor through its exact route and authenticated peer.
+/// Comparing only the compact route is unsafe because different PeerIds can
+/// collide on its 16-bit node prefix and reuse the same local-id suffix.
+fn authenticated_v2_actor_route(
+    actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
+    actor: crate::v2::ActorId,
+    route: ServiceId,
+    authenticated_peer: Option<&[u8]>,
+) -> Option<V2ActorRoute> {
+    let binding = v2_actor_route(actor_routes, actor)?;
+    (binding.route == route.0
+        && binding.consistency == crate::v2::ConsistencyModeV2::Local
+        && binding.authenticated_peer.as_deref() == authenticated_peer)
+        .then_some(binding)
 }
 
 fn prepare_v2_root_slot<B>(
@@ -4175,15 +4204,18 @@ fn handle_v2_root_transport<B>(
             publication,
             message,
         } => {
-            let source = v2_actor_route(actor_routes, message.from);
+            let source = authenticated_v2_actor_route(
+                actor_routes,
+                message.from,
+                envelope.from,
+                envelope.authenticated_peer.as_deref(),
+            );
             if message.to != service.root_actor()
                 || message.to_service != *service.identity()
                 || message.proof_requested
                 || message.authorization != crate::v2::AuthorizationEvidenceV2::Public
                 || source.as_ref().is_none_or(|source| {
-                    source.route != envelope.from.0
-                        || source.consistency != crate::v2::ConsistencyModeV2::Local
-                        || source.service != publication.receipt.service
+                    source.service != publication.receipt.service
                         || source.service != message.from_service
                 })
                 || publication.receipt.consistency != crate::v2::ConsistencyModeV2::Local
@@ -4217,6 +4249,7 @@ fn handle_v2_root_transport<B>(
                         from: id,
                         to: envelope.from,
                         payload: accepted.encode(),
+                        authenticated_peer: envelope.authenticated_peer.clone(),
                     });
                     run_v2_root_inbox(
                         id,
@@ -4240,12 +4273,16 @@ fn handle_v2_root_transport<B>(
             let Some(reply) = publication.published.reply.clone() else {
                 return;
             };
-            let producer = v2_actor_route(actor_routes, reply.producer);
-            if producer.as_ref().is_none_or(|producer| {
-                producer.route != envelope.from.0
-                    || producer.consistency != crate::v2::ConsistencyModeV2::Local
-                    || producer.service != publication.receipt.service
-            }) || publication.receipt.consistency != crate::v2::ConsistencyModeV2::Local
+            let producer = authenticated_v2_actor_route(
+                actor_routes,
+                reply.producer,
+                envelope.from,
+                envelope.authenticated_peer.as_deref(),
+            );
+            if producer
+                .as_ref()
+                .is_none_or(|producer| producer.service != publication.receipt.service)
+                || publication.receipt.consistency != crate::v2::ConsistencyModeV2::Local
             {
                 warn!(%id, from = %envelope.from, call = ?reply.call_id, "rejected misrouted v2 reply");
                 return;
@@ -4290,6 +4327,7 @@ fn handle_v2_root_transport<B>(
                 from: id,
                 to: envelope.from,
                 payload: accepted.encode(),
+                authenticated_peer: envelope.authenticated_peer.clone(),
             });
             if let Some(committed) = committed {
                 publish_v2_root_slice(id, service, committed, None, outbox, actor_routes, state);
@@ -4303,6 +4341,7 @@ fn handle_v2_root_transport<B>(
             id,
             service,
             envelope.from,
+            envelope.authenticated_peer.as_deref(),
             input,
             publication,
             call,
@@ -4391,6 +4430,7 @@ fn queue_v2_root_publication<B>(
                 from: id,
                 to: ServiceId(route.route),
                 payload: transport.encode(),
+                authenticated_peer: route.authenticated_peer.clone(),
             });
         }
     } else if !publication.published.outbox.is_empty() {
@@ -4455,6 +4495,7 @@ fn queue_v2_root_publication<B>(
                         from: id,
                         to: ServiceId(route.route),
                         payload: transport.encode(),
+                        authenticated_peer: route.authenticated_peer.clone(),
                     });
                     // Sending a remote reply is not acceptance; only the
                     // destination's guest-commit acknowledgement retires it.
@@ -4506,6 +4547,7 @@ fn acknowledge_v2_root_publication<B>(
     id: ServiceId,
     service: &mut crate::v2::LocalRootTreeServiceV2<B>,
     from: ServiceId,
+    authenticated_peer: Option<&[u8]>,
     input: crate::v2::WorkInputIdV2,
     commitment: crate::v2::Hash,
     call: crate::v2::CallId,
@@ -4530,11 +4572,9 @@ fn acknowledge_v2_root_publication<B>(
         .iter()
         .find(|message| message.call_id == call)
     {
-        if v2_actor_route(actor_routes, message.to).is_some_and(|route| {
-            route.route == from.0
-                && route.consistency == crate::v2::ConsistencyModeV2::Local
-                && route.service == message.to_service
-        }) {
+        if authenticated_v2_actor_route(actor_routes, message.to, from, authenticated_peer)
+            .is_some_and(|route| route.service == message.to_service)
+        {
             progress.accepted_calls.insert(call);
         } else {
             return;
@@ -4550,11 +4590,10 @@ fn acknowledge_v2_root_publication<B>(
             .ok()
             .flatten()
             .and_then(|(actor, service, _)| {
-                v2_actor_route(actor_routes, actor).filter(|route| route.service == service)
+                authenticated_v2_actor_route(actor_routes, actor, from, authenticated_peer)
+                    .filter(|route| route.service == service)
             });
-        if expected.is_none_or(|route| {
-            route.route != from.0 || route.consistency != crate::v2::ConsistencyModeV2::Local
-        }) {
+        if expected.is_none() {
             return;
         }
         progress.reply_accepted = true;
@@ -4636,37 +4675,42 @@ fn retry_v2_root_transport<B>(
             logical_timeslot.load(Ordering::Relaxed) >= deadline || v2_wall_timeslot() >= deadline
         });
     if should_expire {
-        let expiration_slot = match prepare_v2_root_slot(service, logical_timeslot) {
-            Ok(slot) => slot,
+        match prepare_v2_root_slot(service, logical_timeslot) {
+            Ok(expiration_slot) => {
+                if let Err(failure) = service.expire_due_calls_after_barrier(expiration_slot) {
+                    // Earlier expirations in the same drive may already be
+                    // durable. Continue into outcome rediscovery instead of
+                    // losing those workflows with the returned error.
+                    warn!(%id, ?failure, "v2 durable call expiration failed");
+                }
+            }
             Err(failure) => {
                 warn!(%id, ?failure, "could not allocate trusted v2 expiration slot");
-                return;
             }
-        };
-        let expired = match service.expire_due_calls_after_barrier(expiration_slot) {
-            Ok(expired) => expired,
+        }
+    }
+    let pending_timeouts = match service.pending_timeout_resumes() {
+        Ok(pending) => pending,
+        Err(failure) => {
+            warn!(%id, ?failure, "could not rediscover durable v2 timeout outcomes");
+            Vec::new()
+        }
+    };
+    for invocation in pending_timeouts {
+        let resume_slot = match prepare_v2_root_slot(service, logical_timeslot) {
+            Ok(slot) => slot,
             Err(failure) => {
-                warn!(%id, ?failure, "v2 durable call expiration failed");
-                return;
+                warn!(%id, ?failure, ?invocation, "could not allocate v2 timeout-resume slot");
+                continue;
             }
         };
-        for timeout in expired {
-            let invocation = timeout.expiration.timeout.caller_invocation;
-            let resume_slot = match prepare_v2_root_slot(service, logical_timeslot) {
-                Ok(slot) => slot,
-                Err(failure) => {
-                    warn!(%id, ?failure, ?invocation, "could not allocate v2 timeout-resume slot");
-                    continue;
-                }
-            };
-            match service.resume_timeout_after_barrier(invocation, resume_slot) {
-                Ok(Some(committed)) => {
-                    publish_v2_root_slice(id, service, committed, None, outbox, actor_routes, state)
-                }
-                Ok(None) => {}
-                Err(failure) => {
-                    warn!(%id, ?failure, ?invocation, "v2 timed-out workflow resume failed")
-                }
+        match service.resume_timeout_after_barrier(invocation, resume_slot) {
+            Ok(Some(committed)) => {
+                publish_v2_root_slice(id, service, committed, None, outbox, actor_routes, state)
+            }
+            Ok(None) => {}
+            Err(failure) => {
+                warn!(%id, ?failure, ?invocation, "v2 timed-out workflow resume failed")
             }
         }
     }
@@ -5411,6 +5455,7 @@ fn handle_invoke_request(
             from: from_id,
             to: target,
             payload: memo,
+            authenticated_peer: None,
         });
     }
 
@@ -5882,6 +5927,7 @@ fn dispatch_once(
             from: from_id,
             to: target,
             payload: memo,
+            authenticated_peer: None,
         });
     }
     Ok(())
@@ -6318,6 +6364,7 @@ fn extension_thread(
             from: id,
             to: envelope.from,
             payload: reply_bytes,
+            authenticated_peer: None,
         });
         persist(strategy.as_mut(), &instance, id);
     }
@@ -7873,6 +7920,7 @@ fn handle_effect(
                 from: extension_id,
                 to: ServiceId(target_id),
                 payload,
+                authenticated_peer: None,
             });
             wait_for_reply(inbox, target_id, deferred)
         }
@@ -9090,6 +9138,47 @@ mod tests {
     }
 
     #[test]
+    fn v2_transport_peer_is_bound_to_the_exact_claimed_actor() {
+        let actor_a = crate::v2::ActorId([0xA1; 32]);
+        let actor_b = crate::v2::ActorId([0xB1; 32]);
+        let route = ServiceId::new(0xCAFE, 7);
+        let service = crate::v2::ServiceIdentityV2 {
+            space: crate::v2::SpaceId([1; 32]),
+            root_service: crate::v2::RootServiceId([2; 32]),
+            deployment: crate::v2::DeploymentId([3; 32]),
+            service_program: crate::v2::VOS_SERVICE_PROGRAM_ID,
+            service_abi: crate::v2::ABI_VERSION,
+            execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
+        };
+        let routes = RwLock::new(HashMap::from([
+            (
+                actor_a,
+                V2ActorRoute {
+                    route: route.0,
+                    service: service.clone(),
+                    consistency: crate::v2::ConsistencyModeV2::Local,
+                    authenticated_peer: Some(vec![0xA2]),
+                },
+            ),
+            (
+                actor_b,
+                V2ActorRoute {
+                    route: route.0,
+                    service,
+                    consistency: crate::v2::ConsistencyModeV2::Local,
+                    authenticated_peer: Some(vec![0xB2]),
+                },
+            ),
+        ]));
+
+        assert!(authenticated_v2_actor_route(&routes, actor_a, route, Some(&[0xA2])).is_some());
+        assert!(
+            authenticated_v2_actor_route(&routes, actor_b, route, Some(&[0xA2])).is_none(),
+            "a colliding route owned by peer A cannot authenticate actor B"
+        );
+    }
+
+    #[test]
     fn v2_ingress_uses_the_canonical_peer_subject_identity() {
         let peer = vec![0xaa, 0xbb, 0xcc];
         let routes = RwLock::new(HashMap::new());
@@ -9306,6 +9395,7 @@ mod tests {
                     from: ServiceId(0),
                     to: target,
                     payload,
+                    authenticated_peer: None,
                 })
                 .unwrap();
             }
@@ -9392,6 +9482,7 @@ mod tests {
                 from: ServiceId(0),
                 to: fetcher_id,
                 payload,
+                authenticated_peer: None,
             })
             .unwrap();
         }
@@ -9455,6 +9546,7 @@ mod tests {
                 from: ServiceId(0), // pretend it's from the registry
                 to: proxy_id,
                 payload,
+                authenticated_peer: None,
             })
             .unwrap();
         }
@@ -9531,6 +9623,7 @@ mod tests {
                 from: ServiceId(0),
                 to: id,
                 payload,
+                authenticated_peer: None,
             })
             .unwrap();
 
@@ -9629,6 +9722,7 @@ mod tests {
                 from: ServiceId(0),
                 to: id,
                 payload,
+                authenticated_peer: None,
             })
             .unwrap();
 

@@ -453,9 +453,11 @@ pub struct NetworkConfig {
 
 impl Default for NetworkConfig {
     fn default() -> Self {
+        let keypair = identity::Keypair::generate_ed25519();
+        let local_prefix = derive_node_prefix(&PeerId::from(keypair.public()));
         Self {
-            keypair: identity::Keypair::generate_ed25519(),
-            local_prefix: 0,
+            keypair,
+            local_prefix,
             listen: Vec::new(),
             bootstrap: Vec::new(),
             auto_dial_mdns: true,
@@ -606,18 +608,13 @@ enum OutboundReply {
 
 impl Network {
     /// Spin up the libp2p swarm on a dedicated thread.
-    pub fn start(mut config: NetworkConfig) -> Self {
+    pub fn start(config: NetworkConfig) -> Self {
         let peer_id = PeerId::from(config.keypair.public());
         let local_prefix = derive_node_prefix(&peer_id);
-        if config.local_prefix != local_prefix {
-            warn!(
-                configured = format!("{:#06x}", config.local_prefix),
-                derived = format!("{local_prefix:#06x}"),
-                %peer_id,
-                "network: replacing an unauthenticated configured prefix with the PeerId-derived prefix"
-            );
-            config.local_prefix = local_prefix;
-        }
+        assert_eq!(
+            config.local_prefix, local_prefix,
+            "NetworkConfig::local_prefix must equal the authenticated PeerId-derived prefix"
+        );
         let prefix_map: PrefixMap = Arc::new(Mutex::new(HashMap::new()));
         let listen_addrs: ListenAddrs = Arc::new(Mutex::new(Vec::new()));
         let service: Arc<OnceLock<Arc<dyn NetworkService>>> = Arc::new(OnceLock::new());
@@ -2347,6 +2344,38 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(
+        expected = "NetworkConfig::local_prefix must equal the authenticated PeerId-derived prefix"
+    )]
+    fn network_rejects_a_configured_prefix_that_disagrees_with_its_identity() {
+        let keypair = identity::Keypair::generate_ed25519();
+        let derived = derive_node_prefix(&PeerId::from(keypair.public()));
+        Network::start(NetworkConfig {
+            keypair,
+            local_prefix: derived.wrapping_add(1),
+            listen: Vec::new(),
+            bootstrap: Vec::new(),
+            auto_dial_mdns: false,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "VosNode prefix must match the authenticated network prefix")]
+    fn node_rejects_a_network_with_a_different_service_prefix() {
+        let keypair = identity::Keypair::generate_ed25519();
+        let derived = derive_node_prefix(&PeerId::from(keypair.public()));
+        let network = Network::start(NetworkConfig {
+            keypair,
+            local_prefix: derived,
+            listen: Vec::new(),
+            bootstrap: Vec::new(),
+            auto_dial_mdns: false,
+        });
+        let mut node = crate::node::VosNode::with_prefix(derived.wrapping_add(1));
+        node.attach_network(network);
+    }
+
+    #[test]
     fn derive_node_prefix_differs_for_different_peers() {
         // Two random keypairs almost always hash to different prefixes.
         let mut seen = std::collections::HashSet::new();
@@ -3303,6 +3332,7 @@ mod tests {
                 from: ServiceId::new(prefix_a, 0xFFFF),
                 to: inspector_id,
                 payload: payload.clone(),
+                authenticated_peer: None,
             })
             .expect("outbox_a accepts envelope");
 

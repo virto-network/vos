@@ -1475,13 +1475,20 @@ where
         &mut self,
         logical_timeslot: u64,
     ) -> Result<Vec<super::AccumulatedTimeoutV2>, LocalRootTreeInvokeErrorV2> {
-        let due = LocalWorkSchedulerV2::prepare_due_call_expirations(
-            self.service.accumulate_host().local_store(),
-            logical_timeslot,
-        )
-        .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
-        let mut expired = Vec::with_capacity(due.len());
-        for expiration in due {
+        let mut expired = Vec::new();
+        loop {
+            // A linear expiration advances the service revision. Re-read and
+            // prepare after every commit so the next envelope binds the fresh
+            // base rather than a shared stale snapshot of the due set.
+            let Some(expiration) = LocalWorkSchedulerV2::prepare_due_call_expirations(
+                self.service.accumulate_host().local_store(),
+                logical_timeslot,
+            )
+            .map_err(LocalRootTreeInvokeErrorV2::Schedule)?
+            .into_iter()
+            .next() else {
+                break;
+            };
             let accumulated = self
                 .service
                 .accumulate_at_after_barrier(
@@ -1703,6 +1710,16 @@ where
             .pending_call_deadlines()
             .map(|deadlines| deadlines.into_iter().map(|row| row.deadline_timeslot).min())
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)
+    }
+
+    /// Guest-committed timeout outcomes whose saved workflow still awaits
+    /// consumption. Unlike deadline discovery this survives a crash between
+    /// ExpireCall and exact continuation resume.
+    pub(crate) fn pending_timeout_resumes(
+        &self,
+    ) -> Result<Vec<super::InvocationId>, LocalRootTreeInvokeErrorV2> {
+        LocalWorkSchedulerV2::pending_timeout_resumes(self.service.accumulate_host().local_store())
+            .map_err(LocalRootTreeInvokeErrorV2::Schedule)
     }
 
     /// Recover the durable return route of a pending callee reply without

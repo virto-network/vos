@@ -645,6 +645,11 @@ pub fn call_expiration_storage_key(call: CallId) -> Vec<u8> {
     key
 }
 
+#[cfg(feature = "std")]
+pub(crate) const fn call_expiration_storage_prefix() -> &'static [u8] {
+    CALL_EXPIRATION_STORAGE_PREFIX
+}
+
 pub fn pending_call_deadline_storage_key(call: CallId) -> Vec<u8> {
     let mut key = Vec::with_capacity(PENDING_CALL_DEADLINE_STORAGE_PREFIX.len() + call.0.len());
     key.extend_from_slice(PENDING_CALL_DEADLINE_STORAGE_PREFIX);

@@ -784,6 +784,29 @@ impl LocalJamStoreV2 {
             })
     }
 
+    /// Enumerate every durable timeout outcome in canonical CallId order.
+    /// Outcomes outlive deadline rows and continuation completion so restart
+    /// orchestration can rediscover an expiration committed just before a
+    /// crash. Callers must still check whether its workflow remains pending.
+    pub fn call_expirations(&self) -> Result<Vec<AccumulatedTimeoutV2>, LocalStoreReadErrorV2> {
+        let prefix = super::storage::call_expiration_storage_prefix();
+        self.committed
+            .rows
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .map(|(key, bytes)| {
+                let timeout = AccumulatedTimeoutV2::decode(bytes)
+                    .map_err(|_| LocalStoreReadErrorV2::CorruptExpiration)?;
+                if super::call_expiration_storage_key(timeout.expiration.timeout.call_id).as_slice()
+                    != key.as_slice()
+                {
+                    return Err(LocalStoreReadErrorV2::CorruptExpiration);
+                }
+                Ok(timeout)
+            })
+            .collect()
+    }
+
     /// Enumerate deadline-bearing suspended calls from guest-owned physical
     /// bookkeeping. Every row is cross-checked against the authoritative
     /// outbox before it is exposed to restart orchestration.

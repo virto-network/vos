@@ -35,6 +35,11 @@ scan requires no process-local `InvocationId`. IC-5 independently reads an
 ambient Accumulate-only timeslot capability and rejects expiration when that
 trusted observation is absent or still before the deadline; the scheduler's
 due-time filter is only an orchestration convenience.
+Expiration outcomes have a separate durable index. The node enumerates that
+index on every transport poll and after restart, then filters it against the
+current continuation before resuming, so a crash after deadline removal cannot
+strand the suspended workflow. Linear expirations are prepared and committed
+one at a time against the freshly advanced service revision.
 The committed outcome uses the deadline itself as `expired_at`, so hosts which
 first observe the due call in different later slots still derive identical
 bytes.
