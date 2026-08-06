@@ -33,11 +33,11 @@ use vos::v2::{
     NoRefineProtocolHostV2, Origin, PackageManifestV2, PackageRolePoliciesV2, ProducerId,
     ProgramId, ProofArtifactStoreV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
     RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2, ReplicatedServiceErrorV2,
-    ReplyRecordV2, RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId,
-    RootTreeInvocationV2, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2,
-    ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId, SystemCapabilityId,
-    TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2, WorkflowOperationV2, artifact_hash,
-    public_policy_hash, space_role_policy_hash,
+    ReplyRecordV2, RoleAuthorityBindingV2, RoleAuthorityMutationV2, RoleCredentialV2,
+    RoleCredentialVerificationRequestV2, RootServiceId, RootTreeInvocationV2, ScheduleErrorV2,
+    ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2,
+    StateKeyV2, SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2,
+    WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     Decode, Encode,
@@ -630,6 +630,13 @@ fn cycle_v2_elf() -> Vec<u8> {
     )
 }
 
+fn space_authority_elf() -> Vec<u8> {
+    required_elf(
+        "../actors/space-authority/target/riscv64em-javm/release/space_authority.elf",
+        "just build-v2-pvm-test-artifacts",
+    )
+}
+
 fn actor_pvm(result: u64) -> Vec<u8> {
     let mut assembler = grey_transpiler::assembler::Assembler::new();
     assembler
@@ -1092,6 +1099,142 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         .expect("acknowledged image restores through the same service identity");
     assert!(restarted.pending_publications().unwrap().is_empty());
     assert_eq!(restarted.store().header().unwrap().unwrap().revision, 1);
+}
+
+#[test]
+fn canonical_space_authority_produces_extractable_accumulated_assertion() {
+    let actor_elf = space_authority_elf();
+    let package_signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&actor_elf, &package_signer);
+    let authority_actor = ActorId([184; 32]);
+    let service = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([183; 32]),
+        root_service: RootServiceId([185; 32]),
+        deployment: package.deployment_id(),
+        service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+    };
+    let root = libp2p::identity::Keypair::generate_ed25519();
+    let root_peer_id = libp2p::PeerId::from(root.public()).to_bytes();
+    let initial_state = space_authority::initial_state(service.space, root_peer_id)
+        .expect("the authority genesis pins an Ed25519 space root");
+    let binding = RoleAuthorityBindingV2 {
+        service: service.clone(),
+        actor: authority_actor,
+    };
+    let config = LocalRootTreeConfigV2 {
+        role_authority: None,
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package,
+        service,
+        root_actor: authority_actor,
+        actor_name,
+        consistency: ConsistencyModeV2::Local,
+        initial_state,
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([186; 32]),
+            authenticator: vec![187],
+        },
+        refine_gas: 1_000_000_000,
+        accumulate_gas: 5_000_000_000,
+    };
+    let mut authority = LocalRootTreeServiceV2::open(config, FailableCommittedImages::default())
+        .expect("the canonical authority installs through guest Accumulate");
+
+    let holder = Origin::Member(SubjectId([188; 32]));
+    let grant = RoleAuthorityMutationV2::Grant {
+        space: binding.service.space,
+        holder,
+        role: vos::SpaceRole::Developer,
+        epoch: 1,
+    };
+    let signature = root
+        .sign(&grant.encode())
+        .expect("the space root signs the canonical mutation wire");
+    let mut grant_arguments = vec![vos::value::TAG_DYNAMIC];
+    grant_arguments.extend_from_slice(
+        &Msg::new("mutate_role")
+            .with("mutation", grant.encode())
+            .with("signature", signature)
+            .encode(),
+    );
+    let grant_result = authority
+        .invoke(LocalWorkRequestV2 {
+            invocation: InvocationId([189; 32]),
+            workflow_step: 0,
+            logical_timeslot: 1,
+            target: authority_actor,
+            method: "mutate_role".into(),
+            arguments: grant_arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        })
+        .expect("the signed grant commits before the authority decision");
+    let expected_grant_reply = Value::Bool(true).encode();
+    assert_eq!(
+        grant_result
+            .published
+            .reply
+            .as_ref()
+            .map(|reply| reply.result.as_slice()),
+        Some(expected_grant_reply.as_slice())
+    );
+
+    let claim = vos::v2::RoleAuthorizationClaimV2 {
+        space: binding.service.space,
+        holder,
+        role: vos::SpaceRole::Member,
+        audience: ServiceIdentityV2 {
+            root_service: RootServiceId([190; 32]),
+            deployment: DeploymentId([191; 32]),
+            service_program: ProgramId([192; 32]),
+            ..binding.service.clone()
+        },
+        invocation: InvocationId([193; 32]),
+        scope: Hash([194; 32]),
+        target: ActorId([195; 32]),
+        method: "restricted".into(),
+        policy: Hash([196; 32]),
+    };
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(
+        &Msg::new("authorize_role")
+            .with("claim", claim.encode())
+            .encode(),
+    );
+    let committed = authority
+        .invoke(LocalWorkRequestV2 {
+            invocation: claim.authority_invocation(),
+            workflow_step: 0,
+            logical_timeslot: 2,
+            target: authority_actor,
+            method: "authorize_role".into(),
+            arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        })
+        .expect("the canonical authority decision commits before publication");
+    let assertion = committed
+        .role_assertion(claim.clone(), &binding)
+        .expect("the actor reply and guest receipt form the exact role assertion");
+    assert_eq!(assertion.claim, claim);
+    assert!(assertion.matches_authority(&binding));
 }
 
 #[test]

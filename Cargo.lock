@@ -6474,6 +6474,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "space-authority"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "vos",
+]
+
+[[package]]
 name = "space-bridge"
 version = "0.1.0"
 dependencies = [
@@ -7688,6 +7696,7 @@ dependencies = [
  "scheduler",
  "serde",
  "sha2",
+ "space-authority",
  "space-bridge",
  "space-registry",
  "tally",
