@@ -633,8 +633,9 @@ proving keys and traces are caches keyed by `ProgramId`.
 catalog artifacts and opens each ordinary Local or Raft deployment as one
 durable root-tree service. Raft rows resolve membership only after their exact
 package and root configuration pass validation, then order genesis and every
-mutation as canonical IC-5 request bytes. It verifies the package signature, capability layout, and
-protocol-pinned service `ProgramId`; it never extracts the actor PVM into the
+mutation as canonical IC-5 request bytes. It verifies the package signature,
+capability layout, and protocol-pinned service `ProgramId`; it never extracts
+the actor PVM into the
 legacy runtime or retranspiles an ELF. Missing or invalid service artifacts
 skip only the affected row, so an installed package cannot prevent the rest of
 a space from starting. Package classification precedes every legacy Raft seed,
@@ -643,8 +644,22 @@ The daemon derives the guest root-service identity and image path from the
 registry installation incarnation `(SpaceId, instance name, replication_id)`.
 Restarting the same installation reopens its exact image; uninstalling and
 reinstalling under the required fresh replication id creates a fresh actor and
-deduplication domain. On the next boot, images and proof side-CAS directories
-whose incarnation is no longer present move to recoverable trash.
+deduplication domain. Its Raft database is keyed by that root-service identity
+too, so a reinstall cannot inherit terms, logs, cursors, or voters from the
+retired incarnation. On the next boot, images, proof side-CAS directories, and
+Raft databases whose incarnation is no longer present move to recoverable
+trash.
+
+A joining v2 Raft root starts its worker, registers the inbound Raft handler,
+opens its durable service, and validates its still-unpublished route before it
+asks the leader for voter promotion. Once the request is sent, an ambiguous
+timeout never tears that prepared replica down: the request is retried
+idempotently and the route becomes public only after the local worker observes
+the final non-joint membership. Definite pre-change refusals leave the existing
+membership untouched. Calls that reach a follower receive a transport-level
+leader redirect; the original node opens the redirected connection itself, so
+the leader authenticates the original peer rather than trusting a
+follower-rewritten origin.
 
 V2 CRDT rows remain fail-closed until anti-entropy can authenticate receipt
 finality independently of the peer-supplied sync envelope. Local root transport

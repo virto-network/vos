@@ -1186,40 +1186,60 @@ fn spawn_installed_agents(
                 }
             };
         let supports_raft = matches!(&prepared, RowConfig::Ready(_) | RowConfig::V2 { .. });
-        let raft_members =
-            if supports_raft && consistency_from_u8(a.consistency) == Some(Consistency::Raft) {
-                if !blob_store::cache_path_for(&BlobHash(a.program_hash)).exists() {
-                    tracing::warn!(
-                        "skipping agent '{}' — program blob {} not in local cache",
+        let is_v2 = matches!(&prepared, RowConfig::V2 { .. });
+        let svc_id = instance_service_id(&a.instance_name, local_prefix);
+        let raft_seed = if supports_raft
+            && consistency_from_u8(a.consistency) == Some(Consistency::Raft)
+        {
+            if !blob_store::cache_path_for(&BlobHash(a.program_hash)).exists() {
+                tracing::warn!(
+                    "skipping agent '{}' — program blob {} not in local cache",
+                    a.instance_name,
+                    BlobHash(a.program_hash),
+                );
+                continue;
+            }
+            let db_path = raft_db_path_for_row(data_dir, svc_id, &prepared);
+            match raft_members_for_row(node, &db_path, &a, local_prefix, &mut boot_grace) {
+                Ok(RaftSeed::Join { leader, known }) if !is_v2 => {
+                    let Some(network) = node.network() else {
+                        tracing::info!(
+                            "agent '{}' (raft) deferred: no network attached",
+                            a.instance_name
+                        );
+                        continue;
+                    };
+                    match join_raft_group(&network, &a, local_prefix, leader, known)? {
+                        RaftSeed::Members(members) => Some(RaftSeed::Members(members)),
+                        RaftSeed::Defer(reason) => {
+                            tracing::info!("agent '{}' (raft) deferred: {reason}", a.instance_name);
+                            continue;
+                        }
+                        RaftSeed::Join { .. } => unreachable!(),
+                    }
+                }
+                Ok(seed @ (RaftSeed::Members(_) | RaftSeed::Join { .. })) => Some(seed),
+                Ok(RaftSeed::Defer(reason)) => {
+                    tracing::info!(
+                        "agent '{}' (raft) deferred to the runtime reconciler: {reason}",
                         a.instance_name,
-                        BlobHash(a.program_hash),
                     );
                     continue;
                 }
-                match raft_members_for_row(node, data_dir, &a, local_prefix, &mut boot_grace) {
-                    Ok(RaftSeed::Members(m)) => Some(m),
-                    Ok(RaftSeed::Defer(reason)) => {
-                        tracing::info!(
-                            "agent '{}' (raft) deferred to the runtime reconciler: {reason}",
-                            a.instance_name,
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!("agent '{}' (raft) deferred: {e}", a.instance_name);
-                        continue;
-                    }
+                Err(e) => {
+                    tracing::warn!("agent '{}' (raft) deferred: {e}", a.instance_name);
+                    continue;
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
         match prepared {
             RowConfig::Ready(cfg) => {
                 let mut cfg = *cfg;
-                if let Some(members) = raft_members {
+                if let Some(RaftSeed::Members(members)) = raft_seed {
                     cfg.members = members;
                 }
-                let svc_id = instance_service_id(&a.instance_name, local_prefix);
                 let id = node.register_at_id(cfg, svc_id);
                 tracing::info!(
                     "agent '{}' as {id} ({})",
@@ -1240,7 +1260,7 @@ fn spawn_installed_agents(
                     a.replication_id,
                     *config,
                     state_path,
-                    raft_members,
+                    raft_seed,
                     local_prefix,
                     svc_id,
                     network_reachable,
@@ -1680,17 +1700,17 @@ fn register_v2_root_from_row(
     replication_id: [u8; 32],
     config: vos::v2::LocalRootTreeConfigV2,
     state_path: PathBuf,
-    raft_members: Option<Vec<u16>>,
+    raft_seed: Option<RaftSeed>,
     local_prefix: u16,
     svc_id: ServiceId,
     network_reachable: bool,
 ) -> anyhow::Result<ServiceId> {
     let backend = vos::v2::FileCommittedImageStoreV2::new(state_path);
     if config.consistency == vos::v2::ConsistencyModeV2::Raft {
-        let members = raft_members.ok_or_else(|| {
+        let seed = raft_seed.ok_or_else(|| {
             anyhow::anyhow!("v2 Raft root tree '{instance_name}' has no resolved voter set")
         })?;
-        let raft_path = raft_db_path(data_dir, svc_id);
+        let raft_path = v2_raft_db_path(data_dir, config.service.root_service);
         if let Some(parent) = raft_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1698,22 +1718,55 @@ fn register_v2_root_from_row(
             redb::Database::create(&raft_path)
                 .map_err(|error| anyhow::anyhow!("open {}: {error}", raft_path.display()))?,
         );
-        return node
-            .register_v2_raft_root_at_id(
-                instance_name,
-                config,
-                backend,
-                db,
-                vos::raft::RaftConfig {
-                    me: local_prefix,
-                    members,
-                    replication_id,
-                    ..vos::raft::RaftConfig::default()
-                },
-                svc_id,
-                network_reachable,
-            )
-            .map_err(|error| anyhow::anyhow!("register v2 Raft root tree: {error}"));
+        let make_config = |members| vos::raft::RaftConfig {
+            me: local_prefix,
+            members,
+            replication_id,
+            ..vos::raft::RaftConfig::default()
+        };
+        return match seed {
+            RaftSeed::Members(members) => node
+                .register_v2_raft_root_at_id(
+                    instance_name,
+                    config,
+                    backend,
+                    db,
+                    make_config(members),
+                    svc_id,
+                    network_reachable,
+                )
+                .map_err(|error| anyhow::anyhow!("register v2 Raft root tree: {error}")),
+            RaftSeed::Join { leader, known } => {
+                let network = node
+                    .network()
+                    .ok_or_else(|| anyhow::anyhow!("v2 Raft join requires an attached network"))?;
+                let promotion_name = instance_name.clone();
+                node.register_v2_raft_root_at_id_after_local_attach(
+                    instance_name,
+                    config,
+                    backend,
+                    db,
+                    make_config(known.clone()),
+                    svc_id,
+                    network_reachable,
+                    move |worker| {
+                        promote_prepared_v2_raft_root(
+                            &network,
+                            &promotion_name,
+                            replication_id,
+                            local_prefix,
+                            leader,
+                            known,
+                            worker,
+                        )
+                    },
+                )
+                .map_err(|error| anyhow::anyhow!("register v2 Raft root tree: {error}"))
+            }
+            RaftSeed::Defer(reason) => Err(anyhow::anyhow!(
+                "v2 Raft root tree '{instance_name}' remains deferred: {reason}"
+            )),
+        };
     }
 
     let service = vos::v2::LocalRootTreeServiceV2::open(config, backend)
@@ -1722,10 +1775,23 @@ fn register_v2_root_from_row(
         .map_err(|error| anyhow::anyhow!("register v2 root tree: {error}"))
 }
 
-fn raft_db_path(data_dir: &Path, svc_id: ServiceId) -> PathBuf {
+fn legacy_raft_db_path(data_dir: &Path, svc_id: ServiceId) -> PathBuf {
     data_dir
         .join("agents")
         .join(format!("{:08x}.redb", svc_id.0))
+}
+
+fn v2_raft_db_path(data_dir: &Path, root_service: vos::v2::RootServiceId) -> PathBuf {
+    data_dir
+        .join("v2-services")
+        .join(format!("{}.raft.redb", hex::encode(root_service.0)))
+}
+
+fn raft_db_path_for_row(data_dir: &Path, svc_id: ServiceId, prepared: &RowConfig) -> PathBuf {
+    match prepared {
+        RowConfig::V2 { config, .. } => v2_raft_db_path(data_dir, config.service.root_service),
+        _ => legacy_raft_db_path(data_dir, svc_id),
+    }
 }
 
 /// Recover executable bytes from one content-addressed catalog artifact.
@@ -1893,6 +1959,13 @@ fn decide_raft_spawn(
 /// spawn with, or the reason the row stays deferred this pass.
 enum RaftSeed {
     Members(Vec<u16>),
+    /// A live group exists, but this replica is not a voter yet. The v2 path
+    /// starts its worker and validates its route before sending the join;
+    /// legacy roots complete the old eager handshake immediately before spawn.
+    Join {
+        leader: u16,
+        known: Vec<u16>,
+    },
     Defer(String),
 }
 
@@ -1909,7 +1982,7 @@ type BootGrace = std::collections::HashMap<(String, [u8; 32]), u32>;
 /// spawn follows it.
 fn raft_members_for_row(
     node: &VosNode,
-    data_dir: &std::path::Path,
+    db_path: &std::path::Path,
     a: &vos::registry::AgentRow,
     local_prefix: u16,
     boot_grace: &mut BootGrace,
@@ -1927,8 +2000,6 @@ fn raft_members_for_row(
     voters.sort_unstable();
     voters.dedup();
 
-    let svc_id = instance_service_id(&a.instance_name, local_prefix);
-    let db_path = raft_db_path(data_dir, svc_id);
     let anchored = db_path.exists()
         && vos::raft::persisted_membership(&db_path)
             .unwrap_or_default()
@@ -1983,16 +2054,14 @@ fn raft_members_for_row(
             // the registry says by then — which may have grown,
             // leaving the group unable to elect (and the pending
             // joiner with no leader to join).
-            vos::raft::seed_initial_config(&db_path, &[local_prefix])
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            vos::raft::seed_initial_config(db_path, &[local_prefix])
                 .map_err(|e| anyhow::anyhow!("seed raft config for '{}': {e}", a.instance_name))?;
             Ok(RaftSeed::Members(vec![local_prefix]))
         }
-        RaftPlan::Join { leader, known } => {
-            let Some(net) = net else {
-                return Ok(RaftSeed::Defer("no network attached".into()));
-            };
-            join_raft_group(&net, a, local_prefix, leader, known)
-        }
+        RaftPlan::Join { leader, known } => Ok(RaftSeed::Join { leader, known }),
     }
 }
 
@@ -2002,26 +2071,48 @@ fn raft_members_for_row(
 /// our probe and our join must be in our seed, or we'd reject its
 /// votes until the log catches up) and fall back to the probed
 /// `known` view when the re-probe fails.
-fn join_raft_group(
+struct AcceptedRaftJoin {
+    joint_index: u64,
+    members: Vec<u16>,
+}
+
+struct RejectedRaftJoin {
+    reason: String,
+    /// A timeout, transient leadership change, or in-flight configuration is
+    /// ambiguous: the leader may already have appended our joint entry before
+    /// its response was lost. A prepared replica must remain live and retry in
+    /// those cases. Only an authenticated refusal or a confirmed missing group
+    /// is safe to return to the caller and tear down locally.
+    retryable: bool,
+    /// The request was sent but no response arrived. The remote leader may
+    /// already have appended the joint entry, so no later refusal from another
+    /// peer makes local teardown safe.
+    membership_may_have_changed: bool,
+}
+
+fn request_raft_join(
     net: &std::sync::Arc<vos::network::Network>,
-    a: &vos::registry::AgentRow,
+    instance_name: &str,
+    replication_id: [u8; 32],
     local_prefix: u16,
     mut leader: u16,
     known: Vec<u16>,
-) -> anyhow::Result<RaftSeed> {
+) -> anyhow::Result<Result<AcceptedRaftJoin, RejectedRaftJoin>> {
     use vos::network::RaftJoinResult;
 
     for _redirect in 0..2 {
         let Some(peer) = net.peer_for_prefix(leader) else {
-            return Ok(RaftSeed::Defer(format!(
-                "raft leader {leader:#06x} is not connected",
-            )));
+            return Ok(Err(RejectedRaftJoin {
+                reason: format!("raft leader {leader:#06x} is not connected"),
+                retryable: true,
+                membership_may_have_changed: false,
+            }));
         };
-        let rx = net.send_raft_join_req(peer, a.replication_id, local_prefix);
+        let rx = net.send_raft_join_req(peer, replication_id, local_prefix);
         match rx.recv_timeout(RAFT_JOIN_TIMEOUT) {
-            Ok(RaftJoinResult::Accepted { .. }) => {
+            Ok(RaftJoinResult::Accepted { joint_index }) => {
                 let mut members = match net
-                    .send_raft_status_req(peer, a.replication_id)
+                    .send_raft_status_req(peer, replication_id)
                     .recv_timeout(RAFT_PROBE_TIMEOUT)
                 {
                     Ok(st) if st.present && !st.members.is_empty() => st.members,
@@ -2032,10 +2123,13 @@ fn join_raft_group(
                 members.dedup();
                 tracing::info!(
                     "agent '{}': joined raft group as voter (leader {leader:#06x}, {} member(s))",
-                    a.instance_name,
+                    instance_name,
                     members.len(),
                 );
-                return Ok(RaftSeed::Members(members));
+                return Ok(Ok(AcceptedRaftJoin {
+                    joint_index,
+                    members,
+                }));
             }
             Ok(RaftJoinResult::NotLeader {
                 leader_hint: Some(h),
@@ -2043,36 +2137,136 @@ fn join_raft_group(
                 leader = h; // follow one redirect
             }
             Ok(RaftJoinResult::NotLeader { .. }) => {
-                return Ok(RaftSeed::Defer(
-                    "leadership moved during the join handshake".into(),
-                ));
+                return Ok(Err(RejectedRaftJoin {
+                    reason: "leadership moved during the join handshake".into(),
+                    retryable: true,
+                    membership_may_have_changed: false,
+                }));
             }
             Ok(RaftJoinResult::Busy) => {
-                return Ok(RaftSeed::Defer(
-                    "another membership change is in flight".into(),
-                ));
+                return Ok(Err(RejectedRaftJoin {
+                    reason: "another membership change is in flight".into(),
+                    retryable: true,
+                    membership_may_have_changed: false,
+                }));
             }
             Ok(RaftJoinResult::UnknownGroup) => {
-                return Ok(RaftSeed::Defer(format!(
-                    "peer {leader:#06x} no longer runs the group",
-                )));
+                return Ok(Err(RejectedRaftJoin {
+                    reason: format!("peer {leader:#06x} no longer runs the group"),
+                    retryable: false,
+                    membership_may_have_changed: false,
+                }));
             }
             Ok(RaftJoinResult::NotAuthorized) => {
                 // Permanent refusal — this node isn't an enrolled voter.
                 // Don't retry; an admin must enrol it first.
-                return Ok(RaftSeed::Defer(format!(
-                    "this node ({local_prefix:#06x}) is not enrolled as a voter for \
-                     agent '{}'; an admin must run `vosx space members add <peer> \
-                     --role voter`",
-                    a.instance_name,
-                )));
+                return Ok(Err(RejectedRaftJoin {
+                    reason: format!(
+                        "this node ({local_prefix:#06x}) is not enrolled as a voter for \
+                         agent '{}'; an admin must run `vosx space members add <peer> \
+                         --role voter`",
+                        instance_name,
+                    ),
+                    retryable: false,
+                    membership_may_have_changed: false,
+                }));
             }
             Err(_) => {
-                return Ok(RaftSeed::Defer("join request timed out".into()));
+                return Ok(Err(RejectedRaftJoin {
+                    reason: "join request timed out".into(),
+                    retryable: true,
+                    membership_may_have_changed: true,
+                }));
             }
         }
     }
-    Ok(RaftSeed::Defer("leader redirects did not converge".into()))
+    Ok(Err(RejectedRaftJoin {
+        reason: "leader redirects did not converge".into(),
+        retryable: true,
+        membership_may_have_changed: false,
+    }))
+}
+
+fn join_raft_group(
+    net: &std::sync::Arc<vos::network::Network>,
+    a: &vos::registry::AgentRow,
+    local_prefix: u16,
+    leader: u16,
+    known: Vec<u16>,
+) -> anyhow::Result<RaftSeed> {
+    Ok(
+        match request_raft_join(
+            net,
+            &a.instance_name,
+            a.replication_id,
+            local_prefix,
+            leader,
+            known,
+        )? {
+            Ok(joined) => RaftSeed::Members(joined.members),
+            Err(rejection) => RaftSeed::Defer(rejection.reason),
+        },
+    )
+}
+
+fn promote_prepared_v2_raft_root(
+    net: &std::sync::Arc<vos::network::Network>,
+    instance_name: &str,
+    replication_id: [u8; 32],
+    local_prefix: u16,
+    leader: u16,
+    known: Vec<u16>,
+    worker: &vos::raft::WorkerHandle,
+) -> Result<(), String> {
+    let mut membership_may_have_changed = false;
+    let accepted = loop {
+        match request_raft_join(
+            net,
+            instance_name,
+            replication_id,
+            local_prefix,
+            leader,
+            known.clone(),
+        )
+        .map_err(|error| error.to_string())?
+        {
+            Ok(accepted) => break accepted,
+            Err(rejection)
+                if !rejection.retryable
+                    && !membership_may_have_changed
+                    && !rejection.membership_may_have_changed =>
+            {
+                return Err(rejection.reason);
+            }
+            Err(rejection) => {
+                membership_may_have_changed |= rejection.membership_may_have_changed;
+                tracing::warn!(
+                    "agent '{instance_name}': prepared Raft join is still pending: {}",
+                    rejection.reason,
+                );
+                // Once a join request has left this process, a timeout is
+                // ambiguous: the leader may already require this voter in its
+                // joint quorum. Keep the unexposed worker alive and retry
+                // instead of tearing it down and potentially wedging the old
+                // group. Repeating the request is idempotent because an
+                // already-member join returns Accepted { joint_index: 0 }.
+                std::thread::sleep(RAFT_PROBE_TIMEOUT);
+            }
+        }
+    };
+    loop {
+        if let Some(snapshot) = worker.snapshot()
+            && snapshot.members.contains(&local_prefix)
+            && snapshot.joint_old.is_none()
+            && snapshot.commit_index >= accepted.joint_index.saturating_add(1)
+        {
+            return Ok(());
+        }
+        // Do not abandon an accepted join: the existing cluster may already
+        // require this worker's vote. Route publication waits here until the
+        // final (non-joint) configuration is locally committed.
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 /// Cap on agents brought up in a single reconcile pass. The pass
@@ -2269,7 +2463,8 @@ fn reconcile_installed_agents(
                 }
             };
         let supports_raft = matches!(&prepared, RowConfig::Ready(_) | RowConfig::V2 { .. });
-        let raft_members = if supports_raft
+        let is_v2 = matches!(&prepared, RowConfig::V2 { .. });
+        let raft_seed = if supports_raft
             && consistency_from_u8(a.consistency) == Some(Consistency::Raft)
         {
             if !blob_store::cache_path_for(&BlobHash(a.program_hash)).exists() {
@@ -2284,10 +2479,32 @@ fn reconcile_installed_agents(
                 }
                 continue;
             }
-            match raft_members_for_row(node, data_dir, &a, local_prefix, boot_grace) {
-                Ok(RaftSeed::Members(m)) => {
+            let db_path = raft_db_path_for_row(data_dir, svc_id, &prepared);
+            match raft_members_for_row(node, &db_path, &a, local_prefix, boot_grace) {
+                Ok(RaftSeed::Join { leader, known }) if !is_v2 => {
+                    let Some(network) = node.network() else {
+                        continue;
+                    };
+                    match join_raft_group(&network, &a, local_prefix, leader, known)? {
+                        RaftSeed::Members(members) => {
+                            damped.remove(&key(RowNote::RaftWaiting));
+                            Some(RaftSeed::Members(members))
+                        }
+                        RaftSeed::Defer(reason) => {
+                            if damped.insert(key(RowNote::RaftWaiting)) {
+                                tracing::warn!(
+                                    "agent '{}' (raft) deferred: {reason}",
+                                    a.instance_name
+                                );
+                            }
+                            continue;
+                        }
+                        RaftSeed::Join { .. } => unreachable!(),
+                    }
+                }
+                Ok(seed @ (RaftSeed::Members(_) | RaftSeed::Join { .. })) => {
                     damped.remove(&key(RowNote::RaftWaiting));
-                    Some(m)
+                    Some(seed)
                 }
                 Ok(RaftSeed::Defer(reason)) => {
                     if damped.insert(key(RowNote::RaftWaiting)) {
@@ -2310,7 +2527,7 @@ fn reconcile_installed_agents(
         match prepared {
             RowConfig::Ready(cfg) => {
                 let mut cfg = *cfg;
-                if let Some(members) = raft_members {
+                if let Some(RaftSeed::Members(members)) = raft_seed {
                     cfg.members = members;
                 }
                 let id = node.register_at_id(cfg, svc_id);
@@ -2351,7 +2568,7 @@ fn reconcile_installed_agents(
                     a.replication_id,
                     *config,
                     state_path,
-                    raft_members,
+                    raft_seed,
                     local_prefix,
                     svc_id,
                     network_reachable,
@@ -2473,7 +2690,10 @@ fn sweep_orphan_v2_services(
             continue;
         };
         let suffix = &name_str[64..];
-        if !matches!(suffix, ".image" | ".image.proofs" | ".image.v2-next") {
+        if !matches!(
+            suffix,
+            ".image" | ".image.proofs" | ".image.v2-next" | ".raft.redb"
+        ) {
             continue;
         }
         let Ok(root_bytes) = hex::decode(root_hex) else {
@@ -2633,6 +2853,20 @@ mod tests {
     }
 
     #[test]
+    fn v2_raft_storage_is_scoped_to_the_installation_incarnation() {
+        let data = Path::new("/tmp/vos-v2-raft-path-test");
+        let first = v2_raft_db_path(data, vos::v2::RootServiceId([1; 32]));
+        let reinstalled = v2_raft_db_path(data, vos::v2::RootServiceId([2; 32]));
+        assert_ne!(first, reinstalled);
+        let expected = format!("{}.raft.redb", hex::encode([1; 32]));
+        assert_eq!(
+            first.file_name().and_then(|name| name.to_str()),
+            Some(expected.as_str()),
+        );
+        assert!(first.starts_with(data.join("v2-services")));
+    }
+
+    #[test]
     fn agent_policies_come_from_local_toml() {
         // Node-local policy is now sourced from local.toml, not the
         // recipe — the fix for the bare-restart drop. A bare agent
@@ -2719,16 +2953,22 @@ mod tests {
         let active_image = services.join(format!("{}.image", hex::encode(active)));
         let orphan_image = services.join(format!("{}.image", hex::encode(orphan)));
         let orphan_proofs = services.join(format!("{}.image.proofs", hex::encode(orphan)));
+        let active_raft = services.join(format!("{}.raft.redb", hex::encode(active)));
+        let orphan_raft = services.join(format!("{}.raft.redb", hex::encode(orphan)));
         std::fs::write(&active_image, b"active").unwrap();
         std::fs::write(&orphan_image, b"orphan").unwrap();
+        std::fs::write(&active_raft, b"active raft").unwrap();
+        std::fs::write(&orphan_raft, b"orphan raft").unwrap();
         std::fs::create_dir_all(&orphan_proofs).unwrap();
         std::fs::write(orphan_proofs.join("proof"), b"proof").unwrap();
 
         sweep_orphan_v2_services(&dir, &[active].into_iter().collect());
 
         assert!(active_image.is_file());
+        assert!(active_raft.is_file());
         assert!(!orphan_image.exists());
         assert!(!orphan_proofs.exists());
+        assert!(!orphan_raft.exists());
         assert!(
             dir.join("trash")
                 .join("v2-services")
@@ -2740,6 +2980,12 @@ mod tests {
                 .join("v2-services")
                 .join(orphan_proofs.file_name().unwrap())
                 .is_dir(),
+        );
+        assert!(
+            dir.join("trash")
+                .join("v2-services")
+                .join(orphan_raft.file_name().unwrap())
+                .is_file(),
         );
         let _ = std::fs::remove_dir_all(dir);
     }

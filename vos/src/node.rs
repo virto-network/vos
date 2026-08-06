@@ -99,6 +99,7 @@ pub enum V2RaftNodeRegistrationError<E> {
     Log(crate::commit::CommitError),
     Open(crate::v2::LocalRootTreeOpenErrorV2<E>),
     Registration(V2NodeRegistrationError),
+    Promotion(String),
 }
 
 #[cfg(all(feature = "storage", feature = "network"))]
@@ -1767,11 +1768,25 @@ impl crate::network::NetworkService for NodeService {
     fn dispatch_invoke(
         &self,
         caller_peer_id: Option<libp2p::PeerId>,
-        _from: u32,
+        from: u32,
         to: u32,
         chain: Vec<u32>,
         msg: Vec<u8>,
     ) -> Vec<u8> {
+        match self.dispatch_invoke_routed(caller_peer_id, from, to, chain, msg) {
+            crate::network::NetworkInvokeResponse::Reply(reply) => reply,
+            crate::network::NetworkInvokeResponse::Redirect { .. } => Vec::new(),
+        }
+    }
+
+    fn dispatch_invoke_routed(
+        &self,
+        caller_peer_id: Option<libp2p::PeerId>,
+        _from: u32,
+        to: u32,
+        chain: Vec<u32>,
+        msg: Vec<u8>,
+    ) -> crate::network::NetworkInvokeResponse {
         // The chain arrived already including the original caller's
         // ID (the remote peer's agent). The receiver's own
         // external_invoke prepends *this* agent's ID when dispatching
@@ -1799,7 +1814,7 @@ impl crate::network::NetworkService for NodeService {
             })
         {
             warn!(peer = ?caller_peer_id, "redeem_invite refused: token expired");
-            return forbidden_envelope();
+            return forbidden_envelope().into();
         }
 
         // Locality boundary: a node-confined agent (`Local`/`Ephemeral`)
@@ -1828,7 +1843,7 @@ impl crate::network::NetworkService for NodeService {
                 "invoke refused: node-confined agent is reachable only by this \
                  device's operator",
             );
-            return Vec::new();
+            return Vec::new().into();
         }
 
         // Reserved generic lifecycle methods are answered
@@ -1844,7 +1859,7 @@ impl crate::network::NetworkService for NodeService {
         if let Some(reply) =
             self.try_intercept_lifecycle(to, to_unscoped, &msg, caller_peer_id.as_ref())
         {
-            return reply;
+            return reply.into();
         }
 
         // The dispatch-layer role gate has moved to the actor's own
@@ -1866,7 +1881,7 @@ impl crate::network::NetworkService for NodeService {
             })
         });
         let Some(tx) = tx else {
-            return Vec::new();
+            return Vec::new().into();
         };
         let (reply_tx, reply_rx) = mpsc::channel();
         // libp2p noise verified the PeerId at connect time; the
@@ -1938,7 +1953,7 @@ impl crate::network::NetworkService for NodeService {
                     peer = ?caller_peer_id,
                     "invoke refused: private replica read requires space membership",
                 );
-                return Vec::new();
+                return Vec::new().into();
             }
         }
 
@@ -1953,7 +1968,7 @@ impl crate::network::NetworkService for NodeService {
             })
             .is_err()
         {
-            return Vec::new();
+            return Vec::new().into();
         }
         // The receiver replies with the full invoke envelope; the
         // libp2p protocol still ships only reply bytes, so unwrap
@@ -1983,11 +1998,15 @@ impl crate::network::NetworkService for NodeService {
                         peer = %peer_label,
                         "auth: actor refused call — caller lacks the required role",
                     );
-                    return forbidden_envelope();
+                    return forbidden_envelope().into();
                 }
-                unwrap_invoke_envelope(&env).unwrap_or_default()
+                #[cfg(all(feature = "storage", feature = "network"))]
+                if let Some(leader_prefix) = decode_v2_raft_redirect(&env) {
+                    return crate::network::NetworkInvokeResponse::Redirect { leader_prefix };
+                }
+                unwrap_invoke_envelope(&env).unwrap_or_default().into()
             }
-            None => Vec::new(),
+            None => Vec::new().into(),
         }
     }
 
@@ -2844,6 +2863,19 @@ impl VosNode {
             + Send
             + 'static,
     {
+        self.validate_v2_root_registration(&service, id)?;
+        Ok(self.attach_v2_root_unchecked(name.into(), service, id, network_reachable))
+    }
+
+    fn validate_v2_root_registration<B>(
+        &self,
+        service: &crate::v2::LocalRootTreeServiceV2<B>,
+        id: ServiceId,
+    ) -> Result<(), V2NodeRegistrationError>
+    where
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+    {
         if self.routes.contains_key(&id.0)
             || self.agent_info.read().unwrap().contains_key(&id.0)
             || self.invoke_routes.lock().unwrap().contains_key(&id.0)
@@ -2851,8 +2883,28 @@ impl VosNode {
             return Err(V2NodeRegistrationError::ServiceRouteOccupied(id));
         }
         let actor = service.root_actor();
+        restore_v2_root_logical_timeslot(service, &self.v2_logical_timeslot)?;
+        if self.v2_actor_routes.read().unwrap().contains_key(&actor) {
+            return Err(V2NodeRegistrationError::ActorAlreadyRegistered(actor));
+        }
+        Ok(())
+    }
+
+    fn attach_v2_root_unchecked<B>(
+        &mut self,
+        name: String,
+        service: crate::v2::LocalRootTreeServiceV2<B>,
+        id: ServiceId,
+        network_reachable: bool,
+    ) -> ServiceId
+    where
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+            + Send
+            + 'static,
+    {
+        let actor = service.root_actor();
         let service_identity = service.identity().clone();
-        restore_v2_root_logical_timeslot(&service, &self.v2_logical_timeslot)?;
         let consistency = match service.consistency() {
             crate::v2::ConsistencyModeV2::Ephemeral => Consistency::Ephemeral,
             crate::v2::ConsistencyModeV2::Local => Consistency::Local,
@@ -2861,9 +2913,6 @@ impl VosNode {
         };
         {
             let mut actors = self.v2_actor_routes.write().unwrap();
-            if actors.contains_key(&actor) {
-                return Err(V2NodeRegistrationError::ActorAlreadyRegistered(actor));
-            }
             actors.insert(
                 actor,
                 V2ActorRoute {
@@ -2874,7 +2923,6 @@ impl VosNode {
                 },
             );
         }
-        let name = name.into();
         let (inbox_tx, inbox_rx) = mpsc::channel();
         let (invoke_tx, invoke_rx) = mpsc::channel();
         self.routes.insert(id.0, inbox_tx);
@@ -2910,7 +2958,7 @@ impl VosNode {
                 )
             })),
         });
-        Ok(id)
+        id
     }
 
     /// Attach one Raft-backed v2 root tree to the node. The worker orders
@@ -2937,6 +2985,47 @@ impl VosNode {
             + Send
             + 'static,
     {
+        self.register_v2_raft_root_at_id_after_local_attach(
+            name,
+            config,
+            backend,
+            db,
+            raft_config,
+            id,
+            network_reachable,
+            |_| Ok(()),
+        )
+    }
+
+    /// Start and validate a Raft replica before an optional voter-promotion
+    /// handshake, then publish its actor route only after that handshake
+    /// succeeds. The callback runs while the worker and inbound Raft handler
+    /// are live, so joint consensus can replicate to the joiner immediately;
+    /// any local open/route failure occurs before the existing cluster changes
+    /// membership.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_v2_raft_root_at_id_after_local_attach<B, F>(
+        &mut self,
+        name: String,
+        config: crate::v2::LocalRootTreeConfigV2,
+        backend: B,
+        db: Arc<redb::Database>,
+        raft_config: crate::raft::RaftConfig,
+        id: ServiceId,
+        network_reachable: bool,
+        promote: F,
+    ) -> Result<
+        ServiceId,
+        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+    >
+    where
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+            + Send
+            + 'static,
+        F: FnOnce(&crate::raft::WorkerHandle) -> Result<(), String>,
+    {
         let replication_id = raft_config.replication_id;
         let network = self
             .shared_network
@@ -2956,10 +3045,10 @@ impl VosNode {
             network.clone(),
             Some(apply_tx),
         );
+        let worker_handle = worker.handler();
         if let Some(network) = network.as_ref() {
-            network.register_raft_handler(replication_id, Arc::new(worker.handler()));
+            network.register_raft_handler(replication_id, Arc::new(worker_handle.clone()));
         }
-        self.raft_hosts.lock().unwrap().insert(id.0, replication_id);
 
         let cleanup = |node: &Self| {
             if let Some(network) = network.as_ref() {
@@ -2986,13 +3075,16 @@ impl VosNode {
                 return Err(V2RaftNodeRegistrationError::Open(error));
             }
         };
-        match self.register_v2_root_at_id(name, service, id, network_reachable) {
-            Ok(id) => Ok(id),
-            Err(error) => {
-                cleanup(self);
-                Err(V2RaftNodeRegistrationError::Registration(error))
-            }
+        if let Err(error) = self.validate_v2_root_registration(&service, id) {
+            cleanup(self);
+            return Err(V2RaftNodeRegistrationError::Registration(error));
         }
+        if let Err(error) = promote(&worker_handle) {
+            cleanup(self);
+            return Err(V2RaftNodeRegistrationError::Promotion(error));
+        }
+        self.raft_hosts.lock().unwrap().insert(id.0, replication_id);
+        Ok(self.attach_v2_root_unchecked(name, service, id, network_reachable))
     }
 
     /// Bind an externally owned v2 actor to an authenticated physical route.
@@ -3803,7 +3895,7 @@ impl VosNode {
                 caller: crate::actors::Caller::System,
                 space_role: None,
                 actor_local_role: None,
-                msg,
+                msg: msg.clone(),
                 reply: ReplyChannel::Sync(reply_tx),
                 chain: Vec::new(),
             })
@@ -3812,10 +3904,18 @@ impl VosNode {
             // envelope (status + state + reply); host callers
             // don't care about YIELDED/DONE so unwrap to just
             // reply bytes.
-            return reply_rx
-                .recv_timeout(timeout)
-                .ok()
-                .and_then(|env| unwrap_invoke_envelope(&env));
+            let envelope = reply_rx.recv_timeout(timeout).ok()?;
+            #[cfg(all(feature = "network", feature = "storage"))]
+            if let Some(leader_prefix) = decode_v2_raft_redirect(&envelope) {
+                let net = self.shared_network.lock().ok().and_then(|g| g.clone())?;
+                let peer = net.peer_for_prefix(leader_prefix)?;
+                let leader_target = ServiceId::new(leader_prefix, target.local_id()).0;
+                return net
+                    .send_invoke(peer, ServiceId::REGISTRY.0, leader_target, Vec::new(), msg)
+                    .recv_timeout(timeout)
+                    .ok();
+            }
+            return unwrap_invoke_envelope(&envelope);
         }
 
         // 2. Cross-node fallback.
@@ -4064,6 +4164,23 @@ fn send_v2_status(reply: ReplyChannel, status: u8, id: ServiceId) {
     let _ = send_reply_capped(reply, encode_invoke_envelope(status, &[], &[]), id);
 }
 
+#[cfg(all(feature = "storage", feature = "network"))]
+const V2_RAFT_REDIRECT_STATUS: u8 = 0xFE;
+
+#[cfg(all(feature = "storage", feature = "network"))]
+fn encode_v2_raft_redirect(leader_prefix: u16) -> Vec<u8> {
+    let mut wire = Vec::with_capacity(3);
+    wire.push(V2_RAFT_REDIRECT_STATUS);
+    wire.extend_from_slice(&leader_prefix.to_le_bytes());
+    wire
+}
+
+#[cfg(all(feature = "storage", feature = "network"))]
+fn decode_v2_raft_redirect(wire: &[u8]) -> Option<u16> {
+    (wire.len() == 3 && wire[0] == V2_RAFT_REDIRECT_STATUS)
+        .then(|| u16::from_le_bytes([wire[1], wire[2]]))
+}
+
 #[derive(Default)]
 struct V2RootThreadState {
     pending_callers: HashMap<crate::v2::InvocationId, Vec<ReplyChannel>>,
@@ -4207,6 +4324,12 @@ where
             Ok(floor) => floor,
             Err(failure) => {
                 error!(%id, ?failure, "v2 root-tree admission barrier failed");
+                #[cfg(all(feature = "storage", feature = "network"))]
+                if let Some(leader_prefix) = service.admission_leader_hint() {
+                    let _ =
+                        send_reply_capped(req.reply, encode_v2_raft_redirect(leader_prefix), id);
+                    continue;
+                }
                 send_v2_status(req.reply, crate::STATUS_PANICKED, id);
                 continue;
             }
@@ -5022,7 +5145,22 @@ fn agent_thread(
             // boundary so the calling actor can keep driving a
             // yielded child.
             match reply_rx.recv_timeout(std::time::Duration::from_secs(10)) {
-                Ok(envelope) => return decode_invoke_envelope(&envelope),
+                Ok(envelope) => {
+                    #[cfg(all(feature = "network", feature = "storage"))]
+                    if decode_v2_raft_redirect(&envelope).is_some()
+                        && let Some(rep_id) = raft_forward_plan(&raft_fwd, id, target.0)
+                    {
+                        return agent_forward_to_raft_leader(
+                            &raft_fwd,
+                            id,
+                            target.0,
+                            rep_id,
+                            msg.to_vec(),
+                        )
+                        .map(crate::runtime::ExternalInvokeReply::Done);
+                    }
+                    return decode_invoke_envelope(&envelope);
+                }
                 // The local target dropped its reply sender — the signature of
                 // a raft follower refusing a write. If it is a raft agent,
                 // forward the write to the leader (the agent analogue of the
@@ -7423,7 +7561,18 @@ async fn route_invoke(
     .await;
 
     match outcome {
-        AskOutcome::Reply(env) => unwrap_invoke_envelope(&env),
+        AskOutcome::Reply(env) => {
+            #[cfg(all(feature = "network", feature = "storage"))]
+            if decode_v2_raft_redirect(&env).is_some() {
+                return match forward_plan {
+                    Some((rep_id, payload)) => {
+                        forward_to_raft_leader(fwd, extension_id, target, rep_id, payload).await
+                    }
+                    None => None,
+                };
+            }
+            unwrap_invoke_envelope(&env)
+        }
         AskOutcome::Timeout => None,
         AskOutcome::Canceled => match forward_plan {
             Some((rep_id, payload)) => {

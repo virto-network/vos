@@ -207,6 +207,21 @@ pub struct ManifestReply {
 ///
 /// [`set_service`]: Network::set_service
 /// [`register_raft_handler`]: Network::register_raft_handler
+/// Result of dispatching one network invocation. Redirects are transport
+/// control, never actor reply bytes: the originating network instance follows
+/// them so the final leader authenticates the original peer directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkInvokeResponse {
+    Reply(Vec<u8>),
+    Redirect { leader_prefix: u16 },
+}
+
+impl From<Vec<u8>> for NetworkInvokeResponse {
+    fn from(reply: Vec<u8>) -> Self {
+        Self::Reply(reply)
+    }
+}
+
 pub trait NetworkService: Send + Sync {
     /// Inbound `Frame::InvokeRequest`. Default returns empty —
     /// surfaces to the caller as "target not found." The real
@@ -230,6 +245,20 @@ pub trait NetworkService: Send + Sync {
         _msg: Vec<u8>,
     ) -> Vec<u8> {
         Vec::new()
+    }
+
+    /// Dispatch with transport control preserved. Implementations that do not
+    /// host leader-routed services inherit ordinary reply behavior.
+    fn dispatch_invoke_routed(
+        &self,
+        caller_peer_id: Option<libp2p::PeerId>,
+        from: u32,
+        to: u32,
+        chain: Vec<u32>,
+        msg: Vec<u8>,
+    ) -> NetworkInvokeResponse {
+        self.dispatch_invoke(caller_peer_id, from, to, chain, msg)
+            .into()
     }
 
     /// Inbound `Frame::FetchHeads` for a replication group.
@@ -593,7 +622,7 @@ pub(in crate::network) enum NetworkCmd {
 
 /// Outbound request kinds tracked while we wait for the reply.
 enum OutboundReply {
-    Invoke(std_mpsc::Sender<Vec<u8>>),
+    Invoke(PendingInvoke),
     Heads(std_mpsc::Sender<Vec<[u8; 32]>>),
     Node(std_mpsc::Sender<Option<Vec<u8>>>),
     RaftAppend(std_mpsc::Sender<RaftAppendResult>),
@@ -604,6 +633,15 @@ enum OutboundReply {
     RaftStatus(std_mpsc::Sender<RaftStatusReply>),
     ProofBlob(std_mpsc::Sender<Option<Vec<u8>>>),
     ProgramBlob(std_mpsc::Sender<Option<Vec<u8>>>),
+}
+
+struct PendingInvoke {
+    reply: std_mpsc::Sender<Vec<u8>>,
+    from: u32,
+    to: u32,
+    chain: Vec<u32>,
+    msg: Vec<u8>,
+    redirects: u8,
 }
 
 impl Network {
@@ -1175,12 +1213,27 @@ async fn network_main(
                     Some(NetworkCmd::SendInvoke {
                         target_peer, from, to, chain, msg, reply,
                     }) => {
-                        let frame = Frame::InvokeRequest { from, to, chain, msg };
+                        let frame = Frame::InvokeRequest {
+                            from,
+                            to,
+                            chain: chain.clone(),
+                            msg: msg.clone(),
+                        };
                         let req_id = swarm
                             .behaviour_mut()
                             .req_resp
                             .send_request(&target_peer, frame);
-                        outbound_replies.insert(req_id, OutboundReply::Invoke(reply));
+                        outbound_replies.insert(
+                            req_id,
+                            OutboundReply::Invoke(PendingInvoke {
+                                reply,
+                                from,
+                                to,
+                                chain,
+                                msg,
+                                redirects: 0,
+                            }),
+                        );
                         debug!(%target_peer, from, to, "network: sent InvokeRequest");
                     }
                     Some(NetworkCmd::SendFetchHeads {
@@ -1661,8 +1714,10 @@ fn handle_req_resp(
                         let response_tx = response_tx.clone();
                         let caller = peer;
                         tokio::task::spawn_blocking(move || {
-                            let payload = match svc {
-                                Some(s) => s.dispatch_invoke(Some(caller), from, to, chain, msg),
+                            let response = match svc {
+                                Some(s) => {
+                                    s.dispatch_invoke_routed(Some(caller), from, to, chain, msg)
+                                }
                                 None => {
                                     warn!(
                                         from,
@@ -1670,10 +1725,18 @@ fn handle_req_resp(
                                         "network: inbound InvokeRequest with no \
                                          service installed; replying empty",
                                     );
-                                    Vec::new()
+                                    NetworkInvokeResponse::Reply(Vec::new())
                                 }
                             };
-                            let _ = response_tx.send((channel, Frame::InvokeReply { payload }));
+                            let frame = match response {
+                                NetworkInvokeResponse::Reply(payload) => {
+                                    Frame::InvokeReply { payload }
+                                }
+                                NetworkInvokeResponse::Redirect { leader_prefix } => {
+                                    Frame::InvokeRedirect { leader_prefix }
+                                }
+                            };
+                            let _ = response_tx.send((channel, frame));
                         });
                     }
                     Frame::FetchHeads { replication_id } => {
@@ -2038,8 +2101,39 @@ fn handle_req_resp(
                     (Frame::Ack, _) => {
                         debug!(%peer, "network: Tell ack received");
                     }
-                    (Frame::InvokeReply { payload }, Some(OutboundReply::Invoke(tx))) => {
-                        let _ = tx.send(payload);
+                    (Frame::InvokeReply { payload }, Some(OutboundReply::Invoke(pending))) => {
+                        let _ = pending.reply.send(payload);
+                    }
+                    (
+                        Frame::InvokeRedirect { leader_prefix },
+                        Some(OutboundReply::Invoke(mut pending)),
+                    ) => {
+                        if pending.redirects >= 1 || leader_prefix == local_prefix {
+                            warn!(%peer, leader_prefix, "network: refusing recursive/self invoke redirect");
+                            return;
+                        }
+                        let target_peer = prefix_map
+                            .lock()
+                            .ok()
+                            .and_then(|owners| owners.get(&leader_prefix).copied());
+                        let Some(target_peer) = target_peer else {
+                            warn!(%peer, leader_prefix, "network: invoke redirect names an unknown authenticated peer");
+                            return;
+                        };
+                        pending.redirects += 1;
+                        pending.to = ((leader_prefix as u32) << 16) | (pending.to & 0xFFFF);
+                        let frame = Frame::InvokeRequest {
+                            from: pending.from,
+                            to: pending.to,
+                            chain: pending.chain.clone(),
+                            msg: pending.msg.clone(),
+                        };
+                        let redirected = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, frame);
+                        outbound_replies.insert(redirected, OutboundReply::Invoke(pending));
+                        debug!(%target_peer, leader_prefix, "network: followed Raft invoke redirect as the original peer");
                     }
                     (Frame::Heads { roots, .. }, Some(OutboundReply::Heads(tx))) => {
                         let _ = tx.send(roots);
@@ -3162,6 +3256,119 @@ mod tests {
 
         net_a.join();
         net_b.join();
+    }
+
+    #[test]
+    fn raft_invoke_redirect_is_followed_by_the_original_authenticated_peer() {
+        struct Redirector(u16);
+        impl NetworkService for Redirector {
+            fn dispatch_invoke_routed(
+                &self,
+                _caller_peer_id: Option<libp2p::PeerId>,
+                _from: u32,
+                _to: u32,
+                _chain: Vec<u32>,
+                _msg: Vec<u8>,
+            ) -> NetworkInvokeResponse {
+                NetworkInvokeResponse::Redirect {
+                    leader_prefix: self.0,
+                }
+            }
+        }
+
+        struct LeaderDispatcher {
+            caller: Arc<Mutex<Option<PeerId>>>,
+        }
+        impl NetworkService for LeaderDispatcher {
+            fn dispatch_invoke(
+                &self,
+                caller_peer_id: Option<PeerId>,
+                _from: u32,
+                _to: u32,
+                _chain: Vec<u32>,
+                _msg: Vec<u8>,
+            ) -> Vec<u8> {
+                *self.caller.lock().unwrap() = caller_peer_id;
+                b"leader reply".to_vec()
+            }
+        }
+
+        let key_a = identity::Keypair::generate_ed25519();
+        let prefix_a = derive_node_prefix(&PeerId::from(key_a.public()));
+        let (key_b, prefix_b) = loop {
+            let key = identity::Keypair::generate_ed25519();
+            let prefix = derive_node_prefix(&PeerId::from(key.public()));
+            if prefix != prefix_a {
+                break (key, prefix);
+            }
+        };
+        let (key_c, prefix_c) = loop {
+            let key = identity::Keypair::generate_ed25519();
+            let prefix = derive_node_prefix(&PeerId::from(key.public()));
+            if prefix != prefix_a && prefix != prefix_b {
+                break (key, prefix);
+            }
+        };
+
+        let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+        let net_a = Network::start(NetworkConfig {
+            keypair: key_a,
+            local_prefix: prefix_a,
+            listen: vec![listen.clone()],
+            bootstrap: vec![],
+            auto_dial_mdns: true,
+        });
+        let address_a = wait_for(
+            || net_a.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("requester binds")
+        .with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+        let net_b = Network::start(NetworkConfig {
+            keypair: key_b,
+            local_prefix: prefix_b,
+            listen: vec![listen.clone()],
+            bootstrap: vec![address_a.clone()],
+            auto_dial_mdns: true,
+        });
+        let net_c = Network::start(NetworkConfig {
+            keypair: key_c,
+            local_prefix: prefix_c,
+            listen: vec![listen],
+            bootstrap: vec![address_a],
+            auto_dial_mdns: true,
+        });
+        net_b.set_service(Arc::new(Redirector(prefix_c)));
+        let seen_caller = Arc::new(Mutex::new(None));
+        net_c.set_service(Arc::new(LeaderDispatcher {
+            caller: seen_caller.clone(),
+        }));
+
+        wait_for(
+            || {
+                (net_a.peer_for_prefix(prefix_b).is_some()
+                    && net_a.peer_for_prefix(prefix_c).is_some())
+                .then_some(())
+            },
+            Duration::from_secs(10),
+        )
+        .expect("requester authenticates follower and leader");
+
+        let follower = net_a.peer_for_prefix(prefix_b).unwrap();
+        let reply = net_a
+            .send_invoke(follower, 7, ((prefix_b as u32) << 16) | 9, vec![], vec![1])
+            .recv_timeout(Duration::from_secs(5))
+            .expect("redirected invoke completes");
+        assert_eq!(reply, b"leader reply");
+        assert_eq!(
+            *seen_caller.lock().unwrap(),
+            Some(net_a.peer_id()),
+            "the leader must authenticate the original requester, not the follower",
+        );
+
+        net_a.join();
+        net_b.join();
+        net_c.join();
     }
 
     /// Full path: `VosNode::invoke` on A finds no local route,

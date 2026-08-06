@@ -506,6 +506,18 @@ where
         }
     }
 
+    #[cfg(all(feature = "storage", feature = "network"))]
+    fn leader_hint(&self) -> Option<u16> {
+        match self {
+            Self::Direct(_) => None,
+            Self::Raft(service) => service
+                .log()
+                .worker_handle()?
+                .snapshot()
+                .and_then(|snapshot| snapshot.leader_hint),
+        }
+    }
+
     fn refine_actor_tree_after_barrier(
         &self,
         work: &super::WorkEnvelopeV2,
@@ -1214,6 +1226,14 @@ where
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
             .map(|header| header.admission_timeslot_high_water)
             .ok_or(LocalRootTreeInvokeErrorV2::ServiceNotInstalled)
+    }
+
+    /// Best authenticated leader hint observed by this root's Raft worker.
+    /// Node ingress uses it only after a failed admission barrier to return a
+    /// transport-level redirect; it never substitutes for the barrier itself.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    pub(crate) fn admission_leader_hint(&self) -> Option<u16> {
+        self.service.leader_hint()
     }
 
     fn ensure_installed(&mut self) -> Result<bool, LocalRootTreeInvokeErrorV2> {

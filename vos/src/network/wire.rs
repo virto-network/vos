@@ -21,6 +21,7 @@ const TAG_TELL: u8 = 0x01;
 const TAG_INVOKE_REQ: u8 = 0x02;
 const TAG_INVOKE_REPLY: u8 = 0x03;
 const TAG_ACK: u8 = 0x04;
+const TAG_INVOKE_REDIRECT: u8 = 0x05;
 const TAG_FETCH_HEADS: u8 = 0x20;
 const TAG_HEADS: u8 = 0x21;
 const TAG_FETCH_NODE: u8 = 0x22;
@@ -138,6 +139,13 @@ pub enum Frame {
     },
     InvokeReply {
         payload: Vec<u8>,
+    },
+    /// The addressed service is a Raft follower. The original requester
+    /// reissues the same invocation directly to this authenticated node
+    /// prefix, so the leader observes the original noise-authenticated peer
+    /// rather than an identity-losing proxy.
+    InvokeRedirect {
+        leader_prefix: u16,
     },
     /// "What are your merkle-clock roots for this replication
     /// group?" Sent as a request; reply rides back as
@@ -431,6 +439,10 @@ impl Frame {
                 out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
                 out.extend_from_slice(payload);
             }
+            Frame::InvokeRedirect { leader_prefix } => {
+                out.push(TAG_INVOKE_REDIRECT);
+                out.extend_from_slice(&leader_prefix.to_le_bytes());
+            }
             Frame::FetchHeads { replication_id } => {
                 out.push(TAG_FETCH_HEADS);
                 out.extend_from_slice(replication_id);
@@ -713,6 +725,9 @@ impl Frame {
             }
             TAG_INVOKE_REPLY => Frame::InvokeReply {
                 payload: r.bytes_with_len_prefix()?,
+            },
+            TAG_INVOKE_REDIRECT => Frame::InvokeRedirect {
+                leader_prefix: r.u16()?,
             },
             TAG_FETCH_HEADS => Frame::FetchHeads {
                 replication_id: r.fixed::<REPLICATION_ID_BYTES>()?,
@@ -1138,6 +1153,9 @@ mod tests {
         roundtrip(Frame::InvokeReply { payload: vec![] });
         roundtrip(Frame::InvokeReply {
             payload: vec![0x00, 0xFF, 0x42],
+        });
+        roundtrip(Frame::InvokeRedirect {
+            leader_prefix: 0x1234,
         });
     }
 

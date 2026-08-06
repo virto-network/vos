@@ -1398,9 +1398,54 @@ fn node_registers_a_raft_root_through_the_canonical_request_log() {
             .as_nanos(),
     ));
     std::fs::create_dir_all(&directory).unwrap();
+    let member = 0xA109;
+
+    // Route validation is part of local attachment and must happen before a
+    // join callback can change the existing cluster's membership. Model the
+    // leader-side membership set in the callback and occupy the route first:
+    // a failed local attachment leaves that set byte-for-byte unchanged.
+    let occupied_path = directory.join("occupied.redb");
+    let occupied_db = Arc::new(redb::Database::create(&occupied_path).unwrap());
+    let occupied_route = ServiceId::new(member, 208);
+    let mut unavailable = VosNode::new();
+    unavailable.register_at_id(
+        vos::node::AgentConfig::new(actor_elf.clone()),
+        occupied_route,
+    );
+    let membership = Arc::new(std::sync::Mutex::new(vec![member]));
+    let changed_membership = membership.clone();
+    let failed = unavailable.register_v2_raft_root_at_id_after_local_attach(
+        "unavailable-root".into(),
+        config.clone(),
+        FailableCommittedImages::default(),
+        occupied_db,
+        RaftConfig {
+            me: member,
+            members: vec![member],
+            replication_id: [0xA0; 32],
+            ..RaftConfig::default()
+        },
+        occupied_route,
+        true,
+        move |_| {
+            changed_membership.lock().unwrap().push(0xA10A);
+            Ok(())
+        },
+    );
+    assert!(matches!(
+        failed,
+        Err(vos::node::V2RaftNodeRegistrationError::Registration(
+            vos::node::V2NodeRegistrationError::ServiceRouteOccupied(id),
+        )) if id == occupied_route
+    ));
+    assert_eq!(*membership.lock().unwrap(), vec![member]);
+    unavailable
+        .shutdown_handle()
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = unavailable.collect();
+
     let log_path = directory.join("raft.redb");
     let db = Arc::new(redb::Database::create(&log_path).unwrap());
-    let member = 0xA109;
     let route = ServiceId::new(member, 209);
     let mut node = VosNode::new();
     node.register_v2_raft_root_at_id(
@@ -1457,6 +1502,271 @@ fn node_registers_a_raft_root_through_the_canonical_request_log() {
         "the elected worker's no-op precedes four IC-5 requests"
     );
     drop(log);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
+    let actor_elf = greeter_elf();
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&actor_elf, &signer);
+    let actor = ActorId([0xB1; 32]);
+    let config = LocalRootTreeConfigV2 {
+        role_authority: None,
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        service: ServiceIdentityV2 {
+            space: vos::v2::SpaceId([0xB2; 32]),
+            root_service: RootServiceId([0xB3; 32]),
+            deployment: package.deployment_id(),
+            service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+            service_abi: vos::v2::ABI_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        },
+        package,
+        root_actor: actor,
+        actor_name,
+        consistency: ConsistencyModeV2::Raft,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([0xB4; 32]),
+            authenticator: vec![0xB5],
+        },
+        refine_gas: 1_000_000_000,
+        accumulate_gas: 5_000_000_000,
+    };
+
+    let key_a = libp2p::identity::Keypair::generate_ed25519();
+    let prefix_a = vos::network::derive_node_prefix(&libp2p::PeerId::from(key_a.public()));
+    let (key_b, prefix_b) = loop {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let prefix = vos::network::derive_node_prefix(&libp2p::PeerId::from(key.public()));
+        if prefix != prefix_a {
+            break (key, prefix);
+        }
+    };
+    let (key_client, prefix_client) = loop {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let prefix = vos::network::derive_node_prefix(&libp2p::PeerId::from(key.public()));
+        if prefix != prefix_a && prefix != prefix_b {
+            break (key, prefix);
+        }
+    };
+
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let network_a = vos::network::Network::start(vos::network::NetworkConfig {
+        keypair: key_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
+        auto_dial_mdns: true,
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let address_a = loop {
+        if let Some(address) = network_a.listen_addrs().into_iter().next() {
+            break address.with(libp2p::multiaddr::Protocol::P2p(network_a.peer_id()));
+        }
+        assert!(std::time::Instant::now() < deadline, "node A did not bind");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let network_b = vos::network::Network::start(vos::network::NetworkConfig {
+        keypair: key_b,
+        local_prefix: prefix_b,
+        listen: vec![listen.clone()],
+        bootstrap: vec![address_a.clone()],
+        auto_dial_mdns: true,
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let address_b = loop {
+        if let Some(address) = network_b.listen_addrs().into_iter().next() {
+            break address.with(libp2p::multiaddr::Protocol::P2p(network_b.peer_id()));
+        }
+        assert!(std::time::Instant::now() < deadline, "node B did not bind");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let client_network = vos::network::Network::start(vos::network::NetworkConfig {
+        keypair: key_client,
+        local_prefix: prefix_client,
+        listen: vec![listen],
+        bootstrap: vec![address_a, address_b],
+        auto_dial_mdns: true,
+    });
+
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    node_a.attach_network(network_a);
+    node_b.attach_network(network_b);
+    let network_a = node_a.network().unwrap();
+    let network_b = node_b.network().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while (network_a.peer_for_prefix(prefix_b).is_none()
+        || network_b.peer_for_prefix(prefix_a).is_none()
+        || client_network.peer_for_prefix(prefix_a).is_none()
+        || client_network.peer_for_prefix(prefix_b).is_none())
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(client_network.peer_for_prefix(prefix_a).is_some());
+    assert!(client_network.peer_for_prefix(prefix_b).is_some());
+
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-root-follower-redirect-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let db_a = Arc::new(redb::Database::create(directory.join("a.redb")).unwrap());
+    let db_b = Arc::new(redb::Database::create(directory.join("b.redb")).unwrap());
+    let replication_id = [0xB6; 32];
+    let members = vec![prefix_a, prefix_b];
+    let raft_config = |me| RaftConfig {
+        me,
+        members: members.clone(),
+        election_timeout_ms: (50, 150),
+        heartbeat_interval_ms: 20,
+        replication_id,
+        propose_timeout_ms: 5_000,
+    };
+    let (apply_a_tx, apply_a_rx) = std::sync::mpsc::channel();
+    let (apply_b_tx, apply_b_rx) = std::sync::mpsc::channel();
+    let worker_a = RaftWorker::spawn(
+        db_a.clone(),
+        WorkerConfig {
+            me: prefix_a,
+            members: members.clone(),
+            replication_id,
+            election_timeout_ms: (50, 150),
+            heartbeat_interval_ms: 20,
+        },
+        Some(network_a.clone()),
+        Some(apply_a_tx),
+    );
+    let worker_b = RaftWorker::spawn(
+        db_b.clone(),
+        WorkerConfig {
+            me: prefix_b,
+            members: members.clone(),
+            replication_id,
+            election_timeout_ms: (50, 150),
+            heartbeat_interval_ms: 20,
+        },
+        Some(network_b.clone()),
+        Some(apply_b_tx),
+    );
+    let handle_a = worker_a.handler();
+    let handle_b = worker_b.handler();
+    network_a.register_raft_handler(replication_id, Arc::new(handle_a.clone()));
+    network_b.register_raft_handler(replication_id, Arc::new(handle_b.clone()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let leader = loop {
+        if handle_a.role() == Role::Leader {
+            break prefix_a;
+        }
+        if handle_b.role() == Role::Leader {
+            break prefix_b;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "two-node Raft root did not elect a leader"
+        );
+        std::thread::sleep(Duration::from_millis(15));
+    };
+
+    let log_a = RaftAccumulateLogV2::from_worker(db_a, raft_config(prefix_a), worker_a, apply_a_rx)
+        .unwrap();
+    let log_b = RaftAccumulateLogV2::from_worker(db_b, raft_config(prefix_b), worker_b, apply_b_rx)
+        .unwrap();
+    let local_id = 0x3600;
+    if leader == prefix_a {
+        let service_a = LocalRootTreeServiceV2::open_raft(
+            config.clone(),
+            FailableCommittedImages::default(),
+            log_a,
+        )
+        .unwrap();
+        node_a
+            .register_v2_root_at_id(
+                "raft-root-a",
+                service_a,
+                ServiceId::new(prefix_a, local_id),
+                true,
+            )
+            .unwrap();
+        let service_b =
+            LocalRootTreeServiceV2::open_raft(config, FailableCommittedImages::default(), log_b)
+                .unwrap();
+        node_b
+            .register_v2_root_at_id(
+                "raft-root-b",
+                service_b,
+                ServiceId::new(prefix_b, local_id),
+                true,
+            )
+            .unwrap();
+    } else {
+        let service_b = LocalRootTreeServiceV2::open_raft(
+            config.clone(),
+            FailableCommittedImages::default(),
+            log_b,
+        )
+        .unwrap();
+        node_b
+            .register_v2_root_at_id(
+                "raft-root-b",
+                service_b,
+                ServiceId::new(prefix_b, local_id),
+                true,
+            )
+            .unwrap();
+        let service_a =
+            LocalRootTreeServiceV2::open_raft(config, FailableCommittedImages::default(), log_a)
+                .unwrap();
+        node_a
+            .register_v2_root_at_id(
+                "raft-root-a",
+                service_a,
+                ServiceId::new(prefix_a, local_id),
+                true,
+            )
+            .unwrap();
+    }
+
+    let follower = if leader == prefix_a {
+        prefix_b
+    } else {
+        prefix_a
+    };
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("start").encode());
+    let ingress = RootTreeInvocationV2 {
+        invocation: InvocationId([0xB7; 32]),
+        target: actor,
+        method: "start".into(),
+        arguments,
+        proof_requested: false,
+    };
+    let follower_peer = client_network.peer_for_prefix(follower).unwrap();
+    let reply = client_network
+        .send_invoke(
+            follower_peer,
+            ServiceId::REGISTRY.0,
+            ServiceId::new(follower, local_id).0,
+            Vec::new(),
+            ingress.encode(),
+        )
+        .recv_timeout(Duration::from_secs(120))
+        .expect("follower ingress redirects and commits through the leader");
+    assert_eq!(Value::try_decode(&reply), Some(Value::Unit));
+
+    let results_a = node_a.collect();
+    let results_b = node_b.collect();
+    assert!(results_a.into_iter().all(|result| result.is_ok()));
+    assert!(results_b.into_iter().all(|result| result.is_ok()));
+    client_network.join();
     std::fs::remove_dir_all(directory).unwrap();
 }
 
