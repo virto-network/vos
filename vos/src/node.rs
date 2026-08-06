@@ -97,8 +97,9 @@ const V2_LOCAL_INVOKE_TIMEOUT: Duration = Duration::from_secs(10);
 const V2_RAFT_VOTER_AUTH_TIMEOUT_MS: u64 = 5_000;
 
 /// One end-to-end Raft invocation can consume one voter-authentication probe,
-/// one read barrier, and one proposal wait. Reserve two further proposal
-/// windows for physical guest execution, network transit, and scheduling
+/// one read barrier, and two proposal waits (`AdmitIngress` and `Apply`).
+/// Reserve one further proposal window for physical guest execution, transit,
+/// and scheduling
 /// jitter. The caller applies this once across both the local follower and
 /// redirected leader hops rather than restarting a per-hop timeout.
 #[cfg(all(feature = "storage", feature = "network"))]
@@ -1311,6 +1312,10 @@ type SharedNetwork = Arc<Mutex<Option<Arc<crate::network::Network>>>>;
 #[cfg(feature = "network")]
 struct NodeService {
     invoke_routes: InvokeRoutes,
+    /// Guest-owned root routes distinguish canonical v2 Raft delegation from
+    /// legacy Raft forwarding. Only the former consumes delegated origin and
+    /// can safely omit the legacy host-role probes.
+    v2_actor_routes: Arc<RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>>,
     /// Clone of the node's [`AgentNames`] reverse map, read by
     /// [`Self::dispatch_invoke`] to resolve the target's instance name
     /// for the actor-local grant probe — so an operator-written
@@ -1361,6 +1366,17 @@ const SYNC_FLOOR_TTL: Duration = Duration::from_secs(30);
 
 #[cfg(feature = "network")]
 impl NodeService {
+    #[cfg(feature = "storage")]
+    fn target_is_local_v2_raft_root(&self, target: u32, target_unscoped: u32) -> bool {
+        self.v2_actor_routes.read().ok().is_some_and(|routes| {
+            routes.values().any(|route| {
+                route.consistency == crate::v2::ConsistencyModeV2::Raft
+                    && route.authenticated_peer.is_none()
+                    && (route.route == target || (route.route & 0xFFFF) == target_unscoped)
+            })
+        })
+    }
+
     /// Sprint 2 auth lookup. Send a synchronous `peer_role` invoke
     /// to the local space-registry and surface the result as the
     /// `AUTH_ROLE_*` byte the gate compares against. Returns
@@ -1985,6 +2001,11 @@ impl crate::network::NetworkService for NodeService {
         };
         #[cfg(not(feature = "storage"))]
         let preserve_envelope = false;
+        #[cfg(feature = "storage")]
+        let authenticated_raft_delegation =
+            delegated_origin.is_some() && self.target_is_local_v2_raft_root(to, to_unscoped);
+        #[cfg(not(feature = "storage"))]
+        let authenticated_raft_delegation = false;
 
         // Expiry is checked once, on the serving host, before the operation is
         // admitted into the registry DAG. The signed deadline is re-verified
@@ -2087,22 +2108,33 @@ impl crate::network::NetworkService for NodeService {
         // space-registry. Targets the host never registered (anonymous,
         // cross-node) resolve to `None` → no actor-local grant, which
         // is the correct deny-by-omission.
-        let (space_role, actor_local_role) = match &caller {
-            crate::actors::Caller::Peer(_) => {
-                let space = self.lookup_caller_role(caller_peer_id.as_ref());
-                let actor_local = match self.agent_name_for(to_unscoped) {
-                    Some(name) => self.lookup_caller_actor_role(caller_peer_id.as_ref(), &name),
-                    None => AUTH_ROLE_NONE,
-                };
-                (
-                    (space != AUTH_ROLE_NONE).then_some(space),
-                    (actor_local != AUTH_ROLE_NONE).then_some(actor_local),
-                )
+        let (space_role, actor_local_role) = if authenticated_raft_delegation {
+            // The full-PeerId voter check above is the authority boundary for
+            // VRD2. The canonical v2 root ingress accepts only public methods
+            // and consumes `delegated_origin`, not host role bytes. Re-probing
+            // the forwarding node's space/actor roles is therefore both
+            // semantically irrelevant and two extra serial 5-second waits.
+            // Keep both absent so a future non-public v2 cutover fails closed
+            // until it carries its own authenticated authorization evidence.
+            (None, None)
+        } else {
+            match &caller {
+                crate::actors::Caller::Peer(_) => {
+                    let space = self.lookup_caller_role(caller_peer_id.as_ref());
+                    let actor_local = match self.agent_name_for(to_unscoped) {
+                        Some(name) => self.lookup_caller_actor_role(caller_peer_id.as_ref(), &name),
+                        None => AUTH_ROLE_NONE,
+                    };
+                    (
+                        (space != AUTH_ROLE_NONE).then_some(space),
+                        (actor_local != AUTH_ROLE_NONE).then_some(actor_local),
+                    )
+                }
+                // Unauthenticated has no grant lookups; intra-system
+                // Actor callers bypass via the Context::has_role
+                // short-circuit.
+                _ => (None, None),
             }
-            // Unauthenticated has no grant lookups; intra-system
-            // Actor callers bypass via the Context::has_role
-            // short-circuit.
-            _ => (None, None),
         };
 
         // Private-replica read gate. A `Private`-floor replica (the
@@ -2916,6 +2948,7 @@ impl VosNode {
         // trait's empty-reply defaults.
         let service = Arc::new(NodeService {
             invoke_routes: self.invoke_routes.clone(),
+            v2_actor_routes: self.v2_actor_routes.clone(),
             agent_names: self.agent_names.clone(),
             agent_shutdown: self.agent_shutdown.clone(),
             agent_info: self.agent_info.clone(),
@@ -10003,7 +10036,7 @@ mod tests {
         assert_eq!(
             v2_raft_invoke_timeout(5_000),
             Duration::from_secs(25),
-            "voter auth + read barrier + commit + two proposal windows of margin",
+            "voter auth + read barrier + two commits + one proposal window of margin",
         );
         assert_eq!(
             v2_raft_invoke_timeout(2_000),
@@ -11577,6 +11610,7 @@ mod tests {
 
         let service = NodeService {
             invoke_routes: Arc::new(Mutex::new(routes)),
+            v2_actor_routes: Arc::new(RwLock::new(HashMap::new())),
             agent_names: Arc::new(std::sync::RwLock::new(names)),
             agent_shutdown: Arc::new(Mutex::new(HashMap::new())),
             agent_info: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -11926,6 +11960,203 @@ mod tests {
         assert!(!node_member_authenticates_voter(&observer, prefix, &voter));
     }
 
+    #[test]
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn authenticated_raft_delegation_performs_only_the_voter_registry_probe() {
+        use crate::actors::codec::{Decode, Encode};
+        use crate::actors::run::STATUS_DONE;
+        use crate::network::{
+            Network, NetworkConfig, NetworkService, RaftAppendResult, RaftEntry, RaftRole,
+            RaftRpcHandler, RaftStatusReply, RaftVoteResult,
+        };
+        use crate::registry::{MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, MemberPage, MemberRow};
+        use crate::value::{Msg, TAG_DYNAMIC, Value};
+
+        struct StatusHandler {
+            voter: u16,
+        }
+
+        impl RaftRpcHandler for StatusHandler {
+            fn append_entries(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                prev_log_index: u64,
+                _prev_log_term: u64,
+                _leader_commit: u64,
+                _entries: Vec<RaftEntry>,
+            ) -> RaftAppendResult {
+                RaftAppendResult {
+                    term,
+                    success: false,
+                    match_index: prev_log_index,
+                }
+            }
+
+            fn request_vote(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                _last_log_index: u64,
+                _last_log_term: u64,
+            ) -> RaftVoteResult {
+                RaftVoteResult {
+                    term,
+                    vote_granted: false,
+                }
+            }
+
+            fn handle_status(&self, _replication_id: &[u8; 32]) -> RaftStatusReply {
+                RaftStatusReply {
+                    present: true,
+                    role: RaftRole::Leader,
+                    current_term: 1,
+                    commit_index: 1,
+                    last_log_index: 1,
+                    members: vec![self.voter],
+                    leader_hint: Some(self.voter),
+                }
+            }
+        }
+
+        let voter = libp2p::PeerId::random();
+        let voter_prefix = crate::network::derive_node_prefix(&voter);
+        let replication_id = [0xA4; 32];
+        let target = ServiceId::new(0xCAFE, 0x0444);
+        let target_name = "raft-public-root";
+
+        let network_key = libp2p::identity::Keypair::generate_ed25519();
+        let network_peer = libp2p::PeerId::from(network_key.public());
+        let network = Arc::new(Network::start(NetworkConfig {
+            keypair: network_key,
+            local_prefix: crate::network::derive_node_prefix(&network_peer),
+            listen: Vec::new(),
+            bootstrap: Vec::new(),
+            auto_dial_mdns: false,
+        }));
+        network.register_raft_handler(
+            replication_id,
+            Arc::new(StatusHandler {
+                voter: voter_prefix,
+            }),
+        );
+
+        let probes = Arc::new(Mutex::new(Vec::<String>::new()));
+        let probes_for_registry = probes.clone();
+        let (registry_tx, registry_rx) = mpsc::channel::<InvokeRequest>();
+        let voter_bytes = voter.to_bytes();
+        let registry = thread::spawn(move || {
+            while let Ok(request) = registry_rx.recv() {
+                let message = Msg::try_decode(&request.msg[1..]).expect("registry probe decodes");
+                probes_for_registry
+                    .lock()
+                    .unwrap()
+                    .push(message.name.clone());
+                let value = if message.name == "members" {
+                    Value::Bytes(
+                        MemberPage {
+                            members: vec![MemberRow {
+                                kind: MEMBER_KIND_NODE,
+                                key: voter_bytes.clone(),
+                                prefix: voter_prefix,
+                                role: crate::registry::NODE_ROLE_VOTER,
+                                proof_kind: 0,
+                                proof_data: Vec::new(),
+                            }],
+                            next_kind: MEMBER_KIND_IDENTITY,
+                            next_key: Vec::new(),
+                            more: false,
+                        }
+                        .encode(),
+                    )
+                } else {
+                    // A regression would issue peer_role and actor_role here.
+                    // Answer promptly so the assertion reports the exact
+                    // redundant probes instead of making the test sleep 10 s.
+                    Value::U8(AUTH_ROLE_ADMIN)
+                };
+                let _ =
+                    request
+                        .reply
+                        .send(encode_invoke_envelope(STATUS_DONE, &[], &value.encode()));
+            }
+        });
+
+        let (target_tx, target_rx) = mpsc::channel::<InvokeRequest>();
+        let target_thread = thread::spawn(move || {
+            let request = target_rx.recv().expect("delegated request reaches root");
+            assert_eq!(request.space_role, None);
+            assert_eq!(request.actor_local_role, None);
+            assert_eq!(request.delegated_origin, Some(crate::v2::Origin::System));
+            let _ = request.reply.send(encode_invoke_envelope(
+                STATUS_DONE,
+                &[],
+                &Value::Unit.encode(),
+            ));
+        });
+
+        let routes = Arc::new(Mutex::new(HashMap::from([
+            (ServiceId::REGISTRY.0, registry_tx),
+            (target.0, target_tx),
+        ])));
+        let mut service = lifecycle_service(
+            routes,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
+        service.v2_actor_routes.write().unwrap().insert(
+            crate::v2::ActorId([0xA5; 32]),
+            V2ActorRoute {
+                route: target.0,
+                service: crate::v2::ServiceIdentityV2 {
+                    space: crate::v2::SpaceId([0xA6; 32]),
+                    root_service: crate::v2::RootServiceId([0xA7; 32]),
+                    deployment: crate::v2::DeploymentId([0xA8; 32]),
+                    service_program: crate::v2::VOS_SERVICE_PROGRAM_ID,
+                    service_abi: crate::v2::ABI_VERSION,
+                    execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
+                },
+                consistency: crate::v2::ConsistencyModeV2::Raft,
+                invoke_timeout: v2_raft_invoke_timeout(5_000),
+                authenticated_peer: None,
+            },
+        );
+        service.agent_names = Arc::new(RwLock::new(HashMap::from([(
+            local_id_of(target.0),
+            target_name.to_string(),
+        )])));
+        service
+            .raft_hosts
+            .lock()
+            .unwrap()
+            .insert(target.0, replication_id);
+        service.shared_network = Arc::new(Mutex::new(Some(network.clone())));
+        service.sync_floor_cache.write().unwrap().insert(
+            target_name.to_string(),
+            (crate::registry::SyncFloor::Public, Instant::now()),
+        );
+
+        let mut ingress = vec![TAG_DYNAMIC];
+        ingress.extend_from_slice(&Msg::new("start").encode());
+        let delegated = encode_v2_raft_delegation(crate::v2::Origin::System, true, &ingress);
+        let reply = service.dispatch_invoke(Some(voter), 0, target.0, Vec::new(), delegated);
+        assert!(!reply.is_empty());
+        assert_eq!(
+            probes.lock().unwrap().as_slice(),
+            &["members".to_string()],
+            "VRD2 authenticates the voter once and never probes its irrelevant host roles",
+        );
+
+        drop(service);
+        registry.join().unwrap();
+        target_thread.join().unwrap();
+        if let Ok(network) = Arc::try_unwrap(network) {
+            network.join();
+        }
+    }
+
     /// A stub registry on route 0 that answers the `peer_role` probe with a
     /// fixed role byte — so the lifecycle interceptor's `lookup_caller_role`
     /// gate sees a known grant. Returns (routes, join handle).
@@ -12159,6 +12390,7 @@ mod tests {
     ) -> NodeService {
         NodeService {
             invoke_routes: routes,
+            v2_actor_routes: Arc::new(RwLock::new(HashMap::new())),
             agent_names: Arc::new(std::sync::RwLock::new(HashMap::new())),
             agent_shutdown: shutdown,
             agent_info: info,
