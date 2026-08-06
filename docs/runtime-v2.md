@@ -652,14 +652,18 @@ trash.
 
 A joining v2 Raft root starts its worker, registers the inbound Raft handler,
 opens its durable service, and validates its still-unpublished route before it
-asks the leader for voter promotion. Once the request is sent, an ambiguous
-timeout never tears that prepared replica down: the request is retried
-idempotently and the route becomes public only after the local worker observes
-the final non-joint membership. Definite pre-change refusals leave the existing
-membership untouched. Calls that reach a follower receive a transport-level
-leader redirect; the original node opens the redirected connection itself, so
-the leader authenticates the original peer rather than trusting a
-follower-rewritten origin.
+asks the leader for voter promotion. Promotion is node-owned background state,
+not work performed by the router or reconciliation callback. A definite
+pre-request refusal returns the row to deferred reconciliation; once a request
+has an ambiguous outcome, the prepared worker stays available and retries
+idempotently until final non-joint membership is visible. Shutdown cancels and
+joins that worker, and the route becomes public only after successful final
+membership. Calls that reach a follower receive a transport-level leader
+redirect which both the raw node API and generated typed actor handles follow.
+This ordinary public Raft ingress uses one canonical anonymous origin on every
+replica, so local `System`, forwarding peer, and leader changes cannot alter the
+committed work identity. Role-bearing identities use the separately
+authenticated authority path rather than implicit forwarding delegation.
 
 V2 CRDT rows remain fail-closed until anti-entropy can authenticate receipt
 finality independently of the peer-supplied sync envelope. Local root transport

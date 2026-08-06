@@ -1749,7 +1749,7 @@ fn register_v2_root_from_row(
                     make_config(known.clone()),
                     svc_id,
                     network_reachable,
-                    move |worker| {
+                    move |worker, shutdown| {
                         promote_prepared_v2_raft_root(
                             &network,
                             &promotion_name,
@@ -1758,6 +1758,7 @@ fn register_v2_root_from_row(
                             leader,
                             known,
                             worker,
+                            shutdown,
                         )
                     },
                 )
@@ -2078,12 +2079,6 @@ struct AcceptedRaftJoin {
 
 struct RejectedRaftJoin {
     reason: String,
-    /// A timeout, transient leadership change, or in-flight configuration is
-    /// ambiguous: the leader may already have appended our joint entry before
-    /// its response was lost. A prepared replica must remain live and retry in
-    /// those cases. Only an authenticated refusal or a confirmed missing group
-    /// is safe to return to the caller and tear down locally.
-    retryable: bool,
     /// The request was sent but no response arrived. The remote leader may
     /// already have appended the joint entry, so no later refusal from another
     /// peer makes local teardown safe.
@@ -2104,7 +2099,6 @@ fn request_raft_join(
         let Some(peer) = net.peer_for_prefix(leader) else {
             return Ok(Err(RejectedRaftJoin {
                 reason: format!("raft leader {leader:#06x} is not connected"),
-                retryable: true,
                 membership_may_have_changed: false,
             }));
         };
@@ -2139,21 +2133,18 @@ fn request_raft_join(
             Ok(RaftJoinResult::NotLeader { .. }) => {
                 return Ok(Err(RejectedRaftJoin {
                     reason: "leadership moved during the join handshake".into(),
-                    retryable: true,
                     membership_may_have_changed: false,
                 }));
             }
             Ok(RaftJoinResult::Busy) => {
                 return Ok(Err(RejectedRaftJoin {
                     reason: "another membership change is in flight".into(),
-                    retryable: true,
                     membership_may_have_changed: false,
                 }));
             }
             Ok(RaftJoinResult::UnknownGroup) => {
                 return Ok(Err(RejectedRaftJoin {
                     reason: format!("peer {leader:#06x} no longer runs the group"),
-                    retryable: false,
                     membership_may_have_changed: false,
                 }));
             }
@@ -2167,14 +2158,12 @@ fn request_raft_join(
                          --role voter`",
                         instance_name,
                     ),
-                    retryable: false,
                     membership_may_have_changed: false,
                 }));
             }
             Err(_) => {
                 return Ok(Err(RejectedRaftJoin {
                     reason: "join request timed out".into(),
-                    retryable: true,
                     membership_may_have_changed: true,
                 }));
             }
@@ -2182,7 +2171,6 @@ fn request_raft_join(
     }
     Ok(Err(RejectedRaftJoin {
         reason: "leader redirects did not converge".into(),
-        retryable: true,
         membership_may_have_changed: false,
     }))
 }
@@ -2217,9 +2205,13 @@ fn promote_prepared_v2_raft_root(
     leader: u16,
     known: Vec<u16>,
     worker: &vos::raft::WorkerHandle,
+    shutdown: &std::sync::atomic::AtomicBool,
 ) -> Result<(), String> {
     let mut membership_may_have_changed = false;
     let accepted = loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("node shut down while Raft voter promotion was pending".into());
+        }
         match request_raft_join(
             net,
             instance_name,
@@ -2232,10 +2224,11 @@ fn promote_prepared_v2_raft_root(
         {
             Ok(accepted) => break accepted,
             Err(rejection)
-                if !rejection.retryable
-                    && !membership_may_have_changed
-                    && !rejection.membership_may_have_changed =>
+                if !membership_may_have_changed && !rejection.membership_may_have_changed =>
             {
+                // No join request reached an authoritative peer, so no
+                // membership change can depend on this prepared replica.
+                // Return it to reconciliation instead of blocking the router.
                 return Err(rejection.reason);
             }
             Err(rejection) => {
@@ -2250,11 +2243,14 @@ fn promote_prepared_v2_raft_root(
                 // instead of tearing it down and potentially wedging the old
                 // group. Repeating the request is idempotent because an
                 // already-member join returns Accepted { joint_index: 0 }.
-                std::thread::sleep(RAFT_PROBE_TIMEOUT);
+                wait_for_raft_promotion_retry(shutdown, RAFT_PROBE_TIMEOUT)?;
             }
         }
     };
     loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("node shut down before Raft voter promotion finalized".into());
+        }
         if let Some(snapshot) = worker.snapshot()
             && snapshot.members.contains(&local_prefix)
             && snapshot.joint_old.is_none()
@@ -2265,8 +2261,22 @@ fn promote_prepared_v2_raft_root(
         // Do not abandon an accepted join: the existing cluster may already
         // require this worker's vote. Route publication waits here until the
         // final (non-joint) configuration is locally committed.
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        wait_for_raft_promotion_retry(shutdown, std::time::Duration::from_millis(25))?;
     }
+}
+
+fn wait_for_raft_promotion_retry(
+    shutdown: &std::sync::atomic::AtomicBool,
+    duration: std::time::Duration,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + duration;
+    while std::time::Instant::now() < deadline {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("node shut down while Raft voter promotion was pending".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 /// Cap on agents brought up in a single reconcile pass. The pass

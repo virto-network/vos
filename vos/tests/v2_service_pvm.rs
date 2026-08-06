@@ -1427,7 +1427,7 @@ fn node_registers_a_raft_root_through_the_canonical_request_log() {
         },
         occupied_route,
         true,
-        move |_| {
+        move |_, _| {
             changed_membership.lock().unwrap().push(0xA10A);
             Ok(())
         },
@@ -1443,6 +1443,61 @@ fn node_registers_a_raft_root_through_the_canonical_request_log() {
         .shutdown_handle()
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = unavailable.collect();
+
+    // Voter promotion is node-owned background state: registering it must not
+    // stall the router, it remains unexposed while pending, and node shutdown
+    // cancels and joins the worker promptly.
+    let pending_path = directory.join("pending.redb");
+    let pending_db = Arc::new(redb::Database::create(&pending_path).unwrap());
+    let pending_route = ServiceId::new(member, 210);
+    let mut pending = VosNode::new();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let promotion_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let callback_finished = promotion_finished.clone();
+    pending
+        .register_v2_raft_root_at_id_after_local_attach(
+            "pending-root".into(),
+            config.clone(),
+            FailableCommittedImages::default(),
+            pending_db,
+            RaftConfig {
+                me: member,
+                members: vec![member],
+                replication_id: [0xAF; 32],
+                ..RaftConfig::default()
+            },
+            pending_route,
+            true,
+            move |_, shutdown| {
+                let _ = started_tx.send(());
+                while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                callback_finished.store(true, std::sync::atomic::Ordering::Relaxed);
+                Err("cancelled by shutdown".into())
+            },
+        )
+        .expect("local preparation returns before voter promotion completes");
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("background promotion started");
+    assert!(
+        !promotion_finished.load(std::sync::atomic::Ordering::Relaxed),
+        "registration returns while the promotion callback is still pending",
+    );
+    assert!(pending.has_agent(pending_route));
+    let mut pending_arguments = vec![vos::value::TAG_DYNAMIC];
+    pending_arguments.extend_from_slice(&Msg::new("start").encode());
+    assert!(
+        matches!(
+            pending.invoke_actor(actor, pending_arguments),
+            Err(ClientError::NotFound)
+        ),
+        "a prepared voter is reserved but not publicly routable",
+    );
+    let shutdown_at = std::time::Instant::now();
+    let _ = pending.collect();
+    assert!(shutdown_at.elapsed() < Duration::from_secs(1));
 
     let log_path = directory.join("raft.redb");
     let db = Arc::new(redb::Database::create(&log_path).unwrap());
@@ -1761,6 +1816,20 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
         .recv_timeout(Duration::from_secs(120))
         .expect("follower ingress redirects and commits through the leader");
     assert_eq!(Value::try_decode(&reply), Some(Value::Unit));
+
+    let follower_node = if follower == prefix_a {
+        &node_a
+    } else {
+        &node_b
+    };
+    {
+        use vos::ActorReference;
+
+        let mut invoker = follower_node;
+        let mut handle = host_greeter_surface::GreeterRef::bind(actor, &mut invoker);
+        vos::block_on(handle.start())
+            .expect("the typed actor API follows a follower redirect to the leader");
+    }
 
     let results_a = node_a.collect();
     let results_b = node_b.collect();
@@ -9727,15 +9796,13 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
             ..
         }
     ));
+    let failover_apply = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+        work: second,
+        transition: second_transition,
+        provided_blobs: vec![],
+    });
     assert!(matches!(
-        follower
-            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
-                work: second,
-                transition: second_transition,
-                provided_blobs: vec![],
-            }))
-            .unwrap()
-            .result,
+        follower.accumulate(&failover_apply).unwrap().result,
         AccumulationResultV2::Accepted {
             duplicate: false,
             ..
@@ -9751,6 +9818,25 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
     );
     assert_eq!(leader.log_mut().applied_index().unwrap(), 9);
     assert_eq!(follower.log_mut().applied_index().unwrap(), 9);
+
+    follower.log_mut().leader = false;
+    leader.log_mut().leader = true;
+    assert!(matches!(
+        leader.accumulate(&failover_apply).unwrap().result,
+        AccumulationResultV2::Accepted {
+            duplicate: true,
+            ..
+        }
+    ));
+    assert_eq!(follower.catch_up().unwrap(), 1);
+    assert!(
+        leader
+            .service()
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&follower.service().accumulate_host().snapshot()),
+        "an exact retry remains convergent after leadership returns to the first replica"
+    );
 }
 
 #[test]

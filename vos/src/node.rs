@@ -984,6 +984,19 @@ pub struct VosNode {
     /// current leader.
     #[cfg(all(feature = "network", feature = "storage"))]
     raft_hosts: RaftHosts,
+    /// Prepared Raft roots remain absent from public route tables while voter
+    /// promotion is pending. Background workers send a type-erased publication
+    /// closure here once final non-joint membership is locally visible.
+    #[cfg(all(feature = "network", feature = "storage"))]
+    pending_v2_root_ready_tx: mpsc::Sender<PendingV2RootReady>,
+    #[cfg(all(feature = "network", feature = "storage"))]
+    pending_v2_root_ready_rx: mpsc::Receiver<PendingV2RootReady>,
+    #[cfg(all(feature = "network", feature = "storage"))]
+    pending_v2_root_threads: Vec<thread::JoinHandle<()>>,
+    #[cfg(all(feature = "network", feature = "storage"))]
+    pending_v2_root_ids: Arc<Mutex<std::collections::HashSet<u32>>>,
+    #[cfg(all(feature = "network", feature = "storage"))]
+    pending_v2_root_actors: Arc<Mutex<std::collections::HashSet<crate::v2::ActorId>>>,
     /// Optional manifest payload exposed to peers via
     /// [`Frame::ManifestReq`](crate::network::Frame::ManifestReq).
     /// Populated by [`set_manifest`](Self::set_manifest) before
@@ -1085,6 +1098,21 @@ type InvokeRoutes = Arc<Mutex<HashMap<u32, mpsc::Sender<InvokeRequest>>>>;
 /// replica drops a write.
 #[cfg(all(feature = "network", feature = "storage"))]
 type RaftHosts = Arc<Mutex<HashMap<u32, [u8; 32]>>>;
+
+/// Type-erased completion of one prepared v2 Raft root. The promotion worker
+/// owns the concrete durable backend and root service until final membership
+/// is locally visible, then hands this closure back to the router thread for
+/// the short mutable-node publication step.
+#[cfg(all(feature = "network", feature = "storage"))]
+type PendingV2RootReady = Box<dyn FnOnce(&mut VosNode) + Send>;
+
+#[cfg(all(feature = "network", feature = "storage"))]
+type PreparedV2RaftRoot<B> = (
+    crate::v2::LocalRootTreeServiceV2<B>,
+    crate::raft::WorkerHandle,
+    Option<Arc<crate::network::Network>>,
+    [u8; 32],
+);
 
 /// Shared host-side reverse map: `local_id` (`id.0 & 0xFFFF`) →
 /// installed instance name. The companion to `InvokeRoutes` for the
@@ -2518,6 +2546,8 @@ impl VosNode {
     /// Create a node with a specific network prefix.
     pub fn with_prefix(node_prefix: u16) -> Self {
         let (outbox_tx, outbox_rx) = mpsc::channel();
+        #[cfg(all(feature = "network", feature = "storage"))]
+        let (pending_v2_root_ready_tx, pending_v2_root_ready_rx) = mpsc::channel();
         let mut v2_invocation_seed = [0_u8; 32];
         getrandom::getrandom(&mut v2_invocation_seed)
             .expect("OS entropy for v2 host invocation identities");
@@ -2547,6 +2577,16 @@ impl VosNode {
             crdt_replicas: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(feature = "network", feature = "storage"))]
             raft_hosts: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(all(feature = "network", feature = "storage"))]
+            pending_v2_root_ready_tx,
+            #[cfg(all(feature = "network", feature = "storage"))]
+            pending_v2_root_ready_rx,
+            #[cfg(all(feature = "network", feature = "storage"))]
+            pending_v2_root_threads: Vec::new(),
+            #[cfg(all(feature = "network", feature = "storage"))]
+            pending_v2_root_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            #[cfg(all(feature = "network", feature = "storage"))]
+            pending_v2_root_actors: Arc::new(Mutex::new(std::collections::HashSet::new())),
             #[cfg(feature = "network")]
             manifest: Arc::new(OnceLock::new()),
             #[cfg(all(feature = "network", feature = "storage"))]
@@ -2882,9 +2922,17 @@ impl VosNode {
         {
             return Err(V2NodeRegistrationError::ServiceRouteOccupied(id));
         }
+        #[cfg(all(feature = "network", feature = "storage"))]
+        if self.pending_v2_root_ids.lock().unwrap().contains(&id.0) {
+            return Err(V2NodeRegistrationError::ServiceRouteOccupied(id));
+        }
         let actor = service.root_actor();
         restore_v2_root_logical_timeslot(service, &self.v2_logical_timeslot)?;
         if self.v2_actor_routes.read().unwrap().contains_key(&actor) {
+            return Err(V2NodeRegistrationError::ActorAlreadyRegistered(actor));
+        }
+        #[cfg(all(feature = "network", feature = "storage"))]
+        if self.pending_v2_root_actors.lock().unwrap().contains(&actor) {
             return Err(V2NodeRegistrationError::ActorAlreadyRegistered(actor));
         }
         Ok(())
@@ -2985,23 +3033,25 @@ impl VosNode {
             + Send
             + 'static,
     {
-        self.register_v2_raft_root_at_id_after_local_attach(
-            name,
-            config,
-            backend,
-            db,
-            raft_config,
-            id,
-            network_reachable,
-            |_| Ok(()),
-        )
+        let (service, _worker, _network, replication_id) =
+            self.prepare_v2_raft_root(config, backend, db, raft_config)?;
+        if let Err(error) = self.validate_v2_root_registration(&service, id) {
+            if let Some(network) = _network.as_ref() {
+                network.unregister_raft_handler(&replication_id);
+            }
+            return Err(V2RaftNodeRegistrationError::Registration(error));
+        }
+        self.raft_hosts.lock().unwrap().insert(id.0, replication_id);
+        Ok(self.attach_v2_root_unchecked(name, service, id, network_reachable))
     }
 
     /// Start and validate a Raft replica before an optional voter-promotion
-    /// handshake, then publish its actor route only after that handshake
-    /// succeeds. The callback runs while the worker and inbound Raft handler
-    /// are live, so joint consensus can replicate to the joiner immediately;
-    /// any local open/route failure occurs before the existing cluster changes
+    /// handshake. Promotion and final-membership observation run on a
+    /// shutdown-aware background worker; the root remains reserved but absent
+    /// from public route tables until that worker hands it back to the router.
+    /// The callback runs while the worker and inbound Raft handler are live, so
+    /// joint consensus can replicate to the joiner immediately; any local
+    /// open/route failure occurs before the existing cluster changes
     /// membership.
     #[cfg(all(feature = "storage", feature = "network"))]
     #[allow(clippy::too_many_arguments)]
@@ -3024,7 +3074,80 @@ impl VosNode {
             + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
             + Send
             + 'static,
-        F: FnOnce(&crate::raft::WorkerHandle) -> Result<(), String>,
+        F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool) -> Result<(), String> + Send + 'static,
+    {
+        let (service, worker_handle, network, replication_id) =
+            self.prepare_v2_raft_root(config, backend, db, raft_config)?;
+        if let Err(error) = self.validate_v2_root_registration(&service, id) {
+            if let Some(network) = network.as_ref() {
+                network.unregister_raft_handler(&replication_id);
+            }
+            return Err(V2RaftNodeRegistrationError::Registration(error));
+        }
+
+        let actor = service.root_actor();
+        self.pending_v2_root_ids.lock().unwrap().insert(id.0);
+        self.pending_v2_root_actors.lock().unwrap().insert(actor);
+        let ready_tx = self.pending_v2_root_ready_tx.clone();
+        let pending_ids = self.pending_v2_root_ids.clone();
+        let pending_actors = self.pending_v2_root_actors.clone();
+        let shutdown = self.shutdown.clone();
+        let cleanup_network = network.clone();
+        let join = thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                promote(&worker_handle, &shutdown)
+            }))
+            .unwrap_or_else(|_| Err("prepared v2 Raft root promotion panicked".into()));
+            if outcome.is_ok() && !shutdown.load(Ordering::Relaxed) {
+                let ready_network = network.clone();
+                let ready_pending_ids = pending_ids.clone();
+                let ready_pending_actors = pending_actors.clone();
+                let ready: PendingV2RootReady = Box::new(move |node| {
+                    ready_pending_ids.lock().unwrap().remove(&id.0);
+                    ready_pending_actors.lock().unwrap().remove(&actor);
+                    if node.shutdown.load(Ordering::Relaxed) {
+                        if let Some(network) = ready_network.as_ref() {
+                            network.unregister_raft_handler(&replication_id);
+                        }
+                        return;
+                    }
+                    node.raft_hosts.lock().unwrap().insert(id.0, replication_id);
+                    node.attach_v2_root_unchecked(name, service, id, network_reachable);
+                });
+                if ready_tx.send(ready).is_ok() {
+                    return;
+                }
+            }
+
+            pending_ids.lock().unwrap().remove(&id.0);
+            pending_actors.lock().unwrap().remove(&actor);
+            if let Some(network) = cleanup_network.as_ref() {
+                network.unregister_raft_handler(&replication_id);
+            }
+            if let Err(error) = outcome {
+                warn!(%id, %error, "prepared v2 Raft root promotion deferred");
+            }
+        });
+        self.pending_v2_root_threads.push(join);
+        Ok(id)
+    }
+
+    #[cfg(all(feature = "storage", feature = "network"))]
+    fn prepare_v2_raft_root<B>(
+        &self,
+        config: crate::v2::LocalRootTreeConfigV2,
+        backend: B,
+        db: Arc<redb::Database>,
+        raft_config: crate::raft::RaftConfig,
+    ) -> Result<
+        PreparedV2RaftRoot<B>,
+        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+    >
+    where
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+            + Send
+            + 'static,
     {
         let replication_id = raft_config.replication_id;
         let network = self
@@ -3049,12 +3172,10 @@ impl VosNode {
         if let Some(network) = network.as_ref() {
             network.register_raft_handler(replication_id, Arc::new(worker_handle.clone()));
         }
-
-        let cleanup = |node: &Self| {
+        let cleanup = || {
             if let Some(network) = network.as_ref() {
                 network.unregister_raft_handler(&replication_id);
             }
-            node.raft_hosts.lock().unwrap().remove(&id.0);
         };
         let log = match crate::raft::RaftAccumulateLogV2::from_worker(
             db,
@@ -3064,27 +3185,18 @@ impl VosNode {
         ) {
             Ok(log) => log,
             Err(error) => {
-                cleanup(self);
+                cleanup();
                 return Err(V2RaftNodeRegistrationError::Log(error));
             }
         };
         let service = match crate::v2::LocalRootTreeServiceV2::open_raft(config, backend, log) {
             Ok(service) => service,
             Err(error) => {
-                cleanup(self);
+                cleanup();
                 return Err(V2RaftNodeRegistrationError::Open(error));
             }
         };
-        if let Err(error) = self.validate_v2_root_registration(&service, id) {
-            cleanup(self);
-            return Err(V2RaftNodeRegistrationError::Registration(error));
-        }
-        if let Err(error) = promote(&worker_handle) {
-            cleanup(self);
-            return Err(V2RaftNodeRegistrationError::Promotion(error));
-        }
-        self.raft_hosts.lock().unwrap().insert(id.0, replication_id);
-        Ok(self.attach_v2_root_unchecked(name, service, id, network_reachable))
+        Ok((service, worker_handle, network, replication_id))
     }
 
     /// Bind an externally owned v2 actor to an authenticated physical route.
@@ -3436,6 +3548,28 @@ impl VosNode {
         self.run_until_idle(Duration::from_secs(2));
     }
 
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn publish_ready_v2_raft_roots(&mut self) {
+        while let Ok(publish) = self.pending_v2_root_ready_rx.try_recv() {
+            publish(self);
+            *self.last_activity.lock().unwrap() = Instant::now();
+        }
+        let mut index = 0;
+        while index < self.pending_v2_root_threads.len() {
+            if self.pending_v2_root_threads[index].is_finished() {
+                let thread = self.pending_v2_root_threads.swap_remove(index);
+                let _ = thread.join();
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn has_pending_v2_raft_roots(&self) -> bool {
+        !self.pending_v2_root_ids.lock().unwrap().is_empty()
+    }
+
     /// Route messages until traffic — both outbox routing AND
     /// agent/worker dispatch — has been quiet for `threshold`,
     /// then signal shutdown to all threads.
@@ -3448,6 +3582,8 @@ impl VosNode {
     pub fn run_until_idle(&mut self, threshold: Duration) {
         *self.last_activity.lock().unwrap() = Instant::now();
         loop {
+            #[cfg(all(feature = "network", feature = "storage"))]
+            self.publish_ready_v2_raft_roots();
             match self.outbox_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(envelope) => {
                     self.route(envelope);
@@ -3461,6 +3597,8 @@ impl VosNode {
                         .agents
                         .iter()
                         .all(|h| h.join.as_ref().is_none_or(|j| j.is_finished()));
+                    #[cfg(all(feature = "network", feature = "storage"))]
+                    let all_done = all_done && !self.has_pending_v2_raft_roots();
                     if all_done {
                         break;
                     }
@@ -3510,6 +3648,8 @@ impl VosNode {
     ///   to bootstrap the first agent.
     pub fn run_forever_with(&mut self, mut on_tick: impl FnMut(&mut Self)) {
         loop {
+            #[cfg(all(feature = "network", feature = "storage"))]
+            self.publish_ready_v2_raft_roots();
             match self.outbox_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(envelope) => {
                     self.route(envelope);
@@ -3524,6 +3664,8 @@ impl VosNode {
                         .agents
                         .iter()
                         .all(|h| h.join.as_ref().is_none_or(|j| j.is_finished()));
+                    #[cfg(all(feature = "network", feature = "storage"))]
+                    let all_done = all_done && !self.has_pending_v2_raft_roots();
                     if all_done {
                         break;
                     }
@@ -3602,17 +3744,22 @@ impl VosNode {
         }
     }
 
-    /// Whether an agent (actor, service, or transport) is
-    /// registered under `id` on this node. Stays `true` for agents
+    /// Whether an agent (actor, service, or transport) is registered or has a
+    /// locally prepared Raft root awaiting voter promotion under `id` on this
+    /// node. Stays `true` for agents
     /// that were stopped individually (`stop_agent`) — their slot
     /// is still taken, so re-registering at the same id would
     /// clobber routes. The cheap idempotency probe for embedder
     /// spawn-reconcile loops.
     pub fn has_agent(&self, id: ServiceId) -> bool {
-        self.agent_info
+        let registered = self
+            .agent_info
             .read()
             .map(|m| m.contains_key(&id.0))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        #[cfg(all(feature = "network", feature = "storage"))]
+        let registered = registered || self.pending_v2_root_ids.lock().unwrap().contains(&id.0);
+        registered
     }
 
     /// Describe a SINGLE agent by id: a JSON snapshot of its
@@ -3830,11 +3977,12 @@ impl VosNode {
             proof_requested: false,
         };
         let (reply_tx, reply_rx) = mpsc::channel();
+        let ingress_wire = crate::v2::V2Wire::encode(&ingress);
         tx.send(InvokeRequest {
             caller: crate::actors::Caller::System,
             space_role: None,
             actor_local_role: None,
-            msg: crate::v2::V2Wire::encode(&ingress),
+            msg: ingress_wire.clone(),
             reply: ReplyChannel::Sync(reply_tx),
             chain: Vec::new(),
         })
@@ -3842,6 +3990,29 @@ impl VosNode {
         let envelope = reply_rx
             .recv_timeout(Duration::from_secs(10))
             .map_err(|_| crate::actors::client::ClientError::Unreachable)?;
+        #[cfg(all(feature = "network", feature = "storage"))]
+        if let Some(leader_prefix) = decode_v2_raft_redirect(&envelope) {
+            let network = self
+                .shared_network
+                .lock()
+                .map_err(|_| crate::actors::client::ClientError::Unreachable)?
+                .clone()
+                .ok_or(crate::actors::client::ClientError::Unreachable)?;
+            let peer = network
+                .peer_for_prefix(leader_prefix)
+                .ok_or(crate::actors::client::ClientError::Unreachable)?;
+            let leader_route = ServiceId::new(leader_prefix, ServiceId(route).local_id());
+            return network
+                .send_invoke(
+                    peer,
+                    ServiceId::REGISTRY.0,
+                    leader_route.0,
+                    Vec::new(),
+                    ingress_wire,
+                )
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| crate::actors::client::ClientError::Unreachable);
+        }
         decode_host_invoke_envelope(&envelope)
     }
 
@@ -4037,6 +4208,17 @@ impl VosNode {
         // so agent threads polling their OWN flag — notably the transport accept
         // loop, which has no inbox to disconnect — exit cleanly.
         self.signal_node_shutdown();
+        #[cfg(all(feature = "network", feature = "storage"))]
+        {
+            for thread in self.pending_v2_root_threads.drain(..) {
+                let _ = thread.join();
+            }
+            // A promotion may have completed immediately before shutdown and
+            // queued its publication closure. Execute it under the shutdown
+            // flag so it unregisters the prepared Raft handler instead of
+            // leaving it attached to a separately-owned Network.
+            self.publish_ready_v2_raft_roots();
+        }
         drop(self.outbox_tx);
         drop(self.routes); // drop agent inboxes so threads can detect disconnect
         // Drain the invoke routes too so threads' invoke_rx
@@ -4092,6 +4274,23 @@ fn v2_root_origin(
             .iter()
             .find_map(|(actor, candidate)| (candidate.route == route.0).then_some(*actor))
             .map(crate::v2::Origin::Actor),
+    }
+}
+
+/// Public Raft-root ingress has one consensus identity regardless of which
+/// replica accepted or forwarded the request. This staged daemon surface only
+/// admits public, non-attested methods, so it deliberately does not delegate a
+/// local `System`, actor, or remote peer identity across the Raft boundary.
+/// Role-bearing calls use the separately authenticated authority path.
+fn v2_root_ingress_origin(
+    consistency: crate::v2::ConsistencyModeV2,
+    caller: &crate::actors::Caller,
+    actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
+) -> Option<crate::v2::Origin> {
+    if consistency == crate::v2::ConsistencyModeV2::Raft {
+        Some(crate::v2::Origin::Anonymous)
+    } else {
+        v2_root_origin(caller, actor_routes)
     }
 }
 
@@ -4353,7 +4552,9 @@ where
             send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
             continue;
         }
-        let Some(origin) = v2_root_origin(&req.caller, &actor_routes) else {
+        let Some(origin) =
+            v2_root_ingress_origin(service.consistency(), &req.caller, &actor_routes)
+        else {
             send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
             continue;
         };
@@ -9527,6 +9728,31 @@ mod tests {
             Some(crate::v2::Origin::Member(
                 crate::actors::context::authenticated_peer_subject(&peer)
             ))
+        );
+    }
+
+    #[test]
+    fn raft_public_ingress_has_one_origin_across_forwarding_paths() {
+        let routes = RwLock::new(HashMap::new());
+        for caller in [
+            crate::actors::Caller::System,
+            crate::actors::Caller::Unauthenticated,
+            crate::actors::Caller::Peer(vec![1, 2, 3]),
+        ] {
+            assert_eq!(
+                v2_root_ingress_origin(crate::v2::ConsistencyModeV2::Raft, &caller, &routes,),
+                Some(crate::v2::Origin::Anonymous),
+                "leader selection must not alter consensus-significant origin",
+            );
+        }
+        assert_eq!(
+            v2_root_ingress_origin(
+                crate::v2::ConsistencyModeV2::Local,
+                &crate::actors::Caller::System,
+                &routes,
+            ),
+            Some(crate::v2::Origin::System),
+            "the canonicalization is confined to the public Raft ingress seam",
         );
     }
 
