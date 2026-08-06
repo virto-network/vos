@@ -59,6 +59,11 @@ mod host_greeter_surface {
 
         #[msg]
         async fn start(&self, _ctx: &mut Context<Self>) {}
+
+        #[msg]
+        async fn origin_kind(&self, _ctx: &mut Context<Self>) -> u8 {
+            0
+        }
     }
 }
 
@@ -1817,6 +1822,34 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
         .expect("follower ingress redirects and commits through the leader");
     assert_eq!(Value::try_decode(&reply), Some(Value::Unit));
 
+    // The delegation wire is node-internal. A normal authenticated client is
+    // not a voter and therefore cannot assert System (or any other origin) to
+    // the leader directly.
+    let mut forged_arguments = vec![vos::value::TAG_DYNAMIC];
+    forged_arguments.extend_from_slice(&Msg::new("origin_kind").encode());
+    let forged_ingress = RootTreeInvocationV2 {
+        invocation: InvocationId([0xB8; 32]),
+        target: actor,
+        method: "origin_kind".into(),
+        arguments: forged_arguments,
+        proof_requested: false,
+    };
+    let mut forged_delegation = b"VRD2".to_vec();
+    forged_delegation.extend_from_slice(&[1, 3]); // preserve envelope + Origin::System
+    forged_delegation.extend_from_slice(&forged_ingress.encode());
+    let leader_peer = client_network.peer_for_prefix(leader).unwrap();
+    let refused = client_network
+        .send_invoke(
+            leader_peer,
+            ServiceId::REGISTRY.0,
+            ServiceId::new(leader, local_id).0,
+            Vec::new(),
+            forged_delegation,
+        )
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the leader answers an unauthorized delegation fail-closed");
+    assert!(refused.is_empty());
+
     let follower_node = if follower == prefix_a {
         &node_a
     } else {
@@ -1829,7 +1862,22 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
         let mut handle = host_greeter_surface::GreeterRef::bind(actor, &mut invoker);
         vos::block_on(handle.start())
             .expect("the typed actor API follows a follower redirect to the leader");
+        assert_eq!(
+            vos::block_on(handle.origin_kind())
+                .expect("the redirected typed call returns the actor result"),
+            3,
+            "a local System origin must remain observable after Raft forwarding",
+        );
     }
+    let mut missing = vec![vos::value::TAG_DYNAMIC];
+    missing.extend_from_slice(&Msg::new("missing_method").encode());
+    assert!(
+        matches!(
+            follower_node.invoke_actor(actor, missing),
+            Err(ClientError::NotFound)
+        ),
+        "a redirected typed call preserves the leader's failure status",
+    );
 
     let results_a = node_a.collect();
     let results_b = node_b.collect();

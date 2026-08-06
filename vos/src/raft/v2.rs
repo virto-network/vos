@@ -95,6 +95,11 @@ pub struct RaftAccumulateLogV2 {
 }
 
 impl RaftAccumulateLogV2 {
+    /// Stable identity of the replication group backing this request log.
+    pub const fn replication_id(&self) -> [u8; 32] {
+        self.cfg.replication_id
+    }
+
     /// Open a self-quorum log. Every proposal commits in one redb transaction,
     /// but service application and `last_applied` remain a separate ordered
     /// step so restart exercises the same replay contract as a real cluster.

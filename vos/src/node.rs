@@ -765,6 +765,11 @@ struct InvokeRequest {
     /// in M5; until then, all sites leave it at `None`.
     #[allow(dead_code)] // Consumer wired in M3/M5.
     actor_local_role: Option<u8>,
+    /// Consensus-significant origin observed by another replica before it
+    /// redirected this Raft invocation. Only the network ingress may populate
+    /// this field, after authenticating the forwarding peer as a current voter.
+    #[cfg(all(feature = "network", feature = "storage"))]
+    delegated_origin: Option<crate::v2::Origin>,
     msg: Vec<u8>,
     reply: ReplyChannel,
     // Read by agent_thread via `&req.chain` before moving `req`
@@ -1112,6 +1117,7 @@ type PreparedV2RaftRoot<B> = (
     crate::raft::WorkerHandle,
     Option<Arc<crate::network::Network>>,
     [u8; 32],
+    Arc<dyn crate::network::RaftRpcHandler>,
 );
 
 /// Shared host-side reverse map: `local_id` (`id.0 & 0xFFFF`) →
@@ -1238,6 +1244,8 @@ impl InvokeHandle {
             caller: crate::actors::Caller::System,
             space_role: None,
             actor_local_role: None,
+            #[cfg(all(feature = "network", feature = "storage"))]
+            delegated_origin: None,
             msg,
             reply: ReplyChannel::Sync(reply_tx),
             chain: Vec::new(),
@@ -1293,6 +1301,11 @@ struct NodeService {
     agent_info: AgentInfos,
     #[cfg(feature = "storage")]
     replicas: Arc<Mutex<HashMap<[u8; 32], ReplicaSlot>>>,
+    /// Route-to-group ownership and live voter membership used to authenticate
+    /// the internal Raft origin-delegation envelope.
+    #[cfg(feature = "storage")]
+    raft_hosts: RaftHosts,
+    shared_network: SharedNetwork,
     manifest: Arc<OnceLock<crate::network::ManifestReply>>,
     proof_blobs: ProofBlobStore,
     proof_blobs_dir: Option<std::path::PathBuf>,
@@ -1691,6 +1704,39 @@ impl NodeService {
             .is_some_and(|(op, p)| op == p.to_bytes().as_slice())
     }
 
+    /// Authenticate the node-internal Raft delegation channel. The forwarding
+    /// peer must be a member of the exact replication group serving `target`;
+    /// an arbitrary Noise-authenticated peer cannot assert a System/Actor
+    /// origin. Raft voters are already trusted to replicate the state machine,
+    /// so carrying the origin they observed does not enlarge that trust set.
+    #[cfg(feature = "storage")]
+    fn caller_is_v2_raft_voter(
+        &self,
+        target: u32,
+        target_unscoped: u32,
+        caller: &libp2p::PeerId,
+    ) -> bool {
+        let replication_id = self.raft_hosts.lock().ok().and_then(|hosts| {
+            hosts
+                .get(&target)
+                .or_else(|| hosts.get(&target_unscoped))
+                .copied()
+        });
+        let Some(replication_id) = replication_id else {
+            return false;
+        };
+        let status = self
+            .shared_network
+            .lock()
+            .ok()
+            .and_then(|network| network.as_ref()?.local_raft_status(&replication_id));
+        let Some(status) = status else {
+            return false;
+        };
+        let prefix = crate::network::derive_node_prefix(caller);
+        status.members.contains(&prefix)
+    }
+
     /// Render an agent's describe JSON by id (the `__describe` primitive's
     /// core). `None` when no agent is registered under `id`.
     fn describe_agent_id(&self, id: u32) -> Option<String> {
@@ -1723,6 +1769,8 @@ fn registry_probe_reply(routes: &InvokeRoutes, payload: Vec<u8>) -> Option<Vec<u
             caller: crate::actors::Caller::System,
             space_role: None,
             actor_local_role: None,
+            #[cfg(all(feature = "network", feature = "storage"))]
+            delegated_origin: None,
             msg: payload,
             reply: ReplyChannel::Sync(reply_tx),
             chain: vec![],
@@ -1813,7 +1861,7 @@ impl crate::network::NetworkService for NodeService {
         _from: u32,
         to: u32,
         chain: Vec<u32>,
-        msg: Vec<u8>,
+        mut msg: Vec<u8>,
     ) -> crate::network::NetworkInvokeResponse {
         // The chain arrived already including the original caller's
         // ID (the remote peer's agent). The receiver's own
@@ -1828,6 +1876,31 @@ impl crate::network::NetworkService for NodeService {
         // matches our own node — same routing decision the local
         // path makes via `is_on_node || is_local`.
         let to_unscoped = to & 0xFFFF;
+
+        // A follower forwarding a local System/Actor call cannot rely on the
+        // new Noise hop for identity: that hop authenticates the follower,
+        // not the original caller. Accept its delegated origin only from a
+        // current voter of this exact root's Raft group. Ordinary network
+        // redirects do not use this wrapper; the transport reconnects the
+        // original peer directly and the leader derives Member normally.
+        #[cfg(feature = "storage")]
+        let (delegated_origin, preserve_envelope) = match decode_v2_raft_delegation(&msg) {
+            Ok(Some(delegated))
+                if caller_peer_id
+                    .as_ref()
+                    .is_some_and(|peer| self.caller_is_v2_raft_voter(to, to_unscoped, peer)) =>
+            {
+                msg = delegated.ingress;
+                (Some(delegated.origin), delegated.preserve_envelope)
+            }
+            Ok(Some(_)) | Err(()) => {
+                warn!(target = to, peer = ?caller_peer_id, "refused unauthenticated Raft origin delegation");
+                return Vec::new().into();
+            }
+            Ok(None) => (None, false),
+        };
+        #[cfg(not(feature = "storage"))]
+        let preserve_envelope = false;
 
         // Expiry is checked once, on the serving host, before the operation is
         // admitted into the registry DAG. The signed deadline is re-verified
@@ -1990,6 +2063,8 @@ impl crate::network::NetworkService for NodeService {
                 caller,
                 space_role,
                 actor_local_role,
+                #[cfg(all(feature = "network", feature = "storage"))]
+                delegated_origin,
                 msg,
                 reply: ReplyChannel::Sync(reply_tx),
                 chain,
@@ -2016,6 +2091,15 @@ impl crate::network::NetworkService for NodeService {
         // the wire layer is still patient.
         match reply_rx.recv_timeout(Duration::from_secs(300)).ok() {
             Some(env) => {
+                #[cfg(feature = "storage")]
+                if let Some(redirect) = decode_v2_raft_redirect(&env) {
+                    return crate::network::NetworkInvokeResponse::Redirect {
+                        leader_prefix: redirect.leader_prefix,
+                    };
+                }
+                if preserve_envelope {
+                    return env.into();
+                }
                 if env.first().copied() == Some(crate::actors::run::STATUS_FORBIDDEN) {
                     let peer_label = caller_peer_id
                         .as_ref()
@@ -2027,10 +2111,6 @@ impl crate::network::NetworkService for NodeService {
                         "auth: actor refused call — caller lacks the required role",
                     );
                     return forbidden_envelope().into();
-                }
-                #[cfg(all(feature = "storage", feature = "network"))]
-                if let Some(leader_prefix) = decode_v2_raft_redirect(&env) {
-                    return crate::network::NetworkInvokeResponse::Redirect { leader_prefix };
                 }
                 unwrap_invoke_envelope(&env).unwrap_or_default().into()
             }
@@ -2757,6 +2837,9 @@ impl VosNode {
             agent_info: self.agent_info.clone(),
             #[cfg(feature = "storage")]
             replicas: self.crdt_replicas.clone(),
+            #[cfg(feature = "storage")]
+            raft_hosts: self.raft_hosts.clone(),
+            shared_network: self.shared_network.clone(),
             manifest: self.manifest.clone(),
             proof_blobs: self.proof_blobs.clone(),
             proof_blobs_dir: self.proof_blobs_dir.clone(),
@@ -2952,6 +3035,10 @@ impl VosNode {
             + 'static,
     {
         let actor = service.root_actor();
+        #[cfg(all(feature = "network", feature = "storage"))]
+        if let Some(replication_id) = service.replication_id() {
+            self.raft_hosts.lock().unwrap().insert(id.0, replication_id);
+        }
         let service_identity = service.identity().clone();
         let consistency = match service.consistency() {
             crate::v2::ConsistencyModeV2::Ephemeral => Consistency::Ephemeral,
@@ -3033,11 +3120,11 @@ impl VosNode {
             + Send
             + 'static,
     {
-        let (service, _worker, _network, replication_id) =
+        let (service, _worker, _network, replication_id, handler) =
             self.prepare_v2_raft_root(config, backend, db, raft_config)?;
         if let Err(error) = self.validate_v2_root_registration(&service, id) {
             if let Some(network) = _network.as_ref() {
-                network.unregister_raft_handler(&replication_id);
+                network.unregister_raft_handler_if(&replication_id, &handler);
             }
             return Err(V2RaftNodeRegistrationError::Registration(error));
         }
@@ -3076,11 +3163,11 @@ impl VosNode {
             + 'static,
         F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool) -> Result<(), String> + Send + 'static,
     {
-        let (service, worker_handle, network, replication_id) =
+        let (service, worker_handle, network, replication_id, handler) =
             self.prepare_v2_raft_root(config, backend, db, raft_config)?;
         if let Err(error) = self.validate_v2_root_registration(&service, id) {
             if let Some(network) = network.as_ref() {
-                network.unregister_raft_handler(&replication_id);
+                network.unregister_raft_handler_if(&replication_id, &handler);
             }
             return Err(V2RaftNodeRegistrationError::Registration(error));
         }
@@ -3093,6 +3180,7 @@ impl VosNode {
         let pending_actors = self.pending_v2_root_actors.clone();
         let shutdown = self.shutdown.clone();
         let cleanup_network = network.clone();
+        let cleanup_handler = handler.clone();
         let join = thread::spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 promote(&worker_handle, &shutdown)
@@ -3102,28 +3190,31 @@ impl VosNode {
                 let ready_network = network.clone();
                 let ready_pending_ids = pending_ids.clone();
                 let ready_pending_actors = pending_actors.clone();
+                let ready_handler = handler.clone();
                 let ready: PendingV2RootReady = Box::new(move |node| {
-                    ready_pending_ids.lock().unwrap().remove(&id.0);
-                    ready_pending_actors.lock().unwrap().remove(&actor);
                     if node.shutdown.load(Ordering::Relaxed) {
                         if let Some(network) = ready_network.as_ref() {
-                            network.unregister_raft_handler(&replication_id);
+                            network.unregister_raft_handler_if(&replication_id, &ready_handler);
                         }
+                        ready_pending_ids.lock().unwrap().remove(&id.0);
+                        ready_pending_actors.lock().unwrap().remove(&actor);
                         return;
                     }
                     node.raft_hosts.lock().unwrap().insert(id.0, replication_id);
                     node.attach_v2_root_unchecked(name, service, id, network_reachable);
+                    ready_pending_ids.lock().unwrap().remove(&id.0);
+                    ready_pending_actors.lock().unwrap().remove(&actor);
                 });
                 if ready_tx.send(ready).is_ok() {
                     return;
                 }
             }
 
+            if let Some(network) = cleanup_network.as_ref() {
+                network.unregister_raft_handler_if(&replication_id, &cleanup_handler);
+            }
             pending_ids.lock().unwrap().remove(&id.0);
             pending_actors.lock().unwrap().remove(&actor);
-            if let Some(network) = cleanup_network.as_ref() {
-                network.unregister_raft_handler(&replication_id);
-            }
             if let Err(error) = outcome {
                 warn!(%id, %error, "prepared v2 Raft root promotion deferred");
             }
@@ -3169,12 +3260,13 @@ impl VosNode {
             Some(apply_tx),
         );
         let worker_handle = worker.handler();
+        let handler: Arc<dyn crate::network::RaftRpcHandler> = Arc::new(worker_handle.clone());
         if let Some(network) = network.as_ref() {
-            network.register_raft_handler(replication_id, Arc::new(worker_handle.clone()));
+            network.register_raft_handler(replication_id, handler.clone());
         }
         let cleanup = || {
             if let Some(network) = network.as_ref() {
-                network.unregister_raft_handler(&replication_id);
+                network.unregister_raft_handler_if(&replication_id, &handler);
             }
         };
         let log = match crate::raft::RaftAccumulateLogV2::from_worker(
@@ -3196,7 +3288,7 @@ impl VosNode {
                 return Err(V2RaftNodeRegistrationError::Open(error));
             }
         };
-        Ok((service, worker_handle, network, replication_id))
+        Ok((service, worker_handle, network, replication_id, handler))
     }
 
     /// Bind an externally owned v2 actor to an authenticated physical route.
@@ -3982,6 +4074,8 @@ impl VosNode {
             caller: crate::actors::Caller::System,
             space_role: None,
             actor_local_role: None,
+            #[cfg(all(feature = "network", feature = "storage"))]
+            delegated_origin: None,
             msg: ingress_wire.clone(),
             reply: ReplyChannel::Sync(reply_tx),
             chain: Vec::new(),
@@ -3991,7 +4085,7 @@ impl VosNode {
             .recv_timeout(Duration::from_secs(10))
             .map_err(|_| crate::actors::client::ClientError::Unreachable)?;
         #[cfg(all(feature = "network", feature = "storage"))]
-        if let Some(leader_prefix) = decode_v2_raft_redirect(&envelope) {
+        if let Some(redirect) = decode_v2_raft_redirect(&envelope) {
             let network = self
                 .shared_network
                 .lock()
@@ -3999,19 +4093,21 @@ impl VosNode {
                 .clone()
                 .ok_or(crate::actors::client::ClientError::Unreachable)?;
             let peer = network
-                .peer_for_prefix(leader_prefix)
+                .peer_for_prefix(redirect.leader_prefix)
                 .ok_or(crate::actors::client::ClientError::Unreachable)?;
-            let leader_route = ServiceId::new(leader_prefix, ServiceId(route).local_id());
-            return network
+            let leader_route = ServiceId::new(redirect.leader_prefix, ServiceId(route).local_id());
+            let delegated = encode_v2_raft_delegation(redirect.origin, true, &ingress_wire);
+            let leader_envelope = network
                 .send_invoke(
                     peer,
                     ServiceId::REGISTRY.0,
                     leader_route.0,
                     Vec::new(),
-                    ingress_wire,
+                    delegated,
                 )
                 .recv_timeout(Duration::from_secs(10))
-                .map_err(|_| crate::actors::client::ClientError::Unreachable);
+                .map_err(|_| crate::actors::client::ClientError::Unreachable)?;
+            return decode_host_invoke_envelope(&leader_envelope);
         }
         decode_host_invoke_envelope(&envelope)
     }
@@ -4066,6 +4162,8 @@ impl VosNode {
                 caller: crate::actors::Caller::System,
                 space_role: None,
                 actor_local_role: None,
+                #[cfg(all(feature = "network", feature = "storage"))]
+                delegated_origin: None,
                 msg: msg.clone(),
                 reply: ReplyChannel::Sync(reply_tx),
                 chain: Vec::new(),
@@ -4077,12 +4175,19 @@ impl VosNode {
             // reply bytes.
             let envelope = reply_rx.recv_timeout(timeout).ok()?;
             #[cfg(all(feature = "network", feature = "storage"))]
-            if let Some(leader_prefix) = decode_v2_raft_redirect(&envelope) {
+            if let Some(redirect) = decode_v2_raft_redirect(&envelope) {
                 let net = self.shared_network.lock().ok().and_then(|g| g.clone())?;
-                let peer = net.peer_for_prefix(leader_prefix)?;
-                let leader_target = ServiceId::new(leader_prefix, target.local_id()).0;
+                let peer = net.peer_for_prefix(redirect.leader_prefix)?;
+                let leader_target = ServiceId::new(redirect.leader_prefix, target.local_id()).0;
+                let delegated = encode_v2_raft_delegation(redirect.origin, false, &msg);
                 return net
-                    .send_invoke(peer, ServiceId::REGISTRY.0, leader_target, Vec::new(), msg)
+                    .send_invoke(
+                        peer,
+                        ServiceId::REGISTRY.0,
+                        leader_target,
+                        Vec::new(),
+                        delegated,
+                    )
                     .recv_timeout(timeout)
                     .ok();
             }
@@ -4277,23 +4382,6 @@ fn v2_root_origin(
     }
 }
 
-/// Public Raft-root ingress has one consensus identity regardless of which
-/// replica accepted or forwarded the request. This staged daemon surface only
-/// admits public, non-attested methods, so it deliberately does not delegate a
-/// local `System`, actor, or remote peer identity across the Raft boundary.
-/// Role-bearing calls use the separately authenticated authority path.
-fn v2_root_ingress_origin(
-    consistency: crate::v2::ConsistencyModeV2,
-    caller: &crate::actors::Caller,
-    actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
-) -> Option<crate::v2::Origin> {
-    if consistency == crate::v2::ConsistencyModeV2::Raft {
-        Some(crate::v2::Origin::Anonymous)
-    } else {
-        v2_root_origin(caller, actor_routes)
-    }
-}
-
 fn v2_wall_timeslot() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4367,17 +4455,118 @@ fn send_v2_status(reply: ReplyChannel, status: u8, id: ServiceId) {
 const V2_RAFT_REDIRECT_STATUS: u8 = 0xFE;
 
 #[cfg(all(feature = "storage", feature = "network"))]
-fn encode_v2_raft_redirect(leader_prefix: u16) -> Vec<u8> {
-    let mut wire = Vec::with_capacity(3);
+const V2_RAFT_DELEGATION_MAGIC: [u8; 4] = *b"VRD2";
+
+#[cfg(all(feature = "storage", feature = "network"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct V2RaftRedirect {
+    leader_prefix: u16,
+    origin: crate::v2::Origin,
+}
+
+#[cfg(all(feature = "storage", feature = "network"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct V2RaftDelegatedIngress {
+    origin: crate::v2::Origin,
+    /// Return the complete status/state/reply envelope to typed host callers.
+    /// Actor/extension forwarding keeps the historical raw-reply contract.
+    preserve_envelope: bool,
+    ingress: Vec<u8>,
+}
+
+#[cfg(all(feature = "storage", feature = "network"))]
+fn encode_v2_origin(wire: &mut Vec<u8>, origin: crate::v2::Origin) {
+    match origin {
+        crate::v2::Origin::Anonymous => wire.push(0),
+        crate::v2::Origin::Member(subject) => {
+            wire.push(1);
+            wire.extend_from_slice(&subject.0);
+        }
+        crate::v2::Origin::Actor(actor) => {
+            wire.push(2);
+            wire.extend_from_slice(&actor.0);
+        }
+        crate::v2::Origin::System => wire.push(3),
+    }
+}
+
+#[cfg(all(feature = "storage", feature = "network"))]
+fn decode_v2_origin(wire: &[u8], cursor: &mut usize) -> Option<crate::v2::Origin> {
+    let tag = *wire.get(*cursor)?;
+    *cursor += 1;
+    match tag {
+        0 => Some(crate::v2::Origin::Anonymous),
+        1 | 2 => {
+            let end = cursor.checked_add(32)?;
+            let bytes: [u8; 32] = wire.get(*cursor..end)?.try_into().ok()?;
+            *cursor = end;
+            (tag == 1)
+                .then_some(crate::v2::Origin::Member(crate::v2::SubjectId(bytes)))
+                .or_else(|| Some(crate::v2::Origin::Actor(crate::v2::ActorId(bytes))))
+        }
+        3 => Some(crate::v2::Origin::System),
+        _ => None,
+    }
+}
+
+#[cfg(all(feature = "storage", feature = "network"))]
+fn encode_v2_raft_redirect(leader_prefix: u16, origin: crate::v2::Origin) -> Vec<u8> {
+    let mut wire = Vec::with_capacity(36);
     wire.push(V2_RAFT_REDIRECT_STATUS);
     wire.extend_from_slice(&leader_prefix.to_le_bytes());
+    encode_v2_origin(&mut wire, origin);
     wire
 }
 
 #[cfg(all(feature = "storage", feature = "network"))]
-fn decode_v2_raft_redirect(wire: &[u8]) -> Option<u16> {
-    (wire.len() == 3 && wire[0] == V2_RAFT_REDIRECT_STATUS)
-        .then(|| u16::from_le_bytes([wire[1], wire[2]]))
+fn decode_v2_raft_redirect(wire: &[u8]) -> Option<V2RaftRedirect> {
+    if wire.first().copied() != Some(V2_RAFT_REDIRECT_STATUS) || wire.len() < 4 {
+        return None;
+    }
+    let leader_prefix = u16::from_le_bytes([wire[1], wire[2]]);
+    let mut cursor = 3;
+    let origin = decode_v2_origin(wire, &mut cursor)?;
+    (cursor == wire.len()).then_some(V2RaftRedirect {
+        leader_prefix,
+        origin,
+    })
+}
+
+#[cfg(all(feature = "storage", feature = "network"))]
+fn encode_v2_raft_delegation(
+    origin: crate::v2::Origin,
+    preserve_envelope: bool,
+    ingress: &[u8],
+) -> Vec<u8> {
+    let mut wire = Vec::with_capacity(6 + 32 + ingress.len());
+    wire.extend_from_slice(&V2_RAFT_DELEGATION_MAGIC);
+    wire.push(u8::from(preserve_envelope));
+    encode_v2_origin(&mut wire, origin);
+    wire.extend_from_slice(ingress);
+    wire
+}
+
+#[cfg(all(feature = "storage", feature = "network"))]
+fn decode_v2_raft_delegation(wire: &[u8]) -> Result<Option<V2RaftDelegatedIngress>, ()> {
+    if !wire.starts_with(&V2_RAFT_DELEGATION_MAGIC) {
+        return Ok(None);
+    }
+    let preserve_envelope = match wire.get(4) {
+        Some(0) => false,
+        Some(1) => true,
+        _ => return Err(()),
+    };
+    let mut cursor = 5;
+    let origin = decode_v2_origin(wire, &mut cursor).ok_or(())?;
+    let ingress = wire
+        .get(cursor..)
+        .filter(|bytes| !bytes.is_empty())
+        .ok_or(())?;
+    Ok(Some(V2RaftDelegatedIngress {
+        origin,
+        preserve_envelope,
+        ingress: ingress.to_vec(),
+    }))
 }
 
 #[derive(Default)]
@@ -4515,6 +4704,21 @@ where
             send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
             continue;
         }
+        #[cfg(all(feature = "network", feature = "storage"))]
+        let delegated_origin = req.delegated_origin;
+        #[cfg(not(all(feature = "network", feature = "storage")))]
+        let delegated_origin: Option<crate::v2::Origin> = None;
+        let origin = match delegated_origin {
+            Some(origin) if service.consistency() == crate::v2::ConsistencyModeV2::Raft => {
+                Some(origin)
+            }
+            Some(_) => None,
+            None => v2_root_origin(&req.caller, &actor_routes),
+        };
+        let Some(origin) = origin else {
+            send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+            continue;
+        };
         // A role check is not a sufficient leadership gate: Raft exposes
         // Leader before the promotion no-op reaches quorum. The service read
         // barrier waits for that current-term entry and catches up the complete
@@ -4525,8 +4729,11 @@ where
                 error!(%id, ?failure, "v2 root-tree admission barrier failed");
                 #[cfg(all(feature = "storage", feature = "network"))]
                 if let Some(leader_prefix) = service.admission_leader_hint() {
-                    let _ =
-                        send_reply_capped(req.reply, encode_v2_raft_redirect(leader_prefix), id);
+                    let _ = send_reply_capped(
+                        req.reply,
+                        encode_v2_raft_redirect(leader_prefix, origin),
+                        id,
+                    );
                     continue;
                 }
                 send_v2_status(req.reply, crate::STATUS_PANICKED, id);
@@ -4552,12 +4759,6 @@ where
             send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
             continue;
         }
-        let Some(origin) =
-            v2_root_ingress_origin(service.consistency(), &req.caller, &actor_routes)
-        else {
-            send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
-            continue;
-        };
         // Nothing catches up again between this allocation and the proposal.
         if let Err(failure) = restore_v2_logical_timeslot(&logical_timeslot, admission_floor) {
             error!(%id, ?failure, "v2 root-tree admission clock restoration failed");
@@ -5334,6 +5535,8 @@ fn agent_thread(
                 caller,
                 space_role,
                 actor_local_role,
+                #[cfg(all(feature = "network", feature = "storage"))]
+                delegated_origin: None,
                 msg: msg.to_vec(),
                 reply: ReplyChannel::Sync(reply_tx),
                 chain: chain_snapshot,
@@ -5348,7 +5551,7 @@ fn agent_thread(
             match reply_rx.recv_timeout(std::time::Duration::from_secs(10)) {
                 Ok(envelope) => {
                     #[cfg(all(feature = "network", feature = "storage"))]
-                    if decode_v2_raft_redirect(&envelope).is_some()
+                    if let Some(redirect) = decode_v2_raft_redirect(&envelope)
                         && let Some(rep_id) = raft_forward_plan(&raft_fwd, id, target.0)
                     {
                         return agent_forward_to_raft_leader(
@@ -5357,6 +5560,7 @@ fn agent_thread(
                             target.0,
                             rep_id,
                             msg.to_vec(),
+                            Some(redirect.origin),
                         )
                         .map(crate::runtime::ExternalInvokeReply::Done);
                     }
@@ -5375,6 +5579,7 @@ fn agent_thread(
                             target.0,
                             rep_id,
                             msg.to_vec(),
+                            None,
                         )
                         .map(crate::runtime::ExternalInvokeReply::Done);
                     }
@@ -7734,6 +7939,8 @@ async fn route_invoke(
             caller,
             space_role,
             actor_local_role,
+            #[cfg(all(feature = "network", feature = "storage"))]
+            delegated_origin: None,
             msg: payload,
             reply: ReplyChannel::Async(reply_tx),
             chain: Vec::new(),
@@ -7764,10 +7971,18 @@ async fn route_invoke(
     match outcome {
         AskOutcome::Reply(env) => {
             #[cfg(all(feature = "network", feature = "storage"))]
-            if decode_v2_raft_redirect(&env).is_some() {
+            if let Some(redirect) = decode_v2_raft_redirect(&env) {
                 return match forward_plan {
                     Some((rep_id, payload)) => {
-                        forward_to_raft_leader(fwd, extension_id, target, rep_id, payload).await
+                        forward_to_raft_leader(
+                            fwd,
+                            extension_id,
+                            target,
+                            rep_id,
+                            payload,
+                            Some(redirect.origin),
+                        )
+                        .await
                     }
                     None => None,
                 };
@@ -7777,7 +7992,7 @@ async fn route_invoke(
         AskOutcome::Timeout => None,
         AskOutcome::Canceled => match forward_plan {
             Some((rep_id, payload)) => {
-                forward_to_raft_leader(fwd, extension_id, target, rep_id, payload).await
+                forward_to_raft_leader(fwd, extension_id, target, rep_id, payload, None).await
             }
             None => None,
         },
@@ -7839,7 +8054,8 @@ fn agent_forward_to_raft_leader(
     from_id: ServiceId,
     target: u32,
     rep_id: [u8; 32],
-    payload: Vec<u8>,
+    mut payload: Vec<u8>,
+    delegated_origin: Option<crate::v2::Origin>,
 ) -> Option<Vec<u8>> {
     let net = fwd.network.lock().ok()?.clone()?;
     let st = net.local_raft_status(&rep_id)?;
@@ -7854,6 +8070,9 @@ fn agent_forward_to_raft_leader(
     }
     let peer = net.peer_for_prefix(leader)?;
     let to = ((leader as u32) << 16) | (target & 0xFFFF);
+    if let Some(origin) = delegated_origin {
+        payload = encode_v2_raft_delegation(origin, false, &payload);
+    }
     debug!(%from_id, target, leader, "agent ask: forwarding follower-dropped raft write to leader");
     let rx = net.send_invoke(peer, from_id.0, to, Vec::new(), payload);
     match rx.recv_timeout(RAFT_FORWARD_TIMEOUT) {
@@ -7873,7 +8092,8 @@ async fn forward_to_raft_leader(
     extension_id: ServiceId,
     target: u32,
     rep_id: [u8; 32],
-    payload: Vec<u8>,
+    mut payload: Vec<u8>,
+    delegated_origin: Option<crate::v2::Origin>,
 ) -> Option<Vec<u8>> {
     let net = fwd.network.lock().ok()?.clone()?;
     let st = net.local_raft_status(&rep_id)?;
@@ -7888,6 +8108,9 @@ async fn forward_to_raft_leader(
     }
     let peer = net.peer_for_prefix(leader)?;
     let to = ((leader as u32) << 16) | (target & 0xFFFF);
+    if let Some(origin) = delegated_origin {
+        payload = encode_v2_raft_delegation(origin, false, &payload);
+    }
     debug!(
         %extension_id, target, leader,
         "ext ask: forwarding follower-dropped raft write to leader"
@@ -7926,6 +8149,7 @@ async fn forward_to_raft_leader(
     _target: u32,
     _rep_id: [u8; 32],
     _payload: Vec<u8>,
+    _delegated_origin: Option<crate::v2::Origin>,
 ) -> Option<Vec<u8>> {
     None
 }
@@ -9732,28 +9956,38 @@ mod tests {
     }
 
     #[test]
-    fn raft_public_ingress_has_one_origin_across_forwarding_paths() {
-        let routes = RwLock::new(HashMap::new());
-        for caller in [
-            crate::actors::Caller::System,
-            crate::actors::Caller::Unauthenticated,
-            crate::actors::Caller::Peer(vec![1, 2, 3]),
+    fn raft_redirect_and_delegation_preserve_the_observed_origin() {
+        for origin in [
+            crate::v2::Origin::System,
+            crate::v2::Origin::Anonymous,
+            crate::v2::Origin::Member(crate::v2::SubjectId([7; 32])),
+            crate::v2::Origin::Actor(crate::v2::ActorId([8; 32])),
         ] {
+            let redirect = encode_v2_raft_redirect(41, origin);
             assert_eq!(
-                v2_root_ingress_origin(crate::v2::ConsistencyModeV2::Raft, &caller, &routes,),
-                Some(crate::v2::Origin::Anonymous),
-                "leader selection must not alter consensus-significant origin",
+                decode_v2_raft_redirect(&redirect),
+                Some(V2RaftRedirect {
+                    leader_prefix: 41,
+                    origin,
+                }),
+                "the follower's authenticated origin survives leader selection",
+            );
+            let delegated = encode_v2_raft_delegation(origin, true, b"root ingress");
+            assert_eq!(
+                decode_v2_raft_delegation(&delegated),
+                Ok(Some(V2RaftDelegatedIngress {
+                    origin,
+                    preserve_envelope: true,
+                    ingress: b"root ingress".to_vec(),
+                })),
             );
         }
-        assert_eq!(
-            v2_root_ingress_origin(
-                crate::v2::ConsistencyModeV2::Local,
-                &crate::actors::Caller::System,
-                &routes,
-            ),
-            Some(crate::v2::Origin::System),
-            "the canonicalization is confined to the public Raft ingress seam",
+        assert!(
+            decode_v2_raft_delegation(b"ordinary ingress")
+                .unwrap()
+                .is_none()
         );
+        assert!(decode_v2_raft_delegation(b"VRD2\x02bad").is_err());
     }
 
     #[test]
@@ -11218,6 +11452,9 @@ mod tests {
             agent_info: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(feature = "storage")]
             replicas: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "storage")]
+            raft_hosts: Arc::new(Mutex::new(HashMap::new())),
+            shared_network: Arc::new(Mutex::new(None)),
             manifest: Arc::new(OnceLock::new()),
             proof_blobs: Arc::new(RwLock::new(HashMap::new())),
             proof_blobs_dir: None,
@@ -11728,6 +11965,9 @@ mod tests {
             agent_info: info,
             #[cfg(feature = "storage")]
             replicas: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "storage")]
+            raft_hosts: Arc::new(Mutex::new(HashMap::new())),
+            shared_network: Arc::new(Mutex::new(None)),
             manifest: Arc::new(OnceLock::new()),
             proof_blobs: Arc::new(RwLock::new(HashMap::new())),
             proof_blobs_dir: None,

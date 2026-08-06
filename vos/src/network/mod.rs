@@ -738,6 +738,28 @@ impl Network {
         }
     }
 
+    /// Drop a Raft handler only when the map still contains the exact
+    /// registration owned by `expected`. A retiring prepared replica must not
+    /// unregister a successor which reused the same replication identity.
+    pub fn unregister_raft_handler_if(
+        &self,
+        replication_id: &[u8; 32],
+        expected: &Arc<dyn RaftRpcHandler>,
+    ) -> bool {
+        let Ok(mut handlers) = self.raft_handlers.lock() else {
+            return false;
+        };
+        if handlers
+            .get(replication_id)
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            handlers.remove(replication_id);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Snapshot of every replication group with a registered
     /// handler. Returned in deterministic order (BTreeMap
     /// iteration). Used by the manifest-fetch / join paths to
@@ -2435,6 +2457,62 @@ mod tests {
         assert_eq!(p1, p2);
         assert_ne!(p1, 0);
         assert_eq!(normalize_node_prefix(0), u16::MAX);
+    }
+
+    #[test]
+    fn retiring_raft_handler_cannot_unregister_its_replacement() {
+        struct Handler;
+        impl RaftRpcHandler for Handler {
+            fn append_entries(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                prev_log_index: u64,
+                _prev_log_term: u64,
+                _leader_commit: u64,
+                entries: Vec<RaftEntry>,
+            ) -> RaftAppendResult {
+                RaftAppendResult {
+                    term,
+                    success: true,
+                    match_index: prev_log_index + entries.len() as u64,
+                }
+            }
+
+            fn request_vote(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                _last_log_index: u64,
+                _last_log_term: u64,
+            ) -> RaftVoteResult {
+                RaftVoteResult {
+                    term,
+                    vote_granted: true,
+                }
+            }
+        }
+
+        let network = Network::start(NetworkConfig::default());
+        let replication_id = [0x71; 32];
+        let old: Arc<dyn RaftRpcHandler> = Arc::new(Handler);
+        let replacement: Arc<dyn RaftRpcHandler> = Arc::new(Handler);
+        network.register_raft_handler(replication_id, old.clone());
+        network.register_raft_handler(replication_id, replacement.clone());
+
+        assert!(!network.unregister_raft_handler_if(&replication_id, &old));
+        let registered = network
+            .raft_handlers
+            .lock()
+            .unwrap()
+            .get(&replication_id)
+            .cloned()
+            .unwrap();
+        assert!(Arc::ptr_eq(&registered, &replacement));
+        assert!(network.unregister_raft_handler_if(&replication_id, &replacement));
+        network.join();
     }
 
     #[test]

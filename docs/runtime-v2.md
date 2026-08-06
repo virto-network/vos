@@ -660,10 +660,15 @@ idempotently until final non-joint membership is visible. Shutdown cancels and
 joins that worker, and the route becomes public only after successful final
 membership. Calls that reach a follower receive a transport-level leader
 redirect which both the raw node API and generated typed actor handles follow.
-This ordinary public Raft ingress uses one canonical anonymous origin on every
-replica, so local `System`, forwarding peer, and leader changes cannot alter the
-committed work identity. Role-bearing identities use the separately
-authenticated authority path rather than implicit forwarding delegation.
+Remote peers reconnect to the leader directly and therefore retain their
+Noise-authenticated member identity. For local `System` and actor calls, the
+follower carries the exact typed origin in a node-internal delegation envelope;
+the leader accepts that envelope only from a current voter of the target's
+exact replication group. This is the same non-Byzantine trust boundary as Raft
+state replication, and keeps `Context::origin()` and exact-retry identity stable
+across leader changes. Typed forwarding requests the full invoke envelope, so
+`Forbidden`, `NotFound`, panic and out-of-gas statuses remain identical to a
+direct leader call.
 
 V2 CRDT rows remain fail-closed until anti-entropy can authenticate receipt
 finality independently of the peer-supplied sync envelope. Local root transport
