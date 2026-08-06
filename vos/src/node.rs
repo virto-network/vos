@@ -97,15 +97,15 @@ const V2_LOCAL_INVOKE_TIMEOUT: Duration = Duration::from_secs(10);
 const V2_RAFT_VOTER_AUTH_TIMEOUT_MS: u64 = 5_000;
 
 /// One end-to-end Raft invocation can consume one voter-authentication probe,
-/// one read barrier, and two proposal waits (`AdmitIngress` and `Apply`).
-/// Reserve one further proposal window for physical guest execution, transit,
-/// and scheduling
-/// jitter. The caller applies this once across both the local follower and
-/// redirected leader hops rather than restarting a per-hop timeout.
+/// one read barrier, and up to three proposal waits (fresh-root `Install`,
+/// `AdmitIngress`, and `Apply`). Reserve one further proposal window for
+/// physical guest execution, transit, and scheduling jitter. The caller
+/// applies this once across both the local follower and redirected leader hops
+/// rather than restarting a per-hop timeout.
 #[cfg(all(feature = "storage", feature = "network"))]
 fn v2_raft_invoke_timeout(propose_timeout_ms: u64) -> Duration {
     Duration::from_millis(
-        V2_RAFT_VOTER_AUTH_TIMEOUT_MS.saturating_add(propose_timeout_ms.saturating_mul(4)),
+        V2_RAFT_VOTER_AUTH_TIMEOUT_MS.saturating_add(propose_timeout_ms.saturating_mul(5)),
     )
 }
 
@@ -10035,12 +10035,12 @@ mod tests {
     fn raft_typed_invoke_budget_covers_every_bounded_stage() {
         assert_eq!(
             v2_raft_invoke_timeout(5_000),
-            Duration::from_secs(25),
-            "voter auth + read barrier + two commits + one proposal window of margin",
+            Duration::from_secs(30),
+            "voter auth + read barrier + genesis + admission + apply + one margin window",
         );
         assert_eq!(
             v2_raft_invoke_timeout(2_000),
-            Duration::from_secs(13),
+            Duration::from_secs(15),
             "the end-to-end budget follows the configured proposal timeout",
         );
     }
