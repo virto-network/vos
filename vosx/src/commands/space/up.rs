@@ -1644,6 +1644,7 @@ fn v2_config_from_row(
         .join(format!("{}.image", hex::encode(root_service.0)));
     let install_authenticator = package.deployment_signature.signature.clone();
     let config = vos::v2::LocalRootTreeConfigV2 {
+        role_authority: None,
         service_pvm: pinned.pvm.as_ref().clone(),
         package,
         service: vos::v2::ServiceIdentityV2 {

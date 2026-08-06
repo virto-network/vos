@@ -15,7 +15,7 @@ use super::{
     ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 24;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 25;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -145,6 +145,9 @@ pub enum StateKeyV2 {
     ActorDirectory,
     /// Canonical install-time bindings to actors owned by other root trees.
     ExternalActorDirectory,
+    /// Immutable platform authority whose finalized replies may satisfy
+    /// generated space-role policies for this root tree.
+    RoleAuthority,
     ActorDescriptor(ActorId),
     MethodPolicy {
         actor: ActorId,
@@ -172,6 +175,9 @@ impl V2Wire for StateKeyV2 {
             }
             Self::ExternalActorDirectory => {
                 e.u8(10);
+            }
+            Self::RoleAuthority => {
+                e.u8(11);
             }
             Self::ActorDescriptor(actor) => {
                 e.u8(0);
@@ -236,6 +242,7 @@ impl V2Wire for StateKeyV2 {
             7 => Ok(Self::CrdtMaterialization(ActorId(d.fixed()?))),
             9 => Ok(Self::ActorDirectory),
             10 => Ok(Self::ExternalActorDirectory),
+            11 => Ok(Self::RoleAuthority),
             _ => Err(DecodeError::InvalidTag),
         }
     }
@@ -860,6 +867,10 @@ mod tests {
         };
         assert_eq!(StateKeyV2::decode(&row.encode()).unwrap(), row);
         assert_eq!(StateKeyV2::decode(&policy.encode()).unwrap(), policy);
+        assert_eq!(
+            StateKeyV2::decode(&StateKeyV2::RoleAuthority.encode()).unwrap(),
+            StateKeyV2::RoleAuthority
+        );
         assert_ne!(row.encode(), policy.encode());
 
         let invalid = StateKeyV2::ActorRow { actor, key: vec![] };

@@ -20,9 +20,9 @@ use super::{
     JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2, LocalStoreReadErrorV2, LocalWorkRequestV2,
     LocalWorkSchedulerV2, MethodPolicyV2, NoRefineProtocolHostV2, PackageError,
     PackageRolePoliciesV2, PreparedWorkV2, ProgramId, ProofArtifactStoreV2, PublicationAckV2,
-    PublicationRecordV2, PublishedEffectsV2, RefinedServiceOutputV2, ScheduleErrorV2,
-    ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2,
-    WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
+    PublicationRecordV2, PublishedEffectsV2, RefinedServiceOutputV2, RoleAuthorityBindingV2,
+    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire,
+    VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
 };
 
 #[cfg(feature = "storage")]
@@ -260,6 +260,7 @@ pub struct LocalRootTreeConfigV2 {
     pub consistency: ConsistencyModeV2,
     pub initial_state: Vec<u8>,
     pub external_actors: Vec<ExternalActorBindingV2>,
+    pub role_authority: Option<RoleAuthorityBindingV2>,
     pub install_authorization: AuthorizationEvidenceV2,
     pub refine_gas: u64,
     pub accumulate_gas: u64,
@@ -276,6 +277,7 @@ pub enum LocalRootTreeConfigErrorV2 {
     WrongServiceAbi,
     WrongExecutionSemantics,
     InvalidConsistency,
+    InvalidRoleAuthority,
     ReplicationDriverRequired,
     ZeroGas,
 }
@@ -530,6 +532,7 @@ pub struct LocalRootTreeServiceV2<B> {
     genesis: ServiceGenesisV2,
     expected_root: ActorGenesisV2,
     expected_external_actors: Vec<ExternalActorBindingV2>,
+    expected_role_authority: Option<RoleAuthorityBindingV2>,
 }
 
 fn verify_ed25519_signature(public_key_wire: &[u8], message: &[u8], signature: &[u8]) -> bool {
@@ -603,6 +606,15 @@ impl LocalRootTreeConfigV2 {
         if self.package.manifest.crdt != (self.consistency == ConsistencyModeV2::Crdt) {
             return Err(LocalRootTreeConfigErrorV2::InvalidConsistency);
         }
+        if self.role_authority.as_ref().is_some_and(|authority| {
+            authority.service.space != self.service.space
+                || authority.service == self.service
+                || authority.service.service_abi != super::ABI_VERSION
+                || authority.service.execution_semantics != super::EXECUTION_SEMANTICS_ID
+                || authority.actor == ActorId::ZERO
+        }) {
+            return Err(LocalRootTreeConfigErrorV2::InvalidRoleAuthority);
+        }
         if self.refine_gas == 0 || self.accumulate_gas == 0 {
             return Err(LocalRootTreeConfigErrorV2::ZeroGas);
         }
@@ -621,6 +633,7 @@ impl LocalRootTreeConfigV2 {
             consistency: self.consistency,
             actors: vec![descriptor.clone()],
             external_actors: self.external_actors.clone(),
+            role_authority: self.role_authority.clone(),
             authorization: self.install_authorization.clone(),
         };
         ServiceGenesisV2::decode(&genesis.encode())
@@ -919,6 +932,7 @@ where
             genesis,
             expected_root,
             expected_external_actors: config.external_actors,
+            expected_role_authority: config.role_authority,
         };
         root.ensure_installed().map_err(|error| match error {
             LocalRootTreeInvokeErrorV2::Service(error) => LocalRootTreeOpenErrorV2::Service(error),
@@ -1198,10 +1212,19 @@ where
             .state_row(header.service_root, &StateKeyV2::ExternalActorDirectory)
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
             .and_then(|bytes| ExternalActorDirectoryV2::decode(&bytes).ok());
+        let role_authority = self
+            .service
+            .accumulate_host()
+            .state_row(header.service_root, &StateKeyV2::RoleAuthority)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .map(|bytes| RoleAuthorityBindingV2::decode(&bytes))
+            .transpose()
+            .map_err(|_| LocalRootTreeInvokeErrorV2::ExistingActorMismatch)?;
         if descriptor.as_ref() != Some(&self.expected_root)
             || external.as_ref().is_none_or(|directory| {
                 directory.actors.as_slice() != self.expected_external_actors.as_slice()
             })
+            || role_authority != self.expected_role_authority
         {
             return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
         }

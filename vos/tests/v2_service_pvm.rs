@@ -874,6 +874,7 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
     };
     let actor = ActorId([93; 32]);
     let config = LocalRootTreeConfigV2 {
+        role_authority: None,
         service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
         package,
         service: identity,
@@ -1100,6 +1101,7 @@ fn raft_root_tree_orders_genesis_apply_and_ack_through_physical_accumulate() {
     let (package, actor_name) = signed_test_package(&actor_elf, &signer);
     let actor = ActorId([113; 32]);
     let config = LocalRootTreeConfigV2 {
+        role_authority: None,
         service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
         service: ServiceIdentityV2 {
             space: vos::v2::SpaceId([114; 32]),
@@ -1207,6 +1209,7 @@ fn raft_follower_registers_before_genesis_and_restores_caught_up_admission_time(
     let (package, actor_name) = signed_test_package(&actor_elf, &signer);
     let actor = ActorId([119; 32]);
     let config = LocalRootTreeConfigV2 {
+        role_authority: None,
         service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
         service: ServiceIdentityV2 {
             space: vos::v2::SpaceId([120; 32]),
@@ -1367,6 +1370,7 @@ fn node_routes_canonical_actor_ids_through_the_guest_owned_root_service() {
     let (package, actor_name) = signed_test_package(&actor_elf, &signer);
     let actor = ActorId([103; 32]);
     let config = LocalRootTreeConfigV2 {
+        role_authority: None,
         service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
         service: ServiceIdentityV2 {
             space: vos::v2::SpaceId([104; 32]),
@@ -1526,6 +1530,7 @@ fn node_routes_an_ordinary_cross_root_await_through_guest_accumulate() {
         authenticator: vec![0xB7],
     };
     let source_config = LocalRootTreeConfigV2 {
+        role_authority: None,
         service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
         package: package.clone(),
         service: source_identity.clone(),
@@ -1545,6 +1550,7 @@ fn node_routes_an_ordinary_cross_root_await_through_guest_accumulate() {
         accumulate_gas: 5_000_000_000,
     };
     let destination_config = LocalRootTreeConfigV2 {
+        role_authority: None,
         service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
         package,
         service: destination_identity,
@@ -1653,6 +1659,7 @@ fn node_retries_a_direct_reply_publication_ack_after_the_caller_is_gone() {
     let (package, actor_name) = signed_test_package(&actor_elf, &signer);
     let actor = ActorId([0xD1; 32]);
     let config = LocalRootTreeConfigV2 {
+        role_authority: None,
         service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
         service: ServiceIdentityV2 {
             space: vos::v2::SpaceId([0xD2; 32]),
@@ -1731,6 +1738,7 @@ fn node_expires_and_resumes_an_unreachable_durable_call() {
         ..source_identity.clone()
     };
     let config = LocalRootTreeConfigV2 {
+        role_authority: None,
         service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
         package,
         service: source_identity,
@@ -1820,6 +1828,7 @@ fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
     let (package, actor_name) = signed_test_package(&actor_elf, &signer);
     let actor = ActorId([97; 32]);
     let config = LocalRootTreeConfigV2 {
+        role_authority: None,
         service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
         service: ServiceIdentityV2 {
             space: vos::v2::SpaceId([98; 32]),
@@ -2092,6 +2101,7 @@ fn same_package_child_spawn_commits_before_the_child_becomes_callable() {
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        role_authority: None,
         external_actors: vec![],
         service: seed.service.clone(),
         consistency: ConsistencyModeV2::Local,
@@ -2286,6 +2296,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        role_authority: None,
         external_actors: vec![private_age_binding(&seed.service)],
         service: seed.service.clone(),
         consistency: ConsistencyModeV2::Local,
@@ -3431,6 +3442,7 @@ fn same_tree_causal_cycles_return_an_explicit_guest_error() {
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        role_authority: None,
         external_actors: vec![],
         service: seed.service.clone(),
         consistency: ConsistencyModeV2::Local,
@@ -3641,6 +3653,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        role_authority: None,
         external_actors: vec![],
         service: work.service.clone(),
         consistency: ConsistencyModeV2::Crdt,
@@ -4000,6 +4013,7 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        role_authority: None,
         external_actors: vec![private_age_binding(&seed.service)],
         service: seed.service.clone(),
         consistency: ConsistencyModeV2::Crdt,
@@ -4674,6 +4688,7 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        role_authority: None,
         external_actors: vec![],
         service: first_work.service.clone(),
         consistency: ConsistencyModeV2::Crdt,
@@ -4917,6 +4932,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        role_authority: None,
         external_actors: vec![],
         service: first_work.service.clone(),
         consistency: ConsistencyModeV2::Local,
@@ -5243,6 +5259,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
     )
     .unwrap();
     let install_request = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        role_authority: None,
         external_actors: vec![private_age_binding(&seed_work.service)],
         service: seed_work.service.clone(),
         consistency: ConsistencyModeV2::Local,
@@ -5803,6 +5820,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
     )
     .unwrap();
     let install_request = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        role_authority: None,
         external_actors: vec![
             external_binding(
                 "peer-1",
@@ -6516,6 +6534,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     remote_service.root_service = RootServiceId([82; 32]);
     remote_service.deployment = DeploymentId([83; 32]);
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        role_authority: None,
         external_actors: vec![external_binding(
             "peer-81",
             remote_service.clone(),
@@ -7483,6 +7502,7 @@ fn physical_guest_accumulate_upgrades_only_an_idle_authorized_actor() {
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        role_authority: None,
         service: seed.service.clone(),
         consistency: ConsistencyModeV2::Local,
         actors: vec![ActorGenesisV2 {
@@ -7655,6 +7675,7 @@ fn disclosed_role_credentials_require_authority_verification_in_physical_accumul
     let policy = space_role_policy_hash(vos::SpaceRole::Member.as_u8()).unwrap();
 
     let genesis = ServiceGenesisV2 {
+        role_authority: None,
         external_actors: vec![],
         service: work.service.clone(),
         consistency: ConsistencyModeV2::Local,
@@ -7843,6 +7864,7 @@ fn attested_driver_rejects_a_transition_not_produced_by_exact_refine() {
         private_credential.private_evidence(private_policy);
 
     let genesis = ServiceGenesisV2 {
+        role_authority: None,
         external_actors: vec![],
         service: seed.service.clone(),
         consistency: ConsistencyModeV2::Raft,
@@ -8009,6 +8031,7 @@ fn physical_guest_install_rejects_an_unavailable_actor_program() {
     )
     .unwrap();
     let genesis = ServiceGenesisV2 {
+        role_authority: None,
         external_actors: vec![],
         service: seed_work.service,
         consistency: ConsistencyModeV2::Local,
@@ -8072,6 +8095,7 @@ fn physical_guest_rejects_the_missing_preimage_length_sentinel() {
     )
     .unwrap();
     let genesis = ServiceGenesisV2 {
+        role_authority: None,
         external_actors: vec![],
         service: seed_work.service,
         consistency: ConsistencyModeV2::Local,
@@ -8146,6 +8170,7 @@ fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
         )
         .unwrap();
         let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            role_authority: None,
             external_actors,
             service: identity.clone(),
             consistency: ConsistencyModeV2::Local,
@@ -8355,6 +8380,7 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
         )
         .unwrap();
         let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            role_authority: None,
             external_actors,
             service: identity.clone(),
             consistency: ConsistencyModeV2::Local,
@@ -8765,6 +8791,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
     let initial = BlobRefV2::of_bytes(&initial_bytes);
     let seed = work(actor_program, initial.clone());
     let genesis = ServiceGenesisV2 {
+        role_authority: None,
         external_actors: vec![],
         service: seed.service.clone(),
         consistency: ConsistencyModeV2::Raft,
@@ -9169,6 +9196,7 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
     let initial = BlobRefV2::of_bytes(&initial_bytes);
     let seed = work(actor_program, initial.clone());
     let genesis = ServiceGenesisV2 {
+        role_authority: None,
         external_actors: vec![],
         service: seed.service,
         consistency: ConsistencyModeV2::Raft,
@@ -9348,6 +9376,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
     let mut seed = work(actor_program, initial.clone());
     seed.service.service_program = service_program;
     let genesis = ServiceGenesisV2 {
+        role_authority: None,
         external_actors: vec![],
         service: seed.service.clone(),
         consistency: ConsistencyModeV2::Raft,
@@ -9611,6 +9640,7 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
     let initial = BlobRefV2::of_bytes(&initial_bytes);
     let seed = work(actor_program, initial.clone());
     let genesis = ServiceGenesisV2 {
+        role_authority: None,
         external_actors: vec![],
         service: seed.service,
         consistency: ConsistencyModeV2::Raft,

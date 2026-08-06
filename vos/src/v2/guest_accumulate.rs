@@ -620,6 +620,15 @@ fn install<S: GuestAccumulateStoreV2>(
                 .encode(),
             ),
         )?;
+        tree_apply(
+            &mut tree,
+            &StateKeyV2::RoleAuthority,
+            genesis
+                .role_authority
+                .as_ref()
+                .map(super::RoleAuthorityBindingV2::encode)
+                .as_deref(),
+        )?;
         for actor in &genesis.actors {
             tree_apply(
                 &mut tree,
@@ -4358,6 +4367,7 @@ mod tests {
         let initial = store.provide_blob(initial).unwrap();
         store.programs.insert(program(), FIXTURE_ACTOR_PVM.to_vec());
         let request = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            role_authority: None,
             external_actors: external_bindings(),
             service: identity(),
             consistency,
@@ -4401,6 +4411,7 @@ mod tests {
         };
         let initial = BlobRefV2::of_bytes(b"unavailable state");
         let genesis = ServiceGenesisV2 {
+            role_authority: None,
             external_actors: vec![],
             service: identity(),
             consistency: ConsistencyModeV2::Local,
@@ -4444,6 +4455,7 @@ mod tests {
             ..MemStore::default()
         };
         let genesis = ServiceGenesisV2 {
+            role_authority: None,
             external_actors: vec![],
             service: identity(),
             consistency: ConsistencyModeV2::Local,
@@ -4476,6 +4488,7 @@ mod tests {
         let mut store = MemStore::default();
         let initial = store.provide_blob(b"state").unwrap();
         let genesis = ServiceGenesisV2 {
+            role_authority: None,
             external_actors: vec![],
             service: identity(),
             consistency: ConsistencyModeV2::Local,
@@ -4748,6 +4761,7 @@ mod tests {
             actor_role: None,
         };
         let genesis = ServiceGenesisV2 {
+            role_authority: None,
             service: identity(),
             consistency: ConsistencyModeV2::Local,
             actors: vec![
@@ -5233,6 +5247,7 @@ mod tests {
         ];
         assert_eq!(actors.len(), super::super::MAX_ROOT_TREE_ACTORS);
         let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            role_authority: None,
             external_actors: external_bindings(),
             service: identity(),
             consistency: ConsistencyModeV2::Local,
@@ -6032,6 +6047,7 @@ mod tests {
         store.programs.insert(program(), FIXTURE_ACTOR_PVM.to_vec());
         let child = ActorId([7; 32]);
         let request = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            role_authority: None,
             external_actors: vec![],
             service: identity(),
             consistency: ConsistencyModeV2::Local,
@@ -6247,6 +6263,7 @@ mod tests {
         let required_policy =
             super::super::space_role_policy_hash(crate::SpaceRole::Member.as_u8()).unwrap();
         let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            role_authority: None,
             external_actors: external_bindings(),
             service: identity(),
             consistency: ConsistencyModeV2::Local,
