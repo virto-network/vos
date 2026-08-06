@@ -99,6 +99,7 @@ pub enum V2RaftNodeRegistrationError<E> {
     Log(crate::commit::CommitError),
     Open(crate::v2::LocalRootTreeOpenErrorV2<E>),
     Registration(V2NodeRegistrationError),
+    ReplicationHandlerOccupied([u8; 32]),
     Promotion(String),
 }
 
@@ -1414,6 +1415,42 @@ impl NodeService {
         self.probe_registry_for_u8(payload).unwrap_or(0)
     }
 
+    /// Resolve the exact NODE roster row at `prefix`. The compact prefix is
+    /// useful for routing and Raft membership arithmetic, but it is not an
+    /// authenticated identity: two Noise PeerIds can collide in 16 bits.
+    /// Callers making an authority decision must compare `MemberRow::key`
+    /// with the full authenticated PeerId as well.
+    #[cfg(feature = "storage")]
+    fn lookup_node_member(&self, prefix: u16) -> Option<crate::registry::MemberRow> {
+        use crate::actors::codec::{Decode, Encode};
+        use crate::registry::{MEMBER_KIND_NODE, MemberPage};
+        use crate::value::{Msg, TAG_DYNAMIC, Value};
+
+        // `members` resumes strictly *after* its cursor. Starting immediately
+        // before `prefix` gives an O(1)-page exact lookup; prefix zero uses
+        // the documented empty-cursor start.
+        let after_key = prefix
+            .checked_sub(1)
+            .map(|previous| previous.to_be_bytes().to_vec())
+            .unwrap_or_default();
+        let msg = Msg::new("members")
+            .with("after_kind", MEMBER_KIND_NODE)
+            .with("after_key", after_key)
+            .with("budget", 1u32);
+        let mut payload = Vec::with_capacity(1 + 64);
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&msg.encode());
+        let reply = registry_probe_reply(&self.invoke_routes, payload)?;
+        let Value::Bytes(bytes) = <Value as Decode>::try_decode(&reply)? else {
+            return None;
+        };
+        let page = <MemberPage as Decode>::try_decode(&bytes)?;
+        page.members
+            .into_iter()
+            .next()
+            .filter(|member| member.kind == MEMBER_KIND_NODE && member.prefix == prefix)
+    }
+
     /// Membership gate for serving a replica's sync data (heads / nodes),
     /// keyed on the replica's [`SyncFloor`](crate::registry::SyncFloor):
     /// `Public` serves any connected peer; `Member` requires a space read
@@ -1705,10 +1742,13 @@ impl NodeService {
     }
 
     /// Authenticate the node-internal Raft delegation channel. The forwarding
-    /// peer must be a member of the exact replication group serving `target`;
-    /// an arbitrary Noise-authenticated peer cannot assert a System/Actor
-    /// origin. Raft voters are already trusted to replicate the state machine,
-    /// so carrying the origin they observed does not enlarge that trust set.
+    /// peer must be a member of the exact replication group serving `target`,
+    /// and the registry's row for its compact prefix must name the exact
+    /// Noise-authenticated PeerId. An arbitrary peer — including one which
+    /// deliberately collides in the 16-bit route space — cannot assert a
+    /// System/Actor origin. Raft voters are already trusted to replicate the
+    /// state machine, so carrying the origin they observed does not enlarge
+    /// that trust set.
     #[cfg(feature = "storage")]
     fn caller_is_v2_raft_voter(
         &self,
@@ -1735,6 +1775,9 @@ impl NodeService {
         };
         let prefix = crate::network::derive_node_prefix(caller);
         status.members.contains(&prefix)
+            && self
+                .lookup_node_member(prefix)
+                .is_some_and(|member| node_member_authenticates_voter(&member, prefix, caller))
     }
 
     /// Render an agent's describe JSON by id (the `__describe` primitive's
@@ -1786,6 +1829,22 @@ fn registry_probe_reply(routes: &InvokeRoutes, payload: Vec<u8>) -> Option<Vec<u
 #[cfg(feature = "network")]
 fn registry_probe_u8(routes: &InvokeRoutes, payload: Vec<u8>) -> Option<u8> {
     decode_u8_reply(&registry_probe_reply(routes, payload)?)
+}
+
+/// Bind the compact Raft voter slot back to its complete authenticated
+/// identity. `expected_prefix` has already passed the replication group's
+/// membership check; the registry row supplies the non-truncatable identity
+/// needed for delegation authority.
+#[cfg(all(feature = "network", feature = "storage"))]
+fn node_member_authenticates_voter(
+    member: &crate::registry::MemberRow,
+    expected_prefix: u16,
+    peer: &libp2p::PeerId,
+) -> bool {
+    member.kind == crate::registry::MEMBER_KIND_NODE
+        && member.role == crate::registry::NODE_ROLE_VOTER
+        && member.prefix == expected_prefix
+        && member.key == peer.to_bytes()
 }
 
 /// Pull a `u8` out of the actor-framework reply bytes. Handles
@@ -3261,8 +3320,13 @@ impl VosNode {
         );
         let worker_handle = worker.handler();
         let handler: Arc<dyn crate::network::RaftRpcHandler> = Arc::new(worker_handle.clone());
-        if let Some(network) = network.as_ref() {
-            network.register_raft_handler(replication_id, handler.clone());
+        if let Some(network) = network.as_ref()
+            && !network.register_raft_handler_if_absent(replication_id, handler.clone())
+        {
+            worker.shutdown();
+            return Err(V2RaftNodeRegistrationError::ReplicationHandlerOccupied(
+                replication_id,
+            ));
         }
         let cleanup = || {
             if let Some(network) = network.as_ref() {
@@ -11725,6 +11789,75 @@ mod tests {
         assert!(!check(Some(0)), "an unenrolled prefix is refused");
         assert!(!check(Some(2)), "an OBSERVER is refused");
         assert!(!check(None), "an unreachable registry fails closed");
+    }
+
+    #[test]
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn raft_delegation_binds_the_full_authenticated_peer_id() {
+        use crate::actors::codec::Encode;
+        use crate::value::Value;
+
+        let voter = libp2p::PeerId::random();
+        let colliding_peer = libp2p::PeerId::random();
+        let prefix = crate::network::derive_node_prefix(&voter);
+        let row = crate::registry::MemberRow {
+            kind: crate::registry::MEMBER_KIND_NODE,
+            key: voter.to_bytes(),
+            prefix,
+            role: crate::registry::NODE_ROLE_VOTER,
+            proof_kind: 0,
+            proof_data: Vec::new(),
+        };
+
+        // Drive the real registry-query wire as well as the pure identity
+        // predicate. This catches accidental regressions back to node_role's
+        // prefix-only reply.
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<InvokeRequest>();
+        routes.lock().unwrap().insert(ServiceId::REGISTRY.0, tx);
+        let registry_row = row.clone();
+        let registry = thread::spawn(move || {
+            let request = rx.recv().unwrap();
+            assert_eq!(
+                intercepted_method_name(&request.msg).as_deref(),
+                Some("members")
+            );
+            let page = crate::registry::MemberPage {
+                members: vec![registry_row],
+                next_kind: crate::registry::MEMBER_KIND_IDENTITY,
+                next_key: Vec::new(),
+                more: true,
+            };
+            let reply = encode_invoke_envelope(
+                crate::actors::run::STATUS_DONE,
+                &[],
+                &Value::Bytes(page.encode()).encode(),
+            );
+            assert!(request.reply.send(reply));
+        });
+        let service = lifecycle_service(
+            routes,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
+        );
+        let enrolled = service.lookup_node_member(prefix).unwrap();
+        registry.join().unwrap();
+
+        assert!(node_member_authenticates_voter(&enrolled, prefix, &voter));
+        // Model the preceding 16-bit group-membership check admitting a
+        // distinct PeerId with the same compact prefix. Full roster identity
+        // still refuses it, so prefix grinding cannot authorize delegation.
+        assert!(!node_member_authenticates_voter(
+            &enrolled,
+            prefix,
+            &colliding_peer
+        ));
+
+        let observer = crate::registry::MemberRow {
+            role: crate::registry::NODE_ROLE_OBSERVER,
+            ..row
+        };
+        assert!(!node_member_authenticates_voter(&observer, prefix, &voter));
     }
 
     /// A stub registry on route 0 that answers the `peer_role` probe with a

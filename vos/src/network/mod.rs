@@ -727,6 +727,28 @@ impl Network {
         }
     }
 
+    /// Register the first handler for `replication_id` without replacing a
+    /// live owner. Returns `false` when the group is already registered or
+    /// the handler map is unavailable. Replica preparation uses this form so
+    /// a later route-validation failure cannot first evict an existing
+    /// replica and then remove its replacement during cleanup.
+    pub fn register_raft_handler_if_absent(
+        &self,
+        replication_id: [u8; 32],
+        handler: Arc<dyn RaftRpcHandler>,
+    ) -> bool {
+        let Ok(mut handlers) = self.raft_handlers.lock() else {
+            return false;
+        };
+        match handlers.entry(replication_id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(handler);
+                true
+            }
+            std::collections::btree_map::Entry::Occupied(_) => false,
+        }
+    }
+
     /// Drop the handler for `replication_id`. Inbound RPCs for
     /// that group will surface to the peer as the
     /// no-handler default (current-term answer with `success =
@@ -2512,6 +2534,60 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&registered, &replacement));
         assert!(network.unregister_raft_handler_if(&replication_id, &replacement));
+        network.join();
+    }
+
+    #[test]
+    fn duplicate_raft_handler_registration_preserves_the_live_owner() {
+        struct Handler;
+        impl RaftRpcHandler for Handler {
+            fn append_entries(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                _prev_log_index: u64,
+                _prev_log_term: u64,
+                _leader_commit: u64,
+                entries: Vec<RaftEntry>,
+            ) -> RaftAppendResult {
+                RaftAppendResult {
+                    term,
+                    success: true,
+                    match_index: entries.len() as u64,
+                }
+            }
+
+            fn request_vote(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                _last_log_index: u64,
+                _last_log_term: u64,
+            ) -> RaftVoteResult {
+                RaftVoteResult {
+                    term,
+                    vote_granted: true,
+                }
+            }
+        }
+
+        let network = Network::start(NetworkConfig::default());
+        let replication_id = [0x72; 32];
+        let live: Arc<dyn RaftRpcHandler> = Arc::new(Handler);
+        let duplicate: Arc<dyn RaftRpcHandler> = Arc::new(Handler);
+        assert!(network.register_raft_handler_if_absent(replication_id, live.clone()));
+        assert!(!network.register_raft_handler_if_absent(replication_id, duplicate));
+
+        let registered = network
+            .raft_handlers
+            .lock()
+            .unwrap()
+            .get(&replication_id)
+            .cloned()
+            .unwrap();
+        assert!(Arc::ptr_eq(&registered, &live));
         network.join();
     }
 

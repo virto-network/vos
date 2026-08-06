@@ -642,6 +642,49 @@ fn space_authority_elf() -> Vec<u8> {
     )
 }
 
+fn install_test_voter_registry(
+    node: &mut VosNode,
+    registry_pvm: Vec<u8>,
+    voters: &[(u16, Vec<u8>)],
+) {
+    use ed25519_dalek::{Signer, SigningKey};
+    use space_registry::{
+        NODE_ROLE_VOTER, SpaceRegistryRef, Status, canonical_op_bytes, pack_auth,
+    };
+
+    node.register_at_id(
+        vos::node::AgentConfig::new(registry_pvm),
+        ServiceId::REGISTRY,
+    );
+    let registry = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let root_key = SigningKey::from_bytes(&[0xB9; 32]);
+    let mut root_peer = vec![0x00u8, 0x24, 0x08, 0x01, 0x12, 0x20];
+    root_peer.extend_from_slice(&root_key.verifying_key().to_bytes());
+    assert_eq!(
+        vos::block_on(registry.set_root(&mut &*node, root_peer.clone())).unwrap(),
+        Status::Ok,
+    );
+    for (prefix, peer) in voters {
+        let prefix = u32::from(*prefix);
+        let canonical = canonical_op_bytes(
+            "add_node",
+            &[&prefix.to_le_bytes(), peer, &[NODE_ROLE_VOTER]],
+        );
+        let authorization = pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes());
+        assert_eq!(
+            vos::block_on(registry.add_node(
+                &mut &*node,
+                prefix,
+                peer.clone(),
+                NODE_ROLE_VOTER,
+                authorization,
+            ))
+            .unwrap(),
+            Status::Ok,
+        );
+    }
+}
+
 fn actor_pvm(result: u64) -> Vec<u8> {
     let mut assembler = grey_transpiler::assembler::Assembler::new();
     assembler
@@ -1449,6 +1492,92 @@ fn node_registers_a_raft_root_through_the_canonical_request_log() {
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = unavailable.collect();
 
+    // A duplicate replication identity is rejected without replacing the
+    // already-live handler. This drives the node registration facade, not
+    // merely Network's map primitive: preparation must be atomic even when
+    // route validation would happen later.
+    struct ExistingHandler;
+    impl RaftRpcHandler for ExistingHandler {
+        fn append_entries(
+            &self,
+            _replication_id: &[u8; 32],
+            _from_prefix: u16,
+            term: u64,
+            _prev_log_index: u64,
+            _prev_log_term: u64,
+            _leader_commit: u64,
+            _entries: Vec<vos::network::RaftEntry>,
+        ) -> vos::network::RaftAppendResult {
+            vos::network::RaftAppendResult {
+                term,
+                success: false,
+                match_index: 0,
+            }
+        }
+
+        fn request_vote(
+            &self,
+            _replication_id: &[u8; 32],
+            _from_prefix: u16,
+            term: u64,
+            _last_log_index: u64,
+            _last_log_term: u64,
+        ) -> vos::network::RaftVoteResult {
+            vos::network::RaftVoteResult {
+                term,
+                vote_granted: false,
+            }
+        }
+
+        fn handle_status(&self, _replication_id: &[u8; 32]) -> vos::network::RaftStatusReply {
+            vos::network::RaftStatusReply {
+                present: true,
+                role: vos::network::RaftRole::Leader,
+                current_term: 77,
+                commit_index: 11,
+                last_log_index: 11,
+                members: vec![0xA109],
+                leader_hint: Some(0xA109),
+            }
+        }
+    }
+
+    let duplicate_network = vos::network::Network::start(vos::network::NetworkConfig::default());
+    let duplicate_prefix = duplicate_network.local_prefix();
+    let duplicate_replication_id = [0xAE; 32];
+    duplicate_network.register_raft_handler(duplicate_replication_id, Arc::new(ExistingHandler));
+    let mut duplicate_node = VosNode::with_prefix(duplicate_prefix);
+    duplicate_node.attach_network(duplicate_network);
+    let duplicate_network = duplicate_node.network().unwrap();
+    let duplicate_db =
+        Arc::new(redb::Database::create(directory.join("duplicate-handler.redb")).unwrap());
+    let duplicate = duplicate_node.register_v2_raft_root_at_id(
+        "duplicate-root".into(),
+        config.clone(),
+        FailableCommittedImages::default(),
+        duplicate_db,
+        RaftConfig {
+            me: duplicate_prefix,
+            members: vec![duplicate_prefix],
+            replication_id: duplicate_replication_id,
+            ..RaftConfig::default()
+        },
+        ServiceId::new(duplicate_prefix, 211),
+        true,
+    );
+    assert!(matches!(
+        duplicate,
+        Err(vos::node::V2RaftNodeRegistrationError::ReplicationHandlerOccupied(id))
+            if id == duplicate_replication_id
+    ));
+    let live_status = duplicate_network
+        .local_raft_status(&duplicate_replication_id)
+        .expect("the prior handler remains registered");
+    assert_eq!(live_status.current_term, 77);
+    assert_eq!(live_status.commit_index, 11);
+    drop(duplicate_network);
+    let _ = duplicate_node.collect();
+
     // Voter promotion is node-owned background state: registering it must not
     // stall the router, it remains unexposed while pending, and node shutdown
     // cancels and joins the worker promptly.
@@ -1597,12 +1726,14 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
     };
 
     let key_a = libp2p::identity::Keypair::generate_ed25519();
-    let prefix_a = vos::network::derive_node_prefix(&libp2p::PeerId::from(key_a.public()));
-    let (key_b, prefix_b) = loop {
+    let peer_a = libp2p::PeerId::from(key_a.public());
+    let prefix_a = vos::network::derive_node_prefix(&peer_a);
+    let (key_b, peer_b, prefix_b) = loop {
         let key = libp2p::identity::Keypair::generate_ed25519();
-        let prefix = vos::network::derive_node_prefix(&libp2p::PeerId::from(key.public()));
+        let peer = libp2p::PeerId::from(key.public());
+        let prefix = vos::network::derive_node_prefix(&peer);
         if prefix != prefix_a {
-            break (key, prefix);
+            break (key, peer, prefix);
         }
     };
     let (key_client, prefix_client) = loop {
@@ -1654,6 +1785,12 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
 
     let mut node_a = VosNode::with_prefix(prefix_a);
     let mut node_b = VosNode::with_prefix(prefix_b);
+    let registry_pvm =
+        grey_transpiler::link_elf(include_bytes!("../../vosx/blobs/space_registry.elf"))
+            .expect("committed space-registry ELF transpiles");
+    let voters = [(prefix_a, peer_a.to_bytes()), (prefix_b, peer_b.to_bytes())];
+    install_test_voter_registry(&mut node_a, registry_pvm.clone(), &voters);
+    install_test_voter_registry(&mut node_b, registry_pvm, &voters);
     node_a.attach_network(network_a);
     node_b.attach_network(network_b);
     let network_a = node_a.network().unwrap();
