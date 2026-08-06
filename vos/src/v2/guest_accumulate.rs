@@ -16,16 +16,17 @@ use super::causal::{
 };
 use super::contracts::crdt_change_blob_references;
 use super::{
-    ABI_VERSION, AccumulateRequestV2, AccumulatedTimeoutV2, AccumulationEnvelopeV2,
-    AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2, ActorGenesisV2, ActorId,
-    ActorUpgradeRecordV2, ActorUpgradeV2, AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2,
-    CHECKPOINT_TOKEN_CAPACITY, CallExpirationEnvelopeV2, CallTimeoutV2, CheckpointTokenV2,
-    ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2, CrdtDispatchV2,
-    CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryEnvelopeV2, DeliveryRecordV2, DirectIngressV2,
-    EXECUTION_SEMANTICS_ID, ExternalActorDirectoryV2, Hash, IngressRecordV2, MessageRecordV2,
-    MethodPolicyV2, PendingCallDeadlineV2, ProgramId, ProofVerificationRequestV2, PublicationAckV2,
-    PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2, ReplyAdmissionRecordV2,
-    RoleCredentialV2, RoleCredentialVerificationRequestV2, ServiceGenesisV2,
+    ABI_VERSION, AccumulateRequestV2, AccumulatedRoleAssertionV2, AccumulatedTimeoutV2,
+    AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2,
+    ActorGenesisV2, ActorId, ActorUpgradeRecordV2, ActorUpgradeV2, AuthorizationEvidenceV2,
+    AwaitResumeV2, BlobRefV2, CHECKPOINT_TOKEN_CAPACITY, CallExpirationEnvelopeV2, CallTimeoutV2,
+    CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2,
+    CrdtDispatchV2, CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryEnvelopeV2, DeliveryRecordV2,
+    DirectIngressV2, EXECUTION_SEMANTICS_ID, ExternalActorDirectoryV2, Hash, IngressRecordV2,
+    MessageRecordV2, MethodPolicyV2, PendingCallDeadlineV2, ProgramId, ProofVerificationRequestV2,
+    PublicationAckV2, PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
+    ReplyAdmissionRecordV2, RoleAuthorityBindingV2, RoleCredentialV2,
+    RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServiceIdentityV2,
     ServiceInstallReceiptV2, ServiceStateTreeV2, StateKeyV2, StateTreeError, StateTreeStore,
     StoreHeaderV2, StoreOpenError, V2Wire, WorkInputIdV2, WorkflowCheckpointV2,
     WorkflowOperationV2, actor_upgrade_storage_key, call_expiration_storage_key,
@@ -488,10 +489,17 @@ fn admit_ingress<S: GuestAccumulateStoreV2>(
         imported_blobs: ingress.imported_blobs.clone(),
         proof_requested: ingress.proof_requested,
     };
-    if policy.attested != ingress.proof_requested
-        || !authorized(&authorization_work, &policy, tree.store_ref())?
-    {
+    let authority = tree_get_wire::<_, RoleAuthorityBindingV2>(&tree, &StateKeyV2::RoleAuthority)?;
+    if policy.attested != ingress.proof_requested {
         return Ok(rejected(AccumulationRejectionV2::Unauthorized));
+    }
+    if let Some(rejection) = authorization_rejection(
+        &authorization_work,
+        &policy,
+        tree.store_ref(),
+        authority.as_ref(),
+    )? {
+        return Ok(rejected(rejection));
     }
     drop(tree);
     for reference in &ingress.imported_blobs {
@@ -2548,8 +2556,11 @@ fn apply<S: GuestAccumulateStoreV2>(
     else {
         return Ok(rejected(AccumulationRejectionV2::Unauthorized));
     };
-    if !authorized(work, &policy, tree.store_ref())? {
-        return Ok(rejected(AccumulationRejectionV2::Unauthorized));
+    let authority = tree_get_wire::<_, RoleAuthorityBindingV2>(&tree, &StateKeyV2::RoleAuthority)?;
+    if let Some(rejection) =
+        authorization_rejection(work, &policy, tree.store_ref(), authority.as_ref())?
+    {
+        return Ok(rejected(rejection));
     }
     let proof_required = policy.attested || work.proof_requested;
     if proof_required
@@ -3452,17 +3463,18 @@ fn canonical_transition_shape(
         })
 }
 
-fn authorized<S: GuestAccumulateStoreV2>(
+fn authorization_rejection<S: GuestAccumulateStoreV2>(
     work: &super::WorkEnvelopeV2,
     policy: &MethodPolicyV2,
     store: &S,
-) -> GuestResult<bool, S::Error> {
+    authority: Option<&RoleAuthorityBindingV2>,
+) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
     if method_role_policy_hash(policy.space_role, policy.actor_role) != Some(policy.policy)
         || policy.public != (policy.space_role.is_none() && policy.actor_role.is_none())
     {
-        return Ok(false);
+        return Ok(Some(AccumulationRejectionV2::Unauthorized));
     }
-    Ok(match &work.authorization {
+    let authorized = match &work.authorization {
         AuthorizationEvidenceV2::Public => policy.public && policy.policy == public_policy_hash(),
         AuthorizationEvidenceV2::Credential {
             policy: supplied_policy,
@@ -3470,12 +3482,9 @@ fn authorized<S: GuestAccumulateStoreV2>(
             bytes,
         } => {
             let Ok(credential) = RoleCredentialV2::decode(bytes) else {
-                return Ok(false);
+                return Ok(Some(AccumulationRejectionV2::Unauthorized));
             };
-            let Some(verification) = RoleCredentialVerificationRequestV2::for_work(work) else {
-                return Ok(false);
-            };
-            !policy.public
+            let structurally_authorized = !policy.public
                 && credential.holder == work.origin
                 // Step zero binds the credential to the original arguments.
                 // Later slices omit those dead bytes; their unchanged
@@ -3494,17 +3503,41 @@ fn authorized<S: GuestAccumulateStoreV2>(
                         .is_some_and(|actual| actual >= required)
                 })
                 && *supplied_policy == policy.policy
-                && *credential_commitment == credential.commitment()
-                && store
+                && *credential_commitment == credential.commitment();
+            if !structurally_authorized {
+                false
+            } else if policy.space_role.is_some() && authority.is_some() {
+                if let Some(rejection) = validate_pinned_role_assertion(
+                    store,
+                    authority.expect("checked above"),
+                    &work.service,
+                    work,
+                    policy,
+                    &credential,
+                )? {
+                    return Ok(Some(rejection));
+                }
+                true
+            } else {
+                let Some(verification) = RoleCredentialVerificationRequestV2::for_work(work) else {
+                    return Ok(Some(AccumulationRejectionV2::Unauthorized));
+                };
+                store
                     .verify_role_credential(&verification)
                     .map_err(GuestAccumulateError::Storage)?
+            }
         }
         AuthorizationEvidenceV2::PrivateCredential {
             policy: supplied_policy,
             credential_commitment,
             witness,
         } => {
-            !policy.public
+            // A pinned authority assertion is receipt-verified by Accumulate.
+            // Private witness bytes are intentionally unavailable here, so
+            // authority-backed private grants remain fail-closed until the
+            // proof public inputs expose that assertion separately.
+            !(authority.is_some() && policy.space_role.is_some())
+                && !policy.public
                 && (policy.attested || work.proof_requested)
                 && (policy.space_role.is_some() || policy.actor_role.is_some())
                 && matches!(
@@ -3518,7 +3551,54 @@ fn authorized<S: GuestAccumulateStoreV2>(
         // A future statement version will bind platform authority keys. Until
         // then System is an identity class, never an authorization bypass.
         AuthorizationEvidenceV2::SystemCapability { .. } => false,
-    })
+    };
+    Ok((!authorized).then_some(AccumulationRejectionV2::Unauthorized))
+}
+
+fn validate_pinned_role_assertion<S: GuestAccumulateStoreV2>(
+    store: &S,
+    authority: &RoleAuthorityBindingV2,
+    service: &ServiceIdentityV2,
+    work: &super::WorkEnvelopeV2,
+    policy: &MethodPolicyV2,
+    credential: &RoleCredentialV2,
+) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
+    let assertion = match AccumulatedRoleAssertionV2::decode(&credential.authenticator) {
+        Ok(assertion) => assertion,
+        Err(_) => return Ok(Some(AccumulationRejectionV2::Unauthorized)),
+    };
+    let claim = &assertion.claim;
+    if credential.holder != claim.holder
+        || credential.space_role != Some(claim.role)
+        || credential.scope != claim.scope
+        || claim.space != service.space
+        || claim.holder != work.origin
+        || claim.audience != *service
+        || claim.invocation != work.invocation
+        || claim.target != work.target
+        || claim.method != work.method
+        || claim.policy != policy.policy
+        || (work.workflow_step == 0 && claim.scope != work.authorization_scope())
+        || assertion.receipt.outbox_commitment.is_some()
+        || assertion.receipt.checkpoint != 0
+        || !assertion.matches_authority(authority)
+    {
+        return Ok(Some(AccumulationRejectionV2::Unauthorized));
+    }
+    let request = ReceiptVerificationRequestV2 {
+        expected_producer: authority.actor,
+        receipt: assertion.receipt,
+    };
+    Ok(
+        match store
+            .verify_receipt(&request)
+            .map_err(GuestAccumulateError::Storage)?
+        {
+            ReceiptVerificationV2::Valid => None,
+            ReceiptVerificationV2::Invalid => Some(AccumulationRejectionV2::InvalidReceipt),
+            ReceiptVerificationV2::Unavailable => Some(AccumulationRejectionV2::ReceiptUnavailable),
+        },
+    )
 }
 
 fn work_matches_durable_inbox<S: StateTreeStore>(
@@ -4329,6 +4409,66 @@ mod tests {
 
     fn actor() -> ActorId {
         ActorId([4; 32])
+    }
+
+    fn role_authority() -> RoleAuthorityBindingV2 {
+        RoleAuthorityBindingV2 {
+            service: ServiceIdentityV2 {
+                root_service: RootServiceId([70; 32]),
+                deployment: DeploymentId([71; 32]),
+                service_program: ProgramId([72; 32]),
+                ..identity()
+            },
+            actor: ActorId([73; 32]),
+        }
+    }
+
+    fn receipt_bound_role_credential(
+        store: &mut MemStore,
+        work: &WorkEnvelopeV2,
+        role: crate::SpaceRole,
+        policy: Hash,
+    ) -> RoleCredentialV2 {
+        let authority = role_authority();
+        let claim = super::super::RoleAuthorizationClaimV2 {
+            space: work.service.space,
+            holder: work.origin,
+            role,
+            audience: work.service.clone(),
+            invocation: work.invocation,
+            scope: work.authorization_scope(),
+            target: work.target,
+            method: work.method.clone(),
+            policy,
+        };
+        let receipt = AccumulationReceiptV2 {
+            service: authority.service.clone(),
+            accepted_transition: Hash::digest(
+                b"vos/test-role-authority-transition/v2",
+                &[&claim.encode()],
+            ),
+            reply_commitment: Some(claim.authority_reply(authority.actor).commitment()),
+            outbox_commitment: None,
+            resulting_state_root: Some(Hash([74; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 1,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Local,
+        };
+        store.receipt_allowlist.insert(
+            ReceiptVerificationRequestV2 {
+                expected_producer: authority.actor,
+                receipt: receipt.clone(),
+            }
+            .hash(),
+        );
+        RoleCredentialV2 {
+            holder: claim.holder,
+            scope: claim.scope,
+            space_role: Some(claim.role),
+            actor_role: None,
+            authenticator: AccumulatedRoleAssertionV2 { claim, receipt }.encode(),
+        }
     }
 
     const FIXTURE_ACTOR_PVM: &[u8] = b"fixture actor pvm";
@@ -6263,7 +6403,7 @@ mod tests {
         let required_policy =
             super::super::space_role_policy_hash(crate::SpaceRole::Member.as_u8()).unwrap();
         let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
-            role_authority: None,
+            role_authority: Some(role_authority()),
             external_actors: external_bindings(),
             service: identity(),
             consistency: ConsistencyModeV2::Local,
@@ -6301,20 +6441,14 @@ mod tests {
 
         let mut admitted_work = linear_work(initial.clone(), base);
         admitted_work.origin = origin;
-        let developer = RoleCredentialV2 {
-            holder: origin,
-            scope: admitted_work.authorization_scope(),
-            space_role: Some(crate::SpaceRole::Developer),
-            actor_role: None,
-            authenticator: b"developer grant".to_vec(),
-        };
+        let developer = receipt_bound_role_credential(
+            &mut store,
+            &admitted_work,
+            crate::SpaceRole::Developer,
+            required_policy,
+        );
         admitted_work.authorization = developer.disclosed_evidence(required_policy);
         seed_direct_ingress(&mut store, &admitted_work);
-        store.role_credential_allowlist.insert(
-            RoleCredentialVerificationRequestV2::for_work(&admitted_work)
-                .unwrap()
-                .hash(),
-        );
         let admitted = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             transition: linear_transition(&admitted_work, b"admitted"),
             work: admitted_work,
@@ -6328,6 +6462,15 @@ mod tests {
                 ..
             }
         ));
+
+        let mut unavailable_store = store.clone();
+        unavailable_store.receipt_allowlist.clear();
+        let unavailable_before = unavailable_store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut unavailable_store, &admitted).unwrap(),
+            rejected(AccumulationRejectionV2::ReceiptUnavailable)
+        );
+        assert_eq!(unavailable_store, unavailable_before);
 
         let mut replayed_work = linear_work(initial.clone(), base);
         replayed_work.origin = origin;
@@ -6349,20 +6492,14 @@ mod tests {
 
         let mut denied_work = linear_work(initial.clone(), base);
         denied_work.origin = origin;
-        let guest = RoleCredentialV2 {
-            holder: origin,
-            scope: denied_work.authorization_scope(),
-            space_role: Some(crate::SpaceRole::Guest),
-            actor_role: None,
-            authenticator: b"guest grant".to_vec(),
-        };
+        let guest = receipt_bound_role_credential(
+            &mut store,
+            &denied_work,
+            crate::SpaceRole::Guest,
+            required_policy,
+        );
         denied_work.authorization = guest.disclosed_evidence(required_policy);
         seed_direct_ingress(&mut store, &denied_work);
-        store.role_credential_allowlist.insert(
-            RoleCredentialVerificationRequestV2::for_work(&denied_work)
-                .unwrap()
-                .hash(),
-        );
         let denied = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             transition: linear_transition(&denied_work, b"denied"),
             work: denied_work,

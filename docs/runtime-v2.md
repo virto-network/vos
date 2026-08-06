@@ -350,6 +350,17 @@ Production admission therefore remains gated on a consensus-authoritative
 issuer/verifier authenticating the exact scoped credential bytes and on a
 proof backend that consumes the bound canonical Refine witness.
 
+When service genesis pins a `RoleAuthorityBindingV2`, disclosed space-role
+credentials instead carry an `AccumulatedRoleAssertionV2`. Guest Accumulate
+requires a finalized reply from that exact authority service and producer,
+binding the space, holder, role, audience service, invocation, complete
+authorization scope, target actor, method, and generated policy. A copied
+assertion cannot authorize another invocation or survive a package-only target
+upgrade. Receipt unavailability rejects the complete ingress or transition
+without staging writes. Private space-role credentials remain fail-closed on
+authority-backed roots until the proof public inputs expose the authority
+assertion independently of the private witness bytes.
+
 The current legacy `vosx space publish` path does not activate this v2 Install
 entry. Production v2 installation must resolve a signature-verified `.vos`
 package, derive the exact `ActorGenesisV2` (including its canonical role-policy

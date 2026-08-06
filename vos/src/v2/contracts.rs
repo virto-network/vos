@@ -127,6 +127,9 @@ pub struct RoleAuthorizationClaimV2 {
     pub role: crate::SpaceRole,
     pub audience: ServiceIdentityV2,
     pub invocation: InvocationId,
+    /// Complete invocation authorization scope, including target deployment,
+    /// program, arguments, origin, causal identity, and proof mode.
+    pub scope: Hash,
     pub target: ActorId,
     pub method: String,
     pub policy: Hash,
@@ -2686,6 +2689,7 @@ impl V2Wire for RoleAuthorizationClaimV2 {
         encoder.u8(self.role.as_u8());
         encode_service(&mut encoder, &self.audience);
         encoder.fixed(&self.invocation.0);
+        encoder.fixed(&self.scope.0);
         encoder.fixed(&self.target.0);
         encoder.string(&self.method);
         encoder.fixed(&self.policy.0);
@@ -2698,6 +2702,7 @@ impl V2Wire for RoleAuthorizationClaimV2 {
             role: crate::SpaceRole::from_u8(decoder.u8()?).ok_or(DecodeError::NonCanonical)?,
             audience: decode_service(decoder)?,
             invocation: InvocationId(decoder.fixed()?),
+            scope: Hash(decoder.fixed()?),
             target: ActorId(decoder.fixed()?),
             method: decoder.string()?,
             policy: Hash(decoder.fixed()?),
@@ -2705,6 +2710,7 @@ impl V2Wire for RoleAuthorizationClaimV2 {
         if !matches!(value.holder, Origin::Member(_) | Origin::Actor(_))
             || value.space != value.audience.space
             || value.invocation == InvocationId::ZERO
+            || value.scope == Hash::ZERO
             || value.target == ActorId::ZERO
             || value.method.is_empty()
             || value.policy == Hash::ZERO
@@ -4913,6 +4919,7 @@ mod tests {
             role: crate::SpaceRole::Developer,
             audience,
             invocation: InvocationId([45; 32]),
+            scope: Hash([52; 32]),
             target: ActorId([46; 32]),
             method: "publish".into(),
             policy: Hash([47; 32]),
