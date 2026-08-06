@@ -526,6 +526,14 @@ where
         }
     }
 
+    #[cfg(all(feature = "storage", feature = "network"))]
+    fn raft_propose_timeout_ms(&self) -> Option<u64> {
+        match self {
+            Self::Direct(_) => None,
+            Self::Raft(service) => Some(service.log().propose_timeout_ms()),
+        }
+    }
+
     fn refine_actor_tree_after_barrier(
         &self,
         work: &super::WorkEnvelopeV2,
@@ -1087,6 +1095,14 @@ where
     #[cfg(all(feature = "storage", feature = "network"))]
     pub fn replication_id(&self) -> Option<[u8; 32]> {
         self.service.replication_id()
+    }
+
+    /// Proposal/read-barrier liveness budget for a networked Raft host.
+    /// Kept crate-private because it is host scheduling metadata, not part of
+    /// the guest-owned service identity or canonical request wire.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    pub(crate) fn raft_propose_timeout_ms(&self) -> Option<u64> {
+        self.service.raft_propose_timeout_ms()
     }
 
     pub fn store(&self) -> &DurableJamStoreV2<B> {

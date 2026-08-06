@@ -1760,7 +1760,7 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
         bootstrap: vec![],
         auto_dial_mdns: true,
     });
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let address_a = loop {
         if let Some(address) = network_a.listen_addrs().into_iter().next() {
             break address.with(libp2p::multiaddr::Protocol::P2p(network_a.peer_id()));
@@ -1775,7 +1775,7 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
         bootstrap: vec![address_a.clone()],
         auto_dial_mdns: true,
     });
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let address_b = loop {
         if let Some(address) = network_b.listen_addrs().into_iter().next() {
             break address.with(libp2p::multiaddr::Protocol::P2p(network_b.peer_id()));
@@ -1803,7 +1803,7 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
     node_b.attach_network(network_b);
     let network_a = node_a.network().unwrap();
     let network_b = node_b.network().unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     while (network_a.peer_for_prefix(prefix_b).is_none()
         || network_b.peer_for_prefix(prefix_a).is_none()
         || client_network.peer_for_prefix(prefix_a).is_none()

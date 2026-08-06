@@ -100,6 +100,13 @@ impl RaftAccumulateLogV2 {
         self.cfg.replication_id
     }
 
+    /// Operator-configured bound shared by the read barrier and each proposal
+    /// wait. Node ingress uses it to derive one encompassing typed-call
+    /// deadline instead of imposing a shorter unrelated host timeout.
+    pub(crate) const fn propose_timeout_ms(&self) -> u64 {
+        self.cfg.propose_timeout_ms
+    }
+
     /// Open a self-quorum log. Every proposal commits in one redb transaction,
     /// but service application and `last_applied` remain a separate ordered
     /// step so restart exercises the same replay contract as a real cluster.

@@ -80,9 +80,32 @@ struct V2ActorRoute {
     route: u32,
     service: crate::v2::ServiceIdentityV2,
     consistency: crate::v2::ConsistencyModeV2,
+    /// End-to-end host wait for one typed invocation. Raft roots derive this
+    /// from their proposal budget so the voter-authentication, read-barrier,
+    /// commit, transport, and execution stages share one sufficient deadline.
+    invoke_timeout: Duration,
     /// Full Noise-authenticated libp2p PeerId bytes for remote routes.
     /// Local routes never cross the network bridge and therefore use `None`.
     authenticated_peer: Option<Vec<u8>>,
+}
+
+const V2_LOCAL_INVOKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The network ingress gate can spend this long consulting the registry to
+/// bind a compact voter slot back to its complete authenticated peer identity.
+#[cfg(feature = "network")]
+const V2_RAFT_VOTER_AUTH_TIMEOUT_MS: u64 = 5_000;
+
+/// One end-to-end Raft invocation can consume one voter-authentication probe,
+/// one read barrier, and one proposal wait. Reserve two further proposal
+/// windows for physical guest execution, network transit, and scheduling
+/// jitter. The caller applies this once across both the local follower and
+/// redirected leader hops rather than restarting a per-hop timeout.
+#[cfg(all(feature = "storage", feature = "network"))]
+fn v2_raft_invoke_timeout(propose_timeout_ms: u64) -> Duration {
+    Duration::from_millis(
+        V2_RAFT_VOTER_AUTH_TIMEOUT_MS.saturating_add(propose_timeout_ms.saturating_mul(4)),
+    )
 }
 
 impl std::fmt::Display for V2NodeRegistrationError {
@@ -1822,7 +1845,9 @@ fn registry_probe_reply(routes: &InvokeRoutes, payload: Vec<u8>) -> Option<Vec<u
     {
         return None;
     }
-    let envelope = reply_rx.recv_timeout(Duration::from_secs(5)).ok()?;
+    let envelope = reply_rx
+        .recv_timeout(Duration::from_millis(V2_RAFT_VOTER_AUTH_TIMEOUT_MS))
+        .ok()?;
     unwrap_invoke_envelope(&envelope)
 }
 
@@ -3094,6 +3119,13 @@ impl VosNode {
             + 'static,
     {
         let actor = service.root_actor();
+        #[cfg(all(feature = "storage", feature = "network"))]
+        let invoke_timeout = service
+            .raft_propose_timeout_ms()
+            .map(v2_raft_invoke_timeout)
+            .unwrap_or(V2_LOCAL_INVOKE_TIMEOUT);
+        #[cfg(not(all(feature = "storage", feature = "network")))]
+        let invoke_timeout = V2_LOCAL_INVOKE_TIMEOUT;
         #[cfg(all(feature = "network", feature = "storage"))]
         if let Some(replication_id) = service.replication_id() {
             self.raft_hosts.lock().unwrap().insert(id.0, replication_id);
@@ -3113,6 +3145,7 @@ impl VosNode {
                     route: id.0,
                     service: service_identity,
                     consistency: service.consistency(),
+                    invoke_timeout,
                     authenticated_peer: None,
                 },
             );
@@ -3393,6 +3426,7 @@ impl VosNode {
             route: route.0,
             service,
             consistency,
+            invoke_timeout: V2_LOCAL_INVOKE_TIMEOUT,
             authenticated_peer: Some(authenticated_peer),
         };
         match routes.get(&actor) {
@@ -4117,13 +4151,17 @@ impl VosNode {
         }
         let message = <crate::value::Msg as Decode>::try_decode(&arguments[1..])
             .ok_or(crate::actors::client::ClientError::Decode)?;
-        let route = self
+        let binding = self
             .v2_actor_routes
             .read()
             .map_err(|_| crate::actors::client::ClientError::Unreachable)?
             .get(&target)
-            .map(|binding| binding.route)
+            .cloned()
             .ok_or(crate::actors::client::ClientError::NotFound)?;
+        let route = binding.route;
+        let deadline = Instant::now()
+            .checked_add(binding.invoke_timeout)
+            .ok_or(crate::actors::client::ClientError::Unreachable)?;
         let tx = self
             .invoke_routes
             .lock()
@@ -4157,7 +4195,7 @@ impl VosNode {
         })
         .map_err(|_| crate::actors::client::ClientError::Unreachable)?;
         let envelope = reply_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .map_err(|_| crate::actors::client::ClientError::Unreachable)?;
         #[cfg(all(feature = "network", feature = "storage"))]
         if let Some(redirect) = decode_v2_raft_redirect(&envelope) {
@@ -4180,7 +4218,7 @@ impl VosNode {
                     Vec::new(),
                     delegated,
                 )
-                .recv_timeout(Duration::from_secs(10))
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .map_err(|_| crate::actors::client::ClientError::Unreachable)?;
             return decode_host_invoke_envelope(&leader_envelope);
         }
@@ -9936,6 +9974,7 @@ mod tests {
                     route: route.0,
                     service: service.clone(),
                     consistency: crate::v2::ConsistencyModeV2::Local,
+                    invoke_timeout: V2_LOCAL_INVOKE_TIMEOUT,
                     authenticated_peer: Some(vec![0xA2]),
                 },
             ),
@@ -9945,6 +9984,7 @@ mod tests {
                     route: route.0,
                     service,
                     consistency: crate::v2::ConsistencyModeV2::Local,
+                    invoke_timeout: V2_LOCAL_INVOKE_TIMEOUT,
                     authenticated_peer: Some(vec![0xB2]),
                 },
             ),
@@ -9954,6 +9994,21 @@ mod tests {
         assert!(
             authenticated_v2_actor_route(&routes, actor_b, route, Some(&[0xA2])).is_none(),
             "a colliding route owned by peer A cannot authenticate actor B"
+        );
+    }
+
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[test]
+    fn raft_typed_invoke_budget_covers_every_bounded_stage() {
+        assert_eq!(
+            v2_raft_invoke_timeout(5_000),
+            Duration::from_secs(25),
+            "voter auth + read barrier + commit + two proposal windows of margin",
+        );
+        assert_eq!(
+            v2_raft_invoke_timeout(2_000),
+            Duration::from_secs(13),
+            "the end-to-end budget follows the configured proposal timeout",
         );
     }
 
