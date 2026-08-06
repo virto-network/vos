@@ -1235,6 +1235,20 @@ fn canonical_space_authority_produces_extractable_accumulated_assertion() {
         .expect("the actor reply and guest receipt form the exact role assertion");
     assert_eq!(assertion.claim, claim);
     assert!(assertion.matches_authority(&binding));
+    authority
+        .acknowledge_publication(
+            committed
+                .publication
+                .as_ref()
+                .expect("the decision remains published before acknowledgement"),
+        )
+        .expect("guest Accumulate acknowledges the authority reply");
+    assert_eq!(
+        authority
+            .recover_role_assertion(claim, &binding)
+            .expect("durable workflow and receipt rows recover the assertion"),
+        assertion
+    );
 }
 
 #[test]

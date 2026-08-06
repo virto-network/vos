@@ -1011,8 +1011,31 @@ where
         &self.identity
     }
 
+    pub fn role_authority(&self) -> Option<&RoleAuthorityBindingV2> {
+        self.expected_role_authority.as_ref()
+    }
+
     pub const fn root_actor(&self) -> ActorId {
         self.root_actor
+    }
+
+    fn owns_actor(&self, actor: ActorId) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        let header = self
+            .service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        let directory = self
+            .service
+            .accumulate_host()
+            .state_row(header.service_root, &StateKeyV2::ActorDirectory)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .map(|bytes| ActorDirectoryV2::decode(&bytes))
+            .transpose()
+            .map_err(|_| LocalRootTreeInvokeErrorV2::CorruptWorkflow)?
+            .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        Ok(directory.actors.binary_search(&actor).is_ok())
     }
 
     pub const fn consistency(&self) -> ConsistencyModeV2 {
@@ -1304,6 +1327,53 @@ where
             .binary_search_by(|candidate| candidate.method.as_str().cmp(method))
             .ok()
             .map(|index| policies.methods[index].clone()))
+    }
+
+    /// Recover an authority decision from guest-owned durable workflow and
+    /// receipt rows after its transient publication was acknowledged. This is
+    /// the exact-invocation retry path used by platform authorization; it
+    /// never re-executes the authority actor or fabricates a receipt.
+    pub fn recover_role_assertion(
+        &self,
+        claim: RoleAuthorizationClaimV2,
+        authority: &RoleAuthorityBindingV2,
+    ) -> Result<AccumulatedRoleAssertionV2, LocalRootTreeInvokeErrorV2> {
+        if authority.service != self.identity || !self.owns_actor(authority.actor)? {
+            return Err(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication);
+        }
+        let input = WorkInputIdV2 {
+            invocation: claim.authority_invocation(),
+            workflow_step: 0,
+        };
+        let checkpoint = self
+            .service
+            .accumulate_host()
+            .workflow_checkpoint(input.invocation)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication)?;
+        let receipt = self
+            .service
+            .accumulate_host()
+            .accumulation_receipt(input)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication)?;
+        let expected_reply = claim.authority_reply(authority.actor);
+        if checkpoint.input != input
+            || checkpoint.resume_work.target != authority.actor
+            || checkpoint.resume_work.method != super::ROLE_AUTHORITY_DECISION_METHOD_V2
+            || receipt.service != authority.service
+            || receipt.accepted_transition != checkpoint.transition_hash
+            || receipt.reply_commitment != Some(expected_reply.commitment())
+            || receipt.outbox_commitment.is_some()
+            || receipt.checkpoint != 0
+        {
+            return Err(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication);
+        }
+        let assertion = AccumulatedRoleAssertionV2 { claim, receipt };
+        if !assertion.matches_authority(authority) {
+            return Err(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication);
+        }
+        Ok(assertion)
     }
 
     /// Execute one ordinary slice. Attested work requires a configured proof
