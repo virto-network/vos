@@ -419,6 +419,64 @@ type PrefixMap = Arc<Mutex<HashMap<u16, PeerId>>>;
 /// `[[agent]] consistency = "raft"`) needs the map.
 type RaftHandlerMap = Arc<Mutex<BTreeMap<[u8; 32], Arc<dyn RaftRpcHandler>>>>;
 
+/// Ownership token for a not-yet-started Raft replica. The fail-closed
+/// placeholder occupies the replication id before worker/database startup;
+/// dropping an unactivated token removes only that exact placeholder.
+pub(crate) struct RaftHandlerReservation {
+    replication_id: [u8; 32],
+    placeholder: Arc<dyn RaftRpcHandler>,
+    handlers: RaftHandlerMap,
+}
+
+impl Drop for RaftHandlerReservation {
+    fn drop(&mut self) {
+        let Ok(mut handlers) = self.handlers.lock() else {
+            return;
+        };
+        if handlers
+            .get(&self.replication_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.placeholder))
+        {
+            handlers.remove(&self.replication_id);
+        }
+    }
+}
+
+struct ReservedRaftHandler;
+
+impl RaftRpcHandler for ReservedRaftHandler {
+    fn append_entries(
+        &self,
+        _replication_id: &[u8; 32],
+        _from_prefix: u16,
+        term: u64,
+        prev_log_index: u64,
+        _prev_log_term: u64,
+        _leader_commit: u64,
+        _entries: Vec<RaftEntry>,
+    ) -> RaftAppendResult {
+        RaftAppendResult {
+            term,
+            success: false,
+            match_index: prev_log_index,
+        }
+    }
+
+    fn request_vote(
+        &self,
+        _replication_id: &[u8; 32],
+        _from_prefix: u16,
+        term: u64,
+        _last_log_index: u64,
+        _last_log_term: u64,
+    ) -> RaftVoteResult {
+        RaftVoteResult {
+            term,
+            vote_granted: false,
+        }
+    }
+}
+
 /// Multiaddrs the local swarm has actually bound to. Populated
 /// from `SwarmEvent::NewListenAddr`. Useful for tests that bind
 /// to port 0 and need the kernel-assigned port.
@@ -727,26 +785,51 @@ impl Network {
         }
     }
 
-    /// Register the first handler for `replication_id` without replacing a
-    /// live owner. Returns `false` when the group is already registered or
-    /// the handler map is unavailable. Replica preparation uses this form so
-    /// a later route-validation failure cannot first evict an existing
-    /// replica and then remove its replacement during cleanup.
-    pub fn register_raft_handler_if_absent(
+    /// Atomically reserve an unused replication id before starting its Raft
+    /// worker. A live handler or another preparation owns the id exclusively;
+    /// neither can be replaced by a rejected registration.
+    pub(crate) fn reserve_raft_handler(
         &self,
         replication_id: [u8; 32],
+    ) -> Option<RaftHandlerReservation> {
+        let Ok(mut handlers) = self.raft_handlers.lock() else {
+            return None;
+        };
+        let placeholder: Arc<dyn RaftRpcHandler> = Arc::new(ReservedRaftHandler);
+        match handlers.entry(replication_id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(placeholder.clone());
+                Some(RaftHandlerReservation {
+                    replication_id,
+                    placeholder,
+                    handlers: self.raft_handlers.clone(),
+                })
+            }
+            std::collections::btree_map::Entry::Occupied(_) => None,
+        }
+    }
+
+    /// Replace one exact preparation reservation with its live worker
+    /// handler. Returns `false` if ownership changed in the meantime.
+    pub(crate) fn activate_raft_handler(
+        &self,
+        reservation: &RaftHandlerReservation,
         handler: Arc<dyn RaftRpcHandler>,
     ) -> bool {
+        if !Arc::ptr_eq(&self.raft_handlers, &reservation.handlers) {
+            return false;
+        }
         let Ok(mut handlers) = self.raft_handlers.lock() else {
             return false;
         };
-        match handlers.entry(replication_id) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(handler);
-                true
-            }
-            std::collections::btree_map::Entry::Occupied(_) => false,
+        let Some(current) = handlers.get_mut(&reservation.replication_id) else {
+            return false;
+        };
+        if !Arc::ptr_eq(current, &reservation.placeholder) {
+            return false;
         }
+        *current = handler;
+        true
     }
 
     /// Drop the handler for `replication_id`. Inbound RPCs for
@@ -2538,7 +2621,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_raft_handler_registration_preserves_the_live_owner() {
+    fn raft_handler_reservation_is_exclusive_and_owner_checked() {
         struct Handler;
         impl RaftRpcHandler for Handler {
             fn append_entries(
@@ -2577,17 +2660,45 @@ mod tests {
         let replication_id = [0x72; 32];
         let live: Arc<dyn RaftRpcHandler> = Arc::new(Handler);
         let duplicate: Arc<dyn RaftRpcHandler> = Arc::new(Handler);
-        assert!(network.register_raft_handler_if_absent(replication_id, live.clone()));
-        assert!(!network.register_raft_handler_if_absent(replication_id, duplicate));
+        network.register_raft_handler(replication_id, live.clone());
+        assert!(network.reserve_raft_handler(replication_id).is_none());
 
-        let registered = network
+        let registered_before = network
             .raft_handlers
             .lock()
             .unwrap()
             .get(&replication_id)
             .cloned()
             .unwrap();
-        assert!(Arc::ptr_eq(&registered, &live));
+        assert!(Arc::ptr_eq(&registered_before, &live));
+
+        assert!(network.unregister_raft_handler_if(&replication_id, &live));
+        let reservation = network.reserve_raft_handler(replication_id).unwrap();
+        assert!(
+            network.reserve_raft_handler(replication_id).is_none(),
+            "a second preparation cannot share the reservation"
+        );
+        assert!(network.activate_raft_handler(&reservation, duplicate.clone()));
+        drop(reservation);
+        let registered_after = network
+            .raft_handlers
+            .lock()
+            .unwrap()
+            .get(&replication_id)
+            .cloned()
+            .unwrap();
+        assert!(Arc::ptr_eq(&registered_after, &duplicate));
+        assert!(network.unregister_raft_handler_if(&replication_id, &duplicate));
+        let abandoned = network.reserve_raft_handler(replication_id).unwrap();
+        drop(abandoned);
+        assert!(
+            !network
+                .raft_handlers
+                .lock()
+                .unwrap()
+                .contains_key(&replication_id),
+            "dropping an unactivated reservation releases only its slot"
+        );
         network.join();
     }
 

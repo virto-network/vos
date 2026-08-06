@@ -1555,7 +1555,7 @@ fn node_registers_a_raft_root_through_the_canonical_request_log() {
         "duplicate-root".into(),
         config.clone(),
         FailableCommittedImages::default(),
-        duplicate_db,
+        duplicate_db.clone(),
         RaftConfig {
             me: duplicate_prefix,
             members: vec![duplicate_prefix],
@@ -1575,6 +1575,14 @@ fn node_registers_a_raft_root_through_the_canonical_request_log() {
         .expect("the prior handler remains registered");
     assert_eq!(live_status.current_term, 77);
     assert_eq!(live_status.commit_index, 11);
+    assert!(
+        duplicate_db
+            .begin_read()
+            .unwrap()
+            .open_table(vos::raft::RAFT_META)
+            .is_err(),
+        "the rejected duplicate never starts a worker or initializes Raft storage",
+    );
     drop(duplicate_network);
     let _ = duplicate_node.collect();
 
@@ -1820,10 +1828,21 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
     let db_b = Arc::new(redb::Database::create(directory.join("b.redb")).unwrap());
     let replication_id = [0xB6; 32];
     let members = vec![prefix_a, prefix_b];
+    // This test is about typed redirect/status preservation, not election
+    // churn. Give B the deterministic short election window and keep A's
+    // follower timeout beyond the test's request sequence, then observe a
+    // sustained leader before publishing either root route.
+    let election_timeout_for = |me| {
+        if me == prefix_b {
+            (50, 100)
+        } else {
+            (30_000, 40_000)
+        }
+    };
     let raft_config = |me| RaftConfig {
         me,
         members: members.clone(),
-        election_timeout_ms: (50, 150),
+        election_timeout_ms: election_timeout_for(me),
         heartbeat_interval_ms: 20,
         replication_id,
         propose_timeout_ms: 5_000,
@@ -1836,7 +1855,7 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
             me: prefix_a,
             members: members.clone(),
             replication_id,
-            election_timeout_ms: (50, 150),
+            election_timeout_ms: election_timeout_for(prefix_a),
             heartbeat_interval_ms: 20,
         },
         Some(network_a.clone()),
@@ -1848,7 +1867,7 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
             me: prefix_b,
             members: members.clone(),
             replication_id,
-            election_timeout_ms: (50, 150),
+            election_timeout_ms: election_timeout_for(prefix_b),
             heartbeat_interval_ms: 20,
         },
         Some(network_b.clone()),
@@ -1860,9 +1879,6 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
     network_b.register_raft_handler(replication_id, Arc::new(handle_b.clone()));
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     let leader = loop {
-        if handle_a.role() == Role::Leader {
-            break prefix_a;
-        }
         if handle_b.role() == Role::Leader {
             break prefix_b;
         }
@@ -1872,6 +1888,13 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
         );
         std::thread::sleep(Duration::from_millis(15));
     };
+    assert_eq!(leader, prefix_b, "the asymmetric election elects B");
+    let stable_until = std::time::Instant::now() + Duration::from_millis(500);
+    while std::time::Instant::now() < stable_until {
+        assert_eq!(handle_b.role(), Role::Leader);
+        assert_ne!(handle_a.role(), Role::Leader);
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     let log_a = RaftAccumulateLogV2::from_worker(db_a, raft_config(prefix_a), worker_a, apply_a_rx)
         .unwrap();
@@ -2008,12 +2031,10 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
     }
     let mut missing = vec![vos::value::TAG_DYNAMIC];
     missing.extend_from_slice(&Msg::new("missing_method").encode());
+    let missing_result = follower_node.invoke_actor(actor, missing);
     assert!(
-        matches!(
-            follower_node.invoke_actor(actor, missing),
-            Err(ClientError::NotFound)
-        ),
-        "a redirected typed call preserves the leader's failure status",
+        matches!(missing_result, Err(ClientError::NotFound)),
+        "a redirected typed call preserves the leader's failure status; got {missing_result:?}",
     );
 
     let results_a = node_a.collect();

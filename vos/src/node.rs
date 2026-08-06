@@ -3305,6 +3305,13 @@ impl VosNode {
             .lock()
             .ok()
             .and_then(|guard| guard.clone());
+        let reservation = if let Some(network) = network.as_ref() {
+            Some(network.reserve_raft_handler(replication_id).ok_or(
+                V2RaftNodeRegistrationError::ReplicationHandlerOccupied(replication_id),
+            )?)
+        } else {
+            None
+        };
         let (apply_tx, apply_rx) = mpsc::channel::<u64>();
         let worker = crate::raft::RaftWorker::spawn(
             db.clone(),
@@ -3320,14 +3327,18 @@ impl VosNode {
         );
         let worker_handle = worker.handler();
         let handler: Arc<dyn crate::network::RaftRpcHandler> = Arc::new(worker_handle.clone());
-        if let Some(network) = network.as_ref()
-            && !network.register_raft_handler_if_absent(replication_id, handler.clone())
+        if let (Some(network), Some(reservation)) = (network.as_ref(), reservation.as_ref())
+            && !network.activate_raft_handler(reservation, handler.clone())
         {
             worker.shutdown();
             return Err(V2RaftNodeRegistrationError::ReplicationHandlerOccupied(
                 replication_id,
             ));
         }
+        // Activation replaced the placeholder, so dropping the reservation is
+        // now a no-op. Any earlier panic/error would instead remove only the
+        // still-owned placeholder through its Drop implementation.
+        drop(reservation);
         let cleanup = || {
             if let Some(network) = network.as_ref() {
                 network.unregister_raft_handler_if(&replication_id, &handler);
