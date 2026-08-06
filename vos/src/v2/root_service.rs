@@ -21,9 +21,10 @@ use super::{
     LocalJamStoreV2, LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
     MethodPolicyV2, NoRefineProtocolHostV2, PackageError, PackageRolePoliciesV2, PreparedWorkV2,
     ProgramId, ProofArtifactStoreV2, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
-    RefinedServiceOutputV2, RoleAuthorityBindingV2, RoleAuthorizationClaimV2, ScheduleErrorV2,
-    ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2,
-    WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
+    RefinedServiceOutputV2, RoleAssertionEligibilityV2, RoleAuthorityBindingV2,
+    RoleAuthorizationClaimV2, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2,
+    ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2,
+    crdt_node_storage_key, dedup_storage_key,
 };
 
 #[cfg(feature = "storage")]
@@ -344,6 +345,7 @@ pub struct CommittedRootTreeSliceV2 {
     pub receipt: AccumulationReceiptV2,
     pub published: PublishedEffectsV2,
     pub publication: Option<PublicationRecordV2>,
+    pub role_assertion_eligibility: Option<RoleAssertionEligibilityV2>,
     pub duplicate: bool,
     pub refine_gas_used: u64,
     pub accumulate_gas_used: u64,
@@ -367,6 +369,14 @@ impl CommittedRootTreeSliceV2 {
             && self.receipt.checkpoint == 0
             && self.receipt.reply_commitment == Some(expected_reply.commitment())
             && self.receipt.outbox_commitment.is_none()
+            && self
+                .role_assertion_eligibility
+                .as_ref()
+                .is_some_and(|eligibility| {
+                    eligibility.input == self.input
+                        && eligibility.transition_commitment == self.receipt.accepted_transition
+                        && eligibility.reply_commitment == expected_reply.commitment()
+                })
             && self.published.reply.as_ref() == Some(&expected_reply)
             && self.published.outbox.is_empty()
             && self.published.exported_blobs.is_empty()
@@ -788,6 +798,12 @@ where
                     .as_ref()
                     .map_or_else(PublishedEffectsV2::default, |row| row.published.clone()),
                 publication,
+                role_assertion_eligibility: self
+                    .service
+                    .accumulate_host()
+                    .local_store()
+                    .role_assertion_eligibility(input)
+                    .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?,
                 duplicate: true,
                 refine_gas_used: 0,
                 accumulate_gas_used: 0,
@@ -883,6 +899,12 @@ where
                 .as_ref()
                 .map_or_else(PublishedEffectsV2::default, |row| row.published.clone()),
             publication,
+            role_assertion_eligibility: self
+                .service
+                .accumulate_host()
+                .local_store()
+                .role_assertion_eligibility(checkpoint.input)
+                .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?,
             duplicate: true,
             refine_gas_used: 0,
             accumulate_gas_used: 0,
@@ -1357,15 +1379,41 @@ where
             .accumulation_receipt(input)
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
             .ok_or(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication)?;
+        let eligibility = self
+            .service
+            .accumulate_host()
+            .local_store()
+            .role_assertion_eligibility(input)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication)?;
         let expected_reply = claim.authority_reply(authority.actor);
+        let transition_is_bound = if receipt.consistency == ConsistencyModeV2::Crdt {
+            self.service
+                .accumulate_host()
+                .row(&crdt_node_storage_key(checkpoint.transition_hash))
+                .and_then(|bytes| CrdtChangeV2::decode(bytes).ok())
+                .is_some_and(|change| {
+                    change.cid() == checkpoint.transition_hash
+                        && change.receipt_commitment() == receipt.accepted_transition
+                        && receipt
+                            .resulting_crdt_heads
+                            .binary_search(&checkpoint.transition_hash)
+                            .is_ok()
+                })
+        } else {
+            receipt.accepted_transition == checkpoint.transition_hash
+        };
         if checkpoint.input != input
             || checkpoint.resume_work.target != authority.actor
             || checkpoint.resume_work.method != super::ROLE_AUTHORITY_DECISION_METHOD_V2
             || receipt.service != authority.service
-            || receipt.accepted_transition != checkpoint.transition_hash
+            || !transition_is_bound
             || receipt.reply_commitment != Some(expected_reply.commitment())
             || receipt.outbox_commitment.is_some()
             || receipt.checkpoint != 0
+            || eligibility.input != input
+            || eligibility.transition_commitment != receipt.accepted_transition
+            || eligibility.reply_commitment != expected_reply.commitment()
         {
             return Err(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication);
         }
@@ -1726,6 +1774,12 @@ where
             receipt,
             published,
             publication,
+            role_assertion_eligibility: self
+                .service
+                .accumulate_host()
+                .local_store()
+                .role_assertion_eligibility(input)
+                .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?,
             duplicate,
             refine_gas_used: refined.gas_used,
             accumulate_gas_used: accumulated.gas_used,
@@ -2018,7 +2072,7 @@ mod tests {
             consistency: ConsistencyModeV2::Local,
         };
         let published = PublishedEffectsV2 {
-            reply: Some(reply),
+            reply: Some(reply.clone()),
             ..PublishedEffectsV2::default()
         };
         let publication = PublicationRecordV2 {
@@ -2031,6 +2085,11 @@ mod tests {
             authority,
             CommittedRootTreeSliceV2 {
                 input,
+                role_assertion_eligibility: Some(RoleAssertionEligibilityV2 {
+                    input,
+                    transition_commitment: receipt.accepted_transition,
+                    reply_commitment: reply.commitment(),
+                }),
                 receipt,
                 published,
                 publication: Some(publication),

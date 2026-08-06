@@ -786,6 +786,20 @@ impl LocalJamStoreV2 {
             })
     }
 
+    /// Recover the guest-owned proof that this exact transition had the
+    /// single-slice external-effect shape required for a role assertion.
+    /// Unlike its publication row, the eligibility record survives effect
+    /// acknowledgement.
+    pub fn role_assertion_eligibility(
+        &self,
+        input: super::WorkInputIdV2,
+    ) -> Result<Option<super::RoleAssertionEligibilityV2>, LocalStoreReadErrorV2> {
+        self.row(&super::role_assertion_eligibility_storage_key(input))
+            .map(super::RoleAssertionEligibilityV2::decode)
+            .transpose()
+            .map_err(|_| LocalStoreReadErrorV2::CorruptReceipt)
+    }
+
     /// Recover the exact guest-committed outcome for one expired durable
     /// call. The row remains after continuation completion so retries can be
     /// classified without reconstructing a process-local timer.

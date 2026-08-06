@@ -25,7 +25,7 @@ use super::{
     DirectIngressV2, EXECUTION_SEMANTICS_ID, ExternalActorDirectoryV2, Hash, IngressRecordV2,
     MessageRecordV2, MethodPolicyV2, PendingCallDeadlineV2, ProgramId, ProofVerificationRequestV2,
     PublicationAckV2, PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
-    ReplyAdmissionRecordV2, RoleAuthorityBindingV2, RoleCredentialV2,
+    ReplyAdmissionRecordV2, RoleAssertionEligibilityV2, RoleAuthorityBindingV2, RoleCredentialV2,
     RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServiceIdentityV2,
     ServiceInstallReceiptV2, ServiceStateTreeV2, StateKeyV2, StateTreeError, StateTreeStore,
     StoreHeaderV2, StoreOpenError, V2Wire, WorkInputIdV2, WorkflowCheckpointV2,
@@ -34,6 +34,7 @@ use super::{
     dedup_storage_key, delivery_storage_key, header_storage_key, ingress_storage_key,
     method_role_policy_hash, pending_call_deadline_storage_key, public_policy_hash,
     publication_storage_key, receipt_storage_key, reply_admission_storage_key,
+    role_assertion_eligibility_storage_key,
 };
 
 /// Extra content-addressed operations needed by guest Accumulate in addition
@@ -2250,6 +2251,14 @@ fn apply_dedup_materialization<S: StateTreeStore>(
             write(store, &receipt_key, Some(&receipt.encode()))?;
         }
 
+        let eligibility_key = role_assertion_eligibility_storage_key(checkpoint.input);
+        let eligibility = crdt_role_assertion_eligibility(&change, &receipt);
+        write(
+            store,
+            &eligibility_key,
+            eligibility.as_ref().map(V2Wire::encode).as_deref(),
+        )?;
+
         let publication_key = publication_storage_key(checkpoint.input);
         if let Some(existing) = read(store, &publication_key)? {
             let existing = PublicationRecordV2::decode(&existing)
@@ -3170,6 +3179,12 @@ fn apply<S: GuestAccumulateStoreV2>(
         &dedup_storage_key(work.input_id()),
         Some(&record.encode()),
     )?;
+    let eligibility = role_assertion_eligibility(work, transition, transition_commitment);
+    write(
+        store,
+        &role_assertion_eligibility_storage_key(work.input_id()),
+        eligibility.as_ref().map(V2Wire::encode).as_deref(),
+    )?;
     if let Some(awaited_reply) = work.awaited_reply.as_ref() {
         let admission = ReplyAdmissionRecordV2 {
             call_id: awaited_reply.reply.call_id,
@@ -3461,6 +3476,73 @@ fn canonical_transition_shape(
                         .parent_call
                         .unwrap_or_else(|| work.invocation.root_reply_id())
         })
+}
+
+fn role_assertion_eligibility(
+    work: &super::WorkEnvelopeV2,
+    transition: &super::TransitionV2,
+    transition_commitment: Hash,
+) -> Option<RoleAssertionEligibilityV2> {
+    let reply = transition.reply.as_ref()?;
+    if work.workflow_step != 0
+        || work.method != super::ROLE_AUTHORITY_DECISION_METHOD_V2
+        || work.parent_call.is_some()
+        || work.causal_parent.is_some()
+        || work.awaited_reply.is_some()
+        || work.awaited_timeout.is_some()
+        || work.proof_requested
+        || !transition.spawns.is_empty()
+        || !transition.continuations.is_empty()
+        || !transition.inbox.is_empty()
+        || !transition.outbox.is_empty()
+        || !transition.exported_blobs.is_empty()
+        || transition.proof.is_some()
+    {
+        return None;
+    }
+    Some(RoleAssertionEligibilityV2 {
+        input: work.input_id(),
+        transition_commitment,
+        reply_commitment: reply.commitment(),
+    })
+}
+
+fn crdt_role_assertion_eligibility(
+    change: &CrdtChangeV2,
+    receipt: &AccumulationReceiptV2,
+) -> Option<RoleAssertionEligibilityV2> {
+    if !change.exported_blobs.is_empty() || change.awaited_reply.is_some() {
+        return None;
+    }
+    let mut work = None;
+    let mut reply = None;
+    for operation in &change.workflow {
+        match operation {
+            WorkflowOperationV2::Checkpoint(candidate) if work.is_none() => work = Some(candidate),
+            WorkflowOperationV2::Reply(candidate) if reply.is_none() => reply = Some(candidate),
+            _ => return None,
+        }
+    }
+    let work = work?;
+    let reply = reply?;
+    if change.workflow.len() != 2
+        || work.workflow_step != 0
+        || work.method != super::ROLE_AUTHORITY_DECISION_METHOD_V2
+        || work.parent_call.is_some()
+        || work.causal_parent.is_some()
+        || work.awaited_reply.is_some()
+        || work.awaited_timeout.is_some()
+        || work.proof_requested
+        || receipt.accepted_transition != change.receipt_commitment()
+        || receipt.reply_commitment != Some(reply.commitment())
+    {
+        return None;
+    }
+    Some(RoleAssertionEligibilityV2 {
+        input: work.input_id(),
+        transition_commitment: receipt.accepted_transition,
+        reply_commitment: reply.commitment(),
+    })
 }
 
 fn authorization_rejection<S: GuestAccumulateStoreV2>(
@@ -6164,6 +6246,119 @@ mod tests {
                 input: work.input_id(),
                 duplicate: true,
             }
+        );
+    }
+
+    #[test]
+    fn side_effecting_authority_reply_never_gains_recoverable_eligibility() {
+        let mut store = MemStore::default();
+        let initial = store.provide_blob(b"before").unwrap();
+        store.programs.insert(program(), FIXTURE_ACTOR_PVM.to_vec());
+        let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            role_authority: None,
+            external_actors: external_bindings(),
+            service: identity(),
+            consistency: ConsistencyModeV2::Local,
+            actors: vec![ActorGenesisV2 {
+                actor: actor(),
+                name: "root".into(),
+                parent: None,
+                producer: super::super::ProducerId([4; 32]),
+                deployment: identity().deployment,
+                program: program(),
+                initial_state: initial.clone(),
+                crdt: false,
+                role_policies: role_policies(vec![MethodPolicyV2 {
+                    method: super::super::ROLE_AUTHORITY_DECISION_METHOD_V2.into(),
+                    schema: Hash([6; 32]),
+                    policy: public_policy_hash(),
+                    public: true,
+                    attested: false,
+                    space_role: None,
+                    actor_role: None,
+                }]),
+            }],
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: super::super::SystemCapabilityId([8; 32]),
+                authenticator: vec![9],
+            },
+        });
+        let AccumulationResultV2::Installed(receipt) =
+            execute_guest_accumulate(&mut store, &install).unwrap()
+        else {
+            panic!("install rejected")
+        };
+        let mut work = linear_work(initial, receipt.resulting_state_root.unwrap());
+        work.method = super::super::ROLE_AUTHORITY_DECISION_METHOD_V2.into();
+        seed_direct_ingress(&mut store, &work);
+        let artifact_bytes = b"disallowed authority artifact".to_vec();
+        let artifact = BlobRefV2::of_bytes(&artifact_bytes);
+        let mut transition = linear_transition(&work, b"after");
+        transition.exported_blobs.push(artifact.clone());
+        let result = execute_guest_accumulate(
+            &mut store,
+            &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: work.clone(),
+                transition,
+                provided_blobs: vec![ImportedBlobV2 {
+                    reference: artifact.clone(),
+                    bytes: artifact_bytes,
+                }],
+            }),
+        )
+        .unwrap();
+        let AccumulationResultV2::Accepted {
+            receipt,
+            published,
+            duplicate: false,
+        } = result
+        else {
+            panic!("side-effecting reply did not commit: {result:?}")
+        };
+        assert_eq!(published.exported_blobs, vec![artifact]);
+        assert!(
+            read(
+                &store,
+                &role_assertion_eligibility_storage_key(work.input_id())
+            )
+            .unwrap()
+            .is_none(),
+            "guest Accumulate must not persist assertion eligibility for a side-effecting reply"
+        );
+
+        let publication = PublicationRecordV2::decode(
+            store
+                .rows
+                .get(&publication_storage_key(work.input_id()))
+                .expect("the side-effecting reply is published before acknowledgement"),
+        )
+        .unwrap();
+        assert_eq!(publication.receipt, receipt);
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::AcknowledgePublication(PublicationAckV2 {
+                    service: identity(),
+                    input: work.input_id(),
+                    publication: publication.commitment(),
+                })
+            )
+            .unwrap(),
+            AccumulationResultV2::PublicationAcknowledged {
+                duplicate: false,
+                ..
+            }
+        ));
+
+        let restarted = store.clone();
+        assert!(
+            read(
+                &restarted,
+                &role_assertion_eligibility_storage_key(work.input_id())
+            )
+            .unwrap()
+            .is_none(),
+            "restart cannot make an ineligible reply recoverable"
         );
     }
 

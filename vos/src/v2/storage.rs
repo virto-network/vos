@@ -15,7 +15,7 @@ use super::{
     ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 25;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 26;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -23,6 +23,7 @@ const HEADER_STORAGE_KEY: &[u8] = b"\0vos/v2/header";
 const DEDUP_STORAGE_PREFIX: &[u8] = b"\0vos/v2/dedup/";
 const RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/receipt/";
 const PUBLICATION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/publication/";
+const ROLE_ASSERTION_ELIGIBILITY_STORAGE_PREFIX: &[u8] = b"\0vos/v2/role-assertion/";
 const DELIVERY_STORAGE_PREFIX: &[u8] = b"\0vos/v2/delivery/";
 const INGRESS_STORAGE_PREFIX: &[u8] = b"\0vos/v2/ingress/";
 const REPLY_ADMISSION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/reply-admission/";
@@ -291,6 +292,17 @@ pub struct PublicationRecordV2 {
     pub published: PublishedEffectsV2,
 }
 
+/// Guest-owned proof that one exact transition produced only the atomic reply
+/// shape accepted as a platform role assertion. Unlike the publication row,
+/// this record survives acknowledgement so recovery cannot forget a
+/// suspension, artifact, proof, attestation, or other external side effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleAssertionEligibilityV2 {
+    pub input: WorkInputIdV2,
+    pub transition_commitment: Hash,
+    pub reply_commitment: Hash,
+}
+
 impl PublicationRecordV2 {
     pub fn commitment(&self) -> Hash {
         Hash::digest(b"vos/publication/v2", &[&self.encode()])
@@ -445,6 +457,29 @@ impl V2Wire for PublicationRecordV2 {
             || value.receipt.outbox_commitment
                 != super::MessageRecordV2::outbox_commitment(&value.published.outbox)
         {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+impl V2Wire for RoleAssertionEligibilityV2 {
+    const MAGIC: [u8; 4] = *b"VRE2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        encode_input(&mut e, self.input);
+        e.fixed(&self.transition_commitment.0);
+        e.fixed(&self.reply_commitment.0);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            input: decode_input(d)?,
+            transition_commitment: Hash(d.fixed()?),
+            reply_commitment: Hash(d.fixed()?),
+        };
+        if value.input.invocation == InvocationId::ZERO || value.input.workflow_step != 0 {
             return Err(DecodeError::NonCanonical);
         }
         Ok(value)
@@ -622,6 +657,10 @@ pub fn receipt_storage_key(input: WorkInputIdV2) -> Vec<u8> {
 
 pub fn publication_storage_key(input: WorkInputIdV2) -> Vec<u8> {
     input_storage_key(PUBLICATION_STORAGE_PREFIX, input)
+}
+
+pub fn role_assertion_eligibility_storage_key(input: WorkInputIdV2) -> Vec<u8> {
+    input_storage_key(ROLE_ASSERTION_ELIGIBILITY_STORAGE_PREFIX, input)
 }
 
 #[cfg(feature = "std")]
@@ -889,6 +928,7 @@ mod tests {
         let dedup = dedup_storage_key(input);
         let receipt = receipt_storage_key(input);
         let publication = publication_storage_key(input);
+        let role_assertion = role_assertion_eligibility_storage_key(input);
         let delivery = delivery_storage_key(CallId([4; 32]));
         let ingress = ingress_storage_key(input.invocation);
         let reply_admission = reply_admission_storage_key(CallId([4; 32]));
@@ -898,6 +938,8 @@ mod tests {
         assert_ne!(dedup, receipt);
         assert_ne!(dedup, publication);
         assert_ne!(receipt, publication);
+        assert_ne!(role_assertion, receipt);
+        assert_ne!(role_assertion, publication);
         assert_ne!(delivery, publication);
         assert_ne!(reply_admission, delivery);
         assert_ne!(reply_admission, publication);

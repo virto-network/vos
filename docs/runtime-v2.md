@@ -356,8 +356,16 @@ requires a finalized reply from that exact authority service and producer,
 binding the space, holder, role, audience service, invocation, complete
 authorization scope, target actor, method, and generated policy. A copied
 assertion cannot authorize another invocation or survive a package-only target
-upgrade. Receipt unavailability rejects the complete ingress or transition
-without staging writes. Private space-role credentials remain fail-closed on
+upgrade. An assertion authenticates only its space role: assertion-backed
+credentials carrying an actor-local role are rejected before Refine and again
+by guest Accumulate, so mixed policies require a separately authenticated
+actor role. Receipt unavailability rejects the complete ingress or transition
+without staging writes. Guest Accumulate also persists a transition-bound
+eligibility record only for the single-slice authority reply shape. That record
+survives publication acknowledgement and is required for recovery, so a reply
+with a continuation, outbox, exported artifact, proof, attestation, spawn, or
+other external effect cannot later become an assertion after its publication
+row disappears. Private space-role credentials remain fail-closed on
 authority-backed roots until the proof public inputs expose the authority
 assertion independently of the private witness bytes.
 

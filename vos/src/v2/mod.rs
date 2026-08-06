@@ -100,12 +100,13 @@ pub use state_tree::{
 };
 pub use storage::{
     ActorUpgradeRecordV2, DedupRecordV2, DeliveryRecordV2, IngressRecordV2, PendingCallDeadlineV2,
-    PublicationRecordV2, ReplyAdmissionRecordV2, SERVICE_STORE_SCHEMA_VERSION, StateKeyV2,
-    StoreHeaderV2, StoreOpenError, WorkflowCheckpointV2, actor_upgrade_storage_key,
-    call_expiration_storage_key, crdt_change_storage_key, crdt_node_receipt_storage_key,
-    crdt_node_storage_key, dedup_storage_key, delivery_storage_key, header_storage_key,
-    ingress_storage_key, pending_call_deadline_storage_key, publication_storage_key,
-    receipt_storage_key, reply_admission_storage_key,
+    PublicationRecordV2, ReplyAdmissionRecordV2, RoleAssertionEligibilityV2,
+    SERVICE_STORE_SCHEMA_VERSION, StateKeyV2, StoreHeaderV2, StoreOpenError, WorkflowCheckpointV2,
+    actor_upgrade_storage_key, call_expiration_storage_key, crdt_change_storage_key,
+    crdt_node_receipt_storage_key, crdt_node_storage_key, dedup_storage_key, delivery_storage_key,
+    header_storage_key, ingress_storage_key, pending_call_deadline_storage_key,
+    publication_storage_key, receipt_storage_key, reply_admission_storage_key,
+    role_assertion_eligibility_storage_key,
 };
 #[cfg(feature = "std")]
 pub use transport::{
@@ -115,7 +116,7 @@ pub use transport::{
 pub use wire::{DecodeError, V2Wire};
 
 /// Platform wire/ABI version carried by v2 work, transitions, and receipts.
-pub const ABI_VERSION: u16 = 4;
+pub const ABI_VERSION: u16 = 5;
 /// Portable continuation format version.
 pub const SNAPSHOT_VERSION: u16 = 6;
 /// Attestation statement version required by runtime v2.
@@ -126,8 +127,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0x69, 0xb5, 0xd9, 0x4e, 0x74, 0x53, 0x7e, 0x05, 0xa9, 0x59, 0x55, 0xc9, 0xa4, 0xb9, 0x64, 0x1c,
-    0x42, 0xd1, 0xac, 0x4c, 0xf0, 0x0a, 0x98, 0x96, 0xba, 0x11, 0x9d, 0x1b, 0xa4, 0xa8, 0xa5, 0xaa,
+    0x11, 0xf2, 0xbe, 0xfb, 0x0c, 0xb4, 0x70, 0x4e, 0xd1, 0x75, 0xa9, 0x39, 0x24, 0x2f, 0x6a, 0x17,
+    0x42, 0x74, 0x2f, 0x3b, 0x6e, 0xac, 0x73, 0xe1, 0x23, 0x37, 0x85, 0xf7, 0xa6, 0xbd, 0x7d, 0x9b,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.
