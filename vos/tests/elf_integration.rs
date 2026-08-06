@@ -1428,7 +1428,8 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
         from: agent_id,
         to: agent_id,
         payload: Vec::new(),
-        authenticated_peer: None,
+        authenticated_source_peer: None,
+        destination_peer: None,
     };
 
     // ── Second run: reuse the same data-dir. The agent_thread

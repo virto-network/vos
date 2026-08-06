@@ -3332,7 +3332,8 @@ mod tests {
                 from: ServiceId::new(prefix_a, 0xFFFF),
                 to: inspector_id,
                 payload: payload.clone(),
-                authenticated_peer: None,
+                authenticated_source_peer: None,
+                destination_peer: None,
             })
             .expect("outbox_a accepts envelope");
 

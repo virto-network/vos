@@ -73,6 +73,11 @@ record binds the `CallId`, accumulated reply, work input and work hash, so a
 lost transport acknowledgement remains an idempotent duplicate after another
 restart or a later workflow slice. The callee publication is acknowledged only
 after the caller commit succeeds.
+Node envelopes retain the authenticated source peer separately from the exact
+destination peer selected by the external directory. An explicit destination
+is routed before the lossy 16-bit local-prefix test, so a prefix collision can
+neither redirect remote traffic locally nor change who authenticated inbound
+delivery, reply, or acknowledgement bytes.
 When the original message requests an attestation, the drain path performs
 read-only preparation, proof production and proved guest Accumulate rather
 than submitting an ordinary Apply. The recoverable publication retains the

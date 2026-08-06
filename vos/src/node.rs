@@ -37,10 +37,13 @@ pub struct Envelope {
     pub from: ServiceId,
     pub to: ServiceId,
     pub payload: Vec<u8>,
-    /// Exact authenticated peer for canonical v2 root transport. Inbound
-    /// network frames retain their Noise identity here; outbound frames pin
-    /// the peer selected from the claimed actor's trusted directory entry.
-    pub authenticated_peer: Option<Vec<u8>>,
+    /// Exact Noise-authenticated source of an inbound canonical v2 frame.
+    /// Local and not-yet-networked envelopes carry `None`.
+    pub authenticated_source_peer: Option<Vec<u8>>,
+    /// Exact destination selected from a trusted external-actor binding.
+    /// This is directionally distinct from the authenticated source because
+    /// a compact route may collide with this node's own 16-bit prefix.
+    pub destination_peer: Option<Vec<u8>>,
 }
 
 /// Handle to a running agent thread.
@@ -2728,7 +2731,8 @@ impl VosNode {
                     from: ServiceId(tell.from),
                     to: ServiceId(tell.to),
                     payload: tell.payload,
-                    authenticated_peer: Some(tell.peer.to_bytes()),
+                    authenticated_source_peer: Some(tell.peer.to_bytes()),
+                    destination_peer: None,
                 };
                 if outbox_tx.send(env).is_err() {
                     break;
@@ -3741,6 +3745,43 @@ impl VosNode {
     fn route(&self, envelope: Envelope) {
         let target = envelope.to;
 
+        // Canonical v2 transport may deliberately target a remote PeerId
+        // whose derived 16-bit prefix collides with this node. An explicit
+        // trusted destination therefore wins over the lossy local-prefix
+        // classification. Inbound frames carry only `authenticated_source_peer`
+        // and continue through ordinary local delivery below.
+        if envelope.payload.starts_with(b"VRT2")
+            && let Some(_peer_bytes) = envelope.destination_peer.as_deref()
+        {
+            #[cfg(feature = "network")]
+            {
+                let Some(peer) = libp2p::PeerId::from_bytes(_peer_bytes).ok() else {
+                    warn!(%target, "node: v2 root envelope carried an invalid destination peer");
+                    return;
+                };
+                let bound = self.v2_actor_routes.read().ok().is_some_and(|routes| {
+                    routes.values().any(|route| {
+                        route.route == target.0
+                            && route.consistency == crate::v2::ConsistencyModeV2::Local
+                            && route.authenticated_peer.as_deref() == Some(_peer_bytes)
+                    })
+                });
+                if !bound {
+                    warn!(%target, %peer, "node: v2 root envelope peer is not bound to its route");
+                    return;
+                }
+                let net = self.shared_network.lock().ok().and_then(|g| g.clone());
+                if let Some(net) = net {
+                    net.send_tell(peer, envelope.from.0, envelope.to.0, envelope.payload);
+                } else {
+                    warn!(%target, %peer, "node: no network layer for exact v2 destination");
+                }
+            }
+            #[cfg(not(feature = "network"))]
+            warn!(%target, "node: no network support for exact v2 destination");
+            return;
+        }
+
         // Local delivery: prefix matches or target is unscoped (prefix 0)
         if target.is_on_node(self.node_prefix) || target.is_local() {
             if let Some(tx) = self.routes.get(&target.0) {
@@ -3761,26 +3802,7 @@ impl VosNode {
             let net = self.shared_network.lock().ok().and_then(|g| g.clone());
             if let Some(net) = net {
                 if envelope.payload.starts_with(b"VRT2") {
-                    let Some(peer_bytes) = envelope.authenticated_peer.as_deref() else {
-                        warn!(%target, "node: v2 root envelope omitted its exact destination peer");
-                        return;
-                    };
-                    let Some(peer) = libp2p::PeerId::from_bytes(peer_bytes).ok() else {
-                        warn!(%target, "node: v2 root envelope carried an invalid destination peer");
-                        return;
-                    };
-                    let bound = self.v2_actor_routes.read().ok().is_some_and(|routes| {
-                        routes.values().any(|route| {
-                            route.route == target.0
-                                && route.consistency == crate::v2::ConsistencyModeV2::Local
-                                && route.authenticated_peer.as_deref() == Some(peer_bytes)
-                        })
-                    });
-                    if !bound {
-                        warn!(%target, %peer, "node: v2 root envelope peer is not bound to its route");
-                        return;
-                    }
-                    net.send_tell(peer, envelope.from.0, envelope.to.0, envelope.payload);
+                    warn!(%target, "node: remote v2 envelope omitted its exact destination peer");
                     return;
                 }
                 let prefix = target.node_prefix();
@@ -4208,7 +4230,7 @@ fn handle_v2_root_transport<B>(
                 actor_routes,
                 message.from,
                 envelope.from,
-                envelope.authenticated_peer.as_deref(),
+                envelope.authenticated_source_peer.as_deref(),
             );
             if message.to != service.root_actor()
                 || message.to_service != *service.identity()
@@ -4249,7 +4271,8 @@ fn handle_v2_root_transport<B>(
                         from: id,
                         to: envelope.from,
                         payload: accepted.encode(),
-                        authenticated_peer: envelope.authenticated_peer.clone(),
+                        authenticated_source_peer: None,
+                        destination_peer: envelope.authenticated_source_peer.clone(),
                     });
                     run_v2_root_inbox(
                         id,
@@ -4277,7 +4300,7 @@ fn handle_v2_root_transport<B>(
                 actor_routes,
                 reply.producer,
                 envelope.from,
-                envelope.authenticated_peer.as_deref(),
+                envelope.authenticated_source_peer.as_deref(),
             );
             if producer
                 .as_ref()
@@ -4327,7 +4350,8 @@ fn handle_v2_root_transport<B>(
                 from: id,
                 to: envelope.from,
                 payload: accepted.encode(),
-                authenticated_peer: envelope.authenticated_peer.clone(),
+                authenticated_source_peer: None,
+                destination_peer: envelope.authenticated_source_peer.clone(),
             });
             if let Some(committed) = committed {
                 publish_v2_root_slice(id, service, committed, None, outbox, actor_routes, state);
@@ -4341,7 +4365,7 @@ fn handle_v2_root_transport<B>(
             id,
             service,
             envelope.from,
-            envelope.authenticated_peer.as_deref(),
+            envelope.authenticated_source_peer.as_deref(),
             input,
             publication,
             call,
@@ -4430,7 +4454,8 @@ fn queue_v2_root_publication<B>(
                 from: id,
                 to: ServiceId(route.route),
                 payload: transport.encode(),
-                authenticated_peer: route.authenticated_peer.clone(),
+                authenticated_source_peer: None,
+                destination_peer: route.authenticated_peer.clone(),
             });
         }
     } else if !publication.published.outbox.is_empty() {
@@ -4495,7 +4520,8 @@ fn queue_v2_root_publication<B>(
                         from: id,
                         to: ServiceId(route.route),
                         payload: transport.encode(),
-                        authenticated_peer: route.authenticated_peer.clone(),
+                        authenticated_source_peer: None,
+                        destination_peer: route.authenticated_peer.clone(),
                     });
                     // Sending a remote reply is not acceptance; only the
                     // destination's guest-commit acknowledgement retires it.
@@ -5455,7 +5481,8 @@ fn handle_invoke_request(
             from: from_id,
             to: target,
             payload: memo,
-            authenticated_peer: None,
+            authenticated_source_peer: None,
+            destination_peer: None,
         });
     }
 
@@ -5927,7 +5954,8 @@ fn dispatch_once(
             from: from_id,
             to: target,
             payload: memo,
-            authenticated_peer: None,
+            authenticated_source_peer: None,
+            destination_peer: None,
         });
     }
     Ok(())
@@ -6364,7 +6392,8 @@ fn extension_thread(
             from: id,
             to: envelope.from,
             payload: reply_bytes,
-            authenticated_peer: None,
+            authenticated_source_peer: None,
+            destination_peer: None,
         });
         persist(strategy.as_mut(), &instance, id);
     }
@@ -7920,7 +7949,8 @@ fn handle_effect(
                 from: extension_id,
                 to: ServiceId(target_id),
                 payload,
-                authenticated_peer: None,
+                authenticated_source_peer: None,
+                destination_peer: None,
             });
             wait_for_reply(inbox, target_id, deferred)
         }
@@ -9178,6 +9208,67 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "network")]
+    #[test]
+    fn v2_exact_destination_precedes_a_colliding_local_prefix() {
+        let remote_key = libp2p::identity::Keypair::generate_ed25519();
+        let remote_peer = libp2p::PeerId::from(remote_key.public());
+        let peer_bytes = remote_peer.to_bytes();
+        let colliding_prefix = crate::network::derive_node_prefix(&remote_peer);
+        let route = ServiceId::new(colliding_prefix, 7);
+        let actor = crate::v2::ActorId([0xD1; 32]);
+        let service = crate::v2::ServiceIdentityV2 {
+            space: crate::v2::SpaceId([4; 32]),
+            root_service: crate::v2::RootServiceId([5; 32]),
+            deployment: crate::v2::DeploymentId([6; 32]),
+            service_program: crate::v2::VOS_SERVICE_PROGRAM_ID,
+            service_abi: crate::v2::ABI_VERSION,
+            execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
+        };
+
+        let mut node = VosNode::with_prefix(colliding_prefix);
+        node.bind_v2_actor_route(
+            actor,
+            service,
+            crate::v2::ConsistencyModeV2::Local,
+            route,
+            peer_bytes.clone(),
+        )
+        .unwrap();
+        let (local_tx, local_rx) = mpsc::channel();
+        node.routes.insert(route.0, local_tx);
+
+        node.route(Envelope {
+            from: ServiceId::new(colliding_prefix, 8),
+            to: route,
+            payload: b"VRT2 collision regression".to_vec(),
+            authenticated_source_peer: None,
+            destination_peer: Some(peer_bytes.clone()),
+        });
+
+        assert!(
+            matches!(local_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "an exact remote destination must never fall through to the colliding local route"
+        );
+
+        node.route(Envelope {
+            from: route,
+            to: route,
+            payload: b"VRT2 inbound collision regression".to_vec(),
+            authenticated_source_peer: Some(peer_bytes.clone()),
+            destination_peer: None,
+        });
+        let inbound = local_rx
+            .try_recv()
+            .expect("an inbound authenticated source still reaches its local destination");
+        assert_eq!(
+            inbound.authenticated_source_peer,
+            Some(peer_bytes),
+            "local dispatch retains the exact source for actor-level authentication"
+        );
+        assert!(inbound.destination_peer.is_none());
+    }
+
     #[test]
     fn v2_ingress_uses_the_canonical_peer_subject_identity() {
         let peer = vec![0xaa, 0xbb, 0xcc];
@@ -9395,7 +9486,8 @@ mod tests {
                     from: ServiceId(0),
                     to: target,
                     payload,
-                    authenticated_peer: None,
+                    authenticated_source_peer: None,
+                    destination_peer: None,
                 })
                 .unwrap();
             }
@@ -9482,7 +9574,8 @@ mod tests {
                 from: ServiceId(0),
                 to: fetcher_id,
                 payload,
-                authenticated_peer: None,
+                authenticated_source_peer: None,
+                destination_peer: None,
             })
             .unwrap();
         }
@@ -9546,7 +9639,8 @@ mod tests {
                 from: ServiceId(0), // pretend it's from the registry
                 to: proxy_id,
                 payload,
-                authenticated_peer: None,
+                authenticated_source_peer: None,
+                destination_peer: None,
             })
             .unwrap();
         }
@@ -9623,7 +9717,8 @@ mod tests {
                 from: ServiceId(0),
                 to: id,
                 payload,
-                authenticated_peer: None,
+                authenticated_source_peer: None,
+                destination_peer: None,
             })
             .unwrap();
 
@@ -9722,7 +9817,8 @@ mod tests {
                 from: ServiceId(0),
                 to: id,
                 payload,
-                authenticated_peer: None,
+                authenticated_source_peer: None,
+                destination_peer: None,
             })
             .unwrap();
 
