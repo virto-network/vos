@@ -3506,10 +3506,10 @@ fn authorization_rejection<S: GuestAccumulateStoreV2>(
                 && *credential_commitment == credential.commitment();
             if !structurally_authorized {
                 false
-            } else if policy.space_role.is_some() && authority.is_some() {
+            } else if let (Some(_), Some(authority)) = (policy.space_role, authority) {
                 if let Some(rejection) = validate_pinned_role_assertion(
                     store,
-                    authority.expect("checked above"),
+                    authority,
                     &work.service,
                     work,
                     policy,
