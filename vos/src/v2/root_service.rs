@@ -646,8 +646,10 @@ pub struct LocalRootTreeServiceV2<B> {
     root_actor: ActorId,
     consistency: ConsistencyModeV2,
     genesis: ServiceGenesisV2,
-    install_programs: Vec<ImportedProgramV2>,
-    install_blobs: Vec<ImportedBlobV2>,
+    /// One-shot bytes needed only until genesis is present in the durable
+    /// service image. Followers retain them while waiting for the committed
+    /// Install entry; an installed or caught-up root drops them immediately.
+    pending_install_availability: Option<(Vec<ImportedProgramV2>, Vec<ImportedBlobV2>)>,
     expected_root: ActorGenesisV2,
     expected_external_actors: Vec<ExternalActorBindingV2>,
     expected_role_authority: Option<RoleAuthorityBindingV2>,
@@ -1057,8 +1059,7 @@ where
             root_actor: config.root_actor,
             consistency: config.consistency,
             genesis,
-            install_programs,
-            install_blobs,
+            pending_install_availability: Some((install_programs, install_blobs)),
             expected_root,
             expected_external_actors: config.external_actors,
             expected_role_authority: config.role_authority,
@@ -1253,6 +1254,19 @@ where
         self.ensure_installed()
     }
 
+    fn validate_installed_and_release_availability(
+        &mut self,
+    ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        let installed = self.validate_installed()?;
+        if installed {
+            // The committed store and snapshots now own these bytes. Dropping
+            // the sidecar avoids retaining another full actor PVM/genesis
+            // image for the lifetime of every root service.
+            self.pending_install_availability = None;
+        }
+        Ok(installed)
+    }
+
     /// Establish the current-term admission barrier and return the durable
     /// service high-water visible after applying through it. Node ingress must
     /// restore and allocate its trusted timeslot from this value, then call
@@ -1261,7 +1275,7 @@ where
         self.service
             .admission_barrier()
             .map_err(RootTreeDriverErrorV2::into_invoke)?;
-        if !self.validate_installed()? {
+        if !self.validate_installed_and_release_availability()? {
             if !self.service.is_writable() {
                 return Err(LocalRootTreeInvokeErrorV2::ServiceNotInstalled);
             }
@@ -1269,12 +1283,16 @@ where
             // first writable leader, is ordered after the same barrier and
             // before any actor admission slot exists. Use the no-catch-up path
             // so the ordering remains one contiguous critical sequence.
+            let (programs, blobs) = self
+                .pending_install_availability
+                .as_ref()
+                .ok_or(LocalRootTreeInvokeErrorV2::ServiceNotInstalled)?;
             let result = self
                 .service
                 .accumulate_with_availability_after_barrier(
                     &AccumulateRequestV2::Install(self.genesis.clone()),
-                    &self.install_programs,
-                    &self.install_blobs,
+                    programs,
+                    blobs,
                 )
                 .map_err(RootTreeDriverErrorV2::into_invoke)?;
             match result.result {
@@ -1284,10 +1302,11 @@ where
                 }
                 _ => return Err(LocalRootTreeInvokeErrorV2::UnexpectedResult),
             }
-            if !self.validate_installed()? {
+            if !self.validate_installed_and_release_availability()? {
                 return Err(LocalRootTreeInvokeErrorV2::ServiceNotInstalled);
             }
         }
+        debug_assert!(self.pending_install_availability.is_none());
         self.service
             .accumulate_host()
             .header()
@@ -1308,18 +1327,23 @@ where
         self.service
             .catch_up()
             .map_err(RootTreeDriverErrorV2::into_invoke)?;
-        if self.validate_installed()? {
+        if self.validate_installed_and_release_availability()? {
+            debug_assert!(self.pending_install_availability.is_none());
             return Ok(true);
         }
         if !self.service.is_writable() {
             return Ok(false);
         }
+        let (programs, blobs) = self
+            .pending_install_availability
+            .as_ref()
+            .ok_or(LocalRootTreeInvokeErrorV2::ServiceNotInstalled)?;
         let result = self
             .service
             .accumulate_with_availability(
                 &AccumulateRequestV2::Install(self.genesis.clone()),
-                &self.install_programs,
-                &self.install_blobs,
+                programs,
+                blobs,
             )
             .map_err(RootTreeDriverErrorV2::into_invoke)?;
         match result.result {
@@ -1329,7 +1353,8 @@ where
             }
             _ => return Err(LocalRootTreeInvokeErrorV2::UnexpectedResult),
         }
-        if self.validate_installed()? {
+        if self.validate_installed_and_release_availability()? {
+            debug_assert!(self.pending_install_availability.is_none());
             Ok(true)
         } else {
             Err(LocalRootTreeInvokeErrorV2::ServiceNotInstalled)
