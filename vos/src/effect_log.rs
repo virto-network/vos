@@ -423,6 +423,13 @@ impl EffectMode {
         matches!(self, EffectMode::Replaying(_))
     }
 
+    /// Whether this call tree belongs to a dispatch whose result would be
+    /// replicated. Reply recording/replay remains depth-scoped, but privacy
+    /// policy applies to every nested child in the tree.
+    pub(crate) fn has_replication_context(&self) -> bool {
+        !matches!(self, EffectMode::Inactive)
+    }
+
     /// Mark the whole dispatch as uncommittable because it attempted to
     /// capture a producer-private proving witness under a replicated mode.
     /// This bit is deliberately host-local: serializing it would put the

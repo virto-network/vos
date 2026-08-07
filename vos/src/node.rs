@@ -12783,7 +12783,7 @@ mod tests {
     /// rejection is therefore a dispatch-level abort, not merely a PANICKED
     /// child reply that the parent can catch and commit around.
     #[test]
-    fn replicated_provable_dispatch_never_calls_the_commit_strategy() {
+    fn nested_provable_queue_never_calls_the_parent_commit_strategy() {
         use crate::actors::codec::Encode;
         use crate::value::{Msg, TAG_DYNAMIC};
         use std::sync::mpsc;
@@ -12801,17 +12801,22 @@ mod tests {
         let mut runtime = VosRuntime::new();
         let blob_idx = runtime.register_service_blob(blob);
         let scheduler = runtime.register_service(blob_idx);
+        let child = runtime.register_service(blob_idx);
         let args = crate::init::InitArgs::new()
             .with("children", crate::init::InitValue::ListU32(Vec::new()));
         let encoded = crate::rkyv::to_bytes::<crate::rkyv::rancor::Error>(&args).unwrap();
         runtime
             .storage
             .write(scheduler, crate::lifecycle::INIT_KEY, &encoded);
+        runtime
+            .storage
+            .write(child, crate::lifecycle::INIT_KEY, &encoded);
 
         let no_keys = crate::rkyv::to_bytes::<crate::rkyv::rancor::Error>(&Vec::<Vec<u8>>::new())
             .unwrap()
             .to_vec();
-        let encoded_msg = Msg::new("queue_provable_task")
+        let encoded_msg = Msg::new("queue_provable_via_peer")
+            .with("actor_id", child.0)
             .with("code_hash", vec![0x42u8; 32])
             .with("task_msg", vec![TAG_DYNAMIC, 0xAA])
             .with("row_keys", no_keys)
@@ -12858,6 +12863,13 @@ mod tests {
                 .read(scheduler, crate::lifecycle::STATE_KEY_BYTES),
             None,
             "the parent state initialized during the rejected dispatch must roll back"
+        );
+        assert_eq!(
+            runtime
+                .storage
+                .read(child, crate::lifecycle::STATE_KEY_BYTES),
+            None,
+            "the nested child's queued TaskRecord must never reach storage"
         );
         assert!(rx.try_recv().is_err(), "no transfer may escape rejection");
     }

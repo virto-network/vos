@@ -1698,9 +1698,7 @@ fn handle_refine_hostcall(
             (now, 0)
         }
         hostcall::PROVABLE_RECORD_INTENT => {
-            if matches!(mode, crate::effect_log::EffectMode::Inactive) {
-                (error::HOST_OK, 0)
-            } else {
+            if mode.has_replication_context() {
                 // The actor has not serialized the secret TaskRecord yet.
                 // Reject the complete top-level dispatch so neither its
                 // incoming message nor any surrounding parent effects enter
@@ -1708,6 +1706,8 @@ fn handle_refine_hostcall(
                 mode.reject_private_record();
                 journal.private_record_rejected = true;
                 (error::HOST_NONE, 0)
+            } else {
+                (error::HOST_OK, 0)
             }
         }
         crate::crypto::ECALL_BLAKE2B_COMPRESS => {
@@ -2237,7 +2237,7 @@ fn handle_invoke(
     // Reject before execution in either mode so neither the witness nor a
     // ProofRecordEntry can enter InvokeEffects. Local/Inactive parents keep
     // the durable record in their own committed keyspace.
-    if record_requested && !matches!(mode, crate::effect_log::EffectMode::Inactive) {
+    if record_requested && mode.has_replication_context() {
         mode.reject_private_record();
         journal.private_record_rejected = true;
         return record_and_write_invoke(
@@ -2594,10 +2594,14 @@ fn handle_invoke(
                 );
             }
             KernelResult::ProtocolCall { slot } => {
-                // Nested invokes by the child actor are not part
-                // of the caller's recording/replay session. Feed
-                // them an Inactive mode so they run normally.
-                let mut child_mode = crate::effect_log::EffectMode::Inactive;
+                // Nested replies are not entries in the outer EffectLog —
+                // `record_and_write_invoke` and the replay cursor already
+                // enforce that with their depth == 1 gates. The replication
+                // privacy context is different: it must flow through the
+                // whole inline call tree, otherwise a local child can queue a
+                // secret TaskRecord and return those bytes inside the outer
+                // recorded reply. Preserve the outer mode here; only reply
+                // recording/replay is depth-scoped.
                 handle_refine_hostcall(
                     &mut child,
                     slot as u32,
@@ -2614,7 +2618,7 @@ fn handle_invoke(
                     depth,
                     next_id,
                     external_invoke,
-                    &mut child_mode,
+                    mode,
                 );
             }
         }

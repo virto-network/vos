@@ -121,6 +121,30 @@ impl Agent {
             .spawn_raw_provable_with_rows(code_hash, task_msg, keys, tag)
     }
 
+    /// Ask a local child service to queue provable work. This is the nested
+    /// privacy boundary: when this scheduler is replicated, the child's
+    /// queue-time intent must reject the outer dispatch even though nested
+    /// replies themselves are not separate EffectLog observations.
+    #[msg]
+    async fn queue_provable_via_peer(
+        &mut self,
+        actor_id: u32,
+        code_hash: [u8; 32],
+        task_msg: Vec<u8>,
+        row_keys: Vec<u8>,
+        tag: [u8; 32],
+        ctx: &mut Context<Self>,
+    ) -> u64 {
+        let request = Msg::new("queue_provable_task")
+            .with("code_hash", code_hash.to_vec())
+            .with("task_msg", task_msg)
+            .with("row_keys", row_keys)
+            .with("tag", tag.to_vec());
+        let id = self.tasks.spawn(Child::Peer(actor_id), &request);
+        self.drive_round(ctx);
+        id
+    }
+
     /// Export the captured proof record under `tag` — the raw
     /// `ProofRecordEntry` bytes from this agent's own
     /// `__vos_proofrec/<tag>` row (empty when no record exists). The
