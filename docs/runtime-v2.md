@@ -439,9 +439,11 @@ conformance allowlist. That authority must bind the executing JAM service
 account and its current code identity to the exact signature-verified package
 and derived genesis, not trust the genesis's self-declared identity.
 `ROLE_CREDENTIAL_VERIFY` must use the consensus-authoritative role issuer
-rather than its local conformance allowlist. `PROGRAM_LOOKUP` availability
-must be pinned to or imported from consensus-visible state rather than a
-node-local cache. `RECEIPT_VERIFY` must likewise use
+rather than its local conformance allowlist. Installed `PROGRAM_LOOKUP`
+availability is already part of the recoverable service image: Install and
+Upgrade order the exact content-addressed program/genesis bytes and stage them
+atomically with IC-5, while snapshots carry the resulting catalog.
+`RECEIPT_VERIFY` must likewise use
 consensus-authoritative receipt finality rather than its local conformance
 allowlist, and every delivery, deadline, and expiration observation must come
 from the JAM slot. `PROOF_VERIFY`
@@ -541,17 +543,22 @@ nested stack; guest Accumulate rejects a partial lock or unlock. Suspended
 actors are non-reentrant, including children whose caller remains suspended,
 and later messages remain queued.
 
-Raft orders canonical `AccumulateRequestV2` bytes together with the
-consensus-observed JAM slot for a time-dependent `ExpireCall`. The slot is
-part of the committed entry, so leader execution, follower catch-up, restart,
-and failover inject the identical IC-5 ambient input; a slotless replicated
-expiration is rejected before proposal. An `Apply` request carries
-the `AccumulationEnvelopeV2::provided_blobs` needed by that transition, while
-`Install` carries actor programs and initial state by content identity only.
-A joining replica therefore obtains installation artifacts from an
-authenticated pre-provisioning channel or an exact service snapshot; log-only
-cluster join is not supported. Raft does not replicate an `EffectLog` or a
-leader-produced post-state image. `ReplicatedJamServiceV2` waits for the
+Raft orders canonical `AccumulateRequestV2` bytes together with a canonical
+availability sidecar and the consensus-observed JAM slot for a time-dependent
+`ExpireCall`. The slot is part of the committed entry, so leader execution,
+follower catch-up, restart, and failover inject the identical IC-5 ambient
+input; a slotless replicated expiration is rejected before proposal. An
+`Apply` request carries the `AccumulationEnvelopeV2::provided_blobs` needed by
+that transition. `Install` and `UpgradeActor` additionally carry exactly the
+program and genesis-blob bytes named by their content identities. Those bytes
+are inserted only into the request's cloned Accumulate transaction: rejection
+leaves no availability trace, acceptance makes them part of the durable
+service image, and a follower with an empty node-local cache can replay the log
+tail. Snapshot catch-up carries the same installed program/blob catalog.
+The replicated payload uses the clean-break `VRQ3` wire; retired payloads fail
+loud rather than being interpreted without their availability sidecar. Raft
+does not replicate an `EffectLog` or a leader-produced post-state image.
+`ReplicatedJamServiceV2` waits for the
 request's log position to commit, then applies it through the physical
 service-PVM Accumulate entry before advancing the replica's applied cursor.
 For a proved Apply, durable proof-CAS hydration is a retryable local
