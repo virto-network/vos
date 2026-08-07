@@ -7,8 +7,9 @@ edition = "2024"
 
 
 [features]
-default = ["wasm"]
+default = ["wasm", "bin"]
 wasm = ["vos/wasm"]
+bin = []
 
 [lints.rust.unexpected_cfgs]
 level = "allow"

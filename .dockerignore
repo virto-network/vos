@@ -27,7 +27,6 @@ target/
 
 # ── Test fixtures we don't need at build time ──────────────────
 examples/data/
-examples/wasm/*/target/
 zkpvm/STWO_MERKLE_LIFTED_OOB_ISSUE_DRAFT.md
 
 # ── Existing container outputs ─────────────────────────────────

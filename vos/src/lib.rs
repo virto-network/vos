@@ -1050,6 +1050,49 @@ macro_rules! __vos_emit_wasm_glue {
                 core::mem::forget(out);
                 pack_buf(ptr as u32, len as u32)
             }
+
+            /// Encode an ArgsDesc into rkyv-encoded `Args` bytes, ready
+            /// to pass to `vos_wasm_create` as init args.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_wasm_encode_args(desc_ptr: u32, desc_len: u32) -> u64 {
+                if desc_ptr == 0 || desc_len == 0 {
+                    return 0;
+                }
+                let desc = unsafe {
+                    core::slice::from_raw_parts(desc_ptr as *const u8, desc_len as usize)
+                };
+                let Some(args) = $crate::value::desc::decode_args(desc) else {
+                    return 0;
+                };
+                use $crate::Encode;
+                let mut encoded = args.encode();
+                encoded.shrink_to_fit();
+                let len = encoded.len();
+                let ptr = encoded.as_mut_ptr();
+                core::mem::forget(encoded);
+                pack_buf(ptr as u32, len as u32)
+            }
+
+            /// Decode a checked rkyv `Value` into the JS-friendly ValueDesc format.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn vos_wasm_decode_value(value_ptr: u32, value_len: u32) -> u64 {
+                if value_ptr == 0 || value_len == 0 {
+                    return 0;
+                }
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(value_ptr as *const u8, value_len as usize)
+                };
+                let Some(value) = <$crate::value::Value as $crate::Decode>::try_decode(bytes)
+                else {
+                    return 0;
+                };
+                let mut out = $crate::value::desc::encode_value(&value);
+                out.shrink_to_fit();
+                let len = out.len();
+                let ptr = out.as_mut_ptr();
+                core::mem::forget(out);
+                pack_buf(ptr as u32, len as u32)
+            }
         }
     };
 }

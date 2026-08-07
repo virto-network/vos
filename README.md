@@ -21,7 +21,8 @@ the user's critical path.
 | [`actors/`](actors/) | Built-in PVM actors bundled into `vosx` (e.g. `space-registry`) |
 | [`extensions/`](extensions/) | Native extension plugins loaded by the runtime (e.g. `http-gateway`) |
 | [`zkpvm/`](zkpvm/) | ZK proving for PVM bytecode via Stwo |
-| [`examples/`](examples/) | Four v2 actor examples plus extension and WASM API samples |
+| [`examples/`](examples/) | Four canonical v2 actor examples |
+| [`tests/fixtures/`](tests/fixtures/) | Test-only legacy, extension, WASM, and proving workloads |
 | [`tests/acceptance/clerk/`](tests/acceptance/clerk/) | Complex replicated-payment acceptance application |
 | [`docs/`](docs/) | The VOS Book (architecture, protocols, applications) |
 
