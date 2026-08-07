@@ -198,7 +198,7 @@ impl Tasks {
         self.push(child, msg, row_keys, None)
     }
 
-    /// Queue a provable child: driven with a record tag so the host
+    /// Queue a provable Task hash: driven with a record tag so the host
     /// captures a durable proof record (`__vos_proofrec/<tag>`) of the
     /// transition into THIS parent's keyspace. The tag is a
     /// caller-chosen business id (e.g. a transfer id) that keys the
@@ -206,7 +206,7 @@ impl Tasks {
     /// [`spawn`](Self::spawn).
     pub fn spawn_provable(
         &mut self,
-        child: Child,
+        task_hash: [u8; 32],
         msg: &super::value::Msg,
         tag: [u8; 32],
     ) -> TaskId {
@@ -214,20 +214,22 @@ impl Tasks {
         let mut payload = Vec::with_capacity(1 + encoded.len());
         payload.push(super::value::TAG_DYNAMIC);
         payload.extend_from_slice(&encoded);
-        self.push(child, payload, Vec::new(), Some(tag))
+        self.push(Child::Task(task_hash), payload, Vec::new(), Some(tag))
     }
 
     /// [`spawn_provable`](Self::spawn_provable) with pre-encoded message
     /// bytes and named witnessed-row keys — the provable counterpart of
-    /// [`spawn_raw_with_rows`](Self::spawn_raw_with_rows).
+    /// [`spawn_raw_with_rows`](Self::spawn_raw_with_rows). Provable peers are
+    /// intentionally unrepresentable: only content-addressed Tasks use the
+    /// witness-delivered record wire.
     pub fn spawn_raw_provable_with_rows(
         &mut self,
-        child: Child,
+        task_hash: [u8; 32],
         msg: Vec<u8>,
         row_keys: Vec<Vec<u8>>,
         tag: [u8; 32],
     ) -> TaskId {
-        self.push(child, msg, row_keys, Some(tag))
+        self.push(Child::Task(task_hash), msg, row_keys, Some(tag))
     }
 
     fn push(
@@ -364,5 +366,15 @@ mod tests {
         assert_eq!(back, tasks);
         assert_eq!(back.status(id), Some(TaskStatus::Yielded));
         assert_eq!(back.get(id).unwrap().state, b"mid-state");
+    }
+
+    #[test]
+    fn provable_spawns_are_task_typed() {
+        let mut tasks = Tasks::new();
+        let hash = [0xA5; 32];
+        let id =
+            tasks.spawn_raw_provable_with_rows(hash, b"prove".to_vec(), Vec::new(), [0x5A; 32]);
+        assert_eq!(tasks.get(id).unwrap().child, Child::Task(hash));
+        assert!(tasks.get(id).unwrap().record_tag.is_some());
     }
 }

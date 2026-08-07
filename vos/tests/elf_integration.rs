@@ -11827,9 +11827,8 @@ fn task_storage_reads_come_from_the_witness() {
 /// split `(ProvableInput, ProvableRecord)` under `__vos_proofrec/<tag>`
 /// in the parent's COMMITTED keyspace. The record's bound io-hash
 /// (φ[9..12]) re-traces from its own stored witness bytes, and the row is
-/// ordinary committed parent state — so it survives restart and CRDT
-/// replay (the property A10 makes non-optional: replay short-circuits the
-/// child, so a record can't "regenerate" and must be persisted).
+/// ordinary committed Local parent state, while replicated parents reject
+/// capture before the secret witness can enter their effect log.
 #[test]
 fn provable_task_captures_a_durable_re_traceable_record() {
     use vos::provable::{ProofRecordEntry, proofrec_key};
@@ -11933,6 +11932,160 @@ fn provable_task_captures_a_durable_re_traceable_record() {
         entry.record.io_hash,
         vos::zk::compute_io_hash(&[], &[]),
         "the io-hash must commit to the transition, not the empty placeholder"
+    );
+}
+
+/// Provable input is the complete proving secret. CRDT and Raft both enter
+/// the runtime through EffectMode::Recording, and even the incoming parent
+/// message in that EffectLog contains the Task witness. The complete dispatch
+/// must therefore roll back and be marked uncommittable, not merely omit its
+/// ProofRecordEntry invoke effect.
+#[test]
+fn provable_capture_rejects_the_complete_replicated_dispatch() {
+    use vos::provable::proofrec_key;
+    use vos::value::Msg;
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let sched_path = format!(
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let sched_elf = match std::fs::read(&sched_path) {
+        Ok(data) => data,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+    let tally_elf = example_elf("tally");
+    let (witness_addr, witness_cap) =
+        vos::zk::witness_symbol(&tally_elf).expect("tally exports a Task witness buffer");
+    let tally_blob = transpile_actor(&tally_elf);
+
+    let mut rt = VosRuntime::new();
+    let sched_id = register_svc(&mut rt, transpile_actor(&sched_elf));
+    let args = vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(vec![]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage
+        .write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
+    let task_hash = rt.register_task_blob(tally_blob, witness_addr as u32, witness_cap as u32);
+
+    let tag = [0xE1; 32];
+    let no_keys = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&Vec::<Vec<u8>>::new())
+        .unwrap()
+        .to_vec();
+    let request = Msg::new("run_provable_task")
+        .with("code_hash", task_hash.to_vec())
+        .with(
+            "task_msg",
+            task_gate_dyn_msg(&Msg::new("add").with("n", 5u64)),
+        )
+        .with("row_keys", no_keys)
+        .with("tag", tag.to_vec());
+    let dispatch = task_gate_dyn_msg(&request);
+    let state_before = rt
+        .storage
+        .read(sched_id, vos::lifecycle::STATE_KEY_BYTES)
+        .map(<[u8]>::to_vec);
+    rt.begin_recording(dispatch.clone());
+    rt.send_to(sched_id, dispatch.clone());
+    rt.run_blocking();
+    assert!(
+        rt.private_record_rejected(),
+        "the node must be told to discard this complete recording"
+    );
+    assert_eq!(
+        rt.take_last_reply(sched_id),
+        None,
+        "a rejected dispatch must not surface a successful parent reply"
+    );
+    let log = rt.finish_recording().expect("recording session");
+
+    assert!(
+        log.invoke_effects.is_empty(),
+        "a rejected provable invoke must put no secret-bearing effect in the replicated log"
+    );
+    assert_eq!(
+        rt.storage
+            .read(sched_id, vos::lifecycle::STATE_KEY_BYTES)
+            .map(<[u8]>::to_vec),
+        state_before,
+        "the parent's Task bookkeeping and state must roll back with the rejected dispatch"
+    );
+    assert_eq!(
+        rt.storage.read(sched_id, &proofrec_key(&tag)),
+        None,
+        "replicated parents must not commit a proof-record row"
+    );
+    assert!(
+        log.msg.windows(tag.len()).any(|window| window == tag),
+        "the ordinary incoming log really does contain private request material; the host must discard it whole"
+    );
+
+    // Defense in depth for hostile/legacy history: if such a log is ever
+    // presented for replay, it must fail the replay-completeness gate rather
+    // than materialize a PANICKED Task record as valid replicated history.
+    rt.begin_replay(log);
+    rt.send_to(sched_id, dispatch);
+    rt.run_blocking();
+    let replay = rt.finish_replay().expect("replay session");
+    assert!(
+        !replay.is_complete(),
+        "a private-record dispatch can never be valid replicated history"
+    );
+}
+
+/// Defense in depth for raw guests: the record bit cannot be paired with a
+/// ServiceId-shaped code hash and reinterpreted by the peer invoke path.
+#[test]
+fn provable_record_flag_never_reaches_a_peer_invoke() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use vos::value::Msg;
+
+    let workspace = env!("CARGO_MANIFEST_DIR");
+    let sched_path = format!(
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        workspace
+    );
+    let sched_elf = match std::fs::read(&sched_path) {
+        Ok(data) => data,
+        Err(_) => {
+            eprintln!("SKIP: scheduler agent not built");
+            return;
+        }
+    };
+    let mut rt = VosRuntime::new();
+    let sched_id = register_svc(&mut rt, transpile_actor(&sched_elf));
+    let args = vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(vec![]));
+    let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
+    rt.storage
+        .write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let called = Arc::clone(&calls);
+    rt.set_external_invoke(Box::new(move |_, _| {
+        called.fetch_add(1, Ordering::SeqCst);
+        Some(vos::runtime::ExternalInvokeReply::done(b"peer".to_vec()))
+    }));
+    let service_hash = vos::actors::run::service_code_hash(0x1122_3344);
+    let request = Msg::new("run_provable_task")
+        .with("code_hash", service_hash.to_vec())
+        .with("task_msg", task_gate_dyn_msg(&Msg::new("anything")))
+        .with("row_keys", Vec::<u8>::new())
+        .with("tag", vec![0x77u8; 32]);
+    let id = task_gate_ask(&mut rt, sched_id, &request)
+        .as_u64()
+        .expect("scheduler returns the rejected Task id");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the external peer path must not observe a record-flagged invoke"
+    );
+    let status = task_gate_ask(&mut rt, sched_id, &Msg::new("task_status").with("id", id));
+    assert_eq!(
+        status.as_u32(),
+        Some(vos::agent::TaskStatus::Panicked as u32)
     );
 }
 

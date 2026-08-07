@@ -6211,6 +6211,22 @@ fn handle_invoke_request(
     // the retry never comes, orphan them.
     let external = drive_capturing_external(runtime, svc_id);
 
+    // A producer-private proof-record request under CRDT/Raft rejects the
+    // entire dispatch. The runtime has rolled back its journal; discard the
+    // recording too because its incoming message may itself contain the
+    // witness. Committing even an otherwise-empty log would disclose it to
+    // replicas.
+    if recording_enabled && runtime.private_record_rejected() {
+        let _ = runtime.take_dispatch_delta(svc_id);
+        let _ = runtime.take_dispatch_anchor(svc_id);
+        let _ = runtime.finish_recording().expect("recording was started");
+        let _ = runtime.take_last_reply(svc_id);
+        let _ = runtime.take_last_status(svc_id);
+        drop(external);
+        drop(req.reply);
+        return Ok(());
+    }
+
     // Persist before replying. If the commit fails, we drop the reply so
     // the caller sees `Unreachable` and can retry against the new leader.
     // Doing it in this order means the client only sees success when the
@@ -6707,6 +6723,19 @@ fn dispatch_once(
     // the next tick discards them; route them only after the commit
     // succeeds so a failed commit (e.g. Raft `NotLeader`) leaks nothing.
     let external = drive_capturing_external(runtime, svc_id);
+
+    // See `handle_invoke_request`: the secret may be present in the incoming
+    // message even though the runtime emitted no ProofRecordEntry, so no log
+    // from this rejected dispatch may reach the commit strategy.
+    if recorded && runtime.private_record_rejected() {
+        let _ = runtime.take_dispatch_delta(svc_id);
+        let _ = runtime.take_dispatch_anchor(svc_id);
+        let _ = runtime.finish_recording().expect("recording was started");
+        let _ = runtime.take_last_reply(svc_id);
+        let _ = runtime.take_last_status(svc_id);
+        drop(external);
+        return Ok(());
+    }
 
     // See handle_invoke_request — the dispatch's whole-agent delta,
     // taken unconditionally so stale entries never leak across
@@ -12747,5 +12776,89 @@ mod tests {
             rx.try_recv().is_err(),
             "exactly one transfer routed — the failed attempt left nothing to duplicate"
         );
+    }
+
+    /// Producer-private provable inputs must never reach a CRDT/Raft commit,
+    /// including through the ordinary incoming EffectLog message. The runtime
+    /// rejection is therefore a dispatch-level abort, not merely a PANICKED
+    /// child reply that the parent can catch and commit around.
+    #[test]
+    fn replicated_provable_dispatch_never_calls_the_commit_strategy() {
+        use crate::actors::codec::Encode;
+        use crate::value::{Msg, TAG_DYNAMIC};
+        use std::sync::mpsc;
+
+        let workspace = env!("CARGO_MANIFEST_DIR");
+        let elf_path = format!(
+            "{workspace}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf"
+        );
+        let Ok(elf) = std::fs::read(&elf_path) else {
+            eprintln!("SKIP: scheduler ELF not built — run: cargo +nightly actor");
+            return;
+        };
+        let blob = grey_transpiler::link_elf(&elf).expect("scheduler transpiles");
+
+        let mut runtime = VosRuntime::new();
+        let blob_idx = runtime.register_service_blob(blob);
+        let scheduler = runtime.register_service(blob_idx);
+        let args = crate::init::InitArgs::new()
+            .with("children", crate::init::InitValue::ListU32(Vec::new()));
+        let encoded = crate::rkyv::to_bytes::<crate::rkyv::rancor::Error>(&args).unwrap();
+        runtime
+            .storage
+            .write(scheduler, crate::lifecycle::INIT_KEY, &encoded);
+
+        let no_keys = crate::rkyv::to_bytes::<crate::rkyv::rancor::Error>(&Vec::<Vec<u8>>::new())
+            .unwrap()
+            .to_vec();
+        let encoded_msg = Msg::new("run_provable_task")
+            .with("code_hash", vec![0x42u8; 32])
+            .with("task_msg", vec![TAG_DYNAMIC, 0xAA])
+            .with("row_keys", no_keys)
+            .with("tag", vec![0xE1u8; 32])
+            .encode();
+        let mut msg = vec![TAG_DYNAMIC];
+        msg.extend_from_slice(&encoded_msg);
+
+        #[derive(Default)]
+        struct CountCommit(usize);
+        impl crate::commit::CommitStrategy for CountCommit {
+            fn restore(&mut self) -> Option<Vec<u8>> {
+                None
+            }
+
+            fn commit(
+                &mut self,
+                _delta: &crate::commit::AgentDelta<'_>,
+            ) -> Result<crate::commit::CommitReceipt, crate::commit::CommitError> {
+                self.0 += 1;
+                Ok(crate::commit::CommitReceipt {
+                    node_appended: true,
+                })
+            }
+        }
+
+        let (tx, rx) = mpsc::channel::<Envelope>();
+        let mut commits = CountCommit::default();
+        dispatch_once(
+            &mut runtime,
+            scheduler,
+            &tx,
+            scheduler,
+            Some(msg),
+            &mut commits,
+            true,
+        )
+        .expect("privacy refusal is a clean dispatch rejection");
+
+        assert_eq!(commits.0, 0, "no secret-bearing log may be committed");
+        assert_eq!(
+            runtime
+                .storage
+                .read(scheduler, crate::lifecycle::STATE_KEY_BYTES),
+            None,
+            "the parent state initialized during the rejected dispatch must roll back"
+        );
+        assert!(rx.try_recv().is_err(), "no transfer may escape rejection");
     }
 }

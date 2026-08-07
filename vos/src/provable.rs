@@ -14,9 +14,11 @@
 //!   (φ[9..12]). It carries no witnessed leaf values.
 //!
 //! Both are stored together as a [`ProofRecordEntry`] under the reserved
-//! `__vos_proofrec/<tag>` row, so they ride the parent's ordinary commit —
-//! surviving restart and CRDT/Raft replay (A10 short-circuits the child on
-//! replay, so a record could not "regenerate"; it must be persisted state).
+//! `__vos_proofrec/<tag>` row, so they ride a **Local** parent's ordinary
+//! durable commit. Record capture fails closed while a CRDT/Raft recording or
+//! replay session is active: effect logs are replicated, but the exact witness
+//! must never enter them. Replicated producer-local record sidecars remain
+//! explicitly outside W2/W3.
 //! The app prunes a record once its proof is published (a
 //! `Delete{__vos_proofrec/<tag>}` effect).
 //!

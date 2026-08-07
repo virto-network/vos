@@ -286,6 +286,12 @@ struct RefineJournal {
     /// Service creation requests: (code_hash, assigned_service_id).
     /// Committed after refine by registering the blob+service.
     new_services: Vec<([u8; 32], u32)>,
+    /// A nested invoke attempted producer-private proof-record capture while
+    /// this dispatch was being recorded/replayed. The entire top-level
+    /// dispatch must roll back: its incoming EffectLog message and ordinary
+    /// parent effects may contain the same witness even when no
+    /// `ProofRecordEntry` was emitted.
+    private_record_rejected: bool,
 }
 
 impl RefineJournal {
@@ -841,6 +847,14 @@ impl<D: DataLayer> VosRuntime<D> {
         self.effect_mode.is_replaying()
     }
 
+    /// Whether the active recording/replay dispatch tried to capture a
+    /// producer-private proving witness. Hosts must discard the whole
+    /// recording rather than commit even its ordinary message/effects.
+    #[doc(hidden)]
+    pub fn private_record_rejected(&self) -> bool {
+        self.effect_mode.private_record_rejected()
+    }
+
     pub fn register_blob(&mut self, blob: Vec<u8>) -> usize {
         let idx = self.blobs.len();
         self.blob_by_hash.insert(blob_hash(&blob), idx);
@@ -1017,6 +1031,7 @@ impl<D: DataLayer> VosRuntime<D> {
 
             did_work = true;
             let mut journal = RefineJournal::default();
+            let tick_mark = journal.mark();
 
             // A durable continuation is consumed only by the first slice.
             // Completed handlers processing later self-messages cold-start
@@ -1120,6 +1135,21 @@ impl<D: DataLayer> VosRuntime<D> {
                     } => (Some(output), continuation),
                     RefineKernelExit::Failed => (None, None),
                 };
+
+                // A provable Task witness is producer-private. Returning a
+                // child PANICKED marker is not enough under CRDT/Raft: the
+                // parent may catch it and its ordinary EffectLog message or
+                // Task bookkeeping can still contain the witness. Reject the
+                // complete top-level tick before absorbing its work-result,
+                // and leave the host-visible rejection bit set so the node
+                // discards the recording instead of committing an empty log.
+                if journal.private_record_rejected {
+                    journal.rollback_to(tick_mark);
+                    self.last_reply.remove(&svc_id);
+                    self.last_status.remove(&svc_id);
+                    *panics += 1;
+                    break;
+                }
 
                 // Verify + absorb the guest's work-result (if any) into
                 // the journal. This covers the actor framework's
@@ -1838,6 +1868,19 @@ fn split_invoke_input(input: &[u8]) -> (&[u8], alloc::vec::Vec<&[u8]>, Option<[u
     (state, row_keys, tag, rest)
 }
 
+/// Does this invoke request provable-record capture?
+///
+/// Kept separate from [`split_invoke_input`] so the host can reject the
+/// privacy-sensitive mode before replay short-circuits the child or a
+/// non-Task service interprets the flagged length as ordinary state.
+fn invoke_input_requests_record(input: &[u8]) -> bool {
+    input
+        .get(..4)
+        .and_then(|word| <[u8; 4]>::try_from(word).ok())
+        .map(u32::from_le_bytes)
+        .is_some_and(|word| word & crate::lifecycle::INVOKE_INPUT_RECORD != 0)
+}
+
 /// Build a Task child's kernel: fresh instance from the blob, VOS
 /// precompile caps installed, `(state, msg)` input patched into the
 /// initial image at the blob's witness address — the exact image a
@@ -2171,6 +2214,27 @@ fn handle_invoke(
     let output_packed = caller.active_reg(11);
     let output_ptr = output_packed as u32;
     let output_buf_len = (output_packed >> 32) as u32 as usize;
+    let input = kread(caller, input_ptr, input_len);
+    let record_requested = invoke_input_requests_record(&input);
+
+    // Provable input contains the exact secret witness. Record replication
+    // is deliberately outside W2/W3: a Recording log is serialized into a
+    // CRDT node or Raft entry, while Replay consumes those replicated bytes.
+    // Reject before execution in either mode so neither the witness nor a
+    // ProofRecordEntry can enter InvokeEffects. Local/Inactive parents keep
+    // the durable record in their own committed keyspace.
+    if record_requested && !matches!(mode, crate::effect_log::EffectMode::Inactive) {
+        mode.reject_private_record();
+        journal.private_record_rejected = true;
+        return record_and_write_invoke(
+            caller,
+            output_ptr,
+            output_buf_len,
+            &[STATUS_PANICKED],
+            depth,
+            mode,
+        );
+    }
 
     // Replay fast path: at the top-level invoke under a replay
     // session, return the next recorded output instead of running
@@ -2236,7 +2300,6 @@ fn handle_invoke(
         && let Some(&blob_idx) = blob_by_hash.get(&code_hash)
         && let Some(blob) = blobs.get(blob_idx)
     {
-        let input = kread(caller, input_ptr, input_len);
         let (state, row_keys, record_tag, msg) = split_invoke_input(&input);
         // Resolve the caller-named row keys against the invoking
         // parent's EFFECTIVE keyspace (the same overlay its own reads
@@ -2275,6 +2338,21 @@ fn handle_invoke(
             code_cache,
             output_ptr,
             output_buf_len,
+            depth,
+            mode,
+        );
+    }
+
+    // The record flag is Task-only. A raw guest can bypass the typed
+    // `Tasks::spawn_provable` API and pair it with a service-code hash; fail
+    // closed before the service/local-peer/external-peer paths can reinterpret
+    // the flagged length word as an enormous ordinary state length.
+    if record_requested {
+        return record_and_write_invoke(
+            caller,
+            output_ptr,
+            output_buf_len,
+            &[STATUS_PANICKED],
             depth,
             mode,
         );
@@ -2383,8 +2461,6 @@ fn handle_invoke(
             );
         }
     };
-
-    let input = kread(caller, input_ptr, input_len);
 
     let gas = if gas_limit == 0 {
         DEFAULT_GAS
@@ -2924,6 +3000,8 @@ mod tests {
         assert!(k.is_empty());
         assert_eq!(t, Some(tag));
         assert_eq!(m, b"MSG");
+        assert!(invoke_input_requests_record(&rec));
+        assert!(!invoke_input_requests_record(&base));
 
         // Rows AND record together, in order.
         let both = build(b"ST", &[b"k1", b"key2"], Some(tag), b"MSG");

@@ -422,6 +422,26 @@ impl EffectMode {
     pub fn is_replaying(&self) -> bool {
         matches!(self, EffectMode::Replaying(_))
     }
+
+    /// Mark the whole dispatch as uncommittable because it attempted to
+    /// capture a producer-private proving witness under a replicated mode.
+    /// This bit is deliberately host-local: serializing it would put the
+    /// secret-bearing dispatch on the very replication path being refused.
+    pub(crate) fn reject_private_record(&mut self) {
+        match self {
+            EffectMode::Recording(session) => session.private_record_rejected = true,
+            EffectMode::Replaying(replay) => replay.private_record_rejected = true,
+            EffectMode::Inactive => {}
+        }
+    }
+
+    pub(crate) fn private_record_rejected(&self) -> bool {
+        match self {
+            EffectMode::Recording(session) => session.private_record_rejected,
+            EffectMode::Replaying(replay) => replay.private_record_rejected,
+            EffectMode::Inactive => false,
+        }
+    }
 }
 
 /// In-flight recording state for one dispatch.
@@ -436,6 +456,7 @@ impl EffectMode {
 pub struct EffectSession {
     log: EffectLog,
     cap: usize,
+    private_record_rejected: bool,
 }
 
 impl EffectSession {
@@ -444,6 +465,7 @@ impl EffectSession {
         Self {
             log: EffectLog::for_msg(msg),
             cap: DEFAULT_REPLY_CAP,
+            private_record_rejected: false,
         }
     }
 
@@ -504,6 +526,7 @@ pub struct EffectReplay {
     log: EffectLog,
     pos: usize,
     exhausted: bool,
+    private_record_rejected: bool,
 }
 
 impl EffectReplay {
@@ -513,6 +536,7 @@ impl EffectReplay {
             log,
             pos: 0,
             exhausted: false,
+            private_record_rejected: false,
         }
     }
 
@@ -552,7 +576,7 @@ impl EffectReplay {
 
     /// Did the replay consume every recorded reply?
     pub fn is_complete(&self) -> bool {
-        !self.exhausted && self.pos == self.log.replies.len()
+        !self.exhausted && !self.private_record_rejected && self.pos == self.log.replies.len()
     }
 
     /// Did the handler ask for more replies than were recorded?

@@ -369,7 +369,8 @@ pub fn invoke_hash_with_rows(
 /// durable [`ProvableRecord`](crate::provable) under `__vos_proofrec/<tag>`
 /// in this parent's keyspace. Flagged by [`INVOKE_INPUT_RECORD`]; the tag
 /// rides the input between the row keys and the message and never reaches
-/// the child (it is host metadata).
+/// the child (it is host metadata). The host accepts this flag only when
+/// `code_hash` names a registered Task; service/peer hashes fail closed.
 ///
 /// Full extended layout (either flag independent):
 /// ```text

@@ -97,7 +97,7 @@ impl Agent {
             vos::rkyv::from_bytes::<Vec<Vec<u8>>, vos::rkyv::rancor::Error>(&row_keys)
                 .unwrap_or_default();
         let id = self.tasks.spawn_raw_provable_with_rows(
-            Child::Task(code_hash),
+            code_hash,
             task_msg,
             keys,
             tag,

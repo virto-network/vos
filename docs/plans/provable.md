@@ -79,8 +79,10 @@ Landed and gated; `#[provable]` composes it.
   roots; `state_root` reads them O(1). The *app* reads these roots
   (`CommittedMap::root()`) to name `root_before`/`root_after` — no
   framework anchor reinterpretation.
-- **Replay safety** (A10): invoke effects re-absorb on replay —
-  provable Tasks run on replicated parents.
+- **Replay safety** (A10): ordinary Task invoke effects re-absorb on
+  replay. Provable record capture is Local-only until a producer-local
+  durable secret sidecar exists; replicated recording/replay rejects the
+  record flag before Task execution.
 - **Pinning + proving** (B1/B3/B8): `ProvableCatalog` / `vosx zk pin`;
   the prover extension's prove/verify + async job queue.
 
@@ -198,10 +200,12 @@ them and made records droppable — both wrong.
   invoke cleanly instead of misparsing the length (the wire-compat
   fix). The host persists `ProvableInput` + `ProvableRecord` keyed by
   `(svc, tag)` into the agent's own storage under a reserved
-  `__vos_proofrec/` prefix — so they survive restart and CRDT
-  soft-restart (the draft's "records regenerate" was false: replay
-  short-circuits the child, the effect log holds no invoke input, and
-  the parent's state has advanced). The invoke output envelope returns
+  `__vos_proofrec/` prefix — so they survive a Local producer restart.
+  CRDT/Raft capture is rejected before execution: those strategies
+  replicate effect logs, and putting `ProvableInput` into an invoke
+  effect would disclose the exact secret witness. A future replicated
+  producer needs a producer-local durable sidecar, not replicated actor
+  state. The invoke output envelope returns
   the tag so the parent can correlate. Records are pruned by the app
   (a `prune_proof_record(tag)` handler) once a proof is published or
   the settlement window closes — not silently ring-dropped.
