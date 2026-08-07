@@ -4,7 +4,7 @@ version = 1
 name = "voucher-check"
 version = 2
 commitments = [
-    "472873fe13b2d5c40a35cc3628d8070400a61dca4b112cce4245f97d30c07959",
+    "c49b587a2e8aa4dcf79c9b5c856f7733a86fa6514f7d465ece8135eeb95363d8",
 ]
 canonical_profile = [
     15,
@@ -42,5 +42,5 @@ canonical_profile = [
 ]
 seg_steps = 32000
 page_budget = 8
-witness_addr = 742480
-unpatched_image_root = "4269b4a55192fed9a2c9e8add9e0b80070f8a3d265d1107049fd4123c49bff29"
+witness_addr = 742432
+unpatched_image_root = "70ecb5f5658773ab579964511e405bf3e006e2a3d599254748d16979750197fd"

@@ -6853,11 +6853,11 @@ const VOUCHER_CHECK_CANONICAL_PROFILE: [u32; 32] = [
 /// `verify_chain` accepts a chain whose every segment commitment equals it.
 const VOUCHER_CHECK_COMMITMENTS: [[u8; 32]; 1] = [
     // C_0 — software-arithmetic canonical shape.
-    // blake2s 472873fe13b2d5c40a35cc3628d8070400a61dca4b112cce4245f97d30c07959
+    // blake2s c49b587a2e8aa4dcf79c9b5c856f7733a86fa6514f7d465ece8135eeb95363d8
     [
-        0x47, 0x28, 0x73, 0xfe, 0x13, 0xb2, 0xd5, 0xc4, 0x0a, 0x35, 0xcc, 0x36, 0x28, 0xd8, 0x07,
-        0x04, 0x00, 0xa6, 0x1d, 0xca, 0x4b, 0x11, 0x2c, 0xce, 0x42, 0x45, 0xf9, 0x7d, 0x30, 0xc0,
-        0x79, 0x59,
+        0xc4, 0x9b, 0x58, 0x7a, 0x2e, 0x8a, 0xa4, 0xdc, 0xf7, 0x9c, 0x9b, 0x5c, 0x85, 0x6f, 0x77,
+        0x33, 0xa8, 0x6f, 0xa6, 0x51, 0x4f, 0x7d, 0x46, 0x5e, 0xce, 0x81, 0x35, 0xee, 0xb9, 0x53,
+        0x63, 0xd8,
     ],
 ];
 
@@ -9508,7 +9508,8 @@ fn clerk_ledger_two_bank_federation() {
 
         // Real-STARK happy path (federation wire-through) — opt-in via
         // VOS_FEDERATION_REAL_STARK (the canonical chain prove is minutes: the
-        // conservation transition is ~76 bounded segments). voucher-check proves
+        // software-arithmetic conservation transition is roughly 710 bounded segments).
+        // voucher-check proves
         // the full conservation-of-value transition (a multi-million-step trace)
         // as a CHAIN of bounded canonical-shape segments; the bridge dispatches
         // verify_chain, which verifies the whole chain against the program's

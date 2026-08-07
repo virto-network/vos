@@ -107,10 +107,10 @@ const TRACE_GAS: u64 = 100_000_000;
 /// Defensive ceiling on the number of segments a chain manifest may list.
 /// A verifier fetches + STARK-verifies every listed segment, so an
 /// oversized manifest is an unbounded-work (DoS) lever. Legitimate chains
-/// are tens of segments (the conservation transition is ~76); this cap is
-/// far above any real chain — a belt-and-suspenders bound over the invoke's
-/// own gas metering. Bump it if a deployment segments a genuinely larger
-/// batch.
+/// are hundreds of segments (the software-arithmetic conservation transition
+/// is currently roughly 710); this cap is far above any real chain — a
+/// belt-and-suspenders bound over the invoke's own gas metering. Bump it if a
+/// deployment segments a genuinely larger batch.
 const MAX_CHAIN_SEGMENTS: usize = 65_536;
 
 /// Spawn `f` on a dedicated 512 MiB-stack thread WITHOUT joining it. A
