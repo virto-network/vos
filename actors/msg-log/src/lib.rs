@@ -56,7 +56,14 @@ use vos::prelude::*;
 
 /// Status returned by a log mutation handler. `Ok` is `0`.
 #[derive(
-    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Copy, Debug, PartialEq, Eq,
+    vos::rkyv::Archive,
+    vos::rkyv::Serialize,
+    vos::rkyv::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
 )]
 #[rkyv(crate = vos::rkyv)]
 #[repr(u8)]
@@ -163,10 +170,7 @@ impl MsgLog {
             to_hint,
             body,
         };
-        match self
-            .envelopes
-            .insert(crdt::ChangeId::new(id).operation(0), id, row)
-        {
+        match self.envelopes.insert(id, row) {
             Ok(()) => Status::Ok,
             Err(_) => Status::OperationConflict,
         }
