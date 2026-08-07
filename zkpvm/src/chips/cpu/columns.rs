@@ -412,6 +412,11 @@ pub enum Column {
     /// `(val_b + imm) mod 2^32`.
     #[size = 1]
     IsJumpInd,
+    /// 1 iff this `JumpInd` targets the distinguished PVM halt address.
+    /// Halt is a terminal dynamic jump handled before the program jump
+    /// table, so it must not emit a JumpTable lookup.
+    #[size = 1]
+    IsHaltJumpInd,
     /// Virtual jump address (low 32 bits of `val_b + imm`),
     /// 4 little-endian bytes.  Pinned by the carry-chain constraint on
     /// JumpInd rows; emitted as the first half of the JumpTableChip
@@ -429,6 +434,10 @@ pub enum Column {
     /// `LoadImmJumpIndAddr = val_d + ImmYBytes` (low 32 bits).
     #[size = 1]
     IsLoadImmJumpInd,
+    /// 1 iff this `LoadImmJumpInd` targets the distinguished PVM halt
+    /// address. See [`Self::IsHaltJumpInd`].
+    #[size = 1]
+    IsHaltLoadImmJumpInd,
     /// 4 little-endian bytes of `step.imm_y`
     /// (the second immediate, used for LoadImmJumpInd's jump offset).
     /// Bound to canonical bytecode decoding via the prog_mem tuple.

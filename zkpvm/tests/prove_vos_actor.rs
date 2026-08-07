@@ -711,6 +711,40 @@ fn prove_blake2b_precompile() {
     eprintln!("Blake2b precompile: PROVED!");
 }
 
+/// A normal PVM return is a dynamic jump to the distinguished halt
+/// address, not a dispatch through the program's jump table. Keep that
+/// terminal convention inside the proved CPU semantics: treating it as an
+/// ordinary JumpTable consumer leaves an unmatched lookup and makes every
+/// freshly-built VOS Task proof unverifiable.
+#[test]
+fn prove_vos_halt_jump_without_a_program_jump_table() {
+    use grey_transpiler::assembler::{Assembler, Reg};
+
+    let mut assembler = Assembler::new();
+    assembler
+        .load_imm_64(Reg::T0, javm::PVM_HALT_ADDR)
+        .jump_ind(Reg::T0, 0);
+    let blob = assembler.build();
+    let mut side_note =
+        zkpvm::actor::trace_blob(&blob, 1_000_000).expect("trace the canonical halt jump");
+    assert!(side_note.jump_table.is_empty());
+
+    let config = zkpvm::PcsConfig {
+        pow_bits: 5,
+        fri_config: zkpvm::FriConfig::new(0, 1, 3, 1),
+        lifting_log_size: None,
+    };
+    let proof = zkpvm::prove_with_config(&mut side_note, config)
+        .expect("the terminal halt jump must prove");
+    let policy = zkpvm::PcsPolicy {
+        min_pow_bits: 5,
+        min_fri_queries: 3,
+        min_fri_log_blowup: 0,
+    };
+    zkpvm::verify_with_pcs_policy(proof, &side_note, &policy)
+        .expect("the terminal halt jump must verify without a jump-table row");
+}
+
 /// Prove + verify a pre-built RistrettoChip side note against the
 /// chip-isolated components (`RangeMultiplicity256` + `RistrettoChip`)
 /// only — the full-machine path rejects step-less traces via the Z0

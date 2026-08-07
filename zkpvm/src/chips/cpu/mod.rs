@@ -35,6 +35,10 @@ use crate::{
     },
 };
 
+/// Distinguished dynamic-jump target that terminates a PVM normally.
+/// Kept feature-independent because the verifier does not link `javm`.
+const PVM_HALT_ADDR_BYTES: [u8; 4] = 0xffff_0000u32.to_le_bytes();
+
 // Opcode classification + register-access derivation consume `javm`
 // types (`Opcode`, `InstructionCategory`) and `PvmStep` witnesses, all of
 // which exist only at trace-fill time — prover-only, like the fill code
@@ -2560,13 +2564,24 @@ impl BuiltInComponent for CpuChip {
         // jump_table[(val_b+imm)/2 - 1] — exactly the runtime djump.
         {
             let is_jump_ind_col = crate::trace::trace_eval!(trace_eval, Column::IsJumpInd);
+            let is_halt_jump_ind = crate::trace::trace_eval!(trace_eval, Column::IsHaltJumpInd);
             let jump_ind_addr = crate::trace::trace_eval!(trace_eval, Column::JumpIndAddr);
             let jump_ind_carry = crate::trace::trace_eval!(trace_eval, Column::JumpIndCarry);
             let imm_bytes_col = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
-            let next_pc_col = crate::trace::trace_eval!(trace_eval, Column::NextPc);
-            // Boolean witness.
+            let pc_col = crate::trace::trace_eval!(trace_eval, Column::Pc);
+            let is_padding_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsPadding);
+            // Boolean witnesses. A halt selector is only valid on JumpInd,
+            // pins the computed address to the distinguished halt target,
+            // preserves the interpreter's terminal PC, and forbids a
+            // successor row.
             eval.add_constraint(
                 is_jump_ind_col[0].clone() * (E::F::one() - is_jump_ind_col[0].clone()),
+            );
+            eval.add_constraint(
+                is_halt_jump_ind[0].clone() * (E::F::one() - is_halt_jump_ind[0].clone()),
+            );
+            eval.add_constraint(
+                is_halt_jump_ind[0].clone() * (E::F::one() - is_jump_ind_col[0].clone()),
             );
             for i in 0..4 {
                 let carry_in: E::F = if i == 0 {
@@ -2581,7 +2596,18 @@ impl BuiltInComponent for CpuChip {
                             - imm_bytes_col[i].clone()
                             - carry_in),
                 );
+                eval.add_constraint(
+                    is_halt_jump_ind[0].clone()
+                        * (jump_ind_addr[i].clone()
+                            - E::F::from(BaseField::from(PVM_HALT_ADDR_BYTES[i] as u32))),
+                );
+                eval.add_constraint(
+                    is_halt_jump_ind[0].clone() * (next_pc[i].clone() - pc_col[i].clone()),
+                );
             }
+            eval.add_constraint(
+                is_halt_jump_ind[0].clone() * (E::F::one() - is_padding_next[0].clone()),
+            );
             // Paired JumpTable consumer (mult = is_jump_ind on each emission;
             // ProgramMemory-style pair doubling so the per-pair degree stays
             // bounded).  Tuple = (jump_ind_addr[4], next_pc[4]) — pinned to
@@ -2590,15 +2616,14 @@ impl BuiltInComponent for CpuChip {
             jt_tuple.extend_from_slice(&next_pc);
             eval.add_to_relation(RelationEntry::new(
                 jump_table_lookup,
-                is_jump_ind_col[0].clone().into(),
+                (is_jump_ind_col[0].clone() - is_halt_jump_ind[0].clone()).into(),
                 &jt_tuple,
             ));
             eval.add_to_relation(RelationEntry::new(
                 jump_table_lookup,
-                is_jump_ind_col[0].clone().into(),
+                (is_jump_ind_col[0].clone() - is_halt_jump_ind[0].clone()).into(),
                 &jt_tuple,
             ));
-            let _ = next_pc_col; // reuse outer next_pc
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -2618,11 +2643,17 @@ impl BuiltInComponent for CpuChip {
         // extended.
         {
             let is_lij_col = crate::trace::trace_eval!(trace_eval, Column::IsLoadImmJumpInd);
+            let is_halt_lij = crate::trace::trace_eval!(trace_eval, Column::IsHaltLoadImmJumpInd);
             let lij_addr = crate::trace::trace_eval!(trace_eval, Column::LoadImmJumpIndAddr);
             let lij_carry = crate::trace::trace_eval!(trace_eval, Column::LoadImmJumpIndCarry);
             let imm_y_bytes = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
-            // Boolean witness.
+            let pc_col = crate::trace::trace_eval!(trace_eval, Column::Pc);
+            let is_padding_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsPadding);
+            // Boolean witnesses and the same terminal-halt binding as
+            // JumpInd above.
             eval.add_constraint(is_lij_col[0].clone() * (E::F::one() - is_lij_col[0].clone()));
+            eval.add_constraint(is_halt_lij[0].clone() * (E::F::one() - is_halt_lij[0].clone()));
+            eval.add_constraint(is_halt_lij[0].clone() * (E::F::one() - is_lij_col[0].clone()));
             // Carry chain: lij_addr = val_d + imm_y_bytes (low 32 bits).
             for i in 0..4 {
                 let carry_in: E::F = if i == 0 {
@@ -2637,18 +2668,29 @@ impl BuiltInComponent for CpuChip {
                             - imm_y_bytes[i].clone()
                             - carry_in),
                 );
+                eval.add_constraint(
+                    is_halt_lij[0].clone()
+                        * (lij_addr[i].clone()
+                            - E::F::from(BaseField::from(PVM_HALT_ADDR_BYTES[i] as u32))),
+                );
+                eval.add_constraint(
+                    is_halt_lij[0].clone() * (next_pc[i].clone() - pc_col[i].clone()),
+                );
             }
+            eval.add_constraint(
+                is_halt_lij[0].clone() * (E::F::one() - is_padding_next[0].clone()),
+            );
             // Paired JumpTable consumer.
             let mut lij_tuple: Vec<E::F> = lij_addr.to_vec();
             lij_tuple.extend_from_slice(&next_pc);
             eval.add_to_relation(RelationEntry::new(
                 jump_table_lookup,
-                is_lij_col[0].clone().into(),
+                (is_lij_col[0].clone() - is_halt_lij[0].clone()).into(),
                 &lij_tuple,
             ));
             eval.add_to_relation(RelationEntry::new(
                 jump_table_lookup,
-                is_lij_col[0].clone().into(),
+                (is_lij_col[0].clone() - is_halt_lij[0].clone()).into(),
                 &lij_tuple,
             ));
         }

@@ -962,6 +962,8 @@ pub(super) fn generate_interaction_trace(
         let jt: &JumpTableLookupElements = lookup_elements.as_ref();
         let is_jump_ind_col =
             crate::trace::original_base_column!(component_trace, Column::IsJumpInd);
+        let is_halt_jump_ind =
+            crate::trace::original_base_column!(component_trace, Column::IsHaltJumpInd);
         let jump_ind_addr =
             crate::trace::original_base_column!(component_trace, Column::JumpIndAddr);
         let next_pc_col = crate::trace::original_base_column!(component_trace, Column::NextPc);
@@ -970,7 +972,12 @@ pub(super) fn generate_interaction_trace(
         tuple.extend_from_slice(&next_pc_col);
 
         for _ in 0..2 {
-            logup.add_to_relation_with(jt, [is_jump_ind_col[0].clone()], |[m]| m.into(), &tuple);
+            logup.add_to_relation_with(
+                jt,
+                [is_jump_ind_col[0].clone(), is_halt_jump_ind[0].clone()],
+                |[is_jump, is_halt]| (is_jump - is_halt).into(),
+                &tuple,
+            );
         }
     }
 
@@ -979,6 +986,8 @@ pub(super) fn generate_interaction_trace(
         let jt: &JumpTableLookupElements = lookup_elements.as_ref();
         let is_lij_col =
             crate::trace::original_base_column!(component_trace, Column::IsLoadImmJumpInd);
+        let is_halt_lij =
+            crate::trace::original_base_column!(component_trace, Column::IsHaltLoadImmJumpInd);
         let lij_addr =
             crate::trace::original_base_column!(component_trace, Column::LoadImmJumpIndAddr);
         let next_pc_col = crate::trace::original_base_column!(component_trace, Column::NextPc);
@@ -987,7 +996,12 @@ pub(super) fn generate_interaction_trace(
         tuple.extend_from_slice(&next_pc_col);
 
         for _ in 0..2 {
-            logup.add_to_relation_with(jt, [is_lij_col[0].clone()], |[m]| m.into(), &tuple);
+            logup.add_to_relation_with(
+                jt,
+                [is_lij_col[0].clone(), is_halt_lij[0].clone()],
+                |[is_jump, is_halt]| (is_jump - is_halt).into(),
+                &tuple,
+            );
         }
     }
 

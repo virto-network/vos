@@ -574,7 +574,15 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, flags.is_sign_ext_16, Column::IsSignExt16);
         trace.fill_columns(row, flags.is_trap, Column::IsTrap);
         trace.fill_columns(row, flags.is_jump_ind, Column::IsJumpInd);
+        let is_halt_jump_ind = flags.is_jump_ind
+            && step.exit
+            && (val_b.wrapping_add(step.imm) as u32 == javm::PVM_HALT_ADDR as u32);
+        trace.fill_columns(row, is_halt_jump_ind, Column::IsHaltJumpInd);
         trace.fill_columns(row, flags.is_load_imm_jump_ind, Column::IsLoadImmJumpInd);
+        let is_halt_load_imm_jump_ind = flags.is_load_imm_jump_ind
+            && step.exit
+            && (val_d.wrapping_add(step.imm_y) as u32 == javm::PVM_HALT_ADDR as u32);
+        trace.fill_columns(row, is_halt_load_imm_jump_ind, Column::IsHaltLoadImmJumpInd);
         // ImmYBytes always carries low 4 bytes of step.imm_y so the
         // prog_mem lookup balances on every row (canonical = 0 for
         // non-LoadImmJumpInd ops).
@@ -603,7 +611,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             // JumpTableChip's producer multiplicity matches.  Index =
             // addr/2 - 1 (mirrors the runtime djump indexing).
             let addr = u32::from_le_bytes(addr_bytes);
-            if addr >= 2 && addr.is_multiple_of(2) {
+            if !is_halt_jump_ind && addr >= 2 && addr.is_multiple_of(2) {
                 let idx = (addr / 2 - 1) as usize;
                 if let Some(counts) = side_note.jump_table_counts.get_mut(idx) {
                     *counts += 1;
@@ -628,7 +636,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns_bytes(row, &carry_bytes, Column::LoadImmJumpIndCarry);
 
             let addr = u32::from_le_bytes(addr_bytes);
-            if addr >= 2 && addr.is_multiple_of(2) {
+            if !is_halt_load_imm_jump_ind && addr >= 2 && addr.is_multiple_of(2) {
                 let idx = (addr / 2 - 1) as usize;
                 if let Some(counts) = side_note.jump_table_counts.get_mut(idx) {
                     *counts += 1;
