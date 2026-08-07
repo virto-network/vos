@@ -2589,6 +2589,14 @@ impl BuiltInComponent for CpuChip {
                 } else {
                     jump_ind_carry[i - 1].clone()
                 };
+                // Carries are integer carry bits, not arbitrary field
+                // elements. Without this constraint a prover can solve the
+                // byte equations backwards from PVM_HALT_ADDR with
+                // field-valued carries, assert `is_halt = 1`, and suppress
+                // the jump-table lookup for an ordinary dynamic jump.
+                eval.add_constraint(
+                    jump_ind_carry[i].clone() * (E::F::one() - jump_ind_carry[i].clone()),
+                );
                 eval.add_constraint(
                     is_jump_ind_col[0].clone()
                         * (jump_ind_addr[i].clone() + jump_ind_carry[i].clone() * f256.clone()
@@ -2661,6 +2669,7 @@ impl BuiltInComponent for CpuChip {
                 } else {
                     lij_carry[i - 1].clone()
                 };
+                eval.add_constraint(lij_carry[i].clone() * (E::F::one() - lij_carry[i].clone()));
                 eval.add_constraint(
                     is_lij_col[0].clone()
                         * (lij_addr[i].clone() + lij_carry[i].clone() * f256.clone()
