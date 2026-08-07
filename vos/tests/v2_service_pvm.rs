@@ -440,16 +440,20 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
                 index: shared.entries.len() as u64 + 1,
                 request,
                 logical_timeslot: None,
+                availability_programs: vec![],
+                availability_blobs: vec![],
             };
             shared.entries.push(entry);
         }
         Ok(shared.entries.len() as u64)
     }
 
-    fn propose_at(
+    fn propose_at_with_availability(
         &mut self,
         request: &[u8],
         logical_timeslot: Option<u64>,
+        programs: &[ImportedProgramV2],
+        blobs: &[ImportedBlobV2],
     ) -> Result<CommittedAccumulateEntryV2, Self::Error> {
         if !self.leader {
             return Err(TestLogError::NotLeader);
@@ -460,6 +464,8 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
                 index: shared.entries.len() as u64 + 1,
                 request,
                 logical_timeslot: None,
+                availability_programs: vec![],
+                availability_blobs: vec![],
             };
             shared.entries.push(entry);
         }
@@ -467,6 +473,8 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
             index: shared.entries.len() as u64 + 1,
             request: request.to_vec(),
             logical_timeslot,
+            availability_programs: programs.to_vec(),
+            availability_blobs: blobs.to_vec(),
         };
         shared.entries.push(entry.clone());
         Ok(entry)
@@ -2931,9 +2939,15 @@ fn same_package_child_spawn_commits_before_the_child_becomes_callable() {
     let initial_bytes = Vec::new();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
     let seed = work(actor_program, initial.clone());
-    let mut host = LocalJamStoreV2::default();
-    assert_eq!(host.import_blob(initial_bytes), initial);
-    assert_eq!(host.import_program(actor_pvm), actor_program);
+    let availability_programs = vec![ImportedProgramV2 {
+        program: actor_program,
+        pvm: actor_pvm,
+    }];
+    let availability_blobs = vec![ImportedBlobV2 {
+        reference: initial.clone(),
+        bytes: initial_bytes,
+    }];
+    let host = LocalJamStoreV2::default();
     let mut service = JamServiceV2::new(
         CANONICAL_SERVICE_PVM.to_vec(),
         vos::v2::VOS_SERVICE_PROGRAM_ID,
@@ -2955,7 +2969,7 @@ fn same_package_child_spawn_commits_before_the_child_becomes_callable() {
             producer: ProducerId([53; 32]),
             deployment: seed.target_deployment,
             program: actor_program,
-            initial_state: initial,
+            initial_state: initial.clone(),
             crdt: false,
             role_policies: role_policies(vec![
                 MethodPolicyV2 {
@@ -2983,9 +2997,21 @@ fn same_package_child_spawn_commits_before_the_child_becomes_callable() {
             authenticator: vec![154],
         },
     });
+    assert_eq!(
+        service
+            .accumulate_with_availability(&install, &availability_programs, &availability_blobs,)
+            .unwrap()
+            .result,
+        AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::Unauthorized)
+    );
+    assert!(service.accumulate_host().program(actor_program).is_none());
+    assert!(service.accumulate_host().blob(&initial).is_none());
     authorize_install(&mut service, &install);
     assert!(matches!(
-        service.accumulate(&install).unwrap().result,
+        service
+            .accumulate_with_availability(&install, &availability_programs, &availability_blobs,)
+            .unwrap()
+            .result,
         AccumulationResultV2::Installed(_)
     ));
 
@@ -8381,13 +8407,6 @@ fn physical_guest_accumulate_upgrades_only_an_idle_authorized_actor() {
     else {
         panic!("service install rejected")
     };
-    assert_eq!(
-        service
-            .accumulate_host_mut()
-            .import_program(replacement_pvm.clone()),
-        replacement_program
-    );
-
     let upgrade = ActorUpgradeV2 {
         service: seed.service.clone(),
         actor: seed.target,
@@ -8414,29 +8433,57 @@ fn physical_guest_accumulate_upgrades_only_an_idle_authorized_actor() {
             authenticator: vec![38],
         },
     };
+    let upgrade_programs = vec![ImportedProgramV2 {
+        program: replacement_program,
+        pvm: replacement_pvm.clone(),
+    }];
     let before = service.accumulate_host().snapshot();
     assert_eq!(
         service
-            .accumulate(&AccumulateRequestV2::UpgradeActor(upgrade.clone()))
+            .accumulate_with_availability(
+                &AccumulateRequestV2::UpgradeActor(upgrade.clone()),
+                &upgrade_programs,
+                &[],
+            )
             .unwrap()
             .result,
         AccumulationResultV2::Rejected(vos::v2::AccumulationRejectionV2::Unauthorized)
     );
     assert_eq!(service.accumulate_host().snapshot(), before);
+    assert!(
+        service
+            .accumulate_host()
+            .program(replacement_program)
+            .is_none()
+    );
 
     assert!(service.accumulate_host_mut().allow_upgrade(&upgrade));
     let before_failed_commit = service.accumulate_host().snapshot();
     service.accumulate_host_mut().backend_mut().fail_next_commit = true;
     assert!(matches!(
-        service.accumulate(&AccumulateRequestV2::UpgradeActor(upgrade.clone())),
+        service.accumulate_with_availability(
+            &AccumulateRequestV2::UpgradeActor(upgrade.clone()),
+            &upgrade_programs,
+            &[],
+        ),
         Err(ServiceDispatchError::Pvm(
             ServicePvmErrorV2::AccumulateCommitRejected
         ))
     ));
     assert_eq!(service.accumulate_host().snapshot(), before_failed_commit);
+    assert!(
+        service
+            .accumulate_host()
+            .program(replacement_program)
+            .is_none()
+    );
 
     let upgraded = service
-        .accumulate(&AccumulateRequestV2::UpgradeActor(upgrade.clone()))
+        .accumulate_with_availability(
+            &AccumulateRequestV2::UpgradeActor(upgrade.clone()),
+            &upgrade_programs,
+            &[],
+        )
         .unwrap();
     let AccumulationResultV2::ActorUpgraded {
         previous_program,
@@ -8490,7 +8537,11 @@ fn physical_guest_accumulate_upgrades_only_an_idle_authorized_actor() {
     let before_retry = service.accumulate_host().snapshot();
     assert!(matches!(
         service
-            .accumulate(&AccumulateRequestV2::UpgradeActor(upgrade))
+            .accumulate_with_availability(
+                &AccumulateRequestV2::UpgradeActor(upgrade),
+                &upgrade_programs,
+                &[],
+            )
             .unwrap()
             .result,
         AccumulationResultV2::ActorUpgraded {
@@ -9663,13 +9714,17 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
         },
     };
 
+    let availability_programs = vec![ImportedProgramV2 {
+        program: actor_program,
+        pvm: actor_pvm,
+    }];
+    let availability_blobs = vec![ImportedBlobV2 {
+        reference: initial.clone(),
+        bytes: initial_bytes,
+    }];
     let mut leader_host = LocalJamStoreV2::default();
-    assert_eq!(leader_host.import_blob(initial_bytes.clone()), initial);
-    assert_eq!(leader_host.import_program(actor_pvm.clone()), actor_program);
     leader_host.allow_install(&genesis);
     let mut follower_host = LocalJamStoreV2::default();
-    assert_eq!(follower_host.import_blob(initial_bytes), initial);
-    assert_eq!(follower_host.import_program(actor_pvm), actor_program);
     follower_host.allow_install(&genesis);
 
     let shared_log = Arc::new(Mutex::new(SharedCommittedLog::default()));
@@ -9714,12 +9769,26 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
 
     assert!(matches!(
         leader
-            .accumulate(&AccumulateRequestV2::Install(genesis))
+            .accumulate_with_availability(
+                &AccumulateRequestV2::Install(genesis),
+                &availability_programs,
+                &availability_blobs,
+            )
             .unwrap()
             .result,
         AccumulationResultV2::Installed(_)
     ));
     assert_eq!(follower.catch_up().unwrap(), 1);
+    assert_eq!(
+        follower.service().accumulate_host().program(actor_program),
+        Some(availability_programs[0].pvm.as_slice()),
+        "a follower with no node-local program cache replays Install from the ordered sidecar"
+    );
+    assert_eq!(
+        follower.service().accumulate_host().blob(&initial),
+        Some(availability_blobs[0].bytes.as_slice()),
+        "genesis bytes are replayable from the same committed entry"
+    );
     assert!(
         leader
             .service()
@@ -10085,21 +10154,19 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
         },
     };
 
+    let availability_programs = vec![ImportedProgramV2 {
+        program: actor_program,
+        pvm: actor_pvm,
+    }];
+    let availability_blobs = vec![ImportedBlobV2 {
+        reference: initial.clone(),
+        bytes: initial_bytes,
+    }];
     let mut poison_host = LocalJamStoreV2::default();
-    assert_eq!(poison_host.import_blob(initial_bytes.clone()), initial);
-    assert_eq!(poison_host.import_program(actor_pvm.clone()), actor_program);
     poison_host.allow_install(&genesis);
     let poison_shared = Arc::new(Mutex::new(SharedCommittedLog::default()));
     let poison_log = TestCommittedLog::new(poison_shared.clone(), true);
     let mut poison_follower_host = LocalJamStoreV2::default();
-    assert_eq!(
-        poison_follower_host.import_blob(initial_bytes.clone()),
-        initial
-    );
-    assert_eq!(
-        poison_follower_host.import_program(actor_pvm.clone()),
-        actor_program
-    );
     poison_follower_host.allow_install(&genesis);
     let poison_service = JamServiceV2::new(
         service_pvm.clone(),
@@ -10124,7 +10191,11 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
         poison_follower_service,
         TestCommittedLog::new(poison_shared, false),
     );
-    let poison_result = poisoned.accumulate(&AccumulateRequestV2::Install(genesis.clone()));
+    let poison_result = poisoned.accumulate_with_availability(
+        &AccumulateRequestV2::Install(genesis.clone()),
+        &availability_programs,
+        &availability_blobs,
+    );
     assert!(
         matches!(
             poison_result,
@@ -10172,8 +10243,6 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
         ..FailableCommittedImages::default()
     })
     .unwrap();
-    assert_eq!(retry_host.import_blob(initial_bytes), initial);
-    assert_eq!(retry_host.import_program(actor_pvm), actor_program);
     retry_host.allow_install(&genesis);
     let retry_log =
         TestCommittedLog::new(Arc::new(Mutex::new(SharedCommittedLog::default())), true);
@@ -10188,7 +10257,11 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
     .unwrap();
     let mut retryable = ReplicatedJamServiceV2::new(retry_service, retry_log);
     assert!(matches!(
-        retryable.accumulate(&AccumulateRequestV2::Install(genesis)),
+        retryable.accumulate_with_availability(
+            &AccumulateRequestV2::Install(genesis),
+            &availability_programs,
+            &availability_blobs,
+        ),
         Err(vos::v2::ReplicatedServiceErrorV2::Dispatch(
             ServiceDispatchError::Pvm(ServicePvmErrorV2::AccumulateCommitRejected)
         ))
@@ -10265,17 +10338,21 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         },
     };
 
+    let availability_programs = vec![ImportedProgramV2 {
+        program: actor_program,
+        pvm: actor_pvm,
+    }];
+    let availability_blobs = vec![ImportedBlobV2 {
+        reference: initial.clone(),
+        bytes: initial_bytes,
+    }];
     let mut leader_host = LocalJamStoreV2::default();
-    assert_eq!(leader_host.import_blob(initial_bytes.clone()), initial);
-    assert_eq!(leader_host.import_program(actor_pvm.clone()), actor_program);
     leader_host.allow_install(&genesis);
     let mut follower_host = DurableJamStoreV2::open(FailableCommittedImages {
         fail_next_proof_commit: true,
         ..FailableCommittedImages::default()
     })
     .unwrap();
-    assert_eq!(follower_host.import_blob(initial_bytes), initial);
-    assert_eq!(follower_host.import_program(actor_pvm), actor_program);
     follower_host.allow_install(&genesis);
 
     let shared_log = Arc::new(Mutex::new(SharedCommittedLog::default()));
@@ -10307,7 +10384,11 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
     );
     assert!(matches!(
         leader
-            .accumulate(&AccumulateRequestV2::Install(genesis))
+            .accumulate_with_availability(
+                &AccumulateRequestV2::Install(genesis),
+                &availability_programs,
+                &availability_blobs,
+            )
             .unwrap()
             .result,
         AccumulationResultV2::Installed(_)
@@ -10529,9 +10610,15 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
         },
     };
 
+    let availability_programs = vec![ImportedProgramV2 {
+        program: actor_program,
+        pvm: actor_pvm,
+    }];
+    let availability_blobs = vec![ImportedBlobV2 {
+        reference: initial.clone(),
+        bytes: initial_bytes,
+    }];
     let mut host = LocalJamStoreV2::default();
-    assert_eq!(host.import_blob(initial_bytes), initial);
-    assert_eq!(host.import_program(actor_pvm), actor_program);
     host.allow_install(&genesis);
     let service = JamServiceV2::new(
         service_pvm.clone(),
@@ -10557,7 +10644,11 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
 
     assert!(matches!(
         replicated
-            .accumulate(&AccumulateRequestV2::Install(genesis))
+            .accumulate_with_availability(
+                &AccumulateRequestV2::Install(genesis),
+                &availability_programs,
+                &availability_blobs,
+            )
             .unwrap()
             .result,
         AccumulationResultV2::Installed(_)

@@ -333,6 +333,23 @@ pub trait AccumulateProtocolHostV2 {
         }
     }
 
+    /// Begin one transaction with canonical availability artifacts ordered by
+    /// the same authority as the Accumulate request. Implementations must
+    /// stage these bytes inside the transaction; dropping it discards them.
+    fn begin_at_with_availability(
+        &mut self,
+        logical_timeslot: Option<u64>,
+        programs: &[super::ImportedProgramV2],
+        blobs: &[super::ImportedBlobV2],
+    ) -> Result<Self::Transaction, ServicePvmErrorV2> {
+        if !programs.is_empty() || !blobs.is_empty() {
+            return Err(ServicePvmErrorV2::AccumulateHostRejected(
+                crate::abi::hostcall::PROGRAM_LOOKUP as u8,
+            ));
+        }
+        self.begin_at(logical_timeslot)
+    }
+
     fn commit(&mut self, transaction: Self::Transaction) -> Result<(), ServicePvmErrorV2>;
 }
 
@@ -992,7 +1009,36 @@ impl ServicePvmV2 {
         gas_limit: u64,
         host: &mut H,
     ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
-        self.accumulate_at_with_backend(arguments, gas_limit, host, None, javm::PvmBackend::Default)
+        self.accumulate_at_with_backend(
+            arguments,
+            gas_limit,
+            host,
+            None,
+            &[],
+            &[],
+            javm::PvmBackend::Default,
+        )
+    }
+
+    /// Execute Accumulate while staging canonical program/blob availability
+    /// in the same transaction as the guest result.
+    pub fn accumulate_with_availability<H: AccumulateProtocolHostV2>(
+        &self,
+        arguments: &[u8],
+        gas_limit: u64,
+        host: &mut H,
+        programs: &[super::ImportedProgramV2],
+        blobs: &[super::ImportedBlobV2],
+    ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
+        self.accumulate_at_with_backend(
+            arguments,
+            gas_limit,
+            host,
+            None,
+            programs,
+            blobs,
+            javm::PvmBackend::Default,
+        )
     }
 
     /// Execute Accumulate with the consensus-authenticated JAM timeslot for
@@ -1009,6 +1055,28 @@ impl ServicePvmV2 {
             gas_limit,
             host,
             Some(logical_timeslot),
+            &[],
+            &[],
+            javm::PvmBackend::Default,
+        )
+    }
+
+    pub fn accumulate_at_with_availability<H: AccumulateProtocolHostV2>(
+        &self,
+        arguments: &[u8],
+        gas_limit: u64,
+        host: &mut H,
+        logical_timeslot: u64,
+        programs: &[super::ImportedProgramV2],
+        blobs: &[super::ImportedBlobV2],
+    ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
+        self.accumulate_at_with_backend(
+            arguments,
+            gas_limit,
+            host,
+            Some(logical_timeslot),
+            programs,
+            blobs,
             javm::PvmBackend::Default,
         )
     }
@@ -1022,7 +1090,7 @@ impl ServicePvmV2 {
         host: &mut H,
         backend: javm::PvmBackend,
     ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
-        self.accumulate_at_with_backend(arguments, gas_limit, host, None, backend)
+        self.accumulate_at_with_backend(arguments, gas_limit, host, None, &[], &[], backend)
     }
 
     fn accumulate_at_with_backend<H: AccumulateProtocolHostV2>(
@@ -1031,6 +1099,8 @@ impl ServicePvmV2 {
         gas_limit: u64,
         host: &mut H,
         logical_timeslot: Option<u64>,
+        programs: &[super::ImportedProgramV2],
+        blobs: &[super::ImportedBlobV2],
         backend: javm::PvmBackend,
     ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
         let mut kernel =
@@ -1043,7 +1113,7 @@ impl ServicePvmV2 {
             .map_err(|_| ServicePvmErrorV2::InvalidVmLifecycle)?;
         install_accumulate_scheduler_caps(&mut kernel);
         kernel.set_entry_ic(ACCUMULATE_ENTRY_IC);
-        let mut transaction = host.begin_at(logical_timeslot)?;
+        let mut transaction = host.begin_at_with_availability(logical_timeslot, programs, blobs)?;
 
         loop {
             match kernel.run() {

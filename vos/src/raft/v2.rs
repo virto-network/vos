@@ -20,8 +20,8 @@ use crate::commit::CommitError;
 use crate::v2::wire::{DecodeError, Decoder, Encoder};
 use crate::v2::{
     AccumulateRequestV2, CommittedAccumulateBatchV2, CommittedAccumulateEntryV2,
-    CommittedAccumulateLogV2, CommittedServiceSnapshotV2, ImportedBlobV2, LocalJamStoreSnapshotV2,
-    V2Wire,
+    CommittedAccumulateLogV2, CommittedServiceSnapshotV2, ImportedBlobV2, ImportedProgramV2,
+    LocalJamStoreSnapshotV2, ProgramId, V2Wire,
 };
 
 use super::log::{LogEntry, RaftLog, RaftMeta};
@@ -33,45 +33,90 @@ use super::worker::{ProposeError, RaftWorker, ReadIndexError, WorkerHandle};
 struct RaftAccumulatePayloadV2 {
     request: Vec<u8>,
     logical_timeslot: Option<u64>,
+    programs: Vec<ImportedProgramV2>,
+    blobs: Vec<ImportedBlobV2>,
 }
 
 impl RaftAccumulatePayloadV2 {
-    fn from_request(request: &[u8], logical_timeslot: Option<u64>) -> Result<Self, CommitError> {
+    fn from_request(
+        request: &[u8],
+        logical_timeslot: Option<u64>,
+        programs: &[ImportedProgramV2],
+        blobs: &[ImportedBlobV2],
+    ) -> Result<Self, CommitError> {
         let decoded = AccumulateRequestV2::decode(request).map_err(|_| {
             CommitError::Config("raft v2 entry is not a canonical AccumulateRequestV2".into())
         })?;
-        if matches!(decoded, AccumulateRequestV2::ExpireCall(_)) != logical_timeslot.is_some() {
+        if matches!(&decoded, AccumulateRequestV2::ExpireCall(_)) != logical_timeslot.is_some() {
             return Err(CommitError::Config(
                 "raft v2 time-dependent entry has invalid JAM-slot provenance".into(),
             ));
         }
+        CommittedAccumulateEntryV2::validate_availability(&decoded, programs, blobs).map_err(
+            |_| {
+                CommitError::Config(
+                    "raft v2 entry does not carry its exact availability artifacts".into(),
+                )
+            },
+        )?;
         Ok(Self {
             request: request.to_vec(),
             logical_timeslot,
+            programs: programs.to_vec(),
+            blobs: blobs.to_vec(),
         })
     }
 }
 
 impl V2Wire for RaftAccumulatePayloadV2 {
-    const MAGIC: [u8; 4] = *b"VRQ2";
+    const MAGIC: [u8; 4] = *b"VRQ3";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
         encoder.bytes(&self.request);
         encoder.option(&self.logical_timeslot, |encoder, slot| encoder.u64(*slot));
+        encoder.list(&self.programs, |encoder, program| {
+            encoder.fixed(&program.program.0);
+            encoder.bytes(&program.pvm);
+        });
+        encoder.list(&self.blobs, |encoder, blob| {
+            encoder.fixed(&blob.reference.hash.0);
+            encoder.u64(blob.reference.len);
+            encoder.bytes(&blob.bytes);
+        });
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let request = decoder.bytes()?;
         let logical_timeslot = decoder.option(Decoder::u64)?;
+        let programs = decoder.list(|decoder| {
+            Ok(ImportedProgramV2 {
+                program: ProgramId(decoder.fixed()?),
+                pvm: decoder.bytes()?,
+            })
+        })?;
+        let blobs = decoder.list(|decoder| {
+            Ok(ImportedBlobV2 {
+                reference: crate::v2::BlobRefV2 {
+                    hash: crate::v2::Hash(decoder.fixed()?),
+                    len: decoder.u64()?,
+                },
+                bytes: decoder.bytes()?,
+            })
+        })?;
         let decoded =
             AccumulateRequestV2::decode(&request).map_err(|_| DecodeError::NonCanonical)?;
-        if matches!(decoded, AccumulateRequestV2::ExpireCall(_)) != logical_timeslot.is_some() {
+        if matches!(&decoded, AccumulateRequestV2::ExpireCall(_)) != logical_timeslot.is_some()
+            || CommittedAccumulateEntryV2::validate_availability(&decoded, &programs, &blobs)
+                .is_err()
+        {
             return Err(DecodeError::NonCanonical);
         }
         Ok(Self {
             request,
             logical_timeslot,
+            programs,
+            blobs,
         })
     }
 }
@@ -184,6 +229,8 @@ impl RaftAccumulateLogV2 {
                     index: entry.index,
                     request: payload.request,
                     logical_timeslot: payload.logical_timeslot,
+                    availability_programs: payload.programs,
+                    availability_blobs: payload.blobs,
                 }))
             }
             vos_raft::EntryKind::ConfigChange { .. } => Ok(None),
@@ -232,6 +279,8 @@ impl RaftAccumulateLogV2 {
                 index,
                 request: decoded.request,
                 logical_timeslot: decoded.logical_timeslot,
+                availability_programs: decoded.programs,
+                availability_blobs: decoded.blobs,
             })
         })();
         if let Err(error) = result {
@@ -285,7 +334,11 @@ impl RaftAccumulateLogV2 {
             }
         }
         let entry = self.committed_entry(index)?;
-        if entry.request != decoded.request || entry.logical_timeslot != decoded.logical_timeslot {
+        if entry.request != decoded.request
+            || entry.logical_timeslot != decoded.logical_timeslot
+            || entry.availability_programs != decoded.programs
+            || entry.availability_blobs != decoded.blobs
+        {
             return Err(CommitError::Config(alloc::format!(
                 "raft v2 committed bytes at proposal index {index} changed"
             )));
@@ -325,12 +378,16 @@ impl CommittedAccumulateLogV2 for RaftAccumulateLogV2 {
         }
     }
 
-    fn propose_at(
+    fn propose_at_with_availability(
         &mut self,
         request: &[u8],
         logical_timeslot: Option<u64>,
+        programs: &[ImportedProgramV2],
+        blobs: &[ImportedBlobV2],
     ) -> Result<CommittedAccumulateEntryV2, Self::Error> {
-        let payload = RaftAccumulatePayloadV2::from_request(request, logical_timeslot)?.encode();
+        let payload =
+            RaftAccumulatePayloadV2::from_request(request, logical_timeslot, programs, blobs)?
+                .encode();
         match &self.role {
             RoleV2::SingleNode => self.propose_single(&payload),
             #[cfg(feature = "network")]
@@ -556,8 +613,11 @@ mod tests {
     #[test]
     fn replicated_timeout_payload_pins_the_ambient_jam_slot() {
         let bytes = expiration_request().encode();
-        assert!(RaftAccumulatePayloadV2::from_request(&bytes, None).is_err());
-        assert!(RaftAccumulatePayloadV2::from_request(&request(1).encode(), Some(50)).is_err());
+        assert!(RaftAccumulatePayloadV2::from_request(&bytes, None, &[], &[],).is_err());
+        assert!(
+            RaftAccumulatePayloadV2::from_request(&request(1).encode(), Some(50), &[], &[],)
+                .is_err()
+        );
 
         let (path, directory) = temp_path();
         let mut log = RaftAccumulateLogV2::open(&path, RaftConfig::default()).unwrap();

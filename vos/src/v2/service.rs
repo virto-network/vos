@@ -17,11 +17,69 @@ use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateProtocolHostV2, AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2,
     AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2, AttestationDeliveryV2,
-    CommittedServiceImageHostV2, ImportedBlobV2, LocalJamStoreSnapshotV2, ProgramId,
-    ProofCommitmentV2, ProofVerificationRequestV2, PublishedEffectsV2, RefineImportsV2,
+    CommittedServiceImageHostV2, ImportedBlobV2, ImportedProgramV2, LocalJamStoreSnapshotV2,
+    ProgramId, ProofCommitmentV2, ProofVerificationRequestV2, PublishedEffectsV2, RefineImportsV2,
     RefineOutputV2, RefineProtocolHostV2, RefineTraceV2, ServiceImageInstallErrorV2,
     ServicePvmErrorV2, ServicePvmOutputV2, ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
+
+fn validate_accumulate_availability(
+    request: &AccumulateRequestV2,
+    programs: &[ImportedProgramV2],
+    blobs: &[ImportedBlobV2],
+) -> Result<(), DecodeError> {
+    if programs
+        .windows(2)
+        .any(|pair| pair[0].program >= pair[1].program)
+        || programs
+            .iter()
+            .any(|program| ProgramId::of_pvm(&program.pvm) != program.program)
+        || blobs
+            .windows(2)
+            .any(|pair| pair[0].reference.hash >= pair[1].reference.hash)
+        || blobs
+            .iter()
+            .any(|blob| !blob.reference.matches(&blob.bytes))
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+
+    let (mut expected_programs, mut expected_blobs) = match request {
+        AccumulateRequestV2::Install(genesis) => (
+            genesis
+                .actors
+                .iter()
+                .map(|actor| actor.program)
+                .collect::<Vec<_>>(),
+            genesis
+                .actors
+                .iter()
+                .map(|actor| actor.initial_state.clone())
+                .collect::<Vec<_>>(),
+        ),
+        AccumulateRequestV2::UpgradeActor(upgrade) => {
+            (alloc::vec![upgrade.replacement_program], Vec::new())
+        }
+        _ => (Vec::new(), Vec::new()),
+    };
+    expected_programs.sort();
+    expected_programs.dedup();
+    expected_blobs.sort_by_key(|reference| reference.hash);
+    expected_blobs.dedup();
+
+    if programs
+        .iter()
+        .map(|program| program.program)
+        .ne(expected_programs)
+        || blobs
+            .iter()
+            .map(|blob| blob.reference.clone())
+            .ne(expected_blobs)
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefinedServiceOutputV2 {
@@ -180,6 +238,20 @@ pub struct CommittedAccumulateEntryV2 {
     pub index: u64,
     pub request: Vec<u8>,
     pub logical_timeslot: Option<u64>,
+    /// Canonical content bytes required to make this entry independently
+    /// replayable on a replica with an empty node-local cache.
+    pub availability_programs: Vec<ImportedProgramV2>,
+    pub availability_blobs: Vec<ImportedBlobV2>,
+}
+
+impl CommittedAccumulateEntryV2 {
+    pub(crate) fn validate_availability(
+        request: &AccumulateRequestV2,
+        programs: &[ImportedProgramV2],
+        blobs: &[ImportedBlobV2],
+    ) -> Result<(), DecodeError> {
+        validate_accumulate_availability(request, programs, blobs)
+    }
 }
 
 /// Committed application entries after one replica's apply cursor. Raft may
@@ -285,11 +357,21 @@ pub trait CommittedAccumulateLogV2 {
     /// already allocated an admission timeslot.
     fn leader_read_index(&mut self) -> Result<u64, Self::Error>;
 
+    fn propose_at_with_availability(
+        &mut self,
+        request: &[u8],
+        logical_timeslot: Option<u64>,
+        programs: &[ImportedProgramV2],
+        blobs: &[ImportedBlobV2],
+    ) -> Result<CommittedAccumulateEntryV2, Self::Error>;
+
     fn propose_at(
         &mut self,
         request: &[u8],
         logical_timeslot: Option<u64>,
-    ) -> Result<CommittedAccumulateEntryV2, Self::Error>;
+    ) -> Result<CommittedAccumulateEntryV2, Self::Error> {
+        self.propose_at_with_availability(request, logical_timeslot, &[], &[])
+    }
 
     fn propose(&mut self, request: &[u8]) -> Result<CommittedAccumulateEntryV2, Self::Error> {
         self.propose_at(request, None)
@@ -331,6 +413,7 @@ pub enum ServiceDispatchError {
     },
     InvalidRefineOutput,
     InvalidAccumulateOutput,
+    InvalidAvailabilityArtifacts,
 }
 
 impl ServiceDispatchError {
@@ -353,7 +436,9 @@ impl ServiceDispatchError {
                     | ServicePvmErrorV2::InvalidProtocolResume
                     | ServicePvmErrorV2::InvalidVmLifecycle
             ),
-            Self::ServiceProgramMismatch { .. } | Self::InvalidAccumulateOutput => true,
+            Self::ServiceProgramMismatch { .. }
+            | Self::InvalidAccumulateOutput
+            | Self::InvalidAvailabilityArtifacts => true,
             Self::InvalidRefineOutput => false,
         }
     }
@@ -544,6 +629,33 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
         })
     }
 
+    pub fn accumulate_with_availability(
+        &mut self,
+        request: &AccumulateRequestV2,
+        programs: &[ImportedProgramV2],
+        blobs: &[ImportedBlobV2],
+    ) -> Result<AccumulatedServiceOutputV2, ServiceDispatchError> {
+        self.validate_service_program(request.service().service_program)?;
+        validate_accumulate_availability(request, programs, blobs)
+            .map_err(|_| ServiceDispatchError::InvalidAvailabilityArtifacts)?;
+        let output = self
+            .pvm
+            .accumulate_with_availability(
+                &request.encode(),
+                self.accumulate_gas,
+                &mut self.accumulate_host,
+                programs,
+                blobs,
+            )
+            .map_err(ServiceDispatchError::Pvm)?;
+        let result = AccumulationResultV2::decode(&output.bytes)
+            .map_err(|_| ServiceDispatchError::InvalidAccumulateOutput)?;
+        Ok(AccumulatedServiceOutputV2 {
+            result,
+            gas_used: output.gas_used,
+        })
+    }
+
     /// Accumulate a time-dependent request against a consensus-authenticated
     /// JAM logical timeslot. Ordinary requests should use [`Self::accumulate`].
     pub fn accumulate_at(
@@ -551,14 +663,28 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
         request: &AccumulateRequestV2,
         logical_timeslot: u64,
     ) -> Result<AccumulatedServiceOutputV2, ServiceDispatchError> {
+        self.accumulate_at_with_availability(request, logical_timeslot, &[], &[])
+    }
+
+    pub fn accumulate_at_with_availability(
+        &mut self,
+        request: &AccumulateRequestV2,
+        logical_timeslot: u64,
+        programs: &[ImportedProgramV2],
+        blobs: &[ImportedBlobV2],
+    ) -> Result<AccumulatedServiceOutputV2, ServiceDispatchError> {
         self.validate_service_program(request.service().service_program)?;
+        validate_accumulate_availability(request, programs, blobs)
+            .map_err(|_| ServiceDispatchError::InvalidAvailabilityArtifacts)?;
         let output = self
             .pvm
-            .accumulate_at(
+            .accumulate_at_with_availability(
                 &request.encode(),
                 self.accumulate_gas,
                 &mut self.accumulate_host,
                 logical_timeslot,
+                programs,
+                blobs,
             )
             .map_err(ServiceDispatchError::Pvm)?;
         let result = AccumulationResultV2::decode(&output.bytes)
@@ -890,12 +1016,20 @@ where
                 && capture.is_some_and(|target| {
                     target.request.as_slice() != entry.request.as_slice()
                         || target.logical_timeslot != entry.logical_timeslot
+                        || target.availability_programs != entry.availability_programs
+                        || target.availability_blobs != entry.availability_blobs
                 })
             {
                 return Err(ReplicatedServiceErrorV2::InvalidCommittedLog);
             }
             let request = AccumulateRequestV2::decode(&entry.request)
                 .map_err(|_| ReplicatedServiceErrorV2::InvalidCommittedLog)?;
+            validate_accumulate_availability(
+                &request,
+                &entry.availability_programs,
+                &entry.availability_blobs,
+            )
+            .map_err(|_| ReplicatedServiceErrorV2::InvalidCommittedLog)?;
             if matches!(request, AccumulateRequestV2::ExpireCall(_))
                 != entry.logical_timeslot.is_some()
             {
@@ -907,8 +1041,17 @@ where
             ensure_request_proof_available(self.service.accumulate_host_mut(), &request)
                 .map_err(|_| ReplicatedServiceErrorV2::ProofUnavailable)?;
             let outcome = match entry.logical_timeslot {
-                Some(logical_timeslot) => self.service.accumulate_at(&request, logical_timeslot),
-                None => self.service.accumulate(&request),
+                Some(logical_timeslot) => self.service.accumulate_at_with_availability(
+                    &request,
+                    logical_timeslot,
+                    &entry.availability_programs,
+                    &entry.availability_blobs,
+                ),
+                None => self.service.accumulate_with_availability(
+                    &request,
+                    &entry.availability_programs,
+                    &entry.availability_blobs,
+                ),
             };
             if let Err(error) = outcome.as_ref()
                 && !error.is_deterministic_accumulate_failure()
@@ -1043,7 +1186,18 @@ where
         &mut self,
         request: &AccumulateRequestV2,
     ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
-        self.accumulate_ordered(request, None)
+        self.accumulate_with_availability(request, &[], &[])
+    }
+
+    /// Quorum-order one request together with the exact content-addressed
+    /// programs and blobs needed to execute it on an otherwise empty replica.
+    pub fn accumulate_with_availability(
+        &mut self,
+        request: &AccumulateRequestV2,
+        programs: &[ImportedProgramV2],
+        blobs: &[ImportedBlobV2],
+    ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
+        self.accumulate_ordered(request, None, programs, blobs)
     }
 
     /// Quorum-order a time-dependent request together with the
@@ -1054,16 +1208,18 @@ where
         request: &AccumulateRequestV2,
         logical_timeslot: u64,
     ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
-        self.accumulate_ordered(request, Some(logical_timeslot))
+        self.accumulate_ordered(request, Some(logical_timeslot), &[], &[])
     }
 
     fn accumulate_ordered(
         &mut self,
         request: &AccumulateRequestV2,
         logical_timeslot: Option<u64>,
+        programs: &[ImportedProgramV2],
+        blobs: &[ImportedBlobV2],
     ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
         self.catch_up()?;
-        self.accumulate_ordered_after_barrier(request, logical_timeslot)
+        self.accumulate_ordered_after_barrier(request, logical_timeslot, programs, blobs)
     }
 
     #[cfg(feature = "storage")]
@@ -1071,7 +1227,17 @@ where
         &mut self,
         request: &AccumulateRequestV2,
     ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
-        self.accumulate_ordered_after_barrier(request, None)
+        self.accumulate_with_availability_after_barrier(request, &[], &[])
+    }
+
+    #[cfg(feature = "storage")]
+    pub(crate) fn accumulate_with_availability_after_barrier(
+        &mut self,
+        request: &AccumulateRequestV2,
+        programs: &[ImportedProgramV2],
+        blobs: &[ImportedBlobV2],
+    ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
+        self.accumulate_ordered_after_barrier(request, None, programs, blobs)
     }
 
     /// Quorum-order a slot-bound request after the caller has already
@@ -1082,14 +1248,22 @@ where
         request: &AccumulateRequestV2,
         logical_timeslot: u64,
     ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
-        self.accumulate_ordered_after_barrier(request, Some(logical_timeslot))
+        self.accumulate_ordered_after_barrier(request, Some(logical_timeslot), &[], &[])
     }
 
     fn accumulate_ordered_after_barrier(
         &mut self,
         request: &AccumulateRequestV2,
         logical_timeslot: Option<u64>,
+        programs: &[ImportedProgramV2],
+        blobs: &[ImportedBlobV2],
     ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
+        self.service
+            .validate_service_program(request.service().service_program)
+            .map_err(ReplicatedServiceErrorV2::Dispatch)?;
+        validate_accumulate_availability(request, programs, blobs).map_err(|_| {
+            ReplicatedServiceErrorV2::Dispatch(ServiceDispatchError::InvalidAvailabilityArtifacts)
+        })?;
         let expires_call = matches!(request, AccumulateRequestV2::ExpireCall(_));
         if expires_call && logical_timeslot.is_none() {
             return Err(ReplicatedServiceErrorV2::LogicalTimeslotRequired);
@@ -1100,19 +1274,16 @@ where
         if matches!(request, AccumulateRequestV2::PrepareAttested(_)) {
             return self
                 .service
-                .accumulate(request)
+                .accumulate_with_availability(request, programs, blobs)
                 .map_err(ReplicatedServiceErrorV2::Dispatch);
         }
         ensure_request_proof_available(self.service.accumulate_host_mut(), request)
             .map_err(|_| ReplicatedServiceErrorV2::ProofUnavailable)?;
 
-        self.service
-            .validate_service_program(request.service().service_program)
-            .map_err(ReplicatedServiceErrorV2::Dispatch)?;
         let request_bytes = request.encode();
         let entry = self
             .log
-            .propose_at(&request_bytes, logical_timeslot)
+            .propose_at_with_availability(&request_bytes, logical_timeslot, programs, blobs)
             .map_err(ReplicatedServiceErrorV2::Log)?;
         let applied = self
             .log
@@ -1121,6 +1292,8 @@ where
         if entry.index <= applied
             || entry.request != request_bytes
             || entry.logical_timeslot != logical_timeslot
+            || entry.availability_programs.as_slice() != programs
+            || entry.availability_blobs.as_slice() != blobs
         {
             return Err(ReplicatedServiceErrorV2::InvalidCommittedLog);
         }

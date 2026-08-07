@@ -17,14 +17,14 @@ use super::{
     ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2, BlobRefV2,
     CommittedImageStoreV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2,
     CrdtSyncEnvelopeV2, DedupRecordV2, DirectIngressV2, DurableJamStoreV2, DurableStoreOpenErrorV2,
-    ExternalActorBindingV2, ExternalActorDirectoryV2, JamServiceV2, LocalJamStoreHostV2,
-    LocalJamStoreV2, LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
-    MethodPolicyV2, NoRefineProtocolHostV2, PackageError, PackageRolePoliciesV2, PreparedWorkV2,
-    ProgramId, ProofArtifactStoreV2, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
-    RefinedServiceOutputV2, RoleAssertionEligibilityV2, RoleAuthorityBindingV2,
-    RoleAuthorizationClaimV2, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2,
-    ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2,
-    crdt_node_storage_key, dedup_storage_key,
+    ExternalActorBindingV2, ExternalActorDirectoryV2, ImportedBlobV2, ImportedProgramV2,
+    JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2, LocalStoreReadErrorV2, LocalWorkRequestV2,
+    LocalWorkSchedulerV2, MethodPolicyV2, NoRefineProtocolHostV2, PackageError,
+    PackageRolePoliciesV2, PreparedWorkV2, ProgramId, ProofArtifactStoreV2, PublicationAckV2,
+    PublicationRecordV2, PublishedEffectsV2, RefinedServiceOutputV2, RoleAssertionEligibilityV2,
+    RoleAuthorityBindingV2, RoleAuthorizationClaimV2, ScheduleErrorV2, ServiceDispatchError,
+    ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2, WorkInputIdV2,
+    WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
 };
 
 #[cfg(feature = "storage")]
@@ -565,6 +565,23 @@ where
         }
     }
 
+    fn accumulate_with_availability(
+        &mut self,
+        request: &AccumulateRequestV2,
+        programs: &[ImportedProgramV2],
+        blobs: &[ImportedBlobV2],
+    ) -> Result<AccumulatedServiceOutputV2, RootTreeDriverErrorV2> {
+        match self {
+            Self::Direct(service) => service
+                .accumulate_with_availability(request, programs, blobs)
+                .map_err(RootTreeDriverErrorV2::Direct),
+            #[cfg(feature = "storage")]
+            Self::Raft(service) => service
+                .accumulate_with_availability(request, programs, blobs)
+                .map_err(RootTreeDriverErrorV2::Raft),
+        }
+    }
+
     fn accumulate_after_barrier(
         &mut self,
         request: &AccumulateRequestV2,
@@ -576,6 +593,23 @@ where
             #[cfg(feature = "storage")]
             Self::Raft(service) => service
                 .accumulate_after_barrier(request)
+                .map_err(RootTreeDriverErrorV2::Raft),
+        }
+    }
+
+    fn accumulate_with_availability_after_barrier(
+        &mut self,
+        request: &AccumulateRequestV2,
+        programs: &[ImportedProgramV2],
+        blobs: &[ImportedBlobV2],
+    ) -> Result<AccumulatedServiceOutputV2, RootTreeDriverErrorV2> {
+        match self {
+            Self::Direct(service) => service
+                .accumulate_with_availability(request, programs, blobs)
+                .map_err(RootTreeDriverErrorV2::Direct),
+            #[cfg(feature = "storage")]
+            Self::Raft(service) => service
+                .accumulate_with_availability_after_barrier(request, programs, blobs)
                 .map_err(RootTreeDriverErrorV2::Raft),
         }
     }
@@ -612,6 +646,8 @@ pub struct LocalRootTreeServiceV2<B> {
     root_actor: ActorId,
     consistency: ConsistencyModeV2,
     genesis: ServiceGenesisV2,
+    install_programs: Vec<ImportedProgramV2>,
+    install_blobs: Vec<ImportedBlobV2>,
     expected_root: ActorGenesisV2,
     expected_external_actors: Vec<ExternalActorBindingV2>,
     expected_role_authority: Option<RoleAuthorityBindingV2>,
@@ -977,11 +1013,24 @@ where
         let (expected_root, genesis) = config
             .installation()
             .map_err(LocalRootTreeOpenErrorV2::InvalidConfig)?;
+        let install_request = AccumulateRequestV2::Install(genesis.clone());
+        let install_programs = vec![ImportedProgramV2 {
+            program: expected_root.program,
+            pvm: config.package.actor_pvm.clone(),
+        }];
+        let install_blobs = vec![ImportedBlobV2 {
+            reference: expected_root.initial_state.clone(),
+            bytes: config.initial_state.clone(),
+        }];
+        super::CommittedAccumulateEntryV2::validate_availability(
+            &install_request,
+            &install_programs,
+            &install_blobs,
+        )
+        .map_err(|_| {
+            LocalRootTreeOpenErrorV2::InvalidConfig(LocalRootTreeConfigErrorV2::InvalidGenesis)
+        })?;
         let store = DurableJamStoreV2::open(backend).map_err(LocalRootTreeOpenErrorV2::Store)?;
-        let needs_imports = store
-            .header()
-            .map_err(LocalRootTreeOpenErrorV2::CorruptStore)?
-            .is_none();
         let expected_program = config.service.service_program;
         let mut service = JamServiceV2::new(
             config.service_pvm,
@@ -993,22 +1042,6 @@ where
         )
         .map_err(LocalRootTreeOpenErrorV2::Service)?;
 
-        if needs_imports {
-            let initial = service
-                .accumulate_host_mut()
-                .import_blob(config.initial_state.clone());
-            if initial != expected_root.initial_state {
-                return Err(LocalRootTreeOpenErrorV2::ExistingActorMismatch);
-            }
-            let imported_program = service
-                .accumulate_host_mut()
-                .import_program(config.package.actor_pvm.clone());
-            if imported_program != expected_root.program {
-                return Err(LocalRootTreeOpenErrorV2::InvalidConfig(
-                    LocalRootTreeConfigErrorV2::InvalidPackage(PackageError::ProgramIdMismatch),
-                ));
-            }
-        }
         service.accumulate_host_mut().allow_install(&genesis);
         let service = match driver {
             RootTreeDriverConfigV2::Direct => RootTreeServiceDriverV2::Direct(service),
@@ -1024,6 +1057,8 @@ where
             root_actor: config.root_actor,
             consistency: config.consistency,
             genesis,
+            install_programs,
+            install_blobs,
             expected_root,
             expected_external_actors: config.external_actors,
             expected_role_authority: config.role_authority,
@@ -1236,7 +1271,11 @@ where
             // so the ordering remains one contiguous critical sequence.
             let result = self
                 .service
-                .accumulate_after_barrier(&AccumulateRequestV2::Install(self.genesis.clone()))
+                .accumulate_with_availability_after_barrier(
+                    &AccumulateRequestV2::Install(self.genesis.clone()),
+                    &self.install_programs,
+                    &self.install_blobs,
+                )
                 .map_err(RootTreeDriverErrorV2::into_invoke)?;
             match result.result {
                 AccumulationResultV2::Installed(_) => {}
@@ -1277,7 +1316,11 @@ where
         }
         let result = self
             .service
-            .accumulate(&AccumulateRequestV2::Install(self.genesis.clone()))
+            .accumulate_with_availability(
+                &AccumulateRequestV2::Install(self.genesis.clone()),
+                &self.install_programs,
+                &self.install_blobs,
+            )
             .map_err(RootTreeDriverErrorV2::into_invoke)?;
         match result.result {
             AccumulationResultV2::Installed(_) => {}

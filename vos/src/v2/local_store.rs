@@ -967,16 +967,10 @@ impl LocalJamStoreV2 {
         self.role_credential_allowlist.insert(request.hash());
     }
 
-    /// Authorize one exact actor upgrade. The replacement program must have
-    /// been imported first; authorization cannot manufacture package bytes.
+    /// Authorize one exact actor upgrade. The replacement program is supplied
+    /// separately as content-addressed request availability and must be
+    /// present in the staged image before guest validation can accept it.
     pub fn allow_upgrade(&mut self, upgrade: &ActorUpgradeV2) -> bool {
-        if !self
-            .committed
-            .programs
-            .contains_key(&upgrade.replacement_program.0)
-        {
-            return false;
-        }
         self.upgrade_allowlist.insert(upgrade.hash());
         true
     }
@@ -1335,8 +1329,48 @@ impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
         &mut self,
         logical_timeslot: Option<u64>,
     ) -> Result<Self::Transaction, ServicePvmErrorV2> {
+        self.begin_at_with_availability(logical_timeslot, &[], &[])
+    }
+
+    fn begin_at_with_availability(
+        &mut self,
+        logical_timeslot: Option<u64>,
+        programs: &[super::ImportedProgramV2],
+        blobs: &[super::ImportedBlobV2],
+    ) -> Result<Self::Transaction, ServicePvmErrorV2> {
+        let mut staged = self.committed.clone();
+        for program in programs {
+            if super::ProgramId::of_pvm(&program.pvm) != program.program
+                || staged
+                    .programs
+                    .get(&program.program.0)
+                    .is_some_and(|bytes| bytes != &program.pvm)
+            {
+                return Err(ServicePvmErrorV2::AccumulateHostRejected(
+                    crate::abi::hostcall::PROGRAM_LOOKUP as u8,
+                ));
+            }
+            staged
+                .programs
+                .insert(program.program.0, program.pvm.clone());
+        }
+        for blob in blobs {
+            if !blob.reference.matches(&blob.bytes)
+                || staged
+                    .blobs
+                    .get(&blob.reference.hash.0)
+                    .is_some_and(|bytes| bytes != &blob.bytes)
+            {
+                return Err(ServicePvmErrorV2::AccumulateHostRejected(
+                    crate::abi::hostcall::PREIMAGE_PROVIDE as u8,
+                ));
+            }
+            staged
+                .blobs
+                .insert(blob.reference.hash.0, blob.bytes.clone());
+        }
         Ok(LocalJamTransactionV2 {
-            staged: self.committed.clone(),
+            staged,
             logical_timeslot,
             proof_blobs: self.proof_blobs.clone(),
             proof_allowlist: self.proof_allowlist.clone(),
@@ -1370,6 +1404,16 @@ impl<B: CommittedImageStoreV2> AccumulateProtocolHostV2 for DurableJamStoreV2<B>
         logical_timeslot: Option<u64>,
     ) -> Result<Self::Transaction, ServicePvmErrorV2> {
         self.local.begin_at(logical_timeslot)
+    }
+
+    fn begin_at_with_availability(
+        &mut self,
+        logical_timeslot: Option<u64>,
+        programs: &[super::ImportedProgramV2],
+        blobs: &[super::ImportedBlobV2],
+    ) -> Result<Self::Transaction, ServicePvmErrorV2> {
+        self.local
+            .begin_at_with_availability(logical_timeslot, programs, blobs)
     }
 
     fn commit(&mut self, mut transaction: Self::Transaction) -> Result<(), ServicePvmErrorV2> {
