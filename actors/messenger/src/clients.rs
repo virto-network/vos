@@ -69,6 +69,34 @@ fn value_to_bytes(v: Value) -> Option<Vec<u8>> {
     }
 }
 
+/// Decode the canonical `Option<T>` handler reply: `[0]` for `None`,
+/// `[1] || rkyv(T)` for `Some`. The empty/unit and untagged cases retain
+/// read-only compatibility with older registry guests.
+fn decode_option_value<T: vos::Decode>(value: Value) -> Result<Option<T>, ()> {
+    let bytes = value_to_bytes(value).ok_or(())?;
+    if bytes.is_empty() || bytes.as_slice() == [0] {
+        return Ok(None);
+    }
+    let payload = bytes.strip_prefix(&[1]).unwrap_or(bytes.as_slice());
+    T::try_decode(payload).map(Some).ok_or(())
+}
+
+#[cfg(test)]
+mod option_reply_tests {
+    use super::*;
+
+    #[test]
+    fn tagged_option_reply_decodes_some_and_none() {
+        let mut some = alloc::vec![1];
+        some.extend_from_slice(&7u32.encode());
+        assert_eq!(decode_option_value::<u32>(Value::Bytes(some)), Ok(Some(7)),);
+        assert_eq!(
+            decode_option_value::<u32>(Value::Bytes(alloc::vec![0])),
+            Ok(None),
+        );
+    }
+}
+
 /// Extract a status byte from a `u8`-returning handler reply.
 fn value_to_status(v: Value) -> Option<u8> {
     match v {
@@ -116,15 +144,8 @@ pub(crate) async fn reg_agent_by_pattern(
     let value = ask_value(ctx, ServiceId(REGISTRY_ID), &msg)
         .await
         .ok_or_else(|| "registry unreachable".to_string())?;
-    // `Some(row)` → `Value::Bytes(rkyv(AgentRow))`; `None` → `Value::Unit`
-    // (empty bytes via `value_to_bytes`).
-    let inner = value_to_bytes(value).ok_or_else(|| "bad registry reply".to_string())?;
-    if inner.is_empty() {
-        return Ok(None);
-    }
-    <space_registry::AgentRow as vos::Decode>::try_decode(&inner)
-        .map(Some)
-        .ok_or_else(|| "bad registry agent_by_pattern payload".to_string())
+    decode_option_value::<space_registry::AgentRow>(value)
+        .map_err(|()| "bad registry agent_by_pattern payload".to_string())
 }
 
 /// `space-registry.peer_role` — is `peer_id` an enrolled space member (any
@@ -337,14 +358,10 @@ pub(crate) async fn dir_claim_kp(
 pub(crate) async fn chronos_beacon(ctx: &mut MsgrCtx) -> Option<[u8; 32]> {
     let chronos_id = resolve(ctx, CHRONOS_AGENT).await.ok()?;
     let msg = Msg::new("latest_final");
-    // `Option<BeaconRound>` over the wire: empty bytes = None (no finalized
-    // round), populated = rkyv-encoded BeaconRound (see the macro's reply
-    // encoding). Mirror the `dir_claim_kp` shape.
-    let inner = value_to_bytes(ask_value(ctx, ServiceId(chronos_id), &msg).await?)?;
-    if inner.is_empty() {
-        return None;
-    }
-    let round = <chronos::BeaconRound as vos::Decode>::try_decode(&inner)?;
+    let round = decode_option_value::<chronos::BeaconRound>(
+        ask_value(ctx, ServiceId(chronos_id), &msg).await?,
+    )
+    .ok()??;
     Some(vos::crypto::blake2b_hash::<32>(
         b"vos-msg/beacon-hedge/v1",
         &[&round.round.to_le_bytes(), &round.beacon],

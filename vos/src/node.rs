@@ -1589,22 +1589,15 @@ impl NodeService {
     /// isn't installed, or the reply doesn't decode.
     #[cfg(all(feature = "storage", feature = "network"))]
     fn probe_agent_floor(&self, name: &str) -> Option<crate::registry::SyncFloor> {
-        use crate::actors::codec::{Decode, Encode};
-        use crate::value::{Msg, TAG_DYNAMIC, Value};
+        use crate::actors::codec::Encode;
+        use crate::value::{Msg, TAG_DYNAMIC};
         let msg = Msg::new("agent").with("instance_name", name);
         let mut payload = Vec::with_capacity(1 + 64);
         payload.push(TAG_DYNAMIC);
         payload.extend_from_slice(&msg.encode());
         let reply = registry_probe_reply(&self.invoke_routes, payload)?;
-        // `agent` replies `Value::Bytes(rkyv AgentRow)` (installed) or
-        // `Value::Unit` (not installed).
-        match <Value as Decode>::try_decode(&reply)? {
-            Value::Bytes(b) => {
-                let row = <crate::registry::AgentRow as Decode>::try_decode(&b)?;
-                Some(row.sync_role)
-            }
-            _ => None,
-        }
+        let row = decode_registry_option_reply::<crate::registry::AgentRow>(&reply)??;
+        Some(row.sync_role)
     }
 
     /// Storage-only build (no network): the floor probe is unavailable, so
@@ -1628,8 +1621,8 @@ impl NodeService {
     /// A missing/unreachable registry fails closed so the global host cache
     /// never becomes an open cross-space CAS.
     fn program_hash_catalogued(&self, hash: &[u8; 32]) -> bool {
-        use crate::actors::codec::{Decode, Encode};
-        use crate::value::{Msg, TAG_DYNAMIC, Value};
+        use crate::actors::codec::Encode;
+        use crate::value::{Msg, TAG_DYNAMIC};
         // Targeted hash lookup — the registry answers with just the matching
         // row (or none), so this stays a bounded single-reply probe rather
         // than draining the whole (now paginated) catalog.
@@ -1640,15 +1633,9 @@ impl NodeService {
         let Some(reply) = registry_probe_reply(&self.invoke_routes, payload) else {
             return false;
         };
-        // `Some(row)` → `Value::Bytes(rkyv(ProgramRow))`; `None` → `Value::Unit`
-        // (or empty bytes). Only a decodable row whose hash matches counts.
-        match <Value as Decode>::try_decode(&reply) {
-            Some(Value::Bytes(bytes)) if !bytes.is_empty() => {
-                <crate::registry::ProgramRow as Decode>::try_decode(&bytes)
-                    .is_some_and(|p| &p.hash == hash)
-            }
-            _ => false,
-        }
+        decode_registry_option_reply::<crate::registry::ProgramRow>(&reply)
+            .flatten()
+            .is_some_and(|program| &program.hash == hash)
     }
 
     /// Resolve a (possibly prefix-scoped) target `ServiceId` value back
@@ -1872,6 +1859,28 @@ fn registry_probe_reply(routes: &InvokeRoutes, payload: Vec<u8>) -> Option<Vec<u
         .recv_timeout(Duration::from_millis(V2_RAFT_VOTER_AUTH_TIMEOUT_MS))
         .ok()?;
     unwrap_invoke_envelope(&envelope)
+}
+
+/// Decode a registry handler's `Option<T>` reply after the outer invoke
+/// envelope has been removed. Current guests emit `[0]` / `[1] || rkyv(T)`;
+/// the unit/empty and untagged forms remain accepted for legacy registries.
+#[cfg(feature = "network")]
+fn decode_registry_option_reply<T: crate::actors::codec::Decode>(
+    reply: &[u8],
+) -> Option<Option<T>> {
+    use crate::value::Value;
+
+    let value = <Value as crate::actors::codec::Decode>::try_decode(reply)?;
+    let bytes = match value {
+        Value::Unit => return Some(None),
+        Value::Bytes(bytes) => bytes,
+        _ => return None,
+    };
+    if bytes.is_empty() || bytes.as_slice() == [0] {
+        return Some(None);
+    }
+    let payload = bytes.strip_prefix(&[1]).unwrap_or(bytes.as_slice());
+    T::try_decode(payload).map(Some)
 }
 
 #[cfg(feature = "network")]
@@ -12268,17 +12277,19 @@ mod tests {
                     // `program_by_hash` verb's `Option<ProgramRow>` wire shape.
                     Some("program_by_hash") => {
                         if catalogued {
-                            Value::Bytes(
-                                crate::registry::ProgramRow {
+                            let mut tagged = vec![1];
+                            tagged.extend_from_slice(
+                                &crate::registry::ProgramRow {
                                     name: "program".into(),
                                     version: "1".into(),
                                     hash,
                                     crdt: false,
                                 }
                                 .encode(),
-                            )
+                            );
+                            Value::Bytes(tagged)
                         } else {
-                            Value::Unit
+                            Value::Bytes(vec![0])
                         }
                     }
                     _ => Value::U8(peer_role),
