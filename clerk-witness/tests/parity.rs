@@ -26,9 +26,24 @@ const BATCH_TS: u64 = 600_000;
 /// `(key, canonical leaf content)` pairs cipher-clerk's SMT commits.
 fn full_leaves(
     l: &VecLedger,
-) -> (FullLeaves, FullLeaves, FullLeaves, FullLeaves, FullLeaves, FullLeaves) {
-    let accounts = l.accounts.iter().map(|a| (a.id.0, account_leaf_content(a))).collect();
-    let transfers = l.transfers.iter().map(|t| (t.id.0, transfer_leaf_content(t))).collect();
+) -> (
+    FullLeaves,
+    FullLeaves,
+    FullLeaves,
+    FullLeaves,
+    FullLeaves,
+    FullLeaves,
+) {
+    let accounts = l
+        .accounts
+        .iter()
+        .map(|a| (a.id.0, account_leaf_content(a)))
+        .collect();
+    let transfers = l
+        .transfers
+        .iter()
+        .map(|t| (t.id.0, transfer_leaf_content(t)))
+        .collect();
     let journals = l
         .journal
         .iter()
@@ -74,9 +89,20 @@ fn conservation_setup() -> (VecLedger, Vec<Transfer>, OpeningsOracle, Amount) {
 
     let alice_kp = Keypair::generate();
     let bob_kp = Keypair::generate();
-    let alice = Account::open(AccountKind::Asset, jid, alice_kp.public, Iso4217::USD, BankCode::Vault);
-    let bob =
-        Account::open(AccountKind::Liability, jid, bob_kp.public, Iso4217::USD, BankCode::Checking);
+    let alice = Account::open(
+        AccountKind::Asset,
+        jid,
+        alice_kp.public,
+        Iso4217::USD,
+        BankCode::Vault,
+    );
+    let bob = Account::open(
+        AccountKind::Liability,
+        jid,
+        bob_kp.public,
+        Iso4217::USD,
+        BankCode::Checking,
+    );
     for r in cipher_clerk::apply_account_creations(
         &mut ledger,
         &[
@@ -105,7 +131,11 @@ fn bridge_witness(
 ) -> (ClerkTransitionWitness, TouchedKeys) {
     let (touched, statuses) = discover_touched(ledger, events, oracle, BATCH_TS);
     for s in &statuses {
-        assert_eq!(*s, EventStatus::Created, "the probe batch must apply cleanly");
+        assert_eq!(
+            *s,
+            EventStatus::Created,
+            "the probe batch must apply cleanly"
+        );
     }
     let (accounts, transfers, journals, external_ids, voided, pending) = full_leaves(ledger);
     let witness = witness_from_leaves(
@@ -143,7 +173,10 @@ fn bridge_roots_match_cipher_clerk_and_live_apply() {
     // the same transition through the vos WitnessedLedger stack.
     let (witness, _touched) = bridge_witness(&ledger, &events, &oracle);
     let applied = apply_witnessed(witness);
-    assert_eq!(applied.root_before, root_before, "bridge root_before parity");
+    assert_eq!(
+        applied.root_before, root_before,
+        "bridge root_before parity"
+    );
     assert_eq!(applied.root_after, root_after, "bridge root_after parity");
     assert!(
         applied.has_debit_commit(&amount_commit),

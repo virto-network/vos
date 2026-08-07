@@ -2763,6 +2763,7 @@ mod tests {
         cli_methods: &[],
         doc: "",
         crdt: false,
+        provable: false,
     };
 
     fn signed_v2_package(service_program: ProgramId) -> VosPackageV2 {

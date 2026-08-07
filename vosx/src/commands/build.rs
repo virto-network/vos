@@ -661,6 +661,7 @@ mod tests {
             cli_methods: &[],
             doc: "",
             crdt: false,
+            provable: false,
         };
 
         let temp = TempDir::new("deterministic");

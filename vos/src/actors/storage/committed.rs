@@ -842,7 +842,10 @@ mod tests {
             for (k, v) in &values {
                 let mut key16 = [0u8; 16];
                 key16.copy_from_slice(k);
-                assert_eq!(v.as_deref(), model.get(&key16).map(|x| x.encode()).as_deref());
+                assert_eq!(
+                    v.as_deref(),
+                    model.get(&key16).map(|x| x.encode()).as_deref()
+                );
             }
         }
 
@@ -889,15 +892,25 @@ mod tests {
             .map(|(k, v)| (k, v.map(|bytes| content(&bytes))))
             .collect();
         let ledger = WitnessedLedger::new(p, proof, touched, m.root());
-        assert_eq!(ledger.get(&key(2)), Some(content(&22u64.encode()).as_slice()));
-        assert_eq!(ledger.get(&key(50_000)), None, "named-but-absent is proven absent");
+        assert_eq!(
+            ledger.get(&key(2)),
+            Some(content(&22u64.encode()).as_slice())
+        );
+        assert_eq!(
+            ledger.get(&key(50_000)),
+            None,
+            "named-but-absent is proven absent"
+        );
 
         // Edge trees: empty map (all-absent witness over the empty
         // root), and a single-leaf map probed off-path.
         fresh();
         let m = map();
         let (proof, values) = m.batch_proof(&[key(1), key(2)]);
-        assert_eq!(proof, BatchProof::build::<[u8; 16]>(&p, &[], &[&key(1), &key(2)]));
+        assert_eq!(
+            proof,
+            BatchProof::build::<[u8; 16]>(&p, &[], &[&key(1), &key(2)])
+        );
         let touched: Vec<(Vec<u8>, Option<Vec<u8>>)> =
             values.into_iter().map(|(k, v)| (k, v)).collect();
         let ledger = WitnessedLedger::new(p, proof, touched, m.root());

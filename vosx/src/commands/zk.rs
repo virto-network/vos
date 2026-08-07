@@ -241,7 +241,10 @@ fn pin(args: PinArgs) -> Result<()> {
     // note rather than a refusal.
     match vos::metadata::from_elf(&elf) {
         Some(meta) if meta.provable => {
-            eprintln!("'{}' is marked provable (#[actor(task, provable)])", meta.actor_name);
+            eprintln!(
+                "'{}' is marked provable (#[actor(task, provable)])",
+                meta.actor_name
+            );
         }
         Some(meta) => {
             eprintln!(

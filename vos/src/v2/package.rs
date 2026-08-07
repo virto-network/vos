@@ -414,6 +414,7 @@ mod tests {
         cli_methods: &[],
         doc: "",
         crdt: false,
+        provable: false,
     };
 
     fn schema_and_policies() -> (Vec<u8>, Vec<u8>) {

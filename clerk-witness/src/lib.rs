@@ -44,9 +44,8 @@ use cipher_clerk::refine::apply_batch_refine;
 use cipher_clerk::snapshot::OpeningsOracle;
 use cipher_clerk::state::{LedgerState, Oracle, PendingStatus};
 use cipher_clerk::state_root::{
-    account_leaf_content, composite_root_from_subroots, external_id_key,
-    external_id_leaf_content, journal_leaf_content, pending_leaf_content,
-    transfer_leaf_content, voided_leaf_content,
+    account_leaf_content, composite_root_from_subroots, external_id_key, external_id_leaf_content,
+    journal_leaf_content, pending_leaf_content, transfer_leaf_content, voided_leaf_content,
 };
 use cipher_clerk::types::{Account, Direction, Journal, Transfer};
 use vos::rkyv;
@@ -228,9 +227,7 @@ fn decode_canonical<T, F>(content: &[u8], encode: F, what: &str) -> T
 where
     T: rkyv::Archive,
     T::Archived: rkyv::Deserialize<T, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>>
-        + for<'a> rkyv::bytecheck::CheckBytes<
-            rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
-        >,
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
     F: Fn(&T) -> Vec<u8>,
 {
     assert!(!content.is_empty(), "empty {what} leaf content");
@@ -305,7 +302,8 @@ impl LedgerState for WitnessedClerkState {
         // current occupant (and the unproven-slot panic).
         let _ = self.external_id_seen(eid, o);
         let key = external_id_key(&eid.0);
-        self.external_ids.insert(&key, external_id_leaf_content(&eid.0));
+        self.external_ids
+            .insert(&key, external_id_leaf_content(&eid.0));
     }
 
     fn transfer_voided(&self, id: &TransferId, _o: &mut dyn Oracle) -> bool {
@@ -450,11 +448,15 @@ impl<'a, S: LedgerState> LedgerState for RecordingState<'a, S> {
         self.transfers.borrow_mut().insert(t.id.0);
     }
     fn external_id_seen(&self, eid: &ExternalId, o: &mut dyn Oracle) -> bool {
-        self.external_ids.borrow_mut().insert(external_id_key(&eid.0));
+        self.external_ids
+            .borrow_mut()
+            .insert(external_id_key(&eid.0));
         self.inner.external_id_seen(eid, o)
     }
     fn mark_external_id(&mut self, eid: &ExternalId, _o: &mut dyn Oracle) {
-        self.external_ids.borrow_mut().insert(external_id_key(&eid.0));
+        self.external_ids
+            .borrow_mut()
+            .insert(external_id_key(&eid.0));
     }
     fn transfer_voided(&self, id: &TransferId, o: &mut dyn Oracle) -> bool {
         self.voided.borrow_mut().insert(id.0);
@@ -526,18 +528,32 @@ pub fn ledger_witness_from_leaves(
 /// ledger, so this walks every leaf; a live clerk-ledger parent
 /// extracts touched-only proofs via `CommittedMap::batch_proof`
 /// instead.
-pub fn vec_ledger_full_leaves(
-    l: &cipher_clerk::snapshot::VecLedger,
-) -> [FullLeaves; 6] {
-    let accounts = l.accounts.iter().map(|a| (a.id.0, account_leaf_content(a))).collect();
-    let transfers = l.transfers.iter().map(|t| (t.id.0, transfer_leaf_content(t))).collect();
-    let journals = l.journal.iter().map(|j| (j.id.0, journal_leaf_content(j))).collect();
+pub fn vec_ledger_full_leaves(l: &cipher_clerk::snapshot::VecLedger) -> [FullLeaves; 6] {
+    let accounts = l
+        .accounts
+        .iter()
+        .map(|a| (a.id.0, account_leaf_content(a)))
+        .collect();
+    let transfers = l
+        .transfers
+        .iter()
+        .map(|t| (t.id.0, transfer_leaf_content(t)))
+        .collect();
+    let journals = l
+        .journal
+        .iter()
+        .map(|j| (j.id.0, journal_leaf_content(j)))
+        .collect();
     let external_ids = l
         .external_ids
         .iter()
         .map(|eid| (external_id_key(eid), external_id_leaf_content(eid)))
         .collect();
-    let voided = l.voided_transfers.iter().map(|id| (*id, voided_leaf_content(id))).collect();
+    let voided = l
+        .voided_transfers
+        .iter()
+        .map(|id| (*id, voided_leaf_content(id)))
+        .collect();
     let pending = l
         .pending_statuses
         .iter()
@@ -589,7 +605,10 @@ pub fn witness_from_vec_ledger(
 ) -> ClerkTransitionWitness {
     let (touched, statuses) = discover_touched(ledger, &events, &oracle, batch_seed_timestamp);
     for s in &statuses {
-        assert!(*s == EventStatus::Created, "probe batch does not apply cleanly");
+        assert!(
+            *s == EventStatus::Created,
+            "probe batch does not apply cleanly"
+        );
     }
     let [accounts, transfers, journals, external_ids, voided, pending] =
         vec_ledger_full_leaves(ledger);

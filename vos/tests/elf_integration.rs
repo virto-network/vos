@@ -12446,13 +12446,28 @@ fn clerk_apply_conservation() -> (Vec<u8>, [u8; 32], [u8; 32], [u8; 32]) {
     let value: u64 = 100;
     let blinding = Blinding::from_bytes([3u8; 32]).expect("canonical scalar");
     let amount_commit = Amount::commit(value, &blinding);
-    let mut oracle = OpeningsOracle::new(vec![Opening { amount: amount_commit, value, blinding }]);
+    let mut oracle = OpeningsOracle::new(vec![Opening {
+        amount: amount_commit,
+        value,
+        blinding,
+    }]);
 
     let alice_kp = Keypair::generate();
     let bob_kp = Keypair::generate();
-    let alice = Account::open(AccountKind::Asset, jid, alice_kp.public, Iso4217::USD, BankCode::Vault);
-    let bob =
-        Account::open(AccountKind::Liability, jid, bob_kp.public, Iso4217::USD, BankCode::Checking);
+    let alice = Account::open(
+        AccountKind::Asset,
+        jid,
+        alice_kp.public,
+        Iso4217::USD,
+        BankCode::Vault,
+    );
+    let bob = Account::open(
+        AccountKind::Liability,
+        jid,
+        bob_kp.public,
+        Iso4217::USD,
+        BankCode::Checking,
+    );
     for r in cipher_clerk::apply_account_creations(
         &mut ledger,
         &[
@@ -12477,10 +12492,12 @@ fn clerk_apply_conservation() -> (Vec<u8>, [u8; 32], [u8; 32], [u8; 32]) {
     let mut live_oracle = oracle.clone();
     let _ = cipher_clerk::apply_batch(&mut live, &events, &mut live_oracle, BATCH_TS);
     let root_after = live.root();
-    assert_ne!(root_before, root_after, "the transfer must move the composite root");
+    assert_ne!(
+        root_before, root_after,
+        "the transfer must move the composite root"
+    );
 
-    let witness =
-        clerk_witness::witness_from_vec_ledger(&ledger, events.clone(), oracle, BATCH_TS);
+    let witness = clerk_witness::witness_from_vec_ledger(&ledger, events.clone(), oracle, BATCH_TS);
     // The batch digest the Task binds (over the same rkyv(events)).
     let ev_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&events)
         .expect("events rkyv-encode")
@@ -12511,7 +12528,7 @@ fn clerk_apply_task_captures_a_conservation_record() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let sched_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let sched_elf = match std::fs::read(&sched_path) {
@@ -12543,7 +12560,8 @@ fn clerk_apply_task_captures_a_conservation_record() {
     let sched_id = register_svc(&mut rt, transpile_actor(&sched_elf));
     let args = vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(vec![]));
     let encoded = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args).unwrap();
-    rt.storage.write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
+    rt.storage
+        .write(sched_id, vos::lifecycle::INIT_KEY, &encoded);
     let task_hash =
         rt.register_task_blob(clerk_blob.clone(), witness_addr as u32, witness_cap as u32);
 
@@ -12585,36 +12603,62 @@ fn clerk_apply_task_captures_a_conservation_record() {
     // The app-named roots the Task bound: root_before ‖ root_after ‖
     // batch_digest, recomputed from a live VecLedger apply the "verifier"
     // independently knows.
-    assert_eq!(record.app_public.len(), 96, "apply binds two roots + a digest");
+    assert_eq!(
+        record.app_public.len(),
+        96,
+        "apply binds two roots + a digest"
+    );
     assert_eq!(
         record.root_before(),
         Some(root_before),
         "app_public must LEAD with the composite root_before (the expected_root_before comparand)"
     );
-    assert_eq!(&record.app_public[32..64], &root_after, "the post-transition composite root");
-    assert_eq!(&record.app_public[64..], &batch_digest, "the bound batch digest");
+    assert_eq!(
+        &record.app_public[32..64],
+        &root_after,
+        "the post-transition composite root"
+    );
+    assert_eq!(
+        &record.app_public[64..],
+        &batch_digest,
+        "the bound batch digest"
+    );
 
     // The record binds itself (verify_record's witness-free check 3).
-    assert!(record.io_consistent(), "the clerk record reconstructs its own io-hash");
+    assert!(
+        record.io_consistent(),
+        "the clerk record reconstructs its own io-hash"
+    );
 
     // LIVE ≡ TRACED: the stored witness re-traces (the prover's path) to
     // the SAME io-hash the live invoke captured — so a proof of this
     // record will carry exactly this binding. This is the precompile
     // host handlers' soundness guarantee, exercised end to end.
-    let (mut interp, mut img) = zkpvm::actor::interpreter_from_blob(&clerk_blob, 500_000_000)
+    let (mut interp, _) = zkpvm::actor::interpreter_from_blob(&clerk_blob, 500_000_000)
         .expect("parse clerk-apply blob");
     let w = &entry.input.witness_bytes;
-    img[witness_addr as usize..witness_addr as usize + w.len()].copy_from_slice(w);
-    interp.flat_mem = img;
+    let witness_addr = u32::try_from(witness_addr).expect("witness address fits the PVM address");
+    for (offset, byte) in w.iter().copied().enumerate() {
+        interp
+            .write_u8(witness_addr + offset as u32, byte)
+            .expect("write witness into clerk-apply memory");
+    }
     let mut tracing = zkpvm::core::tracing::TracingPvm::new(interp);
     let exit = format!("{:?}", tracing.run_with_vos_stubs());
-    assert!(exit == "HostCall(0)" || exit == "Ecall", "clean halt, got {exit}");
+    assert_eq!(exit, "Halt", "clean canonical halt");
     let mut io = [0u8; 32];
     for (i, word) in tracing.pvm.registers[9..13].iter().enumerate() {
         io[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
     }
-    assert_eq!(io, record.io_hash, "live invoke and prover trace must bind the identical io-hash");
-    assert_ne!(io, vos::zk::compute_io_hash(&[], &[]), "a real binding, not the empty placeholder");
+    assert_eq!(
+        io, record.io_hash,
+        "live invoke and prover trace must bind the identical io-hash"
+    );
+    assert_ne!(
+        io,
+        vos::zk::compute_io_hash(&[], &[]),
+        "a real binding, not the empty placeholder"
+    );
 }
 
 #[test]

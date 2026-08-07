@@ -274,6 +274,7 @@ mod tests {
         cli_methods: &[],
         doc: "",
         crdt: false,
+        provable: false,
     };
 
     fn signed_package() -> VosPackageV2 {

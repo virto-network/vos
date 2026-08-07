@@ -1,6 +1,6 @@
 # `#[provable]` — proofs of actor transitions
 
-Status: **W1–W3 implemented; W4 (macro + clerk migration) remains**.
+Status: **W1–W4 implemented; parent-side Clerk production wiring remains**.
 The first draft
 tried to make a provable Task re-anchor its invoking parent's committed
 `0x02` composite and verify committed reads in-circuit against it. A
@@ -335,12 +335,12 @@ the record opt-in, not a semantic fork — "every Task is one
    over the B8 queue; `vosx zk prove/verify`. Gate: record → prove
    (release, heavy) → verify all checks, plus rejection of a tampered
    record/reply/root and a wrong `expected_root_before`.
-4. **W4 — next: clerk migration + macro.** Extract clerk-ledger's
-   `apply_transfer` kernel into an `apply` provable Task over a
-   witnessed `BatchProof`; the `provable` flag + `.vos_meta` bit;
-   append-versioned catalog + `blob_hash`; migrate voucher-check onto
-   the generalized helper; docs. This is the proof the whole design
-   pays for itself — voucher-check should shrink, not grow.
+4. **W4 — complete: Clerk flagship + macro.** Extract the Clerk
+   transition kernel into an `apply` provable Task over a witnessed
+   `BatchProof`; add the `provable` flag + `.vos_meta` bit; drive the
+   Task live through the same precompiles the prover traces; capture and
+   re-trace its durable record. The existing voucher-check guest remains
+   on its established wire by the explicit deferral below.
 
 ## Landing status (W1–W4)
 
