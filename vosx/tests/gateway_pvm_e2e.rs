@@ -27,7 +27,7 @@
 //!    sensible body); dispatch to an *unknown* name returns 404.
 //! 3. State-bearing handlers persist across requests — the
 //!    counter actor's count advances on each successive
-//!    `/counter/start`.
+//!    `/counter/put` + `/counter/get` pair.
 //!
 //! Build prerequisites
 //!
@@ -71,6 +71,12 @@ fn actor_elf(name: &str) -> PathBuf {
     ))
 }
 
+fn committed_counter_elf() -> PathBuf {
+    workspace().join(
+        "tests/fixtures/legacy-v1/actors/committed-counter/target/riscv64em-javm/release/committed_counter.elf",
+    )
+}
+
 fn ensure_built() {
     for (path, hint) in [
         (vosx_bin(), "cargo build -p vosx"),
@@ -80,7 +86,7 @@ fn ensure_built() {
             "cd tests/fixtures/legacy-v1 && just build",
         ),
         (
-            actor_elf("counter"),
+            committed_counter_elf(),
             "cd tests/fixtures/legacy-v1 && just build",
         ),
         (
@@ -272,7 +278,7 @@ path = "{gateway}"
 init = {{ bind_addr = "127.0.0.1", port = {port} }}
 "#,
         greeter = actor_elf("greeter").display(),
-        counter = actor_elf("counter").display(),
+        counter = committed_counter_elf().display(),
         math = actor_elf("math").display(),
         gateway = gateway_so().display(),
     );
@@ -452,18 +458,36 @@ fn pvm_actors_via_gateway() {
         "greeter.start returns (); expected JSON null"
     );
 
-    // 3. Dispatch to counter. Same shape — different actor,
-    //    different registered ServiceId. If the registry is
-    //    returning the same garbage id for every name (blake2b
-    //    no-op'd), the gateway hits the same target as step 3
-    //    and the counter never ticks.
-    for _ in 0..3 {
-        let (status, body) = http_request(daemon.port(), "POST", "/counter/start", None, &[]);
+    // 3. Dispatch to the finite committed-counter fixture, registered
+    //    under the public name `counter`. The canonical plain counter
+    //    is intentionally an endless yielding loop and remains reserved
+    //    for scheduler tests. Put/get pairs prove state survives separate
+    //    HTTP requests.
+    for expected in 1..=3 {
+        let put = format!(r#"{{"key":7,"value":{expected}}}"#);
+        let (status, body) =
+            http_request(daemon.port(), "POST", "/counter/put", None, put.as_bytes());
         assert_eq!(
             status,
             200,
-            "POST /counter/start expected 200, got {status} body={:?}",
+            "POST /counter/put expected 200, got {status} body={:?}",
             String::from_utf8_lossy(&body),
+        );
+
+        let (status, body) =
+            http_request(daemon.port(), "POST", "/counter/get", None, br#"{"key":7}"#);
+        assert_eq!(
+            status,
+            200,
+            "POST /counter/get expected 200, got {status} body={:?}",
+            String::from_utf8_lossy(&body),
+        );
+        assert_eq!(
+            std::str::from_utf8(&body)
+                .expect("counter body utf-8")
+                .trim(),
+            expected.to_string(),
+            "counter state did not advance across HTTP requests",
         );
     }
 

@@ -9,11 +9,9 @@
 # What you can verify
 # -------------------
 #
-# All the example actors here only have `start` handlers that
-# return `()`, so every dispatch responds `200 null`. That's
-# enough to prove the URL → registry → actor wire path is live —
-# look at the daemon's stderr for the `counter: count = N` /
-# `greeter: Hello` log lines to confirm the handler actually ran.
+# The finite committed-counter `put`/`get` handlers expose persisted
+# state; greeter's `start` handler returns `()`. Together they prove
+# the URL → registry → actor wire path and cross-request actor state.
 #
 # For richer reply-type and arg coverage see
 # `extensions/http-gateway/tests/dispatch_e2e.rs` — the kitchen-
@@ -34,8 +32,9 @@
 #   # boot genesis-applies the banked recipe
 #   RUST_LOG=info ./target/debug/vosx space up gw &
 #
-#   # exercise it (each returns 200 with body `null`)
-#   curl -s http://localhost:18080/counter/start; echo
+#   # exercise it (`1`, then `7`, then `200 null`)
+#   curl -s -X POST -d '{"key":7,"value":7}' http://localhost:18080/counter/put; echo
+#   curl -s -X POST -d '{"key":7}' http://localhost:18080/counter/get; echo
 #   curl -s http://localhost:18080/greeter/start; echo
 #
 #   # status snapshot — JSON object with port, requests counter, uptime
@@ -47,7 +46,7 @@
 #   curl -sw '\n%{http_code}\n' http://localhost:18080/counter/missing
 #   #   → 200 null (handler not found; current behaviour, see
 #   #              dispatch_e2e.rs comments for the gap)
-#   curl -X DELETE -sw '\n%{http_code}\n' http://localhost:18080/counter/start
+#   curl -X DELETE -sw '\n%{http_code}\n' http://localhost:18080/counter/get
 #   #   → 405
 #
 #   # graceful stop of the gateway extension. The host daemon
@@ -63,13 +62,12 @@ version = "0.1.0"
 
 # ── PVM agents ──────────────────────────────────────────────────
 #
-# Both actors expose only `start` (returns ()). The gateway
-# routes /counter/start and /greeter/start to them; the daemon's
-# stderr shows the handler ran.
+# The gateway routes `/counter/put`, `/counter/get`, and
+# `/greeter/start`; the daemon's stderr also shows each handler ran.
 
 [[agent]]
 name = "counter"
-path = "actors/counter/target/riscv64em-javm/release/counter.elf"
+path = "actors/committed-counter/target/riscv64em-javm/release/committed_counter.elf"
 consistency = "local"
 
 [[agent]]
