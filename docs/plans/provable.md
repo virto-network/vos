@@ -384,7 +384,7 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
 
 **Deferred (documented, orthogonal to the framework):**
 
-- *voucher-check migration.* The bridge's parity gate already
+- *voucher-check witness-wire migration.* The bridge's parity gate already
   establishes that `WitnessedLedger` reproduces cipher-clerk's succinct
   verify byte-for-byte, and clerk-apply is a fuller demonstration than
   a voucher-check swap. Migrating voucher-check's guest would change its
@@ -392,9 +392,12 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
   `SuccinctTransitionWitness`), break the federation e2e's six witness
   builders, and force another money-path re-pin for marginal in-repo
   shrink (voucher-check's guest is already a ~110-line wrapper; the
-  shrinkable machinery lives in cipher-clerk, a separate repo). Its legacy
-  precompile-based proof path is not production-sound until the curve/scalar
-  AIR is completed or that guest is likewise rebuilt on software arithmetic.
+  shrinkable machinery lives in cipher-clerk, a separate repo). The trusted
+  voucher-check guest has nevertheless been rebuilt on software arithmetic,
+  and every precompile-backed catalog pin was retired: direct chain proofs no
+  longer rely on the unconstrained curve/scalar ECALL outputs. Re-enabling
+  `pvm-precompile` remains forbidden until that arithmetic is constrained in
+  the AIR.
 - *Parent-side delegation glue + the clerk-ledger production wiring.*
   D6's macro-generated "gather touched leaves + `batch_proof` + invoke +
   apply" boilerplate, and rewiring clerk-ledger's `apply_transfer` to

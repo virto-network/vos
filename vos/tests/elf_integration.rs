@@ -6841,31 +6841,23 @@ const VC_TRACE_GAS: u64 = 100_000_000;
 /// ONE commitment (so no floor tuning is ever needed) is the
 /// recursive-aggregation work in docs/plans/proving-time.md §6.
 const VOUCHER_CHECK_CANONICAL_PROFILE: [u32; 32] = [
-    15, 15, 16, 18, 9, 6, 4, 17, 4, 4, 4, 18, 12, 8, 8, 6, 8, 8, 8, 14, 12, 13, 12, 4, 7, 10, 11,
+    15, 15, 16, 18, 9, 6, 4, 17, 4, 4, 4, 18, 12, 8, 8, 6, 8, 8, 8, 14, 13, 13, 12, 4, 7, 10, 11,
     6, 5, 6, 5, 16,
 ];
 
 /// Published canonical-shape program-commitment ALLOWLIST for
 /// `voucher-check` (production Blake2s channel). The commitment is the
-/// preprocessed-trace Merkle root; under canonical proving every window of
-/// the conservation transition collapses to one of these — `[0]` = a
-/// comb-free window (the vast majority, short tail included), `[1]` = a
-/// window carrying one fixed-base scalar mult. `verify_chain` accepts a
-/// chain whose every segment commitment is in this set.
-const VOUCHER_CHECK_COMMITMENTS: [[u8; 32]; 2] = [
-    // C_0 — comb-free canonical shape.
-    // blake2s 78cf26f531fccd9a2cba332be1f5cd5228aa7ed9d516048f6ee34f33c8049924
+/// preprocessed-trace Merkle root; the software-arithmetic guest has no
+/// crypto-precompile/comb chip activity, so the canonical profile collapses
+/// every window (including the short tail) onto this one shape.
+/// `verify_chain` accepts a chain whose every segment commitment equals it.
+const VOUCHER_CHECK_COMMITMENTS: [[u8; 32]; 1] = [
+    // C_0 — software-arithmetic canonical shape.
+    // blake2s 472873fe13b2d5c40a35cc3628d8070400a61dca4b112cce4245f97d30c07959
     [
-        0x78, 0xcf, 0x26, 0xf5, 0x31, 0xfc, 0xcd, 0x9a, 0x2c, 0xba, 0x33, 0x2b, 0xe1, 0xf5, 0xcd,
-        0x52, 0x28, 0xaa, 0x7e, 0xd9, 0xd5, 0x16, 0x04, 0x8f, 0x6e, 0xe3, 0x4f, 0x33, 0xc8, 0x04,
-        0x99, 0x24,
-    ],
-    // C_1 — one-comb-call canonical shape (the fixed-base scalar mult window).
-    // blake2s ddb150a59d0be473e11f095e265ca95e7a8215a5fa37b02aed056b00158a721b
-    [
-        0xdd, 0xb1, 0x50, 0xa5, 0x9d, 0x0b, 0xe4, 0x73, 0xe1, 0x1f, 0x09, 0x5e, 0x26, 0x5c, 0xa9,
-        0x5e, 0x7a, 0x82, 0x15, 0xa5, 0xfa, 0x37, 0xb0, 0x2a, 0xed, 0x05, 0x6b, 0x00, 0x15, 0x8a,
-        0x72, 0x1b,
+        0x47, 0x28, 0x73, 0xfe, 0x13, 0xb2, 0xd5, 0xc4, 0x0a, 0x35, 0xcc, 0x36, 0x28, 0xd8, 0x07,
+        0x04, 0x00, 0xa6, 0x1d, 0xca, 0x4b, 0x11, 0x2c, 0xce, 0x42, 0x45, 0xf9, 0x7d, 0x30, 0xc0,
+        0x79, 0x59,
     ],
 ];
 
@@ -6969,9 +6961,10 @@ fn voucher_check_profile_floors_cover_natural_sizes() {
 }
 
 /// Drift guard for the relocated `VOUCHER_CHECK_COMMITMENTS` allowlist:
-/// re-derive C_0 (a comb-free segment) and C_1 (the comb segment) by
-/// canonical proving over the CURRENT `voucher-check.elf` transpiled with
-/// vos's grey-transpiler, and assert they equal the baked values. Fails
+/// re-derive the software-arithmetic canonical commitment by proving over
+/// the CURRENT `voucher-check.elf` transpiled with vos's grey-transpiler,
+/// assert it equals the baked value, and reject any crypto-precompile comb
+/// activity. Fails
 /// loudly if the AIR, the canonical profile, the budgeted cut, the
 /// voucher-check ELF, or the transpiler shifts the program commitment —
 /// re-run and re-pin `VOUCHER_CHECK_COMMITMENTS` from the printed values
@@ -6983,7 +6976,7 @@ fn voucher_check_profile_floors_cover_natural_sizes() {
 /// production `prove_chain` shape — so reproducing the pinned values here
 /// also certifies the streaming path emits the deployed commitments.
 ///
-/// Heavy (canonical prove of 2 segments, minutes); `#[ignore]`. Run:
+/// Heavy (canonical proof, minutes); `#[ignore]`. Run:
 ///   cargo test -p vos --release --test elf_integration \
 ///     voucher_check_commitment_drift_guard -- --ignored --nocapture
 #[test]
@@ -7026,12 +7019,10 @@ fn voucher_check_commitment_drift_guard() {
         total > 1_000_000,
         "trace is only {total} steps — guest early-exited (stale voucher-check ELF?)"
     );
-    let comb_seg = comb_seg
-        .expect("the conservation transition must contain a fixed-base scalar mult (comb) segment");
-
     // Streaming pass 2: re-trace (deterministic — pinned by the bounds
-    // check below) and prove ONLY the two probe windows, skip-advancing
-    // through the rest.
+    // check below) and prove the first window plus the first comb window
+    // when one exists. The software-arithmetic guest intentionally has no
+    // comb window; the legacy precompile guest had one.
     let mut prover = stream();
     let mut commitments: Vec<(usize, [u8; 32])> = Vec::new();
     for (i, &expected) in bounds.iter().enumerate() {
@@ -7039,7 +7030,7 @@ fn voucher_check_commitment_drift_guard() {
             .next_window()
             .expect("re-trace must yield the same window count");
         assert_eq!(b, expected, "re-trace cut diverged at window {i}");
-        if i != 0 && i != comb_seg {
+        if i != 0 && Some(i) != comb_seg {
             continue;
         }
         let mut sn = prover.side_note();
@@ -7063,26 +7054,25 @@ fn voucher_check_commitment_drift_guard() {
             .1
     };
     let c0 = commitment_of(0);
-    let c1 = commitment_of(comb_seg);
     let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-    eprintln!("C_0 (comb-free) = {}", hex(&c0));
-    eprintln!("C_1 (one comb)  = {}", hex(&c1));
+    eprintln!("C_0 (software arithmetic) = {}", hex(&c0));
     assert_eq!(
         c0, VOUCHER_CHECK_COMMITMENTS[0],
         "C_0 drifted — re-pin VOUCHER_CHECK_COMMITMENTS[0]"
     );
-    assert_eq!(
-        c1, VOUCHER_CHECK_COMMITMENTS[1],
-        "C_1 drifted — re-pin VOUCHER_CHECK_COMMITMENTS[1]"
-    );
+    if let Some(comb_seg) = comb_seg {
+        let c1 = commitment_of(comb_seg);
+        eprintln!("unexpected C_1 (one comb) = {}", hex(&c1));
+        panic!("software voucher-check unexpectedly issued a crypto precompile");
+    }
 }
 
 /// Allowlist-completeness gate: EVERY distinct canonical segment shape of the
 /// conservation transition must land in the pinned `VOUCHER_CHECK_COMMITMENTS`
-/// allowlist. The drift guard only pins seg 0 + the first comb segment; this
-/// prints the per-segment comb-call histogram (trace-only, cheap) then proves
-/// one representative per distinct comb count PLUS seg 0 and the last (short)
-/// segment, asserting each commitment is in the allowlist. Catches an
+/// allowlist. The drift guard pins segment 0 and rejects precompile activity;
+/// this prints the per-segment comb-call histogram (trace-only, cheap), proves
+/// segment 0 and the last (short) segment, and asserts each commitment is in
+/// the allowlist. Catches an
 /// incomplete allowlist — e.g. the short trailing segment landing on a third
 /// commitment when a canonical-profile floor under-forces it (the 2026-07
 /// `verify_chain` ProofInvalid) — without proving every window. Run:
@@ -7118,9 +7108,14 @@ fn voucher_check_allowlist_coverage() {
         *hist.entry(c).or_default() += 1;
     }
     eprintln!("comb-count histogram (combs_per_segment -> #segments): {hist:?}");
+    assert!(
+        counts.iter().all(|&count| count == 0),
+        "software voucher-check unexpectedly issued a crypto precompile"
+    );
 
-    // Probe seg 0, the last (possibly short) segment, and the first segment of
-    // each distinct comb count. Prove each and check allowlist membership.
+    // Probe seg 0 and the last (possibly short) segment. Keeping the generic
+    // distinct-count selection makes this gate diagnose any future accidental
+    // precompile shape before the assertion above is relaxed or removed.
     let mut probe: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     probe.insert(0);
     probe.insert(n - 1);
@@ -7246,7 +7241,7 @@ fn voucher_check_chain_accept_path() {
 /// Returns the public, the succinct witness, and the `(value, blinding)` to
 /// seal the value envelope. Mirrors the prover-extension's `build_transition`
 /// test fixture; the chain commitment is witness-independent (canonical-shape
-/// proving), so the OsRng-drawn account keys don't shift the {C_0, C_1}
+/// proving), so the OsRng-drawn account keys don't shift the canonical C_0
 /// allowlist the chain proves against.
 fn build_conservation_transition(
     registrar: &cipher_clerk::crypto::Keypair,
@@ -13059,6 +13054,11 @@ fn voucher_check_catalog_matches_pinned_constants() {
     let pin = catalog
         .require("voucher-check")
         .expect("catalog pins voucher-check");
+    assert_eq!(pin.version, 2, "the software-arithmetic pin is version 2");
+    assert!(
+        catalog.get_version("voucher-check", 1).is_none(),
+        "the retired precompile-backed pin must not remain trusted"
+    );
     assert_eq!(
         pin.commitments_bytes().expect("decode catalog commitments"),
         VOUCHER_CHECK_COMMITMENTS.to_vec(),

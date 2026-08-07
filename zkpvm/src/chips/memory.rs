@@ -36,6 +36,11 @@ use crate::{framework::BuiltInComponent, lookups::MemoryAccessLookupElements};
 /// reads must return the value from the last write.
 pub struct MemoryChip;
 
+/// Ordering deltas must fit below this bit width. Twenty-eight bits cover the
+/// canonical actor-proof budget (<100M steps) while staying far enough below
+/// the M31 modulus to reject a field-wrapped negative as an alleged positive.
+const ORDER_DELTA_BITS: usize = 28;
+
 /// Byte-level memory model: each row is a single byte access.
 /// Multi-byte accesses are decomposed into N byte entries.
 #[derive(Debug, Copy, Clone, AirColumn)]
@@ -83,13 +88,14 @@ pub enum Column {
     /// {IsSameAddrNext, AdvLoH, AdvHiH} holds on a real→real transition.
     #[size = 1]
     AdvHiH,
-    /// 24-bit little-endian decomposition of the per-transition ordering delta
+    /// 28-bit little-endian decomposition of the per-transition ordering delta
     /// `OrderDelta = IsSameAddrNext·ts_diff + AdvLoH·(lo_diff−1) +
     /// AdvHiH·(hi_diff−1)`, a SELF-CONTAINED non-negativity range-check (no
     /// Range256 lookup — the consumer pass runs with an immutable `&SideNote`).
-    /// 24 bits covers `ts_diff < 2^24` and the 16-bit half diffs, and `2^24 ≪ p`
-    /// so a field-wrapped negative cannot alias a valid small positive.
-    #[size = 24]
+    /// 28 bits covers every timestamp admitted by the canonical 100M-gas
+    /// actor-proof budget plus the 16-bit half diffs. `2^28 < p/4`, so a
+    /// field-wrapped negative cannot alias a valid small positive.
+    #[size = 28]
     OrderBits,
     /// 1 iff this is a per-page closing read (the §2 boundary injection),
     /// produced only by MemoryPageChip; 0 for every step / precompile /
@@ -220,7 +226,7 @@ impl BuiltInComponent for MemoryChip {
             is_same_addr[0].clone() + adv_lo[0].clone() + adv_hi[0].clone() - both_real,
         );
 
-        // OrderDelta = same·ts_diff + lo·(lo_diff−1) + hi·(hi_diff−1), 24-bit
+        // OrderDelta = same·ts_diff + lo·(lo_diff−1) + hi·(hi_diff−1), 28-bit
         // range-checked ≥ 0.  same=1 ⇒ ts non-decreasing; lo=1 ⇒ lo strictly
         // increases (hi equal) ⇒ addr↑; hi=1 ⇒ hi strictly increases ⇒ addr↑.
         // 0 on every non-real→real transition (all three coeffs are 0 there).
@@ -896,7 +902,7 @@ impl BuiltInProverComponent for MemoryChip {
 
         // Pass 2: ordering helpers, reading the cyclic next = (row+1) % num_rows.
         //   AdvLoH / AdvHiH: which 16-bit half advances (when not same address).
-        //   OrderBits: 24-bit decomposition of OrderDelta = same·ts_diff +
+        //   OrderBits: 28-bit decomposition of OrderDelta = same·ts_diff +
         //   lo·(lo_diff−1) + hi·(hi_diff−1), all ≥ 0.
         for row in 0..num_rows {
             let next = (row + 1) % num_rows;
@@ -926,7 +932,11 @@ impl BuiltInProverComponent for MemoryChip {
             } else {
                 0
             };
-            let bits: [BaseField; 24] =
+            assert!(
+                order_delta < (1u64 << ORDER_DELTA_BITS),
+                "memory ordering delta {order_delta} exceeds the {ORDER_DELTA_BITS}-bit proof bound"
+            );
+            let bits: [BaseField; ORDER_DELTA_BITS] =
                 core::array::from_fn(|b| BaseField::from(((order_delta >> b) & 1) as u32));
             trace.fill_columns_base_field(row, &bits, Column::OrderBits);
         }

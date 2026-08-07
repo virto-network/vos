@@ -39,6 +39,11 @@ use crate::{framework::BuiltInComponent, lookups::RegisterMemoryLookupElements};
 /// previous value).
 pub struct RegisterMemoryChip;
 
+/// Ordering deltas must fit below this bit width. Twenty-eight bits cover the
+/// canonical actor-proof budget (<100M steps) while staying far enough below
+/// the M31 modulus to reject a field-wrapped negative as an alleged positive.
+const ORDER_DELTA_BITS: usize = 28;
+
 #[derive(Debug, Copy, Clone, AirColumn)]
 pub enum Column {
     /// Register index.  `#[mask_next_row]` so the read-consistency /
@@ -98,15 +103,16 @@ pub enum Column {
     #[size = 1]
     #[mask_next_row]
     IsPadding,
-    /// 24-bit little-endian decomposition of the per-transition ordering delta
+    /// 28-bit little-endian decomposition of the per-transition ordering delta
     /// `OrderDelta = both_real · (IsSameRegNext·ts_diff + (1−IsSameRegNext)·
     /// (reg_diff−1))`.  Each bit is constrained boolean and recomposed; this is
     /// a SELF-CONTAINED non-negativity range-check (no Range256 lookup — the
     /// consumer pass runs with an immutable `&SideNote` and cannot bump
-    /// multiplicities).  24 bits covers `ts_diff < 2^24` and `reg_diff − 1 <
-    /// NUM_REGS`, and `2^24 ≪ p` so a field-wrapped negative (≈ p − small ≈
-    /// 2^31, needing 31 bits) cannot alias a valid small positive.
-    #[size = 24]
+    /// multiplicities).  28 bits covers every timestamp admitted by the
+    /// canonical 100M-gas actor-proof budget and `reg_diff − 1 < NUM_REGS`.
+    /// `2^28 < p/4`, so a field-wrapped negative (≈ p − small) cannot alias a
+    /// valid positive in the admitted range.
+    #[size = 28]
     OrderBits,
     /// Helper (degree flattening, so all constraints stay ≤ degree 2):
     /// `BothRealH = (1−IsPadding)·(1−IsPadding_next)` — 1 iff this row and its
@@ -240,15 +246,15 @@ impl BuiltInComponent for RegisterMemoryChip {
                     + (E::F::one() - is_same_reg[0].clone()) * (reg_diff - E::F::one())),
         );
 
-        // OrderDelta = BothRealH · OrderValH, range-checked ≥ 0 via a 24-bit
+        // OrderDelta = BothRealH · OrderValH, range-checked ≥ 0 via a 28-bit
         // decomposition (self-contained — no Range256 lookup, the consumer pass
-        // runs with an immutable `&SideNote`; 24 bits ≪ p so a field-wrapped
+        // runs with an immutable `&SideNote`; 28 bits < p/4 so a field-wrapped
         // negative cannot alias a valid small positive).  Then:
         //   key_same=1 ⇒ ts non-decreasing (ts_diff ≥ 0).
         //   key_same=0, both real ⇒ reg strictly increases (reg_diff ≥ 1) ⇒
         //     registers are contiguous (no value-chain bleed) AND key_same is
         //     forced truthful (claiming 0 on equal regs yields −1, which has no
-        //     24-bit decomposition).
+        //     28-bit decomposition).
         let two = E::F::from(BaseField::from(2u32));
         let mut recomposed = E::F::zero();
         let mut pow2 = E::F::one();
@@ -402,7 +408,7 @@ impl BuiltInProverComponent for RegisterMemoryChip {
         //   OrderValH = key_same·ts_diff + (1−key_same)·(reg_diff−1)  [in field;
         //               may be negative on padding/wraparound rows, where
         //               BothRealH = 0 gates OrderDelta to 0].
-        //   OrderDelta = BothRealH·OrderValH, 24-bit range-checked ≥ 0.
+        //   OrderDelta = BothRealH·OrderValH, 28-bit range-checked ≥ 0.
         let one = BaseField::from(1u32);
         for row in 0..num_rows {
             let next = (row + 1) % num_rows;
@@ -423,7 +429,11 @@ impl BuiltInProverComponent for RegisterMemoryChip {
             } else {
                 (regs[next] as u64) - (regs[row] as u64) - 1
             };
-            let bits: [BaseField; 24] =
+            assert!(
+                order_delta < (1u64 << ORDER_DELTA_BITS),
+                "register ordering delta {order_delta} exceeds the {ORDER_DELTA_BITS}-bit proof bound"
+            );
+            let bits: [BaseField; ORDER_DELTA_BITS] =
                 core::array::from_fn(|b| BaseField::from(((order_delta >> b) & 1) as u32));
             trace.fill_columns_base_field(row, &bits, Column::OrderBits);
         }

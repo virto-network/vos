@@ -277,3 +277,33 @@ fn memory_forged_read_value_is_rejected() {
          read consistency is vacuous cross-row."
     );
 }
+
+/// Software-arithmetic proof guests can legitimately execute for more than
+/// 2^24 steps. The ledger's ordering range check must accept such timestamps
+/// (and their synthetic closing reads) instead of producing a trace that fails
+/// only when the terminal segment is proven.
+#[test]
+fn ledgers_accept_timestamp_deltas_above_the_retired_24_bit_ceiling() {
+    let base = (1u64 << 24) + 17;
+
+    let mut registers = register_side_note();
+    for (offset, step) in registers.steps.iter_mut().enumerate() {
+        step.timestamp = base + offset as u64;
+    }
+    let register_chip = RegisterMemoryChip;
+    let register_trace = register_chip.generate_component_trace_immut(&registers);
+    assert_chip(&register_chip, &register_trace, &registers)
+        .expect("28-bit register-ledger ordering must cover the actor-proof budget");
+
+    let mut memory = memory_side_note();
+    for (offset, step) in memory.steps.iter_mut().enumerate() {
+        step.timestamp = base + offset as u64;
+    }
+    // Rebuild the page boundary after moving the accesses; ingest is
+    // deliberately idempotent and replaces the earlier payload.
+    memory.ingest_memory_pages();
+    let memory_chip = MemoryChip;
+    let memory_trace = memory_chip.generate_component_trace_immut(&memory);
+    assert_chip(&memory_chip, &memory_trace, &memory)
+        .expect("28-bit RAM-ledger ordering must cover the actor-proof budget");
+}

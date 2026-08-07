@@ -118,14 +118,22 @@ use crate::recursion_pcs::ProverMerkleHasher;
 ///       relations, a wider CpuChip, and restructured ristretto chips — no new
 ///       CHIPS (`COUNT` unchanged at 31) — so the proof bytes differ and older
 ///       verifiers must reject.
+///   10 — Register/RAM ledger ordering deltas widen from 24 to 28 bits. The
+///        former hidden `2^24` timestamp ceiling made long software-arithmetic
+///        actor traces unprovable at their terminal segment. Twenty-eight bits
+///        cover the canonical 100M-gas actor-proof budget while remaining well
+///        below the M31 modulus, preserving the wrapped-negative rejection the
+///        sortedness proof relies on. AIR column counts change, so older
+///        verifiers must reject. Version 9 was already assigned to the
+///        Poseidon2-M31 PCS variant of format 8.
 #[cfg(not(feature = "poseidon2-channel"))]
-pub const PROOF_FORMAT_VERSION: u32 = 8;
+pub const PROOF_FORMAT_VERSION: u32 = 10;
 /// Native recursion: the PCS commit hash + Fiat-Shamir
 /// transcript move from Blake2s to Poseidon2-M31, so `stark_proof.commitments`
 /// become `P2Hash` digests — a different wire format. A Blake2s verifier
-/// (v8) and a Poseidon2-M31 verifier (v9) therefore reject each other's proofs.
+/// (v10) and a Poseidon2-M31 verifier (v11) therefore reject each other's proofs.
 #[cfg(feature = "poseidon2-channel")]
-pub const PROOF_FORMAT_VERSION: u32 = 9;
+pub const PROOF_FORMAT_VERSION: u32 = 11;
 
 /// Execution state at a segment boundary (initial or final).
 /// Maps to VOS's ContinuationHeader for checkpoint integration.

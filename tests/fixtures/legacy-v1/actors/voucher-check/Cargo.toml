@@ -44,13 +44,11 @@ vos = { path = "../../../../../vos", default-features = false, features = ["macr
 cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = [
     "viewing-keys",
     "voucher",
-    "pvm-precompile",
 ] }
-# `pvm-precompile` routes cipher-clerk's Ristretto / scalar ops through
-# zkpvm's precompile ECALLs (RistrettoEcall + comb chips) instead of dalek
-# software arithmetic — a much smaller prove trace. cipher-clerk owns its
-# own path-dep on zkpvm-precompiles via this feature; it is not pulled here
-# directly.
+# This proof-producing guest deliberately uses cipher-clerk's software
+# Ristretto/scalar arithmetic. The precompile AIR currently binds ECALL
+# boundary bytes but not the arithmetic relation, so `pvm-precompile` is
+# forbidden here until those constraints land.
 #
 # `signing` is intentionally NOT enabled: the guest only DECODES and verifies
 # a witness, it never builds transitions, and `signing` would drag in

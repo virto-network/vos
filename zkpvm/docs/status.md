@@ -183,7 +183,7 @@ commit.
 soundly against a from-scratch prover: each read's value is bound
 cross-row to the previous same-key row's value (`#[mask_next_row]`
 `prev_value` binding), the ledger is sorted by `(key, ts)` via a
-range-checked sortedness gadget (self-contained 24-bit decomposition),
+range-checked sortedness gadget (self-contained 28-bit decomposition),
 and `is_write` is part of the logup tuple (register ledger widened to
 18 limbs; the RAM tuple already carried it) so a read can't masquerade
 as a write to skip the check.  This closes the previously-honest-only

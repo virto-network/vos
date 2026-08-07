@@ -75,7 +75,7 @@ producer's value (`final_regs[r]`) is the one freely-chosen value.
    lie) → **(key, ts) sortedness** (closing_ts = last+1 is max, so with ts
    non-decreasing the closing read sorts last → its predecessor is the true last
    access). Timestamps are per-STEP counters chained +1 by CpuChip and bounded
-   `< 2^24 ≪ p`, so **non-decreasing (≤)** monotonicity is SUFFICIENT (equal-ts
+   `< 2^28 < p/4`, so **non-decreasing (≤)** monotonicity is SUFFICIENT (equal-ts
    collisions occur only within one step and are self-policed by
    read-consistency + the bound tuple values).
 3. **is_write-flip** (mark the closing/any read `is_write=1`; read-consistency is
@@ -123,16 +123,18 @@ key_same ⇒ keys equal:   key_same · key_diff = 0
 key_same ⇒ both real:    key_same · (1 − both_real) = 0        # deg 3 — needs degree bump, see below
 order_val   = key_same·ts_diff + (1−key_same)·(key_diff − 1)   # ts_diff = ts_next − ts_cur (combine_le)
 order_delta = both_real · order_val                            # =0 off real→real transitions
-Σ bits·2^i == order_delta ;  each bit boolean                  # 24 bits: ts_diff<2^24, key_diff−1<13
+Σ bits·2^i == order_delta ;  each bit boolean                  # 28 bits: ts_diff<100M, key_diff−1<13
 ```
 
 - `key_same=1` ⇒ ts non-decreasing (order_val = ts_diff ≥ 0).
 - `key_same=0` ⇒ order_val = key_diff−1 ≥ 0 ⇒ key strictly increases ⇒ keys are
   CONTIGUOUS (no value-chain bleed between keys) AND `key_same` is forced
-  truthful (claiming 0 on equal keys gives −1, which has no 24-bit decomposition
+  truthful (claiming 0 on equal keys gives −1, which has no 28-bit decomposition
   since a field-wrapped negative ≈ p−small ≈ 2^31 needs 31 bits → rejected).
-- **24-bit bound is load-bearing**: it must be `< 2^30 < p` so a wrapped negative
-  can't alias a valid small positive. ts/reg deltas are `< 2^24` ✓.
+- **28-bit bound is load-bearing**: it must remain comfortably below the M31
+  modulus so a wrapped negative cannot alias a valid small positive. The
+  canonical actor-proof budget admits fewer than 100M steps, which is `< 2^27`;
+  register/address deltas are smaller still.
 
 **Degree:** `both_real·key_same·ts_diff` is degree 4. Cleanest is to **bump
 `LOG_CONSTRAINT_DEGREE_BOUND` 1→2** on these two chips (degree ≤ 4 fits

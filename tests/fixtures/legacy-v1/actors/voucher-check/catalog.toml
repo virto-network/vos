@@ -2,56 +2,9 @@ version = 1
 
 [[program]]
 name = "voucher-check"
-version = 1
-commitments = [
-    "86eee4dbbe6d03916bcb42a2a82a9233ccab13c38df5b18c8f41a471e5fde0b3",
-    "5798e675f8b337e74050b63ddb103646fd9cb1c6e16af0885d10f3ea67c5fb40",
-]
-canonical_profile = [
-    15,
-    15,
-    16,
-    18,
-    9,
-    6,
-    4,
-    17,
-    4,
-    4,
-    4,
-    18,
-    11,
-    8,
-    8,
-    6,
-    8,
-    8,
-    8,
-    14,
-    12,
-    13,
-    12,
-    4,
-    7,
-    10,
-    11,
-    6,
-    5,
-    6,
-    5,
-    16,
-]
-seg_steps = 32000
-page_budget = 8
-witness_addr = 289672
-unpatched_image_root = "0a7852d48e67937e544530eb0a6c3d645958b7cfc72cf59dfea81bee8be013d7"
-
-[[program]]
-name = "voucher-check"
 version = 2
 commitments = [
-    "78cf26f531fccd9a2cba332be1f5cd5228aa7ed9d516048f6ee34f33c8049924",
-    "ddb150a59d0be473e11f095e265ca95e7a8215a5fa37b02aed056b00158a721b",
+    "472873fe13b2d5c40a35cc3628d8070400a61dca4b112cce4245f97d30c07959",
 ]
 canonical_profile = [
     15,
@@ -74,7 +27,7 @@ canonical_profile = [
     8,
     8,
     14,
-    12,
+    13,
     13,
     12,
     4,
@@ -89,5 +42,5 @@ canonical_profile = [
 ]
 seg_steps = 32000
 page_budget = 8
-witness_addr = 723280
-unpatched_image_root = "b8bb001d6506872194a4bd6579f0a2bd494579a2961691217fdfc3b9312abf8e"
+witness_addr = 742480
+unpatched_image_root = "4269b4a55192fed9a2c9e8add9e0b80070f8a3d265d1107049fd4123c49bff29"
