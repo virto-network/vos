@@ -28,8 +28,8 @@ unexpected_cfgs = { level = "allow" }
 # the riscv64em-javm target + build-std, exactly like voucher-check).
 
 [dependencies]
-vos = { path = "../../../vos", default-features = false, features = ["macros", "service"] }
-clerk-witness = { path = "../../../clerk-witness", default-features = false }
+vos = { path = "../../../../vos", default-features = false, features = ["macros", "service"] }
+clerk-witness = { path = "../../../../clerk-witness", default-features = false }
 cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false }
 
 # The proof-producing Task deliberately uses cipher-clerk's software

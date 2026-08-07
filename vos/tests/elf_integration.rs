@@ -12416,7 +12416,7 @@ fn clerk_apply_elf_path() -> std::path::PathBuf {
         return std::path::PathBuf::from(p);
     }
     std::path::PathBuf::from(format!(
-        "{}/../examples/actors/clerk-apply/target/riscv64em-javm/release/clerk-apply.elf",
+        "{}/../tests/fixtures/provable/clerk-apply/target/riscv64em-javm/release/clerk-apply.elf",
         env!("CARGO_MANIFEST_DIR"),
     ))
 }

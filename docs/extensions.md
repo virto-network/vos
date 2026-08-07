@@ -239,9 +239,9 @@ Conventional tokens (loose, not enforced):
   `#[actor(kind = …, caps = […])]` + `#[messages]` parsing
 - [`extensions/http-gateway/`](https://github.com/virto-network/vos/tree/master/extensions/http-gateway) —
   the canonical Transport extension
-- [`examples/extensions/{echo,heartbeat,fetcher,proxy}/`](https://github.com/virto-network/vos/tree/master/examples/extensions) —
-  Actor-mode examples (`heartbeat` shows the `tick` handler);
-  [`tcp-echo`](https://github.com/virto-network/vos/tree/master/examples/extensions/tcp-echo) is a minimal Transport example
+- [`tests/fixtures/extensions/{echo,heartbeat,fetcher,proxy}/`](https://github.com/virto-network/vos/tree/master/tests/fixtures/extensions) —
+  executable Actor-mode fixtures (`heartbeat` shows the `tick` handler);
+  [`tcp-echo`](https://github.com/virto-network/vos/tree/master/tests/fixtures/extensions/tcp-echo) is the minimal Transport fixture
 - [`extensions/AUTHORING.md`](https://github.com/virto-network/vos/tree/master/extensions/AUTHORING.md) —
   the full cookbook
 

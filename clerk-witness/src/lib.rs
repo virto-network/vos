@@ -10,7 +10,7 @@
 //! over exactly those leaves, and folds `root_after`. This crate owns
 //! that shape once, for all three consumers:
 //!
-//! - the **clerk-apply Task** (`actors/clerk-apply`) — the transition
+//! - the **clerk-apply Task** (`tests/fixtures/provable/clerk-apply`) — the transition
 //!   verifier a clerk-ledger parent invokes with a record tag;
 //! - the **voucher-check guest** — the same verification behind a
 //!   voucher's `(state_root_before, state_root_after)` binding;

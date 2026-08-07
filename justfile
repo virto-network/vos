@@ -21,8 +21,7 @@ build-extensions:
 
 # Build WASM actors (wasm32-unknown-unknown target).
 build-wasm:
-    cd examples/wasm/echo; cargo build --target wasm32-unknown-unknown --release
-    cd examples/wasm/fetcher; cargo build --target wasm32-unknown-unknown --release
+    cd tests/fixtures/wasm/echo; cargo build --target wasm32-unknown-unknown --release
 
 # Build the public v2 actors and the legacy PVM regression fixtures.
 build-pvm: build-examples build-v2-registry-fixtures build-legacy-pvm-fixtures
@@ -85,7 +84,7 @@ build-witnessed-transfer:
 
 # Build the flagship #[actor(task, provable)] pure verifier.
 build-clerk-apply:
-    cd examples/actors/clerk-apply; cargo +nightly build --release
+    cd tests/fixtures/provable/clerk-apply; cargo +nightly build --release
 
 # Refresh the bundled space-registry ELF shipped with vosx.
 refresh-bundled-registry: (build-actor "space-registry")

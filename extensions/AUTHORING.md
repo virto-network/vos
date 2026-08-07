@@ -16,8 +16,8 @@ intro.
 - **Actor** if the extension's job is "something calls in, the handler
   runs, replies, done" — or it needs to originate work on a timer (a
   heartbeat, a cache sweep) via `tick`. No listening sockets, no
-  self-managed threads. Examples: `examples/extensions/echo`,
-  `examples/extensions/fetcher`, `examples/extensions/heartbeat`,
+  self-managed threads. Executable fixtures: `tests/fixtures/extensions/echo`,
+  `tests/fixtures/extensions/fetcher`, `tests/fixtures/extensions/heartbeat`,
   `extensions/dev`, `extensions/ai`.
 
 - **Transport** if the extension serves a network protocol over a socket

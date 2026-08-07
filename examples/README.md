@@ -25,10 +25,10 @@ cargo +nightly actor -p v2-age-gate
 cargo +nightly actor -p v2-shared-board
 ```
 
-[`extensions`](extensions/) and [`wasm`](wasm/) contain native and WASM API
-examples. They are separate from the canonical actor-PVM examples above.
-
 The old single-actor replay samples are retained only as internal regression
 fixtures under [`tests/fixtures/legacy-v1`](../tests/fixtures/legacy-v1/); they
-are not an application API. Clerk is the larger acceptance application under
-[`tests/acceptance/clerk`](../tests/acceptance/clerk/), not a beginner sample.
+are not an application API. Native-extension, WASM, and proof-program fixtures
+also live under [`tests/fixtures`](../tests/fixtures/), keeping this directory
+limited to the canonical actor source surface. Clerk is the larger acceptance
+application under [`tests/acceptance/clerk`](../tests/acceptance/clerk/), not a
+beginner sample.

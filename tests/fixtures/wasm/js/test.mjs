@@ -1,6 +1,6 @@
 // Quick smoke test for vos.js — loads echo-wasm and verifies metadata
 // parsing. Runs in Node:
-//   node examples/wasm/js/test.mjs
+//   node tests/fixtures/wasm/js/test.mjs
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';

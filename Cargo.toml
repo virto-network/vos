@@ -19,7 +19,7 @@ members = [
     "extensions/http-gateway",
     "extensions/prover",
     "clerk-witness",
-    "examples/extensions/*",
+    "tests/fixtures/extensions/*",
 ]
 exclude = [
     # Retired single-actor programs are test fixtures, not public examples.
@@ -33,7 +33,7 @@ exclude = [
     "tests/fixtures/legacy-v1/actors/tally",
     "tests/fixtures/legacy-v1/actors/big-map",
     "tests/fixtures/legacy-v1/actors/committed-counter",
-    "examples/wasm/*",
+    "tests/fixtures/wasm/*",
     # Built-in PVM actors (riscv64em-javm target) live alongside
     # the workspace crates but build with their own toolchain.
     # Listing the directory itself keeps it from being picked

@@ -1,7 +1,7 @@
 // Smoke test for WASM state persistence.
 // In Node (no IndexedDB) we use the in-memory fallback to prove the
 // load/save plumbing works end-to-end. In a browser, IndexedDB is used.
-//   node examples/wasm/js/test-persist.mjs
+//   node tests/fixtures/wasm/js/test-persist.mjs
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
