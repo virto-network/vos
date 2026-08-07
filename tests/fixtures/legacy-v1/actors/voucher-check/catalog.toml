@@ -4,8 +4,8 @@ version = 1
 name = "voucher-check"
 version = 1
 commitments = [
-    "f5eb3c60cb09d654f4ec3f12c673ea6ac1e3963b4e39d83b4ae1aed5eba10a41",
-    "fafb1a4dc3ad53fe3a31d23aede0f9c9fbbe0a7e10bcec72153a6c1efdf91a26",
+    "86eee4dbbe6d03916bcb42a2a82a9233ccab13c38df5b18c8f41a471e5fde0b3",
+    "5798e675f8b337e74050b63ddb103646fd9cb1c6e16af0885d10f3ea67c5fb40",
 ]
 canonical_profile = [
     15,
@@ -44,4 +44,50 @@ canonical_profile = [
 seg_steps = 32000
 page_budget = 8
 witness_addr = 289672
-unpatched_image_root = "9a61df1467712a35125b1dd5d4c4cb03e2f07f2ef53f4128a37019b25a807087"
+unpatched_image_root = "0a7852d48e67937e544530eb0a6c3d645958b7cfc72cf59dfea81bee8be013d7"
+
+[[program]]
+name = "voucher-check"
+version = 2
+commitments = [
+    "78cf26f531fccd9a2cba332be1f5cd5228aa7ed9d516048f6ee34f33c8049924",
+    "ddb150a59d0be473e11f095e265ca95e7a8215a5fa37b02aed056b00158a721b",
+]
+canonical_profile = [
+    15,
+    15,
+    16,
+    18,
+    9,
+    6,
+    4,
+    17,
+    4,
+    4,
+    4,
+    18,
+    12,
+    8,
+    8,
+    6,
+    8,
+    8,
+    8,
+    14,
+    12,
+    13,
+    12,
+    4,
+    7,
+    10,
+    11,
+    6,
+    5,
+    6,
+    5,
+    16,
+]
+seg_steps = 32000
+page_budget = 8
+witness_addr = 723280
+unpatched_image_root = "b8bb001d6506872194a4bd6579f0a2bd494579a2961691217fdfc3b9312abf8e"
