@@ -12510,14 +12510,14 @@ fn clerk_apply_conservation() -> (Vec<u8>, [u8; 32], [u8; 32], [u8; 32]) {
 /// docs/plans/provable.md W4 — the flagship provable Task, driven LIVE.
 /// A real cipher-clerk batch transition runs through the clerk-apply
 /// `#[actor(task, provable)]` guest as a PURE VERIFIER, invoked through
-/// the ordinary `run_task_invoke` path (the runtime now executes the
-/// guest's Ristretto/scalar precompile ECALLs host-side). The host
+/// the ordinary `run_task_invoke` path using software Ristretto/scalar
+/// arithmetic whose instructions are constrained by the AIR. The host
 /// captures a durable `ProvableRecord` whose `app_public` leads with the
 /// composite `root_before` (the settlement comparand), carries
 /// `root_after` and the batch digest, is io-consistent, and RE-TRACES
 /// from its own stored witness to the SAME io-hash — proving the live
-/// invoke and the prover's trace agree (live ≡ traced) for a
-/// precompile-using Task. That is the whole W1-W4 stack (batch_proof
+/// invoke and the prover's trace agree (live ≡ traced). That is the whole
+/// W1-W4 stack (batch_proof
 /// extraction → clerk-witness bridge → real kernel → v4 app_public
 /// surfacing → durable record capture → the binding equation) over the
 /// real ledger kernel, end to end.
@@ -12555,6 +12555,12 @@ fn clerk_apply_task_captures_a_conservation_record() {
     let clerk_blob = transpile_actor(&clerk_elf);
 
     let (witness_bytes, root_before, root_after, batch_digest) = clerk_apply_conservation();
+    let invalid_signature_witness = {
+        let mut witness = clerk_witness::ClerkTransitionWitness::decode(&witness_bytes)
+            .expect("conservation witness decodes");
+        witness.events[0].signatures[0].s = [0u8; 32];
+        witness.encode()
+    };
 
     let mut rt = VosRuntime::new();
     let sched_id = register_svc(&mut rt, transpile_actor(&sched_elf));
@@ -12567,12 +12573,13 @@ fn clerk_apply_task_captures_a_conservation_record() {
 
     // Spawn the provable apply Task LIVE under a business tag (the
     // transfer's domain), passing the witness as the handler's `witness`
-    // arg. The runtime executes the guest's precompile ECALLs host-side.
+    // arg. The guest executes proof-constrained software curve arithmetic.
     let tag = [0x4Cu8; 32];
     let task_msg = task_gate_dyn_msg(&Msg::new("apply").with("witness", witness_bytes));
     let no_keys = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&Vec::<Vec<u8>>::new())
         .expect("encode empty row keys")
         .to_vec();
+    let no_keys_for_invalid_signature = no_keys.clone();
     let id = task_gate_ask(
         &mut rt,
         sched_id,
@@ -12632,8 +12639,7 @@ fn clerk_apply_task_captures_a_conservation_record() {
 
     // LIVE ≡ TRACED: the stored witness re-traces (the prover's path) to
     // the SAME io-hash the live invoke captured — so a proof of this
-    // record will carry exactly this binding. This is the precompile
-    // host handlers' soundness guarantee, exercised end to end.
+    // record will carry exactly this binding, exercised end to end.
     let (mut interp, _) = zkpvm::actor::interpreter_from_blob(&clerk_blob, 500_000_000)
         .expect("parse clerk-apply blob");
     let w = &entry.input.witness_bytes;
@@ -12646,6 +12652,13 @@ fn clerk_apply_task_captures_a_conservation_record() {
     let mut tracing = zkpvm::core::tracing::TracingPvm::new(interp);
     let exit = format!("{:?}", tracing.run_with_vos_stubs());
     assert_eq!(exit, "Halt", "clean canonical halt");
+    assert!(
+        tracing.ristretto_records.is_empty()
+            && tracing.ristretto_add_records.is_empty()
+            && tracing.scalar_reduce_wide_records.is_empty()
+            && tracing.scalar_binop_records.is_empty(),
+        "proof-producing clerk-apply must not issue unconstrained crypto ECALLs"
+    );
     let mut io = [0u8; 32];
     for (i, word) in tracing.pvm.registers[9..13].iter().enumerate() {
         io[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
@@ -12658,6 +12671,38 @@ fn clerk_apply_task_captures_a_conservation_record() {
         io,
         vos::zk::compute_io_hash(&[], &[]),
         "a real binding, not the empty placeholder"
+    );
+
+    // The proof-producing guest is compiled without the unconstrained crypto
+    // precompiles. Drive an invalid signature through the physical PVM and
+    // require the software verifier to trap before any record is captured.
+    let bad_tag = [0x4Du8; 32];
+    let bad_task_msg =
+        task_gate_dyn_msg(&Msg::new("apply").with("witness", invalid_signature_witness));
+    let bad_id = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &Msg::new("run_provable_task")
+            .with("code_hash", task_hash.to_vec())
+            .with("task_msg", bad_task_msg)
+            .with("row_keys", no_keys_for_invalid_signature)
+            .with("tag", bad_tag.to_vec()),
+    )
+    .as_u64()
+    .expect("invalid-signature task still receives an id");
+    let bad_status = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &Msg::new("task_status").with("id", bad_id),
+    );
+    assert_eq!(
+        bad_status.as_u32(),
+        Some(vos::agent::TaskStatus::Panicked as u32),
+        "invalid signature must be rejected by software arithmetic in the PVM"
+    );
+    assert!(
+        rt.storage.read(sched_id, &proofrec_key(&bad_tag)).is_none(),
+        "a rejected signature must not capture a proof record"
     );
 }
 

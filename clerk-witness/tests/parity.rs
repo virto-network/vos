@@ -236,19 +236,22 @@ fn a_lying_absent_leaf_is_rejected() {
 }
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "witnessed batch must contain at least one event")]
 fn a_tampered_batch_is_rejected() {
     let (ledger, events, oracle, _) = conservation_setup();
     let (mut witness, _) = bridge_witness(&ledger, &events, &oracle);
-    // Replace the batch with an empty one: the kernel produces no
-    // delta, root_after == root_before, but the openings/events no
-    // longer describe the witnessed transition. An empty batch applies
-    // cleanly to a no-op — so the guard that matters is the caller's
-    // (has_debit_commit / root movement); assert the roots collapse.
+    // An empty batch is not a transition and cannot satisfy any caller's
+    // intended debit. Reject it at the bridge boundary instead of relying
+    // on a test-owned assertion after apply_witnessed has accepted it.
     witness.events.clear();
-    let applied = apply_witnessed(witness);
-    assert_ne!(
-        applied.root_before, applied.root_after,
-        "an empty batch is a no-op transition — the caller must reject it"
-    );
+    let _ = apply_witnessed(witness);
+}
+
+#[test]
+#[should_panic(expected = "witnessed batch event did not apply cleanly")]
+fn an_invalid_signature_is_rejected_by_the_software_kernel() {
+    let (ledger, events, oracle, _) = conservation_setup();
+    let (mut witness, _) = bridge_witness(&ledger, &events, &oracle);
+    witness.events[0].signatures[0].s = [0u8; 32];
+    let _ = apply_witnessed(witness);
 }

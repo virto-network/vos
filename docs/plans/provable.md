@@ -338,8 +338,8 @@ the record opt-in, not a semantic fork — "every Task is one
 4. **W4 — complete: Clerk flagship + macro.** Extract the Clerk
    transition kernel into an `apply` provable Task over a witnessed
    `BatchProof`; add the `provable` flag + `.vos_meta` bit; drive the
-   Task live through the same precompiles the prover traces; capture and
-   re-trace its durable record. The existing voucher-check guest remains
+   Task live through proof-constrained software curve arithmetic; capture
+   and re-trace its durable record. The existing voucher-check guest remains
    on its established wire by the explicit deferral below.
 
 ## Landing status (W1–W4)
@@ -367,23 +367,20 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
   `#[actor(task, provable)]` guest that verifies a cipher-clerk batch
   transition through the bridge and binds `app_public = root_before ‖
   root_after ‖ batch_digest`. It is driven LIVE through the ordinary
-  `run_task_invoke` path — the runtime executes the guest's Ristretto/
-  scalar precompile ECALLs host-side (`handle_precompile_ecall`, via
-  `zkpvm-precompiles`' curve25519-dalek host fallback, byte-identical to
-  the prover's tracer). Its gate captures a durable `ProvableRecord`,
+  `run_task_invoke` path using cipher-clerk's software Ristretto/scalar
+  arithmetic inside the PVM. Its gate captures a durable `ProvableRecord`,
   checks the bound roots against a live apply, and re-traces the stored
   witness to the SAME io-hash the live invoke bound — **live ≡ traced**
-  for a precompile-using Task, so a proof of the captured record carries
-  exactly that binding.
+  over proof-constrained instructions, so a proof of the captured record
+  carries exactly that binding.
 
-- **Live-drive precompile handlers.** `handle_precompile_ecall`
-  (`runtime.rs`) services ECALLs 110/111 (Ristretto scalar-mult /
-  point-add), 112 (wide-scalar reduce), 113/114 (scalar mul/add mod ℓ)
-  in BOTH the task and refine hostcall paths — the curve crypto a
-  `pvm-precompile` actor issues now runs live, not only when the prover
-  traces it. The host functions are byte-identical to the tracer's
-  `*_sw` reference, so live ≡ traced (gated end to end). This also lets
-  clerk-ledger itself adopt `pvm-precompile` for a smaller trace.
+- **Precompile safety boundary.** `handle_precompile_ecall` can accelerate
+  non-recorded Task and Refine execution, with Refine preserving phi[7]/phi[8]
+  exactly as tracing does. Recorded Tasks reject ECALLs 110–114 fail-closed:
+  the current AIR binds their call/memory boundary but not the required
+  Ristretto/scalar arithmetic, so honest live/traced parity is not a proof of
+  soundness. `clerk-apply` deliberately compiles the software arithmetic until
+  those AIR constraints land.
 
 **Deferred (documented, orthogonal to the framework):**
 
@@ -395,14 +392,15 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
   `SuccinctTransitionWitness`), break the federation e2e's six witness
   builders, and force another money-path re-pin for marginal in-repo
   shrink (voucher-check's guest is already a ~110-line wrapper; the
-  shrinkable machinery lives in cipher-clerk, a separate repo).
+  shrinkable machinery lives in cipher-clerk, a separate repo). Its legacy
+  precompile-based proof path is not production-sound until the curve/scalar
+  AIR is completed or that guest is likewise rebuilt on software arithmetic.
 - *Parent-side delegation glue + the clerk-ledger production wiring.*
   D6's macro-generated "gather touched leaves + `batch_proof` + invoke +
   apply" boilerplate, and rewiring clerk-ledger's `apply_transfer` to
   gather touched leaves via `CommittedMap::batch_proof`, `spawn_provable`
   the apply Task with `tag = transfer.id`, and apply the live writes
-  against the attested root. The live-drive handler (above) unblocks
-  this; it is the natural next step now.
+  against the attested root. It is the natural next step now.
 
 ---
 

@@ -263,14 +263,14 @@ fn install_vos_runtime_caps(kernel: &mut InvocationKernel) {
 /// `call_id` was one of these precompiles (and it was serviced), `false`
 /// otherwise so the caller falls through to its own dispatch.
 ///
-/// SOUNDNESS — live ≡ traced. The prover's tracer
+/// EXECUTION PARITY — live ≡ honestly traced. The prover's tracer
 /// (`zkpvm::core::tracing::TracingPvm::step_with_vos_stubs`) executes the
 /// identical curve arithmetic through the same `curve25519-dalek`
 /// reference (`zkpvm_precompiles`'s host fallback is byte-for-byte the
-/// tracer's `*_sw` functions), so a Task driven live and the same Task
-/// proven halt with the identical io-hash. The
-/// [`clerk_apply_task_binds_a_conservation_transition`] gate and the
-/// live≡traced Task gate both exercise this.
+/// tracer's `*_sw` functions). This is not proof soundness: the current AIR
+/// records the observed inputs and outputs without constraining the curve/
+/// scalar relation. Recorded Tasks therefore reject these calls, and the
+/// Clerk proof guest uses software arithmetic until the AIR is complete.
 ///
 /// ECALL ABI (grey-transpiler maps RISC-V `a0/a1/a2` → φ[7/8/9]): the
 /// argument registers hold flat-memory pointers to the 32-byte operands
@@ -283,9 +283,7 @@ fn install_vos_runtime_caps(kernel: &mut InvocationKernel) {
 /// guest's logical memory is the one asymmetry: the tracer bounds-checks
 /// against `flat_mem.len()` and skips, while the data-cap window here
 /// does not — the same property the blake2b handler already has. It is
-/// fail-closed, never a soundness hole: any divergence makes the
-/// captured record fail to re-trace to its bound io-hash, so
-/// `verify_record` rejects it.
+/// fail-closed for live execution; recorded Tasks do not reach this path.
 #[cfg(feature = "std")]
 fn handle_precompile_ecall(k: &mut InvocationKernel, call_id: u32) -> bool {
     use zkpvm_precompiles::{
@@ -336,6 +334,31 @@ fn handle_precompile_ecall(k: &mut InvocationKernel, call_id: u32) -> bool {
         _ => return false,
     }
     true
+}
+
+#[cfg(feature = "std")]
+fn is_unconstrained_crypto_precompile(call_id: u32) -> bool {
+    use zkpvm_precompiles::{
+        ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT, ECALL_SCALAR_ADD_MOD_L,
+        ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
+    };
+    matches!(
+        call_id,
+        ECALL_RISTRETTO_SCALAR_MULT
+            | ECALL_RISTRETTO_POINT_ADD
+            | ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE
+            | ECALL_SCALAR_MUL_MOD_L
+            | ECALL_SCALAR_ADD_MOD_L
+    )
+}
+
+/// The tracer executes crypto-precompile ECALLs by mutating operand memory
+/// and leaves phi[7]/phi[8] untouched. Refine must resume with the same
+/// register pair; returning `(HOST_OK, 0)` here would make live and traced
+/// execution disagree for a guest that observes the argument registers.
+#[cfg(feature = "std")]
+const fn precompile_resume_registers(a0: u64, a1: u64) -> (u64, u64) {
+    (a0, a1)
 }
 
 fn kwrite(k: &mut InvocationKernel, addr: u32, data: &[u8]) {
@@ -1833,12 +1856,9 @@ fn handle_refine_hostcall(
             );
             (result, 0)
         }
-        // The zkpvm Ristretto/scalar precompiles — the curve crypto a
-        // `pvm-precompile` service actor (clerk-ledger's kernel) runs
-        // live, executed host-side bit-identically to the prover's trace
-        // (see `handle_precompile_ecall`). Output rides operand memory,
-        // so the return registers stay `(HOST_OK, 0)`.
-        other if handle_precompile_ecall(kernel, other) => (error::HOST_OK, 0),
+        // Precompile outputs ride operand memory. The tracer preserves the
+        // argument registers, so Refine must resume with the original pair.
+        other if handle_precompile_ecall(kernel, other) => precompile_resume_registers(a0, a1),
         _ => (error::HOST_WHAT, 0),
     };
 
@@ -2019,11 +2039,16 @@ fn build_task_kernel(
 ///   that does gets the same garbage the trace would. `DEBUG_WRITE`
 ///   additionally mirrors to stderr — a host-side effect the guest
 ///   cannot observe;
-/// - everything else (INVOKE, TRANSFER, NOW_MS, the ristretto
-///   precompiles — no vos host handler yet, though the tracer has one)
-///   returns `false`: fail loud, exactly where the tracer would end the
-///   trace un-halted and the proof could not complete.
-fn handle_task_hostcall(kernel: &mut InvocationKernel, call_id: u32) -> bool {
+/// - Ristretto/scalar precompiles run only for non-recorded Tasks. The
+///   current AIR does not constrain their arithmetic, so recorded Tasks
+///   reject them fail-closed before executing the child further;
+/// - everything else (INVOKE, TRANSFER, NOW_MS) returns `false`: fail
+///   loud, exactly where the tracer would end un-halted.
+fn handle_task_hostcall(
+    kernel: &mut InvocationKernel,
+    call_id: u32,
+    allow_unconstrained_crypto: bool,
+) -> bool {
     let echo7 = kernel.active_reg(7);
     let echo8 = kernel.active_reg(8);
     match call_id {
@@ -2053,10 +2078,18 @@ fn handle_task_hostcall(kernel: &mut InvocationKernel, call_id: u32) -> bool {
             let _ = std::io::stderr().write_all(&buf);
             let _ = std::io::stderr().flush();
         }
-        // The zkpvm Ristretto/scalar precompiles — refine-pure (pure
-        // functions of their operand memory), so a provable Task using
-        // cipher-clerk's curve crypto runs live bit-identically to the
-        // prover's trace (see `handle_precompile_ecall`).
+        // The current precompile AIR binds the ECALL boundary bytes but not
+        // the curve/scalar arithmetic. A recorded Task would therefore admit
+        // an adversarial proof with forged output bytes. Non-recorded Tasks
+        // may use the live acceleration; proof-producing Tasks fail closed
+        // until those arithmetic constraints land.
+        other if is_unconstrained_crypto_precompile(other) && !allow_unconstrained_crypto => {
+            error!(
+                call_id = other,
+                "recorded task: unconstrained crypto precompile is not proof-safe"
+            );
+            return false;
+        }
         other if handle_precompile_ecall(kernel, other) => {}
         other => {
             error!(
@@ -2154,7 +2187,7 @@ fn run_task_invoke(
                 );
             }
             KernelResult::ProtocolCall { slot } => {
-                if !handle_task_hostcall(&mut child, slot as u32) {
+                if !handle_task_hostcall(&mut child, slot as u32, record_tag.is_none()) {
                     journal.rollback_to(invoke_mark);
                     return record_and_write_invoke(
                         caller,
@@ -2915,6 +2948,33 @@ fn blob_hash(data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_tasks_classify_every_unconstrained_crypto_precompile() {
+        use zkpvm_precompiles::{
+            ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT, ECALL_SCALAR_ADD_MOD_L,
+            ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
+        };
+        for call_id in [
+            ECALL_RISTRETTO_SCALAR_MULT,
+            ECALL_RISTRETTO_POINT_ADD,
+            ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE,
+            ECALL_SCALAR_MUL_MOD_L,
+            ECALL_SCALAR_ADD_MOD_L,
+        ] {
+            assert!(
+                is_unconstrained_crypto_precompile(call_id),
+                "record capture must reject precompile ECALL {call_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn refine_precompile_resume_matches_tracer_register_semantics() {
+        let a0 = 0x1122_3344_5566_7788;
+        let a1 = 0x8877_6655_4433_2211;
+        assert_eq!(precompile_resume_registers(a0, a1), (a0, a1));
+    }
 
     #[test]
     fn retired_v2_work_result_remains_reserved_and_fail_loud() {

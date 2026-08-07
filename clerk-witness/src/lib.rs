@@ -168,6 +168,10 @@ pub fn apply_witnessed(witness: ClerkTransitionWitness) -> AppliedTransition {
         events,
         batch_seed_timestamp,
     } = witness;
+    assert!(
+        !events.is_empty(),
+        "witnessed batch must contain at least one event"
+    );
     let mut state = WitnessedClerkState {
         accounts: accounts.into_ledger(CC_SMT_PARAMS),
         transfers: transfers.into_ledger(CC_SMT_PARAMS),
