@@ -4924,7 +4924,8 @@ mod tests {
                 name: String::new(),
                 version: String::from("1"),
                 hash: alloc::vec![7u8; 32],
-                auth: root_auth("publish", &[b"", b"1", &[7u8; 32]]),
+                crdt: false,
+                auth: root_auth("publish", &[b"", b"1", &[7u8; 32], &[0u8]]),
             },
         );
         assert_eq!(status, Status::BadHash, "empty program name must be rejected");
