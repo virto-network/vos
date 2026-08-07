@@ -6,11 +6,13 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-# `bin` gates the PVM entry-point block (`_start` + `accumulate`)
-# emitted by `#[actor]`. Default-on so a plain `cargo build` for the
-# riscv64em-javm target produces a non-empty ELF.
+# `bin` gates the PVM entry point emitted by `#[actor(task)]`.
+# Default-on so `cargo +nightly actor` produces the Task ELF.
 default = ["bin"]
 bin = []
+
+[lib]
+crate-type = ["rlib", "cdylib"]
 
 [lints.rust.unexpected_cfgs]
 level = "allow"
@@ -22,10 +24,10 @@ check-cfg = ['cfg(feature, values("pvm", "service", "extension", "wasm"))']
 # `BatchProof` from `__VOS_WITNESS`, verifies them against an app-named
 # `root_before`, applies a batch of transfers, computes `root_after`, and
 # binds `(root_before, root_after, batch_digest)` — the generalized shape
-# voucher-check will collapse onto in W4. Built via `cargo +nightly build
-# --release` (see `just build-witnessed-transfer`).
+# voucher-check will collapse onto in W4. Built via `cargo +nightly actor`
+# (see `just build-witnessed-transfer`).
 [dependencies]
-vos = { path = "../../../vos", default-features = false, features = ["macros", "service"] }
+vos = { path = "../../../../../vos", default-features = false, features = ["macros", "service"] }
 
 [profile.release]
 opt-level = "s"

@@ -835,10 +835,11 @@ fn retrace_io_hash(pvm_blob: &[u8], witness_bytes: &[u8], witness_addr: usize) -
         }
         let mut tracing = zkpvm::core::tracing::TracingPvm::new(interp);
         // zkpvm pins its own javm revision, so its ExitReason is a
-        // different type than vos's — compare the Debug form, as the
-        // elf-integration gates do. HostCall(0)/Ecall = clean halt.
+        // different type than vos's — compare the Debug form. The
+        // current Task ABI terminates only through the dedicated HALT
+        // address; retired root-reply hostcall termination is rejected.
         let exit = format!("{:?}", tracing.run_with_vos_stubs());
-        if exit != "HostCall(0)" && exit != "Ecall" {
+        if exit != "Halt" {
             return None;
         }
         let mut io = [0u8; 32];

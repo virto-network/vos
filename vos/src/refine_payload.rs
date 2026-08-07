@@ -174,8 +174,8 @@ pub enum Effect {
 /// A complete refine output ready to encode/decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefinePayload {
-    /// Wire version this payload was decoded from. VOS accepts only the
-    /// canonical v3 format; older stores and actor blobs must be reinstalled.
+    /// Wire version this payload was decoded from. VOS accepts canonical
+    /// v3/v4; retired v2 stores and actor blobs must be reinstalled.
     pub version: u8,
     /// Commitment kind for the state this refine ran against.
     pub anchor_kind: u8,

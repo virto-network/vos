@@ -7333,7 +7333,7 @@ fn build_conservation_transition(
 }
 
 /// Length-prefixed `[u32 public_len][public][u32 secret_len][secret]` — the
-/// `__VOS_WITNESS` payload the voucher-check guest decodes (mirrors
+/// legacy voucher-check witness payload (mirrors
 /// `vos::zk::read_witness_buffer`).
 fn encode_witness_payload(public_bytes: &[u8], secret_bytes: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(8 + public_bytes.len() + secret_bytes.len());
@@ -7347,8 +7347,8 @@ fn encode_witness_payload(public_bytes: &[u8], secret_bytes: &[u8]) -> Vec<u8> {
 // ── W1 provable-verifier fixture (witnessed-transfer) ────────────────
 //
 // The `#[provable]` primitive `vos::zk::state::WitnessedLedger`, exercised
-// end-to-end in a real traced guest: the fixture reads touched leaves + a
-// `BatchProof` from `__VOS_WITNESS`, verifies them against an app-named
+// end-to-end in a real traced Task guest: the fixture reads touched leaves + a
+// `BatchProof` from its dynamic message, verifies them against an app-named
 // `root_before`, applies a batch of transfers, computes `root_after`, and
 // binds `(root_before, root_after, batch_digest)` into φ[9..12]. The gate
 // asserts the clean transition binds the io-hash a verifier would recompute,
@@ -7362,7 +7362,7 @@ fn witnessed_transfer_elf_path() -> std::path::PathBuf {
         return std::path::PathBuf::from(p);
     }
     std::path::PathBuf::from(format!(
-        "{}/../tests/fixtures/legacy-v1/actors/witnessed-transfer/target/riscv64em-javm/release/witnessed-transfer.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/witnessed-transfer/target/riscv64em-javm/release/witnessed_transfer.elf",
         env!("CARGO_MANIFEST_DIR"),
     ))
 }
@@ -7458,16 +7458,43 @@ fn wt_apply_root(accounts: &[(u64, u64)], transfers: &[(u64, u64, u64)]) -> [u8;
     vos::zk::state::root_of_sorted(&wt_params(), &wt_leaves(&accts))
 }
 
-/// Trace the fixture over a patched witness. Returns `(exit_reason,
-/// step_count, bound_io_hash)`; the io-hash (φ[9..12]) is only meaningful
-/// on a clean halt.
-fn wt_trace(blob: &[u8], addr: usize, gas: u64, witness_buf: &[u8]) -> (String, usize, [u8; 32]) {
+fn wt_task_input(public: &[u8], secret: &[u8]) -> Vec<u8> {
+    use vos::value::Msg;
+
+    let message = task_gate_dyn_msg(
+        &Msg::new("verify")
+            .with("public", public.to_vec())
+            .with("secret", secret.to_vec()),
+    );
+    let input = vos::task_abi::encode_task_input(&[], &message);
+    assert!(
+        input.len() <= 16 * 1024,
+        "witnessed-transfer Task input is {} bytes",
+        input.len()
+    );
+    input
+}
+
+/// Trace the fixture over a canonical Task input. Returns `(exit_reason,
+/// step_count, bound_io_hash, payload)`; the io-hash and payload are only
+/// meaningful on a clean halt.
+fn wt_trace(
+    blob: &[u8],
+    addr: usize,
+    gas: u64,
+    task_input: &[u8],
+) -> (
+    String,
+    usize,
+    [u8; 32],
+    Option<vos::refine_payload::RefinePayload>,
+) {
     let (mut interp, mut img) =
         zkpvm::actor::interpreter_from_blob(blob, gas).expect("parse witnessed-transfer blob");
-    let end = addr + witness_buf.len();
+    let end = addr + task_input.len();
     assert!(end <= img.len(), "witness buffer overruns the guest image");
-    img[addr..end].copy_from_slice(witness_buf);
-    for (index, byte) in witness_buf.iter().copied().enumerate() {
+    img[addr..end].copy_from_slice(task_input);
+    for (index, byte) in task_input.iter().copied().enumerate() {
         interp
             .write_u8(
                 u32::try_from(addr + index).expect("witness address fits u32"),
@@ -7476,17 +7503,29 @@ fn wt_trace(blob: &[u8], addr: usize, gas: u64, witness_buf: &[u8]) -> (String, 
             .expect("witness write is in bounds");
     }
     let mut tracing = zkpvm::core::tracing::TracingPvm::new(interp);
-    let exit = format!("{:?}", tracing.run_with_vos_stubs());
+    let reason = tracing.run_with_vos_stubs();
+    let exit = format!("{reason:?} pc={}", tracing.pvm.pc);
     let steps = tracing.num_steps();
     let mut io = [0u8; 32];
     for (i, word) in tracing.pvm.registers[9..13].iter().enumerate() {
         io[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
     }
-    (exit, steps, io)
+    let payload = if format!("{reason:?}") == "Halt" {
+        let ptr = tracing.pvm.registers[7] as usize;
+        let len = tracing.pvm.registers[8] as usize;
+        tracing
+            .pvm
+            .flat_mem()
+            .get(ptr..ptr.saturating_add(len))
+            .and_then(vos::refine_payload::RefinePayload::decode)
+    } else {
+        None
+    };
+    (exit, steps, io, payload)
 }
 
 fn wt_is_clean_halt(exit: &str) -> bool {
-    exit == "HostCall(0)" || exit == "Ecall"
+    exit.starts_with("Halt pc=")
 }
 
 /// The W1 gate. A real committed-map transition proves through
@@ -7517,27 +7556,34 @@ fn witnessed_transfer_verifies_and_rejects_doctored_witnesses() {
     let secret = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&witness)
         .expect("encode LedgerWitness")
         .to_vec();
-    let witness_buf = encode_witness_payload(&public, &secret);
+    let task_input = wt_task_input(&public, &secret);
 
-    // Independently derive the io-hash the guest must bind.
+    // Independently derive the app-public statement the guest must bind.
     let root_after = wt_apply_root(&accounts, &transfers);
     let batch_digest = vos::crypto::blake2b_hash::<32>(b"witnessed-transfer/batch/v1", &[&public]);
     let mut public_bytes = Vec::with_capacity(96);
     public_bytes.extend_from_slice(&root_before);
     public_bytes.extend_from_slice(&root_after);
     public_bytes.extend_from_slice(&batch_digest);
-    let expected_io = vos::zk::compute_io_hash(&public_bytes, &[1u8]);
 
     // Clean run: completes and binds the expected transition io-hash.
-    let (exit, clean_steps, io) = wt_trace(&blob, addr, WT_TRACE_GAS, &witness_buf);
+    let (exit, clean_steps, io, payload) = wt_trace(&blob, addr, WT_TRACE_GAS, &task_input);
     assert!(
         wt_is_clean_halt(&exit),
         "clean witnessed transition must halt cleanly, got {exit} after {clean_steps} steps"
     );
+    let payload = payload.expect("clean Task halt must return a Refine payload");
+    assert_eq!(payload.app_public, public_bytes);
+    let public_prime = vos::refine_payload::folded_public(
+        payload.anchor_kind,
+        &payload.anchor,
+        &payload.transition_digest(),
+        &payload.app_public,
+    );
+    let expected_io = vos::zk::compute_io_hash(&public_prime, &payload.reply);
     assert_eq!(
         io, expected_io,
-        "the guest must bind io_hash(root_before ‖ root_after ‖ batch_digest, [1]) \
-         a verifier can recompute"
+        "Task framework must bind the exact payload"
     );
     assert_ne!(root_after, root_before, "the transition must move the root");
     eprintln!("clean transition: {exit} in {clean_steps} steps, io-hash bound OK");
@@ -7558,8 +7604,8 @@ fn witnessed_transfer_verifies_and_rejects_doctored_witnesses() {
         let secret = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&w)
             .unwrap()
             .to_vec();
-        let buf = encode_witness_payload(&public, &secret);
-        let (exit, steps, _) = wt_trace(&blob, addr, doctored_gas, &buf);
+        let input = wt_task_input(&public, &secret);
+        let (exit, steps, _, _) = wt_trace(&blob, addr, doctored_gas, &input);
         assert!(
             !wt_is_clean_halt(&exit),
             "a swapped witnessed value must trap, got clean halt {exit} in {steps} steps"
@@ -7577,8 +7623,8 @@ fn witnessed_transfer_verifies_and_rejects_doctored_witnesses() {
         let secret = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&w)
             .unwrap()
             .to_vec();
-        let buf = encode_witness_payload(&public, &secret);
-        let (exit, steps, _) = wt_trace(&blob, addr, doctored_gas, &buf);
+        let input = wt_task_input(&public, &secret);
+        let (exit, steps, _, _) = wt_trace(&blob, addr, doctored_gas, &input);
         assert!(
             !wt_is_clean_halt(&exit),
             "a lying-absent leaf must trap, got clean halt {exit} in {steps} steps"
@@ -7592,8 +7638,8 @@ fn witnessed_transfer_verifies_and_rejects_doctored_witnesses() {
         let secret = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&w)
             .unwrap()
             .to_vec();
-        let buf = encode_witness_payload(&public, &secret);
-        let (exit, steps, _) = wt_trace(&blob, addr, doctored_gas, &buf);
+        let input = wt_task_input(&public, &secret);
+        let (exit, steps, _, _) = wt_trace(&blob, addr, doctored_gas, &input);
         assert!(
             !wt_is_clean_halt(&exit),
             "a wrong root_before must trap, got clean halt {exit} in {steps} steps"
@@ -7606,8 +7652,8 @@ fn witnessed_transfer_verifies_and_rejects_doctored_witnesses() {
     {
         let bad_transfers = [(1u64, 2u64, 10u64), (7, 5, 5)];
         let public_bad = wt_encode_transfers(&bad_transfers);
-        let buf = encode_witness_payload(&public_bad, &secret);
-        let (exit, steps, _) = wt_trace(&blob, addr, doctored_gas, &buf);
+        let input = wt_task_input(&public_bad, &secret);
+        let (exit, steps, _, _) = wt_trace(&blob, addr, doctored_gas, &input);
         assert!(
             !wt_is_clean_halt(&exit),
             "an unproven read must trap, got clean halt {exit} in {steps} steps"
@@ -11791,7 +11837,7 @@ fn provable_task_captures_a_durable_re_traceable_record() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let sched_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let sched_elf = match std::fs::read(&sched_path) {
@@ -11874,10 +11920,7 @@ fn provable_task_captures_a_durable_re_traceable_record() {
     }
     let mut tracing = zkpvm::core::tracing::TracingPvm::new(interp);
     let exit = format!("{:?}", tracing.run_with_vos_stubs());
-    assert!(
-        exit == "HostCall(0)" || exit == "Ecall",
-        "the re-trace must halt cleanly, got {exit}"
-    );
+    assert!(exit == "Halt", "the re-trace must halt cleanly, got {exit}");
     let mut io = [0u8; 32];
     for (i, word) in tracing.pvm.registers[9..13].iter().enumerate() {
         io[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
@@ -11905,7 +11948,7 @@ fn capture_rooted_record() -> Option<(vos::provable::ProofRecordEntry, Vec<u8>, 
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let sched_path = format!(
-        "{}/../examples/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
         workspace
     );
     let sched_elf = match std::fs::read(&sched_path) {
@@ -12325,13 +12368,10 @@ fn task_invoke_live_equals_traced() {
 
     let mut tracing = zkpvm::core::tracing::TracingPvm::new(interp);
     // zkpvm pins its own javm rev, so its ExitReason is a different
-    // type than vos's javm — compare the Debug form; the decodable v3
+    // type than vos's javm — compare the Debug form; the decodable current
     // payload below is the real halt proof.
     let exit = format!("{:?}", tracing.run_with_vos_stubs());
-    assert!(
-        exit == "HostCall(0)" || exit == "Ecall",
-        "traced task must halt cleanly, got {exit}"
-    );
+    assert!(exit == "Halt", "traced task must halt cleanly, got {exit}");
     let ptr = tracing.pvm.registers[7] as usize;
     let len = tracing.pvm.registers[8] as usize;
     let raw = &tracing.pvm.flat_mem()[ptr..ptr + len];

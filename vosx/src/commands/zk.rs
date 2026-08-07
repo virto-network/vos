@@ -109,9 +109,9 @@ pub struct PinArgs {
     /// created if absent).
     #[arg(long, value_name = "FILE")]
     out: PathBuf,
-    /// Representative witness payload to inject at `__VOS_WITNESS` before
-    /// tracing (the `[u32 pub_len][pub][u32 sec_len][sec]` bytes). Required to
-    /// MEASURE the commitment allowlist; unused with `--allowlist`.
+    /// Representative exact witness payload to inject at `__VOS_WITNESS`
+    /// before tracing (for a Task, its canonical `VOST` Task envelope).
+    /// Required to MEASURE the commitment allowlist; unused with `--allowlist`.
     #[arg(long, value_name = "FILE")]
     witness: Option<PathBuf>,
     /// Comma-separated hex commitments to RECORD as the allowlist instead of

@@ -1,6 +1,7 @@
 # `#[provable]` — proofs of actor transitions
 
-Status: **design, revised after adversarial review**. The first draft
+Status: **W1–W3 implemented; W4 (macro + clerk migration) remains**.
+The first draft
 tried to make a provable Task re-anchor its invoking parent's committed
 `0x02` composite and verify committed reads in-circuit against it. A
 four-lens review killed that (six independent blockers): a separate
@@ -311,7 +312,7 @@ the record opt-in, not a semantic fork — "every Task is one
 
 ## Waves
 
-1. **W1 — the provable-verifier primitive.** A `WitnessedLedger`-style
+1. **W1 — complete: the provable-verifier primitive.** A `WitnessedLedger`-style
    helper in `vos::zk::state` (generalizing cipher-clerk's
    `SparseLedger`) that a Task builds from `(leaves, BatchProof,
    root_before)`, panics on any read/write inconsistent with the proof,
@@ -319,17 +320,17 @@ the record opt-in, not a semantic fork — "every Task is one
    surface (above). Gate: a committed fixture Task that verifies a
    real transition and whose doctored witness (swapped value, lying
    absent, wrong root) fails to complete a trace. Guest change ⇒ re-pin.
-2. **W2 — record capture, durable + split.** `ProvableInput` /
+2. **W2 — complete: record capture, durable + split.** `ProvableInput` /
    `ProvableRecord`, the `__vos_proofrec/` persistence, the
    `spawn_provable(tag)` flag + reserved-bits wire rule, tag-in-output,
    φ-register io-hash capture. Gate: record survives a restart and its
    input re-traces to the same io-hash.
-3. **W3 — verify surface.** `prove_record` (pre-flight + chain) /
+3. **W3 — complete: verify surface.** `prove_record` (pre-flight + chain) /
    `verify_record` (witness-free four checks) on the prover extension
    over the B8 queue; `vosx zk prove/verify`. Gate: record → prove
    (release, heavy) → verify all checks, plus rejection of a tampered
    record/reply/root and a wrong `expected_root_before`.
-4. **W4 — clerk migration + macro.** Extract clerk-ledger's
+4. **W4 — next: clerk migration + macro.** Extract clerk-ledger's
    `apply_transfer` kernel into an `apply` provable Task over a
    witnessed `BatchProof`; the `provable` flag + `.vos_meta` bit;
    append-versioned catalog + `blob_hash`; migrate voucher-check onto

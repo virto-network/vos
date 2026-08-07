@@ -5,7 +5,7 @@
 //! ## What it proves
 //!
 //! A committed field of `u64 → u64` balances has a sparse-Merkle root.
-//! The guest receives, in `__VOS_WITNESS`:
+//! The guest receives, through the canonical Task input:
 //!
 //! - **public half** — the batch of transfers to apply (`(from, to,
 //!   amount)` triples, flat little-endian);
@@ -34,18 +34,15 @@
 //!
 //! ## Witness injection
 //!
-//! The host patches the length-prefixed `(public, secret)` payload into
-//! `__VOS_WITNESS` (located by ELF symbol) before tracing. A bare run
-//! with no injected witness is not a proving run; `start` returns early.
+//! `#[actor(task = 16384)]` emits the standard `__VOS_WITNESS` buffer.
+//! The host patches a Task envelope containing the dynamic `verify`
+//! message; its `public` and `secret` fields are ordinary handler
+//! arguments. This is the same input and transition-binding path used
+//! by durable provable records.
 
 use vos::crypto::blake2b_hash;
 use vos::prelude::*;
 use vos::zk::state::{LedgerWitness, SmtParams};
-
-// ZK witness-injection buffer. A `LedgerWitness` carries only the batch's
-// TOUCHED leaves + their multiproof frontier (not the whole field), so
-// its size scales with the batch, not the ledger.
-vos::zk::witness_buffer!(16384);
 
 /// Accounts are keyed by `u64` big-endian → an 8-byte key → a depth-64
 /// SMT under the default vos domains.
@@ -54,31 +51,31 @@ const KEY_WIDTH: usize = 8;
 /// Domain separating this fixture's batch digest from any other bytes.
 const BATCH_DOMAIN: &[u8] = b"witnessed-transfer/batch/v1";
 
-#[actor]
-struct WitnessedTransfer;
+// A `LedgerWitness` carries only the batch's TOUCHED leaves + its
+// multiproof frontier (not the whole field), so the buffer scales with
+// the batch rather than the ledger.
+#[actor(task = 16384)]
+struct WitnessedTransfer {
+    marker: u8,
+}
 
 #[messages]
 impl WitnessedTransfer {
     fn new() -> Self {
-        WitnessedTransfer
+        WitnessedTransfer { marker: 1 }
     }
 
-    /// Lifecycle `on_start` hook — the prove path. Reads the witness,
-    /// verifies + applies the transition, and binds the roots.
+    /// Pure-verifier Task entry: verify + apply the witnessed transition
+    /// and designate its application-level public statement.
     #[msg]
-    async fn start(&self, _ctx: &mut Context<Self>) -> u8 {
-        let Some((public, secret)) = __vos_read_witness() else {
-            // No injected witness — not a proving run. Nothing to prove.
-            return 1;
-        };
-
+    async fn verify(&self, public: Vec<u8>, secret: Vec<u8>) -> u8 {
         // Public half: the batch of transfers.
         let transfers = decode_transfers(&public);
 
         // Secret half: the committed field's touched leaves + BatchProof.
         // A decode failure is a malformed witness → panic → Trap.
         let witness = vos::rkyv::from_bytes::<LedgerWitness, vos::rkyv::rancor::Error>(&secret)
-            .expect("decode LedgerWitness from __VOS_WITNESS");
+            .expect("decode LedgerWitness from Task input");
         let root_before = witness.root_before;
 
         // Verify the touched leaves reconstruct `root_before` (panics on
@@ -117,7 +114,12 @@ impl WitnessedTransfer {
         public_bytes.extend_from_slice(&root_before);
         public_bytes.extend_from_slice(&root_after);
         public_bytes.extend_from_slice(&batch_digest);
-        vos::zk::bind_io_bytes(&public_bytes, &[1u8]);
+        // The Task framework composes these bytes with the anchored
+        // input state, exact transition digest, and encoded reply.
+        #[cfg(target_arch = "riscv64")]
+        vos::zk::bind_public_bytes(&public_bytes);
+        #[cfg(not(target_arch = "riscv64"))]
+        let _ = public_bytes;
         1
     }
 }
@@ -133,7 +135,8 @@ fn decode_transfers(bytes: &[u8]) -> Vec<(u64, u64, u64)> {
     let count = u32::from_le_bytes(bytes[..4].try_into().expect("transfer count")) as usize;
     let mut out = Vec::with_capacity(count);
     let mut at = 4;
-    let field = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("transfer field"));
+    let field =
+        |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("transfer field"));
     for _ in 0..count {
         let from = field(at);
         let to = field(at + 8);

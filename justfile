@@ -81,7 +81,7 @@ build-voucher-check:
 
 # Build the pure-verifier Task used by the WitnessedLedger proof gate.
 build-witnessed-transfer:
-    cd tests/fixtures/legacy-v1/actors/witnessed-transfer; cargo +nightly build --release
+    cd tests/fixtures/legacy-v1/actors/witnessed-transfer; cargo +nightly actor
 
 # Refresh the bundled space-registry ELF shipped with vosx.
 refresh-bundled-registry: (build-actor "space-registry")

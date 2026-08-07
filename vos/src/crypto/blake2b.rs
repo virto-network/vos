@@ -134,15 +134,16 @@ fn ecall_compress(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
     // boundary when the result is unused. JAR resumes by overwriting a0/a1,
     // so that optimization turns the following drop into a load through
     // HOST_OK. Declaring both late outputs here makes the suspension boundary
-    // explicit to the code that owns the buffers.
-    let status: u64;
-    let result1: u64;
+    // explicit to the code that owns the buffers. The outputs are deliberately
+    // discarded: the proof tracer and refine-pure Task host implement this
+    // precompile as a memory transform and leave the input registers in place;
+    // the digest bytes written through `h_ptr` are the only portable result.
     unsafe {
         core::arch::asm!(
             "ecall",
             in("t0") ECALL_BLAKE2B_COMPRESS as u64,
-            inlateout("a0") h_ptr => status,
-            inlateout("a1") m_ptr => result1,
+            inlateout("a0") h_ptr => _,
+            inlateout("a1") m_ptr => _,
             in("a2") t_low,
             in("a3") f_flag,
             in("a4") 0u64,
@@ -150,12 +151,6 @@ fn ecall_compress(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
             options(nostack),
         );
     }
-    assert_eq!(
-        status,
-        crate::abi::error::HOST_OK,
-        "BLAKE2B hostcall failed"
-    );
-    assert_eq!(result1, 0, "BLAKE2B hostcall returned invalid status");
 }
 
 // ── Host kernel handler: per-block compress for the ECALL ──

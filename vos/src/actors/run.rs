@@ -661,7 +661,7 @@ pub fn run_refine_service<A: super::Actor>() {
 ///    exact state bytes (genesis when empty).
 /// 2. `load_or_create::<A>(state)` and dispatch the single message
 ///    (effects buffer into the context — refine mode).
-/// 3. Halt with the v3 `RefinePayload`: state as the final
+/// 3. Halt with the current `RefinePayload`: state as the final
 ///    `Write{STATE_KEY}` when changed, reply, effects, `continue_next`
 ///    from `yield_now`/`sleep`.
 ///

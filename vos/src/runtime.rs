@@ -1925,11 +1925,10 @@ fn handle_task_hostcall(kernel: &mut InvocationKernel, call_id: u32) -> bool {
 
 /// Run a witness-delivered Task invocation (the A9 invoke mode): patch
 /// `(state, msg)` into the child's initial image, run it under the
-/// tracer-parity hostcall table, verify + convert its v3 work-result.
+/// tracer-parity hostcall table, verify + convert its current work-result.
 /// No child ServiceId, no child storage row — the extracted state goes
 /// to the parent's envelope and the remaining effects fold into the
 /// PARENT's keyspace.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn run_task_invoke(
     caller: &mut InvocationKernel,
