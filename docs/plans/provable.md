@@ -201,7 +201,8 @@ them and made records droppable — both wrong.
   fix). The host persists `ProvableInput` + `ProvableRecord` keyed by
   `(svc, tag)` into the agent's own storage under a reserved
   `__vos_proofrec/` prefix — so they survive a Local producer restart.
-  CRDT/Raft capture is rejected before execution: those strategies
+  CRDT/Raft capture is rejected at queue time, before the secret enters the
+  parent's serialized task table: those strategies
   replicate effect logs, and putting `ProvableInput` into an invoke
   effect would disclose the exact secret witness. A future replicated
   producer needs a producer-local durable sidecar, not replicated actor

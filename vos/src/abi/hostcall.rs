@@ -59,6 +59,14 @@ pub const QUOTA: u32 = 28;
 // guest `ecalli N` resolves to a `ProtocolCall { slot: N }` the runtime handles
 // rather than `RESULT_WHAT`. All fit javm's `imm <= 127` budget.
 
+/// Declare that the current actor dispatch is about to retain a
+/// producer-private provable Task input in its serialized state.
+///
+/// Local parents receive `HOST_OK`. CRDT/Raft recording and replay mark the
+/// complete dispatch uncommittable before the secret is queued; waiting until
+/// the Task's later `INVOKE` would already have replicated the parent state.
+pub const PROVABLE_RECORD_INTENT: u32 = 109;
+
 /// Exchange invocation-private actor data with the generic VOS scheduler.
 ///
 /// An active application VM receives only its own state and authenticated
@@ -145,6 +153,7 @@ mod tests {
     #[test]
     fn vos_capabilities_never_use_jam_protocol_slots() {
         let supplied = [
+            PROVABLE_RECORD_INTENT,
             GROW_HEAP,
             DEBUG_WRITE,
             INVOKE,
@@ -177,6 +186,7 @@ mod tests {
             ..crate::v2::TARGET_ACTOR_HANDLE_SLOT + crate::v2::MAX_ROOT_TREE_ACTORS as u8;
         let occupied = [
             crate::crypto::ECALL_BLAKE2B_COMPRESS as u8,
+            PROVABLE_RECORD_INTENT as u8,
             GROW_HEAP as u8,
             DEBUG_WRITE as u8,
             INVOKE as u8,

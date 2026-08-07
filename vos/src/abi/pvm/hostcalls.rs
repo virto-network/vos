@@ -74,6 +74,14 @@ pub fn grow_heap(pages: u32) -> u64 {
     ecall1(hostcall::GROW_HEAP, pages as u64)
 }
 
+/// Announce producer-private provable work before it is serialized into the
+/// parent actor's task table. Replicated hosts deny this and reject the whole
+/// dispatch; Local hosts return `HOST_OK`.
+#[inline]
+pub fn provable_record_intent() -> u64 {
+    ecall0(hostcall::PROVABLE_RECORD_INTENT)
+}
+
 /// Write debug output. vosx prints to stderr.
 #[inline]
 pub fn debug_write(data: &[u8]) -> u64 {

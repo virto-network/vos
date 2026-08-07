@@ -96,14 +96,29 @@ impl Agent {
         let keys: Vec<Vec<u8>> =
             vos::rkyv::from_bytes::<Vec<Vec<u8>>, vos::rkyv::rancor::Error>(&row_keys)
                 .unwrap_or_default();
-        let id = self.tasks.spawn_raw_provable_with_rows(
-            code_hash,
-            task_msg,
-            keys,
-            tag,
-        );
+        let id = self
+            .tasks
+            .spawn_raw_provable_with_rows(code_hash, task_msg, keys, tag);
         self.drive_round(ctx);
         id
+    }
+
+    /// Queue provable work without driving it. This deliberately separates
+    /// the privacy decision from the later INVOKE so replicated-parent tests
+    /// prove the secret cannot first land in serialized actor state.
+    #[msg]
+    async fn queue_provable_task(
+        &mut self,
+        code_hash: [u8; 32],
+        task_msg: Vec<u8>,
+        row_keys: Vec<u8>,
+        tag: [u8; 32],
+    ) -> u64 {
+        let keys: Vec<Vec<u8>> =
+            vos::rkyv::from_bytes::<Vec<Vec<u8>>, vos::rkyv::rancor::Error>(&row_keys)
+                .unwrap_or_default();
+        self.tasks
+            .spawn_raw_provable_with_rows(code_hash, task_msg, keys, tag)
     }
 
     /// Export the captured proof record under `tag` — the raw

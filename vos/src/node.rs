@@ -12811,7 +12811,7 @@ mod tests {
         let no_keys = crate::rkyv::to_bytes::<crate::rkyv::rancor::Error>(&Vec::<Vec<u8>>::new())
             .unwrap()
             .to_vec();
-        let encoded_msg = Msg::new("run_provable_task")
+        let encoded_msg = Msg::new("queue_provable_task")
             .with("code_hash", vec![0x42u8; 32])
             .with("task_msg", vec![TAG_DYNAMIC, 0xAA])
             .with("row_keys", no_keys)

@@ -210,6 +210,7 @@ impl Tasks {
         msg: &super::value::Msg,
         tag: [u8; 32],
     ) -> TaskId {
+        require_local_provable_recording();
         let encoded = super::codec::Encode::encode(msg);
         let mut payload = Vec::with_capacity(1 + encoded.len());
         payload.push(super::value::TAG_DYNAMIC);
@@ -229,6 +230,7 @@ impl Tasks {
         row_keys: Vec<Vec<u8>>,
         tag: [u8; 32],
     ) -> TaskId {
+        require_local_provable_recording();
         self.push(Child::Task(task_hash), msg, row_keys, Some(tag))
     }
 
@@ -323,6 +325,21 @@ impl Tasks {
         self.records.iter().map(|(id, r)| (*id, r))
     }
 }
+
+/// The secret message enters `TaskRecord` at queue time, which can precede
+/// the first drive pass by arbitrarily many committed dispatches. Ask the host
+/// to approve producer-local storage before constructing that record. On a
+/// replicated parent the host marks the complete dispatch uncommittable and
+/// this panic prevents the handler from proceeding as though it queued work.
+#[cfg(all(feature = "pvm", target_arch = "riscv64"))]
+fn require_local_provable_recording() {
+    if crate::abi::pvm::hostcalls::provable_record_intent() != crate::abi::error::HOST_OK {
+        panic!("provable Task records require a Local parent");
+    }
+}
+
+#[cfg(not(all(feature = "pvm", target_arch = "riscv64")))]
+fn require_local_provable_recording() {}
 
 #[cfg(test)]
 mod tests {

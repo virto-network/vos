@@ -235,8 +235,9 @@ fn install_vos_runtime_caps(kernel: &mut InvocationKernel) {
     // handler today); ristretto IDs are hardcoded here until vos
     // grows its own handler — the install is a no-op for slots
     // whose ECALL never fires.
-    let slots: [u8; 12] = [
+    let slots: [u8; 13] = [
         crate::crypto::ECALL_BLAKE2B_COMPRESS as u8, // 100
+        hostcall::PROVABLE_RECORD_INTENT as u8,      // 109 (queue-time privacy gate)
         110,                                         // ristretto_scalar_mult
         111,                                         // ristretto_point_add
         112,                                         // scalar_from_bytes_mod_order_wide
@@ -1695,6 +1696,19 @@ fn handle_refine_hostcall(
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             (now, 0)
+        }
+        hostcall::PROVABLE_RECORD_INTENT => {
+            if matches!(mode, crate::effect_log::EffectMode::Inactive) {
+                (error::HOST_OK, 0)
+            } else {
+                // The actor has not serialized the secret TaskRecord yet.
+                // Reject the complete top-level dispatch so neither its
+                // incoming message nor any surrounding parent effects enter
+                // a CRDT/Raft log.
+                mode.reject_private_record();
+                journal.private_record_rejected = true;
+                (error::HOST_NONE, 0)
+            }
         }
         crate::crypto::ECALL_BLAKE2B_COMPRESS => {
             // Wire ABI matches `zkpvm-precompiles`: a0=h_ptr (64B

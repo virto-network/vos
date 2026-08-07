@@ -11974,7 +11974,7 @@ fn provable_capture_rejects_the_complete_replicated_dispatch() {
     let no_keys = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&Vec::<Vec<u8>>::new())
         .unwrap()
         .to_vec();
-    let request = Msg::new("run_provable_task")
+    let request = Msg::new("queue_provable_task")
         .with("code_hash", task_hash.to_vec())
         .with(
             "task_msg",
