@@ -1,6 +1,11 @@
 use super::*;
+use core::sync::atomic::{AtomicU64, Ordering};
 use vos::Message;
 use vos::actors::context::ServiceId;
+
+static NEXT_TEST_INVOCATION: AtomicU64 = AtomicU64::new(1);
+static TEST_CHANGE_SCOPE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const TEST_ACTOR: vos::ActorId = vos::ActorId::new([0x4d; 32]);
 
 fn log() -> MsgLog {
     MsgLog::new()
@@ -35,12 +40,46 @@ fn run<F: core::future::Future>(fut: F) -> F::Output {
     }
 }
 
+fn test_change(domain: &[u8], identity: &[u8]) -> vos::v2::ChangeId {
+    vos::v2::ChangeId::new(vos::InvocationId::derive(domain, identity).0)
+}
+
+fn dispatch_with_change<M>(
+    l: &mut MsgLog,
+    msg: M,
+    change: vos::v2::ChangeId,
+) -> <MsgLog as Message<M>>::Output
+where
+    MsgLog: Message<M>,
+{
+    // `vos` is deliberately built no-std for this actor's host tests, so its
+    // guest-style allocator is process-global. Serialise direct dispatches as
+    // the real single-threaded actor VM does.
+    let _scope = TEST_CHANGE_SCOPE.lock().expect("test change scope lock");
+    let dispatch = vos::v2::CrdtDispatchV2 { change, ordinal: 0 };
+    let scoped_change = crdt::ChangeId::for_dispatch(change, TEST_ACTOR, dispatch.ordinal);
+    let mut ctx: vos::Context<MsgLog> = vos::Context::new(ServiceId(0));
+    let output = crdt::with_change(scoped_change, || {
+        Ok(run(<MsgLog as Message<M>>::handle(l, msg, &mut ctx)))
+    })
+    .expect("test dispatch establishes one CRDT change scope");
+    crdt::take_operations(TEST_ACTOR, dispatch)
+        .expect("test dispatch consumes one contiguous CRDT operation batch");
+    output
+}
+
 fn dispatch<M>(l: &mut MsgLog, msg: M) -> <MsgLog as Message<M>>::Output
 where
     MsgLog: Message<M>,
 {
-    let mut ctx: vos::Context<MsgLog> = vos::Context::new(ServiceId(0));
-    run(<MsgLog as Message<M>>::handle(l, msg, &mut ctx))
+    // Direct dispatch bypasses generated actor entry glue, so give every
+    // synthetic invocation its own scoped operation allocator.
+    let nonce = NEXT_TEST_INVOCATION.fetch_add(1, Ordering::Relaxed);
+    dispatch_with_change(
+        l,
+        msg,
+        test_change(b"msg-log/tests/dispatch", &nonce.to_le_bytes()),
+    )
 }
 
 /// Wrap a test payload in the minimal MLS PrivateMessage framing
@@ -52,7 +91,19 @@ fn framed(payload: &[u8]) -> Vec<u8> {
 }
 
 fn post(l: &mut MsgLog, lamport: u64, body: &[u8]) -> Status {
-    dispatch(
+    let body = framed(body);
+    let id = envelope_id(
+        EnvelopeKind::App as u8,
+        1,
+        lamport,
+        1000 + lamport,
+        &[0u8; 32],
+        &body,
+    );
+    // Distinct envelopes model distinct invocations. Re-posting identical
+    // content models an exact retry and deliberately reuses its ChangeId,
+    // including when replicas receive envelopes in different orders.
+    dispatch_with_change(
         l,
         Post {
             kind: EnvelopeKind::App as u8,
@@ -60,8 +111,9 @@ fn post(l: &mut MsgLog, lamport: u64, body: &[u8]) -> Status {
             lamport,
             ts_ms: 1000 + lamport,
             to_hint: Vec::new(),
-            body: framed(body),
+            body,
         },
+        test_change(b"msg-log/tests/post", &id),
     )
 }
 
