@@ -648,11 +648,24 @@ fn vosx_ok(data_home: &Path, config_home: &Path, args: &[&str]) -> String {
 /// Boot host A (new + up) and install the CRDT counter fixture as a
 /// member-floor app agent. Returns (data_a, cfg_a, daemon_a, log_a).
 fn boot_admin(space: &str) -> (TempDir, TempDir, Daemon, PathBuf) {
+    boot_admin_with_service(space, None)
+}
+
+fn boot_admin_with_service(
+    space: &str,
+    service_pvm: Option<&Path>,
+) -> (TempDir, TempDir, Daemon, PathBuf) {
     let data_a = TempDir::new("a-data");
     let cfg_a = TempDir::new("a-config");
     vosx_ok(data_a.path(), cfg_a.path(), &["space", "new", space]);
     let log_a = data_a.path().join("daemon-a.stderr");
-    let daemon_a = Daemon(spawn_up(data_a.path(), cfg_a.path(), space, &log_a));
+    let daemon_a = Daemon(spawn_up_with_service(
+        data_a.path(),
+        cfg_a.path(),
+        space,
+        &log_a,
+        service_pvm,
+    ));
     wait_for_endpoint(data_a.path(), &log_a, "A");
     let counter_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../tests/fixtures/v2/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter_v2.elf");
@@ -777,7 +790,13 @@ fn expired_token_not_redeemed_and_non_member_cannot_sync() {
 #[test]
 fn double_redemption_is_flagged() {
     let space = "dbl";
-    let (data_a, cfg_a, _da, _la) = boot_admin(space);
+    let service_pvm =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../services/vos-service/vos-service.pvm");
+    assert!(
+        service_pvm.is_file(),
+        "build the canonical service first: `just build-vos-service`",
+    );
+    let (data_a, cfg_a, _da, _la) = boot_admin_with_service(space, Some(&service_pvm));
     let stdout = vosx_ok(
         data_a.path(),
         cfg_a.path(),
@@ -790,14 +809,34 @@ fn double_redemption_is_flagged() {
     let data_b = TempDir::new("dbl-b-data");
     let cfg_b = TempDir::new("dbl-b-config");
     let log_b = data_b.path().join("b.stderr");
-    let _db = Daemon(spawn_up(data_b.path(), cfg_b.path(), &token, &log_b));
-    wait_for_endpoint(data_b.path(), &log_b, "B");
+    let _db = Daemon(spawn_up_with_service(
+        data_b.path(),
+        cfg_b.path(),
+        &token,
+        &log_b,
+        Some(&service_pvm),
+    ));
+    let endpoint_b = wait_for_endpoint(data_b.path(), &log_b, "B");
+    let pending_b = endpoint_b
+        .parent()
+        .expect("B endpoint has a space directory")
+        .join(".pending-invite.token");
 
     let data_c = TempDir::new("dbl-c-data");
     let cfg_c = TempDir::new("dbl-c-config");
     let log_c = data_c.path().join("c.stderr");
-    let _dc = Daemon(spawn_up(data_c.path(), cfg_c.path(), &token, &log_c));
-    wait_for_endpoint(data_c.path(), &log_c, "C");
+    let _dc = Daemon(spawn_up_with_service(
+        data_c.path(),
+        cfg_c.path(),
+        &token,
+        &log_c,
+        Some(&service_pvm),
+    ));
+    let endpoint_c = wait_for_endpoint(data_c.path(), &log_c, "C");
+    let pending_c = endpoint_c
+        .parent()
+        .expect("C endpoint has a space directory")
+        .join(".pending-invite.token");
 
     // A records BOTH redemptions on the one InviteRow → members flags it.
     poll_until(
@@ -810,6 +849,24 @@ fn double_redemption_is_flagged() {
             format!(
                 "A never flagged the double-redemption. members:\n{}\nB log:\n{}\nC log:\n{}",
                 vosx_ok(data_a.path(), cfg_a.path(), &["space", "members", space]),
+                fs::read_to_string(&log_b).unwrap_or_default(),
+                fs::read_to_string(&log_c).unwrap_or_default(),
+            )
+        },
+    );
+
+    // Registry acceptance is only the first half of v2 onboarding. The
+    // daemon removes the bearer secret only after the canonical authority PVM
+    // accepts the same evidence through physical guest Accumulate.
+    poll_until(
+        30,
+        || !pending_b.exists() && !pending_c.exists(),
+        || {
+            format!(
+                "one or both joiners never committed invite redemption to space-authority \
+                 (pending B={}, C={}). B log:\n{}\nC log:\n{}",
+                pending_b.exists(),
+                pending_c.exists(),
                 fs::read_to_string(&log_b).unwrap_or_default(),
                 fs::read_to_string(&log_c).unwrap_or_default(),
             )

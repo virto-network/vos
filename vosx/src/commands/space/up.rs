@@ -622,9 +622,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Bounded per-attempt timeout for the redeem invoke — short so the
-/// router tick isn't stalled by a slow bootnode.
-const REDEEM_INVOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Keep legacy-registry probes short so an unreachable bootnode does not
+/// stall the reconciliation tick.
+const REDEEM_REGISTRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+// A canonical authority is a Raft root. Its bounded invoke may legitimately
+// spend one voter-auth probe, a read barrier, genesis admission, and the two
+// proposals used by one root invocation. Keep this at least as large as the
+// node's full Raft invoke budget; the short registry probe above is not a
+// sufficient deadline for that path.
+const REDEEM_AUTHORITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 // ── Trivalent `up` positional (decision 1) ───────────────────────────
 
@@ -987,7 +993,7 @@ fn try_redeem(node: &VosNode, data_dir: &Path, token_str: &str) -> anyhow::Resul
         let reg = RegistryRef::at(ServiceId::new(peer_prefix, ServiceId::REGISTRY.local_id()));
         let mut inv = TimedNode {
             node,
-            timeout: REDEEM_INVOKE_TIMEOUT,
+            timeout: REDEEM_REGISTRY_TIMEOUT,
         };
         let status = vos::block_on(reg.redeem_invite(
             &mut inv,
@@ -1020,7 +1026,7 @@ fn try_redeem(node: &VosNode, data_dir: &Path, token_str: &str) -> anyhow::Resul
                 match node.invoke_with_timeout(
                     authority_route,
                     invocation.encode(),
-                    REDEEM_INVOKE_TIMEOUT,
+                    REDEEM_AUTHORITY_TIMEOUT,
                 ) {
                     Some(reply)
                         if <vos::value::Value as vos::Decode>::try_decode(&reply)

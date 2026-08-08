@@ -1335,6 +1335,54 @@ fn canonical_space_authority_produces_extractable_accumulated_assertion() {
         Some(Value::Bool(true).encode().as_slice()),
     );
 
+    let second_invited = libp2p::identity::Keypair::generate_ed25519();
+    let second_peer_id = libp2p::PeerId::from(second_invited.public()).to_bytes();
+    let second_redeem =
+        vos::registry::canonical_op_bytes("redeem_invite", &[&token_pub, &second_peer_id]);
+    let second_redemption = RoleAuthorityInviteRedemptionV2 {
+        holder_peer_id: second_peer_id,
+        redeem_signature: token.sign(&second_redeem).unwrap().try_into().unwrap(),
+        holder_signature: second_invited
+            .sign(&second_redeem)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        ..redemption
+    };
+    let mut second_arguments = vec![vos::value::TAG_DYNAMIC];
+    second_arguments.extend_from_slice(
+        &Msg::new("redeem_invite")
+            .with("redemption", second_redemption.encode())
+            .encode(),
+    );
+    let second_result = authority
+        .invoke(LocalWorkRequestV2 {
+            invocation: InvocationId([205; 32]),
+            workflow_step: 0,
+            logical_timeslot: 3,
+            target: authority_actor,
+            method: "redeem_invite".into(),
+            arguments: second_arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        })
+        .expect("a second proven holder may redeem the same partitioned token");
+    assert_eq!(
+        second_result
+            .published
+            .reply
+            .as_ref()
+            .map(|reply| reply.result.as_slice()),
+        Some(Value::Bool(true).encode().as_slice()),
+    );
+
     let invited_holder = Origin::Member(SubjectId::of_authenticated_peer(&invited_peer_id));
     let invited_claim = vos::v2::RoleAuthorizationClaimV2 {
         space: binding.service.space,
@@ -1362,7 +1410,7 @@ fn canonical_space_authority_produces_extractable_accumulated_assertion() {
         .invoke(LocalWorkRequestV2 {
             invocation: invited_claim.authority_invocation(),
             workflow_step: 0,
-            logical_timeslot: 3,
+            logical_timeslot: 4,
             target: authority_actor,
             method: "authorize_role".into(),
             arguments: invited_arguments,
@@ -1412,7 +1460,7 @@ fn canonical_space_authority_produces_extractable_accumulated_assertion() {
         .invoke(LocalWorkRequestV2 {
             invocation: claim.authority_invocation(),
             workflow_step: 0,
-            logical_timeslot: 4,
+            logical_timeslot: 5,
             target: authority_actor,
             method: "authorize_role".into(),
             arguments,

@@ -560,6 +560,28 @@ mod tests {
         let developer = claim(space, holder, SpaceRole::Developer);
         assert_eq!(authorize(&mut authority, &developer), developer.encode());
 
+        let second_holder_key = SigningKey::from_bytes(&[36; 32]);
+        let second_holder = Origin::Member(SubjectId::of_authenticated_peer(&root_peer(
+            &second_holder_key,
+        )));
+        let second_redemption = invite_redemption(
+            space,
+            &admin,
+            &token,
+            &second_holder_key,
+            SpaceRole::Developer,
+            50,
+        );
+        assert!(
+            redeem(&mut authority, &second_redemption),
+            "partitioned redemption of the same bearer token grants each proven holder"
+        );
+        let second_developer = claim(space, second_holder, SpaceRole::Developer);
+        assert_eq!(
+            authorize(&mut authority, &second_developer),
+            second_developer.encode()
+        );
+
         assert!(apply(
             &mut authority,
             &root,

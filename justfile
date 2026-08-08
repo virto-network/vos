@@ -23,8 +23,8 @@ build-extensions:
 build-wasm:
     cd tests/fixtures/wasm/echo; cargo build --target wasm32-unknown-unknown --release
 
-# Build the public v2 actors and the legacy PVM regression fixtures.
-build-pvm: build-examples build-v2-registry-fixtures build-legacy-pvm-fixtures
+# Build the generic service, public v2 actors, and legacy PVM fixtures.
+build-pvm: build-vos-service build-examples build-v2-registry-fixtures build-legacy-pvm-fixtures
 
 # Build the four public v2 examples (private-age + age-gate is one scenario).
 build-examples:
