@@ -300,8 +300,10 @@ impl SpaceAuthority {
             if !role_grant_supersedes(
                 epoch,
                 &grantor_peer_id,
+                role.as_u8(),
                 row.grant_epoch,
                 &row.grantor_peer_id,
+                row.role,
                 &self.root_peer_id,
             ) {
                 // Valid but dominated evidence is an idempotent success in
@@ -552,6 +554,44 @@ mod tests {
         assert_eq!(authorize(&mut actor, &member), member.encode());
         let admin = claim(space, holder, SpaceRole::Admin);
         assert!(authorize(&mut actor, &admin).is_empty());
+    }
+
+    #[test]
+    fn equal_epoch_role_conflicts_use_the_registry_total_order() {
+        let signing = SigningKey::from_bytes(&[70; 32]);
+        let space = SpaceId([71; 32]);
+        let holder = Origin::Member(SubjectId([72; 32]));
+        let apply_order = |roles: [SpaceRole; 2]| {
+            let mut authority = actor(space, &signing);
+            for role in roles {
+                assert!(apply(
+                    &mut authority,
+                    &signing,
+                    RoleAuthorityMutationV2::Grant {
+                        space,
+                        holder,
+                        role,
+                        epoch: 7,
+                    },
+                ));
+            }
+            let member = claim(space, holder, SpaceRole::Member);
+            let developer = claim(space, holder, SpaceRole::Developer);
+            (
+                authorize(&mut authority, &member),
+                authorize(&mut authority, &developer),
+            )
+        };
+        let expected = apply_order([SpaceRole::Admin, SpaceRole::Member]);
+        assert_eq!(expected, apply_order([SpaceRole::Member, SpaceRole::Admin]),);
+        assert!(
+            !expected.0.is_empty(),
+            "the selected Member grant authorizes Member"
+        );
+        assert!(
+            expected.1.is_empty(),
+            "the lower role wins equal root/grantor/epoch evidence",
+        );
     }
 
     #[test]

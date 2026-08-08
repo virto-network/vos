@@ -154,11 +154,20 @@ delegated invite redemption, and grow-only invite cancellation execute in
 that actor; the joiner deletes its pending bearer only after physical
 Accumulate publishes `Bool(true)`. The admin signature binds the authority's
 replication incarnation, so a lagging registry replica cannot turn absence of
-its catalog row into legacy completion. Authority activation refuses every
-effective non-root registry grant and every dormant delegated grant which
-could revive if its grantor is re-granted. Migration is an explicit
-revoke-before-cutover and re-grant-after-cutover operation; rows already
-dominated by the holder's own revoke high-water do not block it. No registry
+its catalog row into legacy completion; markerless invitation minting and
+redemption are disabled. Activation is an atomic, root-signed registry-guest
+barrier, not a host-side scan: exactly one node must remain enrolled, and the
+same actor transaction rejects every effective non-root grant, every dormant
+grant which could revive, and every live actor-local ACL before sealing legacy
+role admission to the exact authority incarnation. The one-node condition is
+the conservative admission point for this CRDT cutover; any previously unseen
+legacy row that materializes afterward has no authority witness and therefore
+fails closed. Migration is an explicit revoke/remove-before-cutover and
+re-grant-after-cutover operation; rows already
+dominated by their holder's own revoke high-water do not block it. Registry and
+authority use the same total grant order (rootness, epoch, grantor, role), and
+post-cutover registry grants carry a guest-owned witness for the exact
+authority incarnation. No registry
 lookup or daemon-local signature is treated as a finalized authority receipt. A direct reply is
 acknowledged only after its waiting channel accepts
 the bytes. Ordinary outbox and suspended-workflow publications are retried by

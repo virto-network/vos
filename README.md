@@ -87,14 +87,16 @@ registry.
 ```bash
 # host A — create with a genesis recipe, boot, then invite a member
 vosx space new a --recipe ./my-space.toml
-vosx space up a --listen /ip4/0.0.0.0/tcp/4811 &   # first boot genesis-applies the recipe
+vosx space up a --service-pvm ./dist/vos-service.pvm \
+  --listen /ip4/0.0.0.0/tcp/4811 &   # first boot seals canonical authority
 vosx space info a            # prints the node's bootnode hint:
                              #   /ip4/.../tcp/4811/p2p/<peer-id>
 vosx space invite a --role member --bootnode <bootnode-hint>
                              # prints a vos1… token on its first stdout line
 
 # host B — redeem the token: join-if-needed + boot + auto-redeem
-vosx space up "<paste-the-vos1-token>" &
+vosx space up "<paste-the-vos1-token>" \
+  --service-pvm ./dist/vos-service.pvm &
                              # or  vosx space up -  to read the token from stdin
 ```
 

@@ -22,7 +22,7 @@
 //!
 //! [`mint`] generates a fresh token keypair `T`, has the operator key
 //! sign the invite canonical (`invite`, `[space_id, [role], expires_le,
-//! token_pub, authority_replication_id?]`) — byte-for-byte what
+//! token_pub, authority_replication_id]`) — byte-for-byte what
 //! `space-registry::redeem_invite`
 //! rebuilds — and packs the token secret so the joiner can later prove
 //! possession. [`redeem_sig`] signs the joiner's own node peer-id (bound
@@ -48,10 +48,10 @@ pub const TOKEN_HRP: &str = "vos1";
 
 /// Current token format version — the first raw byte inside the bs58
 /// blob. Bump on any breaking `InvitePayload` layout change.
-pub const TOKEN_VERSION: u8 = 2;
+pub const TOKEN_VERSION: u8 = 3;
 
 /// Domain tag for the token's integrity checksum.
-const CHECKSUM_DOMAIN: &[u8] = b"vos-invite/v2";
+const CHECKSUM_DOMAIN: &[u8] = b"vos-invite/v3";
 
 /// Trailing checksum length (bytes of a domain-separated blake2b).
 const CHECKSUM_LEN: usize = 4;
@@ -76,10 +76,10 @@ pub struct InvitePayload {
     /// Expiry (unix seconds). Bound into the signed invite canonical,
     /// checked host-side at admission — never at CRDT replay.
     pub expires_at: u64,
-    /// Durable protocol marker. `Some` pins redemption to the canonical v2
-    /// authority incarnation; `None` is accepted only while the registry has
-    /// no authority row. It is covered by `admin_sig`.
-    pub authority_replication_id: Option<[u8; 32]>,
+    /// Durable protocol marker pinning redemption to the canonical v2
+    /// authority incarnation. Markerless invitations are intentionally no
+    /// longer representable: replica-local absence cannot prove legacy mode.
+    pub authority_replication_id: [u8; 32],
     /// The minting admin's libp2p peer-id bytes — the key `admin_sig`
     /// verifies under. Named so the registry verifies in O(1) instead of
     /// scanning the grant table; a false claim fails verification.
@@ -112,9 +112,12 @@ pub fn mint(
     bootnodes: Vec<String>,
     role: u8,
     expires_at: u64,
-    authority_replication_id: Option<[u8; 32]>,
+    authority_replication_id: [u8; 32],
 ) -> anyhow::Result<String> {
     validate_role(role)?;
+    if authority_replication_id == [0; 32] {
+        return Err(anyhow!("canonical role-authority marker is zero"));
+    }
     // Fresh single-use token keypair from OS entropy.
     let mut token_secret = [0u8; 32];
     getrandom::getrandom(&mut token_secret)
@@ -130,7 +133,7 @@ pub fn mint(
         role,
         expires_at,
         &token_pub,
-        authority_replication_id.as_ref(),
+        Some(&authority_replication_id),
     );
     let admin_sig = sig64(
         &operator
@@ -188,6 +191,11 @@ pub fn parse(token: &str) -> anyhow::Result<InvitePayload> {
     let payload = vos::rkyv::from_bytes::<InvitePayload, vos::rkyv::rancor::Error>(&aligned)
         .map_err(|e| anyhow!("decode invite token payload: {e}"))?;
     validate_role(payload.role)?;
+    if payload.authority_replication_id == [0; 32] {
+        return Err(anyhow!(
+            "invite token has no canonical role-authority marker"
+        ));
+    }
     Ok(payload)
 }
 
@@ -289,7 +297,7 @@ mod tests {
             vec!["/ip4/1.2.3.4/tcp/9000".into()],
             AUTH_ROLE_READONLY,
             2_000_000_000,
-            None,
+            [0xa7; 32],
         )
         .unwrap();
         assert!(token.starts_with("vos1"));
@@ -315,7 +323,7 @@ mod tests {
             vec![],
             AUTH_ROLE_READONLY,
             1,
-            None,
+            [0xa7; 32],
         )
         .unwrap();
         // Flip a character in the middle of the base58 body.
@@ -336,7 +344,7 @@ mod tests {
             vec![],
             AUTH_ROLE_ADMIN,
             1,
-            None,
+            [0xa7; 32],
         )
         .unwrap_err()
         .to_string();
@@ -352,7 +360,7 @@ mod tests {
             vec![],
             AUTH_ROLE_READONLY,
             1,
-            None,
+            [0xa7; 32],
         )
         .unwrap();
         let mut payload = parse(&token).unwrap();
@@ -366,6 +374,42 @@ mod tests {
     }
 
     #[test]
+    fn markerless_invites_are_unrepresentable() {
+        let op = Keypair::generate_ed25519();
+        let error = mint(
+            &op,
+            sample_space_id(),
+            "x".into(),
+            vec![],
+            AUTH_ROLE_READONLY,
+            1,
+            [0; 32],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("marker is zero"), "{error}");
+
+        let token = mint(
+            &op,
+            sample_space_id(),
+            "x".into(),
+            vec![],
+            AUTH_ROLE_READONLY,
+            1,
+            [0xa7; 32],
+        )
+        .unwrap();
+        let mut payload = parse(&token).unwrap();
+        payload.authority_replication_id = [0; 32];
+        let forged = encode(&payload).unwrap();
+        let error = parse(&forged).unwrap_err().to_string();
+        assert!(
+            error.contains("no canonical role-authority marker"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn wrong_version_byte_is_rejected() {
         let op = Keypair::generate_ed25519();
         let token = mint(
@@ -375,7 +419,7 @@ mod tests {
             vec![],
             AUTH_ROLE_READONLY,
             1,
-            None,
+            [0xa7; 32],
         )
         .unwrap();
         // Decode, bump the version byte, re-checksum, re-encode.
@@ -419,11 +463,11 @@ mod tests {
             vec![],
             role,
             expires_at,
-            Some(authority),
+            authority,
         )
         .unwrap();
         let p = parse(&token).unwrap();
-        assert_eq!(p.authority_replication_id, Some(authority));
+        assert_eq!(p.authority_replication_id, authority);
 
         // admin_sig over the invite canonical (bound to space_id) verifies
         // under admin_peer_id.
@@ -432,7 +476,7 @@ mod tests {
             role,
             expires_at,
             &p.token_pub,
-            p.authority_replication_id.as_ref(),
+            Some(&p.authority_replication_id),
         );
         assert!(
             verify_op_sig(&p.admin_peer_id, &invite_canon, &p.admin_sig),
@@ -446,7 +490,7 @@ mod tests {
             role,
             expires_at,
             &p.token_pub,
-            p.authority_replication_id.as_ref(),
+            Some(&p.authority_replication_id),
         );
         assert!(!verify_op_sig(&p.admin_peer_id, &wrong_canon, &p.admin_sig));
         let downgraded =

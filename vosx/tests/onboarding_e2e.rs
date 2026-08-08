@@ -100,10 +100,6 @@ fn vosx(data_home: &Path, config_home: &Path, args: &[&str]) -> Output {
 }
 
 /// Spawn a long-running `space up <arg>` daemon, logging to a file.
-fn spawn_up(data_home: &Path, config_home: &Path, arg: &str, log_path: &Path) -> Child {
-    spawn_up_with_service(data_home, config_home, arg, log_path, None)
-}
-
 fn spawn_up_with_service(
     data_home: &Path,
     config_home: &Path,
@@ -696,12 +692,8 @@ fn vosx_ok(data_home: &Path, config_home: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
-/// Boot host A (new + up) and install the CRDT counter fixture as a
-/// member-floor app agent. Returns (data_a, cfg_a, daemon_a, log_a).
-fn boot_admin(space: &str) -> (TempDir, TempDir, Daemon, PathBuf) {
-    boot_admin_with_service(space, None)
-}
-
+/// Boot host A (new + up) with the canonical service guest. Returns
+/// `(data_a, cfg_a, daemon_a, log_a)`.
 fn boot_admin_with_service(
     space: &str,
     service_pvm: Option<&Path>,
@@ -779,7 +771,10 @@ fn tampered_token_fails_parse() {
 #[test]
 fn expired_token_not_redeemed_and_non_member_cannot_sync() {
     let space = "exp";
-    let (data_a, cfg_a, _da, _la) = boot_admin(space);
+    let service_pvm =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../services/vos-service/vos-service.pvm");
+    assert!(service_pvm.is_file(), "run `just build-vos-service`");
+    let (data_a, cfg_a, _da, _la) = boot_admin_with_service(space, Some(&service_pvm));
 
     // Mint with a 1-second lifetime, then let it lapse before B boots.
     let stdout = vosx_ok(
@@ -801,7 +796,13 @@ fn expired_token_not_redeemed_and_non_member_cannot_sync() {
     let data_b = TempDir::new("exp-b-data");
     let cfg_b = TempDir::new("exp-b-config");
     let log_b = data_b.path().join("daemon-b.stderr");
-    let _db = Daemon(spawn_up(data_b.path(), cfg_b.path(), &token, &log_b));
+    let _db = Daemon(spawn_up_with_service(
+        data_b.path(),
+        cfg_b.path(),
+        &token,
+        &log_b,
+        Some(&service_pvm),
+    ));
     wait_for_endpoint(data_b.path(), &log_b, "B");
 
     // The daemon recognizes the token as expired and refuses to redeem.

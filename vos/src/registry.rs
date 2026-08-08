@@ -247,12 +247,11 @@ pub const AUTH_ROLE_ADMIN: u8 = 3;
 
 /// Canonical invite evidence signed by the granting administrator.
 ///
-/// Legacy spaces omit `authority_replication_id` and retain their original
-/// four-field canonical. Once a canonical v2 authority is installed, the
-/// registry requires the fifth field to equal that authority's durable
-/// replication incarnation. The signed marker prevents either a joining
-/// client or a lagging peer from silently downgrading an authority-bound
-/// bearer to registry-only redemption.
+/// The optional input exists only to reconstruct and reject historical
+/// four-field evidence. Current invite tokens always carry the fifth field,
+/// equal to the registry guest's sealed authority incarnation. The signed
+/// marker prevents either a joining client or a lagging peer from silently
+/// downgrading an authority-bound bearer to registry-only redemption.
 pub fn invite_signed_bytes(
     space_id: &[u8; 32],
     role: u8,
@@ -274,13 +273,17 @@ pub fn invite_signed_bytes(
 /// single grant retained per subject.
 ///
 /// Root evidence dominates delegated evidence regardless of epoch. Otherwise
-/// the greater epoch wins, with the exact grantor PeerId providing the same
-/// deterministic equal-epoch tie-break in both stores.
+/// the greater epoch wins, with the exact grantor PeerId and then the role
+/// byte providing the same deterministic equal-epoch tie-break in both
+/// stores. Lower role wins the final tie so concurrent grant/downgrade
+/// evidence is fail-closed as well as total.
 pub fn role_grant_supersedes(
     new_epoch: u64,
     new_grantor: &[u8],
+    new_role: u8,
     cur_epoch: u64,
     cur_grantor: &[u8],
+    cur_role: u8,
     root: &[u8],
 ) -> bool {
     let new_root = !root.is_empty() && new_grantor == root;
@@ -291,7 +294,10 @@ pub fn role_grant_supersedes(
     if new_epoch != cur_epoch {
         return new_epoch > cur_epoch;
     }
-    new_grantor < cur_grantor
+    if new_grantor != cur_grantor {
+        return new_grantor < cur_grantor;
+    }
+    new_role < cur_role
 }
 
 /// Per-PeerId auth grant. `peer_id` is the libp2p PeerId in
@@ -466,6 +472,9 @@ pub enum Status {
     /// CRDT consistency was requested for a catalog entry whose signed
     /// publication does not declare `#[actor(crdt)]`.
     CrdtOptInRequired = 12,
+    /// Canonical role-authority cutover requires one fully synchronized
+    /// registry replica and no legacy role evidence that could remain live.
+    AuthorityCutoverNotQuiescent = 13,
 }
 
 impl Status {
@@ -486,6 +495,7 @@ impl Status {
             10 => Some(Self::ReplicationIdReused),
             11 => Some(Self::StaleUpgrade),
             12 => Some(Self::CrdtOptInRequired),
+            13 => Some(Self::AuthorityCutoverNotQuiescent),
             _ => None,
         }
     }
@@ -507,6 +517,7 @@ impl core::fmt::Display for Status {
             Status::ReplicationIdReused => "replication id reused",
             Status::StaleUpgrade => "stale upgrade",
             Status::CrdtOptInRequired => "CRDT consistency requires #[actor(crdt)]",
+            Status::AuthorityCutoverNotQuiescent => "role-authority cutover is not quiescent",
         })
     }
 }
@@ -518,6 +529,13 @@ pub const REGISTRY_OP_DOMAIN: &[u8] = b"vos-registry-op/v1";
 
 /// ed25519 signature length.
 pub const OP_SIG_LEN: usize = 64;
+
+/// Root-signed cutover barrier. Once committed, the registry refuses legacy
+/// role grants and markerless invite redemption and accepts only evidence
+/// bound to this exact authority incarnation.
+pub fn role_authority_cutover_signed_bytes(authority_replication_id: &[u8; 32]) -> Vec<u8> {
+    canonical_op_bytes("seal_role_authority", &[authority_replication_id])
+}
 
 /// Canonical byte string a mutation's author signs. Layout:
 /// `domain || u16(op.len) || op || (u32(field.len) || field)*`.
@@ -1237,6 +1255,32 @@ impl RegistryRef {
         decode_bytes(self.call(inv, Msg::new("space_id")).await?)
     }
 
+    /// Durable guest-owned role-authority cutover marker, or empty while the
+    /// registry remains in legacy role mode.
+    pub async fn role_authority_cutover<I: Invoker>(
+        &self,
+        inv: &mut I,
+    ) -> Result<Vec<u8>, ClientError> {
+        decode_bytes(self.call(inv, Msg::new("role_authority_cutover")).await?)
+    }
+
+    pub async fn seal_role_authority<I: Invoker>(
+        &self,
+        inv: &mut I,
+        authority_replication_id: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("seal_role_authority")
+                    .with("authority_replication_id", authority_replication_id)
+                    .with("auth", auth),
+            )
+            .await?,
+        )
+    }
+
     pub async fn publish<I: Invoker>(
         &self,
         inv: &mut I,
@@ -1493,21 +1537,24 @@ impl RegistryRef {
         )
     }
 
-    /// Grant rows which block cutting a legacy registry over to canonical v2
-    /// authority: effective grants and grantor-dormant rows that could revive.
-    /// Rows dominated by their holder's own revoke high-water are omitted.
-    pub async fn auth_grant_cutover_blockers<I: Invoker>(
+    pub async fn grant_role_v2<I: Invoker>(
         &self,
         inv: &mut I,
-        after_peer: Vec<u8>,
-        budget: u32,
-    ) -> Result<AuthGrantPage, ClientError> {
+        peer_id: Vec<u8>,
+        role: u8,
+        epoch: u64,
+        authority_replication_id: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
         decode_rkyv(
             self.call(
                 inv,
-                Msg::new("auth_grant_cutover_blockers")
-                    .with("after_peer", after_peer)
-                    .with("budget", budget),
+                Msg::new("grant_role_v2")
+                    .with("peer_id", peer_id)
+                    .with("role", role)
+                    .with("epoch", epoch)
+                    .with("authority_replication_id", authority_replication_id)
+                    .with("auth", auth),
             )
             .await?,
         )
@@ -1526,6 +1573,27 @@ impl RegistryRef {
                 Msg::new("revoke_role")
                     .with("peer_id", peer_id)
                     .with("epoch", epoch)
+                    .with("auth", auth),
+            )
+            .await?,
+        )
+    }
+
+    pub async fn revoke_role_v2<I: Invoker>(
+        &self,
+        inv: &mut I,
+        peer_id: Vec<u8>,
+        epoch: u64,
+        authority_replication_id: Vec<u8>,
+        auth: Vec<u8>,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("revoke_role_v2")
+                    .with("peer_id", peer_id)
+                    .with("epoch", epoch)
+                    .with("authority_replication_id", authority_replication_id)
                     .with("auth", auth),
             )
             .await?,

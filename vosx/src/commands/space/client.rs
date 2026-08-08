@@ -772,28 +772,45 @@ impl DaemonClient {
     // ── Auth grants ────────────────────────────────────
 
     pub fn grant_role(&self, peer_id: Vec<u8>, role: u8) -> anyhow::Result<Status> {
-        let has_v2_authority = self.has_v2_role_authority()?;
-        if has_v2_authority {
+        let authority = self.role_authority_cutover_id()?;
+        if authority.is_some() {
             self.require_v2_role_authority_root()?;
         }
         // Read the peer's current freshness epoch and sign `epoch + 1`
         // so the grant strictly post-dates any prior revoke — a replayed
         // stale-epoch grant can never resurrect a revoked role.
         let epoch = self.peer_epoch(peer_id.clone())? + 1;
-        let auth = op_auth(
-            &self.signer,
-            "grant_role",
-            &[&peer_id, &[role], &epoch.to_le_bytes()],
-        )?;
-        let status = vos::block_on(self.registry().grant_role(
-            &mut &self.node,
-            peer_id.clone(),
-            role,
-            epoch,
-            auth,
-        ))
-        .map_err(|e| anyhow::anyhow!("registry.grant_role(): {e}"))?;
-        if status == Status::Ok && has_v2_authority {
+        let status = if let Some(authority) = authority {
+            let auth = op_auth(
+                &self.signer,
+                "grant_role_v2",
+                &[&peer_id, &[role], &epoch.to_le_bytes(), &authority],
+            )?;
+            vos::block_on(self.registry().grant_role_v2(
+                &mut &self.node,
+                peer_id.clone(),
+                role,
+                epoch,
+                authority.to_vec(),
+                auth,
+            ))
+            .map_err(|e| anyhow::anyhow!("registry.grant_role_v2(): {e}"))?
+        } else {
+            let auth = op_auth(
+                &self.signer,
+                "grant_role",
+                &[&peer_id, &[role], &epoch.to_le_bytes()],
+            )?;
+            vos::block_on(self.registry().grant_role(
+                &mut &self.node,
+                peer_id.clone(),
+                role,
+                epoch,
+                auth,
+            ))
+            .map_err(|e| anyhow::anyhow!("registry.grant_role(): {e}"))?
+        };
+        if status == Status::Ok && authority.is_some() {
             let mutation = role_grant_mutation(self.v2_space_id()?, &peer_id, role, epoch)?;
             self.commit_v2_role_mutation(&mutation).map_err(|error| {
                 anyhow::anyhow!(
@@ -805,24 +822,40 @@ impl DaemonClient {
     }
 
     pub fn revoke_role(&self, peer_id: Vec<u8>) -> anyhow::Result<Status> {
-        let has_v2_authority = self.has_v2_role_authority()?;
-        if has_v2_authority {
+        let authority = self.role_authority_cutover_id()?;
+        if authority.is_some() {
             self.require_v2_role_authority_root()?;
         }
         let epoch = self.peer_epoch(peer_id.clone())? + 1;
-        let auth = op_auth(
-            &self.signer,
-            "revoke_role",
-            &[&peer_id, &epoch.to_le_bytes()],
-        )?;
-        let status = vos::block_on(self.registry().revoke_role(
-            &mut &self.node,
-            peer_id.clone(),
-            epoch,
-            auth,
-        ))
-        .map_err(|e| anyhow::anyhow!("registry.revoke_role(): {e}"))?;
-        if status == Status::Ok && has_v2_authority {
+        let status = if let Some(authority) = authority {
+            let auth = op_auth(
+                &self.signer,
+                "revoke_role_v2",
+                &[&peer_id, &epoch.to_le_bytes(), &authority],
+            )?;
+            vos::block_on(self.registry().revoke_role_v2(
+                &mut &self.node,
+                peer_id.clone(),
+                epoch,
+                authority.to_vec(),
+                auth,
+            ))
+            .map_err(|e| anyhow::anyhow!("registry.revoke_role_v2(): {e}"))?
+        } else {
+            let auth = op_auth(
+                &self.signer,
+                "revoke_role",
+                &[&peer_id, &epoch.to_le_bytes()],
+            )?;
+            vos::block_on(self.registry().revoke_role(
+                &mut &self.node,
+                peer_id.clone(),
+                epoch,
+                auth,
+            ))
+            .map_err(|e| anyhow::anyhow!("registry.revoke_role(): {e}"))?
+        };
+        if status == Status::Ok && authority.is_some() {
             let mutation = role_revoke_mutation(self.v2_space_id()?, &peer_id, epoch);
             self.commit_v2_role_mutation(&mutation).map_err(|error| {
                 anyhow::anyhow!(
@@ -833,8 +866,19 @@ impl DaemonClient {
         Ok(status)
     }
 
-    fn has_v2_role_authority(&self) -> anyhow::Result<bool> {
-        Ok(self.agent(vos::v2::ROLE_AUTHORITY_INSTANCE_V2)?.is_some())
+    pub fn role_authority_cutover_id(&self) -> anyhow::Result<Option<[u8; 32]>> {
+        let marker = vos::block_on(self.registry().role_authority_cutover(&mut &self.node))
+            .map_err(|error| anyhow::anyhow!("registry.role_authority_cutover(): {error}"))?;
+        if marker.is_empty() {
+            return Ok(None);
+        }
+        let marker: [u8; 32] = marker
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("registry role-authority marker is corrupt"))?;
+        if marker == [0; 32] {
+            anyhow::bail!("registry role-authority marker is zero");
+        }
+        Ok(Some(marker))
     }
 
     fn require_v2_role_authority_root(&self) -> anyhow::Result<()> {
@@ -951,7 +995,7 @@ impl DaemonClient {
     /// canonical is just `("revoke_invite", [token_pub])` — no epoch,
     /// unlike grant/revoke_role.
     pub fn revoke_invite(&self, token_pub: Vec<u8>) -> anyhow::Result<Status> {
-        if self.has_v2_role_authority()? {
+        if self.role_authority_cutover_id()?.is_some() {
             let token: [u8; 32] = token_pub
                 .as_slice()
                 .try_into()
@@ -1005,6 +1049,11 @@ impl DaemonClient {
         agent_name: String,
         role: u8,
     ) -> anyhow::Result<Status> {
+        if self.role_authority_cutover_id()?.is_some() {
+            anyhow::bail!(
+                "actor-local registry roles are unavailable after canonical authority cutover"
+            );
+        }
         let epoch = self.actor_epoch(peer_id.clone(), agent_name.clone())? + 1;
         let auth = op_auth(
             &self.signer,
@@ -1032,6 +1081,11 @@ impl DaemonClient {
         peer_id: Vec<u8>,
         agent_name: String,
     ) -> anyhow::Result<Status> {
+        if self.role_authority_cutover_id()?.is_some() {
+            anyhow::bail!(
+                "actor-local registry roles are unavailable after canonical authority cutover"
+            );
+        }
         let epoch = self.actor_epoch(peer_id.clone(), agent_name.clone())? + 1;
         let auth = op_auth(
             &self.signer,

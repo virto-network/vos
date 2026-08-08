@@ -229,9 +229,11 @@ fn mint(args: Args) -> anyhow::Result<()> {
             );
         }
 
-        let authority_replication_id = client
-            .agent(vos::v2::ROLE_AUTHORITY_INSTANCE_V2)?
-            .map(|row| row.replication_id);
+        let authority_replication_id = client.role_authority_cutover_id()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "invite minting is disabled until the immutable root completes canonical role-authority cutover; start the root with --service-pvm and retry"
+            )
+        })?;
 
         let tok = token::mint(
             &operator,
