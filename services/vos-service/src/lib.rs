@@ -136,14 +136,14 @@ mod guest {
         let actor_output = aggregate_actor_effects(&work, &call_result, effects);
         if let Some(checkpoint) = actor_output.checkpoint.as_ref() {
             if checkpoint.input != work.input_id() {
-                work = checkpoint
+                work = *checkpoint
                     .resume_work
                     .clone()
                     .unwrap_or_else(|| fail_closed());
             } else if checkpoint
                 .resume_work
                 .as_ref()
-                .is_some_and(|resume_work| resume_work != &work)
+                .is_some_and(|resume_work| resume_work.as_ref() != &work)
             {
                 fail_closed();
             }

@@ -17,10 +17,11 @@ use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateProtocolHostV2, AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2,
     AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2, AttestationDeliveryV2,
-    CommittedServiceImageHostV2, ImportedBlobV2, ImportedProgramV2, LocalJamStoreSnapshotV2,
-    ProgramId, ProofCommitmentV2, ProofVerificationRequestV2, PublishedEffectsV2, RefineImportsV2,
-    RefineOutputV2, RefineProtocolHostV2, RefineTraceV2, ServiceImageInstallErrorV2,
-    ServicePvmErrorV2, ServicePvmOutputV2, ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
+    CommittedServiceImageHostV2, GasScheduleV2, ImportedBlobV2, ImportedProgramV2,
+    LocalJamStoreSnapshotV2, ProgramId, ProofCommitmentV2, ProofVerificationRequestV2,
+    PublishedEffectsV2, RefineImportsV2, RefineOutputV2, RefineProtocolHostV2, RefineTraceV2,
+    ServiceIdentityV2, ServiceImageInstallErrorV2, ServicePvmErrorV2, ServicePvmOutputV2,
+    ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 
 fn validate_accumulate_availability(
@@ -411,6 +412,11 @@ pub enum ServiceDispatchError {
         expected: ProgramId,
         declared: ProgramId,
     },
+    ServiceGasScheduleMismatch {
+        expected: GasScheduleV2,
+        declared: GasScheduleV2,
+    },
+    InvalidGasSchedule(GasScheduleV2),
     InvalidRefineOutput,
     InvalidAccumulateOutput,
     InvalidAvailabilityArtifacts,
@@ -439,7 +445,9 @@ impl ServiceDispatchError {
             Self::ServiceProgramMismatch { .. }
             | Self::InvalidAccumulateOutput
             | Self::InvalidAvailabilityArtifacts => true,
-            Self::InvalidRefineOutput => false,
+            Self::ServiceGasScheduleMismatch { .. }
+            | Self::InvalidGasSchedule(_)
+            | Self::InvalidRefineOutput => false,
         }
     }
 }
@@ -465,6 +473,14 @@ mod dispatch_tests {
         assert!(
             !ServiceDispatchError::Pvm(ServicePvmErrorV2::AccumulateCommitRejected)
                 .is_deterministic_accumulate_failure()
+        );
+        assert!(
+            !ServiceDispatchError::ServiceGasScheduleMismatch {
+                expected: GasScheduleV2::new(1, 2),
+                declared: GasScheduleV2::new(1, 3),
+            }
+            .is_deterministic_accumulate_failure(),
+            "a replica configured with a different gas schedule must stop before advancing"
         );
     }
 }
@@ -503,8 +519,7 @@ pub struct JamServiceV2<R, A> {
     pvm: ServicePvmV2,
     refine_host: R,
     accumulate_host: A,
-    refine_gas: u64,
-    accumulate_gas: u64,
+    gas_schedule: GasScheduleV2,
 }
 
 /// Raft orchestration around the canonical generic service PVM.
@@ -528,19 +543,26 @@ impl<R, A> JamServiceV2<R, A> {
         refine_gas: u64,
         accumulate_gas: u64,
     ) -> Result<Self, ServiceDispatchError> {
+        let gas_schedule = GasScheduleV2::new(refine_gas, accumulate_gas);
+        if !gas_schedule.is_valid() {
+            return Err(ServiceDispatchError::InvalidGasSchedule(gas_schedule));
+        }
         let pvm = ServicePvmV2::new(canonical_service_pvm, expected_program)
             .map_err(ServiceDispatchError::Pvm)?;
         Ok(Self {
             pvm,
             refine_host,
             accumulate_host,
-            refine_gas,
-            accumulate_gas,
+            gas_schedule,
         })
     }
 
     pub const fn program_id(&self) -> ProgramId {
         self.pvm.program_id()
+    }
+
+    pub const fn gas_schedule(&self) -> GasScheduleV2 {
+        self.gas_schedule
     }
 
     pub fn accumulate_host(&self) -> &A {
@@ -588,10 +610,15 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
         work: &WorkEnvelopeV2,
         imports: &RefineImportsV2,
     ) -> Result<RefinedServiceOutputV2, ServiceDispatchError> {
-        self.validate_service_program(work.service.service_program)?;
+        self.validate_service_identity(&work.service)?;
         let output = self
             .pvm
-            .refine_actor_tree(&work.encode(), imports, self.refine_gas, &self.refine_host)
+            .refine_actor_tree(
+                &work.encode(),
+                imports,
+                self.gas_schedule.refine,
+                &self.refine_host,
+            )
             .map_err(ServiceDispatchError::Pvm)?;
         decode_refined_service_output(output)
     }
@@ -601,9 +628,15 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
         work: &WorkEnvelopeV2,
         imports: &RefineImportsV2,
     ) -> Result<RefinedServiceOutputV2, ServiceDispatchError> {
+        self.validate_service_identity(&work.service)?;
         let output = self
             .pvm
-            .refine_actor_tree_traced(&work.encode(), imports, self.refine_gas, &self.refine_host)
+            .refine_actor_tree_traced(
+                &work.encode(),
+                imports,
+                self.gas_schedule.refine,
+                &self.refine_host,
+            )
             .map_err(ServiceDispatchError::Pvm)?;
         decode_refined_service_output(output)
     }
@@ -612,12 +645,12 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
         &mut self,
         request: &AccumulateRequestV2,
     ) -> Result<AccumulatedServiceOutputV2, ServiceDispatchError> {
-        self.validate_service_program(request.service().service_program)?;
+        self.validate_service_identity(request.service())?;
         let output = self
             .pvm
             .accumulate(
                 &request.encode(),
-                self.accumulate_gas,
+                self.gas_schedule.accumulate,
                 &mut self.accumulate_host,
             )
             .map_err(ServiceDispatchError::Pvm)?;
@@ -635,14 +668,14 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
         programs: &[ImportedProgramV2],
         blobs: &[ImportedBlobV2],
     ) -> Result<AccumulatedServiceOutputV2, ServiceDispatchError> {
-        self.validate_service_program(request.service().service_program)?;
+        self.validate_service_identity(request.service())?;
         validate_accumulate_availability(request, programs, blobs)
             .map_err(|_| ServiceDispatchError::InvalidAvailabilityArtifacts)?;
         let output = self
             .pvm
             .accumulate_with_availability(
                 &request.encode(),
-                self.accumulate_gas,
+                self.gas_schedule.accumulate,
                 &mut self.accumulate_host,
                 programs,
                 blobs,
@@ -673,14 +706,14 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
         programs: &[ImportedProgramV2],
         blobs: &[ImportedBlobV2],
     ) -> Result<AccumulatedServiceOutputV2, ServiceDispatchError> {
-        self.validate_service_program(request.service().service_program)?;
+        self.validate_service_identity(request.service())?;
         validate_accumulate_availability(request, programs, blobs)
             .map_err(|_| ServiceDispatchError::InvalidAvailabilityArtifacts)?;
         let output = self
             .pvm
             .accumulate_at_with_availability(
                 &request.encode(),
-                self.accumulate_gas,
+                self.gas_schedule.accumulate,
                 &mut self.accumulate_host,
                 logical_timeslot,
                 programs,
@@ -695,10 +728,22 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
         })
     }
 
-    fn validate_service_program(&self, declared: ProgramId) -> Result<(), ServiceDispatchError> {
+    fn validate_service_identity(
+        &self,
+        declared: &ServiceIdentityV2,
+    ) -> Result<(), ServiceDispatchError> {
         let expected = self.program_id();
-        if declared != expected {
-            return Err(ServiceDispatchError::ServiceProgramMismatch { expected, declared });
+        if declared.service_program != expected {
+            return Err(ServiceDispatchError::ServiceProgramMismatch {
+                expected,
+                declared: declared.service_program,
+            });
+        }
+        if declared.gas_schedule != self.gas_schedule {
+            return Err(ServiceDispatchError::ServiceGasScheduleMismatch {
+                expected: self.gas_schedule,
+                declared: declared.gas_schedule,
+            });
         }
         Ok(())
     }
@@ -1259,7 +1304,7 @@ where
         blobs: &[ImportedBlobV2],
     ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
         self.service
-            .validate_service_program(request.service().service_program)
+            .validate_service_identity(request.service())
             .map_err(ReplicatedServiceErrorV2::Dispatch)?;
         validate_accumulate_availability(request, programs, blobs).map_err(|_| {
             ReplicatedServiceErrorV2::Dispatch(ServiceDispatchError::InvalidAvailabilityArtifacts)

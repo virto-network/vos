@@ -197,6 +197,7 @@ mod tests {
                 service_program: ProgramId([5; 32]),
                 service_abi: vos::v2::ABI_VERSION,
                 execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+                gas_schedule: vos::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
             },
             invocation: InvocationId([6; 32]),
             scope: Hash([17; 32]),

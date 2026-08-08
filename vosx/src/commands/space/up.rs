@@ -1658,6 +1658,7 @@ fn v2_config_from_row(
             service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
             service_abi: vos::v2::ABI_VERSION,
             execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: vos::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
         },
         root_actor,
         actor_name: row.instance_name.clone(),

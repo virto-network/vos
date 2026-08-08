@@ -18,6 +18,25 @@ pub struct ServiceIdentityV2 {
     pub service_program: ProgramId,
     pub service_abi: u16,
     pub execution_semantics: Hash,
+    /// Consensus-visible execution budget. Replicas must reject work whose
+    /// declared schedule differs from the host schedule used to run it.
+    pub gas_schedule: GasScheduleV2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GasScheduleV2 {
+    pub refine: u64,
+    pub accumulate: u64,
+}
+
+impl GasScheduleV2 {
+    pub const fn new(refine: u64, accumulate: u64) -> Self {
+        Self { refine, accumulate }
+    }
+
+    pub const fn is_valid(self) -> bool {
+        self.refine != 0 && self.accumulate != 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -497,7 +516,10 @@ pub struct CheckpointTokenV2 {
     /// The restored service VM still holds the pre-suspension Rust frame, so
     /// it must explicitly rebind that frame before emitting workflow state.
     /// Initial step-0 checkpoint finalization carries `None`.
-    pub resume_work: Option<WorkEnvelopeV2>,
+    /// Heap-backed because exact resume decodes this complete envelope while
+    /// a compact actor guest is already holding a 4 KiB protocol buffer on
+    /// its stack. The canonical wire remains an ordinary optional byte frame.
+    pub resume_work: Option<Box<WorkEnvelopeV2>>,
     /// Causal height of `base` for a CRDT slice. Linear slices carry `None`.
     pub base_causal_height: Option<u64>,
     /// Fresh allocator namespace installed after an exact CRDT resume.
@@ -4292,6 +4314,8 @@ pub(super) fn encode_service(e: &mut Encoder<'_>, value: &ServiceIdentityV2) {
     e.fixed(&value.service_program.0);
     e.u16(value.service_abi);
     e.fixed(&value.execution_semantics.0);
+    e.u64(value.gas_schedule.refine);
+    e.u64(value.gas_schedule.accumulate);
 }
 
 pub(super) fn decode_service(d: &mut Decoder<'_>) -> Result<ServiceIdentityV2, DecodeError> {
@@ -4302,8 +4326,9 @@ pub(super) fn decode_service(d: &mut Decoder<'_>) -> Result<ServiceIdentityV2, D
         service_program: ProgramId(d.fixed()?),
         service_abi: d.u16()?,
         execution_semantics: Hash(d.fixed()?),
+        gas_schedule: GasScheduleV2::new(d.u64()?, d.u64()?),
     };
-    if value.service_abi != super::ABI_VERSION {
+    if value.service_abi != super::ABI_VERSION || !value.gas_schedule.is_valid() {
         return Err(DecodeError::InvalidVersion);
     }
     Ok(value)
@@ -4721,7 +4746,7 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, Dec
         },
         base: decode_base(d)?,
         work_hash: Hash(d.fixed()?),
-        resume_work: d.option(|d| WorkEnvelopeV2::decode(&d.bytes()?))?,
+        resume_work: d.option(|d| Ok(Box::new(WorkEnvelopeV2::decode(&d.bytes()?)?)))?,
         base_causal_height: d.option(Decoder::u64)?,
         change: d.option(|d| {
             Ok(CrdtDispatchV2 {
@@ -4934,6 +4959,7 @@ mod tests {
             service_program: ProgramId([3; 32]),
             service_abi: super::super::ABI_VERSION,
             execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            gas_schedule: GasScheduleV2::new(1_000_000_000, 5_000_000_000),
         }
     }
 
@@ -5044,6 +5070,7 @@ mod tests {
                 service_program: ProgramId([42; 32]),
                 service_abi: super::super::ABI_VERSION,
                 execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+                gas_schedule: GasScheduleV2::new(1_000_000_000, 5_000_000_000),
             },
             actor: ActorId([43; 32]),
         };
@@ -5102,6 +5129,26 @@ mod tests {
         let bytes = value.encode();
         assert_eq!(bytes, value.encode());
         assert_eq!(WorkEnvelopeV2::decode(&bytes).unwrap(), value);
+
+        let mut different_schedule = value.clone();
+        different_schedule.service.gas_schedule.accumulate += 1;
+        assert_ne!(
+            different_schedule.encode(),
+            bytes,
+            "the service wire must bind the exact gas schedule"
+        );
+        assert_ne!(
+            different_schedule.authorization_scope(),
+            value.authorization_scope(),
+            "authorization cannot cross a gas-schedule change"
+        );
+
+        let mut invalid_schedule = value.clone();
+        invalid_schedule.service.gas_schedule.refine = 0;
+        assert_eq!(
+            WorkEnvelopeV2::decode(&invalid_schedule.encode()),
+            Err(DecodeError::InvalidVersion)
+        );
 
         let mut trailing = bytes.clone();
         trailing.push(0);
@@ -5512,7 +5559,7 @@ mod tests {
         rebound_work.base = checkpoint.base.clone();
         let mut resumed_checkpoint = checkpoint.clone();
         resumed_checkpoint.work_hash = rebound_work.hash();
-        resumed_checkpoint.resume_work = Some(rebound_work);
+        resumed_checkpoint.resume_work = Some(Box::new(rebound_work));
         assert_eq!(
             CheckpointTokenV2::decode(&resumed_checkpoint.encode()).unwrap(),
             resumed_checkpoint

@@ -2120,6 +2120,7 @@ mod tests {
                 service_program: crate::v2::ProgramId([5; 32]),
                 service_abi: crate::v2::ABI_VERSION,
                 execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
+                gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000,),
             },
             actor,
             producer: crate::v2::ProducerId([6; 32]),

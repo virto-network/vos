@@ -46,13 +46,14 @@ pub use contracts::{
     ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2,
     CrdtIngressV2, CrdtMaterializationV2, CrdtOperationV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2,
     DeliveryEnvelopeV2, DirectIngressV2, ExternalActorBindingV2, ExternalActorDirectoryV2,
-    GasAccountingV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, MessageRecordV2,
-    MethodPolicyV2, ProofCommitmentV2, ProofVerificationRequestV2, PublicationAckV2,
-    PublishedEffectsV2, ROLE_AUTHORITY_DECISION_METHOD_V2, ROLE_AUTHORITY_MUTATION_METHOD_V2,
-    ReceiptVerificationRequestV2, RefineError, RefineImportsV2, RefineOutputV2, ReplyRecordV2,
-    RoleAuthorityBindingV2, RoleAuthorityMutationV2, RoleAuthorizationClaimV2, RoleCredentialV2,
-    RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServiceIdentityV2,
-    ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
+    GasAccountingV2, GasScheduleV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
+    MessageRecordV2, MethodPolicyV2, ProofCommitmentV2, ProofVerificationRequestV2,
+    PublicationAckV2, PublishedEffectsV2, ROLE_AUTHORITY_DECISION_METHOD_V2,
+    ROLE_AUTHORITY_MUTATION_METHOD_V2, ReceiptVerificationRequestV2, RefineError, RefineImportsV2,
+    RefineOutputV2, ReplyRecordV2, RoleAuthorityBindingV2, RoleAuthorityMutationV2,
+    RoleAuthorizationClaimV2, RoleCredentialV2, RoleCredentialVerificationRequestV2,
+    ServiceGenesisV2, ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2,
+    WorkInputIdV2, WorkflowOperationV2,
 };
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStoreV2, ProofVerificationV2, ReceiptVerificationV2,
@@ -116,7 +117,7 @@ pub use transport::{
 pub use wire::{DecodeError, V2Wire};
 
 /// Platform wire/ABI version carried by v2 work, transitions, and receipts.
-pub const ABI_VERSION: u16 = 5;
+pub const ABI_VERSION: u16 = 6;
 /// Portable continuation format version.
 pub const SNAPSHOT_VERSION: u16 = 6;
 /// Attestation statement version required by runtime v2.
@@ -127,8 +128,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0x19, 0xe3, 0xbc, 0x21, 0x05, 0x68, 0xaf, 0x77, 0x6c, 0x1a, 0x42, 0x58, 0x4c, 0x19, 0x3e, 0xdb,
-    0x3b, 0x64, 0x19, 0x70, 0x15, 0x2c, 0x76, 0xb0, 0x3b, 0x34, 0x63, 0x73, 0x0e, 0x3b, 0xc9, 0xa4,
+    0x40, 0x7b, 0x9b, 0x63, 0xad, 0xcc, 0x3d, 0x31, 0x0c, 0x4a, 0xc8, 0x44, 0xbb, 0x95, 0x02, 0x50,
+    0xbd, 0x4a, 0x8d, 0x23, 0x5b, 0xf9, 0xda, 0x9d, 0x50, 0xeb, 0x55, 0x96, 0x2f, 0xd7, 0x4b, 0x61,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.

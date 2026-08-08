@@ -10044,6 +10044,7 @@ mod tests {
             service_program: crate::v2::VOS_SERVICE_PROGRAM_ID,
             service_abi: crate::v2::ABI_VERSION,
             execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
         };
         let routes = RwLock::new(HashMap::from([
             (
@@ -10106,6 +10107,7 @@ mod tests {
             service_program: crate::v2::VOS_SERVICE_PROGRAM_ID,
             service_abi: crate::v2::ABI_VERSION,
             execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
         };
 
         let mut node = VosNode::with_prefix(colliding_prefix);
@@ -12162,6 +12164,7 @@ mod tests {
                     service_program: crate::v2::VOS_SERVICE_PROGRAM_ID,
                     service_abi: crate::v2::ABI_VERSION,
                     execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
+                    gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
                 },
                 consistency: crate::v2::ConsistencyModeV2::Raft,
                 invoke_timeout: v2_raft_invoke_timeout(5_000),

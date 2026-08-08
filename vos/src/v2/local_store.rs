@@ -1477,6 +1477,7 @@ mod tests {
                 service_program: ProgramId([4; 32]),
                 service_abi: super::super::ABI_VERSION,
                 execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+                gas_schedule: super::super::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
             },
             super::super::ConsistencyModeV2::Local,
         )

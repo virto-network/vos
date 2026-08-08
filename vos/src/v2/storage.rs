@@ -15,7 +15,7 @@ use super::{
     ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 26;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 27;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -79,6 +79,7 @@ impl StoreHeaderV2 {
         if header.schema_version != SERVICE_STORE_SCHEMA_VERSION
             || header.service.service_abi != super::ABI_VERSION
             || header.service.execution_semantics != super::EXECUTION_SEMANTICS_ID
+            || !header.service.gas_schedule.is_valid()
             || header.snapshot_version != super::SNAPSHOT_VERSION
         {
             return Err(StoreOpenError::IncompatibleSemantics);
@@ -780,6 +781,8 @@ fn encode_service(e: &mut Encoder<'_>, service: &ServiceIdentityV2) {
     e.fixed(&service.service_program.0);
     e.u16(service.service_abi);
     e.fixed(&service.execution_semantics.0);
+    e.u64(service.gas_schedule.refine);
+    e.u64(service.gas_schedule.accumulate);
 }
 
 fn decode_service(d: &mut Decoder<'_>) -> Result<ServiceIdentityV2, DecodeError> {
@@ -790,6 +793,7 @@ fn decode_service(d: &mut Decoder<'_>) -> Result<ServiceIdentityV2, DecodeError>
         service_program: super::ProgramId(d.fixed()?),
         service_abi: d.u16()?,
         execution_semantics: Hash(d.fixed()?),
+        gas_schedule: super::GasScheduleV2::new(d.u64()?, d.u64()?),
     })
 }
 
@@ -856,6 +860,7 @@ mod tests {
             service_program: ProgramId([byte.wrapping_add(2); 32]),
             service_abi: ABI_VERSION,
             execution_semantics: EXECUTION_SEMANTICS_ID,
+            gas_schedule: super::super::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
         }
     }
 

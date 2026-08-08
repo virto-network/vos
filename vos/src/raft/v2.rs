@@ -518,6 +518,7 @@ mod tests {
                 service_program: ProgramId([4; 32]),
                 service_abi: ABI_VERSION,
                 execution_semantics: EXECUTION_SEMANTICS_ID,
+                gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
             },
             input: WorkInputIdV2 {
                 invocation: InvocationId([5; 32]),

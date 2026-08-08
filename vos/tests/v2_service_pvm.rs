@@ -25,25 +25,27 @@ use vos::v2::{
     CommittedAccumulateEntryV2, CommittedAccumulateLogV2, CommittedImageStoreV2,
     CommittedServiceImageHostV2, CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationChangeV2, ContinuationSnapshotV2, CrdtChangeV2, DeploymentId, DirectIngressV2,
-    DurableJamStoreV2, ExternalActorBindingV2, GasAccountingV2, Hash, ImportedActorV2,
-    ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2, InvocationId, JamServiceV2,
-    LocalJamStoreHostV2, LocalJamStoreSnapshotV2, LocalJamStoreV2, LocalRootTreeConfigErrorV2,
-    LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2, LocalRootTreeServiceV2, LocalTransportV2,
-    LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
-    NoRefineProtocolHostV2, Origin, PackageManifestV2, PackageRolePoliciesV2, ProducerId,
-    ProgramId, ProofArtifactStoreV2, PublishedEffectsV2, ReceiptVerificationRequestV2,
-    RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2, ReplicatedServiceErrorV2,
-    ReplyRecordV2, RoleAuthorityBindingV2, RoleAuthorityMutationV2, RoleCredentialV2,
-    RoleCredentialVerificationRequestV2, RootServiceId, RootTreeInvocationV2, ScheduleErrorV2,
-    ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2,
-    StateKeyV2, SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2,
-    WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
+    DurableJamStoreV2, ExternalActorBindingV2, GasAccountingV2, GasScheduleV2, Hash,
+    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2, InvocationId,
+    JamServiceV2, LocalJamStoreHostV2, LocalJamStoreSnapshotV2, LocalJamStoreV2,
+    LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2,
+    LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
+    MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin, PackageManifestV2,
+    PackageRolePoliciesV2, ProducerId, ProgramId, ProofArtifactStoreV2, PublishedEffectsV2,
+    ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2,
+    ReplicatedServiceErrorV2, ReplyRecordV2, RoleAuthorityBindingV2, RoleAuthorityMutationV2,
+    RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId, RootTreeInvocationV2,
+    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
+    ServicePvmV2, StateKeyV2, SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2,
+    WorkEnvelopeV2, WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     Decode, Encode,
     actors::{client::ClientError, context::ServiceId},
     value::{Msg, Value},
 };
+
+const TEST_GAS_SCHEDULE: GasScheduleV2 = GasScheduleV2::new(1_000_000_000, 5_000_000_000);
 
 mod host_greeter_surface {
     use vos::prelude::*;
@@ -371,8 +373,8 @@ fn restart_durable_service(
         service_program,
         NoRefineProtocolHostV2,
         DurableJamStoreV2::open(backend).expect("committed service image reopens"),
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap()
 }
@@ -713,6 +715,7 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
             service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
             service_abi: vos::v2::ABI_VERSION,
             execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: TEST_GAS_SCHEDULE,
         },
         invocation: InvocationId([4; 32]),
         workflow_step: 0,
@@ -934,6 +937,7 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
         service_abi: vos::v2::ABI_VERSION,
         execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
     };
     let actor = ActorId([93; 32]);
     let config = LocalRootTreeConfigV2 {
@@ -968,6 +972,14 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         forged_config.validate(),
         Err(LocalRootTreeConfigErrorV2::InvalidPackageSignature),
         "installation authority must be cryptographically authenticated"
+    );
+
+    let mut wrong_gas_schedule = config.clone();
+    wrong_gas_schedule.service.gas_schedule.accumulate -= 1;
+    assert_eq!(
+        wrong_gas_schedule.validate(),
+        Err(LocalRootTreeConfigErrorV2::WrongGasSchedule),
+        "the declared service identity must match the executing host limits"
     );
 
     let mut invalid_layout = config.clone();
@@ -1170,6 +1182,7 @@ fn canonical_space_authority_produces_extractable_accumulated_assertion() {
         service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
         service_abi: vos::v2::ABI_VERSION,
         execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
     };
     let root = libp2p::identity::Keypair::generate_ed25519();
     let root_peer_id = libp2p::PeerId::from(root.public()).to_bytes();
@@ -1323,6 +1336,7 @@ fn raft_root_tree_orders_genesis_apply_and_ack_through_physical_accumulate() {
             service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
             service_abi: vos::v2::ABI_VERSION,
             execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: TEST_GAS_SCHEDULE,
         },
         package,
         root_actor: actor,
@@ -1431,6 +1445,7 @@ fn node_registers_a_raft_root_through_the_canonical_request_log() {
             service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
             service_abi: vos::v2::ABI_VERSION,
             execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: TEST_GAS_SCHEDULE,
         },
         package,
         root_actor: actor,
@@ -1726,6 +1741,7 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
             service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
             service_abi: vos::v2::ABI_VERSION,
             execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: TEST_GAS_SCHEDULE,
         },
         package,
         root_actor: actor,
@@ -2069,6 +2085,7 @@ fn raft_follower_registers_before_genesis_and_restores_caught_up_admission_time(
             service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
             service_abi: vos::v2::ABI_VERSION,
             execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: TEST_GAS_SCHEDULE,
         },
         package,
         root_actor: actor,
@@ -2230,6 +2247,7 @@ fn node_routes_canonical_actor_ids_through_the_guest_owned_root_service() {
             service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
             service_abi: vos::v2::ABI_VERSION,
             execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: TEST_GAS_SCHEDULE,
         },
         package,
         root_actor: actor,
@@ -2371,6 +2389,7 @@ fn node_routes_an_ordinary_cross_root_await_through_guest_accumulate() {
         service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
         service_abi: vos::v2::ABI_VERSION,
         execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
     };
     let destination_identity = ServiceIdentityV2 {
         root_service: RootServiceId([0xB5; 32]),
@@ -2519,6 +2538,7 @@ fn node_retries_a_direct_reply_publication_ack_after_the_caller_is_gone() {
             service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
             service_abi: vos::v2::ABI_VERSION,
             execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: TEST_GAS_SCHEDULE,
         },
         package,
         root_actor: actor,
@@ -2583,6 +2603,7 @@ fn node_expires_and_resumes_an_unreachable_durable_call() {
         service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
         service_abi: vos::v2::ABI_VERSION,
         execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
     };
     let destination_identity = ServiceIdentityV2 {
         root_service: RootServiceId([0xC4; 32]),
@@ -2688,6 +2709,7 @@ fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
             service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
             service_abi: vos::v2::ABI_VERSION,
             execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: TEST_GAS_SCHEDULE,
         },
         package,
         root_actor: actor,
@@ -2953,8 +2975,8 @@ fn same_package_child_spawn_commits_before_the_child_becomes_callable() {
         vos::v2::VOS_SERVICE_PROGRAM_ID,
         NoRefineProtocolHostV2,
         host,
-        1_000_000_000,
-        1_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
@@ -3160,8 +3182,8 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
         vos::v2::VOS_SERVICE_PROGRAM_ID,
         NoRefineProtocolHostV2,
         host,
-        1_000_000_000,
-        1_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
@@ -3655,8 +3677,8 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
         vos::v2::VOS_SERVICE_PROGRAM_ID,
         NoRefineProtocolHostV2,
         restarted_store,
-        1_000_000_000,
-        1_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let awaited_reply = peer_reply(&seed.service, call_id, 7, 68);
@@ -3822,8 +3844,8 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
         vos::v2::VOS_SERVICE_PROGRAM_ID,
         NoRefineProtocolHostV2,
         LocalJamStoreV2::from_snapshot_bytes(&persisted).unwrap(),
-        1_000_000_000,
-        1_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let first_reply = peer_reply(&seed.service, first_call, 1, 76);
@@ -3891,8 +3913,8 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
         vos::v2::VOS_SERVICE_PROGRAM_ID,
         NoRefineProtocolHostV2,
         LocalJamStoreV2::from_snapshot_bytes(&persisted).unwrap(),
-        1_000_000_000,
-        1_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let second_reply = peer_reply(&seed.service, second_call, 2, 80);
@@ -4306,8 +4328,8 @@ fn same_tree_causal_cycles_return_an_explicit_guest_error() {
         vos::v2::VOS_SERVICE_PROGRAM_ID,
         NoRefineProtocolHostV2,
         host,
-        1_000_000_000,
-        1_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
@@ -4517,8 +4539,8 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
         ProgramId::of_pvm(&service_pvm),
         NoRefineProtocolHostV2,
         host,
-        1_000_000_000,
-        1_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
@@ -4641,8 +4663,8 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
         ProgramId::of_pvm(&service_pvm),
         NoRefineProtocolHostV2,
         replica_host,
-        1_000_000_000,
-        1_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let AccumulateRequestV2::Install(genesis) = &install else {
@@ -4877,8 +4899,8 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
         vos::v2::VOS_SERVICE_PROGRAM_ID,
         NoRefineProtocolHostV2,
         host,
-        1_000_000_000,
-        1_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
@@ -5552,8 +5574,8 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
         ProgramId::of_pvm(&service_pvm),
         NoRefineProtocolHostV2,
         host,
-        1_000_000_000,
-        1_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
@@ -5796,8 +5818,8 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
         service_program,
         NoRefineProtocolHostV2,
         host,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
@@ -6010,8 +6032,8 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
         service_program,
         NoRefineProtocolHostV2,
         reopened,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .expect("snapshot reopens the canonical service PVM over committed state");
 
@@ -6123,8 +6145,8 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
         service_program,
         NoRefineProtocolHostV2,
         host,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let install_request = AccumulateRequestV2::Install(ServiceGenesisV2 {
@@ -6258,8 +6280,8 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
         service_program,
         NoRefineProtocolHostV2,
         timeout_store,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let timeout_follower_store = LocalJamStoreV2::from_snapshot_bytes(&persisted_checkpoint)
@@ -6269,8 +6291,8 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
         service_program,
         NoRefineProtocolHostV2,
         timeout_follower_store,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let timeout_log = Arc::new(Mutex::new(SharedCommittedLog::default()));
@@ -6367,8 +6389,8 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
         service_program,
         NoRefineProtocolHostV2,
         timeout_restarted_store,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     assert_eq!(
@@ -6591,8 +6613,8 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
         service_program,
         NoRefineProtocolHostV2,
         reopened,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .expect("reopened state drives the same canonical service PVM");
     let resumed = RefineOutputV2::decode(&resumed_output.bytes)
@@ -6684,8 +6706,8 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
         service_program,
         NoRefineProtocolHostV2,
         host,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let install_request = AccumulateRequestV2::Install(ServiceGenesisV2 {
@@ -6927,8 +6949,8 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
         service_program,
         NoRefineProtocolHostV2,
         timeout_branch,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let expiration = LocalWorkSchedulerV2::prepare_call_expiration(
@@ -7200,8 +7222,8 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
         service_program,
         NoRefineProtocolHostV2,
         reopened,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     committed
@@ -7323,8 +7345,8 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
         service_program,
         NoRefineProtocolHostV2,
         reopened,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     committed
@@ -7381,8 +7403,8 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         ProgramId::of_pvm(&pvm),
         NoRefineProtocolHostV2,
         host,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
 
@@ -7671,8 +7693,8 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         ProgramId::of_pvm(&pvm),
         NoRefineProtocolHostV2,
         proof_host,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     admit_linear_work(&mut proof_service, &proof_work);
@@ -8366,8 +8388,8 @@ fn physical_guest_accumulate_upgrades_only_an_idle_authorized_actor() {
         service_program,
         NoRefineProtocolHostV2,
         store,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
@@ -8606,8 +8628,8 @@ fn disclosed_role_credentials_require_authority_verification_in_physical_accumul
         service_program,
         NoRefineProtocolHostV2,
         host,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     authorize_install(&mut service, &install);
@@ -8799,8 +8821,8 @@ fn attested_driver_rejects_a_transition_not_produced_by_exact_refine() {
         service_program,
         NoRefineProtocolHostV2,
         host,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     authorize_install(&mut service, &install);
@@ -8920,8 +8942,8 @@ fn physical_guest_install_rejects_an_unavailable_actor_program() {
         ProgramId::of_pvm(&pvm),
         NoRefineProtocolHostV2,
         host,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let genesis = ServiceGenesisV2 {
@@ -8984,8 +9006,8 @@ fn physical_guest_rejects_the_missing_preimage_length_sentinel() {
         ProgramId::of_pvm(&pvm),
         NoRefineProtocolHostV2,
         host,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let genesis = ServiceGenesisV2 {
@@ -9035,6 +9057,7 @@ fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
         service_program,
         service_abi: vos::v2::ABI_VERSION,
         execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
     };
     let destination_identity = ServiceIdentityV2 {
         root_service: RootServiceId([204; 32]),
@@ -9059,8 +9082,8 @@ fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
             service_program,
             NoRefineProtocolHostV2,
             host,
-            1_000_000_000,
-            1_000_000_000,
+            TEST_GAS_SCHEDULE.refine,
+            TEST_GAS_SCHEDULE.accumulate,
         )
         .unwrap();
         let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
@@ -9269,8 +9292,8 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
             service_program,
             NoRefineProtocolHostV2,
             host,
-            100_000_000,
-            5_000_000_000,
+            TEST_GAS_SCHEDULE.refine,
+            TEST_GAS_SCHEDULE.accumulate,
         )
         .unwrap();
         let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
@@ -9318,6 +9341,7 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
         service_program,
         service_abi: vos::v2::ABI_VERSION,
         execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
     };
     let destination_identity = ServiceIdentityV2 {
         space: vos::v2::SpaceId([79; 32]),
@@ -9326,6 +9350,7 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
         service_program,
         service_abi: vos::v2::ABI_VERSION,
         execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
     };
     let source_actor = ActorId([5; 32]);
     let destination_actor = ActorId([44; 32]);
@@ -9733,8 +9758,8 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
         ProgramId::of_pvm(&service_pvm),
         NoRefineProtocolHostV2,
         leader_host,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let follower_service = JamServiceV2::new(
@@ -9742,8 +9767,8 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
         ProgramId::of_pvm(&service_pvm),
         NoRefineProtocolHostV2,
         follower_host,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let mut leader = ReplicatedJamServiceV2::new(
@@ -10123,7 +10148,9 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_bytes = b"raft failure classification".to_vec();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
-    let seed = work(actor_program, initial.clone());
+    let mut seed = work(actor_program, initial.clone());
+    let poison_gas_schedule = GasScheduleV2::new(100_000_000, 9_000_000);
+    seed.service.gas_schedule = poison_gas_schedule;
     let genesis = ServiceGenesisV2 {
         role_authority: None,
         external_actors: vec![],
@@ -10173,8 +10200,8 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
         service_program,
         NoRefineProtocolHostV2,
         poison_host,
-        100_000_000,
-        9_000_000,
+        poison_gas_schedule.refine,
+        poison_gas_schedule.accumulate,
     )
     .unwrap();
     let mut poisoned = ReplicatedJamServiceV2::new(poison_service, poison_log);
@@ -10183,13 +10210,13 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
         service_program,
         NoRefineProtocolHostV2,
         poison_follower_host,
-        100_000_000,
-        9_000_000,
+        poison_gas_schedule.refine,
+        poison_gas_schedule.accumulate,
     )
     .unwrap();
     let mut poison_follower = ReplicatedJamServiceV2::new(
         poison_follower_service,
-        TestCommittedLog::new(poison_shared, false),
+        TestCommittedLog::new(poison_shared.clone(), false),
     );
     let poison_result = poisoned.accumulate_with_availability(
         &AccumulateRequestV2::Install(genesis.clone()),
@@ -10238,12 +10265,45 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
             .is_none()
     );
 
+    let mut mismatched_host = LocalJamStoreV2::default();
+    mismatched_host.allow_install(&genesis);
+    let mismatched_service = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        mismatched_host,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
+    )
+    .unwrap();
+    let mut mismatched_follower = ReplicatedJamServiceV2::new(
+        mismatched_service,
+        TestCommittedLog::new(poison_shared, false),
+    );
+    let mismatch = mismatched_follower.catch_up();
+    assert!(matches!(
+        mismatch,
+        Err(vos::v2::ReplicatedServiceErrorV2::Dispatch(
+            ServiceDispatchError::ServiceGasScheduleMismatch {
+                expected: TEST_GAS_SCHEDULE,
+                declared,
+            }
+        )) if declared == poison_gas_schedule
+    ));
+    assert_eq!(
+        mismatched_follower.log_mut().applied_index().unwrap(),
+        0,
+        "a replica with the wrong gas schedule must not advance past the entry"
+    );
+
+    let mut retry_genesis = genesis.clone();
+    retry_genesis.service.gas_schedule = TEST_GAS_SCHEDULE;
     let mut retry_host = DurableJamStoreV2::open(FailableCommittedImages {
         fail_next_commit: true,
         ..FailableCommittedImages::default()
     })
     .unwrap();
-    retry_host.allow_install(&genesis);
+    retry_host.allow_install(&retry_genesis);
     let retry_log =
         TestCommittedLog::new(Arc::new(Mutex::new(SharedCommittedLog::default())), true);
     let retry_service = JamServiceV2::new(
@@ -10251,14 +10311,14 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
         service_program,
         NoRefineProtocolHostV2,
         retry_host,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let mut retryable = ReplicatedJamServiceV2::new(retry_service, retry_log);
     assert!(matches!(
         retryable.accumulate_with_availability(
-            &AccumulateRequestV2::Install(genesis),
+            &AccumulateRequestV2::Install(retry_genesis),
             &availability_programs,
             &availability_blobs,
         ),
@@ -10361,8 +10421,8 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         service_program,
         NoRefineProtocolHostV2,
         leader_host,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let follower_service = JamServiceV2::new(
@@ -10370,8 +10430,8 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         service_program,
         NoRefineProtocolHostV2,
         follower_host,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let mut leader = ReplicatedJamServiceV2::new(
@@ -10528,8 +10588,8 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         service_program,
         NoRefineProtocolHostV2,
         snapshot_host,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let mut snapshot_follower = ReplicatedJamServiceV2::new(
@@ -10625,8 +10685,8 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
         ProgramId::of_pvm(&service_pvm),
         NoRefineProtocolHostV2,
         host,
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let directory = std::env::temp_dir().join(format!(
@@ -10721,8 +10781,8 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
             ..FailableCommittedImages::default()
         })
         .unwrap(),
-        100_000_000,
-        5_000_000_000,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
     let follower_log =

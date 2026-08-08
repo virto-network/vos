@@ -1112,6 +1112,7 @@ mod tests {
                 service_program: ProgramId([2; 32]),
                 service_abi: crate::v2::ABI_VERSION,
                 execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
+                gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
             },
             accepted_transition: Hash([4; 32]),
             reply_commitment: Some(reply.commitment()),

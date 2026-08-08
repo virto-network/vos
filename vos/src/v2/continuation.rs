@@ -90,6 +90,7 @@ impl ContinuationSnapshotV2 {
             || self.jar_semantics != super::EXECUTION_SEMANTICS_ID
             || self.service.service_abi != super::ABI_VERSION
             || self.service.execution_semantics != super::EXECUTION_SEMANTICS_ID
+            || !self.service.gas_schedule.is_valid()
         {
             return Err(DecodeError::InvalidVersion);
         }
@@ -196,6 +197,7 @@ impl ContinuationMetadataV2 {
             || self.jar_semantics != super::EXECUTION_SEMANTICS_ID
             || self.service.service_abi != super::ABI_VERSION
             || self.service.execution_semantics != super::EXECUTION_SEMANTICS_ID
+            || !self.service.gas_schedule.is_valid()
         {
             return Err(DecodeError::InvalidVersion);
         }
@@ -420,17 +422,24 @@ fn encode_service(e: &mut Encoder<'_>, value: &ServiceIdentityV2) {
     e.fixed(&value.service_program.0);
     e.u16(value.service_abi);
     e.fixed(&value.execution_semantics.0);
+    e.u64(value.gas_schedule.refine);
+    e.u64(value.gas_schedule.accumulate);
 }
 
 fn decode_service(d: &mut Decoder<'_>) -> Result<ServiceIdentityV2, DecodeError> {
-    Ok(ServiceIdentityV2 {
+    let service = ServiceIdentityV2 {
         space: super::SpaceId(d.fixed()?),
         root_service: super::RootServiceId(d.fixed()?),
         deployment: super::DeploymentId(d.fixed()?),
         service_program: ProgramId(d.fixed()?),
         service_abi: d.u16()?,
         execution_semantics: super::Hash(d.fixed()?),
-    })
+        gas_schedule: super::GasScheduleV2::new(d.u64()?, d.u64()?),
+    };
+    if service.service_abi != super::ABI_VERSION || !service.gas_schedule.is_valid() {
+        return Err(DecodeError::InvalidVersion);
+    }
+    Ok(service)
 }
 
 #[cfg(test)]
@@ -452,6 +461,7 @@ mod tests {
             service_program: ProgramId([3; 32]),
             service_abi: crate::v2::ABI_VERSION,
             execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
         }
     }
 

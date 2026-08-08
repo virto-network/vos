@@ -278,6 +278,7 @@ pub enum LocalRootTreeConfigErrorV2 {
     WrongServiceProgram,
     WrongServiceAbi,
     WrongExecutionSemantics,
+    WrongGasSchedule,
     InvalidConsistency,
     InvalidRoleAuthority,
     ReplicationDriverRequired,
@@ -731,12 +732,18 @@ impl LocalRootTreeConfigV2 {
                 || authority.service == self.service
                 || authority.service.service_abi != super::ABI_VERSION
                 || authority.service.execution_semantics != super::EXECUTION_SEMANTICS_ID
+                || !authority.service.gas_schedule.is_valid()
                 || authority.actor == ActorId::ZERO
         }) {
             return Err(LocalRootTreeConfigErrorV2::InvalidRoleAuthority);
         }
         if self.refine_gas == 0 || self.accumulate_gas == 0 {
             return Err(LocalRootTreeConfigErrorV2::ZeroGas);
+        }
+        if self.service.gas_schedule
+            != super::GasScheduleV2::new(self.refine_gas, self.accumulate_gas)
+        {
+            return Err(LocalRootTreeConfigErrorV2::WrongGasSchedule);
         }
 
         let descriptor = self
@@ -2155,6 +2162,7 @@ mod tests {
                 service_program: ProgramId([33; 32]),
                 service_abi: super::super::ABI_VERSION,
                 execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+                gas_schedule: super::super::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
             },
             actor: ActorId([34; 32]),
         };
@@ -2267,6 +2275,7 @@ mod tests {
             service_program: ProgramId([4; 32]),
             service_abi: super::super::ABI_VERSION,
             execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            gas_schedule: super::super::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
         };
         let destination = ServiceIdentityV2 {
             root_service: super::super::RootServiceId([5; 32]),
