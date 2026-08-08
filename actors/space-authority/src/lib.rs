@@ -9,8 +9,8 @@
 
 use vos::prelude::*;
 use vos::v2::{
-    Origin, RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2, RoleAuthorizationClaimV2,
-    SpaceId, SubjectId, V2Wire,
+    Origin, RoleAuthorityInviteRedemptionV2, RoleAuthorityInviteRevocationV2,
+    RoleAuthorityMutationV2, RoleAuthorizationClaimV2, SpaceId, SubjectId, V2Wire,
 };
 
 #[derive(
@@ -37,6 +37,7 @@ pub fn initial_state(space: SpaceId, root_peer_id: Vec<u8>) -> Option<Vec<u8>> {
         SpaceAuthority {
             space: space.0,
             root_peer_id,
+            revoked_invites: Vec::new(),
             grants: vec![GrantRow {
                 holder_kind: 0,
                 holder: root.0,
@@ -55,6 +56,7 @@ pub fn initial_state(space: SpaceId, root_peer_id: Vec<u8>) -> Option<Vec<u8>> {
 pub struct SpaceAuthority {
     space: [u8; 32],
     root_peer_id: Vec<u8>,
+    revoked_invites: Vec<[u8; 32]>,
     grants: Vec<GrantRow>,
 }
 
@@ -66,6 +68,7 @@ impl SpaceAuthority {
         Self {
             space: [0; 32],
             root_peer_id: Vec::new(),
+            revoked_invites: Vec::new(),
             grants: Vec::new(),
         }
     }
@@ -104,6 +107,13 @@ impl SpaceAuthority {
             return false;
         };
         if redemption.space.0 != self.space {
+            return false;
+        }
+        if self
+            .revoked_invites
+            .binary_search(&redemption.token_pub)
+            .is_ok()
+        {
             return false;
         }
         let grantor = redemption.grantor();
@@ -145,6 +155,32 @@ impl SpaceAuthority {
             redemption.expires_at,
             grantor,
         )
+    }
+
+    /// Permanently cancel an offline bearer. The authority authenticates the
+    /// admin independently of the legacy registry and stores a sorted,
+    /// grow-only token set, so replay and merge order cannot resurrect it.
+    #[msg]
+    fn revoke_invite(&mut self, revocation: Vec<u8>, signature: Vec<u8>) -> bool {
+        let Ok(revocation) = RoleAuthorityInviteRevocationV2::decode(&revocation) else {
+            return false;
+        };
+        if revocation.space.0 != self.space
+            || self.effective_role(revocation.grantor()) != Some(SpaceRole::Admin)
+        {
+            return false;
+        }
+        let Ok(signature) = <[u8; 64]>::try_from(signature) else {
+            return false;
+        };
+        if !Self::verify_peer_signature(&revocation.admin_peer_id, &revocation.encode(), &signature)
+        {
+            return false;
+        }
+        if let Err(index) = self.revoked_invites.binary_search(&revocation.token_pub) {
+            self.revoked_invites.insert(index, revocation.token_pub);
+        }
+        true
     }
 
     /// Return the exact claim bytes only when the current grant satisfies its
@@ -580,6 +616,48 @@ mod tests {
         assert_eq!(
             authorize(&mut authority, &second_developer),
             second_developer.encode()
+        );
+
+        let revocation = RoleAuthorityInviteRevocationV2 {
+            space,
+            token_pub: *token.verifying_key().as_bytes(),
+            admin_peer_id: root_peer(&admin),
+        };
+        let revoke_signature = admin.sign(&revocation.encode()).to_bytes().to_vec();
+        assert!(dispatch(
+            &mut authority,
+            RevokeInvite {
+                revocation: revocation.encode(),
+                signature: revoke_signature.clone(),
+            },
+        ));
+        assert!(
+            dispatch(
+                &mut authority,
+                RevokeInvite {
+                    revocation: revocation.encode(),
+                    signature: revoke_signature,
+                },
+            ),
+            "revocation replay is idempotent"
+        );
+        let blocked_holder = SigningKey::from_bytes(&[37; 32]);
+        let blocked_redemption = invite_redemption(
+            space,
+            &admin,
+            &token,
+            &blocked_holder,
+            SpaceRole::Developer,
+            50,
+        );
+        assert!(
+            !redeem(&mut authority, &blocked_redemption),
+            "a grow-only revocation blocks later holders"
+        );
+        assert_eq!(
+            authorize(&mut authority, &developer),
+            developer.encode(),
+            "invite revocation does not claw back an already committed grant"
         );
 
         assert!(apply(

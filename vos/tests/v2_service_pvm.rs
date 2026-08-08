@@ -584,10 +584,74 @@ fn missing_required_guest_is_a_hard_failure() {
 }
 
 fn service_elf() -> Vec<u8> {
-    required_elf(
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let service_dir = manifest_dir.join("../services/vos-service");
+    let path = service_dir.join("target/riscv64em-javm/release/vos_service.elf");
+    let elf = required_elf(
         "../services/vos-service/target/riscv64em-javm/release/vos_service.elf",
         "just build-v2-pvm-test-artifacts",
-    )
+    );
+    let built_at = std::fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .expect("read canonical service artifact modification time");
+    let inputs = [
+        manifest_dir.join("src"),
+        manifest_dir.join("Cargo.toml"),
+        manifest_dir.join("../Cargo.toml"),
+        manifest_dir.join("../Cargo.lock"),
+        service_dir.join("src"),
+        service_dir.join("Cargo.toml"),
+        service_dir.join("Cargo.lock"),
+        service_dir.join("riscv64em-javm.json"),
+        service_dir.join("rust-toolchain.toml"),
+        service_dir.join(".cargo/config.toml"),
+        service_dir.join("rustc-remap.sh"),
+    ];
+    if let Some(newer) = newer_build_input(&inputs, built_at) {
+        panic!(
+            "canonical service artifact is stale: {} is newer than {}; rebuild with \
+             `just build-vos-service`",
+            newer.display(),
+            path.display(),
+        );
+    }
+    elf
+}
+
+fn newer_build_input(inputs: &[PathBuf], built_at: std::time::SystemTime) -> Option<PathBuf> {
+    let mut pending = inputs.to_vec();
+    while let Some(path) = pending.pop() {
+        let metadata = std::fs::metadata(&path).unwrap_or_else(|error| {
+            panic!(
+                "inspect canonical service build input {}: {error}",
+                path.display()
+            )
+        });
+        if metadata.is_dir() {
+            let entries = std::fs::read_dir(&path).unwrap_or_else(|error| {
+                panic!(
+                    "enumerate canonical service build input {}: {error}",
+                    path.display()
+                )
+            });
+            pending.extend(entries.map(|entry| {
+                entry
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "enumerate canonical service build input {}: {error}",
+                            path.display()
+                        )
+                    })
+                    .path()
+            }));
+        } else if metadata
+            .modified()
+            .is_ok_and(|modified| modified > built_at)
+        {
+            return Some(path);
+        }
+    }
+    None
 }
 
 #[test]

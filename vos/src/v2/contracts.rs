@@ -133,6 +133,7 @@ pub struct RoleAuthorityBindingV2 {
 
 pub const ROLE_AUTHORITY_MUTATION_METHOD_V2: &str = "mutate_role";
 pub const ROLE_AUTHORITY_INVITE_METHOD_V2: &str = "redeem_invite";
+pub const ROLE_AUTHORITY_INVITE_REVOKE_METHOD_V2: &str = "revoke_invite";
 pub const ROLE_AUTHORITY_DECISION_METHOD_V2: &str = "authorize_role";
 /// Reserved installed root name for the one canonical authority service in a
 /// space. Application manifests cannot choose a sibling authority by route.
@@ -201,6 +202,23 @@ impl RoleAuthorityInviteRedemptionV2 {
         Origin::Member(SubjectId::of_authenticated_peer(&self.holder_peer_id))
     }
 
+    pub fn grantor(&self) -> Origin {
+        Origin::Member(SubjectId::of_authenticated_peer(&self.admin_peer_id))
+    }
+}
+
+/// Admin-signed cancellation of one offline invite bearer. Unlike the
+/// legacy registry operation, this canonical wire binds the space as well as
+/// the token, so an administrator of two spaces cannot replay one signature
+/// across their independent authorities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleAuthorityInviteRevocationV2 {
+    pub space: SpaceId,
+    pub token_pub: [u8; 32],
+    pub admin_peer_id: Vec<u8>,
+}
+
+impl RoleAuthorityInviteRevocationV2 {
     pub fn grantor(&self) -> Origin {
         Origin::Member(SubjectId::of_authenticated_peer(&self.admin_peer_id))
     }
@@ -2883,6 +2901,29 @@ impl V2Wire for RoleAuthorityInviteRedemptionV2 {
     }
 }
 
+impl V2Wire for RoleAuthorityInviteRevocationV2 {
+    const MAGIC: [u8; 4] = *b"VIR2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        encoder.fixed(&self.space.0);
+        encoder.fixed(&self.token_pub);
+        encoder.bytes(&self.admin_peer_id);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            space: SpaceId(decoder.fixed()?),
+            token_pub: decoder.fixed()?,
+            admin_peer_id: decoder.bytes()?,
+        };
+        if value.admin_peer_id.is_empty() || value.admin_peer_id.len() > 256 {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
 impl V2Wire for RoleAuthorizationClaimV2 {
     const MAGIC: [u8; 4] = *b"VCL2";
 
@@ -5175,6 +5216,26 @@ mod tests {
         malformed.holder_peer_id.clear();
         assert_eq!(
             RoleAuthorityInviteRedemptionV2::decode(&malformed.encode()),
+            Err(DecodeError::NonCanonical),
+        );
+
+        let revocation = RoleAuthorityInviteRevocationV2 {
+            space: SpaceId([49; 32]),
+            token_pub: [50; 32],
+            admin_peer_id: vec![51; 38],
+        };
+        assert_eq!(
+            RoleAuthorityInviteRevocationV2::decode(&revocation.encode()).unwrap(),
+            revocation,
+        );
+        assert!(matches!(revocation.grantor(), Origin::Member(_)));
+        let mut other_space = revocation.clone();
+        other_space.space.0[0] ^= 1;
+        assert_ne!(other_space.encode(), revocation.encode());
+        let mut malformed = revocation;
+        malformed.admin_peer_id.clear();
+        assert_eq!(
+            RoleAuthorityInviteRevocationV2::decode(&malformed.encode()),
             Err(DecodeError::NonCanonical),
         );
     }

@@ -951,12 +951,50 @@ impl DaemonClient {
     /// canonical is just `("revoke_invite", [token_pub])` — no epoch,
     /// unlike grant/revoke_role.
     pub fn revoke_invite(&self, token_pub: Vec<u8>) -> anyhow::Result<Status> {
+        if self.has_v2_role_authority()? {
+            let token: [u8; 32] = token_pub
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invite token public key is not 32 bytes"))?;
+            self.commit_v2_invite_revocation(token)?;
+        }
         let auth = op_auth(&self.signer, "revoke_invite", &[&token_pub])?;
         vos::block_on(
             self.registry()
                 .revoke_invite(&mut &self.node, token_pub, auth),
         )
         .map_err(|e| anyhow::anyhow!("registry.revoke_invite(): {e}"))
+    }
+
+    fn commit_v2_invite_revocation(&self, token_pub: [u8; 32]) -> anyhow::Result<()> {
+        use vos::v2::V2Wire;
+
+        let revocation = vos::v2::RoleAuthorityInviteRevocationV2 {
+            space: self.v2_space_id()?,
+            token_pub,
+            admin_peer_id: libp2p::PeerId::from(self.signer.public()).to_bytes(),
+        };
+        let signature = self
+            .signer
+            .sign(&revocation.encode())
+            .map_err(|error| anyhow::anyhow!("sign v2 invite revocation: {error}"))?;
+        if signature.len() != vos::registry::OP_SIG_LEN {
+            anyhow::bail!("v2 role authority requires an Ed25519 admin identity");
+        }
+        let target = self.resolve_target(vos::v2::ROLE_AUTHORITY_INSTANCE_V2)?;
+        if !self.v2_targets.lock().unwrap().contains_key(&target.0) {
+            anyhow::bail!("canonical space-authority package is unavailable to the CLI");
+        }
+        let reply = self.invoke_dyn(
+            target,
+            &vos::value::Msg::new(vos::v2::ROLE_AUTHORITY_INVITE_REVOKE_METHOD_V2)
+                .with("revocation", revocation.encode())
+                .with("signature", signature),
+        )?;
+        if reply.as_bool() != Some(true) {
+            anyhow::bail!("space-authority rejected the signed invite revocation");
+        }
+        Ok(())
     }
 
     // ── Actor-local grants ────────────────────────────────

@@ -49,12 +49,13 @@ pub use contracts::{
     GasAccountingV2, GasScheduleV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
     MessageRecordV2, MethodPolicyV2, ProofCommitmentV2, ProofVerificationRequestV2,
     PublicationAckV2, PublishedEffectsV2, ROLE_AUTHORITY_DECISION_METHOD_V2,
-    ROLE_AUTHORITY_INSTANCE_V2, ROLE_AUTHORITY_INVITE_METHOD_V2, ROLE_AUTHORITY_MUTATION_METHOD_V2,
+    ROLE_AUTHORITY_INSTANCE_V2, ROLE_AUTHORITY_INVITE_METHOD_V2,
+    ROLE_AUTHORITY_INVITE_REVOKE_METHOD_V2, ROLE_AUTHORITY_MUTATION_METHOD_V2,
     ReceiptVerificationRequestV2, RefineError, RefineImportsV2, RefineOutputV2, ReplyRecordV2,
-    RoleAuthorityBindingV2, RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2,
-    RoleAuthorizationClaimV2, RoleCredentialV2, RoleCredentialVerificationRequestV2,
-    ServiceGenesisV2, ServiceIdentityV2, ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2,
-    WorkInputIdV2, WorkflowOperationV2,
+    RoleAuthorityBindingV2, RoleAuthorityInviteRedemptionV2, RoleAuthorityInviteRevocationV2,
+    RoleAuthorityMutationV2, RoleAuthorizationClaimV2, RoleCredentialV2,
+    RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServiceIdentityV2,
+    ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
 };
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStoreV2, ProofVerificationV2, ReceiptVerificationV2,
@@ -129,8 +130,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0x40, 0x7b, 0x9b, 0x63, 0xad, 0xcc, 0x3d, 0x31, 0x0c, 0x4a, 0xc8, 0x44, 0xbb, 0x95, 0x02, 0x50,
-    0xbd, 0x4a, 0x8d, 0x23, 0x5b, 0xf9, 0xda, 0x9d, 0x50, 0xeb, 0x55, 0x96, 0x2f, 0xd7, 0x4b, 0x61,
+    0x4e, 0xb8, 0x42, 0xe4, 0xc2, 0xe9, 0x3e, 0x66, 0x10, 0x17, 0x59, 0xb7, 0x62, 0xe8, 0x65, 0x7c,
+    0x31, 0xcd, 0x38, 0x6a, 0x28, 0x2f, 0xc4, 0x30, 0x2a, 0x6e, 0xd9, 0xce, 0xda, 0x81, 0x88, 0xdc,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.
