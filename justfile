@@ -94,10 +94,9 @@ refresh-bundled-registry: (build-actor "space-registry")
 # Refresh the exact canonical PVM used to construct each space's root-signed
 # authority package. The temporary .vos is discarded: package signing belongs
 # to the space root at first startup, so every peer installs the same bytes.
-refresh-bundled-authority service_pvm="dist/vos-service.pvm": (build-actor "space-authority")
+refresh-bundled-authority: (build-actor "space-authority")
     cargo run -p vosx -- build actors/space-authority --name space-authority \
-      --version artifact-only --service-pvm {{service_pvm}} \
-      --out-dir target/bundled-space-authority
+      --version artifact-only --out-dir target/bundled-space-authority
     cp target/bundled-space-authority/space-authority.pvm \
        vosx/blobs/space_authority.pvm
 

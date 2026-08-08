@@ -33,11 +33,12 @@ use vos::v2::{
     MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin, PackageManifestV2,
     PackageRolePoliciesV2, ProducerId, ProgramId, ProofArtifactStoreV2, PublishedEffectsV2,
     ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2,
-    ReplicatedServiceErrorV2, ReplyRecordV2, RoleAuthorityBindingV2, RoleAuthorityMutationV2,
-    RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId, RootTreeInvocationV2,
-    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
-    ServicePvmV2, StateKeyV2, SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2,
-    WorkEnvelopeV2, WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
+    ReplicatedServiceErrorV2, ReplyRecordV2, RoleAuthorityBindingV2,
+    RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2, RoleCredentialV2,
+    RoleCredentialVerificationRequestV2, RootServiceId, RootTreeInvocationV2, ScheduleErrorV2,
+    ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2,
+    StateKeyV2, SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2,
+    WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     Decode, Encode,
@@ -1270,6 +1271,121 @@ fn canonical_space_authority_produces_extractable_accumulated_assertion() {
         Some(expected_grant_reply.as_slice())
     );
 
+    let token = libp2p::identity::Keypair::generate_ed25519();
+    let invited = libp2p::identity::Keypair::generate_ed25519();
+    let invited_peer_id = libp2p::PeerId::from(invited.public()).to_bytes();
+    let token_pub = vos::registry::ed25519_pubkey_from_peer_id(
+        &libp2p::PeerId::from(token.public()).to_bytes(),
+    )
+    .expect("the invite token is Ed25519");
+    let expires_at = 1_000u64;
+    let invite = vos::registry::canonical_op_bytes(
+        "invite",
+        &[
+            &binding.service.space.0,
+            &[vos::SpaceRole::Member.as_u8()],
+            &expires_at.to_le_bytes(),
+            &token_pub,
+        ],
+    );
+    let redeem =
+        vos::registry::canonical_op_bytes("redeem_invite", &[&token_pub, &invited_peer_id]);
+    let redemption = RoleAuthorityInviteRedemptionV2 {
+        space: binding.service.space,
+        token_pub,
+        role: vos::SpaceRole::Member,
+        expires_at,
+        admin_peer_id: libp2p::PeerId::from(root.public()).to_bytes(),
+        admin_signature: root.sign(&invite).unwrap().try_into().unwrap(),
+        holder_peer_id: invited_peer_id.clone(),
+        redeem_signature: token.sign(&redeem).unwrap().try_into().unwrap(),
+        holder_signature: invited.sign(&redeem).unwrap().try_into().unwrap(),
+    };
+    let mut redemption_arguments = vec![vos::value::TAG_DYNAMIC];
+    redemption_arguments.extend_from_slice(
+        &Msg::new("redeem_invite")
+            .with("redemption", redemption.encode())
+            .encode(),
+    );
+    let redemption_result = authority
+        .invoke(LocalWorkRequestV2 {
+            invocation: InvocationId([197; 32]),
+            workflow_step: 0,
+            logical_timeslot: 2,
+            target: authority_actor,
+            method: "redeem_invite".into(),
+            arguments: redemption_arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        })
+        .expect("the canonical actor PVM verifies and commits the invite chain");
+    assert_eq!(
+        redemption_result
+            .published
+            .reply
+            .as_ref()
+            .map(|reply| reply.result.as_slice()),
+        Some(Value::Bool(true).encode().as_slice()),
+    );
+
+    let invited_holder = Origin::Member(SubjectId::of_authenticated_peer(&invited_peer_id));
+    let invited_claim = vos::v2::RoleAuthorizationClaimV2 {
+        space: binding.service.space,
+        holder: invited_holder,
+        role: vos::SpaceRole::Member,
+        audience: ServiceIdentityV2 {
+            root_service: RootServiceId([198; 32]),
+            deployment: DeploymentId([199; 32]),
+            service_program: ProgramId([200; 32]),
+            ..binding.service.clone()
+        },
+        invocation: InvocationId([201; 32]),
+        scope: Hash([202; 32]),
+        target: ActorId([203; 32]),
+        method: "restricted".into(),
+        policy: Hash([204; 32]),
+    };
+    let mut invited_arguments = vec![vos::value::TAG_DYNAMIC];
+    invited_arguments.extend_from_slice(
+        &Msg::new("authorize_role")
+            .with("claim", invited_claim.encode())
+            .encode(),
+    );
+    let invited_result = authority
+        .invoke(LocalWorkRequestV2 {
+            invocation: invited_claim.authority_invocation(),
+            workflow_step: 0,
+            logical_timeslot: 3,
+            target: authority_actor,
+            method: "authorize_role".into(),
+            arguments: invited_arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        })
+        .expect("the invited member receives an authority decision");
+    assert_eq!(
+        invited_result
+            .published
+            .reply
+            .as_ref()
+            .map(|reply| reply.result.as_slice()),
+        Some(Value::Bytes(invited_claim.encode()).encode().as_slice()),
+    );
+
     let claim = vos::v2::RoleAuthorizationClaimV2 {
         space: binding.service.space,
         holder,
@@ -1296,7 +1412,7 @@ fn canonical_space_authority_produces_extractable_accumulated_assertion() {
         .invoke(LocalWorkRequestV2 {
             invocation: claim.authority_invocation(),
             workflow_step: 0,
-            logical_timeslot: 2,
+            logical_timeslot: 4,
             target: authority_actor,
             method: "authorize_role".into(),
             arguments,
