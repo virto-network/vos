@@ -152,8 +152,14 @@ bypass. Space startup installs the immutable-root-signed canonical
 `space-authority` package as its own Raft root. Root-signed role mutations,
 delegated invite redemption, and grow-only invite cancellation execute in
 that actor; the joiner deletes its pending bearer only after physical
-Accumulate publishes `Bool(true)`. No registry lookup or daemon-local
-signature is treated as a finalized authority receipt. A direct reply is
+Accumulate publishes `Bool(true)`. The admin signature binds the authority's
+replication incarnation, so a lagging registry replica cannot turn absence of
+its catalog row into legacy completion. Authority activation refuses every
+effective non-root registry grant and every dormant delegated grant which
+could revive if its grantor is re-granted. Migration is an explicit
+revoke-before-cutover and re-grant-after-cutover operation; rows already
+dominated by the holder's own revoke high-water do not block it. No registry
+lookup or daemon-local signature is treated as a finalized authority receipt. A direct reply is
 acknowledged only after its waiting channel accepts
 the bytes. Ordinary outbox and suspended-workflow publications are retried by
 the node transport until the destination guest has committed them. Proof and

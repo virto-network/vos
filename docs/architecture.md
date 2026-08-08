@@ -78,7 +78,12 @@ the same evidence: the registry records the delegated redemption, then the
 canonical `space-authority` root commits the holder grant through physical
 Accumulate. Restricted v2 calls use an invocation-scoped authority reply and
 its finalized accumulation receipt; a daemon-local role lookup is not a v2
-credential. Before first redemption, an operator may cancel the bearer by
+credential. Authority-aware tokens sign the authority's replication
+incarnation; a peer missing that catalog row cannot downgrade redemption to
+legacy success. Enabling the authority refuses a registry that already has
+non-root roles: operators must revoke them under the legacy daemon, activate
+the authority, then re-grant them into both layers. Before first redemption,
+an operator may cancel the bearer by
 passing the exact `vos1…` token to `space invite <space> revoke`; the same
 grow-only cancellation is committed to both authorization layers.
 

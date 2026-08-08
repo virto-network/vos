@@ -245,6 +245,55 @@ pub const AUTH_ROLE_READONLY: u8 = 1;
 pub const AUTH_ROLE_DEVELOPER: u8 = 2;
 pub const AUTH_ROLE_ADMIN: u8 = 3;
 
+/// Canonical invite evidence signed by the granting administrator.
+///
+/// Legacy spaces omit `authority_replication_id` and retain their original
+/// four-field canonical. Once a canonical v2 authority is installed, the
+/// registry requires the fifth field to equal that authority's durable
+/// replication incarnation. The signed marker prevents either a joining
+/// client or a lagging peer from silently downgrading an authority-bound
+/// bearer to registry-only redemption.
+pub fn invite_signed_bytes(
+    space_id: &[u8; 32],
+    role: u8,
+    expires_at: u64,
+    token_pub: &[u8; 32],
+    authority_replication_id: Option<&[u8; 32]>,
+) -> Vec<u8> {
+    let expires_at = expires_at.to_le_bytes();
+    match authority_replication_id {
+        Some(authority) => canonical_op_bytes(
+            "invite",
+            &[space_id, &[role], &expires_at, token_pub, authority],
+        ),
+        None => canonical_op_bytes("invite", &[space_id, &[role], &expires_at, token_pub]),
+    }
+}
+
+/// Total ordering shared by the registry and canonical v2 authority for the
+/// single grant retained per subject.
+///
+/// Root evidence dominates delegated evidence regardless of epoch. Otherwise
+/// the greater epoch wins, with the exact grantor PeerId providing the same
+/// deterministic equal-epoch tie-break in both stores.
+pub fn role_grant_supersedes(
+    new_epoch: u64,
+    new_grantor: &[u8],
+    cur_epoch: u64,
+    cur_grantor: &[u8],
+    root: &[u8],
+) -> bool {
+    let new_root = !root.is_empty() && new_grantor == root;
+    let cur_root = !root.is_empty() && cur_grantor == root;
+    if new_root != cur_root {
+        return new_root;
+    }
+    if new_epoch != cur_epoch {
+        return new_epoch > cur_epoch;
+    }
+    new_grantor < cur_grantor
+}
+
 /// Per-PeerId auth grant. `peer_id` is the libp2p PeerId in
 /// multihash bytes (same encoding as `MemberRow.key` when
 /// `kind = Node`); `role` is one of the `AUTH_ROLE_*` constants.
@@ -1444,6 +1493,26 @@ impl RegistryRef {
         )
     }
 
+    /// Grant rows which block cutting a legacy registry over to canonical v2
+    /// authority: effective grants and grantor-dormant rows that could revive.
+    /// Rows dominated by their holder's own revoke high-water are omitted.
+    pub async fn auth_grant_cutover_blockers<I: Invoker>(
+        &self,
+        inv: &mut I,
+        after_peer: Vec<u8>,
+        budget: u32,
+    ) -> Result<AuthGrantPage, ClientError> {
+        decode_rkyv(
+            self.call(
+                inv,
+                Msg::new("auth_grant_cutover_blockers")
+                    .with("after_peer", after_peer)
+                    .with("budget", budget),
+            )
+            .await?,
+        )
+    }
+
     pub async fn revoke_role<I: Invoker>(
         &self,
         inv: &mut I,
@@ -1544,6 +1613,7 @@ impl RegistryRef {
         token_pub: Vec<u8>,
         role: u8,
         expires_at: u64,
+        authority_replication_id: Vec<u8>,
         admin_peer_id: Vec<u8>,
         admin_sig: Vec<u8>,
         peer_id: Vec<u8>,
@@ -1557,6 +1627,7 @@ impl RegistryRef {
                     .with("token_pub", token_pub)
                     .with("role", role)
                     .with("expires_at", expires_at)
+                    .with("authority_replication_id", authority_replication_id)
                     .with("admin_peer_id", admin_peer_id)
                     .with("admin_sig", admin_sig)
                     .with("peer_id", peer_id)

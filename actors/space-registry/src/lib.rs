@@ -57,8 +57,8 @@ pub use vos::registry::{
     InvitePage, InviteRow, MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, MemberPage, MemberRow,
     NODE_ROLE_OBSERVER, NODE_ROLE_VOTER, OP_SIG_LEN, PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK,
     ProgramPage, ProgramRow, REGISTRY_OP_DOMAIN, SPACE_ID_DOMAIN_TAG, Status, SyncFloor,
-    binding_signed_bytes,
-    canonical_op_bytes, ed25519_pubkey_from_peer_id, instance_service_id, pack_auth,
+    binding_signed_bytes, canonical_op_bytes, ed25519_pubkey_from_peer_id, instance_service_id,
+    invite_signed_bytes, pack_auth, role_grant_supersedes,
 };
 
 // ── Programs ──────────────────────────────────────────────────────
@@ -557,7 +557,12 @@ impl SpaceRegistry {
     /// backing `programs` is kept sorted on insert, so a natural cursor over
     /// the last emitted row pages the whole catalog without a per-page sort.
     #[msg]
-    async fn programs(&self, after_name: String, after_version: String, budget: u32) -> ProgramPage {
+    async fn programs(
+        &self,
+        after_name: String,
+        after_version: String,
+        budget: u32,
+    ) -> ProgramPage {
         let started = after_name.is_empty() && after_version.is_empty();
         let mut it = self
             .programs
@@ -1343,7 +1348,7 @@ impl SpaceRegistry {
         let key = peer_key(&peer_id);
         let supersedes = match self.auth_grants.get(&key) {
             Some(cur) => {
-                grant_supersedes(epoch, &grantor, cur.epoch, &cur.grantor, &self.root_bytes())
+                role_grant_supersedes(epoch, &grantor, cur.epoch, &cur.grantor, &self.root_bytes())
             }
             None => true,
         };
@@ -1446,6 +1451,44 @@ impl SpaceRegistry {
         AuthGrantPage { grants, next }
     }
 
+    /// Page every grant row which blocks canonical-authority cutover.
+    ///
+    /// Besides currently-effective grants, this includes delegated rows that
+    /// are dormant only because their grantor is no longer an admin: those
+    /// rows could become effective again if the grantor is re-granted. A row
+    /// dominated by its holder's own revoke high-water is safe to retain and
+    /// is omitted, making "revoke, then activate" a durable recovery path.
+    #[msg]
+    async fn auth_grant_cutover_blockers(&self, after_peer: Vec<u8>, budget: u32) -> AuthGrantPage {
+        let skip = (!after_peer.is_empty()).then(|| peer_key(&after_peer));
+        let start = skip.unwrap_or([0u8; 32]);
+        let root = self.root_bytes();
+        let mut raw = self
+            .auth_grants
+            .iter_from(&start)
+            .filter(move |(key, _)| skip != Some(*key))
+            .map(|(_, grant)| grant)
+            .filter(|grant| {
+                grant.peer_id != root
+                    && (self.effective_role(&grant.peer_id) != AUTH_ROLE_NONE
+                        || self.revoke_floor(&grant.peer_id) < grant.epoch)
+            });
+        let (grants, more) = fill_page(
+            &mut raw,
+            page_rows(budget).min(ROLE_PAGE_MAX_ROWS),
+            PAGE_BYTE_BUDGET,
+        );
+        let next = if more {
+            grants
+                .last()
+                .map(|grant| grant.peer_id.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        AuthGrantPage { grants, next }
+    }
+
     // ── Invites ─────────────────────────────────────────────────
 
     /// Redeem an invite token: grant `role` to `peer_id`. Deliberately
@@ -1460,7 +1503,8 @@ impl SpaceRegistry {
     ///     under `token_pub` — the joiner proves it holds the token
     ///     secret, binding the redemption to this node,
     ///  3. `admin_sig` over the invite canonical (`invite`,
-    ///     `[space_id, [role], expires_le, token_pub]`) under
+    ///     `[space_id, [role], expires_le, token_pub,
+    ///     authority_replication_id?]`) under
     ///     `admin_peer_id`, which must itself be a current-epoch
     ///     effective admin — the delegated-grant chain admin→token→node,
     ///  4. the token isn't revoked (a grow-only flag on the row).
@@ -1468,8 +1512,10 @@ impl SpaceRegistry {
     /// The invite names its minting admin (`admin_peer_id`) so the
     /// signature is verified in O(1) against a known key rather than by
     /// scanning the grant table; a lie there fails `verify_op_sig` or
-    /// `is_effective_admin`, so it can't escalate. No expiry check
-    /// happens here — expiry is checked once, host-side, at admission
+    /// `is_effective_admin`, so it can't escalate. The signed optional
+    /// authority marker must equal the installed authority row, preventing
+    /// post-cutover registry-only completion. No expiry check happens here —
+    /// expiry is checked once, host-side, at admission
     /// (replay re-verifies signatures only, never the clock).
     ///
     /// On success it records the redemption (appending `peer_id` to the
@@ -1488,6 +1534,7 @@ impl SpaceRegistry {
         token_pub: Vec<u8>,
         role: u8,
         expires_at: u64,
+        authority_replication_id: Vec<u8>,
         admin_peer_id: Vec<u8>,
         admin_sig: Vec<u8>,
         peer_id: Vec<u8>,
@@ -1541,10 +1588,31 @@ impl SpaceRegistry {
         // shared operator identity); `space_id` (a fresh per-space genesis
         // origin) can, so a mismatched space rebuilds a different canonical
         // and the signature fails.
-        let space_id = self.space_id_bytes();
-        let invite_canon = canonical_op_bytes(
-            "invite",
-            &[&space_id, &[role], &expires_at.to_le_bytes(), &token_pub],
+        let Some(space_id) = bytes_to_32(&self.space_id_bytes()) else {
+            return Status::Forbidden;
+        };
+        let authority_replication_id = if authority_replication_id.is_empty() {
+            None
+        } else {
+            let Some(value) = bytes_to_32(&authority_replication_id) else {
+                return Status::BadHash;
+            };
+            Some(value)
+        };
+        let installed_authority = self
+            .agents
+            .iter()
+            .find(|agent| agent.instance_name == vos::v2::ROLE_AUTHORITY_INSTANCE_V2)
+            .map(|agent| agent.replication_id);
+        if installed_authority != authority_replication_id {
+            return Status::Forbidden;
+        }
+        let invite_canon = invite_signed_bytes(
+            &space_id,
+            role,
+            expires_at,
+            &token_pub_key,
+            authority_replication_id.as_ref(),
         );
         if !verify_op_sig(&admin_peer_id, &invite_canon, &admin_sig)
             || !self.is_effective_admin(&admin_peer_id)
@@ -1575,7 +1643,7 @@ impl SpaceRegistry {
         let epoch = expires_at;
         let key = peer_key(&peer_id);
         let supersedes = match self.auth_grants.get(&key) {
-            Some(cur) => grant_supersedes(
+            Some(cur) => role_grant_supersedes(
                 epoch,
                 &admin_peer_id,
                 cur.epoch,
@@ -1703,7 +1771,7 @@ impl SpaceRegistry {
         let key = acl_key(&peer_id, &agent_name);
         let supersedes = match self.actor_acls.get(&key) {
             Some(cur) => {
-                grant_supersedes(epoch, &grantor, cur.epoch, &cur.grantor, &self.root_bytes())
+                role_grant_supersedes(epoch, &grantor, cur.epoch, &cur.grantor, &self.root_bytes())
             }
             None => true,
         };
@@ -1994,36 +2062,6 @@ impl SpaceRegistry {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-/// Decide whether an incoming grant should replace the stored grant for
-/// the same target (one row per target). The ordering is a max over a
-/// total, content-derived order — independent of replay/merge order:
-///
-///   1. A **root-signed** grant dominates any non-root grant *regardless
-///      of epoch*. Root authority is immutable, so a delegated admin can
-///      never capture a root-granted target's trust path by re-granting
-///      it (which would let revoking that admin void a root delegation).
-///   2. Otherwise the higher epoch wins (a stale grant is dominated).
-///   3. At equal epoch and equal root-ness, the lexicographically smaller
-///      grantor wins — a deterministic tiebreak so two concurrent grants
-///      at the same epoch resolve identically on every replica.
-fn grant_supersedes(
-    new_epoch: u64,
-    new_grantor: &[u8],
-    cur_epoch: u64,
-    cur_grantor: &[u8],
-    root: &[u8],
-) -> bool {
-    let new_root = !root.is_empty() && new_grantor == root;
-    let cur_root = !root.is_empty() && cur_grantor == root;
-    if new_root != cur_root {
-        return new_root;
-    }
-    if new_epoch != cur_epoch {
-        return new_epoch > cur_epoch;
-    }
-    compare_bytes(new_grantor, cur_grantor) < 0
-}
-
 fn bytes_to_32(b: &[u8]) -> Option<[u8; 32]> {
     if b.len() != 32 {
         return None;
@@ -2151,26 +2189,6 @@ fn compare_program(a_name: &str, a_version: &str, b_name: &str, b_version: &str)
         return 1;
     }
     0
-}
-
-fn compare_bytes(a: &[u8], b: &[u8]) -> i8 {
-    let mut i = 0usize;
-    while i < a.len() && i < b.len() {
-        if a[i] < b[i] {
-            return -1;
-        }
-        if a[i] > b[i] {
-            return 1;
-        }
-        i += 1;
-    }
-    if a.len() < b.len() {
-        -1
-    } else if a.len() > b.len() {
-        1
-    } else {
-        0
-    }
 }
 
 // ── Signed registry ops ──────────────────────────────────
@@ -3929,6 +3947,55 @@ mod tests {
     }
 
     #[test]
+    fn cutover_inventory_retains_only_potentially_live_evidence() {
+        let mut r = registry();
+        let delegator_key = SigningKey::from_bytes(&[91; 32]);
+        let delegator = peer_id_for(&delegator_key.verifying_key().to_bytes());
+        let holder = alloc::vec![4, 5, 6];
+        assert_eq!(grant_space(&mut r, &delegator, AUTH_ROLE_ADMIN), Status::Ok);
+        assert_eq!(
+            grant_space_signed(&mut r, &delegator_key, &holder, AUTH_ROLE_DEVELOPER,),
+            Status::Ok
+        );
+        assert_eq!(revoke_space(&mut r, &delegator), Status::Ok);
+        let effective = dispatch(
+            &mut r,
+            AuthGrants {
+                after_peer: Vec::new(),
+                budget: 0,
+            },
+        );
+        assert!(
+            effective.grants.iter().all(|grant| grant.peer_id != holder),
+            "the ordinary listing stays an effective-role view"
+        );
+        let blockers = dispatch(
+            &mut r,
+            AuthGrantCutoverBlockers {
+                after_peer: Vec::new(),
+                budget: 0,
+            },
+        );
+        assert!(
+            blockers.grants.iter().any(|grant| grant.peer_id == holder),
+            "cutover sees a delegated row which would revive with its grantor"
+        );
+
+        assert_eq!(revoke_space(&mut r, &holder), Status::Ok);
+        let blockers = dispatch(
+            &mut r,
+            AuthGrantCutoverBlockers {
+                after_peer: Vec::new(),
+                budget: 0,
+            },
+        );
+        assert!(
+            blockers.grants.iter().all(|grant| grant.peer_id != holder),
+            "the holder's own durable revoke makes cutover safe and recoverable"
+        );
+    }
+
+    #[test]
     fn replayed_install_cannot_resurrect_an_uninstalled_agent() {
         // The replay guard: the replication_id is a grow-only tombstone. Capturing a
         // root-signed install and replaying it after uninstall reuses
@@ -4160,16 +4227,24 @@ mod tests {
         role: u8,
         node: &SigningKey,
     ) -> RedeemInvite {
+        redeem_msg_for_authority(admin_key, token_key, role, node, None)
+    }
+
+    fn redeem_msg_for_authority(
+        admin_key: &SigningKey,
+        token_key: &SigningKey,
+        role: u8,
+        node: &SigningKey,
+        authority_replication_id: Option<[u8; 32]>,
+    ) -> RedeemInvite {
         let token_pub = token_key.verifying_key().to_bytes();
         let peer_id = node_peer_of(node);
-        let invite_canon = canonical_op_bytes(
-            "invite",
-            &[
-                &TEST_SPACE_ID,
-                &[role],
-                &INVITE_EXPIRES.to_le_bytes(),
-                &token_pub,
-            ],
+        let invite_canon = invite_signed_bytes(
+            &TEST_SPACE_ID,
+            role,
+            INVITE_EXPIRES,
+            &token_pub,
+            authority_replication_id.as_ref(),
         );
         let admin_sig = admin_key.sign(&invite_canon).to_bytes();
         let redeem_canon = canonical_op_bytes("redeem_invite", &[&token_pub, &peer_id]);
@@ -4179,12 +4254,56 @@ mod tests {
             token_pub: token_pub.to_vec(),
             role,
             expires_at: INVITE_EXPIRES,
+            authority_replication_id: authority_replication_id
+                .map(|id| id.to_vec())
+                .unwrap_or_default(),
             admin_peer_id: peer_id_for(&admin_key.verifying_key().to_bytes()),
             admin_sig: admin_sig.to_vec(),
             peer_id,
             redeem_sig: redeem_sig.to_vec(),
             node_sig: node_sig.to_vec(),
         }
+    }
+
+    #[test]
+    fn installed_authority_requires_the_exact_signed_invite_marker() {
+        let mut r = registry();
+        let authority_replication_id = [91; 32];
+        r.agents.push(AgentRow {
+            instance_name: String::from(vos::v2::ROLE_AUTHORITY_INSTANCE_V2),
+            program_hash: [92; 32],
+            program_name: String::from(vos::v2::ROLE_AUTHORITY_INSTANCE_V2),
+            program_version: String::from("test"),
+            replication_id: authority_replication_id,
+            consistency: 3,
+            network_reachable: false,
+            sync_role: SyncFloor::Member,
+            install_args: Vec::new(),
+            install_payloads: Vec::new(),
+        });
+        let token = SigningKey::from_bytes(&[93; 32]);
+        let node = node_key(94);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node)
+            ),
+            Status::Forbidden,
+            "a markerless legacy bearer cannot bypass an installed authority"
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                redeem_msg_for_authority(
+                    &root_key(),
+                    &token,
+                    AUTH_ROLE_READONLY,
+                    &node,
+                    Some(authority_replication_id),
+                )
+            ),
+            Status::Ok,
+        );
     }
 
     /// Drain the paginated invites table.
@@ -4427,6 +4546,7 @@ mod tests {
             token_pub: token_pub.to_vec(),
             role: AUTH_ROLE_READONLY,
             expires_at: INVITE_EXPIRES,
+            authority_replication_id: Vec::new(),
             admin_peer_id: root_peer_id(),
             admin_sig: root_key().sign(&invite_canon).to_bytes().to_vec(),
             peer_id: peer.clone(),
@@ -4487,6 +4607,7 @@ mod tests {
                 token_pub: token_pub.to_vec(),
                 role,
                 expires_at: INVITE_EXPIRES,
+                authority_replication_id: Vec::new(),
                 admin_peer_id: root_peer_id(),
                 admin_sig: root_key().sign(&invite_canon).to_bytes().to_vec(),
                 peer_id: victim_peer.clone(),
@@ -4759,7 +4880,14 @@ mod tests {
                 .last()
                 .map(|p| (p.name.clone(), p.version.clone()))
                 .unwrap_or_default();
-            let page = dispatch(r, Programs { after_name, after_version, budget });
+            let page = dispatch(
+                r,
+                Programs {
+                    after_name,
+                    after_version,
+                    budget,
+                },
+            );
             let more = page.more;
             out.extend(page.rows);
             if !more {
@@ -4772,7 +4900,10 @@ mod tests {
     fn agents_drain(r: &mut SpaceRegistry, budget: u32) -> Vec<AgentRow> {
         let mut out: Vec<AgentRow> = Vec::new();
         loop {
-            let after_name = out.last().map(|a| a.instance_name.clone()).unwrap_or_default();
+            let after_name = out
+                .last()
+                .map(|a| a.instance_name.clone())
+                .unwrap_or_default();
             let page = dispatch(r, Agents { after_name, budget });
             let more = page.more;
             out.extend(page.rows);
@@ -4811,11 +4942,21 @@ mod tests {
             (String::from("gamma"), String::from("1")),
         ];
         let key = |v: Vec<ProgramRow>| {
-            v.into_iter().map(|p| (p.name, p.version)).collect::<Vec<_>>()
+            v.into_iter()
+                .map(|p| (p.name, p.version))
+                .collect::<Vec<_>>()
         };
         // A single big page and a budget=2 walk agree, both sorted by (name, version).
-        assert_eq!(key(programs_drain(&mut r, 0)), want, "single page is the sorted catalog");
-        assert_eq!(key(programs_drain(&mut r, 2)), want, "budget=2 walk visits every row once, in order");
+        assert_eq!(
+            key(programs_drain(&mut r, 0)),
+            want,
+            "single page is the sorted catalog"
+        );
+        assert_eq!(
+            key(programs_drain(&mut r, 2)),
+            want,
+            "budget=2 walk visits every row once, in order"
+        );
     }
 
     #[test]
@@ -4827,14 +4968,22 @@ mod tests {
         // budget=2 over 3 rows: full first page + more, then the tail.
         let page1 = dispatch(
             &mut r,
-            Programs { after_name: String::new(), after_version: String::new(), budget: 2 },
+            Programs {
+                after_name: String::new(),
+                after_version: String::new(),
+                budget: 2,
+            },
         );
         assert_eq!(page1.rows.len(), 2);
         assert!(page1.more, "a full page over a longer catalog reports more");
         let last = page1.rows.last().unwrap().clone();
         let page2 = dispatch(
             &mut r,
-            Programs { after_name: last.name, after_version: last.version, budget: 2 },
+            Programs {
+                after_name: last.name,
+                after_version: last.version,
+                budget: 2,
+            },
         );
         assert_eq!(page2.rows.len(), 1, "the tail page holds the remainder");
         assert!(!page2.more, "the last page terminates the walk");
@@ -4848,7 +4997,11 @@ mod tests {
         assert!(agent_names_drain(&mut r, 2).is_empty());
         let p = dispatch(
             &mut r,
-            Programs { after_name: String::new(), after_version: String::new(), budget: 0 },
+            Programs {
+                after_name: String::new(),
+                after_version: String::new(),
+                budget: 0,
+            },
         );
         assert!(p.rows.is_empty() && !p.more, "empty start page has no more");
     }
@@ -4859,10 +5012,26 @@ mod tests {
         for name in ["zeta", "alpha", "mu"] {
             assert_eq!(install_at(&mut r, name, 1), Status::Ok);
         }
-        let want = alloc::vec![String::from("alpha"), String::from("mu"), String::from("zeta")];
-        let names = |rows: Vec<AgentRow>| rows.into_iter().map(|a| a.instance_name).collect::<Vec<_>>();
-        assert_eq!(names(agents_drain(&mut r, 0)), want, "single page is the sorted roster");
-        assert_eq!(names(agents_drain(&mut r, 1)), want, "budget=1 walk visits every agent once, in order");
+        let want = alloc::vec![
+            String::from("alpha"),
+            String::from("mu"),
+            String::from("zeta")
+        ];
+        let names = |rows: Vec<AgentRow>| {
+            rows.into_iter()
+                .map(|a| a.instance_name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(agents_drain(&mut r, 0)),
+            want,
+            "single page is the sorted roster"
+        );
+        assert_eq!(
+            names(agents_drain(&mut r, 1)),
+            want,
+            "budget=1 walk visits every agent once, in order"
+        );
     }
 
     #[test]
@@ -4871,8 +5040,10 @@ mod tests {
         for name in ["b-agent", "a-agent", "c-agent"] {
             assert_eq!(install_at(&mut r, name, 1), Status::Ok);
         }
-        let from_rows: Vec<String> =
-            agents_drain(&mut r, 0).into_iter().map(|a| a.instance_name).collect();
+        let from_rows: Vec<String> = agents_drain(&mut r, 0)
+            .into_iter()
+            .map(|a| a.instance_name)
+            .collect();
         assert_eq!(
             agent_names_drain(&mut r, 2),
             from_rows,
@@ -4887,11 +5058,23 @@ mod tests {
             assert_eq!(install_at(&mut r, name, 1), Status::Ok);
         }
         let by = |r: &mut SpaceRegistry, pre: &str, suf: &str| {
-            dispatch(r, AgentByPattern { prefix: String::from(pre), suffix: String::from(suf) })
-                .map(|a| a.instance_name)
+            dispatch(
+                r,
+                AgentByPattern {
+                    prefix: String::from(pre),
+                    suffix: String::from(suf),
+                },
+            )
+            .map(|a| a.instance_name)
         };
-        assert_eq!(by(&mut r, "msg-", "-log"), Some(String::from("msg-general-log")));
-        assert_eq!(by(&mut r, "msg-", "-ctl"), Some(String::from("msg-general-ctl")));
+        assert_eq!(
+            by(&mut r, "msg-", "-log"),
+            Some(String::from("msg-general-log"))
+        );
+        assert_eq!(
+            by(&mut r, "msg-", "-ctl"),
+            Some(String::from("msg-general-ctl"))
+        );
         // Both ends must match: a missing suffix or a wrong prefix yields None.
         assert_eq!(by(&mut r, "msg-", "-xyz"), None);
         assert_eq!(by(&mut r, "zzz-", "-log"), None);
@@ -4905,7 +5088,10 @@ mod tests {
         }
         let hit = dispatch(
             &mut r,
-            AgentByPattern { prefix: String::from("msg-"), suffix: String::from("-log") },
+            AgentByPattern {
+                prefix: String::from("msg-"),
+                suffix: String::from("-log"),
+            },
         );
         assert_eq!(
             hit.map(|a| a.instance_name),
@@ -4928,7 +5114,11 @@ mod tests {
                 auth: root_auth("publish", &[b"", b"1", &[7u8; 32], &[0u8]]),
             },
         );
-        assert_eq!(status, Status::BadHash, "empty program name must be rejected");
+        assert_eq!(
+            status,
+            Status::BadHash,
+            "empty program name must be rejected"
+        );
         // An empty instance name is the `agents`/`agent_names` pager sentinel.
         let hash = alloc::vec![1u8; 32];
         let rep = fresh_rep_id();
@@ -4962,7 +5152,11 @@ mod tests {
                 ),
             },
         );
-        assert_eq!(status, Status::BadHash, "empty instance name must be rejected");
+        assert_eq!(
+            status,
+            Status::BadHash,
+            "empty instance name must be rejected"
+        );
         // Neither sentinel row landed, so the drains stay wedge-free.
         assert!(agents_drain(&mut r, 0).is_empty());
         assert!(programs_drain(&mut r, 0).is_empty());
@@ -4973,10 +5167,31 @@ mod tests {
         let mut r = registry();
         publish_prog(&mut r, "alpha", "1"); // hash = [5; 32]
         publish_prog(&mut r, "beta", "1"); //  hash = [4; 32]
-        let hit = dispatch(&mut r, ProgramByHash { hash: alloc::vec![5u8; 32] });
+        let hit = dispatch(
+            &mut r,
+            ProgramByHash {
+                hash: alloc::vec![5u8; 32],
+            },
+        );
         assert_eq!(hit.map(|p| p.name), Some(String::from("alpha")));
         // Unknown hash → None; a non-32-byte hash → None (never panics).
-        assert!(dispatch(&mut r, ProgramByHash { hash: alloc::vec![9u8; 32] }).is_none());
-        assert!(dispatch(&mut r, ProgramByHash { hash: alloc::vec![5u8; 4] }).is_none());
+        assert!(
+            dispatch(
+                &mut r,
+                ProgramByHash {
+                    hash: alloc::vec![9u8; 32]
+                }
+            )
+            .is_none()
+        );
+        assert!(
+            dispatch(
+                &mut r,
+                ProgramByHash {
+                    hash: alloc::vec![5u8; 4]
+                }
+            )
+            .is_none()
+        );
     }
 }

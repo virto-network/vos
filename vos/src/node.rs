@@ -12471,6 +12471,7 @@ mod tests {
 
         let redemption = crate::v2::RoleAuthorityInviteRedemptionV2 {
             space: crate::v2::SpaceId([1; 32]),
+            authority_replication_id: [10; 32],
             token_pub: [2; 32],
             role: crate::SpaceRole::Member,
             expires_at: 101,

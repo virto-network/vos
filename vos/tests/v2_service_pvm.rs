@@ -1263,8 +1263,10 @@ fn canonical_space_authority_produces_extractable_accumulated_assertion() {
     };
     let root = libp2p::identity::Keypair::generate_ed25519();
     let root_peer_id = libp2p::PeerId::from(root.public()).to_bytes();
-    let initial_state = space_authority::initial_state(service.space, root_peer_id)
-        .expect("the authority genesis pins an Ed25519 space root");
+    let authority_replication_id = [0xa6; 32];
+    let initial_state =
+        space_authority::initial_state(service.space, root_peer_id, authority_replication_id)
+            .expect("the authority genesis pins an Ed25519 space root and replication incarnation");
     let binding = RoleAuthorityBindingV2 {
         service: service.clone(),
         actor: authority_actor,
@@ -1343,19 +1345,18 @@ fn canonical_space_authority_produces_extractable_accumulated_assertion() {
     )
     .expect("the invite token is Ed25519");
     let expires_at = 1_000u64;
-    let invite = vos::registry::canonical_op_bytes(
-        "invite",
-        &[
-            &binding.service.space.0,
-            &[vos::SpaceRole::Member.as_u8()],
-            &expires_at.to_le_bytes(),
-            &token_pub,
-        ],
+    let invite = vos::registry::invite_signed_bytes(
+        &binding.service.space.0,
+        vos::SpaceRole::Member.as_u8(),
+        expires_at,
+        &token_pub,
+        Some(&authority_replication_id),
     );
     let redeem =
         vos::registry::canonical_op_bytes("redeem_invite", &[&token_pub, &invited_peer_id]);
     let redemption = RoleAuthorityInviteRedemptionV2 {
         space: binding.service.space,
+        authority_replication_id,
         token_pub,
         role: vos::SpaceRole::Member,
         expires_at,

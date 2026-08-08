@@ -62,10 +62,11 @@ fn load_pinned_v2_service(path: Option<&Path>) -> anyhow::Result<Option<PinnedV2
     }))
 }
 
-fn role_authority_package_version() -> String {
+fn role_authority_package_version(actor_program: vos::v2::ProgramId) -> String {
     format!(
-        "v2-service-{}",
-        hex::encode(vos::v2::VOS_SERVICE_PROGRAM_ID.0)
+        "v2-service-{}-actor-{}",
+        hex::encode(vos::v2::VOS_SERVICE_PROGRAM_ID.0),
+        hex::encode(actor_program.0),
     )
 }
 
@@ -88,16 +89,17 @@ fn root_signed_role_authority_package(
     let metadata = vos::metadata::decode(&schemas)
         .ok_or_else(|| anyhow::anyhow!("canonical space-authority metadata is invalid"))?;
     let role_policies = vos::v2::PackageRolePoliciesV2::from_metadata(&metadata)?.encode();
+    let actor_program = vos::v2::ProgramId::of_pvm(&actor_pvm);
     let public_key = root.public().encode_protobuf();
     let mut package = vos::v2::VosPackageV2 {
         manifest: vos::v2::PackageManifestV2 {
             name: vos::v2::ROLE_AUTHORITY_INSTANCE_V2.into(),
-            version: role_authority_package_version(),
+            version: role_authority_package_version(actor_program),
             service_abi: vos::v2::ABI_VERSION,
             snapshot_version: vos::v2::SNAPSHOT_VERSION,
             execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
             service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
-            actor_program: vos::v2::ProgramId::of_pvm(&actor_pvm),
+            actor_program,
             crdt: false,
             interfaces_hash: artifact_hash(b"interfaces", &[]),
             role_policies_hash: artifact_hash(b"role-policies", &role_policies),
@@ -119,6 +121,40 @@ fn root_signed_role_authority_package(
         .map_err(|error| anyhow::anyhow!("sign canonical space-authority package: {error}"))?;
     package.validate()?;
     Ok(package)
+}
+
+fn validate_role_authority_cutover(
+    root_peer: &[u8],
+    grants: &[vos::registry::AuthGrantRow],
+) -> anyhow::Result<()> {
+    let existing: Vec<_> = grants
+        .iter()
+        .filter(|grant| grant.peer_id.as_slice() != root_peer)
+        .collect();
+    if !existing.is_empty() {
+        anyhow::bail!(
+            "refusing canonical role-authority activation with {} existing non-root role grant(s); restart without --service-pvm, revoke those roles, then activate the authority and re-grant them so both authorization layers begin from the same state",
+            existing.len(),
+        );
+    }
+    Ok(())
+}
+
+fn registry_grant_cutover_blockers(
+    node: &VosNode,
+    registry: &RegistryRef,
+) -> anyhow::Result<Vec<vos::registry::AuthGrantRow>> {
+    let mut grants = Vec::new();
+    let mut after = Vec::new();
+    loop {
+        let page = vos::block_on(registry.auth_grant_cutover_blockers(&mut &*node, after, 0))
+            .map_err(|error| anyhow::anyhow!("query role grants before v2 cutover: {error}"))?;
+        grants.extend(page.grants);
+        if page.next.is_empty() {
+            return Ok(grants);
+        }
+        after = page.next;
+    }
 }
 
 /// On the immutable-root node, publish and install the canonical authority
@@ -144,6 +180,7 @@ fn ensure_v2_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::Resul
         );
         return Ok(());
     }
+    validate_role_authority_cutover(&root_peer, &registry_grant_cutover_blockers(node, &reg)?)?;
     let root = crate::identity::load_or_create()?;
     if libp2p::PeerId::from(root.public()).to_bytes() != root_peer {
         anyhow::bail!("loaded operator key no longer matches the registry's immutable space root");
@@ -896,6 +933,9 @@ fn authority_invite_redemption(
     redeem_signature: [u8; vos::registry::OP_SIG_LEN],
     holder_signature: Vec<u8>,
 ) -> anyhow::Result<vos::v2::RoleAuthorityInviteRedemptionV2> {
+    let authority_replication_id = payload
+        .authority_replication_id
+        .ok_or_else(|| anyhow::anyhow!("invite is not bound to a canonical v2 role authority"))?;
     let role = match vos::SpaceRole::from_u8(payload.role) {
         Some(role @ (vos::SpaceRole::Member | vos::SpaceRole::Developer)) => role,
         _ => anyhow::bail!("invite role {} is not canonical v2", payload.role),
@@ -905,6 +945,7 @@ fn authority_invite_redemption(
         .map_err(|_| anyhow::anyhow!("node invite signature is not Ed25519"))?;
     Ok(vos::v2::RoleAuthorityInviteRedemptionV2 {
         space: vos::v2::SpaceId(payload.space_id),
+        authority_replication_id,
         token_pub: payload.token_pub,
         role,
         expires_at: payload.expires_at,
@@ -918,7 +959,6 @@ fn authority_invite_redemption(
 
 fn authority_invite_invocation(
     redemption: &vos::v2::RoleAuthorityInviteRedemptionV2,
-    authority_replication_id: [u8; 32],
     peer_prefix: u16,
 ) -> (ServiceId, vos::v2::RootTreeInvocationV2) {
     use vos::Encode;
@@ -927,7 +967,7 @@ fn authority_invite_invocation(
     let root_service = v2_root_service_id(
         redemption.space,
         vos::v2::ROLE_AUTHORITY_INSTANCE_V2,
-        authority_replication_id,
+        redemption.authority_replication_id,
     );
     let target = v2_root_actor_id(root_service, vos::v2::ROLE_AUTHORITY_INSTANCE_V2);
     let redemption = redemption.encode();
@@ -978,8 +1018,17 @@ fn try_redeem(node: &VosNode, data_dir: &Path, token_str: &str) -> anyhow::Resul
     let node_sig = node_kp
         .sign(&redeem_canon)
         .map_err(|e| anyhow::anyhow!("node_sig sign: {e}"))?;
-    let authority_redemption =
-        authority_invite_redemption(&payload, node_peer_id.clone(), redeem_sig, node_sig.clone())?;
+    let authority_redemption = payload
+        .authority_replication_id
+        .map(|_| {
+            authority_invite_redemption(
+                &payload,
+                node_peer_id.clone(),
+                redeem_sig,
+                node_sig.clone(),
+            )
+        })
+        .transpose()?;
 
     let Some(net) = node.network() else {
         return Ok(false);
@@ -995,34 +1044,30 @@ fn try_redeem(node: &VosNode, data_dir: &Path, token_str: &str) -> anyhow::Resul
             node,
             timeout: REDEEM_REGISTRY_TIMEOUT,
         };
-        let status = vos::block_on(reg.redeem_invite(
-            &mut inv,
-            payload.token_pub.to_vec(),
-            payload.role,
-            payload.expires_at,
-            payload.admin_peer_id.clone(),
-            payload.admin_sig.to_vec(),
-            node_peer_id.clone(),
-            redeem_sig.to_vec(),
-            node_sig.clone(),
-        ));
+        let status = vos::block_on(
+            reg.redeem_invite(
+                &mut inv,
+                payload.token_pub.to_vec(),
+                payload.role,
+                payload.expires_at,
+                payload
+                    .authority_replication_id
+                    .map(|id| id.to_vec())
+                    .unwrap_or_default(),
+                payload.admin_peer_id.clone(),
+                payload.admin_sig.to_vec(),
+                node_peer_id.clone(),
+                redeem_sig.to_vec(),
+                node_sig.clone(),
+            ),
+        );
         match status {
             Ok(Status::Ok) => {
-                let authority_row =
-                    vos::block_on(reg.agent(&mut inv, vos::v2::ROLE_AUTHORITY_INSTANCE_V2.into()));
-                let authority_row = match authority_row {
-                    Ok(Some(row)) => row,
-                    Ok(None) => return Ok(true),
-                    Err(error) => {
-                        tracing::debug!("v2 authority catalog query via {peer} failed: {error}");
-                        continue;
-                    }
+                let Some(authority_redemption) = authority_redemption.as_ref() else {
+                    return Ok(true);
                 };
-                let (authority_route, invocation) = authority_invite_invocation(
-                    &authority_redemption,
-                    authority_row.replication_id,
-                    peer_prefix,
-                );
+                let (authority_route, invocation) =
+                    authority_invite_invocation(authority_redemption, peer_prefix);
                 match node.invoke_with_timeout(
                     authority_route,
                     invocation.encode(),
@@ -1825,7 +1870,8 @@ fn validate_role_authority_deployment(
         anyhow::anyhow!("vosx was built without the canonical space-authority PVM")
     })?;
     if package.manifest.name != vos::v2::ROLE_AUTHORITY_INSTANCE_V2
-        || package.manifest.version != role_authority_package_version()
+        || package.manifest.version
+            != role_authority_package_version(vos::v2::ProgramId::of_pvm(canonical_pvm))
         || package.actor_pvm != canonical_pvm
     {
         anyhow::bail!("installed space-authority is not the canonical platform deployment");
@@ -2088,9 +2134,12 @@ fn v2_config_from_row(
         None
     };
     let initial_state = if is_role_authority {
-        space_authority::initial_state(space, root_peer_id.to_vec()).ok_or_else(|| {
-            anyhow::anyhow!("registry root is not a valid Ed25519 space-authority identity")
-        })?
+        space_authority::initial_state(space, root_peer_id.to_vec(), row.replication_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "registry root or replication ID is not a valid space-authority identity"
+                )
+            })?
     } else {
         Vec::new()
     };
@@ -3342,6 +3391,29 @@ mod tests {
     }
 
     #[test]
+    fn authority_cutover_refuses_preexisting_non_root_roles() {
+        let root = vec![1; 38];
+        let root_grant = vos::registry::AuthGrantRow {
+            peer_id: root.clone(),
+            role: vos::registry::AUTH_ROLE_ADMIN,
+            epoch: 1,
+            grantor: root.clone(),
+        };
+        assert!(validate_role_authority_cutover(&root, core::slice::from_ref(&root_grant)).is_ok());
+        let member = vos::registry::AuthGrantRow {
+            peer_id: vec![2; 38],
+            role: vos::registry::AUTH_ROLE_READONLY,
+            epoch: 2,
+            grantor: root.clone(),
+        };
+        let error = validate_role_authority_cutover(&root, &[root_grant, member])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("existing non-root role grant"), "{error}");
+        assert!(error.contains("restart without --service-pvm"), "{error}");
+    }
+
+    #[test]
     fn invite_redemption_maps_exact_evidence_to_stable_authority_ingress() {
         use vos::Decode;
 
@@ -3351,6 +3423,7 @@ mod tests {
             bootnodes: vec!["/memory/1".into()],
             role: vos::registry::AUTH_ROLE_DEVELOPER,
             expires_at: 123_456,
+            authority_replication_id: Some([15; 32]),
             admin_peer_id: vec![8; 38],
             token_pub: [9; 32],
             admin_sig: [10; vos::registry::OP_SIG_LEN],
@@ -3364,6 +3437,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(redemption.space, vos::v2::SpaceId(payload.space_id));
+        assert_eq!(redemption.authority_replication_id, [15; 32]);
         assert_eq!(redemption.role, vos::SpaceRole::Developer);
         assert_eq!(redemption.admin_peer_id, payload.admin_peer_id);
         assert_eq!(redemption.admin_signature, payload.admin_sig);
@@ -3372,8 +3446,8 @@ mod tests {
         assert_eq!(redemption.holder_signature, [14; 64]);
 
         let replication_id = [15; 32];
-        let (route, invocation) = authority_invite_invocation(&redemption, replication_id, 0x1234);
-        let repeated = authority_invite_invocation(&redemption, replication_id, 0x1234);
+        let (route, invocation) = authority_invite_invocation(&redemption, 0x1234);
+        let repeated = authority_invite_invocation(&redemption, 0x1234);
         let root_service = v2_root_service_id(
             vos::v2::SpaceId(payload.space_id),
             vos::v2::ROLE_AUTHORITY_INSTANCE_V2,
@@ -3408,6 +3482,7 @@ mod tests {
             bootnodes: vec![],
             role: vos::registry::AUTH_ROLE_ADMIN,
             expires_at: 123_456,
+            authority_replication_id: Some([29; 32]),
             admin_peer_id: vec![22; 38],
             token_pub: [23; 32],
             admin_sig: [24; vos::registry::OP_SIG_LEN],
@@ -3419,6 +3494,11 @@ mod tests {
         payload.role = vos::registry::AUTH_ROLE_READONLY;
         assert!(
             authority_invite_redemption(&payload, vec![26; 38], [27; 64], vec![28; 63]).is_err()
+        );
+        payload.authority_replication_id = None;
+        assert!(
+            authority_invite_redemption(&payload, vec![26; 38], [27; 64], vec![28; 64]).is_err(),
+            "a markerless legacy token never enters the v2 authority path"
         );
     }
 

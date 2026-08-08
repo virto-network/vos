@@ -187,6 +187,9 @@ impl RoleAuthorityMutationV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleAuthorityInviteRedemptionV2 {
     pub space: SpaceId,
+    /// Signed durable marker naming the exact canonical authority
+    /// incarnation this bearer must commit through.
+    pub authority_replication_id: [u8; 32],
     pub token_pub: [u8; 32],
     pub role: crate::SpaceRole,
     pub expires_at: u64,
@@ -2855,6 +2858,7 @@ impl V2Wire for RoleAuthorityInviteRedemptionV2 {
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
         encoder.fixed(&self.space.0);
+        encoder.fixed(&self.authority_replication_id);
         encoder.fixed(&self.token_pub);
         encoder.u8(self.role.as_u8());
         encoder.u64(self.expires_at);
@@ -2868,6 +2872,7 @@ impl V2Wire for RoleAuthorityInviteRedemptionV2 {
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let value = Self {
             space: SpaceId(decoder.fixed()?),
+            authority_replication_id: decoder.fixed()?,
             token_pub: decoder.fixed()?,
             role: crate::SpaceRole::from_u8(decoder.u8()?).ok_or(DecodeError::NonCanonical)?,
             expires_at: decoder.u64()?,
@@ -2886,10 +2891,12 @@ impl V2Wire for RoleAuthorityInviteRedemptionV2 {
                 .try_into()
                 .map_err(|_| DecodeError::NonCanonical)?,
         };
-        if !matches!(
-            value.role,
-            crate::SpaceRole::Member | crate::SpaceRole::Developer
-        ) || value.expires_at == 0
+        if value.authority_replication_id == [0; 32]
+            || !matches!(
+                value.role,
+                crate::SpaceRole::Member | crate::SpaceRole::Developer
+            )
+            || value.expires_at == 0
             || value.admin_peer_id.is_empty()
             || value.admin_peer_id.len() > 256
             || value.holder_peer_id.is_empty()
@@ -5190,6 +5197,7 @@ mod tests {
     fn authority_invite_wire_binds_the_complete_delegation_chain() {
         let redemption = RoleAuthorityInviteRedemptionV2 {
             space: SpaceId([41; 32]),
+            authority_replication_id: [40; 32],
             token_pub: [42; 32],
             role: crate::SpaceRole::Developer,
             expires_at: 43,

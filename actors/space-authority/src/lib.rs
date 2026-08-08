@@ -8,6 +8,7 @@
 //! into the credential accepted by another root service.
 
 use vos::prelude::*;
+use vos::registry::{invite_signed_bytes, role_grant_supersedes};
 use vos::v2::{
     Origin, RoleAuthorityInviteRedemptionV2, RoleAuthorityInviteRevocationV2,
     RoleAuthorityMutationV2, RoleAuthorizationClaimV2, SpaceId, SubjectId, V2Wire,
@@ -25,17 +26,27 @@ struct GrantRow {
     revoke_epoch: u64,
     grantor_kind: u8,
     grantor: [u8; 32],
+    /// Exact PeerId bytes used by the registry's canonical equal-epoch
+    /// ordering. `grantor` remains the compact authorization identity.
+    grantor_peer_id: Vec<u8>,
 }
 
 /// A package host can use this to construct the immutable initial actor state
 /// committed by service genesis. Empty or malformed root identities produce
 /// no state rather than an authority which could be claimed after install.
-pub fn initial_state(space: SpaceId, root_peer_id: Vec<u8>) -> Option<Vec<u8>> {
+pub fn initial_state(
+    space: SpaceId,
+    root_peer_id: Vec<u8>,
+    authority_replication_id: [u8; 32],
+) -> Option<Vec<u8>> {
     vos::registry::ed25519_pubkey_from_peer_id(&root_peer_id)?;
+    (authority_replication_id != [0; 32]).then_some(())?;
     let root = vos::v2::SubjectId::of_authenticated_peer(&root_peer_id);
+    let root_grantor_peer_id = root_peer_id.clone();
     Some(
         SpaceAuthority {
             space: space.0,
+            authority_replication_id,
             root_peer_id,
             revoked_invites: Vec::new(),
             grants: vec![GrantRow {
@@ -46,6 +57,7 @@ pub fn initial_state(space: SpaceId, root_peer_id: Vec<u8>) -> Option<Vec<u8>> {
                 revoke_epoch: 0,
                 grantor_kind: 0,
                 grantor: root.0,
+                grantor_peer_id: root_grantor_peer_id,
             }],
         }
         .encode(),
@@ -55,6 +67,7 @@ pub fn initial_state(space: SpaceId, root_peer_id: Vec<u8>) -> Option<Vec<u8>> {
 #[actor]
 pub struct SpaceAuthority {
     space: [u8; 32],
+    authority_replication_id: [u8; 32],
     root_peer_id: Vec<u8>,
     revoked_invites: Vec<[u8; 32]>,
     grants: Vec<GrantRow>,
@@ -67,6 +80,7 @@ impl SpaceAuthority {
     fn new() -> Self {
         Self {
             space: [0; 32],
+            authority_replication_id: [0; 32],
             root_peer_id: Vec::new(),
             revoked_invites: Vec::new(),
             grants: Vec::new(),
@@ -91,7 +105,13 @@ impl SpaceAuthority {
                 role,
                 epoch,
                 ..
-            } => self.apply_grant(holder, role, epoch, self.root_origin()),
+            } => self.apply_grant(
+                holder,
+                role,
+                epoch,
+                self.root_origin(),
+                self.root_peer_id.clone(),
+            ),
             RoleAuthorityMutationV2::Revoke { holder, epoch, .. } => {
                 self.apply_revoke(holder, epoch)
             }
@@ -106,7 +126,9 @@ impl SpaceAuthority {
         let Ok(redemption) = RoleAuthorityInviteRedemptionV2::decode(&redemption) else {
             return false;
         };
-        if redemption.space.0 != self.space {
+        if redemption.space.0 != self.space
+            || redemption.authority_replication_id != self.authority_replication_id
+        {
             return false;
         }
         if self
@@ -120,14 +142,12 @@ impl SpaceAuthority {
         if self.effective_role(grantor) != Some(SpaceRole::Admin) {
             return false;
         }
-        let invite = vos::registry::canonical_op_bytes(
-            "invite",
-            &[
-                &redemption.space.0,
-                &[redemption.role.as_u8()],
-                &redemption.expires_at.to_le_bytes(),
-                &redemption.token_pub,
-            ],
+        let invite = invite_signed_bytes(
+            &redemption.space.0,
+            redemption.role.as_u8(),
+            redemption.expires_at,
+            &redemption.token_pub,
+            Some(&redemption.authority_replication_id),
         );
         if !Self::verify_peer_signature(
             &redemption.admin_peer_id,
@@ -154,6 +174,7 @@ impl SpaceAuthority {
             redemption.role,
             redemption.expires_at,
             grantor,
+            redemption.admin_peer_id,
         )
     }
 
@@ -244,6 +265,7 @@ impl SpaceAuthority {
         role: SpaceRole,
         epoch: u64,
         grantor: Origin,
+        grantor_peer_id: Vec<u8>,
     ) -> bool {
         let Some((holder_kind, holder)) = holder_key(holder) else {
             return false;
@@ -251,22 +273,40 @@ impl SpaceAuthority {
         let Some((grantor_kind, grantor)) = holder_key(grantor) else {
             return false;
         };
+        let root = holder_key(self.root_origin());
+        let grantor_identity = Origin::Member(SubjectId::of_authenticated_peer(&grantor_peer_id));
+        let grantor_matches = if Some((grantor_kind, grantor)) == root {
+            grantor_peer_id == self.root_peer_id
+        } else {
+            holder_key(grantor_identity) == Some((grantor_kind, grantor))
+        };
+        if !grantor_matches {
+            return false;
+        }
         let index = self
             .grants
             .iter()
             .position(|row| row.holder_kind == holder_kind && row.holder == holder);
         if let Some(index) = index {
             let row = &self.grants[index];
-            let current_epoch = row.grant_epoch.max(row.revoke_epoch);
-            if epoch < current_epoch {
-                return false;
+            if row.grant_epoch == epoch
+                && row.role == role.as_u8()
+                && row.grantor_kind == grantor_kind
+                && row.grantor == grantor
+                && row.grantor_peer_id == grantor_peer_id
+            {
+                return true;
             }
-            if epoch == current_epoch {
-                return row.grant_epoch == epoch
-                    && row.revoke_epoch < epoch
-                    && row.role == role.as_u8()
-                    && row.grantor_kind == grantor_kind
-                    && row.grantor == grantor;
+            if !role_grant_supersedes(
+                epoch,
+                &grantor_peer_id,
+                row.grant_epoch,
+                &row.grantor_peer_id,
+                &self.root_peer_id,
+            ) {
+                // Valid but dominated evidence is an idempotent success in
+                // both stores; callers must not retry it forever.
+                return true;
             }
         }
         let index = match index {
@@ -280,6 +320,7 @@ impl SpaceAuthority {
                     revoke_epoch: 0,
                     grantor_kind,
                     grantor,
+                    grantor_peer_id: grantor_peer_id.clone(),
                 });
                 self.grants.len() - 1
             }
@@ -288,6 +329,7 @@ impl SpaceAuthority {
         self.grants[index].grant_epoch = epoch;
         self.grants[index].grantor_kind = grantor_kind;
         self.grants[index].grantor = grantor;
+        self.grants[index].grantor_peer_id = grantor_peer_id;
         true
     }
 
@@ -299,16 +341,6 @@ impl SpaceAuthority {
             .grants
             .iter()
             .position(|row| row.holder_kind == holder_kind && row.holder == holder);
-        let current_epoch = index
-            .map(|index| {
-                self.grants[index]
-                    .grant_epoch
-                    .max(self.grants[index].revoke_epoch)
-            })
-            .unwrap_or(0);
-        if epoch <= current_epoch {
-            return false;
-        }
         let Some(root) = holder_key(self.root_origin()) else {
             return false;
         };
@@ -323,11 +355,12 @@ impl SpaceAuthority {
                     revoke_epoch: 0,
                     grantor_kind: root.0,
                     grantor: root.1,
+                    grantor_peer_id: self.root_peer_id.clone(),
                 });
                 self.grants.len() - 1
             }
         };
-        self.grants[index].revoke_epoch = epoch;
+        self.grants[index].revoke_epoch = self.grants[index].revoke_epoch.max(epoch);
         true
     }
 
@@ -403,7 +436,7 @@ mod tests {
     }
 
     fn actor(space: SpaceId, signing: &SigningKey) -> SpaceAuthority {
-        let bytes = initial_state(space, root_peer(signing)).unwrap();
+        let bytes = initial_state(space, root_peer(signing), [90; 32]).unwrap();
         SpaceAuthority::decode(&bytes)
     }
 
@@ -451,22 +484,22 @@ mod tests {
         role: SpaceRole,
         expires_at: u64,
     ) -> RoleAuthorityInviteRedemptionV2 {
+        let authority_replication_id = [90; 32];
         let token_pub = *token.verifying_key().as_bytes();
         let admin_peer_id = root_peer(admin);
         let holder_peer_id = root_peer(holder);
-        let invite = vos::registry::canonical_op_bytes(
-            "invite",
-            &[
-                &space.0,
-                &[role.as_u8()],
-                &expires_at.to_le_bytes(),
-                &token_pub,
-            ],
+        let invite = invite_signed_bytes(
+            &space.0,
+            role.as_u8(),
+            expires_at,
+            &token_pub,
+            Some(&authority_replication_id),
         );
         let redeem =
             vos::registry::canonical_op_bytes("redeem_invite", &[&token_pub, &holder_peer_id]);
         RoleAuthorityInviteRedemptionV2 {
             space,
+            authority_replication_id,
             token_pub,
             role,
             expires_at,
@@ -545,8 +578,64 @@ mod tests {
                 epoch: 5,
             },
         ));
-        assert!(!apply(&mut actor, &signing, grant));
+        assert!(
+            apply(&mut actor, &signing, grant),
+            "valid but revoke-dominated evidence is idempotent"
+        );
         assert!(authorize(&mut actor, &claim(space, holder, SpaceRole::Member)).is_empty());
+    }
+
+    #[test]
+    fn root_grant_dominates_a_later_delegated_invite_in_registry_order() {
+        let root = SigningKey::from_bytes(&[60; 32]);
+        let admin = SigningKey::from_bytes(&[61; 32]);
+        let token = SigningKey::from_bytes(&[62; 32]);
+        let holder_key = SigningKey::from_bytes(&[63; 32]);
+        let space = SpaceId([64; 32]);
+        let admin_holder = Origin::Member(SubjectId::of_authenticated_peer(&root_peer(&admin)));
+        let holder = Origin::Member(SubjectId::of_authenticated_peer(&root_peer(&holder_key)));
+        let mut authority = actor(space, &root);
+
+        assert!(apply(
+            &mut authority,
+            &root,
+            RoleAuthorityMutationV2::Grant {
+                space,
+                holder: admin_holder,
+                role: SpaceRole::Admin,
+                epoch: 2,
+            },
+        ));
+        let root_grant = RoleAuthorityMutationV2::Grant {
+            space,
+            holder,
+            role: SpaceRole::Developer,
+            epoch: 3,
+        };
+        assert!(apply(&mut authority, &root, root_grant.clone()));
+
+        let delegated = invite_redemption(
+            space,
+            &admin,
+            &token,
+            &holder_key,
+            SpaceRole::Member,
+            2_000_000_000,
+        );
+        assert!(
+            redeem(&mut authority, &delegated),
+            "valid dominated evidence is acknowledged instead of retried forever"
+        );
+        let developer = claim(space, holder, SpaceRole::Developer);
+        assert_eq!(
+            authorize(&mut authority, &developer),
+            developer.encode(),
+            "the delegated Unix expiry cannot displace a root grant"
+        );
+        assert!(
+            apply(&mut authority, &root, root_grant),
+            "registry-epoch repair remains idempotent after dominated evidence"
+        );
     }
 
     #[test]
@@ -588,6 +677,12 @@ mod tests {
 
         let redemption =
             invite_redemption(space, &admin, &token, &holder_key, SpaceRole::Developer, 50);
+        let mut wrong_incarnation = redemption.clone();
+        wrong_incarnation.authority_replication_id[0] ^= 1;
+        assert!(
+            !redeem(&mut authority, &wrong_incarnation),
+            "a direct actor call cannot replay a bearer from another authority incarnation"
+        );
         assert!(redeem(&mut authority, &redemption));
         assert!(
             redeem(&mut authority, &redemption),

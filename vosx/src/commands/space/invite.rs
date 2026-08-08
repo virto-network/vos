@@ -229,6 +229,10 @@ fn mint(args: Args) -> anyhow::Result<()> {
             );
         }
 
+        let authority_replication_id = client
+            .agent(vos::v2::ROLE_AUTHORITY_INSTANCE_V2)?
+            .map(|row| row.replication_id);
+
         let tok = token::mint(
             &operator,
             space_id,
@@ -236,6 +240,7 @@ fn mint(args: Args) -> anyhow::Result<()> {
             bootnodes.clone(),
             role,
             expires_at,
+            authority_replication_id,
         )?;
 
         if output::is_json() {

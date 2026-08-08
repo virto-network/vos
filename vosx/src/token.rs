@@ -22,7 +22,8 @@
 //!
 //! [`mint`] generates a fresh token keypair `T`, has the operator key
 //! sign the invite canonical (`invite`, `[space_id, [role], expires_le,
-//! token_pub]`) — byte-for-byte what `space-registry::redeem_invite`
+//! token_pub, authority_replication_id?]`) — byte-for-byte what
+//! `space-registry::redeem_invite`
 //! rebuilds — and packs the token secret so the joiner can later prove
 //! possession. [`redeem_sig`] signs the joiner's own node peer-id (bound
 //! into the `redeem_invite` canonical) with that token secret. The
@@ -47,10 +48,10 @@ pub const TOKEN_HRP: &str = "vos1";
 
 /// Current token format version — the first raw byte inside the bs58
 /// blob. Bump on any breaking `InvitePayload` layout change.
-pub const TOKEN_VERSION: u8 = 1;
+pub const TOKEN_VERSION: u8 = 2;
 
 /// Domain tag for the token's integrity checksum.
-const CHECKSUM_DOMAIN: &[u8] = b"vos-invite/v1";
+const CHECKSUM_DOMAIN: &[u8] = b"vos-invite/v2";
 
 /// Trailing checksum length (bytes of a domain-separated blake2b).
 const CHECKSUM_LEN: usize = 4;
@@ -75,6 +76,10 @@ pub struct InvitePayload {
     /// Expiry (unix seconds). Bound into the signed invite canonical,
     /// checked host-side at admission — never at CRDT replay.
     pub expires_at: u64,
+    /// Durable protocol marker. `Some` pins redemption to the canonical v2
+    /// authority incarnation; `None` is accepted only while the registry has
+    /// no authority row. It is covered by `admin_sig`.
+    pub authority_replication_id: Option<[u8; 32]>,
     /// The minting admin's libp2p peer-id bytes — the key `admin_sig`
     /// verifies under. Named so the registry verifies in O(1) instead of
     /// scanning the grant table; a false claim fails verification.
@@ -107,6 +112,7 @@ pub fn mint(
     bootnodes: Vec<String>,
     role: u8,
     expires_at: u64,
+    authority_replication_id: Option<[u8; 32]>,
 ) -> anyhow::Result<String> {
     validate_role(role)?;
     // Fresh single-use token keypair from OS entropy.
@@ -119,9 +125,12 @@ pub fn mint(
 
     // The operator (an admin) signs the invite canonical — byte-for-byte
     // what `redeem_invite` rebuilds to verify, binding the space_id.
-    let invite_canon = canonical_op_bytes(
-        "invite",
-        &[&space_id, &[role], &expires_at.to_le_bytes(), &token_pub],
+    let invite_canon = vos::registry::invite_signed_bytes(
+        &space_id,
+        role,
+        expires_at,
+        &token_pub,
+        authority_replication_id.as_ref(),
     );
     let admin_sig = sig64(
         &operator
@@ -136,6 +145,7 @@ pub fn mint(
         bootnodes,
         role,
         expires_at,
+        authority_replication_id,
         admin_peer_id,
         token_pub,
         admin_sig,
@@ -279,6 +289,7 @@ mod tests {
             vec!["/ip4/1.2.3.4/tcp/9000".into()],
             AUTH_ROLE_READONLY,
             2_000_000_000,
+            None,
         )
         .unwrap();
         assert!(token.starts_with("vos1"));
@@ -304,6 +315,7 @@ mod tests {
             vec![],
             AUTH_ROLE_READONLY,
             1,
+            None,
         )
         .unwrap();
         // Flip a character in the middle of the base58 body.
@@ -324,6 +336,7 @@ mod tests {
             vec![],
             AUTH_ROLE_ADMIN,
             1,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -339,6 +352,7 @@ mod tests {
             vec![],
             AUTH_ROLE_READONLY,
             1,
+            None,
         )
         .unwrap();
         let mut payload = parse(&token).unwrap();
@@ -361,6 +375,7 @@ mod tests {
             vec![],
             AUTH_ROLE_READONLY,
             1,
+            None,
         )
         .unwrap();
         // Decode, bump the version byte, re-checksum, re-encode.
@@ -396,14 +411,28 @@ mod tests {
         let space_id = sample_space_id();
         let role = AUTH_ROLE_READONLY;
         let expires_at = 2_000_000_000u64;
-        let token = mint(&op, space_id, "demo".into(), vec![], role, expires_at).unwrap();
+        let authority = [0xa7; 32];
+        let token = mint(
+            &op,
+            space_id,
+            "demo".into(),
+            vec![],
+            role,
+            expires_at,
+            Some(authority),
+        )
+        .unwrap();
         let p = parse(&token).unwrap();
+        assert_eq!(p.authority_replication_id, Some(authority));
 
         // admin_sig over the invite canonical (bound to space_id) verifies
         // under admin_peer_id.
-        let invite_canon = canonical_op_bytes(
-            "invite",
-            &[&space_id, &[role], &expires_at.to_le_bytes(), &p.token_pub],
+        let invite_canon = vos::registry::invite_signed_bytes(
+            &space_id,
+            role,
+            expires_at,
+            &p.token_pub,
+            p.authority_replication_id.as_ref(),
         );
         assert!(
             verify_op_sig(&p.admin_peer_id, &invite_canon, &p.admin_sig),
@@ -412,16 +441,20 @@ mod tests {
         // Binding space_id defeats cross-space replay: a sibling space's
         // id makes the rebuilt canonical (and signature) mismatch.
         let other_space: [u8; 32] = [0x11; 32];
-        let wrong_canon = canonical_op_bytes(
-            "invite",
-            &[
-                &other_space,
-                &[role],
-                &expires_at.to_le_bytes(),
-                &p.token_pub,
-            ],
+        let wrong_canon = vos::registry::invite_signed_bytes(
+            &other_space,
+            role,
+            expires_at,
+            &p.token_pub,
+            p.authority_replication_id.as_ref(),
         );
         assert!(!verify_op_sig(&p.admin_peer_id, &wrong_canon, &p.admin_sig));
+        let downgraded =
+            vos::registry::invite_signed_bytes(&space_id, role, expires_at, &p.token_pub, None);
+        assert!(
+            !verify_op_sig(&p.admin_peer_id, &downgraded, &p.admin_sig),
+            "the signed authority marker cannot be stripped"
+        );
 
         // The joining node signs the redeem canonical with BOTH the token
         // secret (redeem_sig, under token_pub) and its own node key
