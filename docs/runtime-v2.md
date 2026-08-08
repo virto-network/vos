@@ -425,7 +425,10 @@ slice consumes that outcome independently of whether it completes, yields, or
 immediately checkpoints at a later await.
 The inline reply envelope is bounded by `CHECKPOINT_TOKEN_CAPACITY`; larger
 application results must use a content-addressed blob reference once the
-transport API exposes that result form. A resumed CRDT slice may complete,
+transport API exposes that result form. The optional rebound work envelope in
+that token is heap-backed, so exact resume does not combine its complete wire
+shape with the fixed 4 KiB protocol buffer on the compact actor stack. A
+resumed CRDT slice may complete,
 checkpoint at another await, or explicitly yield. In every case it records
 consumption of the admitted reply independently of the outgoing checkpoint
 shape, and binds any replacement continuation to the selected causal branch.
@@ -451,8 +454,10 @@ must use the workspace-pinned verifier and execution-semantics identity rather
 than the local proof allowlist. Its proof backend must consume or reproduce
 the canonical Refine trace committed by the proof request before attested
 execution becomes a production path.
-Replicated service identity must also bind the gas schedule before `OutOfGas`
-is treated as a deterministic cross-replica result.
+Replicated service identity binds the exact Refine and Accumulate gas schedule.
+`OutOfGas` is therefore a deterministic cross-replica result only for replicas
+with that declared schedule; a mismatched host stops before advancing its
+applied cursor rather than recording a local no-op.
 Production Raft/CRDT routing must retain the Local path's rule of recovering
 and retrying guest publication, delivery and reply-admission rows rather than
 maintaining a second native message ledger. A
@@ -730,16 +735,17 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 26, continuation snapshot version 6, and platform ABI version 5
+Store schema 27, continuation snapshot version 6, and platform ABI version 6
 are therefore a clean
 break from earlier experimental v2 images. They add exact actor-package
 identity to descriptors, work, checkpoints, transitions, upgrades, and
 cross-root proof bindings, bind durable messages and retained causal context to
 their exact source/destination services, retain the complete dormant
 actor-program layout in each continuation, retain the immutable role-authority
-binding, and support guest-owned atomic same-package child creation. Actor and
-service guests must be rebuilt together; an ABI-3 artifact is rejected rather
-than interpreted as this wire.
+binding, bind the executing Refine and Accumulate gas limits into service
+identity, and support guest-owned atomic same-package child creation. Actor and
+service guests must be rebuilt together; an earlier-ABI artifact is rejected
+rather than interpreted as this wire.
 ## CRDT boundary
 
 Only `#[actor(crdt)]` packages may select CRDT consistency. Their replicated
