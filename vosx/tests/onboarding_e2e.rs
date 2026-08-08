@@ -129,6 +129,37 @@ fn spawn_up_with_service(
         .expect("spawn vosx space up")
 }
 
+fn counter_package_fixture(output_dir: &Path) -> PathBuf {
+    let actor_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../examples/actors/target/riscv64em-javm/release/v2_counter.elf");
+    assert!(
+        actor_elf.is_file(),
+        "build the public counter first: `just build-examples` ({})",
+        actor_elf.display(),
+    );
+    let build_data = output_dir.join("build-data");
+    let build_config = output_dir.join("build-config");
+    let actor = actor_elf.to_string_lossy().into_owned();
+    let out = output_dir.to_string_lossy().into_owned();
+    vosx_ok(
+        &build_data,
+        &build_config,
+        &[
+            "build",
+            &actor,
+            "--name",
+            "onboarding-counter",
+            "--version",
+            "0.1.0",
+            "--out-dir",
+            &out,
+        ],
+    );
+    let package = output_dir.join("onboarding-counter.vos");
+    assert!(package.is_file(), "vosx build must emit the signed package");
+    package
+}
+
 fn wait_for_endpoint(data_home: &Path, log_path: &Path, who: &str) -> PathBuf {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -163,15 +194,46 @@ fn poll_until(secs: u64, mut f: impl FnMut() -> bool, on_fail: impl FnOnce() -> 
 #[test]
 fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
     let space = "onb";
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let service_pvm = workspace.join("services/vos-service/vos-service.pvm");
+    assert!(
+        service_pvm.is_file(),
+        "build the canonical service first: `just build-vos-service`",
+    );
+    let artifacts = TempDir::new("onb-artifacts");
+    let counter_package = counter_package_fixture(artifacts.path());
     let data_b = TempDir::new("b-data");
     let cfg_b = TempDir::new("b-config");
 
-    // ── host A: create + boot + install a MEMBER-floor app agent ───
-    // (the CRDT counter fixture) so B has something to spawn once it is a
-    // member. Its sync floor defaults to `member`, so a node judged
-    // non-member would narrow it out — exercising node_is_member's
-    // node-key grant path.
-    let (data_a, cfg_a, _daemon_a, log_a) = boot_admin(space);
+    // ── host A: create + boot + install a MEMBER-floor v2 actor ────
+    let (data_a, cfg_a, _daemon_a, log_a) = boot_admin_with_service(space, Some(&service_pvm));
+    vosx_ok(
+        data_a.path(),
+        cfg_a.path(),
+        &[
+            "space",
+            "publish",
+            space,
+            "onboarding-counter:0.1.0",
+            counter_package.to_str().expect("package path is UTF-8"),
+        ],
+    );
+    vosx_ok(
+        data_a.path(),
+        cfg_a.path(),
+        &[
+            "space",
+            "install",
+            space,
+            "onboarding-counter:0.1.0",
+            "--name",
+            "counter",
+            "--consistency",
+            "local",
+            "--sync",
+            "member",
+        ],
+    );
 
     // ── host A: mint a member invite (default bootnodes = A's addrs) ─
     let stdout = vosx_ok(
@@ -192,8 +254,18 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
 
     // ── host B: literally `space up <token>` — join + redeem + sync ─
     let log_b = data_b.path().join("daemon-b.stderr");
-    let daemon_b = Daemon(spawn_up(data_b.path(), cfg_b.path(), &token, &log_b));
-    wait_for_endpoint(data_b.path(), &log_b, "B");
+    let daemon_b = Daemon(spawn_up_with_service(
+        data_b.path(),
+        cfg_b.path(),
+        &token,
+        &log_b,
+        Some(&service_pvm),
+    ));
+    let endpoint_b = wait_for_endpoint(data_b.path(), &log_b, "B");
+    let pending_invite = endpoint_b
+        .parent()
+        .expect("B endpoint has a space directory")
+        .join(".pending-invite.token");
 
     // (1) Redemption reaches A: an `# invites` section appears in A's
     //     members only once the `redeem_invite` handler records the row.
@@ -237,44 +309,35 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
         },
     );
 
-    // (3) B SPAWNS the Member-floor agent: node_is_member must recognize
-    //     B's redeemed node-key grant, else node_meets_floor narrows
-    //     crdt-counter out and B logs "not spawned … sync floor is above".
-    //     A spawned agent opens its own per-node redb, so a redb in B's
-    //     agents dir other than the registry's (00000000.redb) is the
-    //     spawn signal — sync alone (the row) would not create it.
-    let agents_dir = find_endpoint(data_b.path())
-        .and_then(|ep| ep.parent().map(|p| p.join("agents")))
-        .expect("B has a space data dir");
     poll_until(
         40,
-        || spawned_app_agent(&agents_dir),
+        || !pending_invite.exists(),
         || {
             format!(
-                "B synced crdt-counter's row but never SPAWNED it — node_is_member likely still \
-                 ignores the redeemed node-key grant, so node_meets_floor narrowed the Member \
-                 agent out. B log:\n{}",
+                "B's registry grant landed, but canonical authority redemption did not. B log:\n{}",
                 fs::read_to_string(&log_b).unwrap_or_default(),
             )
         },
     );
 
-    // (4) The spawned agent is live + reachable on B — a real call
-    //     (`get`, a no-arg read) returns rather than erroring.
+    // (3) B starts the signed Member-floor v2 root and serves a real call.
+    // Registry sync alone cannot make this pass: B must fetch the exact
+    // package, validate its service pin, open the guest-owned image, and
+    // register the root route.
     poll_until(
-        30,
+        40,
         || {
             vosx(
                 data_b.path(),
                 cfg_b.path(),
-                &["space", "call", space, "crdt-counter", "get"],
+                &["space", "call", space, "counter", "value"],
             )
             .status
             .success()
         },
         || {
             format!(
-                "a call to the spawned crdt-counter on B never succeeded. B log:\n{}",
+                "a call to the signed v2 counter on B never succeeded. B log:\n{}",
                 fs::read_to_string(&log_b).unwrap_or_default(),
             )
         },
@@ -288,7 +351,13 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
     drop(daemon_b); // SIGKILL B's first daemon
     let restart_at = std::time::SystemTime::now();
     let log_b2 = data_b.path().join("daemon-b2.stderr");
-    let _daemon_b2 = Daemon(spawn_up(data_b.path(), cfg_b.path(), space, &log_b2));
+    let _daemon_b2 = Daemon(spawn_up_with_service(
+        data_b.path(),
+        cfg_b.path(),
+        space,
+        &log_b2,
+        Some(&service_pvm),
+    ));
     // Wait for a FRESH endpoint (newer than the kill), past the stale one.
     poll_until(
         20,
@@ -305,24 +374,22 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
             )
         },
     );
-    // Re-spawn is proven by the agent being reachable again (the redb
-    // file persists on disk regardless, so its presence proves nothing);
-    // a successful call means B re-registered crdt-counter from the cached
-    // registry row + blob with no token/manifest in play.
+    // Reopen is proven by the actor being reachable again; merely retaining
+    // its image on disk would not prove route registration or guest startup.
     poll_until(
         30,
         || {
             vosx(
                 data_b.path(),
                 cfg_b.path(),
-                &["space", "call", space, "crdt-counter", "get"],
+                &["space", "call", space, "counter", "value"],
             )
             .status
             .success()
         },
         || {
             format!(
-                "B didn't re-spawn crdt-counter after a bare `space up {space}` restart; log:\n{}",
+                "B didn't reopen counter after a bare `space up {space}` restart; log:\n{}",
                 fs::read_to_string(&log_b2).unwrap_or_default()
             )
         },
@@ -615,22 +682,6 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
             .is_file(),
         "deleted installation image was not moved to recoverable trash",
     );
-}
-
-/// True once B's agents dir holds a per-agent redb other than the
-/// registry's `00000000.redb` — i.e. an app agent actually spawned.
-fn spawned_app_agent(agents_dir: &Path) -> bool {
-    let Ok(entries) = fs::read_dir(agents_dir) else {
-        return false;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        if name.ends_with(".redb") && name != "00000000.redb" {
-            return true;
-        }
-    }
-    false
 }
 
 /// Run a `vosx` command and assert it succeeded, returning stdout.
