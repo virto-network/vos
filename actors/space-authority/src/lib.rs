@@ -27,11 +27,18 @@ struct GrantRow {
 /// no state rather than an authority which could be claimed after install.
 pub fn initial_state(space: SpaceId, root_peer_id: Vec<u8>) -> Option<Vec<u8>> {
     vos::registry::ed25519_pubkey_from_peer_id(&root_peer_id)?;
+    let root = vos::v2::SubjectId::of_authenticated_peer(&root_peer_id);
     Some(
         SpaceAuthority {
             space: space.0,
             root_peer_id,
-            grants: Vec::new(),
+            grants: vec![GrantRow {
+                holder_kind: 0,
+                holder: root.0,
+                role: SpaceRole::Admin.as_u8(),
+                grant_epoch: 1,
+                revoke_epoch: 0,
+            }],
         }
         .encode(),
     )
@@ -246,6 +253,17 @@ mod tests {
                 claim: claim.encode(),
             },
         )
+    }
+
+    #[test]
+    fn initial_state_contains_an_explicit_root_admin_grant() {
+        let signing = SigningKey::from_bytes(&[21; 32]);
+        let peer = root_peer(&signing);
+        let space = SpaceId([22; 32]);
+        let mut authority = actor(space, &signing);
+        let root = Origin::Member(SubjectId::of_authenticated_peer(&peer));
+        let admin = claim(space, root, SpaceRole::Admin);
+        assert_eq!(authorize(&mut authority, &admin), admin.encode());
     }
 
     #[test]

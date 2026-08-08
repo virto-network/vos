@@ -7,10 +7,7 @@ use alloc::vec::Vec;
 /// change the persistent [`crate::v2::SubjectId`].
 #[inline(always)]
 pub(crate) fn authenticated_peer_subject(peer: &[u8]) -> crate::v2::SubjectId {
-    crate::v2::SubjectId(crate::crypto::blake2b_hash::<32>(
-        b"vos/subject/v2",
-        &[peer],
-    ))
+    crate::v2::SubjectId::of_authenticated_peer(peer)
 }
 
 /// Execution context passed to message handlers.

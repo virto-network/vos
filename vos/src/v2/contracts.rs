@@ -198,15 +198,11 @@ pub struct RoleAuthorityInviteRedemptionV2 {
 
 impl RoleAuthorityInviteRedemptionV2 {
     pub fn holder(&self) -> Origin {
-        Origin::Member(crate::actors::context::authenticated_peer_subject(
-            &self.holder_peer_id,
-        ))
+        Origin::Member(SubjectId::of_authenticated_peer(&self.holder_peer_id))
     }
 
     pub fn grantor(&self) -> Origin {
-        Origin::Member(crate::actors::context::authenticated_peer_subject(
-            &self.admin_peer_id,
-        ))
+        Origin::Member(SubjectId::of_authenticated_peer(&self.admin_peer_id))
     }
 }
 

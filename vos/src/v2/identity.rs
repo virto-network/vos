@@ -70,6 +70,18 @@ impl ProgramId {
     }
 }
 
+impl SubjectId {
+    /// Canonical v2 identity of a transport-authenticated peer. The raw
+    /// libp2p multihash remains a host credential; actor wires carry only this
+    /// fixed-width, domain-separated subject.
+    pub fn of_authenticated_peer(peer_id: &[u8]) -> Self {
+        Self(crate::crypto::blake2b_hash::<32>(
+            b"vos/subject/v2",
+            &[peer_id],
+        ))
+    }
+}
+
 impl ActorId {
     /// Stable identity of one owned child in its parent's namespace.
     /// Replaying the same spawn therefore addresses the same actor, while
@@ -197,6 +209,18 @@ mod tests {
     fn program_id_uses_canonical_bytes() {
         assert_eq!(ProgramId::of_pvm(b"pvm"), ProgramId::of_pvm(b"pvm"));
         assert_ne!(ProgramId::of_pvm(b"pvm"), ProgramId::of_pvm(b"elf"));
+    }
+
+    #[test]
+    fn authenticated_peer_subjects_are_stable_and_peer_scoped() {
+        assert_eq!(
+            SubjectId::of_authenticated_peer(b"peer-a"),
+            SubjectId::of_authenticated_peer(b"peer-a")
+        );
+        assert_ne!(
+            SubjectId::of_authenticated_peer(b"peer-a"),
+            SubjectId::of_authenticated_peer(b"peer-b")
+        );
     }
 
     #[test]
