@@ -397,6 +397,7 @@ struct TestCommittedLog {
     before_next_read_index: Vec<Vec<u8>>,
     before_next_proposal: Vec<Vec<u8>>,
     installed_snapshot: Option<CommittedServiceSnapshotV2>,
+    committed_index_floor: Option<u64>,
 }
 
 impl TestCommittedLog {
@@ -408,11 +409,17 @@ impl TestCommittedLog {
             before_next_read_index: Vec::new(),
             before_next_proposal: Vec::new(),
             installed_snapshot: None,
+            committed_index_floor: None,
         }
     }
 
     fn with_installed_snapshot(mut self, snapshot: CommittedServiceSnapshotV2) -> Self {
         self.installed_snapshot = Some(snapshot);
+        self
+    }
+
+    fn with_committed_index_floor(mut self, index: u64) -> Self {
+        self.committed_index_floor = Some(index);
         self
     }
 
@@ -490,6 +497,9 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
             return Err(TestLogError::InvalidCursor);
         }
         let shared = self.shared.lock().unwrap();
+        let committed_index = self
+            .committed_index_floor
+            .unwrap_or(shared.entries.len() as u64);
         Ok(CommittedAccumulateBatchV2 {
             entries: shared
                 .entries
@@ -497,7 +507,7 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
                 .filter(|entry| entry.index > applied_index)
                 .cloned()
                 .collect(),
-            committed_index: shared.entries.len() as u64,
+            committed_index,
         })
     }
 
@@ -525,7 +535,9 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
         _service_image: &[u8],
         _proof_artifacts: &[ImportedBlobV2],
     ) -> Result<(), Self::Error> {
-        let committed = self.shared.lock().unwrap().entries.len() as u64;
+        let committed = self
+            .committed_index_floor
+            .unwrap_or_else(|| self.shared.lock().unwrap().entries.len() as u64);
         if index < self.applied || index > committed {
             return Err(TestLogError::InvalidCursor);
         }
@@ -10578,6 +10590,97 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         Err(vos::v2::DecodeError::NonCanonical),
         "a snapshot cannot omit an artifact referenced by its publication"
     );
+
+    let mismatched_schedule =
+        GasScheduleV2::new(TEST_GAS_SCHEDULE.refine, TEST_GAS_SCHEDULE.accumulate - 1);
+    let mismatched_snapshot_host =
+        DurableJamStoreV2::open(FailableCommittedImages::default()).unwrap();
+    let mismatched_snapshot_service = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        mismatched_snapshot_host,
+        mismatched_schedule.refine,
+        mismatched_schedule.accumulate,
+    )
+    .unwrap();
+    let mut mismatched_snapshot_follower = ReplicatedJamServiceV2::new(
+        mismatched_snapshot_service,
+        TestCommittedLog::new(shared_log.clone(), false).with_installed_snapshot(snapshot.clone()),
+    );
+    let empty_service_image = mismatched_snapshot_follower
+        .service()
+        .accumulate_host()
+        .committed_service_image();
+    assert!(matches!(
+        mismatched_snapshot_follower.catch_up(),
+        Err(vos::v2::ReplicatedServiceErrorV2::Dispatch(
+            ServiceDispatchError::ServiceGasScheduleMismatch {
+                expected,
+                declared,
+            }
+        )) if expected == mismatched_schedule && declared == TEST_GAS_SCHEDULE
+    ));
+    assert_eq!(
+        mismatched_snapshot_follower
+            .service()
+            .accumulate_host()
+            .committed_service_image(),
+        empty_service_image,
+        "a mismatched snapshot cannot replace the fresh service image"
+    );
+    assert_eq!(
+        mismatched_snapshot_follower
+            .service()
+            .accumulate_host()
+            .proof_bytes(&committed.proof.proof_blob),
+        None,
+        "snapshot identity is checked before the proof side-CAS is hydrated"
+    );
+    assert_eq!(
+        mismatched_snapshot_follower
+            .log_mut()
+            .applied_index()
+            .unwrap(),
+        0,
+        "snapshot identity is checked before the cursor advances"
+    );
+
+    let mark_only_host = LocalJamStoreV2::from_snapshot_bytes(&snapshot.service_image).unwrap();
+    let mark_only_image = mark_only_host.committed_service_image();
+    let mark_only_service = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        mark_only_host,
+        mismatched_schedule.refine,
+        mismatched_schedule.accumulate,
+    )
+    .unwrap();
+    let mut mark_only_follower = ReplicatedJamServiceV2::new(
+        mark_only_service,
+        TestCommittedLog::new(Arc::new(Mutex::new(SharedCommittedLog::default())), false)
+            .with_committed_index_floor(1),
+    );
+    assert!(matches!(
+        mark_only_follower.catch_up(),
+        Err(vos::v2::ReplicatedServiceErrorV2::Dispatch(
+            ServiceDispatchError::ServiceGasScheduleMismatch {
+                expected,
+                declared,
+            }
+        )) if expected == mismatched_schedule && declared == TEST_GAS_SCHEDULE
+    ));
+    assert_eq!(mark_only_follower.log_mut().applied_index().unwrap(), 0);
+    assert_eq!(
+        mark_only_follower
+            .service()
+            .accumulate_host()
+            .committed_service_image(),
+        mark_only_image,
+        "cursor-only advancement cannot bless a mismatched existing image"
+    );
+
     let snapshot_host = DurableJamStoreV2::open(FailableCommittedImages {
         fail_next_proof_commit: true,
         ..FailableCommittedImages::default()

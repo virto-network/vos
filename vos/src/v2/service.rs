@@ -1029,6 +1029,23 @@ where
     A: AccumulateProtocolHostV2 + AttestationProofHostV2 + CommittedServiceImageHostV2,
     L: CommittedAccumulateLogV2,
 {
+    fn validate_service_image_identity(
+        &self,
+        service_image: &[u8],
+    ) -> Result<(), ReplicatedServiceErrorV2<L::Error>> {
+        let snapshot = LocalJamStoreSnapshotV2::decode(service_image).map_err(|_| {
+            ReplicatedServiceErrorV2::ServiceImage(ServiceImageInstallErrorV2::InvalidSnapshot)
+        })?;
+        if let Some(identity) = snapshot.service_identity().map_err(|_| {
+            ReplicatedServiceErrorV2::ServiceImage(ServiceImageInstallErrorV2::InvalidSnapshot)
+        })? {
+            self.service
+                .validate_service_identity(&identity)
+                .map_err(ReplicatedServiceErrorV2::Dispatch)?;
+        }
+        Ok(())
+    }
+
     fn apply_committed_after(
         &mut self,
         applied: u64,
@@ -1125,6 +1142,10 @@ where
         }
         if batch.committed_index > cursor {
             let service_image = self.service.accumulate_host().committed_service_image();
+            // Configuration/no-op entries advance only the cursor. They must
+            // not bless an image produced under another program or gas
+            // schedule merely because no application entry was replayed.
+            self.validate_service_image_identity(&service_image)?;
             let proof_artifacts =
                 snapshot_proof_artifacts(self.service.accumulate_host(), &service_image)
                     .map_err(|_| ReplicatedServiceErrorV2::ProofUnavailable)?;
@@ -1154,6 +1175,10 @@ where
             if snapshot.applied_index <= applied {
                 return Err(ReplicatedServiceErrorV2::InvalidCommittedLog);
             }
+            // Validate before hydrating the proof side-CAS, installing the
+            // image, or advancing the applied cursor. A fresh host has no
+            // existing header against which install can detect a mismatch.
+            self.validate_service_image_identity(&snapshot.service_image)?;
             for artifact in &snapshot.proof_artifacts {
                 if !self
                     .service

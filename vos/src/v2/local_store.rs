@@ -46,6 +46,20 @@ impl LocalJamStoreSnapshotV2 {
         self.rows == other.rows && self.blobs == other.blobs && self.programs == other.programs
     }
 
+    /// Service identity declared by this image, when genesis has committed.
+    /// Snapshot recovery uses this read-only view before mutating either the
+    /// proof side-CAS or the locally visible service image.
+    pub(crate) fn service_identity(&self) -> Result<Option<super::ServiceIdentityV2>, DecodeError> {
+        self.rows
+            .get(super::header_storage_key())
+            .map(|bytes| {
+                StoreHeaderV2::open(bytes)
+                    .map(|header| header.service)
+                    .map_err(|_| DecodeError::NonCanonical)
+            })
+            .transpose()
+    }
+
     /// Proof blobs required to finish pending transport work.
     ///
     /// Permanent reply-admission rows are replay markers, not pending work:
