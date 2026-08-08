@@ -148,7 +148,13 @@ resolves `ActorId` directly rather than truncating it to a `ServiceId`. This
 first node cutover admits only ordinary methods whose
 signed installed policy is public and non-attested; protected or attested
 methods fail closed instead of inheriting the legacy trusted-System role
-bypass. A direct reply is acknowledged only after its waiting channel accepts
+bypass. Space startup installs the immutable-root-signed canonical
+`space-authority` package as its own Raft root. Root-signed role mutations,
+delegated invite redemption, and grow-only invite cancellation execute in
+that actor; the joiner deletes its pending bearer only after physical
+Accumulate publishes `Bool(true)`. No registry lookup or daemon-local
+signature is treated as a finalized authority receipt. A direct reply is
+acknowledged only after its waiting channel accepts
 the bytes. Ordinary outbox and suspended-workflow publications are retried by
 the node transport until the destination guest has committed them. Proof and
 attestation publications stay durable but are not admitted by this ordinary
