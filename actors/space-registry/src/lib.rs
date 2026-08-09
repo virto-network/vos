@@ -58,7 +58,8 @@ pub use vos::registry::{
     NODE_ROLE_OBSERVER, NODE_ROLE_VOTER, OP_SIG_LEN, PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK,
     ProgramPage, ProgramRow, REGISTRY_OP_DOMAIN, SPACE_ID_DOMAIN_TAG, Status, SyncFloor,
     binding_signed_bytes, canonical_op_bytes, ed25519_pubkey_from_peer_id, instance_service_id,
-    invite_signed_bytes, pack_auth, role_authority_cutover_signed_bytes, role_grant_supersedes,
+    invite_signed_bytes, pack_auth, role_authority_cutover_signed_bytes,
+    role_authority_invite_attestation_signed_bytes, role_grant_supersedes,
 };
 
 // ── Programs ──────────────────────────────────────────────────────
@@ -451,12 +452,30 @@ impl SpaceRegistry {
             .unwrap_or_default()
     }
 
-    /// Atomically close legacy role admission before installing the canonical
-    /// authority. Cutover is deliberately limited to a single enrolled node,
-    /// and the same actor transaction checks its complete materialized role
-    /// inventory and commits the barrier. An unseen concurrent legacy row is
-    /// still harmless: post-cutover roles count only with an exact witness
-    /// written by an authority-bound message.
+    /// Advisory operator check performed immediately before sealing. It is
+    /// deliberately read-only: the durable root-signed seal below must replay
+    /// monotonically even when a concurrent legacy CRDT row materializes in a
+    /// different order. Such a late row remains ineffective because it lacks
+    /// a canonical-authority witness.
+    #[msg]
+    async fn role_authority_cutover_preflight(&self) -> Status {
+        let enrolled_nodes = self.nodes.iter_from(&0).take(2).count();
+        if enrolled_nodes == 1
+            && !self.has_role_authority_cutover_blockers()
+            && !self.has_actor_authority_cutover_blockers()
+        {
+            Status::Ok
+        } else {
+            Status::AuthorityCutoverNotQuiescent
+        }
+    }
+
+    /// Monotonically close legacy role admission before installing the
+    /// canonical authority. Quiescence is an operator preflight, never a
+    /// replay-time condition: once the immutable root signs this seal, every
+    /// valid replay recreates it. Unseen concurrent legacy rows remain
+    /// harmless because post-cutover roles count only with an exact
+    /// authority-attested point witness.
     #[msg(role = SpaceRegistryRole::Admin)]
     async fn seal_role_authority(
         &mut self,
@@ -480,13 +499,6 @@ impl SpaceRegistry {
             } else {
                 Status::Forbidden
             };
-        }
-        let enrolled_nodes = self.nodes.iter_from(&0).take(2).count();
-        if enrolled_nodes != 1
-            || self.has_role_authority_cutover_blockers()
-            || self.has_actor_authority_cutover_blockers()
-        {
-            return Status::AuthorityCutoverNotQuiescent;
         }
         let key = role_authority_cutover_key();
         self.metas.insert(
@@ -660,11 +672,17 @@ impl SpaceRegistry {
         let Some(program_hash) = bytes_to_32(&program_hash) else {
             return Status::BadHash;
         };
-        // This exact row is guest-owned protocol state, not a program's
-        // metadata. Refuse even a correctly signed catalog write so an
-        // administrator cannot accidentally erase the cutover barrier or
-        // its canonical-authority grant witnesses.
+        // The cutover row is guest-owned protocol state, not a program's
+        // metadata. After cutover, metadata may update only an actually
+        // catalogued program hash. Point-addressed authority witnesses live at
+        // domain-separated non-program keys, so even a delegated catalog
+        // administrator cannot overwrite or fabricate one.
         if program_hash == role_authority_cutover_key() {
+            return Status::Forbidden;
+        }
+        if self.role_authority_cutover_id().is_some()
+            && !self.programs.iter().any(|row| row.hash == program_hash)
+        {
             return Status::Forbidden;
         }
         // Upsert: one point write, keyed by the program hash.
@@ -1615,6 +1633,7 @@ impl SpaceRegistry {
         peer_id: Vec<u8>,
         redeem_sig: Vec<u8>,
         node_sig: Vec<u8>,
+        authority_attestation: Vec<u8>,
     ) -> Status {
         let Some(token_pub_key) = bytes_to_32(&token_pub) else {
             return Status::BadHash;
@@ -1670,6 +1689,24 @@ impl SpaceRegistry {
             return Status::BadHash;
         };
         if self.role_authority_cutover_id() != Some(authority_replication_id) {
+            return Status::Forbidden;
+        }
+        // The root host adds this signature only after the canonical Raft
+        // authority has durably returned `true` for the exact redemption.
+        // It is recorded in the CRDT message, so every replay verifies the
+        // same attestation without consulting a node-local availability set.
+        let authority_canonical = role_authority_invite_attestation_signed_bytes(
+            &authority_replication_id,
+            &token_pub,
+            role,
+            expires_at,
+            &admin_peer_id,
+            &admin_sig,
+            &peer_id,
+            &redeem_sig,
+            &node_sig,
+        );
+        if !self.authorize_root_op(&authority_canonical, &authority_attestation) {
             return Status::Forbidden;
         }
         let invite_canon = invite_signed_bytes(
@@ -2031,60 +2068,28 @@ impl SpaceRegistry {
     }
 
     fn bind_authority_grant(&mut self, authority: [u8; 32], row: &AuthGrantRow) {
-        let key = role_authority_cutover_key();
-        let mut blob = self
-            .metas
-            .get(&key)
-            .filter(|record| record.program_hash == key)
-            .map(|record| record.blob)
-            .unwrap_or_else(|| authority.to_vec());
-        if blob.len() < 32 || blob[..32] != authority {
+        if self.role_authority_cutover_id() != Some(authority) {
             return;
         }
         let peer = peer_key(&row.peer_id);
+        let key = role_authority_grant_witness_key(authority, peer);
         let binding = role_authority_grant_binding(authority, row);
-        let mut entries: Vec<([u8; 32], [u8; 32])> = blob[32..]
-            .chunks_exact(64)
-            .map(|chunk| {
-                let mut stored_peer = [0; 32];
-                let mut stored_binding = [0; 32];
-                stored_peer.copy_from_slice(&chunk[..32]);
-                stored_binding.copy_from_slice(&chunk[32..]);
-                (stored_peer, stored_binding)
-            })
-            .collect();
-        if let Some(existing) = entries.iter_mut().find(|(stored, _)| *stored == peer) {
-            existing.1 = binding;
-        } else {
-            entries.push((peer, binding));
-            entries.sort_by_key(|(stored, _)| *stored);
-        }
-        blob.truncate(32);
-        for (stored_peer, stored_binding) in entries {
-            blob.extend_from_slice(&stored_peer);
-            blob.extend_from_slice(&stored_binding);
-        }
         self.metas.insert(
             &key,
             &MetaRow {
                 program_hash: key,
-                blob,
+                blob: binding.to_vec(),
             },
         );
     }
 
     fn authority_grant_is_bound(&self, authority: [u8; 32], row: &AuthGrantRow) -> bool {
-        let key = role_authority_cutover_key();
         let peer = peer_key(&row.peer_id);
+        let key = role_authority_grant_witness_key(authority, peer);
         let expected = role_authority_grant_binding(authority, row);
-        self.metas.get(&key).is_some_and(|record| {
-            record.program_hash == key
-                && record.blob.len() >= 32
-                && record.blob[..32] == authority
-                && record.blob[32..]
-                    .chunks_exact(64)
-                    .any(|chunk| chunk[..32] == peer && chunk[32..] == expected)
-        })
+        self.metas
+            .get(&key)
+            .is_some_and(|record| record.program_hash == key && record.blob.as_slice() == expected)
     }
 
     /// Authorize a mutation: the `auth` blob's signature must be valid
@@ -2347,6 +2352,13 @@ fn role_authority_grant_binding(authority: [u8; 32], row: &AuthGrantRow) -> [u8;
             &row.epoch.to_le_bytes(),
             &row.grantor,
         ],
+    )
+}
+
+fn role_authority_grant_witness_key(authority: [u8; 32], peer: [u8; 32]) -> [u8; 32] {
+    vos::crypto::blake2b_hash::<32>(
+        b"space-registry/role-authority-grant-witness/v3",
+        &[&authority, &peer],
     )
 }
 
@@ -4289,7 +4301,7 @@ mod tests {
     }
 
     #[test]
-    fn authority_cutover_atomically_checks_quiescence_and_closes_legacy_admission() {
+    fn authority_cutover_preflight_is_advisory_and_seal_is_monotone() {
         let mut r = registry();
         let root = root_peer_id();
         assert_eq!(
@@ -4317,17 +4329,26 @@ mod tests {
             auth: root_auth("seal_role_authority", &[&TEST_AUTHORITY_ID]),
         };
         assert_eq!(
-            dispatch(&mut r, seal()),
+            dispatch(&mut r, RoleAuthorityCutoverPreflight),
             Status::AuthorityCutoverNotQuiescent,
-            "a live legacy grant blocks the same transaction that would seal admission",
+            "a live legacy grant blocks operator preflight",
         );
         assert!(dispatch(&mut r, RoleAuthorityCutover).is_empty());
 
-        assert_eq!(revoke_space(&mut r, &holder), Status::Ok);
         assert_eq!(dispatch(&mut r, seal()), Status::Ok);
         assert_eq!(
             dispatch(&mut r, RoleAuthorityCutover),
             TEST_AUTHORITY_ID.to_vec(),
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: holder.clone()
+                }
+            ),
+            AUTH_ROLE_NONE,
+            "legacy evidence materialized before the replayed seal stays fail closed",
         );
         assert_eq!(dispatch(&mut r, seal()), Status::Ok, "idempotent seal");
 
@@ -4437,13 +4458,7 @@ mod tests {
             );
         }
         assert_eq!(
-            dispatch(
-                &mut r,
-                SealRoleAuthority {
-                    authority_replication_id: TEST_AUTHORITY_ID.to_vec(),
-                    auth: root_auth("seal_role_authority", &[&TEST_AUTHORITY_ID]),
-                },
-            ),
+            dispatch(&mut r, RoleAuthorityCutoverPreflight),
             Status::AuthorityCutoverNotQuiescent,
         );
 
@@ -4469,26 +4484,11 @@ mod tests {
             Status::Ok,
         );
         assert_eq!(
-            dispatch(
-                &mut r,
-                SealRoleAuthority {
-                    authority_replication_id: TEST_AUTHORITY_ID.to_vec(),
-                    auth: root_auth("seal_role_authority", &[&TEST_AUTHORITY_ID]),
-                },
-            ),
+            dispatch(&mut r, RoleAuthorityCutoverPreflight),
             Status::AuthorityCutoverNotQuiescent,
         );
         assert_eq!(revoke_actor(&mut r, &holder, "private"), Status::Ok);
-        assert_eq!(
-            dispatch(
-                &mut r,
-                SealRoleAuthority {
-                    authority_replication_id: TEST_AUTHORITY_ID.to_vec(),
-                    auth: root_auth("seal_role_authority", &[&TEST_AUTHORITY_ID]),
-                },
-            ),
-            Status::Ok,
-        );
+        assert_eq!(dispatch(&mut r, RoleAuthorityCutoverPreflight), Status::Ok,);
     }
 
     #[test]
@@ -4746,16 +4746,32 @@ mod tests {
         let redeem_canon = canonical_op_bytes("redeem_invite", &[&token_pub, &peer_id]);
         let redeem_sig = token_key.sign(&redeem_canon).to_bytes();
         let node_sig = node.sign(&redeem_canon).to_bytes();
+        let admin_peer_id = peer_id_for(&admin_key.verifying_key().to_bytes());
+        let authority_attestation = root_auth(
+            "attest_role_authority_invite",
+            &[
+                &authority_replication_id,
+                &token_pub,
+                &[role],
+                &INVITE_EXPIRES.to_le_bytes(),
+                &admin_peer_id,
+                &admin_sig,
+                &peer_id,
+                &redeem_sig,
+                &node_sig,
+            ],
+        );
         RedeemInvite {
             token_pub: token_pub.to_vec(),
             role,
             expires_at: INVITE_EXPIRES,
             authority_replication_id: authority_replication_id.to_vec(),
-            admin_peer_id: peer_id_for(&admin_key.verifying_key().to_bytes()),
+            admin_peer_id,
             admin_sig: admin_sig.to_vec(),
             peer_id,
             redeem_sig: redeem_sig.to_vec(),
             node_sig: node_sig.to_vec(),
+            authority_attestation,
         }
     }
 
@@ -4791,6 +4807,45 @@ mod tests {
                 redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node),
             ),
             Status::Ok,
+        );
+    }
+
+    #[test]
+    fn registry_invite_requires_the_root_hosts_authority_attestation() {
+        let mut r = authority_registry();
+        let token = SigningKey::from_bytes(&[95; 32]);
+        let node = node_key(96);
+        let peer = node_peer_of(&node);
+        let mut message = redeem_msg(&root_key(), &token, AUTH_ROLE_READONLY, &node);
+        message.authority_attestation.clear();
+        assert_eq!(dispatch(&mut r, message), Status::Forbidden);
+        assert_eq!(dispatch(&mut r, PeerRole { peer_id: peer }), AUTH_ROLE_NONE);
+    }
+
+    #[test]
+    fn authority_grant_witnesses_are_point_rows_not_one_growing_blob() {
+        let mut r = authority_registry();
+        for index in 0..1_050u32 {
+            let mut peer = alloc::vec![0x2a; 38];
+            peer[..4].copy_from_slice(&index.to_le_bytes());
+            assert_eq!(
+                grant_space_v2(&mut r, &peer, AUTH_ROLE_READONLY),
+                Status::Ok,
+            );
+            assert_eq!(
+                dispatch(&mut r, PeerRole { peer_id: peer }),
+                AUTH_ROLE_READONLY
+            );
+        }
+        let marker = r
+            .metas
+            .get(&role_authority_cutover_key())
+            .expect("the cutover marker remains present");
+        assert_eq!(marker.blob, TEST_AUTHORITY_ID.to_vec());
+        assert_eq!(
+            r.metas.len(),
+            1_051,
+            "one fixed-size witness row is retained per peer",
         );
     }
 
@@ -5028,16 +5083,34 @@ mod tests {
             Some(&TEST_AUTHORITY_ID),
         );
         let redeem_canon = canonical_op_bytes("redeem_invite", &[&token_pub, &peer]);
+        let admin_sig = root_key().sign(&invite_canon).to_bytes();
+        let redeem_sig = token.sign(&redeem_canon).to_bytes();
+        let node_sig = node.sign(&redeem_canon).to_bytes();
+        let authority_attestation = root_auth(
+            "attest_role_authority_invite",
+            &[
+                &TEST_AUTHORITY_ID,
+                &token_pub,
+                &[AUTH_ROLE_READONLY],
+                &INVITE_EXPIRES.to_le_bytes(),
+                &root_peer_id(),
+                &admin_sig,
+                &peer,
+                &redeem_sig,
+                &node_sig,
+            ],
+        );
         let msg = RedeemInvite {
             token_pub: token_pub.to_vec(),
             role: AUTH_ROLE_READONLY,
             expires_at: INVITE_EXPIRES,
             authority_replication_id: TEST_AUTHORITY_ID.to_vec(),
             admin_peer_id: root_peer_id(),
-            admin_sig: root_key().sign(&invite_canon).to_bytes().to_vec(),
+            admin_sig: admin_sig.to_vec(),
             peer_id: peer.clone(),
-            redeem_sig: token.sign(&redeem_canon).to_bytes().to_vec(),
-            node_sig: node.sign(&redeem_canon).to_bytes().to_vec(),
+            redeem_sig: redeem_sig.to_vec(),
+            node_sig: node_sig.to_vec(),
+            authority_attestation,
         };
         assert_eq!(dispatch(&mut r, msg), Status::Forbidden);
         assert_eq!(dispatch(&mut r, PeerRole { peer_id: peer }), AUTH_ROLE_NONE);
@@ -5083,16 +5156,34 @@ mod tests {
                 Some(&TEST_AUTHORITY_ID),
             );
             let redeem_canon = canonical_op_bytes("redeem_invite", &[&token_pub, &victim_peer]);
+            let admin_sig = root_key().sign(&invite_canon).to_bytes();
+            let redeem_sig = token.sign(&redeem_canon).to_bytes();
+            let node_sig = attacker.sign(&redeem_canon).to_bytes();
+            let authority_attestation = root_auth(
+                "attest_role_authority_invite",
+                &[
+                    &TEST_AUTHORITY_ID,
+                    &token_pub,
+                    &[role],
+                    &INVITE_EXPIRES.to_le_bytes(),
+                    &root_peer_id(),
+                    &admin_sig,
+                    &victim_peer,
+                    &redeem_sig,
+                    &node_sig,
+                ],
+            );
             RedeemInvite {
                 token_pub: token_pub.to_vec(),
                 role,
                 expires_at: INVITE_EXPIRES,
                 authority_replication_id: TEST_AUTHORITY_ID.to_vec(),
                 admin_peer_id: root_peer_id(),
-                admin_sig: root_key().sign(&invite_canon).to_bytes().to_vec(),
+                admin_sig: admin_sig.to_vec(),
                 peer_id: victim_peer.clone(),
-                redeem_sig: token.sign(&redeem_canon).to_bytes().to_vec(),
-                node_sig: attacker.sign(&redeem_canon).to_bytes().to_vec(),
+                redeem_sig: redeem_sig.to_vec(),
+                node_sig: node_sig.to_vec(),
+                authority_attestation,
             }
         };
         assert_eq!(

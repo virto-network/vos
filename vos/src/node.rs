@@ -1346,6 +1346,11 @@ struct NodeService {
     /// sole caller [`Self::dispatch_invoke`] admits to a node-confined
     /// target. `None` denies every caller (fail closed).
     operator_peer: Option<Vec<u8>>,
+    /// Root/operator signer used only to attest that an exact invite
+    /// redemption was durably accepted by the canonical role authority before
+    /// it enters the registry CRDT. Non-root operators produce a signature the
+    /// registry rejects under its immutable-root check.
+    operator_signer: Option<crate::registry::CatalogOpSigner>,
     /// Per-instance-name `SyncFloor` cache for the sync-serve gate. The
     /// floor is a static install-time property, but resolving it hits the
     /// registry with a blocking probe (up to ~5 s); caching keeps
@@ -1375,6 +1380,186 @@ impl NodeService {
                     && (route.route == target || (route.route & 0xFFFF) == target_unscoped)
             })
         })
+    }
+
+    /// Drive one exact invite through the canonical Raft authority and, only
+    /// after its committed `Bool(true)` reply is visible, attach an immutable
+    /// root signature to the registry message. The signature becomes part of
+    /// the recorded CRDT operation, so replay never trusts a caller-supplied
+    /// authority marker or a process-local allowlist.
+    #[cfg(feature = "storage")]
+    fn attest_registry_invite(&self, mut message: crate::value::Msg) -> Option<Vec<u8>> {
+        use crate::actors::codec::{Decode, Encode};
+        use crate::v2::V2Wire;
+
+        if message.name != "redeem_invite" {
+            return None;
+        }
+        let token_pub = message.args.get_bytes("token_pub")?;
+        let role_byte = message.args.get_u8("role")?;
+        let expires_at = message.args.get_u64("expires_at")?;
+        let authority_bytes = message.args.get_bytes("authority_replication_id")?;
+        let authority_replication_id: [u8; 32] = authority_bytes.as_slice().try_into().ok()?;
+        let admin_peer_id = message.args.get_bytes("admin_peer_id")?;
+        let admin_sig = message.args.get_bytes("admin_sig")?;
+        let admin_signature: [u8; 64] = admin_sig.as_slice().try_into().ok()?;
+        let holder_peer_id = message.args.get_bytes("peer_id")?;
+        let redeem_sig = message.args.get_bytes("redeem_sig")?;
+        let redeem_signature: [u8; 64] = redeem_sig.as_slice().try_into().ok()?;
+        let node_sig = message.args.get_bytes("node_sig")?;
+        let holder_signature: [u8; 64] = node_sig.as_slice().try_into().ok()?;
+        let role = match crate::SpaceRole::from_u8(role_byte) {
+            Some(role @ (crate::SpaceRole::Member | crate::SpaceRole::Developer)) => role,
+            _ => return None,
+        };
+
+        // The anchored space id is guest-owned registry state, not an inbound
+        // field the redeemer can substitute.
+        let mut space_query = vec![crate::value::TAG_DYNAMIC];
+        space_query.extend_from_slice(&crate::value::Msg::new("space_id").encode());
+        let space_reply = registry_probe_reply(&self.invoke_routes, space_query)?;
+        let crate::value::Value::Bytes(space_bytes) =
+            <crate::value::Value as Decode>::try_decode(&space_reply)?
+        else {
+            return None;
+        };
+        let space = crate::v2::SpaceId(space_bytes.as_slice().try_into().ok()?);
+        if space == crate::v2::SpaceId([0; 32]) || authority_replication_id == [0; 32] {
+            return None;
+        }
+
+        let root_service = crate::v2::RootServiceId(
+            crate::v2::Hash::digest(
+                b"vos/installed-root-service/v2",
+                &[
+                    &space.0,
+                    crate::v2::ROLE_AUTHORITY_INSTANCE_V2.as_bytes(),
+                    &authority_replication_id,
+                ],
+            )
+            .0,
+        );
+        let authority_actor = crate::v2::ActorId(
+            crate::v2::Hash::digest(
+                b"vos/installed-root-actor/v2",
+                &[
+                    &root_service.0,
+                    crate::v2::ROLE_AUTHORITY_INSTANCE_V2.as_bytes(),
+                ],
+            )
+            .0,
+        );
+        let route = self
+            .v2_actor_routes
+            .read()
+            .ok()?
+            .get(&authority_actor)
+            .cloned()
+            .filter(|route| {
+                route.service.space == space
+                    && route.service.root_service == root_service
+                    && route.consistency == crate::v2::ConsistencyModeV2::Raft
+            })?;
+
+        let redemption = crate::v2::RoleAuthorityInviteRedemptionV2 {
+            space,
+            authority_replication_id,
+            token_pub: token_pub.as_slice().try_into().ok()?,
+            role,
+            expires_at,
+            admin_peer_id: admin_peer_id.clone(),
+            admin_signature,
+            holder_peer_id: holder_peer_id.clone(),
+            redeem_signature,
+            holder_signature,
+        };
+        let redemption_wire = redemption.encode();
+        let mut arguments = vec![crate::value::TAG_DYNAMIC];
+        arguments.extend_from_slice(
+            &crate::value::Msg::new(crate::v2::ROLE_AUTHORITY_INVITE_METHOD_V2)
+                .with("redemption", redemption_wire.clone())
+                .encode(),
+        );
+        let ingress = crate::v2::RootTreeInvocationV2 {
+            invocation: crate::v2::InvocationId::derive(
+                b"vos/invite-authority-redemption/v2",
+                &redemption_wire,
+            ),
+            target: authority_actor,
+            method: crate::v2::ROLE_AUTHORITY_INVITE_METHOD_V2.into(),
+            arguments,
+            proof_requested: false,
+        };
+        let reply = self.invoke_v2_root_route(&route, ingress.encode())?;
+        if <crate::value::Value as Decode>::try_decode(&reply).and_then(|value| value.as_bool())
+            != Some(true)
+        {
+            return None;
+        }
+
+        let canonical = crate::registry::role_authority_invite_attestation_signed_bytes(
+            &authority_replication_id,
+            &token_pub,
+            role_byte,
+            expires_at,
+            &admin_peer_id,
+            &admin_sig,
+            &holder_peer_id,
+            &redeem_sig,
+            &node_sig,
+        );
+        let attestation = self.operator_signer.as_ref()?(&canonical)?;
+        // Never preserve a caller-provided value. Only the signature produced
+        // after the committed authority reply enters the recorded message.
+        message
+            .args
+            .0
+            .retain(|(name, _)| name != "authority_attestation");
+        message
+            .args
+            .0
+            .push(("authority_attestation".into(), attestation.into()));
+        let mut encoded = vec![crate::value::TAG_DYNAMIC];
+        encoded.extend_from_slice(&message.encode());
+        Some(encoded)
+    }
+
+    #[cfg(feature = "storage")]
+    fn invoke_v2_root_route(&self, route: &V2ActorRoute, ingress: Vec<u8>) -> Option<Vec<u8>> {
+        let tx = self.invoke_routes.lock().ok()?.get(&route.route).cloned()?;
+        let deadline = Instant::now().checked_add(route.invoke_timeout)?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(InvokeRequest {
+            caller: crate::actors::Caller::System,
+            space_role: None,
+            actor_local_role: None,
+            delegated_origin: None,
+            msg: ingress.clone(),
+            reply: ReplyChannel::Sync(reply_tx),
+            chain: Vec::new(),
+        })
+        .ok()?;
+        let envelope = reply_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()?;
+        if let Some(redirect) = decode_v2_raft_redirect(&envelope) {
+            let network = self.shared_network.lock().ok()?.clone()?;
+            let peer = network.peer_for_prefix(redirect.leader_prefix)?;
+            let leader_route =
+                ServiceId::new(redirect.leader_prefix, ServiceId(route.route).local_id());
+            let delegated = encode_v2_raft_delegation(redirect.origin, false, &ingress);
+            return network
+                .send_invoke(
+                    peer,
+                    ServiceId::REGISTRY.0,
+                    leader_route.0,
+                    Vec::new(),
+                    delegated,
+                )
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .ok();
+        }
+        unwrap_invoke_envelope(&envelope)
     }
 
     /// Sprint 2 auth lookup. Send a synchronous `peer_role` invoke
@@ -2068,6 +2253,29 @@ impl crate::network::NetworkService for NodeService {
         if expired_registry_invite || expired_authority_invite {
             warn!(peer = ?caller_peer_id, "redeem_invite refused: token expired");
             return forbidden_envelope().into();
+        }
+
+        // A registry invite is never admitted directly from network bytes.
+        // First execute the exact redemption in the canonical Raft authority;
+        // then replace any caller-supplied attestation with the immutable
+        // root's signature over that accepted operation. The registry records
+        // this signature in its CRDT node and deterministically re-verifies it
+        // on every replay.
+        if to_unscoped == ServiceId::REGISTRY.local_id() as u32
+            && intercepted_msg(&msg).is_some_and(|decoded| decoded.name == "redeem_invite")
+        {
+            #[cfg(feature = "storage")]
+            match intercepted_msg(&msg).and_then(|decoded| self.attest_registry_invite(decoded)) {
+                Some(attested) => msg = attested,
+                None => {
+                    warn!(peer = ?caller_peer_id, "redeem_invite refused: canonical authority did not attest acceptance");
+                    return forbidden_envelope().into();
+                }
+            }
+            #[cfg(not(feature = "storage"))]
+            {
+                return forbidden_envelope().into();
+            }
         }
 
         // Locality boundary: a node-confined agent (`Local`/`Ephemeral`)
@@ -3009,6 +3217,7 @@ impl VosNode {
             proof_blobs_dir: self.proof_blobs_dir.clone(),
             program_blobs_dir: self.program_blobs_dir.clone(),
             operator_peer: self.operator_peer.clone(),
+            operator_signer: self.operator_signer.clone(),
             #[cfg(feature = "storage")]
             sync_floor_cache: Arc::new(RwLock::new(HashMap::new())),
         });
@@ -11702,6 +11911,7 @@ mod tests {
             proof_blobs_dir: None,
             program_blobs_dir: None,
             operator_peer: None,
+            operator_signer: None,
             #[cfg(feature = "storage")]
             sync_floor_cache: Arc::new(RwLock::new(HashMap::new())),
         };
@@ -12524,6 +12734,7 @@ mod tests {
             proof_blobs_dir: None,
             program_blobs_dir: None,
             operator_peer: None,
+            operator_signer: None,
             #[cfg(feature = "storage")]
             sync_floor_cache: Arc::new(RwLock::new(HashMap::new())),
         }

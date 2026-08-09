@@ -74,22 +74,25 @@ and each agent reaches a member only if that member's role clears the
 agent's sync floor.
 
 The daemon retains an invite bearer until both authorization layers accept
-the same evidence: the registry records the delegated redemption, then the
-canonical `space-authority` root commits the holder grant through physical
-Accumulate. Restricted v2 calls use an invocation-scoped authority reply and
+the same evidence: the serving root first commits the holder grant through
+physical Accumulate in canonical `space-authority`, then signs that exact
+accepted redemption and records the attestation with the registry operation.
+A rejected authority redemption therefore leaves no effective registry role.
+Restricted v2 calls use an invocation-scoped authority reply and
 its finalized accumulation receipt; a daemon-local role lookup is not a v2
 credential. Authority-aware tokens sign the authority's replication
 incarnation, and markerless tokens are no longer minted or accepted. Authority
-activation is a root-signed transaction inside the registry actor: it requires
-exactly one enrolled node, verifies there is no live or revivable legacy
-space/actor grant, and then seals legacy role admission to that authority
-incarnation. The single-node condition is a conservative cutover prerequisite;
-any legacy row discovered later remains ineffective because post-cutover roles
-also require an exact guest-owned authority witness. Catalog presence or
-replica-local absence never selects a protocol mode. Operators revoke legacy
-grants and remove other nodes before cutover, then re-grant through both
-canonical layers. Before first redemption,
-an operator may cancel the bearer by
+activation uses a read-only registry-guest preflight requiring exactly one
+enrolled node and no live or revivable legacy space/actor grant. The separate
+root-signed seal is unconditional and replay-monotone; it closes legacy role
+admission even if a concurrent row later reorders before it. The single-node
+condition is a conservative cutover prerequisite; any legacy row discovered
+later remains ineffective because post-cutover roles
+also require an exact point-addressed guest-owned authority witness. Catalog
+presence or replica-local absence never selects a protocol mode. Operators
+revoke legacy grants and remove other nodes before cutover, then re-grant
+through both canonical layers. Before first redemption, an operator may
+cancel the bearer by
 passing the exact `vos1…` token to `space invite <space> revoke`; the same
 grow-only cancellation is committed to both authorization layers.
 

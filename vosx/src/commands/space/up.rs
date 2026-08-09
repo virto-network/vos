@@ -156,6 +156,13 @@ fn ensure_v2_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::Resul
     let cutover = vos::block_on(reg.role_authority_cutover(&mut &*node))
         .map_err(|error| anyhow::anyhow!("query role-authority cutover: {error}"))?;
     if cutover.is_empty() {
+        let preflight = vos::block_on(reg.role_authority_cutover_preflight(&mut &*node))
+            .map_err(|error| anyhow::anyhow!("preflight role-authority cutover: {error}"))?;
+        if preflight != Status::Ok {
+            anyhow::bail!(
+                "canonical role-authority cutover requires exactly one enrolled registry node and no live or revivable legacy space/actor role grants; revoke those grants and remove other nodes before retrying --service-pvm"
+            );
+        }
         let auth = crate::commands::space::op_sign::op_auth(
             &root,
             "seal_role_authority",
@@ -166,9 +173,6 @@ fn ensure_v2_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::Resul
                 .map_err(|error| anyhow::anyhow!("seal role-authority cutover: {error}"))?;
         match status {
             Status::Ok => {}
-            Status::AuthorityCutoverNotQuiescent => anyhow::bail!(
-                "canonical role-authority cutover requires exactly one enrolled registry node and no live or revivable legacy space/actor role grants; revoke those grants and remove other nodes before retrying --service-pvm"
-            ),
             other => anyhow::bail!("sealing canonical role-authority cutover returned {other}"),
         }
     } else if cutover.as_slice() != replication_id {
@@ -646,15 +650,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Keep legacy-registry probes short so an unreachable bootnode does not
-/// stall the reconciliation tick.
-const REDEEM_REGISTRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-// A canonical authority is a Raft root. Its bounded invoke may legitimately
-// spend one voter-auth probe, a read barrier, genesis admission, and the two
-// proposals used by one root invocation. Keep this at least as large as the
-// node's full Raft invoke budget; the short registry probe above is not a
-// sufficient deadline for that path.
-const REDEEM_AUTHORITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Invite admission now includes the canonical Raft-authority commit before
+/// the registry reply is emitted. Its bounded invoke may legitimately spend
+/// one voter-auth probe, a read barrier, genesis admission, and the two
+/// proposals used by one root invocation, so this must cover the full root
+/// budget plus transport/dispatch margin. The pending bearer remains durable
+/// across a timeout and is retried on the next reconciliation tick.
+const REDEEM_REGISTRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
 
 // ── Trivalent `up` positional (decision 1) ───────────────────────────
 
@@ -897,6 +899,17 @@ struct TimedNode<'a> {
     timeout: std::time::Duration,
 }
 
+fn decode_timed_node_reply(outcome: Option<Vec<u8>>) -> Result<vos::value::Value, ClientError> {
+    match outcome {
+        Some(b) if b.len() == 5 && b[0] == vos::STATUS_FORBIDDEN && b[1..] == [0, 0, 0, 0] => {
+            Err(ClientError::Forbidden)
+        }
+        Some(b) if b.is_empty() => Ok(vos::value::Value::Unit),
+        Some(b) => <vos::value::Value as vos::Decode>::try_decode(&b).ok_or(ClientError::Decode),
+        None => Err(ClientError::Unreachable),
+    }
+}
+
 impl Invoker for TimedNode<'_> {
     fn invoke(
         &mut self,
@@ -904,13 +917,7 @@ impl Invoker for TimedNode<'_> {
         payload: Vec<u8>,
     ) -> impl std::future::Future<Output = Result<vos::value::Value, ClientError>> + '_ {
         let outcome = self.node.invoke_with_timeout(target, payload, self.timeout);
-        async move {
-            match outcome {
-                Some(b) if b.is_empty() => Ok(vos::value::Value::Unit),
-                Some(b) => Ok(<vos::value::Value as vos::Decode>::decode(&b)),
-                None => Err(ClientError::Unreachable),
-            }
-        }
+        async move { decode_timed_node_reply(outcome) }
     }
 }
 
@@ -945,6 +952,7 @@ fn authority_invite_redemption(
     })
 }
 
+#[cfg(test)]
 fn authority_invite_invocation(
     redemption: &vos::v2::RoleAuthorityInviteRedemptionV2,
     peer_prefix: u16,
@@ -981,13 +989,12 @@ fn authority_invite_invocation(
 }
 
 /// One redeem attempt: build the joiner's two signatures and invoke each
-/// connected peer's registry, then its canonical authority, until both grant
-/// this node's key. `Ok(true)` clears the pending token only after the
-/// authority's guest Accumulate reply is published; a partial legacy-only
-/// success remains retryable.
+/// connected peer's registry. The serving root host first drives the exact
+/// redemption through its canonical authority and injects a root-signed
+/// acceptance attestation into the recorded registry operation. `Ok(true)`
+/// therefore means both commits completed; a rejected or unavailable
+/// authority leaves no effective registry grant and remains retryable.
 fn try_redeem(node: &VosNode, data_dir: &Path, token_str: &str) -> anyhow::Result<bool> {
-    use vos::v2::V2Wire;
-
     let payload = crate::token::parse(token_str)?;
 
     // Redemption grants the DAEMON's node key (not the operator CLI
@@ -1006,7 +1013,10 @@ fn try_redeem(node: &VosNode, data_dir: &Path, token_str: &str) -> anyhow::Resul
     let node_sig = node_kp
         .sign(&redeem_canon)
         .map_err(|e| anyhow::anyhow!("node_sig sign: {e}"))?;
-    let authority_redemption =
+    // Validate the exact authority wire locally before handing the same fields
+    // to a serving peer. The peer reconstructs and commits this value before
+    // author-signing registry admission.
+    let _authority_redemption =
         authority_invite_redemption(&payload, node_peer_id.clone(), redeem_sig, node_sig.clone())?;
 
     let Some(net) = node.network() else {
@@ -1034,30 +1044,10 @@ fn try_redeem(node: &VosNode, data_dir: &Path, token_str: &str) -> anyhow::Resul
             node_peer_id.clone(),
             redeem_sig.to_vec(),
             node_sig.clone(),
+            Vec::new(),
         ));
         match status {
-            Ok(Status::Ok) => {
-                let (authority_route, invocation) =
-                    authority_invite_invocation(&authority_redemption, peer_prefix);
-                match node.invoke_with_timeout(
-                    authority_route,
-                    invocation.encode(),
-                    REDEEM_AUTHORITY_TIMEOUT,
-                ) {
-                    Some(reply)
-                        if <vos::value::Value as vos::Decode>::try_decode(&reply)
-                            .is_some_and(|value| value.as_bool() == Some(true)) =>
-                    {
-                        return Ok(true);
-                    }
-                    Some(_) => tracing::debug!(
-                        "v2 authority via {peer} rejected invite after registry acceptance"
-                    ),
-                    None => tracing::debug!(
-                        "v2 authority via {peer} unavailable after registry acceptance"
-                    ),
-                }
-            }
+            Ok(Status::Ok) => return Ok(true),
             Ok(other) => tracing::debug!("redeem via {peer}: {other}"),
             Err(e) => tracing::debug!("redeem via {peer}: {e}"),
         }
@@ -3257,6 +3247,19 @@ mod tests {
         crdt: false,
         provable: false,
     };
+
+    #[test]
+    fn timed_inviter_fails_loudly_on_remote_denial_or_malformed_reply() {
+        let forbidden = vec![vos::STATUS_FORBIDDEN, 0, 0, 0, 0];
+        assert!(matches!(
+            decode_timed_node_reply(Some(forbidden)),
+            Err(ClientError::Forbidden)
+        ));
+        assert!(matches!(
+            decode_timed_node_reply(Some(vec![vos::STATUS_PANICKED, 0, 0, 0, 0])),
+            Err(ClientError::Decode)
+        ));
+    }
 
     fn signed_v2_package(service_program: ProgramId) -> VosPackageV2 {
         let mut assembler = grey_transpiler::assembler::Assembler::new();

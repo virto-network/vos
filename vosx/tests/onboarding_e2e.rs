@@ -10,16 +10,16 @@
 //!
 //! and asserts the two properties that make the wave work:
 //!
-//! 1. B's redeem loop reaches A and A records the redemption — A's
-//!    `space members` grows an `# invites` section (an InviteRow is
-//!    written only by the `redeem_invite` handler, so its mere presence
-//!    proves the delegated-grant chain verified on A).
+//! 1. B's redeem loop reaches A, A's canonical authority commits the exact
+//!    redemption, and only then A records the root-attested registry grant.
+//!    Its `space members` output grows an `# invites` section.
 //! 2. B syncs A's registry — which now serves at the MEMBER floor
 //!    (decision 9). B started with an empty registry, so the genesis
 //!    ADMIN grant showing up in B's `space role list` can only have
 //!    arrived by a Member-gated `FetchHeads` that A served *because* the
 //!    redemption granted B's node key. This is the bootstrap the flip
-//!    depends on: redeem-first (ungated invoke) → grant → sync.
+//!    depends on: public redeem request → authority commit → attested
+//!    registry grant → sync.
 
 #![cfg(unix)]
 
@@ -985,9 +985,10 @@ fn double_redemption_is_flagged() {
         },
     );
 
-    // Registry acceptance is only the first half of v2 onboarding. The
-    // daemon removes the bearer secret only after the canonical authority PVM
-    // accepts the same evidence through physical guest Accumulate.
+    // Registry acceptance is emitted only after the canonical authority PVM
+    // accepts the exact evidence through physical guest Accumulate. The
+    // daemon removes the bearer secret only after that combined operation
+    // replies successfully.
     poll_until(
         30,
         || !pending_b.exists() && !pending_c.exists(),

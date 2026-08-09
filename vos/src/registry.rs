@@ -537,6 +537,38 @@ pub fn role_authority_cutover_signed_bytes(authority_replication_id: &[u8; 32]) 
     canonical_op_bytes("seal_role_authority", &[authority_replication_id])
 }
 
+/// Root-host attestation emitted only after the canonical authority has
+/// durably accepted this exact invite redemption. The complete redemption
+/// fields are length-framed by [`canonical_op_bytes`], so no signature can be
+/// transplanted to another token, holder, role, deadline, or authority.
+#[allow(clippy::too_many_arguments)]
+pub fn role_authority_invite_attestation_signed_bytes(
+    authority_replication_id: &[u8; 32],
+    token_pub: &[u8],
+    role: u8,
+    expires_at: u64,
+    admin_peer_id: &[u8],
+    admin_sig: &[u8],
+    peer_id: &[u8],
+    redeem_sig: &[u8],
+    node_sig: &[u8],
+) -> Vec<u8> {
+    canonical_op_bytes(
+        "attest_role_authority_invite",
+        &[
+            authority_replication_id,
+            token_pub,
+            &[role],
+            &expires_at.to_le_bytes(),
+            admin_peer_id,
+            admin_sig,
+            peer_id,
+            redeem_sig,
+            node_sig,
+        ],
+    )
+}
+
 /// Canonical byte string a mutation's author signs. Layout:
 /// `domain || u16(op.len) || op || (u32(field.len) || field)*`.
 /// The signer (CLI/daemon) and the verifier (actor) build these from the
@@ -1281,6 +1313,19 @@ impl RegistryRef {
         )
     }
 
+    /// Read-only operator preflight for the canonical authority cutover. A
+    /// successful result is advisory: the signed seal itself is monotone and
+    /// never becomes replay-conditional on this replica's materialized rows.
+    pub async fn role_authority_cutover_preflight<I: Invoker>(
+        &self,
+        inv: &mut I,
+    ) -> Result<Status, ClientError> {
+        decode_rkyv(
+            self.call(inv, Msg::new("role_authority_cutover_preflight"))
+                .await?,
+        )
+    }
+
     pub async fn publish<I: Invoker>(
         &self,
         inv: &mut I,
@@ -1687,6 +1732,7 @@ impl RegistryRef {
         peer_id: Vec<u8>,
         redeem_sig: Vec<u8>,
         node_sig: Vec<u8>,
+        authority_attestation: Vec<u8>,
     ) -> Result<Status, ClientError> {
         decode_rkyv(
             self.call(
@@ -1700,7 +1746,8 @@ impl RegistryRef {
                     .with("admin_sig", admin_sig)
                     .with("peer_id", peer_id)
                     .with("redeem_sig", redeem_sig)
-                    .with("node_sig", node_sig),
+                    .with("node_sig", node_sig)
+                    .with("authority_attestation", authority_attestation),
             )
             .await?,
         )

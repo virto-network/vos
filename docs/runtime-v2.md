@@ -151,24 +151,29 @@ methods fail closed instead of inheriting the legacy trusted-System role
 bypass. Space startup installs the immutable-root-signed canonical
 `space-authority` package as its own Raft root. Root-signed role mutations,
 delegated invite redemption, and grow-only invite cancellation execute in
-that actor; the joiner deletes its pending bearer only after physical
-Accumulate publishes `Bool(true)`. The admin signature binds the authority's
-replication incarnation, so a lagging registry replica cannot turn absence of
-its catalog row into legacy completion; markerless invitation minting and
-redemption are disabled. Activation is an atomic, root-signed registry-guest
-barrier, not a host-side scan: exactly one node must remain enrolled, and the
-same actor transaction rejects every effective non-root grant, every dormant
-grant which could revive, and every live actor-local ACL before sealing legacy
-role admission to the exact authority incarnation. The one-node condition is
-the conservative admission point for this CRDT cutover; any previously unseen
-legacy row that materializes afterward has no authority witness and therefore
-fails closed. Migration is an explicit revoke/remove-before-cutover and
-re-grant-after-cutover operation; rows already
+that actor. For invite redemption the serving immutable-root host first waits
+for physical Accumulate to publish `Bool(true)`, then signs that exact
+redemption and records the attestation with the registry CRDT operation; a
+rejected authority transition can never create an effective registry grant.
+The joiner deletes its pending bearer only after both commits succeed. The
+admin signature binds the authority's replication incarnation, so a lagging
+registry replica cannot turn absence of its catalog row into legacy completion;
+markerless invitation minting and redemption are disabled. Activation first
+runs a read-only guest preflight: exactly one node must remain enrolled, with
+no effective non-root grant,
+dormant revivable grant, or live actor-local ACL. The separately root-signed
+seal is unconditional and monotone, so CRDT replay can never erase it merely
+because a concurrent legacy row materializes in a different order. The
+one-node condition is the conservative operator admission point for this CRDT
+cutover; any previously unseen legacy row that materializes afterward has no
+authority witness and therefore fails closed. Migration is an explicit
+revoke/remove-before-cutover and re-grant-after-cutover operation; rows already
 dominated by their holder's own revoke high-water do not block it. Registry and
 authority use the same total grant order (rootness, epoch, grantor, role), and
-post-cutover registry grants carry a guest-owned witness for the exact
-authority incarnation. No registry
-lookup or daemon-local signature is treated as a finalized authority receipt. A direct reply is
+post-cutover registry grants carry one fixed-size, point-addressed guest-owned
+witness per peer. An invitation witness additionally carries the immutable
+root host's signature emitted only after the exact authority commit; a bare
+caller-supplied authority ID is never sufficient. A direct reply is
 acknowledged only after its waiting channel accepts
 the bytes. Ordinary outbox and suspended-workflow publications are retried by
 the node transport until the destination guest has committed them. Proof and
