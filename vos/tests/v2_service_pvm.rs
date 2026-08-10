@@ -10443,6 +10443,335 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
 }
 
 #[test]
+fn raft_delivery_and_reply_verifiers_replay_before_physical_accumulate() {
+    let service_pvm = vos::v2::transpile_service_elf(&service_elf()).unwrap();
+    let service_program = ProgramId::of_pvm(&service_pvm);
+    let actor_pvm = grey_transpiler::link_elf(&probe_elf()).unwrap();
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_state = Vec::new();
+    let initial_state_ref = BlobRefV2::of_bytes(&initial_state);
+
+    let install_service = |identity: ServiceIdentityV2,
+                           actor: ActorId,
+                           method: &str,
+                           external_actors: Vec<ExternalActorBindingV2>| {
+        let mut host = LocalJamStoreV2::default();
+        assert_eq!(host.import_blob(initial_state.clone()), initial_state_ref);
+        assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
+        let mut service = JamServiceV2::new(
+            service_pvm.clone(),
+            service_program,
+            NoRefineProtocolHostV2,
+            host,
+            TEST_GAS_SCHEDULE.refine,
+            TEST_GAS_SCHEDULE.accumulate,
+        )
+        .unwrap();
+        let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            role_authority: None,
+            external_actors,
+            service: identity.clone(),
+            consistency: ConsistencyModeV2::Raft,
+            actors: vec![ActorGenesisV2 {
+                actor,
+                name: "root".into(),
+                parent: None,
+                producer: ProducerId([0x91; 32]),
+                deployment: identity.deployment,
+                program: actor_program,
+                initial_state: initial_state_ref.clone(),
+                crdt: false,
+                role_policies: role_policies(vec![MethodPolicyV2 {
+                    method: method.into(),
+                    schema: Hash([0x92; 32]),
+                    policy: public_policy_hash(),
+                    public: true,
+                    attested: false,
+                    space_role: None,
+                    actor_role: None,
+                }]),
+            }],
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: SystemCapabilityId([0x93; 32]),
+                authenticator: vec![0x94],
+            },
+        });
+        authorize_install(&mut service, &install);
+        assert!(matches!(
+            service.accumulate(&install).unwrap().result,
+            AccumulationResultV2::Installed(_)
+        ));
+        service
+    };
+
+    let source_identity = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([0x81; 32]),
+        root_service: RootServiceId([0x82; 32]),
+        deployment: DeploymentId([0x83; 32]),
+        service_program,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
+    };
+    let destination_identity = ServiceIdentityV2 {
+        root_service: RootServiceId([0x84; 32]),
+        deployment: DeploymentId([0x85; 32]),
+        ..source_identity.clone()
+    };
+    let source_actor = ActorId([0x86; 32]);
+    let destination_actor = ActorId([44; 32]);
+    let mut source = install_service(
+        source_identity,
+        source_actor,
+        "await_peer",
+        vec![external_binding(
+            "peer",
+            destination_identity.clone(),
+            destination_actor,
+            ProducerId([0x91; 32]),
+            actor_program,
+        )],
+    );
+    let destination = install_service(
+        destination_identity,
+        destination_actor,
+        "peer_value",
+        vec![],
+    );
+
+    let invocation = InvocationId([0x88; 32]);
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("await_peer").encode());
+    let source_work = LocalWorkSchedulerV2::prepare(
+        source.accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation,
+            workflow_step: 0,
+            logical_timeslot: 1,
+            target: source_actor,
+            method: "await_peer".into(),
+            arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap();
+    admit_linear_work(&mut source, &source_work.work);
+    let source_refined = source
+        .refine_actor_tree(&source_work.work, &source_work.imports)
+        .unwrap();
+    assert_eq!(
+        source_refined.transition.outbox.len(),
+        1,
+        "await_peer must suspend with one durable call: {:?}",
+        source_refined.transition
+    );
+    let call = source_refined.transition.outbox[0].call_id;
+    source
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: source_work.work,
+            transition: source_refined.transition,
+            provided_blobs: source_refined.exported_blobs,
+        }))
+        .unwrap();
+    let source_publication = LocalTransportV2::pending_publications(&source)
+        .unwrap()
+        .pop()
+        .unwrap();
+
+    let source_snapshot = source.accumulate_host().snapshot();
+    let source_log = Arc::new(Mutex::new(SharedCommittedLog::default()));
+    let mut source_leader =
+        ReplicatedJamServiceV2::new(source, TestCommittedLog::new(source_log.clone(), true));
+    let mut source_follower = ReplicatedJamServiceV2::new(
+        JamServiceV2::new(
+            service_pvm.clone(),
+            service_program,
+            NoRefineProtocolHostV2,
+            LocalJamStoreV2::from_snapshot(source_snapshot),
+            TEST_GAS_SCHEDULE.refine,
+            TEST_GAS_SCHEDULE.accumulate,
+        )
+        .unwrap(),
+        TestCommittedLog::new(source_log.clone(), false),
+    );
+    let destination_snapshot = destination.accumulate_host().snapshot();
+    let destination_log = Arc::new(Mutex::new(SharedCommittedLog::default()));
+    let mut destination_leader = ReplicatedJamServiceV2::new(
+        destination,
+        TestCommittedLog::new(destination_log.clone(), true),
+    );
+    let mut destination_follower = ReplicatedJamServiceV2::new(
+        JamServiceV2::new(
+            service_pvm,
+            service_program,
+            NoRefineProtocolHostV2,
+            LocalJamStoreV2::from_snapshot(destination_snapshot),
+            TEST_GAS_SCHEDULE.refine,
+            TEST_GAS_SCHEDULE.accumulate,
+        )
+        .unwrap(),
+        TestCommittedLog::new(destination_log.clone(), false),
+    );
+
+    let delivery = LocalWorkSchedulerV2::prepare_delivery(
+        destination_leader.service().accumulate_host(),
+        2,
+        source_publication.published.outbox[0].clone(),
+        source_publication.published.outbox.clone(),
+        source_publication.receipt.clone(),
+    )
+    .unwrap();
+    let delivery_request = AccumulateRequestV2::Deliver(delivery);
+    let delivery_verification = ReceiptVerificationRequestV2 {
+        expected_producer: source_actor,
+        receipt: source_publication.receipt.clone(),
+    };
+    destination_leader
+        .service_mut()
+        .accumulate_host_mut()
+        .allow_receipt(&delivery_verification);
+    assert!(matches!(
+        destination_leader.accumulate(&delivery_request),
+        Err(vos::v2::ReplicatedServiceErrorV2::Dispatch(
+            ServiceDispatchError::InvalidAvailabilityArtifacts
+        ))
+    ));
+    assert!(destination_log.lock().unwrap().entries.is_empty());
+    destination_leader
+        .log_mut()
+        .propose_at_with_availability(
+            &delivery_request.encode(),
+            None,
+            &[],
+            &[],
+            core::slice::from_ref(&delivery_verification),
+        )
+        .unwrap();
+    assert_eq!(destination_leader.catch_up().unwrap(), 1);
+    assert_eq!(destination_follower.catch_up().unwrap(), 1);
+    assert_eq!(
+        destination_leader
+            .service()
+            .accumulate_host()
+            .pending_inbox_calls()
+            .unwrap(),
+        vec![(call, 2)]
+    );
+    assert!(
+        destination_leader
+            .service()
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&destination_follower.service().accumulate_host().snapshot())
+    );
+
+    let inbox = LocalWorkSchedulerV2::prepare_inbox(
+        destination_leader.service().accumulate_host(),
+        call,
+        3,
+    )
+    .unwrap();
+    let destination_refined = destination_leader
+        .refine_actor_tree(&inbox.work, &inbox.imports)
+        .unwrap();
+    let destination_applied = destination_leader
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: inbox.work,
+            transition: destination_refined.transition,
+            provided_blobs: destination_refined.exported_blobs,
+        }))
+        .unwrap();
+    assert_eq!(destination_follower.catch_up().unwrap(), 1);
+    let AccumulationResultV2::Accepted {
+        receipt: destination_receipt,
+        published: destination_published,
+        duplicate: false,
+    } = destination_applied.result
+    else {
+        panic!("destination inbox must commit a reply")
+    };
+    let reply = destination_published.reply.clone().unwrap();
+    let awaited_reply = AccumulatedReplyV2 {
+        reply,
+        receipt: destination_receipt.clone(),
+        attestation: None,
+    };
+    let resumed = LocalWorkSchedulerV2::prepare_resume(
+        source_leader.service().accumulate_host(),
+        invocation,
+        4,
+        Some(awaited_reply),
+    )
+    .unwrap();
+    let source_resumed = source_leader
+        .refine_actor_tree(&resumed.work, &resumed.imports)
+        .unwrap();
+    let resume_request = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+        work: resumed.work,
+        transition: source_resumed.transition,
+        provided_blobs: source_resumed.exported_blobs,
+    });
+    let reply_verification = ReceiptVerificationRequestV2 {
+        expected_producer: destination_actor,
+        receipt: destination_receipt,
+    };
+    source_leader
+        .service_mut()
+        .accumulate_host_mut()
+        .allow_receipt(&reply_verification);
+    assert!(matches!(
+        source_leader.accumulate(&resume_request),
+        Err(vos::v2::ReplicatedServiceErrorV2::Dispatch(
+            ServiceDispatchError::InvalidAvailabilityArtifacts
+        ))
+    ));
+    assert!(source_log.lock().unwrap().entries.is_empty());
+    source_leader
+        .log_mut()
+        .propose_at_with_availability(
+            &resume_request.encode(),
+            None,
+            &[],
+            &[],
+            core::slice::from_ref(&reply_verification),
+        )
+        .unwrap();
+    assert_eq!(source_leader.catch_up().unwrap(), 1);
+    assert_eq!(source_follower.catch_up().unwrap(), 1);
+    assert!(
+        source_leader
+            .service()
+            .accumulate_host()
+            .reply_admission(call)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        source_leader
+            .service()
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&source_follower.service().accumulate_host().snapshot())
+    );
+    assert_eq!(
+        destination_log.lock().unwrap().entries[0].receipt_verifications,
+        vec![delivery_verification]
+    );
+    assert_eq!(
+        source_log.lock().unwrap().entries[0].receipt_verifications,
+        vec![reply_verification]
+    );
+}
+
+#[test]
 fn raft_authority_receipt_replays_on_a_fresh_follower_before_actor_apply() {
     let elf = service_elf();
     let service_pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
