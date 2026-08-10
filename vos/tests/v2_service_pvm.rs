@@ -419,6 +419,11 @@ impl TestCommittedLog {
         self
     }
 
+    fn with_applied(mut self, applied: u64) -> Self {
+        self.applied = applied;
+        self
+    }
+
     fn with_committed_index_floor(mut self, index: u64) -> Self {
         self.committed_index_floor = Some(index);
         self
@@ -452,6 +457,7 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
                 logical_timeslot: None,
                 availability_programs: vec![],
                 availability_blobs: vec![],
+                receipt_verifications: vec![],
             };
             shared.entries.push(entry);
         }
@@ -464,6 +470,7 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
         logical_timeslot: Option<u64>,
         programs: &[ImportedProgramV2],
         blobs: &[ImportedBlobV2],
+        receipt_verifications: &[ReceiptVerificationRequestV2],
     ) -> Result<CommittedAccumulateEntryV2, Self::Error> {
         if !self.leader {
             return Err(TestLogError::NotLeader);
@@ -476,6 +483,7 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
                 logical_timeslot: None,
                 availability_programs: vec![],
                 availability_blobs: vec![],
+                receipt_verifications: vec![],
             };
             shared.entries.push(entry);
         }
@@ -485,6 +493,7 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
             logical_timeslot,
             availability_programs: programs.to_vec(),
             availability_blobs: blobs.to_vec(),
+            receipt_verifications: receipt_verifications.to_vec(),
         };
         shared.entries.push(entry.clone());
         Ok(entry)
@@ -1715,7 +1724,7 @@ fn canonical_space_authority_authorizes_a_physical_target_and_exact_retry() {
 }
 
 #[test]
-fn node_ingress_uses_canonical_authority_not_legacy_role_bytes() {
+fn node_ingress_quorum_orders_canonical_authority_for_a_raft_target() {
     let node_key = libp2p::identity::Keypair::generate_ed25519();
     let granted_key = libp2p::identity::Keypair::generate_ed25519();
     let denied_key = libp2p::identity::Keypair::generate_ed25519();
@@ -1840,7 +1849,18 @@ fn node_ingress_uses_canonical_authority_not_legacy_role_bytes() {
         execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
-    let target = LocalRootTreeServiceV2::open(
+    let target_replication_id = [0xE0; 32];
+    let target_log = RaftAccumulateLogV2::open(
+        &directory.join("target.redb"),
+        RaftConfig {
+            me: node_prefix,
+            members: vec![node_prefix],
+            replication_id: target_replication_id,
+            ..RaftConfig::default()
+        },
+    )
+    .unwrap();
+    let target = LocalRootTreeServiceV2::open_raft(
         LocalRootTreeConfigV2 {
             role_authority: Some(authority_binding.clone()),
             service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
@@ -1848,7 +1868,7 @@ fn node_ingress_uses_canonical_authority_not_legacy_role_bytes() {
             package: target_package,
             root_actor: target_actor,
             actor_name: target_name,
-            consistency: ConsistencyModeV2::Local,
+            consistency: ConsistencyModeV2::Raft,
             initial_state: vec![],
             external_actors: vec![],
             install_authorization: AuthorizationEvidenceV2::SystemCapability {
@@ -1859,8 +1879,9 @@ fn node_ingress_uses_canonical_authority_not_legacy_role_bytes() {
             accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
         },
         FailableCommittedImages::default(),
+        target_log,
     )
-    .expect("the target pins the authority identity in guest-owned state");
+    .expect("the Raft target pins the authority identity in guest-owned state");
 
     let authority_route = ServiceId::new(node_prefix, 0x3a00);
     let target_route = ServiceId::new(node_prefix, 0x3a01);
@@ -10419,6 +10440,307 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
         caller_publications,
         "the caller's newly committed publication is independent of the callee acknowledgement"
     );
+}
+
+#[test]
+fn raft_authority_receipt_replays_on_a_fresh_follower_before_actor_apply() {
+    let elf = service_elf();
+    let service_pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
+    let actor_pvm = actor_pvm(0);
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_bytes = b"raft role initial state".to_vec();
+    let initial = BlobRefV2::of_bytes(&initial_bytes);
+    let actor = ActorId([0x61; 32]);
+    let authority_actor = ActorId([0x62; 32]);
+    let service = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([0x63; 32]),
+        root_service: RootServiceId([0x64; 32]),
+        deployment: DeploymentId([0x65; 32]),
+        service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
+    };
+    let authority = RoleAuthorityBindingV2 {
+        service: ServiceIdentityV2 {
+            root_service: RootServiceId([0x66; 32]),
+            deployment: DeploymentId([0x67; 32]),
+            ..service.clone()
+        },
+        actor: authority_actor,
+    };
+    let policy = MethodPolicyV2 {
+        method: "member_only".into(),
+        schema: Hash([0x68; 32]),
+        policy: space_role_policy_hash(vos::SpaceRole::Member.as_u8()).unwrap(),
+        public: false,
+        attested: false,
+        space_role: Some(vos::SpaceRole::Member.as_u8()),
+        actor_role: None,
+    };
+    let genesis = ServiceGenesisV2 {
+        role_authority: Some(authority.clone()),
+        external_actors: vec![],
+        service: service.clone(),
+        consistency: ConsistencyModeV2::Raft,
+        actors: vec![ActorGenesisV2 {
+            actor,
+            name: "root".into(),
+            parent: None,
+            producer: ProducerId([0x69; 32]),
+            deployment: service.deployment,
+            program: actor_program,
+            initial_state: initial.clone(),
+            crdt: false,
+            role_policies: role_policies(vec![policy.clone()]),
+        }],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([0x6A; 32]),
+            authenticator: vec![0x6B],
+        },
+    };
+    let programs = vec![ImportedProgramV2 {
+        program: actor_program,
+        pvm: actor_pvm,
+    }];
+    let blobs = vec![ImportedBlobV2 {
+        reference: initial,
+        bytes: initial_bytes,
+    }];
+    let mut leader_host = LocalJamStoreV2::default();
+    leader_host.allow_install(&genesis);
+    let mut follower_host = LocalJamStoreV2::default();
+    follower_host.allow_install(&genesis);
+    let shared = Arc::new(Mutex::new(SharedCommittedLog::default()));
+    let mut leader = ReplicatedJamServiceV2::new(
+        JamServiceV2::new(
+            service_pvm.clone(),
+            ProgramId::of_pvm(&service_pvm),
+            NoRefineProtocolHostV2,
+            leader_host,
+            TEST_GAS_SCHEDULE.refine,
+            TEST_GAS_SCHEDULE.accumulate,
+        )
+        .unwrap(),
+        TestCommittedLog::new(shared.clone(), true),
+    );
+    let mut follower = ReplicatedJamServiceV2::new(
+        JamServiceV2::new(
+            service_pvm.clone(),
+            ProgramId::of_pvm(&service_pvm),
+            NoRefineProtocolHostV2,
+            follower_host,
+            TEST_GAS_SCHEDULE.refine,
+            TEST_GAS_SCHEDULE.accumulate,
+        )
+        .unwrap(),
+        TestCommittedLog::new(shared.clone(), false),
+    );
+    assert!(matches!(
+        leader
+            .accumulate_with_availability(
+                &AccumulateRequestV2::Install(genesis),
+                &programs,
+                &blobs,
+            )
+            .unwrap()
+            .result,
+        AccumulationResultV2::Installed(_)
+    ));
+    assert_eq!(follower.catch_up().unwrap(), 1);
+
+    let holder = Origin::Member(SubjectId([0x6C; 32]));
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("member_only").encode());
+    let provisional = LocalWorkRequestV2 {
+        invocation: InvocationId([0x6D; 32]),
+        workflow_step: 0,
+        logical_timeslot: 7,
+        target: actor,
+        method: policy.method.clone(),
+        arguments,
+        origin: holder,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let provisional_work =
+        LocalWorkSchedulerV2::prepare(leader.service().accumulate_host(), provisional.clone())
+            .unwrap()
+            .work;
+    let claim = RoleAuthorizationClaimV2 {
+        space: service.space,
+        holder,
+        role: vos::SpaceRole::Member,
+        audience: service,
+        invocation: provisional.invocation,
+        scope: provisional_work.authorization_scope(),
+        target: actor,
+        method: policy.method.clone(),
+        policy: policy.policy,
+    };
+    let authority_reply = claim.authority_reply(authority_actor);
+    let assertion = AccumulatedRoleAssertionV2 {
+        claim: claim.clone(),
+        receipt: AccumulationReceiptV2 {
+            service: authority.service.clone(),
+            accepted_transition: Hash([0x6E; 32]),
+            reply_commitment: Some(authority_reply.commitment()),
+            outbox_commitment: None,
+            resulting_state_root: Some(Hash([0x6F; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 3,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Raft,
+        },
+    };
+    assert!(assertion.matches_authority(&authority));
+    let verification = ReceiptVerificationRequestV2 {
+        expected_producer: authority_actor,
+        receipt: assertion.receipt.clone(),
+    };
+    let credential = RoleCredentialV2 {
+        holder,
+        scope: claim.scope,
+        space_role: Some(vos::SpaceRole::Member),
+        actor_role: None,
+        authenticator: assertion.encode(),
+    }
+    .disclosed_evidence(policy.policy);
+    let mut authorized = provisional;
+    authorized.authorization = credential;
+    let work = LocalWorkSchedulerV2::prepare(leader.service().accumulate_host(), authorized)
+        .unwrap()
+        .work;
+    let ingress = direct_linear_ingress(&work);
+    let mut forged_verification = verification.clone();
+    forged_verification.expected_producer = ActorId([0x70; 32]);
+    let rejection_path = std::env::temp_dir().join(format!(
+        "vos-v2-raft-authority-sidecar-{}-{}.redb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let mut canonical_log =
+        RaftAccumulateLogV2::open(&rejection_path, RaftConfig::default()).unwrap();
+    assert!(
+        canonical_log
+            .propose_at_with_availability(
+                &ingress.encode(),
+                None,
+                &[],
+                &[],
+                core::slice::from_ref(&forged_verification),
+            )
+            .is_err(),
+        "the log rejects a verifier decision that does not bind the assertion reply",
+    );
+    drop(canonical_log);
+    std::fs::remove_file(rejection_path).unwrap();
+    assert_eq!(
+        shared.lock().unwrap().entries.len(),
+        1,
+        "invalid verifier inputs never become a poison entry",
+    );
+    leader
+        .log_mut()
+        .propose_at_with_availability(
+            &ingress.encode(),
+            None,
+            &[],
+            &[],
+            core::slice::from_ref(&verification),
+        )
+        .unwrap();
+    assert_eq!(leader.catch_up().unwrap(), 1);
+    assert_eq!(follower.catch_up().unwrap(), 1);
+    assert!(
+        follower
+            .service()
+            .accumulate_host()
+            .ingress_record(work.invocation)
+            .unwrap()
+            .is_some(),
+        "the follower guest admits the exact authority assertion from the ordered verifier sidecar",
+    );
+
+    // Reopen the follower from only its committed service image. Receipt
+    // verifier allowlists are process-local and therefore empty here. The
+    // subsequent Apply must authenticate from the guest-owned ingress row.
+    let follower_snapshot = follower.service().accumulate_host().snapshot();
+    let follower_applied = follower.log_mut().applied_index().unwrap();
+    drop(follower);
+    let follower_host = LocalJamStoreV2::from_snapshot(follower_snapshot);
+    let mut follower = ReplicatedJamServiceV2::new(
+        JamServiceV2::new(
+            service_pvm.clone(),
+            ProgramId::of_pvm(&service_pvm),
+            NoRefineProtocolHostV2,
+            follower_host,
+            TEST_GAS_SCHEDULE.refine,
+            TEST_GAS_SCHEDULE.accumulate,
+        )
+        .unwrap(),
+        TestCommittedLog::new(shared.clone(), false).with_applied(follower_applied),
+    );
+    let transition = TransitionV2 {
+        service: work.service.clone(),
+        consumed_input: work.input_id(),
+        target_deployment: work.target_deployment,
+        target_program: work.target_program,
+        base: work.base.clone(),
+        writes: vec![ActorWriteV2 {
+            actor,
+            key: vos::lifecycle::STATE_KEY_BYTES.to_vec(),
+            value: Some(b"authorized follower state".to_vec()),
+        }],
+        crdt_change: None,
+        spawns: vec![],
+        continuations: vec![],
+        inbox: vec![],
+        outbox: vec![],
+        reply: Some(ReplyRecordV2 {
+            call_id: work.invocation.root_reply_id(),
+            producer: actor,
+            result: Value::U32(99).encode(),
+        }),
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    let applied = leader
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work,
+            transition,
+            provided_blobs: vec![],
+        }))
+        .expect("the leader applies the admitted role-authorized invocation");
+    assert!(matches!(
+        applied.result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert_eq!(follower.catch_up().unwrap(), 1);
+    assert!(
+        leader
+            .service()
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&follower.service().accumulate_host().snapshot()),
+        "a fresh follower applies the actor slice without any process-local receipt allowlist",
+    );
+    let entries = &shared.lock().unwrap().entries;
+    assert_eq!(entries[1].receipt_verifications, vec![verification]);
+    assert!(entries[2].receipt_verifications.is_empty());
 }
 
 #[test]
