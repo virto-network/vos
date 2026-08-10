@@ -423,6 +423,10 @@ receipt must itself declare Raft consistency. Assertion reply extraction is
 selected by a host-private marker carried only on this local protocol and its
 voter-authenticated redirect; an application method merely named
 `authorize_role` retains its ordinary declared reply.
+Authority decisions and invite redemptions use a no-auto-redirect network
+send: every leadership change is surfaced to the caller and reauthenticated
+against a fresh exact-group status plus the complete roster PeerId. The
+generic prefix-map redirect helper is never on either authorization path.
 
 The current legacy `vosx space publish` path does not activate this v2 Install
 entry. Production v2 installation must resolve a signature-verified `.vos`

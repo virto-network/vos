@@ -1470,6 +1470,9 @@ impl NodeService {
                 route.service.space == space
                     && route.service.root_service == root_service
                     && route.consistency == crate::v2::ConsistencyModeV2::Raft
+                    && route.replication_id == Some(authority_replication_id)
+                    && route.is_role_authority
+                    && route.authenticated_peer.is_none()
             })?;
 
         let redemption = crate::v2::RoleAuthorityInviteRedemptionV2 {
@@ -1501,7 +1504,7 @@ impl NodeService {
             arguments,
             proof_requested: false,
         };
-        let reply = self.invoke_v2_root_route(&route, ingress.encode())?;
+        let reply = self.invoke_v2_authority_route(&route, ingress.encode())?;
         if <crate::value::Value as Decode>::try_decode(&reply).and_then(|value| value.as_bool())
             != Some(true)
         {
@@ -1536,7 +1539,7 @@ impl NodeService {
     }
 
     #[cfg(feature = "storage")]
-    fn invoke_v2_root_route(&self, route: &V2ActorRoute, ingress: Vec<u8>) -> Option<Vec<u8>> {
+    fn invoke_v2_authority_route(&self, route: &V2ActorRoute, ingress: Vec<u8>) -> Option<Vec<u8>> {
         let tx = self.invoke_routes.lock().ok()?.get(&route.route).cloned()?;
         let deadline = Instant::now().checked_add(route.invoke_timeout)?;
         let (reply_tx, reply_rx) = mpsc::channel();
@@ -1556,20 +1559,19 @@ impl NodeService {
             .ok()?;
         if let Some(redirect) = decode_v2_raft_redirect(&envelope) {
             let network = self.shared_network.lock().ok()?.clone()?;
-            let peer = network.peer_for_prefix(redirect.leader_prefix)?;
-            let leader_route =
-                ServiceId::new(redirect.leader_prefix, ServiceId(route.route).local_id());
-            let delegated = encode_v2_raft_delegation(redirect.origin, false, false, &ingress);
-            return network
-                .send_invoke(
-                    peer,
-                    ServiceId::REGISTRY.0,
-                    leader_route.0,
-                    Vec::new(),
-                    delegated,
-                )
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .ok();
+            let status = network.local_raft_status(&route.replication_id?)?;
+            return send_v2_authority_invoke_exact(
+                &network,
+                &self.invoke_routes,
+                route,
+                status,
+                redirect.leader_prefix,
+                redirect.origin,
+                false,
+                false,
+                &ingress,
+                deadline,
+            );
         }
         unwrap_invoke_envelope(&envelope)
     }
@@ -2131,6 +2133,60 @@ fn authenticated_v2_raft_leader_peer(
     }
     let peer = libp2p::PeerId::from_bytes(&member.key).ok()?;
     node_member_authenticates_voter(member, leader_prefix, &peer).then_some(peer)
+}
+
+/// Follow authority redirects without ever entering the network's generic
+/// prefix-based redirect path. Every hop is selected from an exact group
+/// status and the canonical roster's complete PeerId; a second leadership
+/// change is returned here and reauthenticated before another send.
+#[cfg(all(feature = "network", feature = "storage"))]
+#[allow(clippy::too_many_arguments)]
+fn send_v2_authority_invoke_exact(
+    network: &crate::network::Network,
+    invoke_routes: &InvokeRoutes,
+    route: &V2ActorRoute,
+    mut status: crate::network::RaftStatusReply,
+    mut leader_prefix: u16,
+    origin: crate::v2::Origin,
+    preserve_envelope: bool,
+    role_authority_request: bool,
+    ingress: &[u8],
+    deadline: Instant,
+) -> Option<Vec<u8>> {
+    let replication_id = route.replication_id?;
+    let mut visited = std::collections::BTreeSet::new();
+    loop {
+        if !visited.insert(leader_prefix) {
+            return None;
+        }
+        let member = lookup_node_member_from_routes(invoke_routes, leader_prefix)?;
+        let peer = authenticated_v2_raft_leader_peer(&status, &member, leader_prefix)?;
+        let leader_route = ServiceId::new(leader_prefix, ServiceId(route.route).local_id()).0;
+        let delegated =
+            encode_v2_raft_delegation(origin, preserve_envelope, role_authority_request, ingress);
+        let response = network
+            .send_invoke_exact(
+                peer,
+                ServiceId::REGISTRY.0,
+                leader_route,
+                Vec::new(),
+                delegated,
+            )
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()?;
+        match response {
+            crate::network::NetworkInvokeResponse::Reply(payload) => return Some(payload),
+            crate::network::NetworkInvokeResponse::Redirect {
+                leader_prefix: next,
+            } => {
+                status = network
+                    .send_raft_status_req(peer, replication_id)
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .ok()?;
+                leader_prefix = next;
+            }
+        }
+    }
 }
 
 /// Pull a `u8` out of the actor-framework reply bytes. Handles
@@ -5175,24 +5231,19 @@ fn request_v2_role_assertion(
         let network = shared_network.lock().map_err(|_| ())?.clone().ok_or(())?;
         let replication_id = route.replication_id.ok_or(())?;
         let status = network.local_raft_status(&replication_id).ok_or(())?;
-        let member =
-            lookup_node_member_from_routes(invoke_routes, redirect.leader_prefix).ok_or(())?;
-        let peer =
-            authenticated_v2_raft_leader_peer(&status, &member, redirect.leader_prefix).ok_or(())?;
-        let leader_route =
-            ServiceId::new(redirect.leader_prefix, ServiceId(route.route).local_id());
-        let delegated =
-            encode_v2_raft_delegation(crate::v2::Origin::System, true, true, &ingress_wire);
-        network
-            .send_invoke(
-                peer,
-                ServiceId::REGISTRY.0,
-                leader_route.0,
-                Vec::new(),
-                delegated,
-            )
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| ())?
+        send_v2_authority_invoke_exact(
+            &network,
+            invoke_routes,
+            &route,
+            status,
+            redirect.leader_prefix,
+            crate::v2::Origin::System,
+            true,
+            true,
+            &ingress_wire,
+            deadline,
+        )
+        .ok_or(())?
     } else {
         envelope
     };

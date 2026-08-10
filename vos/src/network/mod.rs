@@ -207,9 +207,9 @@ pub struct ManifestReply {
 ///
 /// [`set_service`]: Network::set_service
 /// [`register_raft_handler`]: Network::register_raft_handler
-/// Result of dispatching one network invocation. Redirects are transport
-/// control, never actor reply bytes: the originating network instance follows
-/// them so the final leader authenticates the original peer directly.
+/// Result of one network invocation. Redirects are transport control, never
+/// actor reply bytes: ordinary sends follow one transparently, while exact
+/// sends surface them for protocol-specific authentication.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkInvokeResponse {
     Reply(Vec<u8>),
@@ -568,6 +568,16 @@ pub(in crate::network) enum NetworkCmd {
         msg: Vec<u8>,
         reply: std_mpsc::Sender<Vec<u8>>,
     },
+    /// Security-sensitive invoke which returns a redirect to its caller
+    /// instead of consulting the lossy 16-bit prefix map automatically.
+    SendInvokeExact {
+        target_peer: PeerId,
+        from: u32,
+        to: u32,
+        chain: Vec<u32>,
+        msg: Vec<u8>,
+        reply: std_mpsc::Sender<NetworkInvokeResponse>,
+    },
     SendFetchHeads {
         target_peer: PeerId,
         replication_id: [u8; 32],
@@ -681,6 +691,7 @@ pub(in crate::network) enum NetworkCmd {
 /// Outbound request kinds tracked while we wait for the reply.
 enum OutboundReply {
     Invoke(PendingInvoke),
+    InvokeExact(std_mpsc::Sender<NetworkInvokeResponse>),
     Heads(std_mpsc::Sender<Vec<[u8; 32]>>),
     Node(std_mpsc::Sender<Option<Vec<u8>>>),
     RaftAppend(std_mpsc::Sender<RaftAppendResult>),
@@ -1135,6 +1146,29 @@ impl Network {
         rx
     }
 
+    /// Invoke one exact authenticated peer without transparent Raft redirect
+    /// following. Security-sensitive callers must authenticate any returned
+    /// leader against their own replication-group authority before retrying.
+    pub fn send_invoke_exact(
+        &self,
+        target_peer: PeerId,
+        from: u32,
+        to: u32,
+        chain: Vec<u32>,
+        msg: Vec<u8>,
+    ) -> std_mpsc::Receiver<NetworkInvokeResponse> {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self.cmd_tx.send(NetworkCmd::SendInvokeExact {
+            target_peer,
+            from,
+            to,
+            chain,
+            msg,
+            reply: tx,
+        });
+        rx
+    }
+
     /// Take ownership of the inbound-Tell receiver. The first call
     /// returns `Some(rx)`; subsequent calls return `None`. The
     /// caller is responsible for draining and dispatching frames
@@ -1362,6 +1396,27 @@ async fn network_main(
                             }),
                         );
                         debug!(%target_peer, from, to, "network: sent InvokeRequest");
+                    }
+                    Some(NetworkCmd::SendInvokeExact {
+                        target_peer,
+                        from,
+                        to,
+                        chain,
+                        msg,
+                        reply,
+                    }) => {
+                        let frame = Frame::InvokeRequest {
+                            from,
+                            to,
+                            chain,
+                            msg,
+                        };
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, frame);
+                        outbound_replies.insert(req_id, OutboundReply::InvokeExact(reply));
+                        debug!(%target_peer, from, to, "network: sent exact InvokeRequest");
                     }
                     Some(NetworkCmd::SendFetchHeads {
                         target_peer, replication_id, reply,
@@ -2230,6 +2285,15 @@ fn handle_req_resp(
                     }
                     (Frame::InvokeReply { payload }, Some(OutboundReply::Invoke(pending))) => {
                         let _ = pending.reply.send(payload);
+                    }
+                    (Frame::InvokeReply { payload }, Some(OutboundReply::InvokeExact(reply))) => {
+                        let _ = reply.send(NetworkInvokeResponse::Reply(payload));
+                    }
+                    (
+                        Frame::InvokeRedirect { leader_prefix },
+                        Some(OutboundReply::InvokeExact(reply)),
+                    ) => {
+                        let _ = reply.send(NetworkInvokeResponse::Redirect { leader_prefix });
                     }
                     (
                         Frame::InvokeRedirect { leader_prefix },
@@ -3629,6 +3693,18 @@ mod tests {
             *seen_caller.lock().unwrap(),
             Some(net_a.peer_id()),
             "the leader must authenticate the original requester, not the follower",
+        );
+
+        let exact = net_a
+            .send_invoke_exact(follower, 7, ((prefix_b as u32) << 16) | 9, vec![], vec![2])
+            .recv_timeout(Duration::from_secs(5))
+            .expect("exact invoke returns the follower response");
+        assert_eq!(
+            exact,
+            NetworkInvokeResponse::Redirect {
+                leader_prefix: prefix_c,
+            },
+            "exact-peer invokes surface redirects without consulting the prefix map",
         );
 
         net_a.join();
