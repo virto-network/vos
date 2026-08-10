@@ -415,6 +415,15 @@ finality proof ordered or independently available to every follower before an
 Apply can be deterministic. Actor-local and mixed policies still require the
 separate bound-handle authority path.
 
+Authority redirects never trust the 16-bit routing prefix as identity. The
+target retains the authority's exact Raft replication ID, requires the leader
+hint to name a live member of that group, resolves that slot through the
+canonical node roster, and sends to the row's complete PeerId. The resulting
+receipt must itself declare Raft consistency. Assertion reply extraction is
+selected by a host-private marker carried only on this local protocol and its
+voter-authenticated redirect; an application method merely named
+`authorize_role` retains its ordinary declared reply.
+
 The current legacy `vosx space publish` path does not activate this v2 Install
 entry. Production v2 installation must resolve a signature-verified `.vos`
 package, derive the exact `ActorGenesisV2` (including its canonical role-policy

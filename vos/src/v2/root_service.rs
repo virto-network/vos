@@ -519,10 +519,10 @@ where
         }
     }
 
-    #[cfg(all(feature = "storage", feature = "network"))]
     fn replication_id(&self) -> Option<[u8; 32]> {
         match self {
             Self::Direct(_) => None,
+            #[cfg(feature = "storage")]
             Self::Raft(service) => Some(service.log().replication_id()),
         }
     }
@@ -1135,7 +1135,6 @@ where
         self.consistency
     }
 
-    #[cfg(all(feature = "storage", feature = "network"))]
     pub fn replication_id(&self) -> Option<[u8; 32]> {
         self.service.replication_id()
     }

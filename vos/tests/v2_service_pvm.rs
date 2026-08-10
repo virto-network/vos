@@ -19,26 +19,26 @@ use vos::network::RaftRpcHandler;
 use vos::node::{AgentResult, V2NodeRegistrationError, VosNode};
 use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, Role, WorkerConfig};
 use vos::v2::{
-    AccumulateProtocolHostV2, AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2,
-    AccumulationReceiptV2, AccumulationResultV2, ActorGenesisV2, ActorId, ActorUpgradeV2,
-    ActorWriteV2, AuthorizationEvidenceV2, BlobRefV2, CallId, CommittedAccumulateBatchV2,
-    CommittedAccumulateEntryV2, CommittedAccumulateLogV2, CommittedImageStoreV2,
-    CommittedServiceImageHostV2, CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationChangeV2, ContinuationSnapshotV2, CrdtChangeV2, DeploymentId, DirectIngressV2,
-    DurableJamStoreV2, ExternalActorBindingV2, GasAccountingV2, GasScheduleV2, Hash,
-    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2, InvocationId,
-    JamServiceV2, LocalJamStoreHostV2, LocalJamStoreSnapshotV2, LocalJamStoreV2,
-    LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2,
+    AccumulateProtocolHostV2, AccumulateRequestV2, AccumulatedReplyV2, AccumulatedRoleAssertionV2,
+    AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationResultV2, ActorGenesisV2, ActorId,
+    ActorUpgradeV2, ActorWriteV2, AuthorizationEvidenceV2, BlobRefV2, CallId,
+    CommittedAccumulateBatchV2, CommittedAccumulateEntryV2, CommittedAccumulateLogV2,
+    CommittedImageStoreV2, CommittedServiceImageHostV2, CommittedServiceSnapshotV2,
+    ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2, ContinuationSnapshotV2,
+    CrdtChangeV2, DeploymentId, DirectIngressV2, DurableJamStoreV2, ExternalActorBindingV2,
+    GasAccountingV2, GasScheduleV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
+    InboxDrainOutcomeV2, InvocationId, JamServiceV2, LocalJamStoreHostV2, LocalJamStoreSnapshotV2,
+    LocalJamStoreV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2,
     LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
     MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin, PackageManifestV2,
     PackageRolePoliciesV2, ProducerId, ProgramId, ProofArtifactStoreV2, PublishedEffectsV2,
     ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2,
     ReplicatedServiceErrorV2, ReplyRecordV2, RoleAuthorityBindingV2,
-    RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2, RoleCredentialV2,
-    RoleCredentialVerificationRequestV2, RootServiceId, RootTreeInvocationV2, ScheduleErrorV2,
-    ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2,
-    StateKeyV2, SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2,
-    WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
+    RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2, RoleAuthorizationClaimV2,
+    RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId, RootTreeInvocationV2,
+    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
+    ServicePvmV2, StateKeyV2, SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2,
+    WorkEnvelopeV2, WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     Decode, Encode,
@@ -1831,19 +1831,20 @@ fn node_ingress_uses_canonical_authority_not_legacy_role_bytes() {
     let target_actor = ActorId([218; 32]);
     let target_signer = libp2p::identity::Keypair::generate_ed25519();
     let (target_package, target_name) = signed_test_package(&cycle_v2_elf(), &target_signer);
+    let target_identity = ServiceIdentityV2 {
+        space,
+        root_service: RootServiceId([219; 32]),
+        deployment: target_package.deployment_id(),
+        service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
+    };
     let target = LocalRootTreeServiceV2::open(
         LocalRootTreeConfigV2 {
-            role_authority: Some(authority_binding),
+            role_authority: Some(authority_binding.clone()),
             service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
-            service: ServiceIdentityV2 {
-                space,
-                root_service: RootServiceId([219; 32]),
-                deployment: target_package.deployment_id(),
-                service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
-                service_abi: vos::v2::ABI_VERSION,
-                execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
-                gas_schedule: TEST_GAS_SCHEDULE,
-            },
+            service: target_identity.clone(),
             package: target_package,
             root_actor: target_actor,
             actor_name: target_name,
@@ -1946,6 +1947,50 @@ fn node_ingress_uses_canonical_authority_not_legacy_role_bytes() {
     }
     assert!(granted_network.peer_for_prefix(node_prefix).is_some());
     assert!(denied_network.peer_for_prefix(node_prefix).is_some());
+
+    let ordinary_claim = RoleAuthorizationClaimV2 {
+        space,
+        holder,
+        role: vos::SpaceRole::Member,
+        audience: target_identity,
+        invocation: InvocationId([0xDA; 32]),
+        scope: Hash([0xDB; 32]),
+        target: target_actor,
+        method: "member_only".into(),
+        policy: Hash([0xDC; 32]),
+    };
+    let mut ordinary_arguments = vec![vos::value::TAG_DYNAMIC];
+    ordinary_arguments.extend_from_slice(
+        &Msg::new("authorize_role")
+            .with("claim", ordinary_claim.encode())
+            .encode(),
+    );
+    let ordinary_authority_reply = granted_network
+        .send_invoke(
+            node_peer,
+            ServiceId::REGISTRY.0,
+            authority_route.0,
+            vec![],
+            RootTreeInvocationV2 {
+                invocation: ordinary_claim.authority_invocation(),
+                target: authority_actor,
+                method: "authorize_role".into(),
+                arguments: ordinary_arguments,
+                proof_requested: false,
+            }
+            .encode(),
+        )
+        .recv_timeout(Duration::from_secs(120))
+        .expect("an ordinary authorize_role call commits its declared actor reply");
+    let Some(Value::Bytes(ordinary_reply_bytes)) = Value::try_decode(&ordinary_authority_reply)
+    else {
+        panic!("ordinary authorize_role must return its declared Vec<u8> reply")
+    };
+    assert_eq!(ordinary_reply_bytes, ordinary_claim.encode());
+    assert!(
+        AccumulatedRoleAssertionV2::decode(&ordinary_reply_bytes).is_err(),
+        "method-name coincidence must not activate the host-private assertion override",
+    );
 
     let ingress = |invocation| {
         let mut arguments = vec![vos::value::TAG_DYNAMIC];
