@@ -1040,6 +1040,19 @@ impl AttestationProofHostV2 for LocalJamStoreV2 {
     }
 }
 
+impl super::ReceiptVerificationHostV2 for LocalJamStoreV2 {
+    fn make_receipt_available(&mut self, request: &ReceiptVerificationRequestV2) -> bool {
+        self.allow_receipt(request);
+        true
+    }
+}
+
+impl<B> super::ReceiptVerificationHostV2 for DurableJamStoreV2<B> {
+    fn make_receipt_available(&mut self, request: &ReceiptVerificationRequestV2) -> bool {
+        super::ReceiptVerificationHostV2::make_receipt_available(&mut self.local, request)
+    }
+}
+
 impl<B: ProofArtifactStoreV2> AttestationProofHostV2 for DurableJamStoreV2<B> {
     fn make_proof_available(&mut self, request: &ProofVerificationRequestV2, proof: &[u8]) -> bool {
         if !request.proof_blob.matches(proof)

@@ -3675,6 +3675,15 @@ fn validate_pinned_role_assertion<S: GuestAccumulateStoreV2>(
     {
         return Ok(Some(AccumulationRejectionV2::Unauthorized));
     }
+    // Direct ingress already crossed this exact receipt-verification boundary
+    // before guest Accumulate persisted the invocation. Later Apply slices
+    // may therefore authenticate the same credential against that guest-owned
+    // row instead of depending on process-local verifier state. This is
+    // load-bearing for Raft follower replay and restart between admission and
+    // execution; durable inbox/reply paths still call RECEIPT_VERIFY below.
+    if admitted_direct_role_authorization(store, work)? {
+        return Ok(None);
+    }
     let request = ReceiptVerificationRequestV2 {
         expected_producer: authority.actor,
         receipt: assertion.receipt,
@@ -3689,6 +3698,31 @@ fn validate_pinned_role_assertion<S: GuestAccumulateStoreV2>(
             ReceiptVerificationV2::Unavailable => Some(AccumulationRejectionV2::ReceiptUnavailable),
         },
     )
+}
+
+fn admitted_direct_role_authorization<S: StateTreeStore>(
+    store: &S,
+    work: &super::WorkEnvelopeV2,
+) -> GuestResult<bool, S::Error> {
+    if work.parent_call.is_some() || work.causal_parent.is_some() || work.causal_context.is_some() {
+        return Ok(false);
+    }
+    let Some(bytes) = read(store, &ingress_storage_key(work.invocation))? else {
+        return Ok(false);
+    };
+    let record = IngressRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
+    if work.workflow_step == 0 {
+        return Ok(!record.consumed && record.ingress.matches_work(work));
+    }
+    Ok(record.consumed
+        && record.ingress.service == work.service
+        && record.ingress.invocation == work.invocation
+        && record.ingress.target == work.target
+        && record.ingress.method == work.method
+        && record.ingress.origin == work.origin
+        && record.ingress.authorization == work.authorization
+        && record.ingress.imported_blobs == work.imported_blobs
+        && record.ingress.proof_requested == work.proof_requested)
 }
 
 fn work_matches_durable_inbox<S: StateTreeStore>(
@@ -6653,6 +6687,7 @@ mod tests {
         );
         admitted_work.authorization = developer.disclosed_evidence(required_policy);
         seed_direct_ingress(&mut store, &admitted_work);
+        let admitted_invocation = admitted_work.invocation;
         let admitted = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             transition: linear_transition(&admitted_work, b"admitted"),
             work: admitted_work,
@@ -6667,14 +6702,28 @@ mod tests {
             }
         ));
 
-        let mut unavailable_store = store.clone();
-        unavailable_store.receipt_allowlist.clear();
-        let unavailable_before = unavailable_store.clone();
+        let mut recovered_store = store.clone();
+        recovered_store.receipt_allowlist.clear();
+        assert!(matches!(
+            execute_guest_accumulate(&mut recovered_store, &admitted).unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+
+        let mut unadmitted_store = store.clone();
+        unadmitted_store.receipt_allowlist.clear();
+        unadmitted_store
+            .rows
+            .remove(&ingress_storage_key(admitted_invocation));
+        let unadmitted_before = unadmitted_store.clone();
         assert_eq!(
-            execute_guest_accumulate(&mut unavailable_store, &admitted).unwrap(),
-            rejected(AccumulationRejectionV2::ReceiptUnavailable)
+            execute_guest_accumulate(&mut unadmitted_store, &admitted).unwrap(),
+            rejected(AccumulationRejectionV2::ReceiptUnavailable),
+            "only the exact guest-owned ingress can replace the transient verifier decision",
         );
-        assert_eq!(unavailable_store, unavailable_before);
+        assert_eq!(unadmitted_store, unadmitted_before);
 
         let mut replayed_work = linear_work(initial.clone(), base);
         replayed_work.origin = origin;

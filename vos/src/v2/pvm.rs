@@ -353,6 +353,17 @@ pub trait AccumulateProtocolHostV2 {
     fn commit(&mut self, transaction: Self::Transaction) -> Result<(), ServicePvmErrorV2>;
 }
 
+/// Host authority which can make one exact finalized receipt-verification
+/// decision available to physical guest Accumulate.
+///
+/// Local services use this as process policy. Replicated services call it
+/// only for decisions carried by the same committed Raft entry as the
+/// request, so every replica exposes the identical verifier result before
+/// executing IC-5.
+pub trait ReceiptVerificationHostV2 {
+    fn make_receipt_available(&mut self, request: &super::ReceiptVerificationRequestV2) -> bool;
+}
+
 /// Host used by pure service programs that need no protocol imports.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoRefineProtocolHostV2;

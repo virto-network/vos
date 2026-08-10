@@ -5454,6 +5454,7 @@ where
             imported_blobs: Vec::new(),
             proof_requested: false,
         };
+        let mut receipt_verifications = Vec::new();
         let recovered_authorization = match service.recover_direct_authorization(&request) {
             Ok(authorization) => authorization,
             Err(failure) => {
@@ -5491,8 +5492,10 @@ where
                         send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
                         continue;
                     };
-                    let valid = service.consistency() == crate::v2::ConsistencyModeV2::Local
-                        && credential.commitment() == *credential_commitment
+                    let valid = matches!(
+                        service.consistency(),
+                        crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
+                    ) && credential.commitment() == *credential_commitment
                         && credential.holder == origin
                         && credential.scope == claim.scope
                         && credential.space_role == Some(claim.role)
@@ -5521,7 +5524,9 @@ where
                         send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
                         continue;
                     }
-                    service.authorize_finalized_receipt(authority.actor, &assertion.receipt);
+                    receipt_verifications.push(
+                        service.authorize_finalized_receipt(authority.actor, &assertion.receipt),
+                    );
                 }
                 crate::v2::AuthorizationEvidenceV2::PrivateCredential { .. }
                 | crate::v2::AuthorizationEvidenceV2::SystemCapability { .. } => {
@@ -5558,7 +5563,10 @@ where
                     continue;
                 };
                 if policy.actor_role.is_some()
-                    || service.consistency() != crate::v2::ConsistencyModeV2::Local
+                    || !matches!(
+                        service.consistency(),
+                        crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
+                    )
                 {
                     send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
                     continue;
@@ -5589,7 +5597,8 @@ where
                         continue;
                     }
                 };
-                service.authorize_finalized_receipt(authority.actor, &assertion.receipt);
+                receipt_verifications
+                    .push(service.authorize_finalized_receipt(authority.actor, &assertion.receipt));
                 request.authorization = crate::v2::RoleCredentialV2 {
                     holder: origin,
                     scope: claim.scope,
@@ -5608,7 +5617,8 @@ where
             break;
         }
         request.logical_timeslot = next_v2_logical_timeslot(&logical_timeslot);
-        let result = service.invoke_after_admission_barrier(request);
+        let result =
+            service.invoke_after_admission_barrier_with_receipts(request, &receipt_verifications);
         let committed = match result {
             Ok(committed) => committed,
             Err(crate::v2::LocalRootTreeInvokeErrorV2::Rejected(

@@ -79,8 +79,9 @@ pub use package::{
 #[cfg(feature = "std")]
 pub use pvm::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, NoRefineProtocolHostV2,
-    RefineProtocolHostV2, RefineTraceV2, SERVICE_ARGUMENT_PAGES_V2, ServicePvmErrorV2,
-    ServicePvmOutputV2, ServicePvmV2, transpile_service_elf, validate_actor_program_layout,
+    ReceiptVerificationHostV2, RefineProtocolHostV2, RefineTraceV2, SERVICE_ARGUMENT_PAGES_V2,
+    ServicePvmErrorV2, ServicePvmOutputV2, ServicePvmV2, transpile_service_elf,
+    validate_actor_program_layout,
 };
 #[cfg(feature = "std")]
 pub use root_service::{
@@ -130,8 +131,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0x0c, 0x35, 0xf0, 0x3b, 0x21, 0x06, 0xaf, 0xd3, 0xdd, 0x82, 0xe6, 0xb2, 0x06, 0xf4, 0x42, 0xc0,
-    0x1c, 0x5e, 0x2c, 0x35, 0xf6, 0x95, 0x97, 0xc9, 0xcb, 0x23, 0x11, 0x68, 0x12, 0xbd, 0x86, 0xa7,
+    0xf1, 0x80, 0x11, 0xb5, 0x95, 0x67, 0xe5, 0xbf, 0x2c, 0xcd, 0xbd, 0x73, 0x89, 0x83, 0x1a, 0xa5,
+    0x8c, 0x17, 0x8f, 0xac, 0x5b, 0x45, 0x40, 0xb0, 0xb1, 0x92, 0xc9, 0x1e, 0x39, 0xac, 0x74, 0x16,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.
@@ -217,4 +218,4 @@ pub const JAR_REVISION: &str = "41d31e64b0f5d6c57a43769d7b8785556a311684";
 /// Consensus-visible execution semantics. Changing interpreter/recompiler or
 /// trace behavior requires a new identifier even if the public Rust API did
 /// not change.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v4\0");
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v5\0");

@@ -598,6 +598,39 @@ where
         }
     }
 
+    fn accumulate_with_receipt_verifications_after_barrier(
+        &mut self,
+        request: &AccumulateRequestV2,
+        receipt_verifications: &[super::ReceiptVerificationRequestV2],
+    ) -> Result<AccumulatedServiceOutputV2, RootTreeDriverErrorV2> {
+        match self {
+            Self::Direct(service) => {
+                super::CommittedAccumulateEntryV2::validate_receipt_verifications(
+                    request,
+                    receipt_verifications,
+                )
+                .map_err(|_| {
+                    RootTreeDriverErrorV2::Direct(
+                        super::ServiceDispatchError::InvalidAvailabilityArtifacts,
+                    )
+                })?;
+                for verification in receipt_verifications {
+                    super::ReceiptVerificationHostV2::make_receipt_available(
+                        service.accumulate_host_mut(),
+                        verification,
+                    );
+                }
+                service
+                    .accumulate(request)
+                    .map_err(RootTreeDriverErrorV2::Direct)
+            }
+            #[cfg(feature = "storage")]
+            Self::Raft(service) => service
+                .accumulate_with_receipt_verifications_after_barrier(request, receipt_verifications)
+                .map_err(RootTreeDriverErrorV2::Raft),
+        }
+    }
+
     fn accumulate_with_availability_after_barrier(
         &mut self,
         request: &AccumulateRequestV2,
@@ -1688,6 +1721,18 @@ where
         &mut self,
         request: LocalWorkRequestV2,
     ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        self.invoke_after_admission_barrier_with_receipts(request, &[])
+    }
+
+    /// Admit one invocation with exact receipt-verifier decisions already
+    /// authenticated by node routing. Raft roots quorum-order those decisions
+    /// beside AdmitIngress; Local roots expose them only to the same physical
+    /// IC-5 call.
+    pub(crate) fn invoke_after_admission_barrier_with_receipts(
+        &mut self,
+        request: LocalWorkRequestV2,
+        receipt_verifications: &[super::ReceiptVerificationRequestV2],
+    ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
         if request.proof_requested {
             return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
         }
@@ -1695,7 +1740,7 @@ where
             return Ok(committed);
         }
         let invocation = request.invocation;
-        self.admit_ingress_after_barrier(&request)?;
+        self.admit_ingress_after_barrier_with_receipts(&request, receipt_verifications)?;
         self.invoke_admitted_after_barrier(invocation)
     }
 
@@ -1715,6 +1760,14 @@ where
         &mut self,
         request: &LocalWorkRequestV2,
     ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        self.admit_ingress_after_barrier_with_receipts(request, &[])
+    }
+
+    pub(crate) fn admit_ingress_after_barrier_with_receipts(
+        &mut self,
+        request: &LocalWorkRequestV2,
+        receipt_verifications: &[super::ReceiptVerificationRequestV2],
+    ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
         if request.proof_requested {
             return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
         }
@@ -1725,7 +1778,10 @@ where
         )?;
         let accumulated = self
             .service
-            .accumulate_after_barrier(&AccumulateRequestV2::AdmitIngress(ingress))
+            .accumulate_with_receipt_verifications_after_barrier(
+                &AccumulateRequestV2::AdmitIngress(ingress),
+                receipt_verifications,
+            )
             .map_err(RootTreeDriverErrorV2::into_invoke)?;
         match accumulated.result {
             AccumulationResultV2::IngressAdmitted {
@@ -1809,14 +1865,18 @@ where
         &mut self,
         expected_producer: ActorId,
         receipt: &AccumulationReceiptV2,
-    ) {
-        self.service
-            .accumulate_host_mut()
-            .local_store_mut()
-            .allow_receipt(&super::ReceiptVerificationRequestV2 {
-                expected_producer,
-                receipt: receipt.clone(),
-            });
+    ) -> super::ReceiptVerificationRequestV2 {
+        let verification = super::ReceiptVerificationRequestV2 {
+            expected_producer,
+            receipt: receipt.clone(),
+        };
+        if self.consistency() == ConsistencyModeV2::Local {
+            self.service
+                .accumulate_host_mut()
+                .local_store_mut()
+                .allow_receipt(&verification);
+        }
+        verification
     }
 
     /// Admit one authenticated source outbox member after the caller has

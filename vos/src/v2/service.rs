@@ -15,13 +15,14 @@ use crate::attestation::{
 
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
-    AccumulateProtocolHostV2, AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2,
-    AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2, AttestationDeliveryV2,
-    CommittedServiceImageHostV2, GasScheduleV2, ImportedBlobV2, ImportedProgramV2,
-    LocalJamStoreSnapshotV2, ProgramId, ProofCommitmentV2, ProofVerificationRequestV2,
-    PublishedEffectsV2, RefineImportsV2, RefineOutputV2, RefineProtocolHostV2, RefineTraceV2,
-    ServiceIdentityV2, ServiceImageInstallErrorV2, ServicePvmErrorV2, ServicePvmOutputV2,
-    ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
+    AccumulateProtocolHostV2, AccumulateRequestV2, AccumulatedReplyV2, AccumulatedRoleAssertionV2,
+    AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2,
+    AttestationDeliveryV2, AuthorizationEvidenceV2, CommittedServiceImageHostV2, GasScheduleV2,
+    ImportedBlobV2, ImportedProgramV2, LocalJamStoreSnapshotV2, ProgramId, ProofCommitmentV2,
+    ProofVerificationRequestV2, PublishedEffectsV2, ReceiptVerificationHostV2,
+    ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, RefineProtocolHostV2,
+    RefineTraceV2, RoleCredentialV2, ServiceIdentityV2, ServiceImageInstallErrorV2,
+    ServicePvmErrorV2, ServicePvmOutputV2, ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
 };
 
 fn validate_accumulate_availability(
@@ -76,6 +77,44 @@ fn validate_accumulate_availability(
             .iter()
             .map(|blob| blob.reference.clone())
             .ne(expected_blobs)
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(())
+}
+
+fn validate_receipt_verifications(
+    request: &AccumulateRequestV2,
+    verifications: &[ReceiptVerificationRequestV2],
+) -> Result<(), DecodeError> {
+    if verifications
+        .windows(2)
+        .any(|pair| pair[0].hash() >= pair[1].hash())
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    if verifications.is_empty() {
+        return Ok(());
+    }
+    let [verification] = verifications else {
+        return Err(DecodeError::NonCanonical);
+    };
+    let AccumulateRequestV2::AdmitIngress(ingress) = request else {
+        return Err(DecodeError::NonCanonical);
+    };
+    let AuthorizationEvidenceV2::Credential { bytes, .. } = &ingress.authorization else {
+        return Err(DecodeError::NonCanonical);
+    };
+    let credential = RoleCredentialV2::decode(bytes)?;
+    let assertion = AccumulatedRoleAssertionV2::decode(&credential.authenticator)?;
+    if verification.receipt != assertion.receipt
+        || assertion.receipt.reply_commitment
+            != Some(
+                assertion
+                    .claim
+                    .authority_reply(verification.expected_producer)
+                    .commitment(),
+            )
     {
         return Err(DecodeError::NonCanonical);
     }
@@ -243,6 +282,11 @@ pub struct CommittedAccumulateEntryV2 {
     /// replayable on a replica with an empty node-local cache.
     pub availability_programs: Vec<ImportedProgramV2>,
     pub availability_blobs: Vec<ImportedBlobV2>,
+    /// Exact positive receipt-verifier decisions ordered beside this request.
+    /// Currently only direct ingress may carry one authority assertion. Later
+    /// actor slices rely on the guest-owned admitted ingress, not this
+    /// process-local verifier input.
+    pub receipt_verifications: Vec<ReceiptVerificationRequestV2>,
 }
 
 impl CommittedAccumulateEntryV2 {
@@ -252,6 +296,13 @@ impl CommittedAccumulateEntryV2 {
         blobs: &[ImportedBlobV2],
     ) -> Result<(), DecodeError> {
         validate_accumulate_availability(request, programs, blobs)
+    }
+
+    pub(crate) fn validate_receipt_verifications(
+        request: &AccumulateRequestV2,
+        verifications: &[ReceiptVerificationRequestV2],
+    ) -> Result<(), DecodeError> {
+        validate_receipt_verifications(request, verifications)
     }
 }
 
@@ -364,6 +415,7 @@ pub trait CommittedAccumulateLogV2 {
         logical_timeslot: Option<u64>,
         programs: &[ImportedProgramV2],
         blobs: &[ImportedBlobV2],
+        receipt_verifications: &[ReceiptVerificationRequestV2],
     ) -> Result<CommittedAccumulateEntryV2, Self::Error>;
 
     fn propose_at(
@@ -371,7 +423,7 @@ pub trait CommittedAccumulateLogV2 {
         request: &[u8],
         logical_timeslot: Option<u64>,
     ) -> Result<CommittedAccumulateEntryV2, Self::Error> {
-        self.propose_at_with_availability(request, logical_timeslot, &[], &[])
+        self.propose_at_with_availability(request, logical_timeslot, &[], &[], &[])
     }
 
     fn propose(&mut self, request: &[u8]) -> Result<CommittedAccumulateEntryV2, Self::Error> {
@@ -491,6 +543,7 @@ pub enum ReplicatedServiceErrorV2<E> {
     Log(E),
     ServiceImage(ServiceImageInstallErrorV2),
     ProofUnavailable,
+    ReceiptUnavailable,
     LogicalTimeslotRequired,
     UnexpectedLogicalTimeslot,
     InvalidCommittedLog,
@@ -1026,7 +1079,10 @@ fn validate_committed_attestation<E, P>(
 impl<R, A, L> ReplicatedJamServiceV2<R, A, L>
 where
     R: RefineProtocolHostV2,
-    A: AccumulateProtocolHostV2 + AttestationProofHostV2 + CommittedServiceImageHostV2,
+    A: AccumulateProtocolHostV2
+        + AttestationProofHostV2
+        + CommittedServiceImageHostV2
+        + ReceiptVerificationHostV2,
     L: CommittedAccumulateLogV2,
 {
     fn validate_service_image_identity(
@@ -1080,6 +1136,7 @@ where
                         || target.logical_timeslot != entry.logical_timeslot
                         || target.availability_programs != entry.availability_programs
                         || target.availability_blobs != entry.availability_blobs
+                        || target.receipt_verifications != entry.receipt_verifications
                 })
             {
                 return Err(ReplicatedServiceErrorV2::InvalidCommittedLog);
@@ -1092,6 +1149,8 @@ where
                 &entry.availability_blobs,
             )
             .map_err(|_| ReplicatedServiceErrorV2::InvalidCommittedLog)?;
+            validate_receipt_verifications(&request, &entry.receipt_verifications)
+                .map_err(|_| ReplicatedServiceErrorV2::InvalidCommittedLog)?;
             if matches!(request, AccumulateRequestV2::ExpireCall(_))
                 != entry.logical_timeslot.is_some()
             {
@@ -1102,6 +1161,11 @@ where
             // unapplied so exact catch-up can retry it.
             ensure_request_proof_available(self.service.accumulate_host_mut(), &request)
                 .map_err(|_| ReplicatedServiceErrorV2::ProofUnavailable)?;
+            ensure_request_receipts_available(
+                self.service.accumulate_host_mut(),
+                &entry.receipt_verifications,
+            )
+            .map_err(|_| ReplicatedServiceErrorV2::ReceiptUnavailable)?;
             let outcome = match entry.logical_timeslot {
                 Some(logical_timeslot) => self.service.accumulate_at_with_availability(
                     &request,
@@ -1267,7 +1331,7 @@ where
         programs: &[ImportedProgramV2],
         blobs: &[ImportedBlobV2],
     ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
-        self.accumulate_ordered(request, None, programs, blobs)
+        self.accumulate_ordered(request, None, programs, blobs, &[])
     }
 
     /// Quorum-order a time-dependent request together with the
@@ -1278,7 +1342,7 @@ where
         request: &AccumulateRequestV2,
         logical_timeslot: u64,
     ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
-        self.accumulate_ordered(request, Some(logical_timeslot), &[], &[])
+        self.accumulate_ordered(request, Some(logical_timeslot), &[], &[], &[])
     }
 
     fn accumulate_ordered(
@@ -1287,9 +1351,16 @@ where
         logical_timeslot: Option<u64>,
         programs: &[ImportedProgramV2],
         blobs: &[ImportedBlobV2],
+        receipt_verifications: &[ReceiptVerificationRequestV2],
     ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
         self.catch_up()?;
-        self.accumulate_ordered_after_barrier(request, logical_timeslot, programs, blobs)
+        self.accumulate_ordered_after_barrier(
+            request,
+            logical_timeslot,
+            programs,
+            blobs,
+            receipt_verifications,
+        )
     }
 
     #[cfg(feature = "storage")]
@@ -1307,7 +1378,20 @@ where
         programs: &[ImportedProgramV2],
         blobs: &[ImportedBlobV2],
     ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
-        self.accumulate_ordered_after_barrier(request, None, programs, blobs)
+        self.accumulate_ordered_after_barrier(request, None, programs, blobs, &[])
+    }
+
+    /// Quorum-order one request together with an exact positive receipt
+    /// verification selected by authenticated host routing. Only direct
+    /// ingress accepts this sidecar; canonical validation rejects every other
+    /// request shape before proposal.
+    #[cfg(feature = "storage")]
+    pub(crate) fn accumulate_with_receipt_verifications_after_barrier(
+        &mut self,
+        request: &AccumulateRequestV2,
+        receipt_verifications: &[ReceiptVerificationRequestV2],
+    ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
+        self.accumulate_ordered_after_barrier(request, None, &[], &[], receipt_verifications)
     }
 
     /// Quorum-order a slot-bound request after the caller has already
@@ -1318,7 +1402,7 @@ where
         request: &AccumulateRequestV2,
         logical_timeslot: u64,
     ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
-        self.accumulate_ordered_after_barrier(request, Some(logical_timeslot), &[], &[])
+        self.accumulate_ordered_after_barrier(request, Some(logical_timeslot), &[], &[], &[])
     }
 
     fn accumulate_ordered_after_barrier(
@@ -1327,11 +1411,15 @@ where
         logical_timeslot: Option<u64>,
         programs: &[ImportedProgramV2],
         blobs: &[ImportedBlobV2],
+        receipt_verifications: &[ReceiptVerificationRequestV2],
     ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
         self.service
             .validate_service_identity(request.service())
             .map_err(ReplicatedServiceErrorV2::Dispatch)?;
         validate_accumulate_availability(request, programs, blobs).map_err(|_| {
+            ReplicatedServiceErrorV2::Dispatch(ServiceDispatchError::InvalidAvailabilityArtifacts)
+        })?;
+        validate_receipt_verifications(request, receipt_verifications).map_err(|_| {
             ReplicatedServiceErrorV2::Dispatch(ServiceDispatchError::InvalidAvailabilityArtifacts)
         })?;
         let expires_call = matches!(request, AccumulateRequestV2::ExpireCall(_));
@@ -1353,7 +1441,13 @@ where
         let request_bytes = request.encode();
         let entry = self
             .log
-            .propose_at_with_availability(&request_bytes, logical_timeslot, programs, blobs)
+            .propose_at_with_availability(
+                &request_bytes,
+                logical_timeslot,
+                programs,
+                blobs,
+                receipt_verifications,
+            )
             .map_err(ReplicatedServiceErrorV2::Log)?;
         let applied = self
             .log
@@ -1364,6 +1458,7 @@ where
             || entry.logical_timeslot != logical_timeslot
             || entry.availability_programs.as_slice() != programs
             || entry.availability_blobs.as_slice() != blobs
+            || entry.receipt_verifications.as_slice() != receipt_verifications
         {
             return Err(ReplicatedServiceErrorV2::InvalidCommittedLog);
         }
@@ -1464,6 +1559,18 @@ fn ensure_request_proof_available<A: AttestationProofHostV2>(
         || !host.make_proof_available(&verification, &imported.bytes)
     {
         return Err(());
+    }
+    Ok(())
+}
+
+fn ensure_request_receipts_available<A: ReceiptVerificationHostV2>(
+    host: &mut A,
+    verifications: &[ReceiptVerificationRequestV2],
+) -> Result<(), ()> {
+    for verification in verifications {
+        if !host.make_receipt_available(verification) {
+            return Err(());
+        }
     }
     Ok(())
 }

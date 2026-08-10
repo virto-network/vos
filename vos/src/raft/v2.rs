@@ -21,7 +21,7 @@ use crate::v2::wire::{DecodeError, Decoder, Encoder};
 use crate::v2::{
     AccumulateRequestV2, CommittedAccumulateBatchV2, CommittedAccumulateEntryV2,
     CommittedAccumulateLogV2, CommittedServiceSnapshotV2, ImportedBlobV2, ImportedProgramV2,
-    LocalJamStoreSnapshotV2, ProgramId, V2Wire,
+    LocalJamStoreSnapshotV2, ProgramId, ReceiptVerificationRequestV2, V2Wire,
 };
 
 use super::log::{LogEntry, RaftLog, RaftMeta};
@@ -35,6 +35,7 @@ struct RaftAccumulatePayloadV2 {
     logical_timeslot: Option<u64>,
     programs: Vec<ImportedProgramV2>,
     blobs: Vec<ImportedBlobV2>,
+    receipt_verifications: Vec<ReceiptVerificationRequestV2>,
 }
 
 impl RaftAccumulatePayloadV2 {
@@ -43,6 +44,7 @@ impl RaftAccumulatePayloadV2 {
         logical_timeslot: Option<u64>,
         programs: &[ImportedProgramV2],
         blobs: &[ImportedBlobV2],
+        receipt_verifications: &[ReceiptVerificationRequestV2],
     ) -> Result<Self, CommitError> {
         let decoded = AccumulateRequestV2::decode(request).map_err(|_| {
             CommitError::Config("raft v2 entry is not a canonical AccumulateRequestV2".into())
@@ -59,17 +61,24 @@ impl RaftAccumulatePayloadV2 {
                 )
             },
         )?;
+        CommittedAccumulateEntryV2::validate_receipt_verifications(&decoded, receipt_verifications)
+            .map_err(|_| {
+                CommitError::Config(
+                    "raft v2 entry does not carry canonical receipt verification inputs".into(),
+                )
+            })?;
         Ok(Self {
             request: request.to_vec(),
             logical_timeslot,
             programs: programs.to_vec(),
             blobs: blobs.to_vec(),
+            receipt_verifications: receipt_verifications.to_vec(),
         })
     }
 }
 
 impl V2Wire for RaftAccumulatePayloadV2 {
-    const MAGIC: [u8; 4] = *b"VRQ3";
+    const MAGIC: [u8; 4] = *b"VRQ4";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
@@ -83,6 +92,9 @@ impl V2Wire for RaftAccumulatePayloadV2 {
             encoder.fixed(&blob.reference.hash.0);
             encoder.u64(blob.reference.len);
             encoder.bytes(&blob.bytes);
+        });
+        encoder.list(&self.receipt_verifications, |encoder, verification| {
+            encoder.bytes(&verification.encode());
         });
     }
 
@@ -104,11 +116,18 @@ impl V2Wire for RaftAccumulatePayloadV2 {
                 bytes: decoder.bytes()?,
             })
         })?;
+        let receipt_verifications =
+            decoder.list(|decoder| ReceiptVerificationRequestV2::decode(&decoder.bytes()?))?;
         let decoded =
             AccumulateRequestV2::decode(&request).map_err(|_| DecodeError::NonCanonical)?;
         if matches!(&decoded, AccumulateRequestV2::ExpireCall(_)) != logical_timeslot.is_some()
             || CommittedAccumulateEntryV2::validate_availability(&decoded, &programs, &blobs)
                 .is_err()
+            || CommittedAccumulateEntryV2::validate_receipt_verifications(
+                &decoded,
+                &receipt_verifications,
+            )
+            .is_err()
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -117,6 +136,7 @@ impl V2Wire for RaftAccumulatePayloadV2 {
             logical_timeslot,
             programs,
             blobs,
+            receipt_verifications,
         })
     }
 }
@@ -231,6 +251,7 @@ impl RaftAccumulateLogV2 {
                     logical_timeslot: payload.logical_timeslot,
                     availability_programs: payload.programs,
                     availability_blobs: payload.blobs,
+                    receipt_verifications: payload.receipt_verifications,
                 }))
             }
             vos_raft::EntryKind::ConfigChange { .. } => Ok(None),
@@ -281,6 +302,7 @@ impl RaftAccumulateLogV2 {
                 logical_timeslot: decoded.logical_timeslot,
                 availability_programs: decoded.programs,
                 availability_blobs: decoded.blobs,
+                receipt_verifications: decoded.receipt_verifications,
             })
         })();
         if let Err(error) = result {
@@ -338,6 +360,7 @@ impl RaftAccumulateLogV2 {
             || entry.logical_timeslot != decoded.logical_timeslot
             || entry.availability_programs != decoded.programs
             || entry.availability_blobs != decoded.blobs
+            || entry.receipt_verifications != decoded.receipt_verifications
         {
             return Err(CommitError::Config(alloc::format!(
                 "raft v2 committed bytes at proposal index {index} changed"
@@ -384,10 +407,16 @@ impl CommittedAccumulateLogV2 for RaftAccumulateLogV2 {
         logical_timeslot: Option<u64>,
         programs: &[ImportedProgramV2],
         blobs: &[ImportedBlobV2],
+        receipt_verifications: &[ReceiptVerificationRequestV2],
     ) -> Result<CommittedAccumulateEntryV2, Self::Error> {
-        let payload =
-            RaftAccumulatePayloadV2::from_request(request, logical_timeslot, programs, blobs)?
-                .encode();
+        let payload = RaftAccumulatePayloadV2::from_request(
+            request,
+            logical_timeslot,
+            programs,
+            blobs,
+            receipt_verifications,
+        )?
+        .encode();
         match &self.role {
             RoleV2::SingleNode => self.propose_single(&payload),
             #[cfg(feature = "network")]
@@ -614,9 +643,9 @@ mod tests {
     #[test]
     fn replicated_timeout_payload_pins_the_ambient_jam_slot() {
         let bytes = expiration_request().encode();
-        assert!(RaftAccumulatePayloadV2::from_request(&bytes, None, &[], &[],).is_err());
+        assert!(RaftAccumulatePayloadV2::from_request(&bytes, None, &[], &[], &[]).is_err());
         assert!(
-            RaftAccumulatePayloadV2::from_request(&request(1).encode(), Some(50), &[], &[],)
+            RaftAccumulatePayloadV2::from_request(&request(1).encode(), Some(50), &[], &[], &[],)
                 .is_err()
         );
 
@@ -633,6 +662,19 @@ mod tests {
             vec![committed]
         );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn replicated_receipt_sidecar_uses_a_clean_break_wire() {
+        let payload =
+            RaftAccumulatePayloadV2::from_request(&request(1).encode(), None, &[], &[], &[])
+                .unwrap();
+        let encoded = payload.encode();
+        assert_eq!(RaftAccumulatePayloadV2::decode(&encoded).unwrap(), payload);
+
+        let mut retired = encoded;
+        retired[..4].copy_from_slice(b"VRQ3");
+        assert!(RaftAccumulatePayloadV2::decode(&retired).is_err());
     }
 
     #[test]
