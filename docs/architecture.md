@@ -87,8 +87,8 @@ enrolled node and no live or revivable legacy space/actor grant. The separate
 root-signed seal is unconditional and replay-monotone; it closes legacy role
 admission even if a concurrent row later reorders before it. The single-node
 condition is a conservative cutover prerequisite; any legacy row discovered
-later remains ineffective because post-cutover roles
-also require an exact point-addressed guest-owned authority witness. Catalog
+later remains ineffective because post-cutover roles also require an exact
+point-addressed authority witness in a guest-private storage namespace. Catalog
 presence or replica-local absence never selects a protocol mode. Operators
 revoke legacy grants and remove other nodes before cutover, then re-grant
 through both canonical layers. Before first redemption, an operator may

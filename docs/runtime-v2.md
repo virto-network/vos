@@ -171,7 +171,8 @@ revoke/remove-before-cutover and re-grant-after-cutover operation; rows already
 dominated by their holder's own revoke high-water do not block it. Registry and
 authority use the same total grant order (rootness, epoch, grantor, role), and
 post-cutover registry grants carry one fixed-size, point-addressed guest-owned
-witness per peer. An invitation witness additionally carries the immutable
+witness per peer in a private storage map which catalog metadata cannot address.
+An invitation witness additionally carries the immutable
 root host's signature emitted only after the exact authority commit; a bare
 caller-supplied authority ID is never sufficient. A direct reply is
 acknowledged only after its waiting channel accepts

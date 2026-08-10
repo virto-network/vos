@@ -263,6 +263,13 @@ pub struct SpaceRegistry {
     /// enumerated — instead of riding the state blob.
     #[storage]
     metas: StorageMap<[u8; 32], MetaRow>,
+    /// Exact canonical-authority bindings, one private point row per peer.
+    /// This is deliberately a separate storage namespace from `metas`: an
+    /// administrator may author program metadata, but only the dedicated v2
+    /// grant/redeem handlers can write this map. The value is the complete
+    /// authority/grant binding digest checked by `effective_role`.
+    #[storage]
+    authority_grant_witnesses: StorageMap<[u8; 32], [u8; 32]>,
     /// Opaque metadata blobs for native `.so` extensions, keyed by
     /// the manifest `instance_name`. Service-mode extensions have
     /// no program-hash identity in this catalog (the host loads
@@ -371,6 +378,7 @@ impl SpaceRegistry {
             nodes: StorageMap::default(),
             identities: StorageMap::default(),
             metas: StorageMap::default(),
+            authority_grant_witnesses: StorageMap::default(),
             extension_metas: StorageMap::default(),
             auth_grants: StorageMap::default(),
             actor_acls: StorageMap::default(),
@@ -673,16 +681,9 @@ impl SpaceRegistry {
             return Status::BadHash;
         };
         // The cutover row is guest-owned protocol state, not a program's
-        // metadata. After cutover, metadata may update only an actually
-        // catalogued program hash. Point-addressed authority witnesses live at
-        // domain-separated non-program keys, so even a delegated catalog
-        // administrator cannot overwrite or fabricate one.
+        // metadata. Authority witnesses live in their own private StorageMap,
+        // so no metadata key can alias, overwrite, or pre-seed them.
         if program_hash == role_authority_cutover_key() {
-            return Status::Forbidden;
-        }
-        if self.role_authority_cutover_id().is_some()
-            && !self.programs.iter().any(|row| row.hash == program_hash)
-        {
             return Status::Forbidden;
         }
         // Upsert: one point write, keyed by the program hash.
@@ -2074,22 +2075,14 @@ impl SpaceRegistry {
         let peer = peer_key(&row.peer_id);
         let key = role_authority_grant_witness_key(authority, peer);
         let binding = role_authority_grant_binding(authority, row);
-        self.metas.insert(
-            &key,
-            &MetaRow {
-                program_hash: key,
-                blob: binding.to_vec(),
-            },
-        );
+        self.authority_grant_witnesses.insert(&key, &binding);
     }
 
     fn authority_grant_is_bound(&self, authority: [u8; 32], row: &AuthGrantRow) -> bool {
         let peer = peer_key(&row.peer_id);
         let key = role_authority_grant_witness_key(authority, peer);
         let expected = role_authority_grant_binding(authority, row);
-        self.metas
-            .get(&key)
-            .is_some_and(|record| record.program_hash == key && record.blob.as_slice() == expected)
+        self.authority_grant_witnesses.get(&key) == Some(expected)
     }
 
     /// Authorize a mutation: the `auth` blob's signature must be valid
@@ -4324,6 +4317,30 @@ mod tests {
             grant_space(&mut r, &holder, AUTH_ROLE_DEVELOPER),
             Status::Ok
         );
+        let legacy_row = r
+            .auth_grants
+            .get(&peer_key(&holder))
+            .expect("legacy grant was recorded");
+        let forged_witness_key =
+            role_authority_grant_witness_key(TEST_AUTHORITY_ID, peer_key(&legacy_row.peer_id));
+        let forged_witness = role_authority_grant_binding(TEST_AUTHORITY_ID, &legacy_row);
+        assert_eq!(
+            dispatch(
+                &mut r,
+                RegisterMeta {
+                    program_hash: forged_witness_key.to_vec(),
+                    blob: forged_witness.to_vec(),
+                    auth: root_auth("register_meta", &[&forged_witness_key, &forged_witness],),
+                },
+            ),
+            Status::Ok,
+            "an administrator may legitimately own metadata at the same logical key",
+        );
+        assert_eq!(
+            r.authority_grant_witnesses.get(&forged_witness_key),
+            None,
+            "caller-authored metadata never enters the private witness namespace",
+        );
         let seal = || SealRoleAuthority {
             authority_replication_id: TEST_AUTHORITY_ID.to_vec(),
             auth: root_auth("seal_role_authority", &[&TEST_AUTHORITY_ID]),
@@ -4419,6 +4436,44 @@ mod tests {
             ),
             AUTH_ROLE_ADMIN,
             "a fresh canonical grant repairs the fail-closed row",
+        );
+
+        let canonical_row = r
+            .auth_grants
+            .get(&peer_key(&holder))
+            .expect("canonical grant was recorded");
+        let witness_key =
+            role_authority_grant_witness_key(TEST_AUTHORITY_ID, peer_key(&canonical_row.peer_id));
+        let committed_witness = r
+            .authority_grant_witnesses
+            .get(&witness_key)
+            .expect("canonical grant wrote its private witness");
+        let forged_metadata = [0xa5; 32];
+        assert_eq!(
+            dispatch(
+                &mut r,
+                RegisterMeta {
+                    program_hash: witness_key.to_vec(),
+                    blob: forged_metadata.to_vec(),
+                    auth: root_auth("register_meta", &[&witness_key, &forged_metadata]),
+                },
+            ),
+            Status::Ok,
+            "program metadata remains caller-writable after cutover",
+        );
+        assert_eq!(
+            r.authority_grant_witnesses.get(&witness_key),
+            Some(committed_witness),
+            "metadata cannot overwrite the private authority witness",
+        );
+        assert_eq!(
+            dispatch(
+                &mut r,
+                PeerRole {
+                    peer_id: holder.clone(),
+                },
+            ),
+            AUTH_ROLE_ADMIN,
         );
 
         let reserved = role_authority_cutover_key();
@@ -4844,8 +4899,13 @@ mod tests {
         assert_eq!(marker.blob, TEST_AUTHORITY_ID.to_vec());
         assert_eq!(
             r.metas.len(),
-            1_051,
-            "one fixed-size witness row is retained per peer",
+            1,
+            "the public metadata map contains only the cutover marker",
+        );
+        assert_eq!(
+            r.authority_grant_witnesses.len(),
+            1_050,
+            "one fixed-size private witness row is retained per peer",
         );
     }
 
