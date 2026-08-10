@@ -1247,7 +1247,7 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
 }
 
 #[test]
-fn canonical_space_authority_produces_extractable_accumulated_assertion() {
+fn canonical_space_authority_authorizes_a_physical_target_and_exact_retry() {
     let actor_elf = space_authority_elf();
     let package_signer = libp2p::identity::Keypair::generate_ed25519();
     let (package, actor_name) = signed_test_package(&actor_elf, &package_signer);
@@ -1559,6 +1559,441 @@ fn canonical_space_authority_produces_extractable_accumulated_assertion() {
             .expect("durable workflow and receipt rows recover the assertion"),
         assertion
     );
+
+    let target_signer = libp2p::identity::Keypair::generate_ed25519();
+    let (target_package, target_name) = signed_test_package(&cycle_v2_elf(), &target_signer);
+    let target_actor = ActorId([206; 32]);
+    let target_identity = ServiceIdentityV2 {
+        space: binding.service.space,
+        root_service: RootServiceId([207; 32]),
+        deployment: target_package.deployment_id(),
+        service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
+    };
+    let target_config = LocalRootTreeConfigV2 {
+        role_authority: Some(binding.clone()),
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package: target_package,
+        service: target_identity,
+        root_actor: target_actor,
+        actor_name: target_name,
+        consistency: ConsistencyModeV2::Local,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([208; 32]),
+            authenticator: vec![209],
+        },
+        refine_gas: TEST_GAS_SCHEDULE.refine,
+        accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
+    };
+    let mut target =
+        LocalRootTreeServiceV2::open(target_config.clone(), FailableCommittedImages::default())
+            .expect("the Local target pins the canonical Raft authority at install");
+    let policy = target
+        .root_method_policy("member_only")
+        .unwrap()
+        .expect("the signed package retains its Member policy");
+    assert_eq!(policy.space_role, Some(vos::SpaceRole::Member.as_u8()));
+    assert!(!policy.public);
+
+    let mut member_arguments = vec![vos::value::TAG_DYNAMIC];
+    member_arguments.extend_from_slice(&Msg::new("member_only").encode());
+    let provisional = LocalWorkRequestV2 {
+        invocation: InvocationId([210; 32]),
+        workflow_step: 0,
+        logical_timeslot: 6,
+        target: target_actor,
+        method: "member_only".into(),
+        arguments: member_arguments,
+        origin: holder,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let target_claim = target
+        .role_authorization_claim(&provisional, vos::SpaceRole::Member, &policy)
+        .expect("the target scheduler derives the exact authority scope");
+    let mut decision_arguments = vec![vos::value::TAG_DYNAMIC];
+    decision_arguments.extend_from_slice(
+        &Msg::new("authorize_role")
+            .with("claim", target_claim.encode())
+            .encode(),
+    );
+    let decision = authority
+        .invoke(LocalWorkRequestV2 {
+            invocation: target_claim.authority_invocation(),
+            workflow_step: 0,
+            logical_timeslot: 6,
+            target: authority_actor,
+            method: "authorize_role".into(),
+            arguments: decision_arguments,
+            origin: Origin::System,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        })
+        .expect("the canonical authority finalizes the invocation-scoped decision");
+    let target_assertion = decision
+        .role_assertion(target_claim.clone(), &binding)
+        .expect("the authority reply shape and receipt are bound exactly");
+    target
+        .store_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            expected_producer: authority_actor,
+            receipt: target_assertion.receipt.clone(),
+        });
+    let credential = RoleCredentialV2 {
+        holder,
+        scope: target_claim.scope,
+        space_role: Some(vos::SpaceRole::Member),
+        actor_role: None,
+        authenticator: target_assertion.encode(),
+    }
+    .disclosed_evidence(policy.policy);
+    let mut authorized = provisional.clone();
+    authorized.authorization = credential.clone();
+    let committed = target
+        .invoke(authorized.clone())
+        .expect("guest Accumulate accepts the finalized authority assertion");
+    assert_eq!(
+        committed
+            .published
+            .reply
+            .as_ref()
+            .and_then(|reply| Value::try_decode(&reply.result)),
+        Some(Value::U32(99)),
+    );
+
+    let target_backend = target.into_backend();
+    let mut target = LocalRootTreeServiceV2::open(target_config, target_backend)
+        .expect("the target reopens from its durable image");
+    assert_eq!(
+        target
+            .role_authorization_claim(&provisional, vos::SpaceRole::Member, &policy)
+            .expect("retry scope is recovered from guest-owned ingress"),
+        target_claim,
+    );
+    let mut divergent = provisional.clone();
+    divergent.arguments.push(0);
+    assert!(matches!(
+        target.role_authorization_claim(&divergent, vos::SpaceRole::Member, &policy),
+        Err(LocalRootTreeInvokeErrorV2::DivergentInvocation),
+    ));
+    target
+        .store_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            expected_producer: authority_actor,
+            receipt: target_assertion.receipt.clone(),
+        });
+    let retried = target
+        .invoke(authorized)
+        .expect("the exact role-authorized retry reattaches after restart");
+    assert!(retried.duplicate);
+    assert_eq!(retried.refine_gas_used, 0);
+    assert_eq!(retried.accumulate_gas_used, 0);
+    assert_eq!(
+        retried
+            .published
+            .reply
+            .as_ref()
+            .and_then(|reply| Value::try_decode(&reply.result)),
+        Some(Value::U32(99)),
+    );
+}
+
+#[test]
+fn node_ingress_uses_canonical_authority_not_legacy_role_bytes() {
+    let node_key = libp2p::identity::Keypair::generate_ed25519();
+    let granted_key = libp2p::identity::Keypair::generate_ed25519();
+    let denied_key = libp2p::identity::Keypair::generate_ed25519();
+    let node_peer = libp2p::PeerId::from(node_key.public());
+    let granted_peer = libp2p::PeerId::from(granted_key.public());
+    let denied_peer = libp2p::PeerId::from(denied_key.public());
+    let node_prefix = vos::network::derive_node_prefix(&node_peer);
+
+    let space = vos::v2::SpaceId([211; 32]);
+    let authority_actor = ActorId([212; 32]);
+    let authority_signer = libp2p::identity::Keypair::generate_ed25519();
+    let (authority_package, authority_name) =
+        signed_test_package(&space_authority_elf(), &authority_signer);
+    let root = libp2p::identity::Keypair::generate_ed25519();
+    let replication_id = [213; 32];
+    let authority_identity = ServiceIdentityV2 {
+        space,
+        root_service: RootServiceId([214; 32]),
+        deployment: authority_package.deployment_id(),
+        service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
+    };
+    let authority_binding = RoleAuthorityBindingV2 {
+        service: authority_identity.clone(),
+        actor: authority_actor,
+    };
+    let authority_config = LocalRootTreeConfigV2 {
+        role_authority: None,
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package: authority_package,
+        service: authority_identity,
+        root_actor: authority_actor,
+        actor_name: authority_name,
+        consistency: ConsistencyModeV2::Raft,
+        initial_state: space_authority::initial_state(
+            space,
+            libp2p::PeerId::from(root.public()).to_bytes(),
+            replication_id,
+        )
+        .unwrap(),
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([215; 32]),
+            authenticator: vec![216],
+        },
+        refine_gas: TEST_GAS_SCHEDULE.refine,
+        accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
+    };
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-role-ingress-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let authority_log = RaftAccumulateLogV2::open(
+        &directory.join("authority.redb"),
+        RaftConfig {
+            me: node_prefix,
+            members: vec![node_prefix],
+            replication_id,
+            ..RaftConfig::default()
+        },
+    )
+    .unwrap();
+    let mut authority = LocalRootTreeServiceV2::open_raft(
+        authority_config,
+        FailableCommittedImages::default(),
+        authority_log,
+    )
+    .expect("the single-voter authority installs through its request log");
+    let holder = Origin::Member(SubjectId::of_authenticated_peer(&granted_peer.to_bytes()));
+    let grant = RoleAuthorityMutationV2::Grant {
+        space,
+        holder,
+        role: vos::SpaceRole::Member,
+        epoch: 1,
+    };
+    let mut grant_arguments = vec![vos::value::TAG_DYNAMIC];
+    grant_arguments.extend_from_slice(
+        &Msg::new("mutate_role")
+            .with("mutation", grant.encode())
+            .with("signature", root.sign(&grant.encode()).unwrap())
+            .encode(),
+    );
+    let grant = authority
+        .invoke(LocalWorkRequestV2 {
+            invocation: InvocationId([217; 32]),
+            workflow_step: 0,
+            logical_timeslot: 1,
+            target: authority_actor,
+            method: "mutate_role".into(),
+            arguments: grant_arguments,
+            origin: Origin::System,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        })
+        .expect("the root-signed Member grant commits before ingress");
+    authority
+        .acknowledge_publication(grant.publication.as_ref().unwrap())
+        .unwrap();
+
+    let target_actor = ActorId([218; 32]);
+    let target_signer = libp2p::identity::Keypair::generate_ed25519();
+    let (target_package, target_name) = signed_test_package(&cycle_v2_elf(), &target_signer);
+    let target = LocalRootTreeServiceV2::open(
+        LocalRootTreeConfigV2 {
+            role_authority: Some(authority_binding),
+            service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+            service: ServiceIdentityV2 {
+                space,
+                root_service: RootServiceId([219; 32]),
+                deployment: target_package.deployment_id(),
+                service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+                service_abi: vos::v2::ABI_VERSION,
+                execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+                gas_schedule: TEST_GAS_SCHEDULE,
+            },
+            package: target_package,
+            root_actor: target_actor,
+            actor_name: target_name,
+            consistency: ConsistencyModeV2::Local,
+            initial_state: vec![],
+            external_actors: vec![],
+            install_authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: SystemCapabilityId([220; 32]),
+                authenticator: vec![221],
+            },
+            refine_gas: TEST_GAS_SCHEDULE.refine,
+            accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
+        },
+        FailableCommittedImages::default(),
+    )
+    .expect("the target pins the authority identity in guest-owned state");
+
+    let authority_route = ServiceId::new(node_prefix, 0x3a00);
+    let target_route = ServiceId::new(node_prefix, 0x3a01);
+    let mut node = VosNode::with_prefix(node_prefix);
+    let registry_pvm =
+        grey_transpiler::link_elf(include_bytes!("../../vosx/blobs/space_registry.elf"))
+            .expect("the bundled registry transpiles for the legacy-role adversary");
+    install_test_voter_registry(&mut node, registry_pvm, &[]);
+    {
+        use ed25519_dalek::{Signer, SigningKey};
+        use space_registry::{SpaceRegistryRef, Status, canonical_op_bytes, pack_auth};
+
+        let root_key = SigningKey::from_bytes(&[0xB9; 32]);
+        let mut root_peer = vec![0x00u8, 0x24, 0x08, 0x01, 0x12, 0x20];
+        root_peer.extend_from_slice(&root_key.verifying_key().to_bytes());
+        let denied_bytes = denied_peer.to_bytes();
+        let role = space_registry::AUTH_ROLE_ADMIN;
+        let epoch = 1u64;
+        let canonical = canonical_op_bytes(
+            "grant_role",
+            &[&denied_bytes, &[role], &epoch.to_le_bytes()],
+        );
+        let authorization = pack_auth(&root_peer, &root_key.sign(&canonical).to_bytes());
+        assert_eq!(
+            vos::block_on(SpaceRegistryRef::at(ServiceId::REGISTRY).grant_role(
+                &mut &node,
+                denied_bytes,
+                role,
+                epoch,
+                authorization,
+            ))
+            .unwrap(),
+            Status::Ok,
+            "the adversary holds legacy ADMIN bytes but no canonical authority grant",
+        );
+    }
+    node.register_v2_root_at_id("space-authority", authority, authority_route, true)
+        .unwrap();
+    node.register_v2_root_at_id("role-target", target, target_route, true)
+        .unwrap();
+
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let node_network = vos::network::Network::start(vos::network::NetworkConfig {
+        keypair: node_key,
+        local_prefix: node_prefix,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
+        auto_dial_mdns: false,
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let node_address = loop {
+        if let Some(address) = node_network.listen_addrs().into_iter().next() {
+            break address.with(libp2p::multiaddr::Protocol::P2p(node_peer));
+        }
+        assert!(std::time::Instant::now() < deadline, "node did not bind");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let granted_network = vos::network::Network::start(vos::network::NetworkConfig {
+        keypair: granted_key,
+        local_prefix: vos::network::derive_node_prefix(&granted_peer),
+        listen: vec![listen.clone()],
+        bootstrap: vec![node_address.clone()],
+        auto_dial_mdns: false,
+    });
+    let denied_network = vos::network::Network::start(vos::network::NetworkConfig {
+        keypair: denied_key,
+        local_prefix: vos::network::derive_node_prefix(&denied_peer),
+        listen: vec![listen],
+        bootstrap: vec![node_address],
+        auto_dial_mdns: false,
+    });
+    node.attach_network(node_network);
+    let shutdown = node.shutdown_handle();
+    let runner = std::thread::spawn(move || {
+        node.run_forever();
+        node.collect()
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while (granted_network.peer_for_prefix(node_prefix).is_none()
+        || denied_network.peer_for_prefix(node_prefix).is_none())
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(granted_network.peer_for_prefix(node_prefix).is_some());
+    assert!(denied_network.peer_for_prefix(node_prefix).is_some());
+
+    let ingress = |invocation| {
+        let mut arguments = vec![vos::value::TAG_DYNAMIC];
+        arguments.extend_from_slice(&Msg::new("member_only").encode());
+        RootTreeInvocationV2 {
+            invocation,
+            target: target_actor,
+            method: "member_only".into(),
+            arguments,
+            proof_requested: false,
+        }
+        .encode()
+    };
+    let granted = granted_network
+        .send_invoke(
+            node_peer,
+            ServiceId::REGISTRY.0,
+            target_route.0,
+            vec![],
+            ingress(InvocationId([222; 32])),
+        )
+        .recv_timeout(Duration::from_secs(120))
+        .expect("the member call reaches the local target through its Raft authority");
+    assert_eq!(Value::try_decode(&granted), Some(Value::U32(99)));
+
+    let denied = denied_network
+        .send_invoke(
+            node_peer,
+            ServiceId::REGISTRY.0,
+            target_route.0,
+            vec![],
+            ingress(InvocationId([223; 32])),
+        )
+        .recv_timeout(Duration::from_secs(120))
+        .expect("an ungranted peer receives an explicit refusal");
+    assert_eq!(denied.first().copied(), Some(vos::STATUS_FORBIDDEN));
+
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        runner
+            .join()
+            .unwrap()
+            .into_iter()
+            .all(|result| result.is_ok())
+    );
+    granted_network.join();
+    denied_network.join();
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
