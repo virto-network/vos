@@ -3265,6 +3265,250 @@ fn node_routes_an_ordinary_cross_root_await_through_guest_accumulate() {
 }
 
 #[test]
+fn node_routes_raft_cross_root_reply_between_different_leaders() {
+    let actor_elf = probe_elf();
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&actor_elf, &signer);
+    let deployment = package.deployment_id();
+    let producer = package.deployment_signature.producer;
+    let program = package.manifest.actor_program;
+    let source_actor = ActorId([0xC1; 32]);
+    let destination_actor = ActorId([44; 32]);
+    let source_identity = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([0xC2; 32]),
+        root_service: RootServiceId([0xC3; 32]),
+        deployment,
+        service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
+    };
+    let destination_identity = ServiceIdentityV2 {
+        root_service: RootServiceId([0xC4; 32]),
+        ..source_identity.clone()
+    };
+    let install_authorization = AuthorizationEvidenceV2::SystemCapability {
+        capability: SystemCapabilityId([0xC5; 32]),
+        authenticator: vec![0xC6],
+    };
+    let source_config = LocalRootTreeConfigV2 {
+        role_authority: None,
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package: package.clone(),
+        service: source_identity.clone(),
+        root_actor: source_actor,
+        actor_name: actor_name.clone(),
+        consistency: ConsistencyModeV2::Raft,
+        initial_state: vec![],
+        external_actors: vec![external_binding(
+            "peer",
+            destination_identity.clone(),
+            destination_actor,
+            producer,
+            program,
+        )],
+        install_authorization: install_authorization.clone(),
+        refine_gas: TEST_GAS_SCHEDULE.refine,
+        accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
+    };
+    let destination_config = LocalRootTreeConfigV2 {
+        role_authority: None,
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package,
+        service: destination_identity.clone(),
+        root_actor: destination_actor,
+        actor_name,
+        consistency: ConsistencyModeV2::Raft,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization,
+        refine_gas: TEST_GAS_SCHEDULE.refine,
+        accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
+    };
+
+    let key_a = libp2p::identity::Keypair::generate_ed25519();
+    let peer_a = libp2p::PeerId::from(key_a.public());
+    let prefix_a = vos::network::derive_node_prefix(&peer_a);
+    let (key_b, peer_b, prefix_b) = loop {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let peer = libp2p::PeerId::from(key.public());
+        let prefix = vos::network::derive_node_prefix(&peer);
+        if prefix != prefix_a {
+            break (key, peer, prefix);
+        }
+    };
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let network_a = vos::network::Network::start(vos::network::NetworkConfig {
+        keypair: key_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
+        auto_dial_mdns: false,
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let address_a = loop {
+        if let Some(address) = network_a.listen_addrs().into_iter().next() {
+            break address.with(libp2p::multiaddr::Protocol::P2p(peer_a));
+        }
+        assert!(std::time::Instant::now() < deadline, "node A did not bind");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let network_b = vos::network::Network::start(vos::network::NetworkConfig {
+        keypair: key_b,
+        local_prefix: prefix_b,
+        listen: vec![listen],
+        bootstrap: vec![address_a],
+        auto_dial_mdns: false,
+    });
+
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    let registry_pvm =
+        grey_transpiler::link_elf(include_bytes!("../../vosx/blobs/space_registry.elf"))
+            .expect("committed space-registry ELF transpiles");
+    let voters = [(prefix_a, peer_a.to_bytes()), (prefix_b, peer_b.to_bytes())];
+    install_test_voter_registry(&mut node_a, registry_pvm.clone(), &voters);
+    install_test_voter_registry(&mut node_b, registry_pvm, &voters);
+    node_a.attach_network(network_a);
+    node_b.attach_network(network_b);
+    let network_a = node_a.network().unwrap();
+    let network_b = node_b.network().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while (network_a.peer_for_prefix(prefix_b).is_none()
+        || network_b.peer_for_prefix(prefix_a).is_none())
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(network_a.peer_for_prefix(prefix_b).is_some());
+    assert!(network_b.peer_for_prefix(prefix_a).is_some());
+
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-raft-root-transport-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source_replication = [0xC7; 32];
+    let destination_replication = [0xC8; 32];
+    let source_route = ServiceId::new(prefix_a, 0x3700);
+    let destination_route = ServiceId::new(prefix_b, 0x3800);
+    let raft_config = |me, replication_id| RaftConfig {
+        me,
+        members: vec![me],
+        election_timeout_ms: (50, 100),
+        heartbeat_interval_ms: 20,
+        replication_id,
+        propose_timeout_ms: 5_000,
+    };
+    node_a
+        .register_v2_raft_root_at_id(
+            "raft-workflow-source".into(),
+            source_config,
+            FailableCommittedImages::default(),
+            Arc::new(redb::Database::create(directory.join("source.redb")).unwrap()),
+            raft_config(prefix_a, source_replication),
+            source_route,
+            true,
+        )
+        .unwrap();
+    node_b
+        .register_v2_raft_root_at_id(
+            "raft-workflow-destination".into(),
+            destination_config,
+            FailableCommittedImages::default(),
+            Arc::new(redb::Database::create(directory.join("destination.redb")).unwrap()),
+            raft_config(prefix_b, destination_replication),
+            destination_route,
+            true,
+        )
+        .unwrap();
+    node_a
+        .bind_v2_raft_actor_route(
+            destination_actor,
+            destination_identity,
+            destination_replication,
+            destination_route,
+            peer_b.to_bytes(),
+        )
+        .unwrap();
+    node_b
+        .bind_v2_raft_actor_route(
+            source_actor,
+            source_identity,
+            source_replication,
+            source_route,
+            peer_a.to_bytes(),
+        )
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while (network_a
+        .local_raft_status(&source_replication)
+        .is_none_or(|status| status.role != vos::network::RaftRole::Leader)
+        || network_b
+            .local_raft_status(&destination_replication)
+            .is_none_or(|status| status.role != vos::network::RaftRole::Leader))
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    assert_eq!(
+        network_a
+            .local_raft_status(&source_replication)
+            .map(|status| status.role),
+        Some(vos::network::RaftRole::Leader)
+    );
+    assert_eq!(
+        network_b
+            .local_raft_status(&destination_replication)
+            .map(|status| status.role),
+        Some(vos::network::RaftRole::Leader)
+    );
+
+    let shutdown_a = node_a.shutdown_handle();
+    let shutdown_b = node_b.shutdown_handle();
+    let invoke = node_a.invoke_handle();
+    let runner_a = std::thread::spawn(move || {
+        node_a.run_forever();
+        node_a.collect()
+    });
+    let runner_b = std::thread::spawn(move || {
+        node_b.run_forever();
+        node_b.collect()
+    });
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("await_peer_without_deadline").encode());
+    let reply = invoke
+        .invoke_with_timeout(
+            source_route,
+            RootTreeInvocationV2 {
+                invocation: InvocationId([0xC9; 32]),
+                target: source_actor,
+                method: "await_peer_without_deadline".into(),
+                arguments,
+                proof_requested: false,
+            }
+            .encode(),
+            Duration::from_secs(120),
+        )
+        .expect("different Raft leaders complete delivery, reply, and both acknowledgements");
+    assert_eq!(reply, Value::U32(8).encode());
+
+    std::thread::sleep(Duration::from_millis(500));
+    shutdown_a.store(true, std::sync::atomic::Ordering::Relaxed);
+    shutdown_b.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(runner_a.join().unwrap().iter().all(AgentResult::is_ok));
+    assert!(runner_b.join().unwrap().iter().all(AgentResult::is_ok));
+    drop(network_a);
+    drop(network_b);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn node_retries_a_direct_reply_publication_ack_after_the_caller_is_gone() {
     let actor_elf = greeter_elf();
     let signer = libp2p::identity::Keypair::generate_ed25519();

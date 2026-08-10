@@ -196,9 +196,19 @@ both check the full `ServiceIdentityV2` committed in the message; a node route
 is usable only when its ActorId and service identity match a trusted directory
 binding. Across network links, the envelope source prefix must also belong to
 the authenticated peer, so peer-selected payload bytes cannot impersonate a
-different local route. The router is trusted for eventual delivery, not for
-safety: dropping an acknowledgement can delay reclamation, while guest-owned
-delivery, input, and reply-admission records prevent double execution.
+different local route. Raft actor routes retain the exact replication ID and
+only a bootstrap replica: every delivery, reply, and acknowledgement resolves
+the current leader through group status plus the canonical voter row's full
+Noise `PeerId`. Only the source leader redrives durable publications. After
+failover it reconstructs process-local multi-consumer progress by replaying the
+publication and collecting the destinations' permanent duplicate
+acknowledgements; an acknowledgement received by a follower is never retained
+as authoritative progress. The transport wire names both its destination and
+source actor/service identities, so this resolution is unambiguous even when
+roots reuse a local route suffix on different nodes. The router is trusted for
+eventual delivery, not for safety: dropping an acknowledgement can delay
+reclamation, while guest-owned delivery, input, and reply-admission records
+prevent double execution.
 
 The local transport accepts either the in-memory host or this durable host
 without changing scheduling or service semantics. Its physical cross-root
@@ -768,7 +778,9 @@ exactly one canonical `ReceiptVerificationRequestV2` in its log entry. Missing,
 extra, or mismatched verifier input is rejected before proposal and again on
 follower replay; non-receipt-bearing requests require the sidecar to be empty.
 The node periodically redrives pending publications, inboxes, and ingresses
-after restart; permanent guest deduplication makes a lost acknowledgement safe.
+after restart; for Raft roots this redrive begins only after a current-term
+leader barrier, and every hop independently resolves the destination group's
+leader. Permanent guest deduplication makes a lost acknowledgement safe.
 Direct space-role-only calls to Local and Raft roots use the installed
 canonical authority path described above. Attested calls, actor-local or
 mixed-role calls, role-bearing durable messages, and role-authorized CRDT

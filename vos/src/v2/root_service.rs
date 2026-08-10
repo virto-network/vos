@@ -10,6 +10,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use super::contracts::{decode_service, encode_service};
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateRequestV2, AccumulatedRoleAssertionV2, AccumulatedServiceOutputV2,
@@ -92,10 +93,15 @@ pub enum RootTreeTransportV2 {
         message: super::MessageRecordV2,
     },
     Reply {
+        caller: ActorId,
+        caller_service: ServiceIdentityV2,
         caller_invocation: super::InvocationId,
         publication: PublicationRecordV2,
     },
     PublicationAccepted {
+        acceptor: ActorId,
+        acceptor_service: ServiceIdentityV2,
+        service: ServiceIdentityV2,
         input: WorkInputIdV2,
         publication: super::Hash,
         call: super::CallId,
@@ -117,19 +123,29 @@ impl V2Wire for RootTreeTransportV2 {
                 encoder.bytes(&message.encode());
             }
             Self::Reply {
+                caller,
+                caller_service,
                 caller_invocation,
                 publication,
             } => {
                 encoder.u8(1);
+                encoder.fixed(&caller.0);
+                encode_service(&mut encoder, caller_service);
                 encoder.fixed(&caller_invocation.0);
                 encoder.bytes(&publication.encode());
             }
             Self::PublicationAccepted {
+                acceptor,
+                acceptor_service,
+                service,
                 input,
                 publication,
                 call,
             } => {
                 encoder.u8(2);
+                encoder.fixed(&acceptor.0);
+                encode_service(&mut encoder, acceptor_service);
+                encode_service(&mut encoder, service);
                 encoder.fixed(&input.invocation.0);
                 encoder.u64(input.workflow_step);
                 encoder.fixed(&publication.0);
@@ -145,10 +161,15 @@ impl V2Wire for RootTreeTransportV2 {
                 message: super::MessageRecordV2::decode(&decoder.bytes()?)?,
             },
             1 => Self::Reply {
+                caller: ActorId(decoder.fixed()?),
+                caller_service: decode_service(decoder)?,
                 caller_invocation: super::InvocationId(decoder.fixed()?),
                 publication: PublicationRecordV2::decode(&decoder.bytes()?)?,
             },
             2 => Self::PublicationAccepted {
+                acceptor: ActorId(decoder.fixed()?),
+                acceptor_service: decode_service(decoder)?,
+                service: decode_service(decoder)?,
                 input: WorkInputIdV2 {
                     invocation: super::InvocationId(decoder.fixed()?),
                     workflow_step: decoder.u64()?,
@@ -173,7 +194,10 @@ impl RootTreeTransportV2 {
                 message,
             } => {
                 publication.published.reply.is_none()
-                    && publication.receipt.consistency == ConsistencyModeV2::Local
+                    && matches!(
+                        publication.receipt.consistency,
+                        ConsistencyModeV2::Local | ConsistencyModeV2::Raft
+                    )
                     && publication.published.proof.is_none()
                     && publication.published.attestation.is_none()
                     && message.from_service == publication.receipt.service
@@ -185,11 +209,17 @@ impl RootTreeTransportV2 {
                         .is_some_and(|index| publication.published.outbox[index] == *message)
             }
             Self::Reply {
+                caller,
                 caller_invocation,
                 publication,
+                ..
             } => {
-                *caller_invocation != super::InvocationId::ZERO
-                    && publication.receipt.consistency == ConsistencyModeV2::Local
+                *caller != ActorId::ZERO
+                    && *caller_invocation != super::InvocationId::ZERO
+                    && matches!(
+                        publication.receipt.consistency,
+                        ConsistencyModeV2::Local | ConsistencyModeV2::Raft
+                    )
                     && publication.published.reply.is_some()
                     && publication.published.outbox.is_empty()
                     && publication.published.exported_blobs.is_empty()
@@ -197,11 +227,14 @@ impl RootTreeTransportV2 {
                     && publication.published.attestation.is_none()
             }
             Self::PublicationAccepted {
+                acceptor,
                 input,
                 publication,
                 call,
+                ..
             } => {
-                input.invocation != super::InvocationId::ZERO
+                *acceptor != ActorId::ZERO
+                    && input.invocation != super::InvocationId::ZERO
                     && *publication != super::Hash::ZERO
                     && *call != super::CallId::ZERO
             }
@@ -2521,9 +2554,23 @@ mod tests {
         };
         replicated_publication.receipt.consistency = ConsistencyModeV2::Raft;
         assert_eq!(
-            RootTreeTransportV2::decode(&replicated.encode()),
-            Err(DecodeError::NonCanonical),
-            "ordinary node transport is Local-only on the wire"
+            RootTreeTransportV2::decode(&replicated.encode()).unwrap(),
+            replicated,
+            "quorum-finalized Raft publications use the same canonical transport wire"
+        );
+
+        let accepted = RootTreeTransportV2::PublicationAccepted {
+            acceptor: message.to,
+            acceptor_service: message.to_service.clone(),
+            service: publication.receipt.service.clone(),
+            input: publication.input,
+            publication: publication.commitment(),
+            call: message.call_id,
+        };
+        assert_eq!(
+            RootTreeTransportV2::decode(&accepted.encode()).unwrap(),
+            accepted,
+            "an acknowledgement names both the accepting actor and the publication owner"
         );
 
         let mut mismatched = message;
