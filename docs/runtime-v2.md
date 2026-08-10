@@ -7,12 +7,12 @@
 > result; it has no native transition-apply shortcut. `VosNode` can attach an
 > explicitly opened Local or Raft v2 root and route ordinary public calls, durable
 > cross-root outbox delivery, inbox execution, exact reply/timeout resume, and
-> restart retries through it. A direct space-role-only call to a Local root obtains
-> an invocation-scoped accumulated assertion from that space's installed Raft
-> `space-authority`; caller-supplied legacy role bytes are ignored. Signed v2
+> restart retries through it. A direct space-role-only call to a Local or Raft
+> root obtains an invocation-scoped accumulated assertion from that space's
+> installed Raft `space-authority`; caller-supplied legacy role bytes are ignored. Signed v2
 > catalog rows use this root service when the daemon is started with the exact
 > service PVM. CRDT anti-entropy, actor-local or mixed-role external calls,
-> role-authorized Raft targets, role-bearing durable calls, and attested network
+> role-authorized CRDT targets, role-bearing durable calls, and attested network
 > transport remain fail-closed. Legacy node behavior is
 > not evidence of v2 conformance.
 
@@ -409,11 +409,17 @@ denial is acknowledged as an authority publication but surfaces as
 recover the original credential from the target's guest-owned direct-ingress
 row, recover the same authority decision from its durable eligibility/receipt
 rows, and never reinterpret the target's current package policy. This cutover
-is intentionally limited to Local targets: the Local receipt allowlist is a
-process policy seam, whereas a Raft target needs the authority receipt and its
-finality proof ordered or independently available to every follower before an
-Apply can be deterministic. Actor-local and mixed policies still require the
-separate bound-handle authority path.
+supports Local and Raft targets. Local roots expose the exact verifier decision
+only to the admission IC-5 call. Raft roots encode that same
+`ReceiptVerificationRequestV2` beside `AdmitIngress` in the committed entry;
+every replica hydrates it before IC-5 and leaves its applied cursor unchanged
+if hydration fails. Once admission commits, the guest-owned ingress row is the
+durable authorization anchor. Later Apply and resume slices authenticate the
+same scoped credential against that row rather than process-local verifier
+state, including after snapshot recovery. This ordering is narrowly scoped to
+direct authority ingress; it does not make arbitrary receipt-bearing transport
+consensus-authoritative. Actor-local and mixed policies still require the
+separate bound-handle authority path, and CRDT targets remain fail-closed.
 
 Authority redirects never trust the 16-bit routing prefix as identity. The
 target retains the authority's exact Raft replication ID, requires the leader
@@ -439,8 +445,10 @@ The reusable local transport remains a conformance orchestrator. `VosNode`
 connects its ordinary Local subset to authenticated node envelopes, but
 automatic service discovery remains staged: external actor routes must come
 from a trusted registry or consensus directory, never from a received
-envelope. Raft and CRDT transport also remain staged until receipt finality
-and logical time come from their consensus domains.
+envelope. Ordinary durable Raft and CRDT transport also remain staged until
+receipt finality and logical time come from their consensus domains; the
+quorum-ordered direct authority-ingress decision above is the narrow Raft
+exception.
 Acknowledging a publication containing several
 effects is the transport host's responsibility only after every required
 consumer has accepted it.
@@ -504,9 +512,11 @@ rather than its local conformance allowlist. Installed `PROGRAM_LOOKUP`
 availability is already part of the recoverable service image: Install and
 Upgrade order the exact content-addressed program/genesis bytes and stage them
 atomically with IC-5, while snapshots carry the resulting catalog.
-`RECEIPT_VERIFY` must likewise use
-consensus-authoritative receipt finality rather than its local conformance
-allowlist, and every delivery, deadline, and expiration observation must come
+`RECEIPT_VERIFY` must likewise use consensus-authoritative receipt finality
+rather than its local conformance allowlist for general delivery and reply
+paths. Direct role-authorized Raft ingress already quorum-orders its exact
+authority verifier input beside admission and persists the accepted ingress in
+guest state. Every delivery, deadline, and expiration observation must come
 from the JAM slot. `PROOF_VERIFY`
 must use the workspace-pinned verifier and execution-semantics identity rather
 than the local proof allowlist. Its proof backend must consume or reproduce
@@ -618,8 +628,11 @@ are inserted only into the request's cloned Accumulate transaction: rejection
 leaves no availability trace, acceptance makes them part of the durable
 service image, and a follower with an empty node-local cache can replay the log
 tail. Snapshot catch-up carries the same installed program/blob catalog.
-The replicated payload uses the clean-break `VRQ3` wire; retired payloads fail
-loud rather than being interpreted without their availability sidecar. Raft
+Direct role-authorized ingress may additionally carry exactly one canonical
+authority receipt-verification request. No other request shape accepts that
+sidecar. The replicated payload uses the clean-break `VRQ4` wire; retired
+payloads fail loud rather than being interpreted without their availability or
+receipt-verification sidecars. Raft
 does not replicate an `EffectLog` or a leader-produced post-state image.
 `ReplicatedJamServiceV2` waits for the
 request's log position to commit, then applies it through the physical
@@ -749,10 +762,10 @@ canonical node envelopes, admitted through destination IC-5, and resumed from
 the caller's exact saved machine after the committed reply returns. The node
 periodically redrives pending publications, inboxes, and ingresses after
 restart; permanent guest deduplication makes a lost acknowledgement safe.
-Direct space-role-only calls to Local roots use the installed canonical
-authority path described above. Attested calls, actor-local or mixed-role
-calls, role-bearing durable messages, and role-authorized Raft targets remain
-unavailable on this node route; they never fall back to an unproved,
+Direct space-role-only calls to Local and Raft roots use the installed
+canonical authority path described above. Attested calls, actor-local or
+mixed-role calls, role-bearing durable messages, and role-authorized CRDT
+targets remain unavailable on this node route; they never fall back to an unproved,
 caller-declared role or synthetic-System invocation. Legacy ELF/PVM rows
 continue on the old host during this staged cutover.
 
