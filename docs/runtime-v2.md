@@ -7,10 +7,13 @@
 > result; it has no native transition-apply shortcut. `VosNode` can attach an
 > explicitly opened Local or Raft v2 root and route ordinary public calls, durable
 > cross-root outbox delivery, inbox execution, exact reply/timeout resume, and
-> restart retries through it. Signed v2 catalog rows use this root service when the
-> daemon is started with the exact service PVM. Role-authorized, attested,
-> CRDT anti-entropy, role-authorized calls, and attested network transport remain
-> fail-closed. Legacy node behavior is
+> restart retries through it. A direct space-role-only call to a Local root obtains
+> an invocation-scoped accumulated assertion from that space's installed Raft
+> `space-authority`; caller-supplied legacy role bytes are ignored. Signed v2
+> catalog rows use this root service when the daemon is started with the exact
+> service PVM. CRDT anti-entropy, actor-local or mixed-role external calls,
+> role-authorized Raft targets, role-bearing durable calls, and attested network
+> transport remain fail-closed. Legacy node behavior is
 > not evidence of v2 conformance.
 
 The local conformance scheduler can admit one guest-committed durable inbox
@@ -397,6 +400,21 @@ row disappears. Private space-role credentials remain fail-closed on
 authority-backed roots until the proof public inputs expose the authority
 assertion independently of the private witness bytes.
 
+For direct network ingress, the node derives that claim from the target's
+guest-owned scheduler projection, asks the exact locally attached Raft
+authority to finalize `authorize_role`, and admits the target only after the
+returned assertion matches the installed authority and complete claim. A
+denial is acknowledged as an authority publication but surfaces as
+`Forbidden`; it never creates target ingress. Restart and lost-result retries
+recover the original credential from the target's guest-owned direct-ingress
+row, recover the same authority decision from its durable eligibility/receipt
+rows, and never reinterpret the target's current package policy. This cutover
+is intentionally limited to Local targets: the Local receipt allowlist is a
+process policy seam, whereas a Raft target needs the authority receipt and its
+finality proof ordered or independently available to every follower before an
+Apply can be deterministic. Actor-local and mixed policies still require the
+separate bound-handle authority path.
+
 The current legacy `vosx space publish` path does not activate this v2 Install
 entry. Production v2 installation must resolve a signature-verified `.vos`
 package, derive the exact `ActorGenesisV2` (including its canonical role-policy
@@ -718,9 +736,12 @@ canonical node envelopes, admitted through destination IC-5, and resumed from
 the caller's exact saved machine after the committed reply returns. The node
 periodically redrives pending publications, inboxes, and ingresses after
 restart; permanent guest deduplication makes a lost acknowledgement safe.
-Attested and role-gated external calls remain unavailable on this node route;
-they never fall back to an unproved or synthetic-System invocation. Legacy
-ELF/PVM rows continue on the old host during this staged cutover.
+Direct space-role-only calls to Local roots use the installed canonical
+authority path described above. Attested calls, actor-local or mixed-role
+calls, role-bearing durable messages, and role-authorized Raft targets remain
+unavailable on this node route; they never fall back to an unproved,
+caller-declared role or synthetic-System invocation. Legacy ELF/PVM rows
+continue on the old host during this staged cutover.
 
 Registry-level `space upgrade` is rejected whenever either side is a signed v2
 package. A catalog pointer rewrite cannot update guest-owned descriptors or

@@ -28,6 +28,10 @@ use crate::spaces_index::{self, SpaceEntry};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const INVOKE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
+/// A role-authorized v2 call may wait for a Raft authority read barrier and
+/// decision commit before the Local target executes. Match the libp2p
+/// request-response budget unless the operator supplied an explicit override.
+const ROLE_AUTHORIZED_INVOKE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(300);
 
 /// Resolve the per-invoke timeout, honouring an env override.
 /// `VOSX_INVOKE_TIMEOUT_MS` lets the e2e suite shorten the wait
@@ -41,6 +45,20 @@ fn invoke_timeout() -> Duration {
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_millis)
         .unwrap_or(INVOKE_TIMEOUT_DEFAULT)
+}
+
+fn invoke_timeout_for_policy(policy: Option<&vos::v2::MethodPolicyV2>) -> Duration {
+    let configured = invoke_timeout();
+    if std::env::var_os("VOSX_INVOKE_TIMEOUT_MS").is_some() {
+        return configured;
+    }
+    if policy.is_some_and(|policy| {
+        !policy.public && policy.space_role.is_some() && policy.actor_role.is_none()
+    }) {
+        ROLE_AUTHORIZED_INVOKE_TIMEOUT_DEFAULT
+    } else {
+        configured
+    }
 }
 
 pub struct DaemonClient {
@@ -89,9 +107,9 @@ fn encode_v2_invocation(
             msg.name,
         );
     }
-    if !policy.public {
+    if !policy.public && (policy.space_role.is_none() || policy.actor_role.is_some()) {
         anyhow::bail!(
-            "role-gated method '{}' requires an explicit v2 credential, which space call does not accept yet",
+            "actor-local or mixed-role method '{}' requires a bound-handle credential, which space call does not accept yet",
             msg.name,
         );
     }
@@ -346,7 +364,13 @@ impl DaemonClient {
         target: ServiceId,
         msg: &vos::value::Msg,
     ) -> anyhow::Result<vos::value::Value> {
-        self.invoke_dyn_with_timeout(target, msg, invoke_timeout())
+        let timeout = self
+            .v2_targets
+            .lock()
+            .ok()
+            .and_then(|targets| targets.get(&target.0).cloned())
+            .and_then(|target| target.methods.get(&msg.name).cloned());
+        self.invoke_dyn_with_timeout(target, msg, invoke_timeout_for_policy(timeout.as_ref()))
     }
 
     /// Like [`Self::invoke_dyn`] but with an explicit per-call timeout, for the
@@ -1167,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_daemon_ingress_refuses_attested_and_role_gated_methods() {
+    fn daemon_ingress_admits_space_roles_but_refuses_unwired_authorization_paths() {
         let invocation = vos::v2::InvocationId([0x18; 32]);
         let msg = vos::value::Msg::new("claim");
         let arguments = vec![vos::value::TAG_DYNAMIC, 1];
@@ -1182,11 +1206,24 @@ mod tests {
         .to_string();
         assert!(attested.contains("proof-producing transport"));
 
-        let protected =
-            encode_v2_invocation(&target("claim", false, false), invocation, &msg, arguments)
-                .unwrap_err()
-                .to_string();
-        assert!(protected.contains("explicit v2 credential"));
+        let mut space_role = target("claim", false, false);
+        space_role.methods.get_mut("claim").unwrap().space_role =
+            Some(vos::SpaceRole::Member.as_u8());
+        assert!(
+            encode_v2_invocation(&space_role, invocation, &msg, arguments.clone(),).is_ok(),
+            "the daemon obtains an invocation-scoped assertion from the installed authority",
+        );
+        assert_eq!(
+            invoke_timeout_for_policy(space_role.methods.get("claim")),
+            ROLE_AUTHORIZED_INVOKE_TIMEOUT_DEFAULT,
+        );
+
+        let mut actor_role = target("claim", false, false);
+        actor_role.methods.get_mut("claim").unwrap().actor_role = Some(1);
+        let protected = encode_v2_invocation(&actor_role, invocation, &msg, arguments)
+            .unwrap_err()
+            .to_string();
+        assert!(protected.contains("bound-handle credential"));
     }
 
     #[test]

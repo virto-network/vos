@@ -22,9 +22,9 @@ use super::{
     LocalWorkSchedulerV2, MethodPolicyV2, NoRefineProtocolHostV2, PackageError,
     PackageRolePoliciesV2, PreparedWorkV2, ProgramId, ProofArtifactStoreV2, PublicationAckV2,
     PublicationRecordV2, PublishedEffectsV2, RefinedServiceOutputV2, RoleAssertionEligibilityV2,
-    RoleAuthorityBindingV2, RoleAuthorizationClaimV2, ScheduleErrorV2, ServiceDispatchError,
-    ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2, WorkInputIdV2,
-    WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
+    RoleAuthorityBindingV2, RoleAuthorizationClaimV2, RoleCredentialV2, ScheduleErrorV2,
+    ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2,
+    WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
 };
 
 #[cfg(feature = "storage")]
@@ -1473,6 +1473,128 @@ where
             .binary_search_by(|candidate| candidate.method.as_str().cmp(method))
             .ok()
             .map(|index| policies.methods[index].clone()))
+    }
+
+    /// Recover the exact authorization evidence already admitted for a
+    /// direct invocation. This lets a host reattach a lost-result retry
+    /// without reinterpreting the actor's *current* package policy after an
+    /// upgrade. Every caller-controlled stable field is matched first; a
+    /// reused invocation with different input remains divergent.
+    pub(crate) fn recover_direct_authorization(
+        &self,
+        request: &LocalWorkRequestV2,
+    ) -> Result<Option<AuthorizationEvidenceV2>, LocalRootTreeInvokeErrorV2> {
+        let Some(record) = self
+            .service
+            .accumulate_host()
+            .ingress_record(request.invocation)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+        else {
+            return Ok(None);
+        };
+        let ingress = record.ingress;
+        if ingress.service != self.identity
+            || ingress.invocation != request.invocation
+            || ingress.target != request.target
+            || ingress.method != request.method
+            || ingress.arguments != request.arguments
+            || ingress.origin != request.origin
+            || ingress.imported_blobs != request.imported_blobs
+            || ingress.proof_requested != request.proof_requested
+        {
+            return Err(LocalRootTreeInvokeErrorV2::DivergentInvocation);
+        }
+        Ok(Some(ingress.authorization))
+    }
+
+    /// Derive the exact invocation-scoped decision the installed role
+    /// authority must finalize before this work can be admitted.
+    ///
+    /// A fresh claim deliberately uses the same scheduler projection as
+    /// Refine. A retry instead recovers the exact admitted credential. Both
+    /// paths bind the guest-owned target deployment/program and every stable
+    /// caller input without trusting a node-side reconstruction of those
+    /// fields.
+    pub fn role_authorization_claim(
+        &self,
+        request: &LocalWorkRequestV2,
+        role: crate::SpaceRole,
+        policy: &MethodPolicyV2,
+    ) -> Result<RoleAuthorizationClaimV2, LocalRootTreeInvokeErrorV2> {
+        if self.expected_role_authority.is_none()
+            || request.workflow_step != 0
+            || request.authorization != AuthorizationEvidenceV2::Public
+            || request.proof_requested
+            || policy.public
+            || policy.attested
+            || policy.space_role != Some(role.as_u8())
+            || policy.actor_role.is_some()
+        {
+            return Err(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication);
+        }
+        if let Some(authorization) = self.recover_direct_authorization(request)? {
+            let AuthorizationEvidenceV2::Credential {
+                policy: supplied_policy,
+                credential_commitment,
+                bytes,
+            } = authorization
+            else {
+                return Err(LocalRootTreeInvokeErrorV2::CorruptWorkflow);
+            };
+            let credential = RoleCredentialV2::decode(&bytes)
+                .map_err(|_| LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+            if supplied_policy != policy.policy
+                || credential.commitment() != credential_commitment
+                || credential.holder != request.origin
+                || credential.space_role != Some(role)
+                || credential.actor_role.is_some()
+            {
+                return Err(LocalRootTreeInvokeErrorV2::CorruptWorkflow);
+            }
+            let assertion = AccumulatedRoleAssertionV2::decode(&credential.authenticator)
+                .map_err(|_| LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+            let authority = self
+                .expected_role_authority
+                .as_ref()
+                .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+            let claim = assertion.claim.clone();
+            if !assertion.matches_authority(authority)
+                || credential.scope != claim.scope
+                || claim.space != self.identity.space
+                || claim.holder != request.origin
+                || claim.role != role
+                || claim.audience != self.identity
+                || claim.invocation != request.invocation
+                || claim.target != request.target
+                || claim.method != request.method
+                || claim.policy != policy.policy
+            {
+                return Err(LocalRootTreeInvokeErrorV2::CorruptWorkflow);
+            }
+            return Ok(claim);
+        }
+        let prepared =
+            LocalWorkSchedulerV2::prepare(self.service.accumulate_host(), request.clone())
+                .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        if prepared.work.service != self.identity
+            || prepared.work.target != request.target
+            || prepared.work.invocation != request.invocation
+            || prepared.work.method != request.method
+            || prepared.work.origin != request.origin
+        {
+            return Err(LocalRootTreeInvokeErrorV2::CorruptWorkflow);
+        }
+        Ok(RoleAuthorizationClaimV2 {
+            space: self.identity.space,
+            holder: request.origin,
+            role,
+            audience: self.identity.clone(),
+            invocation: request.invocation,
+            scope: prepared.work.authorization_scope(),
+            target: request.target,
+            method: request.method.clone(),
+            policy: policy.policy,
+        })
     }
 
     /// Recover an authority decision from guest-owned durable workflow and

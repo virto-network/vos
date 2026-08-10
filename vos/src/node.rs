@@ -3344,8 +3344,8 @@ impl VosNode {
     }
 
     /// Attach one already-opened guest-owned v2 root tree to a local host
-    /// route. Direct public calls execute through the canonical service PVM;
-    /// this thread never applies actor writes or effects natively.
+    /// route. Direct public and canonical space-role calls execute through the
+    /// service PVM; this thread never applies actor writes or effects natively.
     pub fn register_v2_root_at_id<B>(
         &mut self,
         name: impl Into<String>,
@@ -3457,6 +3457,9 @@ impl VosNode {
         let shutdown = self.register_agent_shutdown(id);
         let activity = self.last_activity.clone();
         let actor_routes = self.v2_actor_routes.clone();
+        let invoke_routes = self.invoke_routes.clone();
+        #[cfg(feature = "network")]
+        let shared_network = self.shared_network.clone();
         let logical_timeslot = self.v2_logical_timeslot.clone();
         let outbox = self.outbox_tx.clone();
         self.agents.push(AgentHandle {
@@ -3468,6 +3471,9 @@ impl VosNode {
                     invoke_rx,
                     outbox,
                     actor_routes,
+                    invoke_routes,
+                    #[cfg(feature = "network")]
+                    shared_network,
                     logical_timeslot,
                     shutdown,
                     activity,
@@ -4973,8 +4979,17 @@ fn decode_v2_raft_delegation(wire: &[u8]) -> Result<Option<V2RaftDelegatedIngres
 
 #[derive(Default)]
 struct V2RootThreadState {
-    pending_callers: HashMap<crate::v2::InvocationId, Vec<ReplyChannel>>,
+    pending_callers: HashMap<crate::v2::InvocationId, Vec<V2PendingCaller>>,
     publication_progress: HashMap<crate::v2::Hash, V2PublicationProgress>,
+}
+
+struct V2PendingCaller {
+    reply: ReplyChannel,
+    /// Platform protocols may expose a stronger host result than the actor's
+    /// committed reply bytes. The role authority uses this to return the
+    /// receipt-bound assertion while its receipt continues to commit the
+    /// actor-produced claim bytes exactly.
+    override_result: Option<Result<Vec<u8>, u8>>,
 }
 
 #[derive(Default)]
@@ -5022,6 +5037,141 @@ where
     Ok(next_v2_logical_timeslot(logical_timeslot))
 }
 
+/// Ask the locally attached canonical Raft authority to finalize one exact
+/// invocation-scoped role claim. A follower redirect preserves the platform
+/// `System` origin through the existing voter-authenticated delegation wire;
+/// the returned assertion is still checked byte-for-byte against the target
+/// service's installed authority binding before it reaches guest Accumulate.
+fn request_v2_role_assertion(
+    authority: &crate::v2::RoleAuthorityBindingV2,
+    claim: &crate::v2::RoleAuthorizationClaimV2,
+    actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
+    invoke_routes: &InvokeRoutes,
+    #[cfg(feature = "network")] shared_network: &SharedNetwork,
+) -> Result<crate::v2::AccumulatedRoleAssertionV2, ()> {
+    use crate::{Decode, Encode, v2::V2Wire};
+
+    let route = v2_actor_route(actor_routes, authority.actor).filter(|route| {
+        route.service == authority.service
+            && route.consistency == crate::v2::ConsistencyModeV2::Raft
+            && route.authenticated_peer.is_none()
+    });
+    let Some(route) = route else {
+        return Err(());
+    };
+    let mut arguments = vec![crate::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(
+        &crate::value::Msg::new(crate::v2::ROLE_AUTHORITY_DECISION_METHOD_V2)
+            .with("claim", claim.encode())
+            .encode(),
+    );
+    let ingress = crate::v2::RootTreeInvocationV2 {
+        invocation: claim.authority_invocation(),
+        target: authority.actor,
+        method: crate::v2::ROLE_AUTHORITY_DECISION_METHOD_V2.into(),
+        arguments,
+        proof_requested: false,
+    };
+    let ingress_wire = ingress.encode();
+    let tx = invoke_routes
+        .lock()
+        .map_err(|_| ())?
+        .get(&route.route)
+        .cloned()
+        .ok_or(())?;
+    let deadline = Instant::now().checked_add(route.invoke_timeout).ok_or(())?;
+    let (reply_tx, reply_rx) = mpsc::channel();
+    tx.send(InvokeRequest {
+        caller: crate::actors::Caller::System,
+        space_role: None,
+        actor_local_role: None,
+        #[cfg(all(feature = "network", feature = "storage"))]
+        delegated_origin: None,
+        msg: ingress_wire.clone(),
+        reply: ReplyChannel::Sync(reply_tx),
+        chain: Vec::new(),
+    })
+    .map_err(|_| ())?;
+    let envelope = reply_rx
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|_| ())?;
+
+    #[cfg(all(feature = "network", feature = "storage"))]
+    let envelope = if let Some(redirect) = decode_v2_raft_redirect(&envelope) {
+        let network = shared_network.lock().map_err(|_| ())?.clone().ok_or(())?;
+        let peer = network.peer_for_prefix(redirect.leader_prefix).ok_or(())?;
+        let leader_route =
+            ServiceId::new(redirect.leader_prefix, ServiceId(route.route).local_id());
+        let delegated = encode_v2_raft_delegation(crate::v2::Origin::System, true, &ingress_wire);
+        network
+            .send_invoke(
+                peer,
+                ServiceId::REGISTRY.0,
+                leader_route.0,
+                Vec::new(),
+                delegated,
+            )
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| ())?
+    } else {
+        envelope
+    };
+
+    let reply = decode_host_invoke_envelope(&envelope).map_err(|_| ())?;
+    let crate::value::Value::Bytes(bytes) =
+        <crate::value::Value as Decode>::try_decode(&reply).ok_or(())?
+    else {
+        return Err(());
+    };
+    let assertion = crate::v2::AccumulatedRoleAssertionV2::decode(&bytes).map_err(|_| ())?;
+    if assertion.claim != *claim || !assertion.matches_authority(authority) {
+        return Err(());
+    }
+    Ok(assertion)
+}
+
+fn role_authority_reply_override<B>(
+    service: &crate::v2::LocalRootTreeServiceV2<B>,
+    ingress: &crate::v2::RootTreeInvocationV2,
+    committed: &crate::v2::CommittedRootTreeSliceV2,
+) -> Option<Result<Vec<u8>, u8>>
+where
+    B: crate::v2::CommittedImageStoreV2
+        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+{
+    use crate::{Decode, Encode, v2::V2Wire};
+
+    if ingress.method != crate::v2::ROLE_AUTHORITY_DECISION_METHOD_V2 {
+        return None;
+    }
+    let assertion = (|| {
+        let message = <crate::value::Msg as Decode>::try_decode(
+            ingress
+                .arguments
+                .strip_prefix(&[crate::value::TAG_DYNAMIC])?,
+        )?;
+        if message.name != crate::v2::ROLE_AUTHORITY_DECISION_METHOD_V2 {
+            return None;
+        }
+        let claim =
+            crate::v2::RoleAuthorizationClaimV2::decode(&message.args.get_bytes("claim")?).ok()?;
+        if claim.authority_invocation() != ingress.invocation {
+            return None;
+        }
+        let authority = crate::v2::RoleAuthorityBindingV2 {
+            service: service.identity().clone(),
+            actor: ingress.target,
+        };
+        let assertion = if committed.duplicate {
+            service.recover_role_assertion(claim, &authority).ok()?
+        } else {
+            committed.role_assertion(claim, &authority).ok()?
+        };
+        Some(crate::value::Value::Bytes(assertion.encode()).encode())
+    })();
+    Some(assertion.ok_or(crate::STATUS_FORBIDDEN))
+}
+
 fn v2_root_service_thread<B>(
     id: ServiceId,
     mut service: crate::v2::LocalRootTreeServiceV2<B>,
@@ -5029,6 +5179,8 @@ fn v2_root_service_thread<B>(
     invoke_rx: mpsc::Receiver<InvokeRequest>,
     outbox: mpsc::Sender<Envelope>,
     actor_routes: Arc<RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>>,
+    invoke_routes: InvokeRoutes,
+    #[cfg(feature = "network")] shared_network: SharedNetwork,
     logical_timeslot: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
@@ -5142,39 +5294,20 @@ where
                 continue;
             }
         };
-        let policy = match service.root_method_policy(&ingress.method) {
-            Ok(Some(policy)) => policy,
-            Ok(None) => {
-                send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
-                continue;
-            }
-            Err(failure) => {
-                error!(%id, ?failure, "v2 root policy lookup failed");
-                send_v2_status(req.reply, crate::STATUS_PANICKED, id);
-                continue;
-            }
-        };
-        // This cutover admits only ordinary public methods. Role credentials
-        // and proof production must use their exact authority/attestation
-        // paths, never a synthetic System shortcut from the legacy runtime.
-        if !policy.public || policy.attested || ingress.proof_requested {
+        if ingress.proof_requested {
             send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
             continue;
         }
-        // Nothing catches up again between this allocation and the proposal.
-        if let Err(failure) = restore_v2_logical_timeslot(&logical_timeslot, admission_floor) {
-            error!(%id, ?failure, "v2 root-tree admission clock restoration failed");
-            send_v2_status(req.reply, crate::STATUS_PANICKED, id);
-            error = Some(format!("v2 root-tree clock restoration failed: {failure}"));
-            break;
-        }
-        let result = service.invoke_after_admission_barrier(crate::v2::LocalWorkRequestV2 {
+        let mut request = crate::v2::LocalWorkRequestV2 {
             invocation: ingress.invocation,
             workflow_step: 0,
-            logical_timeslot: next_v2_logical_timeslot(&logical_timeslot),
+            // Scope excludes the scheduler observation slot. Use the first
+            // value above the barrier while the authority runs, then replace
+            // it with the actually allocated slot immediately before admit.
+            logical_timeslot: admission_floor.saturating_add(1),
             target: ingress.target,
-            method: ingress.method,
-            arguments: ingress.arguments,
+            method: ingress.method.clone(),
+            arguments: ingress.arguments.clone(),
             origin,
             authorization: crate::v2::AuthorizationEvidenceV2::Public,
             causal_parent: None,
@@ -5184,7 +5317,162 @@ where
             awaited_timeout: None,
             imported_blobs: Vec::new(),
             proof_requested: false,
-        });
+        };
+        let recovered_authorization = match service.recover_direct_authorization(&request) {
+            Ok(authorization) => authorization,
+            Err(failure) => {
+                warn!(%id, ?failure, "v2 direct invocation retry diverged");
+                send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                continue;
+            }
+        };
+        if let Some(authorization) = recovered_authorization {
+            match &authorization {
+                crate::v2::AuthorizationEvidenceV2::Public => {}
+                crate::v2::AuthorizationEvidenceV2::Credential {
+                    policy,
+                    credential_commitment,
+                    bytes,
+                } => {
+                    let credential = match crate::v2::RoleCredentialV2::decode(bytes) {
+                        Ok(credential) => credential,
+                        Err(_) => {
+                            send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                            continue;
+                        }
+                    };
+                    let assertion = match crate::v2::AccumulatedRoleAssertionV2::decode(
+                        &credential.authenticator,
+                    ) {
+                        Ok(assertion) => assertion,
+                        Err(_) => {
+                            send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                            continue;
+                        }
+                    };
+                    let claim = &assertion.claim;
+                    let Some(authority) = service.role_authority().cloned() else {
+                        send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                        continue;
+                    };
+                    let valid = service.consistency() == crate::v2::ConsistencyModeV2::Local
+                        && credential.commitment() == *credential_commitment
+                        && credential.holder == origin
+                        && credential.scope == claim.scope
+                        && credential.space_role == Some(claim.role)
+                        && credential.actor_role.is_none()
+                        && *policy == claim.policy
+                        && claim.space == service.identity().space
+                        && claim.holder == origin
+                        && claim.audience == *service.identity()
+                        && claim.invocation == ingress.invocation
+                        && claim.target == ingress.target
+                        && claim.method == ingress.method
+                        && assertion.matches_authority(&authority);
+                    if !valid {
+                        send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                        continue;
+                    }
+                    let finalized = request_v2_role_assertion(
+                        &authority,
+                        claim,
+                        &actor_routes,
+                        &invoke_routes,
+                        #[cfg(feature = "network")]
+                        &shared_network,
+                    );
+                    if finalized.as_ref() != Ok(&assertion) {
+                        send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                        continue;
+                    }
+                    service.authorize_finalized_receipt(authority.actor, &assertion.receipt);
+                }
+                crate::v2::AuthorizationEvidenceV2::PrivateCredential { .. }
+                | crate::v2::AuthorizationEvidenceV2::SystemCapability { .. } => {
+                    send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                    continue;
+                }
+            }
+            request.authorization = authorization;
+        } else {
+            let policy = match service.root_method_policy(&ingress.method) {
+                Ok(Some(policy)) => policy,
+                Ok(None) => {
+                    send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
+                    continue;
+                }
+                Err(failure) => {
+                    error!(%id, ?failure, "v2 root policy lookup failed");
+                    send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                    continue;
+                }
+            };
+            // Attested work and actor-local/mixed roles retain their separate
+            // fail-closed paths. A space-role-only method on a Local root is
+            // authorized by an invocation-scoped receipt from the installed
+            // Raft authority; neither legacy role bytes nor synthetic System
+            // identity enter the guest work envelope.
+            if policy.attested {
+                send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                continue;
+            }
+            if !policy.public {
+                let Some(role) = policy.space_role.and_then(crate::SpaceRole::from_u8) else {
+                    send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                    continue;
+                };
+                if policy.actor_role.is_some()
+                    || service.consistency() != crate::v2::ConsistencyModeV2::Local
+                {
+                    send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                    continue;
+                }
+                let Some(authority) = service.role_authority().cloned() else {
+                    send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                    continue;
+                };
+                let claim = match service.role_authorization_claim(&request, role, &policy) {
+                    Ok(claim) => claim,
+                    Err(failure) => {
+                        warn!(%id, ?failure, "could not derive v2 role authorization claim");
+                        send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                        continue;
+                    }
+                };
+                let assertion = match request_v2_role_assertion(
+                    &authority,
+                    &claim,
+                    &actor_routes,
+                    &invoke_routes,
+                    #[cfg(feature = "network")]
+                    &shared_network,
+                ) {
+                    Ok(assertion) => assertion,
+                    Err(()) => {
+                        send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                        continue;
+                    }
+                };
+                service.authorize_finalized_receipt(authority.actor, &assertion.receipt);
+                request.authorization = crate::v2::RoleCredentialV2 {
+                    holder: origin,
+                    scope: claim.scope,
+                    space_role: Some(role),
+                    actor_role: None,
+                    authenticator: assertion.encode(),
+                }
+                .disclosed_evidence(policy.policy);
+            }
+        }
+        // Nothing catches up again between this allocation and the proposal.
+        if let Err(failure) = restore_v2_logical_timeslot(&logical_timeslot, admission_floor) {
+            error!(%id, ?failure, "v2 root-tree admission clock restoration failed");
+            send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+            error = Some(format!("v2 root-tree clock restoration failed: {failure}"));
+            break;
+        }
+        request.logical_timeslot = next_v2_logical_timeslot(&logical_timeslot);
+        let result = service.invoke_after_admission_barrier(request);
         let committed = match result {
             Ok(committed) => committed,
             Err(crate::v2::LocalRootTreeInvokeErrorV2::Rejected(
@@ -5199,11 +5487,15 @@ where
                 continue;
             }
         };
+        let override_result = role_authority_reply_override(&service, &ingress, &committed);
         publish_v2_root_slice(
             id,
             &mut service,
             committed,
-            Some(req.reply),
+            Some(V2PendingCaller {
+                reply: req.reply,
+                override_result,
+            }),
             &outbox,
             &actor_routes,
             &mut state,
@@ -5407,7 +5699,7 @@ fn publish_v2_root_slice<B>(
     id: ServiceId,
     service: &mut crate::v2::LocalRootTreeServiceV2<B>,
     committed: crate::v2::CommittedRootTreeSliceV2,
-    caller: Option<ReplyChannel>,
+    caller: Option<V2PendingCaller>,
     outbox: &mpsc::Sender<Envelope>,
     actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
     state: &mut V2RootThreadState,
@@ -5417,7 +5709,7 @@ fn publish_v2_root_slice<B>(
 {
     if committed.published.proof.is_some() || committed.published.attestation.is_some() {
         if let Some(caller) = caller {
-            send_v2_status(caller, crate::STATUS_FORBIDDEN, id);
+            send_v2_status(caller.reply, crate::STATUS_FORBIDDEN, id);
         }
         return;
     }
@@ -5433,7 +5725,17 @@ fn publish_v2_root_slice<B>(
             && let Some(callers) = state.pending_callers.remove(&committed.input.invocation)
         {
             for caller in callers {
-                send_v2_status(caller, crate::STATUS_PANICKED, id);
+                match caller.override_result {
+                    Some(Ok(result)) => {
+                        let _ = send_reply_capped(
+                            caller.reply,
+                            encode_invoke_envelope(crate::STATUS_DONE, &[], &result),
+                            id,
+                        );
+                    }
+                    Some(Err(status)) => send_v2_status(caller.reply, status, id),
+                    None => send_v2_status(caller.reply, crate::STATUS_PANICKED, id),
+                }
             }
         }
         return;
@@ -5524,11 +5826,12 @@ fn queue_v2_root_publication<B>(
     let mut accepted = false;
     if let Some(callers) = state.pending_callers.remove(&publication.input.invocation) {
         for caller in callers {
-            accepted |= send_reply_capped(
-                caller,
-                encode_invoke_envelope(crate::STATUS_DONE, &[], &reply.result),
-                id,
-            );
+            let envelope = match caller.override_result {
+                Some(Ok(result)) => encode_invoke_envelope(crate::STATUS_DONE, &[], &result),
+                Some(Err(status)) => encode_invoke_envelope(status, &[], &[]),
+                None => encode_invoke_envelope(crate::STATUS_DONE, &[], &reply.result),
+            };
+            accepted |= send_reply_capped(caller.reply, envelope, id);
         }
     } else {
         match service.publication_return_target(publication) {
