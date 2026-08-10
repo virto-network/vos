@@ -10548,6 +10548,21 @@ fn raft_authority_receipt_replays_on_a_fresh_follower_before_actor_apply() {
         AccumulationResultV2::Installed(_)
     ));
     assert_eq!(follower.catch_up().unwrap(), 1);
+    let fresh_follower_snapshot = follower.service().accumulate_host().snapshot();
+    let fresh_follower_applied = follower.log_mut().applied_index().unwrap();
+    drop(follower);
+    let mut follower = ReplicatedJamServiceV2::new(
+        JamServiceV2::new(
+            service_pvm.clone(),
+            ProgramId::of_pvm(&service_pvm),
+            NoRefineProtocolHostV2,
+            LocalJamStoreV2::from_snapshot(fresh_follower_snapshot),
+            TEST_GAS_SCHEDULE.refine,
+            TEST_GAS_SCHEDULE.accumulate,
+        )
+        .unwrap(),
+        TestCommittedLog::new(shared.clone(), false).with_applied(fresh_follower_applied),
+    );
 
     let holder = Origin::Member(SubjectId([0x6C; 32]));
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
@@ -10618,6 +10633,40 @@ fn raft_authority_receipt_replays_on_a_fresh_follower_before_actor_apply() {
         .unwrap()
         .work;
     let ingress = direct_linear_ingress(&work);
+    leader
+        .service_mut()
+        .accumulate_host_mut()
+        .allow_receipt(&verification);
+    let leader_before_unordered = leader.service().accumulate_host().snapshot();
+    let follower_before_unordered = follower.service().accumulate_host().snapshot();
+    assert!(matches!(
+        leader.accumulate(&ingress),
+        Err(vos::v2::ReplicatedServiceErrorV2::Dispatch(
+            ServiceDispatchError::InvalidAvailabilityArtifacts,
+        ))
+    ));
+    assert_eq!(
+        shared.lock().unwrap().entries.len(),
+        1,
+        "a leader-local receipt decision never enters the replicated log",
+    );
+    assert_eq!(follower.catch_up().unwrap(), 0);
+    assert!(
+        leader
+            .service()
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&leader_before_unordered),
+        "the rejected sidecar-free leader path leaves guest state unchanged",
+    );
+    assert!(
+        follower
+            .service()
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&follower_before_unordered),
+        "the fresh follower never observes a leader-local verifier decision",
+    );
     let mut forged_verification = verification.clone();
     forged_verification.expected_producer = ActorId([0x70; 32]);
     let rejection_path = std::env::temp_dir().join(format!(

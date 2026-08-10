@@ -628,9 +628,11 @@ are inserted only into the request's cloned Accumulate transaction: rejection
 leaves no availability trace, acceptance makes them part of the durable
 service image, and a follower with an empty node-local cache can replay the log
 tail. Snapshot catch-up carries the same installed program/blob catalog.
-Direct role-authorized ingress may additionally carry exactly one canonical
-authority receipt-verification request. No other request shape accepts that
-sidecar. The replicated payload uses the clean-break `VRQ4` wire; retired
+Replicated direct role-authorized ingress must carry exactly one canonical
+authority receipt-verification request; an empty sidecar is rejected even if the
+leader's process-local verifier already knows that receipt. No other request
+shape accepts a verification sidecar. The replicated payload uses the
+clean-break `VRQ4` wire; retired
 payloads fail loud rather than being interpreted without their availability or
 receipt-verification sidecars. Raft
 does not replicate an `EffectLog` or a leader-produced post-state image.

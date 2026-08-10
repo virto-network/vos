@@ -86,6 +86,7 @@ fn validate_accumulate_availability(
 fn validate_receipt_verifications(
     request: &AccumulateRequestV2,
     verifications: &[ReceiptVerificationRequestV2],
+    require_assertion_verification: bool,
 ) -> Result<(), DecodeError> {
     if verifications
         .windows(2)
@@ -93,20 +94,33 @@ fn validate_receipt_verifications(
     {
         return Err(DecodeError::NonCanonical);
     }
-    if verifications.is_empty() {
+    let assertion = match request {
+        AccumulateRequestV2::AdmitIngress(ingress) => match &ingress.authorization {
+            AuthorizationEvidenceV2::Credential { bytes, .. } => {
+                RoleCredentialV2::decode(bytes).ok().and_then(|credential| {
+                    AccumulatedRoleAssertionV2::decode(&credential.authenticator).ok()
+                })
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(assertion) = assertion else {
+        return if verifications.is_empty() {
+            Ok(())
+        } else {
+            Err(DecodeError::NonCanonical)
+        };
+    };
+    if verifications.is_empty() && !require_assertion_verification {
         return Ok(());
     }
     let [verification] = verifications else {
+        // An assertion is a positive external-finality claim. Replicated
+        // admission must therefore order exactly one verifier decision beside
+        // it; a leader's process-local allowlist is never a consensus input.
         return Err(DecodeError::NonCanonical);
     };
-    let AccumulateRequestV2::AdmitIngress(ingress) = request else {
-        return Err(DecodeError::NonCanonical);
-    };
-    let AuthorizationEvidenceV2::Credential { bytes, .. } = &ingress.authorization else {
-        return Err(DecodeError::NonCanonical);
-    };
-    let credential = RoleCredentialV2::decode(bytes)?;
-    let assertion = AccumulatedRoleAssertionV2::decode(&credential.authenticator)?;
     if verification.receipt != assertion.receipt
         || assertion.receipt.reply_commitment
             != Some(
@@ -302,7 +316,14 @@ impl CommittedAccumulateEntryV2 {
         request: &AccumulateRequestV2,
         verifications: &[ReceiptVerificationRequestV2],
     ) -> Result<(), DecodeError> {
-        validate_receipt_verifications(request, verifications)
+        validate_receipt_verifications(request, verifications, false)
+    }
+
+    pub(crate) fn validate_replicated_receipt_verifications(
+        request: &AccumulateRequestV2,
+        verifications: &[ReceiptVerificationRequestV2],
+    ) -> Result<(), DecodeError> {
+        validate_receipt_verifications(request, verifications, true)
     }
 }
 
@@ -1149,7 +1170,7 @@ where
                 &entry.availability_blobs,
             )
             .map_err(|_| ReplicatedServiceErrorV2::InvalidCommittedLog)?;
-            validate_receipt_verifications(&request, &entry.receipt_verifications)
+            validate_receipt_verifications(&request, &entry.receipt_verifications, true)
                 .map_err(|_| ReplicatedServiceErrorV2::InvalidCommittedLog)?;
             if matches!(request, AccumulateRequestV2::ExpireCall(_))
                 != entry.logical_timeslot.is_some()
@@ -1419,7 +1440,7 @@ where
         validate_accumulate_availability(request, programs, blobs).map_err(|_| {
             ReplicatedServiceErrorV2::Dispatch(ServiceDispatchError::InvalidAvailabilityArtifacts)
         })?;
-        validate_receipt_verifications(request, receipt_verifications).map_err(|_| {
+        validate_receipt_verifications(request, receipt_verifications, true).map_err(|_| {
             ReplicatedServiceErrorV2::Dispatch(ServiceDispatchError::InvalidAvailabilityArtifacts)
         })?;
         let expires_call = matches!(request, AccumulateRequestV2::ExpireCall(_));

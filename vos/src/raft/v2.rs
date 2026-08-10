@@ -61,12 +61,15 @@ impl RaftAccumulatePayloadV2 {
                 )
             },
         )?;
-        CommittedAccumulateEntryV2::validate_receipt_verifications(&decoded, receipt_verifications)
-            .map_err(|_| {
-                CommitError::Config(
-                    "raft v2 entry does not carry canonical receipt verification inputs".into(),
-                )
-            })?;
+        CommittedAccumulateEntryV2::validate_replicated_receipt_verifications(
+            &decoded,
+            receipt_verifications,
+        )
+        .map_err(|_| {
+            CommitError::Config(
+                "raft v2 entry does not carry canonical receipt verification inputs".into(),
+            )
+        })?;
         Ok(Self {
             request: request.to_vec(),
             logical_timeslot,
@@ -123,7 +126,7 @@ impl V2Wire for RaftAccumulatePayloadV2 {
         if matches!(&decoded, AccumulateRequestV2::ExpireCall(_)) != logical_timeslot.is_some()
             || CommittedAccumulateEntryV2::validate_availability(&decoded, &programs, &blobs)
                 .is_err()
-            || CommittedAccumulateEntryV2::validate_receipt_verifications(
+            || CommittedAccumulateEntryV2::validate_replicated_receipt_verifications(
                 &decoded,
                 &receipt_verifications,
             )
