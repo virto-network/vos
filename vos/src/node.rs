@@ -5142,9 +5142,7 @@ fn authenticated_v2_actor_route(
     authenticated_peer: Option<&[u8]>,
 ) -> Option<V2ActorRoute> {
     let binding = v2_actor_route(actor_routes, actor)?;
-    (binding.route == route.0
-        && binding.consistency == crate::v2::ConsistencyModeV2::Local
-        && binding.authenticated_peer.as_deref() == authenticated_peer)
+    (binding.route == route.0 && binding.authenticated_peer.as_deref() == authenticated_peer)
         .then_some(binding)
 }
 
@@ -5684,11 +5682,15 @@ fn handle_v2_root_transport<B>(
             return;
         }
     };
-    // Receipt finality for replicated and CRDT services must come from their
-    // consensus domains. A node-local authenticated route is sufficient only
-    // for the single-owner Local transport implemented in this batch.
-    if service.consistency() != crate::v2::ConsistencyModeV2::Local {
-        warn!(%id, from = %envelope.from, "v2 root transport requires a Local destination");
+    // CRDT receipt finality still requires an independent anti-entropy
+    // authority. Local roots consume the authenticated route decision in one
+    // IC-5 call; Raft roots quorum-order the exact decision beside the
+    // delivery or reply Apply entry before any follower executes it.
+    if !matches!(
+        service.consistency(),
+        crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
+    ) {
+        warn!(%id, from = %envelope.from, "v2 root transport requires a Local or Raft destination");
         return;
     }
     match transport {
@@ -5709,8 +5711,12 @@ fn handle_v2_root_transport<B>(
                 || source.as_ref().is_none_or(|source| {
                     source.service != publication.receipt.service
                         || source.service != message.from_service
+                        || source.consistency != publication.receipt.consistency
                 })
-                || publication.receipt.consistency != crate::v2::ConsistencyModeV2::Local
+                || !matches!(
+                    publication.receipt.consistency,
+                    crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
+                )
             {
                 warn!(%id, from = %envelope.from, call = ?message.call_id, "rejected unauthenticated or unsupported v2 delivery");
                 return;
@@ -5722,7 +5728,8 @@ fn handle_v2_root_transport<B>(
                     return;
                 }
             };
-            service.authorize_finalized_receipt(message.from, &publication.receipt);
+            let receipt_verification =
+                service.authorize_finalized_receipt(message.from, &publication.receipt);
             let call = message.call_id;
             let commitment = publication.commitment();
             match service.deliver_finalized_after_barrier(
@@ -5730,6 +5737,7 @@ fn handle_v2_root_transport<B>(
                 message,
                 publication.published.outbox.clone(),
                 publication.receipt,
+                receipt_verification,
             ) {
                 Ok(_) => {
                     let accepted = crate::v2::RootTreeTransportV2::PublicationAccepted {
@@ -5772,11 +5780,13 @@ fn handle_v2_root_transport<B>(
                 envelope.from,
                 envelope.authenticated_source_peer.as_deref(),
             );
-            if producer
-                .as_ref()
-                .is_none_or(|producer| producer.service != publication.receipt.service)
-                || publication.receipt.consistency != crate::v2::ConsistencyModeV2::Local
-            {
+            if producer.as_ref().is_none_or(|producer| {
+                producer.service != publication.receipt.service
+                    || producer.consistency != publication.receipt.consistency
+            }) || !matches!(
+                publication.receipt.consistency,
+                crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
+            ) {
                 warn!(%id, from = %envelope.from, call = ?reply.call_id, "rejected misrouted v2 reply");
                 return;
             }
@@ -5802,8 +5812,14 @@ fn handle_v2_root_transport<B>(
             let committed = if already {
                 None
             } else {
-                service.authorize_finalized_receipt(reply.producer, &publication.receipt);
-                match service.resume_reply_after_barrier(caller_invocation, slot, accumulated) {
+                let receipt_verification =
+                    service.authorize_finalized_receipt(reply.producer, &publication.receipt);
+                match service.resume_reply_after_barrier(
+                    caller_invocation,
+                    slot,
+                    accumulated,
+                    receipt_verification,
+                ) {
                     Ok(committed) => Some(committed),
                     Err(failure) => {
                         warn!(%id, ?failure, "caller guest rejected finalized v2 reply");
@@ -5914,15 +5930,20 @@ fn queue_v2_root_publication<B>(
         warn!(%id, "ignored a publication owned by another v2 root");
         return;
     }
-    let local_transport = service.consistency() == crate::v2::ConsistencyModeV2::Local
-        && publication.receipt.consistency == crate::v2::ConsistencyModeV2::Local;
-    if local_transport {
+    let ordinary_transport = matches!(
+        service.consistency(),
+        crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
+    ) && publication.receipt.consistency == service.consistency();
+    if ordinary_transport {
         for message in &publication.published.outbox {
             let Some(route) = v2_actor_route(actor_routes, message.to) else {
                 continue;
             };
             if route.service != message.to_service
-                || route.consistency != crate::v2::ConsistencyModeV2::Local
+                || !matches!(
+                    route.consistency,
+                    crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
+                )
             {
                 continue;
             }
@@ -5939,7 +5960,7 @@ fn queue_v2_root_publication<B>(
             });
         }
     } else if !publication.published.outbox.is_empty() {
-        warn!(%id, "retained a non-Local outbox publication outside ordinary root transport");
+        warn!(%id, "retained a non-Local/Raft outbox publication outside ordinary root transport");
     }
 
     // A direct caller channel is process-local. Do not expose its reply while
@@ -5987,9 +6008,13 @@ fn queue_v2_root_publication<B>(
     } else {
         match service.publication_return_target(publication) {
             Ok(Some((actor, caller_service, caller_invocation))) => {
-                if local_transport && let Some(route) = v2_actor_route(actor_routes, actor) {
+                if ordinary_transport && let Some(route) = v2_actor_route(actor_routes, actor) {
                     if route.service != caller_service
-                        || route.consistency != crate::v2::ConsistencyModeV2::Local
+                        || !matches!(
+                            route.consistency,
+                            crate::v2::ConsistencyModeV2::Local
+                                | crate::v2::ConsistencyModeV2::Raft
+                        )
                     {
                         return;
                     }
@@ -6080,7 +6105,13 @@ fn acknowledge_v2_root_publication<B>(
         .find(|message| message.call_id == call)
     {
         if authenticated_v2_actor_route(actor_routes, message.to, from, authenticated_peer)
-            .is_some_and(|route| route.service == message.to_service)
+            .is_some_and(|route| {
+                route.service == message.to_service
+                    && matches!(
+                        route.consistency,
+                        crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
+                    )
+            })
         {
             progress.accepted_calls.insert(call);
         } else {
@@ -6097,8 +6128,16 @@ fn acknowledge_v2_root_publication<B>(
             .ok()
             .flatten()
             .and_then(|(actor, service, _)| {
-                authenticated_v2_actor_route(actor_routes, actor, from, authenticated_peer)
-                    .filter(|route| route.service == service)
+                authenticated_v2_actor_route(actor_routes, actor, from, authenticated_peer).filter(
+                    |route| {
+                        route.service == service
+                            && matches!(
+                                route.consistency,
+                                crate::v2::ConsistencyModeV2::Local
+                                    | crate::v2::ConsistencyModeV2::Raft
+                            )
+                    },
+                )
             });
         if expected.is_none() {
             return;
@@ -6226,8 +6265,10 @@ fn retry_v2_root_transport<B>(
             queue_v2_root_publication(id, service, &publication, outbox, actor_routes, state);
         }
     }
-    if service.consistency() == crate::v2::ConsistencyModeV2::Local
-        && let Ok(pending) = service.pending_inbox_calls()
+    if matches!(
+        service.consistency(),
+        crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
+    ) && let Ok(pending) = service.pending_inbox_calls()
     {
         for (call, _) in pending {
             run_v2_root_inbox(
@@ -10760,8 +10801,8 @@ mod tests {
                 V2ActorRoute {
                     route: route.0,
                     service,
-                    consistency: crate::v2::ConsistencyModeV2::Local,
-                    replication_id: None,
+                    consistency: crate::v2::ConsistencyModeV2::Raft,
+                    replication_id: Some([0xB3; 32]),
                     is_role_authority: false,
                     invoke_timeout: V2_LOCAL_INVOKE_TIMEOUT,
                     authenticated_peer: Some(vec![0xB2]),
@@ -10770,9 +10811,10 @@ mod tests {
         ]));
 
         assert!(authenticated_v2_actor_route(&routes, actor_a, route, Some(&[0xA2])).is_some());
+        assert!(authenticated_v2_actor_route(&routes, actor_b, route, Some(&[0xB2])).is_some());
         assert!(
             authenticated_v2_actor_route(&routes, actor_b, route, Some(&[0xA2])).is_none(),
-            "a colliding route owned by peer A cannot authenticate actor B"
+            "a colliding Local route owned by peer A cannot authenticate Raft actor B"
         );
     }
 

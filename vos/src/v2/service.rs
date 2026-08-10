@@ -86,7 +86,7 @@ fn validate_accumulate_availability(
 fn validate_receipt_verifications(
     request: &AccumulateRequestV2,
     verifications: &[ReceiptVerificationRequestV2],
-    require_assertion_verification: bool,
+    require_external_verification: bool,
 ) -> Result<(), DecodeError> {
     if verifications
         .windows(2)
@@ -105,34 +105,57 @@ fn validate_receipt_verifications(
         },
         _ => None,
     };
-    let Some(assertion) = assertion else {
-        return if verifications.is_empty() {
-            Ok(())
-        } else {
-            Err(DecodeError::NonCanonical)
+    let expected = if let Some(assertion) = assertion {
+        let [verification] = verifications else {
+            return if verifications.is_empty() && !require_external_verification {
+                Ok(())
+            } else {
+                Err(DecodeError::NonCanonical)
+            };
         };
+        if verification.receipt != assertion.receipt
+            || assertion.receipt.reply_commitment
+                != Some(
+                    assertion
+                        .claim
+                        .authority_reply(verification.expected_producer)
+                        .commitment(),
+                )
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        return Ok(());
+    } else {
+        match request {
+            AccumulateRequestV2::Deliver(delivery) => Some(ReceiptVerificationRequestV2 {
+                expected_producer: delivery.message.from,
+                receipt: delivery.source_receipt.clone(),
+            }),
+            AccumulateRequestV2::Apply(envelope) => {
+                envelope
+                    .work
+                    .awaited_reply
+                    .as_ref()
+                    .map(|reply| ReceiptVerificationRequestV2 {
+                        expected_producer: reply.reply.producer,
+                        receipt: reply.receipt.clone(),
+                    })
+            }
+            _ => None,
+        }
     };
-    if verifications.is_empty() && !require_assertion_verification {
+    let Some(expected) = expected else {
+        return verifications
+            .is_empty()
+            .then_some(())
+            .ok_or(DecodeError::NonCanonical);
+    };
+    if verifications.is_empty() && !require_external_verification {
         return Ok(());
     }
-    let [verification] = verifications else {
-        // An assertion is a positive external-finality claim. Replicated
-        // admission must therefore order exactly one verifier decision beside
-        // it; a leader's process-local allowlist is never a consensus input.
-        return Err(DecodeError::NonCanonical);
-    };
-    if verification.receipt != assertion.receipt
-        || assertion.receipt.reply_commitment
-            != Some(
-                assertion
-                    .claim
-                    .authority_reply(verification.expected_producer)
-                    .commitment(),
-            )
-    {
-        return Err(DecodeError::NonCanonical);
-    }
-    Ok(())
+    (verifications == [expected])
+        .then_some(())
+        .ok_or(DecodeError::NonCanonical)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,9 +320,9 @@ pub struct CommittedAccumulateEntryV2 {
     pub availability_programs: Vec<ImportedProgramV2>,
     pub availability_blobs: Vec<ImportedBlobV2>,
     /// Exact positive receipt-verifier decisions ordered beside this request.
-    /// Currently only direct ingress may carry one authority assertion. Later
-    /// actor slices rely on the guest-owned admitted ingress, not this
-    /// process-local verifier input.
+    /// Authority ingress, durable delivery, and awaited-reply consumption
+    /// each bind exactly one external receipt; every other request carries an
+    /// empty list.
     pub receipt_verifications: Vec<ReceiptVerificationRequestV2>,
 }
 
@@ -1385,14 +1408,6 @@ where
     }
 
     #[cfg(feature = "storage")]
-    pub(crate) fn accumulate_after_barrier(
-        &mut self,
-        request: &AccumulateRequestV2,
-    ) -> Result<AccumulatedServiceOutputV2, ReplicatedServiceErrorV2<L::Error>> {
-        self.accumulate_with_availability_after_barrier(request, &[], &[])
-    }
-
-    #[cfg(feature = "storage")]
     pub(crate) fn accumulate_with_availability_after_barrier(
         &mut self,
         request: &AccumulateRequestV2,
@@ -1402,10 +1417,10 @@ where
         self.accumulate_ordered_after_barrier(request, None, programs, blobs, &[])
     }
 
-    /// Quorum-order one request together with an exact positive receipt
-    /// verification selected by authenticated host routing. Only direct
-    /// ingress accepts this sidecar; canonical validation rejects every other
-    /// request shape before proposal.
+    /// Quorum-order one request together with its exact positive receipt
+    /// verification selected by authenticated host routing. Canonical
+    /// validation binds the sidecar to authority ingress, durable delivery,
+    /// or awaited-reply consumption and rejects it for every other shape.
     #[cfg(feature = "storage")]
     pub(crate) fn accumulate_with_receipt_verifications_after_barrier(
         &mut self,

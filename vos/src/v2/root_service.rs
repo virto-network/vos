@@ -583,21 +583,6 @@ where
         }
     }
 
-    fn accumulate_after_barrier(
-        &mut self,
-        request: &AccumulateRequestV2,
-    ) -> Result<AccumulatedServiceOutputV2, RootTreeDriverErrorV2> {
-        match self {
-            Self::Direct(service) => service
-                .accumulate(request)
-                .map_err(RootTreeDriverErrorV2::Direct),
-            #[cfg(feature = "storage")]
-            Self::Raft(service) => service
-                .accumulate_after_barrier(request)
-                .map_err(RootTreeDriverErrorV2::Raft),
-        }
-    }
-
     fn accumulate_with_receipt_verifications_after_barrier(
         &mut self,
         request: &AccumulateRequestV2,
@@ -1887,6 +1872,7 @@ where
         message: super::MessageRecordV2,
         source_outbox: Vec<super::MessageRecordV2>,
         source_receipt: AccumulationReceiptV2,
+        receipt_verification: super::ReceiptVerificationRequestV2,
     ) -> Result<super::CommittedDeliveryV2, LocalRootTreeInvokeErrorV2> {
         let call = message.call_id;
         let delivery = LocalWorkSchedulerV2::prepare_delivery(
@@ -1899,7 +1885,10 @@ where
         .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
         let accumulated = self
             .service
-            .accumulate_after_barrier(&AccumulateRequestV2::Deliver(delivery))
+            .accumulate_with_receipt_verifications_after_barrier(
+                &AccumulateRequestV2::Deliver(delivery),
+                &[receipt_verification],
+            )
             .map_err(RootTreeDriverErrorV2::into_invoke)?;
         match accumulated.result {
             AccumulationResultV2::Accepted {
@@ -1944,6 +1933,7 @@ where
         caller_invocation: super::InvocationId,
         logical_timeslot: u64,
         awaited_reply: super::AccumulatedReplyV2,
+        receipt_verification: super::ReceiptVerificationRequestV2,
     ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
         let prepared = LocalWorkSchedulerV2::prepare_resume(
             self.service.accumulate_host().local_store(),
@@ -1955,7 +1945,7 @@ where
         if prepared.work.proof_requested {
             return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
         }
-        self.execute_prepared_after_barrier(prepared)
+        self.execute_prepared_with_receipts_after_barrier(prepared, &[receipt_verification])
     }
 
     /// Commit every durable call whose deadline is at or before the trusted
@@ -2040,6 +2030,14 @@ where
         &mut self,
         prepared: PreparedWorkV2,
     ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        self.execute_prepared_with_receipts_after_barrier(prepared, &[])
+    }
+
+    fn execute_prepared_with_receipts_after_barrier(
+        &mut self,
+        prepared: PreparedWorkV2,
+        receipt_verifications: &[super::ReceiptVerificationRequestV2],
+    ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
         let refined = self
             .service
             .refine_actor_tree_after_barrier(&prepared.work, &prepared.imports)
@@ -2047,11 +2045,14 @@ where
         let input = prepared.work.input_id();
         let accumulated = self
             .service
-            .accumulate_after_barrier(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
-                work: prepared.work,
-                transition: refined.transition,
-                provided_blobs: refined.exported_blobs,
-            }))
+            .accumulate_with_receipt_verifications_after_barrier(
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: prepared.work,
+                    transition: refined.transition,
+                    provided_blobs: refined.exported_blobs,
+                }),
+                receipt_verifications,
+            )
             .map_err(RootTreeDriverErrorV2::into_invoke)?;
         let (receipt, published, duplicate) = match accumulated.result {
             AccumulationResultV2::Accepted {
