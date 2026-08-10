@@ -178,11 +178,14 @@ witness per peer in a private storage map which catalog metadata cannot address.
 An invitation witness additionally carries the immutable
 root host's signature emitted only after the exact authority commit; a bare
 caller-supplied authority ID is never sufficient. A direct reply is
-acknowledged only after its waiting channel accepts
-the bytes. Ordinary outbox and suspended-workflow publications are retried by
-the node transport until the destination guest has committed them. Proof and
-attestation publications stay durable but are not admitted by this ordinary
-node route. The host-generated logical timeslot is still a local admission
+acknowledged only after its waiting channel accepts the bytes. Ordinary outbox
+and suspended-workflow publications are retried by the node transport until
+the destination guest has committed them. Local and Raft roots share that
+guest-owned publication state machine. For a Raft destination, the
+authenticated source-receipt decision is quorum-ordered beside `Deliver` or
+the resumed `Apply`, so a follower never depends on the leader's process-local
+receipt cache. Proof and attestation publications stay durable but are not
+admitted by this ordinary node route. The host-generated logical timeslot is still a local admission
 ordinal, not a consensus JAM slot.
 
 `RootTreeTransportV2` is the canonical node wire for an ordinary publication,
@@ -526,7 +529,7 @@ Replicated service identity binds the exact Refine and Accumulate gas schedule.
 `OutOfGas` is therefore a deterministic cross-replica result only for replicas
 with that declared schedule; a mismatched host stops before advancing its
 applied cursor rather than recording a local no-op.
-Production Raft/CRDT routing must retain the Local path's rule of recovering
+Production CRDT routing must retain the Local/Raft path's rule of recovering
 and retrying guest publication, delivery and reply-admission rows rather than
 maintaining a second native message ledger. A
 bounded reclamation or checkpoint plan for unreachable SMT and CRDT DAG nodes,
@@ -756,14 +759,16 @@ across leader changes. Typed forwarding requests the full invoke envelope, so
 direct leader call.
 
 V2 CRDT rows remain fail-closed until anti-entropy can authenticate receipt
-finality independently of the peer-supplied sync envelope. Local root transport
-remains Local-only; Raft effects require their consensus-aware routing path.
-For Local roots, ordinary
-public cross-root calls are emitted as guest-owned publications, routed over
-canonical node envelopes, admitted through destination IC-5, and resumed from
-the caller's exact saved machine after the committed reply returns. The node
-periodically redrives pending publications, inboxes, and ingresses after
-restart; permanent guest deduplication makes a lost acknowledgement safe.
+finality independently of the peer-supplied sync envelope. For Local and Raft
+roots, ordinary public cross-root calls are emitted as guest-owned
+publications, routed over canonical node envelopes, admitted through
+destination IC-5, and resumed from the caller's exact saved machine after the
+committed reply returns. A Raft `Deliver` or reply-consuming `Apply` carries
+exactly one canonical `ReceiptVerificationRequestV2` in its log entry. Missing,
+extra, or mismatched verifier input is rejected before proposal and again on
+follower replay; non-receipt-bearing requests require the sidecar to be empty.
+The node periodically redrives pending publications, inboxes, and ingresses
+after restart; permanent guest deduplication makes a lost acknowledgement safe.
 Direct space-role-only calls to Local and Raft roots use the installed
 canonical authority path described above. Attested calls, actor-local or
 mixed-role calls, role-bearing durable messages, and role-authorized CRDT
