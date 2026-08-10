@@ -402,6 +402,15 @@ impl WorkerHandle {
 /// blocking-pool thread, not the swarm thread, and the worker
 /// has its own dedicated thread to make progress.
 impl RaftRpcHandler for WorkerHandle {
+    fn local_role(&self) -> Option<RaftRole> {
+        Some(match self.role() {
+            Role::Follower => RaftRole::Follower,
+            Role::PreCandidate => RaftRole::PreCandidate,
+            Role::Candidate => RaftRole::Candidate,
+            Role::Leader => RaftRole::Leader,
+        })
+    }
+
     fn append_entries(
         &self,
         _replication_id: &[u8; 32],

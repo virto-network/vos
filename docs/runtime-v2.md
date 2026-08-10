@@ -199,16 +199,20 @@ the authenticated peer, so peer-selected payload bytes cannot impersonate a
 different local route. Raft actor routes retain the exact replication ID and
 only a bootstrap replica: every delivery, reply, and acknowledgement resolves
 the current leader through group status plus the canonical voter row's full
-Noise `PeerId`. Only the source leader redrives durable publications. After
-failover it reconstructs process-local multi-consumer progress by replaying the
-publication and collecting the destinations' permanent duplicate
-acknowledgements; an acknowledgement received by a follower is never retained
-as authoritative progress. The transport wire names both its destination and
-source actor/service identities, so this resolution is unambiguous even when
-roots reuse a local route suffix on different nodes. The router is trusted for
-eventual delivery, not for safety: dropping an acknowledgement can delay
-reclamation, while guest-owned delivery, input, and reply-admission records
-prevent double execution.
+Noise `PeerId`. A locally attached current leader is selected before network
+discovery, including the supported networkless single-voter configuration.
+Remote discovery never blocks the global envelope router: it has one bounded
+worker per destination root, coalesces repeated durable redrives, briefly
+caches a verified leader, and backs off after failure. Only the source leader
+redrives durable publications. After failover it reconstructs process-local
+multi-consumer progress by replaying the publication and collecting the
+destinations' permanent duplicate acknowledgements; an acknowledgement
+received by a follower is never retained as authoritative progress. The
+transport wire names both its destination and source actor/service identities,
+so this resolution is unambiguous even when roots reuse a local route suffix on
+different nodes. The router is trusted for eventual delivery, not for safety:
+dropping an acknowledgement can delay reclamation, while guest-owned delivery,
+input, and reply-admission records prevent double execution.
 
 The local transport accepts either the in-memory host or this durable host
 without changing scheduling or service semantics. Its physical cross-root
@@ -780,7 +784,9 @@ follower replay; non-receipt-bearing requests require the sidecar to be empty.
 The node periodically redrives pending publications, inboxes, and ingresses
 after restart; for Raft roots this redrive begins only after a current-term
 leader barrier, and every hop independently resolves the destination group's
-leader. Permanent guest deduplication makes a lost acknowledgement safe.
+leader. Slow or partitioned discovery is bounded off-router and coalesced per
+root, so it cannot stall unrelated services or grow one lookup per 250 ms
+retry. Permanent guest deduplication makes a lost acknowledgement safe.
 Direct space-role-only calls to Local and Raft roots use the installed
 canonical authority path described above. Attested calls, actor-local or
 mixed-role calls, role-bearing durable messages, and role-authorized CRDT

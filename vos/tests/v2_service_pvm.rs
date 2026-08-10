@@ -3265,6 +3265,144 @@ fn node_routes_an_ordinary_cross_root_await_through_guest_accumulate() {
 }
 
 #[test]
+fn node_routes_networkless_single_voter_raft_roots() {
+    let actor_elf = probe_elf();
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&actor_elf, &signer);
+    let deployment = package.deployment_id();
+    let producer = package.deployment_signature.producer;
+    let program = package.manifest.actor_program;
+    let source_actor = ActorId([0xBA; 32]);
+    let destination_actor = ActorId([44; 32]);
+    let source_identity = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([0xBB; 32]),
+        root_service: RootServiceId([0xBC; 32]),
+        deployment,
+        service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
+    };
+    let destination_identity = ServiceIdentityV2 {
+        root_service: RootServiceId([0xBD; 32]),
+        ..source_identity.clone()
+    };
+    let install_authorization = AuthorizationEvidenceV2::SystemCapability {
+        capability: SystemCapabilityId([0xBE; 32]),
+        authenticator: vec![0xBF],
+    };
+    let source_config = LocalRootTreeConfigV2 {
+        role_authority: None,
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package: package.clone(),
+        service: source_identity.clone(),
+        root_actor: source_actor,
+        actor_name: actor_name.clone(),
+        consistency: ConsistencyModeV2::Raft,
+        initial_state: vec![],
+        external_actors: vec![external_binding(
+            "peer",
+            destination_identity.clone(),
+            destination_actor,
+            producer,
+            program,
+        )],
+        install_authorization: install_authorization.clone(),
+        refine_gas: TEST_GAS_SCHEDULE.refine,
+        accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
+    };
+    let destination_config = LocalRootTreeConfigV2 {
+        role_authority: None,
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package,
+        service: destination_identity,
+        root_actor: destination_actor,
+        actor_name,
+        consistency: ConsistencyModeV2::Raft,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization,
+        refine_gas: TEST_GAS_SCHEDULE.refine,
+        accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
+    };
+
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-networkless-raft-transport-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let member = 0xCAFE;
+    let source_route = ServiceId::new(member, 0x3600);
+    let destination_route = ServiceId::new(member, 0x3601);
+    let raft_config = |replication_id| RaftConfig {
+        me: member,
+        members: vec![member],
+        election_timeout_ms: (25, 50),
+        heartbeat_interval_ms: 10,
+        replication_id,
+        propose_timeout_ms: 5_000,
+    };
+    let mut node = VosNode::new();
+    node.register_v2_raft_root_at_id(
+        "networkless-raft-source".into(),
+        source_config,
+        FailableCommittedImages::default(),
+        Arc::new(redb::Database::create(directory.join("source.redb")).unwrap()),
+        raft_config([0xC1; 32]),
+        source_route,
+        false,
+    )
+    .unwrap();
+    node.register_v2_raft_root_at_id(
+        "networkless-raft-destination".into(),
+        destination_config,
+        FailableCommittedImages::default(),
+        Arc::new(redb::Database::create(directory.join("destination.redb")).unwrap()),
+        raft_config([0xC2; 32]),
+        destination_route,
+        false,
+    )
+    .unwrap();
+    assert!(
+        node.network().is_none(),
+        "the regression must not accidentally attach a network"
+    );
+
+    let shutdown = node.shutdown_handle();
+    let invoke = node.invoke_handle();
+    let runner = std::thread::spawn(move || {
+        node.run_forever();
+        node.collect()
+    });
+    std::thread::sleep(Duration::from_millis(250));
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("await_peer_without_deadline").encode());
+    let reply = invoke
+        .invoke_with_timeout(
+            source_route,
+            RootTreeInvocationV2 {
+                invocation: InvocationId([0xC3; 32]),
+                target: source_actor,
+                method: "await_peer_without_deadline".into(),
+                arguments,
+                proof_requested: false,
+            }
+            .encode(),
+            Duration::from_secs(120),
+        )
+        .expect("networkless Raft roots complete delivery, reply, and acknowledgements");
+    assert_eq!(reply, Value::U32(8).encode());
+
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(runner.join().unwrap().iter().all(AgentResult::is_ok));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn node_routes_raft_cross_root_reply_between_different_leaders() {
     let actor_elf = probe_elf();
     let signer = libp2p::identity::Keypair::generate_ed25519();

@@ -95,12 +95,54 @@ struct V2ActorRoute {
     authenticated_peer: Option<Vec<u8>>,
 }
 
+/// One Raft transport destination whose current leader is resolved outside
+/// the global envelope router. The replication incarnation prevents a stale
+/// cache entry surviving reinstall; the local route suffix distinguishes
+/// roots when one group hosts more than one service route.
+#[cfg(all(feature = "network", feature = "storage"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct V2RaftTransportResolutionKey {
+    replication_id: [u8; 32],
+    local_id: u16,
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+#[derive(Debug, Clone)]
+enum V2RaftTransportResolution {
+    Pending {
+        until: Instant,
+    },
+    Resolved {
+        peer: libp2p::PeerId,
+        route: ServiceId,
+        until: Instant,
+    },
+    Backoff {
+        until: Instant,
+    },
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+type V2RaftTransportResolutions =
+    Arc<Mutex<HashMap<V2RaftTransportResolutionKey, V2RaftTransportResolution>>>;
+
 const V2_LOCAL_INVOKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The network ingress gate can spend this long consulting the registry to
 /// bind a compact voter slot back to its complete authenticated peer identity.
 #[cfg(feature = "network")]
 const V2_RAFT_VOTER_AUTH_TIMEOUT_MS: u64 = 5_000;
+
+/// Remote transport discovery is deliberately much shorter than an ingress
+/// operation. It runs off-router, is coalesced per root, and is retried from
+/// durable publication state, so a slow/dead bootstrap never needs to hold a
+/// global node thread for the full voter-authentication budget.
+#[cfg(all(feature = "network", feature = "storage"))]
+const V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(all(feature = "network", feature = "storage"))]
+const V2_RAFT_TRANSPORT_LEADER_CACHE_TTL: Duration = Duration::from_secs(1);
+#[cfg(all(feature = "network", feature = "storage"))]
+const V2_RAFT_TRANSPORT_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
 /// One end-to-end Raft invocation can consume one voter-authentication probe,
 /// one read barrier, and up to three proposal waits (fresh-root `Install`,
@@ -1024,6 +1066,11 @@ pub struct VosNode {
     /// current leader.
     #[cfg(all(feature = "network", feature = "storage"))]
     raft_hosts: RaftHosts,
+    /// Short-lived leader cache plus one in-flight marker per Raft root.
+    /// Resolution workers never run on the global envelope router, and
+    /// repeated 250 ms durable redrives coalesce behind the same marker.
+    #[cfg(all(feature = "network", feature = "storage"))]
+    v2_raft_transport_resolutions: V2RaftTransportResolutions,
     /// Prepared Raft roots remain absent from public route tables while voter
     /// promotion is pending. Background workers send a type-erased publication
     /// closure here once final non-joint membership is locally visible.
@@ -2010,6 +2057,22 @@ impl NodeService {
 /// times out, or the payload doesn't decode.
 #[cfg(feature = "network")]
 fn registry_probe_reply(routes: &InvokeRoutes, payload: Vec<u8>) -> Option<Vec<u8>> {
+    registry_probe_reply_with_timeout(
+        routes,
+        payload,
+        Duration::from_millis(V2_RAFT_VOTER_AUTH_TIMEOUT_MS),
+    )
+}
+
+#[cfg(feature = "network")]
+fn registry_probe_reply_with_timeout(
+    routes: &InvokeRoutes,
+    payload: Vec<u8>,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    if timeout.is_zero() {
+        return None;
+    }
     let registry_id = crate::abi::service::ServiceId::REGISTRY.local_id() as u32;
     let tx = routes.lock().ok()?.get(&registry_id).cloned()?;
     let (reply_tx, reply_rx) = mpsc::channel();
@@ -2029,9 +2092,7 @@ fn registry_probe_reply(routes: &InvokeRoutes, payload: Vec<u8>) -> Option<Vec<u
     {
         return None;
     }
-    let envelope = reply_rx
-        .recv_timeout(Duration::from_millis(V2_RAFT_VOTER_AUTH_TIMEOUT_MS))
-        .ok()?;
+    let envelope = reply_rx.recv_timeout(timeout).ok()?;
     unwrap_invoke_envelope(&envelope)
 }
 
@@ -2042,6 +2103,19 @@ fn registry_probe_reply(routes: &InvokeRoutes, payload: Vec<u8>) -> Option<Vec<u
 fn lookup_node_member_from_routes(
     routes: &InvokeRoutes,
     prefix: u16,
+) -> Option<crate::registry::MemberRow> {
+    lookup_node_member_from_routes_with_timeout(
+        routes,
+        prefix,
+        Duration::from_millis(V2_RAFT_VOTER_AUTH_TIMEOUT_MS),
+    )
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn lookup_node_member_from_routes_with_timeout(
+    routes: &InvokeRoutes,
+    prefix: u16,
+    timeout: Duration,
 ) -> Option<crate::registry::MemberRow> {
     use crate::actors::codec::{Decode, Encode};
     use crate::registry::{MEMBER_KIND_NODE, MemberPage};
@@ -2061,7 +2135,7 @@ fn lookup_node_member_from_routes(
     let mut payload = Vec::with_capacity(1 + 64);
     payload.push(TAG_DYNAMIC);
     payload.extend_from_slice(&msg.encode());
-    let reply = registry_probe_reply(routes, payload)?;
+    let reply = registry_probe_reply_with_timeout(routes, payload, timeout)?;
     let Value::Bytes(bytes) = <Value as Decode>::try_decode(&reply)? else {
         return None;
     };
@@ -3136,6 +3210,8 @@ impl VosNode {
             crdt_replicas: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(feature = "network", feature = "storage"))]
             raft_hosts: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(all(feature = "network", feature = "storage"))]
+            v2_raft_transport_resolutions: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(feature = "network", feature = "storage"))]
             pending_v2_root_ready_tx,
             #[cfg(all(feature = "network", feature = "storage"))]
@@ -4815,23 +4891,34 @@ impl VosNode {
             && binding.consistency == crate::v2::ConsistencyModeV2::Raft
         {
             let network = self.shared_network.lock().ok().and_then(|g| g.clone());
-            let Some(network) = network else {
-                warn!(target = %envelope.to, "node: no network layer for Raft v2 transport");
-                return;
-            };
-            let Some((leader, leader_route)) =
-                resolve_v2_raft_leader_route(&binding, &network, &self.invoke_routes)
-            else {
-                warn!(target = %envelope.to, "node: no authenticated leader for Raft v2 transport");
-                return;
-            };
-            if leader == network.peer_id() {
-                envelope.to = leader_route;
-                envelope.destination_peer = None;
-            } else {
-                network.send_tell(leader, envelope.from.0, leader_route.0, envelope.payload);
+            let local_tx = (binding.authenticated_peer.is_none())
+                .then(|| self.routes.get(&binding.route).cloned())
+                .flatten();
+
+            // Networkless single-voter roots are fully supported. When a
+            // network is attached, use its local worker status to avoid
+            // feeding a known follower; absent status means this root was
+            // intentionally attached without a network handler and its own
+            // admission barrier remains the final authority.
+            let local_is_current_leader = local_tx.is_some()
+                && network.as_ref().is_none_or(|network| {
+                    binding
+                        .replication_id
+                        .and_then(|id| network.local_raft_role(&id))
+                        .is_none_or(|role| role == crate::network::RaftRole::Leader)
+                });
+            if local_is_current_leader {
+                envelope.to = ServiceId(binding.route);
+                let _ = local_tx.expect("checked above").send(envelope);
                 return;
             }
+
+            let Some(network) = network else {
+                warn!(target = %envelope.to, "node: no local Raft root or network leader route");
+                return;
+            };
+            self.route_v2_raft_transport_async(envelope, binding, network, local_tx);
+            return;
         }
 
         let target = envelope.to;
@@ -4915,6 +5002,113 @@ impl VosNode {
         }
 
         warn!(%target, "node: no network layer, dropping remote target");
+    }
+
+    /// Resolve and dispatch one durable Raft transport envelope without ever
+    /// blocking the global router. One worker is active per destination root;
+    /// duplicate 250 ms redrives are coalesced, successful leaders are cached
+    /// briefly, and failures back off before durable state retries them.
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn route_v2_raft_transport_async(
+        &self,
+        envelope: Envelope,
+        binding: V2ActorRoute,
+        network: Arc<crate::network::Network>,
+        local_tx: Option<mpsc::Sender<Envelope>>,
+    ) {
+        let Some(replication_id) = binding.replication_id else {
+            warn!(target = %envelope.to, "node: Raft transport route omitted its replication identity");
+            return;
+        };
+        let key = V2RaftTransportResolutionKey {
+            replication_id,
+            local_id: ServiceId(binding.route).local_id(),
+        };
+        let now = Instant::now();
+        let cached = {
+            let Ok(mut resolutions) = self.v2_raft_transport_resolutions.lock() else {
+                return;
+            };
+            match resolutions.get(&key).cloned() {
+                Some(V2RaftTransportResolution::Resolved { peer, route, until }) if until > now => {
+                    Some((peer, route))
+                }
+                Some(V2RaftTransportResolution::Pending { until }) if until > now => return,
+                Some(V2RaftTransportResolution::Backoff { until }) if until > now => return,
+                _ => {
+                    resolutions.insert(
+                        key,
+                        V2RaftTransportResolution::Pending {
+                            until: now + V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT,
+                        },
+                    );
+                    None
+                }
+            }
+        };
+
+        if let Some((peer, route)) = cached {
+            dispatch_resolved_v2_raft_transport(&network, local_tx, peer, route, envelope);
+            return;
+        }
+
+        let resolutions = self.v2_raft_transport_resolutions.clone();
+        let invoke_routes = self.invoke_routes.clone();
+        let shutdown = self.shutdown.clone();
+        let pending_until = now + V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT;
+        thread::spawn(move || {
+            let deadline = Instant::now() + V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT;
+            let resolved =
+                resolve_v2_raft_leader_route_before(&binding, &network, &invoke_routes, deadline);
+            if shutdown.load(Ordering::Relaxed) {
+                if let Ok(mut entries) = resolutions.lock() {
+                    entries.remove(&key);
+                }
+                return;
+            }
+            let now = Instant::now();
+            let owns_resolution = if let Ok(mut entries) = resolutions.lock() {
+                if !matches!(
+                    entries.get(&key),
+                    Some(V2RaftTransportResolution::Pending { until })
+                        if *until == pending_until
+                ) {
+                    false
+                } else {
+                    match resolved.as_ref() {
+                        Some((peer, route)) => {
+                            entries.insert(
+                                key,
+                                V2RaftTransportResolution::Resolved {
+                                    peer: *peer,
+                                    route: *route,
+                                    until: now + V2_RAFT_TRANSPORT_LEADER_CACHE_TTL,
+                                },
+                            );
+                        }
+                        None => {
+                            entries.insert(
+                                key,
+                                V2RaftTransportResolution::Backoff {
+                                    until: now + V2_RAFT_TRANSPORT_RETRY_BACKOFF,
+                                },
+                            );
+                        }
+                    }
+                    true
+                }
+            } else {
+                false
+            };
+            if !owns_resolution {
+                return;
+            }
+            if let Some((peer, route)) = resolved {
+                dispatch_resolved_v2_raft_transport(&network, local_tx, peer, route, envelope);
+            } else {
+                warn!(target = %envelope.to, "node: no authenticated leader for Raft v2 transport");
+            }
+        });
     }
 
     /// Collect results from all agent threads. Forces shutdown if
@@ -5344,25 +5538,45 @@ fn raft_route_peer_is_current_leader(
         })
 }
 
-#[cfg(all(feature = "network", feature = "storage"))]
+#[cfg(all(feature = "network", feature = "storage", test))]
 fn resolve_v2_raft_leader_route(
     binding: &V2ActorRoute,
     network: &crate::network::Network,
     invoke_routes: &InvokeRoutes,
+) -> Option<(libp2p::PeerId, ServiceId)> {
+    resolve_v2_raft_leader_route_before(
+        binding,
+        network,
+        invoke_routes,
+        Instant::now() + V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT,
+    )
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn resolve_v2_raft_leader_route_before(
+    binding: &V2ActorRoute,
+    network: &crate::network::Network,
+    invoke_routes: &InvokeRoutes,
+    deadline: Instant,
 ) -> Option<(libp2p::PeerId, ServiceId)> {
     let replication_id = binding.replication_id?;
     let local_id = ServiceId(binding.route).local_id();
 
     let resolve = |status: crate::network::RaftStatusReply| {
         let leader_prefix = status.leader_hint?;
-        let member = lookup_node_member_from_routes(invoke_routes, leader_prefix)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let member =
+            lookup_node_member_from_routes_with_timeout(invoke_routes, leader_prefix, remaining)?;
         let peer = authenticated_v2_raft_leader_peer(&status, &member, leader_prefix)?;
         Some((peer, ServiceId::new(leader_prefix, local_id)))
     };
 
     // A locally attached replica has the freshest worker snapshot and avoids
     // a network round trip. It is still resolved through the full voter row.
-    if let Some(status) = network.local_raft_status(&replication_id)
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if let Some(status) = network
+        .local_raft_status_receiver(&replication_id)
+        .and_then(|receiver| receiver.recv_timeout(remaining).ok())
         && let Some(leader) = resolve(status)
     {
         return Some(leader);
@@ -5383,16 +5597,26 @@ fn resolve_v2_raft_leader_route(
         }
     }
     for peer in candidates {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
         let prefix = crate::network::derive_node_prefix(&peer);
-        let Some(member) = lookup_node_member_from_routes(invoke_routes, prefix) else {
+        let Some(member) =
+            lookup_node_member_from_routes_with_timeout(invoke_routes, prefix, remaining)
+        else {
             continue;
         };
         if !node_member_authenticates_voter(&member, prefix, &peer) {
             continue;
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
         let Ok(status) = network
             .send_raft_status_req(peer, replication_id)
-            .recv_timeout(Duration::from_millis(V2_RAFT_VOTER_AUTH_TIMEOUT_MS))
+            .recv_timeout(remaining)
         else {
             continue;
         };
@@ -5404,6 +5628,27 @@ fn resolve_v2_raft_leader_route(
         }
     }
     None
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn dispatch_resolved_v2_raft_transport(
+    network: &crate::network::Network,
+    local_tx: Option<mpsc::Sender<Envelope>>,
+    peer: libp2p::PeerId,
+    route: ServiceId,
+    mut envelope: Envelope,
+) {
+    if peer == network.peer_id() {
+        let Some(local_tx) = local_tx else {
+            warn!(%route, "node: resolved local Raft leader has no attached root route");
+            return;
+        };
+        envelope.to = route;
+        envelope.destination_peer = None;
+        let _ = local_tx.send(envelope);
+    } else {
+        network.send_tell(peer, envelope.from.0, route.0, envelope.payload);
+    }
 }
 
 fn authenticated_v2_actor_route_at_node(
@@ -11196,6 +11441,194 @@ mod tests {
             authenticated_v2_actor_route(&routes, actor_b, route, Some(&[0xA2])).is_none(),
             "a colliding Local route owned by peer A cannot authenticate Raft actor B"
         );
+    }
+
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn raft_transport_ack(
+        acceptor: crate::v2::ActorId,
+        acceptor_service: crate::v2::ServiceIdentityV2,
+        destination_service: crate::v2::ServiceIdentityV2,
+    ) -> Vec<u8> {
+        use crate::v2::V2Wire;
+
+        crate::v2::RootTreeTransportV2::PublicationAccepted {
+            acceptor,
+            acceptor_service,
+            service: destination_service,
+            input: crate::v2::WorkInputIdV2 {
+                invocation: crate::v2::InvocationId([0x91; 32]),
+                workflow_step: 0,
+            },
+            publication: crate::v2::Hash([0x92; 32]),
+            call: crate::v2::CallId([0x93; 32]),
+        }
+        .encode()
+    }
+
+    #[cfg(all(feature = "network", feature = "storage"))]
+    #[test]
+    fn networkless_raft_transport_reaches_an_attached_local_root() {
+        let actor = crate::v2::ActorId([0x81; 32]);
+        let acceptor = crate::v2::ActorId([0x82; 32]);
+        let route = ServiceId::new(0x1234, 7);
+        let service = crate::v2::ServiceIdentityV2 {
+            space: crate::v2::SpaceId([1; 32]),
+            root_service: crate::v2::RootServiceId([2; 32]),
+            deployment: crate::v2::DeploymentId([3; 32]),
+            service_program: crate::v2::VOS_SERVICE_PROGRAM_ID,
+            service_abi: crate::v2::ABI_VERSION,
+            execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
+        };
+        let acceptor_service = crate::v2::ServiceIdentityV2 {
+            root_service: crate::v2::RootServiceId([4; 32]),
+            ..service.clone()
+        };
+        let payload = raft_transport_ack(acceptor, acceptor_service, service.clone());
+
+        let mut node = VosNode::new();
+        node.v2_actor_routes.write().unwrap().insert(
+            actor,
+            V2ActorRoute {
+                route: route.0,
+                service,
+                consistency: crate::v2::ConsistencyModeV2::Raft,
+                replication_id: Some([0x83; 32]),
+                is_role_authority: false,
+                invoke_timeout: V2_LOCAL_INVOKE_TIMEOUT,
+                authenticated_peer: None,
+            },
+        );
+        let (tx, rx) = mpsc::channel();
+        node.routes.insert(route.0, tx);
+
+        node.route(Envelope {
+            from: ServiceId::new(0, 8),
+            to: route,
+            payload: payload.clone(),
+            authenticated_source_peer: None,
+            destination_peer: None,
+        });
+
+        let delivered = rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("a networkless Raft root receives same-node transport");
+        assert_eq!(delivered.payload, payload);
+        assert!(node.shared_network.lock().unwrap().is_none());
+    }
+
+    #[cfg(all(feature = "network", feature = "storage"))]
+    #[test]
+    fn slow_raft_leader_discovery_is_off_router_and_coalesced() {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let local_peer = libp2p::PeerId::from(key.public());
+        let prefix = crate::network::derive_node_prefix(&local_peer);
+        let network = Arc::new(crate::network::Network::start(
+            crate::network::NetworkConfig {
+                keypair: key,
+                local_prefix: prefix,
+                listen: Vec::new(),
+                bootstrap: Vec::new(),
+                auto_dial_mdns: false,
+            },
+        ));
+        let remote_peer = libp2p::PeerId::random();
+        let actor = crate::v2::ActorId([0x84; 32]);
+        let acceptor = crate::v2::ActorId([0x85; 32]);
+        let remote_route = ServiceId::new(crate::network::derive_node_prefix(&remote_peer), 9);
+        let service = crate::v2::ServiceIdentityV2 {
+            space: crate::v2::SpaceId([5; 32]),
+            root_service: crate::v2::RootServiceId([6; 32]),
+            deployment: crate::v2::DeploymentId([7; 32]),
+            service_program: crate::v2::VOS_SERVICE_PROGRAM_ID,
+            service_abi: crate::v2::ABI_VERSION,
+            execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
+        };
+        let payload = raft_transport_ack(
+            acceptor,
+            crate::v2::ServiceIdentityV2 {
+                root_service: crate::v2::RootServiceId([8; 32]),
+                ..service.clone()
+            },
+            service.clone(),
+        );
+
+        let mut node = VosNode::with_prefix(prefix);
+        *node.shared_network.lock().unwrap() = Some(network.clone());
+        node.v2_actor_routes.write().unwrap().insert(
+            actor,
+            V2ActorRoute {
+                route: remote_route.0,
+                service,
+                consistency: crate::v2::ConsistencyModeV2::Raft,
+                replication_id: Some([0x86; 32]),
+                is_role_authority: false,
+                invoke_timeout: V2_LOCAL_INVOKE_TIMEOUT,
+                authenticated_peer: Some(remote_peer.to_bytes()),
+            },
+        );
+        let (registry_tx, registry_rx) = mpsc::channel();
+        node.invoke_routes
+            .lock()
+            .unwrap()
+            .insert(ServiceId::REGISTRY.0, registry_tx);
+        let unrelated = ServiceId::new(prefix, 10);
+        let (unrelated_tx, unrelated_rx) = mpsc::channel();
+        node.routes.insert(unrelated.0, unrelated_tx);
+
+        let envelope = Envelope {
+            from: ServiceId::new(prefix, 11),
+            to: remote_route,
+            payload,
+            authenticated_source_peer: None,
+            destination_peer: None,
+        };
+        let started = Instant::now();
+        node.route(envelope.clone());
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "leader lookup must never run on the global router"
+        );
+        let blocked_probe = registry_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("the off-router resolver reaches the deliberately blocked registry");
+
+        for _ in 0..4 {
+            node.route(envelope.clone());
+        }
+        assert!(
+            matches!(registry_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "durable duplicate retries coalesce behind one lookup"
+        );
+
+        node.route(Envelope {
+            from: ServiceId::new(prefix, 12),
+            to: unrelated,
+            payload: b"unrelated".to_vec(),
+            authenticated_source_peer: None,
+            destination_peer: None,
+        });
+        assert_eq!(
+            unrelated_rx
+                .recv_timeout(Duration::from_millis(100))
+                .unwrap()
+                .payload,
+            b"unrelated"
+        );
+        assert_eq!(
+            node.v2_raft_transport_resolutions.lock().unwrap().len(),
+            1,
+            "one destination has at most one resolver/cache entry"
+        );
+
+        drop(blocked_probe);
+        node.shutdown.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(25));
+        drop(node);
+        if let Ok(network) = Arc::try_unwrap(network) {
+            network.join();
+        }
     }
 
     #[cfg(all(feature = "network", feature = "storage"))]

@@ -336,6 +336,14 @@ pub trait NetworkService: Send + Sync {
 /// the handler's own background task; the trait returns synchronously
 /// only the *response* the peer sees.
 pub trait RaftRpcHandler: Send + Sync {
+    /// Lock-free role hint for a replica hosted in this process. The global
+    /// envelope router uses this only to select a known local leader without
+    /// entering the worker inbox; admission still performs the quorum-backed
+    /// read barrier. Implementations without a cheap hint return `None`.
+    fn local_role(&self) -> Option<RaftRole> {
+        None
+    }
+
     /// Inbound `AppendEntries` from `from_prefix`. Returns the
     /// response the peer will read. Implementations are responsible
     /// for log consistency checks, term updates, applying entries,
@@ -904,6 +912,40 @@ impl Network {
             .cloned()?;
         let reply = handler.handle_status(replication_id);
         reply.present.then_some(reply)
+    }
+
+    /// Start a local status read without making the caller wait on the Raft
+    /// worker inbox. Transport discovery applies its own overall deadline to
+    /// the receiver; a wedged local worker therefore cannot strand the
+    /// resolver that owns a durable redrive attempt.
+    pub(crate) fn local_raft_status_receiver(
+        &self,
+        replication_id: &[u8; 32],
+    ) -> Option<std_mpsc::Receiver<RaftStatusReply>> {
+        let handler = self
+            .raft_handlers
+            .lock()
+            .ok()?
+            .get(replication_id)
+            .cloned()?;
+        let replication_id = *replication_id;
+        let (tx, rx) = std_mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(handler.handle_status(&replication_id));
+        });
+        Some(rx)
+    }
+
+    /// Lock-free role hint for a locally hosted group. Unlike
+    /// [`Self::local_raft_status`], this never waits on the worker inbox and is
+    /// therefore safe on the node's global envelope router.
+    pub fn local_raft_role(&self, replication_id: &[u8; 32]) -> Option<RaftRole> {
+        self.raft_handlers
+            .lock()
+            .ok()?
+            .get(replication_id)
+            .cloned()?
+            .local_role()
     }
 
     // Operator-tooling senders (manifest fetch, raft join, raft
