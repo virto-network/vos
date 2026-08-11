@@ -303,7 +303,10 @@ peer's cursor only after the acknowledgement. Each peer finishes an immutable
 transfer even while local writes advance the latest frontier; the next
 transfer offered to that peer then uses the newest frontier, while topology,
 pagination, and other peers' chunk cursors remain intact. Old chunk vectors
-are released when their last peer advances. Lost process-local progress
+are released when their last peer advances. A completed registry scan evicts
+removed peers, exact authorization precedes transfer assignment, and a peer
+that makes no acknowledged progress for thirty seconds releases its snapshot
+and restarts from the newest transfer. Lost process-local progress
 restarts at the first chunk and is safe because the guest classifies already
 committed causal nodes idempotently. Node-roster pagination also retains its
 opaque cursor and fans out each completed page, so registries larger than one
