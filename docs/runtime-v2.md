@@ -299,7 +299,11 @@ local scheduler only packages these authenticated bytes.
 `VosNode` exports complete history locally, then splits it into causally
 ordered deltas below the network frame limit. Each delta commits through guest
 Accumulate before the receiver acknowledges it; the source advances that
-peer's cursor only after the acknowledgement. Lost process-local progress
+peer's cursor only after the acknowledgement. Each peer finishes an immutable
+transfer even while local writes advance the latest frontier; the next
+transfer offered to that peer then uses the newest frontier, while topology,
+pagination, and other peers' chunk cursors remain intact. Old chunk vectors
+are released when their last peer advances. Lost process-local progress
 restarts at the first chunk and is safe because the guest classifies already
 committed causal nodes idempotently. Node-roster pagination also retains its
 opaque cursor and fans out each completed page, so registries larger than one

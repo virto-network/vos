@@ -5510,9 +5510,12 @@ struct V2RootThreadState {
 
 #[cfg(all(feature = "network", feature = "storage"))]
 struct V2CrdtSyncProgress {
-    frontier: crate::v2::Hash,
-    transfer: crate::v2::Hash,
-    chunks: Vec<crate::v2::CrdtSyncEnvelopeV2>,
+    /// Newest local frontier offered after a peer finishes its current
+    /// immutable transfer. Replacing these fields never resets topology or a
+    /// peer's acknowledged chunk cursor.
+    latest_frontier: crate::v2::Hash,
+    latest_transfer: crate::v2::Hash,
+    latest_chunks: Arc<Vec<crate::v2::CrdtSyncEnvelopeV2>>,
     peers: HashMap<Vec<u8>, V2CrdtPeerProgress>,
     roster_after_kind: u8,
     roster_after_key: Vec<u8>,
@@ -5524,10 +5527,47 @@ struct V2CrdtSyncProgress {
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
+impl V2CrdtSyncProgress {
+    fn replace_latest(
+        &mut self,
+        frontier: crate::v2::Hash,
+        transfer: crate::v2::Hash,
+        chunks: Vec<crate::v2::CrdtSyncEnvelopeV2>,
+    ) {
+        self.latest_frontier = frontier;
+        self.latest_transfer = transfer;
+        self.latest_chunks = Arc::new(chunks);
+    }
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
 #[derive(Default)]
 struct V2CrdtPeerProgress {
+    /// The peer finishes this immutable transfer even if the local frontier
+    /// advances. Old chunk vectors are shared only by peers still using them
+    /// and are released automatically after their final acknowledgement.
+    transfer: Option<crate::v2::Hash>,
+    chunks: Option<Arc<Vec<crate::v2::CrdtSyncEnvelopeV2>>>,
     next_chunk: u32,
     last_sent: Option<Instant>,
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn v2_crdt_select_latest_peer_transfer(
+    peer: &mut V2CrdtPeerProgress,
+    latest_transfer: crate::v2::Hash,
+    latest_chunks: &Arc<Vec<crate::v2::CrdtSyncEnvelopeV2>>,
+) {
+    let complete = peer
+        .chunks
+        .as_ref()
+        .is_none_or(|chunks| peer.next_chunk as usize >= chunks.len());
+    if complete && peer.transfer != Some(latest_transfer) {
+        peer.transfer = Some(latest_transfer);
+        peer.chunks = Some(latest_chunks.clone());
+        peer.next_chunk = 0;
+        peer.last_sent = None;
+    }
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
@@ -7061,12 +7101,12 @@ fn handle_v2_root_transport<B>(
                 #[cfg(all(feature = "network", feature = "storage"))]
                 if let (Some(peer), Some(progress)) = (authenticated, state.crdt_sync.as_mut()) {
                     let key = peer.to_bytes();
-                    if progress.transfer == transfer
-                        && (next_chunk as usize) <= progress.chunks.len()
-                        && progress.peers.get(&key).is_some_and(|peer_progress| {
-                            next_chunk == peer_progress.next_chunk.saturating_add(1)
+                    if let Some(peer_progress) = progress.peers.get_mut(&key)
+                        && peer_progress.transfer == Some(transfer)
+                        && peer_progress.chunks.as_ref().is_some_and(|chunks| {
+                            (next_chunk as usize) <= chunks.len()
+                                && next_chunk == peer_progress.next_chunk.saturating_add(1)
                         })
-                        && let Some(peer_progress) = progress.peers.get_mut(&key)
                     {
                         peer_progress.next_chunk = next_chunk;
                         peer_progress.last_sent = None;
@@ -7701,7 +7741,7 @@ fn advertise_v2_crdt_root<B>(
     if state
         .crdt_sync
         .as_ref()
-        .is_none_or(|progress| progress.frontier != commitment)
+        .is_none_or(|progress| progress.latest_frontier != commitment)
     {
         let envelope = match service.crdt_sync_envelope() {
             Ok(Some(envelope)) => envelope,
@@ -7718,16 +7758,23 @@ fn advertise_v2_crdt_root<B>(
                 return;
             }
         };
-        state.crdt_sync = Some(V2CrdtSyncProgress {
-            frontier: commitment,
-            transfer,
-            chunks,
-            peers: HashMap::new(),
-            roster_after_kind: crate::registry::MEMBER_KIND_NODE,
-            roster_after_key: Vec::new(),
-            next_roster_page: now,
-            fanout_after: None,
-        });
+        if let Some(progress) = state.crdt_sync.as_mut() {
+            // A local write only replaces the newest offered snapshot. Every
+            // peer retains its immutable transfer and acknowledgement index;
+            // roster pagination and fair fan-out continue uninterrupted.
+            progress.replace_latest(commitment, transfer, chunks);
+        } else {
+            state.crdt_sync = Some(V2CrdtSyncProgress {
+                latest_frontier: commitment,
+                latest_transfer: transfer,
+                latest_chunks: Arc::new(chunks),
+                peers: HashMap::new(),
+                roster_after_kind: crate::registry::MEMBER_KIND_NODE,
+                roster_after_key: Vec::new(),
+                next_roster_page: now,
+                fanout_after: None,
+            });
+        }
     }
     let Some(network) = shared_network
         .lock()
@@ -7771,7 +7818,8 @@ fn advertise_v2_crdt_root<B>(
         }
     }
 
-    let chunk_count = progress.chunks.len() as u32;
+    let latest_transfer = progress.latest_transfer;
+    let latest_chunks = progress.latest_chunks.clone();
     let mut sent = 0usize;
     let peers = v2_crdt_fanout_order(
         progress.peers.keys().cloned().collect(),
@@ -7784,9 +7832,17 @@ fn advertise_v2_crdt_root<B>(
         let Some(peer_progress) = progress.peers.get_mut(&peer_bytes) else {
             continue;
         };
-        let Some(chunk) = progress.chunks.get(peer_progress.next_chunk as usize) else {
+        v2_crdt_select_latest_peer_transfer(peer_progress, latest_transfer, &latest_chunks);
+        let Some(transfer) = peer_progress.transfer else {
             continue;
         };
+        let Some(chunks) = peer_progress.chunks.as_ref() else {
+            continue;
+        };
+        let Some(chunk) = chunks.get(peer_progress.next_chunk as usize) else {
+            continue;
+        };
+        let chunk_count = chunks.len() as u32;
         if peer_progress
             .last_sent
             .is_some_and(|last| now.duration_since(last) < RETRY)
@@ -7804,7 +7860,7 @@ fn advertise_v2_crdt_root<B>(
             continue;
         }
         let payload = crate::v2::RootTreeTransportV2::CrdtSyncChunk {
-            transfer: progress.transfer,
+            transfer,
             chunk_index: peer_progress.next_chunk,
             chunk_count,
             envelope: chunk.clone(),
@@ -12494,8 +12550,9 @@ mod tests {
         let cap = 3_200;
         let (transfer, chunks) = v2_crdt_sync_chunks(envelope, cap).unwrap();
         assert!(chunks.len() > 1, "the focused cap must force chunking");
+        let chunks = Arc::new(chunks);
         let count = chunks.len() as u32;
-        for (index, chunk) in chunks.into_iter().enumerate() {
+        for (index, chunk) in chunks.iter().cloned().enumerate() {
             let wire = crate::v2::RootTreeTransportV2::CrdtSyncChunk {
                 transfer,
                 chunk_index: index as u32,
@@ -12506,6 +12563,50 @@ mod tests {
             assert!(wire.len() <= cap, "every transport delta is frame-bounded");
             crate::v2::RootTreeTransportV2::decode(&wire).unwrap();
         }
+
+        let peer_key = vec![0xA5];
+        let mut peer = V2CrdtPeerProgress::default();
+        v2_crdt_select_latest_peer_transfer(&mut peer, transfer, &chunks);
+        assert_eq!(peer.transfer, Some(transfer));
+        assert!(Arc::ptr_eq(peer.chunks.as_ref().unwrap(), &chunks));
+
+        let newer_frontier = crate::v2::Hash([0xE1; 32]);
+        let newer_transfer = crate::v2::Hash([0xE2; 32]);
+        let newer_chunks = vec![chunks.last().unwrap().clone()];
+        let mut progress = V2CrdtSyncProgress {
+            latest_frontier: crate::v2::Hash([0xE0; 32]),
+            latest_transfer: transfer,
+            latest_chunks: chunks.clone(),
+            peers: HashMap::from([(peer_key.clone(), peer)]),
+            roster_after_kind: 7,
+            roster_after_key: vec![8],
+            next_roster_page: Instant::now(),
+            fanout_after: Some(peer_key.clone()),
+        };
+        progress.replace_latest(newer_frontier, newer_transfer, newer_chunks);
+        assert_eq!(progress.roster_after_kind, 7);
+        assert_eq!(progress.roster_after_key, vec![8]);
+        assert_eq!(progress.fanout_after, Some(peer_key.clone()));
+
+        let peer = progress.peers.get_mut(&peer_key).unwrap();
+        v2_crdt_select_latest_peer_transfer(
+            peer,
+            progress.latest_transfer,
+            &progress.latest_chunks,
+        );
+        assert_eq!(
+            peer.transfer,
+            Some(transfer),
+            "a frontier refresh cannot interrupt an in-flight peer transfer"
+        );
+        peer.next_chunk = chunks.len() as u32;
+        v2_crdt_select_latest_peer_transfer(
+            peer,
+            progress.latest_transfer,
+            &progress.latest_chunks,
+        );
+        assert_eq!(peer.transfer, Some(newer_transfer));
+        assert_eq!(peer.next_chunk, 0);
     }
 
     #[test]
