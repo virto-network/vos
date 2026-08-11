@@ -4207,10 +4207,10 @@ fn node_anti_entropy_converges_authenticated_crdt_roots_across_restart() {
     let route_a = ServiceId::new(prefix_a, local_id);
     let route_b = ServiceId::new(prefix_b, local_id);
     node_a
-        .register_v2_root_at_id("shared-counter", service_a, route_a, true)
+        .register_v2_root_at_id("", service_a, route_a, true)
         .unwrap();
     node_b
-        .register_v2_root_at_id("shared-counter", service_b, route_b, true)
+        .register_v2_root_at_id("", service_b, route_b, true)
         .unwrap();
     let shutdown_a = node_a.shutdown_handle();
     let shutdown_b = node_b.shutdown_handle();

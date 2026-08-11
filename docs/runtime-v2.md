@@ -303,13 +303,17 @@ peer's cursor only after the acknowledgement. Lost process-local progress
 restarts at the first chunk and is safe because the guest classifies already
 committed causal nodes idempotently. Node-roster pagination also retains its
 opaque cursor and fans out each completed page, so registries larger than one
-scan budget continue to make progress.
+scan budget continue to make progress. A full-peer-identity round-robin cursor
+also advances the bounded send window, preventing an early group of offline
+replicas from starving later roster members.
 
 Both outbound selection and inbound admission bind the complete Noise
 `PeerId` to an exact voter/observer registry row and apply the actor's existing
 sync floor. Enrollment satisfies `Member`, but a `Private` root additionally
 requires a space or actor-local read grant; enrollment alone never discloses
-private state or authorizes imported history. The transport carries no
+private state or authorizes imported history. If the actor catalog row or its
+sync floor cannot be resolved exactly, synchronization fails closed rather
+than assuming the `Member` floor. The transport carries no
 verifier allowlist. After checking the destination service identity, the root
 thread derives the complete ordered
 `ReceiptVerificationRequestV2` sidecar locally before entering IC-5. Missing,

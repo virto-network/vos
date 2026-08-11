@@ -5517,6 +5517,10 @@ struct V2CrdtSyncProgress {
     roster_after_kind: u8,
     roster_after_key: Vec<u8>,
     next_roster_page: Instant,
+    /// Last peer considered successfully for transport. The next drive starts
+    /// strictly after this full identity, so an early group of unreachable
+    /// peers cannot consume every bounded fan-out window forever.
+    fanout_after: Option<Vec<u8>>,
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
@@ -5703,21 +5707,23 @@ fn v2_crdt_replica_roster_page(
 }
 
 /// Resolve the same per-agent sync floor used by the legacy pull service.
-/// Probe failure defaults to `Member`; it can never open a private replica.
+/// Unknown catalog state is distinct from `Member`: callers must deny it so a
+/// timeout, malformed response, or lagging registry cannot open a private
+/// replica.
 #[cfg(all(feature = "network", feature = "storage"))]
 fn v2_crdt_sync_floor(
     invoke_routes: &InvokeRoutes,
     name: &str,
     timeout: Duration,
-) -> crate::registry::SyncFloor {
+) -> Option<crate::registry::SyncFloor> {
     use crate::actors::codec::Encode;
     use crate::registry::SyncFloor;
     use crate::value::{Msg, TAG_DYNAMIC};
 
     match name {
-        "" => return SyncFloor::Public,
-        REGISTRY_AGENT_NAME => return SyncFloor::Member,
-        HYPERSPACE_REGISTRY_AGENT_NAME => return SyncFloor::Public,
+        "" => return Some(SyncFloor::Public),
+        REGISTRY_AGENT_NAME => return Some(SyncFloor::Member),
+        HYPERSPACE_REGISTRY_AGENT_NAME => return Some(SyncFloor::Public),
         _ => {}
     }
     let msg = Msg::new("agent").with("instance_name", name);
@@ -5727,8 +5733,8 @@ fn v2_crdt_sync_floor(
     registry_probe_reply_with_timeout(invoke_routes, payload, timeout)
         .and_then(|reply| decode_registry_option_reply::<crate::registry::AgentRow>(&reply))
         .flatten()
+        .filter(|row| row.instance_name == name)
         .map(|row| row.sync_role)
-        .unwrap_or(SyncFloor::Member)
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
@@ -5778,8 +5784,8 @@ fn v2_crdt_sync_peer_allowed(
         name,
         deadline.saturating_duration_since(Instant::now()),
     ) {
-        SyncFloor::Public | SyncFloor::Member => true,
-        SyncFloor::Private => {
+        Some(SyncFloor::Public | SyncFloor::Member) => true,
+        Some(SyncFloor::Private) => {
             v2_crdt_registry_role(
                 invoke_routes,
                 peer,
@@ -5793,7 +5799,26 @@ fn v2_crdt_sync_peer_allowed(
                     deadline.saturating_duration_since(Instant::now()),
                 ) >= AUTH_ROLE_READONLY
         }
+        None => false,
     }
+}
+
+/// Return full peer identities in a stable cyclic order beginning strictly
+/// after the previous successful send. The cursor is a key rather than a
+/// numeric index so roster growth does not reset progress to the first peers.
+#[cfg(all(feature = "network", feature = "storage"))]
+fn v2_crdt_fanout_order(mut peers: Vec<Vec<u8>>, after: Option<&[u8]>) -> Vec<Vec<u8>> {
+    peers.sort();
+    peers.dedup();
+    if peers.is_empty() {
+        return peers;
+    }
+    if let Some(after) = after {
+        let start = peers.partition_point(|peer| peer.as_slice() <= after);
+        let len = peers.len();
+        peers.rotate_left(start % len);
+    }
+    peers
 }
 
 /// Leave a full MiB for the outer Tell frame and future transport fields.
@@ -7701,6 +7726,7 @@ fn advertise_v2_crdt_root<B>(
             roster_after_kind: crate::registry::MEMBER_KIND_NODE,
             roster_after_key: Vec::new(),
             next_roster_page: now,
+            fanout_after: None,
         });
     }
     let Some(network) = shared_network
@@ -7747,7 +7773,10 @@ fn advertise_v2_crdt_root<B>(
 
     let chunk_count = progress.chunks.len() as u32;
     let mut sent = 0usize;
-    let peers = progress.peers.keys().cloned().collect::<Vec<_>>();
+    let peers = v2_crdt_fanout_order(
+        progress.peers.keys().cloned().collect(),
+        progress.fanout_after.as_deref(),
+    );
     for peer_bytes in peers {
         if sent >= SEND_BUDGET {
             break;
@@ -7797,6 +7826,7 @@ fn advertise_v2_crdt_root<B>(
             .is_ok()
         {
             peer_progress.last_sent = Some(now);
+            progress.fanout_after = Some(peer_bytes);
             sent += 1;
         }
     }
@@ -12481,18 +12511,59 @@ mod tests {
     #[test]
     #[cfg(all(feature = "network", feature = "storage"))]
     fn v2_crdt_private_floor_requires_a_space_or_actor_grant() {
+        use crate::registry::SyncFloor;
+
         let peer = libp2p::PeerId::random();
-        let check = |space_role, actor_role| {
-            let (routes, registry) = spawn_stub_sync_floor_registry(space_role, actor_role);
+        let check = |floor, space_role, actor_role| {
+            let (routes, registry) = spawn_stub_sync_floor_registry(floor, space_role, actor_role);
             let allowed =
                 v2_crdt_sync_peer_allowed(&routes, &peer, "private-board", Duration::from_secs(1));
             drop(routes);
             registry.join().unwrap();
             allowed
         };
-        assert!(!check(AUTH_ROLE_NONE, AUTH_ROLE_NONE));
-        assert!(check(AUTH_ROLE_READONLY, AUTH_ROLE_NONE));
-        assert!(check(AUTH_ROLE_NONE, AUTH_ROLE_READONLY));
+        assert!(!check(
+            Some(SyncFloor::Private),
+            AUTH_ROLE_NONE,
+            AUTH_ROLE_NONE
+        ));
+        assert!(check(
+            Some(SyncFloor::Private),
+            AUTH_ROLE_READONLY,
+            AUTH_ROLE_NONE
+        ));
+        assert!(check(
+            Some(SyncFloor::Private),
+            AUTH_ROLE_NONE,
+            AUTH_ROLE_READONLY
+        ));
+        assert!(check(
+            Some(SyncFloor::Member),
+            AUTH_ROLE_NONE,
+            AUTH_ROLE_NONE
+        ));
+        assert!(
+            !check(None, AUTH_ROLE_READONLY, AUTH_ROLE_READONLY),
+            "an unknown floor must deny even an otherwise granted enrolled peer"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn v2_crdt_fanout_cursor_reaches_peers_after_each_send_window() {
+        let peers = (0u8..12).map(|peer| vec![peer]).collect::<Vec<_>>();
+        let mut after = None;
+        let mut reached = BTreeSet::new();
+        for _ in 0..3 {
+            let order = v2_crdt_fanout_order(peers.clone(), after.as_deref());
+            let window = &order[..4];
+            reached.extend(window.iter().cloned());
+            after = window.last().cloned();
+        }
+        assert_eq!(reached.len(), peers.len());
+
+        let wrapped = v2_crdt_fanout_order(peers, after.as_deref());
+        assert_eq!(&wrapped[..4], &[vec![0], vec![1], vec![2], vec![3]]);
     }
 
     #[test]
@@ -15598,11 +15669,12 @@ mod tests {
 
     #[cfg(all(feature = "network", feature = "storage"))]
     fn spawn_stub_sync_floor_registry(
+        floor: Option<crate::registry::SyncFloor>,
         space_role: u8,
         actor_role: u8,
     ) -> (InvokeRoutes, thread::JoinHandle<()>) {
         use crate::actors::codec::Encode;
-        use crate::registry::{AgentRow, SyncFloor};
+        use crate::registry::AgentRow;
         use crate::value::Value;
 
         let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
@@ -15612,20 +15684,24 @@ mod tests {
             while let Ok(req) = rx.recv() {
                 let value = match intercepted_method_name(&req.msg).as_deref() {
                     Some("agent") => {
-                        let row = AgentRow {
-                            instance_name: "private-board".into(),
-                            program_hash: [1; 32],
-                            program_name: "board".into(),
-                            program_version: "1".into(),
-                            replication_id: [2; 32],
-                            consistency: Consistency::Crdt as u8,
-                            network_reachable: true,
-                            sync_role: SyncFloor::Private,
-                            install_args: Vec::new(),
-                            install_payloads: Vec::new(),
-                        };
-                        let mut tagged = vec![1];
-                        tagged.extend_from_slice(&row.encode());
+                        let mut tagged = vec![u8::from(floor.is_some())];
+                        if let Some(sync_role) = floor {
+                            tagged.extend_from_slice(
+                                &AgentRow {
+                                    instance_name: "private-board".into(),
+                                    program_hash: [1; 32],
+                                    program_name: "board".into(),
+                                    program_version: "1".into(),
+                                    replication_id: [2; 32],
+                                    consistency: Consistency::Crdt as u8,
+                                    network_reachable: true,
+                                    sync_role,
+                                    install_args: Vec::new(),
+                                    install_payloads: Vec::new(),
+                                }
+                                .encode(),
+                            );
+                        }
                         Value::Bytes(tagged)
                     }
                     Some("actor_role") => Value::U8(actor_role),
