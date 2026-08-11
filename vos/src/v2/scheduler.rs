@@ -243,8 +243,13 @@ impl LocalWorkSchedulerV2 {
             nodes,
             provided_blobs: blobs.into_values().collect(),
         };
-        CrdtSyncEnvelopeV2::decode(&envelope.encode())
-            .map_err(|_| ScheduleErrorV2::CorruptCausalDag)
+        // Do not round-trip the complete export through the bounded wire
+        // decoder: histories may legitimately contain more nodes than one
+        // network frame/list. The frontier loader, receipt decoders, blob
+        // importer, BTree ordering and header validation above establish the
+        // same invariants; the node transport subsequently emits canonical,
+        // independently decoded bounded deltas.
+        Ok(envelope)
     }
 
     /// Build the exact destination Accumulate input for one finalized

@@ -106,12 +106,26 @@ pub enum RootTreeTransportV2 {
         publication: super::Hash,
         call: super::CallId,
     },
-    /// Complete causal state advertised by another authenticated replica of
-    /// the same CRDT root. The wire does not confer receipt authority: the
-    /// receiving node admits it only after binding the Noise peer to an exact
-    /// enrolled-node row, then supplies those verifier decisions separately
-    /// to physical Accumulate.
-    CrdtSync { envelope: CrdtSyncEnvelopeV2 },
+    /// One causally ordered, independently committable delta from another
+    /// authenticated replica of the same CRDT root. Large histories are
+    /// split below the network frame limit and advance only after the peer
+    /// acknowledges the preceding chunk. The wire does not confer receipt
+    /// authority: the receiving node supplies verifier decisions separately
+    /// to physical Accumulate after authenticating the exact Noise peer.
+    CrdtSyncChunk {
+        transfer: super::Hash,
+        chunk_index: u32,
+        chunk_count: u32,
+        envelope: CrdtSyncEnvelopeV2,
+    },
+    /// Process-local transport progress for one committed CRDT delta. Losing
+    /// this acknowledgement is safe: the source retries the same chunk and
+    /// guest Accumulate classifies its already-committed nodes idempotently.
+    CrdtSyncAccepted {
+        service: ServiceIdentityV2,
+        transfer: super::Hash,
+        next_chunk: u32,
+    },
 }
 
 impl V2Wire for RootTreeTransportV2 {
@@ -157,9 +171,27 @@ impl V2Wire for RootTreeTransportV2 {
                 encoder.fixed(&publication.0);
                 encoder.fixed(&call.0);
             }
-            Self::CrdtSync { envelope } => {
+            Self::CrdtSyncChunk {
+                transfer,
+                chunk_index,
+                chunk_count,
+                envelope,
+            } => {
                 encoder.u8(3);
+                encoder.fixed(&transfer.0);
+                encoder.u32(*chunk_index);
+                encoder.u32(*chunk_count);
                 encoder.bytes(&envelope.encode());
+            }
+            Self::CrdtSyncAccepted {
+                service,
+                transfer,
+                next_chunk,
+            } => {
+                encoder.u8(4);
+                encode_service(&mut encoder, service);
+                encoder.fixed(&transfer.0);
+                encoder.u32(*next_chunk);
             }
         }
     }
@@ -187,8 +219,16 @@ impl V2Wire for RootTreeTransportV2 {
                 publication: super::Hash(decoder.fixed()?),
                 call: super::CallId(decoder.fixed()?),
             },
-            3 => Self::CrdtSync {
+            3 => Self::CrdtSyncChunk {
+                transfer: super::Hash(decoder.fixed()?),
+                chunk_index: decoder.u32()?,
+                chunk_count: decoder.u32()?,
                 envelope: CrdtSyncEnvelopeV2::decode(&decoder.bytes()?)?,
+            },
+            4 => Self::CrdtSyncAccepted {
+                service: decode_service(decoder)?,
+                transfer: super::Hash(decoder.fixed()?),
+                next_chunk: decoder.u32()?,
             },
             _ => return Err(DecodeError::InvalidTag),
         };
@@ -251,9 +291,23 @@ impl RootTreeTransportV2 {
                     && *publication != super::Hash::ZERO
                     && *call != super::CallId::ZERO
             }
-            Self::CrdtSync { envelope } => {
-                !envelope.advertised_heads.is_empty() && !envelope.nodes.is_empty()
+            Self::CrdtSyncChunk {
+                transfer,
+                chunk_index,
+                chunk_count,
+                envelope,
+            } => {
+                *transfer != super::Hash::ZERO
+                    && *chunk_count != 0
+                    && chunk_index < chunk_count
+                    && !envelope.advertised_heads.is_empty()
+                    && !envelope.nodes.is_empty()
             }
+            Self::CrdtSyncAccepted {
+                transfer,
+                next_chunk,
+                ..
+            } => *transfer != super::Hash::ZERO && *next_chunk != 0,
         }
     }
 }
@@ -2204,9 +2258,10 @@ where
     }
 
     /// Import one CRDT envelope whose exact transport peer was independently
-    /// authenticated as an enrolled replica by the node. The ordered verifier
-    /// sidecar is derived here rather than accepted from the wire, so a peer
-    /// cannot add, omit, or substitute a receipt-verification decision.
+    /// authenticated as an enrolled, sync-floor-authorized replica by the
+    /// node. The ordered verifier sidecar is derived here rather than accepted
+    /// from the wire, so a peer cannot add, omit, or substitute a
+    /// receipt-verification decision.
     pub(crate) fn sync_authenticated_crdt(
         &mut self,
         envelope: CrdtSyncEnvelopeV2,
@@ -2669,31 +2724,44 @@ mod tests {
             exported_blobs: vec![],
         };
         let cid = change.cid();
-        let crdt = RootTreeTransportV2::CrdtSync {
-            envelope: CrdtSyncEnvelopeV2 {
-                service: crdt_service.clone(),
-                advertised_heads: vec![cid],
-                nodes: vec![super::super::CrdtSyncNodeV2 {
-                    receipt: AccumulationReceiptV2 {
-                        service: crdt_service,
-                        accepted_transition: change.receipt_commitment(),
-                        reply_commitment: None,
-                        outbox_commitment: None,
-                        resulting_state_root: None,
-                        resulting_crdt_heads: vec![cid],
-                        sequence: 1,
-                        checkpoint: 0,
-                        consistency: ConsistencyModeV2::Crdt,
-                    },
-                    change,
-                }],
-                provided_blobs: vec![],
-            },
+        let crdt_envelope = CrdtSyncEnvelopeV2 {
+            service: crdt_service.clone(),
+            advertised_heads: vec![cid],
+            nodes: vec![super::super::CrdtSyncNodeV2 {
+                receipt: AccumulationReceiptV2 {
+                    service: crdt_service,
+                    accepted_transition: change.receipt_commitment(),
+                    reply_commitment: None,
+                    outbox_commitment: None,
+                    resulting_state_root: None,
+                    resulting_crdt_heads: vec![cid],
+                    sequence: 1,
+                    checkpoint: 0,
+                    consistency: ConsistencyModeV2::Crdt,
+                },
+                change,
+            }],
+            provided_blobs: vec![],
+        };
+        let crdt = RootTreeTransportV2::CrdtSyncChunk {
+            transfer: crdt_envelope.commitment(),
+            chunk_index: 0,
+            chunk_count: 1,
+            envelope: crdt_envelope,
         };
         assert_eq!(RootTreeTransportV2::decode(&crdt.encode()).unwrap(), crdt);
-        let RootTreeTransportV2::CrdtSync { envelope } = &crdt else {
+        let RootTreeTransportV2::CrdtSyncChunk { envelope, .. } = &crdt else {
             unreachable!()
         };
+        let accepted = RootTreeTransportV2::CrdtSyncAccepted {
+            service: envelope.service.clone(),
+            transfer: envelope.commitment(),
+            next_chunk: 1,
+        };
+        assert_eq!(
+            RootTreeTransportV2::decode(&accepted.encode()).unwrap(),
+            accepted
+        );
         let request = AccumulateRequestV2::SyncCrdt(envelope.clone());
         let verification = super::super::ReceiptVerificationRequestV2 {
             expected_producer: envelope.nodes[0]

@@ -35,6 +35,8 @@ pub(crate) mod wire;
 pub use crate::attestation::AttestationPreparationV2;
 
 pub use continuation::{ContinuationProgramV2, ContinuationSnapshotV2};
+#[cfg(all(feature = "std", feature = "network", feature = "storage"))]
+pub(crate) use contracts::crdt_change_blob_references;
 pub use contracts::{
     AccumulateRequestV2, AccumulatedReplyV2, AccumulatedRoleAssertionV2, AccumulatedTimeoutV2,
     AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2,

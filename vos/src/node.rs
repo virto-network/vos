@@ -18,7 +18,7 @@ use std::collections::HashMap;
 // network-only manifest slot. Gating each to exactly the features its
 // users require keeps every reduced-feature build warning-clean.
 #[cfg(all(feature = "storage", feature = "network"))]
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[cfg(feature = "network")]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
@@ -3471,7 +3471,11 @@ impl VosNode {
                     let crdt_sync = crate::v2::RootTreeTransportV2::decode(&tell.payload)
                         .ok()
                         .is_some_and(|transport| {
-                            matches!(transport, crate::v2::RootTreeTransportV2::CrdtSync { .. })
+                            matches!(
+                                transport,
+                                crate::v2::RootTreeTransportV2::CrdtSyncChunk { .. }
+                                    | crate::v2::RootTreeTransportV2::CrdtSyncAccepted { .. }
+                            )
                         });
                     // The bridge binds the transport route to the complete
                     // Noise peer without blocking the global network thread
@@ -3661,6 +3665,7 @@ impl VosNode {
     {
         let actor = service.root_actor();
         let is_role_authority = name == crate::v2::ROLE_AUTHORITY_INSTANCE_V2;
+        let root_name = name.clone();
         #[cfg(all(feature = "storage", feature = "network"))]
         let invoke_timeout = service
             .raft_propose_timeout_ms()
@@ -3721,6 +3726,7 @@ impl VosNode {
             join: Some(thread::spawn(move || {
                 v2_root_service_thread(
                     id,
+                    root_name,
                     service,
                     inbox_rx,
                     invoke_rx,
@@ -4992,8 +4998,11 @@ impl VosNode {
                 let crdt_service = crate::v2::RootTreeTransportV2::decode(&envelope.payload)
                     .ok()
                     .and_then(|transport| match transport {
-                        crate::v2::RootTreeTransportV2::CrdtSync { envelope } => {
+                        crate::v2::RootTreeTransportV2::CrdtSyncChunk { envelope, .. } => {
                             Some(envelope.service)
+                        }
+                        crate::v2::RootTreeTransportV2::CrdtSyncAccepted { service, .. } => {
+                            Some(service)
                         }
                         _ => None,
                     });
@@ -5492,10 +5501,35 @@ fn decode_v2_raft_delegation(wire: &[u8]) -> Result<Option<V2RaftDelegatedIngres
 struct V2RootThreadState {
     pending_callers: HashMap<crate::v2::InvocationId, Vec<V2PendingCaller>>,
     publication_progress: HashMap<crate::v2::Hash, V2PublicationProgress>,
-    /// Last complete CRDT frontier advertised to enrolled replica peers.
-    /// A changed frontier is sent immediately; an unchanged one is retried on
-    /// a bounded cadence so a lost frame or restarted peer self-heals.
-    crdt_sync: Option<(crate::v2::Hash, Instant)>,
+    /// Bounded, acknowledged CRDT anti-entropy progress. This state is only a
+    /// transport optimization: losing it restarts at chunk zero, which guest
+    /// Accumulate safely classifies as an idempotent causal import.
+    #[cfg(all(feature = "network", feature = "storage"))]
+    crdt_sync: Option<V2CrdtSyncProgress>,
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+struct V2CrdtSyncProgress {
+    frontier: crate::v2::Hash,
+    transfer: crate::v2::Hash,
+    chunks: Vec<crate::v2::CrdtSyncEnvelopeV2>,
+    peers: HashMap<Vec<u8>, V2CrdtPeerProgress>,
+    roster_after_kind: u8,
+    roster_after_key: Vec<u8>,
+    next_roster_page: Instant,
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+#[derive(Default)]
+struct V2CrdtPeerProgress {
+    next_chunk: u32,
+    last_sent: Option<Instant>,
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+struct V2CrdtRosterPage {
+    peers: Vec<libp2p::PeerId>,
+    next: Option<(u8, Vec<u8>)>,
 }
 
 struct V2PendingCaller {
@@ -5546,10 +5580,18 @@ fn v2_transport_destination_route(
             .values()
             .find(|route| route.service == service)
             .cloned(),
-        crate::v2::RootTreeTransportV2::CrdtSync { envelope } => routes
+        crate::v2::RootTreeTransportV2::CrdtSyncChunk { envelope, .. } => routes
             .values()
             .find(|route| {
                 route.service == envelope.service
+                    && route.consistency == crate::v2::ConsistencyModeV2::Crdt
+                    && route.authenticated_peer.is_none()
+            })
+            .cloned(),
+        crate::v2::RootTreeTransportV2::CrdtSyncAccepted { service, .. } => routes
+            .values()
+            .find(|route| {
+                route.service == service
                     && route.consistency == crate::v2::ConsistencyModeV2::Crdt
                     && route.authenticated_peer.is_none()
             })
@@ -5579,7 +5621,8 @@ fn v2_transport_source_route(
             acceptor_service,
             ..
         } => (acceptor, acceptor_service),
-        crate::v2::RootTreeTransportV2::CrdtSync { .. } => return None,
+        crate::v2::RootTreeTransportV2::CrdtSyncChunk { .. }
+        | crate::v2::RootTreeTransportV2::CrdtSyncAccepted { .. } => return None,
     };
     routes
         .get(&actor)
@@ -5609,72 +5652,312 @@ fn authenticated_v2_crdt_replica_peer(
         .then_some(peer)
 }
 
-/// Read the canonical node roster before advertising CRDT state. Candidate
-/// selection never starts from the network prefix map: unauthenticated peers
-/// and cheap 16-bit collisions therefore cannot receive state or crowd an
-/// enrolled replica out of a fixed transport window.
+/// Read one canonical node-roster page. The opaque cursor is retained by the
+/// root thread, so registries larger than one host-side scan budget continue
+/// from their last page instead of restarting at the first 1,024 rows.
 #[cfg(all(feature = "network", feature = "storage"))]
-fn v2_crdt_replica_roster(invoke_routes: &InvokeRoutes, timeout: Duration) -> Vec<libp2p::PeerId> {
+fn v2_crdt_replica_roster_page(
+    invoke_routes: &InvokeRoutes,
+    after_kind: u8,
+    after_key: Vec<u8>,
+    timeout: Duration,
+) -> Option<V2CrdtRosterPage> {
     use crate::actors::codec::{Decode, Encode};
     use crate::registry::{MEMBER_KIND_NODE, MemberPage};
     use crate::value::{Msg, TAG_DYNAMIC, Value};
 
-    let Some(deadline) = Instant::now().checked_add(timeout) else {
-        return Vec::new();
+    let msg = Msg::new("members")
+        .with("after_kind", after_kind)
+        .with("after_key", after_key)
+        .with("budget", 64u32);
+    let mut payload = Vec::with_capacity(1 + 64);
+    payload.push(TAG_DYNAMIC);
+    payload.extend_from_slice(&msg.encode());
+    let reply = registry_probe_reply_with_timeout(invoke_routes, payload, timeout)?;
+    let Value::Bytes(bytes) = <Value as Decode>::try_decode(&reply)? else {
+        return None;
     };
-    let mut after_kind = MEMBER_KIND_NODE;
-    let mut after_key = Vec::new();
+    let page = <MemberPage as Decode>::try_decode(&bytes)?;
     let mut peers = Vec::new();
-    // The registry itself pages by both row and encoded-byte budgets. Bound
-    // this host walk as defense in depth; a later retry resumes from a fresh
-    // canonical snapshot rather than retaining partial authority state.
-    for _ in 0..16 {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Vec::new();
+    for member in page.members {
+        if member.kind != MEMBER_KIND_NODE
+            || !matches!(
+                member.role,
+                crate::registry::NODE_ROLE_VOTER | crate::registry::NODE_ROLE_OBSERVER
+            )
+        {
+            continue;
         }
-        let msg = Msg::new("members")
-            .with("after_kind", after_kind)
-            .with("after_key", after_key)
-            .with("budget", 64u32);
-        let mut payload = Vec::with_capacity(1 + 64);
-        payload.push(TAG_DYNAMIC);
-        payload.extend_from_slice(&msg.encode());
-        let Some(reply) = registry_probe_reply_with_timeout(invoke_routes, payload, remaining)
-        else {
-            return Vec::new();
+        let Ok(peer) = libp2p::PeerId::from_bytes(&member.key) else {
+            continue;
         };
-        let Some(Value::Bytes(bytes)) = <Value as Decode>::try_decode(&reply) else {
-            return Vec::new();
-        };
-        let Some(page) = <MemberPage as Decode>::try_decode(&bytes) else {
-            return Vec::new();
-        };
-        for member in page.members {
-            if member.kind != MEMBER_KIND_NODE
-                || !matches!(
-                    member.role,
-                    crate::registry::NODE_ROLE_VOTER | crate::registry::NODE_ROLE_OBSERVER
-                )
-            {
-                continue;
-            }
-            let Ok(peer) = libp2p::PeerId::from_bytes(&member.key) else {
-                continue;
-            };
-            if crate::network::derive_node_prefix(&peer) == member.prefix {
-                peers.push(peer);
-            }
+        if crate::network::derive_node_prefix(&peer) == member.prefix {
+            peers.push(peer);
         }
-        if !page.more || page.next_kind != MEMBER_KIND_NODE {
-            peers.sort();
-            peers.dedup();
-            return peers;
-        }
-        after_kind = page.next_kind;
-        after_key = page.next_key;
     }
-    Vec::new()
+    peers.sort();
+    peers.dedup();
+    let next = (page.more && page.next_kind == MEMBER_KIND_NODE)
+        .then_some((page.next_kind, page.next_key));
+    Some(V2CrdtRosterPage { peers, next })
+}
+
+/// Resolve the same per-agent sync floor used by the legacy pull service.
+/// Probe failure defaults to `Member`; it can never open a private replica.
+#[cfg(all(feature = "network", feature = "storage"))]
+fn v2_crdt_sync_floor(
+    invoke_routes: &InvokeRoutes,
+    name: &str,
+    timeout: Duration,
+) -> crate::registry::SyncFloor {
+    use crate::actors::codec::Encode;
+    use crate::registry::SyncFloor;
+    use crate::value::{Msg, TAG_DYNAMIC};
+
+    match name {
+        "" => return SyncFloor::Public,
+        REGISTRY_AGENT_NAME => return SyncFloor::Member,
+        HYPERSPACE_REGISTRY_AGENT_NAME => return SyncFloor::Public,
+        _ => {}
+    }
+    let msg = Msg::new("agent").with("instance_name", name);
+    let mut payload = Vec::with_capacity(1 + 64);
+    payload.push(TAG_DYNAMIC);
+    payload.extend_from_slice(&msg.encode());
+    registry_probe_reply_with_timeout(invoke_routes, payload, timeout)
+        .and_then(|reply| decode_registry_option_reply::<crate::registry::AgentRow>(&reply))
+        .flatten()
+        .map(|row| row.sync_role)
+        .unwrap_or(SyncFloor::Member)
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn v2_crdt_registry_role(
+    invoke_routes: &InvokeRoutes,
+    peer: &libp2p::PeerId,
+    actor_name: Option<&str>,
+    timeout: Duration,
+) -> u8 {
+    use crate::actors::codec::Encode;
+    use crate::value::{Msg, TAG_DYNAMIC};
+
+    let mut msg = Msg::new(if actor_name.is_some() {
+        "actor_role"
+    } else {
+        "peer_role"
+    })
+    .with("peer_id", peer.to_bytes());
+    if let Some(name) = actor_name {
+        msg = msg.with("agent_name", name);
+    }
+    let mut payload = Vec::with_capacity(1 + 96);
+    payload.push(TAG_DYNAMIC);
+    payload.extend_from_slice(&msg.encode());
+    registry_probe_reply_with_timeout(invoke_routes, payload, timeout)
+        .and_then(|reply| decode_u8_reply(&reply))
+        .unwrap_or(AUTH_ROLE_NONE)
+}
+
+/// Apply the established sync-floor policy after exact enrolled-node
+/// authentication. Enrollment satisfies `Member`, but deliberately does not
+/// satisfy `Private`; private state requires a space or actor read grant.
+#[cfg(all(feature = "network", feature = "storage"))]
+fn v2_crdt_sync_peer_allowed(
+    invoke_routes: &InvokeRoutes,
+    peer: &libp2p::PeerId,
+    name: &str,
+    timeout: Duration,
+) -> bool {
+    use crate::registry::SyncFloor;
+
+    let Some(deadline) = Instant::now().checked_add(timeout) else {
+        return false;
+    };
+    match v2_crdt_sync_floor(
+        invoke_routes,
+        name,
+        deadline.saturating_duration_since(Instant::now()),
+    ) {
+        SyncFloor::Public | SyncFloor::Member => true,
+        SyncFloor::Private => {
+            v2_crdt_registry_role(
+                invoke_routes,
+                peer,
+                None,
+                deadline.saturating_duration_since(Instant::now()),
+            ) >= AUTH_ROLE_READONLY
+                || v2_crdt_registry_role(
+                    invoke_routes,
+                    peer,
+                    Some(name),
+                    deadline.saturating_duration_since(Instant::now()),
+                ) >= AUTH_ROLE_READONLY
+        }
+    }
+}
+
+/// Leave a full MiB for the outer Tell frame and future transport fields.
+/// The network hard cap is 8 MiB; every encoded VRT2 chunk is checked against
+/// this smaller bound before it can enter the node outbox.
+#[cfg(all(feature = "network", feature = "storage"))]
+const V2_CRDT_SYNC_CHUNK_MAX_BYTES: usize = 7 * 1024 * 1024;
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn v2_crdt_sync_delta(
+    service: &crate::v2::ServiceIdentityV2,
+    heads: &BTreeSet<crate::v2::Hash>,
+    nodes: &[crate::v2::CrdtSyncNodeV2],
+    blobs: &BTreeMap<crate::v2::Hash, crate::v2::ImportedBlobV2>,
+) -> crate::v2::CrdtSyncEnvelopeV2 {
+    let mut nodes = nodes.to_vec();
+    nodes.sort_by_key(|node| node.change.cid());
+    crate::v2::CrdtSyncEnvelopeV2 {
+        service: service.clone(),
+        advertised_heads: heads.iter().copied().collect(),
+        nodes,
+        provided_blobs: blobs.values().cloned().collect(),
+    }
+}
+
+/// Split a complete export into causal, guest-committable deltas. Nodes are
+/// considered by height, while each individual envelope remains CID-sorted
+/// as required by VCS2. The intermediate advertised frontier means a peer can
+/// commit and acknowledge every chunk independently; no process-memory
+/// reassembly is trusted for correctness or restart recovery.
+#[cfg(all(feature = "network", feature = "storage"))]
+fn v2_crdt_sync_chunks(
+    envelope: crate::v2::CrdtSyncEnvelopeV2,
+    max_payload_bytes: usize,
+) -> Result<(crate::v2::Hash, Vec<crate::v2::CrdtSyncEnvelopeV2>), &'static str> {
+    use crate::v2::V2Wire;
+
+    let transfer = envelope.commitment();
+    if transfer == crate::v2::Hash::ZERO || envelope.nodes.is_empty() {
+        return Err("empty CRDT synchronization export");
+    }
+    let mut ordered = envelope.nodes.clone();
+    ordered.sort_by_key(|node| (node.change.causal_height, node.change.cid()));
+    let available_blobs = envelope
+        .provided_blobs
+        .iter()
+        .cloned()
+        .map(|blob| (blob.reference.hash, blob))
+        .collect::<BTreeMap<_, _>>();
+    let mut frontier = BTreeSet::new();
+    let mut current_nodes = Vec::new();
+    let mut current_blobs = BTreeMap::new();
+    let mut current_node_bytes = 0usize;
+    let mut current_blob_bytes = 0usize;
+    let mut chunks = Vec::new();
+
+    // Derive the fixed wire cost from the codecs themselves. The empty shape
+    // is used only for sizing (it is never decoded or transmitted); variable
+    // heads, nodes and blobs are accounted below.
+    let fixed_wire_bytes = crate::v2::RootTreeTransportV2::CrdtSyncChunk {
+        transfer,
+        chunk_index: 0,
+        chunk_count: u32::MAX,
+        envelope: crate::v2::CrdtSyncEnvelopeV2 {
+            service: envelope.service.clone(),
+            advertised_heads: Vec::new(),
+            nodes: Vec::new(),
+            provided_blobs: Vec::new(),
+        },
+    }
+    .encode()
+    .len();
+
+    for node in ordered {
+        let mut next_frontier = frontier.clone();
+        for dependency in &node.change.causal_dependencies {
+            next_frontier.remove(dependency);
+        }
+        next_frontier.insert(node.change.cid());
+        let node_bytes = 8usize
+            .saturating_add(node.change.encode().len())
+            .saturating_add(node.receipt.encode().len());
+        let mut added_blobs = BTreeMap::new();
+        for reference in crate::v2::crdt_change_blob_references(&node.change) {
+            let Some(blob) = available_blobs.get(&reference.hash) else {
+                return Err("complete CRDT export omitted a referenced blob");
+            };
+            if blob.reference != *reference {
+                return Err("CRDT blob hash aliases a different reference");
+            }
+            if !current_blobs.contains_key(&reference.hash) {
+                added_blobs.insert(reference.hash, blob.clone());
+            }
+        }
+        let added_blob_bytes = added_blobs.values().fold(0usize, |total, blob| {
+            total.saturating_add(44usize.saturating_add(blob.bytes.len()))
+        });
+        let candidate_bytes = fixed_wire_bytes
+            .saturating_add(next_frontier.len().saturating_mul(32))
+            .saturating_add(current_node_bytes)
+            .saturating_add(node_bytes)
+            .saturating_add(current_blob_bytes)
+            .saturating_add(added_blob_bytes);
+        if candidate_bytes <= max_payload_bytes {
+            frontier = next_frontier;
+            current_nodes.push(node);
+            current_blobs.extend(added_blobs);
+            current_node_bytes = current_node_bytes.saturating_add(node_bytes);
+            current_blob_bytes = current_blob_bytes.saturating_add(added_blob_bytes);
+            continue;
+        }
+        if current_nodes.is_empty() {
+            return Err("one CRDT causal node exceeds the transport frame budget");
+        }
+        chunks.push(v2_crdt_sync_delta(
+            &envelope.service,
+            &frontier,
+            &current_nodes,
+            &current_blobs,
+        ));
+
+        frontier = next_frontier;
+        current_nodes = vec![node];
+        current_blobs = added_blobs;
+        current_node_bytes = node_bytes;
+        current_blob_bytes = added_blob_bytes;
+        let single_bytes = fixed_wire_bytes
+            .saturating_add(frontier.len().saturating_mul(32))
+            .saturating_add(current_node_bytes)
+            .saturating_add(current_blob_bytes);
+        if single_bytes > max_payload_bytes {
+            return Err("one CRDT causal node exceeds the transport frame budget");
+        }
+    }
+    if !current_nodes.is_empty() {
+        chunks.push(v2_crdt_sync_delta(
+            &envelope.service,
+            &frontier,
+            &current_nodes,
+            &current_blobs,
+        ));
+    }
+    let expected = envelope
+        .advertised_heads
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if frontier != expected || chunks.len() > u32::MAX as usize {
+        return Err("CRDT export did not reduce to its advertised frontier");
+    }
+    let chunk_count = chunks.len() as u32;
+    for (index, chunk) in chunks.iter().enumerate() {
+        let wire = crate::v2::RootTreeTransportV2::CrdtSyncChunk {
+            transfer,
+            chunk_index: index as u32,
+            chunk_count,
+            envelope: chunk.clone(),
+        }
+        .encode();
+        if wire.len() > max_payload_bytes || crate::v2::RootTreeTransportV2::decode(&wire).is_err()
+        {
+            return Err("constructed a non-canonical or oversized CRDT transport chunk");
+        }
+    }
+    Ok((transfer, chunks))
 }
 
 /// Resolve one claimed actor through its exact route and authenticated peer.
@@ -6293,6 +6576,7 @@ where
 
 fn v2_root_service_thread<B>(
     id: ServiceId,
+    root_name: String,
     mut service: crate::v2::LocalRootTreeServiceV2<B>,
     inbox_rx: mpsc::Receiver<Envelope>,
     invoke_rx: mpsc::Receiver<InvokeRequest>,
@@ -6331,6 +6615,7 @@ where
             *activity.lock().unwrap() = Instant::now();
             handle_v2_root_transport(
                 id,
+                &root_name,
                 &mut service,
                 envelope,
                 &outbox,
@@ -6345,6 +6630,7 @@ where
         if last_transport_retry.elapsed() >= Duration::from_millis(250) {
             retry_v2_root_transport(
                 id,
+                &root_name,
                 &mut service,
                 &outbox,
                 &actor_routes,
@@ -6655,6 +6941,7 @@ where
 
 fn handle_v2_root_transport<B>(
     id: ServiceId,
+    root_name: &str,
     service: &mut crate::v2::LocalRootTreeServiceV2<B>,
     envelope: Envelope,
     outbox: &mpsc::Sender<Envelope>,
@@ -6668,6 +6955,8 @@ fn handle_v2_root_transport<B>(
         + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
 {
     use crate::v2::V2Wire;
+    #[cfg(not(all(feature = "network", feature = "storage")))]
+    let _ = root_name;
 
     let transport = match crate::v2::RootTreeTransportV2::decode(&envelope.payload) {
         Ok(transport) => transport,
@@ -6676,10 +6965,11 @@ fn handle_v2_root_transport<B>(
             return;
         }
     };
-    if let crate::v2::RootTreeTransportV2::CrdtSync {
-        envelope: sync_envelope,
-    } = &transport
-    {
+    if matches!(
+        &transport,
+        crate::v2::RootTreeTransportV2::CrdtSyncChunk { .. }
+            | crate::v2::RootTreeTransportV2::CrdtSyncAccepted { .. }
+    ) {
         #[cfg(all(feature = "network", feature = "storage"))]
         let authenticated = envelope
             .authenticated_source_peer
@@ -6687,21 +6977,80 @@ fn handle_v2_root_transport<B>(
             .and_then(|peer| {
                 authenticated_v2_crdt_replica_peer(invoke_routes, peer, Duration::from_millis(500))
             })
-            .is_some_and(|peer| {
+            .filter(|peer| {
                 crate::network::derive_node_prefix(&peer) == envelope.from.node_prefix()
                     && envelope.from.local_id() == id.local_id()
+                    && v2_crdt_sync_peer_allowed(
+                        invoke_routes,
+                        peer,
+                        root_name,
+                        Duration::from_millis(500),
+                    )
             });
         #[cfg(not(all(feature = "network", feature = "storage")))]
-        let authenticated = false;
-        if !authenticated
-            || service.consistency() != crate::v2::ConsistencyModeV2::Crdt
-            || sync_envelope.service != *service.identity()
-        {
+        let authenticated: Option<()> = None;
+        if authenticated.is_none() || service.consistency() != crate::v2::ConsistencyModeV2::Crdt {
             warn!(%id, from = %envelope.from, "rejected unauthenticated or misrouted v2 CRDT sync");
             return;
         }
-        if let Err(failure) = service.sync_authenticated_crdt(sync_envelope.clone()) {
-            warn!(%id, ?failure, "guest rejected authenticated v2 CRDT sync");
+        match transport {
+            crate::v2::RootTreeTransportV2::CrdtSyncChunk {
+                transfer,
+                chunk_index,
+                chunk_count: _,
+                envelope: sync_envelope,
+            } => {
+                if sync_envelope.service != *service.identity() {
+                    warn!(%id, from = %envelope.from, "rejected CRDT chunk for another service");
+                    return;
+                }
+                match service.sync_authenticated_crdt(sync_envelope) {
+                    Ok(_) => {
+                        let accepted = crate::v2::RootTreeTransportV2::CrdtSyncAccepted {
+                            service: service.identity().clone(),
+                            transfer,
+                            next_chunk: chunk_index.saturating_add(1),
+                        };
+                        let _ = outbox.send(Envelope {
+                            from: id,
+                            to: envelope.from,
+                            payload: accepted.encode(),
+                            authenticated_source_peer: None,
+                            destination_peer: envelope.authenticated_source_peer.clone(),
+                        });
+                    }
+                    Err(failure) => {
+                        warn!(%id, ?failure, "guest rejected authenticated v2 CRDT chunk");
+                    }
+                }
+            }
+            crate::v2::RootTreeTransportV2::CrdtSyncAccepted {
+                service: accepted_service,
+                transfer,
+                next_chunk,
+            } => {
+                if accepted_service != *service.identity() {
+                    warn!(%id, from = %envelope.from, "rejected CRDT acknowledgement for another service");
+                    return;
+                }
+                #[cfg(all(feature = "network", feature = "storage"))]
+                if let (Some(peer), Some(progress)) = (authenticated, state.crdt_sync.as_mut()) {
+                    let key = peer.to_bytes();
+                    if progress.transfer == transfer
+                        && (next_chunk as usize) <= progress.chunks.len()
+                        && progress.peers.get(&key).is_some_and(|peer_progress| {
+                            next_chunk == peer_progress.next_chunk.saturating_add(1)
+                        })
+                        && let Some(peer_progress) = progress.peers.get_mut(&key)
+                    {
+                        peer_progress.next_chunk = next_chunk;
+                        peer_progress.last_sent = None;
+                    }
+                }
+                #[cfg(not(all(feature = "network", feature = "storage")))]
+                let _ = (transfer, next_chunk);
+            }
+            _ => unreachable!("matched CRDT transport variants above"),
         }
         return;
     }
@@ -6920,8 +7269,9 @@ fn handle_v2_root_transport<B>(
                 state,
             )
         }
-        crate::v2::RootTreeTransportV2::CrdtSync { .. } => {
-            unreachable!("CRDT sync returned from its fail-closed early handler")
+        crate::v2::RootTreeTransportV2::CrdtSyncChunk { .. }
+        | crate::v2::RootTreeTransportV2::CrdtSyncAccepted { .. } => {
+            unreachable!("CRDT transport returned from its fail-closed early handler")
         }
     }
 }
@@ -7294,6 +7644,7 @@ fn run_v2_root_inbox<B>(
 #[cfg(all(feature = "network", feature = "storage"))]
 fn advertise_v2_crdt_root<B>(
     id: ServiceId,
+    root_name: &str,
     service: &crate::v2::LocalRootTreeServiceV2<B>,
     outbox: &mpsc::Sender<Envelope>,
     invoke_routes: &InvokeRoutes,
@@ -7306,7 +7657,9 @@ fn advertise_v2_crdt_root<B>(
     use crate::v2::V2Wire;
 
     const RETRY: Duration = Duration::from_secs(5);
-    const ROSTER_BUDGET: Duration = Duration::from_millis(500);
+    const ROSTER_BUDGET: Duration = Duration::from_millis(250);
+    const AUTH_BUDGET: Duration = Duration::from_millis(100);
+    const SEND_BUDGET: usize = 4;
 
     if service.consistency() != crate::v2::ConsistencyModeV2::Crdt {
         return;
@@ -7322,21 +7675,34 @@ fn advertise_v2_crdt_root<B>(
     let now = Instant::now();
     if state
         .crdt_sync
-        .is_some_and(|(last, sent)| last == commitment && now.duration_since(sent) < RETRY)
+        .as_ref()
+        .is_none_or(|progress| progress.frontier != commitment)
     {
-        return;
+        let envelope = match service.crdt_sync_envelope() {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => return,
+            Err(failure) => {
+                warn!(%id, ?failure, "could not export canonical v2 CRDT frontier");
+                return;
+            }
+        };
+        let (transfer, chunks) = match v2_crdt_sync_chunks(envelope, V2_CRDT_SYNC_CHUNK_MAX_BYTES) {
+            Ok(chunks) => chunks,
+            Err(failure) => {
+                warn!(%id, %failure, "could not split canonical v2 CRDT frontier");
+                return;
+            }
+        };
+        state.crdt_sync = Some(V2CrdtSyncProgress {
+            frontier: commitment,
+            transfer,
+            chunks,
+            peers: HashMap::new(),
+            roster_after_kind: crate::registry::MEMBER_KIND_NODE,
+            roster_after_key: Vec::new(),
+            next_roster_page: now,
+        });
     }
-    let envelope = match service.crdt_sync_envelope() {
-        Ok(Some(envelope)) => envelope,
-        Ok(None) => return,
-        Err(failure) => {
-            warn!(%id, ?failure, "could not export canonical v2 CRDT frontier");
-            return;
-        }
-    };
-    // Throttle even when no network or roster is currently available. A
-    // daemon partition must not turn its root thread into a registry spin.
-    state.crdt_sync = Some((commitment, now));
     let Some(network) = shared_network
         .lock()
         .ok()
@@ -7345,24 +7711,100 @@ fn advertise_v2_crdt_root<B>(
         return;
     };
     let local_peer = network.peer_id();
-    let payload = crate::v2::RootTreeTransportV2::CrdtSync { envelope }.encode();
-    for peer in v2_crdt_replica_roster(invoke_routes, ROSTER_BUDGET) {
-        if peer == local_peer {
+    let Some(progress) = state.crdt_sync.as_mut() else {
+        return;
+    };
+
+    // Drain one registry page per drive. Completed pages immediately become
+    // eligible recipients; a 1,025th node is reached on the 17th drive rather
+    // than making every attempt discard the first 1,024 rows.
+    if now >= progress.next_roster_page {
+        match v2_crdt_replica_roster_page(
+            invoke_routes,
+            progress.roster_after_kind,
+            progress.roster_after_key.clone(),
+            ROSTER_BUDGET,
+        ) {
+            Some(page) => {
+                for peer in page.peers {
+                    if peer != local_peer {
+                        progress.peers.entry(peer.to_bytes()).or_default();
+                    }
+                }
+                if let Some((kind, key)) = page.next {
+                    progress.roster_after_kind = kind;
+                    progress.roster_after_key = key;
+                    progress.next_roster_page = now;
+                } else {
+                    progress.roster_after_kind = crate::registry::MEMBER_KIND_NODE;
+                    progress.roster_after_key.clear();
+                    progress.next_roster_page = now + RETRY;
+                }
+            }
+            None => progress.next_roster_page = now + Duration::from_secs(1),
+        }
+    }
+
+    let chunk_count = progress.chunks.len() as u32;
+    let mut sent = 0usize;
+    let peers = progress.peers.keys().cloned().collect::<Vec<_>>();
+    for peer_bytes in peers {
+        if sent >= SEND_BUDGET {
+            break;
+        }
+        let Some(peer_progress) = progress.peers.get_mut(&peer_bytes) else {
+            continue;
+        };
+        let Some(chunk) = progress.chunks.get(peer_progress.next_chunk as usize) else {
+            continue;
+        };
+        if peer_progress
+            .last_sent
+            .is_some_and(|last| now.duration_since(last) < RETRY)
+        {
+            continue;
+        }
+        let Some(peer) =
+            authenticated_v2_crdt_replica_peer(invoke_routes, &peer_bytes, AUTH_BUDGET)
+        else {
+            continue;
+        };
+        if peer == local_peer
+            || !v2_crdt_sync_peer_allowed(invoke_routes, &peer, root_name, AUTH_BUDGET)
+        {
+            continue;
+        }
+        let payload = crate::v2::RootTreeTransportV2::CrdtSyncChunk {
+            transfer: progress.transfer,
+            chunk_index: peer_progress.next_chunk,
+            chunk_count,
+            envelope: chunk.clone(),
+        }
+        .encode();
+        if payload.len() > V2_CRDT_SYNC_CHUNK_MAX_BYTES {
+            warn!(%id, bytes = payload.len(), "refused oversized v2 CRDT transport chunk");
             continue;
         }
         let to = ServiceId::new(crate::network::derive_node_prefix(&peer), id.local_id());
-        let _ = outbox.send(Envelope {
-            from: id,
-            to,
-            payload: payload.clone(),
-            authenticated_source_peer: None,
-            destination_peer: Some(peer.to_bytes()),
-        });
+        if outbox
+            .send(Envelope {
+                from: id,
+                to,
+                payload,
+                authenticated_source_peer: None,
+                destination_peer: Some(peer.to_bytes()),
+            })
+            .is_ok()
+        {
+            peer_progress.last_sent = Some(now);
+            sent += 1;
+        }
     }
 }
 
 fn retry_v2_root_transport<B>(
     id: ServiceId,
+    root_name: &str,
     service: &mut crate::v2::LocalRootTreeServiceV2<B>,
     outbox: &mpsc::Sender<Envelope>,
     actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
@@ -7379,9 +7821,17 @@ fn retry_v2_root_transport<B>(
         Ok(false) | Err(_) => return,
     }
     #[cfg(all(feature = "network", feature = "storage"))]
-    advertise_v2_crdt_root(id, service, outbox, invoke_routes, shared_network, state);
+    advertise_v2_crdt_root(
+        id,
+        root_name,
+        service,
+        outbox,
+        invoke_routes,
+        shared_network,
+        state,
+    );
     #[cfg(not(all(feature = "network", feature = "storage")))]
-    let _ = invoke_routes;
+    let _ = (invoke_routes, root_name);
     let should_expire = service
         .next_pending_call_deadline()
         .ok()
@@ -11947,6 +12397,176 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn v2_crdt_sync_is_split_into_causal_frame_bounded_chunks() {
+        use crate::v2::V2Wire;
+
+        let service = crate::v2::ServiceIdentityV2 {
+            space: crate::v2::SpaceId([1; 32]),
+            root_service: crate::v2::RootServiceId([2; 32]),
+            deployment: crate::v2::DeploymentId([3; 32]),
+            service_program: crate::v2::ProgramId([4; 32]),
+            service_abi: crate::v2::ABI_VERSION,
+            execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: crate::v2::GasScheduleV2::new(1_000_000, 1_000_000),
+        };
+        let actor = crate::v2::ActorId([5; 32]);
+        let mut dependency = Vec::new();
+        let mut nodes = Vec::new();
+        for ordinal in 0..12u8 {
+            let ingress = crate::v2::CrdtIngressV2 {
+                service: service.clone(),
+                invocation: crate::v2::InvocationId([ordinal.saturating_add(10); 32]),
+                logical_timeslot: u64::from(ordinal) + 1,
+                target: actor,
+                method: "append".into(),
+                arguments: vec![ordinal; 768],
+                origin: crate::v2::Origin::Anonymous,
+                authorization: crate::v2::AuthorizationEvidenceV2::Public,
+                imported_blobs: Vec::new(),
+                proof_requested: false,
+            };
+            let change = crate::v2::CrdtChangeV2 {
+                id: crate::v2::CrdtChangeV2::derive_ingress_id(&ingress, &dependency),
+                work_hash: ingress.commitment(),
+                causal_dependencies: dependency.clone(),
+                causal_height: u64::from(ordinal) + 1,
+                operations: Vec::new(),
+                workflow: vec![crate::v2::WorkflowOperationV2::Ingress(ingress)],
+                materializations: Vec::new(),
+                awaited_reply: None,
+                exported_blobs: Vec::new(),
+            };
+            let cid = change.cid();
+            nodes.push(crate::v2::CrdtSyncNodeV2 {
+                receipt: crate::v2::AccumulationReceiptV2 {
+                    service: service.clone(),
+                    accepted_transition: change.receipt_commitment(),
+                    reply_commitment: None,
+                    outbox_commitment: None,
+                    resulting_state_root: None,
+                    resulting_crdt_heads: vec![cid],
+                    sequence: change.causal_height,
+                    checkpoint: 0,
+                    consistency: crate::v2::ConsistencyModeV2::Crdt,
+                },
+                change,
+            });
+            dependency = vec![cid];
+        }
+        nodes.sort_by_key(|node| node.change.cid());
+        let envelope = crate::v2::CrdtSyncEnvelopeV2 {
+            service,
+            advertised_heads: dependency,
+            nodes,
+            provided_blobs: Vec::new(),
+        };
+        let cap = 3_200;
+        let (transfer, chunks) = v2_crdt_sync_chunks(envelope, cap).unwrap();
+        assert!(chunks.len() > 1, "the focused cap must force chunking");
+        let count = chunks.len() as u32;
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let wire = crate::v2::RootTreeTransportV2::CrdtSyncChunk {
+                transfer,
+                chunk_index: index as u32,
+                chunk_count: count,
+                envelope: chunk,
+            }
+            .encode();
+            assert!(wire.len() <= cap, "every transport delta is frame-bounded");
+            crate::v2::RootTreeTransportV2::decode(&wire).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn v2_crdt_private_floor_requires_a_space_or_actor_grant() {
+        let peer = libp2p::PeerId::random();
+        let check = |space_role, actor_role| {
+            let (routes, registry) = spawn_stub_sync_floor_registry(space_role, actor_role);
+            let allowed =
+                v2_crdt_sync_peer_allowed(&routes, &peer, "private-board", Duration::from_secs(1));
+            drop(routes);
+            registry.join().unwrap();
+            allowed
+        };
+        assert!(!check(AUTH_ROLE_NONE, AUTH_ROLE_NONE));
+        assert!(check(AUTH_ROLE_READONLY, AUTH_ROLE_NONE));
+        assert!(check(AUTH_ROLE_NONE, AUTH_ROLE_READONLY));
+    }
+
+    #[test]
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn v2_crdt_roster_pagination_progresses_beyond_sixteen_pages() {
+        use crate::actors::codec::Encode;
+        use crate::registry::{MEMBER_KIND_NODE, MemberPage, MemberRow, NODE_ROLE_OBSERVER};
+        use crate::value::Value;
+
+        let mut by_prefix = BTreeMap::new();
+        while by_prefix.len() < 1_025 {
+            let peer = libp2p::PeerId::random();
+            by_prefix
+                .entry(crate::network::derive_node_prefix(&peer))
+                .or_insert(peer);
+        }
+        let rows = by_prefix
+            .into_iter()
+            .map(|(prefix, peer)| MemberRow {
+                kind: MEMBER_KIND_NODE,
+                key: peer.to_bytes(),
+                prefix,
+                role: NODE_ROLE_OBSERVER,
+                proof_kind: 0,
+                proof_data: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<InvokeRequest>();
+        routes.lock().unwrap().insert(ServiceId::REGISTRY.0, tx);
+        let registry = thread::spawn(move || {
+            for (index, page_rows) in rows.chunks(64).enumerate() {
+                let request = rx.recv().unwrap();
+                assert_eq!(
+                    intercepted_method_name(&request.msg).as_deref(),
+                    Some("members")
+                );
+                let more = index + 1 < 17;
+                let page = MemberPage {
+                    members: page_rows.to_vec(),
+                    next_kind: MEMBER_KIND_NODE,
+                    next_key: page_rows.last().unwrap().prefix.to_be_bytes().to_vec(),
+                    more,
+                };
+                let reply = encode_invoke_envelope(
+                    crate::actors::run::STATUS_DONE,
+                    &[],
+                    &Value::Bytes(page.encode()).encode(),
+                );
+                assert!(request.reply.send(reply));
+            }
+        });
+        let mut kind = MEMBER_KIND_NODE;
+        let mut key = Vec::new();
+        let mut peers = BTreeSet::new();
+        let mut pages = 0;
+        loop {
+            let page =
+                v2_crdt_replica_roster_page(&routes, kind, key, Duration::from_secs(1)).unwrap();
+            pages += 1;
+            peers.extend(page.peers);
+            let Some((next_kind, next_key)) = page.next else {
+                break;
+            };
+            kind = next_kind;
+            key = next_key;
+        }
+        assert_eq!(pages, 17);
+        assert_eq!(peers.len(), 1_025);
+        drop(routes);
+        registry.join().unwrap();
+    }
+
+    #[test]
     fn v2_transport_peer_is_bound_to_the_exact_claimed_actor() {
         let actor_a = crate::v2::ActorId([0xA1; 32]);
         let actor_b = crate::v2::ActorId([0xB1; 32]);
@@ -14970,6 +15590,49 @@ mod tests {
                     &[],
                     &Value::U8(byte).encode(),
                 );
+                let _ = req.reply.send(reply);
+            }
+        });
+        (routes, handle)
+    }
+
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn spawn_stub_sync_floor_registry(
+        space_role: u8,
+        actor_role: u8,
+    ) -> (InvokeRoutes, thread::JoinHandle<()>) {
+        use crate::actors::codec::Encode;
+        use crate::registry::{AgentRow, SyncFloor};
+        use crate::value::Value;
+
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<InvokeRequest>();
+        routes.lock().unwrap().insert(ServiceId::REGISTRY.0, tx);
+        let handle = thread::spawn(move || {
+            while let Ok(req) = rx.recv() {
+                let value = match intercepted_method_name(&req.msg).as_deref() {
+                    Some("agent") => {
+                        let row = AgentRow {
+                            instance_name: "private-board".into(),
+                            program_hash: [1; 32],
+                            program_name: "board".into(),
+                            program_version: "1".into(),
+                            replication_id: [2; 32],
+                            consistency: Consistency::Crdt as u8,
+                            network_reachable: true,
+                            sync_role: SyncFloor::Private,
+                            install_args: Vec::new(),
+                            install_payloads: Vec::new(),
+                        };
+                        let mut tagged = vec![1];
+                        tagged.extend_from_slice(&row.encode());
+                        Value::Bytes(tagged)
+                    }
+                    Some("actor_role") => Value::U8(actor_role),
+                    _ => Value::U8(space_role),
+                };
+                let reply =
+                    encode_invoke_envelope(crate::actors::run::STATUS_DONE, &[], &value.encode());
                 let _ = req.reply.send(reply);
             }
         });

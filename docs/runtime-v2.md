@@ -296,18 +296,29 @@ continuation/inbox/outbox/workflow rows from the DAG, and commits nodes,
 receipts, blobs, materialized rows, and the header atomically. The read-only
 local scheduler only packages these authenticated bytes.
 
-`VosNode` periodically advertises that complete envelope to the canonical
-enrolled-node roster and retries an unchanged frontier on a bounded cadence.
-The transport carries no verifier allowlist. On receipt, the root thread binds
-the complete Noise `PeerId` to an exact voter/observer registry row, checks the
-destination service identity, and derives the complete ordered
+`VosNode` exports complete history locally, then splits it into causally
+ordered deltas below the network frame limit. Each delta commits through guest
+Accumulate before the receiver acknowledges it; the source advances that
+peer's cursor only after the acknowledgement. Lost process-local progress
+restarts at the first chunk and is safe because the guest classifies already
+committed causal nodes idempotently. Node-roster pagination also retains its
+opaque cursor and fans out each completed page, so registries larger than one
+scan budget continue to make progress.
+
+Both outbound selection and inbound admission bind the complete Noise
+`PeerId` to an exact voter/observer registry row and apply the actor's existing
+sync floor. Enrollment satisfies `Member`, but a `Private` root additionally
+requires a space or actor-local read grant; enrollment alone never discloses
+private state or authorizes imported history. The transport carries no
+verifier allowlist. After checking the destination service identity, the root
+thread derives the complete ordered
 `ReceiptVerificationRequestV2` sidecar locally before entering IC-5. Missing,
 extra, or substituted verifier entries are rejected at the service boundary.
-This is the same non-Byzantine enrolled-node trust boundary used by the current
-cluster drivers: an enrolled node is trusted to advertise only finalized CRDT
-receipts. A Byzantine-capable deployment must replace that decision with
-independently verifiable receipt certificates; a peer-supplied envelope alone
-is never authority.
+This is the same non-Byzantine authorized-replica trust boundary used by the
+current cluster drivers: an admitted replica is trusted to advertise only
+finalized CRDT receipts. A Byzantine-capable deployment must replace that
+decision with independently verifiable receipt certificates; a peer-supplied
+envelope alone is never authority.
 
 Guest Install is fail-closed on an exact-genesis authorization capability. It
 binds service/deployment identity, consistency mode, the complete actor tree,
@@ -549,9 +560,10 @@ atomically with IC-5, while snapshots carry the resulting catalog.
 `RECEIPT_VERIFY` must likewise use consensus-authoritative receipt finality
 rather than its local conformance allowlist for general delivery and reply
 paths. The automatic CRDT driver currently derives that verifier decision only
-after authenticating an enrolled node's complete Noise identity; deployments
-which do not trust every enrolled replica must carry an independently
-verifiable finality certificate instead. Direct role-authorized Raft ingress
+after authenticating and sync-floor-authorizing an enrolled node's complete
+Noise identity; deployments which do not trust every authorized replica must
+carry an independently verifiable finality certificate instead. Direct
+role-authorized Raft ingress
 already quorum-orders its exact authority verifier input beside admission and
 persists the accepted ingress in guest state. Every delivery, deadline, and
 expiration observation must come from the JAM slot. `PROOF_VERIFY`
@@ -793,9 +805,10 @@ across leader changes. Typed forwarding requests the full invoke envelope, so
 direct leader call.
 
 V2 CRDT roots admit anti-entropy only from a full Noise identity present in the
-canonical node roster. The peer-supplied envelope never carries its own
-allowlist; the receiving root derives an exact ordered verifier sidecar after
-authentication and guest Accumulate independently checks the complete DAG.
+canonical node roster and authorized by the root's `Public`/`Member`/`Private`
+sync floor. Peer-supplied chunks never carry their own allowlist; the receiving
+root derives an exact ordered verifier sidecar after authentication and guest
+Accumulate independently checks each causal delta.
 For Local and Raft roots, ordinary public cross-root calls are emitted as
 guest-owned publications, routed over canonical node envelopes, admitted
 through destination IC-5, and resumed from the caller's exact saved machine
