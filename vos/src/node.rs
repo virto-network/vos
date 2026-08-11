@@ -140,9 +140,13 @@ const V2_RAFT_VOTER_AUTH_TIMEOUT_MS: u64 = 5_000;
 #[cfg(all(feature = "network", feature = "storage"))]
 const V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(all(feature = "network", feature = "storage"))]
+const V2_RAFT_TRANSPORT_RESOLUTION_OWNERSHIP_GRACE: Duration = Duration::from_millis(250);
+#[cfg(all(feature = "network", feature = "storage"))]
 const V2_RAFT_TRANSPORT_LEADER_CACHE_TTL: Duration = Duration::from_secs(1);
 #[cfg(all(feature = "network", feature = "storage"))]
 const V2_RAFT_TRANSPORT_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+#[cfg(all(feature = "network", feature = "storage"))]
+const V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES: usize = 16;
 
 /// One end-to-end Raft invocation can consume one voter-authentication probe,
 /// one read barrier, and up to three proposal waits (fresh-root `Install`,
@@ -5024,6 +5028,7 @@ impl VosNode {
             local_id: ServiceId(binding.route).local_id(),
         };
         let now = Instant::now();
+        let (deadline, pending_until) = v2_raft_transport_resolution_deadlines(now);
         let cached = {
             let Ok(mut resolutions) = self.v2_raft_transport_resolutions.lock() else {
                 return;
@@ -5038,7 +5043,7 @@ impl VosNode {
                     resolutions.insert(
                         key,
                         V2RaftTransportResolution::Pending {
-                            until: now + V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT,
+                            until: pending_until,
                         },
                     );
                     None
@@ -5054,9 +5059,7 @@ impl VosNode {
         let resolutions = self.v2_raft_transport_resolutions.clone();
         let invoke_routes = self.invoke_routes.clone();
         let shutdown = self.shutdown.clone();
-        let pending_until = now + V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT;
         thread::spawn(move || {
-            let deadline = Instant::now() + V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT;
             let resolved =
                 resolve_v2_raft_leader_route_before(&binding, &network, &invoke_routes, deadline);
             if shutdown.load(Ordering::Relaxed) {
@@ -5552,6 +5555,22 @@ fn resolve_v2_raft_leader_route(
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
+fn v2_raft_transport_resolution_deadlines(now: Instant) -> (Instant, Instant) {
+    let resolution_deadline = now + V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT;
+    let ownership_until = resolution_deadline + V2_RAFT_TRANSPORT_RESOLUTION_OWNERSHIP_GRACE;
+    (resolution_deadline, ownership_until)
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn v2_raft_transport_auth_windows(now: Instant, deadline: Instant) -> (Duration, Instant) {
+    let auth_window = deadline
+        .saturating_duration_since(now)
+        .checked_div(2)
+        .unwrap_or_default();
+    (auth_window, now + auth_window)
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
 fn resolve_v2_raft_leader_route_before(
     binding: &V2ActorRoute,
     network: &crate::network::Network,
@@ -5565,43 +5584,60 @@ fn resolve_v2_raft_leader_route_before(
     // follower must not create one detached status thread per durable retry.
     let local_status = network.local_raft_status_cached(&replication_id);
 
-    // Preserve full identities throughout candidate collection. The exact
-    // install-time bootstrap goes first; a connected attacker with the same
-    // compact prefix must neither replace nor suppress it.
+    // Preserve the exact install-time bootstrap separately so ambient peers
+    // can neither replace it nor divide away its authentication budget.
+    let exact_bootstrap = binding
+        .authenticated_peer
+        .as_deref()
+        .and_then(|bytes| libp2p::PeerId::from_bytes(bytes).ok())
+        .map(|peer| (crate::network::derive_node_prefix(&peer), peer));
+
+    // Prefer the fresh worker-published voter roster. Connected peers are a
+    // bounded fallback for a remote root with no local observation; each is
+    // still authenticated against the canonical NODE row below.
     let mut candidates = Vec::new();
-    if let Some(bytes) = binding.authenticated_peer.as_deref()
-        && let Ok(peer) = libp2p::PeerId::from_bytes(bytes)
-    {
-        push_v2_raft_peer_candidate(
-            &mut candidates,
-            crate::network::derive_node_prefix(&peer),
-            peer,
-        );
+    if let Some(status) = local_status.as_ref() {
+        if let Some(prefix) = status.leader_hint {
+            push_v2_raft_prefix_candidate(&mut candidates, prefix);
+        }
+        for &prefix in &status.members {
+            if candidates.len() >= V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES {
+                break;
+            }
+            push_v2_raft_prefix_candidate(&mut candidates, prefix);
+        }
     }
     for peer in network.connected_peers() {
+        if candidates.len() >= V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES {
+            break;
+        }
+        if exact_bootstrap
+            .as_ref()
+            .is_some_and(|(_, exact)| exact == &peer)
+        {
+            continue;
+        }
         let prefix = crate::network::derive_node_prefix(&peer);
         push_v2_raft_peer_candidate(&mut candidates, prefix, peer);
     }
-    if let Some(prefix) = local_status.as_ref().and_then(|status| status.leader_hint) {
-        // This prefix-only hint is resolved through the canonical roster. It
-        // intentionally coexists with same-prefix connected peers: only the
-        // exact roster identity can authenticate below.
-        candidates.push((prefix, None));
-    }
 
-    // Spend at most half the shared deadline authenticating candidate peers,
-    // divided fairly so a blocked bootstrap roster lookup cannot consume the
-    // alternate voters' entire opportunity. The other half is reserved for
-    // status replies that are launched together below.
-    let auth_deadline = Instant::now()
-        + deadline
-            .saturating_duration_since(Instant::now())
-            .checked_div(2)
-            .unwrap_or_default();
+    // Spend at most half the shared deadline on roster authentication. The
+    // exact bootstrap owns that whole budget independently; if it answers
+    // earlier, ambient candidates may divide only the time it leaves. The
+    // latter population is bounded above and stale disconnected peers are
+    // evicted by the network layer.
+    let auth_started = Instant::now();
+    let (bootstrap_budget, auth_deadline) = v2_raft_transport_auth_windows(auth_started, deadline);
     let mut authenticated = HashMap::new();
+    if let Some((prefix, peer)) = exact_bootstrap
+        && let Some((peer, member)) =
+            authenticate_v2_raft_peer_candidate(invoke_routes, prefix, Some(peer), bootstrap_budget)
+    {
+        authenticated.insert(prefix, (peer, member));
+    }
     let candidate_count = candidates.len();
     for (index, (prefix, expected_peer)) in candidates.into_iter().enumerate() {
-        if expected_peer.is_none() && authenticated.contains_key(&prefix) {
+        if authenticated.contains_key(&prefix) {
             continue;
         }
         let candidates_left = candidate_count.saturating_sub(index).max(1) as u32;
@@ -5610,18 +5646,11 @@ fn resolve_v2_raft_leader_route_before(
         if budget.is_zero() {
             continue;
         }
-        let Some(member) =
-            lookup_node_member_from_routes_with_timeout(invoke_routes, prefix, budget)
+        let Some((peer, member)) =
+            authenticate_v2_raft_peer_candidate(invoke_routes, prefix, expected_peer, budget)
         else {
             continue;
         };
-        let Some(peer) = expected_peer.or_else(|| libp2p::PeerId::from_bytes(&member.key).ok())
-        else {
-            continue;
-        };
-        if !node_member_authenticates_voter(&member, prefix, &peer) {
-            continue;
-        }
         authenticated.insert(prefix, (peer, member));
     }
 
@@ -5655,6 +5684,31 @@ fn resolve_v2_raft_leader_route_before(
     // reply; within one term prefer the leader's own report, then the most
     // advanced committed/log view and a deterministic prefix tie-break.
     select_v2_raft_leader_observation(observations, resolve)
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn authenticate_v2_raft_peer_candidate(
+    invoke_routes: &InvokeRoutes,
+    prefix: u16,
+    expected_peer: Option<libp2p::PeerId>,
+    budget: Duration,
+) -> Option<(libp2p::PeerId, crate::registry::MemberRow)> {
+    if budget.is_zero() {
+        return None;
+    }
+    let member = lookup_node_member_from_routes_with_timeout(invoke_routes, prefix, budget)?;
+    let peer = expected_peer.or_else(|| libp2p::PeerId::from_bytes(&member.key).ok())?;
+    node_member_authenticates_voter(&member, prefix, &peer).then_some((peer, member))
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn push_v2_raft_prefix_candidate(candidates: &mut Vec<(u16, Option<libp2p::PeerId>)>, prefix: u16) {
+    if !candidates
+        .iter()
+        .any(|(candidate_prefix, candidate)| *candidate_prefix == prefix && candidate.is_none())
+    {
+        candidates.push((prefix, None));
+    }
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
@@ -11689,6 +11743,40 @@ mod tests {
 
     #[cfg(all(feature = "network", feature = "storage"))]
     #[test]
+    fn raft_discovery_ownership_outlives_its_shared_deadline() {
+        let started = Instant::now();
+        let (deadline, ownership_until) = v2_raft_transport_resolution_deadlines(started);
+
+        assert_eq!(
+            deadline.duration_since(started),
+            V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT
+        );
+        assert_eq!(
+            ownership_until.duration_since(deadline),
+            V2_RAFT_TRANSPORT_RESOLUTION_OWNERSHIP_GRACE
+        );
+        assert!(
+            ownership_until > deadline,
+            "a retry cannot replace the generation while its resolver may still return"
+        );
+    }
+
+    #[cfg(all(feature = "network", feature = "storage"))]
+    #[test]
+    fn exact_bootstrap_budget_is_independent_of_ambient_candidates() {
+        let started = Instant::now();
+        let deadline = started + V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT;
+        let (exact_budget, auth_deadline) = v2_raft_transport_auth_windows(started, deadline);
+
+        assert_eq!(exact_budget, Duration::from_millis(500));
+        assert_eq!(
+            auth_deadline.duration_since(started),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[cfg(all(feature = "network", feature = "storage"))]
+    #[test]
     fn slow_raft_leader_discovery_is_off_router_and_coalesced() {
         let key = libp2p::identity::Keypair::generate_ed25519();
         let local_peer = libp2p::PeerId::from(key.public());
@@ -11954,6 +12042,38 @@ mod tests {
                 kind: MEMBER_KIND_NODE,
                 key: peer_b.to_bytes(),
                 prefix: prefix_b,
+                role: crate::registry::NODE_ROLE_VOTER,
+                proof_kind: 0,
+                proof_data: Vec::new(),
+            },
+            MemberRow {
+                kind: MEMBER_KIND_NODE,
+                key: peer_a.to_bytes(),
+                prefix: prefix_a,
+                role: crate::registry::NODE_ROLE_VOTER,
+                proof_kind: 0,
+                proof_data: Vec::new(),
+            },
+            MemberRow {
+                kind: MEMBER_KIND_NODE,
+                key: peer_b.to_bytes(),
+                prefix: prefix_b,
+                role: crate::registry::NODE_ROLE_VOTER,
+                proof_kind: 0,
+                proof_data: Vec::new(),
+            },
+            MemberRow {
+                kind: MEMBER_KIND_NODE,
+                key: peer_b.to_bytes(),
+                prefix: prefix_b,
+                role: crate::registry::NODE_ROLE_VOTER,
+                proof_kind: 0,
+                proof_data: Vec::new(),
+            },
+            MemberRow {
+                kind: MEMBER_KIND_NODE,
+                key: peer_a.to_bytes(),
+                prefix: prefix_a,
                 role: crate::registry::NODE_ROLE_VOTER,
                 proof_kind: 0,
                 proof_data: Vec::new(),

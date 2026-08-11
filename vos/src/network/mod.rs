@@ -1783,8 +1783,16 @@ fn handle_swarm_event(
                 );
             }
         }
-        SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+        SwarmEvent::ConnectionClosed {
+            peer_id,
+            num_established,
+            cause,
+            ..
+        } => {
             info!(%peer_id, ?cause, "network: peer disconnected");
+            if num_established == 0 {
+                forget_authenticated_prefix(prefix_map, peer_id);
+            }
         }
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             // INFO, not WARN — mDNS-discovered peers fail to dial
@@ -2606,6 +2614,14 @@ fn record_authenticated_prefix(map: &PrefixMap, claimed_prefix: u16, peer: PeerI
     }
 }
 
+fn forget_authenticated_prefix(map: &PrefixMap, peer: PeerId) {
+    let mut prefixes = match map.lock() {
+        Ok(prefixes) => prefixes,
+        Err(_) => return,
+    };
+    prefixes.retain(|_, owner| *owner != peer);
+}
+
 fn authenticated_tell_source(map: &PrefixMap, peer: PeerId, from: u32) -> bool {
     let claimed_prefix = (from >> 16) as u16;
     claimed_prefix != 0
@@ -3055,6 +3071,19 @@ mod tests {
             attacker,
             (u32::from(owner_prefix) << 16) | 7,
         ));
+    }
+
+    #[test]
+    fn disconnected_peer_is_evicted_from_prefix_candidates() {
+        let peer = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let prefix = derive_node_prefix(&peer);
+        let prefixes = Arc::new(Mutex::new(HashMap::new()));
+
+        record_authenticated_prefix(&prefixes, prefix, peer);
+        assert_eq!(prefixes.lock().unwrap().get(&prefix), Some(&peer));
+
+        forget_authenticated_prefix(&prefixes, peer);
+        assert!(prefixes.lock().unwrap().is_empty());
     }
 
     fn wait_for<T>(mut probe: impl FnMut() -> Option<T>, deadline: Duration) -> Option<T> {
