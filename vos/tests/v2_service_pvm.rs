@@ -4079,6 +4079,185 @@ fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
 }
 
 #[test]
+fn node_anti_entropy_converges_authenticated_crdt_roots_across_restart() {
+    let actor_elf = crdt_counter_v2_elf();
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&actor_elf, &signer);
+    let actor = ActorId([0x51; 32]);
+    let config = LocalRootTreeConfigV2 {
+        role_authority: None,
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        service: ServiceIdentityV2 {
+            space: vos::v2::SpaceId([0x52; 32]),
+            root_service: RootServiceId([0x53; 32]),
+            deployment: package.deployment_id(),
+            service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+            service_abi: vos::v2::ABI_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: TEST_GAS_SCHEDULE,
+        },
+        package,
+        root_actor: actor,
+        actor_name,
+        consistency: ConsistencyModeV2::Crdt,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([0x54; 32]),
+            authenticator: vec![0x55],
+        },
+        refine_gas: TEST_GAS_SCHEDULE.refine,
+        accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
+    };
+    let backend_a = SharedCommittedImages::default();
+    let backend_b = SharedCommittedImages::default();
+    let mut service_a = LocalRootTreeServiceV2::open(config.clone(), backend_a.clone()).unwrap();
+    let mut service_b = LocalRootTreeServiceV2::open(config.clone(), backend_b.clone()).unwrap();
+    let increment_request = |invocation, logical_timeslot, amount| {
+        let mut arguments = vec![vos::value::TAG_DYNAMIC];
+        arguments.extend_from_slice(&Msg::new("increment").with("amount", amount).encode());
+        LocalWorkRequestV2 {
+            invocation,
+            workflow_step: 0,
+            logical_timeslot,
+            target: actor,
+            method: "increment".into(),
+            arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        }
+    };
+    service_a
+        .invoke(increment_request(InvocationId([0x56; 32]), 1, 2u64))
+        .expect("first physical CRDT branch commits");
+    service_b
+        .invoke(increment_request(InvocationId([0x57; 32]), 1, 5u64))
+        .expect("second physical CRDT branch commits");
+    assert_ne!(
+        service_a.store().header().unwrap().unwrap().crdt_heads,
+        service_b.store().header().unwrap().unwrap().crdt_heads,
+        "the transport starts from independently committed causal branches"
+    );
+
+    let key_a = libp2p::identity::Keypair::generate_ed25519();
+    let peer_a = libp2p::PeerId::from(key_a.public());
+    let prefix_a = vos::network::derive_node_prefix(&peer_a);
+    let (key_b, peer_b, prefix_b) = loop {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let peer = libp2p::PeerId::from(key.public());
+        let prefix = vos::network::derive_node_prefix(&peer);
+        if prefix != prefix_a {
+            break (key, peer, prefix);
+        }
+    };
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let network_a = vos::network::Network::start(vos::network::NetworkConfig {
+        keypair: key_a,
+        local_prefix: prefix_a,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
+        auto_dial_mdns: false,
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let address_a = loop {
+        if let Some(address) = network_a.listen_addrs().into_iter().next() {
+            break address.with(libp2p::multiaddr::Protocol::P2p(peer_a));
+        }
+        assert!(std::time::Instant::now() < deadline, "node A did not bind");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let network_b = vos::network::Network::start(vos::network::NetworkConfig {
+        keypair: key_b,
+        local_prefix: prefix_b,
+        listen: vec![listen],
+        bootstrap: vec![address_a],
+        auto_dial_mdns: false,
+    });
+
+    let mut node_a = VosNode::with_prefix(prefix_a);
+    let mut node_b = VosNode::with_prefix(prefix_b);
+    let registry_pvm =
+        grey_transpiler::link_elf(include_bytes!("../../vosx/blobs/space_registry.elf"))
+            .expect("committed space-registry ELF transpiles");
+    let voters = [(prefix_a, peer_a.to_bytes()), (prefix_b, peer_b.to_bytes())];
+    install_test_voter_registry(&mut node_a, registry_pvm.clone(), &voters);
+    install_test_voter_registry(&mut node_b, registry_pvm, &voters);
+    node_a.attach_network(network_a);
+    node_b.attach_network(network_b);
+    let network_a = node_a.network().unwrap();
+    let network_b = node_b.network().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while (network_a.peer_for_prefix(prefix_b).is_none()
+        || network_b.peer_for_prefix(prefix_a).is_none())
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(network_a.peer_for_prefix(prefix_b).is_some());
+    assert!(network_b.peer_for_prefix(prefix_a).is_some());
+
+    let local_id = 0x3951;
+    let route_a = ServiceId::new(prefix_a, local_id);
+    let route_b = ServiceId::new(prefix_b, local_id);
+    node_a
+        .register_v2_root_at_id("shared-counter", service_a, route_a, true)
+        .unwrap();
+    node_b
+        .register_v2_root_at_id("shared-counter", service_b, route_b, true)
+        .unwrap();
+    let shutdown_a = node_a.shutdown_handle();
+    let shutdown_b = node_b.shutdown_handle();
+    let runner_a = std::thread::spawn(move || {
+        node_a.run_forever();
+        node_a.collect()
+    });
+    let runner_b = std::thread::spawn(move || {
+        node_b.run_forever();
+        node_b.collect()
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let reopened_a = LocalRootTreeServiceV2::open(config.clone(), backend_a.clone()).unwrap();
+        let reopened_b = LocalRootTreeServiceV2::open(config.clone(), backend_b.clone()).unwrap();
+        let header_a = reopened_a.store().header().unwrap().unwrap();
+        let header_b = reopened_b.store().header().unwrap().unwrap();
+        if header_a.crdt_heads == header_b.crdt_heads
+            && header_a.service_root == header_b.service_root
+            && header_a.crdt_heads.len() >= 2
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "authenticated v2 CRDT roots did not converge"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    shutdown_a.store(true, std::sync::atomic::Ordering::Relaxed);
+    shutdown_b.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(runner_a.join().unwrap().iter().all(AgentResult::is_ok));
+    assert!(runner_b.join().unwrap().iter().all(AgentResult::is_ok));
+    let reopened_a = LocalRootTreeServiceV2::open(config.clone(), backend_a).unwrap();
+    let reopened_b = LocalRootTreeServiceV2::open(config, backend_b).unwrap();
+    assert_eq!(
+        reopened_a.crdt_sync_envelope().unwrap(),
+        reopened_b.crdt_sync_envelope().unwrap(),
+        "durable reopen retains the same authenticated causal history"
+    );
+    drop(network_a);
+    drop(network_b);
+}
+
+#[test]
 fn same_package_child_spawn_commits_before_the_child_becomes_callable() {
     let actor_pvm = grey_transpiler::link_elf(&workflow_v2_elf()).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
