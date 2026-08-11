@@ -316,6 +316,24 @@ impl WorkerHandle {
         block_on(self.inner.snapshot()).map(WorkerSnapshot::from)
     }
 
+    fn status_from_snapshot(snap: vos_raft::WorkerSnapshot<u16>) -> RaftStatusReply {
+        let role = match snap.role {
+            vos_raft::Role::Follower => RaftRole::Follower,
+            vos_raft::Role::PreCandidate => RaftRole::PreCandidate,
+            vos_raft::Role::Candidate => RaftRole::Candidate,
+            vos_raft::Role::Leader => RaftRole::Leader,
+        };
+        RaftStatusReply {
+            present: true,
+            role,
+            current_term: snap.current_term,
+            commit_index: snap.commit_index,
+            last_log_index: snap.last_log_index,
+            members: snap.members,
+            leader_hint: snap.leader_hint,
+        }
+    }
+
     /// Append a new payload to the cluster log. Caller addresses a
     /// Leader; followers / candidates return [`ProposeError::NotLeader`].
     pub fn propose(&self, payload: Vec<u8>) -> Result<u64, ProposeError> {
@@ -411,6 +429,10 @@ impl RaftRpcHandler for WorkerHandle {
         })
     }
 
+    fn local_status(&self) -> Option<RaftStatusReply> {
+        self.inner.cached_snapshot().map(Self::status_from_snapshot)
+    }
+
     fn append_entries(
         &self,
         _replication_id: &[u8; 32],
@@ -472,28 +494,7 @@ impl RaftRpcHandler for WorkerHandle {
     }
 
     fn handle_status(&self, _replication_id: &[u8; 32]) -> RaftStatusReply {
-        let snap = match block_on(self.inner.snapshot()) {
-            Some(s) => s,
-            None => return RaftStatusReply::absent(),
-        };
-        // Explicit match — keeps us honest if vos-raft adds a
-        // new Role variant (the compiler will complain rather
-        // than silently bit-cast it as `Unknown(?)`).
-        let role = match snap.role {
-            vos_raft::Role::Follower => RaftRole::Follower,
-            vos_raft::Role::PreCandidate => RaftRole::PreCandidate,
-            vos_raft::Role::Candidate => RaftRole::Candidate,
-            vos_raft::Role::Leader => RaftRole::Leader,
-        };
-        RaftStatusReply {
-            present: true,
-            role,
-            current_term: snap.current_term,
-            commit_index: snap.commit_index,
-            last_log_index: snap.last_log_index,
-            members: snap.members,
-            leader_hint: snap.leader_hint,
-        }
+        self.local_status().unwrap_or_else(RaftStatusReply::absent)
     }
 
     fn handle_join(&self, _replication_id: &[u8; 32], joiner_prefix: u16) -> RaftJoinResult {
@@ -683,6 +684,38 @@ mod tests {
         worker.shutdown();
         let meta = RaftMeta::load(&db).unwrap();
         assert_eq!(meta.current_term, 9);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cached_status_tracks_worker_events_without_an_inbox_round_trip() {
+        let (db, dir) = temp_db();
+        let worker = RaftWorker::spawn(db, cfg(0xAAAA), None, None);
+        let h = worker.handler();
+        let resp = h.append_entries(&[0xC0; 32], 0xBBBB, 9, 0, 0, 0, alloc::vec![]);
+        assert!(resp.success);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let cached = loop {
+            if let Some(status) = h.local_status()
+                && status.current_term == 9
+                && status.leader_hint == Some(0xBBBB)
+            {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker did not publish its completed AppendEntries status"
+            );
+            std::thread::yield_now();
+        };
+        assert_eq!(cached.role, RaftRole::Follower);
+        assert_eq!(cached.members.len(), 3);
+        assert!(cached.members.contains(&0xAAAA));
+        assert!(cached.members.contains(&0xAAAB));
+        assert!(cached.members.contains(&0xAAA8));
+
+        worker.shutdown();
         let _ = std::fs::remove_dir_all(dir);
     }
 

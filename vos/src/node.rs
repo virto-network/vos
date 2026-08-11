@@ -5562,69 +5562,117 @@ fn resolve_v2_raft_leader_route_before(
     let replication_id = binding.replication_id?;
     let local_id = ServiceId(binding.route).local_id();
 
-    let resolve = |status: crate::network::RaftStatusReply| {
-        let leader_prefix = status.leader_hint?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let member =
-            lookup_node_member_from_routes_with_timeout(invoke_routes, leader_prefix, remaining)?;
-        let peer = authenticated_v2_raft_leader_peer(&status, &member, leader_prefix)?;
-        Some((peer, ServiceId::new(leader_prefix, local_id)))
-    };
-
-    // A locally attached replica has the freshest worker snapshot and avoids
-    // a network round trip. It is still resolved through the full voter row.
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if let Some(status) = network
-        .local_raft_status_receiver(&replication_id)
-        .and_then(|receiver| receiver.recv_timeout(remaining).ok())
-        && let Some(leader) = resolve(status)
-    {
-        return Some(leader);
-    }
+    // The local view is worker-published rather than inbox-driven: a wedged
+    // follower must not create one detached status thread per durable retry.
+    let local_status = network.local_raft_status_cached(&replication_id);
 
     // A cached actor route names only a bootstrap replica. Query it and then
     // all connected, registry-authenticated voters so failover does not leave
     // transport pinned to an unavailable former leader.
     let mut candidates = Vec::new();
+    if let Some(prefix) = local_status.as_ref().and_then(|status| status.leader_hint) {
+        candidates.push((prefix, None));
+    }
+    for peer in network.connected_peers() {
+        let prefix = crate::network::derive_node_prefix(&peer);
+        if !candidates.iter().any(|(candidate, _)| *candidate == prefix) {
+            candidates.push((prefix, Some(peer)));
+        }
+    }
     if let Some(bytes) = binding.authenticated_peer.as_deref()
         && let Ok(peer) = libp2p::PeerId::from_bytes(bytes)
     {
-        candidates.push(peer);
-    }
-    for peer in network.connected_peers() {
-        if !candidates.contains(&peer) {
-            candidates.push(peer);
-        }
-    }
-    for peer in candidates {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
         let prefix = crate::network::derive_node_prefix(&peer);
+        if !candidates.iter().any(|(candidate, _)| *candidate == prefix) {
+            candidates.push((prefix, Some(peer)));
+        }
+    }
+
+    // Spend at most half the shared deadline authenticating candidate peers,
+    // divided fairly so a blocked bootstrap roster lookup cannot consume the
+    // alternate voters' entire opportunity. The other half is reserved for
+    // status replies that are launched together below.
+    let auth_deadline = Instant::now()
+        + deadline
+            .saturating_duration_since(Instant::now())
+            .checked_div(2)
+            .unwrap_or_default();
+    let mut authenticated = HashMap::new();
+    let candidate_count = candidates.len();
+    for (index, (prefix, expected_peer)) in candidates.into_iter().enumerate() {
+        let candidates_left = candidate_count.saturating_sub(index).max(1) as u32;
+        let remaining = auth_deadline.saturating_duration_since(Instant::now());
+        let budget = remaining.checked_div(candidates_left).unwrap_or_default();
+        if budget.is_zero() {
+            continue;
+        }
         let Some(member) =
-            lookup_node_member_from_routes_with_timeout(invoke_routes, prefix, remaining)
+            lookup_node_member_from_routes_with_timeout(invoke_routes, prefix, budget)
+        else {
+            continue;
+        };
+        let Some(peer) = expected_peer.or_else(|| libp2p::PeerId::from_bytes(&member.key).ok())
         else {
             continue;
         };
         if !node_member_authenticates_voter(&member, prefix, &peer) {
             continue;
         }
+        authenticated.insert(prefix, (peer, member));
+    }
+
+    let resolve = |status: &crate::network::RaftStatusReply| {
+        let leader_prefix = status.leader_hint?;
+        let (_, member) = authenticated.get(&leader_prefix)?;
+        let peer = authenticated_v2_raft_leader_peer(status, member, leader_prefix)?;
+        Some((peer, ServiceId::new(leader_prefix, local_id)))
+    };
+
+    if let Some(status) = local_status.as_ref()
+        && let Some(leader) = resolve(status)
+    {
+        return Some(leader);
+    }
+
+    // Fan out before waiting for any response. A responsive-but-stalled old
+    // bootstrap can consume its own request lifetime, but it cannot prevent a
+    // newly elected connected voter from answering within the shared bound.
+    let mut probes = authenticated
+        .iter()
+        .map(|(&prefix, (peer, _))| (prefix, network.send_raft_status_req(*peer, replication_id)))
+        .collect::<Vec<_>>();
+    poll_v2_raft_status_probes(&mut probes, deadline, |prefix, status| {
+        (status.present && status.members.contains(&prefix))
+            .then(|| resolve(&status))
+            .flatten()
+    })
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn poll_v2_raft_status_probes<T>(
+    probes: &mut Vec<(u16, mpsc::Receiver<crate::network::RaftStatusReply>)>,
+    deadline: Instant,
+    mut resolve: impl FnMut(u16, crate::network::RaftStatusReply) -> Option<T>,
+) -> Option<T> {
+    while !probes.is_empty() && Instant::now() < deadline {
+        let mut index = 0;
+        while index < probes.len() {
+            match probes[index].1.try_recv() {
+                Ok(status) => {
+                    let (prefix, _) = probes.swap_remove(index);
+                    if let Some(resolved) = resolve(prefix, status) {
+                        return Some(resolved);
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    probes.swap_remove(index);
+                }
+                Err(mpsc::TryRecvError::Empty) => index += 1,
+            }
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        let Ok(status) = network
-            .send_raft_status_req(peer, replication_id)
-            .recv_timeout(remaining)
-        else {
-            continue;
-        };
-        if !status.present || !status.members.contains(&prefix) {
-            continue;
-        }
-        if let Some(leader) = resolve(status) {
-            return Some(leader);
+        if !remaining.is_zero() && !probes.is_empty() {
+            thread::sleep(remaining.min(Duration::from_millis(2)));
         }
     }
     None
@@ -11519,6 +11567,37 @@ mod tests {
 
     #[cfg(all(feature = "network", feature = "storage"))]
     #[test]
+    fn stalled_first_raft_status_probe_does_not_starve_an_alternate_voter() {
+        let (stalled_tx, stalled_rx) = mpsc::channel();
+        let (leader_tx, leader_rx) = mpsc::channel();
+        leader_tx
+            .send(crate::network::RaftStatusReply {
+                present: true,
+                role: crate::network::RaftRole::Leader,
+                current_term: 9,
+                commit_index: 12,
+                last_log_index: 12,
+                members: vec![0x2222],
+                leader_hint: Some(0x2222),
+            })
+            .unwrap();
+        let mut probes = vec![(0x1111, stalled_rx), (0x2222, leader_rx)];
+        let started = Instant::now();
+        let resolved = poll_v2_raft_status_probes(
+            &mut probes,
+            started + Duration::from_millis(100),
+            |prefix, status| (status.leader_hint == Some(prefix)).then_some(prefix),
+        );
+        assert_eq!(resolved, Some(0x2222));
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "the first unanswered probe must not consume the shared deadline"
+        );
+        drop(stalled_tx);
+    }
+
+    #[cfg(all(feature = "network", feature = "storage"))]
+    #[test]
     fn slow_raft_leader_discovery_is_off_router_and_coalesced() {
         let key = libp2p::identity::Keypair::generate_ed25519();
         let local_peer = libp2p::PeerId::from(key.public());
@@ -11649,6 +11728,10 @@ mod tests {
         }
 
         impl RaftRpcHandler for StatusHandler {
+            fn local_status(&self) -> Option<RaftStatusReply> {
+                Some(self.handle_status(&[0; 32]))
+            }
+
             fn append_entries(
                 &self,
                 _replication_id: &[u8; 32],

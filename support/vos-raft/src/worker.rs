@@ -260,6 +260,7 @@ impl<N: NodeId> Inbox<N> {
 pub struct Worker<N: NodeId> {
     inbox: Inbox<N>,
     role: Arc<AtomicU8>,
+    status: Arc<std::sync::RwLock<Option<WorkerSnapshot<N>>>>,
     join: Option<std::thread::JoinHandle<()>>,
     /// Init signal: `None` while the worker is still trying to
     /// load its persisted meta; `Some(true)` once
@@ -349,6 +350,8 @@ impl<N: NodeId> Worker<N> {
         let (tx, rx) = fmpsc::unbounded();
         let role = Arc::new(AtomicU8::new(Role::Follower.as_u8()));
         let role_for_thread = role.clone();
+        let status = Arc::new(std::sync::RwLock::new(None));
+        let status_for_thread = status.clone();
         let init = Arc::new((
             std::sync::Mutex::new(None::<bool>),
             std::sync::Condvar::new(),
@@ -362,7 +365,7 @@ impl<N: NodeId> Worker<N> {
                     *g = Some(ok);
                     init_for_thread.1.notify_all();
                 };
-                let _ = futures_executor::block_on(run_worker(
+                let _ = futures_executor::block_on(run_worker_with_status(
                     storage,
                     transport,
                     cfg,
@@ -371,6 +374,7 @@ impl<N: NodeId> Worker<N> {
                     clock,
                     rng,
                     role_for_thread,
+                    status_for_thread,
                     init_signal,
                 ));
             })
@@ -378,6 +382,7 @@ impl<N: NodeId> Worker<N> {
         Self {
             inbox: Inbox { inner: tx },
             role,
+            status,
             join: Some(join),
             init,
         }
@@ -411,6 +416,8 @@ impl<N: NodeId> Worker<N> {
         let (tx, rx) = fmpsc::unbounded();
         let role = Arc::new(AtomicU8::new(Role::Follower.as_u8()));
         let role_for_thread = role.clone();
+        let status = Arc::new(std::sync::RwLock::new(None));
+        let status_for_thread = status.clone();
         let init = Arc::new((
             std::sync::Mutex::new(None::<bool>),
             std::sync::Condvar::new(),
@@ -428,7 +435,7 @@ impl<N: NodeId> Worker<N> {
                     .enable_time()
                     .build()
                     .expect("build tokio current-thread runtime for raft worker");
-                let _ = rt.block_on(run_worker(
+                let _ = rt.block_on(run_worker_with_status(
                     storage,
                     transport,
                     cfg,
@@ -437,6 +444,7 @@ impl<N: NodeId> Worker<N> {
                     clock,
                     rng,
                     role_for_thread,
+                    status_for_thread,
                     init_signal,
                 ));
             })
@@ -444,6 +452,7 @@ impl<N: NodeId> Worker<N> {
         Self {
             inbox: Inbox { inner: tx },
             role,
+            status,
             join: Some(join),
             init,
         }
@@ -491,6 +500,7 @@ impl<N: NodeId> Worker<N> {
         WorkerHandle {
             inbox: self.inbox.clone(),
             role: self.role.clone(),
+            status: self.status.clone(),
         }
     }
 
@@ -523,12 +533,21 @@ impl<N: NodeId> Drop for Worker<N> {
 pub struct WorkerHandle<N: NodeId> {
     inbox: Inbox<N>,
     role: Arc<AtomicU8>,
+    status: Arc<std::sync::RwLock<Option<WorkerSnapshot<N>>>>,
 }
 
 impl<N: NodeId> WorkerHandle<N> {
     /// Lock-free read of the worker's current role.
     pub fn role(&self) -> Role {
         Role::from_u8(self.role.load(Ordering::Relaxed))
+    }
+
+    /// Non-blocking snapshot published after every completed state-machine
+    /// event. Unlike [`Self::snapshot`], this never enters the worker inbox,
+    /// so callers may safely use it for best-effort routing while the worker
+    /// is busy or stalled on storage.
+    pub fn cached_snapshot(&self) -> Option<WorkerSnapshot<N>> {
+        self.status.try_read().ok()?.clone()
     }
 
     /// Cheap-to-clone sender for spawning helper tasks.
@@ -1060,6 +1079,7 @@ where
     pre_candidate_misses: u32,
     apply_sink: A,
     role_atomic: Arc<AtomicU8>,
+    status: Arc<std::sync::RwLock<Option<WorkerSnapshot<N>>>>,
     clock: C,
     rng: R,
 }
@@ -1076,6 +1096,30 @@ where
 {
     fn publish_role(&self) {
         self.role_atomic.store(self.role.as_u8(), Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> WorkerSnapshot<N> {
+        WorkerSnapshot {
+            role: self.role,
+            current_term: self.meta.current_term,
+            voted_for: self.meta.voted_for,
+            last_log_index: self.storage.last_index(),
+            commit_index: self.meta.commit_index,
+            snap_last_index: self.storage.snap_last_index(),
+            members: self.effective_cfg.current.clone(),
+            joint_old: self.effective_cfg.joint_old.clone(),
+            leader_hint: self.seen_leader,
+        }
+    }
+
+    fn publish_status(&self) {
+        // Read storage-backed counters before taking the cache lock. If a
+        // backend stalls, readers retain the last completed snapshot rather
+        // than blocking behind a writer that can never finish.
+        let snapshot = self.snapshot();
+        if let Ok(mut status) = self.status.write() {
+            *status = Some(snapshot);
+        }
     }
 
     fn set_role(&mut self, role: Role) {
@@ -1283,6 +1327,43 @@ where
     A: ApplySink,
     F: FnOnce(bool),
 {
+    run_worker_with_status(
+        storage,
+        transport,
+        cfg,
+        inbox_rx,
+        apply_sink,
+        clock,
+        rng,
+        role_atomic,
+        Arc::new(std::sync::RwLock::new(None)),
+        init_done,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_worker_with_status<N, S, T, C, R, A, F>(
+    storage: S,
+    transport: Arc<T>,
+    cfg: Config<N>,
+    inbox_rx: fmpsc::UnboundedReceiver<RaftMsg<N>>,
+    apply_sink: A,
+    clock: C,
+    rng: R,
+    role_atomic: Arc<AtomicU8>,
+    status: Arc<std::sync::RwLock<Option<WorkerSnapshot<N>>>>,
+    init_done: F,
+) -> Result<(), S::Error>
+where
+    N: NodeId,
+    S: Storage<N>,
+    T: Transport<N>,
+    C: Clock,
+    R: Rng,
+    A: ApplySink,
+    F: FnOnce(bool),
+{
     let meta = match storage.load_meta().await {
         Ok(m) => {
             init_done(true);
@@ -1325,11 +1406,13 @@ where
         leader: None,
         apply_sink,
         role_atomic,
+        status,
         clock,
         rng,
     };
     state.reset_election_timer();
     state.publish_role();
+    state.publish_status();
 
     let mut inbox_rx = inbox_rx;
     let mut pending: FuturesUnordered<RpcFut<N>> = FuturesUnordered::new();
@@ -1392,6 +1475,7 @@ where
                 }
             }
         }
+        state.publish_status();
     }
     Ok(())
 }
@@ -1440,17 +1524,7 @@ async fn handle_msg<N, S, T, C, R, A>(
             let _ = reply.send(r);
         }
         RaftMsg::QueryState { reply } => {
-            let _ = reply.send(WorkerSnapshot {
-                role: state.role,
-                current_term: state.meta.current_term,
-                voted_for: state.meta.voted_for,
-                last_log_index: state.storage.last_index(),
-                commit_index: state.meta.commit_index,
-                snap_last_index: state.storage.snap_last_index(),
-                members: state.effective_cfg.current.clone(),
-                joint_old: state.effective_cfg.joint_old.clone(),
-                leader_hint: state.seen_leader,
-            });
+            let _ = reply.send(state.snapshot());
         }
         RaftMsg::Shutdown => unreachable!("handled in run_worker"),
     }

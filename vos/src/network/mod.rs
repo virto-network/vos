@@ -344,6 +344,13 @@ pub trait RaftRpcHandler: Send + Sync {
         None
     }
 
+    /// Non-blocking status snapshot for a replica hosted in this process.
+    /// Real workers publish this out of band after each state-machine event;
+    /// implementations without such a cache return `None`.
+    fn local_status(&self) -> Option<RaftStatusReply> {
+        None
+    }
+
     /// Inbound `AppendEntries` from `from_prefix`. Returns the
     /// response the peer will read. Implementations are responsible
     /// for log consistency checks, term updates, applying entries,
@@ -914,26 +921,19 @@ impl Network {
         reply.present.then_some(reply)
     }
 
-    /// Start a local status read without making the caller wait on the Raft
-    /// worker inbox. Transport discovery applies its own overall deadline to
-    /// the receiver; a wedged local worker therefore cannot strand the
-    /// resolver that owns a durable redrive attempt.
-    pub(crate) fn local_raft_status_receiver(
+    /// Non-blocking status snapshot for a locally hosted group. This reads a
+    /// worker-published cache and never queues a request on the Raft worker.
+    pub(crate) fn local_raft_status_cached(
         &self,
         replication_id: &[u8; 32],
-    ) -> Option<std_mpsc::Receiver<RaftStatusReply>> {
+    ) -> Option<RaftStatusReply> {
         let handler = self
             .raft_handlers
             .lock()
             .ok()?
             .get(replication_id)
             .cloned()?;
-        let replication_id = *replication_id;
-        let (tx, rx) = std_mpsc::channel();
-        thread::spawn(move || {
-            let _ = tx.send(handler.handle_status(&replication_id));
-        });
-        Some(rx)
+        handler.local_status()
     }
 
     /// Lock-free role hint for a locally hosted group. Unlike
@@ -2668,6 +2668,84 @@ mod tests {
         assert_eq!(p1, p2);
         assert_ne!(p1, 0);
         assert_eq!(normalize_node_prefix(0), u16::MAX);
+    }
+
+    #[test]
+    fn cached_local_raft_status_never_enters_the_worker_handler() {
+        struct Handler {
+            blocking_status_calls: std::sync::atomic::AtomicUsize,
+        }
+
+        impl RaftRpcHandler for Handler {
+            fn local_status(&self) -> Option<RaftStatusReply> {
+                Some(RaftStatusReply {
+                    present: true,
+                    role: RaftRole::Follower,
+                    current_term: 3,
+                    commit_index: 7,
+                    last_log_index: 8,
+                    members: vec![0x1111, 0x2222],
+                    leader_hint: Some(0x2222),
+                })
+            }
+
+            fn append_entries(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                prev_log_index: u64,
+                _prev_log_term: u64,
+                _leader_commit: u64,
+                _entries: Vec<RaftEntry>,
+            ) -> RaftAppendResult {
+                RaftAppendResult {
+                    term,
+                    success: false,
+                    match_index: prev_log_index,
+                }
+            }
+
+            fn request_vote(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                _last_log_index: u64,
+                _last_log_term: u64,
+            ) -> RaftVoteResult {
+                RaftVoteResult {
+                    term,
+                    vote_granted: false,
+                }
+            }
+
+            fn handle_status(&self, _replication_id: &[u8; 32]) -> RaftStatusReply {
+                self.blocking_status_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                RaftStatusReply::absent()
+            }
+        }
+
+        let network = Network::start(NetworkConfig::default());
+        let replication_id = [0x70; 32];
+        let handler = Arc::new(Handler {
+            blocking_status_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        network.register_raft_handler(replication_id, handler.clone());
+
+        let status = network
+            .local_raft_status_cached(&replication_id)
+            .expect("worker-published status is available without an inbox request");
+        assert_eq!(status.leader_hint, Some(0x2222));
+        assert_eq!(
+            handler
+                .blocking_status_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the transport cache path must not call the blocking status handler"
+        );
+        network.join();
     }
 
     #[test]
