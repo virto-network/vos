@@ -111,16 +111,36 @@ struct V2RaftTransportResolutionKey {
 enum V2RaftTransportResolution {
     Pending {
         generation: u64,
+        candidate_cursor: usize,
         until: Instant,
     },
     Resolved {
         peer: libp2p::PeerId,
         route: ServiceId,
+        candidate_cursor: usize,
         until: Instant,
     },
     Backoff {
+        candidate_cursor: usize,
         until: Instant,
     },
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+impl V2RaftTransportResolution {
+    fn candidate_cursor(&self) -> usize {
+        match self {
+            Self::Pending {
+                candidate_cursor, ..
+            }
+            | Self::Resolved {
+                candidate_cursor, ..
+            }
+            | Self::Backoff {
+                candidate_cursor, ..
+            } => *candidate_cursor,
+        }
+    }
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
@@ -1078,10 +1098,11 @@ pub struct VosNode {
     /// repeated 250 ms durable redrives coalesce behind the same marker.
     #[cfg(all(feature = "network", feature = "storage"))]
     v2_raft_transport_resolutions: V2RaftTransportResolutions,
-    /// Monotone generation used to rotate the bounded connected-peer fallback
-    /// across durable retries. It is routing-only and never enters consensus.
+    /// Monotone token used only to distinguish ownership of overlapping
+    /// resolver workers. Candidate progress is stored per destination in the
+    /// resolution entry and never depends on this node-global value.
     #[cfg(all(feature = "network", feature = "storage"))]
-    v2_raft_transport_resolution_generation: AtomicU64,
+    v2_raft_transport_ownership_generation: AtomicU64,
     /// Prepared Raft roots remain absent from public route tables while voter
     /// promotion is pending. Background workers send a type-erased publication
     /// closure here once final non-joint membership is locally visible.
@@ -3224,7 +3245,7 @@ impl VosNode {
             #[cfg(all(feature = "network", feature = "storage"))]
             v2_raft_transport_resolutions: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(feature = "network", feature = "storage"))]
-            v2_raft_transport_resolution_generation: AtomicU64::new(0),
+            v2_raft_transport_ownership_generation: AtomicU64::new(0),
             #[cfg(all(feature = "network", feature = "storage"))]
             pending_v2_root_ready_tx,
             #[cfg(all(feature = "network", feature = "storage"))]
@@ -5038,26 +5059,33 @@ impl VosNode {
         };
         let now = Instant::now();
         let (deadline, pending_until) = v2_raft_transport_resolution_deadlines(now);
-        let mut resolution_generation = None;
+        let mut ownership_generation = None;
+        let mut resolution_candidate_cursor = None;
         let cached = {
             let Ok(mut resolutions) = self.v2_raft_transport_resolutions.lock() else {
                 return;
             };
+            let candidate_cursor = resolutions
+                .get(&key)
+                .map(V2RaftTransportResolution::candidate_cursor)
+                .unwrap_or(0);
             match resolutions.get(&key).cloned() {
-                Some(V2RaftTransportResolution::Resolved { peer, route, until }) if until > now => {
-                    Some((peer, route))
-                }
+                Some(V2RaftTransportResolution::Resolved {
+                    peer, route, until, ..
+                }) if until > now => Some((peer, route)),
                 Some(V2RaftTransportResolution::Pending { until, .. }) if until > now => return,
-                Some(V2RaftTransportResolution::Backoff { until }) if until > now => return,
+                Some(V2RaftTransportResolution::Backoff { until, .. }) if until > now => return,
                 _ => {
                     let generation = self
-                        .v2_raft_transport_resolution_generation
+                        .v2_raft_transport_ownership_generation
                         .fetch_add(1, Ordering::Relaxed);
-                    resolution_generation = Some(generation);
+                    ownership_generation = Some(generation);
+                    resolution_candidate_cursor = Some(candidate_cursor);
                     resolutions.insert(
                         key,
                         V2RaftTransportResolution::Pending {
                             generation,
+                            candidate_cursor,
                             until: pending_until,
                         },
                     );
@@ -5070,7 +5098,10 @@ impl VosNode {
             dispatch_resolved_v2_raft_transport(&network, local_tx, peer, route, envelope);
             return;
         }
-        let Some(resolution_generation) = resolution_generation else {
+        let Some(ownership_generation) = ownership_generation else {
+            return;
+        };
+        let Some(resolution_candidate_cursor) = resolution_candidate_cursor else {
             return;
         };
 
@@ -5078,12 +5109,12 @@ impl VosNode {
         let invoke_routes = self.invoke_routes.clone();
         let shutdown = self.shutdown.clone();
         thread::spawn(move || {
-            let resolved = resolve_v2_raft_leader_route_before(
+            let (resolved, next_candidate_cursor) = resolve_v2_raft_leader_route_before(
                 &binding,
                 &network,
                 &invoke_routes,
                 deadline,
-                resolution_generation,
+                resolution_candidate_cursor,
             );
             if shutdown.load(Ordering::Relaxed) {
                 if let Ok(mut entries) = resolutions.lock() {
@@ -5095,8 +5126,10 @@ impl VosNode {
             let owns_resolution = if let Ok(mut entries) = resolutions.lock() {
                 if !matches!(
                     entries.get(&key),
-                    Some(V2RaftTransportResolution::Pending { generation, until })
-                        if *generation == resolution_generation && *until == pending_until
+                    Some(V2RaftTransportResolution::Pending { generation, candidate_cursor, until })
+                        if *generation == ownership_generation
+                            && *candidate_cursor == resolution_candidate_cursor
+                            && *until == pending_until
                 ) {
                     false
                 } else {
@@ -5107,6 +5140,7 @@ impl VosNode {
                                 V2RaftTransportResolution::Resolved {
                                     peer: *peer,
                                     route: *route,
+                                    candidate_cursor: next_candidate_cursor,
                                     until: now + V2_RAFT_TRANSPORT_LEADER_CACHE_TTL,
                                 },
                             );
@@ -5115,6 +5149,7 @@ impl VosNode {
                             entries.insert(
                                 key,
                                 V2RaftTransportResolution::Backoff {
+                                    candidate_cursor: next_candidate_cursor,
                                     until: now + V2_RAFT_TRANSPORT_RETRY_BACKOFF,
                                 },
                             );
@@ -5576,6 +5611,7 @@ fn resolve_v2_raft_leader_route(
         Instant::now() + V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT,
         0,
     )
+    .0
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
@@ -5609,9 +5645,11 @@ fn resolve_v2_raft_leader_route_before(
     network: &crate::network::Network,
     invoke_routes: &InvokeRoutes,
     deadline: Instant,
-    resolution_generation: u64,
-) -> Option<(libp2p::PeerId, ServiceId)> {
-    let replication_id = binding.replication_id?;
+    candidate_cursor: usize,
+) -> (Option<(libp2p::PeerId, ServiceId)>, usize) {
+    let Some(replication_id) = binding.replication_id else {
+        return (None, candidate_cursor);
+    };
     let local_id = ServiceId(binding.route).local_id();
 
     // The local view is worker-published rather than inbox-driven: a wedged
@@ -5641,19 +5679,23 @@ fn resolve_v2_raft_leader_route_before(
             push_v2_raft_prefix_candidate(&mut candidates, prefix);
         }
     }
-    for peer in v2_raft_connected_candidate_window(
-        network.connected_peers(),
-        resolution_generation,
+    let connected = network
+        .connected_peers()
+        .into_iter()
+        .filter(|peer| {
+            !exact_bootstrap
+                .as_ref()
+                .is_some_and(|(_, exact)| exact == peer)
+        })
+        .collect::<Vec<_>>();
+    let (connected_window, next_candidate_cursor) = v2_raft_connected_candidate_window(
+        connected,
+        candidate_cursor,
         V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES.saturating_sub(candidates.len()),
-    ) {
+    );
+    for peer in connected_window {
         if candidates.len() >= V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES {
             break;
-        }
-        if exact_bootstrap
-            .as_ref()
-            .is_some_and(|(_, exact)| exact == &peer)
-        {
-            continue;
         }
         let prefix = crate::network::derive_node_prefix(&peer);
         push_v2_raft_peer_candidate(&mut candidates, prefix, peer);
@@ -5718,32 +5760,36 @@ fn resolve_v2_raft_leader_route_before(
     // reply. The selected term's bounded leader hints are authenticated after
     // collection, so a trusted bootstrap follower can introduce a leader that
     // was absent from both the local cache and connected-peer fallback.
-    resolve_v2_raft_leader_observations(
-        observations,
-        &authenticated,
-        invoke_routes,
-        local_id,
-        deadline,
+    (
+        resolve_v2_raft_leader_observations(
+            observations,
+            &authenticated,
+            invoke_routes,
+            local_id,
+            deadline,
+        ),
+        next_candidate_cursor,
     )
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
 fn v2_raft_connected_candidate_window(
     mut peers: Vec<libp2p::PeerId>,
-    generation: u64,
+    cursor: usize,
     limit: usize,
-) -> Vec<libp2p::PeerId> {
+) -> (Vec<libp2p::PeerId>, usize) {
     if peers.is_empty() || limit == 0 {
-        return Vec::new();
+        return (Vec::new(), cursor);
     }
     // `connected_peers` preserves the prefix map's iteration order while its
-    // population is unchanged. Advancing by a full window therefore covers a
-    // fixed set instead of repeatedly selecting its first untrusted entries.
-    let start =
-        (generation as usize).wrapping_mul(V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES) % peers.len();
+    // population is unchanged. Advancing by the number actually selected
+    // therefore covers a fixed set even when trusted local candidates leave
+    // fewer than sixteen fallback slots.
+    let start = cursor % peers.len();
     peers.rotate_left(start);
-    peers.truncate(limit.min(peers.len()));
-    peers
+    let selected = limit.min(peers.len());
+    peers.truncate(selected);
+    (peers, start.wrapping_add(selected))
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
@@ -11853,24 +11899,51 @@ mod tests {
 
     #[cfg(all(feature = "network", feature = "storage"))]
     #[test]
-    fn connected_candidate_windows_advance_fairly_across_retries() {
+    fn connected_candidate_cursors_are_per_destination_and_advance_by_actual_window() {
+        let peers = (0..32)
+            .map(|_| libp2p::PeerId::random())
+            .collect::<Vec<_>>();
+        let mut cursor_a = 0;
+        let mut cursor_b = 0;
+        let mut observed_a = HashSet::new();
+        let mut observed_b = HashSet::new();
+
+        for _ in 0..2 {
+            let (window_a, next_a) = v2_raft_connected_candidate_window(
+                peers.clone(),
+                cursor_a,
+                V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES,
+            );
+            cursor_a = next_a;
+            observed_a.extend(window_a);
+
+            let (window_b, next_b) = v2_raft_connected_candidate_window(
+                peers.clone(),
+                cursor_b,
+                V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES,
+            );
+            cursor_b = next_b;
+            observed_b.extend(window_b);
+        }
+
+        assert_eq!(observed_a.len(), peers.len());
+        assert_eq!(observed_b.len(), peers.len());
+
         let peers = (0..33)
             .map(|_| libp2p::PeerId::random())
             .collect::<Vec<_>>();
+        let mut cursor = 0;
         let mut observed = HashSet::new();
-
-        for generation in 0..3 {
-            observed.extend(v2_raft_connected_candidate_window(
-                peers.clone(),
-                generation,
-                V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES,
-            ));
+        for _ in 0..3 {
+            let (window, next) = v2_raft_connected_candidate_window(peers.clone(), cursor, 13);
+            assert_eq!(window.len(), 13);
+            cursor = next;
+            observed.extend(window);
         }
-
         assert_eq!(
             observed.len(),
             peers.len(),
-            "a fixed connected non-voter set cannot permanently hide a later voter"
+            "smaller ambient windows must not leave gaps"
         );
     }
 
