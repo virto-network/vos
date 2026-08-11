@@ -249,6 +249,23 @@ impl<N: NodeId> Inbox<N> {
 
 // ── std-only spawn helper ───────────────────────────────────
 
+struct PublishedWorkerStatus<N: NodeId> {
+    snapshot: WorkerSnapshot<N>,
+    valid_until: std::time::Instant,
+}
+
+type SharedWorkerStatus<N> = Arc<std::sync::RwLock<Option<PublishedWorkerStatus<N>>>>;
+
+struct StatusInvalidationGuard<N: NodeId>(SharedWorkerStatus<N>);
+
+impl<N: NodeId> Drop for StatusInvalidationGuard<N> {
+    fn drop(&mut self) {
+        if let Ok(mut status) = self.0.write() {
+            *status = None;
+        }
+    }
+}
+
 /// Owning handle to a worker driven on a dedicated std thread.
 /// Drop or [`shutdown`] cleans up.
 ///
@@ -260,7 +277,7 @@ impl<N: NodeId> Inbox<N> {
 pub struct Worker<N: NodeId> {
     inbox: Inbox<N>,
     role: Arc<AtomicU8>,
-    status: Arc<std::sync::RwLock<Option<WorkerSnapshot<N>>>>,
+    status: SharedWorkerStatus<N>,
     join: Option<std::thread::JoinHandle<()>>,
     /// Init signal: `None` while the worker is still trying to
     /// load its persisted meta; `Some(true)` once
@@ -360,6 +377,7 @@ impl<N: NodeId> Worker<N> {
         let join = std::thread::Builder::new()
             .name(alloc::format!("raft-worker-{:?}", cfg.me))
             .spawn(move || {
+                let _status_guard = StatusInvalidationGuard(status_for_thread.clone());
                 let init_signal = move |ok: bool| {
                     let mut g = init_for_thread.0.lock().unwrap();
                     *g = Some(ok);
@@ -426,6 +444,7 @@ impl<N: NodeId> Worker<N> {
         let join = std::thread::Builder::new()
             .name(alloc::format!("raft-worker-{:?}", cfg.me))
             .spawn(move || {
+                let _status_guard = StatusInvalidationGuard(status_for_thread.clone());
                 let init_signal = move |ok: bool| {
                     let mut g = init_for_thread.0.lock().unwrap();
                     *g = Some(ok);
@@ -533,7 +552,7 @@ impl<N: NodeId> Drop for Worker<N> {
 pub struct WorkerHandle<N: NodeId> {
     inbox: Inbox<N>,
     role: Arc<AtomicU8>,
-    status: Arc<std::sync::RwLock<Option<WorkerSnapshot<N>>>>,
+    status: SharedWorkerStatus<N>,
 }
 
 impl<N: NodeId> WorkerHandle<N> {
@@ -547,7 +566,9 @@ impl<N: NodeId> WorkerHandle<N> {
     /// so callers may safely use it for best-effort routing while the worker
     /// is busy or stalled on storage.
     pub fn cached_snapshot(&self) -> Option<WorkerSnapshot<N>> {
-        self.status.try_read().ok()?.clone()
+        let status = self.status.try_read().ok()?;
+        let published = status.as_ref()?;
+        (published.valid_until > std::time::Instant::now()).then(|| published.snapshot.clone())
     }
 
     /// Cheap-to-clone sender for spawning helper tasks.
@@ -1079,7 +1100,8 @@ where
     pre_candidate_misses: u32,
     apply_sink: A,
     role_atomic: Arc<AtomicU8>,
-    status: Arc<std::sync::RwLock<Option<WorkerSnapshot<N>>>>,
+    status: SharedWorkerStatus<N>,
+    status_valid_for: Duration,
     clock: C,
     rng: R,
 }
@@ -1118,7 +1140,10 @@ where
         // than blocking behind a writer that can never finish.
         let snapshot = self.snapshot();
         if let Ok(mut status) = self.status.write() {
-            *status = Some(snapshot);
+            *status = Some(PublishedWorkerStatus {
+                snapshot,
+                valid_until: std::time::Instant::now() + self.status_valid_for,
+            });
         }
     }
 
@@ -1352,7 +1377,7 @@ async fn run_worker_with_status<N, S, T, C, R, A, F>(
     clock: C,
     rng: R,
     role_atomic: Arc<AtomicU8>,
-    status: Arc<std::sync::RwLock<Option<WorkerSnapshot<N>>>>,
+    status: SharedWorkerStatus<N>,
     init_done: F,
 ) -> Result<(), S::Error>
 where
@@ -1386,6 +1411,12 @@ where
     // backend supports it) so a leader that compacted past the
     // last ConfigChange entry doesn't lose the membership view.
     let recovery = recover_active_config(&storage, &cfg, true).await?;
+    let status_valid_for = Duration::from_millis(
+        cfg.election_timeout_ms
+            .1
+            .max(cfg.heartbeat_interval_ms.saturating_mul(3))
+            .max(1),
+    );
     let mut state = WorkerState {
         storage,
         transport,
@@ -1407,6 +1438,7 @@ where
         apply_sink,
         role_atomic,
         status,
+        status_valid_for,
         clock,
         rng,
     };
@@ -3402,6 +3434,37 @@ mod tests {
         assert_eq!(snap.voted_for, None);
         assert_eq!(snap.last_log_index, 0);
         worker.shutdown();
+    }
+
+    #[test]
+    fn cached_snapshot_expires_when_the_worker_stops_publishing() {
+        let (tx, _rx) = fmpsc::unbounded();
+        let snapshot = WorkerSnapshot {
+            role: Role::Follower,
+            current_term: 7,
+            voted_for: None,
+            last_log_index: 11,
+            commit_index: 11,
+            snap_last_index: 0,
+            members: alloc::vec![0xAAAA, 0xBBBB],
+            joint_old: None,
+            leader_hint: Some(0xAAAA),
+        };
+        let handle = WorkerHandle {
+            inbox: Inbox { inner: tx },
+            role: Arc::new(AtomicU8::new(Role::Follower.as_u8())),
+            status: Arc::new(std::sync::RwLock::new(Some(PublishedWorkerStatus {
+                snapshot,
+                valid_until: std::time::Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .unwrap(),
+            }))),
+        };
+
+        assert!(
+            handle.cached_snapshot().is_none(),
+            "an observation older than its worker lease cannot route clients"
+        );
     }
 
     #[test]

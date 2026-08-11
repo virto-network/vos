@@ -4895,17 +4895,16 @@ impl VosNode {
                 .then(|| self.routes.get(&binding.route).cloned())
                 .flatten();
 
-            // Networkless single-voter roots are fully supported. When a
-            // network is attached, use its local worker status to avoid
-            // feeding a known follower; absent status means this root was
-            // intentionally attached without a network handler and its own
-            // admission barrier remains the final authority.
+            // Networkless single-voter roots are fully supported. Once a
+            // network handler exists, even a fresh local `Leader` role is not
+            // enough: an isolated former leader can retain that role without
+            // quorum. Route through bounded multi-voter discovery so a newer
+            // term elsewhere wins before any local dispatch.
             let local_is_current_leader = local_tx.is_some()
                 && network.as_ref().is_none_or(|network| {
                     binding
                         .replication_id
-                        .and_then(|id| network.local_raft_role(&id))
-                        .is_none_or(|role| role == crate::network::RaftRole::Leader)
+                        .is_none_or(|id| !network.has_local_raft_handler(&id))
                 });
             if local_is_current_leader {
                 envelope.to = ServiceId(binding.route);
@@ -5566,26 +5565,28 @@ fn resolve_v2_raft_leader_route_before(
     // follower must not create one detached status thread per durable retry.
     let local_status = network.local_raft_status_cached(&replication_id);
 
-    // A cached actor route names only a bootstrap replica. Query it and then
-    // all connected, registry-authenticated voters so failover does not leave
-    // transport pinned to an unavailable former leader.
+    // Preserve full identities throughout candidate collection. The exact
+    // install-time bootstrap goes first; a connected attacker with the same
+    // compact prefix must neither replace nor suppress it.
     let mut candidates = Vec::new();
-    if let Some(prefix) = local_status.as_ref().and_then(|status| status.leader_hint) {
-        candidates.push((prefix, None));
-    }
-    for peer in network.connected_peers() {
-        let prefix = crate::network::derive_node_prefix(&peer);
-        if !candidates.iter().any(|(candidate, _)| *candidate == prefix) {
-            candidates.push((prefix, Some(peer)));
-        }
-    }
     if let Some(bytes) = binding.authenticated_peer.as_deref()
         && let Ok(peer) = libp2p::PeerId::from_bytes(bytes)
     {
+        push_v2_raft_peer_candidate(
+            &mut candidates,
+            crate::network::derive_node_prefix(&peer),
+            peer,
+        );
+    }
+    for peer in network.connected_peers() {
         let prefix = crate::network::derive_node_prefix(&peer);
-        if !candidates.iter().any(|(candidate, _)| *candidate == prefix) {
-            candidates.push((prefix, Some(peer)));
-        }
+        push_v2_raft_peer_candidate(&mut candidates, prefix, peer);
+    }
+    if let Some(prefix) = local_status.as_ref().and_then(|status| status.leader_hint) {
+        // This prefix-only hint is resolved through the canonical roster. It
+        // intentionally coexists with same-prefix connected peers: only the
+        // exact roster identity can authenticate below.
+        candidates.push((prefix, None));
     }
 
     // Spend at most half the shared deadline authenticating candidate peers,
@@ -5600,6 +5601,9 @@ fn resolve_v2_raft_leader_route_before(
     let mut authenticated = HashMap::new();
     let candidate_count = candidates.len();
     for (index, (prefix, expected_peer)) in candidates.into_iter().enumerate() {
+        if expected_peer.is_none() && authenticated.contains_key(&prefix) {
+            continue;
+        }
         let candidates_left = candidate_count.saturating_sub(index).max(1) as u32;
         let remaining = auth_deadline.saturating_duration_since(Instant::now());
         let budget = remaining.checked_div(candidates_left).unwrap_or_default();
@@ -5628,12 +5632,6 @@ fn resolve_v2_raft_leader_route_before(
         Some((peer, ServiceId::new(leader_prefix, local_id)))
     };
 
-    if let Some(status) = local_status.as_ref()
-        && let Some(leader) = resolve(status)
-    {
-        return Some(leader);
-    }
-
     // Fan out before waiting for any response. A responsive-but-stalled old
     // bootstrap can consume its own request lifetime, but it cannot prevent a
     // newly elected connected voter from answering within the shared bound.
@@ -5641,28 +5639,76 @@ fn resolve_v2_raft_leader_route_before(
         .iter()
         .map(|(&prefix, (peer, _))| (prefix, network.send_raft_status_req(*peer, replication_id)))
         .collect::<Vec<_>>();
-    poll_v2_raft_status_probes(&mut probes, deadline, |prefix, status| {
-        (status.present && status.members.contains(&prefix))
-            .then(|| resolve(&status))
-            .flatten()
-    })
+    let mut observations = local_status
+        .into_iter()
+        .map(|status| {
+            (
+                crate::network::derive_node_prefix(&network.peer_id()),
+                status,
+            )
+        })
+        .collect::<Vec<_>>();
+    observations.extend(collect_v2_raft_status_probes(&mut probes, deadline));
+
+    // A cache is only one observation, never an authority to short-circuit
+    // live voters. Prefer the highest term seen across every authenticated
+    // reply; within one term prefer the leader's own report, then the most
+    // advanced committed/log view and a deterministic prefix tie-break.
+    select_v2_raft_leader_observation(observations, resolve)
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn poll_v2_raft_status_probes<T>(
+fn push_v2_raft_peer_candidate(
+    candidates: &mut Vec<(u16, Option<libp2p::PeerId>)>,
+    prefix: u16,
+    peer: libp2p::PeerId,
+) {
+    if !candidates
+        .iter()
+        .any(|(_, candidate)| candidate.as_ref() == Some(&peer))
+    {
+        candidates.push((prefix, Some(peer)));
+    }
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn select_v2_raft_leader_observation<T>(
+    observations: Vec<(u16, crate::network::RaftStatusReply)>,
+    mut resolve: impl FnMut(&crate::network::RaftStatusReply) -> Option<T>,
+) -> Option<T> {
+    observations
+        .into_iter()
+        .filter(|(reporter, status)| status.present && status.members.contains(reporter))
+        .filter_map(|(reporter, status)| {
+            let leader = resolve(&status)?;
+            let self_reported_leader = status.role == crate::network::RaftRole::Leader
+                && status.leader_hint == Some(reporter);
+            let rank = (
+                status.current_term,
+                self_reported_leader,
+                status.commit_index,
+                status.last_log_index,
+                reporter,
+            );
+            Some((rank, leader))
+        })
+        .max_by_key(|(rank, _)| *rank)
+        .map(|(_, leader)| leader)
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn collect_v2_raft_status_probes(
     probes: &mut Vec<(u16, mpsc::Receiver<crate::network::RaftStatusReply>)>,
     deadline: Instant,
-    mut resolve: impl FnMut(u16, crate::network::RaftStatusReply) -> Option<T>,
-) -> Option<T> {
+) -> Vec<(u16, crate::network::RaftStatusReply)> {
+    let mut replies = Vec::new();
     while !probes.is_empty() && Instant::now() < deadline {
         let mut index = 0;
         while index < probes.len() {
             match probes[index].1.try_recv() {
                 Ok(status) => {
                     let (prefix, _) = probes.swap_remove(index);
-                    if let Some(resolved) = resolve(prefix, status) {
-                        return Some(resolved);
-                    }
+                    replies.push((prefix, status));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     probes.swap_remove(index);
@@ -5675,7 +5721,7 @@ fn poll_v2_raft_status_probes<T>(
             thread::sleep(remaining.min(Duration::from_millis(2)));
         }
     }
-    None
+    replies
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
@@ -11583,17 +11629,62 @@ mod tests {
             .unwrap();
         let mut probes = vec![(0x1111, stalled_rx), (0x2222, leader_rx)];
         let started = Instant::now();
-        let resolved = poll_v2_raft_status_probes(
-            &mut probes,
-            started + Duration::from_millis(100),
-            |prefix, status| (status.leader_hint == Some(prefix)).then_some(prefix),
-        );
-        assert_eq!(resolved, Some(0x2222));
+        let replies =
+            collect_v2_raft_status_probes(&mut probes, started + Duration::from_millis(100));
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].0, 0x2222);
         assert!(
-            started.elapsed() < Duration::from_millis(50),
-            "the first unanswered probe must not consume the shared deadline"
+            started.elapsed() < Duration::from_millis(150),
+            "the first unanswered probe must not consume another per-voter deadline"
         );
         drop(stalled_tx);
+    }
+
+    #[cfg(all(feature = "network", feature = "storage"))]
+    #[test]
+    fn higher_term_live_status_supersedes_a_stale_cached_leader_hint() {
+        let stale = crate::network::RaftStatusReply {
+            present: true,
+            role: crate::network::RaftRole::Follower,
+            current_term: 7,
+            commit_index: 11,
+            last_log_index: 11,
+            members: vec![0x1111, 0x2222],
+            leader_hint: Some(0x1111),
+        };
+        let current = crate::network::RaftStatusReply {
+            present: true,
+            role: crate::network::RaftRole::Leader,
+            current_term: 8,
+            commit_index: 12,
+            last_log_index: 12,
+            members: vec![0x1111, 0x2222],
+            leader_hint: Some(0x2222),
+        };
+        assert_eq!(
+            select_v2_raft_leader_observation(vec![(0x1111, stale), (0x2222, current)], |status| {
+                status.leader_hint
+            },),
+            Some(0x2222),
+            "a lower-term local cache cannot pin transport to its former leader"
+        );
+    }
+
+    #[cfg(all(feature = "network", feature = "storage"))]
+    #[test]
+    fn exact_raft_bootstrap_survives_a_connected_prefix_collision() {
+        let exact = libp2p::PeerId::random();
+        let colliding = libp2p::PeerId::random();
+        assert_ne!(exact, colliding);
+        let shared_prefix = 0x5151;
+        let mut candidates = Vec::new();
+
+        push_v2_raft_peer_candidate(&mut candidates, shared_prefix, exact);
+        push_v2_raft_peer_candidate(&mut candidates, shared_prefix, colliding);
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0], (shared_prefix, Some(exact)));
+        assert_eq!(candidates[1], (shared_prefix, Some(colliding)));
     }
 
     #[cfg(all(feature = "network", feature = "storage"))]

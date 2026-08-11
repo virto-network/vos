@@ -336,14 +336,6 @@ pub trait NetworkService: Send + Sync {
 /// the handler's own background task; the trait returns synchronously
 /// only the *response* the peer sees.
 pub trait RaftRpcHandler: Send + Sync {
-    /// Lock-free role hint for a replica hosted in this process. The global
-    /// envelope router uses this only to select a known local leader without
-    /// entering the worker inbox; admission still performs the quorum-backed
-    /// read barrier. Implementations without a cheap hint return `None`.
-    fn local_role(&self) -> Option<RaftRole> {
-        None
-    }
-
     /// Non-blocking status snapshot for a replica hosted in this process.
     /// Real workers publish this out of band after each state-machine event;
     /// implementations without such a cache return `None`.
@@ -936,16 +928,14 @@ impl Network {
         handler.local_status()
     }
 
-    /// Lock-free role hint for a locally hosted group. Unlike
-    /// [`Self::local_raft_status`], this never waits on the worker inbox and is
-    /// therefore safe on the node's global envelope router.
-    pub fn local_raft_role(&self, replication_id: &[u8; 32]) -> Option<RaftRole> {
+    /// Whether this process has a handler installed for the group. Kept
+    /// separate from cached status so an expired/stalled worker is not
+    /// mistaken for a root intentionally running without a network handler.
+    pub(crate) fn has_local_raft_handler(&self, replication_id: &[u8; 32]) -> bool {
         self.raft_handlers
             .lock()
-            .ok()?
-            .get(replication_id)
-            .cloned()?
-            .local_role()
+            .ok()
+            .is_some_and(|handlers| handlers.contains_key(replication_id))
     }
 
     // Operator-tooling senders (manifest fetch, raft join, raft

@@ -420,15 +420,6 @@ impl WorkerHandle {
 /// blocking-pool thread, not the swarm thread, and the worker
 /// has its own dedicated thread to make progress.
 impl RaftRpcHandler for WorkerHandle {
-    fn local_role(&self) -> Option<RaftRole> {
-        Some(match self.role() {
-            Role::Follower => RaftRole::Follower,
-            Role::PreCandidate => RaftRole::PreCandidate,
-            Role::Candidate => RaftRole::Candidate,
-            Role::Leader => RaftRole::Leader,
-        })
-    }
-
     fn local_status(&self) -> Option<RaftStatusReply> {
         self.inner.cached_snapshot().map(Self::status_from_snapshot)
     }
@@ -716,6 +707,10 @@ mod tests {
         assert!(cached.members.contains(&0xAAA8));
 
         worker.shutdown();
+        assert!(
+            h.local_status().is_none(),
+            "a stopped worker must invalidate the last published status"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
