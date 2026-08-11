@@ -106,6 +106,12 @@ pub enum RootTreeTransportV2 {
         publication: super::Hash,
         call: super::CallId,
     },
+    /// Complete causal state advertised by another authenticated replica of
+    /// the same CRDT root. The wire does not confer receipt authority: the
+    /// receiving node admits it only after binding the Noise peer to an exact
+    /// enrolled-node row, then supplies those verifier decisions separately
+    /// to physical Accumulate.
+    CrdtSync { envelope: CrdtSyncEnvelopeV2 },
 }
 
 impl V2Wire for RootTreeTransportV2 {
@@ -151,6 +157,10 @@ impl V2Wire for RootTreeTransportV2 {
                 encoder.fixed(&publication.0);
                 encoder.fixed(&call.0);
             }
+            Self::CrdtSync { envelope } => {
+                encoder.u8(3);
+                encoder.bytes(&envelope.encode());
+            }
         }
     }
 
@@ -176,6 +186,9 @@ impl V2Wire for RootTreeTransportV2 {
                 },
                 publication: super::Hash(decoder.fixed()?),
                 call: super::CallId(decoder.fixed()?),
+            },
+            3 => Self::CrdtSync {
+                envelope: CrdtSyncEnvelopeV2::decode(&decoder.bytes()?)?,
             },
             _ => return Err(DecodeError::InvalidTag),
         };
@@ -237,6 +250,9 @@ impl RootTreeTransportV2 {
                     && input.invocation != super::InvocationId::ZERO
                     && *publication != super::Hash::ZERO
                     && *call != super::CallId::ZERO
+            }
+            Self::CrdtSync { envelope } => {
+                !envelope.advertised_heads.is_empty() && !envelope.nodes.is_empty()
             }
         }
     }
@@ -2125,6 +2141,33 @@ where
         })
     }
 
+    /// Commit only the current canonical head set. The node uses this cheap
+    /// identifier to avoid rebuilding the complete O(history) sync envelope
+    /// on every transport poll.
+    pub(crate) fn crdt_frontier_commitment(
+        &self,
+    ) -> Result<Option<super::Hash>, LocalRootTreeInvokeErrorV2> {
+        if self.consistency != ConsistencyModeV2::Crdt {
+            return Err(LocalRootTreeInvokeErrorV2::Schedule(
+                ScheduleErrorV2::UnsupportedConsistency(self.consistency),
+            ));
+        }
+        let header = self
+            .service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::ServiceNotInstalled)?;
+        if header.crdt_heads.is_empty() {
+            return Ok(None);
+        }
+        let mut bytes = Vec::with_capacity(header.crdt_heads.len() * 32);
+        for head in header.crdt_heads {
+            bytes.extend_from_slice(&head.0);
+        }
+        Ok(Some(super::artifact_hash(b"crdt-frontier", &bytes)))
+    }
+
     /// Export the complete authenticated causal DAG from committed guest
     /// state. An empty freshly-installed CRDT has no transport envelope yet.
     pub fn crdt_sync_envelope(
@@ -2157,6 +2200,42 @@ where
         &mut self,
         envelope: CrdtSyncEnvelopeV2,
     ) -> Result<CommittedCrdtSyncV2, LocalRootTreeInvokeErrorV2> {
+        self.sync_crdt_with_verifications(envelope, &[])
+    }
+
+    /// Import one CRDT envelope whose exact transport peer was independently
+    /// authenticated as an enrolled replica by the node. The ordered verifier
+    /// sidecar is derived here rather than accepted from the wire, so a peer
+    /// cannot add, omit, or substitute a receipt-verification decision.
+    pub(crate) fn sync_authenticated_crdt(
+        &mut self,
+        envelope: CrdtSyncEnvelopeV2,
+    ) -> Result<CommittedCrdtSyncV2, LocalRootTreeInvokeErrorV2> {
+        let mut verifications = envelope
+            .nodes
+            .iter()
+            .map(|node| {
+                node.change.expected_producer().map(|expected_producer| {
+                    super::ReceiptVerificationRequestV2 {
+                        expected_producer,
+                        receipt: node.receipt.clone(),
+                    }
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(LocalRootTreeInvokeErrorV2::Rejected(
+                AccumulationRejectionV2::InvalidWorkflowTransition,
+            ))?;
+        verifications.sort_by_key(super::ReceiptVerificationRequestV2::hash);
+        verifications.dedup();
+        self.sync_crdt_with_verifications(envelope, &verifications)
+    }
+
+    fn sync_crdt_with_verifications(
+        &mut self,
+        envelope: CrdtSyncEnvelopeV2,
+        receipt_verifications: &[super::ReceiptVerificationRequestV2],
+    ) -> Result<CommittedCrdtSyncV2, LocalRootTreeInvokeErrorV2> {
         self.require_installed()?;
         if self.consistency != ConsistencyModeV2::Crdt || envelope.service != self.identity {
             return Err(LocalRootTreeInvokeErrorV2::Rejected(
@@ -2165,7 +2244,10 @@ where
         }
         let accumulated = self
             .service
-            .accumulate(&AccumulateRequestV2::SyncCrdt(envelope))
+            .accumulate_with_receipt_verifications_after_barrier(
+                &AccumulateRequestV2::SyncCrdt(envelope),
+                receipt_verifications,
+            )
             .map_err(RootTreeDriverErrorV2::into_invoke)?;
         match accumulated.result {
             AccumulationResultV2::Accepted {
@@ -2557,6 +2639,91 @@ mod tests {
             RootTreeTransportV2::decode(&replicated.encode()).unwrap(),
             replicated,
             "quorum-finalized Raft publications use the same canonical transport wire"
+        );
+
+        let crdt_service = ServiceIdentityV2 {
+            root_service: super::super::RootServiceId([0x51; 32]),
+            ..publication.receipt.service.clone()
+        };
+        let ingress = super::super::CrdtIngressV2 {
+            service: crdt_service.clone(),
+            invocation: InvocationId([0x52; 32]),
+            logical_timeslot: 3,
+            target: ActorId([0x53; 32]),
+            method: "increment".into(),
+            arguments: vec![crate::value::TAG_DYNAMIC, 1],
+            origin: super::super::Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            imported_blobs: vec![],
+            proof_requested: false,
+        };
+        let change = super::super::CrdtChangeV2 {
+            id: super::super::CrdtChangeV2::derive_ingress_id(&ingress, &[]),
+            work_hash: ingress.commitment(),
+            causal_dependencies: vec![],
+            causal_height: 1,
+            operations: vec![],
+            workflow: vec![super::super::WorkflowOperationV2::Ingress(ingress)],
+            materializations: vec![],
+            awaited_reply: None,
+            exported_blobs: vec![],
+        };
+        let cid = change.cid();
+        let crdt = RootTreeTransportV2::CrdtSync {
+            envelope: CrdtSyncEnvelopeV2 {
+                service: crdt_service.clone(),
+                advertised_heads: vec![cid],
+                nodes: vec![super::super::CrdtSyncNodeV2 {
+                    receipt: AccumulationReceiptV2 {
+                        service: crdt_service,
+                        accepted_transition: change.receipt_commitment(),
+                        reply_commitment: None,
+                        outbox_commitment: None,
+                        resulting_state_root: None,
+                        resulting_crdt_heads: vec![cid],
+                        sequence: 1,
+                        checkpoint: 0,
+                        consistency: ConsistencyModeV2::Crdt,
+                    },
+                    change,
+                }],
+                provided_blobs: vec![],
+            },
+        };
+        assert_eq!(RootTreeTransportV2::decode(&crdt.encode()).unwrap(), crdt);
+        let RootTreeTransportV2::CrdtSync { envelope } = &crdt else {
+            unreachable!()
+        };
+        let request = AccumulateRequestV2::SyncCrdt(envelope.clone());
+        let verification = super::super::ReceiptVerificationRequestV2 {
+            expected_producer: envelope.nodes[0]
+                .change
+                .expected_producer()
+                .expect("canonical ingress names its producer"),
+            receipt: envelope.nodes[0].receipt.clone(),
+        };
+        assert!(
+            super::super::CommittedAccumulateEntryV2::validate_replicated_receipt_verifications(
+                &request,
+                &[],
+            )
+            .is_err(),
+            "network CRDT sync cannot authorize its own receipt",
+        );
+        assert!(
+            super::super::CommittedAccumulateEntryV2::validate_replicated_receipt_verifications(
+                &request,
+                std::slice::from_ref(&verification),
+            )
+            .is_ok(),
+        );
+        assert!(
+            super::super::CommittedAccumulateEntryV2::validate_replicated_receipt_verifications(
+                &request,
+                &[verification.clone(), verification],
+            )
+            .is_err(),
+            "extra or duplicate verifier decisions are non-canonical",
         );
 
         let accepted = RootTreeTransportV2::PublicationAccepted {

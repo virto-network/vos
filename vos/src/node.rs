@@ -3465,25 +3465,43 @@ impl VosNode {
                     break;
                 }
                 if tell.payload.starts_with(b"VRT2") {
+                    use crate::v2::V2Wire;
+
                     let peer = tell.peer.to_bytes();
-                    let authenticated = v2_transport_source_route(&v2_actor_routes, &tell.payload)
-                        .is_some_and(|route| match route.consistency {
-                            crate::v2::ConsistencyModeV2::Local => {
-                                route.route == tell.from
-                                    && route.authenticated_peer.as_deref() == Some(peer.as_slice())
-                            }
-                            #[cfg(feature = "storage")]
-                            crate::v2::ConsistencyModeV2::Raft => {
-                                raft_route_peer_is_current_leader(
-                                    &route,
-                                    ServiceId(tell.from),
-                                    &peer,
-                                    &bridge_network,
-                                    &invoke_routes,
-                                )
-                            }
-                            _ => false,
+                    let crdt_sync = crate::v2::RootTreeTransportV2::decode(&tell.payload)
+                        .ok()
+                        .is_some_and(|transport| {
+                            matches!(transport, crate::v2::RootTreeTransportV2::CrdtSync { .. })
                         });
+                    // The bridge binds the transport route to the complete
+                    // Noise peer without blocking the global network thread
+                    // on registry I/O. The destination root thread performs
+                    // the exact enrolled-node lookup before exposing any
+                    // receipt verifier decision to guest Accumulate.
+                    let authenticated_crdt = crdt_sync
+                        && crate::network::derive_node_prefix(&tell.peer)
+                            == ServiceId(tell.from).node_prefix();
+                    let authenticated = authenticated_crdt
+                        || (!crdt_sync
+                            && v2_transport_source_route(&v2_actor_routes, &tell.payload)
+                                .is_some_and(|route| match route.consistency {
+                                    crate::v2::ConsistencyModeV2::Local => {
+                                        route.route == tell.from
+                                            && route.authenticated_peer.as_deref()
+                                                == Some(peer.as_slice())
+                                    }
+                                    #[cfg(feature = "storage")]
+                                    crate::v2::ConsistencyModeV2::Raft => {
+                                        raft_route_peer_is_current_leader(
+                                            &route,
+                                            ServiceId(tell.from),
+                                            &peer,
+                                            &bridge_network,
+                                            &invoke_routes,
+                                        )
+                                    }
+                                    _ => false,
+                                }));
                     if !authenticated {
                         warn!(
                             peer = %tell.peer,
@@ -4970,15 +4988,32 @@ impl VosNode {
                     warn!(%target, "node: v2 root envelope carried an invalid destination peer");
                     return;
                 };
+                use crate::v2::V2Wire;
+                let crdt_service = crate::v2::RootTreeTransportV2::decode(&envelope.payload)
+                    .ok()
+                    .and_then(|transport| match transport {
+                        crate::v2::RootTreeTransportV2::CrdtSync { envelope } => {
+                            Some(envelope.service)
+                        }
+                        _ => None,
+                    });
                 let bound = self.v2_actor_routes.read().ok().is_some_and(|routes| {
-                    routes.values().any(|route| {
-                        route.route == target.0
-                            && matches!(
-                                route.consistency,
-                                crate::v2::ConsistencyModeV2::Local
-                                    | crate::v2::ConsistencyModeV2::Raft
-                            )
-                            && route.authenticated_peer.as_deref() == Some(_peer_bytes)
+                    routes.values().any(|route| match crdt_service.as_ref() {
+                        Some(service) => {
+                            route.service == *service
+                                && route.consistency == crate::v2::ConsistencyModeV2::Crdt
+                                && route.authenticated_peer.is_none()
+                                && ServiceId(route.route).local_id() == target.local_id()
+                        }
+                        None => {
+                            route.route == target.0
+                                && matches!(
+                                    route.consistency,
+                                    crate::v2::ConsistencyModeV2::Local
+                                        | crate::v2::ConsistencyModeV2::Raft
+                                )
+                                && route.authenticated_peer.as_deref() == Some(_peer_bytes)
+                        }
                     })
                 });
                 if !bound {
@@ -5457,6 +5492,10 @@ fn decode_v2_raft_delegation(wire: &[u8]) -> Result<Option<V2RaftDelegatedIngres
 struct V2RootThreadState {
     pending_callers: HashMap<crate::v2::InvocationId, Vec<V2PendingCaller>>,
     publication_progress: HashMap<crate::v2::Hash, V2PublicationProgress>,
+    /// Last complete CRDT frontier advertised to enrolled replica peers.
+    /// A changed frontier is sent immediately; an unchanged one is retried on
+    /// a bounded cadence so a lost frame or restarted peer self-heals.
+    crdt_sync: Option<(crate::v2::Hash, Instant)>,
 }
 
 struct V2PendingCaller {
@@ -5507,6 +5546,14 @@ fn v2_transport_destination_route(
             .values()
             .find(|route| route.service == service)
             .cloned(),
+        crate::v2::RootTreeTransportV2::CrdtSync { envelope } => routes
+            .values()
+            .find(|route| {
+                route.service == envelope.service
+                    && route.consistency == crate::v2::ConsistencyModeV2::Crdt
+                    && route.authenticated_peer.is_none()
+            })
+            .cloned(),
     }
 }
 
@@ -5532,11 +5579,102 @@ fn v2_transport_source_route(
             acceptor_service,
             ..
         } => (acceptor, acceptor_service),
+        crate::v2::RootTreeTransportV2::CrdtSync { .. } => return None,
     };
     routes
         .get(&actor)
         .filter(|route| route.service == service)
         .cloned()
+}
+
+/// Authenticate one CRDT replica by its complete Noise identity and the
+/// canonical enrolled-node row. A compact route prefix is used only to locate
+/// the row; collisions never satisfy the final full-PeerId comparison.
+#[cfg(all(feature = "network", feature = "storage"))]
+fn authenticated_v2_crdt_replica_peer(
+    invoke_routes: &InvokeRoutes,
+    peer_bytes: &[u8],
+    timeout: Duration,
+) -> Option<libp2p::PeerId> {
+    let peer = libp2p::PeerId::from_bytes(peer_bytes).ok()?;
+    let prefix = crate::network::derive_node_prefix(&peer);
+    let member = lookup_node_member_from_routes_with_timeout(invoke_routes, prefix, timeout)?;
+    (member.kind == crate::registry::MEMBER_KIND_NODE
+        && matches!(
+            member.role,
+            crate::registry::NODE_ROLE_VOTER | crate::registry::NODE_ROLE_OBSERVER
+        )
+        && member.prefix == prefix
+        && member.key == peer_bytes)
+        .then_some(peer)
+}
+
+/// Read the canonical node roster before advertising CRDT state. Candidate
+/// selection never starts from the network prefix map: unauthenticated peers
+/// and cheap 16-bit collisions therefore cannot receive state or crowd an
+/// enrolled replica out of a fixed transport window.
+#[cfg(all(feature = "network", feature = "storage"))]
+fn v2_crdt_replica_roster(invoke_routes: &InvokeRoutes, timeout: Duration) -> Vec<libp2p::PeerId> {
+    use crate::actors::codec::{Decode, Encode};
+    use crate::registry::{MEMBER_KIND_NODE, MemberPage};
+    use crate::value::{Msg, TAG_DYNAMIC, Value};
+
+    let Some(deadline) = Instant::now().checked_add(timeout) else {
+        return Vec::new();
+    };
+    let mut after_kind = MEMBER_KIND_NODE;
+    let mut after_key = Vec::new();
+    let mut peers = Vec::new();
+    // The registry itself pages by both row and encoded-byte budgets. Bound
+    // this host walk as defense in depth; a later retry resumes from a fresh
+    // canonical snapshot rather than retaining partial authority state.
+    for _ in 0..16 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Vec::new();
+        }
+        let msg = Msg::new("members")
+            .with("after_kind", after_kind)
+            .with("after_key", after_key)
+            .with("budget", 64u32);
+        let mut payload = Vec::with_capacity(1 + 64);
+        payload.push(TAG_DYNAMIC);
+        payload.extend_from_slice(&msg.encode());
+        let Some(reply) = registry_probe_reply_with_timeout(invoke_routes, payload, remaining)
+        else {
+            return Vec::new();
+        };
+        let Some(Value::Bytes(bytes)) = <Value as Decode>::try_decode(&reply) else {
+            return Vec::new();
+        };
+        let Some(page) = <MemberPage as Decode>::try_decode(&bytes) else {
+            return Vec::new();
+        };
+        for member in page.members {
+            if member.kind != MEMBER_KIND_NODE
+                || !matches!(
+                    member.role,
+                    crate::registry::NODE_ROLE_VOTER | crate::registry::NODE_ROLE_OBSERVER
+                )
+            {
+                continue;
+            }
+            let Ok(peer) = libp2p::PeerId::from_bytes(&member.key) else {
+                continue;
+            };
+            if crate::network::derive_node_prefix(&peer) == member.prefix {
+                peers.push(peer);
+            }
+        }
+        if !page.more || page.next_kind != MEMBER_KIND_NODE {
+            peers.sort();
+            peers.dedup();
+            return peers;
+        }
+        after_kind = page.next_kind;
+        after_key = page.next_key;
+    }
+    Vec::new()
 }
 
 /// Resolve one claimed actor through its exact route and authenticated peer.
@@ -6210,6 +6348,9 @@ where
                 &mut service,
                 &outbox,
                 &actor_routes,
+                &invoke_routes,
+                #[cfg(feature = "network")]
+                &shared_network,
                 &logical_timeslot,
                 &mut state,
             );
@@ -6535,10 +6676,38 @@ fn handle_v2_root_transport<B>(
             return;
         }
     };
-    // CRDT receipt finality still requires an independent anti-entropy
-    // authority. Local roots consume the authenticated route decision in one
-    // IC-5 call; Raft roots quorum-order the exact decision beside the
-    // delivery or reply Apply entry before any follower executes it.
+    if let crate::v2::RootTreeTransportV2::CrdtSync {
+        envelope: sync_envelope,
+    } = &transport
+    {
+        #[cfg(all(feature = "network", feature = "storage"))]
+        let authenticated = envelope
+            .authenticated_source_peer
+            .as_deref()
+            .and_then(|peer| {
+                authenticated_v2_crdt_replica_peer(invoke_routes, peer, Duration::from_millis(500))
+            })
+            .is_some_and(|peer| {
+                crate::network::derive_node_prefix(&peer) == envelope.from.node_prefix()
+                    && envelope.from.local_id() == id.local_id()
+            });
+        #[cfg(not(all(feature = "network", feature = "storage")))]
+        let authenticated = false;
+        if !authenticated
+            || service.consistency() != crate::v2::ConsistencyModeV2::Crdt
+            || sync_envelope.service != *service.identity()
+        {
+            warn!(%id, from = %envelope.from, "rejected unauthenticated or misrouted v2 CRDT sync");
+            return;
+        }
+        if let Err(failure) = service.sync_authenticated_crdt(sync_envelope.clone()) {
+            warn!(%id, ?failure, "guest rejected authenticated v2 CRDT sync");
+        }
+        return;
+    }
+    // Local roots consume the authenticated route decision in one IC-5 call;
+    // Raft roots quorum-order the exact decision beside the delivery or reply
+    // Apply entry before any follower executes it.
     if !matches!(
         service.consistency(),
         crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
@@ -6750,6 +6919,9 @@ fn handle_v2_root_transport<B>(
                 shared_network,
                 state,
             )
+        }
+        crate::v2::RootTreeTransportV2::CrdtSync { .. } => {
+            unreachable!("CRDT sync returned from its fail-closed early handler")
         }
     }
 }
@@ -7119,11 +7291,83 @@ fn run_v2_root_inbox<B>(
     }
 }
 
+#[cfg(all(feature = "network", feature = "storage"))]
+fn advertise_v2_crdt_root<B>(
+    id: ServiceId,
+    service: &crate::v2::LocalRootTreeServiceV2<B>,
+    outbox: &mpsc::Sender<Envelope>,
+    invoke_routes: &InvokeRoutes,
+    shared_network: &SharedNetwork,
+    state: &mut V2RootThreadState,
+) where
+    B: crate::v2::CommittedImageStoreV2
+        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+{
+    use crate::v2::V2Wire;
+
+    const RETRY: Duration = Duration::from_secs(5);
+    const ROSTER_BUDGET: Duration = Duration::from_millis(500);
+
+    if service.consistency() != crate::v2::ConsistencyModeV2::Crdt {
+        return;
+    }
+    let commitment = match service.crdt_frontier_commitment() {
+        Ok(Some(commitment)) => commitment,
+        Ok(None) => return,
+        Err(failure) => {
+            warn!(%id, ?failure, "could not identify canonical v2 CRDT frontier");
+            return;
+        }
+    };
+    let now = Instant::now();
+    if state
+        .crdt_sync
+        .is_some_and(|(last, sent)| last == commitment && now.duration_since(sent) < RETRY)
+    {
+        return;
+    }
+    let envelope = match service.crdt_sync_envelope() {
+        Ok(Some(envelope)) => envelope,
+        Ok(None) => return,
+        Err(failure) => {
+            warn!(%id, ?failure, "could not export canonical v2 CRDT frontier");
+            return;
+        }
+    };
+    // Throttle even when no network or roster is currently available. A
+    // daemon partition must not turn its root thread into a registry spin.
+    state.crdt_sync = Some((commitment, now));
+    let Some(network) = shared_network
+        .lock()
+        .ok()
+        .and_then(|network| network.clone())
+    else {
+        return;
+    };
+    let local_peer = network.peer_id();
+    let payload = crate::v2::RootTreeTransportV2::CrdtSync { envelope }.encode();
+    for peer in v2_crdt_replica_roster(invoke_routes, ROSTER_BUDGET) {
+        if peer == local_peer {
+            continue;
+        }
+        let to = ServiceId::new(crate::network::derive_node_prefix(&peer), id.local_id());
+        let _ = outbox.send(Envelope {
+            from: id,
+            to,
+            payload: payload.clone(),
+            authenticated_source_peer: None,
+            destination_peer: Some(peer.to_bytes()),
+        });
+    }
+}
+
 fn retry_v2_root_transport<B>(
     id: ServiceId,
     service: &mut crate::v2::LocalRootTreeServiceV2<B>,
     outbox: &mpsc::Sender<Envelope>,
     actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
+    invoke_routes: &InvokeRoutes,
+    #[cfg(feature = "network")] shared_network: &SharedNetwork,
     logical_timeslot: &AtomicU64,
     state: &mut V2RootThreadState,
 ) where
@@ -7134,6 +7378,10 @@ fn retry_v2_root_transport<B>(
         Ok(true) => {}
         Ok(false) | Err(_) => return,
     }
+    #[cfg(all(feature = "network", feature = "storage"))]
+    advertise_v2_crdt_root(id, service, outbox, invoke_routes, shared_network, state);
+    #[cfg(not(all(feature = "network", feature = "storage")))]
+    let _ = invoke_routes;
     let should_expire = service
         .next_pending_call_deadline()
         .ok()
@@ -14425,6 +14673,54 @@ mod tests {
             authenticated_v2_raft_leader_peer(&wrong_group, &enrolled, prefix).is_none(),
             "the same roster peer is not trusted outside the authority's exact Raft group",
         );
+    }
+
+    #[test]
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn crdt_replica_authority_binds_the_full_enrolled_peer_id() {
+        use crate::actors::codec::Encode;
+        use crate::value::Value;
+
+        let enrolled = libp2p::PeerId::random();
+        let attacker = libp2p::PeerId::random();
+        let attacker_prefix = crate::network::derive_node_prefix(&attacker);
+        let row = crate::registry::MemberRow {
+            kind: crate::registry::MEMBER_KIND_NODE,
+            key: enrolled.to_bytes(),
+            // Model the exact row selected by the attacker's compact route.
+            // Only the complete key comparison is allowed to reject it.
+            prefix: attacker_prefix,
+            role: crate::registry::NODE_ROLE_VOTER,
+            proof_kind: 0,
+            proof_data: Vec::new(),
+        };
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<InvokeRequest>();
+        routes.lock().unwrap().insert(ServiceId::REGISTRY.0, tx);
+        let registry = thread::spawn(move || {
+            let request = rx.recv().unwrap();
+            let page = crate::registry::MemberPage {
+                members: vec![row],
+                next_kind: crate::registry::MEMBER_KIND_IDENTITY,
+                next_key: Vec::new(),
+                more: true,
+            };
+            assert!(request.reply.send(encode_invoke_envelope(
+                crate::STATUS_DONE,
+                &[],
+                &Value::Bytes(page.encode()).encode(),
+            )));
+        });
+        assert!(
+            authenticated_v2_crdt_replica_peer(
+                &routes,
+                &attacker.to_bytes(),
+                Duration::from_secs(1),
+            )
+            .is_none(),
+            "a prefix-selected row never authenticates a different Noise peer",
+        );
+        registry.join().unwrap();
     }
 
     #[test]

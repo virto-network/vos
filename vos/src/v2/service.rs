@@ -125,6 +125,26 @@ fn validate_receipt_verifications(
             return Err(DecodeError::NonCanonical);
         }
         return Ok(());
+    } else if let AccumulateRequestV2::SyncCrdt(envelope) = request {
+        let mut expected = envelope
+            .nodes
+            .iter()
+            .map(|node| {
+                Some(ReceiptVerificationRequestV2 {
+                    expected_producer: node.change.expected_producer()?,
+                    receipt: node.receipt.clone(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(DecodeError::NonCanonical)?;
+        expected.sort_by_key(ReceiptVerificationRequestV2::hash);
+        expected.dedup();
+        if verifications.is_empty() && !require_external_verification {
+            return Ok(());
+        }
+        return (verifications == expected)
+            .then_some(())
+            .ok_or(DecodeError::NonCanonical);
     } else {
         match request {
             AccumulateRequestV2::Deliver(delivery) => Some(ReceiptVerificationRequestV2 {
@@ -321,8 +341,9 @@ pub struct CommittedAccumulateEntryV2 {
     pub availability_blobs: Vec<ImportedBlobV2>,
     /// Exact positive receipt-verifier decisions ordered beside this request.
     /// Authority ingress, durable delivery, and awaited-reply consumption
-    /// each bind exactly one external receipt; every other request carries an
-    /// empty list.
+    /// each bind exactly one external receipt. CRDT synchronization binds one
+    /// decision per distinct causal-node receipt; requests without an
+    /// external receipt carry an empty list.
     pub receipt_verifications: Vec<ReceiptVerificationRequestV2>,
 }
 
@@ -1420,7 +1441,8 @@ where
     /// Quorum-order one request together with its exact positive receipt
     /// verification selected by authenticated host routing. Canonical
     /// validation binds the sidecar to authority ingress, durable delivery,
-    /// or awaited-reply consumption and rejects it for every other shape.
+    /// awaited-reply consumption, or every distinct CRDT sync-node receipt,
+    /// and rejects it for every other shape.
     #[cfg(feature = "storage")]
     pub(crate) fn accumulate_with_receipt_verifications_after_barrier(
         &mut self,
