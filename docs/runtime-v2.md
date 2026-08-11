@@ -5,14 +5,17 @@
 > APIs, and CRDT primitives described here are present. The local v2 harness
 > executes both phases through that PVM and commits only an accepted guest
 > result; it has no native transition-apply shortcut. `VosNode` can attach an
-> explicitly opened Local or Raft v2 root and route ordinary public calls, durable
-> cross-root outbox delivery, inbox execution, exact reply/timeout resume, and
-> restart retries through it. A direct space-role-only call to a Local or Raft
+> explicitly opened Local, Raft, or CRDT v2 root and route ordinary public
+> calls, durable cross-root outbox delivery, inbox execution, exact
+> reply/timeout resume, and
+> restart retries through Local and Raft roots. Enrolled nodes automatically
+> exchange complete authenticated CRDT frontiers and redrive them after restart.
+> A direct space-role-only call to a Local or Raft
 > root obtains an invocation-scoped accumulated assertion from that space's
 > installed Raft `space-authority`; caller-supplied legacy role bytes are ignored. Signed v2
 > catalog rows use this root service when the daemon is started with the exact
-> service PVM. CRDT anti-entropy, actor-local or mixed-role external calls,
-> role-authorized CRDT targets, role-bearing durable calls, and attested network
+> service PVM. Actor-local or mixed-role external calls, role-authorized CRDT
+> targets, role-bearing durable calls, CRDT cross-root calls, and attested network
 > transport remain fail-closed. Legacy node behavior is
 > not evidence of v2 conformance.
 
@@ -293,6 +296,19 @@ continuation/inbox/outbox/workflow rows from the DAG, and commits nodes,
 receipts, blobs, materialized rows, and the header atomically. The read-only
 local scheduler only packages these authenticated bytes.
 
+`VosNode` periodically advertises that complete envelope to the canonical
+enrolled-node roster and retries an unchanged frontier on a bounded cadence.
+The transport carries no verifier allowlist. On receipt, the root thread binds
+the complete Noise `PeerId` to an exact voter/observer registry row, checks the
+destination service identity, and derives the complete ordered
+`ReceiptVerificationRequestV2` sidecar locally before entering IC-5. Missing,
+extra, or substituted verifier entries are rejected at the service boundary.
+This is the same non-Byzantine enrolled-node trust boundary used by the current
+cluster drivers: an enrolled node is trusted to advertise only finalized CRDT
+receipts. A Byzantine-capable deployment must replace that decision with
+independently verifiable receipt certificates; a peer-supplied envelope alone
+is never authority.
+
 Guest Install is fail-closed on an exact-genesis authorization capability. It
 binds service/deployment identity, consistency mode, the complete actor tree,
 programs, initial states, method policies, and the supplied authorization
@@ -459,13 +475,14 @@ an independently constructed genesis directly to guest Install is only a
 conformance seam.
 
 The reusable local transport remains a conformance orchestrator. `VosNode`
-connects its ordinary Local subset to authenticated node envelopes, but
+connects ordinary Local and Raft calls plus same-service CRDT anti-entropy to
+authenticated node envelopes, but
 automatic service discovery remains staged: external actor routes must come
 from a trusted registry or consensus directory, never from a received
-envelope. Ordinary durable Raft and CRDT transport also remain staged until
-receipt finality and logical time come from their consensus domains; the
-quorum-ordered direct authority-ingress decision above is the narrow Raft
-exception.
+envelope. Durable CRDT cross-root calls remain staged until receipt finality
+and logical time come from their consensus domains. Raft delivery and reply
+transport instead quorum-order their exact verifier sidecars as described
+below.
 Acknowledging a publication containing several
 effects is the transport host's responsibility only after every required
 consumer has accepted it.
@@ -531,10 +548,13 @@ Upgrade order the exact content-addressed program/genesis bytes and stage them
 atomically with IC-5, while snapshots carry the resulting catalog.
 `RECEIPT_VERIFY` must likewise use consensus-authoritative receipt finality
 rather than its local conformance allowlist for general delivery and reply
-paths. Direct role-authorized Raft ingress already quorum-orders its exact
-authority verifier input beside admission and persists the accepted ingress in
-guest state. Every delivery, deadline, and expiration observation must come
-from the JAM slot. `PROOF_VERIFY`
+paths. The automatic CRDT driver currently derives that verifier decision only
+after authenticating an enrolled node's complete Noise identity; deployments
+which do not trust every enrolled replica must carry an independently
+verifiable finality certificate instead. Direct role-authorized Raft ingress
+already quorum-orders its exact authority verifier input beside admission and
+persists the accepted ingress in guest state. Every delivery, deadline, and
+expiration observation must come from the JAM slot. `PROOF_VERIFY`
 must use the workspace-pinned verifier and execution-semantics identity rather
 than the local proof allowlist. Its proof backend must consume or reproduce
 the canonical Refine trace committed by the proof request before attested
@@ -772,13 +792,15 @@ across leader changes. Typed forwarding requests the full invoke envelope, so
 `Forbidden`, `NotFound`, panic and out-of-gas statuses remain identical to a
 direct leader call.
 
-V2 CRDT rows remain fail-closed until anti-entropy can authenticate receipt
-finality independently of the peer-supplied sync envelope. For Local and Raft
-roots, ordinary public cross-root calls are emitted as guest-owned
-publications, routed over canonical node envelopes, admitted through
-destination IC-5, and resumed from the caller's exact saved machine after the
-committed reply returns. A Raft `Deliver` or reply-consuming `Apply` carries
-exactly one canonical `ReceiptVerificationRequestV2` in its log entry. Missing,
+V2 CRDT roots admit anti-entropy only from a full Noise identity present in the
+canonical node roster. The peer-supplied envelope never carries its own
+allowlist; the receiving root derives an exact ordered verifier sidecar after
+authentication and guest Accumulate independently checks the complete DAG.
+For Local and Raft roots, ordinary public cross-root calls are emitted as
+guest-owned publications, routed over canonical node envelopes, admitted
+through destination IC-5, and resumed from the caller's exact saved machine
+after the committed reply returns. A Raft `Deliver` or reply-consuming `Apply`
+carries exactly one canonical `ReceiptVerificationRequestV2` in its log entry. Missing,
 extra, or mismatched verifier input is rejected before proposal and again on
 follower replay; non-receipt-bearing requests require the sidecar to be empty.
 The node periodically redrives pending publications, inboxes, and ingresses
