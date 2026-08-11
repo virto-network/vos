@@ -2047,9 +2047,7 @@ fn v2_config_from_row(
         (false, Consistency::Crdt) => anyhow::bail!(
             "ordinary #[actor] package cannot select CRDT consistency; install it as local"
         ),
-        (true, Consistency::Crdt) => anyhow::bail!(
-            "CRDT package requires the v2 anti-entropy driver, which space up does not attach yet"
-        ),
+        (true, Consistency::Crdt) => {}
         (true, Consistency::Raft) => {
             anyhow::bail!("#[actor(crdt)] package must use CRDT consistency")
         }
@@ -2126,6 +2124,7 @@ fn v2_config_from_row(
         consistency: match consistency {
             Consistency::Local => vos::v2::ConsistencyModeV2::Local,
             Consistency::Raft => vos::v2::ConsistencyModeV2::Raft,
+            Consistency::Crdt => vos::v2::ConsistencyModeV2::Crdt,
             _ => unreachable!("v2 consistency was validated above"),
         },
         initial_state,
@@ -3262,12 +3261,17 @@ mod tests {
     }
 
     fn signed_v2_package(service_program: ProgramId) -> VosPackageV2 {
+        signed_v2_package_with_consistency(service_program, false)
+    }
+
+    fn signed_v2_package_with_consistency(service_program: ProgramId, crdt: bool) -> VosPackageV2 {
         let mut assembler = grey_transpiler::assembler::Assembler::new();
         assembler
             .load_imm_64(grey_transpiler::assembler::Reg::A0, 0)
             .ecalli(0);
         let actor_pvm = assembler.build();
-        let (buffer, length) = vos::metadata::encode::<512>(&V2_META);
+        let metadata_source = ActorMeta { crdt, ..V2_META };
+        let (buffer, length) = vos::metadata::encode::<512>(&metadata_source);
         let schemas = buffer[..length].to_vec();
         let metadata = vos::metadata::decode(&schemas).unwrap();
         let role_policies = PackageRolePoliciesV2::from_metadata(&metadata)
@@ -3284,7 +3288,7 @@ mod tests {
                 execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
                 service_program,
                 actor_program: ProgramId::of_pvm(&actor_pvm),
-                crdt: false,
+                crdt,
                 interfaces_hash: artifact_hash(b"interfaces", &[]),
                 role_policies_hash: artifact_hash(b"role-policies", &role_policies),
                 schemas_hash: artifact_hash(b"schemas", &schemas),
@@ -3519,6 +3523,46 @@ mod tests {
             panic!("v2 package fell through to the legacy runtime")
         };
         assert_eq!(config.consistency, vos::v2::ConsistencyModeV2::Raft);
+    }
+
+    #[test]
+    fn signed_crdt_v2_packages_select_the_anti_entropy_root_driver() {
+        let service_pvm = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../services/vos-service/vos-service.pvm"),
+        )
+        .expect("the protocol-pinned service artifact must be available to tests");
+        let package = signed_v2_package_with_consistency(vos::v2::VOS_SERVICE_PROGRAM_ID, true);
+        let row = vos::registry::AgentRow {
+            instance_name: "shared-counter".into(),
+            program_hash: [11; 32],
+            program_name: "shared-counter".into(),
+            program_version: "2.0.0".into(),
+            replication_id: [12; 32],
+            consistency: Consistency::Crdt as u8,
+            network_reachable: true,
+            sync_role: vos::registry::SyncFloor::Member,
+            install_args: vec![],
+            install_payloads: vec![],
+        };
+        let pinned = PinnedV2Service {
+            pvm: std::sync::Arc::new(service_pvm),
+        };
+        let resolved = v2_config_from_row(
+            Path::new("/tmp/vos-v2-crdt-config-test"),
+            [13; 32],
+            &row,
+            std::slice::from_ref(&row),
+            &AgentPolicies::new(),
+            Consistency::Crdt,
+            package.encode(),
+            Some(&pinned),
+            &[],
+        )
+        .expect("a signed #[actor(crdt)] package selects CRDT");
+        let RowConfig::V2 { config, .. } = resolved else {
+            panic!("v2 CRDT package fell through to the legacy runtime")
+        };
+        assert_eq!(config.consistency, vos::v2::ConsistencyModeV2::Crdt);
     }
 
     #[test]
