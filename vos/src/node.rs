@@ -110,6 +110,7 @@ struct V2RaftTransportResolutionKey {
 #[derive(Debug, Clone)]
 enum V2RaftTransportResolution {
     Pending {
+        generation: u64,
         until: Instant,
     },
     Resolved {
@@ -147,6 +148,8 @@ const V2_RAFT_TRANSPORT_LEADER_CACHE_TTL: Duration = Duration::from_secs(1);
 const V2_RAFT_TRANSPORT_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 #[cfg(all(feature = "network", feature = "storage"))]
 const V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES: usize = 16;
+#[cfg(all(feature = "network", feature = "storage"))]
+const V2_RAFT_TRANSPORT_MAX_LEADER_HINTS: usize = 4;
 
 /// One end-to-end Raft invocation can consume one voter-authentication probe,
 /// one read barrier, and up to three proposal waits (fresh-root `Install`,
@@ -1075,6 +1078,10 @@ pub struct VosNode {
     /// repeated 250 ms durable redrives coalesce behind the same marker.
     #[cfg(all(feature = "network", feature = "storage"))]
     v2_raft_transport_resolutions: V2RaftTransportResolutions,
+    /// Monotone generation used to rotate the bounded connected-peer fallback
+    /// across durable retries. It is routing-only and never enters consensus.
+    #[cfg(all(feature = "network", feature = "storage"))]
+    v2_raft_transport_resolution_generation: AtomicU64,
     /// Prepared Raft roots remain absent from public route tables while voter
     /// promotion is pending. Background workers send a type-erased publication
     /// closure here once final non-joint membership is locally visible.
@@ -3217,6 +3224,8 @@ impl VosNode {
             #[cfg(all(feature = "network", feature = "storage"))]
             v2_raft_transport_resolutions: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(feature = "network", feature = "storage"))]
+            v2_raft_transport_resolution_generation: AtomicU64::new(0),
+            #[cfg(all(feature = "network", feature = "storage"))]
             pending_v2_root_ready_tx,
             #[cfg(all(feature = "network", feature = "storage"))]
             pending_v2_root_ready_rx,
@@ -5029,6 +5038,7 @@ impl VosNode {
         };
         let now = Instant::now();
         let (deadline, pending_until) = v2_raft_transport_resolution_deadlines(now);
+        let mut resolution_generation = None;
         let cached = {
             let Ok(mut resolutions) = self.v2_raft_transport_resolutions.lock() else {
                 return;
@@ -5037,12 +5047,17 @@ impl VosNode {
                 Some(V2RaftTransportResolution::Resolved { peer, route, until }) if until > now => {
                     Some((peer, route))
                 }
-                Some(V2RaftTransportResolution::Pending { until }) if until > now => return,
+                Some(V2RaftTransportResolution::Pending { until, .. }) if until > now => return,
                 Some(V2RaftTransportResolution::Backoff { until }) if until > now => return,
                 _ => {
+                    let generation = self
+                        .v2_raft_transport_resolution_generation
+                        .fetch_add(1, Ordering::Relaxed);
+                    resolution_generation = Some(generation);
                     resolutions.insert(
                         key,
                         V2RaftTransportResolution::Pending {
+                            generation,
                             until: pending_until,
                         },
                     );
@@ -5055,13 +5070,21 @@ impl VosNode {
             dispatch_resolved_v2_raft_transport(&network, local_tx, peer, route, envelope);
             return;
         }
+        let Some(resolution_generation) = resolution_generation else {
+            return;
+        };
 
         let resolutions = self.v2_raft_transport_resolutions.clone();
         let invoke_routes = self.invoke_routes.clone();
         let shutdown = self.shutdown.clone();
         thread::spawn(move || {
-            let resolved =
-                resolve_v2_raft_leader_route_before(&binding, &network, &invoke_routes, deadline);
+            let resolved = resolve_v2_raft_leader_route_before(
+                &binding,
+                &network,
+                &invoke_routes,
+                deadline,
+                resolution_generation,
+            );
             if shutdown.load(Ordering::Relaxed) {
                 if let Ok(mut entries) = resolutions.lock() {
                     entries.remove(&key);
@@ -5072,8 +5095,8 @@ impl VosNode {
             let owns_resolution = if let Ok(mut entries) = resolutions.lock() {
                 if !matches!(
                     entries.get(&key),
-                    Some(V2RaftTransportResolution::Pending { until })
-                        if *until == pending_until
+                    Some(V2RaftTransportResolution::Pending { generation, until })
+                        if *generation == resolution_generation && *until == pending_until
                 ) {
                     false
                 } else {
@@ -5551,6 +5574,7 @@ fn resolve_v2_raft_leader_route(
         network,
         invoke_routes,
         Instant::now() + V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT,
+        0,
     )
 }
 
@@ -5571,11 +5595,21 @@ fn v2_raft_transport_auth_windows(now: Instant, deadline: Instant) -> (Duration,
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
+fn v2_raft_transport_status_deadline(auth_deadline: Instant, deadline: Instant) -> Instant {
+    auth_deadline
+        + deadline
+            .saturating_duration_since(auth_deadline)
+            .checked_div(2)
+            .unwrap_or_default()
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
 fn resolve_v2_raft_leader_route_before(
     binding: &V2ActorRoute,
     network: &crate::network::Network,
     invoke_routes: &InvokeRoutes,
     deadline: Instant,
+    resolution_generation: u64,
 ) -> Option<(libp2p::PeerId, ServiceId)> {
     let replication_id = binding.replication_id?;
     let local_id = ServiceId(binding.route).local_id();
@@ -5607,7 +5641,11 @@ fn resolve_v2_raft_leader_route_before(
             push_v2_raft_prefix_candidate(&mut candidates, prefix);
         }
     }
-    for peer in network.connected_peers() {
+    for peer in v2_raft_connected_candidate_window(
+        network.connected_peers(),
+        resolution_generation,
+        V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES.saturating_sub(candidates.len()),
+    ) {
         if candidates.len() >= V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES {
             break;
         }
@@ -5654,16 +5692,11 @@ fn resolve_v2_raft_leader_route_before(
         authenticated.insert(prefix, (peer, member));
     }
 
-    let resolve = |status: &crate::network::RaftStatusReply| {
-        let leader_prefix = status.leader_hint?;
-        let (_, member) = authenticated.get(&leader_prefix)?;
-        let peer = authenticated_v2_raft_leader_peer(status, member, leader_prefix)?;
-        Some((peer, ServiceId::new(leader_prefix, local_id)))
-    };
-
     // Fan out before waiting for any response. A responsive-but-stalled old
     // bootstrap can consume its own request lifetime, but it cannot prevent a
     // newly elected connected voter from answering within the shared bound.
+    // Stop before the overall deadline so a trusted follower's previously
+    // unseen leader hint can still be bound through the canonical roster.
     let mut probes = authenticated
         .iter()
         .map(|(&prefix, (peer, _))| (prefix, network.send_raft_status_req(*peer, replication_id)))
@@ -5677,13 +5710,40 @@ fn resolve_v2_raft_leader_route_before(
             )
         })
         .collect::<Vec<_>>();
-    observations.extend(collect_v2_raft_status_probes(&mut probes, deadline));
+    let status_deadline = v2_raft_transport_status_deadline(auth_deadline, deadline);
+    observations.extend(collect_v2_raft_status_probes(&mut probes, status_deadline));
 
     // A cache is only one observation, never an authority to short-circuit
     // live voters. Prefer the highest term seen across every authenticated
-    // reply; within one term prefer the leader's own report, then the most
-    // advanced committed/log view and a deterministic prefix tie-break.
-    select_v2_raft_leader_observation(observations, resolve)
+    // reply. The selected term's bounded leader hints are authenticated after
+    // collection, so a trusted bootstrap follower can introduce a leader that
+    // was absent from both the local cache and connected-peer fallback.
+    resolve_v2_raft_leader_observations(
+        observations,
+        &authenticated,
+        invoke_routes,
+        local_id,
+        deadline,
+    )
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn v2_raft_connected_candidate_window(
+    mut peers: Vec<libp2p::PeerId>,
+    generation: u64,
+    limit: usize,
+) -> Vec<libp2p::PeerId> {
+    if peers.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    // `connected_peers` preserves the prefix map's iteration order while its
+    // population is unchanged. Advancing by a full window therefore covers a
+    // fixed set instead of repeatedly selecting its first untrusted entries.
+    let start =
+        (generation as usize).wrapping_mul(V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES) % peers.len();
+    peers.rotate_left(start);
+    peers.truncate(limit.min(peers.len()));
+    peers
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
@@ -5726,28 +5786,78 @@ fn push_v2_raft_peer_candidate(
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn select_v2_raft_leader_observation<T>(
+fn ranked_v2_raft_leader_observations(
     observations: Vec<(u16, crate::network::RaftStatusReply)>,
-    mut resolve: impl FnMut(&crate::network::RaftStatusReply) -> Option<T>,
-) -> Option<T> {
-    observations
+) -> Vec<(u16, crate::network::RaftStatusReply)> {
+    let mut observations = observations
         .into_iter()
         .filter(|(reporter, status)| status.present && status.members.contains(reporter))
-        .filter_map(|(reporter, status)| {
-            let leader = resolve(&status)?;
-            let self_reported_leader = status.role == crate::network::RaftRole::Leader
-                && status.leader_hint == Some(reporter);
-            let rank = (
-                status.current_term,
-                self_reported_leader,
-                status.commit_index,
-                status.last_log_index,
-                reporter,
-            );
-            Some((rank, leader))
-        })
-        .max_by_key(|(rank, _)| *rank)
-        .map(|(_, leader)| leader)
+        .collect::<Vec<_>>();
+    observations.sort_unstable_by_key(|(reporter, status)| {
+        let self_reported_leader = status.role == crate::network::RaftRole::Leader
+            && status.leader_hint == Some(*reporter);
+        std::cmp::Reverse((
+            status.current_term,
+            self_reported_leader,
+            status.commit_index,
+            status.last_log_index,
+            *reporter,
+        ))
+    });
+    let Some(highest_term) = observations.first().map(|(_, status)| status.current_term) else {
+        return observations;
+    };
+    observations.retain(|(_, status)| status.current_term == highest_term);
+    observations
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn resolve_v2_raft_leader_observations(
+    observations: Vec<(u16, crate::network::RaftStatusReply)>,
+    authenticated: &HashMap<u16, (libp2p::PeerId, crate::registry::MemberRow)>,
+    invoke_routes: &InvokeRoutes,
+    local_id: u16,
+    deadline: Instant,
+) -> Option<(libp2p::PeerId, ServiceId)> {
+    let observations = ranked_v2_raft_leader_observations(observations);
+    let mut attempted = HashSet::new();
+    let mut candidates = Vec::new();
+    for (_, status) in observations {
+        let Some(leader_prefix) = status.leader_hint else {
+            continue;
+        };
+        if !attempted.insert(leader_prefix) {
+            continue;
+        }
+        if attempted.len() > V2_RAFT_TRANSPORT_MAX_LEADER_HINTS {
+            break;
+        }
+        candidates.push((leader_prefix, status));
+    }
+
+    let candidate_count = candidates.len();
+    for (index, (leader_prefix, status)) in candidates.into_iter().enumerate() {
+        if let Some((_, member)) = authenticated.get(&leader_prefix)
+            && let Some(peer) = authenticated_v2_raft_leader_peer(&status, member, leader_prefix)
+        {
+            return Some((peer, ServiceId::new(leader_prefix, local_id)));
+        }
+
+        let hints_left = candidate_count.saturating_sub(index).max(1) as u32;
+        let budget = deadline
+            .saturating_duration_since(Instant::now())
+            .checked_div(hints_left)
+            .unwrap_or_default();
+        let Some((_, member)) =
+            authenticate_v2_raft_peer_candidate(invoke_routes, leader_prefix, None, budget)
+        else {
+            continue;
+        };
+        if let Some(peer) = authenticated_v2_raft_leader_peer(&status, &member, leader_prefix) {
+            return Some((peer, ServiceId::new(leader_prefix, local_id)));
+        }
+    }
+    None
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
@@ -11715,13 +11825,13 @@ mod tests {
             members: vec![0x1111, 0x2222],
             leader_hint: Some(0x2222),
         };
+        let ranked = ranked_v2_raft_leader_observations(vec![(0x1111, stale), (0x2222, current)]);
         assert_eq!(
-            select_v2_raft_leader_observation(vec![(0x1111, stale), (0x2222, current)], |status| {
-                status.leader_hint
-            },),
+            ranked.first().and_then(|(_, status)| status.leader_hint),
             Some(0x2222),
             "a lower-term local cache cannot pin transport to its former leader"
         );
+        assert_eq!(ranked.len(), 1, "lower terms cannot be fallback routes");
     }
 
     #[cfg(all(feature = "network", feature = "storage"))]
@@ -11739,6 +11849,114 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0], (shared_prefix, Some(exact)));
         assert_eq!(candidates[1], (shared_prefix, Some(colliding)));
+    }
+
+    #[cfg(all(feature = "network", feature = "storage"))]
+    #[test]
+    fn connected_candidate_windows_advance_fairly_across_retries() {
+        let peers = (0..33)
+            .map(|_| libp2p::PeerId::random())
+            .collect::<Vec<_>>();
+        let mut observed = HashSet::new();
+
+        for generation in 0..3 {
+            observed.extend(v2_raft_connected_candidate_window(
+                peers.clone(),
+                generation,
+                V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES,
+            ));
+        }
+
+        assert_eq!(
+            observed.len(),
+            peers.len(),
+            "a fixed connected non-voter set cannot permanently hide a later voter"
+        );
+    }
+
+    #[cfg(all(feature = "network", feature = "storage"))]
+    #[test]
+    fn authenticated_bootstrap_follower_can_introduce_an_unseen_leader() {
+        use crate::actors::codec::Encode;
+        use crate::registry::{MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, MemberPage, MemberRow};
+        use crate::value::Value;
+
+        let follower = libp2p::PeerId::random();
+        let follower_prefix = crate::network::derive_node_prefix(&follower);
+        let (leader, leader_prefix) = loop {
+            let peer = libp2p::PeerId::random();
+            let prefix = crate::network::derive_node_prefix(&peer);
+            if prefix != follower_prefix {
+                break (peer, prefix);
+            }
+        };
+        let follower_member = MemberRow {
+            kind: MEMBER_KIND_NODE,
+            key: follower.to_bytes(),
+            prefix: follower_prefix,
+            role: crate::registry::NODE_ROLE_VOTER,
+            proof_kind: 0,
+            proof_data: Vec::new(),
+        };
+        let leader_member = MemberRow {
+            kind: MEMBER_KIND_NODE,
+            key: leader.to_bytes(),
+            prefix: leader_prefix,
+            role: crate::registry::NODE_ROLE_VOTER,
+            proof_kind: 0,
+            proof_data: Vec::new(),
+        };
+        let authenticated = HashMap::from([(follower_prefix, (follower, follower_member))]);
+        let observations = vec![(
+            follower_prefix,
+            crate::network::RaftStatusReply {
+                present: true,
+                role: crate::network::RaftRole::Follower,
+                current_term: 12,
+                commit_index: 19,
+                last_log_index: 19,
+                members: vec![follower_prefix, leader_prefix],
+                leader_hint: Some(leader_prefix),
+            },
+        )];
+
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let (registry_tx, registry_rx) = mpsc::channel::<InvokeRequest>();
+        routes
+            .lock()
+            .unwrap()
+            .insert(ServiceId::REGISTRY.0, registry_tx);
+        let registry = thread::spawn(move || {
+            let request = registry_rx.recv().expect("leader roster probe arrives");
+            let reply = Value::Bytes(
+                MemberPage {
+                    members: vec![leader_member],
+                    next_kind: MEMBER_KIND_IDENTITY,
+                    next_key: Vec::new(),
+                    more: false,
+                }
+                .encode(),
+            )
+            .encode();
+            assert!(
+                request
+                    .reply
+                    .send(encode_invoke_envelope(crate::STATUS_DONE, &[], &reply,))
+            );
+        });
+
+        let local_id = 0x4040;
+        assert_eq!(
+            resolve_v2_raft_leader_observations(
+                observations,
+                &authenticated,
+                &routes,
+                local_id,
+                Instant::now() + Duration::from_millis(250),
+            ),
+            Some((leader, ServiceId::new(leader_prefix, local_id)))
+        );
+        registry.join().unwrap();
     }
 
     #[cfg(all(feature = "network", feature = "storage"))]
@@ -11772,6 +11990,11 @@ mod tests {
         assert_eq!(
             auth_deadline.duration_since(started),
             Duration::from_millis(500)
+        );
+        assert_eq!(
+            v2_raft_transport_status_deadline(auth_deadline, deadline).duration_since(started),
+            Duration::from_millis(750),
+            "the final quarter remains reserved for unseen leader authentication"
         );
     }
 
