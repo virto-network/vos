@@ -5558,11 +5558,11 @@ struct V2CrdtPeerProgress {
     transfer: Option<crate::v2::Hash>,
     chunks: Option<Arc<Vec<crate::v2::CrdtSyncEnvelopeV2>>>,
     next_chunk: u32,
+    /// Retry throttle for the current chunk (and for failed authorization).
     last_sent: Option<Instant>,
-    /// Refreshed only when a transfer is selected or its next chunk is
-    /// acknowledged. A connected-but-unresponsive peer cannot pin that
-    /// complete-history generation forever.
-    last_progress: Option<Instant>,
+    /// Set only while one chunk lacks an acknowledgement. Fair-scheduling
+    /// time after an acknowledgement does not count toward the stall limit.
+    awaiting_ack_since: Option<Instant>,
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
@@ -5572,12 +5572,12 @@ impl V2CrdtPeerProgress {
         self.chunks = None;
         self.next_chunk = 0;
         self.last_sent = None;
-        self.last_progress = None;
+        self.awaiting_ack_since = None;
     }
 
     fn release_stalled_transfer(&mut self, now: Instant, stall: Duration) -> bool {
         if self
-            .last_progress
+            .awaiting_ack_since
             .is_some_and(|last| now.saturating_duration_since(last) >= stall)
         {
             self.release_transfer();
@@ -5593,7 +5593,6 @@ fn v2_crdt_select_latest_peer_transfer(
     peer: &mut V2CrdtPeerProgress,
     latest_transfer: crate::v2::Hash,
     latest_chunks: &Arc<Vec<crate::v2::CrdtSyncEnvelopeV2>>,
-    now: Instant,
 ) {
     let complete = peer
         .chunks
@@ -5604,7 +5603,7 @@ fn v2_crdt_select_latest_peer_transfer(
         peer.chunks = Some(latest_chunks.clone());
         peer.next_chunk = 0;
         peer.last_sent = None;
-        peer.last_progress = Some(now);
+        peer.awaiting_ack_since = None;
     }
 }
 
@@ -5905,8 +5904,9 @@ fn v2_crdt_fanout_order(mut peers: Vec<Vec<u8>>, after: Option<&[u8]>) -> Vec<Ve
 #[cfg(all(feature = "network", feature = "storage"))]
 const V2_CRDT_SYNC_CHUNK_MAX_BYTES: usize = 7 * 1024 * 1024;
 
-/// Six missed five-second acknowledgements retire only that peer's immutable
-/// snapshot. Recovery restarts from the newest transfer and guest dedup makes
+/// Thirty seconds with one unacknowledged chunk retire only that peer's
+/// immutable snapshot. Time spent waiting for the next fair fan-out turn is
+/// excluded. Recovery restarts from the newest transfer and guest dedup makes
 /// already imported chunks harmless.
 #[cfg(all(feature = "network", feature = "storage"))]
 const V2_CRDT_SYNC_TRANSFER_STALL: Duration = Duration::from_secs(30);
@@ -7154,7 +7154,7 @@ fn handle_v2_root_transport<B>(
                     {
                         peer_progress.next_chunk = next_chunk;
                         peer_progress.last_sent = None;
-                        peer_progress.last_progress = Some(Instant::now());
+                        peer_progress.awaiting_ack_since = None;
                     }
                 }
                 #[cfg(not(all(feature = "network", feature = "storage")))]
@@ -7902,7 +7902,7 @@ fn advertise_v2_crdt_root<B>(
             continue;
         }
         peer_progress.release_stalled_transfer(now, V2_CRDT_SYNC_TRANSFER_STALL);
-        v2_crdt_select_latest_peer_transfer(peer_progress, latest_transfer, &latest_chunks, now);
+        v2_crdt_select_latest_peer_transfer(peer_progress, latest_transfer, &latest_chunks);
         let Some(transfer) = peer_progress.transfer else {
             continue;
         };
@@ -7935,6 +7935,7 @@ fn advertise_v2_crdt_root<B>(
             })
             .is_ok()
         {
+            peer_progress.awaiting_ack_since.get_or_insert(now);
             peer_progress.last_sent = Some(now);
             progress.fanout_after = Some(peer_bytes);
             sent += 1;
@@ -12621,7 +12622,7 @@ mod tests {
         let peer_key = vec![0xA5];
         let selected_at = Instant::now();
         let mut peer = V2CrdtPeerProgress::default();
-        v2_crdt_select_latest_peer_transfer(&mut peer, transfer, &chunks, selected_at);
+        v2_crdt_select_latest_peer_transfer(&mut peer, transfer, &chunks);
         assert_eq!(peer.transfer, Some(transfer));
         assert!(Arc::ptr_eq(peer.chunks.as_ref().unwrap(), &chunks));
 
@@ -12649,7 +12650,6 @@ mod tests {
             peer,
             progress.latest_transfer,
             &progress.latest_chunks,
-            selected_at,
         );
         assert_eq!(
             peer.transfer,
@@ -12661,12 +12661,21 @@ mod tests {
             peer,
             progress.latest_transfer,
             &progress.latest_chunks,
-            selected_at,
         );
         assert_eq!(peer.transfer, Some(newer_transfer));
         assert_eq!(peer.next_chunk, 0);
 
-        peer.last_progress = selected_at.checked_sub(V2_CRDT_SYNC_TRANSFER_STALL);
+        let after_two_cycles = selected_at + V2_CRDT_SYNC_TRANSFER_STALL * 2;
+        peer.next_chunk = 1;
+        peer.awaiting_ack_since = None;
+        assert!(
+            !peer.release_stalled_transfer(after_two_cycles, V2_CRDT_SYNC_TRANSFER_STALL),
+            "an acknowledged peer may wait longer than the stall limit for its next fan-out turn"
+        );
+        assert_eq!(peer.transfer, Some(newer_transfer));
+        assert_eq!(peer.next_chunk, 1);
+
+        peer.awaiting_ack_since = selected_at.checked_sub(V2_CRDT_SYNC_TRANSFER_STALL);
         assert!(peer.release_stalled_transfer(selected_at, V2_CRDT_SYNC_TRANSFER_STALL));
         assert!(peer.transfer.is_none());
         assert!(peer.chunks.is_none());
