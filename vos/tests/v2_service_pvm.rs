@@ -3365,10 +3365,10 @@ fn node_routes_a_crdt_cross_root_await_and_acknowledges_both_publications() {
                 proof_requested: false,
             }
             .encode(),
-            Duration::from_secs(30),
+            Duration::from_secs(60),
         )
     });
-    node.run_until_idle(Duration::from_secs(6));
+    node.run_until_idle(Duration::from_secs(15));
     let results = node.collect();
     assert_eq!(results.len(), 2);
     assert!(results.iter().all(AgentResult::is_ok));

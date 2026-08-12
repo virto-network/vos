@@ -7319,6 +7319,12 @@ fn handle_v2_root_transport<B>(
                 receipt: publication.receipt.clone(),
                 attestation: None,
             };
+            // Authenticate this exact physical receipt from the bound source
+            // route before consulting logical reply admission. A convergent
+            // alternate CRDT branch may skip actor execution, but it cannot
+            // inherit another branch's verifier decision.
+            let receipt_verification =
+                service.authorize_finalized_receipt(reply.producer, &publication.receipt);
             let already = match service.reply_already_accumulated(caller_invocation, &accumulated) {
                 Ok(already) => already,
                 Err(failure) => {
@@ -7329,8 +7335,6 @@ fn handle_v2_root_transport<B>(
             let committed = if already {
                 None
             } else {
-                let receipt_verification =
-                    service.authorize_finalized_receipt(reply.producer, &publication.receipt);
                 match service.resume_reply_after_barrier(
                     caller_invocation,
                     slot,

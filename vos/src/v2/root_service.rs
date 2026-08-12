@@ -2128,7 +2128,8 @@ where
             .reply_admission(reply.reply.call_id)
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?;
         Ok(admission.is_some_and(|(admission, _)| {
-            admission.input.invocation == invocation && admission.awaited_reply == *reply
+            admission.input.invocation == invocation
+                && admission.awaited_reply.logical_identity() == reply.logical_identity()
         }))
     }
 

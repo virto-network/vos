@@ -995,27 +995,6 @@ fn deliver<S: GuestAccumulateStoreV2>(
 
     let retry_identity = envelope.retry_identity();
     let delivery_key = delivery_storage_key(envelope.message.call_id);
-    if let Some(bytes) = read(store, &delivery_key)? {
-        let record =
-            DeliveryRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
-        if record.receipt.service != header.service
-            || record.receipt.consistency != header.consistency
-        {
-            return Err(GuestAccumulateError::CorruptStore);
-        }
-        return if record.call_id == envelope.message.call_id
-            && record.retry_identity == retry_identity
-        {
-            Ok(AccumulationResultV2::Accepted {
-                receipt: record.receipt,
-                published: PublishedEffectsV2::default(),
-                duplicate: true,
-            })
-        } else {
-            Ok(rejected(AccumulationRejectionV2::DivergentDuplicate))
-        };
-    }
-
     let source = &envelope.source_receipt.service;
     if envelope.message.from_service != *source
         || source.root_service == header.service.root_service
@@ -1038,6 +1017,29 @@ fn deliver<S: GuestAccumulateStoreV2>(
             return Ok(rejected(AccumulationRejectionV2::ReceiptUnavailable));
         }
         ReceiptVerificationV2::Valid => {}
+    }
+    // Receipt evidence is checked before consulting the permanent retry row.
+    // Equivalent CRDT source branches share a logical delivery identity, but
+    // an unverified alternate receipt can never borrow an earlier admission.
+    if let Some(bytes) = read(store, &delivery_key)? {
+        let record =
+            DeliveryRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
+        if record.receipt.service != header.service
+            || record.receipt.consistency != header.consistency
+        {
+            return Err(GuestAccumulateError::CorruptStore);
+        }
+        return if record.call_id == envelope.message.call_id
+            && record.retry_identity == retry_identity
+        {
+            Ok(AccumulationResultV2::Accepted {
+                receipt: record.receipt,
+                published: PublishedEffectsV2::default(),
+                duplicate: true,
+            })
+        } else {
+            Ok(rejected(AccumulationRejectionV2::DivergentDuplicate))
+        };
     }
     if envelope
         .message
@@ -1790,7 +1792,8 @@ fn materialize_workflow_crdt(
             || admissions.iter().skip(1).any(|candidate| {
                 candidate.value.call_id != canonical.value.call_id
                     || candidate.value.input != canonical.value.input
-                    || candidate.value.awaited_reply != canonical.value.awaited_reply
+                    || candidate.value.awaited_reply.logical_identity()
+                        != canonical.value.awaited_reply.logical_identity()
             })
         {
             return Err(AccumulationRejectionV2::InvalidWorkflowTransition);
@@ -2092,7 +2095,12 @@ fn duplicate_crdt_executions(
 }
 
 fn crdt_retry_execution_matches(left: &CrdtChangeV2, right: &CrdtChangeV2) -> bool {
-    left.awaited_reply == right.awaited_reply
+    let replies_match = match (&left.awaited_reply, &right.awaited_reply) {
+        (Some(left), Some(right)) => left.logical_identity() == right.logical_identity(),
+        (None, None) => true,
+        _ => false,
+    };
+    replies_match
         && left.operations.len() == right.operations.len()
         && left
             .operations
@@ -2478,7 +2486,27 @@ fn apply_dedup_materialization<S: StateTreeStore>(
         )?;
 
         let publication_key = publication_storage_key(checkpoint.input);
-        let expected_published = crdt_published_effects(&change)?;
+        if materialized
+            .expirations
+            .values()
+            .flatten()
+            .any(|expiration| {
+                expiration.value.caller_invocation == checkpoint.input.invocation
+                    && expiration.value.checkpoint_step == checkpoint.input.workflow_step
+            })
+        {
+            // Timeout is a terminal consumer of this checkpoint publication.
+            // Unlike an external acknowledgement it has no ACK row, so causal
+            // reconstruction must consult the durable expiration itself.
+            write(store, &publication_key, None)?;
+            continue;
+        }
+        let Some(expected_published) = crdt_published_effects(&change)? else {
+            // Proof and attestation packages are intentionally absent from the
+            // causal change. Preserve a local publication if this replica
+            // produced it, but never synthesize or validate a stripped form.
+            continue;
+        };
         if expected_published != PublishedEffectsV2::default()
             && let Some(acknowledgement) =
                 read(store, &publication_ack_storage_key(checkpoint.input))?
@@ -2539,10 +2567,12 @@ fn apply_dedup_materialization<S: StateTreeStore>(
         if let Some(existing) = read(store, &key)? {
             let existing = ReplyAdmissionRecordV2::decode(&existing)
                 .map_err(|_| GuestAccumulateError::CorruptStore)?;
-            if !admissions
-                .iter()
-                .any(|candidate| candidate.value == existing)
-            {
+            if !admissions.iter().any(|candidate| {
+                candidate.value.call_id == existing.call_id
+                    && candidate.value.input == existing.input
+                    && candidate.value.awaited_reply.logical_identity()
+                        == existing.awaited_reply.logical_identity()
+            }) {
                 return Err(GuestAccumulateError::CorruptStore);
             }
             if existing != *canonical {
@@ -2569,7 +2599,7 @@ fn crdt_publication_matches_receipt<S: StateTreeStore>(
         };
         if change.cid() == *cid
             && crdt_receipt_matches_change(service, &change, &publication.receipt)
-            && crdt_published_effects(&change)? == publication.published
+            && crdt_published_effects(&change)?.as_ref() == Some(&publication.published)
         {
             return Ok(true);
         }
@@ -2579,11 +2609,12 @@ fn crdt_publication_matches_receipt<S: StateTreeStore>(
 
 fn crdt_published_effects<E>(
     change: &CrdtChangeV2,
-) -> Result<PublishedEffectsV2, GuestAccumulateError<E>> {
+) -> Result<Option<PublishedEffectsV2>, GuestAccumulateError<E>> {
     let mut reply = None;
     let mut outbox = Vec::new();
     for operation in &change.workflow {
         match operation {
+            WorkflowOperationV2::Checkpoint(work) if work.proof_requested => return Ok(None),
             WorkflowOperationV2::Reply(candidate) if reply.is_none() => {
                 reply = Some(candidate.clone());
             }
@@ -2593,13 +2624,13 @@ fn crdt_published_effects<E>(
         }
     }
     outbox.sort_by_key(|message| message.call_id);
-    Ok(PublishedEffectsV2 {
+    Ok(Some(PublishedEffectsV2 {
         reply,
         outbox,
         exported_blobs: change.exported_blobs.clone(),
         proof: None,
         attestation: None,
-    })
+    }))
 }
 
 fn materialized_actors_exist<S: StateTreeStore>(
@@ -8018,6 +8049,12 @@ mod tests {
             .unwrap(),
             accumulated
         );
+        assert!(
+            read(&destination, &publication_storage_key(work.input_id()))
+                .unwrap()
+                .is_none(),
+            "synchronizing an expiration must not reconstruct its retired publication"
+        );
 
         let completed_bytes = b"after CRDT timeout".to_vec();
         let completed_state = BlobRefV2::of_bytes(&completed_bytes);
@@ -8258,7 +8295,8 @@ mod tests {
             incoming,
             envelope.source_receipt.clone(),
         );
-        assert_eq!(retry.retry_identity(), envelope.retry_identity());
+        let retry_identity = retry.retry_identity();
+        assert_eq!(retry_identity, envelope.retry_identity());
         assert_ne!(retry.commitment(), envelope.commitment());
         assert!(matches!(
             execute_guest_accumulate(&mut store, &AccumulateRequestV2::Deliver(retry)).unwrap(),
@@ -8269,12 +8307,37 @@ mod tests {
             } if published == PublishedEffectsV2::default()
         ));
 
-        let mut divergent = envelope;
-        divergent.source_receipt.sequence += 1;
+        let mut unverified_alternate = envelope;
+        unverified_alternate.source_receipt.accepted_transition = Hash([95; 32]);
+        unverified_alternate.source_receipt.sequence += 1;
+        assert_eq!(unverified_alternate.retry_identity(), retry_identity);
         assert_eq!(
-            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Deliver(divergent)).unwrap(),
-            rejected(AccumulationRejectionV2::DivergentDuplicate)
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Deliver(unverified_alternate.clone())
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::ReceiptUnavailable),
+            "a logical duplicate cannot borrow the first branch's receipt verification"
         );
+        store.receipt_allowlist.insert(
+            ReceiptVerificationRequestV2 {
+                expected_producer: sender,
+                receipt: unverified_alternate.source_receipt.clone(),
+            }
+            .hash(),
+        );
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Deliver(unverified_alternate)
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -8288,12 +8351,22 @@ mod tests {
         incoming.from_service.root_service = RootServiceId([92; 32]);
         incoming.from_service.deployment = DeploymentId([93; 32]);
         let source_outbox = vec![incoming.clone()];
-        let source_receipt = source_receipt(&source_outbox);
-        for store in [&mut left, &mut right] {
+        let mut left_source_receipt = source_receipt(&source_outbox);
+        left_source_receipt.consistency = ConsistencyModeV2::Crdt;
+        left_source_receipt.resulting_state_root = None;
+        left_source_receipt.resulting_crdt_heads = vec![Hash([94; 32])];
+        let mut right_source_receipt = left_source_receipt.clone();
+        right_source_receipt.accepted_transition = Hash([95; 32]);
+        right_source_receipt.resulting_crdt_heads = vec![Hash([96; 32])];
+        right_source_receipt.sequence += 1;
+        for (store, receipt) in [
+            (&mut left, &left_source_receipt),
+            (&mut right, &right_source_receipt),
+        ] {
             store.receipt_allowlist.insert(
                 ReceiptVerificationRequestV2 {
                     expected_producer: sender,
-                    receipt: source_receipt.clone(),
+                    receipt: receipt.clone(),
                 }
                 .hash(),
             );
@@ -8301,16 +8374,16 @@ mod tests {
         let service = StoreHeaderV2::open(left.rows.get(header_storage_key()).unwrap())
             .unwrap()
             .service;
-        let delivery_at = |logical_timeslot| DeliveryEnvelopeV2 {
+        let delivery_at = |logical_timeslot, source_receipt| DeliveryEnvelopeV2 {
             service: service.clone(),
             logical_timeslot,
             base: ConsistencyBaseV2::Crdt { heads: vec![] },
             message: incoming.clone(),
             source_outbox: source_outbox.clone(),
-            source_receipt: source_receipt.clone(),
+            source_receipt,
         };
-        let left_delivery = delivery_at(10);
-        let right_delivery = delivery_at(11);
+        let left_delivery = delivery_at(10, left_source_receipt);
+        let right_delivery = delivery_at(11, right_source_receipt);
         let left_result = execute_guest_accumulate(
             &mut left,
             &AccumulateRequestV2::Deliver(left_delivery.clone()),
@@ -9079,6 +9152,22 @@ mod tests {
         let mut retry_work = resumed_work.clone();
         retry_work.logical_timeslot = 3;
         retry_work.imported_actors[0].state = BlobRefV2::of_bytes(b"other causal state");
+        let alternate_awaited = retry_work.awaited_reply.as_mut().unwrap();
+        alternate_awaited.receipt.accepted_transition = Hash([48; 32]);
+        alternate_awaited.receipt.resulting_state_root = Some(Hash([49; 32]));
+        alternate_awaited.receipt.sequence += 1;
+        assert_eq!(
+            alternate_awaited.logical_identity(),
+            awaited_reply.logical_identity()
+        );
+        assert_ne!(*alternate_awaited, awaited_reply);
+        let mut wrong_service = alternate_awaited.clone();
+        wrong_service.receipt.service.root_service = RootServiceId([50; 32]);
+        assert_ne!(
+            wrong_service.logical_identity(),
+            awaited_reply.logical_identity(),
+            "logical reply identity remains bound to the producer service"
+        );
         let mut retry = crdt_transition(
             &retry_work,
             BlobRefV2::of_bytes(b"other completed materialization"),
@@ -9193,7 +9282,10 @@ mod tests {
             store.rows[&reply_admission_storage_key(call)].as_slice(),
         )
         .unwrap();
-        assert_eq!(admission.awaited_reply, awaited_reply);
+        assert_eq!(
+            admission.awaited_reply.logical_identity(),
+            awaited_reply.logical_identity()
+        );
         assert_eq!(admission.input, canonical_work.input_id());
         assert_eq!(admission.work_hash, canonical_work.hash());
 
@@ -9213,6 +9305,118 @@ mod tests {
                 ..
             } if receipt == canonical_receipt
         ));
+    }
+
+    #[test]
+    fn causal_sync_never_reconstructs_or_strips_proof_publications() {
+        let mut store = MemStore::default();
+        let (initial, _) = install_fixture(&mut store, ConsistencyModeV2::Crdt, b"initial");
+        let mut work = crdt_work(initial, 33, vec![]);
+        work.proof_requested = true;
+        let mut transition = crdt_transition(&work, BlobRefV2::of_bytes(b"proved state"), 1);
+        transition.reply = Some(ReplyRecordV2 {
+            call_id: work.invocation.root_reply_id(),
+            producer: work.target,
+            result: b"proved reply".to_vec(),
+        });
+        transition.crdt_change.as_mut().unwrap().workflow = transition.workflow_operations(&work);
+        let change = transition.crdt_change.unwrap();
+        let cid = change.cid();
+        let reply = change
+            .workflow
+            .iter()
+            .find_map(|operation| match operation {
+                WorkflowOperationV2::Reply(reply) => Some(reply.clone()),
+                _ => None,
+            });
+        let outbox = change
+            .workflow
+            .iter()
+            .filter_map(|operation| match operation {
+                WorkflowOperationV2::Outbox(message) => Some(message.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let receipt = AccumulationReceiptV2 {
+            service: identity(),
+            accepted_transition: change.receipt_commitment(),
+            reply_commitment: reply.as_ref().map(ReplyRecordV2::commitment),
+            outbox_commitment: MessageRecordV2::outbox_commitment(&outbox),
+            resulting_state_root: None,
+            resulting_crdt_heads: vec![cid],
+            sequence: change.causal_height,
+            checkpoint: work.workflow_step,
+            consistency: ConsistencyModeV2::Crdt,
+        };
+        store
+            .rows
+            .insert(crdt_node_storage_key(cid), change.encode());
+        store
+            .rows
+            .insert(crdt_node_receipt_storage_key(cid), receipt.encode());
+        let nodes = store.rows.clone();
+        let frontier = load_causal_frontier(&[cid], |candidate| {
+            Ok::<_, Infallible>(nodes.get(&crdt_node_storage_key(candidate)).cloned())
+        })
+        .unwrap();
+        let materialized = materialize_workflow_crdt(&frontier, &identity()).unwrap();
+        let statement = crate::AttestationStatementV3 {
+            statement_version: super::super::ATTESTATION_STATEMENT_VERSION,
+            space: receipt.service.space,
+            actor: work.target,
+            producer_name: "fixture".into(),
+            producer: super::super::ProducerId([52; 32]),
+            deployment: work.target_deployment,
+            actor_program: work.target_program,
+            method: work.method.clone(),
+            schema: Hash([53; 32]),
+            invocation: work.invocation,
+            reply_call: reply.as_ref().unwrap().call_id,
+            before: crate::StateCommitmentV3::Crdt(vec![]),
+            after: crate::StateCommitmentV3::Crdt(vec![cid]),
+            claim_commitment: Hash([54; 32]),
+            input_commitment: Hash([55; 32]),
+            authorization_policy: Hash([56; 32]),
+            accumulation_receipt: receipt.clone(),
+        };
+        statement.validate().unwrap();
+        let proof = super::super::ProofCommitmentV2 {
+            statement: statement.commitment(),
+            trace: Hash([51; 32]),
+            proof_blob: BlobRefV2::of_bytes(b"proof bytes"),
+            statement_version: super::super::ATTESTATION_STATEMENT_VERSION,
+        };
+        let publication = PublicationRecordV2 {
+            input: work.input_id(),
+            receipt,
+            published: PublishedEffectsV2 {
+                reply,
+                outbox,
+                exported_blobs: change.exported_blobs,
+                proof: Some(proof.clone()),
+                attestation: Some(Box::new(super::super::AttestationDeliveryV2 {
+                    producer_name: statement.producer_name.clone(),
+                    producer: statement.producer,
+                    statement,
+                    proof,
+                })),
+            },
+        };
+        let key = publication_storage_key(work.input_id());
+        store.rows.insert(key.clone(), publication.encode());
+        apply_dedup_materialization(&mut store, &identity(), &materialized).unwrap();
+        assert_eq!(
+            PublicationRecordV2::decode(store.rows.get(&key).unwrap()).unwrap(),
+            publication,
+            "a producer's complete proof publication must remain byte-exact"
+        );
+
+        store.rows.remove(&key);
+        apply_dedup_materialization(&mut store, &identity(), &materialized).unwrap();
+        assert!(
+            !store.rows.contains_key(&key),
+            "a replica without the proof package must not synthesize a stripped publication"
+        );
     }
 
     #[test]

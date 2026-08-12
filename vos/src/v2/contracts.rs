@@ -753,7 +753,11 @@ impl WorkEnvelopeV2 {
         self.input_id() == candidate.input_id()
             && self.workflow_identity() == candidate.workflow_identity()
             && self.arguments == candidate.arguments
-            && self.awaited_reply == candidate.awaited_reply
+            && match (&self.awaited_reply, &candidate.awaited_reply) {
+                (Some(left), Some(right)) => left.logical_identity() == right.logical_identity(),
+                (None, None) => true,
+                _ => false,
+            }
             && self.awaited_timeout == candidate.awaited_timeout
             && self.imported_blobs == candidate.imported_blobs
             && self.imported_actors.len() == candidate.imported_actors.len()
@@ -1011,6 +1015,28 @@ impl AccumulatedTimeoutV2 {
 }
 
 impl AccumulatedReplyV2 {
+    /// Logical reply identity shared by equivalent finalized CRDT branches.
+    /// The physical accumulation receipt is verification evidence, not part
+    /// of the value injected into the caller. Attested replies retain their
+    /// complete attestation identity because its proof is not reconstructible
+    /// from causal workflow data alone.
+    pub fn logical_identity(&self) -> Hash {
+        let mut bytes = Vec::new();
+        let mut encoder = Encoder(&mut bytes);
+        // The producer service and its consistency/finality domain are part
+        // of logical identity. Only branch-local receipt fields are omitted.
+        encode_service(&mut encoder, &self.receipt.service);
+        encoder.u8(self.receipt.consistency as u8);
+        encode_reply(&mut encoder, &self.reply);
+        encoder.option(&self.attestation, |encoder, attestation| {
+            encoder.string(&attestation.producer_name);
+            encoder.fixed(&attestation.producer.0);
+            encoder.bytes(&attestation.statement.encode());
+            encode_proof(encoder, &attestation.proof);
+        });
+        Hash::digest(b"vos/accumulated-reply-logical/v2", &[&bytes])
+    }
+
     pub fn validate(&self) -> Result<(), crate::AttestationError> {
         if self.receipt.reply_commitment != Some(self.reply.commitment()) {
             return Err(crate::AttestationError::ReceiptMismatch);
@@ -1695,7 +1721,12 @@ impl DeliveryEnvelopeV2 {
         encode_service(&mut e, &self.service);
         e.bytes(&self.message.encode());
         e.list(&self.source_outbox, |e, message| e.bytes(&message.encode()));
-        e.bytes(&self.source_receipt.encode());
+        // A CRDT source may finalize the same logical outbox on several
+        // physical branches. The exact receipt remains mandatory evidence at
+        // every admission, but it must not split destination-side retry
+        // identity when the authenticated service, message and outbox agree.
+        encode_service(&mut e, &self.source_receipt.service);
+        e.u8(self.source_receipt.consistency as u8);
         Hash::digest(b"vos/delivery-retry/v2", &[&bytes])
     }
 }
@@ -6593,6 +6624,24 @@ mod tests {
         later_base.logical_timeslot += 5;
         assert_eq!(later_base.retry_identity(), delivery.retry_identity());
         assert_ne!(later_base.commitment(), delivery.commitment());
+
+        let mut alternate_receipt = delivery.clone();
+        alternate_receipt.source_receipt.accepted_transition = Hash([38; 32]);
+        alternate_receipt.source_receipt.sequence += 1;
+        assert_eq!(
+            alternate_receipt.retry_identity(),
+            delivery.retry_identity(),
+            "physical finality evidence is not logical delivery identity"
+        );
+        assert_ne!(alternate_receipt.commitment(), delivery.commitment());
+
+        let mut wrong_finality_domain = alternate_receipt.clone();
+        wrong_finality_domain.source_receipt.consistency = ConsistencyModeV2::Crdt;
+        assert_ne!(
+            wrong_finality_domain.retry_identity(),
+            delivery.retry_identity(),
+            "the source finality domain remains part of logical delivery identity"
+        );
 
         let mut missing_member = delivery.clone();
         missing_member.message = message(37, 0);

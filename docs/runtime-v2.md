@@ -77,11 +77,20 @@ verifying the finalized source receipt. The node retains the complete source
 outbox and destination observation, and materialization reconstructs both the
 inbox and permanent delivery record on every replica. Concurrent retries may
 observe different destination heads or trusted slots; they retain distinct
-physical CIDs but collapse by stable message/receipt identity before any
+physical CIDs but collapse by stable message/outbox identity before any
 descendant workflow is evaluated. A replica also reconstructs pending source
 publications from synchronized workflow nodes. Its permanent acknowledgement
 marker suppresses publications whose logical reply/outbox was already accepted
 without treating branch-local continuation blobs as new external effects.
+The logical delivery and ordinary-reply identities retain the producer service
+and finality domain but exclude branch-local fields of the physical CRDT
+receipt, so equivalent finalized branches converge. Every submitted physical
+receipt is still authenticated before admission or duplicate classification.
+A causal expiration is also a terminal publication disposition and suppresses
+reconstruction without requiring an external acknowledgement row. Proof and
+attestation packages are not encoded in causal workflow nodes; synchronization
+therefore preserves a producer's complete local publication but never
+synthesizes or validates a stripped proofless form on another replica.
 
 The transport also routes a committed callee reply back to
 the caller service. It recovers the exact caller invocation from the

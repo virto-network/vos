@@ -217,12 +217,25 @@ impl LocalTransportV2 {
             receipt: canonical.receipt,
             attestation: canonical.published.attestation.clone(),
         };
+        // The committed producer publication is the local conformance
+        // verifier's positive decision for this exact physical receipt. Make
+        // it available even when logical reply admission short-circuits actor
+        // execution, so an alternate CRDT branch never borrows the first
+        // branch's verifier decision.
+        caller
+            .accumulate_host_mut()
+            .local_store_mut()
+            .allow_receipt(&ReceiptVerificationRequestV2 {
+                expected_producer: reply.producer,
+                receipt: awaited_reply.receipt.clone(),
+            });
         if let Some((admission, receipt)) = caller
             .accumulate_host()
             .local_store()
             .reply_admission(reply.call_id)?
         {
-            return if admission.awaited_reply == awaited_reply {
+            return if admission.awaited_reply.logical_identity() == awaited_reply.logical_identity()
+            {
                 Ok(CommittedReplyResumeV2 {
                     call: reply.call_id,
                     caller_invocation: admission.input.invocation,
@@ -288,13 +301,6 @@ impl LocalTransportV2 {
                 ));
             }
         }
-        caller
-            .accumulate_host_mut()
-            .local_store_mut()
-            .allow_receipt(&ReceiptVerificationRequestV2 {
-                expected_producer: reply.producer,
-                receipt: awaited_reply.receipt.clone(),
-            });
         let prepared = LocalWorkSchedulerV2::prepare_resume(
             caller.accumulate_host().local_store(),
             caller_invocation,
@@ -326,7 +332,7 @@ impl LocalTransportV2 {
         else {
             return Err(LocalTransportErrorV2::UnexpectedResult);
         };
-        if admission.awaited_reply != awaited_reply
+        if admission.awaited_reply.logical_identity() != awaited_reply.logical_identity()
             || admission.input.invocation != caller_invocation
             || committed_receipt != receipt
         {
