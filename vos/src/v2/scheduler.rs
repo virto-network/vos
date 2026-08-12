@@ -263,19 +263,22 @@ impl LocalWorkSchedulerV2 {
         source_receipt: super::AccumulationReceiptV2,
     ) -> Result<DeliveryEnvelopeV2, ScheduleErrorV2> {
         let header = store.header()?.ok_or(ScheduleErrorV2::StoreUninitialized)?;
-        if header.consistency == ConsistencyModeV2::Crdt {
-            return Err(ScheduleErrorV2::UnsupportedConsistency(header.consistency));
-        }
-        let state_root = header
-            .state_root
-            .ok_or(ScheduleErrorV2::UnsupportedConsistency(header.consistency))?;
+        let base = if header.consistency == ConsistencyModeV2::Crdt {
+            ConsistencyBaseV2::Crdt {
+                heads: header.crdt_heads,
+            }
+        } else {
+            ConsistencyBaseV2::Linear {
+                revision: header.revision,
+                state_root: header
+                    .state_root
+                    .ok_or(ScheduleErrorV2::UnsupportedConsistency(header.consistency))?,
+            }
+        };
         let envelope = DeliveryEnvelopeV2 {
             service: header.service,
             logical_timeslot,
-            base: ConsistencyBaseV2::Linear {
-                revision: header.revision,
-                state_root,
-            },
+            base,
             message,
             source_outbox,
             source_receipt,

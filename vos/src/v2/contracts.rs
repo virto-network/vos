@@ -1116,6 +1116,11 @@ pub enum WorkflowOperationV2 {
     /// carry this as its own causal node so a busy or restarted replica can
     /// recover the queued invocation without relying on host memory.
     Ingress(CrdtIngressV2),
+    /// Finalized cross-root message admitted into a CRDT destination. The
+    /// complete source receipt/outbox and destination observation are retained
+    /// so another replica can reconstruct the permanent delivery identity as
+    /// well as the visible inbox row from causal history alone.
+    Delivery(DeliveryEnvelopeV2),
 }
 
 /// Stable caller-controlled portion of a causal direct-ingress admission.
@@ -1241,6 +1246,14 @@ impl CrdtChangeV2 {
         ChangeId(Hash::digest(b"vos/crdt-ingress-id/v2", &[&bytes]).0)
     }
 
+    /// Physical identity of one destination-side delivery observation. Exact
+    /// retries on the same base reuse the node; retries admitted concurrently
+    /// on another base remain distinct nodes and are contracted by their
+    /// stable [`DeliveryEnvelopeV2::retry_identity`].
+    pub fn derive_delivery_id(delivery: &DeliveryEnvelopeV2) -> ChangeId {
+        ChangeId(Hash::digest(b"vos/crdt-delivery-id/v2", &[&delivery.commitment().0]).0)
+    }
+
     /// Actor whose finalized service receipt authenticates this causal node.
     /// Platform-only ingress and expiration nodes name their actor directly;
     /// an execution slice must contain exactly one checkpoint producer.
@@ -1250,6 +1263,9 @@ impl CrdtChangeV2 {
         }
         if let [WorkflowOperationV2::Ingress(ingress)] = self.workflow.as_slice() {
             return Some(ingress.target);
+        }
+        if let [WorkflowOperationV2::Delivery(delivery)] = self.workflow.as_slice() {
+            return Some(delivery.message.to);
         }
         let mut checkpoints = self.workflow.iter().filter_map(|operation| {
             if let WorkflowOperationV2::Checkpoint(work) = operation {
@@ -1765,6 +1781,27 @@ pub struct PublishedEffectsV2 {
     /// Guest-derived, receipt-bound package metadata retained with the
     /// publication so transport can recover an attested reply after restart.
     pub attestation: Option<Box<AttestationDeliveryV2>>,
+}
+
+impl PublishedEffectsV2 {
+    /// Stable identity of effects whose external delivery must happen once.
+    /// Exported continuation blobs are causal reconstruction artifacts rather
+    /// than consumers; equivalent CRDT retries may legitimately reference a
+    /// different physical snapshot while publishing the same reply/outbox.
+    pub fn transport_commitment(&self) -> Hash {
+        let mut bytes = Vec::new();
+        let mut encoder = Encoder(&mut bytes);
+        encoder.option(&self.reply, encode_reply);
+        encoder.list(&self.outbox, encode_message);
+        encoder.option(&self.proof, encode_proof);
+        encoder.option(&self.attestation, |encoder, attestation| {
+            encoder.string(&attestation.producer_name);
+            encoder.fixed(&attestation.producer.0);
+            encoder.bytes(&attestation.statement.encode());
+            encode_proof(encoder, &attestation.proof);
+        });
+        Hash::digest(b"vos/published-transport/v2", &[&bytes])
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3536,14 +3573,17 @@ impl V2Wire for DeliveryEnvelopeV2 {
             source_receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
         };
         ensure_sorted_unique(&value.source_outbox, |message| message.call_id.0)?;
-        if !matches!(value.base, ConsistencyBaseV2::Linear { .. })
-            || value
-                .source_outbox
-                .binary_search_by_key(&value.message.call_id, |message| message.call_id)
-                .ok()
-                .is_none_or(|index| value.source_outbox[index] != value.message)
+        if value
+            .source_outbox
+            .binary_search_by_key(&value.message.call_id, |message| message.call_id)
+            .ok()
+            .is_none_or(|index| value.source_outbox[index] != value.message)
             || value.source_receipt.outbox_commitment
                 != MessageRecordV2::outbox_commitment(&value.source_outbox)
+            || !matches!(
+                value.source_receipt.consistency,
+                ConsistencyModeV2::Local | ConsistencyModeV2::Raft | ConsistencyModeV2::Crdt
+            )
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -4305,7 +4345,8 @@ pub(crate) fn crdt_change_blob_references(change: &CrdtChangeV2) -> Vec<&BlobRef
             WorkflowOperationV2::Ingress(ingress) => {
                 references.extend(ingress.imported_blobs.iter());
             }
-            WorkflowOperationV2::Inbox(_)
+            WorkflowOperationV2::Delivery(_)
+            | WorkflowOperationV2::Inbox(_)
             | WorkflowOperationV2::Outbox(_)
             | WorkflowOperationV2::ConsumeOutbox(_)
             | WorkflowOperationV2::ExpireCall(_)
@@ -4781,6 +4822,10 @@ fn encode_workflow_operation(e: &mut Encoder<'_>, value: &WorkflowOperationV2) {
             e.u8(6);
             encode_crdt_ingress(e, ingress);
         }
+        WorkflowOperationV2::Delivery(delivery) => {
+            e.u8(7);
+            e.bytes(&delivery.encode());
+        }
     }
 }
 
@@ -4797,6 +4842,9 @@ fn decode_workflow_operation(d: &mut Decoder<'_>) -> Result<WorkflowOperationV2,
         4 => Ok(WorkflowOperationV2::Reply(decode_reply(d)?)),
         5 => Ok(WorkflowOperationV2::ConsumeOutbox(CallId(d.fixed()?))),
         6 => Ok(WorkflowOperationV2::Ingress(decode_crdt_ingress(d)?)),
+        7 => Ok(WorkflowOperationV2::Delivery(DeliveryEnvelopeV2::decode(
+            &d.bytes()?,
+        )?)),
         8 => Ok(WorkflowOperationV2::ExpireCall(CallTimeoutV2::decode(
             &d.bytes()?,
         )?)),

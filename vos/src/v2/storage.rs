@@ -15,7 +15,7 @@ use super::{
     ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 27;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 28;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -23,6 +23,7 @@ const HEADER_STORAGE_KEY: &[u8] = b"\0vos/v2/header";
 const DEDUP_STORAGE_PREFIX: &[u8] = b"\0vos/v2/dedup/";
 const RECEIPT_STORAGE_PREFIX: &[u8] = b"\0vos/v2/receipt/";
 const PUBLICATION_STORAGE_PREFIX: &[u8] = b"\0vos/v2/publication/";
+const PUBLICATION_ACK_STORAGE_PREFIX: &[u8] = b"\0vos/v2/publication-ack/";
 const ROLE_ASSERTION_ELIGIBILITY_STORAGE_PREFIX: &[u8] = b"\0vos/v2/role-assertion/";
 const DELIVERY_STORAGE_PREFIX: &[u8] = b"\0vos/v2/delivery/";
 const INGRESS_STORAGE_PREFIX: &[u8] = b"\0vos/v2/ingress/";
@@ -293,6 +294,16 @@ pub struct PublicationRecordV2 {
     pub published: PublishedEffectsV2,
 }
 
+/// Permanent local suppression marker for external effects already accepted
+/// by their consumers. CRDT rematerialization may reconstruct a publication
+/// from causal history after its transient row was removed; this marker keeps
+/// that replica from publishing the same logical effects forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationAckRecordV2 {
+    pub input: WorkInputIdV2,
+    pub transport_commitment: Hash,
+}
+
 /// Guest-owned proof that one exact transition produced only the atomic reply
 /// shape accepted as a platform role assertion. Unlike the publication row,
 /// this record survives acknowledgement so recovery cannot forget a
@@ -307,6 +318,28 @@ pub struct RoleAssertionEligibilityV2 {
 impl PublicationRecordV2 {
     pub fn commitment(&self) -> Hash {
         Hash::digest(b"vos/publication/v2", &[&self.encode()])
+    }
+}
+
+impl V2Wire for PublicationAckRecordV2 {
+    const MAGIC: [u8; 4] = *b"VPA2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        encode_input(&mut e, self.input);
+        e.fixed(&self.transport_commitment.0);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            input: decode_input(d)?,
+            transport_commitment: Hash(d.fixed()?),
+        };
+        if value.input.invocation == InvocationId::ZERO || value.transport_commitment == Hash::ZERO
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
     }
 }
 
@@ -660,6 +693,10 @@ pub fn publication_storage_key(input: WorkInputIdV2) -> Vec<u8> {
     input_storage_key(PUBLICATION_STORAGE_PREFIX, input)
 }
 
+pub fn publication_ack_storage_key(input: WorkInputIdV2) -> Vec<u8> {
+    input_storage_key(PUBLICATION_ACK_STORAGE_PREFIX, input)
+}
+
 pub fn role_assertion_eligibility_storage_key(input: WorkInputIdV2) -> Vec<u8> {
     input_storage_key(ROLE_ASSERTION_ELIGIBILITY_STORAGE_PREFIX, input)
 }
@@ -933,6 +970,7 @@ mod tests {
         let dedup = dedup_storage_key(input);
         let receipt = receipt_storage_key(input);
         let publication = publication_storage_key(input);
+        let publication_ack = publication_ack_storage_key(input);
         let role_assertion = role_assertion_eligibility_storage_key(input);
         let delivery = delivery_storage_key(CallId([4; 32]));
         let ingress = ingress_storage_key(input.invocation);
@@ -943,6 +981,8 @@ mod tests {
         assert_ne!(dedup, receipt);
         assert_ne!(dedup, publication);
         assert_ne!(receipt, publication);
+        assert_ne!(publication_ack, publication);
+        assert_ne!(publication_ack, receipt);
         assert_ne!(role_assertion, receipt);
         assert_ne!(role_assertion, publication);
         assert_ne!(delivery, publication);
@@ -1043,6 +1083,14 @@ mod tests {
         assert_eq!(
             PublicationRecordV2::decode(&publication.encode()).unwrap(),
             publication
+        );
+        let acknowledgement = PublicationAckRecordV2 {
+            input,
+            transport_commitment: publication.published.transport_commitment(),
+        };
+        assert_eq!(
+            PublicationAckRecordV2::decode(&acknowledgement.encode()).unwrap(),
+            acknowledgement
         );
         let mut bad_publication = publication;
         bad_publication.published.outbox[0].payload.push(0);

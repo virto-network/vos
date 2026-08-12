@@ -106,13 +106,13 @@ pub use state_tree::{
 };
 pub use storage::{
     ActorUpgradeRecordV2, DedupRecordV2, DeliveryRecordV2, IngressRecordV2, PendingCallDeadlineV2,
-    PublicationRecordV2, ReplyAdmissionRecordV2, RoleAssertionEligibilityV2,
-    SERVICE_STORE_SCHEMA_VERSION, StateKeyV2, StoreHeaderV2, StoreOpenError, WorkflowCheckpointV2,
-    actor_upgrade_storage_key, call_expiration_storage_key, crdt_change_storage_key,
-    crdt_node_receipt_storage_key, crdt_node_storage_key, dedup_storage_key, delivery_storage_key,
-    header_storage_key, ingress_storage_key, pending_call_deadline_storage_key,
-    publication_storage_key, receipt_storage_key, reply_admission_storage_key,
-    role_assertion_eligibility_storage_key,
+    PublicationAckRecordV2, PublicationRecordV2, ReplyAdmissionRecordV2,
+    RoleAssertionEligibilityV2, SERVICE_STORE_SCHEMA_VERSION, StateKeyV2, StoreHeaderV2,
+    StoreOpenError, WorkflowCheckpointV2, actor_upgrade_storage_key, call_expiration_storage_key,
+    crdt_change_storage_key, crdt_node_receipt_storage_key, crdt_node_storage_key,
+    dedup_storage_key, delivery_storage_key, header_storage_key, ingress_storage_key,
+    pending_call_deadline_storage_key, publication_ack_storage_key, publication_storage_key,
+    receipt_storage_key, reply_admission_storage_key, role_assertion_eligibility_storage_key,
 };
 #[cfg(feature = "std")]
 pub use transport::{
@@ -133,8 +133,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0xf1, 0x80, 0x11, 0xb5, 0x95, 0x67, 0xe5, 0xbf, 0x2c, 0xcd, 0xbd, 0x73, 0x89, 0x83, 0x1a, 0xa5,
-    0x8c, 0x17, 0x8f, 0xac, 0x5b, 0x45, 0x40, 0xb0, 0xb1, 0x92, 0xc9, 0x1e, 0x39, 0xac, 0x74, 0x16,
+    0x18, 0x0f, 0xa5, 0x90, 0x78, 0xf5, 0x38, 0x7d, 0xd0, 0xeb, 0x90, 0xba, 0xfa, 0xcb, 0x45, 0x08,
+    0xc3, 0xd0, 0xbf, 0x0e, 0x2c, 0x85, 0x12, 0xa8, 0x62, 0xfc, 0x37, 0xcb, 0x71, 0x47, 0xd0, 0x19,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.
@@ -220,4 +220,4 @@ pub const JAR_REVISION: &str = "41d31e64b0f5d6c57a43769d7b8785556a311684";
 /// Consensus-visible execution semantics. Changing interpreter/recompiler or
 /// trace behavior requires a new identifier even if the public Rust API did
 /// not change.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v5\0");
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v6\0");
