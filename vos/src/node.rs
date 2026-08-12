@@ -5020,6 +5020,7 @@ impl VosNode {
                                     route.consistency,
                                     crate::v2::ConsistencyModeV2::Local
                                         | crate::v2::ConsistencyModeV2::Raft
+                                        | crate::v2::ConsistencyModeV2::Crdt
                                 )
                                 && route.authenticated_peer.as_deref() == Some(_peer_bytes)
                         }
@@ -7177,14 +7178,16 @@ fn handle_v2_root_transport<B>(
         }
         return;
     }
-    // Local roots consume the authenticated route decision in one IC-5 call;
-    // Raft roots quorum-order the exact decision beside the delivery or reply
-    // Apply entry before any follower executes it.
+    // Local/CRDT roots consume the authenticated route decision in one IC-5
+    // call; Raft roots quorum-order the exact decision beside the delivery or
+    // reply Apply entry before any follower executes it.
     if !matches!(
         service.consistency(),
-        crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
+        crate::v2::ConsistencyModeV2::Local
+            | crate::v2::ConsistencyModeV2::Raft
+            | crate::v2::ConsistencyModeV2::Crdt
     ) {
-        warn!(%id, from = %envelope.from, "v2 root transport requires a Local or Raft destination");
+        warn!(%id, from = %envelope.from, "v2 root transport requires a Local, Raft, or CRDT destination");
         return;
     }
     match transport {
@@ -7212,7 +7215,9 @@ fn handle_v2_root_transport<B>(
                 })
                 || !matches!(
                     publication.receipt.consistency,
-                    crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
+                    crate::v2::ConsistencyModeV2::Local
+                        | crate::v2::ConsistencyModeV2::Raft
+                        | crate::v2::ConsistencyModeV2::Crdt
                 )
             {
                 warn!(%id, from = %envelope.from, call = ?message.call_id, "rejected unauthenticated or unsupported v2 delivery");
@@ -7294,7 +7299,9 @@ fn handle_v2_root_transport<B>(
                 })
                 || !matches!(
                     publication.receipt.consistency,
-                    crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
+                    crate::v2::ConsistencyModeV2::Local
+                        | crate::v2::ConsistencyModeV2::Raft
+                        | crate::v2::ConsistencyModeV2::Crdt
                 )
             {
                 warn!(%id, from = %envelope.from, call = ?reply.call_id, "rejected misrouted v2 reply");
@@ -7469,7 +7476,9 @@ fn queue_v2_root_publication<B>(
     }
     let ordinary_transport = matches!(
         service.consistency(),
-        crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
+        crate::v2::ConsistencyModeV2::Local
+            | crate::v2::ConsistencyModeV2::Raft
+            | crate::v2::ConsistencyModeV2::Crdt
     ) && publication.receipt.consistency == service.consistency();
     if ordinary_transport {
         for message in &publication.published.outbox {
@@ -7479,7 +7488,9 @@ fn queue_v2_root_publication<B>(
             if route.service != message.to_service
                 || !matches!(
                     route.consistency,
-                    crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
+                    crate::v2::ConsistencyModeV2::Local
+                        | crate::v2::ConsistencyModeV2::Raft
+                        | crate::v2::ConsistencyModeV2::Crdt
                 )
             {
                 continue;
@@ -7497,7 +7508,7 @@ fn queue_v2_root_publication<B>(
             });
         }
     } else if !publication.published.outbox.is_empty() {
-        warn!(%id, "retained a non-Local/Raft outbox publication outside ordinary root transport");
+        warn!(%id, "retained a non-Local/Raft/CRDT outbox publication outside ordinary root transport");
     }
 
     // A direct caller channel is process-local. Do not expose its reply while
@@ -7551,6 +7562,7 @@ fn queue_v2_root_publication<B>(
                             route.consistency,
                             crate::v2::ConsistencyModeV2::Local
                                 | crate::v2::ConsistencyModeV2::Raft
+                                | crate::v2::ConsistencyModeV2::Crdt
                         )
                     {
                         return;
@@ -7666,7 +7678,9 @@ fn acknowledge_v2_root_publication<B>(
             route.service == message.to_service
                 && matches!(
                     route.consistency,
-                    crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
+                    crate::v2::ConsistencyModeV2::Local
+                        | crate::v2::ConsistencyModeV2::Raft
+                        | crate::v2::ConsistencyModeV2::Crdt
                 )
         }) {
             progress.accepted_calls.insert(call);
@@ -7702,6 +7716,7 @@ fn acknowledge_v2_root_publication<B>(
                             route.consistency,
                             crate::v2::ConsistencyModeV2::Local
                                 | crate::v2::ConsistencyModeV2::Raft
+                                | crate::v2::ConsistencyModeV2::Crdt
                         )
                 })
             });
@@ -8049,7 +8064,9 @@ fn retry_v2_root_transport<B>(
     }
     if matches!(
         service.consistency(),
-        crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
+        crate::v2::ConsistencyModeV2::Local
+            | crate::v2::ConsistencyModeV2::Raft
+            | crate::v2::ConsistencyModeV2::Crdt
     ) && let Ok(pending) = service.pending_inbox_calls()
     {
         for (call, _) in pending {

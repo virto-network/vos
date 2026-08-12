@@ -51,7 +51,7 @@ The committed outcome uses the deadline itself as `expired_at`, so hosts which
 first observe the due call in different later slots still derive identical
 bytes.
 
-The linear-service transport is also guest-owned end to end. An accepted
+Cross-root transport is guest-owned end to end. An accepted
 actor slice stores a recoverable publication row whose receipt commits the
 complete canonical outbox. After restart, transport selects a message from
 that publication. Each message commits the exact source and installed
@@ -72,7 +72,18 @@ committed. The exception is an undelivered call which expires at its source:
 expiration atomically retires its publication and deadline index, and a later
 reply is classified terminally from the permanent expiration row.
 
-The linear path also routes a committed callee reply back to
+For a CRDT destination, `Deliver` derives its own causal workflow node after
+verifying the finalized source receipt. The node retains the complete source
+outbox and destination observation, and materialization reconstructs both the
+inbox and permanent delivery record on every replica. Concurrent retries may
+observe different destination heads or trusted slots; they retain distinct
+physical CIDs but collapse by stable message/receipt identity before any
+descendant workflow is evaluated. A replica also reconstructs pending source
+publications from synchronized workflow nodes. Its permanent acknowledgement
+marker suppresses publications whose logical reply/outbox was already accepted
+without treating branch-local continuation blobs as new external effects.
+
+The transport also routes a committed callee reply back to
 the caller service. It recovers the exact caller invocation from the
 guest-owned outbox, reconstructs the saved machine after restart, and submits
 the physical Refine result to guest Accumulate. A permanent reply-admission
@@ -183,8 +194,8 @@ root host's signature emitted only after the exact authority commit; a bare
 caller-supplied authority ID is never sufficient. A direct reply is
 acknowledged only after its waiting channel accepts the bytes. Ordinary outbox
 and suspended-workflow publications are retried by the node transport until
-the destination guest has committed them. Local and Raft roots share that
-guest-owned publication state machine. For a Raft destination, the
+the destination guest has committed them. Local, Raft, and CRDT roots share
+that guest-owned publication state machine. For a Raft destination, the
 authenticated source-receipt decision is quorum-ordered beside `Deliver` or
 the resumed `Apply`, so a follower never depends on the leader's process-local
 receipt cache. Proof and attestation publications stay durable but are not
@@ -501,12 +512,13 @@ an independently constructed genesis directly to guest Install is only a
 conformance seam.
 
 The reusable local transport remains a conformance orchestrator. `VosNode`
-connects ordinary Local and Raft calls plus same-service CRDT anti-entropy to
-authenticated node envelopes, but
+connects ordinary Local, Raft, and CRDT calls plus same-service CRDT
+anti-entropy to authenticated node envelopes, but
 automatic service discovery remains staged: external actor routes must come
 from a trusted registry or consensus directory, never from a received
-envelope. Durable CRDT cross-root calls remain staged until receipt finality
-and logical time come from their consensus domains. Raft delivery and reply
+envelope. Durable CRDT cross-root calls therefore remain a conformance path
+until receipt finality and logical time come from their consensus domains.
+Raft delivery and reply
 transport instead quorum-order their exact verifier sidecars as described
 below.
 Acknowledging a publication containing several
@@ -590,9 +602,10 @@ Replicated service identity binds the exact Refine and Accumulate gas schedule.
 `OutOfGas` is therefore a deterministic cross-replica result only for replicas
 with that declared schedule; a mismatched host stops before advancing its
 applied cursor rather than recording a local no-op.
-Production CRDT routing must retain the Local/Raft path's rule of recovering
-and retrying guest publication, delivery and reply-admission rows rather than
-maintaining a second native message ledger. A
+CRDT routing retains the Local/Raft path's rule of recovering and retrying
+guest publication, delivery and reply-admission rows rather than maintaining a
+second native message ledger. Production use still requires the consensus
+finality and time bindings above. A
 bounded reclamation or checkpoint plan for unreachable SMT and CRDT DAG nodes,
 plus completed delivery/deduplication/reply-admission bookkeeping, is also
 required before the engine stores production state; pruning must not weaken
@@ -824,7 +837,7 @@ canonical node roster and authorized by the root's `Public`/`Member`/`Private`
 sync floor. Peer-supplied chunks never carry their own allowlist; the receiving
 root derives an exact ordered verifier sidecar after authentication and guest
 Accumulate independently checks each causal delta.
-For Local and Raft roots, ordinary public cross-root calls are emitted as
+For Local, Raft, and CRDT roots, ordinary public cross-root calls are emitted as
 guest-owned publications, routed over canonical node envelopes, admitted
 through destination IC-5, and resumed from the caller's exact saved machine
 after the committed reply returns. A Raft `Deliver` or reply-consuming `Apply`

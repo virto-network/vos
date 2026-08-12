@@ -249,7 +249,9 @@ impl RootTreeTransportV2 {
                 publication.published.reply.is_none()
                     && matches!(
                         publication.receipt.consistency,
-                        ConsistencyModeV2::Local | ConsistencyModeV2::Raft
+                        ConsistencyModeV2::Local
+                            | ConsistencyModeV2::Raft
+                            | ConsistencyModeV2::Crdt
                     )
                     && publication.published.proof.is_none()
                     && publication.published.attestation.is_none()
@@ -271,11 +273,12 @@ impl RootTreeTransportV2 {
                     && *caller_invocation != super::InvocationId::ZERO
                     && matches!(
                         publication.receipt.consistency,
-                        ConsistencyModeV2::Local | ConsistencyModeV2::Raft
+                        ConsistencyModeV2::Local
+                            | ConsistencyModeV2::Raft
+                            | ConsistencyModeV2::Crdt
                     )
                     && publication.published.reply.is_some()
                     && publication.published.outbox.is_empty()
-                    && publication.published.exported_blobs.is_empty()
                     && publication.published.proof.is_none()
                     && publication.published.attestation.is_none()
             }
@@ -2694,6 +2697,22 @@ mod tests {
             RootTreeTransportV2::decode(&replicated.encode()).unwrap(),
             replicated,
             "quorum-finalized Raft publications use the same canonical transport wire"
+        );
+        let mut causal = delivery.clone();
+        let RootTreeTransportV2::OutboxDelivery {
+            publication: causal_publication,
+            ..
+        } = &mut causal
+        else {
+            unreachable!()
+        };
+        causal_publication.receipt.consistency = ConsistencyModeV2::Crdt;
+        causal_publication.receipt.resulting_state_root = None;
+        causal_publication.receipt.resulting_crdt_heads = vec![super::super::Hash([11; 32])];
+        assert_eq!(
+            RootTreeTransportV2::decode(&causal.encode()).unwrap(),
+            causal,
+            "causally finalized CRDT publications use the same authenticated transport wire"
         );
 
         let crdt_service = ServiceIdentityV2 {
