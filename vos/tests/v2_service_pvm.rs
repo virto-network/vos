@@ -3265,6 +3265,131 @@ fn node_routes_an_ordinary_cross_root_await_through_guest_accumulate() {
 }
 
 #[test]
+fn node_routes_a_crdt_cross_root_await_and_acknowledges_both_publications() {
+    let actor_elf = crdt_counter_v2_elf();
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&actor_elf, &signer);
+    let deployment = package.deployment_id();
+    let producer = package.deployment_signature.producer;
+    let program = package.manifest.actor_program;
+    let source_actor = ActorId([0xE1; 32]);
+    let destination_actor = ActorId([44; 32]);
+    let source_identity = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([0xE2; 32]),
+        root_service: RootServiceId([0xE3; 32]),
+        deployment,
+        service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
+    };
+    let destination_identity = ServiceIdentityV2 {
+        root_service: RootServiceId([0xE4; 32]),
+        ..source_identity.clone()
+    };
+    let install_authorization = AuthorizationEvidenceV2::SystemCapability {
+        capability: SystemCapabilityId([0xE5; 32]),
+        authenticator: vec![0xE6],
+    };
+    let source_config = LocalRootTreeConfigV2 {
+        role_authority: None,
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package: package.clone(),
+        service: source_identity.clone(),
+        root_actor: source_actor,
+        actor_name: actor_name.clone(),
+        consistency: ConsistencyModeV2::Crdt,
+        initial_state: vec![],
+        external_actors: vec![external_binding(
+            "peer",
+            destination_identity.clone(),
+            destination_actor,
+            producer,
+            program,
+        )],
+        install_authorization: install_authorization.clone(),
+        refine_gas: 1_000_000_000,
+        accumulate_gas: 5_000_000_000,
+    };
+    let destination_config = LocalRootTreeConfigV2 {
+        role_authority: None,
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package,
+        service: destination_identity,
+        root_actor: destination_actor,
+        actor_name,
+        consistency: ConsistencyModeV2::Crdt,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization,
+        refine_gas: 1_000_000_000,
+        accumulate_gas: 5_000_000_000,
+    };
+    let source_backend = SharedCommittedImages::default();
+    let destination_backend = SharedCommittedImages::default();
+    let source = LocalRootTreeServiceV2::open(source_config.clone(), source_backend.clone())
+        .expect("CRDT source root installs");
+    let destination =
+        LocalRootTreeServiceV2::open(destination_config.clone(), destination_backend.clone())
+            .expect("CRDT destination root installs");
+
+    let source_route = ServiceId::new(0, 0x3510);
+    let destination_route = ServiceId::new(0, 0x3511);
+    let mut node = VosNode::new();
+    node.register_v2_root_at_id("crdt-workflow-source-v2", source, source_route, false)
+        .unwrap();
+    node.register_v2_root_at_id(
+        "crdt-workflow-destination-v2",
+        destination,
+        destination_route,
+        false,
+    )
+    .unwrap();
+
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(
+        &Msg::new("increment_around_peer")
+            .with("before", 1u64)
+            .with("after", 2u64)
+            .encode(),
+    );
+    let invoker = node.invoke_handle();
+    let request = std::thread::spawn(move || {
+        invoker.invoke_with_timeout(
+            source_route,
+            RootTreeInvocationV2 {
+                invocation: InvocationId([0xE7; 32]),
+                target: source_actor,
+                method: "increment_around_peer".into(),
+                arguments,
+                proof_requested: false,
+            }
+            .encode(),
+            Duration::from_secs(30),
+        )
+    });
+    node.run_until_idle(Duration::from_secs(6));
+    let results = node.collect();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(AgentResult::is_ok));
+    assert_eq!(request.join().unwrap(), Some(Value::I64(3).encode()));
+
+    let source = LocalRootTreeServiceV2::open(source_config, source_backend)
+        .expect("CRDT source reopens after routed reply");
+    let destination = LocalRootTreeServiceV2::open(destination_config, destination_backend)
+        .expect("CRDT destination reopens after routed reply");
+    assert!(source.pending_publications().unwrap().is_empty());
+    assert!(destination.pending_publications().unwrap().is_empty());
+    assert!(
+        destination
+            .store()
+            .pending_inbox_calls()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn node_routes_networkless_single_voter_raft_roots() {
     let actor_elf = probe_elf();
     let signer = libp2p::identity::Keypair::generate_ed25519();
@@ -10571,6 +10696,165 @@ fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
             .as_ref()
             .map(|package| package.producer),
         Some(destination_producer)
+    );
+}
+
+#[test]
+fn crdt_delivery_is_causal_physical_and_restart_drainable_after_sync() {
+    let service_pvm = vos::v2::transpile_service_elf(&service_elf()).unwrap();
+    let service_program = ProgramId::of_pvm(&service_pvm);
+    let actor_pvm = grey_transpiler::link_elf(&crdt_counter_v2_elf()).unwrap();
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_state = Vec::new();
+    let initial_state_ref = BlobRefV2::of_bytes(&initial_state);
+    let identity = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([0xD1; 32]),
+        root_service: RootServiceId([0xD2; 32]),
+        deployment: DeploymentId([0xD3; 32]),
+        service_program,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
+    };
+    let actor = ActorId([0xD4; 32]);
+    let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        role_authority: None,
+        external_actors: vec![],
+        service: identity.clone(),
+        consistency: ConsistencyModeV2::Crdt,
+        actors: vec![ActorGenesisV2 {
+            actor,
+            name: "root".into(),
+            parent: None,
+            producer: ProducerId([0xD5; 32]),
+            deployment: identity.deployment,
+            program: actor_program,
+            initial_state: initial_state_ref.clone(),
+            crdt: true,
+            role_policies: role_policies(vec![MethodPolicyV2 {
+                method: "increment".into(),
+                schema: Hash([0xD6; 32]),
+                policy: public_policy_hash(),
+                public: true,
+                attested: false,
+                space_role: None,
+                actor_role: None,
+            }]),
+        }],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([0xD7; 32]),
+            authenticator: vec![0xD8],
+        },
+    });
+    let open = || {
+        let mut host = DurableJamStoreV2::open(FailableCommittedImages::default()).unwrap();
+        assert_eq!(host.import_blob(initial_state.clone()), initial_state_ref);
+        assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
+        let mut service = JamServiceV2::new(
+            service_pvm.clone(),
+            service_program,
+            NoRefineProtocolHostV2,
+            host,
+            TEST_GAS_SCHEDULE.refine,
+            TEST_GAS_SCHEDULE.accumulate,
+        )
+        .unwrap();
+        authorize_install(&mut service, &install);
+        assert!(matches!(
+            service.accumulate(&install).unwrap().result,
+            AccumulationResultV2::Installed(_)
+        ));
+        service
+    };
+    let mut destination = open();
+    let replica = open();
+    let source = ServiceIdentityV2 {
+        root_service: RootServiceId([0xD9; 32]),
+        deployment: DeploymentId([0xDA; 32]),
+        ..identity.clone()
+    };
+    let sender = ActorId([0xDB; 32]);
+    let invocation = InvocationId([0xDC; 32]);
+    let message = MessageRecordV2 {
+        call_id: invocation.call_id(0),
+        caller_invocation: invocation,
+        await_ordinal: 0,
+        from_service: source.clone(),
+        from: sender,
+        to_service: identity.clone(),
+        to: actor,
+        parent: None,
+        payload: vec![vos::value::TAG_DYNAMIC],
+        authorization: AuthorizationEvidenceV2::Public,
+        proof_requested: false,
+        deadline_timeslot: Some(100),
+    };
+    let source_receipt = AccumulationReceiptV2 {
+        service: source,
+        accepted_transition: Hash([0xDD; 32]),
+        reply_commitment: None,
+        outbox_commitment: MessageRecordV2::outbox_commitment(core::slice::from_ref(&message)),
+        resulting_state_root: Some(Hash([0xDE; 32])),
+        resulting_crdt_heads: vec![],
+        sequence: 1,
+        checkpoint: 0,
+        consistency: ConsistencyModeV2::Local,
+    };
+    destination
+        .accumulate_host_mut()
+        .local_store_mut()
+        .allow_receipt(&ReceiptVerificationRequestV2 {
+            expected_producer: sender,
+            receipt: source_receipt.clone(),
+        });
+    let delivery = LocalWorkSchedulerV2::prepare_delivery(
+        destination.accumulate_host().local_store(),
+        2,
+        message.clone(),
+        vec![message.clone()],
+        source_receipt,
+    )
+    .unwrap();
+    let AccumulationResultV2::Accepted {
+        receipt: delivery_receipt,
+        duplicate: false,
+        ..
+    } = destination
+        .accumulate(&AccumulateRequestV2::Deliver(delivery))
+        .unwrap()
+        .result
+    else {
+        panic!("physical CRDT delivery was rejected")
+    };
+    assert_eq!(delivery_receipt.consistency, ConsistencyModeV2::Crdt);
+    assert_eq!(delivery_receipt.resulting_crdt_heads.len(), 1);
+
+    let sync = LocalWorkSchedulerV2::prepare_crdt_sync(destination.accumulate_host().local_store())
+        .unwrap();
+    let mut replica = restart_durable_service(replica, &service_pvm, service_program);
+    for node in &sync.nodes {
+        replica
+            .accumulate_host_mut()
+            .local_store_mut()
+            .allow_receipt(&ReceiptVerificationRequestV2 {
+                expected_producer: actor,
+                receipt: node.receipt.clone(),
+            });
+    }
+    assert!(matches!(
+        replica
+            .accumulate(&AccumulateRequestV2::SyncCrdt(sync))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    let replica = restart_durable_service(replica, &service_pvm, service_program);
+    assert_eq!(
+        replica.accumulate_host().pending_inbox_calls().unwrap(),
+        vec![(message.call_id, 2)]
     );
 }
 

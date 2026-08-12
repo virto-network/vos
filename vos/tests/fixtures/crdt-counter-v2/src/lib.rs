@@ -23,6 +23,11 @@ impl CrdtCounterV2 {
     }
 
     #[msg]
+    fn peer_value(&self) -> u32 {
+        7
+    }
+
+    #[msg]
     async fn increment_child_twice(&mut self, ctx: &mut Context<Self>, amount: u64) -> i64 {
         let mut value = 0;
         let Ok(mut child) = ctx.child::<CrdtCounterV2Ref>("child").await else {
