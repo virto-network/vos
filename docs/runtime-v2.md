@@ -313,8 +313,10 @@ restarts at the first chunk and is safe because the guest classifies already
 committed causal nodes idempotently. Node-roster pagination also retains its
 opaque cursor and fans out each completed page, so registries larger than one
 scan budget continue to make progress. A full-peer-identity round-robin cursor
-also advances the bounded send window, preventing an early group of offline
-replicas from starving later roster members.
+also advances before each authentication attempt. Each drive attempts at most
+four retry-eligible peers, so failed or stalled authorization cannot bypass the
+work bound or let an early group of offline replicas starve later roster
+members.
 
 Both outbound selection and inbound admission bind the complete Noise
 `PeerId` to an exact voter/observer registry row and apply the actor's existing

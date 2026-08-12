@@ -5524,8 +5524,8 @@ struct V2CrdtSyncProgress {
     roster_after_kind: u8,
     roster_after_key: Vec<u8>,
     next_roster_page: Instant,
-    /// Last peer considered successfully for transport. The next drive starts
-    /// strictly after this full identity, so an early group of unreachable
+    /// Last peer attempted for transport. The next drive starts strictly after
+    /// this full identity, so an early group of unreachable or unauthorized
     /// peers cannot consume every bounded fan-out window forever.
     fanout_after: Option<Vec<u8>>,
 }
@@ -5567,6 +5567,14 @@ struct V2CrdtPeerProgress {
 
 #[cfg(all(feature = "network", feature = "storage"))]
 impl V2CrdtPeerProgress {
+    fn needs_transfer(&self, latest_transfer: crate::v2::Hash) -> bool {
+        self.transfer != Some(latest_transfer)
+            || self
+                .chunks
+                .as_ref()
+                .is_some_and(|chunks| (self.next_chunk as usize) < chunks.len())
+    }
+
     fn release_transfer(&mut self) {
         self.transfer = None;
         self.chunks = None;
@@ -5881,8 +5889,8 @@ fn v2_crdt_sync_peer_allowed(
 }
 
 /// Return full peer identities in a stable cyclic order beginning strictly
-/// after the previous successful send. The cursor is a key rather than a
-/// numeric index so roster growth does not reset progress to the first peers.
+/// after the previous authentication attempt. The cursor is a key rather than
+/// a numeric index so roster growth does not reset progress to the first peers.
 #[cfg(all(feature = "network", feature = "storage"))]
 fn v2_crdt_fanout_order(mut peers: Vec<Vec<u8>>, after: Option<&[u8]>) -> Vec<Vec<u8>> {
     peers.sort();
@@ -5910,6 +5918,11 @@ const V2_CRDT_SYNC_CHUNK_MAX_BYTES: usize = 7 * 1024 * 1024;
 /// already imported chunks harmless.
 #[cfg(all(feature = "network", feature = "storage"))]
 const V2_CRDT_SYNC_TRANSFER_STALL: Duration = Duration::from_secs(30);
+
+/// Bound synchronous authentication work as well as successful sends. Each
+/// attempt may perform both registry identity and sync-floor resolution.
+#[cfg(all(feature = "network", feature = "storage"))]
+const V2_CRDT_SYNC_ATTEMPT_BUDGET: usize = 4;
 
 #[cfg(all(feature = "network", feature = "storage"))]
 fn v2_crdt_sync_delta(
@@ -7769,7 +7782,6 @@ fn advertise_v2_crdt_root<B>(
     const RETRY: Duration = Duration::from_secs(5);
     const ROSTER_BUDGET: Duration = Duration::from_millis(250);
     const AUTH_BUDGET: Duration = Duration::from_millis(500);
-    const SEND_BUDGET: usize = 4;
 
     if service.consistency() != crate::v2::ConsistencyModeV2::Crdt {
         return;
@@ -7869,24 +7881,28 @@ fn advertise_v2_crdt_root<B>(
 
     let latest_transfer = progress.latest_transfer;
     let latest_chunks = progress.latest_chunks.clone();
-    let mut sent = 0usize;
     let peers = v2_crdt_fanout_order(
-        progress.peers.keys().cloned().collect(),
+        progress
+            .peers
+            .iter()
+            .filter(|(_, peer)| {
+                peer.needs_transfer(latest_transfer)
+                    && peer
+                        .last_sent
+                        .is_none_or(|last| now.duration_since(last) >= RETRY)
+            })
+            .map(|(peer, _)| peer.clone())
+            .collect(),
         progress.fanout_after.as_deref(),
     );
-    for peer_bytes in peers {
-        if sent >= SEND_BUDGET {
-            break;
-        }
+    for peer_bytes in peers.into_iter().take(V2_CRDT_SYNC_ATTEMPT_BUDGET) {
+        // Advance before the blocking probes. Rejection, timeout, malformed
+        // registry data and send failure all consume one bounded attempt and
+        // cannot make this peer monopolize the next drive.
+        progress.fanout_after = Some(peer_bytes.clone());
         let Some(peer_progress) = progress.peers.get_mut(&peer_bytes) else {
             continue;
         };
-        if peer_progress
-            .last_sent
-            .is_some_and(|last| now.duration_since(last) < RETRY)
-        {
-            continue;
-        }
         let Some(peer) =
             authenticated_v2_crdt_replica_peer(invoke_routes, &peer_bytes, AUTH_BUDGET)
         else {
@@ -7937,8 +7953,6 @@ fn advertise_v2_crdt_root<B>(
         {
             peer_progress.awaiting_ack_since.get_or_insert(now);
             peer_progress.last_sent = Some(now);
-            progress.fanout_after = Some(peer_bytes);
-            sent += 1;
         }
     }
 }
@@ -12737,20 +12751,25 @@ mod tests {
 
     #[test]
     #[cfg(all(feature = "network", feature = "storage"))]
-    fn v2_crdt_fanout_cursor_reaches_peers_after_each_send_window() {
+    fn v2_crdt_fanout_cursor_advances_after_failed_attempt_windows() {
         let peers = (0u8..12).map(|peer| vec![peer]).collect::<Vec<_>>();
         let mut after = None;
-        let mut reached = BTreeSet::new();
+        let mut attempted = BTreeSet::new();
         for _ in 0..3 {
             let order = v2_crdt_fanout_order(peers.clone(), after.as_deref());
-            let window = &order[..4];
-            reached.extend(window.iter().cloned());
+            let window = &order[..V2_CRDT_SYNC_ATTEMPT_BUDGET];
+            // Model every authorization attempt failing: no successful send
+            // is needed for the cursor to reach the rest of the roster.
+            attempted.extend(window.iter().cloned());
             after = window.last().cloned();
         }
-        assert_eq!(reached.len(), peers.len());
+        assert_eq!(attempted.len(), peers.len());
 
         let wrapped = v2_crdt_fanout_order(peers, after.as_deref());
-        assert_eq!(&wrapped[..4], &[vec![0], vec![1], vec![2], vec![3]]);
+        assert_eq!(
+            &wrapped[..V2_CRDT_SYNC_ATTEMPT_BUDGET],
+            &[vec![0], vec![1], vec![2], vec![3]]
+        );
     }
 
     #[test]
