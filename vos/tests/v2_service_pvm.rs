@@ -21,7 +21,7 @@ use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, Role, WorkerConfig}
 use vos::v2::{
     AccumulateProtocolHostV2, AccumulateRequestV2, AccumulatedReplyV2, AccumulatedRoleAssertionV2,
     AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationResultV2, ActorGenesisV2, ActorId,
-    ActorUpgradeV2, ActorWriteV2, AuthorizationEvidenceV2, BlobRefV2, CallId,
+    ActorUpgradeV2, ActorWriteV2, AuthorizationEvidenceV2, BlobRefV2, CallId, CausalCallContextV2,
     CommittedAccumulateBatchV2, CommittedAccumulateEntryV2, CommittedAccumulateLogV2,
     CommittedImageStoreV2, CommittedServiceImageHostV2, CommittedServiceSnapshotV2,
     ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2, ContinuationSnapshotV2,
@@ -11031,7 +11031,7 @@ fn crdt_delivery_is_causal_physical_and_restart_drainable_after_sync() {
             initial_state: initial_state_ref.clone(),
             crdt: true,
             role_policies: role_policies(vec![MethodPolicyV2 {
-                method: "increment".into(),
+                method: "inc".into(),
                 schema: Hash([0xD6; 32]),
                 policy: public_policy_hash(),
                 public: true,
@@ -11083,7 +11083,11 @@ fn crdt_delivery_is_causal_physical_and_restart_drainable_after_sync() {
         to_service: identity.clone(),
         to: actor,
         parent: None,
-        payload: vec![vos::value::TAG_DYNAMIC],
+        payload: {
+            let mut payload = vec![vos::value::TAG_DYNAMIC];
+            payload.extend_from_slice(&Msg::new("inc").encode());
+            payload
+        },
         authorization: AuthorizationEvidenceV2::Public,
         proof_requested: false,
         deadline_timeslot: Some(100),
@@ -11916,7 +11920,7 @@ fn raft_delivery_and_reply_verifiers_replay_before_physical_accumulate() {
 }
 
 #[test]
-fn raft_authority_receipt_replays_on_a_fresh_follower_before_actor_apply() {
+fn raft_authority_receipts_replay_on_a_fresh_follower_before_actor_apply() {
     let elf = service_elf();
     let service_pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let actor_pvm = actor_pvm(0);
@@ -12260,9 +12264,231 @@ fn raft_authority_receipt_replays_on_a_fresh_follower_before_actor_apply() {
             .same_service_state(&follower.service().accumulate_host().snapshot()),
         "a fresh follower applies the actor slice without any process-local receipt allowlist",
     );
+    {
+        let entries = &shared.lock().unwrap().entries;
+        assert_eq!(entries[1].receipt_verifications, vec![verification]);
+        assert!(entries[2].receipt_verifications.is_empty());
+    }
+
+    // The same ordered authority decision must compose with the finalized
+    // source receipt of a durable cross-root delivery. The source message is
+    // immutable and public; the destination credential is a separate field
+    // in the delivery request and both receipts are quorum-ordered.
+    let destination_service = leader
+        .service()
+        .accumulate_host()
+        .header()
+        .unwrap()
+        .unwrap()
+        .service;
+    let source_service = ServiceIdentityV2 {
+        root_service: RootServiceId([0x71; 32]),
+        deployment: DeploymentId([0x72; 32]),
+        ..destination_service.clone()
+    };
+    let sender = ActorId([0x73; 32]);
+    let caller_invocation = InvocationId([0x74; 32]);
+    let call = caller_invocation.call_id(0);
+    let mut payload = vec![vos::value::TAG_DYNAMIC];
+    payload.extend_from_slice(&Msg::new("member_only").encode());
+    let message = MessageRecordV2 {
+        call_id: call,
+        caller_invocation,
+        await_ordinal: 0,
+        from_service: source_service.clone(),
+        from: sender,
+        to_service: destination_service.clone(),
+        to: actor,
+        parent: None,
+        payload: payload.clone(),
+        authorization: AuthorizationEvidenceV2::Public,
+        proof_requested: false,
+        deadline_timeslot: Some(100),
+    };
+    let source_outbox = vec![message.clone()];
+    let source_receipt = AccumulationReceiptV2 {
+        service: source_service,
+        accepted_transition: Hash([0x75; 32]),
+        reply_commitment: None,
+        outbox_commitment: MessageRecordV2::outbox_commitment(&source_outbox),
+        resulting_state_root: Some(Hash([0x76; 32])),
+        resulting_crdt_heads: vec![],
+        sequence: 7,
+        checkpoint: 0,
+        consistency: ConsistencyModeV2::Raft,
+    };
+    let delivery_work = LocalWorkSchedulerV2::prepare(
+        leader.service().accumulate_host(),
+        LocalWorkRequestV2 {
+            invocation: InvocationId::for_call(call),
+            workflow_step: 0,
+            logical_timeslot: 10,
+            target: actor,
+            method: policy.method.clone(),
+            arguments: payload,
+            origin: Origin::Actor(sender),
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: Some(caller_invocation),
+            parent_call: Some(call),
+            causal_context: Some(CausalCallContextV2::from(&message)),
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        },
+    )
+    .unwrap()
+    .work;
+    let delivery_claim = RoleAuthorizationClaimV2 {
+        space: destination_service.space,
+        holder: Origin::Actor(sender),
+        role: vos::SpaceRole::Member,
+        audience: destination_service,
+        invocation: delivery_work.invocation,
+        scope: delivery_work.authorization_scope(),
+        target: actor,
+        method: policy.method.clone(),
+        policy: policy.policy,
+    };
+    let delivery_assertion = AccumulatedRoleAssertionV2 {
+        claim: delivery_claim.clone(),
+        receipt: AccumulationReceiptV2 {
+            service: authority.service.clone(),
+            accepted_transition: Hash([0x77; 32]),
+            reply_commitment: Some(delivery_claim.authority_reply(authority_actor).commitment()),
+            outbox_commitment: None,
+            resulting_state_root: Some(Hash([0x78; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 4,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Raft,
+        },
+    };
+    let delivery_authorization = RoleCredentialV2 {
+        holder: Origin::Actor(sender),
+        scope: delivery_claim.scope,
+        space_role: Some(vos::SpaceRole::Member),
+        actor_role: None,
+        authenticator: delivery_assertion.encode(),
+    }
+    .disclosed_evidence(policy.policy);
+    let delivery = LocalWorkSchedulerV2::prepare_authorized_delivery(
+        leader.service().accumulate_host(),
+        10,
+        delivery_authorization,
+        message,
+        source_outbox,
+        source_receipt.clone(),
+    )
+    .unwrap();
+    let delivery_request = AccumulateRequestV2::Deliver(delivery);
+    let mut delivery_verifications = vec![
+        ReceiptVerificationRequestV2 {
+            expected_producer: sender,
+            receipt: source_receipt,
+        },
+        ReceiptVerificationRequestV2 {
+            expected_producer: authority_actor,
+            receipt: delivery_assertion.receipt,
+        },
+    ];
+    delivery_verifications.sort_by_key(ReceiptVerificationRequestV2::hash);
+    assert!(matches!(
+        leader.accumulate(&delivery_request),
+        Err(vos::v2::ReplicatedServiceErrorV2::Dispatch(
+            ServiceDispatchError::InvalidAvailabilityArtifacts,
+        ))
+    ));
+    leader
+        .log_mut()
+        .propose_at_with_availability(
+            &delivery_request.encode(),
+            None,
+            &[],
+            &[],
+            &delivery_verifications,
+        )
+        .unwrap();
+    assert_eq!(leader.catch_up().unwrap(), 1);
+    assert_eq!(follower.catch_up().unwrap(), 1);
+    assert_eq!(
+        follower
+            .service()
+            .accumulate_host()
+            .pending_inbox_calls()
+            .unwrap(),
+        vec![(call, 10)]
+    );
+
+    let follower_snapshot = follower.service().accumulate_host().snapshot();
+    let follower_applied = follower.log_mut().applied_index().unwrap();
+    drop(follower);
+    let mut follower = ReplicatedJamServiceV2::new(
+        JamServiceV2::new(
+            service_pvm.clone(),
+            ProgramId::of_pvm(&service_pvm),
+            NoRefineProtocolHostV2,
+            LocalJamStoreV2::from_snapshot(follower_snapshot),
+            TEST_GAS_SCHEDULE.refine,
+            TEST_GAS_SCHEDULE.accumulate,
+        )
+        .unwrap(),
+        TestCommittedLog::new(shared.clone(), false).with_applied(follower_applied),
+    );
+    let prepared =
+        LocalWorkSchedulerV2::prepare_inbox(leader.service().accumulate_host(), call, 11).unwrap();
+    let inbox_work = prepared.work;
+    let inbox_transition = TransitionV2 {
+        service: inbox_work.service.clone(),
+        consumed_input: inbox_work.input_id(),
+        target_deployment: inbox_work.target_deployment,
+        target_program: inbox_work.target_program,
+        base: inbox_work.base.clone(),
+        writes: vec![ActorWriteV2 {
+            actor,
+            key: vos::lifecycle::STATE_KEY_BYTES.to_vec(),
+            value: Some(b"authorized delivery follower state".to_vec()),
+        }],
+        crdt_change: None,
+        spawns: vec![],
+        continuations: vec![],
+        inbox: vec![],
+        outbox: vec![],
+        reply: Some(ReplyRecordV2 {
+            call_id: call,
+            producer: actor,
+            result: Value::U32(100).encode(),
+        }),
+        exported_blobs: vec![],
+        gas: GasAccountingV2::default(),
+        proof: None,
+    };
+    assert!(matches!(
+        leader
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: inbox_work,
+                transition: inbox_transition,
+                provided_blobs: vec![],
+            }))
+            .unwrap()
+            .result,
+        AccumulationResultV2::Accepted {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert_eq!(follower.catch_up().unwrap(), 1);
+    assert!(
+        leader
+            .service()
+            .accumulate_host()
+            .snapshot()
+            .same_service_state(&follower.service().accumulate_host().snapshot()),
+        "the fresh follower drains an authorized inbox without a process-local verifier cache",
+    );
     let entries = &shared.lock().unwrap().entries;
-    assert_eq!(entries[1].receipt_verifications, vec![verification]);
-    assert!(entries[2].receipt_verifications.is_empty());
+    assert_eq!(entries[3].receipt_verifications, delivery_verifications);
+    assert!(entries[4].receipt_verifications.is_empty());
 }
 
 #[test]

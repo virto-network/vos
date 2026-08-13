@@ -94,6 +94,14 @@ fn validate_receipt_verifications(
     {
         return Err(DecodeError::NonCanonical);
     }
+    let assertion_for = |authorization: &AuthorizationEvidenceV2| match authorization {
+        AuthorizationEvidenceV2::Credential { bytes, .. } => {
+            RoleCredentialV2::decode(bytes).ok().and_then(|credential| {
+                AccumulatedRoleAssertionV2::decode(&credential.authenticator).ok()
+            })
+        }
+        _ => None,
+    };
     let assertion = match request {
         AccumulateRequestV2::AdmitIngress(ingress) => match ingress.authorization() {
             AuthorizationEvidenceV2::Credential { bytes, .. } => {
@@ -125,6 +133,42 @@ fn validate_receipt_verifications(
             return Err(DecodeError::NonCanonical);
         }
         return Ok(());
+    } else if let AccumulateRequestV2::Deliver(delivery) = request {
+        let mut expected = alloc::vec![ReceiptVerificationRequestV2 {
+            expected_producer: delivery.message.from,
+            receipt: delivery.source_receipt.clone(),
+        }];
+        if let Some(assertion) = assertion_for(&delivery.authorization) {
+            let Some(verification) = verifications
+                .iter()
+                .find(|verification| verification.receipt == assertion.receipt)
+            else {
+                return if verifications.is_empty() && !require_external_verification {
+                    Ok(())
+                } else {
+                    Err(DecodeError::NonCanonical)
+                };
+            };
+            if assertion.receipt.reply_commitment
+                != Some(
+                    assertion
+                        .claim
+                        .authority_reply(verification.expected_producer)
+                        .commitment(),
+                )
+            {
+                return Err(DecodeError::NonCanonical);
+            }
+            expected.push(verification.clone());
+        }
+        expected.sort_by_key(ReceiptVerificationRequestV2::hash);
+        expected.dedup();
+        if verifications.is_empty() && !require_external_verification {
+            return Ok(());
+        }
+        return (verifications == expected)
+            .then_some(())
+            .ok_or(DecodeError::NonCanonical);
     } else if let AccumulateRequestV2::SyncCrdt(envelope) = request {
         let mut expected = envelope
             .nodes
@@ -147,10 +191,7 @@ fn validate_receipt_verifications(
             .ok_or(DecodeError::NonCanonical);
     } else {
         match request {
-            AccumulateRequestV2::Deliver(delivery) => Some(ReceiptVerificationRequestV2 {
-                expected_producer: delivery.message.from,
-                receipt: delivery.source_receipt.clone(),
-            }),
+            AccumulateRequestV2::Deliver(_) => unreachable!("delivery handled above"),
             AccumulateRequestV2::Apply(envelope) => {
                 envelope
                     .work

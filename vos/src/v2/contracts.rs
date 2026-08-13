@@ -895,6 +895,57 @@ impl MessageRecordV2 {
         Encoder(&mut bytes).list(messages, encode_message);
         Some(Hash::digest(b"vos/outbox/v2", &[&bytes]))
     }
+
+    /// Canonical destination authorization projection for durable step-zero
+    /// work. Hosts use it to request a scoped authority decision; guest
+    /// Accumulate uses the same projection when verifying that decision.
+    pub fn authorization_work(
+        &self,
+        service: &ServiceIdentityV2,
+        logical_timeslot: u64,
+        authorization: AuthorizationEvidenceV2,
+        consistency: ConsistencyModeV2,
+        base: ConsistencyBaseV2,
+        actor: &ActorGenesisV2,
+    ) -> Option<WorkEnvelopeV2> {
+        if self.authorization != AuthorizationEvidenceV2::Public
+            || self.to_service != *service
+            || self.to != actor.actor
+        {
+            return None;
+        }
+        let method = if self.payload.first() == Some(&crate::value::TAG_DYNAMIC) {
+            <crate::value::Msg as crate::Decode>::try_decode(&self.payload[1..])
+                .map(|message| message.name)
+        } else {
+            None
+        }?;
+        Some(WorkEnvelopeV2 {
+            service: service.clone(),
+            invocation: InvocationId::for_call(self.call_id),
+            workflow_step: 0,
+            logical_timeslot,
+            target: self.to,
+            target_deployment: actor.deployment,
+            target_program: actor.program,
+            method,
+            arguments: self.payload.clone(),
+            origin: Origin::Actor(self.from),
+            authorization,
+            causal_parent: Some(self.caller_invocation),
+            parent_call: Some(self.call_id),
+            causal_context: Some(CausalCallContextV2::from(self)),
+            awaited_reply: None,
+            awaited_timeout: None,
+            consistency,
+            base,
+            base_causal_height: None,
+            imported_actors: Vec::new(),
+            external_actors: Vec::new(),
+            imported_blobs: Vec::new(),
+            proof_requested: self.proof_requested,
+        })
+    }
 }
 
 /// Compact authenticated portion of a durable parent call retained after its
@@ -2015,12 +2066,25 @@ pub struct DeliveryEnvelopeV2 {
     pub service: ServiceIdentityV2,
     pub logical_timeslot: u64,
     pub base: ConsistencyBaseV2,
+    /// Destination-scoped authorization selected by the authenticated
+    /// transport and independently verified by guest Accumulate. The source
+    /// message remains `Public`, so its finalized outbox receipt cannot be
+    /// rewritten to smuggle destination credentials.
+    pub authorization: AuthorizationEvidenceV2,
     pub message: MessageRecordV2,
     pub source_outbox: Vec<MessageRecordV2>,
     pub source_receipt: AccumulationReceiptV2,
 }
 
 impl DeliveryEnvelopeV2 {
+    /// Inbox record committed by the destination after both the source
+    /// receipt and destination authorization have been verified.
+    pub fn admitted_message(&self) -> MessageRecordV2 {
+        let mut message = self.message.clone();
+        message.authorization = self.authorization.clone();
+        message
+    }
+
     /// Exact first-admission commitment, including the current destination
     /// base which the accepted delivery advances.
     pub fn commitment(&self) -> Hash {
@@ -2036,6 +2100,7 @@ impl DeliveryEnvelopeV2 {
         let mut bytes = Vec::new();
         let mut e = Encoder(&mut bytes);
         encode_service(&mut e, &self.service);
+        encode_auth(&mut e, &self.authorization);
         e.bytes(&self.message.encode());
         e.list(&self.source_outbox, |e, message| e.bytes(&message.encode()));
         // A CRDT source may finalize the same logical outbox on several
@@ -3932,6 +3997,7 @@ impl V2Wire for DeliveryEnvelopeV2 {
         encode_service(&mut e, &self.service);
         e.u64(self.logical_timeslot);
         encode_base(&mut e, &self.base);
+        encode_auth(&mut e, &self.authorization);
         encode_message(&mut e, &self.message);
         e.list(&self.source_outbox, encode_message);
         e.bytes(&self.source_receipt.encode());
@@ -3942,16 +4008,18 @@ impl V2Wire for DeliveryEnvelopeV2 {
             service: decode_service(d)?,
             logical_timeslot: d.u64()?,
             base: decode_base(d)?,
+            authorization: decode_auth(d)?,
             message: decode_message(d)?,
             source_outbox: d.list(decode_message)?,
             source_receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
         };
         ensure_sorted_unique(&value.source_outbox, |message| message.call_id.0)?;
-        if value
-            .source_outbox
-            .binary_search_by_key(&value.message.call_id, |message| message.call_id)
-            .ok()
-            .is_none_or(|index| value.source_outbox[index] != value.message)
+        if value.message.authorization != AuthorizationEvidenceV2::Public
+            || value
+                .source_outbox
+                .binary_search_by_key(&value.message.call_id, |message| message.call_id)
+                .ok()
+                .is_none_or(|index| value.source_outbox[index] != value.message)
             || value.source_receipt.outbox_commitment
                 != MessageRecordV2::outbox_commitment(&value.source_outbox)
             || !matches!(
@@ -7011,6 +7079,7 @@ mod tests {
                 revision: 3,
                 state_root: Hash([35; 32]),
             },
+            authorization: AuthorizationEvidenceV2::Public,
             message: first,
             source_outbox,
             source_receipt,
@@ -7033,6 +7102,29 @@ mod tests {
         later_base.logical_timeslot += 5;
         assert_eq!(later_base.retry_identity(), delivery.retry_identity());
         assert_ne!(later_base.commitment(), delivery.commitment());
+
+        let mut different_authorization = delivery.clone();
+        different_authorization.authorization = AuthorizationEvidenceV2::Credential {
+            policy: Hash([37; 32]),
+            credential_commitment: Hash([38; 32]),
+            bytes: vec![39],
+        };
+        assert_ne!(
+            different_authorization.retry_identity(),
+            delivery.retry_identity(),
+            "destination authorization is part of logical delivery identity",
+        );
+
+        let mut source_authorized = delivery.clone();
+        source_authorized.message.authorization = different_authorization.authorization;
+        source_authorized.source_outbox[0] = source_authorized.message.clone();
+        source_authorized.source_receipt.outbox_commitment =
+            MessageRecordV2::outbox_commitment(&source_authorized.source_outbox);
+        assert_eq!(
+            DeliveryEnvelopeV2::decode(&source_authorized.encode()),
+            Err(DecodeError::NonCanonical),
+            "source messages cannot smuggle destination authorization",
+        );
 
         let mut alternate_receipt = delivery.clone();
         alternate_receipt.source_receipt.accepted_transition = Hash([38; 32]);

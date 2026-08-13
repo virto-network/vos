@@ -14,8 +14,9 @@
 > root obtains an invocation-scoped accumulated assertion from that space's
 > installed Raft `space-authority`; caller-supplied legacy role bytes are ignored. Signed v2
 > catalog rows use this root service when the daemon is started with the exact
-> service PVM. Actor-local or mixed-role external calls, role-bearing durable
-> calls, CRDT cross-root calls, and attested network
+> service PVM. Durable cross-root calls to space-role-only methods use the
+> same authority protocol at destination admission. Actor-local or mixed-role
+> external calls and attested network
 > transport remain fail-closed. Legacy node behavior is
 > not evidence of v2 conformance.
 
@@ -61,7 +62,13 @@ also verifies receipt finality,
 producer ownership, full-outbox membership, deadline and the exact current
 destination base before atomically inserting the inbox. External directories
 reject duplicate ActorIds, so application resolution cannot collapse two
-service bindings onto one route. A stable delivery
+service bindings onto one route. The source-committed message remains Public;
+the destination carries a separate invocation-scoped credential and verifies
+its pinned authority receipt before replacing the inbox row's authorization.
+The permanent delivery record becomes the durable authorization anchor, so a
+restart between delivery and inbox execution does not depend on process-local
+receipt policy. Exact retries recover that admitted credential before reading
+the actor's current package policy. A stable delivery
 identity excludes that changing base, so a retry after inbox execution is
 still an idempotent duplicate. Guest delivery records retain the admission
 timeslot and consumed bit; the local scheduler scans them after restart and
@@ -498,10 +505,13 @@ every replica hydrates it before IC-5 and leaves its applied cursor unchanged
 if hydration fails. Once admission commits, the guest-owned ingress row is the
 durable authorization anchor. Later Apply and resume slices authenticate the
 same scoped credential against that row rather than process-local verifier
-state, including after snapshot recovery. This ordering is narrowly scoped to
-direct authority ingress; it does not make arbitrary receipt-bearing transport
-consensus-authoritative. Actor-local and mixed policies still require the
-separate bound-handle authority path.
+state, including after snapshot recovery. Durable delivery uses the same
+boundary with two sorted verification inputs: the finalized source outbox
+receipt and, for a space-role-only destination, the pinned authority assertion
+receipt. Raft orders both beside the exact delivery bytes; CRDT commits them
+into the destination delivery node before anti-entropy may rematerialize its
+authorized inbox. Actor-local and mixed policies still require the separate
+bound-handle authority path.
 
 Authority redirects never trust the 16-bit routing prefix as identity. The
 target retains the authority's exact Raft replication ID, requires the leader
@@ -718,9 +728,11 @@ leaves no availability trace, acceptance makes them part of the durable
 service image, and a follower with an empty node-local cache can replay the log
 tail. Snapshot catch-up carries the same installed program/blob catalog.
 Replicated direct role-authorized ingress must carry exactly one canonical
-authority receipt-verification request; an empty sidecar is rejected even if the
-leader's process-local verifier already knows that receipt. No other request
-shape accepts a verification sidecar. The replicated payload uses the
+authority receipt-verification request. A replicated delivery carries its
+canonical source verification and, when role-authorized, the assertion
+verification in strict hash order. An empty or incomplete sidecar is rejected
+even if the leader's process-local verifier already knows those receipts. The
+replicated payload uses the
 clean-break `VRQ4` wire; retired
 payloads fail loud rather than being interpreted without their availability or
 receipt-verification sidecars. Raft
@@ -909,12 +921,12 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 29, continuation snapshot version 6, and platform ABI version 7
-are therefore a clean break from earlier experimental v2 images. ABI 7 adds
-the content-addressed authorization reference to the causal direct-ingress
-wire; schema 29 rejects durable ingress records and CRDT DAG rows encoded
-before that field existed instead of interpreting mutually incompatible
-images under one version. These versions also add exact actor-package
+Store schema 30, continuation snapshot version 6, and platform ABI version 8
+are therefore a clean break from earlier experimental v2 images. ABI 8 adds
+destination-scoped authorization to durable delivery and its causal CRDT wire;
+schema 30 rejects delivery records and DAG rows encoded before that field
+existed instead of interpreting mutually incompatible images under one
+version. These versions also add exact actor-package
 identity to descriptors, work, checkpoints, transitions, upgrades, and
 cross-root proof bindings, bind durable messages and retained causal context to
 their exact source/destination services, retain the complete dormant

@@ -524,6 +524,7 @@ fn admit_ingress<S: GuestAccumulateStoreV2>(
         tree.store_ref(),
         authority.as_ref(),
         None,
+        false,
     )? {
         return Ok(rejected(rejection));
     }
@@ -1075,10 +1076,46 @@ fn deliver<S: GuestAccumulateStoreV2>(
     }
 
     let tree = ServiceStateTreeV2::new(store, header.service_root);
-    if tree_get_wire::<_, ActorGenesisV2>(&tree, &StateKeyV2::ActorDescriptor(envelope.message.to))?
-        .is_none()
-        || tree_get_wire::<_, MessageRecordV2>(&tree, &StateKeyV2::Inbox(envelope.message.call_id))?
-            .is_some()
+    let Some(actor) = tree_get_wire::<_, ActorGenesisV2>(
+        &tree,
+        &StateKeyV2::ActorDescriptor(envelope.message.to),
+    )?
+    else {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    };
+    let Some(authorization_work) = envelope.message.authorization_work(
+        &envelope.service,
+        envelope.logical_timeslot,
+        envelope.authorization.clone(),
+        header.consistency,
+        envelope.base.clone(),
+        &actor,
+    ) else {
+        return Ok(rejected(AccumulationRejectionV2::Unauthorized));
+    };
+    let Some(policy) = tree_get_wire::<_, MethodPolicyV2>(
+        &tree,
+        &StateKeyV2::MethodPolicy {
+            actor: envelope.message.to,
+            method: authorization_work.method.clone(),
+        },
+    )?
+    else {
+        return Ok(rejected(AccumulationRejectionV2::Unauthorized));
+    };
+    let authority = tree_get_wire::<_, RoleAuthorityBindingV2>(&tree, &StateKeyV2::RoleAuthority)?;
+    if let Some(rejection) = authorization_rejection(
+        &authorization_work,
+        &policy,
+        tree.store_ref(),
+        authority.as_ref(),
+        None,
+        false,
+    )? {
+        return Ok(rejected(rejection));
+    }
+    if tree_get_wire::<_, MessageRecordV2>(&tree, &StateKeyV2::Inbox(envelope.message.call_id))?
+        .is_some()
         || tree_get_wire::<_, MessageRecordV2>(
             &tree,
             &StateKeyV2::Outbox(envelope.message.call_id),
@@ -1088,6 +1125,7 @@ fn deliver<S: GuestAccumulateStoreV2>(
         return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
     drop(tree);
+    let admitted_message = envelope.admitted_message();
 
     let (delivery_commitment, resulting_state_root, resulting_crdt_heads, sequence, delivery_cid) =
         if header.consistency == ConsistencyModeV2::Crdt {
@@ -1148,7 +1186,7 @@ fn deliver<S: GuestAccumulateStoreV2>(
             tree_apply(
                 &mut tree,
                 &StateKeyV2::Inbox(envelope.message.call_id),
-                Some(&envelope.message.encode()),
+                Some(&admitted_message.encode()),
             )?;
             header.service_root = tree.root();
             header.revision += 1;
@@ -1864,7 +1902,7 @@ fn materialize_workflow_crdt(
                         &duplicate_executions,
                         result.inbox.entry(delivery.message.call_id).or_default(),
                         cid,
-                        Some(delivery.message.clone()),
+                        Some(delivery.admitted_message()),
                     );
                 }
             }
@@ -2979,6 +3017,7 @@ fn apply<S: GuestAccumulateStoreV2>(
     } else {
         None
     };
+    let durable_inbox_matches = work_matches_durable_inbox(&tree, work)?;
     if let Some(rejection) = authorization_rejection(
         work,
         &policy,
@@ -2987,6 +3026,7 @@ fn apply<S: GuestAccumulateStoreV2>(
         direct_ingress_record
             .as_ref()
             .map(|(record, _)| record.as_ref()),
+        durable_inbox_matches,
     )? {
         return Ok(rejected(rejection));
     }
@@ -3108,7 +3148,7 @@ fn apply<S: GuestAccumulateStoreV2>(
     if !valid_workflow_input(&tree, work, base_workflow.as_ref())? {
         return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
-    if !work_matches_durable_inbox(&tree, work)? {
+    if !durable_inbox_matches {
         return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
     }
     if header.consistency != ConsistencyModeV2::Crdt && header.revision == u64::MAX {
@@ -4026,6 +4066,7 @@ fn authorization_rejection<S: GuestAccumulateStoreV2>(
     store: &S,
     authority: Option<&RoleAuthorityBindingV2>,
     direct_ingress: Option<&IngressRecordV2>,
+    durable_inbox_matches: bool,
 ) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
     if method_role_policy_hash(policy.space_role, policy.actor_role) != Some(policy.policy)
         || policy.public != (policy.space_role.is_none() && policy.actor_role.is_none())
@@ -4096,6 +4137,7 @@ fn authorization_rejection<S: GuestAccumulateStoreV2>(
                     policy,
                     &credential,
                     direct_ingress,
+                    durable_inbox_matches,
                 )? {
                     return Ok(Some(rejection));
                 }
@@ -4145,6 +4187,7 @@ fn validate_pinned_role_assertion<S: GuestAccumulateStoreV2>(
     policy: &MethodPolicyV2,
     credential: &RoleCredentialV2,
     direct_ingress: Option<&IngressRecordV2>,
+    durable_inbox_matches: bool,
 ) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
     let assertion = match AccumulatedRoleAssertionV2::decode(&credential.authenticator) {
         Ok(assertion) => assertion,
@@ -4177,6 +4220,9 @@ fn validate_pinned_role_assertion<S: GuestAccumulateStoreV2>(
     if admitted_direct_role_authorization(store, work, direct_ingress)? {
         return Ok(None);
     }
+    if admitted_durable_role_authorization(store, work, durable_inbox_matches)? {
+        return Ok(None);
+    }
     let request = ReceiptVerificationRequestV2 {
         expected_producer: authority.actor,
         receipt: assertion.receipt,
@@ -4191,6 +4237,29 @@ fn validate_pinned_role_assertion<S: GuestAccumulateStoreV2>(
             ReceiptVerificationV2::Unavailable => Some(AccumulationRejectionV2::ReceiptUnavailable),
         },
     )
+}
+
+fn admitted_durable_role_authorization<S: StateTreeStore>(
+    store: &S,
+    work: &super::WorkEnvelopeV2,
+    durable_inbox_matches: bool,
+) -> GuestResult<bool, S::Error> {
+    let Some(call) = work.parent_call else {
+        return Ok(false);
+    };
+    let Some(bytes) = read(store, &delivery_storage_key(call))? else {
+        return Ok(false);
+    };
+    let record =
+        DeliveryRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
+    if record.call_id != call {
+        return Err(GuestAccumulateError::CorruptStore);
+    }
+    Ok(if work.workflow_step == 0 {
+        !record.consumed && durable_inbox_matches
+    } else {
+        record.consumed
+    })
 }
 
 fn admitted_direct_role_authorization<S: StateTreeStore>(
@@ -8393,6 +8462,7 @@ mod tests {
                 revision: header.revision,
                 state_root: header.state_root.unwrap(),
             },
+            authorization: AuthorizationEvidenceV2::Public,
             source_outbox: vec![message.clone()],
             message,
             source_receipt,
@@ -8580,6 +8650,142 @@ mod tests {
     }
 
     #[test]
+    fn role_authorized_delivery_survives_verifier_free_restart_before_drain() {
+        let mut store = MemStore::default();
+        let initial = store.provide_blob(b"before").unwrap();
+        store.programs.insert(program(), FIXTURE_ACTOR_PVM.to_vec());
+        let required_policy =
+            super::super::space_role_policy_hash(crate::SpaceRole::Member.as_u8()).unwrap();
+        let install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+            role_authority: Some(role_authority()),
+            external_actors: external_bindings(),
+            service: identity(),
+            consistency: ConsistencyModeV2::Local,
+            actors: vec![ActorGenesisV2 {
+                actor: actor(),
+                name: "root".into(),
+                parent: None,
+                producer: super::super::ProducerId([4; 32]),
+                deployment: identity().deployment,
+                program: program(),
+                initial_state: initial.clone(),
+                crdt: false,
+                role_policies: role_policies(vec![MethodPolicyV2 {
+                    method: "set".into(),
+                    schema: Hash([6; 32]),
+                    policy: required_policy,
+                    public: false,
+                    attested: false,
+                    space_role: Some(crate::SpaceRole::Member.as_u8()),
+                    actor_role: None,
+                }]),
+            }],
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: super::super::SystemCapabilityId([8; 32]),
+                authenticator: vec![9],
+            },
+        });
+        let AccumulationResultV2::Installed(install) =
+            execute_guest_accumulate(&mut store, &install).unwrap()
+        else {
+            panic!("install rejected")
+        };
+        let sender = ActorId([0xA1; 32]);
+        let mut incoming = message(0xA2, sender, actor(), None, Some(100));
+        incoming.from_service.root_service = RootServiceId([0xA3; 32]);
+        incoming.from_service.deployment = DeploymentId([0xA4; 32]);
+        let source_receipt = source_receipt(core::slice::from_ref(&incoming));
+        store.receipt_allowlist.insert(
+            ReceiptVerificationRequestV2 {
+                expected_producer: sender,
+                receipt: source_receipt.clone(),
+            }
+            .hash(),
+        );
+
+        let header = StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
+        let public_delivery = delivery(&header, 2, incoming.clone(), source_receipt.clone());
+        let before = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Deliver(public_delivery.clone())
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::Unauthorized)
+        );
+        assert_eq!(store, before);
+
+        let mut authorization_work =
+            linear_work(initial.clone(), install.resulting_state_root.unwrap());
+        authorization_work.invocation = InvocationId::for_call(incoming.call_id);
+        authorization_work.logical_timeslot = 2;
+        authorization_work.arguments = incoming.payload.clone();
+        authorization_work.origin = Origin::Actor(sender);
+        authorization_work.causal_parent = Some(incoming.caller_invocation);
+        authorization_work.parent_call = Some(incoming.call_id);
+        authorization_work.causal_context =
+            Some(super::super::CausalCallContextV2::from(&incoming));
+        let credential = receipt_bound_role_credential(
+            &mut store,
+            &authorization_work,
+            crate::SpaceRole::Member,
+            required_policy,
+        );
+        let authorization = credential.disclosed_evidence(required_policy);
+        let mut authorized_delivery = public_delivery;
+        authorized_delivery.authorization = authorization.clone();
+        let AccumulationResultV2::Accepted {
+            receipt: delivery_receipt,
+            duplicate: false,
+            ..
+        } = execute_guest_accumulate(
+            &mut store,
+            &AccumulateRequestV2::Deliver(authorized_delivery),
+        )
+        .unwrap()
+        else {
+            panic!("role-authorized delivery rejected")
+        };
+
+        // Receipt policy is process-local and deliberately absent after a
+        // durable reopen. The guest-owned delivery record and inbox preserve
+        // the exact authorization decision needed by the first actor slice.
+        store.receipt_allowlist.clear();
+        let current = StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
+        let mut inbox_work = linear_work(initial, delivery_receipt.resulting_state_root.unwrap());
+        inbox_work.invocation = InvocationId::for_call(incoming.call_id);
+        inbox_work.logical_timeslot = 3;
+        inbox_work.arguments = incoming.payload.clone();
+        inbox_work.origin = Origin::Actor(sender);
+        inbox_work.authorization = authorization;
+        inbox_work.causal_parent = Some(incoming.caller_invocation);
+        inbox_work.parent_call = Some(incoming.call_id);
+        inbox_work.causal_context = Some(super::super::CausalCallContextV2::from(&incoming));
+        inbox_work.base = ConsistencyBaseV2::Linear {
+            revision: current.revision,
+            state_root: current.state_root.unwrap(),
+        };
+        let mut transition = linear_transition(&inbox_work, b"authorized inbox");
+        transition.reply.as_mut().unwrap().call_id = incoming.call_id;
+        assert!(matches!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                    work: inbox_work,
+                    transition,
+                    provided_blobs: vec![],
+                }),
+            )
+            .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn concurrent_crdt_deliveries_converge_and_sync_reconstructs_drain_state() {
         let mut left = MemStore::default();
         let mut right = MemStore::default();
@@ -8617,6 +8823,7 @@ mod tests {
             service: service.clone(),
             logical_timeslot,
             base: ConsistencyBaseV2::Crdt { heads: vec![] },
+            authorization: AuthorizationEvidenceV2::Public,
             message: incoming.clone(),
             source_outbox: source_outbox.clone(),
             source_receipt,

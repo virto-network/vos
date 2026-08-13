@@ -262,6 +262,26 @@ impl LocalWorkSchedulerV2 {
         source_outbox: Vec<MessageRecordV2>,
         source_receipt: super::AccumulationReceiptV2,
     ) -> Result<DeliveryEnvelopeV2, ScheduleErrorV2> {
+        Self::prepare_authorized_delivery(
+            store,
+            logical_timeslot,
+            AuthorizationEvidenceV2::Public,
+            message,
+            source_outbox,
+            source_receipt,
+        )
+    }
+
+    /// Build a delivery whose source bytes remain public while the
+    /// destination commits separately authenticated authorization evidence.
+    pub fn prepare_authorized_delivery(
+        store: &LocalJamStoreV2,
+        logical_timeslot: u64,
+        authorization: AuthorizationEvidenceV2,
+        message: MessageRecordV2,
+        source_outbox: Vec<MessageRecordV2>,
+        source_receipt: super::AccumulationReceiptV2,
+    ) -> Result<DeliveryEnvelopeV2, ScheduleErrorV2> {
         let header = store.header()?.ok_or(ScheduleErrorV2::StoreUninitialized)?;
         let base = if header.consistency == ConsistencyModeV2::Crdt {
             ConsistencyBaseV2::Crdt {
@@ -279,6 +299,7 @@ impl LocalWorkSchedulerV2 {
             service: header.service,
             logical_timeslot,
             base,
+            authorization,
             message,
             source_outbox,
             source_receipt,

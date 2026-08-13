@@ -7235,17 +7235,141 @@ fn handle_v2_root_transport<B>(
                     return;
                 }
             };
-            let receipt_verification =
-                service.authorize_finalized_receipt(message.from, &publication.receipt);
+            let method = if message.payload.first() == Some(&crate::value::TAG_DYNAMIC) {
+                <crate::value::Msg as crate::Decode>::try_decode(&message.payload[1..])
+                    .map(|message| message.name)
+            } else {
+                None
+            };
+            let Some(method) = method else {
+                warn!(%id, call = ?message.call_id, "rejected non-dynamic v2 delivery");
+                return;
+            };
+            let mut receipt_verifications =
+                vec![service.authorize_finalized_receipt(message.from, &publication.receipt)];
+            let recovered = match service.recover_delivery_authorization(
+                &message,
+                &publication.published.outbox,
+                &publication.receipt,
+            ) {
+                Ok(recovered) => recovered,
+                Err(failure) => {
+                    warn!(%id, call = ?message.call_id, ?failure, "divergent durable delivery retry");
+                    return;
+                }
+            };
+            let authorization = if let Some(authorization) = recovered {
+                match &authorization {
+                    crate::v2::AuthorizationEvidenceV2::Public => {}
+                    crate::v2::AuthorizationEvidenceV2::Credential { bytes, .. } => {
+                        let Some(authority) = service.role_authority().cloned() else {
+                            warn!(%id, call = ?message.call_id, "admitted credential lost its pinned authority");
+                            return;
+                        };
+                        let assertion = crate::v2::RoleCredentialV2::decode(bytes).ok().and_then(
+                            |credential| {
+                                crate::v2::AccumulatedRoleAssertionV2::decode(
+                                    &credential.authenticator,
+                                )
+                                .ok()
+                            },
+                        );
+                        let Some(assertion) =
+                            assertion.filter(|assertion| assertion.matches_authority(&authority))
+                        else {
+                            warn!(%id, call = ?message.call_id, "corrupt admitted delivery credential");
+                            return;
+                        };
+                        receipt_verifications.push(
+                            service
+                                .authorize_finalized_receipt(authority.actor, &assertion.receipt),
+                        );
+                    }
+                    crate::v2::AuthorizationEvidenceV2::PrivateCredential { .. }
+                    | crate::v2::AuthorizationEvidenceV2::SystemCapability { .. } => {
+                        warn!(%id, call = ?message.call_id, "unsupported admitted delivery credential");
+                        return;
+                    }
+                }
+                authorization
+            } else {
+                let policy = match service.root_method_policy(&method) {
+                    Ok(Some(policy)) => policy,
+                    Ok(None) => {
+                        warn!(%id, call = ?message.call_id, %method, "rejected delivery to unknown method");
+                        return;
+                    }
+                    Err(failure) => {
+                        warn!(%id, call = ?message.call_id, ?failure, "could not load delivery policy");
+                        return;
+                    }
+                };
+                if policy.attested {
+                    warn!(%id, call = ?message.call_id, "attested durable transport remains fail-closed");
+                    return;
+                }
+                if policy.public {
+                    crate::v2::AuthorizationEvidenceV2::Public
+                } else {
+                    let Some(role) = policy.space_role.and_then(crate::SpaceRole::from_u8) else {
+                        warn!(%id, call = ?message.call_id, "actor-local durable authorization remains fail-closed");
+                        return;
+                    };
+                    if policy.actor_role.is_some() {
+                        warn!(%id, call = ?message.call_id, "mixed durable authorization remains fail-closed");
+                        return;
+                    }
+                    let Some(authority) = service.role_authority().cloned() else {
+                        warn!(%id, call = ?message.call_id, "role-gated destination has no pinned authority");
+                        return;
+                    };
+                    let claim = match service
+                        .delivery_role_authorization_claim(&message, role, &policy, slot)
+                    {
+                        Ok(claim) => claim,
+                        Err(failure) => {
+                            warn!(%id, call = ?message.call_id, ?failure, "could not derive delivery authorization claim");
+                            return;
+                        }
+                    };
+                    let assertion = match request_v2_role_assertion(
+                        &authority,
+                        &claim,
+                        actor_routes,
+                        invoke_routes,
+                        #[cfg(feature = "network")]
+                        shared_network,
+                    ) {
+                        Ok(assertion) => assertion,
+                        Err(()) => {
+                            warn!(%id, call = ?message.call_id, "role authority denied durable delivery");
+                            return;
+                        }
+                    };
+                    receipt_verifications.push(
+                        service.authorize_finalized_receipt(authority.actor, &assertion.receipt),
+                    );
+                    crate::v2::RoleCredentialV2 {
+                        holder: crate::v2::Origin::Actor(message.from),
+                        scope: claim.scope,
+                        space_role: Some(role),
+                        actor_role: None,
+                        authenticator: assertion.encode(),
+                    }
+                    .disclosed_evidence(policy.policy)
+                }
+            };
+            receipt_verifications.sort_by_key(crate::v2::ReceiptVerificationRequestV2::hash);
             let call = message.call_id;
             let commitment = publication.commitment();
             let source_service = publication.receipt.service.clone();
             match service.deliver_finalized_after_barrier(
                 slot,
+                authorization,
                 message,
                 publication.published.outbox.clone(),
                 publication.receipt,
-                receipt_verification,
+                receipt_verifications,
             ) {
                 Ok(_) => {
                     let accepted = crate::v2::RootTreeTransportV2::PublicationAccepted {

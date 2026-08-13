@@ -16,16 +16,18 @@ use super::{
     AccumulateRequestV2, AccumulatedRoleAssertionV2, AccumulatedServiceOutputV2,
     AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2,
     ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2, BlobRefV2,
-    CommittedImageStoreV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2,
-    CrdtSyncEnvelopeV2, DedupRecordV2, DirectIngressV2, DurableJamStoreV2, DurableStoreOpenErrorV2,
-    ExternalActorBindingV2, ExternalActorDirectoryV2, ImportedBlobV2, ImportedProgramV2,
-    JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2, LocalStoreReadErrorV2, LocalWorkRequestV2,
-    LocalWorkSchedulerV2, MethodPolicyV2, NoRefineProtocolHostV2, PackageError,
+    CausalCallContextV2, CommittedImageStoreV2, ConsistencyBaseV2, ConsistencyModeV2,
+    ContinuationSnapshotV2, CrdtChangeV2, CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryRecordV2,
+    DirectIngressV2, DurableJamStoreV2, DurableStoreOpenErrorV2, ExternalActorBindingV2,
+    ExternalActorDirectoryV2, ImportedBlobV2, ImportedProgramV2, JamServiceV2, LocalJamStoreHostV2,
+    LocalJamStoreV2, LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
+    MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin, PackageError,
     PackageRolePoliciesV2, PreparedWorkV2, ProgramId, ProofArtifactStoreV2, PublicationAckV2,
     PublicationRecordV2, PublishedEffectsV2, RefinedServiceOutputV2, RoleAssertionEligibilityV2,
     RoleAuthorityBindingV2, RoleAuthorizationClaimV2, RoleCredentialV2, ScheduleErrorV2,
     ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2,
     WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
+    delivery_storage_key,
 };
 
 #[cfg(feature = "storage")]
@@ -1782,6 +1784,167 @@ where
         })
     }
 
+    /// Derive the destination-scoped authority decision for one finalized
+    /// cross-root message. Source outbox bytes remain public and immutable;
+    /// the resulting credential is carried separately by the delivery and is
+    /// committed into the destination inbox only after guest verification.
+    pub fn delivery_role_authorization_claim(
+        &self,
+        message: &MessageRecordV2,
+        role: crate::SpaceRole,
+        policy: &MethodPolicyV2,
+        logical_timeslot: u64,
+    ) -> Result<RoleAuthorizationClaimV2, LocalRootTreeInvokeErrorV2> {
+        if self.expected_role_authority.is_none()
+            || message.to_service != self.identity
+            || message.to != self.root_actor
+            || message.authorization != AuthorizationEvidenceV2::Public
+            || message.proof_requested
+            || policy.public
+            || policy.attested
+            || policy.space_role != Some(role.as_u8())
+            || policy.actor_role.is_some()
+        {
+            return Err(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication);
+        }
+        let header = self
+            .service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        let actor = self
+            .service
+            .accumulate_host()
+            .state_row(
+                header.service_root,
+                &StateKeyV2::ActorDescriptor(message.to),
+            )
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .and_then(|bytes| ActorGenesisV2::decode(&bytes).ok())
+            .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        let base = if header.consistency == ConsistencyModeV2::Crdt {
+            ConsistencyBaseV2::Crdt {
+                heads: header.crdt_heads,
+            }
+        } else {
+            ConsistencyBaseV2::Linear {
+                revision: header.revision,
+                state_root: header
+                    .state_root
+                    .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?,
+            }
+        };
+        let work = message
+            .authorization_work(
+                &self.identity,
+                logical_timeslot,
+                AuthorizationEvidenceV2::Public,
+                header.consistency,
+                base,
+                &actor,
+            )
+            .filter(|work| work.method == policy.method)
+            .ok_or(LocalRootTreeInvokeErrorV2::InvalidRoleAssertionPublication)?;
+        Ok(RoleAuthorizationClaimV2 {
+            space: self.identity.space,
+            holder: work.origin,
+            role,
+            audience: self.identity.clone(),
+            invocation: work.invocation,
+            scope: work.authorization_scope(),
+            target: work.target,
+            method: work.method,
+            policy: policy.policy,
+        })
+    }
+
+    /// Recover the exact destination authorization of an already committed
+    /// delivery before consulting the actor's current package policy. This is
+    /// the lost-result/restart path and remains valid across later upgrades.
+    pub fn recover_delivery_authorization(
+        &self,
+        message: &MessageRecordV2,
+        source_outbox: &[MessageRecordV2],
+        source_receipt: &AccumulationReceiptV2,
+    ) -> Result<Option<AuthorizationEvidenceV2>, LocalRootTreeInvokeErrorV2> {
+        let Some(bytes) = self
+            .service
+            .accumulate_host()
+            .local_store()
+            .row(&delivery_storage_key(message.call_id))
+        else {
+            return Ok(None);
+        };
+        let record = DeliveryRecordV2::decode(&bytes)
+            .map_err(|_| LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        if record.call_id != message.call_id {
+            return Err(LocalRootTreeInvokeErrorV2::CorruptWorkflow);
+        }
+        let header = self
+            .service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        let authorization = if record.consumed {
+            let workflow = self
+                .service
+                .accumulate_host()
+                .workflow_checkpoint(super::InvocationId::for_call(message.call_id))
+                .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+                .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+            let work = workflow.resume_work;
+            let method = if message.payload.first() == Some(&crate::value::TAG_DYNAMIC) {
+                <crate::value::Msg as crate::Decode>::try_decode(&message.payload[1..])
+                    .map(|message| message.name)
+            } else {
+                None
+            };
+            if work.service != self.identity
+                || work.invocation != super::InvocationId::for_call(message.call_id)
+                || work.target != message.to
+                || method.as_deref() != Some(work.method.as_str())
+                || work.origin != Origin::Actor(message.from)
+                || work.causal_parent != Some(message.caller_invocation)
+                || work.parent_call != Some(message.call_id)
+                || work.causal_context != Some(CausalCallContextV2::from(message))
+                || work.proof_requested != message.proof_requested
+            {
+                return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
+            }
+            work.authorization
+        } else {
+            let inbox = self
+                .service
+                .accumulate_host()
+                .state_row(header.service_root, &StateKeyV2::Inbox(message.call_id))
+                .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+                .and_then(|bytes| MessageRecordV2::decode(&bytes).ok())
+                .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+            let authorization = inbox.authorization.clone();
+            let mut source_message = inbox;
+            source_message.authorization = AuthorizationEvidenceV2::Public;
+            if source_message != *message {
+                return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
+            }
+            authorization
+        };
+        let candidate = LocalWorkSchedulerV2::prepare_authorized_delivery(
+            self.service.accumulate_host().local_store(),
+            record.logical_timeslot,
+            authorization.clone(),
+            message.clone(),
+            source_outbox.to_vec(),
+            source_receipt.clone(),
+        )
+        .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        if candidate.retry_identity() != record.retry_identity {
+            return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
+        }
+        Ok(Some(authorization))
+    }
+
     /// Recover an authority decision from guest-owned durable workflow and
     /// receipt rows after its transient publication was acknowledged. This is
     /// the exact-invocation retry path used by platform authorization; it
@@ -2046,15 +2209,17 @@ where
     pub(crate) fn deliver_finalized_after_barrier(
         &mut self,
         logical_timeslot: u64,
+        authorization: AuthorizationEvidenceV2,
         message: super::MessageRecordV2,
         source_outbox: Vec<super::MessageRecordV2>,
         source_receipt: AccumulationReceiptV2,
-        receipt_verification: super::ReceiptVerificationRequestV2,
+        receipt_verifications: Vec<super::ReceiptVerificationRequestV2>,
     ) -> Result<super::CommittedDeliveryV2, LocalRootTreeInvokeErrorV2> {
         let call = message.call_id;
-        let delivery = LocalWorkSchedulerV2::prepare_delivery(
+        let delivery = LocalWorkSchedulerV2::prepare_authorized_delivery(
             self.service.accumulate_host().local_store(),
             logical_timeslot,
+            authorization,
             message,
             source_outbox,
             source_receipt,
@@ -2064,7 +2229,7 @@ where
             .service
             .accumulate_with_receipt_verifications_after_barrier(
                 &AccumulateRequestV2::Deliver(delivery),
-                &[receipt_verification],
+                &receipt_verifications,
             )
             .map_err(RootTreeDriverErrorV2::into_invoke)?;
         match accumulated.result {
