@@ -16,8 +16,10 @@
 > catalog rows use this root service when the daemon is started with the exact
 > service PVM. Durable cross-root calls to space-role-only methods use the
 > same authority protocol at destination admission. Actor-local or mixed-role
-> external calls and attested network
-> transport remain fail-closed. Legacy node behavior is
+> external calls and attested network transport remain fail-closed. The root
+> owner itself accepts an explicitly supplied proof producer for attested
+> direct and durable-inbox execution; that producer is not yet installed by
+> `VosNode`. Legacy node behavior is
 > not evidence of v2 conformance.
 
 The local conformance scheduler can admit one guest-committed durable inbox
@@ -158,9 +160,10 @@ replication without a driver. `open_raft` composes the same owner with
 `ReplicatedJamServiceV2`: genesis, actor Apply, and publication
 acknowledgement enter the canonical Raft request log before IC-5 mutates the
 local service image. Followers catch up those exact requests and installed
-service snapshots; they never apply native actor commands. Attested work
-remains rejected until a proof producer is explicitly connected by a later
-host surface.
+service snapshots; they never apply native actor commands. The owner exposes
+separate `invoke_attested`, `invoke_admitted_attested`, and
+`invoke_attested_inbox` entry points which require an explicit proof producer;
+ordinary invocation methods continue to reject proof-requested work.
 Every native `std` host verifies the deployment's frozen libp2p-Ed25519 wire
 through its existing native crypto provider. Bare single-node hosts therefore
 retain the same authority check without requiring network transport or adding
@@ -283,6 +286,14 @@ the final proved Apply: preparation remains read-only, while followers hydrate
 the verifier from the carried proof bytes and execute the same guest gate
 before advancing their apply cursor. An exact retry recovers the existing
 proof publication during preparation and does not propose another Apply.
+The durable root owner admits direct attested ingress before Refine, so a
+missing producer, invalid proof, proof-side-CAS failure, or process restart
+leaves a guest-owned queued invocation that can be retried without changing
+service state. Its Raft variant establishes the current-term read barrier once,
+runs read-only preparation against that caught-up image, and proposes only the
+final proved Apply; no second catch-up can intervene after the admission
+boundary. Pending proof bytes are retrievable by content address from the
+separate durable proof store and survive reopening alongside their publication.
 
 The application package is a portable typed `Attestation<T, M>`, not a bare
 claim. Its generated method marker binds the method and exact actor reply wire;

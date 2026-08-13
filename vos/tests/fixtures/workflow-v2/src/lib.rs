@@ -34,6 +34,11 @@ impl WorkflowV2 {
         7
     }
 
+    #[msg(attested)]
+    fn attested_value(&self) -> u32 {
+        self.value + 7
+    }
+
     #[msg]
     async fn call_child(&mut self, ctx: &mut Context<Self>) -> u32 {
         self.value += 10;

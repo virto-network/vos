@@ -21,19 +21,19 @@ use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, Role, WorkerConfig}
 use vos::v2::{
     AccumulateProtocolHostV2, AccumulateRequestV2, AccumulatedReplyV2, AccumulatedRoleAssertionV2,
     AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationResultV2, ActorGenesisV2, ActorId,
-    ActorUpgradeV2, ActorWriteV2, AuthorizationEvidenceV2, BlobRefV2, CallId, CausalCallContextV2,
-    CommittedAccumulateBatchV2, CommittedAccumulateEntryV2, CommittedAccumulateLogV2,
-    CommittedImageStoreV2, CommittedServiceImageHostV2, CommittedServiceSnapshotV2,
-    ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2, ContinuationSnapshotV2,
-    CrdtChangeV2, DeploymentId, DirectIngressV2, DurableJamStoreV2, ExternalActorBindingV2,
-    GasAccountingV2, GasScheduleV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
-    InboxDrainOutcomeV2, InvocationId, JamServiceV2, LocalJamStoreHostV2, LocalJamStoreSnapshotV2,
-    LocalJamStoreV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2,
-    LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
-    MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin, PackageManifestV2,
-    PackageRolePoliciesV2, ProducerId, ProgramId, ProofArtifactStoreV2, PublishedEffectsV2,
-    ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2,
-    ReplicatedServiceErrorV2, ReplyRecordV2, RoleAuthorityBindingV2,
+    ActorUpgradeV2, ActorWriteV2, AttestedRootTreeInvokeErrorV2, AuthorizationEvidenceV2,
+    BlobRefV2, CallId, CausalCallContextV2, CommittedAccumulateBatchV2, CommittedAccumulateEntryV2,
+    CommittedAccumulateLogV2, CommittedImageStoreV2, CommittedServiceImageHostV2,
+    CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2,
+    ContinuationSnapshotV2, CrdtChangeV2, DeploymentId, DirectIngressV2, DurableJamStoreV2,
+    ExternalActorBindingV2, GasAccountingV2, GasScheduleV2, Hash, ImportedActorV2, ImportedBlobV2,
+    ImportedProgramV2, InboxDrainOutcomeV2, InvocationId, JamServiceV2, LocalJamStoreHostV2,
+    LocalJamStoreSnapshotV2, LocalJamStoreV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2,
+    LocalRootTreeInvokeErrorV2, LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2,
+    LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
+    PackageManifestV2, PackageRolePoliciesV2, ProducerId, ProgramId, ProofArtifactStoreV2,
+    PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2,
+    ReplicatedJamServiceV2, ReplicatedServiceErrorV2, ReplyRecordV2, RoleAuthorityBindingV2,
     RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2, RoleAuthorizationClaimV2,
     RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId, RootTreeInvocationV2,
     ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
@@ -1008,6 +1008,211 @@ fn signed_test_package(
         .expect("sign canonical deployment");
     package.validate().expect("package structure is canonical");
     (package, metadata.actor_name)
+}
+
+fn attested_root_fixture(
+    consistency: ConsistencyModeV2,
+    salt: u8,
+) -> (LocalRootTreeConfigV2, LocalWorkRequestV2) {
+    let actor_elf = workflow_v2_elf();
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&actor_elf, &signer);
+    let actor = ActorId([salt; 32]);
+    let service = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([salt.wrapping_add(1); 32]),
+        root_service: RootServiceId([salt.wrapping_add(2); 32]),
+        deployment: package.deployment_id(),
+        service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
+    };
+    let config = LocalRootTreeConfigV2 {
+        role_authority: None,
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package,
+        service,
+        root_actor: actor,
+        actor_name,
+        consistency,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([salt.wrapping_add(3); 32]),
+            authenticator: vec![salt.wrapping_add(4)],
+        },
+        refine_gas: TEST_GAS_SCHEDULE.refine,
+        accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
+    };
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("attested_value").encode());
+    let request = LocalWorkRequestV2 {
+        invocation: InvocationId([salt.wrapping_add(5); 32]),
+        workflow_step: 0,
+        logical_timeslot: 11,
+        target: actor,
+        method: "attested_value".into(),
+        arguments,
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: vec![],
+        proof_requested: true,
+    };
+    (config, request)
+}
+
+#[test]
+fn attested_root_driver_recovers_queued_and_committed_proofs_across_restart() {
+    let (config, request) = attested_root_fixture(ConsistencyModeV2::Local, 0x41);
+    let mut service =
+        LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
+            .expect("the attested root installs");
+    assert!(
+        !service
+            .admit_ingress(&request)
+            .expect("attested ingress is durable before proof production")
+    );
+
+    let mut backend = service.into_backend();
+    backend.fail_next_proof_commit = true;
+    let mut service = LocalRootTreeServiceV2::open(config.clone(), backend)
+        .expect("queued attested ingress reopens from the durable image");
+    let before_invalid_proof = service.store().snapshot();
+    assert!(matches!(
+        service.invoke_admitted_attested(request.invocation, &mut MismatchedTraceProofProducer),
+        Err(AttestedRootTreeInvokeErrorV2::InvalidProducedProof)
+    ));
+    assert_eq!(
+        service.store().snapshot(),
+        before_invalid_proof,
+        "a proof for another trace cannot mutate the admitted workflow"
+    );
+
+    let mut producer = CanonicalTestProofProducer {
+        proof: b"durable-root-attestation-proof".to_vec(),
+        calls: 0,
+    };
+    let before_failed_cas = service.store().snapshot();
+    assert!(matches!(
+        service.invoke_admitted_attested(request.invocation, &mut producer),
+        Err(AttestedRootTreeInvokeErrorV2::ProofUnavailable)
+    ));
+    assert_eq!(
+        service.store().snapshot(),
+        before_failed_cas,
+        "proof-side-CAS failure leaves the admitted service image retryable"
+    );
+    let committed = service
+        .invoke_admitted_attested(request.invocation, &mut producer)
+        .expect("the queued invocation proves and commits");
+    assert!(!committed.duplicate);
+    assert_eq!(producer.calls, 2);
+    assert_eq!(
+        committed
+            .published
+            .reply
+            .as_ref()
+            .and_then(|reply| Value::try_decode(&reply.result)),
+        Some(Value::U32(7))
+    );
+    let proof = committed
+        .published
+        .proof
+        .as_ref()
+        .expect("the publication commits the proof");
+    assert_eq!(
+        committed
+            .published
+            .attestation
+            .as_ref()
+            .map(|attestation| &attestation.proof),
+        Some(proof)
+    );
+    assert_eq!(
+        service
+            .attestation_proof(&proof.proof_blob)
+            .map(|artifact| artifact.bytes),
+        Some(b"durable-root-attestation-proof".to_vec())
+    );
+
+    let backend = service.into_backend();
+    let mut service = LocalRootTreeServiceV2::open(config, backend)
+        .expect("the proof side-CAS and publication reopen together");
+    assert_eq!(
+        service
+            .attestation_proof(&proof.proof_blob)
+            .map(|artifact| artifact.bytes),
+        Some(b"durable-root-attestation-proof".to_vec())
+    );
+    let retry = service
+        .invoke_attested(request, &mut producer)
+        .expect("an exact retry reattaches the committed attestation");
+    assert!(retry.duplicate);
+    assert_eq!(retry.refine_gas_used, 0);
+    assert_eq!(retry.accumulate_gas_used, 0);
+    assert_eq!(producer.calls, 2, "retry never re-enters the producer");
+}
+
+#[test]
+fn raft_attested_root_orders_only_the_final_proved_apply() {
+    let (config, request) = attested_root_fixture(ConsistencyModeV2::Raft, 0x51);
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-attested-root-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let log_path = directory.join("raft.redb");
+    let log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    let mut service =
+        LocalRootTreeServiceV2::open_raft(config.clone(), FailableCommittedImages::default(), log)
+            .expect("the Raft attested root installs");
+    let mut producer = CanonicalTestProofProducer {
+        proof: b"raft-root-attestation-proof".to_vec(),
+        calls: 0,
+    };
+    let committed = service
+        .invoke_attested(request.clone(), &mut producer)
+        .expect("the final proof-bearing Apply commits through Raft");
+    assert!(!committed.duplicate);
+    let proof = committed.published.proof.clone().unwrap();
+    let backend = service.into_backend();
+
+    let mut log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    assert_eq!(
+        log.applied_index().unwrap(),
+        3,
+        "genesis, ingress admission, and the final proved Apply are the only ordered requests"
+    );
+    assert!(log.committed_after(3).unwrap().entries.is_empty());
+    drop(log);
+
+    let log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    let mut service = LocalRootTreeServiceV2::open_raft(config, backend, log)
+        .expect("the Raft root reopens at the proof-bearing apply cursor");
+    assert_eq!(
+        service
+            .attestation_proof(&proof.proof_blob)
+            .map(|artifact| artifact.bytes),
+        Some(b"raft-root-attestation-proof".to_vec())
+    );
+    let retry = service
+        .invoke_attested(request, &mut producer)
+        .expect("the committed Raft attestation reattaches after restart");
+    assert!(retry.duplicate);
+    assert_eq!(retry.refine_gas_used, 0);
+    assert_eq!(retry.accumulate_gas_used, 0);
+    assert_eq!(producer.calls, 1);
+    drop(service);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
