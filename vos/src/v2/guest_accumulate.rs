@@ -3457,8 +3457,15 @@ fn apply<S: GuestAccumulateStoreV2>(
         }
     }
     let proof_blob = attached_proof.map(|proof| &proof.proof_blob);
+    let awaited_proof_blob = work
+        .awaited_reply
+        .as_ref()
+        .and_then(|reply| reply.attestation.as_ref())
+        .map(|attestation| &attestation.proof.proof_blob);
     for candidate in &envelope.provided_blobs {
-        if proof_blob == Some(&candidate.reference) {
+        if proof_blob == Some(&candidate.reference)
+            || awaited_proof_blob == Some(&candidate.reference)
+        {
             // Proof artifacts are verifier/CAS inputs rather than service
             // state. Their content identity is checked here, while the host's
             // PROOF_VERIFY capability reads the same bytes from its external

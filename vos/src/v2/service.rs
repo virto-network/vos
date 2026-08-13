@@ -1694,9 +1694,31 @@ fn ensure_request_proof_available<A: AttestationProofHostV2>(
     let AccumulateRequestV2::Apply(envelope) = request else {
         return Ok(());
     };
-    let Some(proof) = envelope.transition.proof.as_ref() else {
-        return Ok(());
-    };
+    let (actor_program, execution_semantics, proof) =
+        if let Some(proof) = envelope.transition.proof.as_ref() {
+            (
+                envelope.work.target_program,
+                envelope.work.service.execution_semantics,
+                proof,
+            )
+        } else if let Some(attestation) = envelope
+            .work
+            .awaited_reply
+            .as_ref()
+            .and_then(|reply| reply.attestation.as_ref())
+        {
+            (
+                attestation.statement.actor_program,
+                attestation
+                    .statement
+                    .accumulation_receipt
+                    .service
+                    .execution_semantics,
+                &attestation.proof,
+            )
+        } else {
+            return Ok(());
+        };
     let Some(imported) = envelope
         .provided_blobs
         .iter()
@@ -1707,8 +1729,8 @@ fn ensure_request_proof_available<A: AttestationProofHostV2>(
         return Ok(());
     };
     let verification = ProofVerificationRequestV2 {
-        actor_program: envelope.work.target_program,
-        execution_semantics: envelope.work.service.execution_semantics,
+        actor_program,
+        execution_semantics,
         statement: proof.statement,
         trace: proof.trace,
         proof_blob: proof.proof_blob.clone(),

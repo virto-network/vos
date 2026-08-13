@@ -54,6 +54,74 @@ pub struct RootTreeInvocationV2 {
     pub proof_requested: bool,
 }
 
+/// Host-facing result for one attested root invocation. The actor reply and
+/// proof package are released together only after guest Accumulate committed
+/// the publication. The canonical wire is carried inside the ordinary node
+/// invoke envelope so generated clients cannot confuse it with an unproved
+/// method reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootTreeAttestedResultV2 {
+    pub reply: Vec<u8>,
+    pub attestation: super::AttestationDeliveryV2,
+    pub proof: Vec<u8>,
+}
+
+impl RootTreeAttestedResultV2 {
+    pub fn validate(&self) -> Result<(), DecodeError> {
+        let delivery = &self.attestation;
+        let statement = &delivery.statement;
+        let reply = super::ReplyRecordV2 {
+            call_id: statement.reply_call,
+            producer: statement.actor,
+            result: self.reply.clone(),
+        };
+        let accumulated = super::AccumulatedReplyV2 {
+            reply,
+            receipt: statement.accumulation_receipt.clone(),
+            attestation: Some(Box::new(delivery.clone())),
+        };
+        if delivery.producer_name.is_empty()
+            || delivery.producer_name != statement.producer_name
+            || delivery.producer != statement.producer
+            || delivery.proof.trace == super::Hash::ZERO
+            || !delivery.proof.proof_blob.matches(&self.proof)
+            || accumulated.validate().is_err()
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+impl V2Wire for RootTreeAttestedResultV2 {
+    const MAGIC: [u8; 4] = *b"VAR2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        encoder.bytes(&self.reply);
+        encoder.string(&self.attestation.producer_name);
+        encoder.fixed(&self.attestation.producer.0);
+        encoder.bytes(&self.attestation.statement.encode());
+        super::contracts::encode_proof(&mut encoder, &self.attestation.proof);
+        encoder.bytes(&self.proof);
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            reply: decoder.bytes()?,
+            attestation: super::AttestationDeliveryV2 {
+                producer_name: decoder.string()?,
+                producer: super::ProducerId(decoder.fixed()?),
+                statement: crate::AttestationStatementV3::decode(&decoder.bytes()?)?,
+                proof: super::contracts::decode_proof(decoder)?,
+            },
+            proof: decoder.bytes()?,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+}
+
 impl V2Wire for RootTreeInvocationV2 {
     const MAGIC: [u8; 4] = *b"VRI2";
 
@@ -101,6 +169,10 @@ pub enum RootTreeTransportV2 {
         caller_service: ServiceIdentityV2,
         caller_invocation: super::InvocationId,
         publication: PublicationRecordV2,
+        /// Content-addressed proof bytes for an attested reply. These hydrate
+        /// the caller's durable side CAS and are replicated with its final
+        /// Apply; they never enter actor/service state.
+        proof: Option<ImportedBlobV2>,
     },
     PublicationAccepted {
         acceptor: ActorId,
@@ -151,12 +223,18 @@ impl V2Wire for RootTreeTransportV2 {
                 caller_service,
                 caller_invocation,
                 publication,
+                proof,
             } => {
                 encoder.u8(1);
                 encoder.fixed(&caller.0);
                 encode_service(&mut encoder, caller_service);
                 encoder.fixed(&caller_invocation.0);
                 encoder.bytes(&publication.encode());
+                encoder.option(proof, |encoder, proof| {
+                    encoder.fixed(&proof.reference.hash.0);
+                    encoder.u64(proof.reference.len);
+                    encoder.bytes(&proof.bytes);
+                });
             }
             Self::PublicationAccepted {
                 acceptor,
@@ -211,6 +289,15 @@ impl V2Wire for RootTreeTransportV2 {
                 caller_service: decode_service(decoder)?,
                 caller_invocation: super::InvocationId(decoder.fixed()?),
                 publication: PublicationRecordV2::decode(&decoder.bytes()?)?,
+                proof: decoder.option(|decoder| {
+                    Ok(ImportedBlobV2 {
+                        reference: BlobRefV2 {
+                            hash: super::Hash(decoder.fixed()?),
+                            len: decoder.u64()?,
+                        },
+                        bytes: decoder.bytes()?,
+                    })
+                })?,
             },
             2 => Self::PublicationAccepted {
                 acceptor: ActorId(decoder.fixed()?),
@@ -271,6 +358,7 @@ impl RootTreeTransportV2 {
                 caller,
                 caller_invocation,
                 publication,
+                proof,
                 ..
             } => {
                 *caller != ActorId::ZERO
@@ -283,8 +371,15 @@ impl RootTreeTransportV2 {
                     )
                     && publication.published.reply.is_some()
                     && publication.published.outbox.is_empty()
-                    && publication.published.proof.is_none()
-                    && publication.published.attestation.is_none()
+                    && match (publication.published.attestation.as_deref(), proof) {
+                        (None, None) => publication.published.proof.is_none(),
+                        (Some(attestation), Some(proof)) => {
+                            publication.published.proof.as_ref() == Some(&attestation.proof)
+                                && proof.reference == attestation.proof.proof_blob
+                                && proof.reference.matches(&proof.bytes)
+                        }
+                        _ => false,
+                    }
             }
             Self::PublicationAccepted {
                 acceptor,
@@ -459,6 +554,7 @@ impl<E: core::fmt::Debug> core::error::Error for LocalRootTreeOpenErrorV2<E> {}
 #[derive(Debug)]
 pub enum LocalRootTreeInvokeErrorV2 {
     ProofProducerRequired,
+    ProofUnavailable,
     Schedule(ScheduleErrorV2),
     Service(ServiceDispatchError),
     #[cfg(feature = "storage")]
@@ -2507,8 +2603,36 @@ where
         caller_invocation: super::InvocationId,
         logical_timeslot: u64,
         awaited_reply: super::AccumulatedReplyV2,
+        proof_artifact: Option<ImportedBlobV2>,
         receipt_verification: super::ReceiptVerificationRequestV2,
     ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
+        match (awaited_reply.attestation.as_ref(), proof_artifact.as_ref()) {
+            (None, None) => {}
+            (Some(attestation), Some(artifact))
+                if artifact.reference == attestation.proof.proof_blob
+                    && artifact.reference.matches(&artifact.bytes) =>
+            {
+                let verification = super::ProofVerificationRequestV2 {
+                    actor_program: attestation.statement.actor_program,
+                    execution_semantics: attestation
+                        .statement
+                        .accumulation_receipt
+                        .service
+                        .execution_semantics,
+                    statement: attestation.proof.statement,
+                    trace: attestation.proof.trace,
+                    proof_blob: attestation.proof.proof_blob.clone(),
+                };
+                if !self
+                    .service
+                    .accumulate_host_mut()
+                    .make_proof_available(&verification, &artifact.bytes)
+                {
+                    return Err(LocalRootTreeInvokeErrorV2::ProofUnavailable);
+                }
+            }
+            _ => return Err(LocalRootTreeInvokeErrorV2::ProofUnavailable),
+        }
         let prepared = LocalWorkSchedulerV2::prepare_resume(
             self.service.accumulate_host().local_store(),
             caller_invocation,
@@ -2519,7 +2643,11 @@ where
         if prepared.work.proof_requested {
             return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
         }
-        self.execute_prepared_with_receipts_after_barrier(prepared, &[receipt_verification])
+        self.execute_prepared_with_receipts_after_barrier(
+            prepared,
+            &[receipt_verification],
+            proof_artifact,
+        )
     }
 
     /// Commit every durable call whose deadline is at or before the trusted
@@ -2605,26 +2733,39 @@ where
         &mut self,
         prepared: PreparedWorkV2,
     ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
-        self.execute_prepared_with_receipts_after_barrier(prepared, &[])
+        self.execute_prepared_with_receipts_after_barrier(prepared, &[], None)
     }
 
     fn execute_prepared_with_receipts_after_barrier(
         &mut self,
         prepared: PreparedWorkV2,
         receipt_verifications: &[super::ReceiptVerificationRequestV2],
+        proof_artifact: Option<ImportedBlobV2>,
     ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
         let refined = self
             .service
             .refine_actor_tree_after_barrier(&prepared.work, &prepared.imports)
             .map_err(RootTreeDriverErrorV2::into_invoke)?;
         let input = prepared.work.input_id();
+        let mut provided_blobs = refined.exported_blobs;
+        if let Some(proof) = proof_artifact {
+            match provided_blobs
+                .binary_search_by_key(&proof.reference.hash, |blob| blob.reference.hash)
+            {
+                Ok(index) if provided_blobs[index] != proof => {
+                    return Err(LocalRootTreeInvokeErrorV2::ProofUnavailable);
+                }
+                Ok(_) => {}
+                Err(index) => provided_blobs.insert(index, proof),
+            }
+        }
         let accumulated = self
             .service
             .accumulate_with_receipt_verifications_after_barrier(
                 &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                     work: prepared.work,
                     transition: refined.transition,
-                    provided_blobs: refined.exported_blobs,
+                    provided_blobs,
                 }),
                 receipt_verifications,
             )

@@ -16,10 +16,11 @@
 > catalog rows use this root service when the daemon is started with the exact
 > service PVM. Durable cross-root calls to space-role-only methods use the
 > same authority protocol at destination admission. Actor-local or mixed-role
-> external calls and attested network transport remain fail-closed. The root
-> owner itself accepts an explicitly supplied proof producer for attested
-> direct and durable-inbox execution; that producer is not yet installed by
-> `VosNode`. Legacy node behavior is
+> external calls remain fail-closed. `VosNode` can attach an explicit,
+> root-thread-owned proof producer for attested Local and Raft direct ingress
+> and durable inbox execution; proof-bearing replies carry their exact
+> content-addressed artifact back to the suspended caller. Registration
+> without that capability remains fail-closed. Legacy node behavior is
 > not evidence of v2 conformance.
 
 The local conformance scheduler can admit one guest-committed durable inbox
@@ -163,6 +164,8 @@ local service image. Followers catch up those exact requests and installed
 service snapshots; they never apply native actor commands. The owner exposes
 separate `invoke_attested`, `invoke_admitted_attested`, and
 `invoke_attested_inbox` entry points which require an explicit proof producer;
+the node's `*_with_producer` registration APIs own that capability and use
+those paths for direct and durable inbox work. Ordinary registration and
 ordinary invocation methods continue to reject proof-requested work.
 Every native `std` host verifies the deployment's frozen libp2p-Ed25519 wire
 through its existing native crypto provider. Bare single-node hosts therefore
@@ -941,12 +944,13 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 31, continuation snapshot version 6, and platform ABI version 9
-are therefore a clean break from earlier experimental v2 images. ABI 9 adds
-destination-scoped authorization and terminal inbox retirement to durable
-delivery. Schema 31 rejects delivery records and DAG rows encoded before the
-authorization and retirement fields existed instead of interpreting mutually
-incompatible images under one version. These versions also add exact actor-package
+Store schema 32, continuation snapshot version 6, and platform ABI version 10
+are therefore a clean break from earlier experimental v2 images. ABI 10 adds
+the proof artifact to attested root reply transport and admits that artifact
+as a verifier-only Apply input rather than service state. Schema 32 rejects
+images produced under the earlier proofless reply-resume contract instead of
+interpreting mutually incompatible service identities under one version.
+These versions also add exact actor-package
 identity to descriptors, work, checkpoints, transitions, upgrades, and
 cross-root proof bindings, bind durable messages and retained causal context to
 their exact source/destination services, retain the complete dormant

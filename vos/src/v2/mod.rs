@@ -90,8 +90,8 @@ pub use pvm::{
 pub use root_service::{
     AttestedRootTreeInvokeErrorV2, CommittedCrdtSyncV2, CommittedRootTreeSliceV2,
     LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2,
-    LocalRootTreeOpenErrorV2, LocalRootTreeServiceV2, RootTreeIngressRecoveryV2,
-    RootTreeInvocationV2, RootTreeTransportV2,
+    LocalRootTreeOpenErrorV2, LocalRootTreeServiceV2, RootTreeAttestedResultV2,
+    RootTreeIngressRecoveryV2, RootTreeInvocationV2, RootTreeTransportV2,
 };
 #[cfg(feature = "std")]
 pub use scheduler::{LocalWorkRequestV2, LocalWorkSchedulerV2, PreparedWorkV2, ScheduleErrorV2};
@@ -124,7 +124,7 @@ pub use transport::{
 pub use wire::{DecodeError, V2Wire};
 
 /// Platform wire/ABI version carried by v2 work, transitions, and receipts.
-pub const ABI_VERSION: u16 = 9;
+pub const ABI_VERSION: u16 = 10;
 /// Portable continuation format version.
 pub const SNAPSHOT_VERSION: u16 = 6;
 /// Attestation statement version required by runtime v2.
@@ -135,8 +135,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0x12, 0xc6, 0x3e, 0x23, 0x42, 0x3f, 0x83, 0xec, 0x9b, 0x70, 0xc3, 0x0e, 0xf6, 0xbc, 0x8d, 0xee,
-    0x37, 0xa6, 0xb2, 0x4d, 0xe2, 0x6f, 0x1c, 0xd1, 0xca, 0x30, 0xe9, 0x24, 0xb4, 0xc8, 0x8f, 0x56,
+    0x38, 0x5a, 0xbd, 0x75, 0x8c, 0x38, 0x91, 0xc0, 0xce, 0xb3, 0x62, 0x2c, 0xae, 0xa9, 0xd2, 0x44,
+    0xc8, 0x19, 0x36, 0x10, 0x21, 0xdd, 0x3e, 0x19, 0x77, 0x91, 0xa3, 0x1f, 0x5c, 0xf1, 0x87, 0xd4,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.
@@ -222,4 +222,4 @@ pub const JAR_REVISION: &str = "41d31e64b0f5d6c57a43769d7b8785556a311684";
 /// Consensus-visible execution semantics. Changing interpreter/recompiler or
 /// trace behavior requires a new identifier even if the public Rust API did
 /// not change.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v10");
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v11");

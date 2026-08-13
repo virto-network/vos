@@ -3144,7 +3144,7 @@ impl V2Wire for RefineOutputV2 {
                 })
             })?,
         };
-        validate_candidate_blobs(&value.transition, &value.candidate_blobs)?;
+        validate_candidate_blobs(None, &value.transition, &value.candidate_blobs)?;
         Ok(value)
     }
 }
@@ -4786,19 +4786,25 @@ fn validate_accumulation_envelope(value: &AccumulationEnvelopeV2) -> Result<(), 
         }
         _ => Err(DecodeError::NonCanonical),
     }?;
-    validate_candidate_blobs(&value.transition, &value.provided_blobs)?;
+    validate_candidate_blobs(Some(&value.work), &value.transition, &value.provided_blobs)?;
     Ok(())
 }
 
 fn validate_candidate_blobs(
+    work: Option<&WorkEnvelopeV2>,
     transition: &TransitionV2,
     candidates: &[ImportedBlobV2],
 ) -> Result<(), DecodeError> {
     ensure_sorted_unique(candidates, |blob| blob.reference.hash.0)?;
+    let awaited_proof = work
+        .and_then(|work| work.awaited_reply.as_ref())
+        .and_then(|reply| reply.attestation.as_ref())
+        .map(|attestation| &attestation.proof.proof_blob);
     for candidate in candidates {
         if !candidate.reference.matches(&candidate.bytes)
-            || !transition_blob_references(transition)
+            || !(transition_blob_references(transition)
                 .any(|reference| reference == &candidate.reference)
+                || awaited_proof == Some(&candidate.reference))
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -5588,14 +5594,14 @@ fn decode_reply(d: &mut Decoder<'_>) -> Result<ReplyRecordV2, DecodeError> {
     })
 }
 
-fn encode_proof(e: &mut Encoder<'_>, value: &ProofCommitmentV2) {
+pub(crate) fn encode_proof(e: &mut Encoder<'_>, value: &ProofCommitmentV2) {
     e.fixed(&value.statement.0);
     e.fixed(&value.trace.0);
     encode_blob_ref(e, &value.proof_blob);
     e.u16(value.statement_version);
 }
 
-fn decode_proof(d: &mut Decoder<'_>) -> Result<ProofCommitmentV2, DecodeError> {
+pub(crate) fn decode_proof(d: &mut Decoder<'_>) -> Result<ProofCommitmentV2, DecodeError> {
     let value = ProofCommitmentV2 {
         statement: Hash(d.fixed()?),
         trace: Hash(d.fixed()?),
