@@ -189,6 +189,15 @@ struct FailableCommittedImages {
 #[derive(Debug, Clone, Default)]
 struct SharedCommittedImages(Arc<Mutex<Option<Vec<u8>>>>);
 
+#[derive(Debug, Clone, Default)]
+struct SharedProofCommittedImages(Arc<Mutex<SharedProofCommittedImageState>>);
+
+#[derive(Debug, Default)]
+struct SharedProofCommittedImageState {
+    image: Option<Vec<u8>>,
+    proofs: BTreeMap<[u8; 32], Vec<u8>>,
+}
+
 #[derive(Debug, Default)]
 struct SharedFailingImageState {
     image: Option<Vec<u8>>,
@@ -229,6 +238,46 @@ impl ProofArtifactStoreV2 for SharedCommittedImages {
     }
 
     fn commit_proof(&mut self, _reference: &BlobRefV2, _proof: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+impl CommittedImageStoreV2 for SharedProofCommittedImages {
+    type Error = ();
+
+    fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self.0.lock().unwrap().image.clone())
+    }
+
+    fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+        self.0.lock().unwrap().image = Some(image.to_vec());
+        Ok(())
+    }
+}
+
+impl ProofArtifactStoreV2 for SharedProofCommittedImages {
+    type Error = ();
+
+    fn load_proof(&self, reference: &BlobRefV2) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .proofs
+            .get(&reference.hash.0)
+            .filter(|proof| reference.matches(proof))
+            .cloned())
+    }
+
+    fn commit_proof(&mut self, reference: &BlobRefV2, proof: &[u8]) -> Result<(), Self::Error> {
+        if !reference.matches(proof) {
+            return Err(());
+        }
+        self.0
+            .lock()
+            .unwrap()
+            .proofs
+            .insert(reference.hash.0, proof.to_vec());
         Ok(())
     }
 }
@@ -3616,6 +3665,343 @@ fn node_routes_canonical_actor_ids_through_the_guest_owned_root_service() {
         reopened.pending_publications().unwrap().is_empty(),
         "the direct reply is acknowledged only after its channel accepts it"
     );
+}
+
+#[test]
+fn node_attested_root_requires_an_explicit_producer_and_returns_the_committed_package() {
+    let (config, request) = attested_root_fixture(ConsistencyModeV2::Local, 0x71);
+    let backend = SharedCommittedImages::default();
+    let service = LocalRootTreeServiceV2::open(config.clone(), backend.clone()).unwrap();
+    let route = ServiceId::new(0, 0x3310);
+
+    let mut unavailable = VosNode::new();
+    unavailable
+        .register_v2_root_at_id("attested-root-v2", service, route, false)
+        .unwrap();
+    assert!(
+        matches!(
+            unavailable.invoke_actor_attested(request.target, request.arguments.clone()),
+            Err(ClientError::Forbidden)
+        ),
+        "ordinary registration remains fail-closed for signed attested methods"
+    );
+    assert!(unavailable.collect().iter().all(AgentResult::is_ok));
+
+    let service = LocalRootTreeServiceV2::open(config.clone(), backend.clone()).unwrap();
+    let proof = b"node-owned-canonical-proof".to_vec();
+    let mut node = VosNode::new();
+    node.register_v2_root_at_id_with_producer(
+        "attested-root-v2",
+        service,
+        route,
+        false,
+        CanonicalTestProofProducer {
+            proof: proof.clone(),
+            calls: 0,
+        },
+    )
+    .unwrap();
+    let result = node
+        .invoke_actor_attested(request.target, request.arguments)
+        .expect("the node proves and returns one guest-committed package");
+    assert_eq!(result.value, Value::U32(7));
+    assert_eq!(result.proof, proof);
+    assert_eq!(result.statement.actor, request.target);
+    assert_eq!(result.statement.method, "attested_value");
+    assert_eq!(result.statement.producer, result.producer);
+    assert_eq!(result.statement.producer_name, result.producer_name);
+    assert!(node.collect().iter().all(AgentResult::is_ok));
+
+    let reopened = LocalRootTreeServiceV2::open(config, backend)
+        .expect("the node's proof and acknowledgement survive its root thread");
+    assert!(reopened.pending_publications().unwrap().is_empty());
+}
+
+#[test]
+fn node_attested_raft_root_orders_the_proved_apply() {
+    let (config, request) = attested_root_fixture(ConsistencyModeV2::Raft, 0x73);
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-node-attested-raft-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let db = Arc::new(redb::Database::create(directory.join("raft.redb")).unwrap());
+    let member = 0x77u16;
+    let route = ServiceId::new(member, 0x3312);
+    let mut node = VosNode::new();
+    node.register_v2_raft_root_at_id_with_producer(
+        "attested-raft-root-v2".into(),
+        config,
+        FailableCommittedImages::default(),
+        db,
+        RaftConfig {
+            me: member,
+            members: vec![member],
+            election_timeout_ms: (10, 30),
+            heartbeat_interval_ms: 5,
+            replication_id: [0x78; 32],
+            propose_timeout_ms: 2_000,
+        },
+        route,
+        false,
+        CanonicalTestProofProducer {
+            proof: b"node-raft-proof".to_vec(),
+            calls: 0,
+        },
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(350));
+    let result = node
+        .invoke_actor_attested(request.target, request.arguments)
+        .expect("the current leader proves before proposing the final Apply");
+    assert_eq!(result.value, Value::U32(7));
+    assert_eq!(result.proof, b"node-raft-proof");
+    assert!(node.collect().iter().all(AgentResult::is_ok));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+fn attested_node_transport_fixture(
+    consistency: ConsistencyModeV2,
+    salt: u8,
+) -> (
+    LocalRootTreeConfigV2,
+    LocalRootTreeConfigV2,
+    ActorId,
+    ActorId,
+) {
+    let actor_elf = workflow_v2_elf();
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&actor_elf, &signer);
+    let deployment = package.deployment_id();
+    let producer = package.deployment_signature.producer;
+    let program = package.manifest.actor_program;
+    let source_actor = ActorId([salt; 32]);
+    let destination_actor = ActorId([44; 32]);
+    let source_identity = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([salt.wrapping_add(1); 32]),
+        root_service: RootServiceId([salt.wrapping_add(2); 32]),
+        deployment,
+        service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
+    };
+    let destination_identity = ServiceIdentityV2 {
+        root_service: RootServiceId([salt.wrapping_add(3); 32]),
+        ..source_identity.clone()
+    };
+    let install_authorization = AuthorizationEvidenceV2::SystemCapability {
+        capability: SystemCapabilityId([salt.wrapping_add(4); 32]),
+        authenticator: vec![salt.wrapping_add(5)],
+    };
+    let source = LocalRootTreeConfigV2 {
+        role_authority: None,
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package: package.clone(),
+        service: source_identity,
+        root_actor: source_actor,
+        actor_name: actor_name.clone(),
+        consistency,
+        initial_state: vec![],
+        external_actors: vec![external_binding(
+            "private-age",
+            destination_identity.clone(),
+            destination_actor,
+            producer,
+            program,
+        )],
+        install_authorization: install_authorization.clone(),
+        refine_gas: TEST_GAS_SCHEDULE.refine,
+        accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
+    };
+    let destination = LocalRootTreeConfigV2 {
+        role_authority: None,
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package,
+        service: destination_identity,
+        root_actor: destination_actor,
+        actor_name: "private-age".into(),
+        consistency,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization,
+        refine_gas: TEST_GAS_SCHEDULE.refine,
+        accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
+    };
+    (source, destination, source_actor, destination_actor)
+}
+
+#[test]
+fn node_routes_an_attested_durable_call_and_proof_back_into_the_waiting_actor() {
+    let (source_config, destination_config, source_actor, _) =
+        attested_node_transport_fixture(ConsistencyModeV2::Local, 0xD1);
+    let source_backend = SharedProofCommittedImages::default();
+    let destination_backend = SharedProofCommittedImages::default();
+    let source =
+        LocalRootTreeServiceV2::open(source_config.clone(), source_backend.clone()).unwrap();
+    let destination =
+        LocalRootTreeServiceV2::open(destination_config.clone(), destination_backend.clone())
+            .unwrap();
+    let source_route = ServiceId::new(0, 0x3510);
+    let destination_route = ServiceId::new(0, 0x3511);
+    let mut node = VosNode::new();
+    node.register_v2_root_at_id("attested-source-v2", source, source_route, false)
+        .unwrap();
+    node.register_v2_root_at_id_with_producer(
+        "private-age",
+        destination,
+        destination_route,
+        false,
+        CanonicalTestProofProducer {
+            proof: b"peer-proof".to_vec(),
+            calls: 0,
+        },
+    )
+    .unwrap();
+
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("root_await_attested_peer").encode());
+    let ingress = RootTreeInvocationV2 {
+        invocation: InvocationId([0xD7; 32]),
+        target: source_actor,
+        method: "root_await_attested_peer".into(),
+        arguments,
+        proof_requested: false,
+    };
+    let invoker = node.invoke_handle();
+    let shutdown = node.shutdown_handle();
+    let request = std::thread::spawn(move || {
+        let result =
+            invoker.invoke_with_timeout(source_route, ingress.encode(), Duration::from_secs(30));
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        result
+    });
+    node.run_forever();
+    let results = node.collect();
+    assert!(results.iter().all(AgentResult::is_ok));
+    let reply = request.join().unwrap();
+    let source = LocalRootTreeServiceV2::open(source_config, source_backend).unwrap();
+    let destination =
+        LocalRootTreeServiceV2::open(destination_config, destination_backend).unwrap();
+    let source_publications = source.pending_publications().unwrap();
+    let destination_publications = destination.pending_publications().unwrap();
+    let destination_inbox = destination.store().pending_inbox_calls().unwrap();
+    assert_eq!(
+        reply,
+        Some(Value::Bool(true).encode()),
+        "the destination proof reaches the exact suspended caller",
+    );
+    assert!(source_publications.is_empty());
+    assert!(destination_publications.is_empty());
+    assert!(destination_inbox.is_empty());
+}
+
+#[test]
+fn node_raft_transport_orders_attested_inbox_and_reply_proof_on_both_roots() {
+    let (source_config, destination_config, source_actor, _) =
+        attested_node_transport_fixture(ConsistencyModeV2::Raft, 0xE1);
+    let source_backend = SharedProofCommittedImages::default();
+    let destination_backend = SharedProofCommittedImages::default();
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-node-attested-raft-route-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source_db = Arc::new(redb::Database::create(directory.join("source.redb")).unwrap());
+    let destination_db =
+        Arc::new(redb::Database::create(directory.join("destination.redb")).unwrap());
+    let member = 0x79u16;
+    let source_route = ServiceId::new(member, 0x3520);
+    let destination_route = ServiceId::new(member, 0x3521);
+    let raft_config = |replication_id| RaftConfig {
+        me: member,
+        members: vec![member],
+        election_timeout_ms: (10, 30),
+        heartbeat_interval_ms: 5,
+        replication_id,
+        propose_timeout_ms: 2_000,
+    };
+    let mut node = VosNode::new();
+    node.register_v2_raft_root_at_id(
+        "attested-raft-source-v2".into(),
+        source_config,
+        source_backend.clone(),
+        source_db,
+        raft_config([0xEA; 32]),
+        source_route,
+        false,
+    )
+    .unwrap();
+    node.register_v2_raft_root_at_id_with_producer(
+        "attested-raft-destination-v2".into(),
+        destination_config,
+        destination_backend.clone(),
+        destination_db,
+        raft_config([0xEB; 32]),
+        destination_route,
+        false,
+        CanonicalTestProofProducer {
+            proof: b"peer-proof".to_vec(),
+            calls: 0,
+        },
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("root_await_attested_peer").encode());
+    let ingress = RootTreeInvocationV2 {
+        invocation: InvocationId([0xEC; 32]),
+        target: source_actor,
+        method: "root_await_attested_peer".into(),
+        arguments,
+        proof_requested: false,
+    };
+    let invoker = node.invoke_handle();
+    let shutdown = node.shutdown_handle();
+    let request = std::thread::spawn(move || {
+        let result =
+            invoker.invoke_with_timeout(source_route, ingress.encode(), Duration::from_secs(45));
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        result
+    });
+    node.run_forever();
+    let results = node.collect();
+    assert!(results.iter().all(AgentResult::is_ok));
+    assert_eq!(
+        request.join().unwrap(),
+        Some(Value::Bool(true).encode()),
+        "the exact package reaches the caller after both roots order their Apply"
+    );
+    assert!(
+        source_backend
+            .0
+            .lock()
+            .unwrap()
+            .proofs
+            .values()
+            .any(|proof| proof == b"peer-proof"),
+        "the caller replica durably hydrates the proof before ordering resume"
+    );
+    assert!(
+        destination_backend
+            .0
+            .lock()
+            .unwrap()
+            .proofs
+            .values()
+            .any(|proof| proof == b"peer-proof"),
+        "the producer replica retains the proof until reply acknowledgement"
+    );
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -11075,7 +11461,7 @@ fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
         destination_identity,
         destination_actor,
         "private-age",
-        "peer_value",
+        "attested_peer_value",
         true,
         destination_producer,
         vec![],
