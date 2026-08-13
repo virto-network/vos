@@ -10,6 +10,7 @@ rustflags = [
     "-Zcrate-attr=no_main",
     "-Aduplicate-macro-attributes",
     "-Aunused-attributes",
+    "-Clink-arg=-Tpvm.ld",
     # Canonical service identity must not depend on its checkout directory.
     "-Zremap-cwd-prefix=.",
 ]

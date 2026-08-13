@@ -333,8 +333,46 @@ fn direct_ingress_from_request(
         .map_err(LocalRootTreeInvokeErrorV2::Schedule)
 }
 
-fn request_from_direct_ingress(ingress: DirectIngressV2) -> LocalWorkRequestV2 {
-    LocalWorkRequestV2 {
+fn direct_ingress_authorization(
+    store: &LocalJamStoreV2,
+    ingress: &DirectIngressV2,
+) -> Result<AuthorizationEvidenceV2, LocalRootTreeInvokeErrorV2> {
+    let Some(causal) = ingress.crdt_ingress() else {
+        return Ok(ingress.authorization.clone());
+    };
+    match (&causal.authorization, causal.authorization_blob.as_ref()) {
+        (AuthorizationEvidenceV2::Public, None) => Ok(AuthorizationEvidenceV2::Public),
+        (
+            AuthorizationEvidenceV2::Credential {
+                policy,
+                credential_commitment,
+                bytes,
+            },
+            Some(reference),
+        ) if bytes.is_empty() => {
+            let bytes = store
+                .blob(reference)
+                .filter(|bytes| reference.matches(bytes))
+                .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?
+                .to_vec();
+            Ok(AuthorizationEvidenceV2::Credential {
+                policy: *policy,
+                credential_commitment: *credential_commitment,
+                bytes,
+            })
+        }
+        _ => Err(LocalRootTreeInvokeErrorV2::CorruptWorkflow),
+    }
+}
+
+fn request_from_direct_ingress(
+    ingress: DirectIngressV2,
+) -> Result<LocalWorkRequestV2, LocalRootTreeInvokeErrorV2> {
+    let authorization = ingress
+        .crdt_ingress()
+        .map(|causal| causal.authorization.clone())
+        .unwrap_or_else(|| ingress.authorization.clone());
+    Ok(LocalWorkRequestV2 {
         invocation: ingress.invocation,
         workflow_step: 0,
         logical_timeslot: ingress.logical_timeslot,
@@ -342,7 +380,7 @@ fn request_from_direct_ingress(ingress: DirectIngressV2) -> LocalWorkRequestV2 {
         method: ingress.method,
         arguments: ingress.arguments,
         origin: ingress.origin,
-        authorization: ingress.authorization,
+        authorization,
         causal_parent: None,
         parent_call: None,
         causal_context: None,
@@ -350,7 +388,7 @@ fn request_from_direct_ingress(ingress: DirectIngressV2) -> LocalWorkRequestV2 {
         awaited_timeout: None,
         imported_blobs: ingress.imported_blobs,
         proof_requested: ingress.proof_requested,
-    }
+    })
 }
 
 /// Complete immutable installation input for one locally hosted root tree.
@@ -1007,6 +1045,20 @@ where
             }));
         }
         let committed = &checkpoint.resume_work;
+        let authorization_matches = if header.consistency == ConsistencyModeV2::Crdt {
+            let candidate = direct_ingress_from_request(
+                self.service.accumulate_host().local_store(),
+                &self.identity,
+                request,
+            )?;
+            self.service
+                .accumulate_host()
+                .ingress_record(request.invocation)
+                .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+                .is_some_and(|record| record.consumed && record.ingress.matches_retry(&candidate))
+        } else {
+            committed.authorization == request.authorization
+        };
         let exact_ingress = request.workflow_step == 0
             && checkpoint.input.workflow_step == 0
             && checkpoint.input.invocation == request.invocation
@@ -1015,7 +1067,7 @@ where
             && committed.method == request.method
             && committed.arguments == request.arguments
             && committed.origin == request.origin
-            && committed.authorization == request.authorization
+            && authorization_matches
             && committed.causal_parent == request.causal_parent
             && committed.parent_call == request.parent_call
             && committed.causal_context == request.causal_context
@@ -1052,23 +1104,24 @@ where
         // DAG checkpoint, so authenticate the bridge through the checkpoint's
         // content-addressed change: that node retains the admitted work hash
         // and its CID is committed as a resulting receipt head.
-        let checkpoint_is_bound = if header.consistency == ConsistencyModeV2::Crdt {
-            let change = self
-                .service
-                .accumulate_host()
-                .row(&crdt_node_storage_key(checkpoint.transition_hash))
-                .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)
-                .and_then(|bytes| {
-                    CrdtChangeV2::decode(bytes)
-                        .map_err(|_| LocalRootTreeInvokeErrorV2::CorruptWorkflow)
-                })?;
+        let crdt_change = if header.consistency == ConsistencyModeV2::Crdt {
+            Some(
+                self.service
+                    .accumulate_host()
+                    .row(&crdt_node_storage_key(checkpoint.transition_hash))
+                    .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)
+                    .and_then(|bytes| {
+                        CrdtChangeV2::decode(bytes)
+                            .map_err(|_| LocalRootTreeInvokeErrorV2::CorruptWorkflow)
+                    })?,
+            )
+        } else {
+            None
+        };
+        let checkpoint_is_bound = if let Some(change) = crdt_change.as_ref() {
             change.cid() == checkpoint.transition_hash
                 && change.work_hash == dedup.work_hash
-                && dedup
-                    .receipt
-                    .resulting_crdt_heads
-                    .binary_search(&checkpoint.transition_hash)
-                    .is_ok()
+                && change.matches_receipt(&self.identity, &dedup.receipt)
         } else {
             checkpoint.work_hash == dedup.work_hash
                 && checkpoint.transition_hash == dedup.transition_commitment
@@ -1089,12 +1142,18 @@ where
         {
             return Err(LocalRootTreeInvokeErrorV2::CorruptWorkflow);
         }
+        let published = match (publication.as_ref(), crdt_change.as_ref()) {
+            (Some(publication), _) => publication.published.clone(),
+            (None, Some(change)) => change
+                .published_effects()
+                .map_err(|()| LocalRootTreeInvokeErrorV2::CorruptWorkflow)?
+                .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?,
+            (None, None) => PublishedEffectsV2::default(),
+        };
         Ok(Some(CommittedRootTreeSliceV2 {
             input: checkpoint.input,
             receipt: dedup.receipt,
-            published: publication
-                .as_ref()
-                .map_or_else(PublishedEffectsV2::default, |row| row.published.clone()),
+            published,
             publication,
             role_assertion_eligibility: self
                 .service
@@ -1627,7 +1686,10 @@ where
         {
             return Err(LocalRootTreeInvokeErrorV2::DivergentInvocation);
         }
-        Ok(Some(ingress.authorization))
+        Ok(Some(direct_ingress_authorization(
+            self.service.accumulate_host().local_store(),
+            &ingress,
+        )?))
     }
 
     /// Derive the exact invocation-scoped decision the installed role
@@ -1862,6 +1924,14 @@ where
         if request.proof_requested {
             return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
         }
+        if self.consistency() == ConsistencyModeV2::Crdt
+            && let AuthorizationEvidenceV2::Credential { bytes, .. } = &request.authorization
+        {
+            self.service
+                .accumulate_host_mut()
+                .local_store_mut()
+                .import_blob(bytes.clone());
+        }
         let ingress = direct_ingress_from_request(
             self.service.accumulate_host().local_store(),
             &self.identity,
@@ -1910,7 +1980,8 @@ where
         if record.consumed {
             return Err(LocalRootTreeInvokeErrorV2::DivergentInvocation);
         }
-        self.execute_admitted_after_barrier(request_from_direct_ingress(record.ingress))
+        let request = request_from_direct_ingress(record.ingress)?;
+        self.execute_admitted_after_barrier(request)
     }
 
     fn execute_admitted_after_barrier(
@@ -2729,6 +2800,7 @@ mod tests {
             arguments: vec![crate::value::TAG_DYNAMIC, 1],
             origin: super::super::Origin::Anonymous,
             authorization: AuthorizationEvidenceV2::Public,
+            authorization_blob: None,
             imported_blobs: vec![],
             proof_requested: false,
         };

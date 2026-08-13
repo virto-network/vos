@@ -24,18 +24,25 @@ pub(crate) struct CausalFrontierV2 {
 }
 
 impl CausalFrontierV2 {
+    /// Return one CID-validated node retained by this frontier.
+    pub fn node(&self, cid: Hash) -> Option<&CrdtChangeV2> {
+        self.nodes.get(&cid)
+    }
+
     /// Canonical frontier after removing advertised heads which are ancestors
     /// of another advertised head. Concurrent branches are always preserved.
     pub fn canonical_heads(&self) -> Vec<Hash> {
-        let dependencies = self
+        let mut dependencies = self
             .nodes
             .values()
             .flat_map(|change| change.causal_dependencies.iter().copied())
-            .collect::<BTreeSet<_>>();
+            .collect::<Vec<_>>();
+        dependencies.sort();
+        dependencies.dedup();
         self.heads
             .iter()
             .copied()
-            .filter(|head| !dependencies.contains(head))
+            .filter(|head| dependencies.binary_search(head).is_err())
             .collect()
     }
 
@@ -83,20 +90,20 @@ impl CausalFrontierV2 {
     /// This keeps Apply on one ancestry walk: validation loads the union of
     /// the committed and observed frontiers, then staging adds the new node
     /// in memory before materialization.
-    pub fn with_change(mut self, current_heads: &[Hash], change: CrdtChangeV2) -> Option<Self> {
-        let expected_height = change
-            .causal_dependencies
-            .iter()
-            .map(|dependency| self.nodes.get(dependency).map(|node| node.causal_height))
-            .collect::<Option<Vec<_>>>()?
-            .into_iter()
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)?;
+    pub fn with_change(
+        mut self,
+        current_heads: &[Hash],
+        cid: Hash,
+        change: CrdtChangeV2,
+    ) -> Option<Self> {
+        let mut parent_height = 0;
+        for dependency in &change.causal_dependencies {
+            parent_height = parent_height.max(self.nodes.get(dependency)?.causal_height);
+        }
+        let expected_height = parent_height.checked_add(1)?;
         if change.causal_height != expected_height {
             return None;
         }
-        let cid = change.cid();
         if let Some(existing) = self.nodes.get(&cid)
             && existing != &change
         {
@@ -193,16 +200,48 @@ pub(crate) fn load_causal_frontier<E>(
     heads: &[Hash],
     mut read_node: impl FnMut(Hash) -> Result<Option<Vec<u8>>, E>,
 ) -> Result<CausalFrontierV2, CausalFrontierError<E>> {
+    load_causal_frontier_changes(heads, |cid| {
+        let bytes = read_node(cid)
+            .map_err(CausalFrontierError::Storage)?
+            .ok_or(CausalFrontierError::Missing(cid))?;
+        CrdtChangeV2::decode(&bytes).map_err(|_| CausalFrontierError::Corrupt)
+    })
+}
+
+/// Load a frontier by consuming already-decoded synchronized nodes.
+///
+/// A sync envelope has already paid to decode every supplied change. Encoding
+/// those changes only for the generic loader to decode them again briefly
+/// owns three copies of the largest workflow records in the bounded service
+/// guest. Move the canonical value directly and consult storage only for an
+/// ancestry node omitted from the envelope.
+pub(crate) fn load_causal_frontier_with_owned_supplied<E>(
+    heads: &[Hash],
+    mut supplied: Vec<(Hash, CrdtChangeV2)>,
+    mut read_node: impl FnMut(Hash) -> Result<Option<Vec<u8>>, E>,
+) -> Result<CausalFrontierV2, CausalFrontierError<E>> {
+    load_causal_frontier_changes(heads, |cid| {
+        if let Ok(index) = supplied.binary_search_by_key(&cid, |(candidate, _)| *candidate) {
+            return Ok(supplied.remove(index).1);
+        }
+        let bytes = read_node(cid)
+            .map_err(CausalFrontierError::Storage)?
+            .ok_or(CausalFrontierError::Missing(cid))?;
+        CrdtChangeV2::decode(&bytes).map_err(|_| CausalFrontierError::Corrupt)
+    })
+}
+
+fn load_causal_frontier_changes<E>(
+    heads: &[Hash],
+    mut read_node: impl FnMut(Hash) -> Result<CrdtChangeV2, CausalFrontierError<E>>,
+) -> Result<CausalFrontierV2, CausalFrontierError<E>> {
     let mut nodes = BTreeMap::<Hash, CrdtChangeV2>::new();
     let mut pending = heads.to_vec();
     while let Some(cid) = pending.pop() {
         if nodes.contains_key(&cid) {
             continue;
         }
-        let bytes = read_node(cid)
-            .map_err(CausalFrontierError::Storage)?
-            .ok_or(CausalFrontierError::Missing(cid))?;
-        let change = CrdtChangeV2::decode(&bytes).map_err(|_| CausalFrontierError::Corrupt)?;
+        let change = read_node(cid)?;
         if change.cid() != cid {
             return Err(CausalFrontierError::Corrupt);
         }
@@ -310,7 +349,7 @@ mod tests {
 
         let merged = change(4, heads.clone(), 3, Some(4));
         let merged_cid = merged.cid();
-        let extended = frontier.with_change(&heads, merged).unwrap();
+        let extended = frontier.with_change(&heads, merged_cid, merged).unwrap();
         assert_eq!(extended.canonical_heads(), vec![merged_cid]);
         assert_eq!(extended.max_head_height, 3);
 

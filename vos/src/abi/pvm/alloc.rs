@@ -35,7 +35,7 @@ struct FreeNode {
     next: *mut FreeNode,
 }
 
-/// Linked-list free-list allocator over a fixed 64 KiB arena.
+/// Linked-list free-list allocator over the target's fixed arena.
 ///
 /// - First-fit allocation with block splitting.
 /// - Deallocation with immediate coalescing of adjacent free blocks.
@@ -117,16 +117,30 @@ unsafe impl GlobalAlloc for FreeListHeap {
             // room for the header before it.
             let earliest_payload = (block as usize) + HEADER_SIZE;
             let payload_addr = (earliest_payload + payload_align - 1) & !(payload_align - 1);
-            let end = payload_addr + payload_size;
-            let used = end - block as usize;
-
+            let Some(end) = payload_addr.checked_add(payload_size) else {
+                prev = cur;
+                cur = next;
+                continue;
+            };
+            let node_align = core::mem::align_of::<FreeNode>();
+            let Some(used) = (end - block as usize)
+                .max(MIN_BLOCK)
+                .checked_add(node_align - 1)
+                .map(|used| used & !(node_align - 1))
+            else {
+                prev = cur;
+                cur = next;
+                continue;
+            };
+            // Every remainder begins with a `FreeNode`. Rounding the split
+            // boundary is load-bearing: an odd-sized payload must never make
+            // the next node unaligned (which would be undefined behaviour and
+            // corrupt later allocations).
             if used > block_size {
                 prev = cur;
                 cur = next;
                 continue;
             }
-
-            let used = used.max(MIN_BLOCK);
             let remainder = block_size - used;
 
             if remainder >= MIN_BLOCK {

@@ -1724,7 +1724,222 @@ fn canonical_space_authority_authorizes_a_physical_target_and_exact_retry() {
 }
 
 #[test]
-fn node_ingress_quorum_orders_canonical_authority_for_a_raft_target() {
+fn crdt_role_authorization_survives_causal_sync_restart_and_exact_retry() {
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&crdt_counter_v2_elf(), &signer);
+    let actor = ActorId([0xD1; 32]);
+    let authority_actor = ActorId([0xD2; 32]);
+    let service = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([0xD3; 32]),
+        root_service: RootServiceId([0xD4; 32]),
+        deployment: package.deployment_id(),
+        service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
+    };
+    let authority = RoleAuthorityBindingV2 {
+        service: ServiceIdentityV2 {
+            root_service: RootServiceId([0xD5; 32]),
+            deployment: DeploymentId([0xD6; 32]),
+            ..service.clone()
+        },
+        actor: authority_actor,
+    };
+    let config = LocalRootTreeConfigV2 {
+        role_authority: Some(authority.clone()),
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        service,
+        root_actor: actor,
+        actor_name,
+        consistency: ConsistencyModeV2::Crdt,
+        initial_state: vec![],
+        external_actors: vec![],
+        package,
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([0xD7; 32]),
+            authenticator: vec![0xD8],
+        },
+        refine_gas: TEST_GAS_SCHEDULE.refine,
+        accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
+    };
+    let mut source =
+        LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
+            .expect("the authority-bound CRDT source installs");
+    let policy = source
+        .root_method_policy("member_only")
+        .unwrap()
+        .expect("the CRDT package retains its Member policy");
+    assert_eq!(policy.space_role, Some(vos::SpaceRole::Member.as_u8()));
+
+    let holder = Origin::Member(SubjectId([0xD9; 32]));
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("member_only").encode());
+    let provisional = LocalWorkRequestV2 {
+        invocation: InvocationId([0xDA; 32]),
+        workflow_step: 0,
+        logical_timeslot: 10,
+        target: actor,
+        method: "member_only".into(),
+        arguments,
+        origin: holder,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let claim = source
+        .role_authorization_claim(&provisional, vos::SpaceRole::Member, &policy)
+        .expect("the CRDT scheduler derives a frontier-independent authority scope");
+    let assertion = AccumulatedRoleAssertionV2 {
+        receipt: AccumulationReceiptV2 {
+            service: authority.service.clone(),
+            accepted_transition: Hash([0xDB; 32]),
+            reply_commitment: Some(claim.authority_reply(authority_actor).commitment()),
+            outbox_commitment: None,
+            resulting_state_root: Some(Hash([0xDC; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 1,
+            checkpoint: 0,
+            consistency: ConsistencyModeV2::Raft,
+        },
+        claim: claim.clone(),
+    };
+    assert!(assertion.matches_authority(&authority));
+    let authority_verification = ReceiptVerificationRequestV2 {
+        expected_producer: authority_actor,
+        receipt: assertion.receipt.clone(),
+    };
+    source.store_mut().allow_receipt(&authority_verification);
+    let mut authorized = provisional.clone();
+    authorized.authorization = RoleCredentialV2 {
+        holder,
+        scope: claim.scope,
+        space_role: Some(vos::SpaceRole::Member),
+        actor_role: None,
+        authenticator: assertion.encode(),
+    }
+    .disclosed_evidence(policy.policy);
+    let (credential_policy, expected_credential_commitment, credential_bytes) =
+        match &authorized.authorization {
+            AuthorizationEvidenceV2::Credential {
+                policy,
+                credential_commitment,
+                bytes,
+            } => (*policy, *credential_commitment, bytes.clone()),
+            _ => unreachable!("the authorized request carries a disclosed credential"),
+        };
+    let authorization_blob = BlobRefV2::of_bytes(&credential_bytes);
+    assert!(!source.admit_ingress(&authorized).unwrap());
+    let committed = source
+        .invoke_admitted(authorized.invocation)
+        .expect("guest Accumulate admits and executes the scoped CRDT assertion");
+    assert_eq!(
+        committed
+            .published
+            .reply
+            .as_ref()
+            .and_then(|reply| Value::try_decode(&reply.result)),
+        Some(Value::U32(99)),
+    );
+
+    let sync = source
+        .crdt_sync_envelope()
+        .unwrap()
+        .expect("the authorized ingress and execution export causally");
+    assert!(sync.nodes.iter().any(|node| {
+        node.change.workflow.iter().any(|operation| {
+            matches!(operation, WorkflowOperationV2::Ingress(ingress)
+                if ingress.invocation == authorized.invocation
+                    && ingress.authorization_blob == Some(authorization_blob.clone())
+                    && matches!(&ingress.authorization,
+                        AuthorizationEvidenceV2::Credential {
+                            policy,
+                            credential_commitment,
+                            bytes,
+                        } if *policy == credential_policy
+                            && *credential_commitment == expected_credential_commitment
+                            && bytes.is_empty()))
+        })
+    }));
+    assert!(
+        sync.provided_blobs
+            .iter()
+            .any(|blob| { blob.reference == authorization_blob && blob.bytes == credential_bytes })
+    );
+    let sink_backend = SharedCommittedImages::default();
+    let mut sink = LocalRootTreeServiceV2::open(config.clone(), sink_backend.clone())
+        .expect("an independent CRDT replica installs without verifier cache state");
+    assert!(matches!(
+        sink.sync_finalized_crdt(sync.clone()),
+        Err(LocalRootTreeInvokeErrorV2::Rejected(
+            vos::v2::AccumulationRejectionV2::ReceiptUnavailable,
+        ))
+    ));
+    for node in &sync.nodes {
+        sink.store_mut()
+            .allow_receipt(&ReceiptVerificationRequestV2 {
+                expected_producer: node
+                    .change
+                    .expected_producer()
+                    .expect("every authorized causal node names its producer"),
+                receipt: node.receipt.clone(),
+            });
+    }
+    let mut missing_sink =
+        LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
+            .expect("the missing-blob adversary starts from an independent replica");
+    for node in &sync.nodes {
+        missing_sink
+            .store_mut()
+            .allow_receipt(&ReceiptVerificationRequestV2 {
+                expected_producer: node
+                    .change
+                    .expected_producer()
+                    .expect("every authorized causal node names its producer"),
+                receipt: node.receipt.clone(),
+            });
+    }
+    let mut missing_authorization = sync.clone();
+    missing_authorization
+        .provided_blobs
+        .retain(|blob| blob.reference != authorization_blob);
+    assert!(matches!(
+        missing_sink.sync_finalized_crdt(missing_authorization),
+        Err(LocalRootTreeInvokeErrorV2::Rejected(
+            vos::v2::AccumulationRejectionV2::MissingBlob(hash),
+        )) if hash == authorization_blob.hash
+    ));
+    sink.sync_finalized_crdt(sync)
+        .expect("finalized causal receipts transitively authenticate the admitted assertion");
+    drop(sink);
+    let mut sink = LocalRootTreeServiceV2::open(config, sink_backend)
+        .expect("the synchronized authorized replica reopens durably");
+    assert_eq!(
+        sink.role_authorization_claim(&provisional, vos::SpaceRole::Member, &policy)
+            .expect("restart recovers the original scoped claim from causal ingress"),
+        claim,
+    );
+    let recovered = sink
+        .invoke(authorized.clone())
+        .expect("the synchronized exact retry needs no authority re-execution");
+    assert!(recovered.duplicate);
+    assert_eq!(recovered.refine_gas_used, 0);
+    assert_eq!(recovered.accumulate_gas_used, 0);
+    let mut divergent = authorized;
+    divergent.arguments.push(0);
+    assert!(matches!(
+        sink.invoke(divergent),
+        Err(LocalRootTreeInvokeErrorV2::DivergentInvocation),
+    ));
+}
+
+#[test]
+fn node_ingress_uses_canonical_authority_for_raft_and_crdt_targets() {
     let node_key = libp2p::identity::Keypair::generate_ed25519();
     let granted_key = libp2p::identity::Keypair::generate_ed25519();
     let denied_key = libp2p::identity::Keypair::generate_ed25519();
@@ -1883,8 +2098,42 @@ fn node_ingress_quorum_orders_canonical_authority_for_a_raft_target() {
     )
     .expect("the Raft target pins the authority identity in guest-owned state");
 
+    let crdt_actor = ActorId([0xE1; 32]);
+    let crdt_signer = libp2p::identity::Keypair::generate_ed25519();
+    let (crdt_package, crdt_name) = signed_test_package(&crdt_counter_v2_elf(), &crdt_signer);
+    let crdt_identity = ServiceIdentityV2 {
+        space,
+        root_service: RootServiceId([0xE2; 32]),
+        deployment: crdt_package.deployment_id(),
+        service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
+    };
+    let crdt_config = LocalRootTreeConfigV2 {
+        role_authority: Some(authority_binding.clone()),
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        service: crdt_identity,
+        package: crdt_package,
+        root_actor: crdt_actor,
+        actor_name: crdt_name,
+        consistency: ConsistencyModeV2::Crdt,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([0xE3; 32]),
+            authenticator: vec![0xE4],
+        },
+        refine_gas: TEST_GAS_SCHEDULE.refine,
+        accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
+    };
+    let crdt_backend = SharedCommittedImages::default();
+    let crdt_target = LocalRootTreeServiceV2::open(crdt_config.clone(), crdt_backend.clone())
+        .expect("the CRDT target pins the same authority identity in guest-owned state");
+
     let authority_route = ServiceId::new(node_prefix, 0x3a00);
     let target_route = ServiceId::new(node_prefix, 0x3a01);
+    let crdt_route = ServiceId::new(node_prefix, 0x3a02);
     let mut node = VosNode::with_prefix(node_prefix);
     let registry_pvm =
         grey_transpiler::link_elf(include_bytes!("../../vosx/blobs/space_registry.elf"))
@@ -1921,6 +2170,8 @@ fn node_ingress_quorum_orders_canonical_authority_for_a_raft_target() {
     node.register_v2_root_at_id("space-authority", authority, authority_route, true)
         .unwrap();
     node.register_v2_root_at_id("role-target", target, target_route, true)
+        .unwrap();
+    node.register_v2_root_at_id("crdt-role-target", crdt_target, crdt_route, true)
         .unwrap();
 
     let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
@@ -2013,12 +2264,12 @@ fn node_ingress_quorum_orders_canonical_authority_for_a_raft_target() {
         "method-name coincidence must not activate the host-private assertion override",
     );
 
-    let ingress = |invocation| {
+    let ingress = |target, invocation| {
         let mut arguments = vec![vos::value::TAG_DYNAMIC];
         arguments.extend_from_slice(&Msg::new("member_only").encode());
         RootTreeInvocationV2 {
             invocation,
-            target: target_actor,
+            target,
             method: "member_only".into(),
             arguments,
             proof_requested: false,
@@ -2031,11 +2282,35 @@ fn node_ingress_quorum_orders_canonical_authority_for_a_raft_target() {
             ServiceId::REGISTRY.0,
             target_route.0,
             vec![],
-            ingress(InvocationId([222; 32])),
+            ingress(target_actor, InvocationId([222; 32])),
         )
         .recv_timeout(Duration::from_secs(120))
         .expect("the member call reaches the local target through its Raft authority");
     assert_eq!(Value::try_decode(&granted), Some(Value::U32(99)));
+
+    let crdt_invocation = InvocationId([0xE5; 32]);
+    let crdt_granted = granted_network
+        .send_invoke(
+            node_peer,
+            ServiceId::REGISTRY.0,
+            crdt_route.0,
+            vec![],
+            ingress(crdt_actor, crdt_invocation),
+        )
+        .recv_timeout(Duration::from_secs(120))
+        .expect("the member call reaches the CRDT target through the canonical authority");
+    assert_eq!(Value::try_decode(&crdt_granted), Some(Value::U32(99)));
+    let crdt_retry = granted_network
+        .send_invoke(
+            node_peer,
+            ServiceId::REGISTRY.0,
+            crdt_route.0,
+            vec![],
+            ingress(crdt_actor, crdt_invocation),
+        )
+        .recv_timeout(Duration::from_secs(120))
+        .expect("the exact CRDT retry recovers its admitted authority evidence");
+    assert_eq!(crdt_retry, crdt_granted);
 
     let denied = denied_network
         .send_invoke(
@@ -2043,11 +2318,22 @@ fn node_ingress_quorum_orders_canonical_authority_for_a_raft_target() {
             ServiceId::REGISTRY.0,
             target_route.0,
             vec![],
-            ingress(InvocationId([223; 32])),
+            ingress(target_actor, InvocationId([223; 32])),
         )
         .recv_timeout(Duration::from_secs(120))
         .expect("an ungranted peer receives an explicit refusal");
     assert_eq!(denied.first().copied(), Some(vos::STATUS_FORBIDDEN));
+    let crdt_denied = denied_network
+        .send_invoke(
+            node_peer,
+            ServiceId::REGISTRY.0,
+            crdt_route.0,
+            vec![],
+            ingress(crdt_actor, InvocationId([0xE6; 32])),
+        )
+        .recv_timeout(Duration::from_secs(120))
+        .expect("an ungranted peer receives an explicit CRDT refusal");
+    assert_eq!(crdt_denied.first().copied(), Some(vos::STATUS_FORBIDDEN));
 
     shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     assert!(
@@ -2059,6 +2345,19 @@ fn node_ingress_quorum_orders_canonical_authority_for_a_raft_target() {
     );
     granted_network.join();
     denied_network.join();
+    let reopened_crdt = LocalRootTreeServiceV2::open(crdt_config, crdt_backend)
+        .expect("the role-authorized CRDT root reopens from its durable causal state");
+    let sync = reopened_crdt
+        .crdt_sync_envelope()
+        .expect("the reopened CRDT causal frontier is readable")
+        .expect("the authorized ingress and execution remain exportable");
+    assert!(sync.nodes.iter().any(|node| {
+        node.change.workflow.iter().any(|operation| {
+            matches!(operation, WorkflowOperationV2::Ingress(ingress)
+                if ingress.invocation == crdt_invocation
+                    && matches!(&ingress.authorization, AuthorizationEvidenceV2::Credential { .. }))
+        })
+    }));
     std::fs::remove_dir_all(directory).unwrap();
 }
 

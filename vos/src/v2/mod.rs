@@ -62,6 +62,7 @@ pub use contracts::{
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStoreV2, ProofVerificationV2, ReceiptVerificationV2,
     execute_canonical_guest_accumulate, execute_guest_accumulate,
+    execute_owned_canonical_guest_accumulate,
 };
 pub use identity::{
     ActorId, CallId, ChangeId, DeploymentId, Hash, InvocationId, OperationId, Origin, ProducerId,
@@ -133,8 +134,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0x76, 0x2c, 0x74, 0xdf, 0x2f, 0x8f, 0x6e, 0x83, 0x11, 0x5a, 0x26, 0x3e, 0x30, 0x4c, 0x60, 0x0d,
-    0xb2, 0x88, 0xd1, 0x84, 0xc6, 0x2f, 0xc2, 0x84, 0x41, 0x34, 0x5e, 0xd8, 0xd7, 0xd2, 0x13, 0x82,
+    0x2b, 0x72, 0x25, 0x38, 0xdd, 0x80, 0xd5, 0xb3, 0x92, 0x1a, 0x7d, 0xc5, 0x27, 0x8c, 0x26, 0xf5,
+    0x7e, 0xb4, 0xfa, 0x60, 0xdd, 0x83, 0x2d, 0xa1, 0x5a, 0xc4, 0x67, 0x2d, 0x4d, 0x02, 0x1a, 0x0a,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.
@@ -220,4 +221,4 @@ pub const JAR_REVISION: &str = "41d31e64b0f5d6c57a43769d7b8785556a311684";
 /// Consensus-visible execution semantics. Changing interpreter/recompiler or
 /// trace behavior requires a new identifier even if the public Rust API did
 /// not change.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v7\0");
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v8\0");

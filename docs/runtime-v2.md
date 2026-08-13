@@ -10,12 +10,12 @@
 > reply/timeout resume, and
 > restart retries through Local and Raft roots. Enrolled nodes automatically
 > exchange complete authenticated CRDT frontiers and redrive them after restart.
-> A direct space-role-only call to a Local or Raft
+> A direct space-role-only call to a Local, Raft, or CRDT
 > root obtains an invocation-scoped accumulated assertion from that space's
 > installed Raft `space-authority`; caller-supplied legacy role bytes are ignored. Signed v2
 > catalog rows use this root service when the daemon is started with the exact
-> service PVM. Actor-local or mixed-role external calls, role-authorized CRDT
-> targets, role-bearing durable calls, CRDT cross-root calls, and attested network
+> service PVM. Actor-local or mixed-role external calls, role-bearing durable
+> calls, CRDT cross-root calls, and attested network
 > transport remain fail-closed. Legacy node behavior is
 > not evidence of v2 conformance.
 
@@ -488,8 +488,11 @@ denial is acknowledged as an authority publication but surfaces as
 recover the original credential from the target's guest-owned direct-ingress
 row, recover the same authority decision from its durable eligibility/receipt
 rows, and never reinterpret the target's current package policy. This cutover
-supports Local and Raft targets. Local roots expose the exact verifier decision
-only to the admission IC-5 call. Raft roots encode that same
+supports Local, Raft, and CRDT targets. Local and CRDT roots expose the exact
+verifier decision only to the admission IC-5 call. CRDT admission retains the
+scoped credential in its causal ingress node; every syncing replica verifies
+the finalized receipt which commits that complete node before materializing
+it. Raft roots encode that same
 `ReceiptVerificationRequestV2` beside `AdmitIngress` in the committed entry;
 every replica hydrates it before IC-5 and leaves its applied cursor unchanged
 if hydration fails. Once admission commits, the guest-owned ingress row is the
@@ -498,7 +501,7 @@ same scoped credential against that row rather than process-local verifier
 state, including after snapshot recovery. This ordering is narrowly scoped to
 direct authority ingress; it does not make arbitrary receipt-bearing transport
 consensus-authoritative. Actor-local and mixed policies still require the
-separate bound-handle authority path, and CRDT targets remain fail-closed.
+separate bound-handle authority path.
 
 Authority redirects never trust the 16-bit routing prefix as identity. The
 target retains the authority's exact Raft replication ID, requires the leader
@@ -859,11 +862,11 @@ leader barrier, and every hop independently resolves the destination group's
 leader. Slow or partitioned discovery is bounded off-router and coalesced per
 root, so it cannot stall unrelated services or grow one lookup per 250 ms
 retry. Permanent guest deduplication makes a lost acknowledgement safe.
-Direct space-role-only calls to Local and Raft roots use the installed
+Direct space-role-only calls to Local, Raft, and CRDT roots use the installed
 canonical authority path described above. Attested calls, actor-local or
-mixed-role calls, role-bearing durable messages, and role-authorized CRDT
-targets remain unavailable on this node route; they never fall back to an unproved,
-caller-declared role or synthetic-System invocation. Legacy ELF/PVM rows
+mixed-role calls, and role-bearing durable messages remain unavailable on this
+node route; they never fall back to an unproved, caller-declared role or
+synthetic-System invocation. Legacy ELF/PVM rows
 continue on the old host during this staged cutover.
 
 Registry-level `space upgrade` is rejected whenever either side is a signed v2

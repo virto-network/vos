@@ -736,6 +736,18 @@ impl WorkEnvelopeV2 {
         checkpoint.logical_timeslot = 0;
         checkpoint.awaited_reply = None;
         checkpoint.awaited_timeout = None;
+        // Direct CRDT ingress retains disclosed credential bytes once in its
+        // content-addressed admission blob. Repeating the authority assertion
+        // in every causal workflow checkpoint needlessly multiplies the
+        // bounded guest heap and the synchronization payload. Inbox-backed
+        // workflows keep their complete authorization because they have no
+        // direct-ingress blob from which a scheduler can rehydrate it.
+        if checkpoint.consistency == ConsistencyModeV2::Crdt
+            && checkpoint.parent_call.is_none()
+            && let AuthorizationEvidenceV2::Credential { bytes, .. } = &mut checkpoint.authorization
+        {
+            bytes.clear();
+        }
         let empty = BlobRefV2::of_bytes(&[]);
         for actor in &mut checkpoint.imported_actors {
             actor.state = empty.clone();
@@ -1162,6 +1174,10 @@ pub struct CrdtIngressV2 {
     pub arguments: Vec<u8>,
     pub origin: Origin,
     pub authorization: AuthorizationEvidenceV2,
+    /// Content address of disclosed credential bytes. The causal operation
+    /// binds the policy and credential commitment inline without retaining a
+    /// second copy of the authority assertion.
+    pub authorization_blob: Option<BlobRefV2>,
     pub imported_blobs: Vec<BlobRefV2>,
     pub proof_requested: bool,
 }
@@ -1187,8 +1203,73 @@ impl CrdtIngressV2 {
             && self.arguments == candidate.arguments
             && self.origin == candidate.origin
             && self.authorization == candidate.authorization
+            && self.authorization_blob == candidate.authorization_blob
             && self.imported_blobs == candidate.imported_blobs
             && self.proof_requested == candidate.proof_requested
+    }
+
+    /// Bind the causal operation to every non-authorization field of its
+    /// compact direct-admission carrier. CRDT authorization lives only here;
+    /// the outer field is a canonical public sentinel.
+    pub fn matches_direct(&self, direct: &DirectIngressV2) -> bool {
+        self.service == direct.service
+            && self.invocation == direct.invocation
+            && self.logical_timeslot == direct.logical_timeslot
+            && self.target == direct.target
+            && self.method == direct.method
+            && self.arguments == direct.arguments
+            && self.origin == direct.origin
+            && match (
+                &self.authorization,
+                self.authorization_blob.as_ref(),
+                &direct.authorization,
+            ) {
+                (AuthorizationEvidenceV2::Public, None, AuthorizationEvidenceV2::Public) => true,
+                (
+                    AuthorizationEvidenceV2::Credential {
+                        policy,
+                        credential_commitment,
+                        bytes,
+                    },
+                    Some(reference),
+                    AuthorizationEvidenceV2::Credential {
+                        policy: direct_policy,
+                        credential_commitment: direct_commitment,
+                        bytes: direct_bytes,
+                    },
+                ) => {
+                    bytes.is_empty()
+                        && policy == direct_policy
+                        && credential_commitment == direct_commitment
+                        && reference.matches(direct_bytes)
+                }
+                (
+                    AuthorizationEvidenceV2::Credential { bytes, .. },
+                    Some(reference),
+                    AuthorizationEvidenceV2::Public,
+                ) => bytes.is_empty() && reference.len != 0,
+                _ => false,
+            }
+            && self.imported_blobs == direct.imported_blobs
+            && self.proof_requested == direct.proof_requested
+    }
+
+    /// A fresh admission must carry the disclosed credential in the outer
+    /// request so guest Accumulate can verify it before retaining only its
+    /// compact causal reference. The public outer sentinel is reserved for
+    /// already-admitted rows reconstructed from the CRDT DAG.
+    pub fn matches_fresh_direct(&self, direct: &DirectIngressV2) -> bool {
+        self.matches_direct(direct)
+            && matches!(
+                (&self.authorization, &direct.authorization),
+                (
+                    AuthorizationEvidenceV2::Public,
+                    AuthorizationEvidenceV2::Public
+                ) | (
+                    AuthorizationEvidenceV2::Credential { .. },
+                    AuthorizationEvidenceV2::Credential { .. }
+                )
+            )
     }
 }
 
@@ -1248,7 +1329,11 @@ impl CrdtChangeV2 {
     /// later receipt's head set, this commitment cannot authenticate an
     /// unrelated transition which merely retains this node as an ancestor.
     pub fn receipt_commitment(&self) -> Hash {
-        Hash::digest(b"vos/crdt-transition/v2", &[&self.cid().0])
+        Self::receipt_commitment_from_cid(self.cid())
+    }
+
+    pub(crate) fn receipt_commitment_from_cid(cid: Hash) -> Hash {
+        Hash::digest(b"vos/crdt-transition/v2", &[&cid.0])
     }
 
     pub fn derive_expiration_id(
@@ -1265,9 +1350,13 @@ impl CrdtChangeV2 {
     }
 
     pub fn derive_ingress_id(ingress: &CrdtIngressV2, heads: &[Hash]) -> ChangeId {
+        Self::derive_ingress_id_from_commitment(ingress.commitment(), heads)
+    }
+
+    pub(crate) fn derive_ingress_id_from_commitment(ingress: Hash, heads: &[Hash]) -> ChangeId {
         let mut bytes = Vec::new();
         let mut e = Encoder(&mut bytes);
-        e.fixed(&ingress.commitment().0);
+        e.fixed(&ingress.0);
         e.list(heads, |e, head| e.fixed(&head.0));
         ChangeId(Hash::digest(b"vos/crdt-ingress-id/v2", &[&bytes]).0)
     }
@@ -1302,6 +1391,88 @@ impl CrdtChangeV2 {
         });
         let producer = checkpoints.next()?;
         checkpoints.next().is_none().then_some(producer)
+    }
+
+    /// Reconstruct the transport-visible effects committed directly in this
+    /// causal node. Proof packages intentionally live outside the DAG, so a
+    /// proof-bearing checkpoint requires its durable publication row.
+    pub(crate) fn published_effects(&self) -> Result<Option<PublishedEffectsV2>, ()> {
+        let mut reply = None;
+        let mut outbox = Vec::new();
+        for operation in &self.workflow {
+            match operation {
+                WorkflowOperationV2::Checkpoint(work) if work.proof_requested => return Ok(None),
+                WorkflowOperationV2::Reply(candidate) if reply.is_none() => {
+                    reply = Some(candidate.clone());
+                }
+                WorkflowOperationV2::Reply(_) => return Err(()),
+                WorkflowOperationV2::Outbox(message) => outbox.push(message.clone()),
+                _ => {}
+            }
+        }
+        outbox.sort_by_key(|message| message.call_id);
+        Ok(Some(PublishedEffectsV2 {
+            reply,
+            outbox,
+            exported_blobs: self.exported_blobs.clone(),
+            proof: None,
+            attestation: None,
+        }))
+    }
+
+    /// Verify the service receipt against every effect and causal field
+    /// committed by this exact node.
+    pub(crate) fn matches_receipt(
+        &self,
+        service: &ServiceIdentityV2,
+        receipt: &AccumulationReceiptV2,
+    ) -> bool {
+        let mut checkpoints = self
+            .workflow
+            .iter()
+            .filter_map(|operation| match operation {
+                WorkflowOperationV2::Checkpoint(work) => Some(work.workflow_step),
+                WorkflowOperationV2::ExpireCall(timeout) => Some(timeout.checkpoint_step),
+                WorkflowOperationV2::Ingress(_) | WorkflowOperationV2::Delivery(_) => Some(0),
+                _ => None,
+            });
+        let Some(checkpoint) = checkpoints.next() else {
+            return false;
+        };
+        if checkpoints.any(|candidate| candidate != checkpoint) {
+            return false;
+        }
+        let mut replies = self
+            .workflow
+            .iter()
+            .filter_map(|operation| match operation {
+                WorkflowOperationV2::Reply(reply) => Some(reply),
+                _ => None,
+            });
+        let reply_commitment = replies.next().map(ReplyRecordV2::commitment);
+        if replies.next().is_some() {
+            return false;
+        }
+        let outbox = self
+            .workflow
+            .iter()
+            .filter_map(|operation| match operation {
+                WorkflowOperationV2::Outbox(message) => Some(message.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        receipt.service == *service
+            && receipt.accepted_transition == self.receipt_commitment()
+            && receipt.reply_commitment == reply_commitment
+            && receipt.outbox_commitment == MessageRecordV2::outbox_commitment(&outbox)
+            && receipt.resulting_state_root.is_none()
+            && receipt
+                .resulting_crdt_heads
+                .binary_search(&self.cid())
+                .is_ok()
+            && receipt.sequence == self.causal_height
+            && receipt.checkpoint == checkpoint
+            && receipt.consistency == ConsistencyModeV2::Crdt
     }
 }
 
@@ -1486,7 +1657,11 @@ impl TransitionV2 {
         operations.extend(self.outbox.iter().cloned().map(WorkflowOperationV2::Outbox));
         operations.extend(consumed_outbox.map(WorkflowOperationV2::ConsumeOutbox));
         operations.extend(self.reply.iter().cloned().map(WorkflowOperationV2::Reply));
-        operations.sort_by_key(workflow_operation_bytes);
+        // Workflow encodings are required to be strictly unique, so stable
+        // ordering has no semantic effect. The unstable sorter has a much
+        // smaller stack profile in the bounded service PVM than slice's
+        // stable drift sort for this large enum.
+        operations.sort_unstable_by_key(workflow_operation_bytes);
         operations
     }
 }
@@ -1638,6 +1813,71 @@ pub struct DirectIngressV2 {
 }
 
 impl DirectIngressV2 {
+    fn encode_body_with_authorization(
+        &self,
+        out: &mut Vec<u8>,
+        authorization: &AuthorizationEvidenceV2,
+    ) {
+        let mut e = Encoder(out);
+        encode_service(&mut e, &self.service);
+        e.fixed(&self.invocation.0);
+        e.u64(self.logical_timeslot);
+        e.fixed(&self.target.0);
+        e.string(&self.method);
+        e.bytes(&self.arguments);
+        encode_origin(&mut e, self.origin);
+        encode_auth(&mut e, authorization);
+        e.list(&self.imported_blobs, encode_blob_ref);
+        e.bool(self.proof_requested);
+        encode_base(&mut e, &self.base);
+        e.option(&self.base_causal_height, |e, height| e.u64(*height));
+        e.option(&self.crdt_change, |e, change| e.bytes(&change.encode()));
+    }
+
+    /// Encode the permanent admission row without retaining a second copy of
+    /// disclosed CRDT credential bytes. The causal operation already binds
+    /// their content address, policy, and credential commitment.
+    pub(crate) fn encode_admitted(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&Self::MAGIC);
+        out.extend_from_slice(&super::ABI_VERSION.to_le_bytes());
+        let authorization = if self.crdt_change.is_some() {
+            &AuthorizationEvidenceV2::Public
+        } else {
+            &self.authorization
+        };
+        self.encode_body_with_authorization(&mut out, authorization);
+        out
+    }
+
+    /// Encode a CRDT admission reconstructed from its canonical DAG node.
+    ///
+    /// This borrowed form avoids cloning the complete change merely to build
+    /// the permanent ingress row inside the bounded service guest.
+    pub(crate) fn encode_materialized(ingress: &CrdtIngressV2, change: &CrdtChangeV2) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&Self::MAGIC);
+        out.extend_from_slice(&super::ABI_VERSION.to_le_bytes());
+        let mut e = Encoder(&mut out);
+        encode_service(&mut e, &ingress.service);
+        e.fixed(&ingress.invocation.0);
+        e.u64(ingress.logical_timeslot);
+        e.fixed(&ingress.target.0);
+        e.string(&ingress.method);
+        e.bytes(&ingress.arguments);
+        encode_origin(&mut e, ingress.origin);
+        encode_auth(&mut e, &AuthorizationEvidenceV2::Public);
+        e.list(&ingress.imported_blobs, encode_blob_ref);
+        e.bool(ingress.proof_requested);
+        e.u8(1);
+        e.list(&change.causal_dependencies, |e, head| e.fixed(&head.0));
+        e.bool(true);
+        e.u64(change.causal_height.saturating_sub(1));
+        e.bool(true);
+        e.bytes(&change.encode());
+        out
+    }
+
     pub fn commitment(&self) -> Hash {
         Hash::digest(b"vos/direct-ingress/v2", &[&self.encode()])
     }
@@ -1651,12 +1891,35 @@ impl DirectIngressV2 {
             && self.method == candidate.method
             && self.arguments == candidate.arguments
             && self.origin == candidate.origin
-            && self.authorization == candidate.authorization
+            && self.logical_authorization_matches(candidate)
             && self.imported_blobs == candidate.imported_blobs
             && self.proof_requested == candidate.proof_requested
     }
 
+    fn logical_authorization_matches(&self, candidate: &Self) -> bool {
+        match (self.crdt_ingress(), candidate.crdt_ingress()) {
+            (Some(_), _) => self.authorization_matches(candidate.authorization()),
+            (None, Some(_)) => candidate.authorization_matches(self.authorization()),
+            (None, None) => self.authorization == candidate.authorization,
+        }
+    }
+
     pub fn crdt_operation(&self) -> CrdtIngressV2 {
+        let (authorization, authorization_blob) = match &self.authorization {
+            AuthorizationEvidenceV2::Credential {
+                policy,
+                credential_commitment,
+                bytes,
+            } => (
+                AuthorizationEvidenceV2::Credential {
+                    policy: *policy,
+                    credential_commitment: *credential_commitment,
+                    bytes: Vec::new(),
+                },
+                Some(BlobRefV2::of_bytes(bytes)),
+            ),
+            authorization => (authorization.clone(), None),
+        };
         CrdtIngressV2 {
             service: self.service.clone(),
             invocation: self.invocation,
@@ -1665,9 +1928,63 @@ impl DirectIngressV2 {
             method: self.method.clone(),
             arguments: self.arguments.clone(),
             origin: self.origin,
-            authorization: self.authorization.clone(),
+            authorization,
+            authorization_blob,
             imported_blobs: self.imported_blobs.clone(),
             proof_requested: self.proof_requested,
+        }
+    }
+
+    /// Effective authorization carried by this admission. Linear ingress owns
+    /// it directly. CRDT ingress owns it once in the causal operation and uses
+    /// a public top-level sentinel.
+    pub fn authorization(&self) -> &AuthorizationEvidenceV2 {
+        if self.authorization != AuthorizationEvidenceV2::Public {
+            &self.authorization
+        } else {
+            self.crdt_ingress()
+                .map_or(&self.authorization, |ingress| &ingress.authorization)
+        }
+    }
+
+    pub fn crdt_ingress(&self) -> Option<&CrdtIngressV2> {
+        self.crdt_change.as_ref().and_then(|change| {
+            let [WorkflowOperationV2::Ingress(ingress)] = change.workflow.as_slice() else {
+                return None;
+            };
+            Some(ingress)
+        })
+    }
+
+    pub(crate) fn authorization_matches(&self, candidate: &AuthorizationEvidenceV2) -> bool {
+        let Some(ingress) = self.crdt_ingress() else {
+            return &self.authorization == candidate;
+        };
+        match (
+            &ingress.authorization,
+            ingress.authorization_blob.as_ref(),
+            candidate,
+        ) {
+            (AuthorizationEvidenceV2::Public, None, AuthorizationEvidenceV2::Public) => true,
+            (
+                AuthorizationEvidenceV2::Credential {
+                    policy,
+                    credential_commitment,
+                    bytes,
+                },
+                Some(reference),
+                AuthorizationEvidenceV2::Credential {
+                    policy: candidate_policy,
+                    credential_commitment: candidate_commitment,
+                    bytes: candidate_bytes,
+                },
+            ) => {
+                bytes.is_empty()
+                    && policy == candidate_policy
+                    && credential_commitment == candidate_commitment
+                    && (candidate_bytes.is_empty() || reference.matches(candidate_bytes))
+            }
+            _ => false,
         }
     }
 
@@ -1680,7 +1997,7 @@ impl DirectIngressV2 {
             && self.method == work.method
             && self.arguments == work.arguments
             && self.origin == work.origin
-            && self.authorization == work.authorization
+            && self.authorization_matches(&work.authorization)
             && work.causal_parent.is_none()
             && work.parent_call.is_none()
             && work.awaited_reply.is_none()
@@ -2002,6 +2319,21 @@ impl RefineImportsV2 {
             }
         }
         match &work.authorization {
+            AuthorizationEvidenceV2::Credential {
+                credential_commitment,
+                bytes,
+                ..
+            } if bytes.is_empty()
+                && work.consistency == ConsistencyModeV2::Crdt
+                && work.parent_call.is_none() =>
+            {
+                if !self.blobs.iter().any(|blob| {
+                    Hash::digest(b"vos/credential-commitment/v2", &[&blob.bytes])
+                        == *credential_commitment
+                }) {
+                    return Err(RefineError::MissingImport(*credential_commitment));
+                }
+            }
             AuthorizationEvidenceV2::PrivateCredential { witness, .. } => {
                 if self.private_blobs.len() != 1 {
                     return Err(RefineError::NonCanonicalImports);
@@ -2783,16 +3115,24 @@ impl V2Wire for CrdtChangeV2 {
             materialization.actor.0
         })?;
         ensure_sorted_unique(&value.exported_blobs, |reference| reference.hash.0)?;
-        let mut checkpoint_exports = value
-            .workflow
-            .iter()
-            .filter_map(|operation| match operation {
-                WorkflowOperationV2::Continuation(change) => change.replacement.clone(),
-                _ => None,
+        let checkpoint_exports_match = value.exported_blobs.iter().all(|reference| {
+            value.workflow.iter().any(|operation| {
+                matches!(operation,
+                    WorkflowOperationV2::Continuation(change)
+                        if change.replacement.as_ref() == Some(reference))
             })
-            .collect::<Vec<_>>();
-        checkpoint_exports.sort_by_key(|reference| reference.hash);
-        checkpoint_exports.dedup();
+        }) && value.workflow.iter().all(|operation| {
+            let WorkflowOperationV2::Continuation(change) = operation else {
+                return true;
+            };
+            change.replacement.as_ref().is_none_or(|reference| {
+                value
+                    .exported_blobs
+                    .binary_search_by_key(&reference.hash, |candidate| candidate.hash)
+                    .ok()
+                    .is_some_and(|index| value.exported_blobs[index] == *reference)
+            })
+        });
         let operation_scope = value.workflow.iter().find_map(|operation| match operation {
             WorkflowOperationV2::Checkpoint(work) => Self::derive_operation_scope(work),
             _ => None,
@@ -2801,14 +3141,17 @@ impl V2Wire for CrdtChangeV2 {
             .awaited_reply
             .as_ref()
             .map(|reply| reply.reply.call_id);
-        let consumed_outbox_calls = value
-            .workflow
-            .iter()
-            .filter_map(|operation| match operation {
-                WorkflowOperationV2::ConsumeOutbox(call) => Some(*call),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let mut consumed_outbox_calls =
+            value
+                .workflow
+                .iter()
+                .filter_map(|operation| match operation {
+                    WorkflowOperationV2::ConsumeOutbox(call) => Some(*call),
+                    _ => None,
+                });
+        let consumed_reply_is_canonical = consumed_reply_call.is_none_or(|call| {
+            consumed_outbox_calls.next() == Some(call) && consumed_outbox_calls.next().is_none()
+        });
         if value.causal_height == 0
             || value.operations.iter().any(|operation| {
                 operation.payload.is_empty()
@@ -2822,8 +3165,8 @@ impl V2Wire for CrdtChangeV2 {
                             )
                     })
             })
-            || value.exported_blobs != checkpoint_exports
-            || consumed_reply_call.is_some_and(|call| consumed_outbox_calls != [call])
+            || !checkpoint_exports_match
+            || !consumed_reply_is_canonical
             || value.workflow.windows(2).any(|pair| {
                 workflow_operation_bytes(&pair[0]) >= workflow_operation_bytes(&pair[1])
             })
@@ -3659,20 +4002,7 @@ impl V2Wire for DirectIngressV2 {
     const MAGIC: [u8; 4] = *b"VDI2";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
-        let mut e = Encoder(out);
-        encode_service(&mut e, &self.service);
-        e.fixed(&self.invocation.0);
-        e.u64(self.logical_timeslot);
-        e.fixed(&self.target.0);
-        e.string(&self.method);
-        e.bytes(&self.arguments);
-        encode_origin(&mut e, self.origin);
-        encode_auth(&mut e, &self.authorization);
-        e.list(&self.imported_blobs, encode_blob_ref);
-        e.bool(self.proof_requested);
-        encode_base(&mut e, &self.base);
-        e.option(&self.base_causal_height, |e, height| e.u64(*height));
-        e.option(&self.crdt_change, |e, change| e.bytes(&change.encode()));
+        self.encode_body_with_authorization(out, &self.authorization);
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -3701,15 +4031,21 @@ impl V2Wire for DirectIngressV2 {
         }
         match (&value.base, value.base_causal_height, &value.crdt_change) {
             (ConsistencyBaseV2::Linear { .. }, None, None) => {}
-            (ConsistencyBaseV2::Crdt { heads }, Some(height), Some(change))
-                if change.id == CrdtChangeV2::derive_ingress_id(&value.crdt_operation(), heads)
-                    && change.work_hash == value.crdt_operation().commitment()
-                    && change.causal_dependencies == *heads
-                    && height.checked_add(1) == Some(change.causal_height)
-                    && change.operations.is_empty()
-                    && change.materializations.is_empty()
-                    && change.workflow
-                        == [WorkflowOperationV2::Ingress(value.crdt_operation())] => {}
+            (ConsistencyBaseV2::Crdt { heads }, Some(height), Some(change)) => {
+                let [WorkflowOperationV2::Ingress(operation)] = change.workflow.as_slice() else {
+                    return Err(DecodeError::NonCanonical);
+                };
+                if !operation.matches_direct(&value)
+                    || change.id != CrdtChangeV2::derive_ingress_id(operation, heads)
+                    || change.work_hash != operation.commitment()
+                    || change.causal_dependencies != *heads
+                    || height.checked_add(1) != Some(change.causal_height)
+                    || !change.operations.is_empty()
+                    || !change.materializations.is_empty()
+                {
+                    return Err(DecodeError::NonCanonical);
+                }
+            }
             _ => return Err(DecodeError::NonCanonical),
         }
         Ok(value)
@@ -4374,6 +4710,7 @@ pub(crate) fn crdt_change_blob_references(change: &CrdtChangeV2) -> Vec<&BlobRef
                 references.extend(change.replacement.iter());
             }
             WorkflowOperationV2::Ingress(ingress) => {
+                references.extend(ingress.authorization_blob.iter());
                 references.extend(ingress.imported_blobs.iter());
             }
             WorkflowOperationV2::Delivery(_)
@@ -4892,6 +5229,7 @@ fn encode_crdt_ingress(e: &mut Encoder<'_>, value: &CrdtIngressV2) {
     e.bytes(&value.arguments);
     encode_origin(e, value.origin);
     encode_auth(e, &value.authorization);
+    e.option(&value.authorization_blob, encode_blob_ref);
     e.list(&value.imported_blobs, encode_blob_ref);
     e.bool(value.proof_requested);
 }
@@ -4906,6 +5244,7 @@ fn decode_crdt_ingress(d: &mut Decoder<'_>) -> Result<CrdtIngressV2, DecodeError
         arguments: d.bytes()?,
         origin: decode_origin(d)?,
         authorization: decode_auth(d)?,
+        authorization_blob: d.option(decode_blob_ref)?,
         imported_blobs: d.list(decode_blob_ref)?,
         proof_requested: d.bool()?,
     };
@@ -4914,6 +5253,11 @@ fn decode_crdt_ingress(d: &mut Decoder<'_>) -> Result<CrdtIngressV2, DecodeError
         || value.target == ActorId::ZERO
         || value.method.is_empty()
         || value.arguments.is_empty()
+        || !match (&value.authorization, value.authorization_blob.as_ref()) {
+            (AuthorizationEvidenceV2::Public, None) => true,
+            (AuthorizationEvidenceV2::Credential { bytes, .. }, Some(_)) => bytes.is_empty(),
+            _ => false,
+        }
     {
         return Err(DecodeError::NonCanonical);
     }
@@ -6323,6 +6667,63 @@ mod tests {
         assert_eq!(
             AccumulationEnvelopeV2::decode(&unexpected.encode()),
             Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn crdt_ingress_compacts_disclosed_authorization_only_after_admission() {
+        let credential = b"finalized role assertion".to_vec();
+        let authorization = AuthorizationEvidenceV2::Credential {
+            policy: Hash([31; 32]),
+            credential_commitment: Hash::digest(b"vos/credential-commitment/v2", &[&credential]),
+            bytes: credential.clone(),
+        };
+        let mut ingress = DirectIngressV2 {
+            service: service(),
+            invocation: InvocationId([32; 32]),
+            logical_timeslot: 9,
+            target: ActorId([5; 32]),
+            method: "member_only".into(),
+            arguments: vec![1],
+            origin: Origin::Member(SubjectId([33; 32])),
+            authorization,
+            imported_blobs: vec![],
+            proof_requested: false,
+            base: ConsistencyBaseV2::Crdt { heads: vec![] },
+            base_causal_height: Some(0),
+            crdt_change: None,
+        };
+        let operation = ingress.crdt_operation();
+        let change = CrdtChangeV2 {
+            id: CrdtChangeV2::derive_ingress_id(&operation, &[]),
+            work_hash: operation.commitment(),
+            causal_dependencies: vec![],
+            causal_height: 1,
+            operations: vec![],
+            workflow: vec![WorkflowOperationV2::Ingress(operation.clone())],
+            materializations: vec![],
+            awaited_reply: None,
+            exported_blobs: vec![],
+        };
+        ingress.crdt_change = Some(change);
+        assert_eq!(DirectIngressV2::decode(&ingress.encode()).unwrap(), ingress);
+
+        let admitted = DirectIngressV2::decode(&ingress.encode_admitted()).unwrap();
+        let materialized = DirectIngressV2::decode(&DirectIngressV2::encode_materialized(
+            &operation,
+            ingress.crdt_change.as_ref().unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(materialized, admitted);
+        assert_eq!(admitted.authorization, AuthorizationEvidenceV2::Public);
+        assert!(admitted.authorization_matches(&ingress.authorization));
+        assert!(admitted.matches_retry(&ingress));
+        assert!(!operation.matches_fresh_direct(&admitted));
+        assert_eq!(
+            admitted
+                .crdt_ingress()
+                .and_then(|causal| causal.authorization_blob.as_ref()),
+            Some(&BlobRefV2::of_bytes(&credential)),
         );
     }
 

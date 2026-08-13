@@ -21,7 +21,7 @@ mod guest {
         CrdtChangeV2, CrdtDispatchV2, CrdtMaterializationV2, GasAccountingV2,
         GuestAccumulateStoreV2, ImportedBlobV2, MessageRecordV2, ProgramId, RefineOutputV2,
         ReplyRecordV2, StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2,
-        execute_canonical_guest_accumulate,
+        execute_owned_canonical_guest_accumulate,
     };
 
     /// Upper bound for one nested actor transition in this foundation guest. This
@@ -169,9 +169,10 @@ mod guest {
             || actor_output.spawns.iter().any(|spawn| {
                 !imported(spawn.parent)
                     || imported(spawn.actor)
-                    || work.imported_actors.iter().any(|actor| {
-                        actor.parent == Some(spawn.parent) && actor.name == spawn.name
-                    })
+                    || work
+                        .imported_actors
+                        .iter()
+                        .any(|actor| actor.parent == Some(spawn.parent) && actor.name == spawn.name)
             })
             || actor_output.outbox.iter().any(|call| !imported(call.from))
         {
@@ -672,25 +673,19 @@ mod guest {
         let input = unsafe { core::slice::from_raw_parts(arguments, arguments_len) };
         let result = match AccumulateRequestV2::decode(input) {
             Ok(request) => {
-                // The physical service VM is invocation-scoped; its complete
-                // memory image is discarded at HALT. Keep the large decoded
-                // request alive until that boundary instead of running deep
-                // Rust collection drop glue after the result is finalized.
-                let request = core::mem::ManuallyDrop::new(request);
                 // Authenticate the already-canonical physical request bytes.
                 // This avoids re-encoding a large decoded package merely to
                 // present the same commitment to platform authority.
-                let install_authorized = matches!(&*request, AccumulateRequestV2::Install(_))
+                let install_authorized = matches!(&request, AccumulateRequestV2::Install(_))
                     && hostcalls::verify_install_authorization(input) == error::HOST_OK;
-                let upgrade_authorized =
-                    matches!(&*request, AccumulateRequestV2::UpgradeActor(_))
+                let upgrade_authorized = matches!(&request, AccumulateRequestV2::UpgradeActor(_))
                     && hostcalls::verify_upgrade_authorization(input) == error::HOST_OK;
-                execute_canonical_guest_accumulate(
+                execute_owned_canonical_guest_accumulate(
                     &mut JamAccumulateStore {
                         install_authorized,
                         upgrade_authorized,
                     },
-                    &request,
+                    request,
                 )
                 .unwrap_or_else(|_| fail_closed())
             }

@@ -27,6 +27,11 @@ impl CrdtCounterV2 {
         7
     }
 
+    #[msg(space_role = SpaceRole::Member)]
+    fn member_only(&self) -> u32 {
+        99
+    }
+
     #[msg]
     async fn increment_child_twice(&mut self, ctx: &mut Context<Self>, amount: u64) -> i64 {
         let mut value = 0;

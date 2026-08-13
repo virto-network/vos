@@ -6863,77 +6863,85 @@ where
             }
         };
         if let Some(authorization) = recovered_authorization {
-            match &authorization {
-                crate::v2::AuthorizationEvidenceV2::Public => {}
-                crate::v2::AuthorizationEvidenceV2::Credential {
-                    policy,
-                    credential_commitment,
-                    bytes,
-                } => {
-                    let credential = match crate::v2::RoleCredentialV2::decode(bytes) {
-                        Ok(credential) => credential,
-                        Err(_) => {
+            // A CRDT ingress is itself the guest-owned, causally finalized
+            // authorization decision. Reattach that exact evidence for a
+            // queued invocation or committed retry without asking the
+            // authority to execute the same scoped claim again. Accumulate
+            // authenticates it through the retained ingress node/receipt;
+            // fresh calls still take the authority path below.
+            if service.consistency() == crate::v2::ConsistencyModeV2::Crdt {
+                request.authorization = authorization;
+            } else {
+                match &authorization {
+                    crate::v2::AuthorizationEvidenceV2::Public => {}
+                    crate::v2::AuthorizationEvidenceV2::Credential {
+                        policy,
+                        credential_commitment,
+                        bytes,
+                    } => {
+                        let credential = match crate::v2::RoleCredentialV2::decode(bytes) {
+                            Ok(credential) => credential,
+                            Err(_) => {
+                                send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                                continue;
+                            }
+                        };
+                        let assertion = match crate::v2::AccumulatedRoleAssertionV2::decode(
+                            &credential.authenticator,
+                        ) {
+                            Ok(assertion) => assertion,
+                            Err(_) => {
+                                send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                                continue;
+                            }
+                        };
+                        let claim = &assertion.claim;
+                        let Some(authority) = service.role_authority().cloned() else {
+                            send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                            continue;
+                        };
+                        let valid = credential.commitment() == *credential_commitment
+                            && credential.holder == origin
+                            && credential.scope == claim.scope
+                            && credential.space_role == Some(claim.role)
+                            && credential.actor_role.is_none()
+                            && *policy == claim.policy
+                            && claim.space == service.identity().space
+                            && claim.holder == origin
+                            && claim.audience == *service.identity()
+                            && claim.invocation == ingress.invocation
+                            && claim.target == ingress.target
+                            && claim.method == ingress.method
+                            && assertion.matches_authority(&authority);
+                        if !valid {
                             send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
                             continue;
                         }
-                    };
-                    let assertion = match crate::v2::AccumulatedRoleAssertionV2::decode(
-                        &credential.authenticator,
-                    ) {
-                        Ok(assertion) => assertion,
-                        Err(_) => {
+                        let finalized = request_v2_role_assertion(
+                            &authority,
+                            claim,
+                            &actor_routes,
+                            &invoke_routes,
+                            #[cfg(feature = "network")]
+                            &shared_network,
+                        );
+                        if finalized.as_ref() != Ok(&assertion) {
                             send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
                             continue;
                         }
-                    };
-                    let claim = &assertion.claim;
-                    let Some(authority) = service.role_authority().cloned() else {
-                        send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
-                        continue;
-                    };
-                    let valid = matches!(
-                        service.consistency(),
-                        crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
-                    ) && credential.commitment() == *credential_commitment
-                        && credential.holder == origin
-                        && credential.scope == claim.scope
-                        && credential.space_role == Some(claim.role)
-                        && credential.actor_role.is_none()
-                        && *policy == claim.policy
-                        && claim.space == service.identity().space
-                        && claim.holder == origin
-                        && claim.audience == *service.identity()
-                        && claim.invocation == ingress.invocation
-                        && claim.target == ingress.target
-                        && claim.method == ingress.method
-                        && assertion.matches_authority(&authority);
-                    if !valid {
+                        receipt_verifications.push(
+                            service
+                                .authorize_finalized_receipt(authority.actor, &assertion.receipt),
+                        );
+                    }
+                    crate::v2::AuthorizationEvidenceV2::PrivateCredential { .. }
+                    | crate::v2::AuthorizationEvidenceV2::SystemCapability { .. } => {
                         send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
                         continue;
                     }
-                    let finalized = request_v2_role_assertion(
-                        &authority,
-                        claim,
-                        &actor_routes,
-                        &invoke_routes,
-                        #[cfg(feature = "network")]
-                        &shared_network,
-                    );
-                    if finalized.as_ref() != Ok(&assertion) {
-                        send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
-                        continue;
-                    }
-                    receipt_verifications.push(
-                        service.authorize_finalized_receipt(authority.actor, &assertion.receipt),
-                    );
                 }
-                crate::v2::AuthorizationEvidenceV2::PrivateCredential { .. }
-                | crate::v2::AuthorizationEvidenceV2::SystemCapability { .. } => {
-                    send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
-                    continue;
-                }
+                request.authorization = authorization;
             }
-            request.authorization = authorization;
         } else {
             let policy = match service.root_method_policy(&ingress.method) {
                 Ok(Some(policy)) => policy,
@@ -6948,10 +6956,12 @@ where
                 }
             };
             // Attested work and actor-local/mixed roles retain their separate
-            // fail-closed paths. A space-role-only method on a Local root is
-            // authorized by an invocation-scoped receipt from the installed
-            // Raft authority; neither legacy role bytes nor synthetic System
-            // identity enter the guest work envelope.
+            // fail-closed paths. A space-role-only method is authorized by an
+            // invocation-scoped receipt from the installed Raft authority;
+            // neither legacy role bytes nor synthetic System identity enter
+            // the guest work envelope. CRDT ingress carries that exact scoped
+            // assertion in its causal admission node, whose finalized receipt
+            // is independently verified by every syncing replica.
             if policy.attested {
                 send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
                 continue;
@@ -6961,12 +6971,7 @@ where
                     send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
                     continue;
                 };
-                if policy.actor_role.is_some()
-                    || !matches!(
-                        service.consistency(),
-                        crate::v2::ConsistencyModeV2::Local | crate::v2::ConsistencyModeV2::Raft
-                    )
-                {
+                if policy.actor_role.is_some() {
                     send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
                     continue;
                 }
@@ -7435,6 +7440,11 @@ fn publish_v2_root_slice<B>(
             .or_default()
             .push(caller);
     }
+    let recovered_reply = committed
+        .published
+        .reply
+        .as_ref()
+        .map(|reply| reply.result.as_slice());
     let Some(publication) = committed.publication else {
         if committed.duplicate
             && let Some(callers) = state.pending_callers.remove(&committed.input.invocation)
@@ -7449,7 +7459,16 @@ fn publish_v2_root_slice<B>(
                         );
                     }
                     Some(Err(status)) => send_v2_status(caller.reply, status, id),
-                    None => send_v2_status(caller.reply, crate::STATUS_PANICKED, id),
+                    None => match recovered_reply {
+                        Some(result) => {
+                            let _ = send_reply_capped(
+                                caller.reply,
+                                encode_invoke_envelope(crate::STATUS_DONE, &[], result),
+                                id,
+                            );
+                        }
+                        None => send_v2_status(caller.reply, crate::STATUS_PANICKED, id),
+                    },
                 }
             }
         }
@@ -12599,6 +12618,7 @@ mod tests {
                 arguments: vec![ordinal; 768],
                 origin: crate::v2::Origin::Anonymous,
                 authorization: crate::v2::AuthorizationEvidenceV2::Public,
+                authorization_blob: None,
                 imported_blobs: Vec::new(),
                 proof_requested: false,
             };

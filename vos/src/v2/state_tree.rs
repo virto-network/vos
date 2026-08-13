@@ -364,7 +364,7 @@ impl<'a, S: StateTreeStore> ServiceStateTreeV2<'a, S> {
 }
 
 pub fn state_position(key: &StateKeyV2) -> [u8; 32] {
-    Hash::digest(SERVICE_STATE_KEY_DOMAIN, &[&key.encode()]).0
+    hash_state_key(SERVICE_STATE_KEY_DOMAIN, &[], key, &[]).0
 }
 
 pub const fn empty_state_root() -> Hash {
@@ -378,9 +378,13 @@ fn hash_node(node: &StateNodeV2) -> Hash {
             logical_key,
             value,
         } => {
-            let key = logical_key.encode();
             let len = (value.len() as u64).to_le_bytes();
-            Hash::digest(SERVICE_STATE_LEAF_DOMAIN, &[position, &key, &len, value])
+            hash_state_key(
+                SERVICE_STATE_LEAF_DOMAIN,
+                &[position],
+                logical_key,
+                &[&len, value],
+            )
         }
         StateNodeV2::Branch {
             bit,
@@ -392,6 +396,78 @@ fn hash_node(node: &StateNodeV2) -> Hash {
             &[&bit.to_le_bytes(), prefix, &left.0, &right.0],
         ),
     }
+}
+
+/// Hash the canonical StateKeyV2 wire between an optional prefix and suffix
+/// without first allocating that wire. Tree lookup and leaf hashing are hot
+/// during causal rematerialization, where retaining a complete DAG leaves
+/// deliberately little transient heap for redundant key buffers.
+fn hash_state_key(domain: &[u8], prefix: &[&[u8]], key: &StateKeyV2, suffix: &[&[u8]]) -> Hash {
+    let version = super::ABI_VERSION.to_le_bytes();
+    let tag = [match key {
+        StateKeyV2::ActorDescriptor(_) => 0,
+        StateKeyV2::MethodPolicy { .. } => 1,
+        StateKeyV2::ActorRow { .. } => 2,
+        StateKeyV2::Continuation(_) => 3,
+        StateKeyV2::Inbox(_) => 4,
+        StateKeyV2::Outbox(_) => 5,
+        StateKeyV2::Workflow(_) => 6,
+        StateKeyV2::CrdtMaterialization(_) => 7,
+        StateKeyV2::ActorDirectory => 9,
+        StateKeyV2::ExternalActorDirectory => 10,
+        StateKeyV2::RoleAuthority => 11,
+    }];
+    let length = match key {
+        StateKeyV2::MethodPolicy { method, .. } => (method.len() as u32).to_le_bytes(),
+        StateKeyV2::ActorRow { key, .. } => (key.len() as u32).to_le_bytes(),
+        _ => [0; 4],
+    };
+    let mut parts: [&[u8]; 12] = [&[]; 12];
+    let mut used = 0;
+    for part in prefix {
+        parts[used] = part;
+        used += 1;
+    }
+    for part in [&StateKeyV2::MAGIC[..], &version, &tag] {
+        parts[used] = part;
+        used += 1;
+    }
+    match key {
+        StateKeyV2::ActorDescriptor(actor)
+        | StateKeyV2::Continuation(actor)
+        | StateKeyV2::CrdtMaterialization(actor) => {
+            parts[used] = &actor.0;
+            used += 1;
+        }
+        StateKeyV2::Inbox(call) | StateKeyV2::Outbox(call) => {
+            parts[used] = &call.0;
+            used += 1;
+        }
+        StateKeyV2::Workflow(invocation) => {
+            parts[used] = &invocation.0;
+            used += 1;
+        }
+        StateKeyV2::MethodPolicy { actor, method } => {
+            for part in [&actor.0[..], &length, method.as_bytes()] {
+                parts[used] = part;
+                used += 1;
+            }
+        }
+        StateKeyV2::ActorRow { actor, key } => {
+            for part in [&actor.0[..], &length, key.as_slice()] {
+                parts[used] = part;
+                used += 1;
+            }
+        }
+        StateKeyV2::ActorDirectory
+        | StateKeyV2::ExternalActorDirectory
+        | StateKeyV2::RoleAuthority => {}
+    }
+    for part in suffix {
+        parts[used] = part;
+        used += 1;
+    }
+    Hash::digest(domain, &parts[..used])
 }
 
 fn node_storage_key(hash: Hash) -> Vec<u8> {
@@ -431,7 +507,7 @@ mod tests {
     use alloc::vec;
 
     use super::*;
-    use crate::v2::ActorId;
+    use crate::v2::{ActorId, CallId, InvocationId};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum StoreError {
@@ -486,6 +562,53 @@ mod tests {
                 .unwrap();
         }
         root
+    }
+
+    #[test]
+    fn allocation_free_key_hashing_matches_the_canonical_wire() {
+        let actor = ActorId([7; 32]);
+        let keys = vec![
+            StateKeyV2::ActorDirectory,
+            StateKeyV2::ExternalActorDirectory,
+            StateKeyV2::RoleAuthority,
+            StateKeyV2::ActorDescriptor(actor),
+            StateKeyV2::MethodPolicy {
+                actor,
+                method: "increment".into(),
+            },
+            StateKeyV2::ActorRow {
+                actor,
+                key: b"counter/value".to_vec(),
+            },
+            StateKeyV2::Continuation(actor),
+            StateKeyV2::Inbox(CallId([8; 32])),
+            StateKeyV2::Outbox(CallId([9; 32])),
+            StateKeyV2::Workflow(InvocationId([10; 32])),
+            StateKeyV2::CrdtMaterialization(actor),
+        ];
+        let position = [11; 32];
+        let value = b"materialized-value";
+        let value_len = (value.len() as u64).to_le_bytes();
+
+        for key in keys {
+            let encoded = key.encode();
+            assert_eq!(
+                state_position(&key),
+                Hash::digest(SERVICE_STATE_KEY_DOMAIN, &[&encoded]).0,
+            );
+            assert_eq!(
+                hash_state_key(
+                    SERVICE_STATE_LEAF_DOMAIN,
+                    &[&position],
+                    &key,
+                    &[&value_len, value],
+                ),
+                Hash::digest(
+                    SERVICE_STATE_LEAF_DOMAIN,
+                    &[&position, &encoded, &value_len, value],
+                ),
+            );
+        }
     }
 
     #[test]

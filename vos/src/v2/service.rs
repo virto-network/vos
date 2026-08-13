@@ -95,7 +95,7 @@ fn validate_receipt_verifications(
         return Err(DecodeError::NonCanonical);
     }
     let assertion = match request {
-        AccumulateRequestV2::AdmitIngress(ingress) => match &ingress.authorization {
+        AccumulateRequestV2::AdmitIngress(ingress) => match ingress.authorization() {
             AuthorizationEvidenceV2::Credential { bytes, .. } => {
                 RoleCredentialV2::decode(bytes).ok().and_then(|credential| {
                     AccumulatedRoleAssertionV2::decode(&credential.authenticator).ok()

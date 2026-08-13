@@ -904,6 +904,22 @@ impl LocalWorkSchedulerV2 {
         for reference in &work.imported_blobs {
             import_blob(store, &mut blobs, reference)?;
         }
+        if matches!(&work.authorization,
+            AuthorizationEvidenceV2::Credential { bytes, .. } if bytes.is_empty())
+            && work.consistency == ConsistencyModeV2::Crdt
+            && work.parent_call.is_none()
+        {
+            let record = store
+                .ingress_record(work.invocation)?
+                .ok_or(ScheduleErrorV2::InvalidWorkflowStep(work.invocation))?;
+            let reference = record
+                .ingress
+                .crdt_ingress()
+                .filter(|_| record.ingress.authorization_matches(&work.authorization))
+                .and_then(|ingress| ingress.authorization_blob.as_ref())
+                .ok_or(ScheduleErrorV2::InvalidWorkflowStep(work.invocation))?;
+            import_blob(store, &mut blobs, reference)?;
+        }
         if let Some(proof) = work
             .awaited_reply
             .as_ref()

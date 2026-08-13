@@ -1454,7 +1454,25 @@ fn authorization_roles(
             credential_commitment,
             bytes,
             ..
-        } => (*credential_commitment, bytes.as_slice()),
+        } => {
+            let bytes = if bytes.is_empty()
+                && work.consistency == super::ConsistencyModeV2::Crdt
+                && work.parent_call.is_none()
+            {
+                imports
+                    .blobs
+                    .iter()
+                    .find(|blob| {
+                        Hash::digest(b"vos/credential-commitment/v2", &[&blob.bytes])
+                            == *credential_commitment
+                    })
+                    .map(|blob| blob.bytes.as_slice())
+                    .ok_or(ServicePvmErrorV2::InvalidAuthorization)?
+            } else {
+                bytes.as_slice()
+            };
+            (*credential_commitment, bytes)
+        }
         AuthorizationEvidenceV2::PrivateCredential {
             credential_commitment,
             witness,

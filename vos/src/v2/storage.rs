@@ -284,6 +284,67 @@ pub struct IngressRecordV2 {
     pub receipt: AccumulationReceiptV2,
 }
 
+impl IngressRecordV2 {
+    pub(crate) fn encode_admitted(
+        ingress: &DirectIngressV2,
+        consumed: bool,
+        receipt: &AccumulationReceiptV2,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&Self::MAGIC);
+        out.extend_from_slice(&super::ABI_VERSION.to_le_bytes());
+        let mut e = Encoder(&mut out);
+        e.bytes(&ingress.encode_admitted());
+        e.bool(consumed);
+        e.bytes(&receipt.encode());
+        out
+    }
+
+    pub(crate) fn encode_materialized(
+        ingress: &super::CrdtIngressV2,
+        change: &super::CrdtChangeV2,
+        consumed: bool,
+        receipt: &AccumulationReceiptV2,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&Self::MAGIC);
+        out.extend_from_slice(&super::ABI_VERSION.to_le_bytes());
+        let mut e = Encoder(&mut out);
+        e.bytes(&DirectIngressV2::encode_materialized(ingress, change));
+        e.bool(consumed);
+        e.bytes(&receipt.encode());
+        out
+    }
+
+    /// Flip the canonical consumed flag in an already-decoded record without
+    /// rebuilding its nested CRDT change and receipt. Callers must first run
+    /// [`V2Wire::decode`] over the same bytes; this helper only preserves that
+    /// authenticated wire while changing the one atomic lifecycle bit.
+    pub(crate) fn mark_consumed_in_place(bytes: &mut [u8]) -> Result<(), DecodeError> {
+        if bytes.get(..4) != Some(&Self::MAGIC)
+            || bytes.get(4..6) != Some(&super::ABI_VERSION.to_le_bytes())
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        let ingress_len = u32::from_le_bytes(
+            bytes
+                .get(6..10)
+                .ok_or(DecodeError::Truncated)?
+                .try_into()
+                .map_err(|_| DecodeError::Truncated)?,
+        ) as usize;
+        let consumed = 10usize
+            .checked_add(ingress_len)
+            .ok_or(DecodeError::LimitExceeded)?;
+        let flag = bytes.get_mut(consumed).ok_or(DecodeError::Truncated)?;
+        if *flag != 0 {
+            return Err(DecodeError::NonCanonical);
+        }
+        *flag = 1;
+        Ok(())
+    }
+}
+
 /// Recoverable effects created by one committed actor slice. The host may
 /// expose them only after the surrounding service transaction commits, then
 /// removes the row through guest Accumulate acknowledgement.
@@ -400,12 +461,14 @@ impl V2Wire for WorkflowCheckpointV2 {
     const MAGIC: [u8; 4] = *b"VWF2";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
-        let mut e = Encoder(out);
-        encode_input(&mut e, self.input);
-        e.fixed(&self.workflow_identity.0);
-        e.bytes(&self.resume_work.encode());
-        e.fixed(&self.work_hash.0);
-        e.fixed(&self.transition_hash.0);
+        Self::encode_materialized_body(
+            out,
+            self.input,
+            self.workflow_identity,
+            &self.resume_work,
+            self.work_hash,
+            self.transition_hash,
+        );
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -427,6 +490,57 @@ impl V2Wire for WorkflowCheckpointV2 {
 }
 
 impl WorkflowCheckpointV2 {
+    fn encode_materialized_body(
+        out: &mut Vec<u8>,
+        input: WorkInputIdV2,
+        workflow_identity: Hash,
+        resume_work: &WorkEnvelopeV2,
+        work_hash: Hash,
+        transition_hash: Hash,
+    ) {
+        let mut e = Encoder(out);
+        encode_input(&mut e, input);
+        e.fixed(&workflow_identity.0);
+        // Write the length-prefixed nested work directly into the final row.
+        // A separate temporary duplicates the largest workflow owner and can
+        // exhaust the bounded service guest while an exact continuation is
+        // committed.
+        let length_offset = e.0.len();
+        e.u32(0);
+        let resume_offset = e.0.len();
+        e.0.extend_from_slice(&WorkEnvelopeV2::MAGIC);
+        e.0.extend_from_slice(&super::ABI_VERSION.to_le_bytes());
+        resume_work.encode_body(e.0);
+        let resume_len = e.0.len() - resume_offset;
+        let resume_len = u32::try_from(resume_len).expect("workflow wire is bounded by V2Wire");
+        e.0[length_offset..length_offset + 4].copy_from_slice(&resume_len.to_le_bytes());
+        e.fixed(&work_hash.0);
+        e.fixed(&transition_hash.0);
+    }
+
+    /// Encode a causal materialization directly from the authenticated DAG
+    /// work without first cloning its complete nested resume envelope.
+    pub(crate) fn encode_materialized(
+        input: WorkInputIdV2,
+        workflow_identity: Hash,
+        resume_work: &WorkEnvelopeV2,
+        work_hash: Hash,
+        transition_hash: Hash,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&Self::MAGIC);
+        out.extend_from_slice(&super::ABI_VERSION.to_le_bytes());
+        Self::encode_materialized_body(
+            &mut out,
+            input,
+            workflow_identity,
+            resume_work,
+            work_hash,
+            transition_hash,
+        );
+        out
+    }
+
     /// Stable inputs which must survive every exact continuation slice. The
     /// timeslot, step, arguments, consistency base, awaited reply, and actor
     /// state imports are intentionally reconstructed for the next execution.
@@ -1166,6 +1280,18 @@ mod tests {
         let mut ingress = ingress;
         ingress.receipt.accepted_transition = ingress.ingress.commitment();
         assert_eq!(IngressRecordV2::decode(&ingress.encode()).unwrap(), ingress);
+
+        let mut consumed = ingress.encode();
+        IngressRecordV2::mark_consumed_in_place(&mut consumed).unwrap();
+        let decoded = IngressRecordV2::decode(&consumed).unwrap();
+        assert!(decoded.consumed);
+        assert_eq!(decoded.ingress, ingress.ingress);
+        assert_eq!(decoded.receipt, ingress.receipt);
+        assert_eq!(
+            IngressRecordV2::mark_consumed_in_place(&mut consumed),
+            Err(DecodeError::NonCanonical),
+            "the atomic lifecycle bit cannot be consumed twice",
+        );
     }
 
     #[test]
