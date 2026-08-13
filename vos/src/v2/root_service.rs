@@ -2282,15 +2282,15 @@ where
             .ingress_record(invocation)
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
             .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
-        if record.consumed {
-            return Err(LocalRootTreeInvokeErrorV2::DivergentInvocation.into());
-        }
         let request = request_from_direct_ingress(record.ingress)?;
         if !request.proof_requested {
             return Err(AttestedRootTreeInvokeErrorV2::InvalidPreparation);
         }
         if let Some(committed) = self.recover_committed_invocation(&request)? {
             return Ok(committed);
+        }
+        if record.consumed {
+            return Err(LocalRootTreeInvokeErrorV2::DivergentInvocation.into());
         }
         let prepared = LocalWorkSchedulerV2::prepare(self.service.accumulate_host(), request)
             .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;

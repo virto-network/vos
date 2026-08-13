@@ -1217,6 +1217,9 @@ fn deliver<S: GuestAccumulateStoreV2>(
     else {
         return Ok(rejected(AccumulationRejectionV2::Unauthorized));
     };
+    if policy.attested != envelope.message.proof_requested {
+        return Ok(rejected(AccumulationRejectionV2::Unauthorized));
+    }
     let authority = tree_get_wire::<_, RoleAuthorityBindingV2>(&tree, &StateKeyV2::RoleAuthority)?;
     if let Some(rejection) = authorization_rejection(
         &authorization_work,
@@ -5386,6 +5389,15 @@ mod tests {
         consistency: ConsistencyModeV2,
         initial: &[u8],
     ) -> (BlobRefV2, ServiceInstallReceiptV2) {
+        install_fixture_with_policy(store, consistency, initial, false)
+    }
+
+    fn install_fixture_with_policy(
+        store: &mut MemStore,
+        consistency: ConsistencyModeV2,
+        initial: &[u8],
+        attested: bool,
+    ) -> (BlobRefV2, ServiceInstallReceiptV2) {
         let initial = store.provide_blob(initial).unwrap();
         store.programs.insert(program(), FIXTURE_ACTOR_PVM.to_vec());
         let request = AccumulateRequestV2::Install(ServiceGenesisV2 {
@@ -5407,7 +5419,7 @@ mod tests {
                     schema: Hash([6; 32]),
                     policy: public_policy_hash(),
                     public: true,
-                    attested: false,
+                    attested,
                     space_role: None,
                     actor_role: None,
                 }]),
@@ -8638,6 +8650,45 @@ mod tests {
             source_outbox: vec![message.clone()],
             message,
             source_receipt,
+        }
+    }
+
+    #[test]
+    fn delivery_proof_mode_must_match_the_signed_method_policy() {
+        for consistency in [ConsistencyModeV2::Local, ConsistencyModeV2::Raft] {
+            for (policy_attested, requested) in [(false, true), (true, false)] {
+                let mut store = MemStore::default();
+                install_fixture_with_policy(
+                    &mut store,
+                    consistency,
+                    b"proof-mode destination",
+                    policy_attested,
+                );
+                let header =
+                    StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
+                let sender = ActorId([72; 32]);
+                let mut incoming = message(73, sender, actor(), None, Some(10));
+                incoming.from_service.root_service = RootServiceId([96; 32]);
+                incoming.from_service.deployment = DeploymentId([97; 32]);
+                incoming.proof_requested = requested;
+                let source_receipt = source_receipt(&[incoming.clone()]);
+                store.receipt_allowlist.insert(
+                    ReceiptVerificationRequestV2 {
+                        expected_producer: sender,
+                        receipt: source_receipt.clone(),
+                    }
+                    .hash(),
+                );
+                let request =
+                    AccumulateRequestV2::Deliver(delivery(&header, 2, incoming, source_receipt));
+                let before = store.clone();
+                assert_eq!(
+                    execute_guest_accumulate(&mut store, &request).unwrap(),
+                    rejected(AccumulationRejectionV2::Unauthorized),
+                    "{consistency:?} delivery must reject policy.attested={policy_attested} with proof_requested={requested}"
+                );
+                assert_eq!(store, before, "proof-mode rejection must leave zero trace");
+            }
         }
     }
 

@@ -1150,8 +1150,8 @@ fn attested_root_driver_recovers_queued_and_committed_proofs_across_restart() {
         Some(b"durable-root-attestation-proof".to_vec())
     );
     let retry = service
-        .invoke_attested(request, &mut producer)
-        .expect("an exact retry reattaches the committed attestation");
+        .invoke_admitted_attested(request.invocation, &mut producer)
+        .expect("an invocation-only retry reattaches the committed attestation");
     assert!(retry.duplicate);
     assert_eq!(retry.refine_gas_used, 0);
     assert_eq!(retry.accumulate_gas_used, 0);
@@ -1205,8 +1205,8 @@ fn raft_attested_root_orders_only_the_final_proved_apply() {
         Some(b"raft-root-attestation-proof".to_vec())
     );
     let retry = service
-        .invoke_attested(request, &mut producer)
-        .expect("the committed Raft attestation reattaches after restart");
+        .invoke_admitted_attested(request.invocation, &mut producer)
+        .expect("the committed Raft attestation reattaches after the opening barrier");
     assert!(retry.duplicate);
     assert_eq!(retry.refine_gas_used, 0);
     assert_eq!(retry.accumulate_gas_used, 0);
@@ -11004,6 +11004,7 @@ fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
                            actor: ActorId,
                            name: &str,
                            method: &str,
+                           attested: bool,
                            producer: ProducerId,
                            external_actors: Vec<ExternalActorBindingV2>| {
         let mut host = DurableJamStoreV2::open(FailableCommittedImages::default()).unwrap();
@@ -11037,7 +11038,7 @@ fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
                     schema: Hash([206; 32]),
                     policy: public_policy_hash(),
                     public: true,
-                    attested: false,
+                    attested,
                     space_role: None,
                     actor_role: None,
                 }]),
@@ -11060,6 +11061,7 @@ fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
         source_actor,
         "workflow",
         "root_await_attested_peer",
+        false,
         ProducerId([53; 32]),
         vec![external_binding(
             "private-age",
@@ -11074,6 +11076,7 @@ fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
         destination_actor,
         "private-age",
         "peer_value",
+        true,
         destination_producer,
         vec![],
     );
