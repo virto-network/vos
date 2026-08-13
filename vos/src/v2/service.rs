@@ -381,10 +381,11 @@ pub struct CommittedAccumulateEntryV2 {
     pub availability_programs: Vec<ImportedProgramV2>,
     pub availability_blobs: Vec<ImportedBlobV2>,
     /// Exact positive receipt-verifier decisions ordered beside this request.
-    /// Authority ingress, durable delivery, and awaited-reply consumption
-    /// each bind exactly one external receipt. CRDT synchronization binds one
-    /// decision per distinct causal-node receipt; requests without an
-    /// external receipt carry an empty list.
+    /// Authority ingress and awaited-reply consumption each bind one external
+    /// receipt. Durable delivery binds its source receipt plus the authority
+    /// assertion receipt when destination authorization is required. CRDT
+    /// synchronization binds one decision per distinct causal-node receipt;
+    /// requests without an external receipt carry an empty list.
     pub receipt_verifications: Vec<ReceiptVerificationRequestV2>,
 }
 

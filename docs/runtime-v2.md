@@ -68,7 +68,11 @@ its pinned authority receipt before replacing the inbox row's authorization.
 The permanent delivery record becomes the durable authorization anchor, so a
 restart between delivery and inbox execution does not depend on process-local
 receipt policy. Exact retries recover that admitted credential before reading
-the actor's current package policy. A stable delivery
+the actor's current package policy. Linear services also commit a per-actor
+pending-authorized-inbox count in the state tree. `UpgradeActor` returns
+`ActorBusy` until those inbox slices consume their deployment-scoped
+credentials, preventing an admitted call from being stranded between package
+versions. A stable delivery
 identity excludes that changing base, so a retry after inbox execution is
 still an idempotent duplicate. Guest delivery records retain the admission
 timeslot and consumed bit; the local scheduler scans them after restart and
@@ -864,20 +868,22 @@ Accumulate independently checks each causal delta.
 For Local, Raft, and CRDT roots, ordinary public cross-root calls are emitted as
 guest-owned publications, routed over canonical node envelopes, admitted
 through destination IC-5, and resumed from the caller's exact saved machine
-after the committed reply returns. A Raft `Deliver` or reply-consuming `Apply`
-carries exactly one canonical `ReceiptVerificationRequestV2` in its log entry. Missing,
-extra, or mismatched verifier input is rejected before proposal and again on
-follower replay; non-receipt-bearing requests require the sidecar to be empty.
+after the committed reply returns. A Raft reply-consuming `Apply` carries one
+canonical `ReceiptVerificationRequestV2`; `Deliver` carries the source receipt
+and, for space-role-authorized admission, the authority assertion receipt in
+strict hash order. Missing, extra, or mismatched verifier input is rejected
+before proposal and again on follower replay; non-receipt-bearing requests
+require the sidecar to be empty.
 The node periodically redrives pending publications, inboxes, and ingresses
 after restart; for Raft roots this redrive begins only after a current-term
 leader barrier, and every hop independently resolves the destination group's
 leader. Slow or partitioned discovery is bounded off-router and coalesced per
 root, so it cannot stall unrelated services or grow one lookup per 250 ms
 retry. Permanent guest deduplication makes a lost acknowledgement safe.
-Direct space-role-only calls to Local, Raft, and CRDT roots use the installed
-canonical authority path described above. Attested calls, actor-local or
-mixed-role calls, and role-bearing durable messages remain unavailable on this
-node route; they never fall back to an unproved, caller-declared role or
+Direct and durable cross-root space-role-only calls to Local, Raft, and CRDT
+roots use the installed canonical authority path described above. Attested
+calls and actor-local or mixed-role calls remain unavailable on this node
+route; they never fall back to an unproved, caller-declared role or
 synthetic-System invocation. Legacy ELF/PVM rows
 continue on the old host during this staged cutover.
 

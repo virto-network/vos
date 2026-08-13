@@ -6554,6 +6554,19 @@ where
     Ok(next_v2_logical_timeslot(logical_timeslot))
 }
 
+/// Allocate the final slot after a previously established service barrier.
+/// Authority execution may advance the shared node clock in between; the
+/// fetch-max plus allocation therefore orders delivery strictly after that
+/// work without running another service catch-up between allocation and the
+/// proposal.
+fn allocate_v2_root_slot_after_barrier(
+    logical_timeslot: &AtomicU64,
+    admission_floor: u64,
+) -> Result<u64, V2NodeRegistrationError> {
+    restore_v2_logical_timeslot(logical_timeslot, admission_floor)?;
+    Ok(next_v2_logical_timeslot(logical_timeslot))
+}
+
 /// Ask the locally attached canonical Raft authority to finalize one exact
 /// invocation-scoped role claim. A follower redirect preserves the platform
 /// `System` origin through the existing voter-authenticated delegation wire;
@@ -7014,13 +7027,17 @@ where
             }
         }
         // Nothing catches up again between this allocation and the proposal.
-        if let Err(failure) = restore_v2_logical_timeslot(&logical_timeslot, admission_floor) {
-            error!(%id, ?failure, "v2 root-tree admission clock restoration failed");
-            send_v2_status(req.reply, crate::STATUS_PANICKED, id);
-            error = Some(format!("v2 root-tree clock restoration failed: {failure}"));
-            break;
-        }
-        request.logical_timeslot = next_v2_logical_timeslot(&logical_timeslot);
+        let final_slot =
+            match allocate_v2_root_slot_after_barrier(&logical_timeslot, admission_floor) {
+                Ok(slot) => slot,
+                Err(failure) => {
+                    error!(%id, ?failure, "v2 root-tree admission clock restoration failed");
+                    send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                    error = Some(format!("v2 root-tree clock restoration failed: {failure}"));
+                    break;
+                }
+            };
+        request.logical_timeslot = final_slot;
         let result =
             service.invoke_after_admission_barrier_with_receipts(request, &receipt_verifications);
         let committed = match result {
@@ -7228,13 +7245,18 @@ fn handle_v2_root_transport<B>(
                 warn!(%id, from = %envelope.from, call = ?message.call_id, "rejected unauthenticated or unsupported v2 delivery");
                 return;
             }
-            let slot = match prepare_v2_root_slot(service, logical_timeslot) {
-                Ok(slot) => slot,
+            // Establish leadership/current-state readiness before consulting
+            // policy or authority, but do not reserve the committed delivery
+            // slot yet. A local authority invocation advances this same
+            // node-wide clock and must order before the delivery.
+            let admission_floor = match service.prepare_admission_barrier() {
+                Ok(floor) => floor,
                 Err(failure) => {
-                    warn!(%id, ?failure, "could not allocate trusted v2 delivery slot");
+                    warn!(%id, ?failure, "v2 delivery admission barrier failed");
                     return;
                 }
             };
+            let provisional_slot = admission_floor.saturating_add(1);
             let method = if message.payload.first() == Some(&crate::value::TAG_DYNAMIC) {
                 <crate::value::Msg as crate::Decode>::try_decode(&message.payload[1..])
                     .map(|message| message.name)
@@ -7323,9 +7345,12 @@ fn handle_v2_root_transport<B>(
                         warn!(%id, call = ?message.call_id, "role-gated destination has no pinned authority");
                         return;
                     };
-                    let claim = match service
-                        .delivery_role_authorization_claim(&message, role, &policy, slot)
-                    {
+                    let claim = match service.delivery_role_authorization_claim(
+                        &message,
+                        role,
+                        &policy,
+                        provisional_slot,
+                    ) {
                         Ok(claim) => claim,
                         Err(failure) => {
                             warn!(%id, call = ?message.call_id, ?failure, "could not derive delivery authorization claim");
@@ -7360,6 +7385,18 @@ fn handle_v2_root_transport<B>(
                 }
             };
             receipt_verifications.sort_by_key(crate::v2::ReceiptVerificationRequestV2::hash);
+            // No service catch-up or authority call may occur after this
+            // allocation and before proposal. The final slot observes any
+            // node-clock advancement caused by the authority execution above,
+            // so deadline validation uses the true delivery order.
+            let slot = match allocate_v2_root_slot_after_barrier(logical_timeslot, admission_floor)
+            {
+                Ok(slot) => slot,
+                Err(failure) => {
+                    warn!(%id, ?failure, "could not allocate trusted v2 delivery slot");
+                    return;
+                }
+            };
             let call = message.call_id;
             let commitment = publication.commitment();
             let source_service = publication.receipt.service.clone();
@@ -12712,6 +12749,27 @@ mod tests {
         assert_eq!(
             restore_v2_logical_timeslot(&clock, u64::MAX),
             Err(V2NodeRegistrationError::LogicalTimeslotExhausted)
+        );
+    }
+
+    #[test]
+    fn v2_delivery_slot_is_allocated_after_authority_clock_progress() {
+        let floor = v2_wall_timeslot().saturating_add(10_000);
+        let clock = AtomicU64::new(floor.saturating_add(1));
+        let provisional = floor.saturating_add(1);
+
+        // A same-node authority invocation consumes the provisional point in
+        // the shared ordering before the destination proposes its delivery.
+        let authority_slot = next_v2_logical_timeslot(&clock);
+        assert_eq!(authority_slot, provisional);
+        let deadline = authority_slot.saturating_add(1);
+        assert!(provisional < deadline, "the provisional claim is live");
+        let delivery_slot =
+            allocate_v2_root_slot_after_barrier(&clock, floor).expect("slot remains available");
+        assert!(delivery_slot > authority_slot);
+        assert!(
+            delivery_slot >= deadline,
+            "guest delivery must now classify this call as expired"
         );
     }
 

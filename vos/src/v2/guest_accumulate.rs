@@ -275,6 +275,9 @@ fn upgrade_actor<S: GuestAccumulateStoreV2>(
     {
         return Ok(rejected(AccumulationRejectionV2::WrongProgram));
     }
+    if pending_authorized_inbox_count(&tree, upgrade.actor)? != 0 {
+        return Ok(rejected(AccumulationRejectionV2::ActorBusy(upgrade.actor)));
+    }
     // A JAR continuation binds every dormant actor program in its invocation
     // layout, not only the actor whose message produced the checkpoint. Do
     // not activate replacement code while any durable kernel can still call
@@ -1188,6 +1191,9 @@ fn deliver<S: GuestAccumulateStoreV2>(
                 &StateKeyV2::Inbox(envelope.message.call_id),
                 Some(&admitted_message.encode()),
             )?;
+            if envelope.authorization != AuthorizationEvidenceV2::Public {
+                adjust_pending_authorized_inbox_count(&mut tree, envelope.message.to, true)?;
+            }
             header.service_root = tree.root();
             header.revision += 1;
             header.state_root = Some(header.service_root);
@@ -3441,6 +3447,12 @@ fn apply<S: GuestAccumulateStoreV2>(
     if work.workflow_step == 0
         && let Some(call) = work.parent_call
     {
+        if header.consistency != ConsistencyModeV2::Crdt
+            && work.authorization != AuthorizationEvidenceV2::Public
+            && read(tree.store_ref(), &delivery_storage_key(call))?.is_some()
+        {
+            adjust_pending_authorized_inbox_count(&mut tree, work.target, false)?;
+        }
         tree_apply(&mut tree, &StateKeyV2::Inbox(call), None)?;
     }
     // A finalized reply consumes the caller's matching durable request in the
@@ -4917,6 +4929,51 @@ fn lookup_message<S: StateTreeStore>(
 
 fn is_sorted_unique_by<T, K: Ord>(values: &[T], mut key: impl FnMut(&T) -> K) -> bool {
     values.windows(2).all(|pair| key(&pair[0]) < key(&pair[1]))
+}
+
+fn pending_authorized_inbox_count<S: StateTreeStore>(
+    tree: &ServiceStateTreeV2<'_, S>,
+    actor: ActorId,
+) -> GuestResult<u64, S::Error> {
+    let Some(bytes) = tree
+        .get(&StateKeyV2::PendingAuthorizedInbox(actor))
+        .map_err(GuestAccumulateError::StateTree)?
+    else {
+        return Ok(0);
+    };
+    let count = u64::from_le_bytes(
+        bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| GuestAccumulateError::CorruptStore)?,
+    );
+    if count == 0 {
+        return Err(GuestAccumulateError::CorruptStore);
+    }
+    Ok(count)
+}
+
+fn adjust_pending_authorized_inbox_count<S: StateTreeStore>(
+    tree: &mut ServiceStateTreeV2<'_, S>,
+    actor: ActorId,
+    increment: bool,
+) -> GuestResult<(), S::Error> {
+    let current = pending_authorized_inbox_count(tree, actor)?;
+    let next = if increment {
+        current
+            .checked_add(1)
+            .ok_or(GuestAccumulateError::CorruptStore)?
+    } else {
+        current
+            .checked_sub(1)
+            .ok_or(GuestAccumulateError::CorruptStore)?
+    };
+    let bytes = next.to_le_bytes();
+    tree_apply(
+        tree,
+        &StateKeyV2::PendingAuthorizedInbox(actor),
+        (next != 0).then_some(bytes.as_slice()),
+    )
 }
 
 fn tree_get_wire<S: StateTreeStore, T: V2Wire>(
@@ -8748,6 +8805,26 @@ mod tests {
             panic!("role-authorized delivery rejected")
         };
 
+        // The admitted credential is scoped to the current actor deployment
+        // and program. Until its inbox slice consumes that decision, a
+        // package-only or program upgrade must fail atomically instead of
+        // stranding an invocation which can authorize neither version.
+        let admitted_header =
+            StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
+        let mut upgrade = upgrade_fixture(admitted_header.service_root);
+        upgrade.base = ConsistencyBaseV2::Linear {
+            revision: admitted_header.revision,
+            state_root: admitted_header.state_root.unwrap(),
+        };
+        store.upgrade_allowlist.insert(upgrade.hash());
+        let before_upgrade = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::UpgradeActor(upgrade))
+                .unwrap(),
+            rejected(AccumulationRejectionV2::ActorBusy(actor()))
+        );
+        assert_eq!(store, before_upgrade);
+
         // Receipt policy is process-local and deliberately absent after a
         // durable reopen. The guest-owned delivery record and inbox preserve
         // the exact authorization decision needed by the first actor slice.
@@ -8779,6 +8856,29 @@ mod tests {
             )
             .unwrap(),
             AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
+        let drained_header =
+            StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
+        let tree = ServiceStateTreeV2::new(&mut store, drained_header.service_root);
+        assert_eq!(
+            pending_authorized_inbox_count(&tree, actor()).unwrap(),
+            0,
+            "consumption must release the deployment pin"
+        );
+        drop(tree);
+        let mut upgrade = upgrade_fixture(drained_header.service_root);
+        upgrade.base = ConsistencyBaseV2::Linear {
+            revision: drained_header.revision,
+            state_root: drained_header.state_root.unwrap(),
+        };
+        store.upgrade_allowlist.insert(upgrade.hash());
+        assert!(matches!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::UpgradeActor(upgrade))
+                .unwrap(),
+            AccumulationResultV2::ActorUpgraded {
                 duplicate: false,
                 ..
             }

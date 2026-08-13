@@ -413,6 +413,7 @@ fn hash_state_key(domain: &[u8], prefix: &[&[u8]], key: &StateKeyV2, suffix: &[&
         StateKeyV2::Outbox(_) => 5,
         StateKeyV2::Workflow(_) => 6,
         StateKeyV2::CrdtMaterialization(_) => 7,
+        StateKeyV2::PendingAuthorizedInbox(_) => 8,
         StateKeyV2::ActorDirectory => 9,
         StateKeyV2::ExternalActorDirectory => 10,
         StateKeyV2::RoleAuthority => 11,
@@ -435,7 +436,8 @@ fn hash_state_key(domain: &[u8], prefix: &[&[u8]], key: &StateKeyV2, suffix: &[&
     match key {
         StateKeyV2::ActorDescriptor(actor)
         | StateKeyV2::Continuation(actor)
-        | StateKeyV2::CrdtMaterialization(actor) => {
+        | StateKeyV2::CrdtMaterialization(actor)
+        | StateKeyV2::PendingAuthorizedInbox(actor) => {
             parts[used] = &actor.0;
             used += 1;
         }
@@ -585,6 +587,7 @@ mod tests {
             StateKeyV2::Outbox(CallId([9; 32])),
             StateKeyV2::Workflow(InvocationId([10; 32])),
             StateKeyV2::CrdtMaterialization(actor),
+            StateKeyV2::PendingAuthorizedInbox(actor),
         ];
         let position = [11; 32];
         let value = b"materialized-value";

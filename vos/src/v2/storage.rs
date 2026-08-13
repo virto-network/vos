@@ -165,6 +165,10 @@ pub enum StateKeyV2 {
     Outbox(CallId),
     Workflow(InvocationId),
     CrdtMaterialization(ActorId),
+    /// Number of destination-authorized delivery rows which still pin this
+    /// actor's installed deployment and program. Linear upgrades remain busy
+    /// until the corresponding inbox slices consume those rows.
+    PendingAuthorizedInbox(ActorId),
 }
 
 impl V2Wire for StateKeyV2 {
@@ -216,6 +220,10 @@ impl V2Wire for StateKeyV2 {
                 e.u8(7);
                 e.fixed(&actor.0);
             }
+            Self::PendingAuthorizedInbox(actor) => {
+                e.u8(8);
+                e.fixed(&actor.0);
+            }
         }
     }
 
@@ -243,6 +251,7 @@ impl V2Wire for StateKeyV2 {
             5 => Ok(Self::Outbox(CallId(d.fixed()?))),
             6 => Ok(Self::Workflow(InvocationId(d.fixed()?))),
             7 => Ok(Self::CrdtMaterialization(ActorId(d.fixed()?))),
+            8 => Ok(Self::PendingAuthorizedInbox(ActorId(d.fixed()?))),
             9 => Ok(Self::ActorDirectory),
             10 => Ok(Self::ExternalActorDirectory),
             11 => Ok(Self::RoleAuthority),
