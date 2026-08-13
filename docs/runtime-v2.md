@@ -909,9 +909,12 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 27, continuation snapshot version 6, and platform ABI version 6
-are therefore a clean
-break from earlier experimental v2 images. They add exact actor-package
+Store schema 29, continuation snapshot version 6, and platform ABI version 7
+are therefore a clean break from earlier experimental v2 images. ABI 7 adds
+the content-addressed authorization reference to the causal direct-ingress
+wire; schema 29 rejects durable ingress records and CRDT DAG rows encoded
+before that field existed instead of interpreting mutually incompatible
+images under one version. These versions also add exact actor-package
 identity to descriptors, work, checkpoints, transitions, upgrades, and
 cross-root proof bindings, bind durable messages and retained causal context to
 their exact source/destination services, retain the complete dormant

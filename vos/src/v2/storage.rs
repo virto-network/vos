@@ -15,7 +15,7 @@ use super::{
     ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 28;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 29;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -1038,6 +1038,16 @@ mod tests {
         assert_eq!(crdt.revision, 0);
         assert_eq!(crdt.admission_timeslot_high_water, 0);
         assert_eq!(crdt.service_root, empty_state_root());
+    }
+
+    #[test]
+    fn prior_crdt_ingress_schema_is_a_clean_break() {
+        let mut previous = StoreHeaderV2::current(service(9), ConsistencyModeV2::Crdt);
+        previous.schema_version = 28;
+        assert_eq!(
+            StoreHeaderV2::open(&previous.encode()),
+            Err(StoreOpenError::IncompatibleSemantics),
+        );
     }
 
     #[test]

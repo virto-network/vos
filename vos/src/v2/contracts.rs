@@ -6708,6 +6708,14 @@ mod tests {
         ingress.crdt_change = Some(change);
         assert_eq!(DirectIngressV2::decode(&ingress.encode()).unwrap(), ingress);
 
+        let mut previous_abi = ingress.encode();
+        previous_abi[4..6].copy_from_slice(&6u16.to_le_bytes());
+        assert_eq!(
+            DirectIngressV2::decode(&previous_abi),
+            Err(DecodeError::InvalidVersion),
+            "ABI 6 cannot be interpreted as the authorization-reference wire",
+        );
+
         let admitted = DirectIngressV2::decode(&ingress.encode_admitted()).unwrap();
         let materialized = DirectIngressV2::decode(&DirectIngressV2::encode_materialized(
             &operation,
