@@ -51,6 +51,11 @@ pub struct CommittedReplyResumeV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboxDrainOutcomeV2 {
     Committed(CommittedInboxSliceV2),
+    Retired {
+        call: CallId,
+        duplicate: bool,
+        accumulate_gas_used: u64,
+    },
     Deferred {
         call: CallId,
         reason: ScheduleErrorV2,
@@ -120,6 +125,39 @@ impl From<ServiceDispatchError> for LocalTransportErrorV2 {
 pub struct LocalTransportV2;
 
 impl LocalTransportV2 {
+    fn retire_expired_inbox<A>(
+        destination: &mut LocalServiceV2<A>,
+        call: CallId,
+        logical_timeslot: u64,
+    ) -> Result<InboxDrainOutcomeV2, LocalTransportErrorV2>
+    where
+        A: LocalJamStoreHostV2 + AccumulateProtocolHostV2,
+    {
+        let retirement = LocalWorkSchedulerV2::prepare_inbox_retirement(
+            destination.accumulate_host().local_store(),
+            call,
+            logical_timeslot,
+        )?
+        .ok_or(LocalTransportErrorV2::MissingMessage(call))?;
+        let output = destination.accumulate_at(
+            &AccumulateRequestV2::RetireInbox(retirement),
+            logical_timeslot,
+        )?;
+        match output.result {
+            AccumulationResultV2::InboxRetired { call_id, duplicate } if call_id == call => {
+                Ok(InboxDrainOutcomeV2::Retired {
+                    call,
+                    duplicate,
+                    accumulate_gas_used: output.gas_used,
+                })
+            }
+            AccumulationResultV2::Rejected(rejection) => {
+                Err(LocalTransportErrorV2::Rejected(rejection))
+            }
+            _ => Err(LocalTransportErrorV2::UnexpectedResult),
+        }
+    }
+
     /// Recover source effects in canonical guest row order.
     pub fn pending_publications<A: LocalJamStoreHostV2>(
         source: &LocalServiceV2<A>,
@@ -351,9 +389,9 @@ impl LocalTransportV2 {
 
     /// Drain every guest-admitted inbox row which is runnable after restart.
     ///
-    /// Suspended targets and expired rows remain committed for later
-    /// resolution; other scheduling failures indicate corrupt orchestration
-    /// state and fail the batch.
+    /// Suspended targets remain committed for later resolution. Expired rows
+    /// are retired through a separate slot-authenticated guest transaction;
+    /// other scheduling failures indicate corrupt orchestration state.
     pub fn drain_pending<A>(
         destination: &mut LocalServiceV2<A>,
         logical_timeslot: u64,
@@ -380,10 +418,16 @@ impl LocalTransportV2 {
                 logical_timeslot,
             ) {
                 Ok(prepared) => prepared,
-                Err(
-                    reason @ (ScheduleErrorV2::ActorBusy(_) | ScheduleErrorV2::DeadlineExpired(_)),
-                ) => {
+                Err(reason @ ScheduleErrorV2::ActorBusy(_)) => {
                     outcomes.push(InboxDrainOutcomeV2::Deferred { call, reason });
+                    continue;
+                }
+                Err(ScheduleErrorV2::DeadlineExpired(_)) => {
+                    outcomes.push(Self::retire_expired_inbox(
+                        destination,
+                        call,
+                        logical_timeslot,
+                    )?);
                     continue;
                 }
                 Err(error) => return Err(error.into()),
@@ -451,10 +495,15 @@ impl LocalTransportV2 {
                 logical_timeslot,
             ) {
                 Ok(prepared) => prepared,
-                Err(
-                    reason @ (ScheduleErrorV2::ActorBusy(_) | ScheduleErrorV2::DeadlineExpired(_)),
-                ) => {
+                Err(reason @ ScheduleErrorV2::ActorBusy(_)) => {
                     outcomes.push(InboxDrainOutcomeV2::Deferred { call, reason });
+                    continue;
+                }
+                Err(ScheduleErrorV2::DeadlineExpired(_)) => {
+                    outcomes.push(
+                        Self::retire_expired_inbox(destination, call, logical_timeslot)
+                            .map_err(AttestedTransportErrorV2::Transport)?,
+                    );
                     continue;
                 }
                 Err(error) => return Err(LocalTransportErrorV2::Schedule(error).into()),

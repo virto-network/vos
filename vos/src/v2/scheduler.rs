@@ -20,10 +20,11 @@ use super::{
     AuthorizationEvidenceV2, BlobRefV2, CallExpirationEnvelopeV2, CallId, CallTimeoutV2,
     CausalCallContextV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2,
     CrdtChangeV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DecodeError, DeliveryEnvelopeV2,
-    DirectIngressV2, ExternalActorDirectoryV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
-    InvocationId, LocalJamStoreV2, LocalStoreReadErrorV2, MessageRecordV2, Origin, RefineImportsV2,
-    ServiceIdentityV2, StateKeyV2, V2Wire, WorkEnvelopeV2, WorkflowCheckpointV2,
-    WorkflowOperationV2, crdt_node_receipt_storage_key, crdt_node_storage_key,
+    DeliveryRecordV2, DirectIngressV2, ExternalActorDirectoryV2, ImportedActorV2, ImportedBlobV2,
+    ImportedProgramV2, InboxRetirementV2, InvocationId, LocalJamStoreV2, LocalStoreReadErrorV2,
+    MessageRecordV2, Origin, RefineImportsV2, ServiceIdentityV2, StateKeyV2, V2Wire,
+    WorkEnvelopeV2, WorkflowCheckpointV2, WorkflowOperationV2, crdt_node_receipt_storage_key,
+    crdt_node_storage_key, delivery_storage_key,
 };
 
 /// Caller-controlled portion of one local work item. The scheduler supplies
@@ -610,6 +611,55 @@ impl LocalWorkSchedulerV2 {
                 proof_requested: message.proof_requested,
             },
         )
+    }
+
+    /// Construct the terminal guest request for one deadline-bearing linear
+    /// inbox. The physical Accumulate host independently authenticates the
+    /// observation slot; this read-only step binds the exact current base and
+    /// admitted deadline.
+    pub fn prepare_inbox_retirement(
+        store: &LocalJamStoreV2,
+        call: CallId,
+        logical_timeslot: u64,
+    ) -> Result<Option<InboxRetirementV2>, ScheduleErrorV2> {
+        let header = store.header()?.ok_or(ScheduleErrorV2::StoreUninitialized)?;
+        if header.consistency == ConsistencyModeV2::Crdt {
+            return Err(ScheduleErrorV2::UnsupportedConsistency(header.consistency));
+        }
+        let Some(bytes) = store.row(&delivery_storage_key(call)) else {
+            return Err(ScheduleErrorV2::InvalidDelivery);
+        };
+        let delivery =
+            DeliveryRecordV2::decode(&bytes).map_err(|_| ScheduleErrorV2::InvalidDelivery)?;
+        if delivery.call_id != call {
+            return Err(ScheduleErrorV2::InvalidDelivery);
+        }
+        if delivery.consumed || delivery.retired_at.is_some() {
+            return Ok(None);
+        }
+        let message =
+            decode_row::<MessageRecordV2>(store, header.service_root, &StateKeyV2::Inbox(call))?
+                .ok_or(ScheduleErrorV2::MissingInbox(call))?;
+        let Some(deadline_timeslot) = message.deadline_timeslot else {
+            return Ok(None);
+        };
+        if message.call_id != call || message.authorization != delivery.authorization {
+            return Err(ScheduleErrorV2::InvalidDelivery);
+        }
+        if logical_timeslot < deadline_timeslot {
+            return Ok(None);
+        }
+        Ok(Some(InboxRetirementV2 {
+            service: header.service,
+            call_id: call,
+            deadline_timeslot,
+            base: ConsistencyBaseV2::Linear {
+                revision: header.revision,
+                state_root: header
+                    .state_root
+                    .ok_or(ScheduleErrorV2::UnsupportedConsistency(header.consistency))?,
+            },
+        }))
     }
 
     /// Prepare one slice from the current committed linear revision or CRDT

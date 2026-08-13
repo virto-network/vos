@@ -7955,9 +7955,14 @@ fn run_v2_root_inbox<B>(
             publish_v2_root_slice(id, service, committed, None, outbox, actor_routes, state)
         }
         Err(crate::v2::LocalRootTreeInvokeErrorV2::Schedule(
-            crate::v2::ScheduleErrorV2::ActorBusy(_)
-            | crate::v2::ScheduleErrorV2::MissingInbox(_)
-            | crate::v2::ScheduleErrorV2::DeadlineExpired(_),
+            crate::v2::ScheduleErrorV2::DeadlineExpired(_),
+        )) => {
+            if let Err(failure) = service.retire_inbox_after_barrier(call, slot) {
+                warn!(%id, ?call, ?failure, "v2 expired inbox retirement failed");
+            }
+        }
+        Err(crate::v2::LocalRootTreeInvokeErrorV2::Schedule(
+            crate::v2::ScheduleErrorV2::ActorBusy(_) | crate::v2::ScheduleErrorV2::MissingInbox(_),
         )) => {}
         Err(failure) => warn!(%id, ?call, ?failure, "v2 admitted inbox execution failed"),
     }

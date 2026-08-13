@@ -11262,6 +11262,12 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
         "peer_value",
         vec![],
     );
+    let expiring_destination = install_service(
+        destination_identity.clone(),
+        destination_actor,
+        "peer_value",
+        vec![],
+    );
     let impostor_identity = ServiceIdentityV2 {
         root_service: RootServiceId([96; 32]),
         deployment: DeploymentId([97; 32]),
@@ -11318,6 +11324,44 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
     assert_eq!(publications.len(), 1);
     let publication = publications[0].clone();
     assert_eq!(publication.published.outbox[0].call_id, call);
+
+    // A destination which admits immediately before the deadline but does
+    // not execute in time must durably retire the inbox through physical IC-5.
+    // Restart proves discovery comes from the committed delivery row, and a
+    // lost source acknowledgement remains an exact duplicate afterward.
+    let mut expiring_destination =
+        restart_durable_service(expiring_destination, &service_pvm, service_program);
+    assert!(
+        !LocalTransportV2::deliver(&source, &mut expiring_destination, &publication, call, 99,)
+            .unwrap()
+            .duplicate
+    );
+    let mut expiring_destination =
+        restart_durable_service(expiring_destination, &service_pvm, service_program);
+    let retired = LocalTransportV2::drain_pending(&mut expiring_destination, 100).unwrap();
+    assert!(matches!(
+        retired.as_slice(),
+        [InboxDrainOutcomeV2::Retired {
+            call: retired_call,
+            duplicate: false,
+            ..
+        }] if *retired_call == call
+    ));
+    let mut expiring_destination =
+        restart_durable_service(expiring_destination, &service_pvm, service_program);
+    assert!(
+        expiring_destination
+            .accumulate_host()
+            .pending_inbox_calls()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        LocalTransportV2::deliver(&source, &mut expiring_destination, &publication, call, 99,)
+            .unwrap()
+            .duplicate,
+        "retirement keeps the permanent delivery identity for lost acknowledgements"
+    );
 
     let mut destination = restart_durable_service(destination, &service_pvm, service_program);
     let mut impostor = restart_durable_service(impostor, &service_pvm, service_program);

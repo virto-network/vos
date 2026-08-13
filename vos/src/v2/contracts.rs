@@ -2113,6 +2113,18 @@ impl DeliveryEnvelopeV2 {
     }
 }
 
+/// Guest-owned terminal disposition for one deadline-bearing destination
+/// inbox. The trusted observation slot is supplied by the physical Accumulate
+/// host rather than encoded here; `deadline_timeslot` binds the exact admitted
+/// message which may be retired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxRetirementV2 {
+    pub service: ServiceIdentityV2,
+    pub call_id: CallId,
+    pub deadline_timeslot: u64,
+    pub base: ConsistencyBaseV2,
+}
+
 /// One causal node imported from another replica of the same CRDT service.
 /// The finalized accumulation receipt authenticates that this exact CID was
 /// admitted by the canonical service guest; sync never trusts unsigned DAG
@@ -2159,6 +2171,7 @@ pub enum AccumulateRequestV2 {
     Apply(AccumulationEnvelopeV2),
     PrepareAttested(AccumulationEnvelopeV2),
     Deliver(DeliveryEnvelopeV2),
+    RetireInbox(InboxRetirementV2),
     ExpireCall(CallExpirationEnvelopeV2),
     AcknowledgePublication(PublicationAckV2),
     SyncCrdt(CrdtSyncEnvelopeV2),
@@ -2177,6 +2190,7 @@ impl AccumulateRequestV2 {
             Self::AdmitIngress(ingress) => &ingress.service,
             Self::Apply(envelope) | Self::PrepareAttested(envelope) => &envelope.work.service,
             Self::Deliver(envelope) => &envelope.service,
+            Self::RetireInbox(retirement) => &retirement.service,
             Self::ExpireCall(envelope) => &envelope.service,
             Self::AcknowledgePublication(acknowledgement) => &acknowledgement.service,
             Self::SyncCrdt(envelope) => &envelope.service,
@@ -2279,8 +2293,9 @@ impl AccumulationRejectionV2 {
 }
 
 /// Guest output. New installs, ingress admissions, accepted transitions,
-/// actor upgrades, and publication acknowledgements authorize a commit when
-/// non-duplicate; `Prepared` and `Rejected` are read-only.
+/// call/inbox expirations, actor upgrades, and publication acknowledgements
+/// authorize a commit when non-duplicate; `Prepared` and `Rejected` are
+/// read-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccumulationResultV2 {
     Installed(ServiceInstallReceiptV2),
@@ -2297,6 +2312,10 @@ pub enum AccumulationResultV2 {
     Prepared(AttestationPreparationV2),
     CallExpired {
         timeout: AccumulatedTimeoutV2,
+        duplicate: bool,
+    },
+    InboxRetired {
+        call_id: CallId,
         duplicate: bool,
     },
     PublicationAcknowledged {
@@ -4033,6 +4052,34 @@ impl V2Wire for DeliveryEnvelopeV2 {
     }
 }
 
+impl V2Wire for InboxRetirementV2 {
+    const MAGIC: [u8; 4] = *b"VIRX";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        encode_service(&mut e, &self.service);
+        e.fixed(&self.call_id.0);
+        e.u64(self.deadline_timeslot);
+        encode_base(&mut e, &self.base);
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            service: decode_service(d)?,
+            call_id: CallId(d.fixed()?),
+            deadline_timeslot: d.u64()?,
+            base: decode_base(d)?,
+        };
+        if value.call_id == CallId::ZERO
+            || value.deadline_timeslot == 0
+            || !matches!(value.base, ConsistencyBaseV2::Linear { .. })
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
 impl V2Wire for PublicationAckV2 {
     const MAGIC: [u8; 4] = *b"VPA2";
 
@@ -4220,6 +4267,10 @@ impl V2Wire for AccumulateRequestV2 {
                 e.u8(3);
                 e.bytes(&envelope.encode());
             }
+            Self::RetireInbox(retirement) => {
+                e.u8(9);
+                e.bytes(&retirement.encode());
+            }
             Self::ExpireCall(envelope) => {
                 e.u8(7);
                 e.bytes(&envelope.encode());
@@ -4248,6 +4299,7 @@ impl V2Wire for AccumulateRequestV2 {
                 &d.bytes()?,
             )?)),
             3 => Ok(Self::Deliver(DeliveryEnvelopeV2::decode(&d.bytes()?)?)),
+            9 => Ok(Self::RetireInbox(InboxRetirementV2::decode(&d.bytes()?)?)),
             7 => Ok(Self::ExpireCall(CallExpirationEnvelopeV2::decode(
                 &d.bytes()?,
             )?)),
@@ -4353,6 +4405,11 @@ impl V2Wire for AccumulationResultV2 {
                 e.bytes(&timeout.encode());
                 e.bool(*duplicate);
             }
+            Self::InboxRetired { call_id, duplicate } => {
+                e.u8(8);
+                e.fixed(&call_id.0);
+                e.bool(*duplicate);
+            }
             Self::PublicationAcknowledged { input, duplicate } => {
                 e.u8(4);
                 e.fixed(&input.invocation.0);
@@ -4428,6 +4485,14 @@ impl V2Wire for AccumulationResultV2 {
                 timeout: AccumulatedTimeoutV2::decode(&d.bytes()?)?,
                 duplicate: d.bool()?,
             }),
+            8 => {
+                let call_id = CallId(d.fixed()?);
+                let duplicate = d.bool()?;
+                if call_id == CallId::ZERO {
+                    return Err(DecodeError::NonCanonical);
+                }
+                Ok(Self::InboxRetired { call_id, duplicate })
+            }
             3 => Ok(Self::Rejected(decode_rejection(d)?)),
             4 => {
                 let input = WorkInputIdV2 {
@@ -5002,7 +5067,7 @@ fn decode_origin(d: &mut Decoder<'_>) -> Result<Origin, DecodeError> {
     }
 }
 
-fn encode_auth(e: &mut Encoder<'_>, value: &AuthorizationEvidenceV2) {
+pub(super) fn encode_auth(e: &mut Encoder<'_>, value: &AuthorizationEvidenceV2) {
     match value {
         AuthorizationEvidenceV2::Public => e.u8(0),
         AuthorizationEvidenceV2::Credential {
@@ -5036,7 +5101,7 @@ fn encode_auth(e: &mut Encoder<'_>, value: &AuthorizationEvidenceV2) {
     }
 }
 
-fn decode_auth(d: &mut Decoder<'_>) -> Result<AuthorizationEvidenceV2, DecodeError> {
+pub(super) fn decode_auth(d: &mut Decoder<'_>) -> Result<AuthorizationEvidenceV2, DecodeError> {
     match d.u8()? {
         0 => Ok(AuthorizationEvidenceV2::Public),
         1 => Ok(AuthorizationEvidenceV2::Credential {
@@ -7294,6 +7359,29 @@ mod tests {
         assert_eq!(
             AccumulationResultV2::decode(&result.encode()).unwrap(),
             result
+        );
+
+        let retirement = InboxRetirementV2 {
+            service: service(),
+            call_id: timeout.call_id,
+            deadline_timeslot: timeout.deadline_timeslot,
+            base: ConsistencyBaseV2::Linear {
+                revision: 8,
+                state_root: Hash([25; 32]),
+            },
+        };
+        let request = AccumulateRequestV2::RetireInbox(retirement.clone());
+        assert_eq!(
+            AccumulateRequestV2::decode(&request.encode()).unwrap(),
+            request
+        );
+        let retired = AccumulationResultV2::InboxRetired {
+            call_id: retirement.call_id,
+            duplicate: false,
+        };
+        assert_eq!(
+            AccumulationResultV2::decode(&retired.encode()).unwrap(),
+            retired
         );
 
         let mut early = expiration;

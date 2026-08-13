@@ -10,12 +10,12 @@ use alloc::vec::Vec;
 
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 use super::{
-    AccumulatedReplyV2, AccumulationReceiptV2, ActorId, CallId, ConsistencyModeV2, CrdtChangeV2,
-    DeploymentId, DirectIngressV2, Hash, InvocationId, ProgramId, PublishedEffectsV2,
-    ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
+    AccumulatedReplyV2, AccumulationReceiptV2, ActorId, AuthorizationEvidenceV2, CallId,
+    ConsistencyModeV2, CrdtChangeV2, DeploymentId, DirectIngressV2, Hash, InvocationId, ProgramId,
+    PublishedEffectsV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 30;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 31;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -420,6 +420,12 @@ pub struct DeliveryRecordV2 {
     pub call_id: CallId,
     pub logical_timeslot: u64,
     pub consumed: bool,
+    /// Deadline of a terminal inbox retirement. A delivered call is either
+    /// consumed by actor execution or retired, never both.
+    pub retired_at: Option<u64>,
+    /// Exact guest-authorized evidence survives inbox retirement so a lost
+    /// source acknowledgement can still be classified as the same delivery.
+    pub authorization: AuthorizationEvidenceV2,
     pub retry_identity: Hash,
     pub delivery_commitment: Hash,
     pub receipt: AccumulationReceiptV2,
@@ -690,6 +696,8 @@ impl V2Wire for DeliveryRecordV2 {
         e.fixed(&self.call_id.0);
         e.u64(self.logical_timeslot);
         e.bool(self.consumed);
+        e.option(&self.retired_at, |e, retired_at| e.u64(*retired_at));
+        super::contracts::encode_auth(&mut e, &self.authorization);
         e.fixed(&self.retry_identity.0);
         e.fixed(&self.delivery_commitment.0);
         e.bytes(&self.receipt.encode());
@@ -700,6 +708,8 @@ impl V2Wire for DeliveryRecordV2 {
             call_id: CallId(d.fixed()?),
             logical_timeslot: d.u64()?,
             consumed: d.bool()?,
+            retired_at: d.option(Decoder::u64)?,
+            authorization: super::contracts::decode_auth(d)?,
             retry_identity: Hash(d.fixed()?),
             delivery_commitment: Hash(d.fixed()?),
             receipt: AccumulationReceiptV2::decode(&d.bytes()?)?,
@@ -710,6 +720,8 @@ impl V2Wire for DeliveryRecordV2 {
             || value.receipt.reply_commitment.is_some()
             || value.receipt.outbox_commitment.is_some()
             || value.receipt.checkpoint != 0
+            || (value.consumed && value.retired_at.is_some())
+            || value.retired_at == Some(0)
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -1236,6 +1248,8 @@ mod tests {
             call_id: message.call_id,
             logical_timeslot: 7,
             consumed: false,
+            retired_at: None,
+            authorization: message.authorization.clone(),
             retry_identity: Hash([27; 32]),
             delivery_commitment: Hash([28; 32]),
             receipt: AccumulationReceiptV2 {
@@ -1253,6 +1267,19 @@ mod tests {
         assert_eq!(
             DeliveryRecordV2::decode(&delivery.encode()).unwrap(),
             delivery
+        );
+        let mut retired_delivery = delivery.clone();
+        retired_delivery.retired_at = Some(19);
+        assert_eq!(
+            DeliveryRecordV2::decode(&retired_delivery.encode()).unwrap(),
+            retired_delivery
+        );
+        let mut impossible_delivery = delivery.clone();
+        impossible_delivery.consumed = true;
+        impossible_delivery.retired_at = Some(19);
+        assert_eq!(
+            DeliveryRecordV2::decode(&impossible_delivery.encode()),
+            Err(DecodeError::NonCanonical)
         );
         let mut bad_delivery = delivery;
         bad_delivery.receipt.accepted_transition = Hash([31; 32]);

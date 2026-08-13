@@ -677,7 +677,7 @@ impl LocalJamStoreV2 {
             {
                 return Err(LocalStoreReadErrorV2::CorruptDelivery);
             }
-            if delivery.consumed {
+            if delivery.consumed || delivery.retired_at.is_some() {
                 continue;
             }
             let message = self

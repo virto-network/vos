@@ -49,9 +49,9 @@ pub use contracts::{
     CrdtIngressV2, CrdtMaterializationV2, CrdtOperationV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2,
     DeliveryEnvelopeV2, DirectIngressV2, ExternalActorBindingV2, ExternalActorDirectoryV2,
     GasAccountingV2, GasScheduleV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
-    MessageRecordV2, MethodPolicyV2, ProofCommitmentV2, ProofVerificationRequestV2,
-    PublicationAckV2, PublishedEffectsV2, ROLE_AUTHORITY_DECISION_METHOD_V2,
-    ROLE_AUTHORITY_INSTANCE_V2, ROLE_AUTHORITY_INVITE_METHOD_V2,
+    InboxRetirementV2, MessageRecordV2, MethodPolicyV2, ProofCommitmentV2,
+    ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2,
+    ROLE_AUTHORITY_DECISION_METHOD_V2, ROLE_AUTHORITY_INSTANCE_V2, ROLE_AUTHORITY_INVITE_METHOD_V2,
     ROLE_AUTHORITY_INVITE_REVOKE_METHOD_V2, ROLE_AUTHORITY_MUTATION_METHOD_V2,
     ReceiptVerificationRequestV2, RefineError, RefineImportsV2, RefineOutputV2, ReplyRecordV2,
     RoleAuthorityBindingV2, RoleAuthorityInviteRedemptionV2, RoleAuthorityInviteRevocationV2,
@@ -123,7 +123,7 @@ pub use transport::{
 pub use wire::{DecodeError, V2Wire};
 
 /// Platform wire/ABI version carried by v2 work, transitions, and receipts.
-pub const ABI_VERSION: u16 = 8;
+pub const ABI_VERSION: u16 = 9;
 /// Portable continuation format version.
 pub const SNAPSHOT_VERSION: u16 = 6;
 /// Attestation statement version required by runtime v2.
@@ -134,8 +134,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0xa8, 0xe9, 0xac, 0xa6, 0x29, 0xc6, 0x5e, 0x38, 0x7d, 0x61, 0x1c, 0xd0, 0x00, 0x78, 0x4f, 0xd1,
-    0x17, 0x06, 0x39, 0x7b, 0x44, 0x51, 0x33, 0x77, 0x47, 0x23, 0xf7, 0x98, 0x15, 0x71, 0x20, 0x52,
+    0x8f, 0x6e, 0x5d, 0xf5, 0x50, 0xfc, 0x62, 0xb0, 0xc9, 0x46, 0xa9, 0x08, 0x4e, 0x63, 0x1d, 0x9a,
+    0x61, 0x1d, 0x7d, 0xa6, 0xd8, 0x63, 0x19, 0x0e, 0xb0, 0x87, 0x24, 0xe8, 0x03, 0xa1, 0x52, 0x9b,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.
@@ -221,4 +221,4 @@ pub const JAR_REVISION: &str = "41d31e64b0f5d6c57a43769d7b8785556a311684";
 /// Consensus-visible execution semantics. Changing interpreter/recompiler or
 /// trace behavior requires a new identifier even if the public Rust API did
 /// not change.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v9\0");
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v10");

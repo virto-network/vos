@@ -23,18 +23,19 @@ use super::{
     AwaitResumeV2, BlobRefV2, CHECKPOINT_TOKEN_CAPACITY, CallExpirationEnvelopeV2, CallTimeoutV2,
     CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2,
     CrdtDispatchV2, CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryEnvelopeV2, DeliveryRecordV2,
-    DirectIngressV2, EXECUTION_SEMANTICS_ID, ExternalActorDirectoryV2, Hash, IngressRecordV2,
-    MessageRecordV2, MethodPolicyV2, PendingCallDeadlineV2, ProgramId, ProofVerificationRequestV2,
-    PublicationAckRecordV2, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
-    ReceiptVerificationRequestV2, ReplyAdmissionRecordV2, RoleAssertionEligibilityV2,
-    RoleAuthorityBindingV2, RoleCredentialV2, RoleCredentialVerificationRequestV2,
-    ServiceGenesisV2, ServiceIdentityV2, ServiceInstallReceiptV2, ServiceStateTreeV2, StateKeyV2,
-    StateTreeError, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire, WorkInputIdV2,
-    WorkflowCheckpointV2, WorkflowOperationV2, actor_upgrade_storage_key,
-    call_expiration_storage_key, crdt_change_storage_key, crdt_node_receipt_storage_key,
-    crdt_node_storage_key, dedup_storage_key, delivery_storage_key, header_storage_key,
-    ingress_storage_key, method_role_policy_hash, pending_call_deadline_storage_key,
-    public_policy_hash, publication_ack_storage_key, publication_storage_key, receipt_storage_key,
+    DirectIngressV2, EXECUTION_SEMANTICS_ID, ExternalActorDirectoryV2, Hash, InboxRetirementV2,
+    IngressRecordV2, MessageRecordV2, MethodPolicyV2, PendingCallDeadlineV2, ProgramId,
+    ProofVerificationRequestV2, PublicationAckRecordV2, PublicationAckV2, PublicationRecordV2,
+    PublishedEffectsV2, ReceiptVerificationRequestV2, ReplyAdmissionRecordV2,
+    RoleAssertionEligibilityV2, RoleAuthorityBindingV2, RoleCredentialV2,
+    RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServiceIdentityV2,
+    ServiceInstallReceiptV2, ServiceStateTreeV2, StateKeyV2, StateTreeError, StateTreeStore,
+    StoreHeaderV2, StoreOpenError, V2Wire, WorkInputIdV2, WorkflowCheckpointV2,
+    WorkflowOperationV2, actor_upgrade_storage_key, call_expiration_storage_key,
+    crdt_change_storage_key, crdt_node_receipt_storage_key, crdt_node_storage_key,
+    dedup_storage_key, delivery_storage_key, header_storage_key, ingress_storage_key,
+    method_role_policy_hash, pending_call_deadline_storage_key, public_policy_hash,
+    publication_ack_storage_key, publication_storage_key, receipt_storage_key,
     reply_admission_storage_key, role_assertion_eligibility_storage_key,
 };
 
@@ -175,6 +176,7 @@ pub fn execute_canonical_guest_accumulate<S: GuestAccumulateStoreV2>(
             apply(store, envelope, ApplyMode::PrepareAttested)
         }
         AccumulateRequestV2::Deliver(envelope) => deliver(store, envelope),
+        AccumulateRequestV2::RetireInbox(retirement) => retire_inbox(store, retirement),
         AccumulateRequestV2::ExpireCall(envelope) => expire_call(store, envelope),
         AccumulateRequestV2::AcknowledgePublication(acknowledgement) => {
             acknowledge_publication(store, acknowledgement)
@@ -182,6 +184,115 @@ pub fn execute_canonical_guest_accumulate<S: GuestAccumulateStoreV2>(
         AccumulateRequestV2::SyncCrdt(envelope) => sync_crdt(store, envelope.clone()),
         AccumulateRequestV2::UpgradeActor(upgrade) => upgrade_actor(store, upgrade),
     }
+}
+
+#[inline(never)]
+fn retire_inbox<S: GuestAccumulateStoreV2>(
+    store: &mut S,
+    retirement: &InboxRetirementV2,
+) -> GuestResult<AccumulationResultV2, S::Error> {
+    let Some(header_bytes) = read(store, header_storage_key())? else {
+        return Ok(rejected(AccumulationRejectionV2::StoreUninitialized));
+    };
+    let mut header = match StoreHeaderV2::open(&header_bytes) {
+        Ok(header) => header,
+        Err(StoreOpenError::WrongService) => {
+            return Ok(rejected(AccumulationRejectionV2::WrongService));
+        }
+        Err(StoreOpenError::IncompatibleSemantics) => {
+            return Ok(rejected(AccumulationRejectionV2::WrongExecutionSemantics));
+        }
+        Err(StoreOpenError::LegacyStore | StoreOpenError::InvalidHeader(_)) => {
+            return Ok(rejected(AccumulationRejectionV2::NonCanonical));
+        }
+    };
+    if retirement.service != header.service {
+        return Ok(rejected(AccumulationRejectionV2::WrongService));
+    }
+    if header.service.service_abi != ABI_VERSION {
+        return Ok(rejected(AccumulationRejectionV2::WrongAbi));
+    }
+    if header.service.execution_semantics != EXECUTION_SEMANTICS_ID {
+        return Ok(rejected(AccumulationRejectionV2::WrongExecutionSemantics));
+    }
+    if header.consistency == ConsistencyModeV2::Crdt
+        || !retirement.base.mode_compatible(header.consistency)
+    {
+        return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
+    }
+    let observed_timeslot = store
+        .logical_timeslot()
+        .map_err(GuestAccumulateError::Storage)?;
+    if !observed_timeslot.is_some_and(|slot| slot >= retirement.deadline_timeslot) {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
+
+    let delivery_key = delivery_storage_key(retirement.call_id);
+    let Some(delivery_bytes) = read(store, &delivery_key)? else {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    };
+    let mut delivery = DeliveryRecordV2::decode(&delivery_bytes)
+        .map_err(|_| GuestAccumulateError::CorruptStore)?;
+    if delivery.call_id != retirement.call_id
+        || delivery.receipt.service != header.service
+        || delivery.receipt.consistency != header.consistency
+    {
+        return Err(GuestAccumulateError::CorruptStore);
+    }
+    if let Some(retired_at) = delivery.retired_at {
+        return if retired_at == retirement.deadline_timeslot {
+            Ok(AccumulationResultV2::InboxRetired {
+                call_id: retirement.call_id,
+                duplicate: true,
+            })
+        } else {
+            Ok(rejected(AccumulationRejectionV2::DivergentDuplicate))
+        };
+    }
+    if delivery.consumed {
+        return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
+    if let Some(rejection) = validate_base(store, &header, &retirement.base)? {
+        return Ok(rejected(rejection));
+    }
+    if header.revision == u64::MAX {
+        return Ok(rejected(AccumulationRejectionV2::SequenceOverflow));
+    }
+
+    let mut tree = ServiceStateTreeV2::new(store, header.service_root);
+    let Some(message) =
+        tree_get_wire::<_, MessageRecordV2>(&tree, &StateKeyV2::Inbox(retirement.call_id))?
+    else {
+        return Err(GuestAccumulateError::CorruptStore);
+    };
+    if message.call_id != retirement.call_id
+        || message.deadline_timeslot != Some(retirement.deadline_timeslot)
+        || message.authorization != delivery.authorization
+        || tree_get_wire::<_, WorkflowCheckpointV2>(
+            &tree,
+            &StateKeyV2::Workflow(super::InvocationId::for_call(retirement.call_id)),
+        )?
+        .is_some()
+    {
+        return Err(GuestAccumulateError::CorruptStore);
+    }
+    tree_apply(&mut tree, &StateKeyV2::Inbox(retirement.call_id), None)?;
+    if message.authorization != AuthorizationEvidenceV2::Public {
+        adjust_pending_authorized_inbox_count(&mut tree, message.to, false)?;
+    }
+    header.service_root = tree.root();
+    header.revision += 1;
+    header.state_root = Some(header.service_root);
+    header.admission_timeslot_high_water = header
+        .admission_timeslot_high_water
+        .max(observed_timeslot.expect("retirement timeslot was validated"));
+    delivery.retired_at = Some(retirement.deadline_timeslot);
+    write(store, &delivery_key, Some(&delivery.encode()))?;
+    write(store, header_storage_key(), Some(&header.encode()))?;
+    Ok(AccumulationResultV2::InboxRetired {
+        call_id: retirement.call_id,
+        duplicate: false,
+    })
 }
 
 #[inline(never)]
@@ -1233,6 +1344,8 @@ fn deliver<S: GuestAccumulateStoreV2>(
             call_id: envelope.message.call_id,
             logical_timeslot: envelope.logical_timeslot,
             consumed: false,
+            retired_at: None,
+            authorization: envelope.authorization.clone(),
             retry_identity,
             delivery_commitment,
             receipt: receipt.clone(),
@@ -2548,6 +2661,8 @@ fn apply_delivery_materialization<S: GuestAccumulateStoreV2>(
             call_id: *call,
             logical_timeslot: event.value.logical_timeslot,
             consumed,
+            retired_at: None,
+            authorization: event.value.authorization.clone(),
             retry_identity: event.value.retry_identity(),
             delivery_commitment: receipt.accepted_transition,
             receipt,
@@ -3537,7 +3652,7 @@ fn apply<S: GuestAccumulateStoreV2>(
         if let Some(bytes) = read(store, &key)? {
             let mut delivery =
                 DeliveryRecordV2::decode(&bytes).map_err(|_| GuestAccumulateError::CorruptStore)?;
-            if delivery.call_id != call || delivery.consumed {
+            if delivery.call_id != call || delivery.consumed || delivery.retired_at.is_some() {
                 return Err(GuestAccumulateError::CorruptStore);
             }
             delivery.consumed = true;
@@ -4268,9 +4383,9 @@ fn admitted_durable_role_authorization<S: StateTreeStore>(
         return Err(GuestAccumulateError::CorruptStore);
     }
     Ok(if work.workflow_step == 0 {
-        !record.consumed && durable_inbox_matches
+        !record.consumed && record.retired_at.is_none() && durable_inbox_matches
     } else {
-        record.consumed
+        record.consumed && record.retired_at.is_none()
     })
 }
 
@@ -8751,17 +8866,17 @@ mod tests {
         let mut incoming = message(0xA2, sender, actor(), None, Some(100));
         incoming.from_service.root_service = RootServiceId([0xA3; 32]);
         incoming.from_service.deployment = DeploymentId([0xA4; 32]);
-        let source_receipt = source_receipt(core::slice::from_ref(&incoming));
+        let first_source_receipt = source_receipt(core::slice::from_ref(&incoming));
         store.receipt_allowlist.insert(
             ReceiptVerificationRequestV2 {
                 expected_producer: sender,
-                receipt: source_receipt.clone(),
+                receipt: first_source_receipt.clone(),
             }
             .hash(),
         );
 
         let header = StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
-        let public_delivery = delivery(&header, 2, incoming.clone(), source_receipt.clone());
+        let public_delivery = delivery(&header, 2, incoming.clone(), first_source_receipt.clone());
         let before = store.clone();
         assert_eq!(
             execute_guest_accumulate(
@@ -8804,6 +8919,58 @@ mod tests {
         else {
             panic!("role-authorized delivery rejected")
         };
+
+        // Admit a second authorized call which will expire while the first
+        // call is being drained. The per-actor pin must count both decisions
+        // and release each through its own terminal path.
+        let second_sender = ActorId([0xB1; 32]);
+        let mut second_incoming = message(0xB2, second_sender, actor(), None, Some(4));
+        second_incoming.from_service.root_service = RootServiceId([0xB3; 32]);
+        second_incoming.from_service.deployment = DeploymentId([0xB4; 32]);
+        let second_source_receipt = source_receipt(core::slice::from_ref(&second_incoming));
+        store.receipt_allowlist.insert(
+            ReceiptVerificationRequestV2 {
+                expected_producer: second_sender,
+                receipt: second_source_receipt.clone(),
+            }
+            .hash(),
+        );
+        let mut second_authorization_work = linear_work(
+            initial.clone(),
+            delivery_receipt.resulting_state_root.unwrap(),
+        );
+        second_authorization_work.invocation = InvocationId::for_call(second_incoming.call_id);
+        second_authorization_work.logical_timeslot = 3;
+        second_authorization_work.arguments = second_incoming.payload.clone();
+        second_authorization_work.origin = Origin::Actor(second_sender);
+        second_authorization_work.causal_parent = Some(second_incoming.caller_invocation);
+        second_authorization_work.parent_call = Some(second_incoming.call_id);
+        second_authorization_work.causal_context =
+            Some(super::super::CausalCallContextV2::from(&second_incoming));
+        let second_credential = receipt_bound_role_credential(
+            &mut store,
+            &second_authorization_work,
+            crate::SpaceRole::Member,
+            required_policy,
+        );
+        let second_authorization = second_credential.disclosed_evidence(required_policy);
+        let second_header =
+            StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
+        let mut second_delivery = delivery(
+            &second_header,
+            3,
+            second_incoming.clone(),
+            second_source_receipt,
+        );
+        second_delivery.authorization = second_authorization;
+        assert!(matches!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Deliver(second_delivery))
+                .unwrap(),
+            AccumulationResultV2::Accepted {
+                duplicate: false,
+                ..
+            }
+        ));
 
         // The admitted credential is scoped to the current actor deployment
         // and program. Until its inbox slice consumes that decision, a
@@ -8865,14 +9032,89 @@ mod tests {
         let tree = ServiceStateTreeV2::new(&mut store, drained_header.service_root);
         assert_eq!(
             pending_authorized_inbox_count(&tree, actor()).unwrap(),
-            0,
-            "consumption must release the deployment pin"
+            1,
+            "consumption must release exactly its own deployment pin"
         );
         drop(tree);
-        let mut upgrade = upgrade_fixture(drained_header.service_root);
-        upgrade.base = ConsistencyBaseV2::Linear {
+        let mut still_busy = upgrade_fixture(drained_header.service_root);
+        still_busy.base = ConsistencyBaseV2::Linear {
             revision: drained_header.revision,
             state_root: drained_header.state_root.unwrap(),
+        };
+        store.upgrade_allowlist.insert(still_busy.hash());
+        let before_retirement = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::UpgradeActor(still_busy))
+                .unwrap(),
+            rejected(AccumulationRejectionV2::ActorBusy(actor()))
+        );
+        assert_eq!(store, before_retirement);
+
+        let retirement = InboxRetirementV2 {
+            service: drained_header.service.clone(),
+            call_id: second_incoming.call_id,
+            deadline_timeslot: 4,
+            base: ConsistencyBaseV2::Linear {
+                revision: drained_header.revision,
+                state_root: drained_header.state_root.unwrap(),
+            },
+        };
+        let before_untrusted_retirement = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::RetireInbox(retirement.clone())
+            )
+            .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidWorkflowTransition)
+        );
+        assert_eq!(store, before_untrusted_retirement);
+        store.logical_timeslot = Some(4);
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::RetireInbox(retirement.clone())
+            )
+            .unwrap(),
+            AccumulationResultV2::InboxRetired {
+                call_id: second_incoming.call_id,
+                duplicate: false,
+            }
+        );
+        let retired_header =
+            StoreHeaderV2::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
+        let tree = ServiceStateTreeV2::new(&mut store, retired_header.service_root);
+        assert_eq!(
+            tree.get(&StateKeyV2::Inbox(second_incoming.call_id))
+                .unwrap(),
+            None
+        );
+        assert_eq!(pending_authorized_inbox_count(&tree, actor()).unwrap(), 0);
+        drop(tree);
+        let retired = DeliveryRecordV2::decode(
+            store
+                .rows
+                .get(&delivery_storage_key(second_incoming.call_id))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!retired.consumed);
+        assert_eq!(retired.retired_at, Some(4));
+        let committed = store.clone();
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::RetireInbox(retirement))
+                .unwrap(),
+            AccumulationResultV2::InboxRetired {
+                call_id: second_incoming.call_id,
+                duplicate: true,
+            }
+        );
+        assert_eq!(store, committed);
+
+        let mut upgrade = upgrade_fixture(retired_header.service_root);
+        upgrade.base = ConsistencyBaseV2::Linear {
+            revision: retired_header.revision,
+            state_root: retired_header.state_root.unwrap(),
         };
         store.upgrade_allowlist.insert(upgrade.hash());
         assert!(matches!(

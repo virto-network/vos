@@ -1152,6 +1152,10 @@ impl ServicePvmV2 {
                                 duplicate: false,
                                 ..
                             }
+                            | AccumulationResultV2::InboxRetired {
+                                duplicate: false,
+                                ..
+                            }
                             | AccumulationResultV2::ActorUpgraded {
                                 duplicate: false,
                                 ..

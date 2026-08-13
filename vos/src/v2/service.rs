@@ -219,6 +219,13 @@ fn validate_receipt_verifications(
         .ok_or(DecodeError::NonCanonical)
 }
 
+fn requires_logical_timeslot(request: &AccumulateRequestV2) -> bool {
+    matches!(
+        request,
+        AccumulateRequestV2::ExpireCall(_) | AccumulateRequestV2::RetireInbox(_)
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefinedServiceOutputV2 {
     pub transition: TransitionV2,
@@ -1258,9 +1265,7 @@ where
             .map_err(|_| ReplicatedServiceErrorV2::InvalidCommittedLog)?;
             validate_receipt_verifications(&request, &entry.receipt_verifications, true)
                 .map_err(|_| ReplicatedServiceErrorV2::InvalidCommittedLog)?;
-            if matches!(request, AccumulateRequestV2::ExpireCall(_))
-                != entry.logical_timeslot.is_some()
-            {
+            if requires_logical_timeslot(&request) != entry.logical_timeslot.is_some() {
                 return Err(ReplicatedServiceErrorV2::InvalidCommittedLog);
             }
             // Proof hydration is a durable local precondition, not a guest
@@ -1522,11 +1527,11 @@ where
         validate_receipt_verifications(request, receipt_verifications, true).map_err(|_| {
             ReplicatedServiceErrorV2::Dispatch(ServiceDispatchError::InvalidAvailabilityArtifacts)
         })?;
-        let expires_call = matches!(request, AccumulateRequestV2::ExpireCall(_));
-        if expires_call && logical_timeslot.is_none() {
+        let time_dependent = requires_logical_timeslot(request);
+        if time_dependent && logical_timeslot.is_none() {
             return Err(ReplicatedServiceErrorV2::LogicalTimeslotRequired);
         }
-        if !expires_call && logical_timeslot.is_some() {
+        if !time_dependent && logical_timeslot.is_some() {
             return Err(ReplicatedServiceErrorV2::UnexpectedLogicalTimeslot);
         }
         if matches!(request, AccumulateRequestV2::PrepareAttested(_)) {

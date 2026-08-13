@@ -71,8 +71,11 @@ receipt policy. Exact retries recover that admitted credential before reading
 the actor's current package policy. Linear services also commit a per-actor
 pending-authorized-inbox count in the state tree. `UpgradeActor` returns
 `ActorBusy` until those inbox slices consume their deployment-scoped
-credentials, preventing an admitted call from being stranded between package
-versions. A stable delivery
+credentials. If a deadline arrives first, a slot-authenticated `RetireInbox`
+transition atomically removes the inbox, releases that count, and leaves the
+permanent delivery row as a terminal retry tombstone. An acknowledged but
+expired delivery therefore cannot strand the old deployment or later re-enter
+actor execution. A stable delivery
 identity excludes that changing base, so a retry after inbox execution is
 still an idempotent duplicate. Guest delivery records retain the admission
 timeslot and consumed bit; the local scheduler scans them after restart and
@@ -927,12 +930,12 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 30, continuation snapshot version 6, and platform ABI version 8
-are therefore a clean break from earlier experimental v2 images. ABI 8 adds
-destination-scoped authorization to durable delivery and its causal CRDT wire;
-schema 30 rejects delivery records and DAG rows encoded before that field
-existed instead of interpreting mutually incompatible images under one
-version. These versions also add exact actor-package
+Store schema 31, continuation snapshot version 6, and platform ABI version 9
+are therefore a clean break from earlier experimental v2 images. ABI 9 adds
+destination-scoped authorization and terminal inbox retirement to durable
+delivery. Schema 31 rejects delivery records and DAG rows encoded before the
+authorization and retirement fields existed instead of interpreting mutually
+incompatible images under one version. These versions also add exact actor-package
 identity to descriptors, work, checkpoints, transitions, upgrades, and
 cross-root proof bindings, bind durable messages and retained causal context to
 their exact source/destination services, retain the complete dormant

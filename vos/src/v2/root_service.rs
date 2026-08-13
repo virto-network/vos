@@ -1887,7 +1887,22 @@ where
             .header()
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
             .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
-        let authorization = if record.consumed {
+        let authorization = if record.retired_at.is_some() {
+            let inbox = self
+                .service
+                .accumulate_host()
+                .state_row(header.service_root, &StateKeyV2::Inbox(message.call_id))
+                .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?;
+            let workflow = self
+                .service
+                .accumulate_host()
+                .workflow_checkpoint(super::InvocationId::for_call(message.call_id))
+                .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?;
+            if record.consumed || inbox.is_some() || workflow.is_some() {
+                return Err(LocalRootTreeInvokeErrorV2::CorruptWorkflow);
+            }
+            record.authorization.clone()
+        } else if record.consumed {
             let workflow = self
                 .service
                 .accumulate_host()
@@ -1910,6 +1925,7 @@ where
                 || work.parent_call != Some(message.call_id)
                 || work.causal_context != Some(CausalCallContextV2::from(message))
                 || work.proof_requested != message.proof_requested
+                || work.authorization != record.authorization
             {
                 return Err(LocalRootTreeInvokeErrorV2::DivergentReplay);
             }
@@ -1923,6 +1939,9 @@ where
                 .and_then(|bytes| MessageRecordV2::decode(&bytes).ok())
                 .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
             let authorization = inbox.authorization.clone();
+            if authorization != record.authorization {
+                return Err(LocalRootTreeInvokeErrorV2::CorruptWorkflow);
+            }
             let mut source_message = inbox;
             source_message.authorization = AuthorizationEvidenceV2::Public;
             if source_message != *message {
@@ -2267,6 +2286,42 @@ where
             return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
         }
         self.execute_prepared_after_barrier(prepared)
+    }
+
+    /// Atomically retire one expired linear inbox and release any
+    /// deployment-scoped authorization pin. The caller has already
+    /// established the service barrier and supplies its trusted slot to the
+    /// physical Accumulate host.
+    pub(crate) fn retire_inbox_after_barrier(
+        &mut self,
+        call: super::CallId,
+        logical_timeslot: u64,
+    ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        let Some(retirement) = LocalWorkSchedulerV2::prepare_inbox_retirement(
+            self.service.accumulate_host().local_store(),
+            call,
+            logical_timeslot,
+        )
+        .map_err(LocalRootTreeInvokeErrorV2::Schedule)?
+        else {
+            return Ok(true);
+        };
+        let accumulated = self
+            .service
+            .accumulate_at_after_barrier(
+                &AccumulateRequestV2::RetireInbox(retirement),
+                logical_timeslot,
+            )
+            .map_err(RootTreeDriverErrorV2::into_invoke)?;
+        match accumulated.result {
+            AccumulationResultV2::InboxRetired { call_id, duplicate } if call_id == call => {
+                Ok(duplicate)
+            }
+            AccumulationResultV2::Rejected(rejection) => {
+                Err(LocalRootTreeInvokeErrorV2::Rejected(rejection))
+            }
+            _ => Err(LocalRootTreeInvokeErrorV2::UnexpectedResult),
+        }
     }
 
     /// Resume the exact saved machine with one finalized ordinary reply.
