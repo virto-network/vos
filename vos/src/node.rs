@@ -3616,7 +3616,35 @@ impl VosNode {
             + 'static,
     {
         self.validate_v2_root_registration(&service, id)?;
-        Ok(self.attach_v2_root_unchecked(name.into(), service, id, network_reachable))
+        Ok(self.attach_v2_root_unchecked(name.into(), service, id, network_reachable, None))
+    }
+
+    /// Attach a v2 root with an explicit proof producer. Only roots registered
+    /// through this capability may execute methods whose signed policy is
+    /// attested; ordinary registration remains fail-closed.
+    pub fn register_v2_root_at_id_with_producer<B, P>(
+        &mut self,
+        name: impl Into<String>,
+        service: crate::v2::LocalRootTreeServiceV2<B>,
+        id: ServiceId,
+        network_reachable: bool,
+        producer: P,
+    ) -> Result<ServiceId, V2NodeRegistrationError>
+    where
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+            + Send
+            + 'static,
+        P: crate::AttestationProofProducerV2 + Send + 'static,
+    {
+        self.validate_v2_root_registration(&service, id)?;
+        Ok(self.attach_v2_root_unchecked(
+            name.into(),
+            service,
+            id,
+            network_reachable,
+            Some(V2NodeAttestationProofProducer::new(producer)),
+        ))
     }
 
     fn validate_v2_root_registration<B>(
@@ -3656,6 +3684,7 @@ impl VosNode {
         service: crate::v2::LocalRootTreeServiceV2<B>,
         id: ServiceId,
         network_reachable: bool,
+        proof_producer: Option<V2NodeAttestationProofProducer>,
     ) -> ServiceId
     where
         B: crate::v2::CommittedImageStoreV2
@@ -3736,6 +3765,7 @@ impl VosNode {
                     is_role_authority,
                     #[cfg(feature = "network")]
                     shared_network,
+                    proof_producer,
                     logical_timeslot,
                     shutdown,
                     activity,
@@ -3769,6 +3799,79 @@ impl VosNode {
             + Send
             + 'static,
     {
+        self.register_v2_raft_root_at_id_inner(
+            name,
+            config,
+            backend,
+            db,
+            raft_config,
+            id,
+            network_reachable,
+            None,
+        )
+    }
+
+    /// Raft-backed counterpart of [`Self::register_v2_root_at_id_with_producer`].
+    /// The producer runs only on the current leader; the final proof-bearing
+    /// Apply and proof bytes are quorum ordered for deterministic follower
+    /// replay.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_v2_raft_root_at_id_with_producer<B, P>(
+        &mut self,
+        name: String,
+        config: crate::v2::LocalRootTreeConfigV2,
+        backend: B,
+        db: Arc<redb::Database>,
+        raft_config: crate::raft::RaftConfig,
+        id: ServiceId,
+        network_reachable: bool,
+        producer: P,
+    ) -> Result<
+        ServiceId,
+        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+    >
+    where
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+            + Send
+            + 'static,
+        P: crate::AttestationProofProducerV2 + Send + 'static,
+    {
+        self.register_v2_raft_root_at_id_inner(
+            name,
+            config,
+            backend,
+            db,
+            raft_config,
+            id,
+            network_reachable,
+            Some(V2NodeAttestationProofProducer::new(producer)),
+        )
+    }
+
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[allow(clippy::too_many_arguments)]
+    fn register_v2_raft_root_at_id_inner<B>(
+        &mut self,
+        name: String,
+        config: crate::v2::LocalRootTreeConfigV2,
+        backend: B,
+        db: Arc<redb::Database>,
+        raft_config: crate::raft::RaftConfig,
+        id: ServiceId,
+        network_reachable: bool,
+        proof_producer: Option<V2NodeAttestationProofProducer>,
+    ) -> Result<
+        ServiceId,
+        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+    >
+    where
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+            + Send
+            + 'static,
+    {
         let (service, _worker, _network, replication_id, handler) =
             self.prepare_v2_raft_root(config, backend, db, raft_config)?;
         if let Err(error) = self.validate_v2_root_registration(&service, id) {
@@ -3778,7 +3881,7 @@ impl VosNode {
             return Err(V2RaftNodeRegistrationError::Registration(error));
         }
         self.raft_hosts.lock().unwrap().insert(id.0, replication_id);
-        Ok(self.attach_v2_root_unchecked(name, service, id, network_reachable))
+        Ok(self.attach_v2_root_unchecked(name, service, id, network_reachable, proof_producer))
     }
 
     /// Start and validate a Raft replica before an optional voter-promotion
@@ -3850,7 +3953,7 @@ impl VosNode {
                         return;
                     }
                     node.raft_hosts.lock().unwrap().insert(id.0, replication_id);
-                    node.attach_v2_root_unchecked(name, service, id, network_reachable);
+                    node.attach_v2_root_unchecked(name, service, id, network_reachable, None);
                     ready_pending_ids.lock().unwrap().remove(&id.0);
                     ready_pending_actors.lock().unwrap().remove(&actor);
                 });
@@ -4745,6 +4848,41 @@ impl VosNode {
         target: crate::v2::ActorId,
         arguments: Vec<u8>,
     ) -> Result<Vec<u8>, crate::actors::client::ClientError> {
+        self.invoke_actor_wire(target, arguments, false)
+    }
+
+    /// Invoke an attested v2 actor method and return the proof package that
+    /// guest Accumulate committed beside the exact reply. Roots registered
+    /// without an explicit producer reject this capability.
+    pub fn invoke_actor_attested(
+        &self,
+        target: crate::v2::ActorId,
+        arguments: Vec<u8>,
+    ) -> Result<crate::actors::client::AttestedInvocationResult, crate::actors::client::ClientError>
+    {
+        use crate::{Decode, v2::V2Wire};
+
+        let wire = self.invoke_actor_wire(target, arguments, true)?;
+        let result = crate::v2::RootTreeAttestedResultV2::decode(&wire)
+            .map_err(|_| crate::actors::client::ClientError::Decode)?;
+        let value = <crate::value::Value as Decode>::try_decode(&result.reply)
+            .ok_or(crate::actors::client::ClientError::Decode)?;
+        Ok(crate::actors::client::AttestedInvocationResult {
+            value,
+            producer_name: result.attestation.producer_name,
+            producer: result.attestation.producer,
+            statement: result.attestation.statement,
+            trace: result.attestation.proof.trace,
+            proof: result.proof,
+        })
+    }
+
+    fn invoke_actor_wire(
+        &self,
+        target: crate::v2::ActorId,
+        arguments: Vec<u8>,
+        proof_requested: bool,
+    ) -> Result<Vec<u8>, crate::actors::client::ClientError> {
         use crate::Decode;
 
         if arguments.first() != Some(&crate::value::TAG_DYNAMIC) {
@@ -4780,7 +4918,7 @@ impl VosNode {
             target,
             method: message.name,
             arguments,
-            proof_requested: false,
+            proof_requested,
         };
         let (reply_tx, reply_rx) = mpsc::channel();
         let ingress_wire = crate::v2::V2Wire::encode(&ingress);
@@ -5622,6 +5760,51 @@ struct V2CrdtRosterPage {
     next: Option<(u8, Vec<u8>)>,
 }
 
+/// Type-erased, root-thread-owned proof producer. Keeping the capability out
+/// of [`VosNode`] shared state prevents concurrent proof production and makes
+/// the registration boundary explicit: a root without this value cannot
+/// execute an attested policy.
+trait V2NodeAttestationProofProducerDyn: Send {
+    fn prove(
+        &mut self,
+        request: &crate::AttestationProofRequestV2<'_>,
+    ) -> Result<crate::ProducedAttestationProofV2, ()>;
+}
+
+impl<P> V2NodeAttestationProofProducerDyn for P
+where
+    P: crate::AttestationProofProducerV2 + Send,
+{
+    fn prove(
+        &mut self,
+        request: &crate::AttestationProofRequestV2<'_>,
+    ) -> Result<crate::ProducedAttestationProofV2, ()> {
+        crate::AttestationProofProducerV2::prove(self, request).map_err(|_| ())
+    }
+}
+
+struct V2NodeAttestationProofProducer(Box<dyn V2NodeAttestationProofProducerDyn>);
+
+impl V2NodeAttestationProofProducer {
+    fn new<P>(producer: P) -> Self
+    where
+        P: crate::AttestationProofProducerV2 + Send + 'static,
+    {
+        Self(Box::new(producer))
+    }
+}
+
+impl crate::AttestationProofProducerV2 for V2NodeAttestationProofProducer {
+    type Error = ();
+
+    fn prove(
+        &mut self,
+        request: &crate::AttestationProofRequestV2<'_>,
+    ) -> Result<crate::ProducedAttestationProofV2, Self::Error> {
+        self.0.prove(request)
+    }
+}
+
 struct V2PendingCaller {
     reply: ReplyChannel,
     /// Platform protocols may expose a stronger host result than the actor's
@@ -5629,6 +5812,7 @@ struct V2PendingCaller {
     /// receipt-bound assertion while its receipt continues to commit the
     /// actor-produced claim bytes exactly.
     override_result: Option<Result<Vec<u8>, u8>>,
+    attested: bool,
 }
 
 #[derive(Default)]
@@ -6721,6 +6905,7 @@ fn v2_root_service_thread<B>(
     invoke_routes: InvokeRoutes,
     is_role_authority: bool,
     #[cfg(feature = "network")] shared_network: SharedNetwork,
+    mut proof_producer: Option<V2NodeAttestationProofProducer>,
     logical_timeslot: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
@@ -6759,6 +6944,7 @@ where
                 &invoke_routes,
                 #[cfg(feature = "network")]
                 &shared_network,
+                &mut proof_producer,
                 &logical_timeslot,
                 &mut state,
             );
@@ -6773,6 +6959,7 @@ where
                 &invoke_routes,
                 #[cfg(feature = "network")]
                 &shared_network,
+                &mut proof_producer,
                 &logical_timeslot,
                 &mut state,
             );
@@ -6842,7 +7029,10 @@ where
                 continue;
             }
         };
-        if ingress.proof_requested {
+        if ingress.proof_requested
+            && (service.consistency() == crate::v2::ConsistencyModeV2::Crdt
+                || proof_producer.is_none())
+        {
             send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
             continue;
         }
@@ -6864,7 +7054,7 @@ where
             awaited_reply: None,
             awaited_timeout: None,
             imported_blobs: Vec::new(),
-            proof_requested: false,
+            proof_requested: ingress.proof_requested,
         };
         let mut receipt_verifications = Vec::new();
         let recovered_authorization = match service.recover_direct_authorization(&request) {
@@ -6975,7 +7165,7 @@ where
             // the guest work envelope. CRDT ingress carries that exact scoped
             // assertion in its causal admission node, whose finalized receipt
             // is independently verified by every syncing replica.
-            if policy.attested {
+            if policy.attested != ingress.proof_requested {
                 send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
                 continue;
             }
@@ -7038,20 +7228,46 @@ where
                 }
             };
         request.logical_timeslot = final_slot;
-        let result =
-            service.invoke_after_admission_barrier_with_receipts(request, &receipt_verifications);
-        let committed = match result {
-            Ok(committed) => committed,
-            Err(crate::v2::LocalRootTreeInvokeErrorV2::Rejected(
-                crate::v2::AccumulationRejectionV2::Unauthorized,
-            )) => {
-                send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
-                continue;
+        let committed = if request.proof_requested {
+            let producer = proof_producer
+                .as_mut()
+                .expect("attested ingress was gated on an installed producer");
+            match service.invoke_attested_after_admission_barrier_with_receipts(
+                request,
+                &receipt_verifications,
+                producer,
+            ) {
+                Ok(committed) => committed,
+                Err(crate::v2::AttestedRootTreeInvokeErrorV2::Root(
+                    crate::v2::LocalRootTreeInvokeErrorV2::Rejected(
+                        crate::v2::AccumulationRejectionV2::Unauthorized,
+                    ),
+                )) => {
+                    send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                    continue;
+                }
+                Err(failure) => {
+                    error!(%id, ?failure, "v2 attested root invocation failed");
+                    send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                    continue;
+                }
             }
-            Err(failure) => {
-                error!(%id, ?failure, "v2 root invocation failed");
-                send_v2_status(req.reply, crate::STATUS_PANICKED, id);
-                continue;
+        } else {
+            match service
+                .invoke_after_admission_barrier_with_receipts(request, &receipt_verifications)
+            {
+                Ok(committed) => committed,
+                Err(crate::v2::LocalRootTreeInvokeErrorV2::Rejected(
+                    crate::v2::AccumulationRejectionV2::Unauthorized,
+                )) => {
+                    send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                    continue;
+                }
+                Err(failure) => {
+                    error!(%id, ?failure, "v2 root invocation failed");
+                    send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                    continue;
+                }
             }
         };
         let override_result = role_authority_reply_override(
@@ -7067,6 +7283,7 @@ where
             Some(V2PendingCaller {
                 reply: req.reply,
                 override_result,
+                attested: ingress.proof_requested,
             }),
             &outbox,
             &actor_routes,
@@ -7093,6 +7310,7 @@ fn handle_v2_root_transport<B>(
     actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
     invoke_routes: &InvokeRoutes,
     #[cfg(feature = "network")] shared_network: &SharedNetwork,
+    proof_producer: &mut Option<V2NodeAttestationProofProducer>,
     logical_timeslot: &AtomicU64,
     state: &mut V2RootThreadState,
 ) where
@@ -7228,8 +7446,13 @@ fn handle_v2_root_transport<B>(
             );
             if message.to != service.root_actor()
                 || message.to_service != *service.identity()
-                || message.proof_requested
                 || message.authorization != crate::v2::AuthorizationEvidenceV2::Public
+                || (message.proof_requested && proof_producer.is_none())
+                || (message.proof_requested
+                    && (service.consistency() == crate::v2::ConsistencyModeV2::Crdt
+                        || source.as_ref().is_some_and(|source| {
+                            source.consistency == crate::v2::ConsistencyModeV2::Crdt
+                        })))
                 || source.as_ref().is_none_or(|source| {
                     source.service != publication.receipt.service
                         || source.service != message.from_service
@@ -7326,8 +7549,8 @@ fn handle_v2_root_transport<B>(
                         return;
                     }
                 };
-                if policy.attested {
-                    warn!(%id, call = ?message.call_id, "attested durable transport remains fail-closed");
+                if policy.attested != message.proof_requested {
+                    warn!(%id, call = ?message.call_id, "delivery proof mode disagrees with signed method policy");
                     return;
                 }
                 if policy.public {
@@ -7430,6 +7653,7 @@ fn handle_v2_root_transport<B>(
                         call,
                         outbox,
                         actor_routes,
+                        proof_producer,
                         logical_timeslot,
                         state,
                     );
@@ -7444,6 +7668,7 @@ fn handle_v2_root_transport<B>(
             caller_service,
             caller_invocation,
             publication,
+            proof,
         } => {
             let Some(reply) = publication.published.reply.clone() else {
                 return;
@@ -7459,6 +7684,11 @@ fn handle_v2_root_transport<B>(
             );
             if caller != service.root_actor()
                 || caller_service != *service.identity()
+                || (publication.published.attestation.is_some()
+                    && (service.consistency() == crate::v2::ConsistencyModeV2::Crdt
+                        || producer.as_ref().is_some_and(|producer| {
+                            producer.consistency == crate::v2::ConsistencyModeV2::Crdt
+                        })))
                 || producer.as_ref().is_none_or(|producer| {
                     producer.service != publication.receipt.service
                         || producer.consistency != publication.receipt.consistency
@@ -7483,7 +7713,7 @@ fn handle_v2_root_transport<B>(
             let accumulated = crate::v2::AccumulatedReplyV2 {
                 reply: reply.clone(),
                 receipt: publication.receipt.clone(),
-                attestation: None,
+                attestation: publication.published.attestation.clone(),
             };
             // Authenticate this exact physical receipt from the bound source
             // route before consulting logical reply admission. A convergent
@@ -7505,6 +7735,7 @@ fn handle_v2_root_transport<B>(
                     caller_invocation,
                     slot,
                     accumulated,
+                    proof,
                     receipt_verification,
                 ) {
                     Ok(committed) => Some(committed),
@@ -7588,10 +7819,15 @@ fn publish_v2_root_slice<B>(
     B: crate::v2::CommittedImageStoreV2
         + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
 {
-    if committed.published.proof.is_some() || committed.published.attestation.is_some() {
-        if let Some(caller) = caller {
-            send_v2_status(caller.reply, crate::STATUS_FORBIDDEN, id);
-        }
+    if caller
+        .as_ref()
+        .is_some_and(|caller| caller.attested != committed.published.attestation.is_some())
+    {
+        send_v2_status(
+            caller.expect("checked above").reply,
+            crate::STATUS_PANICKED,
+            id,
+        );
         return;
     }
     if let Some(caller) = caller {
@@ -7620,6 +7856,18 @@ fn publish_v2_root_slice<B>(
                         );
                     }
                     Some(Err(status)) => send_v2_status(caller.reply, status, id),
+                    None if caller.attested => {
+                        match encode_v2_attested_result(service, &committed.published) {
+                            Some(result) => {
+                                let _ = send_reply_capped(
+                                    caller.reply,
+                                    encode_invoke_envelope(crate::STATUS_DONE, &[], &result),
+                                    id,
+                                );
+                            }
+                            None => send_v2_status(caller.reply, crate::STATUS_PANICKED, id),
+                        }
+                    }
                     None => match recovered_reply {
                         Some(result) => {
                             let _ = send_reply_capped(
@@ -7651,9 +7899,6 @@ fn queue_v2_root_publication<B>(
 {
     use crate::v2::V2Wire;
 
-    if publication.published.proof.is_some() || publication.published.attestation.is_some() {
-        return;
-    }
     if publication.receipt.service != *service.identity() {
         warn!(%id, "ignored a publication owned by another v2 root");
         return;
@@ -7733,6 +7978,14 @@ fn queue_v2_root_publication<B>(
             let envelope = match caller.override_result {
                 Some(Ok(result)) => encode_invoke_envelope(crate::STATUS_DONE, &[], &result),
                 Some(Err(status)) => encode_invoke_envelope(status, &[], &[]),
+                None if caller.attested => {
+                    let Some(result) = encode_v2_attested_result(service, &publication.published)
+                    else {
+                        send_v2_status(caller.reply, crate::STATUS_PANICKED, id);
+                        continue;
+                    };
+                    encode_invoke_envelope(crate::STATUS_DONE, &[], &result)
+                }
                 None => encode_invoke_envelope(crate::STATUS_DONE, &[], &reply.result),
             };
             accepted |= send_reply_capped(caller.reply, envelope, id);
@@ -7756,7 +8009,19 @@ fn queue_v2_root_publication<B>(
                         caller_service,
                         caller_invocation,
                         publication: publication.clone(),
+                        proof: publication.published.attestation.as_deref().and_then(
+                            |attestation| service.attestation_proof(&attestation.proof.proof_blob),
+                        ),
                     };
+                    if publication.published.attestation.is_some()
+                        && matches!(
+                            &transport,
+                            crate::v2::RootTreeTransportV2::Reply { proof: None, .. }
+                        )
+                    {
+                        warn!(%id, "retained attested reply whose proof artifact is unavailable");
+                        return;
+                    }
                     let _ = outbox.send(Envelope {
                         from: id,
                         to: ServiceId(route.route),
@@ -7780,6 +8045,31 @@ fn queue_v2_root_publication<B>(
             .reply_accepted = true;
         maybe_ack_v2_root_publication(id, service, publication, state);
     }
+}
+
+fn encode_v2_attested_result<B>(
+    service: &crate::v2::LocalRootTreeServiceV2<B>,
+    published: &crate::v2::PublishedEffectsV2,
+) -> Option<Vec<u8>>
+where
+    B: crate::v2::CommittedImageStoreV2
+        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+{
+    use crate::v2::V2Wire;
+
+    let reply = published.reply.as_ref()?;
+    let attestation = published.attestation.as_deref()?.clone();
+    if published.proof.as_ref() != Some(&attestation.proof) {
+        return None;
+    }
+    let proof = service.attestation_proof(&attestation.proof.proof_blob)?;
+    let result = crate::v2::RootTreeAttestedResultV2 {
+        reply: reply.result.clone(),
+        attestation,
+        proof: proof.bytes,
+    };
+    result.validate().ok()?;
+    Some(result.encode())
 }
 
 fn maybe_ack_v2_root_publication<B>(
@@ -7937,6 +8227,7 @@ fn run_v2_root_inbox<B>(
     call: crate::v2::CallId,
     outbox: &mpsc::Sender<Envelope>,
     actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
+    proof_producer: &mut Option<V2NodeAttestationProofProducer>,
     logical_timeslot: &AtomicU64,
     state: &mut V2RootThreadState,
 ) where
@@ -7950,7 +8241,23 @@ fn run_v2_root_inbox<B>(
             return;
         }
     };
-    match service.invoke_inbox_after_barrier(call, slot) {
+    let result = match service.invoke_inbox_after_barrier(call, slot) {
+        Err(crate::v2::LocalRootTreeInvokeErrorV2::ProofProducerRequired) => {
+            let Some(producer) = proof_producer.as_mut() else {
+                return;
+            };
+            match service.invoke_attested_inbox_after_barrier(call, slot, producer) {
+                Ok(committed) => Ok(committed),
+                Err(crate::v2::AttestedRootTreeInvokeErrorV2::Root(error)) => Err(error),
+                Err(failure) => {
+                    warn!(%id, ?call, ?failure, "v2 attested inbox execution failed");
+                    return;
+                }
+            }
+        }
+        result => result,
+    };
+    match result {
         Ok(committed) => {
             publish_v2_root_slice(id, service, committed, None, outbox, actor_routes, state)
         }
@@ -8169,6 +8476,7 @@ fn retry_v2_root_transport<B>(
     actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
     invoke_routes: &InvokeRoutes,
     #[cfg(feature = "network")] shared_network: &SharedNetwork,
+    proof_producer: &mut Option<V2NodeAttestationProofProducer>,
     logical_timeslot: &AtomicU64,
     state: &mut V2RootThreadState,
 ) where
@@ -8265,6 +8573,7 @@ fn retry_v2_root_transport<B>(
                 call,
                 outbox,
                 actor_routes,
+                proof_producer,
                 logical_timeslot,
                 state,
             );
@@ -8272,7 +8581,22 @@ fn retry_v2_root_transport<B>(
     }
     if let Ok(pending) = service.pending_ingresses() {
         for ingress in pending {
-            match service.invoke_admitted(ingress.invocation) {
+            let result = if ingress.proof_requested {
+                let Some(producer) = proof_producer.as_mut() else {
+                    continue;
+                };
+                match service.invoke_admitted_attested(ingress.invocation, producer) {
+                    Ok(committed) => Ok(committed),
+                    Err(crate::v2::AttestedRootTreeInvokeErrorV2::Root(error)) => Err(error),
+                    Err(failure) => {
+                        warn!(%id, ?failure, "v2 queued attested ingress retry failed");
+                        continue;
+                    }
+                }
+            } else {
+                service.invoke_admitted(ingress.invocation)
+            };
+            match result {
                 Ok(committed) => {
                     publish_v2_root_slice(id, service, committed, None, outbox, actor_routes, state)
                 }
