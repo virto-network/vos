@@ -950,7 +950,7 @@ where
     /// actor imports, and guest-derived statement. Apply is not invoked until
     /// a non-empty proof is available; the returned package is constructed
     /// only from a successful non-duplicate guest commit.
-    pub fn accumulate_attested<P: AttestationProofProducerV2>(
+    pub fn accumulate_attested<P: AttestationProofProducerV2 + ?Sized>(
         &mut self,
         envelope: AccumulationEnvelopeV2,
         imports: &RefineImportsV2,
@@ -986,7 +986,7 @@ where
         finish_committed_attestation(proved, prepared.gas_used, committed)
     }
 
-    fn prove_prepared_attestation<P: AttestationProofProducerV2>(
+    fn prove_prepared_attestation<P: AttestationProofProducerV2 + ?Sized>(
         &mut self,
         mut envelope: AccumulationEnvelopeV2,
         imports: &RefineImportsV2,
@@ -1068,7 +1068,7 @@ where
         })
     }
 
-    fn recover_prepared_attestation<E, P: AttestationProofProducerV2>(
+    fn recover_prepared_attestation<E, P: AttestationProofProducerV2 + ?Sized>(
         &mut self,
         envelope: AccumulationEnvelopeV2,
         imports: &RefineImportsV2,
@@ -1576,7 +1576,7 @@ where
     /// proved Apply bytes enter Raft; read-only preparation never consumes a
     /// log position. Followers make the same proof artifact available before
     /// executing the committed request through physical IC-5.
-    pub fn accumulate_attested<P: AttestationProofProducerV2>(
+    pub fn accumulate_attested<P: AttestationProofProducerV2 + ?Sized>(
         &mut self,
         envelope: AccumulationEnvelopeV2,
         imports: &RefineImportsV2,
@@ -1610,6 +1610,59 @@ where
             .map_err(map_attestation_build_error)?;
         let committed = self
             .accumulate(&AccumulateRequestV2::Apply(proved.envelope.clone()))
+            .map_err(AttestedServiceErrorV2::Service)?;
+        finish_committed_attestation(proved, prepared.gas_used, committed)
+    }
+
+    /// Prepare and prove against a caller-established leadership barrier,
+    /// then quorum-order the final proved Apply without another intervening
+    /// catch-up. This is the attested counterpart of the other
+    /// `*_after_barrier` entry points used by the root driver after allocating
+    /// consensus-significant admission time.
+    #[cfg(feature = "storage")]
+    pub(crate) fn accumulate_attested_after_barrier<P: AttestationProofProducerV2 + ?Sized>(
+        &mut self,
+        envelope: AccumulationEnvelopeV2,
+        imports: &RefineImportsV2,
+        producer: &mut P,
+    ) -> Result<
+        CommittedAttestationOutputV2,
+        AttestedServiceErrorV2<ReplicatedServiceErrorV2<L::Error>, P::Error>,
+    > {
+        let prepared = self
+            .service
+            .accumulate(&AccumulateRequestV2::PrepareAttested(envelope.clone()))
+            .map_err(|error| {
+                AttestedServiceErrorV2::Service(ReplicatedServiceErrorV2::Dispatch(error))
+            })?;
+        let preparation = match prepared.result {
+            AccumulationResultV2::Prepared(preparation) => preparation,
+            AccumulationResultV2::Rejected(rejection) => {
+                return Err(AttestedServiceErrorV2::Rejected(rejection));
+            }
+            _ => return Err(AttestedServiceErrorV2::InvalidPreparation),
+        };
+        if preparation.committed_proof.is_some() {
+            return self.service.recover_prepared_attestation(
+                envelope,
+                imports,
+                preparation,
+                producer,
+                prepared.gas_used,
+            );
+        }
+        let proved = self
+            .service
+            .prove_prepared_attestation(envelope, imports, preparation, producer)
+            .map_err(map_attestation_build_error)?;
+        let committed = self
+            .accumulate_ordered_after_barrier(
+                &AccumulateRequestV2::Apply(proved.envelope.clone()),
+                None,
+                &[],
+                &[],
+                &[],
+            )
             .map_err(AttestedServiceErrorV2::Service)?;
         finish_committed_attestation(proved, prepared.gas_used, committed)
     }

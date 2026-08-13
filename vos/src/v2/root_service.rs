@@ -10,13 +10,15 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::attestation::{AttestationProofHostV2, AttestationProofProducerV2};
+
 use super::contracts::{decode_service, encode_service};
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateRequestV2, AccumulatedRoleAssertionV2, AccumulatedServiceOutputV2,
     AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2,
-    ActorDirectoryV2, ActorGenesisV2, ActorId, AuthorizationEvidenceV2, BlobRefV2,
-    CausalCallContextV2, CommittedImageStoreV2, ConsistencyBaseV2, ConsistencyModeV2,
+    ActorDirectoryV2, ActorGenesisV2, ActorId, AttestedServiceErrorV2, AuthorizationEvidenceV2,
+    BlobRefV2, CausalCallContextV2, CommittedImageStoreV2, ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationSnapshotV2, CrdtChangeV2, CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryRecordV2,
     DirectIngressV2, DurableJamStoreV2, DurableStoreOpenErrorV2, ExternalActorBindingV2,
     ExternalActorDirectoryV2, ImportedBlobV2, ImportedProgramV2, JamServiceV2, LocalJamStoreHostV2,
@@ -483,6 +485,34 @@ impl core::fmt::Display for LocalRootTreeInvokeErrorV2 {
 
 impl core::error::Error for LocalRootTreeInvokeErrorV2 {}
 
+/// Failure while preparing, producing, or committing an attested root slice.
+/// Host/service failures remain distinguishable from proof-producer failures
+/// so orchestration can retry unavailable infrastructure without treating a
+/// malformed proof as transient.
+#[derive(Debug)]
+pub enum AttestedRootTreeInvokeErrorV2<P> {
+    Root(LocalRootTreeInvokeErrorV2),
+    Producer(P),
+    InvalidPreparation,
+    InvalidProducedProof,
+    ProofUnavailable,
+    CommitMismatch,
+}
+
+impl<P> From<LocalRootTreeInvokeErrorV2> for AttestedRootTreeInvokeErrorV2<P> {
+    fn from(error: LocalRootTreeInvokeErrorV2) -> Self {
+        Self::Root(error)
+    }
+}
+
+impl<P: core::fmt::Debug> core::fmt::Display for AttestedRootTreeInvokeErrorV2<P> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "cannot invoke attested VOS v2 root tree: {self:?}")
+    }
+}
+
+impl<P: core::fmt::Debug> core::error::Error for AttestedRootTreeInvokeErrorV2<P> {}
+
 /// Result made visible only after physical Accumulate committed the durable
 /// service image. Non-empty effects remain in a recoverable publication row
 /// until the consumer acknowledges its exact commitment through IC-5.
@@ -598,6 +628,27 @@ impl RootTreeDriverErrorV2 {
             #[cfg(feature = "storage")]
             Self::Raft(error) => LocalRootTreeInvokeErrorV2::Replication(error),
         }
+    }
+}
+
+fn map_attested_root_error<E, P>(
+    error: AttestedServiceErrorV2<E, P>,
+    service: impl FnOnce(E) -> LocalRootTreeInvokeErrorV2,
+) -> AttestedRootTreeInvokeErrorV2<P> {
+    match error {
+        AttestedServiceErrorV2::Service(error) => service(error).into(),
+        AttestedServiceErrorV2::Rejected(rejection) => {
+            LocalRootTreeInvokeErrorV2::Rejected(rejection).into()
+        }
+        AttestedServiceErrorV2::InvalidPreparation => {
+            AttestedRootTreeInvokeErrorV2::InvalidPreparation
+        }
+        AttestedServiceErrorV2::Producer(error) => AttestedRootTreeInvokeErrorV2::Producer(error),
+        AttestedServiceErrorV2::InvalidProducedProof => {
+            AttestedRootTreeInvokeErrorV2::InvalidProducedProof
+        }
+        AttestedServiceErrorV2::ProofUnavailable => AttestedRootTreeInvokeErrorV2::ProofUnavailable,
+        AttestedServiceErrorV2::CommitMismatch => AttestedRootTreeInvokeErrorV2::CommitMismatch,
     }
 }
 
@@ -759,6 +810,27 @@ where
             Self::Raft(service) => service
                 .accumulate_with_receipt_verifications_after_barrier(request, receipt_verifications)
                 .map_err(RootTreeDriverErrorV2::Raft),
+        }
+    }
+
+    fn accumulate_attested_after_barrier<P: AttestationProofProducerV2 + ?Sized>(
+        &mut self,
+        envelope: AccumulationEnvelopeV2,
+        imports: &super::RefineImportsV2,
+        producer: &mut P,
+    ) -> Result<super::CommittedAttestationOutputV2, AttestedRootTreeInvokeErrorV2<P::Error>> {
+        match self {
+            Self::Direct(service) => service
+                .accumulate_attested(envelope, imports, producer)
+                .map_err(|error| {
+                    map_attested_root_error(error, LocalRootTreeInvokeErrorV2::Service)
+                }),
+            #[cfg(feature = "storage")]
+            Self::Raft(service) => service
+                .accumulate_attested_after_barrier(envelope, imports, producer)
+                .map_err(|error| {
+                    map_attested_root_error(error, LocalRootTreeInvokeErrorV2::Replication)
+                }),
         }
     }
 
@@ -2050,6 +2122,22 @@ where
         self.invoke_after_admission_barrier(request)
     }
 
+    /// Admit, prove, and commit one attested direct invocation. Proof
+    /// production is read-only; only the final proof-bearing Apply crosses the
+    /// durable or replicated commit boundary. An exact retry reattaches the
+    /// guest-owned publication without invoking the actor or producer again.
+    pub fn invoke_attested<P: AttestationProofProducerV2 + ?Sized>(
+        &mut self,
+        request: LocalWorkRequestV2,
+        producer: &mut P,
+    ) -> Result<CommittedRootTreeSliceV2, AttestedRootTreeInvokeErrorV2<P::Error>> {
+        if !request.proof_requested {
+            return Err(AttestedRootTreeInvokeErrorV2::InvalidPreparation);
+        }
+        self.prepare_admission_barrier()?;
+        self.invoke_attested_after_admission_barrier_with_receipts(request, &[], producer)
+    }
+
     /// Admit and execute ingress after [`Self::prepare_admission_barrier`]
     /// returned and the caller allocated a slot above its high-water.
     pub(crate) fn invoke_after_admission_barrier(
@@ -2079,14 +2167,34 @@ where
         self.invoke_admitted_after_barrier(invocation)
     }
 
+    /// Admit, prove, and commit one attested direct invocation after the
+    /// caller established the service barrier. The read-only preparation and
+    /// proof production happen only after guest-owned ingress admission; Raft
+    /// orders the final proved Apply and its proof artifact.
+    pub(crate) fn invoke_attested_after_admission_barrier_with_receipts<
+        P: AttestationProofProducerV2 + ?Sized,
+    >(
+        &mut self,
+        request: LocalWorkRequestV2,
+        receipt_verifications: &[super::ReceiptVerificationRequestV2],
+        producer: &mut P,
+    ) -> Result<CommittedRootTreeSliceV2, AttestedRootTreeInvokeErrorV2<P::Error>> {
+        if !request.proof_requested {
+            return Err(AttestedRootTreeInvokeErrorV2::InvalidPreparation);
+        }
+        if let Some(committed) = self.recover_committed_invocation(&request)? {
+            return Ok(committed);
+        }
+        let invocation = request.invocation;
+        self.admit_ingress_after_barrier_with_receipts(&request, receipt_verifications)?;
+        self.invoke_admitted_attested_after_barrier(invocation, producer)
+    }
+
     /// Persist one direct invocation through guest Accumulate before Refine.
     pub fn admit_ingress(
         &mut self,
         request: &LocalWorkRequestV2,
     ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
-        if request.proof_requested {
-            return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
-        }
         self.prepare_admission_barrier()?;
         self.admit_ingress_after_barrier(request)
     }
@@ -2103,9 +2211,6 @@ where
         request: &LocalWorkRequestV2,
         receipt_verifications: &[super::ReceiptVerificationRequestV2],
     ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
-        if request.proof_requested {
-            return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
-        }
         if self.consistency() == ConsistencyModeV2::Crdt
             && let AuthorizationEvidenceV2::Credential { bytes, .. } = &request.authorization
         {
@@ -2164,6 +2269,44 @@ where
         }
         let request = request_from_direct_ingress(record.ingress)?;
         self.execute_admitted_after_barrier(request)
+    }
+
+    pub(crate) fn invoke_admitted_attested_after_barrier<P: AttestationProofProducerV2 + ?Sized>(
+        &mut self,
+        invocation: super::InvocationId,
+        producer: &mut P,
+    ) -> Result<CommittedRootTreeSliceV2, AttestedRootTreeInvokeErrorV2<P::Error>> {
+        let record = self
+            .service
+            .accumulate_host()
+            .ingress_record(invocation)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        if record.consumed {
+            return Err(LocalRootTreeInvokeErrorV2::DivergentInvocation.into());
+        }
+        let request = request_from_direct_ingress(record.ingress)?;
+        if !request.proof_requested {
+            return Err(AttestedRootTreeInvokeErrorV2::InvalidPreparation);
+        }
+        if let Some(committed) = self.recover_committed_invocation(&request)? {
+            return Ok(committed);
+        }
+        let prepared = LocalWorkSchedulerV2::prepare(self.service.accumulate_host(), request)
+            .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        self.execute_prepared_attested_after_barrier(prepared, producer)
+    }
+
+    /// Prove and execute one previously admitted attested invocation. This is
+    /// the restart/retry counterpart of [`Self::invoke_attested`]; admission
+    /// remains guest-owned even when no producer was available initially.
+    pub fn invoke_admitted_attested<P: AttestationProofProducerV2 + ?Sized>(
+        &mut self,
+        invocation: super::InvocationId,
+        producer: &mut P,
+    ) -> Result<CommittedRootTreeSliceV2, AttestedRootTreeInvokeErrorV2<P::Error>> {
+        self.prepare_admission_barrier()?;
+        self.invoke_admitted_attested_after_barrier(invocation, producer)
     }
 
     fn execute_admitted_after_barrier(
@@ -2286,6 +2429,40 @@ where
             return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
         }
         self.execute_prepared_after_barrier(prepared)
+    }
+
+    /// Prove and execute one already-admitted attested inbox slice. Delivery
+    /// authorization and the source receipt were committed before this step;
+    /// this method adds the canonical Refine proof before the final Apply.
+    pub(crate) fn invoke_attested_inbox_after_barrier<P: AttestationProofProducerV2 + ?Sized>(
+        &mut self,
+        call: super::CallId,
+        logical_timeslot: u64,
+        producer: &mut P,
+    ) -> Result<CommittedRootTreeSliceV2, AttestedRootTreeInvokeErrorV2<P::Error>> {
+        let prepared = LocalWorkSchedulerV2::prepare_inbox(
+            self.service.accumulate_host().local_store(),
+            call,
+            logical_timeslot,
+        )
+        .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        if !prepared.work.proof_requested {
+            return Err(AttestedRootTreeInvokeErrorV2::InvalidPreparation);
+        }
+        self.execute_prepared_attested_after_barrier(prepared, producer)
+    }
+
+    /// Prove and execute one guest-owned durable inbox row. A failed proof or
+    /// durable commit leaves the inbox queued, so restart recovery can call
+    /// this method again with the same call and trusted admission slot.
+    pub fn invoke_attested_inbox<P: AttestationProofProducerV2 + ?Sized>(
+        &mut self,
+        call: super::CallId,
+        logical_timeslot: u64,
+        producer: &mut P,
+    ) -> Result<CommittedRootTreeSliceV2, AttestedRootTreeInvokeErrorV2<P::Error>> {
+        self.prepare_admission_barrier()?;
+        self.invoke_attested_inbox_after_barrier(call, logical_timeslot, producer)
     }
 
     /// Atomically retire one expired linear inbox and release any
@@ -2490,6 +2667,60 @@ where
         })
     }
 
+    fn execute_prepared_attested_after_barrier<P: AttestationProofProducerV2 + ?Sized>(
+        &mut self,
+        prepared: PreparedWorkV2,
+        producer: &mut P,
+    ) -> Result<CommittedRootTreeSliceV2, AttestedRootTreeInvokeErrorV2<P::Error>> {
+        if !prepared.work.proof_requested {
+            return Err(AttestedRootTreeInvokeErrorV2::InvalidPreparation);
+        }
+        let refined = self
+            .service
+            .refine_actor_tree_after_barrier(&prepared.work, &prepared.imports)
+            .map_err(RootTreeDriverErrorV2::into_invoke)?;
+        let input = prepared.work.input_id();
+        let committed = self.service.accumulate_attested_after_barrier(
+            AccumulationEnvelopeV2 {
+                work: prepared.work,
+                transition: refined.transition,
+                provided_blobs: refined.exported_blobs,
+            },
+            &prepared.imports,
+            producer,
+        )?;
+        let publication = self
+            .service
+            .accumulate_host()
+            .pending_publications()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .into_iter()
+            .find(|publication| publication.input == input)
+            .ok_or(LocalRootTreeInvokeErrorV2::MissingPublication)?;
+        if publication.receipt != committed.preparation.receipt
+            || publication.published != committed.published
+            || publication.published.proof.as_ref() != Some(&committed.proof)
+            || !committed.proof.proof_blob.matches(&committed.proof_bytes)
+        {
+            return Err(AttestedRootTreeInvokeErrorV2::CommitMismatch);
+        }
+        Ok(CommittedRootTreeSliceV2 {
+            input,
+            receipt: committed.preparation.receipt,
+            published: committed.published,
+            publication: Some(publication),
+            role_assertion_eligibility: self
+                .service
+                .accumulate_host()
+                .local_store()
+                .role_assertion_eligibility(input)
+                .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?,
+            duplicate: false,
+            refine_gas_used: refined.gas_used,
+            accumulate_gas_used: committed.accumulate_gas_used,
+        })
+    }
+
     /// Commit only the current canonical head set. The node uses this cheap
     /// identifier to avoid rebuilding the complete O(history) sync envelope
     /// on every transport poll.
@@ -2649,6 +2880,19 @@ where
             .accumulate_host()
             .pending_publications()
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)
+    }
+
+    /// Load one content-addressed proof from the durable producer side-CAS.
+    /// Proof bytes never enter the recoverable service image, but pending
+    /// attested publications keep their reference snapshot-reachable and the
+    /// durable/Raft backends preserve the artifact across restart.
+    pub fn attestation_proof(&self, reference: &BlobRefV2) -> Option<ImportedBlobV2> {
+        AttestationProofHostV2::proof_bytes(self.service.accumulate_host(), reference).map(
+            |bytes| ImportedBlobV2 {
+                reference: reference.clone(),
+                bytes,
+            },
+        )
     }
 
     /// Finalized cross-root calls still waiting in the guest-owned inbox.
