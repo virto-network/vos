@@ -17,7 +17,7 @@
 > service PVM. Durable cross-root calls to space-role-only methods use the
 > same authority protocol at destination admission. Actor-local or mixed-role
 > external calls remain fail-closed. `VosNode` can attach an explicit,
-> root-thread-owned proof producer for attested Local and Raft direct ingress
+> root-thread-owned proof producer/verifier backend for attested Local and Raft direct ingress
 > and durable inbox execution; proof-bearing replies carry their exact
 > content-addressed artifact back to the suspended caller. Registration
 > without that capability remains fail-closed. Legacy node behavior is
@@ -328,13 +328,34 @@ with a particular subject must include a suitable subject or unlinkable
 pseudonym in the typed claim, or verify an application-defined opening of that
 input commitment.
 
-The local proof producer and proof-verification allowlist are conformance
-seams, not a production proof system. A production host must replace them with
-the pinned prover/verifier implementation. Portable verification already
-passes the exact serialized trace as a proof public input; a production prover
-must additionally derive that trace from the observed canonical Refine
-execution rather than relying on the producer interface contract alone. There
-is still no attestation-only
+The bare local proof producer and proof-verification allowlist remain
+conformance seams. Node registration no longer exposes that trust model: a
+proof-producing root must install one backend implementing both production and
+independent verification, a caller may install the verifier alone, and an
+ordinary registration installs an explicit deny-all verifier. Installing any
+backend clears process-local conformance grants, and later `allow_proof` calls
+cannot bypass it. Each replica invokes the installed verifier before proof
+bytes enter its durable side-CAS or become available to IC-5.
+Raft registration installs that verifier before opening snapshots or replaying
+the committed tail, so recovery cannot transiently fall back to conformance
+admission before the public route is attached.
+
+The production artifact is a bounded `VPM2` manifest. It binds the
+execution-semantics-derived proof-system identity, a nonzero entering-image
+root, and at most 1,024 ordered, distinct proof-CAS segment identifiers. The
+manifest remains below the existing 64-KiB v2 proof-object limit, while each
+segment is fetched and verified independently below the 8-MiB network frame
+ceiling. The existing prover extension can wrap its anchored streamed-chain
+output directly; no segment body or secret witness is copied into service
+state. Backend verification must fetch every segment, enforce the 4-MiB
+per-segment limit, prove boundary continuity and the final public input, and
+fail closed on unavailable artifacts.
+
+The daemon does not attach such a backend yet, so attested package methods
+remain fail-closed there. Portable verification already passes the exact
+serialized trace as a proof public input; the next integration must derive
+that trace from the observed canonical Refine execution rather than relying on
+the producer interface contract alone. There is still no attestation-only
 actor binary: proof production always receives the live actor program through
 the canonical Refine imports.
 
@@ -954,6 +975,9 @@ the proof artifact to attested root reply transport and admits that artifact
 as a verifier-only Apply input rather than service state. Schema 32 rejects
 images produced under the earlier proofless reply-resume contract instead of
 interpreting mutually incompatible service identities under one version.
+Execution semantics v12 additionally makes the verifier-backed `VPM2`
+artifact contract part of service identity; a v11 root cannot be reopened or
+replicated under the new host proof decision rules.
 These versions also add exact actor-package
 identity to descriptors, work, checkpoints, transitions, upgrades, and
 cross-root proof bindings, bind durable messages and retained causal context to

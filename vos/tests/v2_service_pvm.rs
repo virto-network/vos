@@ -9,11 +9,12 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use vos::attestation::{
     AttestationProofHostV2, AttestationProofProducerV2, AttestationProofRequestV2,
-    ProducedAttestationProofV2,
+    AttestationProofVerifierV2, ProducedAttestationProofV2,
 };
 use vos::network::RaftRpcHandler;
 use vos::node::{AgentResult, V2NodeRegistrationError, VosNode};
@@ -32,14 +33,14 @@ use vos::v2::{
     LocalRootTreeInvokeErrorV2, LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2,
     LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
     PackageManifestV2, PackageRolePoliciesV2, ProducerId, ProgramId, ProofArtifactStoreV2,
-    PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2,
-    ReplicatedJamServiceV2, ReplicatedServiceErrorV2, ReplyRecordV2, RoleAuthorityBindingV2,
-    RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2, RoleAuthorizationClaimV2,
-    RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId, RootTreeAttestedResultV2,
-    RootTreeInvocationV2, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2,
-    ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId, SystemCapabilityId,
-    TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2, WorkflowOperationV2, artifact_hash,
-    public_policy_hash, space_role_policy_hash,
+    ProofVerificationRequestV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2,
+    RefineOutputV2, ReplicatedJamServiceV2, ReplicatedServiceErrorV2, ReplyRecordV2,
+    RoleAuthorityBindingV2, RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2,
+    RoleAuthorizationClaimV2, RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId,
+    RootTreeAttestedResultV2, RootTreeInvocationV2, ScheduleErrorV2, ServiceDispatchError,
+    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId,
+    SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2, WorkflowOperationV2,
+    artifact_hash, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     Decode, Encode,
@@ -345,6 +346,27 @@ impl AttestationProofProducerV2 for CanonicalTestProofProducer {
             proof: self.proof.clone(),
         })
     }
+}
+
+impl AttestationProofVerifierV2 for CanonicalTestProofProducer {
+    type Error = ();
+
+    fn verify(
+        &mut self,
+        request: &ProofVerificationRequestV2,
+        proof: &[u8],
+    ) -> Result<bool, Self::Error> {
+        Ok(request.proof_blob.matches(proof) && proof == self.proof)
+    }
+}
+
+fn canonical_test_proof_manifest(tag: u8) -> Vec<u8> {
+    vos::v2::AttestationProofManifestV2 {
+        proof_system: vos::v2::AttestationProofManifestV2::proof_system(),
+        initial_root: Hash([tag.wrapping_add(1); 32]),
+        segments: vec![vos::v2::ProofArtifactIdV2([tag; 32])],
+    }
+    .encode()
 }
 
 #[derive(Debug)]
@@ -3689,7 +3711,7 @@ fn node_attested_root_requires_an_explicit_producer_and_returns_the_committed_pa
     assert!(unavailable.collect().iter().all(AgentResult::is_ok));
 
     let service = LocalRootTreeServiceV2::open(config.clone(), backend.clone()).unwrap();
-    let proof = b"node-owned-canonical-proof".to_vec();
+    let proof = canonical_test_proof_manifest(0x81);
     let mut node = VosNode::new();
     node.register_v2_root_at_id_with_producer(
         "attested-root-v2",
@@ -3734,6 +3756,7 @@ fn node_attested_raft_root_orders_the_proved_apply() {
     let member = 0x77u16;
     let route = ServiceId::new(member, 0x3312);
     let mut node = VosNode::new();
+    let proof = canonical_test_proof_manifest(0x82);
     node.register_v2_raft_root_at_id_with_producer(
         "attested-raft-root-v2".into(),
         config,
@@ -3750,7 +3773,7 @@ fn node_attested_raft_root_orders_the_proved_apply() {
         route,
         false,
         CanonicalTestProofProducer {
-            proof: b"node-raft-proof".to_vec(),
+            proof: proof.clone(),
             calls: 0,
         },
     )
@@ -3760,7 +3783,7 @@ fn node_attested_raft_root_orders_the_proved_apply() {
         .invoke_actor_attested(request.target, request.arguments)
         .expect("the current leader proves before proposing the final Apply");
     assert_eq!(result.value, Value::U32(7));
-    assert_eq!(result.proof, b"node-raft-proof");
+    assert_eq!(result.proof, proof);
     assert!(node.collect().iter().all(AgentResult::is_ok));
     std::fs::remove_dir_all(directory).unwrap();
 }
@@ -3849,18 +3872,25 @@ fn node_routes_an_attested_durable_call_and_proof_back_into_the_waiting_actor() 
             .unwrap();
     let source_route = ServiceId::new(0, 0x3510);
     let destination_route = ServiceId::new(0, 0x3511);
+    let proof = canonical_test_proof_manifest(0x83);
     let mut node = VosNode::new();
-    node.register_v2_root_at_id("attested-source-v2", source, source_route, false)
-        .unwrap();
+    node.register_v2_root_at_id_with_verifier(
+        "attested-source-v2",
+        source,
+        source_route,
+        false,
+        CanonicalTestProofProducer {
+            proof: proof.clone(),
+            calls: 0,
+        },
+    )
+    .unwrap();
     node.register_v2_root_at_id_with_producer(
         "private-age",
         destination,
         destination_route,
         false,
-        CanonicalTestProofProducer {
-            proof: b"peer-proof".to_vec(),
-            calls: 0,
-        },
+        CanonicalTestProofProducer { proof, calls: 0 },
     )
     .unwrap();
 
@@ -3930,8 +3960,9 @@ fn node_raft_transport_orders_attested_inbox_and_reply_proof_on_both_roots() {
         replication_id,
         propose_timeout_ms: 2_000,
     };
+    let proof = canonical_test_proof_manifest(0x84);
     let mut node = VosNode::new();
-    node.register_v2_raft_root_at_id(
+    node.register_v2_raft_root_at_id_with_verifier(
         "attested-raft-source-v2".into(),
         source_config,
         source_backend.clone(),
@@ -3939,6 +3970,10 @@ fn node_raft_transport_orders_attested_inbox_and_reply_proof_on_both_roots() {
         raft_config([0xEA; 32]),
         source_route,
         false,
+        CanonicalTestProofProducer {
+            proof: proof.clone(),
+            calls: 0,
+        },
     )
     .unwrap();
     node.register_v2_raft_root_at_id_with_producer(
@@ -3950,7 +3985,7 @@ fn node_raft_transport_orders_attested_inbox_and_reply_proof_on_both_roots() {
         destination_route,
         false,
         CanonicalTestProofProducer {
-            proof: b"peer-proof".to_vec(),
+            proof: proof.clone(),
             calls: 0,
         },
     )
@@ -3989,7 +4024,7 @@ fn node_raft_transport_orders_attested_inbox_and_reply_proof_on_both_roots() {
             .unwrap()
             .proofs
             .values()
-            .any(|proof| proof == b"peer-proof"),
+            .any(|candidate| candidate == &proof),
         "the caller replica durably hydrates the proof before ordering resume"
     );
     assert!(
@@ -3999,7 +4034,7 @@ fn node_raft_transport_orders_attested_inbox_and_reply_proof_on_both_roots() {
             .unwrap()
             .proofs
             .values()
-            .any(|proof| proof == b"peer-proof"),
+            .any(|candidate| candidate == &proof),
         "the producer replica retains the proof until reply acknowledgement"
     );
     std::fs::remove_dir_all(directory).unwrap();
@@ -4026,8 +4061,9 @@ fn promoted_raft_voter_keeps_its_producer_after_taking_leadership() {
     let member = 0x7Au16;
     let source_route = ServiceId::new(member, 0x3530);
     let destination_route = ServiceId::new(member, 0x3531);
+    let proof = canonical_test_proof_manifest(0x85);
     let mut node = VosNode::new();
-    node.register_v2_raft_root_at_id(
+    node.register_v2_raft_root_at_id_with_verifier(
         "promoted-attested-source-v2".into(),
         source_config,
         source_backend,
@@ -4042,6 +4078,10 @@ fn promoted_raft_voter_keeps_its_producer_after_taking_leadership() {
         },
         source_route,
         false,
+        CanonicalTestProofProducer {
+            proof: proof.clone(),
+            calls: 0,
+        },
     )
     .unwrap();
     node.register_v2_raft_root_at_id_after_local_attach_with_producer(
@@ -4063,7 +4103,7 @@ fn promoted_raft_voter_keeps_its_producer_after_taking_leadership() {
         destination_route,
         false,
         CanonicalTestProofProducer {
-            proof: b"peer-proof".to_vec(),
+            proof: proof.clone(),
             calls: 0,
         },
         move |worker, shutdown| {
@@ -4137,7 +4177,7 @@ fn promoted_raft_voter_keeps_its_producer_after_taking_leadership() {
     assert!(node.collect().iter().all(AgentResult::is_ok));
     let (direct, durable) = request.join().unwrap();
     assert_eq!(Value::try_decode(&direct.reply), Some(Value::U32(7)));
-    assert_eq!(direct.proof, b"peer-proof");
+    assert_eq!(direct.proof, proof);
     assert_eq!(durable, Some(Value::Bool(true).encode()));
     assert!(
         destination_backend
@@ -4146,7 +4186,7 @@ fn promoted_raft_voter_keeps_its_producer_after_taking_leadership() {
             .unwrap()
             .proofs
             .values()
-            .any(|proof| proof == b"peer-proof"),
+            .any(|candidate| candidate == &proof),
         "the promoted leader durably produces both direct and inbox proofs"
     );
     std::fs::remove_dir_all(directory).unwrap();
@@ -11683,8 +11723,9 @@ fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
             .same_service_state(&before_mismatched_trace),
         "a proof for a different Refine trace cannot commit"
     );
+    let proof_bytes = canonical_test_proof_manifest(0x98);
     let mut proof_producer = CanonicalTestProofProducer {
-        proof: b"peer-proof".to_vec(),
+        proof: proof_bytes.clone(),
         calls: 0,
     };
     let drained =
@@ -11710,7 +11751,7 @@ fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
             .accumulate_host()
             .proof_bytes(&proof_reference)
             .as_deref(),
-        Some(b"peer-proof".as_slice()),
+        Some(proof_bytes.as_slice()),
         "the proved publication's side-CAS survives a producer restart"
     );
     let reply_publication = LocalTransportV2::pending_publications(&destination)
@@ -13983,14 +14024,24 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         reference: initial.clone(),
         bytes: initial_bytes,
     }];
+    let proof_bytes = canonical_test_proof_manifest(0x87);
     let mut leader_host = LocalJamStoreV2::default();
     leader_host.allow_install(&genesis);
+    let leader_proof = proof_bytes.clone();
+    leader_host.install_proof_verifier(move |_, candidate| candidate == leader_proof);
     let mut follower_host = DurableJamStoreV2::open(FailableCommittedImages {
         fail_next_proof_commit: true,
         ..FailableCommittedImages::default()
     })
     .unwrap();
     follower_host.allow_install(&genesis);
+    let follower_verifications = Arc::new(AtomicUsize::new(0));
+    let follower_verification_count = follower_verifications.clone();
+    let follower_proof = proof_bytes.clone();
+    follower_host.install_proof_verifier(move |_, candidate| {
+        follower_verification_count.fetch_add(1, Ordering::Relaxed);
+        candidate == follower_proof
+    });
 
     let shared_log = Arc::new(Mutex::new(SharedCommittedLog::default()));
     let leader_service = JamServiceV2::new(
@@ -14068,7 +14119,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         .expect("the leader obtains the exact Refine transition before proving it");
     let input = prepared.work.input_id();
     let mut producer = CanonicalTestProofProducer {
-        proof: b"raft canonical proof".to_vec(),
+        proof: proof_bytes,
         calls: 0,
     };
     let envelope = AccumulationEnvelopeV2 {
@@ -14119,6 +14170,10 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         "the identical committed proof entry is retried after CAS recovery"
     );
     assert_eq!(follower.log_mut().applied_index().unwrap(), 3);
+    assert!(
+        follower_verifications.load(Ordering::Relaxed) >= 2,
+        "the follower independently verifies both the failed hydration and exact retry"
+    );
     assert!(
         leader
             .service()

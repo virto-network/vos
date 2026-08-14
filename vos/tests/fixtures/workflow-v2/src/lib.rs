@@ -204,7 +204,10 @@ impl WorkflowV2 {
                 package.value == Value::U32(7)
                     && package.producer_name == "private-age"
                     && package.statement.method == "attested_peer_value"
-                    && package.proof == b"peer-proof"
+                    && <vos::v2::AttestationProofManifestV2 as vos::v2::V2Wire>::decode(
+                        &package.proof,
+                    )
+                    .is_ok()
             }
             Err(_) => false,
         }
