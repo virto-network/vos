@@ -603,21 +603,6 @@ mod tests {
         store.snapshot_bytes()
     }
 
-    fn proof_artifact(byte: u8) -> CommittedProofArtifactV2 {
-        let bytes = vec![byte; 32];
-        let proof_blob = crate::v2::BlobRefV2::of_bytes(&bytes);
-        CommittedProofArtifactV2 {
-            verification: crate::v2::ProofVerificationRequestV2 {
-                actor_program: ProgramId([byte; 32]),
-                execution_semantics: crate::v2::Hash([byte.wrapping_add(1); 32]),
-                statement: crate::v2::Hash([byte.wrapping_add(2); 32]),
-                trace: crate::v2::Hash([byte.wrapping_add(3); 32]),
-                proof_blob,
-            },
-            bytes,
-        }
-    }
-
     #[test]
     fn single_node_log_recovers_canonical_requests_and_apply_cursor() {
         let (path, directory) = temp_path();
@@ -697,13 +682,7 @@ mod tests {
         log.mark_applied(first.index, &first_image, &[]).unwrap();
         let second = log.propose(&request(2).encode()).unwrap();
         let second_image = service_image(2);
-        let second_proof = proof_artifact(9);
-        log.mark_applied(
-            second.index,
-            &second_image,
-            core::slice::from_ref(&second_proof),
-        )
-        .unwrap();
+        log.mark_applied(second.index, &second_image, &[]).unwrap();
         drop(log);
 
         let mut storage = RedbStorage::open(db).unwrap();
@@ -731,7 +710,7 @@ mod tests {
         .unwrap();
         assert_eq!(frozen.applied_index, second.index);
         assert_eq!(frozen.service_image, second_image);
-        assert_eq!(frozen.proof_artifacts, vec![second_proof]);
+        assert!(frozen.proof_artifacts.is_empty());
         drop(storage);
         std::fs::remove_dir_all(directory).unwrap();
     }

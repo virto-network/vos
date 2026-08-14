@@ -3778,6 +3778,69 @@ fn local_registration_reverifies_conformance_proof_history_before_exposing_the_r
 }
 
 #[test]
+fn raft_registration_reverifies_current_conformance_proof_history_before_exposing_the_root() {
+    let (config, request) = attested_root_fixture(ConsistencyModeV2::Raft, 0x74);
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-raft-proof-cutover-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let db = Arc::new(redb::Database::create(directory.join("raft.redb")).unwrap());
+    let backend = SharedProofCommittedImages::default();
+    let member = 0x76u16;
+    let raft_config = RaftConfig {
+        me: member,
+        members: vec![member],
+        election_timeout_ms: (10, 30),
+        heartbeat_interval_ms: 5,
+        replication_id: [0x77; 32],
+        propose_timeout_ms: 2_000,
+    };
+    let log = RaftAccumulateLogV2::from_db_arc(db.clone(), raft_config.clone()).unwrap();
+    let mut service = LocalRootTreeServiceV2::open_raft(config.clone(), backend.clone(), log)
+        .expect("the explicit conformance seam opens the Raft root");
+    service
+        .invoke_attested(
+            request,
+            &mut CanonicalTestProofProducer {
+                proof: canonical_test_proof_manifest(0x93),
+                calls: 0,
+            },
+        )
+        .expect("conformance accepts and applies its locally produced proof");
+    assert_eq!(service.pending_publications().unwrap().len(), 1);
+    let backend = service.into_backend();
+
+    let mut node = VosNode::new();
+    assert!(
+        node.register_v2_raft_root_at_id_with_producer(
+            "attested-raft-root-v2".into(),
+            config,
+            backend,
+            db,
+            raft_config,
+            ServiceId::new(member, 0x3313),
+            false,
+            CanonicalTestProofProducer {
+                proof: canonical_test_proof_manifest(0x94),
+                calls: 0,
+            },
+        )
+        .is_err(),
+        "a current apply cursor cannot bypass production revalidation"
+    );
+    assert!(
+        node.collect().is_empty(),
+        "the rejected Raft root was never exposed"
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn node_attested_raft_root_orders_the_proved_apply() {
     let (config, request) = attested_root_fixture(ConsistencyModeV2::Raft, 0x73);
     let directory = std::env::temp_dir().join(format!(
@@ -14270,6 +14333,18 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         CommittedServiceSnapshotV2::decode(&substituted_request_snapshot.encode()),
         Err(vos::v2::DecodeError::NonCanonical),
         "snapshot proof bytes cannot be rebound to substituted public inputs"
+    );
+    let mut surplus_proof_snapshot = snapshot.clone();
+    let mut surplus = surplus_proof_snapshot.proof_artifacts[0].clone();
+    surplus.verification.statement = Hash([0xF2; 32]);
+    surplus_proof_snapshot.proof_artifacts.push(surplus);
+    surplus_proof_snapshot
+        .proof_artifacts
+        .sort_unstable_by_key(|artifact| artifact.verification.hash());
+    assert_eq!(
+        CommittedServiceSnapshotV2::decode(&surplus_proof_snapshot.encode()),
+        Err(vos::v2::DecodeError::NonCanonical),
+        "a snapshot cannot carry unrelated proof verification work"
     );
 
     let mismatched_schedule =

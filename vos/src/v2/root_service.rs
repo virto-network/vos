@@ -542,6 +542,7 @@ pub enum LocalRootTreeOpenErrorV2<E> {
     ExistingServiceMismatch,
     ExistingActorMismatch,
     MissingInstalledProgram(ProgramId),
+    ProofHistoryUnavailable,
 }
 
 impl<E: core::fmt::Debug> core::fmt::Display for LocalRootTreeOpenErrorV2<E> {
@@ -1422,6 +1423,9 @@ where
             DurableJamStoreV2::open(backend).map_err(LocalRootTreeOpenErrorV2::Store)?;
         if let Some(proof_verifier) = proof_verifier {
             store.install_proof_verifier_arc(proof_verifier);
+            store
+                .revalidate_proof_history()
+                .map_err(|_| LocalRootTreeOpenErrorV2::ProofHistoryUnavailable)?;
         }
         let expected_program = config.service.service_program;
         let mut service = JamServiceV2::new(

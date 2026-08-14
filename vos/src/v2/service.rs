@@ -486,17 +486,14 @@ impl V2Wire for CommittedServiceSnapshotV2 {
         {
             return Err(DecodeError::NonCanonical);
         }
-        for verification in service_snapshot.referenced_proof_verifications()? {
-            let Ok(index) = proof_artifacts
-                .binary_search_by_key(&verification.hash(), |artifact| {
-                    artifact.verification.hash()
-                })
-            else {
-                return Err(DecodeError::NonCanonical);
-            };
-            if proof_artifacts[index].verification != verification {
-                return Err(DecodeError::NonCanonical);
-            }
+        let referenced = service_snapshot.referenced_proof_verifications()?;
+        if proof_artifacts.len() != referenced.len()
+            || proof_artifacts
+                .iter()
+                .zip(&referenced)
+                .any(|(artifact, verification)| artifact.verification != *verification)
+        {
+            return Err(DecodeError::NonCanonical);
         }
         Ok(Self {
             applied_index,

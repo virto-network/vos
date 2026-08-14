@@ -545,6 +545,35 @@ impl<B: CommittedImageStoreV2> DurableJamStoreV2<B> {
     }
 }
 
+impl<B> DurableJamStoreV2<B>
+where
+    B: CommittedImageStoreV2 + ProofArtifactStoreV2<Error = <B as CommittedImageStoreV2>::Error>,
+{
+    /// Re-authorize every proof decision whose validity still affects this
+    /// already-committed image under the currently installed verifier.
+    ///
+    /// Production registration uses this before exposing an existing local
+    /// image. Snapshot/log catch-up verifies its ordered artifacts separately,
+    /// so permanent reply admissions do not make snapshots retain proofs
+    /// forever merely to repeat an already-finalized historical decision.
+    pub(crate) fn revalidate_proof_history(&mut self) -> Result<(), DecodeError> {
+        let requests = self.local.committed.proof_verification_history()?;
+        let artifacts = requests
+            .iter()
+            .map(|request| {
+                AttestationProofHostV2::proof_bytes(self, &request.proof_blob)
+                    .ok_or(DecodeError::NonCanonical)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (request, proof) in requests.iter().zip(&artifacts) {
+            if !AttestationProofHostV2::make_proof_available(self, request, proof) {
+                return Err(DecodeError::NonCanonical);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<B> Deref for DurableJamStoreV2<B> {
     type Target = LocalJamStoreV2;
 
