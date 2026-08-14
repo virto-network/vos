@@ -1,6 +1,7 @@
 # `#[provable]` — proofs of actor transitions
 
-Status: **W1–W4 implemented; parent-side Clerk production wiring remains**.
+Status: **W1–W4 and the Local parent-side Clerk delegation are implemented;
+replicated production wiring remains**.
 The first draft
 tried to make a provable Task re-anchor its invoking parent's committed
 `0x02` composite and verify committed reads in-circuit against it. A
@@ -258,13 +259,16 @@ superseded task blobs as long as any unpruned record references them.
 This makes a month-old settlement proof verifiable after a re-pin —
 "superseded pin" and "forged program" stay distinguishable.
 
-### D6 — what the macro emits
+### D6 — parent delegation and what the macro emits
 
 `#[actor(task, provable)]` adds, beyond `task`: the `.vos_meta`
-`provable` bit (trailing positional-append section); a compile error
-without a task buffer; and — as a follow-up, once the clerk migration
-fixes the shape — parent-side delegation glue (gather touched leaves,
-`BatchProof::build`, `spawn_provable`, apply-on-verified-root). The
+`provable` bit (trailing positional-append section) and a compile error
+without a task buffer. The clerk-ledger migration now fixes the manual
+parent-side shape: discover touched keys, extract each committed map's
+`BatchProof`, synchronously `spawn_provable`, compare the Task's exact
+`root_before || root_after || batch_digest` result, then apply the same
+kernel mutation and require the resulting root. A follow-up macro can
+generate that proven pattern rather than inventing it speculatively. The
 io-binding, witnessed reads, and record capture are runtime behavior
 shared by all Tasks; `provable` is a publication/discovery mark plus
 the record opt-in, not a semantic fork — "every Task is one
@@ -373,6 +377,19 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
   witness to the SAME io-hash the live invoke bound — **live ≡ traced**
   over proof-constrained instructions, so a proof of the captured record
   carries exactly that binding.
+- **The parent-side Clerk seam.** `clerk-ledger::apply_transfer_provable`
+  probes the live ledger for its touched set, extracts six touched-only
+  multiproofs without walking the account set, invokes `clerk-apply`, and
+  commits the live kernel mutation only when the synchronous 96-byte claim
+  exactly binds the entry root, resulting root, and requested batch. The
+  producer record is keyed by transfer id and exports those same claim bytes.
+  The SMT extractor uses an explicit worklist so a 256-bit path cannot exhaust
+  the actor-PVM stack. A physical guest test covers missing-Task refusal,
+  immutable Task selection, the live state change, and exact record/reply/root
+  equality.
+- **Host-neutral Task registration.** `AgentConfig::with_task_blob` makes a
+  content-addressed Task dependency available to one Local actor runtime. It
+  is deliberately not yet canonical package carriage.
 
 - **Precompile safety boundary.** `handle_precompile_ecall` can accelerate
   non-recorded Task and Refine execution, with Refine preserving phi[7]/phi[8]
@@ -398,12 +415,16 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
   longer rely on the unconstrained curve/scalar ECALL outputs. Re-enabling
   `pvm-precompile` remains forbidden until that arithmetic is constrained in
   the AIR.
-- *Parent-side delegation glue + the clerk-ledger production wiring.*
-  D6's macro-generated "gather touched leaves + `batch_proof` + invoke +
-  apply" boilerplate, and rewiring clerk-ledger's `apply_transfer` to
-  gather touched leaves via `CommittedMap::batch_proof`, `spawn_provable`
-  the apply Task with `tag = transfer.id`, and apply the live writes
-  against the attested root. It is the natural next step now.
+- *Replicated clerk-ledger production cutover.* The money-path actor is Raft,
+  while producer-private record capture is intentionally Local-only. Before
+  replacing `apply_transfer`, land (1) a producer-local durable Raft record
+  sidecar that never enters replicated actor state/effect logs, and (2)
+  signed canonical package carriage and installation of content-addressed
+  Task dependencies. Then exercise leadership transfer/restart and switch the
+  Raft handler to the now-proven parent seam.
+- *Generated parent glue.* D6's manual Clerk implementation establishes the
+  contract; a later macro may generate the touched-leaf/proof/invoke/apply
+  boilerplate for other actors without changing its trust model.
 
 ---
 

@@ -6262,9 +6262,24 @@ fn clerk_ledger_bootstrap_and_create_account() {
         }
     };
     let blob = grey_transpiler::link_elf(&elf).expect("transpile clerk-ledger");
+    let clerk_apply_elf = match std::fs::read(clerk_apply_elf_path()) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            eprintln!("SKIP: clerk-apply not built (run `just build-clerk-apply`)");
+            return;
+        }
+    };
+    let (task_witness_addr, task_witness_capacity) =
+        vos::zk::witness_symbol(&clerk_apply_elf).expect("clerk-apply exports __VOS_WITNESS");
+    let clerk_apply_blob = transpile_actor(&clerk_apply_elf);
+    let clerk_apply_hash = vos::provable::task_blob_hash(&clerk_apply_blob);
 
     let mut node = VosNode::with_prefix(0);
-    let ledger_id = node.register(AgentConfig::new(blob));
+    let ledger_id = node.register(AgentConfig::new(blob).with_task_blob(
+        clerk_apply_blob,
+        task_witness_addr as u32,
+        task_witness_capacity as u32,
+    ));
     let ledger = ClerkLedgerRef::at(ledger_id);
 
     // Per-event timestamps come from the JAM block ts in production;
@@ -6486,13 +6501,54 @@ fn clerk_ledger_bootstrap_and_create_account() {
     // pair that apply_transfer is supposed to record.
     let host_observed_root_before =
         vos::block_on(ledger.state_root(&mut &node)).expect("invoke state_root pre-transfer");
-    let status = vos::block_on(ledger.apply_transfer(
+
+    // A root without the configured Task fails before changing ledger state
+    // or capturing a producer record.
+    assert_eq!(
+        vos::block_on(ledger.apply_transfer_provable(
+            &mut &node,
+            transfer_bytes.clone(),
+            openings_bytes.clone(),
+            transfer_ts,
+        ))
+        .expect("invoke apply_transfer_provable without Task"),
+        Status::ProofUnavailable,
+    );
+    assert_eq!(
+        vos::block_on(ledger.state_root(&mut &node)).expect("state root after refused proof"),
+        host_observed_root_before,
+    );
+    assert!(
+        vos::block_on(ledger.transfer_proof_record(&mut &node, transfer_id))
+            .expect("read absent proof record")
+            .is_empty(),
+    );
+
+    // Task selection is one-time and idempotent: an operator cannot swap the
+    // proving program after records have begun to accumulate.
+    assert_eq!(
+        vos::block_on(ledger.configure_provable_apply(&mut &node, clerk_apply_hash))
+            .expect("configure clerk-apply Task"),
+        Status::Ok,
+    );
+    assert_eq!(
+        vos::block_on(ledger.configure_provable_apply(&mut &node, clerk_apply_hash))
+            .expect("repeat clerk-apply Task configuration"),
+        Status::Ok,
+    );
+    assert_eq!(
+        vos::block_on(ledger.configure_provable_apply(&mut &node, [0xA5; 32]))
+            .expect("reject replacement clerk-apply Task"),
+        Status::BadInput,
+    );
+
+    let status = vos::block_on(ledger.apply_transfer_provable(
         &mut &node,
         transfer_bytes,
         openings_bytes,
         transfer_ts,
     ))
-    .expect("invoke apply_transfer");
+    .expect("invoke apply_transfer_provable");
     assert_eq!(
         status,
         Status::Ok,
@@ -6570,6 +6626,25 @@ fn clerk_ledger_bootstrap_and_create_account() {
         root_before, root_after,
         "accepting a state-changing transfer must move the SMT root"
     );
+
+    // The same roots were synchronously returned by clerk-apply and captured
+    // in the durable producer record. This closes the parent/Task gap: the
+    // live mutation above committed only after matching this exact claim.
+    let record_bytes = vos::block_on(ledger.transfer_proof_record(&mut &node, transfer_id))
+        .expect("export transfer proof record");
+    let record = vos::provable::ProofRecordEntry::decode(&record_bytes)
+        .expect("transfer proof record decodes");
+    assert_eq!(record.record.task_hash, clerk_apply_hash);
+    assert!(record.record.io_consistent());
+    assert_eq!(&record.record.app_public[..32], root_before.as_slice());
+    assert_eq!(&record.record.app_public[32..64], root_after.as_slice());
+    let reply = <vos::value::Value as vos::Decode>::try_decode(&record.record.reply)
+        .and_then(|value| match value {
+            vos::value::Value::Bytes(bytes) => Some(bytes),
+            _ => None,
+        })
+        .expect("clerk-apply reply repeats the public claim");
+    assert_eq!(reply, record.record.app_public);
 
     // Unknown transfer id → None.
     let missing = vos::block_on(ledger.transfer_state_roots(&mut &node, [0u8; 16]))
@@ -12625,6 +12700,16 @@ fn clerk_apply_task_captures_a_conservation_record() {
         &record.app_public[64..],
         &batch_digest,
         "the bound batch digest"
+    );
+    let reply = <vos::value::Value as vos::Decode>::try_decode(&record.reply)
+        .and_then(|value| match value {
+            vos::value::Value::Bytes(bytes) => Some(bytes),
+            _ => None,
+        })
+        .expect("clerk-apply replies with its public transition claim");
+    assert_eq!(
+        reply, record.app_public,
+        "the parent-visible result and proof-bound public claim must be identical"
     );
 
     // The record binds itself (verify_record's witness-free check 3).
