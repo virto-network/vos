@@ -35,10 +35,11 @@ use vos::v2::{
     PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2,
     ReplicatedJamServiceV2, ReplicatedServiceErrorV2, ReplyRecordV2, RoleAuthorityBindingV2,
     RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2, RoleAuthorizationClaimV2,
-    RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId, RootTreeInvocationV2,
-    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
-    ServicePvmV2, StateKeyV2, SubjectId, SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2,
-    WorkEnvelopeV2, WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
+    RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId, RootTreeAttestedResultV2,
+    RootTreeInvocationV2, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2,
+    ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId, SystemCapabilityId,
+    TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2, WorkflowOperationV2, artifact_hash,
+    public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     Decode, Encode,
@@ -4000,6 +4001,153 @@ fn node_raft_transport_orders_attested_inbox_and_reply_proof_on_both_roots() {
             .values()
             .any(|proof| proof == b"peer-proof"),
         "the producer replica retains the proof until reply acknowledgement"
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn promoted_raft_voter_keeps_its_producer_after_taking_leadership() {
+    let (source_config, destination_config, source_actor, destination_actor) =
+        attested_node_transport_fixture(ConsistencyModeV2::Raft, 0xF1);
+    let source_backend = SharedProofCommittedImages::default();
+    let destination_backend = SharedProofCommittedImages::default();
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-promoted-attested-voter-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source_db = Arc::new(redb::Database::create(directory.join("source.redb")).unwrap());
+    let destination_db =
+        Arc::new(redb::Database::create(directory.join("destination.redb")).unwrap());
+    let member = 0x7Au16;
+    let source_route = ServiceId::new(member, 0x3530);
+    let destination_route = ServiceId::new(member, 0x3531);
+    let mut node = VosNode::new();
+    node.register_v2_raft_root_at_id(
+        "promoted-attested-source-v2".into(),
+        source_config,
+        source_backend,
+        source_db,
+        RaftConfig {
+            me: member,
+            members: vec![member],
+            election_timeout_ms: (10, 30),
+            heartbeat_interval_ms: 5,
+            replication_id: [0xFA; 32],
+            propose_timeout_ms: 2_000,
+        },
+        source_route,
+        false,
+    )
+    .unwrap();
+    node.register_v2_raft_root_at_id_after_local_attach_with_producer(
+        "promoted-attested-destination-v2".into(),
+        destination_config,
+        destination_backend.clone(),
+        destination_db,
+        RaftConfig {
+            me: member,
+            members: vec![member],
+            // Ensure preparation observes a follower. The promotion callback
+            // then waits for this replica to take leadership before its route
+            // and proof capability become public together.
+            election_timeout_ms: (400, 600),
+            heartbeat_interval_ms: 20,
+            replication_id: [0xFB; 32],
+            propose_timeout_ms: 2_000,
+        },
+        destination_route,
+        false,
+        CanonicalTestProofProducer {
+            proof: b"peer-proof".to_vec(),
+            calls: 0,
+        },
+        move |worker, shutdown| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while worker.role() != Role::Leader {
+                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err("cancelled while waiting for leadership".into());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("promoted voter did not take leadership".into());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    let invoker = node.invoke_handle();
+    let shutdown = node.shutdown_handle();
+    let request = std::thread::spawn(move || {
+        let direct_arguments = {
+            let mut arguments = vec![vos::value::TAG_DYNAMIC];
+            arguments.extend_from_slice(&Msg::new("attested_peer_value").encode());
+            arguments
+        };
+        let direct_ingress = RootTreeInvocationV2 {
+            invocation: InvocationId([0xFC; 32]),
+            target: destination_actor,
+            method: "attested_peer_value".into(),
+            arguments: direct_arguments,
+            proof_requested: true,
+        }
+        .encode();
+        let route_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let direct = loop {
+            if let Some(reply) = invoker.invoke_with_timeout(
+                destination_route,
+                direct_ingress.clone(),
+                Duration::from_secs(30),
+            ) {
+                break reply;
+            }
+            assert!(
+                std::time::Instant::now() < route_deadline,
+                "promoted root route was not published"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let direct = RootTreeAttestedResultV2::decode(&direct)
+            .expect("the promoted leader returns its committed attestation");
+
+        let mut durable_arguments = vec![vos::value::TAG_DYNAMIC];
+        durable_arguments.extend_from_slice(&Msg::new("root_await_attested_peer").encode());
+        let durable = invoker.invoke_with_timeout(
+            source_route,
+            RootTreeInvocationV2 {
+                invocation: InvocationId([0xFD; 32]),
+                target: source_actor,
+                method: "root_await_attested_peer".into(),
+                arguments: durable_arguments,
+                proof_requested: false,
+            }
+            .encode(),
+            Duration::from_secs(45),
+        );
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        (direct, durable)
+    });
+    node.run_forever();
+    assert!(node.collect().iter().all(AgentResult::is_ok));
+    let (direct, durable) = request.join().unwrap();
+    assert_eq!(Value::try_decode(&direct.reply), Some(Value::U32(7)));
+    assert_eq!(direct.proof, b"peer-proof");
+    assert_eq!(durable, Some(Value::Bool(true).encode()));
+    assert!(
+        destination_backend
+            .0
+            .lock()
+            .unwrap()
+            .proofs
+            .values()
+            .any(|proof| proof == b"peer-proof"),
+        "the promoted leader durably produces both direct and inbox proofs"
     );
     std::fs::remove_dir_all(directory).unwrap();
 }

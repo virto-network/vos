@@ -3915,6 +3915,87 @@ impl VosNode {
             + 'static,
         F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool) -> Result<(), String> + Send + 'static,
     {
+        self.register_v2_raft_root_at_id_after_local_attach_inner(
+            name,
+            config,
+            backend,
+            db,
+            raft_config,
+            id,
+            network_reachable,
+            None,
+            promote,
+        )
+    }
+
+    /// Producer-capable counterpart of
+    /// [`Self::register_v2_raft_root_at_id_after_local_attach`]. The proof
+    /// capability remains owned by the prepared replica and moves into the
+    /// root thread only after voter promotion completes, so the replica is
+    /// ready to prove attested direct and durable-inbox work before its route
+    /// becomes public or it can serve as leader.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_v2_raft_root_at_id_after_local_attach_with_producer<B, P, F>(
+        &mut self,
+        name: String,
+        config: crate::v2::LocalRootTreeConfigV2,
+        backend: B,
+        db: Arc<redb::Database>,
+        raft_config: crate::raft::RaftConfig,
+        id: ServiceId,
+        network_reachable: bool,
+        producer: P,
+        promote: F,
+    ) -> Result<
+        ServiceId,
+        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+    >
+    where
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+            + Send
+            + 'static,
+        P: crate::AttestationProofProducerV2 + Send + 'static,
+        F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool) -> Result<(), String> + Send + 'static,
+    {
+        self.register_v2_raft_root_at_id_after_local_attach_inner(
+            name,
+            config,
+            backend,
+            db,
+            raft_config,
+            id,
+            network_reachable,
+            Some(V2NodeAttestationProofProducer::new(producer)),
+            promote,
+        )
+    }
+
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[allow(clippy::too_many_arguments)]
+    fn register_v2_raft_root_at_id_after_local_attach_inner<B, F>(
+        &mut self,
+        name: String,
+        config: crate::v2::LocalRootTreeConfigV2,
+        backend: B,
+        db: Arc<redb::Database>,
+        raft_config: crate::raft::RaftConfig,
+        id: ServiceId,
+        network_reachable: bool,
+        proof_producer: Option<V2NodeAttestationProofProducer>,
+        promote: F,
+    ) -> Result<
+        ServiceId,
+        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+    >
+    where
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+            + Send
+            + 'static,
+        F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool) -> Result<(), String> + Send + 'static,
+    {
         let (service, worker_handle, network, replication_id, handler) =
             self.prepare_v2_raft_root(config, backend, db, raft_config)?;
         if let Err(error) = self.validate_v2_root_registration(&service, id) {
@@ -3953,7 +4034,13 @@ impl VosNode {
                         return;
                     }
                     node.raft_hosts.lock().unwrap().insert(id.0, replication_id);
-                    node.attach_v2_root_unchecked(name, service, id, network_reachable, None);
+                    node.attach_v2_root_unchecked(
+                        name,
+                        service,
+                        id,
+                        network_reachable,
+                        proof_producer,
+                    );
                     ready_pending_ids.lock().unwrap().remove(&id.0);
                     ready_pending_actors.lock().unwrap().remove(&actor);
                 });

@@ -165,8 +165,12 @@ service snapshots; they never apply native actor commands. The owner exposes
 separate `invoke_attested`, `invoke_admitted_attested`, and
 `invoke_attested_inbox` entry points which require an explicit proof producer;
 the node's `*_with_producer` registration APIs own that capability and use
-those paths for direct and durable inbox work. Ordinary registration and
-ordinary invocation methods continue to reject proof-requested work.
+those paths for direct and durable inbox work. The asynchronous
+`after_local_attach_with_producer` path retains the same capability across
+voter promotion, so a prepared follower which later becomes leader does not
+lose attested availability when its public route is installed. Ordinary
+registration and ordinary invocation methods continue to reject
+proof-requested work.
 Every native `std` host verifies the deployment's frozen libp2p-Ed25519 wire
 through its existing native crypto provider. Bare single-node hosts therefore
 retain the same authority check without requiring network transport or adding
