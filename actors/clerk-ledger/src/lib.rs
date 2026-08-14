@@ -79,16 +79,26 @@ use cipher_clerk::ids::{AccountId as CcAccountId, JournalId as CcJournalId};
 use cipher_clerk::kernel::{
     CreateAccount as CcCreateAccount, apply_account_creations, apply_batch,
 };
+use cipher_clerk::snapshot::OpeningsOracle as CcOpeningsOracle;
 use cipher_clerk::types::{
     Account as CcAccount, Direction, Journal as CcJournal, Transfer as CcTransfer, TransferFlags,
+};
+use clerk_witness::{
+    ClerkTransitionClaim, ClerkTransitionWitness, TouchedKeys, batch_digest, discover_touched,
 };
 use vos::prelude::*;
 
 pub use status::Status;
 pub use wire::{Opening, PendingStatusEntry, TransferRootEntry};
 
-use cipher_clerk::state_root::{composite_root_from_subroots, journal_leaf_content};
-use vos::storage::{CommittedMap, StorageMap, StorageVec};
+use cipher_clerk::state_root::{
+    account_leaf_content, composite_root_from_subroots, external_id_leaf_content,
+    journal_leaf_content, pending_leaf_content, transfer_leaf_content, voided_leaf_content,
+};
+use vos::agent::{TaskStatus, Tasks};
+use vos::storage::{CommittedMap, FixedKey, StorageMap, StorageVec};
+use vos::value::{Msg, Value};
+use vos::zk::state::LedgerWitness;
 
 use oracle::{NoopOracle, StatefulOracle};
 use status::map_event_status;
@@ -102,6 +112,42 @@ use view::LedgerView;
 /// to spell `: Option<[u8; N]>` on the destructuring pattern.
 fn try_array<const N: usize>(bytes: Vec<u8>) -> Option<[u8; N]> {
     bytes.try_into().ok()
+}
+
+/// Extract one touched-only witness directly from a committed map. The map
+/// returns its raw value rows; this adapter decodes them and substitutes the
+/// application leaf content that cipher-clerk's SMT actually commits.
+fn committed_witness<K, V>(
+    map: &CommittedMap<K, V>,
+    touched: &[K],
+    leaf_content: impl Fn(&K, &V) -> Vec<u8>,
+) -> LedgerWitness
+where
+    K: FixedKey,
+    V: Encode + Decode,
+{
+    let root_before = map.root();
+    let (proof, rows) = map.batch_proof(touched);
+    let touched = rows
+        .into_iter()
+        .map(|(key_bytes, raw)| {
+            let key = K::read_from(&key_bytes);
+            let content = raw.map(|bytes| {
+                let value = V::decode(&bytes);
+                leaf_content(&key, &value)
+            });
+            (key_bytes, content)
+        })
+        .collect();
+    LedgerWitness {
+        root_before,
+        proof,
+        touched,
+    }
+}
+
+fn transfer_record_tag(id: &[u8; 16]) -> [u8; 32] {
+    vos::crypto::blake2b_hash::<32>(b"clerk-ledger/provable-transfer/v1", &[id])
 }
 
 /// Decode an rkyv archive or short-circuit with `Status::BadInput`.
@@ -200,6 +246,11 @@ pub struct ClerkLedger {
     /// publish nullifiers — the spent-set is a follow-up slice.
     #[storage]
     note_commitments: StorageVec<[u8; 32]>,
+    /// Content-address of the pure `clerk-apply` Task selected by the
+    /// operator. The runtime must also have the corresponding Task blob.
+    /// Package-level dependency installation remains a separate cutover
+    /// step; a missing blob fails before ledger mutation.
+    clerk_apply_task: Option<[u8; 32]>,
 }
 
 impl ClerkLedger {
@@ -224,6 +275,43 @@ impl ClerkLedger {
     fn journal_row(&self) -> Option<CcJournal> {
         self.journal_id.and_then(|id| self.journal.get(&id))
     }
+
+    /// State-hiding signature preflight shared by the direct and provable
+    /// transfer paths. Pending finalization is authenticated through its
+    /// referenced pending transfer inside the kernel, so it deliberately
+    /// skips the entries-based check here.
+    fn transfer_signatures_valid(&self, transfer: &CcTransfer) -> bool {
+        let is_pending_finalize = transfer
+            .flags
+            .contains(TransferFlags::POST_PENDING_TRANSFER)
+            || transfer
+                .flags
+                .contains(TransferFlags::VOID_PENDING_TRANSFER);
+        if is_pending_finalize {
+            return true;
+        }
+
+        let mut distinct_debits: Vec<CcAccountId> = Vec::new();
+        for entry in &transfer.entries {
+            if entry.direction == Direction::Debit
+                && !distinct_debits.contains(&entry.account_id)
+            {
+                distinct_debits.push(entry.account_id);
+            }
+        }
+        if transfer.signatures.len() != distinct_debits.len() {
+            return false;
+        }
+        let msg = transfer.signing_payload();
+        distinct_debits
+            .iter()
+            .zip(&transfer.signatures)
+            .all(|(account_id, signature)| {
+                self.accounts
+                    .get(&account_id.0)
+                    .is_some_and(|account| verify_signature(&account.auth_key, &msg, signature))
+            })
+    }
 }
 
 #[messages]
@@ -239,6 +327,7 @@ impl ClerkLedger {
             pending_statuses: Default::default(),
             transfer_roots: Default::default(),
             note_commitments: Default::default(),
+            clerk_apply_task: None,
         }
     }
 
@@ -376,6 +465,25 @@ impl ClerkLedger {
             .collect()
     }
 
+    /// Select the content-addressed `clerk-apply` Task used by
+    /// [`Self::apply_transfer_provable`]. Configuration is explicit until
+    /// signed packages carry Task dependencies; a zero hash is never a valid
+    /// content address. Repeating the same configuration is idempotent.
+    #[msg(role = ClerkLedgerRole::Operator)]
+    async fn configure_provable_apply(&mut self, task_hash: [u8; 32]) -> Status {
+        if task_hash == [0u8; 32] {
+            return Status::BadInput;
+        }
+        match self.clerk_apply_task {
+            None => {
+                self.clerk_apply_task = Some(task_hash);
+                Status::Ok
+            }
+            Some(existing) if existing == task_hash => Status::Ok,
+            Some(_) => Status::BadInput,
+        }
+    }
+
     /// Accept a signed `cipher_clerk::types::Transfer` plus the
     /// commitment openings (`Vec<Opening>`) needed by the kernel
     /// to verify each entry's `Amount`. Dispatches to
@@ -442,31 +550,8 @@ impl ClerkLedger {
         // pending_id is on file via the TransferNotFound code path.
         // Acceptable for v1: a caller able to name a specific
         // pending_id is already operator-adjacent.
-        let is_pending_finalize = transfer
-            .flags
-            .contains(TransferFlags::POST_PENDING_TRANSFER)
-            || transfer
-                .flags
-                .contains(TransferFlags::VOID_PENDING_TRANSFER);
-        if !is_pending_finalize {
-            let mut distinct_debits: Vec<CcAccountId> = Vec::new();
-            for e in &transfer.entries {
-                if e.direction == Direction::Debit && !distinct_debits.contains(&e.account_id) {
-                    distinct_debits.push(e.account_id);
-                }
-            }
-            if transfer.signatures.len() != distinct_debits.len() {
-                return Status::SignatureInvalid;
-            }
-            let msg = transfer.signing_payload();
-            for (acct_id, sig) in distinct_debits.iter().zip(transfer.signatures.iter()) {
-                let Some(acct) = self.accounts.get(&acct_id.0) else {
-                    return Status::SignatureInvalid;
-                };
-                if !verify_signature(&acct.auth_key, &msg, sig) {
-                    return Status::SignatureInvalid;
-                }
-            }
+        if !self.transfer_signatures_valid(&transfer) {
+            return Status::SignatureInvalid;
         }
 
         // Snapshot the composite SMT root BEFORE the kernel runs.
@@ -511,6 +596,182 @@ impl ClerkLedger {
             self.transfer_roots.insert(&entry.id, &entry);
         }
         status
+    }
+
+    /// Verify a transfer through the content-addressed `clerk-apply` Task,
+    /// capture a durable proof record, then apply the same kernel mutation to
+    /// the live committed maps only when the Task's bound roots and batch
+    /// digest match exactly.
+    ///
+    /// This is the parent-side D6 contract. Record capture is intentionally
+    /// Local-only today: `Tasks::spawn_provable` rejects a CRDT/Raft parent
+    /// before the witness enters serialized state. Production Raft wiring
+    /// requires the producer-local durable record sidecar tracked in
+    /// `docs/plans/provable.md`; the ordinary `apply_transfer` path remains
+    /// available until that cutover lands.
+    #[msg(role = ClerkLedgerRole::Operator)]
+    async fn apply_transfer_provable(
+        &mut self,
+        transfer_bytes: Vec<u8>,
+        openings_bytes: Vec<u8>,
+        batch_seed_timestamp: u64,
+    ) -> Status {
+        if self.journal_id.is_none() {
+            return Status::NotBootstrapped;
+        }
+        let Some(task_hash) = self.clerk_apply_task else {
+            return Status::ProofUnavailable;
+        };
+        let transfer: CcTransfer = decode_or_bad_input!(&transfer_bytes, CcTransfer);
+        let openings: Vec<Opening> = decode_or_bad_input!(&openings_bytes, Vec<Opening>);
+        if !self.transfer_signatures_valid(&transfer) {
+            return Status::SignatureInvalid;
+        }
+
+        let oracle = CcOpeningsOracle::new(openings.clone());
+        let (touched, statuses) = {
+            let view = LedgerView::new(
+                &mut self.accounts,
+                &mut self.transfers,
+                &self.journal,
+                &mut self.external_ids,
+                &mut self.voided_transfers,
+                &mut self.pending_statuses,
+            );
+            discover_touched(
+                &view,
+                core::slice::from_ref(&transfer),
+                &oracle,
+                batch_seed_timestamp,
+            )
+        };
+        let Some(status) = statuses.first().copied() else {
+            return Status::BadInput;
+        };
+        if status != cipher_clerk::error::EventStatus::Created {
+            return map_event_status(status);
+        }
+
+        let TouchedKeys {
+            accounts,
+            transfers,
+            journals,
+            external_ids,
+            voided,
+            pending,
+        } = touched;
+        let accounts: Vec<_> = accounts.into_iter().collect();
+        let transfers: Vec<_> = transfers.into_iter().collect();
+        let journals: Vec<_> = journals.into_iter().collect();
+        let external_ids: Vec<_> = external_ids.into_iter().collect();
+        let voided: Vec<_> = voided.into_iter().collect();
+        let pending: Vec<_> = pending.into_iter().collect();
+        let accounts = committed_witness(&self.accounts, &accounts, |_, value| {
+            account_leaf_content(value)
+        });
+        let transfers = committed_witness(&self.transfers, &transfers, |_, value| {
+            transfer_leaf_content(value)
+        });
+        let journals = committed_witness(&self.journal, &journals, |_, value| {
+            journal_leaf_content(value)
+        });
+        let external_ids = committed_witness(&self.external_ids, &external_ids, |_, value| {
+            external_id_leaf_content(value)
+        });
+        let voided = committed_witness(&self.voided_transfers, &voided, |key, _| {
+            voided_leaf_content(key)
+        });
+        let pending = committed_witness(&self.pending_statuses, &pending, |key, value| {
+            pending_leaf_content(key, *value)
+        });
+        let witness = ClerkTransitionWitness {
+            accounts,
+            transfers,
+            journals,
+            external_ids,
+            voided,
+            pending,
+            oracle,
+            events: vec![transfer.clone()],
+            batch_seed_timestamp,
+        };
+
+        let root_before = self.composite_root();
+        let expected_digest = batch_digest(core::slice::from_ref(&transfer));
+        let tag = transfer_record_tag(&transfer.id.0);
+        // `clerk-apply` is a one-dispatch pure Task. Its table is deliberately
+        // handler-local so the secret witness and Task bookkeeping never
+        // enter the serialized clerk-ledger state; only the host-captured
+        // proof record survives a successful commit.
+        let mut tasks = Tasks::new();
+        let task_id = tasks.spawn_provable(
+            task_hash,
+            &Msg::new("apply").with("witness", witness.encode()),
+            tag,
+        );
+        tasks.drive();
+        if tasks.status(task_id) != Some(TaskStatus::Done) {
+            return Status::ProofUnavailable;
+        }
+        let claim = tasks
+            .reply(task_id)
+            .and_then(Value::try_decode)
+            .and_then(|value| match value {
+                Value::Bytes(bytes) => ClerkTransitionClaim::decode(&bytes),
+                _ => None,
+            });
+        let claim = claim.unwrap_or_else(|| panic!("clerk-apply returned a malformed public claim"));
+        assert!(
+            claim.root_before == root_before && claim.batch_digest == expected_digest,
+            "clerk-apply public claim does not bind the requested transition"
+        );
+
+        let mut view = LedgerView::new(
+            &mut self.accounts,
+            &mut self.transfers,
+            &self.journal,
+            &mut self.external_ids,
+            &mut self.voided_transfers,
+            &mut self.pending_statuses,
+        );
+        let mut live_oracle = StatefulOracle {
+            openings: &openings,
+        };
+        let results = apply_batch(
+            &mut view,
+            core::slice::from_ref(&transfer),
+            &mut live_oracle,
+            batch_seed_timestamp,
+        );
+        if results.len() != 1 || results[0].status != cipher_clerk::error::EventStatus::Created {
+            panic!("clerk-apply and live kernel execution diverged");
+        }
+        let root_after = self.composite_root();
+        if claim.root_after != root_after {
+            panic!("clerk-apply post-state root does not match the live mutation");
+        }
+        let entry = TransferRootEntry {
+            id: transfer.id.0,
+            root_before,
+            root_after,
+        };
+        self.transfer_roots.insert(&entry.id, &entry);
+        Status::Ok
+    }
+
+    /// Export the producer-private proof-record entry for one accepted
+    /// provable transfer. Operator-gated because the entry contains the
+    /// exact witness, including commitment openings.
+    #[msg(role = ClerkLedgerRole::Operator)]
+    async fn transfer_proof_record(&self, transfer_id: [u8; 16]) -> Vec<u8> {
+        #[cfg(target_arch = "riscv64")]
+        return vos::provable::read_record_entry(&transfer_record_tag(&transfer_id))
+            .unwrap_or_default();
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            let _ = transfer_id;
+            Vec::new()
+        }
     }
 
     /// Read an account by id.

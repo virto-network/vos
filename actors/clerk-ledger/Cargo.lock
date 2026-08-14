@@ -694,6 +694,15 @@ name = "clerk-ledger"
 version = "0.1.0"
 dependencies = [
  "cipher-clerk",
+ "clerk-witness",
+ "vos",
+]
+
+[[package]]
+name = "clerk-witness"
+version = "0.1.0"
+dependencies = [
+ "cipher-clerk",
  "vos",
 ]
 
@@ -3937,6 +3946,7 @@ dependencies = [
  "vos-macros",
  "vos-raft",
  "vrf",
+ "zkpvm-precompiles",
 ]
 
 [[package]]
@@ -4520,4 +4530,11 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "zkpvm-precompiles"
+version = "0.1.0"
+dependencies = [
+ "curve25519-dalek",
 ]
