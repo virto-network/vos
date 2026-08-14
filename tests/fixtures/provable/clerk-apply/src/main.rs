@@ -55,11 +55,11 @@ impl ClerkApply {
     /// committed sub-trees. Any decode failure or kernel-rule violation
     /// panics → `Trap` → the proof won't verify.
     ///
-    /// The reply is a status byte; the PROVEN statement is the bound
-    /// `app_public` (the two roots + the batch digest), reconstructed
-    /// verifier-side from the captured `ProvableRecord`.
+    /// The reply repeats the exact 96 public bytes. The parent compares this
+    /// synchronous result before committing its live writes, while a later
+    /// verifier authenticates the same bytes through `app_public`.
     #[msg]
-    async fn apply(&self, witness: Vec<u8>) -> u8 {
+    async fn apply(&self, witness: Vec<u8>) -> Vec<u8> {
         let witness = ClerkTransitionWitness::decode(&witness)
             .expect("clerk-apply: witness is not a ClerkTransitionWitness");
         let applied = apply_witnessed(witness);
@@ -68,11 +68,8 @@ impl ClerkApply {
         // The leading root is what a verifier's expected_root_before
         // compares against; the digest binds the exact batch (closing the
         // empty-batch root_before==root_after substitution).
-        let mut public = [0u8; 96];
-        public[..32].copy_from_slice(&applied.root_before);
-        public[32..64].copy_from_slice(&applied.root_after);
-        public[64..].copy_from_slice(&applied.batch_digest());
+        let public = applied.claim().encode();
         vos::zk::bind_public_bytes(&public);
-        1
+        public.to_vec()
     }
 }

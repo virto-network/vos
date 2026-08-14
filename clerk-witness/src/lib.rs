@@ -113,7 +113,49 @@ pub struct AppliedTransition {
     pub events: Vec<Transfer>,
 }
 
+/// Public result bound by the `clerk-apply` Task and returned to its
+/// parent. The fixed-width wire is deliberately the same 96 bytes placed in
+/// `ProvableRecord::app_public`: the parent can compare the synchronous
+/// result it is about to apply with the result a later proof authenticates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClerkTransitionClaim {
+    pub root_before: [u8; 32],
+    pub root_after: [u8; 32],
+    pub batch_digest: [u8; 32],
+}
+
+impl ClerkTransitionClaim {
+    pub const WIRE_LEN: usize = 96;
+
+    pub fn encode(self) -> [u8; Self::WIRE_LEN] {
+        let mut bytes = [0u8; Self::WIRE_LEN];
+        bytes[..32].copy_from_slice(&self.root_before);
+        bytes[32..64].copy_from_slice(&self.root_after);
+        bytes[64..].copy_from_slice(&self.batch_digest);
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::WIRE_LEN {
+            return None;
+        }
+        Some(Self {
+            root_before: bytes[..32].try_into().ok()?,
+            root_after: bytes[32..64].try_into().ok()?,
+            batch_digest: bytes[64..].try_into().ok()?,
+        })
+    }
+}
+
 impl AppliedTransition {
+    pub fn claim(&self) -> ClerkTransitionClaim {
+        ClerkTransitionClaim {
+            root_before: self.root_before,
+            root_after: self.root_after,
+            batch_digest: self.batch_digest(),
+        }
+    }
+
     /// True iff some applied transfer carries a **debit** entry of
     /// exactly `amount` — the voucher tie (mirrors cipher-clerk's
     /// `SuccinctTransitionWitness::has_debit_commit`): it blocks
@@ -132,11 +174,18 @@ impl AppliedTransition {
     /// proven transition to THIS batch (rkyv re-encoding of the
     /// decoded events is byte-stable for these plain structs).
     pub fn batch_digest(&self) -> [u8; 32] {
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&self.events)
-            .expect("events rkyv-encode")
-            .to_vec();
-        vos::crypto::blake2b_hash::<32>(b"clerk-witness/batch/v1", &[&bytes])
+        batch_digest(&self.events)
     }
+}
+
+/// Domain-tagged digest of a canonical transfer batch. Kept as a free
+/// producer-side helper so a parent can compare the Task claim without
+/// manufacturing an `AppliedTransition` it did not itself execute.
+pub fn batch_digest(events: &[Transfer]) -> [u8; 32] {
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&events.to_vec())
+        .expect("events rkyv-encode")
+        .to_vec();
+    vos::crypto::blake2b_hash::<32>(b"clerk-witness/batch/v1", &[&bytes])
 }
 
 /// Verify-and-apply one witnessed transition — the whole pure-verifier
@@ -628,4 +677,29 @@ pub fn witness_from_vec_ledger(
         events,
         batch_seed_timestamp,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClerkTransitionClaim;
+
+    #[test]
+    fn transition_claim_wire_is_exact_and_roundtrips() {
+        let claim = ClerkTransitionClaim {
+            root_before: [0x11; 32],
+            root_after: [0x22; 32],
+            batch_digest: [0x33; 32],
+        };
+        let encoded = claim.encode();
+        assert_eq!(encoded.len(), ClerkTransitionClaim::WIRE_LEN);
+        assert_eq!(&encoded[..32], &[0x11; 32]);
+        assert_eq!(&encoded[32..64], &[0x22; 32]);
+        assert_eq!(&encoded[64..], &[0x33; 32]);
+        assert_eq!(ClerkTransitionClaim::decode(&encoded), Some(claim));
+        assert_eq!(ClerkTransitionClaim::decode(&encoded[..95]), None);
+
+        let mut trailing = encoded.to_vec();
+        trailing.push(0);
+        assert_eq!(ClerkTransitionClaim::decode(&trailing), None);
+    }
 }
