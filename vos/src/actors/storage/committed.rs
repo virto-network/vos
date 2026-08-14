@@ -410,15 +410,7 @@ impl<K: FixedKey, V: Encode + Decode> CommittedMap<K, V> {
         let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
         let (_, _, top) = self.read_root();
         let mut frontier = Vec::new();
-        self.collect_frontier(
-            &p,
-            &chain,
-            &top,
-            0,
-            alloc::vec![0u8; p.width],
-            &key_refs,
-            &mut frontier,
-        );
+        self.collect_frontier(&p, &chain, &top, &key_refs, &mut frontier);
         (state::BatchProof::from_frontier(frontier), values)
     }
 
@@ -430,85 +422,90 @@ impl<K: FixedKey, V: Encode + Decode> CommittedMap<K, V> {
     /// off-path side of a compressed spine holds no stored content, so
     /// touched keys splitting onto it emit nothing (the verifier folds
     /// the empty chain — their non-inclusion).
-    #[allow(clippy::too_many_arguments)]
     fn collect_frontier(
         &self,
         p: &SmtParams,
         chain: &[[u8; 32]],
         r: &Ref,
-        level: usize,
-        prefix: Vec<u8>,
         touched: &[&[u8]],
         out: &mut Vec<state::FrontierNode>,
     ) {
-        if touched.is_empty() {
-            if !matches!(r, Ref::Empty) {
-                out.push(state::FrontierNode {
-                    level: level as u16,
-                    prefix,
-                    hash: ref_subtree_hash(p, chain, r, level),
-                });
-            }
-            return;
-        }
-        if matches!(r, Ref::Empty) {
-            // Nothing stored below this cell: no frontier to record,
-            // and the touched keys here prove absent through the empty
-            // chain — no need to recurse the remaining levels.
-            return;
-        }
-        if p.depth() == level {
-            // A touched leaf cell: the verifier supplies its content
-            // hash, so nothing is recorded whether or not a leaf is
-            // stored here.
-            return;
-        }
-        // The single stored occupant below this cell (leaf, or a deeper
-        // branch) continues down its own side of every split; the other
-        // side is stored-empty. A real two-child split happens only at
-        // the branch's own level, where the node row names both sides.
-        let (left_ref, right_ref);
-        match r {
-            Ref::Empty => unreachable!("guarded above"),
-            Ref::Leaf { key, .. } => {
-                if state::level_bit(key, level) {
-                    left_ref = Ref::Empty;
-                    right_ref = r.clone();
-                } else {
-                    left_ref = r.clone();
-                    right_ref = Ref::Empty;
+        // A 32-byte key has a 256-level path. Recursing once per bit is
+        // harmless on a host stack but exhausts the deliberately small
+        // actor-PVM stack. Keep the exact same depth-first walk on an
+        // explicit heap worklist instead. The final frontier is sorted by
+        // `BatchProof::from_frontier`, so push order is not observable.
+        let mut work = alloc::vec![(
+            r.clone(),
+            0usize,
+            alloc::vec![0u8; p.width],
+            0usize,
+            touched.len(),
+        )];
+        while let Some((r, level, prefix, start, end)) = work.pop() {
+            if start == end {
+                if !matches!(r, Ref::Empty) {
+                    out.push(state::FrontierNode {
+                        level: level as u16,
+                        prefix,
+                        hash: ref_subtree_hash(p, chain, &r, level),
+                    });
                 }
+                continue;
             }
-            Ref::Branch {
-                level: node_level,
-                prefix: node_prefix,
-                ..
-            } => {
-                if level < *node_level as usize {
-                    // Spine descent toward the branch's own level.
-                    if state::level_bit(node_prefix, level) {
-                        left_ref = Ref::Empty;
-                        right_ref = r.clone();
+            if matches!(r, Ref::Empty) {
+                // Nothing stored below this cell: no frontier to record,
+                // and the touched keys here prove absent through the empty
+                // chain — no need to visit the remaining levels.
+                continue;
+            }
+            if p.depth() == level {
+                // A touched leaf cell: the verifier supplies its content
+                // hash, so nothing is recorded whether or not a leaf is
+                // stored here.
+                continue;
+            }
+
+            // The single stored occupant below this cell (leaf, or a deeper
+            // branch) continues down its own side of every split; the other
+            // side is stored-empty. A real two-child split happens only at
+            // the branch's own level, where the node row names both sides.
+            let (left_ref, right_ref) = match &r {
+                Ref::Empty => unreachable!("guarded above"),
+                Ref::Leaf { key, .. } => {
+                    if state::level_bit(key, level) {
+                        (Ref::Empty, r.clone())
                     } else {
-                        left_ref = r.clone();
-                        right_ref = Ref::Empty;
+                        (r.clone(), Ref::Empty)
                     }
-                } else {
-                    debug_assert_eq!(level, *node_level as usize);
-                    let (l, rt) = self.read_node(*node_level, node_prefix);
-                    left_ref = l;
-                    right_ref = rt;
                 }
-            }
+                Ref::Branch {
+                    level: node_level,
+                    prefix: node_prefix,
+                    ..
+                } => {
+                    if level < *node_level as usize {
+                        // Spine descent toward the branch's own level.
+                        if state::level_bit(node_prefix, level) {
+                            (Ref::Empty, r.clone())
+                        } else {
+                            (r.clone(), Ref::Empty)
+                        }
+                    } else {
+                        debug_assert_eq!(level, *node_level as usize);
+                        self.read_node(*node_level, node_prefix)
+                    }
+                }
+            };
+            let byte_idx = level / 8;
+            let bit_idx = 7 - (level % 8);
+            let split =
+                start + touched[start..end].partition_point(|k| (k[byte_idx] >> bit_idx) & 1 == 0);
+            let mut prefix_r = prefix.clone();
+            prefix_r[byte_idx] |= 1 << bit_idx;
+            work.push((right_ref, level + 1, prefix_r, split, end));
+            work.push((left_ref, level + 1, prefix, start, split));
         }
-        let byte_idx = level / 8;
-        let bit_idx = 7 - (level % 8);
-        let split = touched.partition_point(|k| (k[byte_idx] >> bit_idx) & 1 == 0);
-        let (t_left, t_right) = touched.split_at(split);
-        let mut prefix_r = prefix.clone();
-        prefix_r[byte_idx] |= 1 << bit_idx;
-        self.collect_frontier(p, chain, &left_ref, level + 1, prefix, t_left, out);
-        self.collect_frontier(p, chain, &right_ref, level + 1, prefix_r, t_right, out);
     }
 
     /// Set (`Some(leaf_hash)`) or clear (`None`) `kb`'s leaf and
