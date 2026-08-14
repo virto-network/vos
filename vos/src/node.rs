@@ -3615,7 +3615,7 @@ impl VosNode {
             + Send
             + 'static,
     {
-        install_v2_root_proof_verifier(&mut service, None);
+        install_v2_root_proof_verifier(&mut service, None)?;
         self.validate_v2_root_registration(&service, id)?;
         Ok(self.attach_v2_root_unchecked(name.into(), service, id, network_reachable, None))
     }
@@ -3639,7 +3639,7 @@ impl VosNode {
         P: crate::AttestationProofBackendV2 + Send + 'static,
     {
         let producer = V2NodeAttestationProofProducer::new(producer);
-        install_v2_root_proof_verifier(&mut service, Some(producer.verifier()));
+        install_v2_root_proof_verifier(&mut service, Some(producer.verifier()))?;
         self.validate_v2_root_registration(&service, id)?;
         Ok(self.attach_v2_root_unchecked(
             name.into(),
@@ -3672,7 +3672,7 @@ impl VosNode {
         install_v2_root_proof_verifier(
             &mut service,
             Some(v2_node_attestation_proof_verifier(verifier)),
-        );
+        )?;
         self.validate_v2_root_registration(&service, id)?;
         Ok(self.attach_v2_root_unchecked(name.into(), service, id, network_reachable, None))
     }
@@ -6067,21 +6067,41 @@ impl crate::AttestationProofProducerV2 for V2NodeAttestationProofProducer {
 fn install_v2_root_proof_verifier<B>(
     service: &mut crate::v2::LocalRootTreeServiceV2<B>,
     verifier: Option<V2NodeAttestationProofVerifier>,
-) where
+) -> Result<(), V2NodeRegistrationError>
+where
     B: crate::v2::CommittedImageStoreV2
         + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
 {
-    match verifier {
-        Some(verifier) => service
-            .store_mut()
-            .install_proof_verifier(move |request, proof| verifier(request, proof)),
-        None => {
-            let verifier = v2_deny_all_proof_verifier();
+    // An already-opened conformance service may contain a pending attested
+    // publication accepted under its local allowlist. Reconstruct every exact
+    // public-input request before changing verifier policy, then require the
+    // production verifier to re-authorize the durable proof history before
+    // the root becomes routable. This also makes ordinary registration
+    // fail-closed for proof-bearing roots.
+    let requests = service
+        .store()
+        .snapshot()
+        .proof_verification_history()
+        .map_err(|_| V2NodeRegistrationError::CorruptServiceStore)?;
+    let artifacts = requests
+        .iter()
+        .map(|request| {
             service
-                .store_mut()
-                .install_proof_verifier(move |request, proof| verifier(request, proof));
+                .attestation_proof(&request.proof_blob)
+                .map(|artifact| artifact.bytes)
+                .ok_or(V2NodeRegistrationError::CorruptServiceStore)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let verifier = verifier.unwrap_or_else(v2_deny_all_proof_verifier);
+    service.store_mut().install_proof_verifier_arc(verifier);
+    for (request, proof) in requests.iter().zip(&artifacts) {
+        if !crate::AttestationProofHostV2::make_proof_available(service.store_mut(), request, proof)
+        {
+            return Err(V2NodeRegistrationError::CorruptServiceStore);
         }
     }
+    Ok(())
 }
 
 struct V2PendingCaller {

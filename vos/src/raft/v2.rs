@@ -20,8 +20,8 @@ use crate::commit::CommitError;
 use crate::v2::wire::{DecodeError, Decoder, Encoder};
 use crate::v2::{
     AccumulateRequestV2, CommittedAccumulateBatchV2, CommittedAccumulateEntryV2,
-    CommittedAccumulateLogV2, CommittedServiceSnapshotV2, ImportedBlobV2, ImportedProgramV2,
-    LocalJamStoreSnapshotV2, ProgramId, ReceiptVerificationRequestV2, V2Wire,
+    CommittedAccumulateLogV2, CommittedProofArtifactV2, CommittedServiceSnapshotV2, ImportedBlobV2,
+    ImportedProgramV2, LocalJamStoreSnapshotV2, ProgramId, ReceiptVerificationRequestV2, V2Wire,
 };
 
 use super::log::{LogEntry, RaftLog, RaftMeta};
@@ -497,7 +497,7 @@ impl CommittedAccumulateLogV2 for RaftAccumulateLogV2 {
         &mut self,
         index: u64,
         service_image: &[u8],
-        proof_artifacts: &[ImportedBlobV2],
+        proof_artifacts: &[CommittedProofArtifactV2],
     ) -> Result<(), Self::Error> {
         self.meta = RaftMeta::load(&self.db)?;
         if index < self.meta.last_applied || index > self.meta.commit_index {
@@ -603,10 +603,17 @@ mod tests {
         store.snapshot_bytes()
     }
 
-    fn proof_artifact(byte: u8) -> ImportedBlobV2 {
+    fn proof_artifact(byte: u8) -> CommittedProofArtifactV2 {
         let bytes = vec![byte; 32];
-        ImportedBlobV2 {
-            reference: crate::v2::BlobRefV2::of_bytes(&bytes),
+        let proof_blob = crate::v2::BlobRefV2::of_bytes(&bytes);
+        CommittedProofArtifactV2 {
+            verification: crate::v2::ProofVerificationRequestV2 {
+                actor_program: ProgramId([byte; 32]),
+                execution_semantics: crate::v2::Hash([byte.wrapping_add(1); 32]),
+                statement: crate::v2::Hash([byte.wrapping_add(2); 32]),
+                trace: crate::v2::Hash([byte.wrapping_add(3); 32]),
+                proof_blob,
+            },
             bytes,
         }
     }

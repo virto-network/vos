@@ -18,12 +18,28 @@ use crate::attestation::AttestationProofHostV2;
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, AccumulatedTimeoutV2, AccumulationReceiptV2,
-    ActorUpgradeV2, BlobRefV2, DedupRecordV2, DeliveryRecordV2, DirectIngressV2, ImportedBlobV2,
-    IngressRecordV2, MessageRecordV2, ProgramId, ProofVerificationRequestV2, PublicationRecordV2,
-    ReceiptVerificationRequestV2, ReplyAdmissionRecordV2, RoleCredentialVerificationRequestV2,
-    ServiceGenesisV2, ServicePvmErrorV2, ServiceStateTreeV2, StateKeyV2, StateTreeStore,
-    StoreHeaderV2, StoreOpenError, V2Wire,
+    ActorUpgradeV2, AttestationDeliveryV2, BlobRefV2, DedupRecordV2, DeliveryRecordV2,
+    DirectIngressV2, IngressRecordV2, MessageRecordV2, ProgramId, ProofVerificationRequestV2,
+    PublicationRecordV2, ReceiptVerificationRequestV2, ReplyAdmissionRecordV2,
+    RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServicePvmErrorV2, ServiceStateTreeV2,
+    StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
 };
+
+fn proof_verification_for_attestation(
+    attestation: &AttestationDeliveryV2,
+) -> ProofVerificationRequestV2 {
+    ProofVerificationRequestV2 {
+        actor_program: attestation.statement.actor_program,
+        execution_semantics: attestation
+            .statement
+            .accumulation_receipt
+            .service
+            .execution_semantics,
+        statement: attestation.proof.statement,
+        trace: attestation.proof.trace,
+        proof_blob: attestation.proof.proof_blob.clone(),
+    }
+}
 
 /// Cloneable in-memory image of a committed local v2 service account.
 ///
@@ -67,8 +83,10 @@ impl LocalJamStoreSnapshotV2 {
     /// duplicate routing returns from the admission before reading proof
     /// bytes. Retaining their proofs here would make every Raft snapshot grow
     /// with the complete attested-reply history.
-    pub(crate) fn referenced_proof_blobs(&self) -> Result<Vec<BlobRefV2>, DecodeError> {
-        let mut references = Vec::new();
+    pub(crate) fn referenced_proof_verifications(
+        &self,
+    ) -> Result<Vec<ProofVerificationRequestV2>, DecodeError> {
+        let mut requests = Vec::new();
         let publication_prefix = super::storage::publication_storage_prefix();
         for (key, bytes) in self
             .rows
@@ -79,14 +97,47 @@ impl LocalJamStoreSnapshotV2 {
             if super::publication_storage_key(publication.input).as_slice() != key.as_slice() {
                 return Err(DecodeError::NonCanonical);
             }
-            if let Some(proof) = publication.published.proof {
-                references.push(proof.proof_blob);
+            if publication.published.proof.is_some() {
+                let attestation = publication
+                    .published
+                    .attestation
+                    .as_deref()
+                    .ok_or(DecodeError::NonCanonical)?;
+                requests.push(proof_verification_for_attestation(attestation));
             }
         }
 
-        references.sort_unstable_by_key(|reference| reference.hash);
-        references.dedup();
-        Ok(references)
+        requests.sort_unstable_by_key(ProofVerificationRequestV2::hash);
+        requests.dedup();
+        Ok(requests)
+    }
+
+    /// Proof decisions whose validity still affects durable local behavior.
+    /// Pending publications need their artifact for routing; permanent reply
+    /// admissions prove that an external attestation was allowed to resume an
+    /// actor. A production verifier installed after opening a conformance
+    /// store must revalidate both classes before the root becomes routable.
+    pub(crate) fn proof_verification_history(
+        &self,
+    ) -> Result<Vec<ProofVerificationRequestV2>, DecodeError> {
+        let mut requests = self.referenced_proof_verifications()?;
+        let admission_prefix = super::storage::reply_admission_storage_prefix();
+        for (key, bytes) in self
+            .rows
+            .range(admission_prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(admission_prefix))
+        {
+            let admission = ReplyAdmissionRecordV2::decode(bytes)?;
+            if super::reply_admission_storage_key(admission.call_id).as_slice() != key.as_slice() {
+                return Err(DecodeError::NonCanonical);
+            }
+            if let Some(attestation) = admission.awaited_reply.attestation.as_deref() {
+                requests.push(proof_verification_for_attestation(attestation));
+            }
+        }
+        requests.sort_unstable_by_key(ProofVerificationRequestV2::hash);
+        requests.dedup();
+        Ok(requests)
     }
 }
 
@@ -1074,20 +1125,6 @@ impl AttestationProofHostV2 for LocalJamStoreV2 {
             .filter(|bytes| reference.matches(bytes))
             .cloned()
     }
-
-    fn hydrate_snapshot_proof(&mut self, artifact: &ImportedBlobV2) -> bool {
-        if !artifact.reference.matches(&artifact.bytes) {
-            return false;
-        }
-        match self.proof_blobs.get(&artifact.reference.hash.0) {
-            Some(existing) => existing == &artifact.bytes,
-            None => {
-                self.proof_blobs
-                    .insert(artifact.reference.hash.0, artifact.bytes.clone());
-                true
-            }
-        }
-    }
 }
 
 impl super::ReceiptVerificationHostV2 for LocalJamStoreV2 {
@@ -1125,18 +1162,6 @@ impl<B: ProofArtifactStoreV2> AttestationProofHostV2 for DurableJamStoreV2<B> {
                 .flatten()
                 .filter(|bytes| reference.matches(bytes))
         })
-    }
-
-    fn hydrate_snapshot_proof(&mut self, artifact: &ImportedBlobV2) -> bool {
-        if !artifact.reference.matches(&artifact.bytes)
-            || self
-                .backend
-                .commit_proof(&artifact.reference, &artifact.bytes)
-                .is_err()
-        {
-            return false;
-        }
-        self.local.hydrate_snapshot_proof(artifact)
     }
 }
 

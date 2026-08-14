@@ -803,9 +803,11 @@ bounded recent window. Automatic compaction cannot cross this durable
 application cursor and freezes the matching image—not a newer mutable state
 row—into a `CommittedServiceSnapshotV2`. A lagging follower receives that
 envelope through Raft `InstallSnapshot`, checks that its bound index matches the
-installed snapshot metadata, and durably hydrates the snapshot's separate
-content-addressed proof-artifact bundle for pending publications before
-replacing its physical service image. Completed reply admissions are permanent
+installed snapshot metadata, reconstructs the exact proof-verification public
+inputs committed by every pending publication, and independently verifies each
+content-addressed artifact before durably hydrating the proof side-CAS or
+replacing its physical service image. The request-bound bundle uses the
+clean-break `VRS3` snapshot wire. Completed reply admissions are permanent
 deduplication markers but do not retain proof bytes: their retry path resolves
 before proof lookup. Only after hydration does the follower advance
 `last_applied` and replay any surviving log tail. A proof-CAS or service-image

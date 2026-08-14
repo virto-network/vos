@@ -615,7 +615,7 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
         &mut self,
         index: u64,
         _service_image: &[u8],
-        _proof_artifacts: &[ImportedBlobV2],
+        _proof_artifacts: &[vos::v2::CommittedProofArtifactV2],
     ) -> Result<(), Self::Error> {
         let committed = self
             .committed_index_floor
@@ -3738,6 +3738,43 @@ fn node_attested_root_requires_an_explicit_producer_and_returns_the_committed_pa
     let reopened = LocalRootTreeServiceV2::open(config, backend)
         .expect("the node's proof and acknowledgement survive its root thread");
     assert!(reopened.pending_publications().unwrap().is_empty());
+}
+
+#[test]
+fn local_registration_reverifies_conformance_proof_history_before_exposing_the_root() {
+    let (config, request) = attested_root_fixture(ConsistencyModeV2::Local, 0x72);
+    let backend = SharedProofCommittedImages::default();
+    let mut service = LocalRootTreeServiceV2::open(config, backend).unwrap();
+    let conformance_proof = canonical_test_proof_manifest(0x91);
+    service
+        .invoke_attested(
+            request,
+            &mut CanonicalTestProofProducer {
+                proof: conformance_proof,
+                calls: 0,
+            },
+        )
+        .expect("the explicit conformance seam accepts its locally produced proof");
+    assert_eq!(service.pending_publications().unwrap().len(), 1);
+
+    let mut node = VosNode::new();
+    assert!(matches!(
+        node.register_v2_root_at_id_with_producer(
+            "attested-root-v2",
+            service,
+            ServiceId::new(0, 0x3311),
+            false,
+            CanonicalTestProofProducer {
+                proof: canonical_test_proof_manifest(0x92),
+                calls: 0,
+            },
+        ),
+        Err(V2NodeRegistrationError::CorruptServiceStore)
+    ));
+    assert!(
+        node.collect().is_empty(),
+        "the rejected root was never exposed"
+    );
 }
 
 #[test]
@@ -14194,8 +14231,23 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         logged.transition.proof
     );
 
-    let snapshot_proofs = vec![ImportedBlobV2 {
-        reference: committed.proof.proof_blob.clone(),
+    let snapshot_attestation = committed
+        .published
+        .attestation
+        .as_deref()
+        .expect("attested commit publishes verifier inputs");
+    let snapshot_proofs = vec![vos::v2::CommittedProofArtifactV2 {
+        verification: ProofVerificationRequestV2 {
+            actor_program: snapshot_attestation.statement.actor_program,
+            execution_semantics: snapshot_attestation
+                .statement
+                .accumulation_receipt
+                .service
+                .execution_semantics,
+            statement: snapshot_attestation.proof.statement,
+            trace: snapshot_attestation.proof.trace,
+            proof_blob: snapshot_attestation.proof.proof_blob.clone(),
+        },
         bytes: committed.proof_bytes.clone(),
     }];
     let snapshot = CommittedServiceSnapshotV2 {
@@ -14209,6 +14261,15 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         CommittedServiceSnapshotV2::decode(&missing_proof_snapshot.encode()),
         Err(vos::v2::DecodeError::NonCanonical),
         "a snapshot cannot omit an artifact referenced by its publication"
+    );
+    let mut substituted_request_snapshot = snapshot.clone();
+    substituted_request_snapshot.proof_artifacts[0]
+        .verification
+        .actor_program = ProgramId([0xF1; 32]);
+    assert_eq!(
+        CommittedServiceSnapshotV2::decode(&substituted_request_snapshot.encode()),
+        Err(vos::v2::DecodeError::NonCanonical),
+        "snapshot proof bytes cannot be rebound to substituted public inputs"
     );
 
     let mismatched_schedule =
@@ -14266,6 +14327,51 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         "snapshot identity is checked before the cursor advances"
     );
 
+    let mut rejecting_snapshot_host =
+        DurableJamStoreV2::open(FailableCommittedImages::default()).unwrap();
+    rejecting_snapshot_host.install_proof_verifier(|_, _| false);
+    let rejecting_snapshot_service = JamServiceV2::new(
+        service_pvm.clone(),
+        service_program,
+        NoRefineProtocolHostV2,
+        rejecting_snapshot_host,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
+    )
+    .unwrap();
+    let mut rejecting_snapshot_follower = ReplicatedJamServiceV2::new(
+        rejecting_snapshot_service,
+        TestCommittedLog::new(shared_log.clone(), false).with_installed_snapshot(snapshot.clone()),
+    );
+    assert!(matches!(
+        rejecting_snapshot_follower.catch_up(),
+        Err(vos::v2::ReplicatedServiceErrorV2::ProofUnavailable)
+    ));
+    assert_eq!(
+        rejecting_snapshot_follower
+            .log_mut()
+            .applied_index()
+            .unwrap(),
+        0
+    );
+    assert!(
+        rejecting_snapshot_follower
+            .service()
+            .accumulate_host()
+            .header()
+            .unwrap()
+            .is_none(),
+        "a verifier denial leaves the service image untouched"
+    );
+    assert_eq!(
+        rejecting_snapshot_follower
+            .service()
+            .accumulate_host()
+            .proof_bytes(&committed.proof.proof_blob),
+        None,
+        "a verifier denial leaves the proof side-CAS untouched"
+    );
+
     let mark_only_host = LocalJamStoreV2::from_snapshot_bytes(&snapshot.service_image).unwrap();
     let mark_only_image = mark_only_host.committed_service_image();
     let mark_only_service = JamServiceV2::new(
@@ -14301,11 +14407,18 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         "cursor-only advancement cannot bless a mismatched existing image"
     );
 
-    let snapshot_host = DurableJamStoreV2::open(FailableCommittedImages {
+    let mut snapshot_host = DurableJamStoreV2::open(FailableCommittedImages {
         fail_next_proof_commit: true,
         ..FailableCommittedImages::default()
     })
     .unwrap();
+    let snapshot_verifications = Arc::new(AtomicUsize::new(0));
+    let snapshot_verification_count = snapshot_verifications.clone();
+    let expected_snapshot_proof = committed.proof_bytes.clone();
+    snapshot_host.install_proof_verifier(move |_, candidate| {
+        snapshot_verification_count.fetch_add(1, Ordering::Relaxed);
+        candidate == expected_snapshot_proof
+    });
     let snapshot_service = JamServiceV2::new(
         service_pvm,
         service_program,
@@ -14351,6 +14464,10 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
             .iter()
             .any(|publication| publication.input == input),
         "the installed publication remains routable after snapshot-only catch-up"
+    );
+    assert!(
+        snapshot_verifications.load(Ordering::Relaxed) >= 2,
+        "snapshot retry independently verifies before each side-CAS attempt"
     );
 }
 

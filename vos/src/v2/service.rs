@@ -433,6 +433,14 @@ pub struct CommittedAccumulateBatchV2 {
 /// The image remains the canonical `LocalJamStoreSnapshotV2` wire; this
 /// envelope binds it to the log position advertised by InstallSnapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedProofArtifactV2 {
+    /// Exact public inputs which the receiving replica must independently
+    /// verify before making `bytes` durable or installing the service image.
+    pub verification: ProofVerificationRequestV2,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommittedServiceSnapshotV2 {
     pub applied_index: u64,
     pub service_image: Vec<u8>,
@@ -440,19 +448,18 @@ pub struct CommittedServiceSnapshotV2 {
     /// service image, but must become durable before this snapshot cursor is
     /// installed on another replica. Completed reply admissions do not retain
     /// proof bytes because duplicate routing resolves from the admission row.
-    pub proof_artifacts: Vec<ImportedBlobV2>,
+    pub proof_artifacts: Vec<CommittedProofArtifactV2>,
 }
 
 impl V2Wire for CommittedServiceSnapshotV2 {
-    const MAGIC: [u8; 4] = *b"VRS2";
+    const MAGIC: [u8; 4] = *b"VRS3";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
         encoder.u64(self.applied_index);
         encoder.bytes(&self.service_image);
         encoder.list(&self.proof_artifacts, |encoder, artifact| {
-            encoder.fixed(&artifact.reference.hash.0);
-            encoder.u64(artifact.reference.len);
+            encoder.bytes(&artifact.verification.encode());
             encoder.bytes(&artifact.bytes);
         });
     }
@@ -461,15 +468,8 @@ impl V2Wire for CommittedServiceSnapshotV2 {
         let applied_index = decoder.u64()?;
         let service_image = decoder.bytes()?;
         let proof_artifacts = decoder.list(|decoder| {
-            let reference = super::BlobRefV2 {
-                hash: super::Hash(decoder.fixed()?),
-                len: decoder.u64()?,
-            };
-            if reference.len == u64::MAX {
-                return Err(DecodeError::NonCanonical);
-            }
-            Ok(ImportedBlobV2 {
-                reference,
+            Ok(CommittedProofArtifactV2 {
+                verification: ProofVerificationRequestV2::decode(&decoder.bytes()?)?,
                 bytes: decoder.bytes()?,
             })
         })?;
@@ -479,20 +479,22 @@ impl V2Wire for CommittedServiceSnapshotV2 {
         }
         if proof_artifacts
             .windows(2)
-            .any(|pair| pair[0].reference.hash >= pair[1].reference.hash)
+            .any(|pair| pair[0].verification.hash() >= pair[1].verification.hash())
             || proof_artifacts
                 .iter()
-                .any(|artifact| !artifact.reference.matches(&artifact.bytes))
+                .any(|artifact| !artifact.verification.proof_blob.matches(&artifact.bytes))
         {
             return Err(DecodeError::NonCanonical);
         }
-        for reference in service_snapshot.referenced_proof_blobs()? {
+        for verification in service_snapshot.referenced_proof_verifications()? {
             let Ok(index) = proof_artifacts
-                .binary_search_by_key(&reference.hash, |artifact| artifact.reference.hash)
+                .binary_search_by_key(&verification.hash(), |artifact| {
+                    artifact.verification.hash()
+                })
             else {
                 return Err(DecodeError::NonCanonical);
             };
-            if proof_artifacts[index].reference != reference {
+            if proof_artifacts[index].verification != verification {
                 return Err(DecodeError::NonCanonical);
             }
         }
@@ -567,7 +569,7 @@ pub trait CommittedAccumulateLogV2 {
         &mut self,
         index: u64,
         service_image: &[u8],
-        proof_artifacts: &[ImportedBlobV2],
+        proof_artifacts: &[CommittedProofArtifactV2],
     ) -> Result<(), Self::Error>;
 }
 
@@ -1359,7 +1361,7 @@ where
                 if !self
                     .service
                     .accumulate_host_mut()
-                    .hydrate_snapshot_proof(artifact)
+                    .make_proof_available(&artifact.verification, &artifact.bytes)
                 {
                     return Err(ReplicatedServiceErrorV2::ProofUnavailable);
                 }
@@ -1671,18 +1673,21 @@ where
 fn snapshot_proof_artifacts<A: AttestationProofHostV2>(
     host: &A,
     service_image: &[u8],
-) -> Result<Vec<ImportedBlobV2>, ()> {
+) -> Result<Vec<CommittedProofArtifactV2>, ()> {
     let snapshot = LocalJamStoreSnapshotV2::decode(service_image).map_err(|_| ())?;
     snapshot
-        .referenced_proof_blobs()
+        .referenced_proof_verifications()
         .map_err(|_| ())?
         .into_iter()
-        .map(|reference| {
-            let bytes = host.proof_bytes(&reference).ok_or(())?;
-            if !reference.matches(&bytes) {
+        .map(|verification| {
+            let bytes = host.proof_bytes(&verification.proof_blob).ok_or(())?;
+            if !verification.proof_blob.matches(&bytes) {
                 return Err(());
             }
-            Ok(ImportedBlobV2 { reference, bytes })
+            Ok(CommittedProofArtifactV2 {
+                verification,
+                bytes,
+            })
         })
         .collect()
 }

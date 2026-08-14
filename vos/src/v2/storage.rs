@@ -855,6 +855,11 @@ pub fn reply_admission_storage_key(call: CallId) -> Vec<u8> {
     key
 }
 
+#[cfg(feature = "std")]
+pub(crate) const fn reply_admission_storage_prefix() -> &'static [u8] {
+    REPLY_ADMISSION_STORAGE_PREFIX
+}
+
 /// Guest-owned durable timeout outcome used to reconstruct an exact resume
 /// after process restart or CRDT synchronization.
 pub fn call_expiration_storage_key(call: CallId) -> Vec<u8> {
