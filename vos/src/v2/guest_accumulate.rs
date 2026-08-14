@@ -3463,13 +3463,18 @@ fn apply<S: GuestAccumulateStoreV2>(
         .and_then(|reply| reply.attestation.as_ref())
         .map(|attestation| &attestation.proof.proof_blob);
     for candidate in &envelope.provided_blobs {
-        if proof_blob == Some(&candidate.reference)
-            || awaited_proof_blob == Some(&candidate.reference)
-        {
+        let proof_artifact = proof_blob == Some(&candidate.reference)
+            || awaited_proof_blob == Some(&candidate.reference);
+        let application_blob = application_blob_references(work, transition)
+            .any(|reference| reference == &candidate.reference);
+        if proof_artifact && !application_blob {
             // Proof artifacts are verifier/CAS inputs rather than service
             // state. Their content identity is checked here, while the host's
             // PROOF_VERIFY capability reads the same bytes from its external
-            // proof store. They must never enter the recoverable service image.
+            // proof store. A content address which is also used by actor
+            // state, a continuation, an export, or another application input
+            // is persisted below; only verifier-exclusive artifacts stay out
+            // of the recoverable service image.
             if !candidate.reference.matches(&candidate.bytes) {
                 return Ok(rejected(AccumulationRejectionV2::InvalidProof));
             }
@@ -4869,6 +4874,14 @@ fn referenced_blobs<'a>(
     work: &'a super::WorkEnvelopeV2,
     transition: &'a super::TransitionV2,
 ) -> impl Iterator<Item = &'a BlobRefV2> {
+    application_blob_references(work, transition)
+        .chain(transition.proof.iter().map(|proof| &proof.proof_blob))
+}
+
+fn application_blob_references<'a>(
+    work: &'a super::WorkEnvelopeV2,
+    transition: &'a super::TransitionV2,
+) -> impl Iterator<Item = &'a BlobRefV2> {
     work.imported_blobs
         .iter()
         .chain(work.imported_actors.iter().flat_map(|actor| {
@@ -4891,7 +4904,6 @@ fn referenced_blobs<'a>(
                 .flat_map(|change| change.materializations.iter())
                 .map(|materialization| &materialization.state),
         )
-        .chain(transition.proof.iter().map(|proof| &proof.proof_blob))
 }
 
 fn actor_state_key(consistency: ConsistencyModeV2, actor: ActorId) -> StateKeyV2 {
@@ -6875,8 +6887,13 @@ mod tests {
             "receipt prediction executes against an isolated staging transaction"
         );
 
-        let proof_bytes = b"proof bytes".to_vec();
+        // One canonical candidate may serve both as a verifier artifact and
+        // as application state. It must remain in the recoverable blob image
+        // even though verifier-only proof bytes live exclusively in the
+        // proof side-CAS.
+        let proof_bytes = child_blob.bytes.clone();
         let proof_blob = BlobRefV2::of_bytes(&proof_bytes);
+        assert_eq!(proof_blob, child_blob.reference);
         let proof = super::super::ProofCommitmentV2 {
             statement: preparation.statement.commitment(),
             trace: Hash([12; 32]),
@@ -6892,14 +6909,7 @@ mod tests {
         };
         let mut proved_transition = transition.clone();
         proved_transition.proof = Some(proof.clone());
-        let mut provided_blobs = vec![
-            child_blob.clone(),
-            ImportedBlobV2 {
-                reference: proof_blob.clone(),
-                bytes: proof_bytes.clone(),
-            },
-        ];
-        provided_blobs.sort_by_key(|blob| blob.reference.hash);
+        let provided_blobs = vec![child_blob.clone()];
         let request = AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
             work: work.clone(),
             transition: proved_transition.clone(),
@@ -6926,6 +6936,17 @@ mod tests {
         };
         assert_eq!(receipt, preparation.receipt);
         assert_eq!(published.proof, Some(proof.clone()));
+        assert_eq!(
+            store.blobs.get(&proof_blob.hash),
+            Some(&proof_bytes),
+            "a dual-role proof/application candidate survives without the proof side-CAS"
+        );
+        let mut reopened = store.clone();
+        reopened.proof_blobs.clear();
+        assert!(
+            reopened.blob_available(&proof_blob).unwrap(),
+            "restart may clear verifier availability without losing the application blob"
+        );
 
         let recovered = execute_guest_accumulate(
             &mut store,
@@ -6949,17 +6970,7 @@ mod tests {
             &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                 work,
                 transition: tampered,
-                provided_blobs: {
-                    let mut blobs = vec![
-                        child_blob,
-                        ImportedBlobV2 {
-                            reference: proof_blob,
-                            bytes: proof_bytes,
-                        },
-                    ];
-                    blobs.sort_by_key(|blob| blob.reference.hash);
-                    blobs
-                },
+                provided_blobs: vec![child_blob],
             }),
         )
         .unwrap();
