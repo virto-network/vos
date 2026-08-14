@@ -3779,6 +3779,68 @@ fn local_registration_reverifies_conformance_proof_history_before_exposing_the_r
 }
 
 #[test]
+fn local_registration_reverifies_pending_proofs_despite_image_provenance() {
+    let (config, request) = attested_root_fixture(ConsistencyModeV2::Local, 0x75);
+    let backend = SharedProofCommittedImages::default();
+    let mut service = LocalRootTreeServiceV2::open(config.clone(), backend).unwrap();
+    let proof = canonical_test_proof_manifest(0x95);
+    let expected_proof = proof.clone();
+    service
+        .store_mut()
+        .install_proof_verifier(move |request, candidate| {
+            request.proof_blob.matches(candidate) && candidate == expected_proof
+        });
+    service
+        .invoke_attested(
+            request,
+            &mut CanonicalTestProofProducer {
+                proof: proof.clone(),
+                calls: 0,
+            },
+        )
+        .expect("the production verifier seals the proof-bearing publication");
+    assert_eq!(service.pending_publications().unwrap().len(), 1);
+
+    let backend = service.into_backend();
+    let persisted = backend.0.lock().unwrap();
+    let image = persisted.image.clone();
+    let mut corrupt_proofs = persisted.proofs.clone();
+    drop(persisted);
+    *corrupt_proofs.values_mut().next().unwrap() = b"corrupt proof".to_vec();
+
+    for (case, proofs) in [("missing", BTreeMap::new()), ("corrupt", corrupt_proofs)] {
+        let backend =
+            SharedProofCommittedImages(Arc::new(Mutex::new(SharedProofCommittedImageState {
+                image: image.clone(),
+                proofs,
+            })));
+        let service = LocalRootTreeServiceV2::open(config.clone(), backend)
+            .expect("the marked service image itself remains recoverable");
+        let mut node = VosNode::new();
+        assert!(
+            matches!(
+                node.register_v2_root_at_id_with_producer(
+                    "attested-root-v2",
+                    service,
+                    ServiceId::new(0, 0x3314),
+                    false,
+                    CanonicalTestProofProducer {
+                        proof: proof.clone(),
+                        calls: 0,
+                    },
+                ),
+                Err(V2NodeRegistrationError::CorruptServiceStore)
+            ),
+            "a {case} live publication proof must reject registration"
+        );
+        assert!(
+            node.collect().is_empty(),
+            "a root with a {case} live publication proof was never exposed"
+        );
+    }
+}
+
+#[test]
 fn raft_registration_reverifies_current_conformance_proof_history_before_exposing_the_root() {
     let (config, request) = attested_root_fixture(ConsistencyModeV2::Raft, 0x74);
     let directory = std::env::temp_dir().join(format!(

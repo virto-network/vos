@@ -814,7 +814,9 @@ their retry path resolves before proof lookup. Their verifier provenance remains
 bound to the complete image, so a snapshot-caught replica can restart without
 resurrecting pruned historical proofs. An unmarked conformance image must
 instead revalidate its full durable proof history before production
-registration. Only after hydration
+registration. Provenance never waives a live publication artifact: every such
+proof must still be present and pass the installed verifier before the root is
+exposed. Only after hydration
 does the follower advance `last_applied` and replay any surviving log tail. A
 proof-CAS or service-image failure leaves the old image and cursor eligible for
 retry.

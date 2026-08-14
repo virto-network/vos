@@ -584,15 +584,17 @@ impl<B> DurableJamStoreV2<B>
 where
     B: CommittedImageStoreV2 + ProofArtifactStoreV2<Error = <B as CommittedImageStoreV2>::Error>,
 {
-    /// Re-authorize every proof decision whose validity still affects this
-    /// already-committed image under the currently installed verifier.
+    /// Load and re-authorize an exact set of proof decisions under the
+    /// currently installed verifier.
     ///
     /// Production registration uses this before exposing an existing local
     /// image. Snapshot/log catch-up verifies its ordered artifacts separately,
     /// so permanent reply admissions do not make snapshots retain proofs
     /// forever merely to repeat an already-finalized historical decision.
-    fn revalidate_proof_history(&mut self) -> Result<(), DecodeError> {
-        let requests = self.local.committed.proof_verification_history()?;
+    fn revalidate_proofs(
+        &mut self,
+        requests: &[ProofVerificationRequestV2],
+    ) -> Result<(), DecodeError> {
         let artifacts = requests
             .iter()
             .map(|request| {
@@ -610,17 +612,21 @@ where
 
     /// Establish durable provenance for the current exact image. A snapshot
     /// already carrying valid provenance came from a production-verifier
-    /// commit and needs no pruned historical proof bytes on restart. An
-    /// unmarked conformance image must be revalidated in full before the mark
-    /// is persisted and the root can become routable.
+    /// commit and needs no pruned historical admission proofs on restart.
+    /// Proofs referenced by live publications remain routing dependencies and
+    /// are always loaded and reverified. An unmarked conformance image must be
+    /// revalidated in full before the mark is persisted and the root can
+    /// become routable.
     pub(crate) fn ensure_proof_verifier_provenance(&mut self) -> Result<(), DecodeError> {
         if self.local.proof_verifier.is_none() {
             return Err(DecodeError::NonCanonical);
         }
         if self.local.committed.has_proof_verifier_provenance() {
-            return Ok(());
+            let pending = self.local.committed.referenced_proof_verifications()?;
+            return self.revalidate_proofs(&pending);
         }
-        self.revalidate_proof_history()?;
+        let history = self.local.committed.proof_verification_history()?;
+        self.revalidate_proofs(&history)?;
         let mut replacement = self.local.committed.clone();
         replacement.seal_proof_verifier_provenance();
         self.backend
