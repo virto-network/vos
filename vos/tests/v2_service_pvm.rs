@@ -3439,6 +3439,7 @@ fn raft_follower_registers_before_genesis_and_restores_caught_up_admission_time(
         source_log,
     )
     .unwrap();
+    source.store_mut().install_proof_verifier(|_, _| false);
     let committed_floor = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -4064,9 +4065,9 @@ fn node_raft_transport_orders_attested_inbox_and_reply_proof_on_both_roots() {
     let mut node = VosNode::new();
     node.register_v2_raft_root_at_id_with_verifier(
         "attested-raft-source-v2".into(),
-        source_config,
+        source_config.clone(),
         source_backend.clone(),
-        source_db,
+        source_db.clone(),
         raft_config([0xEA; 32]),
         source_route,
         false,
@@ -4137,6 +4138,31 @@ fn node_raft_transport_orders_attested_inbox_and_reply_proof_on_both_roots() {
             .any(|candidate| candidate == &proof),
         "the producer replica retains the proof until reply acknowledgement"
     );
+
+    // Model a follower which installed the compacted service image but did
+    // not retain the proof for a completed reply admission. The exact image
+    // carries durable production-verifier provenance, so reopening at the
+    // current Raft cursor must not demand intentionally pruned history.
+    let snapshot_only_backend =
+        SharedProofCommittedImages(Arc::new(Mutex::new(SharedProofCommittedImageState {
+            image: source_backend.0.lock().unwrap().image.clone(),
+            proofs: BTreeMap::new(),
+        })));
+    let mut restarted = VosNode::new();
+    restarted
+        .register_v2_raft_root_at_id_with_verifier(
+            "attested-raft-source-v2".into(),
+            source_config,
+            snapshot_only_backend.clone(),
+            source_db,
+            raft_config([0xEA; 32]),
+            source_route,
+            false,
+            CanonicalTestProofProducer { proof, calls: 0 },
+        )
+        .expect("a snapshot-caught production replica reopens without pruned admission proofs");
+    assert!(snapshot_only_backend.0.lock().unwrap().proofs.is_empty());
+    assert!(restarted.collect().iter().all(AgentResult::is_ok));
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -4983,15 +5009,17 @@ fn node_retries_a_direct_reply_publication_ack_after_the_caller_is_gone() {
     let backend = SharedFailingCommittedImages::default();
     let service = LocalRootTreeServiceV2::open(config.clone(), backend.clone())
         .expect("direct-reply root installs");
-    let installed_commits = backend.0.lock().unwrap().commit_attempts;
-    // Admission and Apply are the next two commits; fail the publication Ack
-    // after the reply has already reached and removed the direct caller.
-    backend.fail_at(installed_commits + 3);
 
     let route = ServiceId::new(0, 0x3700);
     let mut node = VosNode::new();
     node.register_v2_root_at_id("direct-ack-retry-v2", service, route, false)
         .unwrap();
+    let registered_commits = backend.0.lock().unwrap().commit_attempts;
+    // Admission and Apply are the next two commits; fail the publication Ack
+    // after the reply has already reached and removed the direct caller. The
+    // registration-time provenance commit is deliberately outside this
+    // invocation fault sequence.
+    backend.fail_at(registered_commits + 3);
     use vos::ActorReference;
     let mut invoker = &node;
     let mut handle = host_greeter_surface::GreeterRef::bind(actor, &mut invoker);

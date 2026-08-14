@@ -54,11 +54,49 @@ pub struct LocalJamStoreSnapshotV2 {
     blobs: BTreeMap<[u8; 32], Vec<u8>>,
     programs: BTreeMap<[u8; 32], Vec<u8>>,
     commit_sequence: u64,
+    /// Production-host seal showing that this exact durable image
+    /// was committed while the production proof verifier was installed.
+    /// It is not actor state and is ignored by `same_service_state`.
+    proof_verifier_provenance: Option<super::Hash>,
 }
 
 impl LocalJamStoreSnapshotV2 {
-    /// Compare consensus-visible rows, blobs, and programs while ignoring the
-    /// host-local count of completed transaction boundaries.
+    fn encode_provenance_input(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        encoder.u64(self.commit_sequence);
+        encoder.u32(self.rows.len() as u32);
+        for (key, value) in &self.rows {
+            encoder.bytes(key);
+            encoder.bytes(value);
+        }
+        encoder.u32(self.blobs.len() as u32);
+        for (hash, bytes) in &self.blobs {
+            encoder.fixed(hash);
+            encoder.bytes(bytes);
+        }
+        encoder.u32(self.programs.len() as u32);
+        for (program, pvm) in &self.programs {
+            encoder.fixed(program);
+            encoder.bytes(pvm);
+        }
+    }
+
+    fn expected_proof_verifier_provenance(&self) -> super::Hash {
+        let mut input = Vec::new();
+        self.encode_provenance_input(&mut input);
+        super::Hash::digest(b"vos/proof-verifier-provenance/v2", &[&input])
+    }
+
+    fn seal_proof_verifier_provenance(&mut self) {
+        self.proof_verifier_provenance = Some(self.expected_proof_verifier_provenance());
+    }
+
+    pub(crate) const fn has_proof_verifier_provenance(&self) -> bool {
+        self.proof_verifier_provenance.is_some()
+    }
+
+    /// Compare consensus-visible rows, blobs, and programs while ignoring
+    /// host-local commit metadata.
     pub fn same_service_state(&self, other: &Self) -> bool {
         self.rows == other.rows && self.blobs == other.blobs && self.programs == other.programs
     }
@@ -142,26 +180,13 @@ impl LocalJamStoreSnapshotV2 {
 }
 
 impl V2Wire for LocalJamStoreSnapshotV2 {
-    const MAGIC: [u8; 4] = *b"VSS2";
+    const MAGIC: [u8; 4] = *b"VSS3";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
-        let mut encoder = Encoder(out);
-        encoder.u64(self.commit_sequence);
-        encoder.u32(self.rows.len() as u32);
-        for (key, value) in &self.rows {
-            encoder.bytes(key);
-            encoder.bytes(value);
-        }
-        encoder.u32(self.blobs.len() as u32);
-        for (hash, bytes) in &self.blobs {
-            encoder.fixed(hash);
-            encoder.bytes(bytes);
-        }
-        encoder.u32(self.programs.len() as u32);
-        for (program, pvm) in &self.programs {
-            encoder.fixed(program);
-            encoder.bytes(pvm);
-        }
+        self.encode_provenance_input(out);
+        Encoder(out).option(&self.proof_verifier_provenance, |encoder, provenance| {
+            encoder.fixed(&provenance.0);
+        });
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -172,6 +197,8 @@ impl V2Wire for LocalJamStoreSnapshotV2 {
         })?;
         let programs =
             decode_content_map(decoder, |key, bytes| ProgramId::of_pvm(bytes).0 == *key)?;
+        let proof_verifier_provenance =
+            decoder.option(|decoder| Ok(super::Hash(decoder.fixed()?)))?;
         if rows.is_empty() != (commit_sequence == 0) {
             return Err(DecodeError::NonCanonical);
         }
@@ -181,12 +208,20 @@ impl V2Wire for LocalJamStoreSnapshotV2 {
                 .ok_or(DecodeError::NonCanonical)?;
             StoreHeaderV2::open(header).map_err(|_| DecodeError::NonCanonical)?;
         }
-        Ok(Self {
+        let snapshot = Self {
             rows,
             blobs,
             programs,
             commit_sequence,
-        })
+            proof_verifier_provenance,
+        };
+        if snapshot
+            .proof_verifier_provenance
+            .is_some_and(|provenance| provenance != snapshot.expected_proof_verifier_provenance())
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(snapshot)
     }
 }
 
@@ -556,7 +591,7 @@ where
     /// image. Snapshot/log catch-up verifies its ordered artifacts separately,
     /// so permanent reply admissions do not make snapshots retain proofs
     /// forever merely to repeat an already-finalized historical decision.
-    pub(crate) fn revalidate_proof_history(&mut self) -> Result<(), DecodeError> {
+    fn revalidate_proof_history(&mut self) -> Result<(), DecodeError> {
         let requests = self.local.committed.proof_verification_history()?;
         let artifacts = requests
             .iter()
@@ -570,6 +605,28 @@ where
                 return Err(DecodeError::NonCanonical);
             }
         }
+        Ok(())
+    }
+
+    /// Establish durable provenance for the current exact image. A snapshot
+    /// already carrying valid provenance came from a production-verifier
+    /// commit and needs no pruned historical proof bytes on restart. An
+    /// unmarked conformance image must be revalidated in full before the mark
+    /// is persisted and the root can become routable.
+    pub(crate) fn ensure_proof_verifier_provenance(&mut self) -> Result<(), DecodeError> {
+        if self.local.proof_verifier.is_none() {
+            return Err(DecodeError::NonCanonical);
+        }
+        if self.local.committed.has_proof_verifier_provenance() {
+            return Ok(());
+        }
+        self.revalidate_proof_history()?;
+        let mut replacement = self.local.committed.clone();
+        replacement.seal_proof_verifier_provenance();
+        self.backend
+            .commit(&replacement.encode())
+            .map_err(|_| DecodeError::NonCanonical)?;
+        self.local.committed = replacement;
         Ok(())
     }
 }
@@ -608,6 +665,7 @@ impl LocalJamStoreV2 {
                 blobs: BTreeMap::new(),
                 programs: BTreeMap::new(),
                 commit_sequence: 0,
+                proof_verifier_provenance: None,
             },
             proof_blobs: BTreeMap::new(),
             private_witnesses: BTreeMap::new(),
@@ -1154,6 +1212,10 @@ impl AttestationProofHostV2 for LocalJamStoreV2 {
             .filter(|bytes| reference.matches(bytes))
             .cloned()
     }
+
+    fn requires_proof_verifier_provenance(&self) -> bool {
+        self.proof_verifier.is_some()
+    }
 }
 
 impl super::ReceiptVerificationHostV2 for LocalJamStoreV2 {
@@ -1191,6 +1253,10 @@ impl<B: ProofArtifactStoreV2> AttestationProofHostV2 for DurableJamStoreV2<B> {
                 .flatten()
                 .filter(|bytes| reference.matches(bytes))
         })
+    }
+
+    fn requires_proof_verifier_provenance(&self) -> bool {
+        self.local.proof_verifier.is_some()
     }
 }
 
@@ -1519,6 +1585,10 @@ impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
             .commit_sequence
             .checked_add(1)
             .ok_or(ServicePvmErrorV2::AccumulateCommitRejected)?;
+        transaction.staged.proof_verifier_provenance = None;
+        if self.proof_verifier.is_some() {
+            transaction.staged.seal_proof_verifier_provenance();
+        }
         self.committed = transaction.staged;
         Ok(())
     }
@@ -1555,6 +1625,10 @@ impl<B: CommittedImageStoreV2> AccumulateProtocolHostV2 for DurableJamStoreV2<B>
             .commit_sequence
             .checked_add(1)
             .ok_or(ServicePvmErrorV2::AccumulateCommitRejected)?;
+        transaction.staged.proof_verifier_provenance = None;
+        if self.local.proof_verifier.is_some() {
+            transaction.staged.seal_proof_verifier_provenance();
+        }
         let image = transaction.staged.encode();
         self.backend
             .commit(&image)
@@ -1785,6 +1859,14 @@ mod tests {
         assert_eq!(
             restarted.program(program),
             Some(b"canonical actor pvm".as_slice())
+        );
+
+        let mut forged_provenance = store.snapshot();
+        forged_provenance.proof_verifier_provenance = Some(super::super::Hash([0xFA; 32]));
+        assert_eq!(
+            LocalJamStoreSnapshotV2::decode(&forged_provenance.encode()),
+            Err(DecodeError::NonCanonical),
+            "verifier provenance is bound to the exact durable image"
         );
 
         let mut corrupt_blob = store.snapshot();

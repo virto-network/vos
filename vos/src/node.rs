@@ -6076,7 +6076,10 @@ where
     service.store_mut().install_proof_verifier_arc(verifier);
     service
         .store_mut()
-        .revalidate_proof_history()
+        .ensure_proof_verifier_provenance()
+        .map_err(|_| V2NodeRegistrationError::CorruptServiceStore)?;
+    service
+        .refresh_proof_provenance_snapshot()
         .map_err(|_| V2NodeRegistrationError::CorruptServiceStore)
 }
 

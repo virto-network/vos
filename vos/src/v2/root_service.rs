@@ -754,6 +754,16 @@ impl<B> RootTreeServiceDriverV2<B>
 where
     B: CommittedImageStoreV2 + ProofArtifactStoreV2<Error = <B as CommittedImageStoreV2>::Error>,
 {
+    fn refresh_proof_provenance_snapshot(&mut self) -> Result<(), RootTreeDriverErrorV2> {
+        match self {
+            Self::Direct(_) => Ok(()),
+            #[cfg(feature = "storage")]
+            Self::Raft(service) => service
+                .refresh_applied_service_snapshot()
+                .map_err(RootTreeDriverErrorV2::Raft),
+        }
+    }
+
     fn accumulate_host(&self) -> &DurableJamStoreV2<B> {
         match self {
             Self::Direct(service) => service.accumulate_host(),
@@ -1419,12 +1429,13 @@ where
         .map_err(|_| {
             LocalRootTreeOpenErrorV2::InvalidConfig(LocalRootTreeConfigErrorV2::InvalidGenesis)
         })?;
+        let production_proof_verifier = proof_verifier.is_some();
         let mut store =
             DurableJamStoreV2::open(backend).map_err(LocalRootTreeOpenErrorV2::Store)?;
         if let Some(proof_verifier) = proof_verifier {
             store.install_proof_verifier_arc(proof_verifier);
             store
-                .revalidate_proof_history()
+                .ensure_proof_verifier_provenance()
                 .map_err(|_| LocalRootTreeOpenErrorV2::ProofHistoryUnavailable)?;
         }
         let expected_program = config.service.service_program;
@@ -1484,7 +1495,28 @@ where
             }
             _ => LocalRootTreeOpenErrorV2::UnexpectedInstallResult,
         })?;
+        if production_proof_verifier {
+            root.service
+                .refresh_proof_provenance_snapshot()
+                .map_err(|error| match error {
+                    RootTreeDriverErrorV2::Direct(error) => {
+                        LocalRootTreeOpenErrorV2::Service(error)
+                    }
+                    #[cfg(feature = "storage")]
+                    RootTreeDriverErrorV2::Raft(error) => {
+                        LocalRootTreeOpenErrorV2::Replication(error)
+                    }
+                })?;
+        }
         Ok(root)
+    }
+
+    pub(crate) fn refresh_proof_provenance_snapshot(
+        &mut self,
+    ) -> Result<(), LocalRootTreeInvokeErrorV2> {
+        self.service
+            .refresh_proof_provenance_snapshot()
+            .map_err(RootTreeDriverErrorV2::into_invoke)
     }
 
     pub fn identity(&self) -> &ServiceIdentityV2 {

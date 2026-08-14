@@ -451,6 +451,13 @@ impl<T> AttestationProofBackendV2 for T where
 pub trait AttestationProofHostV2 {
     fn make_proof_available(&mut self, request: &ProofVerificationRequestV2, proof: &[u8]) -> bool;
 
+    /// Whether recovered Raft snapshots must carry durable proof-verifier
+    /// provenance. Conformance hosts return `false`; production hosts return
+    /// `true` only after their verifier has been installed.
+    fn requires_proof_verifier_provenance(&self) -> bool {
+        false
+    }
+
     /// Recover an already-verified proof artifact for an idempotent retry.
     /// Production hosts back this with their durable proof CAS; conformance
     /// hosts may return `None` after a process restart and deterministically

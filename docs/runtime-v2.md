@@ -803,15 +803,21 @@ bounded recent window. Automatic compaction cannot cross this durable
 application cursor and freezes the matching image—not a newer mutable state
 row—into a `CommittedServiceSnapshotV2`. A lagging follower receives that
 envelope through Raft `InstallSnapshot`, checks that its bound index matches the
-installed snapshot metadata, reconstructs the exact proof-verification public
-inputs committed by every pending publication, and independently verifies each
-content-addressed artifact before durably hydrating the proof side-CAS or
-replacing its physical service image. The request-bound bundle uses the
-clean-break `VRS3` snapshot wire. Completed reply admissions are permanent
-deduplication markers but do not retain proof bytes: their retry path resolves
-before proof lookup. Only after hydration does the follower advance
-`last_applied` and replay any surviving log tail. A proof-CAS or service-image
-failure leaves the old image and cursor eligible for retry.
+installed snapshot metadata, requires durable production-verifier provenance
+bound to the exact service image, reconstructs the exact proof-verification
+public inputs committed by every pending publication, and independently
+verifies each content-addressed artifact before durably hydrating the proof
+side-CAS or replacing its physical service image. The request-bound bundle uses
+the clean-break `VSS3` service-image and `VRS4` Raft-snapshot wires. Completed reply
+admissions are permanent deduplication markers but do not retain proof bytes:
+their retry path resolves before proof lookup. Their verifier provenance remains
+bound to the complete image, so a snapshot-caught replica can restart without
+resurrecting pruned historical proofs. An unmarked conformance image must
+instead revalidate its full durable proof history before production
+registration. Only after hydration
+does the follower advance `last_applied` and replay any surviving log tail. A
+proof-CAS or service-image failure leaves the old image and cursor eligible for
+retry.
 
 Every await is a durable slice boundary. Effects before it may commit even if a
 later slice fails, so multi-await handlers have saga semantics. Same-tree calls

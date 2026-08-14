@@ -452,7 +452,7 @@ pub struct CommittedServiceSnapshotV2 {
 }
 
 impl V2Wire for CommittedServiceSnapshotV2 {
-    const MAGIC: [u8; 4] = *b"VRS3";
+    const MAGIC: [u8; 4] = *b"VRS4";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
@@ -1198,6 +1198,29 @@ where
         + ReceiptVerificationHostV2,
     L: CommittedAccumulateLogV2,
 {
+    /// Rewrite the applied-state snapshot at its existing cursor after a
+    /// host-only image envelope change such as production-verifier
+    /// provenance. No actor request is applied and the cursor does not move.
+    pub(crate) fn refresh_applied_service_snapshot(
+        &mut self,
+    ) -> Result<(), ReplicatedServiceErrorV2<L::Error>> {
+        let applied = self
+            .log
+            .applied_index()
+            .map_err(ReplicatedServiceErrorV2::Log)?;
+        if applied == 0 {
+            return Ok(());
+        }
+        let service_image = self.service.accumulate_host().committed_service_image();
+        self.validate_service_image_identity(&service_image)?;
+        let proof_artifacts =
+            snapshot_proof_artifacts(self.service.accumulate_host(), &service_image)
+                .map_err(|_| ReplicatedServiceErrorV2::ProofUnavailable)?;
+        self.log
+            .mark_applied(applied, &service_image, &proof_artifacts)
+            .map_err(ReplicatedServiceErrorV2::Log)
+    }
+
     fn validate_service_image_identity(
         &self,
         service_image: &[u8],
@@ -1354,6 +1377,16 @@ where
             // image, or advancing the applied cursor. A fresh host has no
             // existing header against which install can detect a mismatch.
             self.validate_service_image_identity(&snapshot.service_image)?;
+            let service_snapshot = LocalJamStoreSnapshotV2::decode(&snapshot.service_image)
+                .map_err(|_| ReplicatedServiceErrorV2::InvalidCommittedLog)?;
+            if self
+                .service
+                .accumulate_host()
+                .requires_proof_verifier_provenance()
+                && !service_snapshot.has_proof_verifier_provenance()
+            {
+                return Err(ReplicatedServiceErrorV2::ProofUnavailable);
+            }
             for artifact in &snapshot.proof_artifacts {
                 if !self
                     .service
