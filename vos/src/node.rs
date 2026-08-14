@@ -308,6 +308,16 @@ pub(crate) fn effective_after_seal(
 }
 
 /// Configuration for registering an agent in the node.
+/// Content-addressed pure Task made available to one actor runtime. The blob
+/// is already transpiled; the witness window comes from the Task ELF's
+/// `__VOS_WITNESS` symbol. Signed package carriage is layered above this
+/// host-neutral registration shape.
+pub struct TaskBlobConfig {
+    pub blob: Vec<u8>,
+    pub witness_addr: u32,
+    pub witness_capacity: u32,
+}
+
 pub struct AgentConfig {
     /// PVM blob (already transpiled).
     pub blob: Vec<u8>,
@@ -322,6 +332,8 @@ pub struct AgentConfig {
     pub init_payloads: Vec<Vec<u8>>,
     /// Pre-populated storage entries (key, value).
     pub storage: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Pure Task dependencies callable by content hash from this actor.
+    pub task_blobs: Vec<TaskBlobConfig>,
     /// Optional data directory for state persistence. When set and
     /// `consistency` isn't `Ephemeral`, the agent's redb file is
     /// created at `{data_dir}/agents/{svc_id}.redb`.
@@ -419,6 +431,7 @@ impl AgentConfig {
             name: None,
             init_payloads: Vec::new(),
             storage: Vec::new(),
+            task_blobs: Vec::new(),
             data_dir: None,
             consistency: Consistency::Ephemeral,
             network_reachable: false,
@@ -481,6 +494,23 @@ impl AgentConfig {
     /// Attach pre-populated storage (key, value) entries.
     pub fn with_storage(mut self, storage: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
         self.storage = storage;
+        self
+    }
+
+    /// Install a content-addressed pure Task into this actor's runtime.
+    /// Returns configuration only; callers derive the hash with
+    /// [`crate::provable::task_blob_hash`] when configuring the parent.
+    pub fn with_task_blob(
+        mut self,
+        blob: Vec<u8>,
+        witness_addr: u32,
+        witness_capacity: u32,
+    ) -> Self {
+        self.task_blobs.push(TaskBlobConfig {
+            blob,
+            witness_addr,
+            witness_capacity,
+        });
         self
     }
 
@@ -9164,6 +9194,9 @@ fn agent_thread(
         },
     };
 
+    for task in std::mem::take(&mut config.task_blobs) {
+        runtime.register_task_blob(task.blob, task.witness_addr, task.witness_capacity);
+    }
     let blob_idx = runtime.register_service_blob(config.blob);
     let svc_id = runtime.register_service_with_id(blob_idx, id);
 
