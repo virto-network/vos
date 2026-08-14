@@ -1542,6 +1542,36 @@ pub struct ProofCommitmentV2 {
     pub statement_version: u16,
 }
 
+/// Versioned, bounded root artifact for a streamed production proof.
+///
+/// [`ProofCommitmentV2::proof_blob`] addresses the encoding of this manifest;
+/// each listed segment lives independently in the verifier's durable CAS.
+/// Segment order is significant because adjacent STARK segments prove
+/// boundary continuity. The manifest remains the one compact proof object on
+/// v2 wires while segment bodies stay below the node frame ceiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestationProofManifestV2 {
+    pub proof_system: Hash,
+    pub initial_root: Hash,
+    pub segments: Vec<ProofArtifactIdV2>,
+}
+
+/// Content identifier in the producer/verifier proof CAS. This intentionally
+/// does not reuse [`BlobRefV2`]: the deployed prover already publishes
+/// segment bodies through the node CAS's native hash domain, and their exact
+/// length is checked when the verifier fetches each bounded frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProofArtifactIdV2(pub [u8; 32]);
+
+impl AttestationProofManifestV2 {
+    pub fn proof_system() -> Hash {
+        Hash::digest(
+            b"vos/attestation-proof-system/v2",
+            &[&super::EXECUTION_SEMANTICS_ID.0],
+        )
+    }
+}
+
 /// Exact public inputs passed from guest Accumulate to the configured proof
 /// verifier capability. Proof bytes remain content addressed and are read by
 /// the host from `proof_blob`; the guest never trusts a host-supplied claim.
@@ -3856,6 +3886,39 @@ impl V2Wire for ProofVerificationRequestV2 {
             proof_blob: decode_blob_ref(d)?,
         };
         if value.statement == Hash::ZERO || value.trace == Hash::ZERO {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+impl V2Wire for AttestationProofManifestV2 {
+    const MAGIC: [u8; 4] = *b"VPM2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut e = Encoder(out);
+        e.fixed(&self.proof_system.0);
+        e.fixed(&self.initial_root.0);
+        e.list(&self.segments, |e, segment| e.fixed(&segment.0));
+    }
+
+    fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            proof_system: Hash(d.fixed()?),
+            initial_root: Hash(d.fixed()?),
+            segments: d.list(|d| d.fixed().map(ProofArtifactIdV2))?,
+        };
+        if value.proof_system != Self::proof_system()
+            || value.initial_root == Hash::ZERO
+            || value.segments.is_empty()
+            || value.segments.len() > super::MAX_ATTESTATION_PROOF_SEGMENTS
+            || value.segments.iter().any(|segment| segment.0 == [0; 32])
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        let mut hashes = value.segments.iter().copied().collect::<Vec<_>>();
+        hashes.sort_unstable();
+        if hashes.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(DecodeError::NonCanonical);
         }
         Ok(value)
@@ -7583,6 +7646,40 @@ mod tests {
         reordered.operations.swap(0, 1);
         assert_eq!(
             CrdtChangeV2::decode(&reordered.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn attestation_proof_manifests_are_bounded_anchored_and_canonical() {
+        let first = ProofArtifactIdV2([92; 32]);
+        let second = ProofArtifactIdV2([93; 32]);
+        let manifest = AttestationProofManifestV2 {
+            proof_system: AttestationProofManifestV2::proof_system(),
+            initial_root: Hash([91; 32]),
+            segments: vec![first.clone(), second.clone()],
+        };
+        assert_eq!(
+            AttestationProofManifestV2::decode(&manifest.encode()).unwrap(),
+            manifest
+        );
+
+        let mut unanchored = manifest.clone();
+        unanchored.initial_root = Hash::ZERO;
+        assert_eq!(
+            AttestationProofManifestV2::decode(&unanchored.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+        let mut duplicate = manifest.clone();
+        duplicate.segments.push(first);
+        assert_eq!(
+            AttestationProofManifestV2::decode(&duplicate.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+        let mut invalid = manifest;
+        invalid.segments[0] = ProofArtifactIdV2([0; 32]);
+        assert_eq!(
+            AttestationProofManifestV2::decode(&invalid.encode()),
             Err(DecodeError::NonCanonical)
         );
     }

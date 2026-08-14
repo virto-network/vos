@@ -1573,6 +1573,32 @@ pub fn encode_chain_manifest_anchored(
     out
 }
 
+/// Wrap the prover's existing anchored segment list in the bounded v2
+/// attestation artifact contract. Segment hashes retain the node proof-CAS
+/// domain used by [`encode_chain_manifest_anchored`]; the wrapper adds the
+/// execution-semantics-derived proof-system identity and strict v2 wire
+/// version without copying any segment body.
+pub fn encode_v2_attestation_manifest(
+    initial_root: [u8; 32],
+    segment_hashes: &[[u8; 32]],
+) -> Option<Vec<u8>> {
+    use vos::v2::{AttestationProofManifestV2, Hash, ProofArtifactIdV2, V2Wire};
+
+    let manifest = AttestationProofManifestV2 {
+        proof_system: AttestationProofManifestV2::proof_system(),
+        initial_root: Hash(initial_root),
+        segments: segment_hashes
+            .iter()
+            .copied()
+            .map(ProofArtifactIdV2)
+            .collect(),
+    };
+    let encoded = manifest.encode();
+    (encoded.len() <= vos::v2::MAX_ATTESTATION_PROOF_BYTES
+        && AttestationProofManifestV2::decode(&encoded).is_ok())
+    .then_some(encoded)
+}
+
 /// Decode a [`ChainManifest`] blob (`[initial_root:32][seg:32]…`). `None` on a
 /// malformed blob — one whose length is not a positive multiple of 32 carrying a
 /// root plus at least one segment (< 64 bytes, or not 32-aligned).
@@ -2606,6 +2632,22 @@ mod job_tests {
             segment_initial_root(&[vec![0xABu8; 16]]),
             None,
             "an undecodable segment 0 yields None, not a panic"
+        );
+    }
+
+    #[test]
+    fn streamed_chain_hashes_wrap_in_the_v2_attestation_contract() {
+        use vos::v2::{AttestationProofManifestV2, ProofArtifactIdV2, V2Wire};
+
+        let root = [0x71; 32];
+        let segments = [[0x72; 32], [0x73; 32]];
+        let encoded = encode_v2_attestation_manifest(root, &segments).unwrap();
+        let decoded = AttestationProofManifestV2::decode(&encoded).unwrap();
+        assert_eq!(decoded.initial_root.0, root);
+        assert_eq!(decoded.segments, segments.map(ProofArtifactIdV2).to_vec());
+        assert_eq!(
+            decoded.proof_system,
+            AttestationProofManifestV2::proof_system()
         );
     }
 

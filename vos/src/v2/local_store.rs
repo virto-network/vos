@@ -9,6 +9,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use javm::kernel::InvocationKernel;
 
@@ -392,7 +393,7 @@ impl core::error::Error for LocalStoreReadErrorV2 {}
 /// and writes only that isolated image, and [`AccumulateProtocolHostV2::commit`]
 /// swaps it into visibility atomically. Dropping a transaction therefore
 /// discards every staged row and blob.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct LocalJamStoreV2 {
     committed: LocalJamStoreSnapshotV2,
     /// Proof artifacts are verifier/CAS inputs, not consensus service state.
@@ -401,11 +402,29 @@ pub struct LocalJamStoreV2 {
     /// Private authorization witnesses are Refine/prover inputs only. They
     /// never enter the recoverable service image or replica sync payloads.
     private_witnesses: BTreeMap<[u8; 32], Vec<u8>>,
+    /// Installed proof verifier for node/production execution. `None` is
+    /// retained only for the explicit conformance harness, whose tests seed
+    /// exact request hashes through the legacy local allowlist seam.
+    proof_verifier: Option<Arc<ProofVerifierFnV2>>,
     proof_allowlist: BTreeSet<super::Hash>,
     role_credential_allowlist: BTreeSet<super::Hash>,
     upgrade_allowlist: BTreeSet<super::Hash>,
     receipt_allowlist: BTreeSet<super::Hash>,
     install_allowlist: BTreeSet<super::Hash>,
+}
+
+pub(crate) type ProofVerifierFnV2 =
+    dyn Fn(&ProofVerificationRequestV2, &[u8]) -> bool + Send + Sync + 'static;
+
+impl core::fmt::Debug for LocalJamStoreV2 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LocalJamStoreV2")
+            .field("committed", &self.committed)
+            .field("proof_blobs", &self.proof_blobs.len())
+            .field("private_witnesses", &self.private_witnesses.len())
+            .field("proof_verifier_installed", &self.proof_verifier.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// JAM storage host whose committed image is durable before IC-5 returns.
@@ -512,6 +531,7 @@ impl LocalJamStoreV2 {
             },
             proof_blobs: BTreeMap::new(),
             private_witnesses: BTreeMap::new(),
+            proof_verifier: None,
             proof_allowlist: BTreeSet::new(),
             role_credential_allowlist: BTreeSet::new(),
             upgrade_allowlist: BTreeSet::new(),
@@ -526,6 +546,7 @@ impl LocalJamStoreV2 {
             committed: snapshot,
             proof_blobs: BTreeMap::new(),
             private_witnesses: BTreeMap::new(),
+            proof_verifier: None,
             proof_allowlist: BTreeSet::new(),
             role_credential_allowlist: BTreeSet::new(),
             upgrade_allowlist: BTreeSet::new(),
@@ -972,6 +993,37 @@ impl LocalJamStoreV2 {
     /// Production hosts replace this process-local allowlist with their
     /// consensus-pinned proof verifier. It is excluded from persisted state.
     pub fn allow_proof(&mut self, request: &ProofVerificationRequestV2) {
+        if self.proof_verifier.is_none() {
+            self.proof_allowlist.insert(request.hash());
+        }
+    }
+
+    /// Install the verifier used by every later proof hydration and IC-5
+    /// transaction. Installing a verifier clears conformance grants so bytes
+    /// accepted under the local seam cannot survive a production cutover.
+    pub fn install_proof_verifier<F>(&mut self, verifier: F)
+    where
+        F: Fn(&ProofVerificationRequestV2, &[u8]) -> bool + Send + Sync + 'static,
+    {
+        self.install_proof_verifier_arc(Arc::new(verifier));
+    }
+
+    pub(crate) fn install_proof_verifier_arc(&mut self, verifier: Arc<ProofVerifierFnV2>) {
+        self.proof_allowlist.clear();
+        self.proof_verifier = Some(verifier);
+    }
+
+    fn proof_is_accepted(&self, request: &ProofVerificationRequestV2, proof: &[u8]) -> bool {
+        request.proof_blob.matches(proof)
+            && self
+                .proof_verifier
+                .as_ref()
+                .is_none_or(|verifier| verifier(request, proof))
+    }
+
+    fn record_proof_available(&mut self, request: &ProofVerificationRequestV2, proof: &[u8]) {
+        self.proof_blobs
+            .insert(request.proof_blob.hash.0, proof.to_vec());
         self.proof_allowlist.insert(request.hash());
     }
 
@@ -1009,12 +1061,10 @@ impl LocalJamStoreV2 {
 
 impl AttestationProofHostV2 for LocalJamStoreV2 {
     fn make_proof_available(&mut self, request: &ProofVerificationRequestV2, proof: &[u8]) -> bool {
-        if !request.proof_blob.matches(proof) {
+        if !self.proof_is_accepted(request, proof) {
             return false;
         }
-        self.proof_blobs
-            .insert(request.proof_blob.hash.0, proof.to_vec());
-        self.allow_proof(request);
+        self.record_proof_available(request, proof);
         true
     }
 
@@ -1055,7 +1105,7 @@ impl<B> super::ReceiptVerificationHostV2 for DurableJamStoreV2<B> {
 
 impl<B: ProofArtifactStoreV2> AttestationProofHostV2 for DurableJamStoreV2<B> {
     fn make_proof_available(&mut self, request: &ProofVerificationRequestV2, proof: &[u8]) -> bool {
-        if !request.proof_blob.matches(proof)
+        if !self.local.proof_is_accepted(request, proof)
             || self
                 .backend
                 .commit_proof(&request.proof_blob, proof)
@@ -1063,7 +1113,8 @@ impl<B: ProofArtifactStoreV2> AttestationProofHostV2 for DurableJamStoreV2<B> {
         {
             return false;
         }
-        self.local.make_proof_available(request, proof)
+        self.local.record_proof_available(request, proof);
+        true
     }
 
     fn proof_bytes(&self, reference: &BlobRefV2) -> Option<Vec<u8>> {
@@ -1563,6 +1614,34 @@ mod tests {
                 .map(Vec::as_slice),
             Some(proof.as_slice())
         );
+    }
+
+    #[test]
+    fn installed_proof_verifier_cannot_be_bypassed_by_conformance_grants() {
+        let mut store = LocalJamStoreV2::new();
+        let proof = b"verified proof artifact".to_vec();
+        let proof_blob = BlobRefV2::of_bytes(&proof);
+        let request = ProofVerificationRequestV2 {
+            actor_program: ProgramId([1; 32]),
+            execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            statement: super::super::Hash([2; 32]),
+            trace: super::super::Hash([3; 32]),
+            proof_blob: proof_blob.clone(),
+        };
+
+        store.allow_proof(&request);
+        store.install_proof_verifier(|_, _| false);
+        store.allow_proof(&request);
+        assert!(!store.make_proof_available(&request, &proof));
+        assert_eq!(store.proof_bytes(&proof_blob), None);
+
+        let expected_request = request.clone();
+        let expected_proof = proof.clone();
+        store.install_proof_verifier(move |candidate, bytes| {
+            candidate == &expected_request && bytes == expected_proof
+        });
+        assert!(store.make_proof_available(&request, &proof));
+        assert_eq!(store.proof_bytes(&proof_blob), Some(proof));
     }
 
     #[test]

@@ -408,6 +408,43 @@ pub trait AttestationProofProducerV2 {
     ) -> Result<ProducedAttestationProofV2, Self::Error>;
 }
 
+/// Consensus-side verifier paired with an attestation proof producer.
+///
+/// Production root registration requires one value which implements both
+/// this trait and [`AttestationProofProducerV2`]. Leaders may produce a proof,
+/// but every replica independently invokes this verifier over the exact
+/// guest-derived public input before making that proof available to IC-5.
+/// Implementations must therefore be deterministic for a fixed execution
+/// semantics identity and proof artifact.
+/// For a streamed [`crate::v2::AttestationProofManifestV2`], verification
+/// includes fetching every referenced segment from the backend's proof CAS,
+/// rejecting a segment larger than
+/// [`crate::v2::MAX_ATTESTATION_PROOF_SEGMENT_BYTES`], and checking the
+/// complete ordered chain rather than trusting manifest presence.
+pub trait AttestationProofVerifierV2 {
+    type Error;
+
+    fn verify(
+        &mut self,
+        request: &ProofVerificationRequestV2,
+        proof: &[u8],
+    ) -> Result<bool, Self::Error>;
+}
+
+/// Complete proof capability installed at a production root boundary.
+///
+/// The marker prevents a node from attaching a producer which can mint proof
+/// bytes but cannot independently validate them during follower replay.
+pub trait AttestationProofBackendV2:
+    AttestationProofProducerV2 + AttestationProofVerifierV2
+{
+}
+
+impl<T> AttestationProofBackendV2 for T where
+    T: AttestationProofProducerV2 + AttestationProofVerifierV2
+{
+}
+
 /// Host cache/verifier seam used after proof generation and before Apply.
 /// Making proof bytes available is not a service-state commit and never
 /// publishes an application attestation package.

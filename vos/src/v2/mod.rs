@@ -43,15 +43,16 @@ pub use contracts::{
     ActorCallRequestV2, ActorCallResultV2, ActorCrdtStateV2, ActorDirectoryV2, ActorEffectBatchV2,
     ActorGenesisV2, ActorPrivateInputV2, ActorSliceInputV2, ActorSliceOutputV2,
     ActorSpawnRequestV2, ActorSpawnV2, ActorTreeImportV2, ActorUpgradeV2, ActorWriteV2,
-    AttestationDeliveryV2, AttestationResumeV2, AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2,
-    CallExpirationEnvelopeV2, CallTimeoutV2, CausalCallContextV2, CheckpointTokenV2,
-    ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2,
-    CrdtIngressV2, CrdtMaterializationV2, CrdtOperationV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2,
-    DeliveryEnvelopeV2, DirectIngressV2, ExternalActorBindingV2, ExternalActorDirectoryV2,
-    GasAccountingV2, GasScheduleV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
-    InboxRetirementV2, MessageRecordV2, MethodPolicyV2, ProofCommitmentV2,
-    ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2,
-    ROLE_AUTHORITY_DECISION_METHOD_V2, ROLE_AUTHORITY_INSTANCE_V2, ROLE_AUTHORITY_INVITE_METHOD_V2,
+    AttestationDeliveryV2, AttestationProofManifestV2, AttestationResumeV2,
+    AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2, CallExpirationEnvelopeV2, CallTimeoutV2,
+    CausalCallContextV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2,
+    ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2, CrdtIngressV2, CrdtMaterializationV2,
+    CrdtOperationV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DeliveryEnvelopeV2, DirectIngressV2,
+    ExternalActorBindingV2, ExternalActorDirectoryV2, GasAccountingV2, GasScheduleV2,
+    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxRetirementV2, MessageRecordV2,
+    MethodPolicyV2, ProofArtifactIdV2, ProofCommitmentV2, ProofVerificationRequestV2,
+    PublicationAckV2, PublishedEffectsV2, ROLE_AUTHORITY_DECISION_METHOD_V2,
+    ROLE_AUTHORITY_INSTANCE_V2, ROLE_AUTHORITY_INVITE_METHOD_V2,
     ROLE_AUTHORITY_INVITE_REVOKE_METHOD_V2, ROLE_AUTHORITY_MUTATION_METHOD_V2,
     ReceiptVerificationRequestV2, RefineError, RefineImportsV2, RefineOutputV2, ReplyRecordV2,
     RoleAuthorityBindingV2, RoleAuthorityInviteRedemptionV2, RoleAuthorityInviteRevocationV2,
@@ -135,8 +136,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0x47, 0x2f, 0xb1, 0x5a, 0xb0, 0xc7, 0x32, 0x8b, 0x8e, 0x03, 0x51, 0xc5, 0xfc, 0x20, 0x0a, 0xac,
-    0x75, 0xd8, 0x2d, 0x95, 0x79, 0xd4, 0x22, 0x85, 0x41, 0x69, 0xb9, 0x73, 0x41, 0x66, 0x98, 0x1b,
+    0xa4, 0x64, 0xd4, 0x38, 0x86, 0x6f, 0xf9, 0x40, 0x4d, 0x5c, 0x1a, 0x0f, 0x75, 0x15, 0xa4, 0xbf,
+    0xa5, 0xd2, 0xe5, 0x48, 0xd8, 0x1c, 0x80, 0xbe, 0x00, 0xaf, 0x22, 0x3c, 0xfe, 0xb0, 0x2b, 0x1a,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.
@@ -190,6 +191,13 @@ pub const CHECKPOINT_TOKEN_CAPACITY: usize = 4096;
 /// Maximum portable proof payload carried through one actor resume. Bytes are
 /// staged in the invocation-owned IPC capability, never the stack token.
 pub const MAX_ATTESTATION_PROOF_BYTES: usize = 16 * 4096;
+/// Maximum number of independently content-addressed STARK segments in one
+/// attestation manifest. The current Clerk-scale trace uses 707; 1024 leaves
+/// headroom while keeping manifest decode and verifier scheduling bounded.
+pub const MAX_ATTESTATION_PROOF_SEGMENTS: usize = 1024;
+/// Each streamed proof artifact must fit comfortably inside the node's 8-MiB
+/// frame together with its authenticated transport envelope.
+pub const MAX_ATTESTATION_PROOF_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
 /// Register marker distinguishing an awaited-call suspension from an explicit
 /// scheduler yield at the shared SUSPEND capability.
 pub const AWAIT_SUSPEND_MAGIC: u64 = 0x564f_532d_4157_5432;
@@ -222,4 +230,4 @@ pub const JAR_REVISION: &str = "41d31e64b0f5d6c57a43769d7b8785556a311684";
 /// Consensus-visible execution semantics. Changing interpreter/recompiler or
 /// trace behavior requires a new identifier even if the public Rust API did
 /// not change.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v11");
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v12");

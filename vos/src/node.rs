@@ -3605,7 +3605,7 @@ impl VosNode {
     pub fn register_v2_root_at_id<B>(
         &mut self,
         name: impl Into<String>,
-        service: crate::v2::LocalRootTreeServiceV2<B>,
+        mut service: crate::v2::LocalRootTreeServiceV2<B>,
         id: ServiceId,
         network_reachable: bool,
     ) -> Result<ServiceId, V2NodeRegistrationError>
@@ -3615,6 +3615,7 @@ impl VosNode {
             + Send
             + 'static,
     {
+        install_v2_root_proof_verifier(&mut service, None);
         self.validate_v2_root_registration(&service, id)?;
         Ok(self.attach_v2_root_unchecked(name.into(), service, id, network_reachable, None))
     }
@@ -3625,7 +3626,7 @@ impl VosNode {
     pub fn register_v2_root_at_id_with_producer<B, P>(
         &mut self,
         name: impl Into<String>,
-        service: crate::v2::LocalRootTreeServiceV2<B>,
+        mut service: crate::v2::LocalRootTreeServiceV2<B>,
         id: ServiceId,
         network_reachable: bool,
         producer: P,
@@ -3635,16 +3636,45 @@ impl VosNode {
             + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
             + Send
             + 'static,
-        P: crate::AttestationProofProducerV2 + Send + 'static,
+        P: crate::AttestationProofBackendV2 + Send + 'static,
     {
+        let producer = V2NodeAttestationProofProducer::new(producer);
+        install_v2_root_proof_verifier(&mut service, Some(producer.verifier()));
         self.validate_v2_root_registration(&service, id)?;
         Ok(self.attach_v2_root_unchecked(
             name.into(),
             service,
             id,
             network_reachable,
-            Some(V2NodeAttestationProofProducer::new(producer)),
+            Some(producer),
         ))
+    }
+
+    /// Attach a root which may verify proof-bearing replies but does not own a
+    /// producer. This is the least-authority registration for callers of an
+    /// attested peer: incoming proofs are checked independently, while direct
+    /// and inbox methods requiring proof production remain fail-closed.
+    pub fn register_v2_root_at_id_with_verifier<B, V>(
+        &mut self,
+        name: impl Into<String>,
+        mut service: crate::v2::LocalRootTreeServiceV2<B>,
+        id: ServiceId,
+        network_reachable: bool,
+        verifier: V,
+    ) -> Result<ServiceId, V2NodeRegistrationError>
+    where
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+            + Send
+            + 'static,
+        V: crate::AttestationProofVerifierV2 + Send + 'static,
+    {
+        install_v2_root_proof_verifier(
+            &mut service,
+            Some(v2_node_attestation_proof_verifier(verifier)),
+        );
+        self.validate_v2_root_registration(&service, id)?;
+        Ok(self.attach_v2_root_unchecked(name.into(), service, id, network_reachable, None))
     }
 
     fn validate_v2_root_registration<B>(
@@ -3808,6 +3838,7 @@ impl VosNode {
             id,
             network_reachable,
             None,
+            None,
         )
     }
 
@@ -3836,7 +3867,46 @@ impl VosNode {
             + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
             + Send
             + 'static,
-        P: crate::AttestationProofProducerV2 + Send + 'static,
+        P: crate::AttestationProofBackendV2 + Send + 'static,
+    {
+        let producer = V2NodeAttestationProofProducer::new(producer);
+        let verifier = producer.verifier();
+        self.register_v2_raft_root_at_id_inner(
+            name,
+            config,
+            backend,
+            db,
+            raft_config,
+            id,
+            network_reachable,
+            Some(verifier),
+            Some(producer),
+        )
+    }
+
+    /// Raft-backed verifier-only registration for callers of attested roots.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_v2_raft_root_at_id_with_verifier<B, V>(
+        &mut self,
+        name: String,
+        config: crate::v2::LocalRootTreeConfigV2,
+        backend: B,
+        db: Arc<redb::Database>,
+        raft_config: crate::raft::RaftConfig,
+        id: ServiceId,
+        network_reachable: bool,
+        verifier: V,
+    ) -> Result<
+        ServiceId,
+        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+    >
+    where
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+            + Send
+            + 'static,
+        V: crate::AttestationProofVerifierV2 + Send + 'static,
     {
         self.register_v2_raft_root_at_id_inner(
             name,
@@ -3846,7 +3916,8 @@ impl VosNode {
             raft_config,
             id,
             network_reachable,
-            Some(V2NodeAttestationProofProducer::new(producer)),
+            Some(v2_node_attestation_proof_verifier(verifier)),
+            None,
         )
     }
 
@@ -3861,6 +3932,7 @@ impl VosNode {
         raft_config: crate::raft::RaftConfig,
         id: ServiceId,
         network_reachable: bool,
+        proof_verifier: Option<V2NodeAttestationProofVerifier>,
         proof_producer: Option<V2NodeAttestationProofProducer>,
     ) -> Result<
         ServiceId,
@@ -3872,8 +3944,9 @@ impl VosNode {
             + Send
             + 'static,
     {
+        let proof_verifier = proof_verifier.unwrap_or_else(v2_deny_all_proof_verifier);
         let (service, _worker, _network, replication_id, handler) =
-            self.prepare_v2_raft_root(config, backend, db, raft_config)?;
+            self.prepare_v2_raft_root(config, backend, db, raft_config, proof_verifier)?;
         if let Err(error) = self.validate_v2_root_registration(&service, id) {
             if let Some(network) = _network.as_ref() {
                 network.unregister_raft_handler_if(&replication_id, &handler);
@@ -3924,6 +3997,7 @@ impl VosNode {
             id,
             network_reachable,
             None,
+            None,
             promote,
         )
     }
@@ -3956,7 +4030,51 @@ impl VosNode {
             + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
             + Send
             + 'static,
-        P: crate::AttestationProofProducerV2 + Send + 'static,
+        P: crate::AttestationProofBackendV2 + Send + 'static,
+        F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool) -> Result<(), String> + Send + 'static,
+    {
+        let producer = V2NodeAttestationProofProducer::new(producer);
+        let verifier = producer.verifier();
+        self.register_v2_raft_root_at_id_after_local_attach_inner(
+            name,
+            config,
+            backend,
+            db,
+            raft_config,
+            id,
+            network_reachable,
+            Some(verifier),
+            Some(producer),
+            promote,
+        )
+    }
+
+    /// Verifier-only counterpart for a joining Raft caller of attested roots.
+    /// The capability is installed before voter promotion, so follower replay
+    /// can validate proof sidecars before the public route appears.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_v2_raft_root_at_id_after_local_attach_with_verifier<B, V, F>(
+        &mut self,
+        name: String,
+        config: crate::v2::LocalRootTreeConfigV2,
+        backend: B,
+        db: Arc<redb::Database>,
+        raft_config: crate::raft::RaftConfig,
+        id: ServiceId,
+        network_reachable: bool,
+        verifier: V,
+        promote: F,
+    ) -> Result<
+        ServiceId,
+        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+    >
+    where
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+            + Send
+            + 'static,
+        V: crate::AttestationProofVerifierV2 + Send + 'static,
         F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool) -> Result<(), String> + Send + 'static,
     {
         self.register_v2_raft_root_at_id_after_local_attach_inner(
@@ -3967,7 +4085,8 @@ impl VosNode {
             raft_config,
             id,
             network_reachable,
-            Some(V2NodeAttestationProofProducer::new(producer)),
+            Some(v2_node_attestation_proof_verifier(verifier)),
+            None,
             promote,
         )
     }
@@ -3983,6 +4102,7 @@ impl VosNode {
         raft_config: crate::raft::RaftConfig,
         id: ServiceId,
         network_reachable: bool,
+        proof_verifier: Option<V2NodeAttestationProofVerifier>,
         proof_producer: Option<V2NodeAttestationProofProducer>,
         promote: F,
     ) -> Result<
@@ -3996,8 +4116,9 @@ impl VosNode {
             + 'static,
         F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool) -> Result<(), String> + Send + 'static,
     {
+        let proof_verifier = proof_verifier.unwrap_or_else(v2_deny_all_proof_verifier);
         let (service, worker_handle, network, replication_id, handler) =
-            self.prepare_v2_raft_root(config, backend, db, raft_config)?;
+            self.prepare_v2_raft_root(config, backend, db, raft_config, proof_verifier)?;
         if let Err(error) = self.validate_v2_root_registration(&service, id) {
             if let Some(network) = network.as_ref() {
                 network.unregister_raft_handler_if(&replication_id, &handler);
@@ -4069,6 +4190,7 @@ impl VosNode {
         backend: B,
         db: Arc<redb::Database>,
         raft_config: crate::raft::RaftConfig,
+        proof_verifier: V2NodeAttestationProofVerifier,
     ) -> Result<
         PreparedV2RaftRoot<B>,
         V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
@@ -4136,7 +4258,12 @@ impl VosNode {
                 return Err(V2RaftNodeRegistrationError::Log(error));
             }
         };
-        let service = match crate::v2::LocalRootTreeServiceV2::open_raft(config, backend, log) {
+        let service = match crate::v2::LocalRootTreeServiceV2::open_raft_with_proof_verifier(
+            config,
+            backend,
+            log,
+            proof_verifier,
+        ) {
             Ok(service) => service,
             Err(error) => {
                 cleanup();
@@ -5847,20 +5974,21 @@ struct V2CrdtRosterPage {
     next: Option<(u8, Vec<u8>)>,
 }
 
-/// Type-erased, root-thread-owned proof producer. Keeping the capability out
-/// of [`VosNode`] shared state prevents concurrent proof production and makes
-/// the registration boundary explicit: a root without this value cannot
-/// execute an attested policy.
+/// Type-erased proof backend shared only between one root thread and that
+/// root's Accumulate host. The mutex serializes expensive production with
+/// verification and keeps the backend out of node-global shared state.
 trait V2NodeAttestationProofProducerDyn: Send {
     fn prove(
         &mut self,
         request: &crate::AttestationProofRequestV2<'_>,
     ) -> Result<crate::ProducedAttestationProofV2, ()>;
+
+    fn verify(&mut self, request: &crate::v2::ProofVerificationRequestV2, proof: &[u8]) -> bool;
 }
 
 impl<P> V2NodeAttestationProofProducerDyn for P
 where
-    P: crate::AttestationProofProducerV2 + Send,
+    P: crate::AttestationProofBackendV2 + Send,
 {
     fn prove(
         &mut self,
@@ -5868,16 +5996,60 @@ where
     ) -> Result<crate::ProducedAttestationProofV2, ()> {
         crate::AttestationProofProducerV2::prove(self, request).map_err(|_| ())
     }
+
+    fn verify(&mut self, request: &crate::v2::ProofVerificationRequestV2, proof: &[u8]) -> bool {
+        if <crate::v2::AttestationProofManifestV2 as crate::v2::V2Wire>::decode(proof).is_err() {
+            return false;
+        }
+        crate::AttestationProofVerifierV2::verify(self, request, proof).unwrap_or(false)
+    }
 }
 
-struct V2NodeAttestationProofProducer(Box<dyn V2NodeAttestationProofProducerDyn>);
+#[derive(Clone)]
+struct V2NodeAttestationProofProducer(Arc<Mutex<Box<dyn V2NodeAttestationProofProducerDyn>>>);
+
+type V2NodeAttestationProofVerifier =
+    Arc<dyn Fn(&crate::v2::ProofVerificationRequestV2, &[u8]) -> bool + Send + Sync + 'static>;
+
+fn v2_deny_all_proof_verifier() -> V2NodeAttestationProofVerifier {
+    Arc::new(|_, _| false)
+}
+
+fn v2_node_attestation_proof_verifier<V>(verifier: V) -> V2NodeAttestationProofVerifier
+where
+    V: crate::AttestationProofVerifierV2 + Send + 'static,
+{
+    let verifier = Arc::new(Mutex::new(verifier));
+    Arc::new(move |request, proof| {
+        if <crate::v2::AttestationProofManifestV2 as crate::v2::V2Wire>::decode(proof).is_err() {
+            return false;
+        }
+        verifier
+            .lock()
+            .map(|mut verifier| {
+                crate::AttestationProofVerifierV2::verify(&mut *verifier, request, proof)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    })
+}
 
 impl V2NodeAttestationProofProducer {
     fn new<P>(producer: P) -> Self
     where
-        P: crate::AttestationProofProducerV2 + Send + 'static,
+        P: crate::AttestationProofBackendV2 + Send + 'static,
     {
-        Self(Box::new(producer))
+        Self(Arc::new(Mutex::new(Box::new(producer))))
+    }
+
+    fn verifier(&self) -> V2NodeAttestationProofVerifier {
+        let backend = self.0.clone();
+        Arc::new(move |request, proof| {
+            backend
+                .lock()
+                .map(|mut backend| backend.verify(request, proof))
+                .unwrap_or(false)
+        })
     }
 }
 
@@ -5888,7 +6060,27 @@ impl crate::AttestationProofProducerV2 for V2NodeAttestationProofProducer {
         &mut self,
         request: &crate::AttestationProofRequestV2<'_>,
     ) -> Result<crate::ProducedAttestationProofV2, Self::Error> {
-        self.0.prove(request)
+        self.0.lock().map_err(|_| ())?.prove(request)
+    }
+}
+
+fn install_v2_root_proof_verifier<B>(
+    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
+    verifier: Option<V2NodeAttestationProofVerifier>,
+) where
+    B: crate::v2::CommittedImageStoreV2
+        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+{
+    match verifier {
+        Some(verifier) => service
+            .store_mut()
+            .install_proof_verifier(move |request, proof| verifier(request, proof)),
+        None => {
+            let verifier = v2_deny_all_proof_verifier();
+            service
+                .store_mut()
+                .install_proof_verifier(move |request, proof| verifier(request, proof));
+        }
     }
 }
 

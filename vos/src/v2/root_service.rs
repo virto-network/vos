@@ -8,6 +8,7 @@
 //! post-Accumulate image.
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::attestation::{AttestationProofHostV2, AttestationProofProducerV2};
@@ -1348,7 +1349,7 @@ where
                 LocalRootTreeConfigErrorV2::ReplicationDriverRequired,
             ));
         }
-        Self::open_with_driver(config, backend, RootTreeDriverConfigV2::Direct)
+        Self::open_with_driver(config, backend, RootTreeDriverConfigV2::Direct, None)
     }
 
     /// Open a Raft root tree whose genesis and every later mutation are
@@ -1364,13 +1365,38 @@ where
                 LocalRootTreeConfigErrorV2::InvalidConsistency,
             ));
         }
-        Self::open_with_driver(config, backend, RootTreeDriverConfigV2::Raft(log))
+        Self::open_with_driver(config, backend, RootTreeDriverConfigV2::Raft(log), None)
+    }
+
+    /// Open a Raft root with its proof verifier installed before snapshot or
+    /// log replay. This is the node registration path; keeping it separate
+    /// from the conformance constructor prevents a follower from hydrating a
+    /// proof under the local allowlist seam during recovery.
+    #[cfg(feature = "storage")]
+    pub(crate) fn open_raft_with_proof_verifier(
+        config: LocalRootTreeConfigV2,
+        backend: B,
+        log: RaftAccumulateLogV2,
+        proof_verifier: Arc<super::local_store::ProofVerifierFnV2>,
+    ) -> Result<Self, LocalRootTreeOpenErrorV2<<B as CommittedImageStoreV2>::Error>> {
+        if config.consistency != ConsistencyModeV2::Raft {
+            return Err(LocalRootTreeOpenErrorV2::InvalidConfig(
+                LocalRootTreeConfigErrorV2::InvalidConsistency,
+            ));
+        }
+        Self::open_with_driver(
+            config,
+            backend,
+            RootTreeDriverConfigV2::Raft(log),
+            Some(proof_verifier),
+        )
     }
 
     fn open_with_driver(
         config: LocalRootTreeConfigV2,
         backend: B,
         driver: RootTreeDriverConfigV2,
+        proof_verifier: Option<Arc<super::local_store::ProofVerifierFnV2>>,
     ) -> Result<Self, LocalRootTreeOpenErrorV2<<B as CommittedImageStoreV2>::Error>> {
         let (expected_root, genesis) = config
             .installation()
@@ -1392,7 +1418,11 @@ where
         .map_err(|_| {
             LocalRootTreeOpenErrorV2::InvalidConfig(LocalRootTreeConfigErrorV2::InvalidGenesis)
         })?;
-        let store = DurableJamStoreV2::open(backend).map_err(LocalRootTreeOpenErrorV2::Store)?;
+        let mut store =
+            DurableJamStoreV2::open(backend).map_err(LocalRootTreeOpenErrorV2::Store)?;
+        if let Some(proof_verifier) = proof_verifier {
+            store.install_proof_verifier_arc(proof_verifier);
+        }
         let expected_program = config.service.service_program;
         let mut service = JamServiceV2::new(
             config.service_pvm,
