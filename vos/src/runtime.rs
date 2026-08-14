@@ -2249,13 +2249,48 @@ fn run_task_invoke(
         );
     }
 
-    // Provable record capture: the caller named a tag, so persist what a
-    // proof of this transition needs later into the PARENT's keyspace as
-    // an ordinary `__vos_proofrec/<tag>` write — riding the same commit
-    // (and recording/replay) path as every other effect, so it survives
-    // restart and CRDT soft-restart. The transition digest is read here,
-    // BEFORE this write is appended and before `take_state_write`, so it
-    // is exactly the digest the guest folded into its bound io-hash.
+    // Assemble the caller-visible result before recording or absorbing any
+    // child effect. A recorded Task is one-shot: a yield proves no completed
+    // transition, and an output that cannot reach the parent cannot be safely
+    // correlated with a durable record. Both cases therefore leave no child
+    // effect or proof record behind.
+    let transition_digest = record_tag.map(|_| payload.transition_digest());
+    let continue_next = payload.continue_next;
+    let child_state = payload.take_state_write().unwrap_or_else(|| state.to_vec());
+    let status = if continue_next {
+        STATUS_YIELDED
+    } else {
+        STATUS_DONE
+    };
+    let mut out = Vec::with_capacity(1 + 4 + child_state.len() + payload.reply.len());
+    out.push(status);
+    out.extend_from_slice(&(child_state.len() as u32).to_le_bytes());
+    out.extend_from_slice(&child_state);
+    out.extend_from_slice(&payload.reply);
+
+    if record_tag.is_some() && continue_next {
+        error!(parent_svc_id, "recorded task yielded instead of completing");
+        journal.rollback_to(invoke_mark);
+        return record_and_write_invoke(
+            caller,
+            output_ptr,
+            output_buf_len,
+            &[STATUS_PANICKED],
+            depth,
+            mode,
+        );
+    }
+    if record_tag.is_some() && output_buf_len > 0 && out.len() > output_buf_len {
+        journal.rollback_to(invoke_mark);
+        return record_and_write_invoke(caller, output_ptr, output_buf_len, &out, depth, mode);
+    }
+
+    // Provable record capture: the caller named a tag and the Task completed
+    // with a deliverable output, so persist what a proof of this transition
+    // needs later into the PARENT's keyspace as an ordinary
+    // `__vos_proofrec/<tag>` write. `transition_digest` was read before this
+    // write and before removing the state effect, so it is exactly the digest
+    // the guest folded into its bound io-hash.
     if let Some(tag) = record_tag {
         let mut io_hash = [0u8; 32];
         for (i, r) in (9usize..13).enumerate() {
@@ -2270,7 +2305,7 @@ fn run_task_invoke(
                 task_hash: *task_hash,
                 anchor_kind: payload.anchor_kind,
                 anchor: payload.anchor,
-                transition_digest: payload.transition_digest(),
+                transition_digest: transition_digest.expect("record tag computes its digest"),
                 reply: payload.reply.clone(),
                 io_hash,
                 app_public: payload.app_public.clone(),
@@ -2295,7 +2330,6 @@ fn run_task_invoke(
     // session, log the effects alongside the invoke output: replay
     // short-circuits the child, so re-absorbing the recorded effects
     // is the only way a rebuilt replica gets them.
-    let child_state = payload.take_state_write().unwrap_or_else(|| state.to_vec());
     if !payload.effects.is_empty()
         && let crate::effect_log::EffectMode::Recording(s) = &mut *mode
     {
@@ -2305,17 +2339,6 @@ fn run_task_invoke(
         );
     }
     journal.absorb_effects(core::mem::take(&mut payload.effects), parent_svc_id);
-
-    let status = if payload.continue_next {
-        STATUS_YIELDED
-    } else {
-        STATUS_DONE
-    };
-    let mut out = Vec::with_capacity(1 + 4 + child_state.len() + payload.reply.len());
-    out.push(status);
-    out.extend_from_slice(&(child_state.len() as u32).to_le_bytes());
-    out.extend_from_slice(&child_state);
-    out.extend_from_slice(&payload.reply);
     record_and_write_invoke(caller, output_ptr, output_buf_len, &out, depth, mode)
 }
 

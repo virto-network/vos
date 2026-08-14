@@ -99,8 +99,9 @@ pub struct TaskRecord {
     pub row_keys: Vec<Vec<u8>>,
     /// When set, drive this task as a provable invoke: the host captures
     /// a durable proof record under `__vos_proofrec/<tag>` in the
-    /// parent's keyspace on every drive pass (see
-    /// `lifecycle::invoke_hash_with_record`). `None` = ordinary drive.
+    /// parent's keyspace when the Task completes in one pass (see
+    /// `lifecycle::invoke_hash_with_record`). Yielded or undeliverable output
+    /// captures no record or child effects. `None` = ordinary drive.
     pub record_tag: Option<[u8; 32]>,
 }
 

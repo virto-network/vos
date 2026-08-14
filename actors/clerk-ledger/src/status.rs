@@ -95,8 +95,9 @@ pub enum Status {
     /// this status rather than silently bucketing into
     /// `TransferInvariant`.
     ImportedUnsupported = 15,
-    /// The configured provable apply Task was missing or rejected the
-    /// transition. No ledger mutation or proof record committed.
+    /// No provable apply Task has been configured. A configured Task that
+    /// fails or does not complete traps the dispatch so no staged child
+    /// effect, ledger mutation, or proof record can commit.
     ProofUnavailable = 16,
     /// The kernel returned an `EventStatus` variant the handler's
     /// taxonomy doesn't map — should be unreachable; widen

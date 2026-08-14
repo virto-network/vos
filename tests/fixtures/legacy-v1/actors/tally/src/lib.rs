@@ -106,4 +106,24 @@ impl Tally {
         }
         self.total
     }
+
+    /// Stage an ordinary parent-keyspace effect and then yield. A recorded
+    /// invocation must roll both back because no completed transition exists.
+    #[msg]
+    async fn yield_recorded(&mut self, ctx: &mut Context<Self>) -> u64 {
+        ctx.store(b"tally/yielded_effect", &[1]);
+        ctx.yield_now().await;
+        self.total
+    }
+
+    /// Deliberately exceeds the parent's fixed INVOKE reply window. The
+    /// record-capture regression requires this to produce `TooBig` without a
+    /// durable proof record or child effect.
+    #[msg]
+    async fn oversized_recorded(&self, ctx: &mut Context<Self>) -> alloc::vec::Vec<u8> {
+        ctx.store(b"tally/oversized_effect", &[1]);
+        let mut bytes = alloc::vec::Vec::new();
+        bytes.resize(9_000, 0xA5);
+        bytes
+    }
 }

@@ -146,7 +146,9 @@ where
     }
 }
 
-fn transfer_record_tag(id: &[u8; 16]) -> [u8; 32] {
+/// Canonical 32-byte proof-record tag for a Clerk transfer id. Pass this to
+/// `vosx zk prove --tag` or the `proof_record`/`prune_proof_record` handlers.
+pub fn transfer_record_tag(id: &[u8; 16]) -> [u8; 32] {
     vos::crypto::blake2b_hash::<32>(b"clerk-ledger/provable-transfer/v1", &[id])
 }
 
@@ -254,6 +256,51 @@ pub struct ClerkLedger {
 }
 
 impl ClerkLedger {
+    /// Proof-record administration exposes producer-only material, so it may
+    /// not inherit the legacy `Caller::Actor` role bypass. Host-controlled
+    /// System calls remain available for local operator tooling; members must
+    /// carry the authenticated role bytes supplied by their ingress boundary.
+    fn authorize_proof_operator(ctx: &mut Context<Self>) -> bool {
+        let allowed = match ctx.origin() {
+            Origin::System => true,
+            Origin::Member(_) => ctx.has_role(ClerkLedgerRole::Operator),
+            Origin::Anonymous | Origin::Actor(_) => false,
+        };
+        if !allowed {
+            ctx.__mark_forbidden();
+        }
+        allowed
+    }
+
+    fn staged_record(tag: &[u8; 32]) -> Option<vos::provable::ProofRecordEntry> {
+        #[cfg(target_arch = "riscv64")]
+        {
+            let bytes = vos::provable::read_record_entry(tag)?;
+            vos::provable::ProofRecordEntry::decode(&bytes)
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            let _ = tag;
+            None
+        }
+    }
+
+    /// The parent-visible reply is not the proof statement. Require the
+    /// runtime-staged record itself to bind the selected Task, exact reply
+    /// wire, and exact public claim before mutating the live ledger.
+    fn record_matches_claim(
+        entry: &vos::provable::ProofRecordEntry,
+        task_hash: [u8; 32],
+        reply: &[u8],
+        claim: ClerkTransitionClaim,
+    ) -> bool {
+        entry.input.task_hash == task_hash
+            && entry.record.task_hash == task_hash
+            && entry.record.reply == reply
+            && entry.record.app_public.as_slice() == claim.encode().as_slice()
+            && entry.record.io_consistent()
+    }
+
     /// Composite SMT root over the actor's full kernel-checked state —
     /// accounts/transfers/journal plus the bookkeeping sets (external
     /// ids, voided transfers, pending statuses), per cipher-clerk's
@@ -470,7 +517,14 @@ impl ClerkLedger {
     /// signed packages carry Task dependencies; a zero hash is never a valid
     /// content address. Repeating the same configuration is idempotent.
     #[msg(role = ClerkLedgerRole::Operator)]
-    async fn configure_provable_apply(&mut self, task_hash: [u8; 32]) -> Status {
+    async fn configure_provable_apply(
+        &mut self,
+        task_hash: [u8; 32],
+        ctx: &mut Context<Self>,
+    ) -> Status {
+        if !Self::authorize_proof_operator(ctx) {
+            return Status::BadInput;
+        }
         if task_hash == [0u8; 32] {
             return Status::BadInput;
         }
@@ -711,12 +765,16 @@ impl ClerkLedger {
         );
         tasks.drive();
         if tasks.status(task_id) != Some(TaskStatus::Done) {
-            return Status::ProofUnavailable;
+            // A failed/yielded recorded Task must abort the whole dispatch:
+            // returning normally would commit any staged child effects. The
+            // runtime independently captures records only for a completed,
+            // deliverable output.
+            panic!("clerk-apply did not complete its one-shot transition");
         }
-        let claim = tasks
+        let task_reply = tasks
             .reply(task_id)
-            .and_then(Value::try_decode)
-            .and_then(|value| match value {
+            .unwrap_or_else(|| panic!("clerk-apply completed without a reply"));
+        let claim = <Value as vos::Decode>::try_decode(task_reply).and_then(|value| match value {
                 Value::Bytes(bytes) => ClerkTransitionClaim::decode(&bytes),
                 _ => None,
             });
@@ -724,6 +782,12 @@ impl ClerkLedger {
         assert!(
             claim.root_before == root_before && claim.batch_digest == expected_digest,
             "clerk-apply public claim does not bind the requested transition"
+        );
+        let staged = Self::staged_record(&tag)
+            .unwrap_or_else(|| panic!("clerk-apply completed without a staged proof record"));
+        assert!(
+            Self::record_matches_claim(&staged, task_hash, task_reply, claim),
+            "clerk-apply proof record does not bind the selected Task and exact public claim"
         );
 
         let mut view = LedgerView::new(
@@ -763,7 +827,14 @@ impl ClerkLedger {
     /// provable transfer. Operator-gated because the entry contains the
     /// exact witness, including commitment openings.
     #[msg(role = ClerkLedgerRole::Operator)]
-    async fn transfer_proof_record(&self, transfer_id: [u8; 16]) -> Vec<u8> {
+    async fn transfer_proof_record(
+        &self,
+        transfer_id: [u8; 16],
+        ctx: &mut Context<Self>,
+    ) -> Vec<u8> {
+        if !Self::authorize_proof_operator(ctx) {
+            return Vec::new();
+        }
         #[cfg(target_arch = "riscv64")]
         return vos::provable::read_record_entry(&transfer_record_tag(&transfer_id))
             .unwrap_or_default();
@@ -771,6 +842,38 @@ impl ClerkLedger {
         {
             let _ = transfer_id;
             Vec::new()
+        }
+    }
+
+    /// Canonical producer-record export consumed by
+    /// `vosx zk prove --from <actor> --tag <hex>`.
+    #[msg(role = ClerkLedgerRole::Operator)]
+    async fn proof_record(&self, tag: [u8; 32], ctx: &mut Context<Self>) -> Vec<u8> {
+        if !Self::authorize_proof_operator(ctx) {
+            return Vec::new();
+        }
+        #[cfg(target_arch = "riscv64")]
+        return vos::provable::read_record_entry(&tag).unwrap_or_default();
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            let _ = tag;
+            Vec::new()
+        }
+    }
+
+    /// Delete a producer-private record after proof publication or settlement
+    /// expiry. Idempotent: a missing tag returns false.
+    #[msg(role = ClerkLedgerRole::Operator)]
+    async fn prune_proof_record(&mut self, tag: [u8; 32], ctx: &mut Context<Self>) -> bool {
+        if !Self::authorize_proof_operator(ctx) {
+            return false;
+        }
+        #[cfg(target_arch = "riscv64")]
+        return vos::provable::prune_record_entry(&tag);
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            let _ = tag;
+            false
         }
     }
 

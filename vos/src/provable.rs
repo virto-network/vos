@@ -214,6 +214,15 @@ pub fn read_record_entry(tag: &[u8; 32]) -> Option<Vec<u8>> {
     crate::actors::storage::read_raw(&proofrec_key(tag))
 }
 
+/// Guest-side (the record-owning parent agent): prune a captured proof record
+/// after its proof has been published or its settlement window has closed.
+/// The delete is an ordinary actor-storage effect and therefore commits
+/// atomically with the handler that authorizes it.
+#[cfg(feature = "service")]
+pub fn prune_record_entry(tag: &[u8; 32]) -> bool {
+    crate::actors::storage::delete_raw(&proofrec_key(tag))
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;

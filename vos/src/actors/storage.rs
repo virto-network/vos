@@ -154,6 +154,17 @@ pub(crate) fn read_raw(key: &[u8]) -> Option<Vec<u8>> {
     overlay_load(key)
 }
 
+/// Delete one raw row through the current dispatch overlay. Returns whether
+/// the row existed before the tombstone was staged. Reserved framework
+/// namespaces use this alongside [`read_raw`] when a typed storage handle
+/// would expose internal keys to application code.
+#[cfg_attr(not(feature = "service"), allow(dead_code))]
+pub(crate) fn delete_raw(key: &[u8]) -> bool {
+    let existed = overlay_load(key).is_some();
+    overlay_store(key.to_vec(), None);
+    existed
+}
+
 /// The effective value of `key` for this dispatch: pending mutations
 /// (tombstones = absent), then the read cache, then the host.
 fn overlay_load(key: &[u8]) -> Option<Vec<u8>> {

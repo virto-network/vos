@@ -23,6 +23,7 @@ use cipher_clerk::types::{
 };
 use vos::storage::CommittedMap;
 
+use crate::{ClerkLedger, ClerkLedgerRole};
 use crate::oracle::NoopOracle;
 use crate::smt::compute_state_root;
 use crate::view::LedgerView;
@@ -386,4 +387,88 @@ fn composite_root_is_insertion_order_invariant() {
     let forward = build(&[0x01, 0x02, 0x03], &[0x10, 0x20]);
     let reverse = build(&[0x03, 0x02, 0x01], &[0x20, 0x10]);
     assert_eq!(forward, reverse, "composite root must be order-invariant");
+}
+
+#[test]
+fn proof_record_administration_rejects_the_legacy_actor_bypass() {
+    use vos::actors::context::ServiceId;
+    use vos::{Caller, Context};
+
+    let mut actor = Context::<ClerkLedger>::new(ServiceId(7));
+    actor.set_caller(Caller::Actor(ServiceId(9)));
+    actor.set_caller_roles(None, Some(ClerkLedgerRole::Operator as u8));
+    assert!(
+        !ClerkLedger::authorize_proof_operator(&mut actor),
+        "an actor-local role must not expose another actor's proving secret"
+    );
+    let mut anonymous = Context::<ClerkLedger>::new(ServiceId(7));
+    assert!(!ClerkLedger::authorize_proof_operator(&mut anonymous));
+
+    let mut peer = Context::<ClerkLedger>::new(ServiceId(7));
+    peer.set_caller(Caller::Peer(vec![0xA5; 32]));
+    peer.set_caller_roles(None, Some(ClerkLedgerRole::Operator as u8));
+    assert!(ClerkLedger::authorize_proof_operator(&mut peer));
+
+    let mut system = Context::<ClerkLedger>::new(ServiceId(7));
+    system.set_caller(Caller::System);
+    assert!(ClerkLedger::authorize_proof_operator(&mut system));
+}
+
+#[test]
+fn parent_requires_the_proof_bound_public_claim_not_only_the_task_reply() {
+    use vos::Encode;
+    use vos::provable::{ProofRecordEntry, ProvableInput, ProvableRecord};
+    use vos::value::Value;
+
+    let task_hash = [0x41; 32];
+    let claim = clerk_witness::ClerkTransitionClaim {
+        root_before: [1; 32],
+        root_after: [2; 32],
+        batch_digest: [3; 32],
+    };
+    let reply = Value::Bytes(claim.encode().to_vec()).encode();
+    let anchor_kind = vos::refine_payload::ANCHOR_GENESIS;
+    let anchor = [0u8; 32];
+    let transition_digest = [4u8; 32];
+    let app_public = claim.encode().to_vec();
+    let public_prime = vos::refine_payload::folded_public(
+        anchor_kind,
+        &anchor,
+        &transition_digest,
+        &app_public,
+    );
+    let entry = ProofRecordEntry {
+        input: ProvableInput {
+            task_hash,
+            witness_bytes: vec![5],
+        },
+        record: ProvableRecord {
+            task_hash,
+            anchor_kind,
+            anchor,
+            transition_digest,
+            reply: reply.clone(),
+            io_hash: vos::zk::compute_io_hash(&public_prime, &reply),
+            app_public,
+            catalog_name: String::new(),
+            catalog_version: 0,
+        },
+    };
+    assert!(ClerkLedger::record_matches_claim(
+        &entry, task_hash, &reply, claim
+    ));
+
+    // Model a malicious Task that returns the expected claim but binds a
+    // different proof-public statement. Keep its io equation internally
+    // valid so the parent must catch the cross-channel mismatch itself.
+    let mut forged = entry.clone();
+    forged.record.app_public[0] ^= 1;
+    forged.record.io_hash = vos::zk::compute_io_hash(
+        &forged.record.public_prime(),
+        &forged.record.reply,
+    );
+    assert!(forged.record.io_consistent());
+    assert!(!ClerkLedger::record_matches_claim(
+        &forged, task_hash, &reply, claim
+    ));
 }

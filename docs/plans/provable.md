@@ -207,8 +207,13 @@ them and made records droppable — both wrong.
   replicate effect logs, and putting `ProvableInput` into an invoke
   effect would disclose the exact secret witness. A future replicated
   producer needs a producer-local durable sidecar, not replicated actor
-  state. The invoke output envelope returns
-  the tag so the parent can correlate. Records are pruned by the app
+  state. A record-enabled Task must complete in one invoke and its complete
+  output must fit the caller buffer; yield or oversized output captures no
+  record or child effects. The parent reads the staged record before its own
+  mutation and checks the selected Task, exact reply wire, and `app_public`
+  rather than trusting the reply as a proxy for the proof statement. Records
+  export through the canonical `proof_record(tag)` ABI used by
+  `vosx zk prove --from` and are pruned by the app
   (a `prune_proof_record(tag)` handler) once a proof is published or
   the settlement window closes — not silently ring-dropped.
 
@@ -380,9 +385,14 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
 - **The parent-side Clerk seam.** `clerk-ledger::apply_transfer_provable`
   probes the live ledger for its touched set, extracts six touched-only
   multiproofs without walking the account set, invokes `clerk-apply`, and
-  commits the live kernel mutation only when the synchronous 96-byte claim
-  exactly binds the entry root, resulting root, and requested batch. The
-  producer record is keyed by transfer id and exports those same claim bytes.
+  commits the live kernel mutation only when the staged producer record names
+  the selected Task and its exact reply and proof-bound `app_public` both
+  carry the same 96-byte claim binding the entry root, resulting root, and
+  requested batch. The producer record is keyed by transfer id, exports via
+  the canonical `proof_record(tag)` ABI, and has an idempotent operator-only
+  prune path. Secret-record administration explicitly rejects anonymous and
+  same-node Actor origins instead of inheriting the legacy trusted-actor role
+  bypass.
   The SMT extractor uses an explicit worklist so a 256-bit path cannot exhaust
   the actor-PVM stack. A physical guest test covers missing-Task refusal,
   immutable Task selection, the live state change, and exact record/reply/root

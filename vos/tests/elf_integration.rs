@@ -6646,6 +6646,30 @@ fn clerk_ledger_bootstrap_and_create_account() {
         .expect("clerk-apply reply repeats the public claim");
     assert_eq!(reply, record.record.app_public);
 
+    // Canonical producer ABI: this is the exact method `vosx zk prove
+    // --from ... --tag ...` invokes, and it must return the same secret entry
+    // as the transfer-id convenience method.
+    let proof_tag = clerk_ledger::transfer_record_tag(&transfer_id);
+    let canonical_record = vos::block_on(ledger.proof_record(&mut &node, proof_tag))
+        .expect("canonical proof_record export");
+    assert_eq!(canonical_record, record_bytes);
+
+    // Application-driven retention: pruning is atomic and idempotent, and
+    // removes the complete witness once the operator has published its proof.
+    assert!(
+        vos::block_on(ledger.prune_proof_record(&mut &node, proof_tag))
+            .expect("prune proof record")
+    );
+    assert!(
+        !vos::block_on(ledger.prune_proof_record(&mut &node, proof_tag))
+            .expect("repeat proof-record prune")
+    );
+    assert!(
+        vos::block_on(ledger.proof_record(&mut &node, proof_tag))
+            .expect("proof record after prune")
+            .is_empty()
+    );
+
     // Unknown transfer id → None.
     let missing = vos::block_on(ledger.transfer_state_roots(&mut &node, [0u8; 16]))
         .expect("invoke transfer_state_roots (missing)");
@@ -12003,6 +12027,90 @@ fn provable_task_captures_a_durable_re_traceable_record() {
         entry.record.io_hash,
         vos::zk::compute_io_hash(&[], &[]),
         "the io-hash must commit to the transition, not the empty placeholder"
+    );
+
+    // Record capture is terminal-only. The same Task fixture's `work`
+    // handler yields on its first pass; a record-enabled invoke must fail the
+    // one-shot contract and leave no durable witness/effects under its tag.
+    let yielded_tag = [0xACu8; 32];
+    let yielded_id = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &Msg::new("run_provable_task")
+            .with("code_hash", task_hash.to_vec())
+            .with("task_msg", task_gate_dyn_msg(&Msg::new("yield_recorded")))
+            .with(
+                "row_keys",
+                vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&Vec::<Vec<u8>>::new())
+                    .expect("encode empty row keys")
+                    .to_vec(),
+            )
+            .with("tag", yielded_tag.to_vec()),
+    )
+    .as_u64()
+    .expect("yielded recorded task receives an id");
+    let yielded_status = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &Msg::new("task_status").with("id", yielded_id),
+    );
+    assert_eq!(
+        yielded_status.as_u32(),
+        Some(vos::agent::TaskStatus::Panicked as u32),
+        "a provable Task must complete in the recording dispatch"
+    );
+    assert!(
+        rt.storage
+            .read(sched_id, &proofrec_key(&yielded_tag))
+            .is_none(),
+        "a yielded Task must not commit a proof record"
+    );
+    assert!(
+        rt.storage.read(sched_id, b"tally/yielded_effect").is_none(),
+        "a yielded recorded Task must not commit child effects"
+    );
+
+    let oversized_tag = [0xADu8; 32];
+    let oversized_id = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &Msg::new("run_provable_task")
+            .with("code_hash", task_hash.to_vec())
+            .with(
+                "task_msg",
+                task_gate_dyn_msg(&Msg::new("oversized_recorded")),
+            )
+            .with(
+                "row_keys",
+                vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&Vec::<Vec<u8>>::new())
+                    .expect("encode empty row keys")
+                    .to_vec(),
+            )
+            .with("tag", oversized_tag.to_vec()),
+    )
+    .as_u64()
+    .expect("oversized recorded task receives an id");
+    let oversized_status = task_gate_ask(
+        &mut rt,
+        sched_id,
+        &Msg::new("task_status").with("id", oversized_id),
+    );
+    assert_eq!(
+        oversized_status.as_u32(),
+        Some(vos::agent::TaskStatus::TooBig as u32),
+        "an undeliverable result must remain typed as TooBig"
+    );
+    assert!(
+        rt.storage
+            .read(sched_id, &proofrec_key(&oversized_tag))
+            .is_none(),
+        "an oversized Task result must not commit a proof record"
+    );
+    assert!(
+        rt.storage
+            .read(sched_id, b"tally/oversized_effect")
+            .is_none(),
+        "an oversized recorded Task must not commit child effects"
     );
 }
 
