@@ -870,12 +870,16 @@ impl LocalWorkSchedulerV2 {
         {
             return Err(ScheduleErrorV2::InvalidWorkflowStep(request.invocation));
         }
+        let task_dependencies = super::PackageRolePoliciesV2::decode(&descriptor.role_policies)
+            .map_err(|_| ScheduleErrorV2::InvalidActorDescriptor(request.target))?
+            .task_dependencies;
         work.imported_actors.push(ImportedActorV2 {
             actor: request.target,
             name: descriptor.name.clone(),
             parent: descriptor.parent,
             deployment: descriptor.deployment,
             program: descriptor.program,
+            task_dependencies: task_dependencies.clone(),
             state: state.clone(),
             causal_states: states.clone(),
             continuation: continuation.clone(),
@@ -889,6 +893,18 @@ impl LocalWorkSchedulerV2 {
                 pvm: program_bytes,
             },
         );
+        for dependency in &task_dependencies {
+            let pvm = store
+                .program(dependency.program)
+                .ok_or(ScheduleErrorV2::MissingProgram(dependency.program))?
+                .to_vec();
+            programs
+                .entry(dependency.program)
+                .or_insert(ImportedProgramV2 {
+                    program: dependency.program,
+                    pvm,
+                });
+        }
         let mut blobs = BTreeMap::new();
         import_blob(store, &mut blobs, &state)?;
         for reference in &states {
@@ -935,12 +951,16 @@ impl LocalWorkSchedulerV2 {
                 actor,
                 root_sibling_continuation,
             );
+            let task_dependencies = super::PackageRolePoliciesV2::decode(&descriptor.role_policies)
+                .map_err(|_| ScheduleErrorV2::CorruptActorDirectory)?
+                .task_dependencies;
             work.imported_actors.push(ImportedActorV2 {
                 actor,
                 name: descriptor.name.clone(),
                 parent: descriptor.parent,
                 deployment: descriptor.deployment,
                 program: descriptor.program,
+                task_dependencies: task_dependencies.clone(),
                 state: sibling_state.clone(),
                 causal_states: sibling_states.clone(),
                 continuation: sibling_continuation.clone(),
@@ -955,6 +975,18 @@ impl LocalWorkSchedulerV2 {
                     program: descriptor.program,
                     pvm,
                 });
+            for dependency in &task_dependencies {
+                let pvm = store
+                    .program(dependency.program)
+                    .ok_or(ScheduleErrorV2::MissingProgram(dependency.program))?
+                    .to_vec();
+                programs
+                    .entry(dependency.program)
+                    .or_insert(ImportedProgramV2 {
+                        program: dependency.program,
+                        pvm,
+                    });
+            }
             import_blob(store, &mut blobs, &sibling_state)?;
             for reference in &sibling_states {
                 import_blob(store, &mut blobs, reference)?;

@@ -1413,10 +1413,18 @@ where
             .installation()
             .map_err(LocalRootTreeOpenErrorV2::InvalidConfig)?;
         let install_request = AccumulateRequestV2::Install(genesis.clone());
-        let install_programs = vec![ImportedProgramV2 {
+        let mut install_programs = vec![ImportedProgramV2 {
             program: expected_root.program,
             pvm: config.package.actor_pvm.clone(),
         }];
+        install_programs.extend(config.package.task_dependencies.iter().map(|dependency| {
+            ImportedProgramV2 {
+                program: dependency.binding.program,
+                pvm: dependency.pvm.clone(),
+            }
+        }));
+        install_programs.sort_by_key(|program| program.program);
+        install_programs.dedup_by_key(|program| program.program);
         let install_blobs = vec![ImportedBlobV2 {
             reference: expected_root.initial_state.clone(),
             bytes: config.initial_state.clone(),

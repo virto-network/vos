@@ -305,11 +305,13 @@ mod tests {
                 interfaces_hash: artifact_hash(b"interfaces", &interfaces),
                 role_policies_hash: artifact_hash(b"role-policies", &role_policies),
                 schemas_hash: artifact_hash(b"schemas", &schemas),
+                task_dependencies_hash: vos::v2::task_dependencies_hash(&[]),
             },
             actor_pvm,
             generated_interfaces: interfaces,
             role_policies,
             schemas,
+            task_dependencies: vec![],
             diagnostics: None,
             deployment_signature: DeploymentSignatureV2 {
                 producer: ProducerId::of_public_key(&public_key),

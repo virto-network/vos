@@ -423,6 +423,15 @@ fn upgrade_actor<S: GuestAccumulateStoreV2>(
         Ok(policies) => policies,
         Err(_) => return Ok(rejected(AccumulationRejectionV2::NonCanonical)),
     };
+    for dependency in &replacement_policies.task_dependencies {
+        if !tree
+            .store_ref()
+            .program_available(dependency.program)
+            .map_err(GuestAccumulateError::Storage)?
+        {
+            return Ok(rejected(AccumulationRejectionV2::WrongProgram));
+        }
+    }
     for policy in &current_policies.methods {
         tree_apply(
             &mut tree,
@@ -726,14 +735,23 @@ fn install<S: GuestAccumulateStoreV2>(
         return Ok(rejected(AccumulationRejectionV2::Unauthorized));
     }
     for actor in &genesis.actors {
-        if super::PackageRolePoliciesV2::decode(&actor.role_policies).is_err() {
-            return Ok(rejected(AccumulationRejectionV2::NonCanonical));
-        }
+        let policies = match super::PackageRolePoliciesV2::decode(&actor.role_policies) {
+            Ok(policies) => policies,
+            Err(_) => return Ok(rejected(AccumulationRejectionV2::NonCanonical)),
+        };
         if !store
             .program_available(actor.program)
             .map_err(GuestAccumulateError::Storage)?
         {
             return Ok(rejected(AccumulationRejectionV2::WrongProgram));
+        }
+        for dependency in &policies.task_dependencies {
+            if !store
+                .program_available(dependency.program)
+                .map_err(GuestAccumulateError::Storage)?
+            {
+                return Ok(rejected(AccumulationRejectionV2::WrongProgram));
+            }
         }
         if !blob_available(store, &actor.initial_state)? {
             return Ok(rejected(AccumulationRejectionV2::MissingBlob(
@@ -3294,7 +3312,13 @@ fn apply<S: GuestAccumulateStoreV2>(
         else {
             return Ok(rejected(AccumulationRejectionV2::WrongProgram));
         };
-        if descriptor.deployment != imported.deployment || descriptor.program != imported.program {
+        let descriptor_tasks = super::PackageRolePoliciesV2::decode(&descriptor.role_policies)
+            .map_err(|_| GuestAccumulateError::CorruptStore)?
+            .task_dependencies;
+        if descriptor.deployment != imported.deployment
+            || descriptor.program != imported.program
+            || descriptor_tasks != imported.task_dependencies
+        {
             return Ok(rejected(AccumulationRejectionV2::WrongProgram));
         }
         if descriptor.name != imported.name || descriptor.parent != imported.parent {
@@ -5168,11 +5192,16 @@ mod tests {
     use crate::v2::{
         ActorWriteV2, ContinuationChangeV2, CrdtMaterializationV2, CrdtOperationV2, DeploymentId,
         GasAccountingV2, ImportedActorV2, ImportedBlobV2, InvocationId, OperationId, Origin,
-        ProgramId, ReplyRecordV2, RootServiceId, ServiceIdentityV2, TransitionV2, WorkEnvelopeV2,
+        PackageRolePoliciesV2, ProgramId, ReplyRecordV2, RootServiceId, ServiceIdentityV2,
+        TaskDependencyV2, TransitionV2, WorkEnvelopeV2,
     };
 
     fn role_policies(methods: Vec<MethodPolicyV2>) -> Vec<u8> {
-        crate::v2::PackageRolePoliciesV2 { methods }.encode()
+        crate::v2::PackageRolePoliciesV2 {
+            methods,
+            task_dependencies: vec![],
+        }
+        .encode()
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5576,6 +5605,60 @@ mod tests {
             rejected(AccumulationRejectionV2::WrongProgram)
         );
         assert_eq!(store, before, "missing code must not initialize the store");
+    }
+
+    #[test]
+    fn install_requires_every_signed_task_program_to_be_available() {
+        let mut store = MemStore::default();
+        let initial = store.provide_blob(b"state").unwrap();
+        store.programs.insert(program(), FIXTURE_ACTOR_PVM.to_vec());
+        let task_pvm = grey_transpiler::assembler::Assembler::new().build();
+        let task_program = ProgramId::of_pvm(&task_pvm);
+        let role_policies = PackageRolePoliciesV2 {
+            methods: vec![],
+            task_dependencies: vec![TaskDependencyV2 {
+                task: Hash([40; 32]),
+                program: task_program,
+                witness_address: 0x1_0000,
+                witness_capacity: 4096,
+            }],
+        }
+        .encode();
+        let genesis = ServiceGenesisV2 {
+            role_authority: None,
+            external_actors: vec![],
+            service: identity(),
+            consistency: ConsistencyModeV2::Local,
+            actors: vec![ActorGenesisV2 {
+                actor: actor(),
+                name: "root".into(),
+                parent: None,
+                producer: super::super::ProducerId([4; 32]),
+                deployment: identity().deployment,
+                program: program(),
+                initial_state: initial,
+                crdt: false,
+                role_policies,
+            }],
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: super::super::SystemCapabilityId([8; 32]),
+                authenticator: vec![9],
+            },
+        };
+        let before = store.clone();
+
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Install(genesis.clone()))
+                .unwrap(),
+            rejected(AccumulationRejectionV2::WrongProgram)
+        );
+        assert_eq!(store, before, "a partial dependency set must stage nothing");
+
+        store.programs.insert(task_program, task_pvm);
+        assert!(matches!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Install(genesis)).unwrap(),
+            AccumulationResultV2::Installed(_)
+        ));
     }
 
     fn store_header(store: &MemStore) -> StoreHeaderV2 {
@@ -6015,6 +6098,7 @@ mod tests {
                 parent: None,
                 deployment: identity().deployment,
                 program: program(),
+                task_dependencies: vec![],
                 state: initial,
                 causal_states: vec![],
                 continuation: None,
@@ -6345,6 +6429,7 @@ mod tests {
                         parent: Some(actor()),
                         deployment: identity().deployment,
                         program: program(),
+                        task_dependencies: vec![],
                         state: initial.clone(),
                         causal_states: vec![],
                         continuation: None,
@@ -7285,6 +7370,7 @@ mod tests {
             parent: Some(actor()),
             deployment: misnamed.target_deployment,
             program: program(),
+            task_dependencies: vec![],
             state: initial,
             causal_states: Vec::new(),
             continuation: None,
@@ -9494,6 +9580,7 @@ mod tests {
             parent: Some(actor()),
             deployment: work.target_deployment,
             program: program(),
+            task_dependencies: vec![],
             state: initial,
             causal_states: vec![],
             continuation: None,
@@ -9539,6 +9626,7 @@ mod tests {
                 parent: None,
                 deployment: identity().deployment,
                 program: program(),
+                task_dependencies: vec![],
                 state: initial,
                 causal_states: vec![],
                 continuation: None,

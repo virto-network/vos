@@ -7,7 +7,8 @@ use std::process::Command;
 use anyhow::{Context, anyhow, bail};
 use vos::v2::{
     DeploymentSignatureV2, PackageDiagnosticsV2, PackageManifestV2, PackageRolePoliciesV2,
-    ProducerId, ProgramId, V2Wire, VosPackageV2, artifact_hash,
+    PackageTaskDependencyV2, ProducerId, ProgramId, TaskDependencyV2, V2Wire, VosPackageV2,
+    artifact_hash, task_dependencies_hash,
 };
 
 const RUSTC_WRAPPER_MODE: &str = "VOSX_CANONICAL_RUSTC_WRAPPER";
@@ -42,6 +43,7 @@ pub struct Args {
     pub role_policies: Option<PathBuf>,
     pub schemas: Option<PathBuf>,
     pub source_map: Option<PathBuf>,
+    pub tasks: Vec<PathBuf>,
     pub include_elf: bool,
     pub crdt: bool,
 }
@@ -90,7 +92,24 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
         .unwrap_or_else(|| actor_metadata.actor_name.clone());
 
     let interfaces = read_optional(args.interfaces.as_deref())?;
-    let generated_role_policies = PackageRolePoliciesV2::from_metadata(&actor_metadata)?.encode();
+    let mut task_dependencies = args
+        .tasks
+        .iter()
+        .map(|input| build_task_dependency(input))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    task_dependencies.sort_by_key(|dependency| dependency.binding.task);
+    if task_dependencies
+        .windows(2)
+        .any(|pair| pair[0].binding.task == pair[1].binding.task)
+    {
+        bail!("duplicate canonical Task dependency");
+    }
+    let mut generated_policies = PackageRolePoliciesV2::from_metadata(&actor_metadata)?;
+    generated_policies.task_dependencies = task_dependencies
+        .iter()
+        .map(|dependency| dependency.binding.clone())
+        .collect();
+    let generated_role_policies = generated_policies.encode();
     let role_policies = match args.role_policies.as_deref() {
         Some(path) => {
             let supplied =
@@ -124,11 +143,13 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
             interfaces_hash: artifact_hash(b"interfaces", &interfaces),
             role_policies_hash: artifact_hash(b"role-policies", &role_policies),
             schemas_hash: artifact_hash(b"schemas", &schemas),
+            task_dependencies_hash: task_dependencies_hash(&task_dependencies),
         },
         actor_pvm: actor_pvm.clone(),
         generated_interfaces: interfaces,
         role_policies,
         schemas,
+        task_dependencies,
         diagnostics: (args.include_elf || !source_map.is_empty()).then_some(PackageDiagnosticsV2 {
             elf: (args.include_elf && !is_pvm).then_some(input),
             source_map: (!source_map.is_empty()).then_some(source_map),
@@ -161,6 +182,47 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
         hex::encode(package.deployment_id().0)
     );
     Ok(())
+}
+
+fn build_task_dependency(input: &Path) -> anyhow::Result<PackageTaskDependencyV2> {
+    let program = resolve_program_input(input)?;
+    if program.extension().and_then(|extension| extension.to_str()) == Some("pvm") {
+        bail!(
+            "{} is a PVM without authenticated witness-layout metadata; pass the canonical Task ELF or project directory",
+            program.display()
+        );
+    }
+    let elf = std::fs::read(&program).with_context(|| format!("read {}", program.display()))?;
+    let pvm = grey_transpiler::link_elf(&elf)
+        .map_err(|error| anyhow!("transpile Task {}: {error:?}", program.display()))?;
+    if pvm.is_empty() {
+        bail!("{} produced an empty Task PVM", program.display());
+    }
+    let (witness_address, witness_capacity) = vos::zk::witness_symbol(&elf).ok_or_else(|| {
+        anyhow!(
+            "{} does not export the required __VOS_WITNESS buffer",
+            program.display()
+        )
+    })?;
+    let witness_address = u32::try_from(witness_address)
+        .context("Task witness address does not fit the PVM address space")?;
+    let witness_capacity = u32::try_from(witness_capacity)
+        .context("Task witness capacity does not fit the package wire")?;
+    if witness_capacity == 0 {
+        bail!(
+            "{} exports an empty __VOS_WITNESS buffer",
+            program.display()
+        );
+    }
+    Ok(PackageTaskDependencyV2 {
+        binding: TaskDependencyV2 {
+            task: vos::v2::Hash(vos::provable::task_blob_hash(&pvm)),
+            program: ProgramId::of_pvm(&pvm),
+            witness_address,
+            witness_capacity,
+        },
+        pvm,
+    })
 }
 
 fn resolve_program_input(input: &Path) -> anyhow::Result<PathBuf> {
@@ -678,6 +740,7 @@ mod tests {
             role_policies: None,
             schemas: Some(temp.0.join("actor.meta")),
             source_map: None,
+            tasks: vec![],
             include_elf: false,
             crdt: false,
         };

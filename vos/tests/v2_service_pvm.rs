@@ -32,14 +32,15 @@ use vos::v2::{
     LocalJamStoreSnapshotV2, LocalJamStoreV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2,
     LocalRootTreeInvokeErrorV2, LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2,
     LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
-    PackageManifestV2, PackageRolePoliciesV2, ProducerId, ProgramId, ProofArtifactStoreV2,
-    ProofVerificationRequestV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2,
-    RefineOutputV2, ReplicatedJamServiceV2, ReplicatedServiceErrorV2, ReplyRecordV2,
-    RoleAuthorityBindingV2, RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2,
-    RoleAuthorizationClaimV2, RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId,
-    RootTreeAttestedResultV2, RootTreeInvocationV2, ScheduleErrorV2, ServiceDispatchError,
-    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId,
-    SystemCapabilityId, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2, WorkflowOperationV2,
+    PackageManifestV2, PackageRolePoliciesV2, PackageTaskDependencyV2, ProducerId, ProgramId,
+    ProofArtifactStoreV2, ProofVerificationRequestV2, PublishedEffectsV2,
+    ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2,
+    ReplicatedServiceErrorV2, ReplyRecordV2, RoleAuthorityBindingV2,
+    RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2, RoleAuthorizationClaimV2,
+    RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId, RootTreeAttestedResultV2,
+    RootTreeInvocationV2, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2,
+    ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId, SystemCapabilityId,
+    TaskDependencyV2, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2, WorkflowOperationV2,
     artifact_hash, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
@@ -74,7 +75,11 @@ mod host_greeter_surface {
 
 fn role_policies(mut methods: Vec<MethodPolicyV2>) -> Vec<u8> {
     methods.sort_by(|left, right| left.method.cmp(&right.method));
-    PackageRolePoliciesV2 { methods }.encode()
+    PackageRolePoliciesV2 {
+        methods,
+        task_dependencies: vec![],
+    }
+    .encode()
 }
 
 fn direct_linear_ingress(work: &WorkEnvelopeV2) -> AccumulateRequestV2 {
@@ -902,6 +907,7 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
             parent: None,
             deployment: DeploymentId([2; 32]),
             program: actor_program,
+            task_dependencies: vec![],
             state,
             causal_states: vec![],
             continuation: None,
@@ -993,6 +999,7 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
         parent: Some(work.target),
         deployment: work.target_deployment,
         program: actor_program,
+        task_dependencies: vec![],
         state: state.clone(),
         causal_states: vec![],
         continuation: None,
@@ -1063,11 +1070,13 @@ fn signed_test_package(
             interfaces_hash: artifact_hash(b"interfaces", &[]),
             role_policies_hash: artifact_hash(b"role-policies", &policies),
             schemas_hash: artifact_hash(b"schemas", &schemas),
+            task_dependencies_hash: vos::v2::task_dependencies_hash(&[]),
         },
         actor_pvm,
         generated_interfaces: vec![],
         role_policies: policies,
         schemas,
+        task_dependencies: vec![],
         diagnostics: None,
         deployment_signature: vos::v2::DeploymentSignatureV2 {
             producer: ProducerId::of_public_key(&public_key),
@@ -1285,6 +1294,74 @@ fn raft_attested_root_orders_only_the_final_proved_apply() {
     assert_eq!(producer.calls, 1);
     drop(service);
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn signed_task_dependencies_install_and_survive_durable_reopen() {
+    let actor_elf = greeter_elf();
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (mut package, actor_name) = signed_test_package(&actor_elf, &signer);
+    let task_pvm = grey_transpiler::assembler::Assembler::new().build();
+    let binding = TaskDependencyV2 {
+        task: Hash(vos::provable::task_blob_hash(&task_pvm)),
+        program: ProgramId::of_pvm(&task_pvm),
+        witness_address: 0x1_0000,
+        witness_capacity: 4096,
+    };
+    package.task_dependencies = vec![PackageTaskDependencyV2 {
+        binding: binding.clone(),
+        pvm: task_pvm.clone(),
+    }];
+    let mut policies = PackageRolePoliciesV2::decode(&package.role_policies).unwrap();
+    policies.task_dependencies = vec![binding.clone()];
+    package.role_policies = policies.encode();
+    package.manifest.role_policies_hash = artifact_hash(b"role-policies", &package.role_policies);
+    package.manifest.task_dependencies_hash =
+        vos::v2::task_dependencies_hash(&package.task_dependencies);
+    package.deployment_signature.signature = signer
+        .sign(&package.signing_message())
+        .expect("sign package carrying the Task dependency");
+    package.validate().expect("Task package is canonical");
+
+    let config = LocalRootTreeConfigV2 {
+        role_authority: None,
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        service: ServiceIdentityV2 {
+            space: vos::v2::SpaceId([121; 32]),
+            root_service: RootServiceId([122; 32]),
+            deployment: package.deployment_id(),
+            service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+            service_abi: vos::v2::ABI_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: TEST_GAS_SCHEDULE,
+        },
+        package,
+        root_actor: ActorId([123; 32]),
+        actor_name,
+        consistency: ConsistencyModeV2::Local,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([124; 32]),
+            authenticator: vec![125],
+        },
+        refine_gas: TEST_GAS_SCHEDULE.refine,
+        accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
+    };
+    let service = LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
+        .expect("install root and its signed Task program");
+    assert_eq!(
+        service.store().program(binding.program),
+        Some(task_pvm.as_slice())
+    );
+
+    let backend = service.into_backend();
+    let reopened = LocalRootTreeServiceV2::open(config, backend)
+        .expect("reopen from the committed service image");
+    assert_eq!(
+        reopened.store().program(binding.program),
+        Some(task_pvm.as_slice())
+    );
 }
 
 #[test]
@@ -9142,6 +9219,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             parent: Some(first_work.target),
             deployment: first_work.target_deployment,
             program: actor_program,
+            task_dependencies: vec![],
             state: new_child_state.clone(),
             causal_states: vec![],
             continuation: None,

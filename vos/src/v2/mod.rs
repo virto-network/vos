@@ -58,7 +58,8 @@ pub use contracts::{
     RoleAuthorityBindingV2, RoleAuthorityInviteRedemptionV2, RoleAuthorityInviteRevocationV2,
     RoleAuthorityMutationV2, RoleAuthorizationClaimV2, RoleCredentialV2,
     RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServiceIdentityV2,
-    ServiceInstallReceiptV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2, WorkflowOperationV2,
+    ServiceInstallReceiptV2, TaskDependencyV2, TransitionV2, WorkEnvelopeV2, WorkInputIdV2,
+    WorkflowOperationV2,
 };
 pub use guest_accumulate::{
     GuestAccumulateError, GuestAccumulateStoreV2, ProofVerificationV2, ReceiptVerificationV2,
@@ -77,8 +78,9 @@ pub use local_store::{
 };
 pub use package::{
     DeploymentSignatureV2, PackageDiagnosticsV2, PackageError, PackageManifestV2,
-    PackageRolePoliciesV2, VosPackageV2, artifact_hash, method_role_policy_hash,
-    method_schema_hash, public_policy_hash, space_role_policy_hash,
+    PackageRolePoliciesV2, PackageTaskDependencyV2, VosPackageV2, artifact_hash,
+    method_role_policy_hash, method_schema_hash, public_policy_hash, space_role_policy_hash,
+    task_dependencies_hash,
 };
 #[cfg(feature = "std")]
 pub use pvm::{
@@ -125,7 +127,7 @@ pub use transport::{
 pub use wire::{DecodeError, V2Wire};
 
 /// Platform wire/ABI version carried by v2 work, transitions, and receipts.
-pub const ABI_VERSION: u16 = 10;
+pub const ABI_VERSION: u16 = 11;
 /// Portable continuation format version.
 pub const SNAPSHOT_VERSION: u16 = 6;
 /// Attestation statement version required by runtime v2.
@@ -136,8 +138,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0xa4, 0x64, 0xd4, 0x38, 0x86, 0x6f, 0xf9, 0x40, 0x4d, 0x5c, 0x1a, 0x0f, 0x75, 0x15, 0xa4, 0xbf,
-    0xa5, 0xd2, 0xe5, 0x48, 0xd8, 0x1c, 0x80, 0xbe, 0x00, 0xaf, 0x22, 0x3c, 0xfe, 0xb0, 0x2b, 0x1a,
+    0xbb, 0x46, 0x76, 0x94, 0x28, 0x94, 0x08, 0x30, 0xe7, 0x75, 0x08, 0xa0, 0xf2, 0xc3, 0xc1, 0x69,
+    0x71, 0x67, 0x03, 0x3f, 0x15, 0x8a, 0x90, 0xe5, 0x53, 0x0b, 0x4e, 0x90, 0x31, 0x9c, 0xb0, 0xb3,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.
@@ -155,6 +157,12 @@ pub const TARGET_ACTOR_HANDLE_SLOT: u8 = 144;
 /// entries. The generic VOS service consumes the first entry, leaving four
 /// application actors. This is a kernel limit, not a VOS wire-size limit.
 pub const MAX_ROOT_TREE_ACTORS: usize = 4;
+
+/// Maximum signed pure-Task dependencies carried by one actor package.
+/// Dependency programs are not installed as dormant root-tree VMs and
+/// therefore do not consume the root tree's scarce JAR code-capability slots,
+/// but the package/work wires still need a deterministic bound.
+pub const MAX_PACKAGE_TASK_DEPENDENCIES: usize = 16;
 
 #[cfg(feature = "std")]
 const _: () = assert!(MAX_ROOT_TREE_ACTORS + 1 == javm::vm_pool::MAX_CODE_CAPS);
@@ -230,4 +238,4 @@ pub const JAR_REVISION: &str = "41d31e64b0f5d6c57a43769d7b8785556a311684";
 /// Consensus-visible execution semantics. Changing interpreter/recompiler or
 /// trace behavior requires a new identifier even if the public Rust API did
 /// not change.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v12");
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v13");

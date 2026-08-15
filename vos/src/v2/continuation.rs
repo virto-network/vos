@@ -522,6 +522,7 @@ mod tests {
                 parent: None,
                 deployment: snapshot.actor_deployment,
                 program: snapshot.actor_program,
+                task_dependencies: vec![],
                 state: crate::v2::BlobRefV2 {
                     hash: Hash([9; 32]),
                     len: 1,
@@ -575,6 +576,7 @@ mod tests {
             parent: Some(snapshot.actor),
             deployment: DeploymentId([9; 32]),
             program: ProgramId([10; 32]),
+            task_dependencies: vec![],
             state: crate::v2::BlobRefV2 {
                 hash: Hash([11; 32]),
                 len: 1,
@@ -609,6 +611,7 @@ mod tests {
             parent: Some(snapshot.actor),
             deployment: DeploymentId([9; 32]),
             program: ProgramId([10; 32]),
+            task_dependencies: vec![],
             state: crate::v2::BlobRefV2 {
                 hash: Hash([11; 32]),
                 len: 1,

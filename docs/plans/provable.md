@@ -397,9 +397,13 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
   the actor-PVM stack. A physical guest test covers missing-Task refusal,
   immutable Task selection, the live state change, and exact record/reply/root
   equality.
-- **Host-neutral Task registration.** `AgentConfig::with_task_blob` makes a
-  content-addressed Task dependency available to one Local actor runtime. It
-  is deliberately not yet canonical package carriage.
+- **Canonical Task dependency carriage.** `vosx build --task` derives each
+  content address, canonical PVM identity, and `__VOS_WITNESS` window from the
+  Task ELF. The sorted, bounded artifact is signed in `.vos`, retained as a
+  compact guest-owned actor policy binding, installed in the recoverable
+  program catalog, and imported by exact identity on every slice. Actor-side
+  INVOKE remains fail-closed in service v2 until nested Task execution is
+  included in the exact Refine trace rather than treated as a host oracle.
 
 - **Precompile safety boundary.** `handle_precompile_ecall` can accelerate
   non-recorded Task and Refine execution, with Refine preserving phi[7]/phi[8]
@@ -428,10 +432,11 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
 - *Replicated clerk-ledger production cutover.* The money-path actor is Raft,
   while producer-private record capture is intentionally Local-only. Before
   replacing `apply_transfer`, land (1) a producer-local durable Raft record
-  sidecar that never enters replicated actor state/effect logs, and (2)
-  signed canonical package carriage and installation of content-addressed
-  Task dependencies. Then exercise leadership transfer/restart and switch the
-  Raft handler to the now-proven parent seam.
+  sidecar that never enters replicated actor state/effect logs. Signed
+  canonical package carriage and installation of content-addressed Task
+  dependencies is complete; after the sidecar lands, bind nested Task
+  execution into the exact Refine trace, exercise leadership transfer/restart,
+  and switch the Raft handler to the now-proven parent seam.
 - *Generated parent glue.* D6's manual Clerk implementation establishes the
   contract; a later macro may generate the touched-leaf/proof/invoke/apply
   boilerplate for other actors without changing its trust model.

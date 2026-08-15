@@ -104,6 +104,10 @@ enum Command {
         schemas: Option<PathBuf>,
         #[arg(long)]
         source_map: Option<PathBuf>,
+        /// Canonical Task project directory or ELF dependency. May be
+        /// repeated; each dependency must export `__VOS_WITNESS`.
+        #[arg(long = "task")]
+        tasks: Vec<PathBuf>,
         /// Retain the input ELF as non-authoritative diagnostics.
         #[arg(long)]
         include_elf: bool,
@@ -269,6 +273,7 @@ fn main() {
             role_policies,
             schemas,
             source_map,
+            tasks,
             include_elf,
             crdt,
         }) => {
@@ -281,6 +286,7 @@ fn main() {
                 role_policies,
                 schemas,
                 source_map,
+                tasks,
                 include_elf,
                 crdt,
             }) {

@@ -47,20 +47,40 @@ fn validate_accumulate_availability(
     }
 
     let (mut expected_programs, mut expected_blobs) = match request {
-        AccumulateRequestV2::Install(genesis) => (
-            genesis
-                .actors
-                .iter()
-                .map(|actor| actor.program)
-                .collect::<Vec<_>>(),
-            genesis
-                .actors
-                .iter()
-                .map(|actor| actor.initial_state.clone())
-                .collect::<Vec<_>>(),
-        ),
+        AccumulateRequestV2::Install(genesis) => {
+            let mut programs = Vec::new();
+            for actor in &genesis.actors {
+                programs.push(actor.program);
+                let policies = super::PackageRolePoliciesV2::decode(&actor.role_policies)?;
+                programs.extend(
+                    policies
+                        .task_dependencies
+                        .iter()
+                        .map(|dependency| dependency.program),
+                );
+            }
+            (
+                programs,
+                genesis
+                    .actors
+                    .iter()
+                    .map(|actor| actor.initial_state.clone())
+                    .collect::<Vec<_>>(),
+            )
+        }
         AccumulateRequestV2::UpgradeActor(upgrade) => {
-            (alloc::vec![upgrade.replacement_program], Vec::new())
+            let policies = super::PackageRolePoliciesV2::decode(&upgrade.role_policies)?;
+            (
+                core::iter::once(upgrade.replacement_program)
+                    .chain(
+                        policies
+                            .task_dependencies
+                            .iter()
+                            .map(|dependency| dependency.program),
+                    )
+                    .collect(),
+                Vec::new(),
+            )
         }
         _ => (Vec::new(), Vec::new()),
     };

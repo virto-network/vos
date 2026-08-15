@@ -871,6 +871,15 @@ and signatures but includes the authoritative manifest and PVM bytes.
 Registries store these bytes and never retranspile an ELF. JIT products,
 proving keys and traces are caches keyed by `ProgramId`.
 
+Each repeated `vosx build --task <project-or-elf>` dependency contributes its
+canonical PVM, content address, `ProgramId`, and `__VOS_WITNESS` address/capacity
+to one sorted, bounded signed artifact. Installation imports those PVM bytes
+into the recoverable program catalog and retains the compact bindings in the
+actor descriptor; every scheduled work envelope and Refine import is checked
+against that guest-owned map. A bare Task `.pvm` is refused because it cannot
+authenticate its witness layout. Service-v2 actor INVOKE remains unavailable
+until nested Task execution is incorporated into the exact Refine proof trace.
+
 `space up --service-pvm <exact-vos-service.pvm>` recognizes signed `.vos`
 catalog artifacts and opens each ordinary Local or Raft deployment as one
 durable root-tree service. Raft rows resolve membership only after their exact
@@ -979,15 +988,15 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 32, continuation snapshot version 6, and platform ABI version 10
-are therefore a clean break from earlier experimental v2 images. ABI 10 adds
-the proof artifact to attested root reply transport and admits that artifact
-as a verifier-only Apply input rather than service state. Schema 32 rejects
-images produced under the earlier proofless reply-resume contract instead of
-interpreting mutually incompatible service identities under one version.
-Execution semantics v12 additionally makes the verifier-backed `VPM2`
-artifact contract part of service identity; a v11 root cannot be reopened or
-replicated under the new host proof decision rules.
+Store schema 33, continuation snapshot version 6, and platform ABI version 11
+are therefore a clean break from earlier experimental v2 images. ABI 11 binds
+each actor's sorted, bounded Task dependency map into the signed package,
+guest-owned descriptor, work envelope, and Refine imports. Schema 33 rejects
+images whose retained role-policy artifact predates those bindings rather than
+silently treating an actor as dependency-free. Execution semantics v13 makes
+the package-carried Task PVM and witness-window contract part of service
+identity; a v12 root cannot be reopened or replicated under the new import
+rules.
 These versions also add exact actor-package
 identity to descriptors, work, checkpoints, transitions, upgrades, and
 cross-root proof bindings, bind durable messages and retained causal context to

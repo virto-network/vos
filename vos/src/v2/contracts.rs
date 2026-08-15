@@ -316,12 +316,28 @@ pub struct ImportedActorV2 {
     /// Exact signed package supplying this actor's code and policy surface.
     pub deployment: DeploymentId,
     pub program: ProgramId,
+    /// Exact signed Task surface of this actor package. The executable bytes
+    /// travel once in `RefineImportsV2::programs`; this compact mapping binds
+    /// the content address and witness window used by actor INVOKE.
+    pub task_dependencies: Vec<TaskDependencyV2>,
     /// First canonical state materialization for this actor at the work base.
     /// Linear work has exactly this state. CRDT work may additionally import
     /// concurrent frontier states which the actor PVM merges before dispatch.
     pub state: BlobRefV2,
     pub causal_states: Vec<BlobRefV2>,
     pub continuation: Option<BlobRefV2>,
+}
+
+/// Compact guest-owned binding for one content-addressed pure Task.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TaskDependencyV2 {
+    /// Hash used by `Tasks::spawn*` and the INVOKE wire.
+    pub task: Hash,
+    /// Canonical executable identity in the service program catalog.
+    pub program: ProgramId,
+    /// Flat-memory witness window preserved from the signed Task ELF.
+    pub witness_address: u32,
+    pub witness_capacity: u32,
 }
 
 /// Exact root-tree member materialized into an actor's invocation-owned IPC
@@ -2476,6 +2492,15 @@ impl RefineImportsV2 {
                 .is_err()
             {
                 return Err(RefineError::MissingImport(Hash(actor.program.0)));
+            }
+            for dependency in &actor.task_dependencies {
+                if self
+                    .programs
+                    .binary_search_by_key(&dependency.program, |program| program.program)
+                    .is_err()
+                {
+                    return Err(RefineError::MissingImport(Hash(dependency.program.0)));
+                }
             }
             self.require_blob(&actor.state)?;
             for state in &actor.causal_states {
@@ -5214,22 +5239,61 @@ fn encode_imported_actor(e: &mut Encoder<'_>, value: &ImportedActorV2) {
     e.option(&value.parent, |e, parent| e.fixed(&parent.0));
     e.fixed(&value.deployment.0);
     e.fixed(&value.program.0);
+    e.list(&value.task_dependencies, encode_task_dependency);
     encode_blob_ref(e, &value.state);
     e.list(&value.causal_states, encode_blob_ref);
     e.option(&value.continuation, encode_blob_ref);
 }
 
 fn decode_imported_actor(d: &mut Decoder<'_>) -> Result<ImportedActorV2, DecodeError> {
-    Ok(ImportedActorV2 {
+    let value = ImportedActorV2 {
         actor: ActorId(d.fixed()?),
         name: d.string()?,
         parent: d.option(|d| d.fixed().map(ActorId))?,
         deployment: DeploymentId(d.fixed()?),
         program: ProgramId(d.fixed()?),
+        task_dependencies: d.list(decode_task_dependency)?,
         state: decode_blob_ref(d)?,
         causal_states: d.list(decode_blob_ref)?,
         continuation: d.option(decode_blob_ref)?,
-    })
+    };
+    validate_task_dependencies(&value.task_dependencies)?;
+    Ok(value)
+}
+
+fn encode_task_dependency(e: &mut Encoder<'_>, value: &TaskDependencyV2) {
+    e.fixed(&value.task.0);
+    e.fixed(&value.program.0);
+    e.u32(value.witness_address);
+    e.u32(value.witness_capacity);
+}
+
+fn decode_task_dependency(d: &mut Decoder<'_>) -> Result<TaskDependencyV2, DecodeError> {
+    let value = TaskDependencyV2 {
+        task: Hash(d.fixed()?),
+        program: ProgramId(d.fixed()?),
+        witness_address: d.u32()?,
+        witness_capacity: d.u32()?,
+    };
+    if value.witness_address == 0
+        || value.witness_capacity == 0
+        || value
+            .witness_address
+            .checked_add(value.witness_capacity)
+            .is_none()
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(value)
+}
+
+fn validate_task_dependencies(values: &[TaskDependencyV2]) -> Result<(), DecodeError> {
+    if values.len() > super::MAX_PACKAGE_TASK_DEPENDENCIES
+        || values.windows(2).any(|pair| pair[0].task >= pair[1].task)
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(())
 }
 
 fn encode_actor_tree_import(e: &mut Encoder<'_>, value: &ActorTreeImportV2) {
@@ -5707,7 +5771,11 @@ mod tests {
     use super::*;
 
     fn role_policies(methods: Vec<MethodPolicyV2>) -> Vec<u8> {
-        super::super::PackageRolePoliciesV2 { methods }.encode()
+        super::super::PackageRolePoliciesV2 {
+            methods,
+            task_dependencies: vec![],
+        }
+        .encode()
     }
 
     fn service() -> ServiceIdentityV2 {
@@ -5752,6 +5820,7 @@ mod tests {
                 parent: None,
                 deployment: DeploymentId([9; 32]),
                 program: ProgramId([6; 32]),
+                task_dependencies: vec![],
                 state: BlobRefV2::of_bytes(b"state"),
                 causal_states: vec![],
                 continuation: None,
@@ -6107,6 +6176,7 @@ mod tests {
             parent: None,
             deployment: work.target_deployment,
             program,
+            task_dependencies: vec![],
             state: state.clone(),
             causal_states: vec![],
             continuation: None,

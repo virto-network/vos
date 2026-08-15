@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 
 use crate::metadata::{ParsedMessage, ParsedMeta};
 
-use super::contracts::{ActorGenesisV2, BlobRefV2, MethodPolicyV2};
+use super::contracts::{ActorGenesisV2, BlobRefV2, MethodPolicyV2, TaskDependencyV2};
 use super::identity::{ActorId, DeploymentId, Hash, ProducerId, ProgramId};
 use super::wire::{DecodeError, Decoder, Encoder, V2Wire};
 
@@ -26,6 +26,7 @@ pub struct PackageManifestV2 {
     pub interfaces_hash: Hash,
     pub role_policies_hash: Hash,
     pub schemas_hash: Hash,
+    pub task_dependencies_hash: Hash,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,8 +49,19 @@ pub struct VosPackageV2 {
     pub generated_interfaces: Vec<u8>,
     pub role_policies: Vec<u8>,
     pub schemas: Vec<u8>,
+    /// Content-addressed pure Task programs this actor may invoke. The exact
+    /// PVM and witness window are signed package content; installation retains
+    /// only the compact binding in guest-owned actor state and places the PVM
+    /// in the recoverable service program catalog.
+    pub task_dependencies: Vec<PackageTaskDependencyV2>,
     pub diagnostics: Option<PackageDiagnosticsV2>,
     pub deployment_signature: DeploymentSignatureV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageTaskDependencyV2 {
+    pub binding: TaskDependencyV2,
+    pub pvm: Vec<u8>,
 }
 
 /// Canonical generated authorization artifact carried by `.vos` v2.
@@ -60,6 +72,10 @@ pub struct VosPackageV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageRolePoliciesV2 {
     pub methods: Vec<MethodPolicyV2>,
+    /// Compact Task bindings duplicated from the package dependency artifact.
+    /// This exact signed policy wire is retained in guest-owned actor state,
+    /// so scheduling after restart never needs the original `.vos` envelope.
+    pub task_dependencies: Vec<TaskDependencyV2>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +90,8 @@ pub enum PackageError {
     InterfaceHashMismatch,
     PolicyHashMismatch,
     SchemaHashMismatch,
+    TaskDependenciesHashMismatch,
+    InvalidTaskDependencies,
     InvalidSchema,
     InvalidRolePolicies,
     PolicySchemaMismatch,
@@ -125,11 +143,40 @@ impl VosPackageV2 {
         if artifact_hash(b"schemas", &self.schemas) != self.manifest.schemas_hash {
             return Err(PackageError::SchemaHashMismatch);
         }
+        if task_dependencies_hash(&self.task_dependencies) != self.manifest.task_dependencies_hash {
+            return Err(PackageError::TaskDependenciesHashMismatch);
+        }
+        if self.task_dependencies.len() > super::MAX_PACKAGE_TASK_DEPENDENCIES
+            || self
+                .task_dependencies
+                .windows(2)
+                .any(|pair| pair[0].binding.task >= pair[1].binding.task)
+            || self.task_dependencies.iter().any(|dependency| {
+                dependency.pvm.is_empty()
+                    || ProgramId::of_pvm(&dependency.pvm) != dependency.binding.program
+                    || Hash(crate::provable::task_blob_hash(&dependency.pvm))
+                        != dependency.binding.task
+                    || dependency.binding.witness_address == 0
+                    || dependency.binding.witness_capacity == 0
+                    || dependency
+                        .binding
+                        .witness_address
+                        .checked_add(dependency.binding.witness_capacity)
+                        .is_none()
+            })
+        {
+            return Err(PackageError::InvalidTaskDependencies);
+        }
         let metadata = crate::metadata::decode(&self.schemas).ok_or(PackageError::InvalidSchema)?;
         let policies = PackageRolePoliciesV2::decode(&self.role_policies)
             .map_err(|_| PackageError::InvalidRolePolicies)?;
         let expected = PackageRolePoliciesV2::from_metadata(&metadata)?;
-        if policies != expected {
+        let package_bindings = self
+            .task_dependencies
+            .iter()
+            .map(|dependency| dependency.binding.clone())
+            .collect::<Vec<_>>();
+        if policies.methods != expected.methods || policies.task_dependencies != package_bindings {
             return Err(PackageError::PolicySchemaMismatch);
         }
         if self.manifest.crdt != metadata.crdt {
@@ -218,7 +265,10 @@ impl PackageRolePoliciesV2 {
         {
             return Err(PackageError::InvalidRolePolicies);
         }
-        Ok(Self { methods })
+        Ok(Self {
+            methods,
+            task_dependencies: Vec::new(),
+        })
     }
 }
 
@@ -278,6 +328,18 @@ pub fn artifact_hash(kind: &[u8], bytes: &[u8]) -> Hash {
     ))
 }
 
+/// Commitment used by the signed manifest for the complete canonical Task
+/// dependency artifact, including executable bytes and witness layout.
+pub fn task_dependencies_hash(dependencies: &[PackageTaskDependencyV2]) -> Hash {
+    let mut bytes = Vec::new();
+    let mut encoder = Encoder(&mut bytes);
+    encoder.list(dependencies, |encoder, dependency| {
+        encode_task_dependency(encoder, &dependency.binding);
+        encoder.bytes(&dependency.pvm);
+    });
+    artifact_hash(b"task-dependencies", &bytes)
+}
+
 impl V2Wire for VosPackageV2 {
     const MAGIC: [u8; 4] = *b"VOSP";
 
@@ -288,6 +350,10 @@ impl V2Wire for VosPackageV2 {
         encoder.bytes(&self.generated_interfaces);
         encoder.bytes(&self.role_policies);
         encoder.bytes(&self.schemas);
+        encoder.list(&self.task_dependencies, |encoder, dependency| {
+            encode_task_dependency(encoder, &dependency.binding);
+            encoder.bytes(&dependency.pvm);
+        });
         encoder.option(&self.diagnostics, |encoder, diagnostics| {
             encoder.option(&diagnostics.elf, |encoder, bytes| encoder.bytes(bytes));
             encoder.option(&diagnostics.source_map, |encoder, bytes| {
@@ -306,6 +372,7 @@ impl V2Wire for VosPackageV2 {
             generated_interfaces: decoder.bytes()?,
             role_policies: decoder.bytes()?,
             schemas: decoder.bytes()?,
+            task_dependencies: decode_package_task_dependencies(decoder)?,
             diagnostics: decoder.option(|decoder| {
                 Ok(PackageDiagnosticsV2 {
                     elf: decoder.option(Decoder::bytes)?,
@@ -325,8 +392,12 @@ impl V2Wire for PackageRolePoliciesV2 {
     const MAGIC: [u8; 4] = *b"VRP2";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
-        Encoder(out).list(&self.methods, |encoder, method| {
+        let mut encoder = Encoder(out);
+        encoder.list(&self.methods, |encoder, method| {
             encoder.bytes(&method.encode())
+        });
+        encoder.list(&self.task_dependencies, |encoder, dependency| {
+            encode_task_dependency(encoder, dependency)
         });
     }
 
@@ -338,8 +409,49 @@ impl V2Wire for PackageRolePoliciesV2 {
         {
             return Err(DecodeError::NonCanonical);
         }
-        Ok(Self { methods })
+        let task_dependencies = decode_task_dependencies(decoder)?;
+        if task_dependencies
+            .windows(2)
+            .any(|pair| pair[0].task >= pair[1].task)
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(Self {
+            methods,
+            task_dependencies,
+        })
     }
+}
+
+fn decode_task_dependencies(
+    decoder: &mut Decoder<'_>,
+) -> Result<Vec<TaskDependencyV2>, DecodeError> {
+    let len = decoder.u32()? as usize;
+    if len > super::MAX_PACKAGE_TASK_DEPENDENCIES {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let mut dependencies = Vec::with_capacity(len);
+    for _ in 0..len {
+        dependencies.push(decode_task_dependency(decoder)?);
+    }
+    Ok(dependencies)
+}
+
+fn decode_package_task_dependencies(
+    decoder: &mut Decoder<'_>,
+) -> Result<Vec<PackageTaskDependencyV2>, DecodeError> {
+    let len = decoder.u32()? as usize;
+    if len > super::MAX_PACKAGE_TASK_DEPENDENCIES {
+        return Err(DecodeError::LimitExceeded);
+    }
+    let mut dependencies = Vec::with_capacity(len);
+    for _ in 0..len {
+        dependencies.push(PackageTaskDependencyV2 {
+            binding: decode_task_dependency(decoder)?,
+            pvm: decoder.bytes()?,
+        });
+    }
+    Ok(dependencies)
 }
 
 fn encode_manifest(encoder: &mut Encoder<'_>, manifest: &PackageManifestV2) {
@@ -354,6 +466,7 @@ fn encode_manifest(encoder: &mut Encoder<'_>, manifest: &PackageManifestV2) {
     encoder.fixed(&manifest.interfaces_hash.0);
     encoder.fixed(&manifest.role_policies_hash.0);
     encoder.fixed(&manifest.schemas_hash.0);
+    encoder.fixed(&manifest.task_dependencies_hash.0);
 }
 
 fn decode_manifest(decoder: &mut Decoder<'_>) -> Result<PackageManifestV2, DecodeError> {
@@ -369,7 +482,34 @@ fn decode_manifest(decoder: &mut Decoder<'_>) -> Result<PackageManifestV2, Decod
         interfaces_hash: Hash(decoder.fixed()?),
         role_policies_hash: Hash(decoder.fixed()?),
         schemas_hash: Hash(decoder.fixed()?),
+        task_dependencies_hash: Hash(decoder.fixed()?),
     })
+}
+
+fn encode_task_dependency(encoder: &mut Encoder<'_>, dependency: &TaskDependencyV2) {
+    encoder.fixed(&dependency.task.0);
+    encoder.fixed(&dependency.program.0);
+    encoder.u32(dependency.witness_address);
+    encoder.u32(dependency.witness_capacity);
+}
+
+fn decode_task_dependency(decoder: &mut Decoder<'_>) -> Result<TaskDependencyV2, DecodeError> {
+    let value = TaskDependencyV2 {
+        task: Hash(decoder.fixed()?),
+        program: ProgramId(decoder.fixed()?),
+        witness_address: decoder.u32()?,
+        witness_capacity: decoder.u32()?,
+    };
+    if value.witness_address == 0
+        || value.witness_capacity == 0
+        || value
+            .witness_address
+            .checked_add(value.witness_capacity)
+            .is_none()
+    {
+        return Err(DecodeError::NonCanonical);
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -444,11 +584,13 @@ mod tests {
                 interfaces_hash: artifact_hash(b"interfaces", &interfaces),
                 role_policies_hash: artifact_hash(b"role-policies", &policies),
                 schemas_hash: artifact_hash(b"schemas", &schemas),
+                task_dependencies_hash: task_dependencies_hash(&[]),
             },
             actor_pvm: pvm,
             generated_interfaces: interfaces,
             role_policies: policies,
             schemas,
+            task_dependencies: vec![],
             diagnostics: None,
             deployment_signature: DeploymentSignatureV2 {
                 producer: ProducerId::of_public_key(b"key"),
@@ -467,6 +609,60 @@ mod tests {
         assert_eq!(decoded, package);
         assert_eq!(decoded.encode(), bytes);
         assert_eq!(decoded.deployment_id(), package.deployment_id());
+    }
+
+    #[test]
+    fn task_dependencies_are_signed_canonical_package_content() {
+        let mut package = package();
+        let task_pvm = grey_transpiler::assembler::Assembler::new().build();
+        let binding = TaskDependencyV2 {
+            task: Hash(crate::provable::task_blob_hash(&task_pvm)),
+            program: ProgramId::of_pvm(&task_pvm),
+            witness_address: 0x1_0000,
+            witness_capacity: 4096,
+        };
+        package.task_dependencies = vec![PackageTaskDependencyV2 {
+            binding: binding.clone(),
+            pvm: task_pvm,
+        }];
+        let mut policies = PackageRolePoliciesV2::decode(&package.role_policies).unwrap();
+        policies.task_dependencies = vec![binding];
+        package.role_policies = policies.encode();
+        package.manifest.role_policies_hash =
+            artifact_hash(b"role-policies", &package.role_policies);
+        package.manifest.task_dependencies_hash =
+            task_dependencies_hash(&package.task_dependencies);
+
+        package.validate().unwrap();
+        let decoded = VosPackageV2::decode(&package.encode()).unwrap();
+        assert_eq!(decoded.task_dependencies, package.task_dependencies);
+        assert_eq!(decoded.deployment_id(), package.deployment_id());
+
+        let mut tampered = package;
+        tampered.task_dependencies[0].pvm.push(0);
+        assert_eq!(
+            tampered.validate(),
+            Err(PackageError::TaskDependenciesHashMismatch)
+        );
+        tampered.manifest.task_dependencies_hash =
+            task_dependencies_hash(&tampered.task_dependencies);
+        assert_eq!(
+            tampered.validate(),
+            Err(PackageError::InvalidTaskDependencies)
+        );
+    }
+
+    #[test]
+    fn task_dependency_wires_reject_an_oversized_count_before_items() {
+        let bytes = ((super::super::MAX_PACKAGE_TASK_DEPENDENCIES + 1) as u32).to_le_bytes();
+        assert_eq!(
+            decode_task_dependencies(&mut Decoder::new(&bytes)),
+            Err(DecodeError::LimitExceeded)
+        );
+        assert_eq!(
+            decode_package_task_dependencies(&mut Decoder::new(&bytes)),
+            Err(DecodeError::LimitExceeded)
+        );
     }
 
     #[test]
