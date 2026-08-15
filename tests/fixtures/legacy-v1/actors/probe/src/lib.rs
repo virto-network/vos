@@ -13,7 +13,9 @@
 //!   handler commits nothing.
 
 use vos::abi::service::ServiceId;
+use vos::agent::{TaskStatus, Tasks};
 use vos::prelude::*;
+use vos::value::Value;
 
 #[actor]
 struct Probe {
@@ -74,11 +76,7 @@ impl Probe {
     async fn await_peer_until(&mut self, ctx: &mut Context<Self>, deadline: u64) -> u32 {
         self.seen += 1;
         if let Ok(vos::value::Value::U32(value)) = ctx
-            .ask_actor(
-                ActorId([44; 32]),
-                &Msg::new("peer_value"),
-                Some(deadline),
-            )
+            .ask_actor(ActorId([44; 32]), &Msg::new("peer_value"), Some(deadline))
             .await
         {
             self.seen += value;
@@ -157,5 +155,64 @@ impl Probe {
         let mut out = [0u8; 512];
         let n = vos::hostcalls::invoke(&hash, &input, 0, &mut out) as usize;
         if n >= 1 { out[0] } else { vos::STATUS_DONE }
+    }
+
+    /// Execute one signed, package-bound Task and require the invocation-local
+    /// producer record to bind the exact Task reply before returning. The v2
+    /// physical gate uses this row-free fixture to prove witnesses remain out
+    /// of Raft while their sidecar survives a producer restart.
+    #[msg]
+    async fn run_provable_task(&mut self, task_hash: Vec<u8>, tag: Vec<u8>, n: u64) -> u64 {
+        let task_hash: [u8; 32] = task_hash
+            .try_into()
+            .unwrap_or_else(|_| panic!("task hash must contain 32 bytes"));
+        let tag: [u8; 32] = tag
+            .try_into()
+            .unwrap_or_else(|_| panic!("record tag must contain 32 bytes"));
+        let mut tasks = Tasks::new();
+        let task = tasks.spawn_provable(task_hash, &Msg::new("add_rooted").with("n", n), tag);
+        tasks.drive();
+        assert!(
+            tasks.status(task) == Some(TaskStatus::Done),
+            "signed Task did not complete"
+        );
+        let reply = tasks
+            .reply(task)
+            .unwrap_or_else(|| panic!("completed Task omitted its reply"));
+        let record = vos::provable::read_record_entry(&tag)
+            .and_then(|bytes| vos::provable::ProofRecordEntry::decode(&bytes))
+            .unwrap_or_else(|| panic!("completed Task omitted its staged record"));
+        assert!(
+            record.input.task_hash == task_hash
+                && record.record.task_hash == task_hash
+                && record.record.reply == reply
+                && record.record.io_consistent(),
+            "producer record does not bind the exact Task execution"
+        );
+        match <Value as vos::Decode>::try_decode(reply) {
+            Some(Value::U64(value)) => value,
+            _ => panic!("Task returned a malformed total"),
+        }
+    }
+
+    /// Queue without driving and stage the resulting secret-bearing table as
+    /// an ordinary actor row. Refine must reject the complete slice before
+    /// that row can enter actor state or a replicated transition.
+    #[msg]
+    async fn defer_provable_task(
+        &mut self,
+        ctx: &mut Context<Self>,
+        task_hash: Vec<u8>,
+        tag: Vec<u8>,
+    ) {
+        let task_hash: [u8; 32] = task_hash
+            .try_into()
+            .unwrap_or_else(|_| panic!("task hash must contain 32 bytes"));
+        let tag: [u8; 32] = tag
+            .try_into()
+            .unwrap_or_else(|_| panic!("record tag must contain 32 bytes"));
+        let mut tasks = Tasks::new();
+        let _ = tasks.spawn_provable(task_hash, &Msg::new("add_rooted").with("n", 1u64), tag);
+        ctx.store(b"deferred-private-task", &tasks.encode());
     }
 }

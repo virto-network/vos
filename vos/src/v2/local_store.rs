@@ -18,7 +18,7 @@ use crate::attestation::AttestationProofHostV2;
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, AccumulatedTimeoutV2, AccumulationReceiptV2,
-    ActorUpgradeV2, AttestationDeliveryV2, BlobRefV2, DedupRecordV2, DeliveryRecordV2,
+    ActorId, ActorUpgradeV2, AttestationDeliveryV2, BlobRefV2, DedupRecordV2, DeliveryRecordV2,
     DirectIngressV2, IngressRecordV2, MessageRecordV2, ProgramId, ProofVerificationRequestV2,
     PublicationRecordV2, ReceiptVerificationRequestV2, ReplyAdmissionRecordV2,
     RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServicePvmErrorV2, ServiceStateTreeV2,
@@ -285,6 +285,38 @@ pub trait ProofArtifactStoreV2 {
     fn load_proof(&self, reference: &BlobRefV2) -> Result<Option<Vec<u8>>, Self::Error>;
 
     fn commit_proof(&mut self, reference: &BlobRefV2, proof: &[u8]) -> Result<(), Self::Error>;
+
+    /// Load one producer-private Task record. The default keeps compatibility
+    /// with proof-only test backends while reporting that no record exists.
+    fn load_producer_record(
+        &self,
+        _actor: ActorId,
+        _tag: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Atomically persist a producer-private Task record. `false` means this
+    /// backend has no durable record sidecar and production Refine must fail
+    /// before proposing its transition.
+    fn commit_producer_record(
+        &mut self,
+        _actor: ActorId,
+        _tag: &[u8; 32],
+        _record: &[u8],
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
+    /// Delete one producer-private record after the operator has proved or
+    /// retired it. `false` means either absent or unsupported.
+    fn delete_producer_record(
+        &mut self,
+        _actor: ActorId,
+        _tag: &[u8; 32],
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,6 +391,23 @@ impl FileCommittedImageStoreV2 {
             name[index * 2 + 1] = HEX[usize::from(byte & 0x0f)];
         }
         self.proof_directory()
+            .join(std::str::from_utf8(&name).expect("lowercase hexadecimal is valid UTF-8"))
+    }
+
+    fn producer_record_directory(&self) -> PathBuf {
+        let mut name = self.path.file_name().unwrap_or_default().to_os_string();
+        name.push(".records");
+        self.path.with_file_name(name)
+    }
+
+    fn producer_record_path(&self, actor: ActorId, tag: &[u8; 32]) -> PathBuf {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut name = [0_u8; 128];
+        for (index, byte) in actor.0.iter().chain(tag).copied().enumerate() {
+            name[index * 2] = HEX[usize::from(byte >> 4)];
+            name[index * 2 + 1] = HEX[usize::from(byte & 0x0f)];
+        }
+        self.producer_record_directory()
             .join(std::str::from_utf8(&name).expect("lowercase hexadecimal is valid UTF-8"))
     }
 }
@@ -449,6 +498,94 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
         std::fs::File::open(&directory)?.sync_all()?;
         Ok(())
     }
+
+    fn load_producer_record(
+        &self,
+        actor: ActorId,
+        tag: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
+        match std::fs::read(self.producer_record_path(actor, tag)) {
+            Ok(bytes)
+                if crate::provable::ProofRecordEntry::decode(&bytes)
+                    .is_some_and(|entry| entry.encode() == bytes) =>
+            {
+                Ok(Some(bytes))
+            }
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "producer record is not canonical",
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn commit_producer_record(
+        &mut self,
+        actor: ActorId,
+        tag: &[u8; 32],
+        record: &[u8],
+    ) -> Result<bool, Self::Error> {
+        use std::io::Write;
+
+        if !crate::provable::ProofRecordEntry::decode(record)
+            .is_some_and(|entry| entry.encode() == record)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "producer record is not canonical",
+            ));
+        }
+        let directory = self.producer_record_directory();
+        std::fs::create_dir_all(&directory)?;
+        if let Some(parent) = directory.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        let path = self.producer_record_path(actor, tag);
+        match std::fs::read(&path) {
+            Ok(existing) if existing == record => return Ok(true),
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "producer record tag already contains different bytes",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let temporary = path.with_extension("v2-next");
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(record)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &path)?;
+        std::fs::File::open(&directory)?.sync_all()?;
+        Ok(true)
+    }
+
+    fn delete_producer_record(
+        &mut self,
+        actor: ActorId,
+        tag: &[u8; 32],
+    ) -> Result<bool, Self::Error> {
+        let directory = self.producer_record_directory();
+        let path = self.producer_record_path(actor, tag);
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                std::fs::File::open(directory)?.sync_all()?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -516,9 +653,9 @@ impl core::fmt::Debug for LocalJamStoreV2 {
 /// JAM storage host whose committed image is durable before IC-5 returns.
 ///
 /// Private-witness inputs and credential, receipt, and install verifier
-/// configuration remain process-local. Proof bytes use the backend's separate
-/// [`ProofArtifactStoreV2`] side-CAS and never enter the consensus service
-/// image.
+/// configuration remain process-local. Proof bytes and producer-private Task
+/// records use the backend's separate [`ProofArtifactStoreV2`] side stores and
+/// never enter the consensus service image.
 pub struct DurableJamStoreV2<B> {
     local: LocalJamStoreV2,
     backend: B,
@@ -584,6 +721,63 @@ impl<B> DurableJamStoreV2<B>
 where
     B: CommittedImageStoreV2 + ProofArtifactStoreV2<Error = <B as CommittedImageStoreV2>::Error>,
 {
+    /// Persist producer-private Task records before the corresponding
+    /// transition can enter a Raft log. Partial failure may leave harmless
+    /// producer-local orphans, but can never make consensus state visible.
+    pub(crate) fn persist_producer_records(
+        &mut self,
+        records: &[super::ProducedProvableRecordV2],
+    ) -> Result<(), ()> {
+        let mut identities = BTreeSet::new();
+        for produced in records {
+            if !identities.insert((produced.actor, produced.tag))
+                || produced.entry.input.task_hash != produced.entry.record.task_hash
+                || !produced.entry.record.io_consistent()
+            {
+                return Err(());
+            }
+            let encoded = produced.entry.encode();
+            if crate::provable::ProofRecordEntry::decode(&encoded).as_ref() != Some(&produced.entry)
+            {
+                return Err(());
+            }
+            match self
+                .backend
+                .load_producer_record(produced.actor, &produced.tag)
+                .map_err(|_| ())?
+            {
+                Some(existing) if existing == encoded => continue,
+                Some(_) => return Err(()),
+                None => {}
+            }
+            if !self
+                .backend
+                .commit_producer_record(produced.actor, &produced.tag, &encoded)
+                .map_err(|_| ())?
+            {
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn producer_record(&self, actor: ActorId, tag: &[u8; 32]) -> Option<Vec<u8>> {
+        self.backend
+            .load_producer_record(actor, tag)
+            .ok()
+            .flatten()
+            .filter(|bytes| {
+                crate::provable::ProofRecordEntry::decode(bytes)
+                    .is_some_and(|entry| entry.encode().as_slice() == bytes.as_slice())
+            })
+    }
+
+    pub fn prune_producer_record(&mut self, actor: ActorId, tag: &[u8; 32]) -> bool {
+        self.backend
+            .delete_producer_record(actor, tag)
+            .unwrap_or(false)
+    }
+
     /// Load and re-authorize an exact set of proof decisions under the
     /// currently installed verifier.
     ///
@@ -2018,14 +2212,56 @@ mod tests {
             proof_blob: proof_blob.clone(),
         };
         assert!(store.make_proof_available(&verification, &proof));
+        let actor = ActorId([44; 32]);
+        let tag = [45; 32];
+        let mut record = crate::provable::ProvableRecord {
+            task_hash: [46; 32],
+            anchor_kind: 1,
+            anchor: [47; 32],
+            transition_digest: [48; 32],
+            reply: b"private Task reply".to_vec(),
+            io_hash: [0; 32],
+            app_public: b"public Task binding".to_vec(),
+            catalog_name: alloc::string::String::new(),
+            catalog_version: 0,
+        };
+        record.io_hash = crate::zk::compute_io_hash(&record.public_prime(), &record.reply);
+        let entry = crate::provable::ProofRecordEntry {
+            input: crate::provable::ProvableInput {
+                task_hash: record.task_hash,
+                witness_bytes: b"producer-only witness".to_vec(),
+            },
+            record,
+        };
+        store
+            .persist_producer_records(&[super::super::ProducedProvableRecordV2 {
+                actor,
+                tag,
+                entry: entry.clone(),
+            }])
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let record_path = store.backend.producer_record_path(actor, &tag);
+            assert_eq!(
+                std::fs::metadata(record_path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "producer witness records must be owner-only",
+            );
+        }
         let expected = store.snapshot();
         drop(store);
 
-        let restarted = DurableJamStoreV2::open(FileCommittedImageStoreV2::new(&path)).unwrap();
+        let mut restarted = DurableJamStoreV2::open(FileCommittedImageStoreV2::new(&path)).unwrap();
         assert_eq!(restarted.snapshot(), expected);
         assert_eq!(restarted.proof_bytes(&proof_blob), Some(proof));
+        assert_eq!(restarted.producer_record(actor, &tag), Some(entry.encode()));
+        assert!(restarted.prune_producer_record(actor, &tag));
+        assert_eq!(restarted.producer_record(actor, &tag), None);
         assert!(!path.with_file_name("service.v2.v2-next").exists());
         assert!(path.with_file_name("service.v2.proofs").is_dir());
+        assert!(path.with_file_name("service.v2.records").is_dir());
         drop(restarted);
 
         std::fs::write(&path, b"legacy-or-corrupt-image").unwrap();

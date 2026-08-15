@@ -1945,7 +1945,9 @@ fn record_and_write_invoke(
 /// malformed keys/tag section degrades to "no keys, no tag, rest is
 /// message": the child then panics on its first unproven read instead of
 /// the host guessing.
-fn split_invoke_input(input: &[u8]) -> (&[u8], alloc::vec::Vec<&[u8]>, Option<[u8; 32]>, &[u8]) {
+pub(crate) fn split_invoke_input(
+    input: &[u8],
+) -> (&[u8], alloc::vec::Vec<&[u8]>, Option<[u8; 32]>, &[u8]) {
     if input.len() < 4 {
         return (&[], alloc::vec::Vec::new(), None, input);
     }
@@ -2007,14 +2009,36 @@ fn invoke_input_requests_record(input: &[u8]) -> bool {
 /// initial image at the blob's witness address — the exact image a
 /// prover's `trace_blob_with_patches` reconstructs from the unmodified
 /// blob plus the same patch.
-fn build_task_kernel(
+pub(crate) fn build_task_kernel(
     blob: &[u8],
     witness_addr: u32,
     input: &[u8],
     gas: Gas,
     code_cache: &mut javm::CodeCache,
 ) -> Option<InvocationKernel> {
-    let mut child = InvocationKernel::new_cached(blob, &[], gas, code_cache).ok()?;
+    build_task_kernel_with_backend(
+        blob,
+        witness_addr,
+        input,
+        gas,
+        code_cache,
+        javm::PvmBackend::Default,
+    )
+}
+
+pub(crate) fn build_task_kernel_with_backend(
+    blob: &[u8],
+    witness_addr: u32,
+    input: &[u8],
+    gas: Gas,
+    code_cache: &mut javm::CodeCache,
+    backend: javm::PvmBackend,
+) -> Option<InvocationKernel> {
+    let mut child = if backend == javm::PvmBackend::Default {
+        InvocationKernel::new_cached(blob, &[], gas, code_cache).ok()?
+    } else {
+        InvocationKernel::new_with_backend(blob, &[], gas, backend).ok()?
+    };
     install_vos_runtime_caps(&mut child);
     child.set_active_reg(7, 0);
     let _ = child
@@ -2044,7 +2068,7 @@ fn build_task_kernel(
 ///   reject them fail-closed before executing the child further;
 /// - everything else (INVOKE, TRANSFER, NOW_MS) returns `false`: fail
 ///   loud, exactly where the tracer would end un-halted.
-fn handle_task_hostcall(
+pub(crate) fn handle_task_hostcall(
     kernel: &mut InvocationKernel,
     call_id: u32,
     allow_unconstrained_crypto: bool,
@@ -2379,12 +2403,12 @@ fn handle_invoke(
     let input = kread(caller, input_ptr, input_len);
     let record_requested = invoke_input_requests_record(&input);
 
-    // Provable input contains the exact secret witness. Record replication
-    // is deliberately outside W2/W3: a Recording log is serialized into a
-    // CRDT node or Raft entry, while Replay consumes those replicated bytes.
-    // Reject before execution in either mode so neither the witness nor a
-    // ProofRecordEntry can enter InvokeEffects. Local/Inactive parents keep
-    // the durable record in their own committed keyspace.
+    // Provable input contains the exact secret witness. This legacy runtime's
+    // Recording log is serialized into a CRDT node or Raft entry, while
+    // Replay consumes those replicated bytes. Reject before execution in
+    // either mode so neither the witness nor a ProofRecordEntry can enter
+    // InvokeEffects. Local/Inactive parents keep the durable record in their
+    // own committed keyspace; service-v2 uses its producer-private sidecar.
     if record_requested && mode.has_replication_context() {
         mode.reject_private_record();
         journal.private_record_rejected = true;

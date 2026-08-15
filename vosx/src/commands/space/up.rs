@@ -3156,14 +3156,15 @@ fn sweep_orphan_redbs(data_dir: &std::path::Path, live: &std::collections::HashS
     }
 }
 
-/// Move service images and proof side-CAS directories whose installation
+/// Move service images and private side-store directories whose installation
 /// incarnation no longer exists in the registry into recoverable trash.
 ///
 /// A v2 installation is keyed by `(space, name, replication_id)`. The
 /// registry forbids reusing a tombstoned replication id, so keeping an orphan
 /// in the active directory can only resurrect deleted state or collide with a
-/// later install. Both the image and its sibling `.image.proofs` directory use
-/// the root-service hash prefix and are swept together on the next daemon boot.
+/// later install. The image and its sibling `.image.proofs` and
+/// `.image.records` directories use the root-service hash prefix and are swept
+/// together on the next daemon boot.
 fn sweep_orphan_v2_services(
     data_dir: &std::path::Path,
     live: &std::collections::HashSet<[u8; 32]>,
@@ -3185,7 +3186,7 @@ fn sweep_orphan_v2_services(
         let suffix = &name_str[64..];
         if !matches!(
             suffix,
-            ".image" | ".image.proofs" | ".image.v2-next" | ".raft.redb"
+            ".image" | ".image.proofs" | ".image.records" | ".image.v2-next" | ".raft.redb"
         ) {
             continue;
         }
@@ -3654,7 +3655,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_v2_images_and_proofs_move_to_recoverable_trash() {
+    fn orphan_v2_images_and_private_sidecars_move_to_recoverable_trash() {
         let dir = std::env::temp_dir().join(format!(
             "vosx-v2-orphan-sweep-{}-{}",
             std::process::id(),
@@ -3670,6 +3671,7 @@ mod tests {
         let active_image = services.join(format!("{}.image", hex::encode(active)));
         let orphan_image = services.join(format!("{}.image", hex::encode(orphan)));
         let orphan_proofs = services.join(format!("{}.image.proofs", hex::encode(orphan)));
+        let orphan_records = services.join(format!("{}.image.records", hex::encode(orphan)));
         let active_raft = services.join(format!("{}.raft.redb", hex::encode(active)));
         let orphan_raft = services.join(format!("{}.raft.redb", hex::encode(orphan)));
         std::fs::write(&active_image, b"active").unwrap();
@@ -3678,6 +3680,8 @@ mod tests {
         std::fs::write(&orphan_raft, b"orphan raft").unwrap();
         std::fs::create_dir_all(&orphan_proofs).unwrap();
         std::fs::write(orphan_proofs.join("proof"), b"proof").unwrap();
+        std::fs::create_dir_all(&orphan_records).unwrap();
+        std::fs::write(orphan_records.join("record"), b"private record").unwrap();
 
         sweep_orphan_v2_services(&dir, &[active].into_iter().collect());
 
@@ -3685,6 +3689,7 @@ mod tests {
         assert!(active_raft.is_file());
         assert!(!orphan_image.exists());
         assert!(!orphan_proofs.exists());
+        assert!(!orphan_records.exists());
         assert!(!orphan_raft.exists());
         assert!(
             dir.join("trash")
@@ -3696,6 +3701,12 @@ mod tests {
             dir.join("trash")
                 .join("v2-services")
                 .join(orphan_proofs.file_name().unwrap())
+                .is_dir(),
+        );
+        assert!(
+            dir.join("trash")
+                .join("v2-services")
+                .join(orphan_records.file_name().unwrap())
                 .is_dir(),
         );
         assert!(

@@ -189,8 +189,10 @@ where
 struct FailableCommittedImages {
     image: Option<Vec<u8>>,
     proofs: BTreeMap<[u8; 32], Vec<u8>>,
+    producer_records: BTreeMap<(ActorId, [u8; 32]), Vec<u8>>,
     fail_next_commit: bool,
     fail_next_proof_commit: bool,
+    fail_next_record_commit: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -433,6 +435,43 @@ impl ProofArtifactStoreV2 for FailableCommittedImages {
                 Ok(())
             }
         }
+    }
+
+    fn load_producer_record(
+        &self,
+        actor: ActorId,
+        tag: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self.producer_records.get(&(actor, *tag)).cloned())
+    }
+
+    fn commit_producer_record(
+        &mut self,
+        actor: ActorId,
+        tag: &[u8; 32],
+        record: &[u8],
+    ) -> Result<bool, Self::Error> {
+        if std::mem::take(&mut self.fail_next_record_commit)
+            || vos::provable::ProofRecordEntry::decode(record).is_none()
+        {
+            return Err(());
+        }
+        match self.producer_records.get(&(actor, *tag)) {
+            Some(existing) if existing != record => Err(()),
+            Some(_) => Ok(true),
+            None => {
+                self.producer_records.insert((actor, *tag), record.to_vec());
+                Ok(true)
+            }
+        }
+    }
+
+    fn delete_producer_record(
+        &mut self,
+        actor: ActorId,
+        tag: &[u8; 32],
+    ) -> Result<bool, Self::Error> {
+        Ok(self.producer_records.remove(&(actor, *tag)).is_some())
     }
 }
 
@@ -783,6 +822,13 @@ fn greeter_elf() -> Vec<u8> {
 fn probe_elf() -> Vec<u8> {
     required_elf(
         "../tests/fixtures/legacy-v1/actors/probe/target/riscv64em-javm/release/probe.elf",
+        "just build-v2-pvm-test-artifacts",
+    )
+}
+
+fn tally_elf() -> Vec<u8> {
+    required_elf(
+        "../tests/fixtures/legacy-v1/actors/tally/target/riscv64em-javm/release/tally.elf",
         "just build-v2-pvm-test-artifacts",
     )
 }
@@ -1330,6 +1376,222 @@ fn signed_task_dependencies_install_and_survive_durable_reopen() {
 }
 
 #[test]
+fn signed_task_refine_keeps_witness_out_of_raft_and_reopens_producer_sidecar() {
+    let task_elf = tally_elf();
+    let (witness_address, witness_capacity) =
+        vos::zk::witness_symbol(&task_elf).expect("tally exports its witness window");
+    let task_pvm = grey_transpiler::link_elf(&task_elf).expect("tally Task transpiles");
+    let (config, binding) = signed_task_dependency_actor_config(
+        &probe_elf(),
+        task_pvm,
+        witness_address as u32,
+        witness_capacity as u32,
+        ConsistencyModeV2::Raft,
+    );
+    let actor = config.root_actor;
+    let tag = [0xD6; 32];
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(
+        &Msg::new("run_provable_task")
+            .with("task_hash", binding.task.0.to_vec())
+            .with("tag", tag.to_vec())
+            .with("n", 9u64)
+            .encode(),
+    );
+    let request = LocalWorkRequestV2 {
+        invocation: InvocationId([0xD7; 32]),
+        workflow_step: 0,
+        logical_timeslot: 9,
+        target: actor,
+        method: "run_provable_task".into(),
+        arguments,
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-task-sidecar-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let log_path = directory.join("raft.redb");
+    let log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    let mut service =
+        LocalRootTreeServiceV2::open_raft(config.clone(), FailableCommittedImages::default(), log)
+            .expect("signed Task root installs");
+    assert!(!service.admit_ingress(&request).unwrap());
+    let prepared = LocalWorkSchedulerV2::prepare(service.store(), request.clone()).unwrap();
+    let physical = ServicePvmV2::new(
+        CANONICAL_SERVICE_PVM.to_vec(),
+        vos::v2::VOS_SERVICE_PROGRAM_ID,
+    )
+    .unwrap();
+    let ordinary = physical
+        .refine_actor_tree_with_backend(
+            &prepared.work.encode(),
+            &prepared.imports,
+            TEST_GAS_SCHEDULE.refine,
+            &NoRefineProtocolHostV2,
+            javm::PvmBackend::ForceRecompiler,
+        )
+        .expect("recompiler executes signed Task Refine");
+    let traced = physical
+        .refine_actor_tree_traced(
+            &prepared.work.encode(),
+            &prepared.imports,
+            TEST_GAS_SCHEDULE.refine,
+            &NoRefineProtocolHostV2,
+        )
+        .expect("interpreter traces the exact nested Task execution");
+    assert_eq!(traced.bytes, ordinary.bytes);
+    assert_eq!(traced.gas_used, ordinary.gas_used);
+    assert_eq!(traced.exported_blobs, ordinary.exported_blobs);
+    assert_eq!(traced.producer_records, ordinary.producer_records);
+    let trace = traced.trace.expect("traced Refine returns a commitment");
+    assert!(trace.instruction_count > 0);
+    assert!(
+        trace.code_hashes.len() >= 3,
+        "service, parent actor, and signed Task programs all enter the exact trace",
+    );
+    assert_eq!(service.producer_record(actor, &tag), None);
+    service.store_mut().backend_mut().fail_next_record_commit = true;
+    assert!(matches!(
+        service.invoke_admitted(request.invocation),
+        Err(LocalRootTreeInvokeErrorV2::ProducerRecordUnavailable)
+    ));
+    assert_eq!(service.producer_record(actor, &tag), None);
+    let committed = service
+        .invoke_admitted(request.invocation)
+        .expect("signed Task executes through exact Refine and Raft Apply");
+    assert!(!committed.duplicate);
+    assert_eq!(
+        committed
+            .published
+            .reply
+            .as_ref()
+            .and_then(|reply| Value::try_decode(&reply.result)),
+        Some(Value::U64(9)),
+    );
+    let record_bytes = service
+        .producer_record(actor, &tag)
+        .expect("producer-private record committed before Apply proposal");
+    let record = vos::provable::ProofRecordEntry::decode(&record_bytes)
+        .expect("sidecar stores a canonical record");
+    assert_eq!(record.input.task_hash, binding.task.0);
+    assert_eq!(record.record.task_hash, binding.task.0);
+    assert!(record.record.io_consistent());
+    assert!(
+        !service
+            .store()
+            .snapshot_bytes()
+            .windows(record_bytes.len())
+            .any(|window| window == record_bytes),
+        "producer witness must not enter the recoverable service image",
+    );
+
+    let backend = service.into_backend();
+    let replicated_bytes = std::fs::read(&log_path).expect("read committed Raft database");
+    assert!(
+        !replicated_bytes
+            .windows(record_bytes.len())
+            .any(|window| window == record_bytes),
+        "producer record must not enter any committed Raft availability channel",
+    );
+
+    let log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    let mut reopened = LocalRootTreeServiceV2::open_raft(config, backend, log)
+        .expect("producer reopens after committed Task execution");
+    assert_eq!(reopened.producer_record(actor, &tag), Some(record_bytes));
+    assert!(reopened.prune_producer_record(actor, &tag));
+    assert_eq!(reopened.producer_record(actor, &tag), None);
+    drop(reopened);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn deferred_provable_task_is_rejected_before_apply_proposal() {
+    let task_elf = tally_elf();
+    let (witness_address, witness_capacity) =
+        vos::zk::witness_symbol(&task_elf).expect("tally exports its witness window");
+    let task_pvm = grey_transpiler::link_elf(&task_elf).expect("tally Task transpiles");
+    let (config, binding) = signed_task_dependency_actor_config(
+        &probe_elf(),
+        task_pvm,
+        witness_address as u32,
+        witness_capacity as u32,
+        ConsistencyModeV2::Raft,
+    );
+    let actor = config.root_actor;
+    let tag = [0xD8; 32];
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(
+        &Msg::new("defer_provable_task")
+            .with("task_hash", binding.task.0.to_vec())
+            .with("tag", tag.to_vec())
+            .encode(),
+    );
+    let request = LocalWorkRequestV2 {
+        invocation: InvocationId([0xD9; 32]),
+        workflow_step: 0,
+        logical_timeslot: 10,
+        target: actor,
+        method: "defer_provable_task".into(),
+        arguments,
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-task-defer-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let log_path = directory.join("raft.redb");
+    let log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    let mut service =
+        LocalRootTreeServiceV2::open_raft(config, FailableCommittedImages::default(), log).unwrap();
+    assert!(matches!(
+        service.invoke(request),
+        Err(LocalRootTreeInvokeErrorV2::Replication(
+            ReplicatedServiceErrorV2::Dispatch(ServiceDispatchError::Pvm(
+                ServicePvmErrorV2::RefineHostRejected(slot)
+            ))
+        )) if slot == vos::abi::hostcall::ACTOR_EFFECT_EXPORT as u8
+    ));
+    assert_eq!(service.producer_record(actor, &tag), None);
+    let backend = service.into_backend();
+    let mut log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    assert_eq!(
+        log.applied_index().unwrap(),
+        2,
+        "only genesis and ingress admission may commit before Refine rejection",
+    );
+    assert_eq!(backend.producer_records.len(), 0);
+    drop(log);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn raft_root_rejects_an_install_entry_above_the_network_frame_cap() {
     let task_pvm = vec![0xa5; vos::network::MAX_FRAME_BYTES];
     let (config, _) = signed_task_dependency_config(task_pvm, ConsistencyModeV2::Raft);
@@ -1343,14 +1605,23 @@ fn signed_task_dependency_config(
     task_pvm: Vec<u8>,
     consistency: ConsistencyModeV2,
 ) -> (LocalRootTreeConfigV2, TaskDependencyV2) {
-    let actor_elf = greeter_elf();
+    signed_task_dependency_actor_config(&greeter_elf(), task_pvm, 0x1_0000, 4096, consistency)
+}
+
+fn signed_task_dependency_actor_config(
+    actor_elf: &[u8],
+    task_pvm: Vec<u8>,
+    witness_address: u32,
+    witness_capacity: u32,
+    consistency: ConsistencyModeV2,
+) -> (LocalRootTreeConfigV2, TaskDependencyV2) {
     let signer = libp2p::identity::Keypair::generate_ed25519();
-    let (mut package, actor_name) = signed_test_package(&actor_elf, &signer);
+    let (mut package, actor_name) = signed_test_package(actor_elf, &signer);
     let binding = TaskDependencyV2 {
         task: Hash(vos::provable::task_blob_hash(&task_pvm)),
         program: ProgramId::of_pvm(&task_pvm),
-        witness_address: 0x1_0000,
-        witness_capacity: 4096,
+        witness_address,
+        witness_capacity,
     };
     package.task_dependencies = vec![PackageTaskDependencyV2 {
         binding: binding.clone(),

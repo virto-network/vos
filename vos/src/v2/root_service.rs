@@ -558,6 +558,7 @@ impl<E: core::fmt::Debug> core::error::Error for LocalRootTreeOpenErrorV2<E> {}
 pub enum LocalRootTreeInvokeErrorV2 {
     ProofProducerRequired,
     ProofUnavailable,
+    ProducerRecordUnavailable,
     Schedule(ScheduleErrorV2),
     Service(ServiceDispatchError),
     #[cfg(feature = "storage")]
@@ -1609,6 +1610,20 @@ where
 
     pub fn store_mut(&mut self) -> &mut DurableJamStoreV2<B> {
         self.service.accumulate_host_mut()
+    }
+
+    /// Read one producer-private Task record from this operator's durable
+    /// sidecar. This host API is intentionally absent from actor messages,
+    /// service snapshots, Raft logs, and replica transport.
+    pub fn producer_record(&self, actor: ActorId, tag: &[u8; 32]) -> Option<Vec<u8>> {
+        self.service.accumulate_host().producer_record(actor, tag)
+    }
+
+    /// Retire one producer-private Task record after proving or expiry.
+    pub fn prune_producer_record(&mut self, actor: ActorId, tag: &[u8; 32]) -> bool {
+        self.service
+            .accumulate_host_mut()
+            .prune_producer_record(actor, tag)
     }
 
     /// Classify a direct invocation retry from guest-authenticated ingress,
@@ -2864,6 +2879,10 @@ where
             .service
             .refine_actor_tree_after_barrier(&prepared.work, &prepared.imports)
             .map_err(RootTreeDriverErrorV2::into_invoke)?;
+        self.service
+            .accumulate_host_mut()
+            .persist_producer_records(&refined.producer_records)
+            .map_err(|_| LocalRootTreeInvokeErrorV2::ProducerRecordUnavailable)?;
         let input = prepared.work.input_id();
         let mut provided_blobs = refined.exported_blobs;
         if let Some(proof) = proof_artifact {
@@ -2938,6 +2957,10 @@ where
             .service
             .refine_actor_tree_after_barrier(&prepared.work, &prepared.imports)
             .map_err(RootTreeDriverErrorV2::into_invoke)?;
+        self.service
+            .accumulate_host_mut()
+            .persist_producer_records(&refined.producer_records)
+            .map_err(|_| LocalRootTreeInvokeErrorV2::ProducerRecordUnavailable)?;
         let input = prepared.work.input_id();
         let committed = self.service.accumulate_attested_after_barrier(
             AccumulationEnvelopeV2 {

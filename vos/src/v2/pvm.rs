@@ -52,9 +52,24 @@ pub struct ServicePvmOutputV2 {
     /// make these bytes available before submitting the transition to
     /// Accumulate; publication still occurs only after commit.
     pub exported_blobs: Vec<ImportedBlobV2>,
+    /// Producer-private Task records captured while Refine executed. These
+    /// bytes are host output, never part of the service transition or a Raft
+    /// request. The root driver must make them durable locally before it may
+    /// propose the corresponding transition.
+    pub producer_records: Vec<ProducedProvableRecordV2>,
     /// Exact canonical-interpreter commitment for a traced Refine slice.
     /// Ordinary Refine and every Accumulate execution leave this absent.
     pub trace: Option<RefineTraceV2>,
+}
+
+/// One completed provable Task record owned by the physical producer which
+/// executed Refine. `tag` is scoped by the parent actor; the entry contains
+/// the exact secret witness and therefore must never enter replicated state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProducedProvableRecordV2 {
+    pub actor: super::ActorId,
+    pub tag: [u8; 32],
+    pub entry: crate::provable::ProofRecordEntry,
 }
 
 /// Compact commitment to one complete nested Refine execution slice.
@@ -202,8 +217,40 @@ impl RefineTraceRecorderV2 {
         self.u64(artifact.reference.len);
     }
 
-    fn output(&mut self, bytes: &[u8], gas_used: u64, exported_blobs: &[ImportedBlobV2]) {
+    fn task_begin(
+        &mut self,
+        actor: super::ActorId,
+        task: Hash,
+        input: &[u8],
+        tag: Option<[u8; 32]>,
+    ) {
         self.state.update(&[4]);
+        self.bytes(&actor.0);
+        self.bytes(&task.0);
+        self.bytes(&Hash::digest(b"vos/task-input/v2", &[input]).0);
+        match tag {
+            Some(tag) => {
+                self.state.update(&[1]);
+                self.bytes(&tag);
+            }
+            None => {
+                self.state.update(&[0]);
+            }
+        }
+        // A separately instantiated Task VM has its own VM-0 namespace. The
+        // explicit begin/end markers make that namespace unambiguous in the
+        // enclosing trace and force a switch at the next observed program.
+        self.previous_vm = None;
+    }
+
+    fn task_end(&mut self, output: &[u8]) {
+        self.state.update(&[5]);
+        self.bytes(output);
+        self.previous_vm = None;
+    }
+
+    fn output(&mut self, bytes: &[u8], gas_used: u64, exported_blobs: &[ImportedBlobV2]) {
+        self.state.update(&[6]);
         self.bytes(bytes);
         self.u64(gas_used);
         self.u64(exported_blobs.len() as u64);
@@ -398,8 +445,22 @@ struct ActorRefineRuntimeV2 {
     program_layout: Vec<super::ContinuationProgramV2>,
     actor_by_vm: Vec<Option<super::ActorId>>,
     private_inputs: BTreeMap<super::ActorId, ActorPrivateInputV2>,
+    task_programs: BTreeMap<(super::ActorId, Hash), TaskProgramV2>,
+    task_code_cache: javm::CodeCache,
+    task_gas_used: u64,
+    record_intents: BTreeMap<super::ActorId, u32>,
+    record_attempts: BTreeMap<super::ActorId, u32>,
+    record_successes: BTreeMap<super::ActorId, u32>,
+    staged_records: BTreeMap<(super::ActorId, [u8; 32]), crate::provable::ProofRecordEntry>,
+    producer_records: Vec<ProducedProvableRecordV2>,
     outputs: Vec<ActorSliceOutputV2>,
     encoded_outputs_len: usize,
+}
+
+struct TaskProgramV2 {
+    pvm: Vec<u8>,
+    witness_address: u32,
+    witness_capacity: u32,
 }
 
 impl ActorRefineRuntimeV2 {
@@ -442,6 +503,7 @@ impl ActorRefineRuntimeV2 {
         );
 
         let mut private_inputs = BTreeMap::new();
+        let mut task_programs = BTreeMap::new();
         for actor in work.imported_actors.iter().filter(|actor| {
             program_layout
                 .binary_search_by_key(&actor.actor, |binding| binding.actor)
@@ -470,28 +532,369 @@ impl ActorRefineRuntimeV2 {
                 return Err(ServicePvmErrorV2::ActorInputTooLarge);
             }
             private_inputs.insert(actor.actor, private);
+            for dependency in &actor.task_dependencies {
+                let imported = imports
+                    .programs
+                    .binary_search_by_key(&dependency.program, |program| program.program)
+                    .ok()
+                    .map(|index| &imports.programs[index])
+                    .ok_or(ServicePvmErrorV2::InvalidRefineImports)?;
+                if Hash(crate::provable::task_blob_hash(&imported.pvm)) != dependency.task
+                    || ProgramId::of_pvm(&imported.pvm) != dependency.program
+                {
+                    return Err(ServicePvmErrorV2::InvalidRefineImports);
+                }
+                task_programs.insert(
+                    (actor.actor, dependency.task),
+                    TaskProgramV2 {
+                        pvm: imported.pvm.clone(),
+                        witness_address: dependency.witness_address,
+                        witness_capacity: dependency.witness_capacity,
+                    },
+                );
+            }
         }
         Ok(Self {
             target: work.target,
             program_layout,
             actor_by_vm,
             private_inputs,
+            task_programs,
+            task_code_cache: javm::CodeCache::new(),
+            task_gas_used: 0,
+            record_intents: BTreeMap::new(),
+            record_attempts: BTreeMap::new(),
+            record_successes: BTreeMap::new(),
+            staged_records: BTreeMap::new(),
+            producer_records: Vec::new(),
             outputs: Vec::new(),
             // V2 header plus the effect-batch list length.
             encoded_outputs_len: 10,
         })
     }
 
+    fn take_producer_records(&mut self) -> Vec<ProducedProvableRecordV2> {
+        core::mem::take(&mut self.producer_records)
+    }
+
     fn actor_for_vm(&self, vm: u16) -> Option<super::ActorId> {
         self.actor_by_vm.get(vm as usize).copied().flatten()
+    }
+
+    fn write_task_result(
+        kernel: &mut InvocationKernel,
+        output: &[u8],
+    ) -> Result<[u64; 2], ServicePvmErrorV2> {
+        let packed = kernel.active_reg(11);
+        let address = packed as u32;
+        let capacity = (packed >> 32) as u32 as usize;
+        let bytes = if capacity != 0 && output.len() > capacity {
+            &[crate::actors::run::STATUS_TOO_BIG][..]
+        } else {
+            output
+        };
+        if !kernel.write_data_cap_window(address, bytes) {
+            return Err(ServicePvmErrorV2::RefineHostRejected(
+                crate::abi::hostcall::INVOKE as u8,
+            ));
+        }
+        Ok([bytes.len() as u64, 0])
+    }
+
+    fn handle_task_invoke(
+        &mut self,
+        kernel: &mut InvocationKernel,
+        mut trace: Option<&mut RefineTraceRecorderV2>,
+    ) -> Result<[u64; 2], ServicePvmErrorV2> {
+        use crate::actors::run::{STATUS_DONE, STATUS_OOG, STATUS_PANICKED, STATUS_YIELDED};
+
+        const DEFAULT_TASK_GAS: u64 = 100_000_000;
+        const MAX_TASK_OUTPUT_BYTES: usize = 1 << 20;
+
+        let actor =
+            self.actor_for_vm(kernel.active_vm)
+                .ok_or(ServicePvmErrorV2::RefineHostRejected(
+                    crate::abi::hostcall::INVOKE as u8,
+                ))?;
+        let hash_address = u32::try_from(kernel.active_reg(7)).map_err(|_| {
+            ServicePvmErrorV2::RefineHostRejected(crate::abi::hostcall::INVOKE as u8)
+        })?;
+        let input_address = u32::try_from(kernel.active_reg(8)).map_err(|_| {
+            ServicePvmErrorV2::RefineHostRejected(crate::abi::hostcall::INVOKE as u8)
+        })?;
+        let input_len = u32::try_from(kernel.active_reg(9)).map_err(|_| {
+            ServicePvmErrorV2::RefineHostRejected(crate::abi::hostcall::INVOKE as u8)
+        })?;
+        let hash_bytes = kernel.read_data_cap_window(hash_address, 32).ok_or(
+            ServicePvmErrorV2::RefineHostRejected(crate::abi::hostcall::INVOKE as u8),
+        )?;
+        let input = kernel
+            .read_data_cap_window(input_address, input_len)
+            .ok_or(ServicePvmErrorV2::RefineHostRejected(
+                crate::abi::hostcall::INVOKE as u8,
+            ))?;
+        let task = Hash(hash_bytes.try_into().map_err(|_| {
+            ServicePvmErrorV2::RefineHostRejected(crate::abi::hostcall::INVOKE as u8)
+        })?);
+        let (state, row_keys, tag, message) = crate::runtime::split_invoke_input(&input);
+        if !row_keys.is_empty() {
+            // Parent-row imports need their own base-authenticated witness
+            // channel. The first production Task surface is intentionally
+            // witness-self-contained; never guess row values here.
+            return Self::write_task_result(kernel, &[STATUS_PANICKED]);
+        }
+        if tag.is_some() {
+            let intents = self.record_intents.entry(actor).or_default();
+            if *intents == 0 {
+                return Self::write_task_result(kernel, &[STATUS_PANICKED]);
+            }
+            *intents -= 1;
+            let attempts = self.record_attempts.entry(actor).or_default();
+            *attempts = attempts
+                .checked_add(1)
+                .ok_or(ServicePvmErrorV2::RefineHostRejected(
+                    crate::abi::hostcall::INVOKE as u8,
+                ))?;
+        }
+        let Some(program) = self.task_programs.get(&(actor, task)) else {
+            return Self::write_task_result(kernel, &[crate::actors::run::STATUS_NOT_FOUND]);
+        };
+        let task_input = crate::task_abi::encode_task_input(state, message);
+        if task_input.len() > program.witness_capacity as usize {
+            return Self::write_task_result(kernel, &[crate::actors::run::STATUS_TOO_BIG]);
+        }
+        if let Some(recorder) = trace.as_deref_mut() {
+            recorder.task_begin(actor, task, &task_input, tag);
+        }
+        let requested_gas = match kernel.active_reg(10) {
+            0 => DEFAULT_TASK_GAS,
+            requested => requested.min(DEFAULT_TASK_GAS),
+        };
+        // JAR does not expose a backend-neutral setter for the live parent's
+        // gas while a recompiled VM is suspended at a protocol boundary.
+        // Maintain the nested charge separately and never let Tasks spend
+        // more than the parent slice's currently unclaimed budget. The two
+        // charges are combined and bounded before Refine can return.
+        let gas_limit = requested_gas.min(kernel.active_gas().saturating_sub(self.task_gas_used));
+        if gas_limit == 0 {
+            let result = Self::write_task_result(kernel, &[STATUS_OOG])?;
+            if let Some(recorder) = trace {
+                recorder.task_end(&[STATUS_OOG]);
+            }
+            return Ok(result);
+        }
+        // Signed Task execution is part of the proof contract. Use the
+        // canonical interpreter in both ordinary Refine and traced replay so
+        // instruction charging and the near-budget outcome cannot depend on
+        // which backend happened to run the enclosing service VM.
+        let task_backend = javm::PvmBackend::ForceInterpreter;
+        let Some(mut child) = crate::runtime::build_task_kernel_with_backend(
+            &program.pvm,
+            program.witness_address,
+            &task_input,
+            gas_limit,
+            &mut self.task_code_cache,
+            task_backend,
+        ) else {
+            let result = Self::write_task_result(kernel, &[STATUS_PANICKED])?;
+            if let Some(recorder) = trace {
+                recorder.task_end(&[STATUS_PANICKED]);
+            }
+            return Ok(result);
+        };
+
+        let failure = loop {
+            let result = if let Some(recorder) = trace.as_deref_mut() {
+                child
+                    .run_observed(|event| recorder.instruction(event))
+                    .map_err(|_| ServicePvmErrorV2::TraceBackendRequired)?
+            } else {
+                child.run()
+            };
+            match result {
+                KernelResult::Halt => break None,
+                KernelResult::Panic | KernelResult::PageFault(_) => break Some(STATUS_PANICKED),
+                KernelResult::OutOfGas => break Some(STATUS_OOG),
+                KernelResult::ProtocolCall { slot } => {
+                    if let Some(recorder) = trace.as_deref_mut() {
+                        recorder.protocol_call(slot, &child);
+                    }
+                    if !crate::runtime::handle_task_hostcall(&mut child, slot as u32, tag.is_none())
+                    {
+                        break Some(STATUS_PANICKED);
+                    }
+                    if let Some(recorder) = trace.as_deref_mut() {
+                        recorder.protocol_resume(slot, child.active_reg(7), child.active_reg(8));
+                    }
+                }
+            }
+        };
+        let task_gas_used = gas_limit.saturating_sub(child.active_gas());
+        self.task_gas_used = self.task_gas_used.saturating_add(task_gas_used);
+        if let Some(status) = failure {
+            let result = Self::write_task_result(kernel, &[status])?;
+            if let Some(recorder) = trace {
+                recorder.task_end(&[status]);
+            }
+            return Ok(result);
+        }
+
+        let output_address = u32::try_from(child.active_reg(7)).map_err(|_| {
+            ServicePvmErrorV2::RefineHostRejected(crate::abi::hostcall::INVOKE as u8)
+        })?;
+        let output_len = usize::try_from(child.active_reg(8))
+            .ok()
+            .filter(|len| *len <= MAX_TASK_OUTPUT_BYTES)
+            .ok_or(ServicePvmErrorV2::RefineHostRejected(
+                crate::abi::hostcall::INVOKE as u8,
+            ))?;
+        let raw_output = child
+            .read_data_cap_window(output_address, output_len as u32)
+            .ok_or(ServicePvmErrorV2::RefineHostRejected(
+                crate::abi::hostcall::INVOKE as u8,
+            ))?;
+        let mut payload = crate::refine_payload::RefinePayload::decode(&raw_output)
+            .filter(|payload| {
+                payload.version == crate::refine_payload::REFINE_PAYLOAD_VERSION
+                    && !payload.forbidden
+            })
+            .ok_or(ServicePvmErrorV2::RefineHostRejected(
+                crate::abi::hostcall::INVOKE as u8,
+            ))?;
+        let expected = crate::refine_payload::anchor_for(Some(state));
+        if (payload.anchor_kind, payload.anchor) != expected {
+            return Self::write_task_result(kernel, &[STATUS_PANICKED]);
+        }
+        let transition_digest = tag.map(|_| payload.transition_digest());
+        let child_state = payload.take_state_write().unwrap_or_else(|| state.to_vec());
+        if !payload.effects.is_empty() {
+            // A producer-local record must not smuggle application effects
+            // around guest Accumulate. The Clerk verifier Task is pure; later
+            // effectful Task support needs an explicit typed transition.
+            return Self::write_task_result(kernel, &[STATUS_PANICKED]);
+        }
+        let status = if payload.continue_next {
+            STATUS_YIELDED
+        } else {
+            STATUS_DONE
+        };
+        let mut output = Vec::with_capacity(5 + child_state.len() + payload.reply.len());
+        output.push(status);
+        output.extend_from_slice(&(child_state.len() as u32).to_le_bytes());
+        output.extend_from_slice(&child_state);
+        output.extend_from_slice(&payload.reply);
+        if tag.is_some() && payload.continue_next {
+            return Self::write_task_result(kernel, &[STATUS_PANICKED]);
+        }
+        let result = Self::write_task_result(kernel, &output)?;
+        if result[0] != output.len() as u64 {
+            if let Some(recorder) = trace {
+                recorder.task_end(&[crate::actors::run::STATUS_TOO_BIG]);
+            }
+            return Ok(result);
+        }
+        if let Some(tag) = tag {
+            let mut io_hash = [0u8; 32];
+            for (index, register) in (9usize..13).enumerate() {
+                io_hash[index * 8..index * 8 + 8]
+                    .copy_from_slice(&child.active_reg(register).to_le_bytes());
+            }
+            let entry = crate::provable::ProofRecordEntry {
+                input: crate::provable::ProvableInput {
+                    task_hash: task.0,
+                    witness_bytes: task_input,
+                },
+                record: crate::provable::ProvableRecord {
+                    task_hash: task.0,
+                    anchor_kind: payload.anchor_kind,
+                    anchor: payload.anchor,
+                    transition_digest: transition_digest.expect("tag computes digest"),
+                    reply: payload.reply,
+                    io_hash,
+                    app_public: payload.app_public,
+                    catalog_name: alloc::string::String::new(),
+                    catalog_version: 0,
+                },
+            };
+            if !entry.record.io_consistent()
+                || self
+                    .staged_records
+                    .insert((actor, tag), entry.clone())
+                    .is_some()
+            {
+                return Err(ServicePvmErrorV2::RefineHostRejected(
+                    crate::abi::hostcall::INVOKE as u8,
+                ));
+            }
+            self.producer_records
+                .push(ProducedProvableRecordV2 { actor, tag, entry });
+            let successes = self.record_successes.entry(actor).or_default();
+            *successes = successes
+                .checked_add(1)
+                .ok_or(ServicePvmErrorV2::RefineHostRejected(
+                    crate::abi::hostcall::INVOKE as u8,
+                ))?;
+        }
+        if let Some(recorder) = trace {
+            recorder.task_end(&output);
+        }
+        Ok(result)
     }
 
     fn handle(
         &mut self,
         slot: u8,
         kernel: &mut InvocationKernel,
+        trace: Option<&mut RefineTraceRecorderV2>,
     ) -> Result<Option<[u64; 2]>, ServicePvmErrorV2> {
         match slot as u32 {
+            crate::abi::hostcall::PROVABLE_RECORD_INTENT => {
+                let actor = self
+                    .actor_for_vm(kernel.active_vm)
+                    .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                let intents = self.record_intents.entry(actor).or_default();
+                *intents = intents
+                    .checked_add(1)
+                    .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                Ok(Some([crate::abi::error::HOST_OK, 0]))
+            }
+            crate::abi::hostcall::INVOKE => {
+                if kernel.active_vm == 0 {
+                    return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                }
+                self.handle_task_invoke(kernel, trace).map(Some)
+            }
+            crate::abi::hostcall::STORAGE_R => {
+                let actor = self
+                    .actor_for_vm(kernel.active_vm)
+                    .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                let key_address = u32::try_from(kernel.active_reg(7))
+                    .map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
+                let key_len = u32::try_from(kernel.active_reg(8))
+                    .map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
+                let key = kernel
+                    .read_data_cap_window(key_address, key_len)
+                    .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                let Some(tag) = key
+                    .strip_prefix(crate::provable::PROOFREC_PREFIX)
+                    .and_then(|tag| <[u8; 32]>::try_from(tag).ok())
+                else {
+                    return Ok(Some([crate::abi::error::HOST_NONE, 0]));
+                };
+                let Some(entry) = self.staged_records.get(&(actor, tag)) else {
+                    return Ok(Some([crate::abi::error::HOST_NONE, 0]));
+                };
+                let bytes = entry.encode();
+                let output_address = u32::try_from(kernel.active_reg(9))
+                    .map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
+                let capacity = usize::try_from(kernel.active_reg(10))
+                    .map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
+                let copy_len = bytes.len().min(capacity);
+                if !kernel.write_data_cap_window(output_address, &bytes[..copy_len]) {
+                    return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                }
+                Ok(Some([bytes.len() as u64, 0]))
+            }
             crate::abi::hostcall::ACTOR_PRIVATE_FETCH => {
                 let bytes = if kernel.active_vm == 0 {
                     if !kernel.call_stack.is_empty() {
@@ -584,6 +987,20 @@ impl ActorRefineRuntimeV2 {
                 let mut output = ActorSliceOutputV2::decode(&bytes)
                     .map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
                 if output.actor != actor {
+                    return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                }
+                if self.record_intents.get(&actor).copied().unwrap_or(0) != 0
+                    || self.record_attempts.get(&actor).copied().unwrap_or(0)
+                        != self.record_successes.get(&actor).copied().unwrap_or(0)
+                    || output
+                        .writes
+                        .iter()
+                        .any(|write| write.key.starts_with(crate::provable::PROOFREC_PREFIX))
+                {
+                    // A queued TaskRecord contains its complete proving
+                    // witness. It must be consumed during this exact Refine
+                    // slice, and its record is emitted only through the
+                    // producer-local host channel above.
                     return Err(ServicePvmErrorV2::RefineHostRejected(slot));
                 }
                 self.encoded_outputs_len = self
@@ -1167,6 +1584,7 @@ impl ServicePvmV2 {
                         bytes,
                         gas_used,
                         exported_blobs: Vec::new(),
+                        producer_records: Vec::new(),
                         trace: None,
                     });
                 }
@@ -1694,7 +2112,31 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
         match result {
             KernelResult::Halt => {
                 let bytes = read_output(&kernel)?;
-                let gas_used = starting_gas.saturating_sub(kernel.active_gas());
+                let task_gas_used = actor_runtime
+                    .as_ref()
+                    .map(|runtime| runtime.task_gas_used)
+                    .unwrap_or(0);
+                let parent_gas_used = starting_gas.saturating_sub(kernel.active_gas());
+                let Some(gas_used) = parent_gas_used
+                    .checked_add(task_gas_used)
+                    .filter(|used| *used <= starting_gas)
+                else {
+                    return Err(ServicePvmErrorV2::OutOfGas {
+                        vm: kernel.active_vm,
+                        pc: kernel.vm_arena.vm(kernel.active_vm).pc,
+                    });
+                };
+                if actor_runtime.as_ref().is_some_and(|runtime| {
+                    runtime.record_intents.values().any(|intents| *intents != 0)
+                }) {
+                    return Err(ServicePvmErrorV2::RefineHostRejected(
+                        crate::abi::hostcall::PROVABLE_RECORD_INTENT as u8,
+                    ));
+                }
+                let producer_records = actor_runtime
+                    .as_mut()
+                    .map(ActorRefineRuntimeV2::take_producer_records)
+                    .unwrap_or_default();
                 let trace = trace.map(|mut recorder| {
                     recorder.output(&bytes, gas_used, &exported_blobs);
                     recorder.finish()
@@ -1703,6 +2145,7 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                     bytes,
                     gas_used,
                     exported_blobs,
+                    producer_records,
                     trace,
                 });
             }
@@ -1729,7 +2172,8 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                     recorder.protocol_call(slot, &kernel);
                 }
                 if let Some(runtime) = actor_runtime.as_mut()
-                    && let Some([result0, result1]) = runtime.handle(slot, &mut kernel)?
+                    && let Some([result0, result1]) =
+                        runtime.handle(slot, &mut kernel, trace.as_mut())?
                 {
                     kernel
                         .resume_protocol_call(result0, result1)
@@ -1844,6 +2288,9 @@ fn install_actor_scheduler_caps(kernel: &mut InvocationKernel, actor_count: usiz
         for slot in [
             crate::abi::hostcall::ACTOR_PRIVATE_FETCH as u8,
             crate::abi::hostcall::ACTOR_EFFECT_EXPORT as u8,
+            crate::abi::hostcall::STORAGE_R as u8,
+            crate::abi::hostcall::INVOKE as u8,
+            crate::abi::hostcall::PROVABLE_RECORD_INTENT as u8,
             crate::crypto::ECALL_BLAKE2B_COMPRESS as u8,
             crate::abi::hostcall::GROW_HEAP as u8,
             crate::abi::hostcall::DEBUG_WRITE as u8,
@@ -1959,6 +2406,9 @@ pub fn validate_actor_program_layout(program: &[u8]) -> Result<(), ServicePvmErr
             || cap.cap_index == super::ACTOR_NESTED_IPC_CAP_SLOT
             || cap.cap_index == crate::abi::hostcall::ACTOR_PRIVATE_FETCH as u8
             || cap.cap_index == crate::abi::hostcall::ACTOR_EFFECT_EXPORT as u8
+            || cap.cap_index == crate::abi::hostcall::STORAGE_R as u8
+            || cap.cap_index == crate::abi::hostcall::INVOKE as u8
+            || cap.cap_index == crate::abi::hostcall::PROVABLE_RECORD_INTENT as u8
     }) {
         return Err(ServicePvmErrorV2::InvalidActorCapabilityLayout);
     }

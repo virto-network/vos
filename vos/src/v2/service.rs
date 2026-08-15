@@ -251,6 +251,9 @@ pub struct RefinedServiceOutputV2 {
     pub transition: TransitionV2,
     pub gas_used: u64,
     pub exported_blobs: Vec<ImportedBlobV2>,
+    /// Producer-private records emitted by nested signed Tasks. These are
+    /// never encoded into the transition or replicated Accumulate request.
+    pub producer_records: Vec<super::ProducedProvableRecordV2>,
     pub trace: Option<RefineTraceV2>,
 }
 
@@ -954,6 +957,7 @@ fn decode_refined_service_output(
         transition: refined.transition,
         gas_used: output.gas_used,
         exported_blobs,
+        producer_records: output.producer_records,
         trace: output.trace,
     })
 }

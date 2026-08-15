@@ -54,6 +54,7 @@ build-v2-daemon-root-artifacts: build-vos-service
 build-v2-pvm-test-artifacts: build-v2-daemon-root-artifacts (build-actor "space-authority")
     cd tests/fixtures/legacy-v1/actors/greeter; cargo +nightly actor
     cd tests/fixtures/legacy-v1/actors/probe; cargo +nightly actor
+    cd tests/fixtures/legacy-v1/actors/tally; cargo +nightly actor
     cd vos/tests/fixtures/crdt-counter-v2; cargo +nightly actor
     cd vos/tests/fixtures/workflow-v2; cargo +nightly actor
     cd vos/tests/fixtures/cycle-v2; cargo +nightly actor
