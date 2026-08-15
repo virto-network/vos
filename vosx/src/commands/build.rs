@@ -185,7 +185,7 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
 }
 
 fn build_task_dependency(input: &Path) -> anyhow::Result<PackageTaskDependencyV2> {
-    let program = resolve_program_input(input)?;
+    let program = resolve_task_input(input)?;
     if program.extension().and_then(|extension| extension.to_str()) == Some("pvm") {
         bail!(
             "{} is a PVM without authenticated witness-layout metadata; pass the canonical Task ELF or project directory",
@@ -223,6 +223,103 @@ fn build_task_dependency(input: &Path) -> anyhow::Result<PackageTaskDependencyV2
         },
         pvm,
     })
+}
+
+/// Resolve a Task input without routing it through the actor-only
+/// `cargo actor` subcommand. Tasks are ordinary binary crates for the pinned
+/// PVM target, so Cargo's JSON artifact stream is the authority for the ELF
+/// location (including custom target-directory configuration).
+fn resolve_task_input(input: &Path) -> anyhow::Result<PathBuf> {
+    if !input.is_dir() {
+        return Ok(input.to_path_buf());
+    }
+    let project = std::fs::canonicalize(input)
+        .with_context(|| format!("resolve Task project {}", input.display()))?;
+    let manifest_path = project.join("Cargo.toml");
+    if !manifest_path.is_file() {
+        bail!("Task project {} has no Cargo.toml", project.display());
+    }
+    let build_root = std::fs::canonicalize(actor_build_root(&project)?)
+        .with_context(|| format!("resolve Task build root for {}", input.display()))?;
+    let output = Command::new("cargo")
+        .args([
+            "+nightly",
+            "build",
+            "--release",
+            "--message-format=json-render-diagnostics",
+            "--manifest-path",
+        ])
+        .arg(&manifest_path)
+        .current_dir(&build_root)
+        .output()
+        .with_context(|| format!("run `cargo +nightly build` in {}", build_root.display()))?;
+    if !output.status.success() {
+        bail!(
+            "Task build failed in {} with status {}:\n{}",
+            input.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let mut artifacts = Vec::new();
+    for line in output.stdout.split(|byte| *byte == b'\n') {
+        let Ok(message) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if message.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-artifact") {
+            continue;
+        }
+        let Some(artifact_manifest) = message
+            .get("manifest_path")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+        else {
+            continue;
+        };
+        if std::fs::canonicalize(&artifact_manifest).ok() != Some(manifest_path.clone()) {
+            continue;
+        }
+        let is_binary = message
+            .get("target")
+            .and_then(|target| target.get("kind"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|kinds| kinds.iter().any(|kind| kind.as_str() == Some("bin")));
+        if !is_binary {
+            continue;
+        }
+        let elf = message
+            .get("executable")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+            .filter(|path| path.extension().and_then(OsStr::to_str) == Some("elf"))
+            .or_else(|| {
+                message
+                    .get("filenames")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(PathBuf::from)
+                    .find(|path| path.extension().and_then(OsStr::to_str) == Some("elf"))
+            });
+        if let Some(elf) = elf {
+            artifacts.push(elf);
+        }
+    }
+    artifacts.sort();
+    artifacts.dedup();
+    match artifacts.as_slice() {
+        [elf] if elf.is_file() => Ok(elf.clone()),
+        [] => bail!(
+            "Task build succeeded but Cargo reported no binary ELF for {}; ensure the Task is a binary crate using the VOS PVM target",
+            manifest_path.display()
+        ),
+        _ => bail!(
+            "Task project {} produced multiple binary ELFs; pass one ELF explicitly",
+            project.display()
+        ),
+    }
 }
 
 fn resolve_program_input(input: &Path) -> anyhow::Result<PathBuf> {

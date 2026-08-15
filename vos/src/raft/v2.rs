@@ -29,6 +29,18 @@ use super::strategy::RaftConfig;
 #[cfg(feature = "network")]
 use super::worker::{ProposeError, RaftWorker, ReadIndexError, WorkerHandle};
 
+/// Encoded bytes outside one data payload in a one-entry
+/// `Frame::RaftAppendReq`: frame tag, Raft header, entry count, entry term,
+/// kind tag, and payload length.
+const RAFT_APPEND_SINGLE_DATA_ENTRY_OVERHEAD: usize = 84;
+/// The network codec's hard frame ceiling. Keep the storage-only root config
+/// able to reject an untransportable install even when `network` is not part
+/// of that particular build.
+const RAFT_NETWORK_FRAME_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+#[cfg(feature = "network")]
+const _: () = assert!(RAFT_NETWORK_FRAME_MAX_BYTES == crate::network::MAX_FRAME_BYTES);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RaftAccumulatePayloadV2 {
     request: Vec<u8>,
@@ -78,6 +90,31 @@ impl RaftAccumulatePayloadV2 {
             receipt_verifications: receipt_verifications.to_vec(),
         })
     }
+}
+
+/// Whether one canonical replicated request fits as the sole data entry in a
+/// network AppendEntries frame. Root genesis carries every signed program in
+/// one entry, so an oversized package must be refused before a worker can
+/// propose an entry that no follower can receive.
+pub(crate) fn accumulate_entry_fits_network_frame(
+    request: &AccumulateRequestV2,
+    logical_timeslot: Option<u64>,
+    programs: &[ImportedProgramV2],
+    blobs: &[ImportedBlobV2],
+    receipt_verifications: &[ReceiptVerificationRequestV2],
+) -> Result<bool, CommitError> {
+    let payload = RaftAccumulatePayloadV2::from_request(
+        &request.encode(),
+        logical_timeslot,
+        programs,
+        blobs,
+        receipt_verifications,
+    )?
+    .encode();
+    Ok(payload
+        .len()
+        .checked_add(RAFT_APPEND_SINGLE_DATA_ENTRY_OVERHEAD)
+        .is_some_and(|frame_len| frame_len <= RAFT_NETWORK_FRAME_MAX_BYTES))
 }
 
 impl V2Wire for RaftAccumulatePayloadV2 {

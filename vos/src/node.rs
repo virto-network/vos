@@ -4231,6 +4231,15 @@ impl VosNode {
             + Send
             + 'static,
     {
+        // Refuse packages whose canonical Install entry cannot cross the
+        // Raft network boundary before reserving a handler or spawning a
+        // worker. `open_raft` repeats this validation at its own trust
+        // boundary, but that is intentionally later than replica startup.
+        config.validate().map_err(|error| {
+            V2RaftNodeRegistrationError::Open(crate::v2::LocalRootTreeOpenErrorV2::InvalidConfig(
+                error,
+            ))
+        })?;
         let replication_id = raft_config.replication_id;
         let network = self
             .shared_network

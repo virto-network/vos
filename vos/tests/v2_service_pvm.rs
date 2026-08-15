@@ -30,18 +30,18 @@ use vos::v2::{
     ExternalActorBindingV2, GasAccountingV2, GasScheduleV2, Hash, ImportedActorV2, ImportedBlobV2,
     ImportedProgramV2, InboxDrainOutcomeV2, InvocationId, JamServiceV2, LocalJamStoreHostV2,
     LocalJamStoreSnapshotV2, LocalJamStoreV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2,
-    LocalRootTreeInvokeErrorV2, LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2,
-    LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
-    PackageManifestV2, PackageRolePoliciesV2, PackageTaskDependencyV2, ProducerId, ProgramId,
-    ProofArtifactStoreV2, ProofVerificationRequestV2, PublishedEffectsV2,
-    ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2,
-    ReplicatedServiceErrorV2, ReplyRecordV2, RoleAuthorityBindingV2,
-    RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2, RoleAuthorizationClaimV2,
-    RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId, RootTreeAttestedResultV2,
-    RootTreeInvocationV2, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2,
-    ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId, SystemCapabilityId,
-    TaskDependencyV2, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2, WorkflowOperationV2,
-    artifact_hash, public_policy_hash, space_role_policy_hash,
+    LocalRootTreeInvokeErrorV2, LocalRootTreeOpenErrorV2, LocalRootTreeServiceV2, LocalTransportV2,
+    LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
+    NoRefineProtocolHostV2, Origin, PackageManifestV2, PackageRolePoliciesV2,
+    PackageTaskDependencyV2, ProducerId, ProgramId, ProofArtifactStoreV2,
+    ProofVerificationRequestV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2,
+    RefineOutputV2, ReplicatedJamServiceV2, ReplicatedServiceErrorV2, ReplyRecordV2,
+    RoleAuthorityBindingV2, RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2,
+    RoleAuthorizationClaimV2, RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId,
+    RootTreeAttestedResultV2, RootTreeInvocationV2, ScheduleErrorV2, ServiceDispatchError,
+    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId,
+    SystemCapabilityId, TaskDependencyV2, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2,
+    WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     Decode, Encode,
@@ -1298,10 +1298,54 @@ fn raft_attested_root_orders_only_the_final_proved_apply() {
 
 #[test]
 fn signed_task_dependencies_install_and_survive_durable_reopen() {
+    let task_pvm = grey_transpiler::assembler::Assembler::new().build();
+    let (config, binding) =
+        signed_task_dependency_config(task_pvm.clone(), ConsistencyModeV2::Local);
+    let service = LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
+        .expect("install root and its signed Task program");
+    assert_eq!(
+        service.store().program(binding.program),
+        Some(task_pvm.as_slice())
+    );
+
+    let backend = service.into_backend();
+    let reopened = LocalRootTreeServiceV2::open(config.clone(), backend)
+        .expect("reopen from the committed service image");
+    assert_eq!(
+        reopened.store().program(binding.program),
+        Some(task_pvm.as_slice())
+    );
+
+    let mut backend = reopened.into_backend();
+    let image = backend.image.take().expect("committed service image");
+    let missing_dependency = snapshot_without_program(&image, binding.program);
+    LocalJamStoreSnapshotV2::decode(&missing_dependency)
+        .expect("the dependency-free snapshot remains canonically encoded");
+    backend.image = Some(missing_dependency);
+    assert!(matches!(
+        LocalRootTreeServiceV2::open(config, backend),
+        Err(LocalRootTreeOpenErrorV2::MissingInstalledProgram(program))
+            if program == binding.program
+    ));
+}
+
+#[test]
+fn raft_root_rejects_an_install_entry_above_the_network_frame_cap() {
+    let task_pvm = vec![0xa5; vos::network::MAX_FRAME_BYTES];
+    let (config, _) = signed_task_dependency_config(task_pvm, ConsistencyModeV2::Raft);
+    assert_eq!(
+        config.validate(),
+        Err(LocalRootTreeConfigErrorV2::RaftInstallEntryTooLarge)
+    );
+}
+
+fn signed_task_dependency_config(
+    task_pvm: Vec<u8>,
+    consistency: ConsistencyModeV2,
+) -> (LocalRootTreeConfigV2, TaskDependencyV2) {
     let actor_elf = greeter_elf();
     let signer = libp2p::identity::Keypair::generate_ed25519();
     let (mut package, actor_name) = signed_test_package(&actor_elf, &signer);
-    let task_pvm = grey_transpiler::assembler::Assembler::new().build();
     let binding = TaskDependencyV2 {
         task: Hash(vos::provable::task_blob_hash(&task_pvm)),
         program: ProgramId::of_pvm(&task_pvm),
@@ -1338,7 +1382,7 @@ fn signed_task_dependencies_install_and_survive_durable_reopen() {
         package,
         root_actor: ActorId([123; 32]),
         actor_name,
-        consistency: ConsistencyModeV2::Local,
+        consistency,
         initial_state: vec![],
         external_actors: vec![],
         install_authorization: AuthorizationEvidenceV2::SystemCapability {
@@ -1348,20 +1392,51 @@ fn signed_task_dependencies_install_and_survive_durable_reopen() {
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
-    let service = LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
-        .expect("install root and its signed Task program");
-    assert_eq!(
-        service.store().program(binding.program),
-        Some(task_pvm.as_slice())
-    );
+    (config, binding)
+}
 
-    let backend = service.into_backend();
-    let reopened = LocalRootTreeServiceV2::open(config, backend)
-        .expect("reopen from the committed service image");
-    assert_eq!(
-        reopened.store().program(binding.program),
-        Some(task_pvm.as_slice())
-    );
+fn snapshot_without_program(snapshot: &[u8], removed: ProgramId) -> Vec<u8> {
+    fn u32_at(bytes: &[u8], position: &mut usize) -> u32 {
+        let value = u32::from_le_bytes(bytes[*position..*position + 4].try_into().unwrap());
+        *position += 4;
+        value
+    }
+
+    fn skip_bytes(bytes: &[u8], position: &mut usize) {
+        let len = u32_at(bytes, position) as usize;
+        *position += len;
+    }
+
+    let mut position = 4 + 2 + 8;
+    let rows = u32_at(snapshot, &mut position);
+    for _ in 0..rows {
+        skip_bytes(snapshot, &mut position);
+        skip_bytes(snapshot, &mut position);
+    }
+    let blobs = u32_at(snapshot, &mut position);
+    for _ in 0..blobs {
+        position += 32;
+        skip_bytes(snapshot, &mut position);
+    }
+    let program_count_offset = position;
+    let programs = u32_at(snapshot, &mut position);
+    let mut encoded = snapshot[..program_count_offset].to_vec();
+    encoded.extend_from_slice(&(programs - 1).to_le_bytes());
+    let mut found = false;
+    for _ in 0..programs {
+        let entry_start = position;
+        let program = ProgramId(snapshot[position..position + 32].try_into().unwrap());
+        position += 32;
+        skip_bytes(snapshot, &mut position);
+        if program == removed {
+            found = true;
+        } else {
+            encoded.extend_from_slice(&snapshot[entry_start..position]);
+        }
+    }
+    assert!(found, "snapshot contains the Task dependency program");
+    encoded.extend_from_slice(&snapshot[position..]);
+    encoded
 }
 
 #[test]

@@ -996,7 +996,11 @@ images whose retained role-policy artifact predates those bindings rather than
 silently treating an actor as dependency-free. Execution semantics v13 makes
 the package-carried Task PVM and witness-window contract part of service
 identity; a v12 root cannot be reopened or replicated under the new import
-rules.
+rules. Task project inputs are ordinary Cargo binary targets (resolved from
+Cargo's JSON artifact stream), not actor-library builds. Reopen verifies every
+retained dependency against the durable program catalog, and Raft roots reject
+an installation whose complete one-entry availability payload cannot fit the
+network frame ceiling.
 These versions also add exact actor-package
 identity to descriptors, work, checkpoints, transitions, upgrades, and
 cross-root proof bindings, bind durable messages and retained causal context to

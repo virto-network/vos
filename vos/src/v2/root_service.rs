@@ -526,6 +526,7 @@ pub enum LocalRootTreeConfigErrorV2 {
     InvalidConsistency,
     InvalidRoleAuthority,
     ReplicationDriverRequired,
+    RaftInstallEntryTooLarge,
     ZeroGas,
 }
 
@@ -1036,6 +1037,33 @@ fn verify_package_signature(package: &VosPackageV2) -> Result<(), LocalRootTreeC
     .ok_or(LocalRootTreeConfigErrorV2::InvalidPackageSignature)
 }
 
+fn installation_availability(
+    config: &LocalRootTreeConfigV2,
+    descriptor: &ActorGenesisV2,
+) -> (Vec<ImportedProgramV2>, Vec<ImportedBlobV2>) {
+    let mut programs = vec![ImportedProgramV2 {
+        program: descriptor.program,
+        pvm: config.package.actor_pvm.clone(),
+    }];
+    programs.extend(
+        config
+            .package
+            .task_dependencies
+            .iter()
+            .map(|dependency| ImportedProgramV2 {
+                program: dependency.binding.program,
+                pvm: dependency.pvm.clone(),
+            }),
+    );
+    programs.sort_by_key(|program| program.program);
+    programs.dedup_by_key(|program| program.program);
+    let blobs = vec![ImportedBlobV2 {
+        reference: descriptor.initial_state.clone(),
+        bytes: config.initial_state.clone(),
+    }];
+    (programs, blobs)
+}
+
 impl LocalRootTreeConfigV2 {
     fn installation(
         &self,
@@ -1109,6 +1137,22 @@ impl LocalRootTreeConfigV2 {
         };
         ServiceGenesisV2::decode(&genesis.encode())
             .map_err(|_| LocalRootTreeConfigErrorV2::InvalidGenesis)?;
+        #[cfg(feature = "storage")]
+        if self.consistency == ConsistencyModeV2::Raft {
+            let request = AccumulateRequestV2::Install(genesis.clone());
+            let (programs, blobs) = installation_availability(self, &descriptor);
+            if !crate::raft::v2::accumulate_entry_fits_network_frame(
+                &request,
+                None,
+                &programs,
+                &blobs,
+                &[],
+            )
+            .map_err(|_| LocalRootTreeConfigErrorV2::InvalidGenesis)?
+            {
+                return Err(LocalRootTreeConfigErrorV2::RaftInstallEntryTooLarge);
+            }
+        }
         Ok((descriptor, genesis))
     }
 
@@ -1413,22 +1457,7 @@ where
             .installation()
             .map_err(LocalRootTreeOpenErrorV2::InvalidConfig)?;
         let install_request = AccumulateRequestV2::Install(genesis.clone());
-        let mut install_programs = vec![ImportedProgramV2 {
-            program: expected_root.program,
-            pvm: config.package.actor_pvm.clone(),
-        }];
-        install_programs.extend(config.package.task_dependencies.iter().map(|dependency| {
-            ImportedProgramV2 {
-                program: dependency.binding.program,
-                pvm: dependency.pvm.clone(),
-            }
-        }));
-        install_programs.sort_by_key(|program| program.program);
-        install_programs.dedup_by_key(|program| program.program);
-        let install_blobs = vec![ImportedBlobV2 {
-            reference: expected_root.initial_state.clone(),
-            bytes: config.initial_state.clone(),
-        }];
+        let (install_programs, install_blobs) = installation_availability(&config, &expected_root);
         super::CommittedAccumulateEntryV2::validate_availability(
             &install_request,
             &install_programs,
@@ -1859,13 +1888,28 @@ where
             .map(|bytes| RoleAuthorityBindingV2::decode(&bytes))
             .transpose()
             .map_err(|_| LocalRootTreeInvokeErrorV2::ExistingActorMismatch)?;
-        if descriptor.as_ref() != Some(&self.expected_root)
+        let descriptor = descriptor.ok_or(LocalRootTreeInvokeErrorV2::ExistingActorMismatch)?;
+        if descriptor != self.expected_root
             || external.as_ref().is_none_or(|directory| {
                 directory.actors.as_slice() != self.expected_external_actors.as_slice()
             })
             || role_authority != self.expected_role_authority
         {
             return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
+        }
+        let policies = PackageRolePoliciesV2::decode(&descriptor.role_policies)
+            .map_err(|_| LocalRootTreeInvokeErrorV2::ExistingActorMismatch)?;
+        for dependency in policies.task_dependencies {
+            if self
+                .service
+                .accumulate_host()
+                .program(dependency.program)
+                .is_none()
+            {
+                return Err(LocalRootTreeInvokeErrorV2::MissingInstalledProgram(
+                    dependency.program,
+                ));
+            }
         }
         Ok(true)
     }
