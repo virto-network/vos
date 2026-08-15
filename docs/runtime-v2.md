@@ -877,8 +877,15 @@ to one sorted, bounded signed artifact. Installation imports those PVM bytes
 into the recoverable program catalog and retains the compact bindings in the
 actor descriptor; every scheduled work envelope and Refine import is checked
 against that guest-owned map. A bare Task `.pvm` is refused because it cannot
-authenticate its witness layout. Service-v2 actor INVOKE remains unavailable
-until nested Task execution is incorporated into the exact Refine proof trace.
+authenticate its witness layout. Service-v2 installs actor INVOKE only for
+those signed dependencies. It runs each Task in an isolated witness-delivered
+kernel and folds its exact instructions, pure protocol boundaries, input
+commitment, and output into the enclosing Refine trace. Record-enabled Tasks
+must complete in the same slice; their secret `ProofRecordEntry` is committed
+to the producing host's private sidecar before any transition proposal and is
+never included in service state or replication. Named actor-row witnesses and
+Task effects remain fail-closed pending an authenticated typed import/effect
+contract.
 
 `space up --service-pvm <exact-vos-service.pvm>` recognizes signed `.vos`
 catalog artifacts and opens each ordinary Local or Raft deployment as one
@@ -897,9 +904,9 @@ Restarting the same installation reopens its exact image; uninstalling and
 reinstalling under the required fresh replication id creates a fresh actor and
 deduplication domain. Its Raft database is keyed by that root-service identity
 too, so a reinstall cannot inherit terms, logs, cursors, or voters from the
-retired incarnation. On the next boot, images, proof side-CAS directories, and
-Raft databases whose incarnation is no longer present move to recoverable
-trash.
+retired incarnation. On the next boot, images, proof side-CAS directories,
+producer-private Task-record directories, and Raft databases whose incarnation
+is no longer present move to recoverable trash.
 
 A joining v2 Raft root starts its worker, registers the inbound Raft handler,
 opens its durable service, and validates its still-unpublished route before it
@@ -996,7 +1003,10 @@ images whose retained role-policy artifact predates those bindings rather than
 silently treating an actor as dependency-free. Execution semantics v13 makes
 the package-carried Task PVM and witness-window contract part of service
 identity; a v12 root cannot be reopened or replicated under the new import
-rules. Task project inputs are ordinary Cargo binary targets (resolved from
+rules. Execution semantics v14 additionally binds package-authorized nested
+Task execution and its begin/end trace records; a v13 root cannot be reopened
+under a host that interprets INVOKE using the new contract. Task project
+inputs are ordinary Cargo binary targets (resolved from
 Cargo's JSON artifact stream), not actor-library builds. Reopen verifies every
 retained dependency against the durable program catalog, and Raft roots reject
 an installation whose complete availability entry cannot fit one network

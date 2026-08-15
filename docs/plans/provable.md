@@ -1,7 +1,8 @@
 # `#[provable]` — proofs of actor transitions
 
-Status: **W1–W4 and the Local parent-side Clerk delegation are implemented;
-replicated production wiring remains**.
+Status: **W1–W4, the parent-side Clerk delegation, signed service-v2 Task
+execution, and producer-local durable record storage are implemented; Clerk
+catalog/node cutover remains**.
 The first draft
 tried to make a provable Task re-anchor its invoking parent's committed
 `0x02` composite and verify committed reads in-circuit against it. A
@@ -80,10 +81,11 @@ Landed and gated; `#[provable]` composes it.
   roots; `state_root` reads them O(1). The *app* reads these roots
   (`CommittedMap::root()`) to name `root_before`/`root_after` — no
   framework anchor reinterpretation.
-- **Replay safety** (A10): ordinary Task invoke effects re-absorb on
-  replay. Provable record capture is Local-only until a producer-local
-  durable secret sidecar exists; replicated recording/replay rejects the
-  record flag before Task execution.
+- **Replay safety** (A10): ordinary legacy Task invoke effects re-absorb on
+  replay. Legacy replicated recording rejects private record capture.
+  Service-v2 runs only signed package dependencies inside exact Refine and
+  persists completed records to a producer-local sidecar before proposing the
+  public transition; followers replay no witness bytes.
 - **Pinning + proving** (B1/B3/B8): `ProvableCatalog` / `vosx zk pin`;
   the prover extension's prove/verify + async job queue.
 
@@ -201,15 +203,15 @@ them and made records droppable — both wrong.
   invoke cleanly instead of misparsing the length (the wire-compat
   fix). The host persists `ProvableInput` + `ProvableRecord` keyed by
   `(svc, tag)` into the agent's own storage under a reserved
-  `__vos_proofrec/` prefix — so they survive a Local producer restart.
-  CRDT/Raft capture is rejected at queue time, before the secret enters the
-  parent's serialized task table: those strategies
-  replicate effect logs, and putting `ProvableInput` into an invoke
-  effect would disclose the exact secret witness. A future replicated
-  producer needs a producer-local durable sidecar, not replicated actor
-  state. A record-enabled Task must complete in one invoke and its complete
-  output must fit the caller buffer; yield or oversized output captures no
-  record or child effects. The parent reads the staged record before its own
+  `__vos_proofrec/` prefix for the legacy Local runtime. Service-v2 instead
+  keys an operator-private durable sidecar by `(ActorId, tag)`. The actor can
+  read the invocation-local staged record before returning, but record bytes
+  never enter its state, the service image, a Raft entry, or a CRDT envelope.
+  The sidecar must commit before the corresponding transition proposal;
+  failure leaves the admitted input retryable. A record-enabled Task must
+  complete in one invoke and its complete output must fit the caller buffer;
+  queue-without-drive, failure, yield, or oversized output rejects the whole
+  service-v2 slice. The parent reads the staged record before its own
   mutation and checks the selected Task, exact reply wire, and `app_public`
   rather than trusting the reply as a proxy for the proof statement. Records
   export through the canonical `proof_record(tag)` ABI used by
@@ -402,8 +404,11 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
   Task ELF. The sorted, bounded artifact is signed in `.vos`, retained as a
   compact guest-owned actor policy binding, installed in the recoverable
   program catalog, and imported by exact identity on every slice. Actor-side
-  INVOKE remains fail-closed in service v2 until nested Task execution is
-  included in the exact Refine trace rather than treated as a host oracle.
+  INVOKE is installed only for package-bound Task identities. The Task runs in
+  an isolated witness-delivered kernel; its instructions, pure hostcalls,
+  input commitment, and exact output are folded into Refine trace semantics
+  v14. Named parent-row imports and effectful Tasks remain fail-closed until
+  they receive an authenticated typed transition contract.
 
 - **Precompile safety boundary.** `handle_precompile_ecall` can accelerate
   non-recorded Task and Refine execution, with Refine preserving phi[7]/phi[8]
@@ -429,14 +434,14 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
   longer rely on the unconstrained curve/scalar ECALL outputs. Re-enabling
   `pvm-precompile` remains forbidden until that arithmetic is constrained in
   the AIR.
-- *Replicated clerk-ledger production cutover.* The money-path actor is Raft,
-  while producer-private record capture is intentionally Local-only. Before
-  replacing `apply_transfer`, land (1) a producer-local durable Raft record
-  sidecar that never enters replicated actor state/effect logs. Signed
-  canonical package carriage and installation of content-addressed Task
-  dependencies is complete; after the sidecar lands, bind nested Task
-  execution into the exact Refine trace, exercise leadership transfer/restart,
-  and switch the Raft handler to the now-proven parent seam.
+- *Replicated clerk-ledger production cutover.* The generic Raft foundation is
+  now present: signed Task execution is exact-traced and the producing
+  operator durably stores the private record before proposal, with restart,
+  backend-parity, and no-Raft-bytes gates. The remaining slice is application
+  wiring: install Clerk as a v2 root, expose authenticated operator retrieval
+  and pruning of its host sidecar, exercise producer leadership transfer, and
+  switch the public money-path handler from `apply_transfer` to the proven
+  parent seam.
 - *Generated parent glue.* D6's manual Clerk implementation establishes the
   contract; a later macro may generate the touched-leaf/proof/invoke/apply
   boilerplate for other actors without changing its trust model.

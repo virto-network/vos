@@ -329,13 +329,14 @@ impl Tasks {
 
 /// The secret message enters `TaskRecord` at queue time, which can precede
 /// the first drive pass by arbitrarily many committed dispatches. Ask the host
-/// to approve producer-local storage before constructing that record. On a
-/// replicated parent the host marks the complete dispatch uncommittable and
-/// this panic prevents the handler from proceeding as though it queued work.
+/// to approve producer-local storage before constructing that record. Legacy
+/// replicated parents reject it; service-v2 accepts only when the Task is
+/// driven successfully in this exact Refine slice and the producer-private
+/// sidecar is durable before the transition can be proposed.
 #[cfg(all(feature = "pvm", target_arch = "riscv64"))]
 fn require_local_provable_recording() {
     if crate::abi::pvm::hostcalls::provable_record_intent() != crate::abi::error::HOST_OK {
-        panic!("provable Task records require a Local parent");
+        panic!("provable Task records require a producer-private host");
     }
 }
 
