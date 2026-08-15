@@ -1763,6 +1763,109 @@ fn install_snapshot_chunked_rejects_oversized_buffer() {
     worker.shutdown();
 }
 
+/// The follower's acknowledged byte count is authoritative. If it reports
+/// zero after losing its volatile partial buffer, the leader must rewind its
+/// per-peer cursor instead of retaining the previous offset with `max`.
+#[test]
+fn snapshot_sender_rewinds_after_follower_loses_partial_buffer() {
+    struct RewindTransport {
+        install_offsets: Mutex<Vec<u64>>,
+    }
+
+    impl Transport<u16> for RewindTransport {
+        type Error = core::convert::Infallible;
+
+        async fn send_append(
+            &self,
+            _peer: u16,
+            req: AppendEntriesReq<u16>,
+        ) -> Result<AppendEntriesResp, Self::Error> {
+            Ok(AppendEntriesResp {
+                term: req.term,
+                success: false,
+                match_index: 0,
+            })
+        }
+
+        async fn send_vote(
+            &self,
+            _peer: u16,
+            req: RequestVoteReq<u16>,
+        ) -> Result<RequestVoteResp, Self::Error> {
+            Ok(RequestVoteResp {
+                term: req.term,
+                vote_granted: true,
+            })
+        }
+
+        async fn send_install(
+            &self,
+            _peer: u16,
+            req: InstallSnapshotReq<u16>,
+        ) -> Result<InstallSnapshotResp, Self::Error> {
+            let mut offsets = self.install_offsets.lock().unwrap();
+            let attempt = offsets.len();
+            offsets.push(req.offset);
+            let chunk_end = req.offset + req.data.len() as u64;
+            Ok(InstallSnapshotResp {
+                term: req.term,
+                // The first chunk lands. The follower then restarts before
+                // the final chunk and asks the leader to restart at zero.
+                bytes_received: if attempt == 1 { 0 } else { chunk_end },
+            })
+        }
+    }
+
+    let transport = Arc::new(RewindTransport {
+        install_offsets: Mutex::new(Vec::new()),
+    });
+    let mut config = cfg(1, vec![1, 2]);
+    config.pre_vote = false;
+    config.election_timeout_ms = (80, 120);
+    config.heartbeat_interval_ms = 10;
+    config.install_snapshot_chunk_bytes = 8;
+    let worker = Worker::spawn_with(
+        MemStorage::<u16>::new(),
+        transport.clone(),
+        config,
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    let handle = worker.handler();
+
+    // Seed state that is already compacted, so the next elected leader must
+    // use InstallSnapshot once its follower rejects the no-op tail.
+    let installed = block_on(handle.handle_inbound_install(
+        9,
+        InstallSnapshotReq {
+            leader: 9,
+            term: 1,
+            last_included_index: 10,
+            last_included_term: 1,
+            offset: 0,
+            done: true,
+            data: vec![0xA5; 16],
+            members: vec![1, 2],
+            joint_old: None,
+        },
+    ));
+    assert_eq!(installed.bytes_received, 16);
+
+    wait_until(
+        || transport.install_offsets.lock().unwrap().len() >= 3,
+        Duration::from_secs(3),
+        "leader retries snapshot from zero after follower restart",
+    );
+    let offsets = transport.install_offsets.lock().unwrap().clone();
+    assert_eq!(
+        &offsets[..3],
+        &[0, 8, 0],
+        "receiver rewind must replace, not max-clamp, the sender cursor",
+    );
+    worker.shutdown();
+}
+
 fn alloc_members(m: &[u16]) -> Vec<u16> {
     m.to_vec()
 }

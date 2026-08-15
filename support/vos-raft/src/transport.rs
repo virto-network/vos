@@ -86,10 +86,9 @@ pub trait Transport<N: NodeId>: Send + Sync + 'static {
         }
     }
 
-    /// Send `InstallSnapshot` to `peer`. Snapshot bytes are
-    /// inside `req.snapshot`; the transport may chunk them as
-    /// it sees fit, but the future resolves once the peer has
-    /// applied the *whole* snapshot.
+    /// Send one `InstallSnapshot` chunk to `peer`. The response reports the
+    /// follower's authoritative assembled-byte count; the worker sequences
+    /// chunks and treats the final acknowledged chunk as completion.
     fn send_install(
         &self,
         peer: N,

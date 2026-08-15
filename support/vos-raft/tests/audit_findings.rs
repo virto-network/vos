@@ -56,6 +56,10 @@ impl SharedStorage {
     fn read_log_entries(&self) -> BTreeMap<u64, LogEntry<u16>> {
         self.inner.lock().unwrap().log.clone()
     }
+
+    fn read_meta(&self) -> Meta<u16> {
+        self.inner.lock().unwrap().meta.clone()
+    }
 }
 
 impl Storage<u16> for SharedStorage {
@@ -171,6 +175,190 @@ impl Transport<u16> for NoopT {
     ) -> Result<vos_raft::InstallSnapshotResp, NoopE> {
         Err(NoopE)
     }
+}
+
+fn snapshot_test_config(me: u16) -> vos_raft::Config<u16> {
+    let mut config = vos_raft::Config::new(me, vec![me, 9], [0u8; 32]);
+    config.election_timeout_ms = (60_000, 120_000);
+    config.heartbeat_interval_ms = 30_000;
+    config.pre_vote = false;
+    config
+}
+
+/// A higher-term non-final InstallSnapshot chunk is an acknowledgement to the
+/// sender and therefore must persist `current_term` before replying. Restart
+/// must recover that term and the cleared vote even though no snapshot state
+/// was committed yet.
+#[test]
+fn partial_snapshot_chunk_persists_higher_term_before_acknowledgement() {
+    let storage = SharedStorage::new();
+    storage.with_inner(|inner| {
+        inner.meta.current_term = 3;
+        inner.meta.voted_for = Some(7);
+    });
+
+    let worker = Worker::spawn_with(
+        storage.clone(),
+        Arc::new(NoopT),
+        snapshot_test_config(1),
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    worker.wait_init().expect("first worker initializes");
+    let response = block_on(worker.handler().handle_inbound_install(
+        9,
+        InstallSnapshotReq {
+            leader: 9,
+            term: 7,
+            last_included_index: 20,
+            last_included_term: 6,
+            offset: 0,
+            done: false,
+            data: vec![0xA5; 8],
+            members: Vec::new(),
+            joint_old: None,
+        },
+    ));
+    assert_eq!(response.term, 7);
+    assert_eq!(response.bytes_received, 8);
+    worker.shutdown();
+
+    let persisted = storage.read_meta();
+    assert_eq!(persisted.current_term, 7);
+    assert_eq!(persisted.voted_for, None);
+
+    let reopened = Worker::spawn_with(
+        storage,
+        Arc::new(NoopT),
+        snapshot_test_config(1),
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    reopened.wait_init().expect("reopened worker initializes");
+    assert_eq!(
+        block_on(reopened.handler().snapshot())
+            .unwrap()
+            .current_term,
+        7
+    );
+    reopened.shutdown();
+}
+
+/// Losing the response to the final chunk must not strand the leader. An
+/// exact retry of a snapshot already installed returns the end offset of that
+/// retried chunk, allowing the leader to mark the install complete.
+#[test]
+fn installed_snapshot_retry_recovers_a_lost_final_response() {
+    let storage = SharedStorage::new();
+    let worker = Worker::spawn_with(
+        storage,
+        Arc::new(NoopT),
+        snapshot_test_config(1),
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    worker.wait_init().expect("worker initializes");
+    let request = || InstallSnapshotReq {
+        leader: 9,
+        term: 4,
+        last_included_index: 20,
+        last_included_term: 3,
+        offset: 8,
+        done: true,
+        data: vec![0x5A; 8],
+        members: vec![1, 9],
+        joint_old: None,
+    };
+
+    // Model the earlier chunk without retaining a transport response.
+    let first = block_on(worker.handler().handle_inbound_install(
+        9,
+        InstallSnapshotReq {
+            done: false,
+            offset: 0,
+            data: vec![0xA5; 8],
+            members: Vec::new(),
+            ..request()
+        },
+    ));
+    assert_eq!(first.bytes_received, 8);
+    let lost = block_on(worker.handler().handle_inbound_install(9, request()));
+    assert_eq!(lost.bytes_received, 16);
+
+    // The response above is deliberately ignored by the modeled leader. Its
+    // exact retry reaches the already-installed branch.
+    let recovered = block_on(worker.handler().handle_inbound_install(9, request()));
+    assert_eq!(recovered.term, 4);
+    assert_eq!(recovered.bytes_received, 16);
+    worker.shutdown();
+}
+
+/// Partial snapshot bytes are intentionally volatile. After a follower
+/// restart, a later-offset chunk must report zero so the leader rewinds and
+/// restarts the stream from the beginning.
+#[test]
+fn snapshot_stream_requests_rewind_after_midstream_restart() {
+    let storage = SharedStorage::new();
+    let worker = Worker::spawn_with(
+        storage.clone(),
+        Arc::new(NoopT),
+        snapshot_test_config(1),
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    worker.wait_init().expect("first worker initializes");
+    let first = block_on(worker.handler().handle_inbound_install(
+        9,
+        InstallSnapshotReq {
+            leader: 9,
+            term: 4,
+            last_included_index: 20,
+            last_included_term: 3,
+            offset: 0,
+            done: false,
+            data: vec![0xA5; 8],
+            members: Vec::new(),
+            joint_old: None,
+        },
+    ));
+    assert_eq!(first.bytes_received, 8);
+    worker.shutdown();
+
+    let reopened = Worker::spawn_with(
+        storage,
+        Arc::new(NoopT),
+        snapshot_test_config(1),
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    reopened.wait_init().expect("reopened worker initializes");
+    let rewind = block_on(reopened.handler().handle_inbound_install(
+        9,
+        InstallSnapshotReq {
+            leader: 9,
+            term: 4,
+            last_included_index: 20,
+            last_included_term: 3,
+            offset: 8,
+            done: true,
+            data: vec![0x5A; 8],
+            members: vec![1, 9],
+            joint_old: None,
+        },
+    ));
+    assert_eq!(rewind.bytes_received, 0);
+    assert_eq!(
+        block_on(reopened.handler().snapshot())
+            .unwrap()
+            .snap_last_index,
+        0
+    );
+    reopened.shutdown();
 }
 
 // ── Audit Finding #1: persisted active_config goes stale ──────

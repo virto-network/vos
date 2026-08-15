@@ -2082,16 +2082,19 @@ where
             bytes_received: 0,
         });
     }
-    // Snapshot meta so a storage failure rolls in-memory back.
-    let meta_snapshot = state.meta.clone();
     if req.term > state.meta.current_term {
-        state.meta.current_term = req.term;
-        state.meta.voted_for = None;
+        // Raft §5.2 requires current_term and voted_for to survive a crash.
+        // A non-final chunk is still an acknowledgement to this leader, so
+        // persist the higher term before accepting or acknowledging any bytes.
+        persist_term_bump(state, req.term).await?;
         state.seen_leader = None;
         // Drop any in-flight snapshot from a prior term — its
         // identity is now stale.
         state.incoming_snapshot = None;
     }
+    // Snapshot meta so a later snapshot-state write failure rolls in-memory
+    // state back without undoing a higher term already persisted above.
+    let meta_snapshot = state.meta.clone();
     let was_leader = state.role == Role::Leader;
     state.set_role(Role::Follower);
     state.votes_received.clear();
@@ -2106,24 +2109,15 @@ where
     // sender — they're a current-term leader that just contacted us.
     state.seen_leader = Some(req.leader);
 
-    // Snapshot already covered by our local snap pointer — no-op.
-    // Drop any in-flight buffer for it too.
+    // Snapshot already covered by our local snap pointer — no-op. Report this
+    // request's acknowledged end offset so a leader whose final response was
+    // lost can still classify the retry as complete. A newer local snapshot
+    // also safely covers an older install request.
     if req.last_included_index <= state.storage.snap_last_index() {
         state.incoming_snapshot = None;
-        if let Err(e) = state
-            .storage
-            .commit_batch(WriteBatch {
-                meta: Some(state.meta.clone()),
-                ..Default::default()
-            })
-            .await
-        {
-            state.meta = meta_snapshot;
-            return Err(e);
-        }
         return Ok(InstallSnapshotResp {
             term: state.meta.current_term,
-            bytes_received: 0,
+            bytes_received: req.offset.saturating_add(req.data.len() as u64),
         });
     }
 
@@ -2377,7 +2371,10 @@ where
     if entry.last_included_index == last_included_index
         && entry.last_included_term == last_included_term
     {
-        entry.offset = entry.offset.max(cursor);
+        // The receiver is authoritative. In particular, zero means it
+        // restarted and lost its volatile partial buffer, so rewind instead
+        // of pinning the old local cursor forever.
+        entry.offset = cursor;
     } else {
         // Identity differs — the leader has compacted past this
         // stream's index, so start a new tracker on next send.
