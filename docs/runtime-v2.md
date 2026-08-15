@@ -999,8 +999,11 @@ identity; a v12 root cannot be reopened or replicated under the new import
 rules. Task project inputs are ordinary Cargo binary targets (resolved from
 Cargo's JSON artifact stream), not actor-library builds. Reopen verifies every
 retained dependency against the durable program catalog, and Raft roots reject
-an installation whose complete one-entry availability payload cannot fit the
-network frame ceiling.
+an installation whose complete availability entry cannot fit one network
+frame. AppendEntries sends the largest byte-bounded prefix that fits each
+frame, so neighboring no-op/configuration entries cannot make an otherwise
+valid installation unreplicable. Compacted service images use bounded,
+resumable InstallSnapshot chunks rather than a one-shot frame.
 These versions also add exact actor-package
 identity to descriptors, work, checkpoints, transitions, upgrades, and
 cross-root proof bindings, bind durable messages and retained causal context to

@@ -13,6 +13,7 @@ mod codec;
 mod ops;
 mod wire;
 
+pub(crate) use wire::raft_append_prefix_len;
 pub use wire::{
     Frame, FrameError, MAX_FRAME_BYTES, ManifestBlob, RaftEntry, RaftEntryKind, RaftJoinResult,
 };
@@ -85,6 +86,7 @@ pub struct RaftVoteResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RaftInstallSnapshotResult {
     pub term: u64,
+    pub bytes_received: u64,
 }
 
 /// Reply to a [`RaftStatusReq`](Frame::RaftStatusReq) — a peer's
@@ -385,9 +387,16 @@ pub trait RaftRpcHandler: Send + Sync {
         term: u64,
         _last_included_index: u64,
         _last_included_term: u64,
+        _offset: u64,
+        _done: bool,
         _snapshot: Vec<u8>,
+        _members: Vec<u16>,
+        _joint_old: Option<Vec<u16>>,
     ) -> RaftInstallSnapshotResult {
-        RaftInstallSnapshotResult { term }
+        RaftInstallSnapshotResult {
+            term,
+            bytes_received: 0,
+        }
     }
 
     /// Inbound `RaftJoinReq` from a fresh node that wants to
@@ -667,7 +676,11 @@ pub(in crate::network) enum NetworkCmd {
         leader_prefix: u16,
         last_included_index: u64,
         last_included_term: u64,
+        offset: u64,
+        done: bool,
         snapshot: Vec<u8>,
+        members: Vec<u16>,
+        joint_old: Option<Vec<u16>>,
         reply: std_mpsc::Sender<RaftInstallSnapshotResult>,
     },
     /// Send a [`Frame::RaftJoinReq`] to a peer to add the local
@@ -1007,7 +1020,11 @@ impl Network {
         leader_prefix: u16,
         last_included_index: u64,
         last_included_term: u64,
+        offset: u64,
+        done: bool,
         snapshot: Vec<u8>,
+        members: Vec<u16>,
+        joint_old: Option<Vec<u16>>,
     ) -> std_mpsc::Receiver<RaftInstallSnapshotResult> {
         let (tx, rx) = std_mpsc::channel();
         let _ = self.cmd_tx.send(NetworkCmd::SendRaftInstallSnapshot {
@@ -1017,7 +1034,11 @@ impl Network {
             leader_prefix,
             last_included_index,
             last_included_term,
+            offset,
+            done,
             snapshot,
+            members,
+            joint_old,
             reply: tx,
         });
         rx
@@ -1588,7 +1609,11 @@ async fn network_main(
                         leader_prefix,
                         last_included_index,
                         last_included_term,
+                        offset,
+                        done,
                         snapshot,
+                        members,
+                        joint_old,
                         reply,
                     }) => {
                         let frame = Frame::RaftInstallSnapshotReq {
@@ -1597,7 +1622,11 @@ async fn network_main(
                             leader_prefix,
                             last_included_index,
                             last_included_term,
+                            offset,
+                            done,
                             snapshot,
+                            members,
+                            joint_old,
                         };
                         let req_id = swarm
                             .behaviour_mut()
@@ -2152,7 +2181,11 @@ fn handle_req_resp(
                         leader_prefix,
                         last_included_index,
                         last_included_term,
+                        offset,
+                        done,
                         snapshot,
+                        members,
+                        joint_old,
                     } => {
                         // Install logic writes redb (state row +
                         // raft_meta + raft_log truncate), so a
@@ -2172,7 +2205,11 @@ fn handle_req_resp(
                                     term,
                                     last_included_index,
                                     last_included_term,
+                                    offset,
+                                    done,
                                     snapshot,
+                                    members,
+                                    joint_old,
                                 ),
                                 None => {
                                     warn!(
@@ -2184,12 +2221,18 @@ fn handle_req_resp(
                                         "network: inbound RaftInstallSnapshotReq for unknown \
                                          replication group; replying with our term",
                                     );
-                                    RaftInstallSnapshotResult { term }
+                                    RaftInstallSnapshotResult {
+                                        term,
+                                        bytes_received: 0,
+                                    }
                                 }
                             };
                             let _ = response_tx.send((
                                 channel,
-                                Frame::RaftInstallSnapshotResp { term: resp.term },
+                                Frame::RaftInstallSnapshotResp {
+                                    term: resp.term,
+                                    bytes_received: resp.bytes_received,
+                                },
                             ));
                         });
                     }
@@ -2399,10 +2442,16 @@ fn handle_req_resp(
                         let _ = tx.send(RaftVoteResult { term, vote_granted });
                     }
                     (
-                        Frame::RaftInstallSnapshotResp { term },
+                        Frame::RaftInstallSnapshotResp {
+                            term,
+                            bytes_received,
+                        },
                         Some(OutboundReply::RaftInstallSnapshot(tx)),
                     ) => {
-                        let _ = tx.send(RaftInstallSnapshotResult { term });
+                        let _ = tx.send(RaftInstallSnapshotResult {
+                            term,
+                            bytes_received,
+                        });
                     }
                     (Frame::RaftJoinResp { result }, Some(OutboundReply::RaftJoin(tx))) => {
                         let _ = tx.send(result);
@@ -4055,6 +4104,7 @@ mod tests {
         struct StubHandler {
             append_calls: StdMutex<Vec<(u16, u64, u64, u64, u64, usize)>>,
             vote_calls: StdMutex<Vec<(u16, u64, u64, u64)>>,
+            install_calls: StdMutex<Vec<(u64, bool, usize, Vec<u16>)>>,
             term: AtomicU64,
         }
         impl StubHandler {
@@ -4062,6 +4112,7 @@ mod tests {
                 Self {
                     append_calls: StdMutex::new(Vec::new()),
                     vote_calls: StdMutex::new(Vec::new()),
+                    install_calls: StdMutex::new(Vec::new()),
                     term: AtomicU64::new(initial_term),
                 }
             }
@@ -4110,6 +4161,30 @@ mod tests {
                 RaftVoteResult {
                     term: local_term,
                     vote_granted: term >= local_term,
+                }
+            }
+
+            fn install_snapshot(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                _last_included_index: u64,
+                _last_included_term: u64,
+                offset: u64,
+                done: bool,
+                snapshot: Vec<u8>,
+                members: Vec<u16>,
+                _joint_old: Option<Vec<u16>>,
+            ) -> RaftInstallSnapshotResult {
+                let bytes_received = offset + snapshot.len() as u64;
+                self.install_calls
+                    .lock()
+                    .unwrap()
+                    .push((offset, done, snapshot.len(), members));
+                RaftInstallSnapshotResult {
+                    term,
+                    bytes_received,
                 }
             }
         }
@@ -4206,6 +4281,50 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], (prefix_a, 9u64, 12u64, 8u64));
         drop(calls);
+
+        // ── InstallSnapshot: bounded chunks preserve their cursor and
+        // final membership metadata across the libp2p wire. ─────────
+        let first = net_a.send_raft_install_snapshot(
+            target_b,
+            rep_id,
+            9,
+            prefix_a,
+            12,
+            8,
+            0,
+            false,
+            vec![0xA5; 7],
+            Vec::new(),
+            None,
+        );
+        let first = first
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first InstallSnapshot chunk response");
+        assert_eq!(first.bytes_received, 7);
+        let final_chunk = net_a.send_raft_install_snapshot(
+            target_b,
+            rep_id,
+            9,
+            prefix_a,
+            12,
+            8,
+            7,
+            true,
+            vec![0x5A; 5],
+            vec![prefix_a, prefix_b],
+            None,
+        );
+        let final_chunk = final_chunk
+            .recv_timeout(Duration::from_secs(5))
+            .expect("final InstallSnapshot chunk response");
+        assert_eq!(final_chunk.bytes_received, 12);
+        assert_eq!(
+            *handler.install_calls.lock().unwrap(),
+            vec![
+                (0, false, 7, Vec::new()),
+                (7, true, 5, vec![prefix_a, prefix_b]),
+            ]
+        );
 
         // ── No-handler fallback: a peer with no handler installed
         // returns success=false / vote_granted=false (not a hang). ──

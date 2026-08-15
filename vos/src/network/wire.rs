@@ -211,21 +211,26 @@ pub enum Frame {
     /// follower the actor state at `last_included_index`/term so
     /// the follower doesn't need a log replay it can no longer
     /// reconstruct (the entries have been compacted away).
-    /// Single-shot for now; chunked support is a separate concern.
+    /// Snapshots are streamed in bounded chunks and assembled atomically by
+    /// the Raft worker.
     RaftInstallSnapshotReq {
         replication_id: [u8; REPLICATION_ID_BYTES],
         term: u64,
         leader_prefix: u16,
         last_included_index: u64,
         last_included_term: u64,
-        /// Opaque actor state at `last_included_index`. Bounded
-        /// by `MAX_FRAME_BYTES` (1 MB) like every other length-
-        /// prefixed payload.
+        offset: u64,
+        done: bool,
+        /// One bounded chunk of the opaque state at
+        /// `last_included_index`.
         snapshot: Vec<u8>,
+        members: Vec<u16>,
+        joint_old: Option<Vec<u16>>,
     },
     /// Reply to [`Frame::RaftInstallSnapshotReq`].
     RaftInstallSnapshotResp {
         term: u64,
+        bytes_received: u64,
     },
     /// Cluster join request — a fresh node asks an existing
     /// replica of `replication_id` to add it as a voter via
@@ -403,6 +408,49 @@ impl RaftEntry {
     }
 }
 
+const RAFT_APPEND_FRAME_BASE_BYTES: usize = 71;
+
+fn raft_entry_encoded_len(entry: &RaftEntry) -> Option<usize> {
+    let body = match &entry.kind {
+        RaftEntryKind::Data { payload } => 1usize.checked_add(4)?.checked_add(payload.len())?,
+        RaftEntryKind::ConfigChange { joint_old, members } => {
+            if members.len() > MAX_RAFT_MEMBERS
+                || joint_old
+                    .as_ref()
+                    .is_some_and(|old| old.len() > MAX_RAFT_MEMBERS)
+            {
+                return None;
+            }
+            let old = joint_old.as_ref().map_or(Some(1), |old| {
+                1usize
+                    .checked_add(2)?
+                    .checked_add(old.len().checked_mul(2)?)
+            })?;
+            1usize
+                .checked_add(old)?
+                .checked_add(2)?
+                .checked_add(members.len().checked_mul(2)?)?
+        }
+    };
+    8usize.checked_add(body)
+}
+
+/// Largest leading entry count that fits one AppendEntries frame. Returning
+/// `None` means even the first entry is individually untransportable.
+pub(crate) fn raft_append_prefix_len(entries: &[RaftEntry]) -> Option<usize> {
+    let mut encoded = RAFT_APPEND_FRAME_BASE_BYTES;
+    let mut count = 0;
+    for entry in entries.iter().take(MAX_RAFT_ENTRIES) {
+        let next = encoded.checked_add(raft_entry_encoded_len(entry)?)?;
+        if next > MAX_FRAME_BYTES {
+            break;
+        }
+        encoded = next;
+        count += 1;
+    }
+    (entries.is_empty() || count != 0).then_some(count)
+}
+
 impl Frame {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -562,7 +610,11 @@ impl Frame {
                 leader_prefix,
                 last_included_index,
                 last_included_term,
+                offset,
+                done,
                 snapshot,
+                members,
+                joint_old,
             } => {
                 out.push(TAG_RAFT_INSTALL_REQ);
                 out.extend_from_slice(replication_id);
@@ -570,12 +622,32 @@ impl Frame {
                 out.extend_from_slice(&leader_prefix.to_le_bytes());
                 out.extend_from_slice(&last_included_index.to_le_bytes());
                 out.extend_from_slice(&last_included_term.to_le_bytes());
+                out.extend_from_slice(&offset.to_le_bytes());
+                out.push(u8::from(*done));
                 out.extend_from_slice(&(snapshot.len() as u32).to_le_bytes());
                 out.extend_from_slice(snapshot);
+                out.extend_from_slice(&(members.len() as u16).to_le_bytes());
+                for member in members {
+                    out.extend_from_slice(&member.to_le_bytes());
+                }
+                match joint_old {
+                    Some(old) => {
+                        out.push(1);
+                        out.extend_from_slice(&(old.len() as u16).to_le_bytes());
+                        for member in old {
+                            out.extend_from_slice(&member.to_le_bytes());
+                        }
+                    }
+                    None => out.push(0),
+                }
             }
-            Frame::RaftInstallSnapshotResp { term } => {
+            Frame::RaftInstallSnapshotResp {
+                term,
+                bytes_received,
+            } => {
                 out.push(TAG_RAFT_INSTALL_RESP);
                 out.extend_from_slice(&term.to_le_bytes());
+                out.extend_from_slice(&bytes_received.to_le_bytes());
             }
             Frame::RaftJoinReq {
                 replication_id,
@@ -861,17 +933,53 @@ impl Frame {
                 let leader_prefix = r.u16()?;
                 let last_included_index = r.u64()?;
                 let last_included_term = r.u64()?;
+                let offset = r.u64()?;
+                let done = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    other => return Err(FrameError::BadOption(other)),
+                };
                 let snapshot = r.bytes_with_len_prefix()?;
+                let member_count = r.u16()? as usize;
+                if member_count > MAX_RAFT_MEMBERS {
+                    return Err(FrameError::RaftMembersTooMany(member_count));
+                }
+                let mut members = Vec::with_capacity(member_count);
+                for _ in 0..member_count {
+                    members.push(r.u16()?);
+                }
+                let joint_old = match r.u8()? {
+                    0 => None,
+                    1 => {
+                        let count = r.u16()? as usize;
+                        if count > MAX_RAFT_MEMBERS {
+                            return Err(FrameError::RaftMembersTooMany(count));
+                        }
+                        let mut old = Vec::with_capacity(count);
+                        for _ in 0..count {
+                            old.push(r.u16()?);
+                        }
+                        Some(old)
+                    }
+                    other => return Err(FrameError::BadOption(other)),
+                };
                 Frame::RaftInstallSnapshotReq {
                     replication_id,
                     term,
                     leader_prefix,
                     last_included_index,
                     last_included_term,
+                    offset,
+                    done,
                     snapshot,
+                    members,
+                    joint_old,
                 }
             }
-            TAG_RAFT_INSTALL_RESP => Frame::RaftInstallSnapshotResp { term: r.u64()? },
+            TAG_RAFT_INSTALL_RESP => Frame::RaftInstallSnapshotResp {
+                term: r.u64()?,
+                bytes_received: r.u64()?,
+            },
             TAG_RAFT_JOIN_REQ => Frame::RaftJoinReq {
                 replication_id: r.fixed::<REPLICATION_ID_BYTES>()?,
                 joiner_prefix: r.u16()?,
@@ -1439,7 +1547,11 @@ mod tests {
             leader_prefix: 0xAAAA,
             last_included_index: 100,
             last_included_term: 8,
+            offset: 32,
+            done: true,
             snapshot: b"opaque actor state".to_vec(),
+            members: vec![1, 2],
+            joint_old: Some(vec![1]),
         });
         // Empty snapshot — degenerate but valid.
         roundtrip(Frame::RaftInstallSnapshotReq {
@@ -1448,13 +1560,20 @@ mod tests {
             leader_prefix: 0,
             last_included_index: 0,
             last_included_term: 0,
+            offset: 0,
+            done: false,
             snapshot: vec![],
+            members: vec![],
+            joint_old: None,
         });
     }
 
     #[test]
     fn raft_install_snapshot_resp_roundtrip() {
-        roundtrip(Frame::RaftInstallSnapshotResp { term: 9 });
+        roundtrip(Frame::RaftInstallSnapshotResp {
+            term: 9,
+            bytes_received: 1234,
+        });
     }
 
     #[test]
@@ -1472,5 +1591,24 @@ mod tests {
             Frame::decode(&bad),
             Err(FrameError::RaftEntriesTooMany(100_000))
         ));
+    }
+
+    #[test]
+    fn raft_append_batching_splits_a_noop_from_a_maximum_data_entry() {
+        let maximum_payload = MAX_FRAME_BYTES - RAFT_APPEND_FRAME_BASE_BYTES - 8 - 1 - 4;
+        let maximum = RaftEntry::data(1, vec![0; maximum_payload]);
+        assert_eq!(
+            raft_append_prefix_len(core::slice::from_ref(&maximum)),
+            Some(1)
+        );
+        assert_eq!(
+            raft_append_prefix_len(&[RaftEntry::data(1, Vec::new()), maximum]),
+            Some(1),
+            "the tail is sent by the next heartbeat instead of overflowing this frame"
+        );
+        assert_eq!(
+            raft_append_prefix_len(&[RaftEntry::data(1, vec![0; maximum_payload + 1])]),
+            None
+        );
     }
 }

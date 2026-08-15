@@ -3670,8 +3670,18 @@ fn raft_follower_registers_before_genesis_and_restores_caught_up_admission_time(
         service_image: source_image,
         proof_artifacts: vec![],
     };
-    let installed =
-        worker_handle.install_snapshot(&[0xE2; 32], 0xCAFE, 1, source_index, 1, snapshot.encode());
+    let installed = worker_handle.install_snapshot(
+        &[0xE2; 32],
+        0xCAFE,
+        1,
+        source_index,
+        1,
+        0,
+        true,
+        snapshot.encode(),
+        vec![0xBEEF],
+        None,
+    );
     assert_eq!(installed.term, 1);
     let election_deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     while worker_handle.role() != Role::Leader && std::time::Instant::now() < election_deadline {
@@ -14926,7 +14936,11 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
         1,
         1,
         1,
+        0,
+        true,
         snapshot.encode(),
+        raft_config.members.clone(),
+        None,
     );
     assert_eq!(installed.term, 1);
 

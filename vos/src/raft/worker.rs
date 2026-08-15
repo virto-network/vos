@@ -43,6 +43,12 @@ use vos_raft::{
     Transport as RaftTransport,
 };
 
+/// Leave ample room inside the 8-MiB VOS frame for the snapshot identity and
+/// final membership sidecar. The generic Raft worker resumes from the
+/// follower's acknowledged byte offset after a dropped chunk.
+const INSTALL_SNAPSHOT_CHUNK_BYTES: usize = 1024 * 1024;
+const _: () = assert!(INSTALL_SNAPSHOT_CHUNK_BYTES < crate::network::MAX_FRAME_BYTES);
+
 // `Role` is the same enum, defined once in vos-raft.
 pub use vos_raft::Role;
 
@@ -84,15 +90,7 @@ impl WorkerConfig {
         // loses the term-inflation-prevention property until
         // the network is upgraded.
         c.pre_vote = false;
-        // Chunked InstallSnapshot streaming relies on the wire
-        // frame carrying `offset` / `done` / `bytes_received`.
-        // Vos's libp2p frame is one-shot today, so we set the
-        // chunk budget to "never chunk" — a single InstallSnapshot
-        // RPC carries the whole snapshot. Production deployments
-        // that exceed libp2p's MAX_TRANSMIT_SIZE need to land
-        // chunked-frame support before raising real-world
-        // snapshot sizes here.
-        c.install_snapshot_chunk_bytes = usize::MAX;
+        c.install_snapshot_chunk_bytes = INSTALL_SNAPSHOT_CHUNK_BYTES;
         c
     }
 }
@@ -536,28 +534,28 @@ impl RaftRpcHandler for WorkerHandle {
         term: u64,
         last_included_index: u64,
         last_included_term: u64,
+        offset: u64,
+        done: bool,
         snapshot: Vec<u8>,
+        members: Vec<u16>,
+        joint_old: Option<Vec<u16>>,
     ) -> RaftInstallSnapshotResult {
-        // Vos's wire frame is one-shot today: the leader produces
-        // a single InstallSnapshotReq carrying the whole snapshot
-        // (Config::install_snapshot_chunk_bytes = usize::MAX in
-        // [`WorkerConfig::into_raft`]), and the receiver sees one
-        // chunk with `offset = 0` and `done = true`. Once the
-        // libp2p frame layer learns to ferry chunked InstallSnapshot,
-        // change this to forward `offset` / `done` from the wire.
         let req = InstallSnapshotReq {
             leader: from_prefix,
             term,
             last_included_index,
             last_included_term,
-            offset: 0,
-            done: true,
+            offset,
+            done,
             data: snapshot,
-            members: Vec::new(),
-            joint_old: None,
+            members,
+            joint_old,
         };
         let resp = block_on(self.inner.handle_inbound_install(from_prefix, req));
-        RaftInstallSnapshotResult { term: resp.term }
+        RaftInstallSnapshotResult {
+            term: resp.term,
+            bytes_received: resp.bytes_received,
+        }
     }
 }
 
@@ -908,8 +906,35 @@ mod tests {
         let h = worker.handler();
 
         let snapshot_bytes = b"actor-state-at-index-3".to_vec();
-        let resp = h.install_snapshot(&[0xC0; 32], 0xBBBB, 7, 3, 2, snapshot_bytes.clone());
+        let split = 9;
+        let first = h.install_snapshot(
+            &[0xC0; 32],
+            0xBBBB,
+            7,
+            3,
+            2,
+            0,
+            false,
+            snapshot_bytes[..split].to_vec(),
+            Vec::new(),
+            None,
+        );
+        assert_eq!(first.term, 7);
+        assert_eq!(first.bytes_received, split as u64);
+        let resp = h.install_snapshot(
+            &[0xC0; 32],
+            0xBBBB,
+            7,
+            3,
+            2,
+            split as u64,
+            true,
+            snapshot_bytes[split..].to_vec(),
+            vec![0xAAAA, 0xBBBB],
+            None,
+        );
         assert_eq!(resp.term, 7);
+        assert_eq!(resp.bytes_received, snapshot_bytes.len() as u64);
         worker.shutdown();
 
         let txn = db.begin_read().unwrap();
@@ -947,8 +972,30 @@ mod tests {
         let worker = RaftWorker::spawn(db.clone(), cfg(0xAAAA), None, None);
         let h = worker.handler();
 
-        let _ = h.install_snapshot(&[0xC0; 32], 0xBBBB, 1, 5, 1, b"v1".to_vec());
-        let _ = h.install_snapshot(&[0xC0; 32], 0xBBBB, 1, 3, 1, b"v2".to_vec());
+        let _ = h.install_snapshot(
+            &[0xC0; 32],
+            0xBBBB,
+            1,
+            5,
+            1,
+            0,
+            true,
+            b"v1".to_vec(),
+            vec![0xAAAA, 0xBBBB],
+            None,
+        );
+        let _ = h.install_snapshot(
+            &[0xC0; 32],
+            0xBBBB,
+            1,
+            3,
+            1,
+            0,
+            true,
+            b"v2".to_vec(),
+            vec![0xAAAA, 0xBBBB],
+            None,
+        );
 
         worker.shutdown();
         let meta = RaftMeta::load(&db).unwrap();

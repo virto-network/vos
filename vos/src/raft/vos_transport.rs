@@ -51,6 +51,9 @@ pub enum VosTransportError {
     /// The reply channel disconnected or timed out before yielding
     /// a response. Treated as "no answer" by the worker.
     NoReply,
+    /// A single Raft entry cannot fit the network frame even without any
+    /// neighboring entries.
+    EntryTooLarge,
 }
 
 impl core::fmt::Display for VosTransportError {
@@ -60,6 +63,7 @@ impl core::fmt::Display for VosTransportError {
                 write!(f, "vos transport: no PeerId mapped for prefix {p:04x}")
             }
             Self::NoReply => write!(f, "vos transport: no reply within timeout"),
+            Self::EntryTooLarge => write!(f, "vos transport: Raft entry exceeds frame cap"),
         }
     }
 }
@@ -104,7 +108,7 @@ impl Transport<u16> for VosTransport {
         // ferry the raw payload bytes; `ConfigChange` entries
         // ferry the membership lists so the receiver's worker
         // can update its quorum view on apply.
-        let entries = req
+        let mut entries = req
             .entries
             .into_iter()
             .map(|e| match e.kind {
@@ -127,7 +131,10 @@ impl Transport<u16> for VosTransport {
                     },
                 },
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let prefix = crate::network::raft_append_prefix_len(&entries)
+            .ok_or(VosTransportError::EntryTooLarge)?;
+        entries.truncate(prefix);
         let rx = self.network.send_raft_append(
             peer_id,
             self.replication_id,
@@ -188,16 +195,6 @@ impl Transport<u16> for VosTransport {
             .network
             .peer_for_prefix(peer)
             .ok_or(VosTransportError::UnknownPeer(peer))?;
-        // Vos's libp2p frame layer is one-shot today: it ferries
-        // a single snapshot blob, not chunked offset/done streams.
-        // [`WorkerConfig::into_raft`] sets
-        // `install_snapshot_chunk_bytes = usize::MAX` so the
-        // leader produces a single chunk with `offset = 0` and
-        // `done = true` — the request always fits the wire frame
-        // shape. When the libp2p frame layer grows chunked
-        // InstallSnapshot support, plumb `req.offset` / `req.done`
-        // through and start respecting `r.bytes_received`.
-        let total_len = req.data.len() as u64;
         let rx = self.network.send_raft_install_snapshot(
             peer_id,
             self.replication_id,
@@ -205,19 +202,18 @@ impl Transport<u16> for VosTransport {
             req.leader,
             req.last_included_index,
             req.last_included_term,
+            req.offset,
+            req.done,
             req.data,
+            req.members,
+            req.joint_old,
         );
         let r = recv_timeout(rx, RPC_TIMEOUT)
             .await
             .ok_or(VosTransportError::NoReply)?;
         Ok(InstallSnapshotResp {
             term: r.term,
-            // Wire reply doesn't carry a real `bytes_received`
-            // yet. Echoing the full chunk length tells the leader
-            // the snapshot landed, which is correct for the
-            // one-shot frame: vos's receiver either accepts the
-            // whole blob or returns the wire-level error.
-            bytes_received: total_len,
+            bytes_received: r.bytes_received,
         })
     }
 }
