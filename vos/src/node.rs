@@ -148,6 +148,11 @@ type V2RaftTransportResolutions =
     Arc<Mutex<HashMap<V2RaftTransportResolutionKey, V2RaftTransportResolution>>>;
 
 const V2_LOCAL_INVOKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Attested ingress additionally runs exact Refine tracing, proof production,
+/// and verifier checks before the guest commit becomes visible. Keep its
+/// caller deadline distinct from the ordinary Local dispatch budget so a
+/// valid proof cannot commit after the caller has already reported failure.
+const V2_LOCAL_ATTESTED_INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The network ingress gate can spend this long consulting the registry to
 /// bind a compact voter slot back to its complete authenticated peer identity.
@@ -5151,8 +5156,13 @@ impl VosNode {
             .cloned()
             .ok_or(crate::actors::client::ClientError::NotFound)?;
         let route = binding.route;
+        let invoke_timeout = if proof_requested {
+            binding.invoke_timeout.max(V2_LOCAL_ATTESTED_INVOKE_TIMEOUT)
+        } else {
+            binding.invoke_timeout
+        };
         let deadline = Instant::now()
-            .checked_add(binding.invoke_timeout)
+            .checked_add(invoke_timeout)
             .ok_or(crate::actors::client::ClientError::Unreachable)?;
         let tx = self
             .invoke_routes
