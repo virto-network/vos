@@ -881,11 +881,18 @@ authenticate its witness layout. Service-v2 installs actor INVOKE only for
 those signed dependencies. It runs each Task in an isolated witness-delivered
 kernel and folds its exact instructions, pure protocol boundaries, input
 commitment, and output into the enclosing Refine trace. Record-enabled Tasks
-must complete in the same slice; their secret `ProofRecordEntry` is committed
-to the producing host's private sidecar before any transition proposal and is
-never included in service state or replication. Named actor-row witnesses and
-Task effects remain fail-closed pending an authenticated typed import/effect
-contract.
+must complete in the same Local slice; their secret `ProofRecordEntry` is
+committed to the producing host's private sidecar before the transition
+commits and is never included in service state. Actor memory receives only the
+verifier-facing `ProvableRecord`; completed scheduler values are scrubbed, and
+any recorded attempt makes suspension fail closed so a kernel snapshot cannot
+export residual witness bytes. Recorded debug output is forbidden and capture
+is bounded per slice. Raft and CRDT packages containing Task dependencies are
+rejected before genesis: their ordinary ingress still contains raw arguments,
+so an output sidecar alone cannot keep a Clerk opening private. Replicated
+execution remains gated on a commitment-only private input carrier. Named
+actor-row witnesses and Task effects likewise remain fail-closed pending an
+authenticated typed import/effect contract.
 
 `space up --service-pvm <exact-vos-service.pvm>` recognizes signed `.vos`
 catalog artifacts and opens each ordinary Local or Raft deployment as one
@@ -1005,7 +1012,11 @@ the package-carried Task PVM and witness-window contract part of service
 identity; a v12 root cannot be reopened or replicated under the new import
 rules. Execution semantics v14 additionally binds package-authorized nested
 Task execution and its begin/end trace records; a v13 root cannot be reopened
-under a host that interprets INVOKE using the new contract. Task project
+under a host that interprets INVOKE using the new contract. Execution
+semantics v15 binds mandatory witness injection, redacted actor-visible
+records, completed scheduler scrubbing, record-count and byte limits,
+recorded-debug rejection, and the no-suspend-after-record rule. It also keeps
+Raft/CRDT Task packages fail-closed until private ingress exists. Task project
 inputs are ordinary Cargo binary targets (resolved from
 Cargo's JSON artifact stream), not actor-library builds. Reopen verifies every
 retained dependency against the durable program catalog, and Raft roots reject
