@@ -200,11 +200,11 @@ impl ProofRecordEntry {
     }
 }
 
-/// Guest-side (the record-owning parent agent): read a captured
-/// `__vos_proofrec/<tag>` row back from THIS actor's own keyspace — the
-/// raw [`ProofRecordEntry`] bytes, or `None` when no record exists under
-/// the tag. The export half of the prove flow: a parent exposes a
-/// handler over this so `vosx zk prove` can fetch the entry.
+/// Legacy guest-side API: read a captured `__vos_proofrec/<tag>` row back from
+/// THIS actor's own keyspace — the raw [`ProofRecordEntry`] bytes, or `None`
+/// when no record exists under the tag. Service-v2 intercepts the
+/// invocation-local read with a redacted [`ProvableRecord`]; operators fetch
+/// the complete entry from the root host's producer sidecar instead.
 ///
 /// The entry contains [`ProvableInput`] — the complete proving SECRET —
 /// so a production parent must gate any handler exposing it to its
@@ -212,6 +212,19 @@ impl ProofRecordEntry {
 #[cfg(feature = "service")]
 pub fn read_record_entry(tag: &[u8; 32]) -> Option<Vec<u8>> {
     crate::actors::storage::read_raw(&proofrec_key(tag))
+}
+
+/// Read the verifier-facing half of a record staged by the current Task
+/// execution. Service-v2 exposes only this redacted value to actor memory;
+/// the complete [`ProofRecordEntry`] remains in the producer-private host
+/// sidecar. Legacy storage rows decode through the same helper by discarding
+/// their private input half.
+#[cfg(feature = "service")]
+pub fn read_staged_record(tag: &[u8; 32]) -> Option<ProvableRecord> {
+    let bytes = crate::actors::storage::read_raw(&proofrec_key(tag))?;
+    ProofRecordEntry::decode(&bytes)
+        .map(|entry| entry.record)
+        .or_else(|| ProvableRecord::decode(&bytes))
 }
 
 /// Guest-side (the record-owning parent agent): prune a captured proof record

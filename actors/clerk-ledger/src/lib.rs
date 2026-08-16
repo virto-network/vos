@@ -272,11 +272,10 @@ impl ClerkLedger {
         allowed
     }
 
-    fn staged_record(tag: &[u8; 32]) -> Option<vos::provable::ProofRecordEntry> {
+    fn staged_record(tag: &[u8; 32]) -> Option<vos::provable::ProvableRecord> {
         #[cfg(target_arch = "riscv64")]
         {
-            let bytes = vos::provable::read_record_entry(tag)?;
-            vos::provable::ProofRecordEntry::decode(&bytes)
+            vos::provable::read_staged_record(tag)
         }
         #[cfg(not(target_arch = "riscv64"))]
         {
@@ -289,16 +288,15 @@ impl ClerkLedger {
     /// runtime-staged record itself to bind the selected Task, exact reply
     /// wire, and exact public claim before mutating the live ledger.
     fn record_matches_claim(
-        entry: &vos::provable::ProofRecordEntry,
+        record: &vos::provable::ProvableRecord,
         task_hash: [u8; 32],
         reply: &[u8],
         claim: ClerkTransitionClaim,
     ) -> bool {
-        entry.input.task_hash == task_hash
-            && entry.record.task_hash == task_hash
-            && entry.record.reply == reply
-            && entry.record.app_public.as_slice() == claim.encode().as_slice()
-            && entry.record.io_consistent()
+        record.task_hash == task_hash
+            && record.reply == reply
+            && record.app_public.as_slice() == claim.encode().as_slice()
+            && record.io_consistent()
     }
 
     /// Composite SMT root over the actor's full kernel-checked state —

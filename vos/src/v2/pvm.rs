@@ -28,6 +28,8 @@ use super::{
 
 const MAX_ACTOR_IPC_PAGES: u32 = 1024;
 const MIN_ACTOR_OUTPUT_HEADROOM: usize = super::MAX_ATTESTATION_PROOF_BYTES;
+const MAX_PRODUCER_RECORDS_PER_SLICE: usize = 16;
+const MAX_PRODUCER_RECORD_BYTES_PER_SLICE: usize = 1024 * 1024;
 const RESULT_WHAT: u64 = u64::MAX - 1;
 const ACTOR_STACK_OBJECT_CAP: u64 = 65;
 
@@ -451,8 +453,9 @@ struct ActorRefineRuntimeV2 {
     record_intents: BTreeMap<super::ActorId, u32>,
     record_attempts: BTreeMap<super::ActorId, u32>,
     record_successes: BTreeMap<super::ActorId, u32>,
-    staged_records: BTreeMap<(super::ActorId, [u8; 32]), crate::provable::ProofRecordEntry>,
+    staged_records: BTreeMap<(super::ActorId, [u8; 32]), crate::provable::ProvableRecord>,
     producer_records: Vec<ProducedProvableRecordV2>,
+    producer_record_bytes: usize,
     outputs: Vec<ActorSliceOutputV2>,
     encoded_outputs_len: usize,
 }
@@ -567,6 +570,7 @@ impl ActorRefineRuntimeV2 {
             record_successes: BTreeMap::new(),
             staged_records: BTreeMap::new(),
             producer_records: Vec::new(),
+            producer_record_bytes: 0,
             outputs: Vec::new(),
             // V2 header plus the effect-batch list length.
             encoded_outputs_len: 10,
@@ -575,6 +579,11 @@ impl ActorRefineRuntimeV2 {
 
     fn take_producer_records(&mut self) -> Vec<ProducedProvableRecordV2> {
         core::mem::take(&mut self.producer_records)
+    }
+
+    fn has_record_activity(&self) -> bool {
+        self.record_intents.values().any(|value| *value != 0)
+            || self.record_attempts.values().any(|value| *value != 0)
     }
 
     fn actor_for_vm(&self, vm: u16) -> Option<super::ActorId> {
@@ -799,35 +808,46 @@ impl ActorRefineRuntimeV2 {
                 io_hash[index * 8..index * 8 + 8]
                     .copy_from_slice(&child.active_reg(register).to_le_bytes());
             }
+            let record = crate::provable::ProvableRecord {
+                task_hash: task.0,
+                anchor_kind: payload.anchor_kind,
+                anchor: payload.anchor,
+                transition_digest: transition_digest.expect("tag computes digest"),
+                reply: payload.reply,
+                io_hash,
+                app_public: payload.app_public,
+                catalog_name: alloc::string::String::new(),
+                catalog_version: 0,
+            };
             let entry = crate::provable::ProofRecordEntry {
                 input: crate::provable::ProvableInput {
                     task_hash: task.0,
                     witness_bytes: task_input,
                 },
-                record: crate::provable::ProvableRecord {
-                    task_hash: task.0,
-                    anchor_kind: payload.anchor_kind,
-                    anchor: payload.anchor,
-                    transition_digest: transition_digest.expect("tag computes digest"),
-                    reply: payload.reply,
-                    io_hash,
-                    app_public: payload.app_public,
-                    catalog_name: alloc::string::String::new(),
-                    catalog_version: 0,
-                },
+                record: record.clone(),
             };
-            if !entry.record.io_consistent()
-                || self
-                    .staged_records
-                    .insert((actor, tag), entry.clone())
-                    .is_some()
+            let encoded_len = entry.encode().len();
+            let Some(total_record_bytes) = self
+                .producer_record_bytes
+                .checked_add(encoded_len)
+                .filter(|total| *total <= MAX_PRODUCER_RECORD_BYTES_PER_SLICE)
+            else {
+                return Err(ServicePvmErrorV2::RefineHostRejected(
+                    crate::abi::hostcall::INVOKE as u8,
+                ));
+            };
+            if self.producer_records.len() >= MAX_PRODUCER_RECORDS_PER_SLICE
+                || !entry.record.io_consistent()
+                || self.staged_records.contains_key(&(actor, tag))
             {
                 return Err(ServicePvmErrorV2::RefineHostRejected(
                     crate::abi::hostcall::INVOKE as u8,
                 ));
             }
+            self.staged_records.insert((actor, tag), record);
             self.producer_records
                 .push(ProducedProvableRecordV2 { actor, tag, entry });
+            self.producer_record_bytes = total_record_bytes;
             let successes = self.record_successes.entry(actor).or_default();
             *successes = successes
                 .checked_add(1)
@@ -881,10 +901,13 @@ impl ActorRefineRuntimeV2 {
                 else {
                     return Ok(Some([crate::abi::error::HOST_NONE, 0]));
                 };
-                let Some(entry) = self.staged_records.get(&(actor, tag)) else {
+                let Some(record) = self.staged_records.get(&(actor, tag)) else {
                     return Ok(Some([crate::abi::error::HOST_NONE, 0]));
                 };
-                let bytes = entry.encode();
+                // Actor memory receives only the verifier-facing record. The
+                // exact witness remains exclusively in producer_records and
+                // is persisted through the host-private sidecar.
+                let bytes = record.encode();
                 let output_address = u32::try_from(kernel.active_reg(9))
                     .map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
                 let capacity = usize::try_from(kernel.active_reg(10))
@@ -2191,6 +2214,13 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                         let runtime = actor_runtime
                             .as_ref()
                             .ok_or(ServicePvmErrorV2::InvalidContinuation)?;
+                        if runtime.has_record_activity() {
+                            // A kernel snapshot contains the complete parent
+                            // address space. Once a recorded Task was even
+                            // attempted, that memory may contain its private
+                            // invoke buffer; no continuation may export it.
+                            return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                        }
                         let (artifact, snapshot, pending_call, pending_actor, suspended) =
                             capture_checkpoint(&mut kernel, work, runtime)?;
                         let (service_program, dormant) =

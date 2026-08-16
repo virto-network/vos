@@ -2041,11 +2041,14 @@ pub(crate) fn build_task_kernel_with_backend(
     };
     install_vos_runtime_caps(&mut child);
     child.set_active_reg(7, 0);
-    let _ = child
+    child
         .vm_arena
         .vm_mut(0)
-        .transition(javm::vm_pool::VmState::Running);
-    kwrite(&mut child, witness_addr, input);
+        .transition(javm::vm_pool::VmState::Running)
+        .ok()?;
+    if !input.is_empty() && !child.write_data_cap_window(witness_addr, input) {
+        return None;
+    }
     Some(child)
 }
 
@@ -2060,9 +2063,9 @@ pub(crate) fn build_task_kernel_with_backend(
 ///   echo the registers untouched — the tracer's "lucky stub" set. A
 ///   Task built on `run_task_service` never issues the input ones
 ///   (witness-delivered, READ/FETCH-free by construction); a handler
-///   that does gets the same garbage the trace would. `DEBUG_WRITE`
-///   additionally mirrors to stderr — a host-side effect the guest
-///   cannot observe;
+///   that does gets the same garbage the trace would. `DEBUG_WRITE` is
+///   available only to ordinary Tasks; recorded execution rejects it so
+///   prover-private memory can never be copied into daemon logs;
 /// - Ristretto/scalar precompiles run only for non-recorded Tasks. The
 ///   current AIR does not constrain their arithmetic, so recorded Tasks
 ///   reject them fail-closed before executing the child further;
@@ -2097,10 +2100,14 @@ pub(crate) fn handle_task_hostcall(
         | hostcall::STORAGE_W
         | hostcall::INFO
         | hostcall::OUTPUT => {}
-        hostcall::DEBUG_WRITE => {
+        hostcall::DEBUG_WRITE if allow_unconstrained_crypto => {
             let buf = kread(kernel, echo7 as u32, echo8 as usize);
             let _ = std::io::stderr().write_all(&buf);
             let _ = std::io::stderr().flush();
+        }
+        hostcall::DEBUG_WRITE => {
+            error!("recorded task: DEBUG_WRITE would disclose private witness bytes");
+            return false;
         }
         // The current precompile AIR binds the ECALL boundary bytes but not
         // the curve/scalar arithmetic. A recorded Task would therefore admit
@@ -2995,6 +3002,24 @@ fn blob_hash(data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_kernel_creation_requires_exact_witness_injection() {
+        let blob = grey_transpiler::assembler::Assembler::new().build();
+        let mut cache = javm::CodeCache::new();
+        assert!(
+            build_task_kernel_with_backend(
+                &blob,
+                0xffff_0000,
+                b"private witness",
+                1_000_000,
+                &mut cache,
+                javm::PvmBackend::ForceInterpreter,
+            )
+            .is_none(),
+            "an unmapped witness window must never yield a runnable Task",
+        );
+    }
 
     #[test]
     fn recorded_tasks_classify_every_unconstrained_crypto_precompile() {

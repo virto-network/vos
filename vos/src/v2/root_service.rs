@@ -524,6 +524,7 @@ pub enum LocalRootTreeConfigErrorV2 {
     WrongExecutionSemantics,
     WrongGasSchedule,
     InvalidConsistency,
+    ReplicatedPrivateTaskUnsupported,
     InvalidRoleAuthority,
     ReplicationDriverRequired,
     RaftInstallEntryTooLarge,
@@ -1099,6 +1100,18 @@ impl LocalRootTreeConfigV2 {
         }
         if self.package.manifest.crdt != (self.consistency == ConsistencyModeV2::Crdt) {
             return Err(LocalRootTreeConfigErrorV2::InvalidConsistency);
+        }
+        if matches!(
+            self.consistency,
+            ConsistencyModeV2::Raft | ConsistencyModeV2::Crdt
+        ) && !self.package.task_dependencies.is_empty()
+        {
+            // Invocation arguments are still part of durable Raft/CRDT
+            // ingress. A producer-private output sidecar cannot make those
+            // input bytes private retroactively. Keep replicated Task actors
+            // fail-closed until ingress carries only a commitment and the
+            // producer hydrates the witness over a private channel.
+            return Err(LocalRootTreeConfigErrorV2::ReplicatedPrivateTaskUnsupported);
         }
         if self.role_authority.as_ref().is_some_and(|authority| {
             authority.service.space != self.service.space

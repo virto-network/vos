@@ -178,21 +178,77 @@ impl Probe {
         );
         let reply = tasks
             .reply(task)
-            .unwrap_or_else(|| panic!("completed Task omitted its reply"));
-        let record = vos::provable::read_record_entry(&tag)
-            .and_then(|bytes| vos::provable::ProofRecordEntry::decode(&bytes))
+            .unwrap_or_else(|| panic!("completed Task omitted its reply"))
+            .to_vec();
+        let completed = tasks
+            .get(task)
+            .unwrap_or_else(|| panic!("completed Task omitted its scheduler record"));
+        assert!(
+            completed.state.is_empty()
+                && completed.msg.is_empty()
+                && completed.row_keys.is_empty()
+                && completed.record_tag.is_none(),
+            "completed recorded Task retained prover-private scheduler fields"
+        );
+        let record = vos::provable::read_staged_record(&tag)
             .unwrap_or_else(|| panic!("completed Task omitted its staged record"));
         assert!(
-            record.input.task_hash == task_hash
-                && record.record.task_hash == task_hash
-                && record.record.reply == reply
-                && record.record.io_consistent(),
-            "producer record does not bind the exact Task execution"
+            record.task_hash == task_hash
+                && record.reply == reply
+                && record.io_consistent(),
+            "public producer record does not bind the exact Task execution"
         );
-        match <Value as vos::Decode>::try_decode(reply) {
+        match <Value as vos::Decode>::try_decode(&reply) {
             Some(Value::U64(value)) => value,
             _ => panic!("Task returned a malformed total"),
         }
+    }
+
+    /// Complete a recorded Task and then attempt to suspend the parent. The
+    /// host must reject checkpoint capture because the live address space may
+    /// still contain the private invoke buffer.
+    #[msg]
+    async fn run_provable_task_then_yield(
+        &mut self,
+        ctx: &mut Context<Self>,
+        task_hash: Vec<u8>,
+        tag: Vec<u8>,
+    ) {
+        let task_hash: [u8; 32] = task_hash
+            .try_into()
+            .unwrap_or_else(|_| panic!("task hash must contain 32 bytes"));
+        let tag: [u8; 32] = tag
+            .try_into()
+            .unwrap_or_else(|_| panic!("record tag must contain 32 bytes"));
+        let mut tasks = Tasks::new();
+        let task = tasks.spawn_provable(
+            task_hash,
+            &Msg::new("add_rooted").with("n", 1u64),
+            tag,
+        );
+        tasks.drive();
+        assert!(tasks.status(task) == Some(TaskStatus::Done));
+        ctx.yield_now().await;
+    }
+
+    /// Attempt one more producer record than a single Refine slice permits.
+    /// The host rejects the slice before returning any record to the parent.
+    #[msg]
+    async fn overproduce_provable_tasks(&mut self, task_hash: Vec<u8>) {
+        let task_hash: [u8; 32] = task_hash
+            .try_into()
+            .unwrap_or_else(|_| panic!("task hash must contain 32 bytes"));
+        let mut tasks = Tasks::new();
+        for ordinal in 0u8..17 {
+            let mut tag = [0xDC; 32];
+            tag[31] = ordinal;
+            tasks.spawn_provable(
+                task_hash,
+                &Msg::new("add_rooted").with("n", u64::from(ordinal) + 1),
+                tag,
+            );
+        }
+        tasks.drive();
     }
 
     /// Queue without driving and stage the resulting secret-bearing table as

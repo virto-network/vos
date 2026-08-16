@@ -423,6 +423,13 @@ fn upgrade_actor<S: GuestAccumulateStoreV2>(
         Ok(policies) => policies,
         Err(_) => return Ok(rejected(AccumulationRejectionV2::NonCanonical)),
     };
+    if matches!(
+        header.consistency,
+        ConsistencyModeV2::Raft | ConsistencyModeV2::Crdt
+    ) && !replacement_policies.task_dependencies.is_empty()
+    {
+        return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
+    }
     for dependency in &replacement_policies.task_dependencies {
         if !tree
             .store_ref()
@@ -739,6 +746,13 @@ fn install<S: GuestAccumulateStoreV2>(
             Ok(policies) => policies,
             Err(_) => return Ok(rejected(AccumulationRejectionV2::NonCanonical)),
         };
+        if matches!(
+            genesis.consistency,
+            ConsistencyModeV2::Raft | ConsistencyModeV2::Crdt
+        ) && !policies.task_dependencies.is_empty()
+        {
+            return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
+        }
         if !store
             .program_available(actor.program)
             .map_err(GuestAccumulateError::Storage)?
@@ -5647,6 +5661,16 @@ mod tests {
         };
         let before = store.clone();
 
+        let mut replicated = genesis.clone();
+        replicated.consistency = ConsistencyModeV2::Raft;
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Install(replicated),)
+                .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidConsistency),
+            "a replicated Task package must fail before availability or genesis writes",
+        );
+        assert_eq!(store, before);
+
         assert_eq!(
             execute_guest_accumulate(&mut store, &AccumulateRequestV2::Install(genesis.clone()))
                 .unwrap(),
@@ -5692,6 +5716,33 @@ mod tests {
                 authenticator: vec![19],
             },
         }
+    }
+
+    #[test]
+    fn replicated_upgrade_cannot_introduce_private_task_dependencies() {
+        let mut store = MemStore::default();
+        let (_, install) = install_fixture(&mut store, ConsistencyModeV2::Raft, b"state");
+        let mut upgrade = upgrade_fixture(install.resulting_state_root.unwrap());
+        let task_pvm = grey_transpiler::assembler::Assembler::new().build();
+        let task_program = ProgramId::of_pvm(&task_pvm);
+        store.programs.insert(task_program, task_pvm);
+        let mut policies = PackageRolePoliciesV2::decode(&upgrade.role_policies).unwrap();
+        policies.task_dependencies.push(TaskDependencyV2 {
+            task: Hash([41; 32]),
+            program: task_program,
+            witness_address: 0x1_0000,
+            witness_capacity: 4096,
+        });
+        upgrade.role_policies = policies.encode();
+        store.upgrade_allowlist.insert(upgrade.hash());
+        let before = store.clone();
+
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::UpgradeActor(upgrade))
+                .unwrap(),
+            rejected(AccumulationRejectionV2::InvalidConsistency),
+        );
+        assert_eq!(store, before);
     }
 
     #[test]

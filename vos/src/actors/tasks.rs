@@ -81,12 +81,12 @@ impl TaskStatus {
 pub struct TaskRecord {
     pub child: Child,
     /// The child's serialized state as of its last work-result —
-    /// authoritative and complete (the runtime echoes the input state
-    /// when a child leaves it unchanged, so this never silently
-    /// empties).
+    /// authoritative and complete while the task is runnable (the runtime
+    /// echoes the input state when a child leaves it unchanged). A completed
+    /// recorded Task deliberately clears this prover-private field.
     pub state: Vec<u8>,
-    /// The message the child is being driven with; re-delivered on
-    /// every drive pass until the child completes.
+    /// The message the child is being driven with; re-delivered on every drive
+    /// pass until the child completes. Cleared after recorded completion.
     pub msg: Vec<u8>,
     pub status: TaskStatus,
     /// Reply bytes from the child's most recent work-result.
@@ -94,14 +94,16 @@ pub struct TaskRecord {
     /// Storage row keys the child's witnessed reads need — resolved by
     /// the host against THIS parent's effective keyspace on every
     /// drive pass and staged into the child's witness buffer (see
-    /// `lifecycle::invoke_hash_with_rows`). Empty for children that
-    /// read no storage.
+    /// `lifecycle::invoke_hash_with_rows`). Empty for children that read no
+    /// storage and after recorded completion.
     pub row_keys: Vec<Vec<u8>>,
     /// When set, drive this task as a provable invoke: the host captures
     /// a durable proof record under `__vos_proofrec/<tag>` in the
     /// parent's keyspace when the Task completes in one pass (see
     /// `lifecycle::invoke_hash_with_record`). Yielded or undeliverable output
-    /// captures no record or child effects. `None` = ordinary drive.
+    /// captures no record or child effects. `None` = ordinary drive or an
+    /// already-completed recorded Task whose private scheduler fields were
+    /// scrubbed.
     pub record_tag: Option<[u8; 32]>,
 }
 
@@ -132,6 +134,17 @@ impl TaskRecord {
                 }
                 self.reply = reply;
                 self.status = TaskStatus::Done;
+                if self.record_tag.is_some() {
+                    // A completed recorded Task is represented durably by the
+                    // producer sidecar, not by this actor-owned scheduler
+                    // value. Retain only the public reply/status: the input
+                    // message, child state, witnessed-row names, and tag can
+                    // all identify or contain prover-private material.
+                    self.state.clear();
+                    self.msg.clear();
+                    self.row_keys.clear();
+                    self.record_tag = None;
+                }
             }
             InvokeResult::Yielded { state, reply } => {
                 if !state.is_empty() {
@@ -329,10 +342,11 @@ impl Tasks {
 
 /// The secret message enters `TaskRecord` at queue time, which can precede
 /// the first drive pass by arbitrarily many committed dispatches. Ask the host
-/// to approve producer-local storage before constructing that record. Legacy
-/// replicated parents reject it; service-v2 accepts only when the Task is
-/// driven successfully in this exact Refine slice and the producer-private
-/// sidecar is durable before the transition can be proposed.
+/// to approve producer-local storage before constructing that record. Every
+/// replicated parent rejects packages with private Task dependencies until a
+/// commitment-only ingress carrier exists. A Local service-v2 parent accepts
+/// only when the Task is driven successfully in this exact Refine slice and
+/// the producer-private sidecar is durable before the transition can commit.
 #[cfg(all(feature = "pvm", target_arch = "riscv64"))]
 fn require_local_provable_recording() {
     if crate::abi::pvm::hostcalls::provable_record_intent() != crate::abi::error::HOST_OK {
