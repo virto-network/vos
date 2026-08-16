@@ -145,6 +145,7 @@ impl LocalWorkSchedulerV2 {
             target: request.target,
             method: request.method.clone(),
             arguments: request.arguments.clone(),
+            private_arguments: None,
             origin: request.origin,
             authorization: request.authorization.clone(),
             imported_blobs: request.imported_blobs.clone(),
@@ -827,6 +828,7 @@ impl LocalWorkSchedulerV2 {
             } else {
                 Vec::new()
             },
+            private_arguments: None,
             origin: request.origin,
             authorization: request.authorization,
             causal_parent: request.causal_parent,

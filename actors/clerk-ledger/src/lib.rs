@@ -655,11 +655,12 @@ impl ClerkLedger {
     /// the live committed maps only when the Task's bound roots and batch
     /// digest match exactly.
     ///
-    /// This is the parent-side D6 contract. Legacy replicated parents still
-    /// reject record capture. Service-v2 executes a package-bound Task in the
-    /// exact Refine trace and persists its witness to a producer-private
-    /// sidecar before any Raft proposal. The ordinary `apply_transfer` path
-    /// remains available until the Clerk catalog is installed as a v2 root.
+    /// This is the parent-side D6 contract. Service-v2 Local execution binds
+    /// the invocation to a private-input commitment, hydrates the exact Refine
+    /// trace from an operator sidecar, and persists the resulting witness to
+    /// the producer-private record sidecar before committing actor state.
+    /// Raft/CRDT Task packages remain fail-closed until private input
+    /// availability has its own replicated protocol.
     #[msg(role = ClerkLedgerRole::Operator)]
     async fn apply_transfer_provable(
         &mut self,

@@ -644,6 +644,11 @@ pub struct WorkEnvelopeV2 {
     pub target_program: ProgramId,
     pub method: String,
     pub arguments: Vec<u8>,
+    /// Content address of producer-private step-zero arguments. The Refine
+    /// request carries the plaintext transiently, while guest-owned ingress
+    /// and workflow rows retain only this reference. Private-input slices may
+    /// not suspend, so no kernel snapshot can persist the hydrated bytes.
+    pub private_arguments: Option<BlobRefV2>,
     pub origin: Origin,
     pub authorization: AuthorizationEvidenceV2,
     pub causal_parent: Option<InvocationId>,
@@ -689,7 +694,18 @@ impl WorkEnvelopeV2 {
     /// Consensus identity of the complete work input, including origin,
     /// authorization evidence, consistency base, and every import reference.
     pub fn hash(&self) -> Hash {
-        Hash::digest(b"vos/work/v2", &[&self.encode()])
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&Self::MAGIC);
+        bytes.extend_from_slice(&super::ABI_VERSION.to_le_bytes());
+        self.encode_body_with_arguments(
+            &mut bytes,
+            if self.private_arguments.is_some() {
+                &[]
+            } else {
+                &self.arguments
+            },
+        );
+        Hash::digest(b"vos/work/v2", &[&bytes])
     }
 
     /// Intent that a role authority signs for one invocation.
@@ -708,7 +724,10 @@ impl WorkEnvelopeV2 {
         e.fixed(&self.target_deployment.0);
         e.fixed(&self.target_program.0);
         e.string(&self.method);
-        e.bytes(&self.arguments);
+        e.option(&self.private_arguments, encode_blob_ref);
+        if self.private_arguments.is_none() {
+            e.bytes(&self.arguments);
+        }
         encode_origin(&mut e, self.origin);
         e.option(&self.causal_parent, |e, id| e.fixed(&id.0));
         e.option(&self.parent_call, |e, id| e.fixed(&id.0));
@@ -731,6 +750,7 @@ impl WorkEnvelopeV2 {
         e.fixed(&self.target_deployment.0);
         e.fixed(&self.target_program.0);
         e.string(&self.method);
+        e.option(&self.private_arguments, encode_blob_ref);
         encode_origin(&mut e, self.origin);
         encode_auth(&mut e, &self.authorization);
         e.list(&self.external_actors, encode_external_actor);
@@ -748,7 +768,7 @@ impl WorkEnvelopeV2 {
     /// Normalizing them lets an exact restored service VM emit the same
     /// checkpoint as guest Accumulate derives from the newly admitted work.
     pub fn workflow_checkpoint(&self) -> Self {
-        let mut checkpoint = self.clone();
+        let mut checkpoint = self.durable_work();
         checkpoint.logical_timeslot = 0;
         checkpoint.awaited_reply = None;
         checkpoint.awaited_timeout = None;
@@ -771,6 +791,17 @@ impl WorkEnvelopeV2 {
             actor.continuation = None;
         }
         checkpoint
+    }
+
+    /// Exact linear work retained in guest-owned workflow state. Private
+    /// arguments are represented only by their committed sidecar reference;
+    /// every other field remains byte-identical to the applied slice.
+    pub fn durable_work(&self) -> Self {
+        let mut work = self.clone();
+        if work.private_arguments.is_some() {
+            work.arguments.clear();
+        }
+        work
     }
 
     /// Logical CRDT execution identity shared by independently scheduled
@@ -946,6 +977,7 @@ impl MessageRecordV2 {
             target_program: actor.program,
             method,
             arguments: self.payload.clone(),
+            private_arguments: None,
             origin: Origin::Actor(self.from),
             authorization,
             causal_parent: Some(self.caller_invocation),
@@ -1900,6 +1932,10 @@ pub struct DirectIngressV2 {
     pub target: ActorId,
     pub method: String,
     pub arguments: Vec<u8>,
+    /// Durable commitment to Local producer-private invocation arguments.
+    /// When present, `arguments` is empty and the host hydrates the bytes from
+    /// a separate durable sidecar before Refine.
+    pub private_arguments: Option<BlobRefV2>,
     pub origin: Origin,
     pub authorization: AuthorizationEvidenceV2,
     pub imported_blobs: Vec<BlobRefV2>,
@@ -1910,6 +1946,14 @@ pub struct DirectIngressV2 {
 }
 
 impl DirectIngressV2 {
+    pub fn matches_arguments(&self, arguments: &[u8]) -> bool {
+        self.private_arguments
+            .as_ref()
+            .map_or(self.arguments.as_slice() == arguments, |reference| {
+                reference.matches(arguments)
+            })
+    }
+
     fn encode_body_with_authorization(
         &self,
         out: &mut Vec<u8>,
@@ -1922,6 +1966,7 @@ impl DirectIngressV2 {
         e.fixed(&self.target.0);
         e.string(&self.method);
         e.bytes(&self.arguments);
+        e.option(&self.private_arguments, encode_blob_ref);
         encode_origin(&mut e, self.origin);
         encode_auth(&mut e, authorization);
         e.list(&self.imported_blobs, encode_blob_ref);
@@ -1962,6 +2007,7 @@ impl DirectIngressV2 {
         e.fixed(&ingress.target.0);
         e.string(&ingress.method);
         e.bytes(&ingress.arguments);
+        e.option(&None::<BlobRefV2>, encode_blob_ref);
         encode_origin(&mut e, ingress.origin);
         encode_auth(&mut e, &AuthorizationEvidenceV2::Public);
         e.list(&ingress.imported_blobs, encode_blob_ref);
@@ -1987,6 +2033,7 @@ impl DirectIngressV2 {
             && self.target == candidate.target
             && self.method == candidate.method
             && self.arguments == candidate.arguments
+            && self.private_arguments == candidate.private_arguments
             && self.origin == candidate.origin
             && self.logical_authorization_matches(candidate)
             && self.imported_blobs == candidate.imported_blobs
@@ -2092,7 +2139,11 @@ impl DirectIngressV2 {
             && self.logical_timeslot == work.logical_timeslot
             && self.target == work.target
             && self.method == work.method
-            && self.arguments == work.arguments
+            && self.private_arguments == work.private_arguments
+            && match self.private_arguments.as_ref() {
+                Some(reference) => reference.matches(&work.arguments),
+                None => self.arguments == work.arguments,
+            }
             && self.origin == work.origin
             && self.authorization_matches(&work.authorization)
             && work.causal_parent.is_none()
@@ -2555,32 +2606,7 @@ impl V2Wire for WorkEnvelopeV2 {
     const MAGIC: [u8; 4] = *b"VWK2";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
-        let mut e = Encoder(out);
-        encode_service(&mut e, &self.service);
-        e.fixed(&self.invocation.0);
-        e.u64(self.workflow_step);
-        e.u64(self.logical_timeslot);
-        e.fixed(&self.target.0);
-        e.fixed(&self.target_deployment.0);
-        e.fixed(&self.target_program.0);
-        e.string(&self.method);
-        e.bytes(&self.arguments);
-        encode_origin(&mut e, self.origin);
-        encode_auth(&mut e, &self.authorization);
-        e.option(&self.causal_parent, |e, id| e.fixed(&id.0));
-        e.option(&self.parent_call, |e, id| e.fixed(&id.0));
-        e.option(&self.causal_context, encode_causal_context);
-        e.option(&self.awaited_reply, |e, reply| e.bytes(&reply.encode()));
-        e.option(&self.awaited_timeout, |e, timeout| {
-            e.bytes(&timeout.encode())
-        });
-        e.u8(self.consistency as u8);
-        encode_base(&mut e, &self.base);
-        e.option(&self.base_causal_height, |e, height| e.u64(*height));
-        e.list(&self.imported_actors, encode_imported_actor);
-        e.list(&self.external_actors, encode_external_actor);
-        e.list(&self.imported_blobs, encode_blob_ref);
-        e.bool(self.proof_requested);
+        self.encode_body_with_arguments(out, &self.arguments);
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -2596,6 +2622,14 @@ impl V2Wire for WorkEnvelopeV2 {
             return Err(DecodeError::NonCanonical);
         }
         let arguments = d.bytes()?;
+        let private_arguments = d.option(decode_blob_ref)?;
+        if private_arguments.as_ref().is_some_and(|reference| {
+            workflow_step != 0
+                || reference.len == 0
+                || !arguments.is_empty() && !reference.matches(&arguments)
+        }) {
+            return Err(DecodeError::NonCanonical);
+        }
         let origin = decode_origin(d)?;
         let authorization = decode_auth(d)?;
         let causal_parent = d.option(|d| d.fixed().map(InvocationId))?;
@@ -2619,6 +2653,9 @@ impl V2Wire for WorkEnvelopeV2 {
             return Err(DecodeError::NonCanonical);
         }
         let consistency = ConsistencyModeV2::decode(d)?;
+        if private_arguments.is_some() && consistency != ConsistencyModeV2::Local {
+            return Err(DecodeError::NonCanonical);
+        }
         let base = decode_base(d)?;
         if !base.mode_compatible(consistency) {
             return Err(DecodeError::NonCanonical);
@@ -2700,6 +2737,7 @@ impl V2Wire for WorkEnvelopeV2 {
             target_program,
             method,
             arguments,
+            private_arguments,
             origin,
             authorization,
             causal_parent,
@@ -2715,6 +2753,46 @@ impl V2Wire for WorkEnvelopeV2 {
             imported_blobs,
             proof_requested,
         })
+    }
+}
+
+impl WorkEnvelopeV2 {
+    pub fn matches_arguments(&self, arguments: &[u8]) -> bool {
+        self.private_arguments
+            .as_ref()
+            .map_or(self.arguments.as_slice() == arguments, |reference| {
+                reference.matches(arguments)
+            })
+    }
+
+    fn encode_body_with_arguments(&self, out: &mut Vec<u8>, arguments: &[u8]) {
+        let mut e = Encoder(out);
+        encode_service(&mut e, &self.service);
+        e.fixed(&self.invocation.0);
+        e.u64(self.workflow_step);
+        e.u64(self.logical_timeslot);
+        e.fixed(&self.target.0);
+        e.fixed(&self.target_deployment.0);
+        e.fixed(&self.target_program.0);
+        e.string(&self.method);
+        e.bytes(arguments);
+        e.option(&self.private_arguments, encode_blob_ref);
+        encode_origin(&mut e, self.origin);
+        encode_auth(&mut e, &self.authorization);
+        e.option(&self.causal_parent, |e, id| e.fixed(&id.0));
+        e.option(&self.parent_call, |e, id| e.fixed(&id.0));
+        e.option(&self.causal_context, encode_causal_context);
+        e.option(&self.awaited_reply, |e, reply| e.bytes(&reply.encode()));
+        e.option(&self.awaited_timeout, |e, timeout| {
+            e.bytes(&timeout.encode())
+        });
+        e.u8(self.consistency as u8);
+        encode_base(&mut e, &self.base);
+        e.option(&self.base_causal_height, |e, height| e.u64(*height));
+        e.list(&self.imported_actors, encode_imported_actor);
+        e.list(&self.external_actors, encode_external_actor);
+        e.list(&self.imported_blobs, encode_blob_ref);
+        e.bool(self.proof_requested);
     }
 }
 
@@ -4216,6 +4294,7 @@ impl V2Wire for DirectIngressV2 {
             target: ActorId(d.fixed()?),
             method: d.string()?,
             arguments: d.bytes()?,
+            private_arguments: d.option(decode_blob_ref)?,
             origin: decode_origin(d)?,
             authorization: decode_auth(d)?,
             imported_blobs: d.list(decode_blob_ref)?,
@@ -4228,7 +4307,10 @@ impl V2Wire for DirectIngressV2 {
         if value.invocation == InvocationId::ZERO
             || value.target == ActorId::ZERO
             || value.method.is_empty()
-            || value.arguments.is_empty()
+            || match value.private_arguments.as_ref() {
+                Some(reference) => reference.len == 0 || !value.arguments.is_empty(),
+                None => value.arguments.is_empty(),
+            }
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -5801,6 +5883,7 @@ mod tests {
             target_program: ProgramId([6; 32]),
             method: "increment".into(),
             arguments: vec![1, 2],
+            private_arguments: None,
             origin: Origin::Anonymous,
             authorization: AuthorizationEvidenceV2::Public,
             causal_parent: None,
@@ -6012,6 +6095,32 @@ mod tests {
         let bytes = value.encode();
         assert_eq!(bytes, value.encode());
         assert_eq!(WorkEnvelopeV2::decode(&bytes).unwrap(), value);
+
+        let mut private = value.clone();
+        private.arguments = (80_u8..128).collect();
+        private.private_arguments = Some(BlobRefV2::of_bytes(&private.arguments));
+        assert_eq!(WorkEnvelopeV2::decode(&private.encode()).unwrap(), private);
+        let checkpoint = private.durable_work();
+        assert!(checkpoint.arguments.is_empty());
+        assert_eq!(checkpoint.hash(), private.hash());
+        assert_eq!(
+            checkpoint.authorization_scope(),
+            private.authorization_scope(),
+            "the role scope binds the private commitment, not its hydrated representation",
+        );
+        assert!(
+            !checkpoint
+                .encode()
+                .windows(private.arguments.len())
+                .any(|window| window == private.arguments),
+            "durable workflow encoding must contain no private plaintext",
+        );
+        let mut mismatched_private = private.clone();
+        mismatched_private.arguments[0] ^= 1;
+        assert_eq!(
+            WorkEnvelopeV2::decode(&mismatched_private.encode()),
+            Err(DecodeError::NonCanonical),
+        );
 
         let mut different_schedule = value.clone();
         different_schedule.service.gas_schedule.accumulate += 1;
@@ -6822,6 +6931,7 @@ mod tests {
             target: ActorId([5; 32]),
             method: "set".into(),
             arguments: vec![1],
+            private_arguments: None,
             origin: Origin::Anonymous,
             authorization: AuthorizationEvidenceV2::Public,
             imported_blobs: vec![],
@@ -6957,6 +7067,7 @@ mod tests {
             target: ActorId([5; 32]),
             method: "member_only".into(),
             arguments: vec![1],
+            private_arguments: None,
             origin: Origin::Member(SubjectId([33; 32])),
             authorization,
             imported_blobs: vec![],

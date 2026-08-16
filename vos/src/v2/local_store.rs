@@ -286,6 +286,35 @@ pub trait ProofArtifactStoreV2 {
 
     fn commit_proof(&mut self, reference: &BlobRefV2, proof: &[u8]) -> Result<(), Self::Error>;
 
+    /// Load producer-private invocation arguments by their durable invocation
+    /// identity and committed content address.
+    fn load_private_ingress(
+        &self,
+        _invocation: super::InvocationId,
+        _reference: &BlobRefV2,
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Persist producer-private invocation arguments before guest admission.
+    /// `false` means this backend does not provide the required sidecar.
+    fn commit_private_ingress(
+        &mut self,
+        _invocation: super::InvocationId,
+        _reference: &BlobRefV2,
+        _arguments: &[u8],
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
+    /// Delete arguments after their terminal Local slice has committed.
+    fn delete_private_ingress(
+        &mut self,
+        _invocation: super::InvocationId,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
     /// Load one producer-private Task record. The default keeps compatibility
     /// with proof-only test backends while reporting that no record exists.
     fn load_producer_record(
@@ -400,6 +429,23 @@ impl FileCommittedImageStoreV2 {
         self.path.with_file_name(name)
     }
 
+    fn private_ingress_directory(&self) -> PathBuf {
+        let mut name = self.path.file_name().unwrap_or_default().to_os_string();
+        name.push(".private-inputs");
+        self.path.with_file_name(name)
+    }
+
+    fn private_ingress_path(&self, invocation: super::InvocationId) -> PathBuf {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut name = [0_u8; 64];
+        for (index, byte) in invocation.0.iter().copied().enumerate() {
+            name[index * 2] = HEX[usize::from(byte >> 4)];
+            name[index * 2 + 1] = HEX[usize::from(byte & 0x0f)];
+        }
+        self.private_ingress_directory()
+            .join(std::str::from_utf8(&name).expect("lowercase hexadecimal is valid UTF-8"))
+    }
+
     fn producer_record_path(&self, actor: ActorId, tag: &[u8; 32]) -> PathBuf {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut name = [0_u8; 128];
@@ -497,6 +543,85 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
         std::fs::rename(&temporary, &path)?;
         std::fs::File::open(&directory)?.sync_all()?;
         Ok(())
+    }
+
+    fn load_private_ingress(
+        &self,
+        invocation: super::InvocationId,
+        reference: &BlobRefV2,
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
+        match std::fs::read(self.private_ingress_path(invocation)) {
+            Ok(bytes) if reference.matches(&bytes) => Ok(Some(bytes)),
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "private ingress does not match its committed content address",
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn commit_private_ingress(
+        &mut self,
+        invocation: super::InvocationId,
+        reference: &BlobRefV2,
+        arguments: &[u8],
+    ) -> Result<bool, Self::Error> {
+        use std::io::Write;
+
+        if !reference.matches(arguments) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "private ingress does not match its committed content address",
+            ));
+        }
+        let directory = self.private_ingress_directory();
+        std::fs::create_dir_all(&directory)?;
+        if let Some(parent) = directory.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        let path = self.private_ingress_path(invocation);
+        match std::fs::read(&path) {
+            Ok(existing) if existing == arguments => return Ok(true),
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "private ingress invocation already contains different bytes",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let temporary = path.with_extension("v2-next");
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(arguments)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &path)?;
+        std::fs::File::open(&directory)?.sync_all()?;
+        Ok(true)
+    }
+
+    fn delete_private_ingress(
+        &mut self,
+        invocation: super::InvocationId,
+    ) -> Result<bool, Self::Error> {
+        let directory = self.private_ingress_directory();
+        match std::fs::remove_file(self.private_ingress_path(invocation)) {
+            Ok(()) => {
+                std::fs::File::open(directory)?.sync_all()?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     fn load_producer_record(
@@ -721,6 +846,52 @@ impl<B> DurableJamStoreV2<B>
 where
     B: CommittedImageStoreV2 + ProofArtifactStoreV2<Error = <B as CommittedImageStoreV2>::Error>,
 {
+    pub(crate) fn persist_private_ingress(
+        &mut self,
+        invocation: super::InvocationId,
+        arguments: &[u8],
+    ) -> Result<BlobRefV2, ()> {
+        let reference = BlobRefV2::of_bytes(arguments);
+        if arguments.is_empty() {
+            return Err(());
+        }
+        match self
+            .backend
+            .load_private_ingress(invocation, &reference)
+            .map_err(|_| ())?
+        {
+            Some(existing) if existing == arguments => return Ok(reference),
+            Some(_) => return Err(()),
+            None => {}
+        }
+        if !self
+            .backend
+            .commit_private_ingress(invocation, &reference, arguments)
+            .map_err(|_| ())?
+        {
+            return Err(());
+        }
+        Ok(reference)
+    }
+
+    pub(crate) fn private_ingress(
+        &self,
+        invocation: super::InvocationId,
+        reference: &BlobRefV2,
+    ) -> Option<Vec<u8>> {
+        self.backend
+            .load_private_ingress(invocation, reference)
+            .ok()
+            .flatten()
+            .filter(|bytes| reference.matches(bytes))
+    }
+
+    pub(crate) fn prune_private_ingress(&mut self, invocation: super::InvocationId) -> bool {
+        self.backend
+            .delete_private_ingress(invocation)
+            .unwrap_or(false)
+    }
+
     /// Persist producer-private Task records before the corresponding
     /// transition can enter a Raft log. Partial failure may leave harmless
     /// producer-local orphans, but can never make consensus state visible.
@@ -2204,6 +2375,11 @@ mod tests {
         store.commit(transaction).unwrap();
         let proof = b"durable proof side-CAS".to_vec();
         let proof_blob = BlobRefV2::of_bytes(&proof);
+        let private_invocation = super::super::InvocationId([40; 32]);
+        let private_arguments = b"operator-private invocation arguments".to_vec();
+        let private_reference = store
+            .persist_private_ingress(private_invocation, &private_arguments)
+            .unwrap();
         let verification = ProofVerificationRequestV2 {
             actor_program: ProgramId([41; 32]),
             execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
@@ -2243,6 +2419,16 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let private_path = store.backend.private_ingress_path(private_invocation);
+            assert_eq!(
+                std::fs::metadata(private_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "private invocation inputs must be owner-only",
+            );
             let record_path = store.backend.producer_record_path(actor, &tag);
             assert_eq!(
                 std::fs::metadata(record_path).unwrap().permissions().mode() & 0o777,
@@ -2255,12 +2441,25 @@ mod tests {
 
         let mut restarted = DurableJamStoreV2::open(FileCommittedImageStoreV2::new(&path)).unwrap();
         assert_eq!(restarted.snapshot(), expected);
+        assert!(
+            !expected
+                .encode()
+                .windows(private_arguments.len())
+                .any(|window| window == private_arguments),
+            "private invocation input must stay outside the service image",
+        );
+        assert_eq!(
+            restarted.private_ingress(private_invocation, &private_reference),
+            Some(private_arguments),
+        );
+        assert!(restarted.prune_private_ingress(private_invocation));
         assert_eq!(restarted.proof_bytes(&proof_blob), Some(proof));
         assert_eq!(restarted.producer_record(actor, &tag), Some(entry.encode()));
         assert!(restarted.prune_producer_record(actor, &tag));
         assert_eq!(restarted.producer_record(actor, &tag), None);
         assert!(!path.with_file_name("service.v2.v2-next").exists());
         assert!(path.with_file_name("service.v2.proofs").is_dir());
+        assert!(path.with_file_name("service.v2.private-inputs").is_dir());
         assert!(path.with_file_name("service.v2.records").is_dir());
         drop(restarted);
 

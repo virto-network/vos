@@ -883,16 +883,19 @@ kernel and folds its exact instructions, pure protocol boundaries, input
 commitment, and output into the enclosing Refine trace. Record-enabled Tasks
 must complete in the same Local slice; their secret `ProofRecordEntry` is
 committed to the producing host's private sidecar before the transition
-commits and is never included in service state. Actor memory receives only the
-verifier-facing `ProvableRecord`; completed scheduler values are scrubbed, and
-any recorded attempt makes suspension fail closed so a kernel snapshot cannot
-export residual witness bytes. Recorded debug output is forbidden and capture
-is bounded per slice. Raft and CRDT packages containing Task dependencies are
-rejected before genesis: their ordinary ingress still contains raw arguments,
-so an output sidecar alone cannot keep a Clerk opening private. Replicated
-execution remains gated on a commitment-only private input carrier. Named
-actor-row witnesses and Task effects likewise remain fail-closed pending an
-authenticated typed import/effect contract.
+commits and is never included in service state. Local ingress likewise stores
+only a content address in guest-owned rows: the durable host-private input
+sidecar commits the plaintext before admission, rehydrates it for Refine after
+restart, and retires it after the terminal Apply. The work hash and role scope
+bind that address. A private-input slice cannot suspend, so neither its durable
+workflow row nor a kernel snapshot can export hydrated bytes. Actor memory
+receives only the verifier-facing `ProvableRecord`; completed scheduler values
+are scrubbed. Recorded debug output is forbidden and capture is bounded per
+slice. Raft and CRDT packages containing Task dependencies remain rejected
+before genesis: replicating a commitment also requires a producer-availability
+and leader/failover protocol for the private preimage. Named actor-row witnesses
+and Task effects likewise remain fail-closed pending an authenticated typed
+import/effect contract.
 
 `space up --service-pvm <exact-vos-service.pvm>` recognizes signed `.vos`
 catalog artifacts and opens each ordinary Local or Raft deployment as one
@@ -1002,8 +1005,8 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 33, continuation snapshot version 6, and platform ABI version 11
-are therefore a clean break from earlier experimental v2 images. ABI 11 binds
+Store schema 34, continuation snapshot version 6, and platform ABI version 12
+are therefore a clean break from earlier experimental v2 images. ABI 11 bound
 each actor's sorted, bounded Task dependency map into the signed package,
 guest-owned descriptor, work envelope, and Refine imports. Schema 33 rejects
 images whose retained role-policy artifact predates those bindings rather than
@@ -1016,7 +1019,11 @@ under a host that interprets INVOKE using the new contract. Execution
 semantics v15 binds mandatory witness injection, redacted actor-visible
 records, completed scheduler scrubbing, record-count and byte limits,
 recorded-debug rejection, and the no-suspend-after-record rule. It also keeps
-Raft/CRDT Task packages fail-closed until private ingress exists. Task project
+Raft/CRDT Task packages fail-closed until private ingress exists. ABI 12,
+schema 34, and execution semantics v16 add commitment-only Local private
+ingress, durable host-side hydration, redacted workflow checkpoints, and the
+stronger no-suspend rule for every private-input slice. Replicated private
+input availability remains deliberately staged. Task project
 inputs are ordinary Cargo binary targets (resolved from
 Cargo's JSON artifact stream), not actor-library builds. Reopen verifies every
 retained dependency against the durable program catalog, and Raft roots reject

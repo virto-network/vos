@@ -2211,6 +2211,12 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                 }
                 if slot == crate::abi::hostcall::SUSPEND as u8 {
                     if let Some(work) = suspension_work {
+                        if work.private_arguments.is_some() {
+                            // The hydrated plaintext exists only in this
+                            // Local invocation. A kernel snapshot would copy
+                            // it back into the consensus service image.
+                            return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                        }
                         let runtime = actor_runtime
                             .as_ref()
                             .ok_or(ServicePvmErrorV2::InvalidContinuation)?;
@@ -2530,6 +2536,7 @@ mod tests {
             target_program: ProgramId([7; 32]),
             method: "check".into(),
             arguments: vec![8],
+            private_arguments: None,
             origin,
             authorization: AuthorizationEvidenceV2::Public,
             causal_parent: None,

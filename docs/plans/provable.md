@@ -82,11 +82,12 @@ Landed and gated; `#[provable]` composes it.
   (`CommittedMap::root()`) to name `root_before`/`root_after` — no
   framework anchor reinterpretation.
 - **Replay safety** (A10): ordinary legacy Task invoke effects re-absorb on
-  replay. Replicated recording remains fail-closed: a raw secret argument
-  would already enter Raft ingress or the CRDT DAG before output capture.
-  Local service-v2 runs only signed package dependencies inside exact Refine
-  and persists completed records to a producer-local sidecar before committing
-  the public transition.
+  replay. Local service-v2 stores only an argument commitment in guest-owned
+  ingress/workflow state, rehydrates the plaintext from a durable private
+  sidecar, and persists completed records to a second producer-local sidecar
+  before committing the public transition. Replicated recording remains
+  fail-closed until the private preimage has an authenticated availability and
+  failover protocol.
 - **Pinning + proving** (B1/B3/B8): `ProvableCatalog` / `vosx zk pin`;
   the prover extension's prove/verify + async job queue.
 
@@ -209,7 +210,10 @@ them and made records droppable — both wrong.
   read only the public `ProvableRecord` before returning; the secret input half
   never enters actor memory or state. A completed recorded `TaskRecord` is
   scrubbed, and the enclosing slice may not suspend after any record attempt.
-  The sidecar must commit before the corresponding Local transition;
+  A separate invocation-keyed private-input sidecar commits before Local
+  admission; guest-owned rows retain only its `BlobRefV2`, and exact recovery
+  rehydrates that reference after restart. It is retired after terminal Apply.
+  The record sidecar must commit before the corresponding Local transition;
   failure leaves the admitted input retryable. A record-enabled Task must
   complete in one invoke and its complete output must fit the caller buffer;
   queue-without-drive, failure, yield, or oversized output rejects the whole
@@ -411,7 +415,7 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
   INVOKE is installed only for package-bound Task identities. The Task runs in
   an isolated witness-delivered kernel; its instructions, pure hostcalls,
   input commitment, and exact output are folded into Refine trace semantics
-  v15. Recorded execution also rejects debug output and enforces per-slice
+  v16. Recorded execution also rejects debug output and enforces per-slice
   count/byte bounds. Named parent-row imports and effectful Tasks remain fail-closed until
   they receive an authenticated typed transition contract.
 
@@ -441,12 +445,12 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
   the AIR.
 - *Replicated clerk-ledger production cutover.* Signed Task execution is
   exact-traced and Local producers durably store the private record before
-  commit. Raft/CRDT packages with Task dependencies deliberately fail before
-  genesis because raw invocation arguments would disclose openings at
-  ingress. The remaining protocol work is a commitment-only private input
-  carrier with producer hydration/recovery, followed by authenticated sidecar
-  retrieval/pruning and leadership-transfer coverage. Only then can the public
-  money path switch from `apply_transfer` to the proven parent seam.
+  commit, while Local guest state binds only the private-input commitment.
+  Raft/CRDT packages with Task dependencies deliberately fail before genesis:
+  the remaining protocol work is authenticated distribution of that private
+  preimage to eligible producers, sidecar retrieval/pruning, and
+  leadership-transfer coverage. Only then can the public money path switch
+  from `apply_transfer` to the proven parent seam.
 - *Generated parent glue.* D6's manual Clerk implementation establishes the
   contract; a later macro may generate the touched-leaf/proof/invoke/apply
   boilerplate for other actors without changing its trust model.

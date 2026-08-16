@@ -15,7 +15,7 @@ use super::{
     PublishedEffectsV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 33;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 34;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
@@ -1304,6 +1304,7 @@ mod tests {
                 target: ActorId([20; 32]),
                 method: "value".into(),
                 arguments: vec![1],
+                private_arguments: None,
                 origin: super::super::Origin::Anonymous,
                 authorization: super::super::AuthorizationEvidenceV2::Public,
                 imported_blobs: vec![],

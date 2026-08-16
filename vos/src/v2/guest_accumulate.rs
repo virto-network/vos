@@ -553,6 +553,7 @@ fn admit_ingress<S: GuestAccumulateStoreV2>(
 
     if !ingress.base.mode_compatible(header.consistency)
         || (header.consistency == ConsistencyModeV2::Crdt) != ingress.crdt_change.is_some()
+        || ingress.private_arguments.is_some() && header.consistency != ConsistencyModeV2::Local
     {
         return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
     }
@@ -609,6 +610,12 @@ fn admit_ingress<S: GuestAccumulateStoreV2>(
     if actor.crdt != (header.consistency == ConsistencyModeV2::Crdt) {
         return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
     }
+    if ingress.private_arguments.is_some()
+        && super::PackageRolePoliciesV2::decode(&actor.role_policies)
+            .map_or(true, |policies| policies.task_dependencies.is_empty())
+    {
+        return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
+    }
     let Some(policy) = tree_get_wire::<_, MethodPolicyV2>(
         &tree,
         &StateKeyV2::MethodPolicy {
@@ -629,6 +636,7 @@ fn admit_ingress<S: GuestAccumulateStoreV2>(
         target_program: actor.program,
         method: ingress.method.clone(),
         arguments: ingress.arguments.clone(),
+        private_arguments: ingress.private_arguments.clone(),
         origin: ingress.origin,
         authorization: ingress.authorization.clone(),
         causal_parent: None,
@@ -1229,6 +1237,14 @@ fn deliver<S: GuestAccumulateStoreV2>(
     else {
         return Ok(rejected(AccumulationRejectionV2::InvalidWorkflowTransition));
     };
+    if super::PackageRolePoliciesV2::decode(&actor.role_policies)
+        .map_or(true, |policies| !policies.task_dependencies.is_empty())
+    {
+        // Durable inbox payloads are guest-owned service state. Task-enabled
+        // actors require the Local direct-ingress private sidecar until a
+        // commitment-only transport protocol exists.
+        return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
+    }
     let Some(authorization_work) = envelope.message.authorization_work(
         &envelope.service,
         envelope.logical_timeslot,
@@ -3678,6 +3694,15 @@ fn apply<S: GuestAccumulateStoreV2>(
             resume_work.hash(),
             transition_crdt_cid.ok_or(GuestAccumulateError::CorruptStore)?,
         )
+    } else if work.private_arguments.is_some() {
+        let resume_work = work.durable_work();
+        WorkflowCheckpointV2::encode_materialized(
+            work.input_id(),
+            resume_work.workflow_identity(),
+            &resume_work,
+            work_hash,
+            transition_commitment,
+        )
     } else {
         // Encode from the authenticated request directly. Cloning the full
         // envelope here temporarily duplicates every actor import and can
@@ -4583,6 +4608,15 @@ fn validate_continuation_change<S: GuestAccumulateStoreV2>(
     envelope: &AccumulationEnvelopeV2,
 ) -> GuestResult<Option<AccumulationRejectionV2>, S::Error> {
     let work = &envelope.work;
+    if work.private_arguments.is_some()
+        && envelope
+            .transition
+            .continuations
+            .iter()
+            .any(|change| change.replacement.is_some())
+    {
+        return Ok(Some(AccumulationRejectionV2::InvalidWorkflowTransition));
+    }
     let current = work
         .imported_actors
         .iter()
@@ -6130,6 +6164,7 @@ mod tests {
             target_program: program(),
             method: "set".into(),
             arguments: vec![1],
+            private_arguments: None,
             origin: Origin::Anonymous,
             authorization: AuthorizationEvidenceV2::Public,
             causal_parent: None,
@@ -6174,6 +6209,7 @@ mod tests {
             target: work.target,
             method: work.method.clone(),
             arguments: work.arguments.clone(),
+            private_arguments: work.private_arguments.clone(),
             origin: work.origin,
             authorization: work.authorization.clone(),
             imported_blobs: work.imported_blobs.clone(),
@@ -6582,6 +6618,7 @@ mod tests {
             target: work.target,
             method: work.method.clone(),
             arguments: work.arguments.clone(),
+            private_arguments: work.private_arguments.clone(),
             origin: work.origin,
             authorization: work.authorization.clone(),
             imported_blobs: work.imported_blobs.clone(),
@@ -6704,6 +6741,7 @@ mod tests {
             target: work.target,
             method: work.method.clone(),
             arguments: work.arguments.clone(),
+            private_arguments: work.private_arguments.clone(),
             origin: work.origin,
             authorization: work.authorization.clone(),
             imported_blobs: work.imported_blobs.clone(),
@@ -6813,6 +6851,7 @@ mod tests {
                 target: work.target,
                 method: work.method.clone(),
                 arguments: work.arguments.clone(),
+                private_arguments: work.private_arguments.clone(),
                 origin: work.origin,
                 authorization: work.authorization.clone(),
                 imported_blobs: work.imported_blobs.clone(),
@@ -9661,6 +9700,7 @@ mod tests {
             target_program: program(),
             method: "set".into(),
             arguments: vec![2],
+            private_arguments: None,
             origin: Origin::Anonymous,
             authorization: AuthorizationEvidenceV2::Public,
             causal_parent: None,

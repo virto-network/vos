@@ -127,7 +127,7 @@ pub use transport::{
 pub use wire::{DecodeError, V2Wire};
 
 /// Platform wire/ABI version carried by v2 work, transitions, and receipts.
-pub const ABI_VERSION: u16 = 11;
+pub const ABI_VERSION: u16 = 12;
 /// Portable continuation format version.
 pub const SNAPSHOT_VERSION: u16 = 6;
 /// Attestation statement version required by runtime v2.
@@ -138,8 +138,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0x5e, 0x99, 0xda, 0x58, 0x08, 0xda, 0xa3, 0xf2, 0x8a, 0x3d, 0x1d, 0x5a, 0xcb, 0xb0, 0x0d, 0x85,
-    0xf2, 0xe9, 0x86, 0xad, 0xd6, 0x87, 0x37, 0x89, 0x94, 0xd3, 0x0e, 0xc6, 0xc3, 0x9b, 0x0c, 0x07,
+    0x36, 0x4f, 0xcd, 0x1c, 0xe8, 0x41, 0x3b, 0xbc, 0x9f, 0x12, 0xeb, 0x6f, 0xd7, 0x5c, 0xa0, 0xf4,
+    0xf0, 0x39, 0x07, 0x5a, 0x74, 0xd8, 0xf9, 0x84, 0x2b, 0xd0, 0x2a, 0xaa, 0xc9, 0x97, 0xa3, 0xda,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.
@@ -238,4 +238,4 @@ pub const JAR_REVISION: &str = "41d31e64b0f5d6c57a43769d7b8785556a311684";
 /// Consensus-visible execution semantics. Changing interpreter/recompiler or
 /// trace behavior requires a new identifier even if the public Rust API did
 /// not change.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v15");
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v16");

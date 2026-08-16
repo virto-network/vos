@@ -503,6 +503,7 @@ mod tests {
             target_program: snapshot.actor_program,
             method: "resume".to_string(),
             arguments: vec![],
+            private_arguments: None,
             origin: Origin::Anonymous,
             authorization: AuthorizationEvidenceV2::Public,
             causal_parent: None,

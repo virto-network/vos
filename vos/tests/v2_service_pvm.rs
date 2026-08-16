@@ -91,6 +91,7 @@ fn direct_linear_ingress(work: &WorkEnvelopeV2) -> AccumulateRequestV2 {
         target: work.target,
         method: work.method.clone(),
         arguments: work.arguments.clone(),
+        private_arguments: work.private_arguments.clone(),
         origin: work.origin,
         authorization: work.authorization.clone(),
         imported_blobs: work.imported_blobs.clone(),
@@ -189,6 +190,7 @@ where
 struct FailableCommittedImages {
     image: Option<Vec<u8>>,
     proofs: BTreeMap<[u8; 32], Vec<u8>>,
+    private_ingresses: BTreeMap<InvocationId, Vec<u8>>,
     producer_records: BTreeMap<(ActorId, [u8; 32]), Vec<u8>>,
     fail_next_commit: bool,
     fail_next_proof_commit: bool,
@@ -435,6 +437,42 @@ impl ProofArtifactStoreV2 for FailableCommittedImages {
                 Ok(())
             }
         }
+    }
+
+    fn load_private_ingress(
+        &self,
+        invocation: InvocationId,
+        reference: &BlobRefV2,
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(self
+            .private_ingresses
+            .get(&invocation)
+            .filter(|bytes| reference.matches(bytes))
+            .cloned())
+    }
+
+    fn commit_private_ingress(
+        &mut self,
+        invocation: InvocationId,
+        reference: &BlobRefV2,
+        arguments: &[u8],
+    ) -> Result<bool, Self::Error> {
+        if !reference.matches(arguments) {
+            return Err(());
+        }
+        match self.private_ingresses.get(&invocation) {
+            Some(existing) if existing != arguments => Err(()),
+            Some(_) => Ok(true),
+            None => {
+                self.private_ingresses
+                    .insert(invocation, arguments.to_vec());
+                Ok(true)
+            }
+        }
+    }
+
+    fn delete_private_ingress(&mut self, invocation: InvocationId) -> Result<bool, Self::Error> {
+        Ok(self.private_ingresses.remove(&invocation).is_some())
     }
 
     fn load_producer_record(
@@ -932,6 +970,7 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
         target: ActorId([5; 32]),
         target_deployment: DeploymentId([2; 32]),
         target_program: actor_program,
+        private_arguments: None,
         method: "start".into(),
         arguments: message,
         origin: Origin::Anonymous,
@@ -1419,7 +1458,23 @@ fn signed_task_refine_redacts_actor_memory_and_reopens_local_producer_sidecar() 
         LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
             .expect("signed Local Task root installs");
     assert!(!service.admit_ingress(&request).unwrap());
-    let prepared = LocalWorkSchedulerV2::prepare(service.store(), request.clone()).unwrap();
+    let admitted_snapshot = service.store().snapshot_bytes();
+    assert!(
+        !admitted_snapshot
+            .windows(tag.len())
+            .any(|window| window == tag),
+        "private argument constituents must not enter the admitted service image",
+    );
+    let backend = service.into_backend();
+    assert_eq!(
+        backend.private_ingresses.get(&request.invocation),
+        Some(&request.arguments),
+        "the pending plaintext belongs only to the durable host-private sidecar",
+    );
+    let mut service = LocalRootTreeServiceV2::open(config.clone(), backend)
+        .expect("private ingress rehydrates after a durable reopen");
+    let mut prepared = LocalWorkSchedulerV2::prepare(service.store(), request.clone()).unwrap();
+    prepared.work.private_arguments = Some(BlobRefV2::of_bytes(&request.arguments));
     let physical = ServicePvmV2::new(
         CANONICAL_SERVICE_PVM.to_vec(),
         vos::v2::VOS_SERVICE_PROGRAM_ID,
@@ -1483,12 +1538,30 @@ fn signed_task_refine_redacts_actor_memory_and_reopens_local_producer_sidecar() 
         !service
             .store()
             .snapshot_bytes()
+            .windows(tag.len())
+            .any(|window| window == tag),
+        "private argument constituents must remain absent after execution",
+    );
+    assert!(
+        !service
+            .store()
+            .snapshot_bytes()
             .windows(record_bytes.len())
             .any(|window| window == record_bytes),
         "producer witness must not enter the recoverable service image",
     );
+    let recovered = service
+        .invoke_admitted(request.invocation)
+        .expect("invocation-only recovery needs no retired private preimage");
+    assert!(recovered.duplicate);
+    assert_eq!(recovered.refine_gas_used, 0);
+    assert_eq!(recovered.accumulate_gas_used, 0);
 
     let backend = service.into_backend();
+    assert!(
+        backend.private_ingresses.is_empty(),
+        "terminal execution retires the one-shot private ingress sidecar",
+    );
     let mut reopened = LocalRootTreeServiceV2::open(config, backend)
         .expect("producer reopens after committed Task execution");
     assert_eq!(reopened.producer_record(actor, &tag), Some(record_bytes));

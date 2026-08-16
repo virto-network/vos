@@ -419,6 +419,7 @@ fn direct_ingress_from_request(
     store: &LocalJamStoreV2,
     service: &ServiceIdentityV2,
     request: &LocalWorkRequestV2,
+    private_arguments: bool,
 ) -> Result<DirectIngressV2, LocalRootTreeInvokeErrorV2> {
     if request.workflow_step != 0
         || request.causal_parent.is_some()
@@ -429,8 +430,16 @@ fn direct_ingress_from_request(
     {
         return Err(LocalRootTreeInvokeErrorV2::DivergentInvocation);
     }
-    LocalWorkSchedulerV2::prepare_direct_ingress(store, service, request)
-        .map_err(LocalRootTreeInvokeErrorV2::Schedule)
+    let mut ingress = LocalWorkSchedulerV2::prepare_direct_ingress(store, service, request)
+        .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+    if private_arguments {
+        if request.arguments.is_empty() {
+            return Err(LocalRootTreeInvokeErrorV2::PrivateIngressUnavailable);
+        }
+        ingress.private_arguments = Some(BlobRefV2::of_bytes(&request.arguments));
+        ingress.arguments.clear();
+    }
+    Ok(ingress)
 }
 
 fn direct_ingress_authorization(
@@ -467,18 +476,26 @@ fn direct_ingress_authorization(
 
 fn request_from_direct_ingress(
     ingress: DirectIngressV2,
+    private_arguments: Option<Vec<u8>>,
+    allow_redacted_private_arguments: bool,
 ) -> Result<LocalWorkRequestV2, LocalRootTreeInvokeErrorV2> {
     let authorization = ingress
         .crdt_ingress()
         .map(|causal| causal.authorization.clone())
         .unwrap_or_else(|| ingress.authorization.clone());
+    let arguments = match (&ingress.private_arguments, private_arguments) {
+        (Some(reference), Some(arguments)) if reference.matches(&arguments) => arguments,
+        (Some(_), None) if allow_redacted_private_arguments => Vec::new(),
+        (None, None) => ingress.arguments,
+        _ => return Err(LocalRootTreeInvokeErrorV2::PrivateIngressUnavailable),
+    };
     Ok(LocalWorkRequestV2 {
         invocation: ingress.invocation,
         workflow_step: 0,
         logical_timeslot: ingress.logical_timeslot,
         target: ingress.target,
         method: ingress.method,
-        arguments: ingress.arguments,
+        arguments,
         origin: ingress.origin,
         authorization,
         causal_parent: None,
@@ -560,6 +577,7 @@ pub enum LocalRootTreeInvokeErrorV2 {
     ProofProducerRequired,
     ProofUnavailable,
     ProducerRecordUnavailable,
+    PrivateIngressUnavailable,
     Schedule(ScheduleErrorV2),
     Service(ServiceDispatchError),
     #[cfg(feature = "storage")]
@@ -1106,11 +1124,10 @@ impl LocalRootTreeConfigV2 {
             ConsistencyModeV2::Raft | ConsistencyModeV2::Crdt
         ) && !self.package.task_dependencies.is_empty()
         {
-            // Invocation arguments are still part of durable Raft/CRDT
-            // ingress. A producer-private output sidecar cannot make those
-            // input bytes private retroactively. Keep replicated Task actors
-            // fail-closed until ingress carries only a commitment and the
-            // producer hydrates the witness over a private channel.
+            // Local roots hydrate commitment-only ingress from one durable
+            // operator sidecar. Raft/CRDT still lack an authenticated
+            // availability/failover protocol for that private preimage, so a
+            // replica must not claim it can execute the signed dependency.
             return Err(LocalRootTreeConfigErrorV2::ReplicatedPrivateTaskUnsupported);
         }
         if self.role_authority.as_ref().is_some_and(|authority| {
@@ -1179,9 +1196,53 @@ impl<B> LocalRootTreeServiceV2<B>
 where
     B: CommittedImageStoreV2 + ProofArtifactStoreV2<Error = <B as CommittedImageStoreV2>::Error>,
 {
+    fn request_from_admitted_ingress(
+        &self,
+        record: super::IngressRecordV2,
+    ) -> Result<(LocalWorkRequestV2, Option<BlobRefV2>), LocalRootTreeInvokeErrorV2> {
+        let consumed = record.consumed;
+        let ingress = record.ingress;
+        let private_reference = ingress.private_arguments.clone();
+        let private_arguments = private_reference.as_ref().and_then(|reference| {
+            self.service
+                .accumulate_host()
+                .private_ingress(ingress.invocation, reference)
+        });
+        if private_reference.is_some() && private_arguments.is_none() && !consumed {
+            return Err(LocalRootTreeInvokeErrorV2::PrivateIngressUnavailable);
+        }
+        Ok((
+            request_from_direct_ingress(ingress, private_arguments, consumed)?,
+            private_reference,
+        ))
+    }
+
+    fn prepare_request(
+        &self,
+        request: LocalWorkRequestV2,
+        private_arguments: Option<BlobRefV2>,
+    ) -> Result<PreparedWorkV2, LocalRootTreeInvokeErrorV2> {
+        let mut prepared = LocalWorkSchedulerV2::prepare(self.service.accumulate_host(), request)
+            .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        prepared.work.private_arguments = private_arguments;
+        Ok(prepared)
+    }
+
     fn recover_committed_invocation(
         &self,
         request: &LocalWorkRequestV2,
+    ) -> Result<Option<CommittedRootTreeSliceV2>, LocalRootTreeInvokeErrorV2> {
+        self.recover_committed_invocation_with_private_reference(request, None)
+    }
+
+    /// Recover from guest-owned admitted input after its one-shot private
+    /// preimage has been retired. Only the durable ingress path may supply
+    /// `private_reference`; caller-provided exact retries still have to prove
+    /// equality by presenting plaintext that hashes to the stored reference.
+    fn recover_committed_invocation_with_private_reference(
+        &self,
+        request: &LocalWorkRequestV2,
+        private_reference: Option<&BlobRefV2>,
     ) -> Result<Option<CommittedRootTreeSliceV2>, LocalRootTreeInvokeErrorV2> {
         let header = self
             .service
@@ -1210,6 +1271,7 @@ where
                 self.service.accumulate_host().local_store(),
                 &self.identity,
                 request,
+                self.request_uses_private_ingress(request)?,
             )?;
             let ingress = self
                 .service
@@ -1290,6 +1352,7 @@ where
                 self.service.accumulate_host().local_store(),
                 &self.identity,
                 request,
+                self.request_uses_private_ingress(request)?,
             )?;
             self.service
                 .accumulate_host()
@@ -1299,13 +1362,17 @@ where
         } else {
             committed.authorization == request.authorization
         };
+        let arguments_match = private_reference.map_or_else(
+            || committed.matches_arguments(&request.arguments),
+            |reference| committed.private_arguments.as_ref() == Some(reference),
+        );
         let exact_ingress = request.workflow_step == 0
             && checkpoint.input.workflow_step == 0
             && checkpoint.input.invocation == request.invocation
             && committed.invocation == request.invocation
             && committed.target == request.target
             && committed.method == request.method
-            && committed.arguments == request.arguments
+            && arguments_match
             && committed.origin == request.origin
             && authorization_matches
             && committed.causal_parent == request.causal_parent
@@ -1582,6 +1649,46 @@ where
         self.root_actor
     }
 
+    fn target_uses_private_ingress(
+        &self,
+        actor: ActorId,
+    ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        if self.consistency != ConsistencyModeV2::Local {
+            return Ok(false);
+        }
+        let header = self
+            .service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::ServiceNotInstalled)?;
+        let descriptor = self
+            .service
+            .accumulate_host()
+            .state_row(header.service_root, &StateKeyV2::ActorDescriptor(actor))
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .and_then(|bytes| ActorGenesisV2::decode(&bytes).ok())
+            .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        let policies = PackageRolePoliciesV2::decode(&descriptor.role_policies)
+            .map_err(|_| LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        Ok(!policies.task_dependencies.is_empty())
+    }
+
+    fn request_uses_private_ingress(
+        &self,
+        request: &LocalWorkRequestV2,
+    ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        if let Some(record) = self
+            .service
+            .accumulate_host()
+            .ingress_record(request.invocation)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+        {
+            return Ok(record.ingress.private_arguments.is_some());
+        }
+        self.target_uses_private_ingress(request.target)
+    }
+
     fn owns_actor(&self, actor: ActorId) -> Result<bool, LocalRootTreeInvokeErrorV2> {
         let header = self
             .service
@@ -1649,6 +1756,7 @@ where
             self.service.accumulate_host().local_store(),
             &self.identity,
             request,
+            self.request_uses_private_ingress(request)?,
         )?;
         let checkpoint = self
             .service
@@ -1995,7 +2103,7 @@ where
             || ingress.invocation != request.invocation
             || ingress.target != request.target
             || ingress.method != request.method
-            || ingress.arguments != request.arguments
+            || !ingress.matches_arguments(&request.arguments)
             || ingress.origin != request.origin
             || ingress.imported_blobs != request.imported_blobs
             || ingress.proof_requested != request.proof_requested
@@ -2074,9 +2182,10 @@ where
             }
             return Ok(claim);
         }
-        let prepared =
-            LocalWorkSchedulerV2::prepare(self.service.accumulate_host(), request.clone())
-                .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        let private_arguments = self
+            .request_uses_private_ingress(request)?
+            .then(|| BlobRefV2::of_bytes(&request.arguments));
+        let prepared = self.prepare_request(request.clone(), private_arguments)?;
         if prepared.work.service != self.identity
             || prepared.work.target != request.target
             || prepared.work.invocation != request.invocation
@@ -2465,7 +2574,27 @@ where
             self.service.accumulate_host().local_store(),
             &self.identity,
             request,
+            self.request_uses_private_ingress(request)?,
         )?;
+        if let Some(reference) = ingress.private_arguments.as_ref() {
+            let already_consumed = self
+                .service
+                .accumulate_host()
+                .ingress_record(request.invocation)
+                .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+                .is_some_and(|record| record.consumed && record.ingress.matches_retry(&ingress));
+            if !already_consumed {
+                let persisted = self
+                    .service
+                    .accumulate_host_mut()
+                    .persist_private_ingress(request.invocation, &request.arguments)
+                    .map_err(|_| LocalRootTreeInvokeErrorV2::PrivateIngressUnavailable)?;
+                if persisted != *reference {
+                    return Err(LocalRootTreeInvokeErrorV2::PrivateIngressUnavailable);
+                }
+            }
+        }
+        let private_ingress = ingress.private_arguments.is_some();
         let accumulated = self
             .service
             .accumulate_with_receipt_verifications_after_barrier(
@@ -2480,9 +2609,21 @@ where
                 duplicate,
             } if invocation == request.invocation => Ok(duplicate),
             AccumulationResultV2::Rejected(rejection) => {
+                if private_ingress {
+                    self.service
+                        .accumulate_host_mut()
+                        .prune_private_ingress(request.invocation);
+                }
                 Err(LocalRootTreeInvokeErrorV2::Rejected(rejection))
             }
-            _ => Err(LocalRootTreeInvokeErrorV2::UnexpectedResult),
+            _ => {
+                if private_ingress {
+                    self.service
+                        .accumulate_host_mut()
+                        .prune_private_ingress(request.invocation);
+                }
+                Err(LocalRootTreeInvokeErrorV2::UnexpectedResult)
+            }
         }
     }
 
@@ -2506,11 +2647,17 @@ where
             .ingress_record(invocation)
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
             .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
-        if record.consumed {
-            return Err(LocalRootTreeInvokeErrorV2::DivergentInvocation);
+        let consumed = record.consumed;
+        let (request, private_arguments) = self.request_from_admitted_ingress(record)?;
+        if consumed {
+            return self
+                .recover_committed_invocation_with_private_reference(
+                    &request,
+                    private_arguments.as_ref(),
+                )?
+                .ok_or(LocalRootTreeInvokeErrorV2::DivergentInvocation);
         }
-        let request = request_from_direct_ingress(record.ingress)?;
-        self.execute_admitted_after_barrier(request)
+        self.execute_admitted_after_barrier(request, private_arguments)
     }
 
     pub(crate) fn invoke_admitted_attested_after_barrier<P: AttestationProofProducerV2 + ?Sized>(
@@ -2524,18 +2671,21 @@ where
             .ingress_record(invocation)
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
             .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
-        let request = request_from_direct_ingress(record.ingress)?;
+        let consumed = record.consumed;
+        let (request, private_arguments) = self.request_from_admitted_ingress(record)?;
         if !request.proof_requested {
             return Err(AttestedRootTreeInvokeErrorV2::InvalidPreparation);
         }
-        if let Some(committed) = self.recover_committed_invocation(&request)? {
+        if let Some(committed) = self.recover_committed_invocation_with_private_reference(
+            &request,
+            private_arguments.as_ref(),
+        )? {
             return Ok(committed);
         }
-        if record.consumed {
+        if consumed {
             return Err(LocalRootTreeInvokeErrorV2::DivergentInvocation.into());
         }
-        let prepared = LocalWorkSchedulerV2::prepare(self.service.accumulate_host(), request)
-            .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        let prepared = self.prepare_request(request, private_arguments)?;
         self.execute_prepared_attested_after_barrier(prepared, producer)
     }
 
@@ -2554,6 +2704,7 @@ where
     fn execute_admitted_after_barrier(
         &mut self,
         request: LocalWorkRequestV2,
+        private_arguments: Option<BlobRefV2>,
     ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
         if request.proof_requested {
             return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
@@ -2561,8 +2712,7 @@ where
         if let Some(committed) = self.recover_committed_invocation(&request)? {
             return Ok(committed);
         }
-        let prepared = LocalWorkSchedulerV2::prepare(self.service.accumulate_host(), request)
-            .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+        let prepared = self.prepare_request(request, private_arguments)?;
         self.execute_prepared_after_barrier(prepared)
     }
 
@@ -2897,6 +3047,7 @@ where
             .persist_producer_records(&refined.producer_records)
             .map_err(|_| LocalRootTreeInvokeErrorV2::ProducerRecordUnavailable)?;
         let input = prepared.work.input_id();
+        let private_ingress = prepared.work.private_arguments.is_some();
         let mut provided_blobs = refined.exported_blobs;
         if let Some(proof) = proof_artifact {
             match provided_blobs
@@ -2941,6 +3092,11 @@ where
         if published != PublishedEffectsV2::default() && publication.is_none() {
             return Err(LocalRootTreeInvokeErrorV2::MissingPublication);
         }
+        if private_ingress {
+            self.service
+                .accumulate_host_mut()
+                .prune_private_ingress(input.invocation);
+        }
         Ok(CommittedRootTreeSliceV2 {
             input,
             receipt,
@@ -2975,6 +3131,7 @@ where
             .persist_producer_records(&refined.producer_records)
             .map_err(|_| LocalRootTreeInvokeErrorV2::ProducerRecordUnavailable)?;
         let input = prepared.work.input_id();
+        let private_ingress = prepared.work.private_arguments.is_some();
         let committed = self.service.accumulate_attested_after_barrier(
             AccumulationEnvelopeV2 {
                 work: prepared.work,
@@ -2998,6 +3155,11 @@ where
             || !committed.proof.proof_blob.matches(&committed.proof_bytes)
         {
             return Err(AttestedRootTreeInvokeErrorV2::CommitMismatch);
+        }
+        if private_ingress {
+            self.service
+                .accumulate_host_mut()
+                .prune_private_ingress(input.invocation);
         }
         Ok(CommittedRootTreeSliceV2 {
             input,
