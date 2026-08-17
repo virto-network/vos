@@ -33,8 +33,8 @@ use vos::v2::{
     LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2,
     LocalRootTreeOpenErrorV2, LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2,
     LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
-    PackageManifestV2, PackageRolePoliciesV2, PackageTaskDependencyV2, ProducerId, ProgramId,
-    ProofArtifactStoreV2, ProofVerificationRequestV2, PublishedEffectsV2,
+    PackageManifestV2, PackageRolePoliciesV2, PackageTaskDependencyV2, PrivateIngressStagingV2,
+    ProducerId, ProgramId, ProofArtifactStoreV2, ProofVerificationRequestV2, PublishedEffectsV2,
     ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2,
     ReplicatedServiceErrorV2, ReplyRecordV2, RoleAuthorityBindingV2,
     RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2, RoleAuthorizationClaimV2,
@@ -192,6 +192,7 @@ struct FailableCommittedImages {
     image: Option<Vec<u8>>,
     proofs: BTreeMap<[u8; 32], Vec<u8>>,
     private_ingresses: BTreeMap<InvocationId, Vec<u8>>,
+    private_ingress_staging: BTreeMap<InvocationId, PrivateIngressStagingV2>,
     producer_records: BTreeMap<(ActorId, [u8; 32]), Vec<u8>>,
     fail_next_commit: bool,
     fail_next_proof_commit: bool,
@@ -258,6 +259,7 @@ impl ProofArtifactStoreV2 for SharedCommittedImages {
     fn reconcile_private_ingresses(
         &mut self,
         retained: &[(InvocationId, BlobRefV2)],
+        _terminal: &[InvocationId],
     ) -> Result<(), Self::Error> {
         if retained.is_empty() { Ok(()) } else { Err(()) }
     }
@@ -305,6 +307,7 @@ impl ProofArtifactStoreV2 for SharedProofCommittedImages {
     fn reconcile_private_ingresses(
         &mut self,
         retained: &[(InvocationId, BlobRefV2)],
+        _terminal: &[InvocationId],
     ) -> Result<(), Self::Error> {
         if retained.is_empty() { Ok(()) } else { Err(()) }
     }
@@ -344,6 +347,7 @@ impl ProofArtifactStoreV2 for SharedFailingCommittedImages {
     fn reconcile_private_ingresses(
         &mut self,
         retained: &[(InvocationId, BlobRefV2)],
+        _terminal: &[InvocationId],
     ) -> Result<(), Self::Error> {
         if retained.is_empty() { Ok(()) } else { Err(()) }
     }
@@ -480,16 +484,23 @@ impl ProofArtifactStoreV2 for FailableCommittedImages {
         invocation: InvocationId,
         reference: &BlobRefV2,
         arguments: &[u8],
+        staging: PrivateIngressStagingV2,
     ) -> Result<bool, Self::Error> {
         if !reference.matches(arguments) {
             return Err(());
         }
         match self.private_ingresses.get(&invocation) {
             Some(existing) if existing != arguments => Err(()),
-            Some(_) => Ok(true),
+            Some(_) => {
+                if staging == PrivateIngressStagingV2::Replicated {
+                    self.private_ingress_staging.insert(invocation, staging);
+                }
+                Ok(true)
+            }
             None => {
                 self.private_ingresses
                     .insert(invocation, arguments.to_vec());
+                self.private_ingress_staging.insert(invocation, staging);
                 Ok(true)
             }
         }
@@ -500,12 +511,14 @@ impl ProofArtifactStoreV2 for FailableCommittedImages {
         if std::mem::take(&mut self.fail_next_private_delete) {
             return Err(());
         }
+        self.private_ingress_staging.remove(&invocation);
         Ok(self.private_ingresses.remove(&invocation).is_some())
     }
 
     fn reconcile_private_ingresses(
         &mut self,
         retained: &[(InvocationId, BlobRefV2)],
+        terminal: &[InvocationId],
     ) -> Result<(), Self::Error> {
         for (invocation, reference) in retained {
             let Some(arguments) = self.private_ingresses.get(invocation) else {
@@ -516,10 +529,15 @@ impl ProofArtifactStoreV2 for FailableCommittedImages {
             }
         }
         self.private_ingresses.retain(|invocation, _| {
-            retained
-                .binary_search_by_key(invocation, |(candidate, _)| *candidate)
-                .is_ok()
+            terminal.binary_search(invocation).is_err()
+                && (retained
+                    .binary_search_by_key(invocation, |(candidate, _)| *candidate)
+                    .is_ok()
+                    || self.private_ingress_staging.get(invocation)
+                        == Some(&PrivateIngressStagingV2::Replicated))
         });
+        self.private_ingress_staging
+            .retain(|invocation, _| self.private_ingresses.contains_key(invocation));
         Ok(())
     }
 

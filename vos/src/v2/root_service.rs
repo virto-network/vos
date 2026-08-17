@@ -1773,7 +1773,7 @@ where
         }
         self.service
             .accumulate_host_mut()
-            .persist_private_ingress(invocation, bytes)
+            .persist_replicated_private_ingress(invocation, bytes)
             .is_ok_and(|persisted| persisted == *reference)
     }
 

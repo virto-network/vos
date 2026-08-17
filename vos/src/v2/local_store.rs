@@ -306,6 +306,7 @@ pub trait ProofArtifactStoreV2 {
         _invocation: super::InvocationId,
         _reference: &BlobRefV2,
         _arguments: &[u8],
+        _staging: PrivateIngressStagingV2,
     ) -> Result<bool, Self::Error> {
         Ok(false)
     }
@@ -320,13 +321,15 @@ pub trait ProofArtifactStoreV2 {
 
     /// Reconcile producer-private ingress artifacts with guest-admitted
     /// requests that still need their plaintext. Implementors must preserve
-    /// both those guest-owned artifacts and self-authenticating pre-admission
-    /// artifacts durably acknowledged by [`Self::commit_private_ingress`],
-    /// while removing incomplete temporary files. `retained` is strictly
-    /// ordered by invocation identity without duplicates.
+    /// guest-owned live artifacts plus replicated pre-admission artifacts
+    /// durably acknowledged by [`Self::commit_private_ingress`]. Local
+    /// pre-admission orphans, guest-consumed artifacts, and incomplete
+    /// temporary files must be removed. Both slices are strictly ordered by
+    /// invocation identity without duplicates and are mutually disjoint.
     fn reconcile_private_ingresses(
         &mut self,
         retained: &[(super::InvocationId, BlobRefV2)],
+        terminal: &[super::InvocationId],
     ) -> Result<(), Self::Error>;
 
     /// Load one producer-private Task record. The default keeps compatibility
@@ -360,6 +363,17 @@ pub trait ProofArtifactStoreV2 {
     ) -> Result<bool, Self::Error> {
         Ok(false)
     }
+}
+
+/// Host-private ownership state for a private input persisted before guest
+/// admission. Local staging has no external acknowledgement and is discarded
+/// if no guest ingress owns it after restart. Replicated staging survives
+/// restart until the matching ordered admission is applied or explicitly
+/// aborted by the replication protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateIngressStagingV2 {
+    Local,
+    Replicated,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -450,7 +464,7 @@ impl FileCommittedImageStoreV2 {
         self.path.with_file_name(name)
     }
 
-    fn private_ingress_path(&self, invocation: super::InvocationId) -> PathBuf {
+    fn legacy_private_ingress_path(&self, invocation: super::InvocationId) -> PathBuf {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut name = [0_u8; 64];
         for (index, byte) in invocation.0.iter().copied().enumerate() {
@@ -459,6 +473,45 @@ impl FileCommittedImageStoreV2 {
         }
         self.private_ingress_directory()
             .join(std::str::from_utf8(&name).expect("lowercase hexadecimal is valid UTF-8"))
+    }
+
+    fn private_ingress_path(&self, invocation: super::InvocationId) -> PathBuf {
+        self.legacy_private_ingress_path(invocation)
+            .with_extension("vpi3")
+    }
+
+    fn write_private_ingress_artifact(
+        &self,
+        invocation: super::InvocationId,
+        staging: PrivateIngressStagingV2,
+        reference: &BlobRefV2,
+        arguments: &[u8],
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let directory = self.private_ingress_directory();
+        std::fs::create_dir_all(&directory)?;
+        if let Some(parent) = directory.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        let path = self.private_ingress_path(invocation);
+        let temporary = path.with_extension("v2-next");
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(&encode_private_ingress_artifact(
+            staging, reference, arguments,
+        ))?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &path)?;
+        std::fs::File::open(&directory)?.sync_all()?;
+        Ok(())
     }
 
     fn producer_record_path(&self, actor: ActorId, tag: &[u8; 32]) -> PathBuf {
@@ -473,7 +526,11 @@ impl FileCommittedImageStoreV2 {
     }
 }
 
-fn decode_private_ingress_file_name(name: &str) -> Option<super::InvocationId> {
+fn decode_private_ingress_file_name(name: &str) -> Option<(super::InvocationId, bool)> {
+    let (name, current) = match name.strip_suffix(".vpi3") {
+        Some(name) => (name, true),
+        None => (name, false),
+    };
     if name.len() != 64 {
         return None;
     }
@@ -488,22 +545,52 @@ fn decode_private_ingress_file_name(name: &str) -> Option<super::InvocationId> {
     for (index, pair) in name.as_bytes().chunks_exact(2).enumerate() {
         invocation[index] = nibble(pair[0])?.checked_shl(4)? | nibble(pair[1])?;
     }
-    Some(super::InvocationId(invocation))
+    Some((super::InvocationId(invocation), current))
 }
 
-const PRIVATE_INGRESS_ARTIFACT_MAGIC: &[u8; 4] = b"VPI2";
+const PRIVATE_INGRESS_ARTIFACT_MAGIC: &[u8; 4] = b"VPI3";
+const LEGACY_PRIVATE_INGRESS_ARTIFACT_MAGIC: &[u8; 4] = b"VPI2";
 
-fn encode_private_ingress_artifact(reference: &BlobRefV2, bytes: &[u8]) -> Vec<u8> {
-    let mut artifact = Vec::with_capacity(4 + 32 + 8 + bytes.len());
+fn encode_private_ingress_artifact(
+    staging: PrivateIngressStagingV2,
+    reference: &BlobRefV2,
+    bytes: &[u8],
+) -> Vec<u8> {
+    let mut artifact = Vec::with_capacity(5 + 32 + 8 + bytes.len());
     artifact.extend_from_slice(PRIVATE_INGRESS_ARTIFACT_MAGIC);
+    artifact.push(match staging {
+        PrivateIngressStagingV2::Local => 0,
+        PrivateIngressStagingV2::Replicated => 1,
+    });
     artifact.extend_from_slice(&reference.hash.0);
     artifact.extend_from_slice(&reference.len.to_le_bytes());
     artifact.extend_from_slice(bytes);
     artifact
 }
 
-fn decode_private_ingress_artifact(bytes: &[u8]) -> Option<(BlobRefV2, &[u8])> {
+fn decode_private_ingress_artifact(
+    bytes: &[u8],
+) -> Option<(PrivateIngressStagingV2, BlobRefV2, &[u8])> {
     if bytes.get(..4)? != PRIVATE_INGRESS_ARTIFACT_MAGIC {
+        return None;
+    }
+    let staging = match *bytes.get(4)? {
+        0 => PrivateIngressStagingV2::Local,
+        1 => PrivateIngressStagingV2::Replicated,
+        _ => return None,
+    };
+    let hash = super::Hash(bytes.get(5..37)?.try_into().ok()?);
+    let len = u64::from_le_bytes(bytes.get(37..45)?.try_into().ok()?);
+    let payload = bytes.get(45..)?;
+    let reference = BlobRefV2 { hash, len };
+    (!payload.is_empty()
+        && payload.len() <= super::ACTOR_PRIVATE_INPUT_MAX_BYTES
+        && reference.matches(payload))
+    .then_some((staging, reference, payload))
+}
+
+fn decode_legacy_private_ingress_artifact(bytes: &[u8]) -> Option<(BlobRefV2, &[u8])> {
+    if bytes.get(..4)? != LEGACY_PRIVATE_INGRESS_ARTIFACT_MAGIC {
         return None;
     }
     let hash = super::Hash(bytes.get(4..36)?.try_into().ok()?);
@@ -610,7 +697,7 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
     ) -> Result<Option<Vec<u8>>, Self::Error> {
         match std::fs::read(self.private_ingress_path(invocation)) {
             Ok(artifact) => {
-                let Some((stored_reference, bytes)) = decode_private_ingress_artifact(&artifact)
+                let Some((_, stored_reference, bytes)) = decode_private_ingress_artifact(&artifact)
                 else {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -635,55 +722,44 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
         invocation: super::InvocationId,
         reference: &BlobRefV2,
         arguments: &[u8],
+        staging: PrivateIngressStagingV2,
     ) -> Result<bool, Self::Error> {
-        use std::io::Write;
-
         if !reference.matches(arguments) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "private ingress does not match its committed content address",
             ));
         }
-        let artifact = encode_private_ingress_artifact(reference, arguments);
-        let directory = self.private_ingress_directory();
-        std::fs::create_dir_all(&directory)?;
-        if let Some(parent) = directory.parent() {
-            std::fs::File::open(parent)?.sync_all()?;
-        }
         let path = self.private_ingress_path(invocation);
         match std::fs::read(&path) {
-            Ok(existing)
-                if decode_private_ingress_artifact(&existing).is_some_and(
-                    |(stored_reference, bytes)| {
-                        stored_reference == *reference && bytes == arguments
-                    },
-                ) =>
-            {
-                return Ok(true);
-            }
-            Ok(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "private ingress invocation already contains different bytes",
-                ));
+            Ok(existing) => {
+                let Some((stored_staging, stored_reference, bytes)) =
+                    decode_private_ingress_artifact(&existing)
+                else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "private ingress artifact is not canonical",
+                    ));
+                };
+                if stored_reference != *reference || bytes != arguments {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "private ingress invocation already contains different bytes",
+                    ));
+                }
+                if stored_staging == staging
+                    || stored_staging == PrivateIngressStagingV2::Replicated
+                {
+                    return Ok(true);
+                }
+                // A replicated acknowledgement is stronger than an earlier
+                // Local staging write. Promote atomically; never downgrade a
+                // replicated artifact merely because local admission races it.
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let temporary = path.with_extension("v2-next");
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).truncate(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary)?;
-        file.write_all(&artifact)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temporary, &path)?;
-        std::fs::File::open(&directory)?.sync_all()?;
+        self.write_private_ingress_artifact(invocation, staging, reference, arguments)?;
         Ok(true)
     }
 
@@ -705,6 +781,7 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
     fn reconcile_private_ingresses(
         &mut self,
         retained: &[(super::InvocationId, BlobRefV2)],
+        terminal: &[super::InvocationId],
     ) -> Result<(), Self::Error> {
         let directory = self.private_ingress_directory();
         let entries = match std::fs::read_dir(&directory) {
@@ -727,8 +804,8 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            let invocation = decode_private_ingress_file_name(&name);
-            let Some(invocation) = invocation else {
+            let decoded_name = decode_private_ingress_file_name(&name);
+            let Some((invocation, current)) = decoded_name else {
                 if entry.file_type()?.is_dir() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -738,23 +815,94 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
                 std::fs::remove_file(path)?;
                 continue;
             };
+            if terminal.binary_search(&invocation).is_ok() {
+                std::fs::remove_file(path)?;
+                continue;
+            }
             let artifact = std::fs::read(&path)?;
-            let Some((stored_reference, _)) = decode_private_ingress_artifact(&artifact) else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "private ingress artifact is not canonical",
-                ));
-            };
             if let Ok(index) =
                 retained.binary_search_by_key(&invocation, |(candidate, _)| *candidate)
             {
-                if retained[index].1 != stored_reference {
+                let expected = &retained[index].1;
+                let decoded = if current {
+                    decode_private_ingress_artifact(&artifact)
+                        .map(|(_, reference, bytes)| (reference, bytes))
+                } else {
+                    (artifact.len() <= super::ACTOR_PRIVATE_INPUT_MAX_BYTES
+                        && expected.matches(&artifact))
+                    .then_some((expected.clone(), artifact.as_slice()))
+                    .or_else(|| decode_legacy_private_ingress_artifact(&artifact))
+                };
+                let Some((stored_reference, bytes)) = decoded else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "private ingress artifact is not canonical",
+                    ));
+                };
+                if *expected != stored_reference {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "private ingress does not match its guest-owned content address",
                     ));
                 }
+                if !current {
+                    let current_path = self.private_ingress_path(invocation);
+                    match std::fs::read(&current_path) {
+                        Ok(existing)
+                            if decode_private_ingress_artifact(&existing).is_some_and(
+                                |(_, reference, current_bytes)| {
+                                    reference == *expected && current_bytes == bytes
+                                },
+                            ) => {}
+                        Ok(_) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "legacy and current private ingress artifacts disagree",
+                            ));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            self.write_private_ingress_artifact(
+                                invocation,
+                                PrivateIngressStagingV2::Local,
+                                expected,
+                                bytes,
+                            )?;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    std::fs::remove_file(path)?;
+                } else if !decode_private_ingress_artifact(&artifact).is_some_and(
+                    |(staging, reference, _)| {
+                        staging == PrivateIngressStagingV2::Local && reference == *expected
+                    },
+                ) {
+                    self.write_private_ingress_artifact(
+                        invocation,
+                        PrivateIngressStagingV2::Local,
+                        expected,
+                        bytes,
+                    )?;
+                }
                 present.insert(invocation);
+                continue;
+            }
+            if !current {
+                // Batch 60 stored raw Local bytes at the unversioned path;
+                // the short-lived VPI2 review format used the same name.
+                // Neither has independently authenticated replicated
+                // ownership, so an orphan is always retired.
+                std::fs::remove_file(path)?;
+                continue;
+            }
+            match decode_private_ingress_artifact(&artifact) {
+                Some((PrivateIngressStagingV2::Replicated, _, _)) => {}
+                Some((PrivateIngressStagingV2::Local, _, _)) => std::fs::remove_file(path)?,
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "private ingress artifact is not canonical",
+                    ));
+                }
             }
         }
         if retained
@@ -978,18 +1126,11 @@ where
                 .map_err(DurableStoreOpenErrorV2::InvalidSnapshot)?,
             None => LocalJamStoreV2::new(),
         };
-        let retained = local
-            .pending_ingresses()
-            .map_err(DurableStoreOpenErrorV2::CorruptStore)?
-            .into_iter()
-            .filter_map(|ingress| {
-                ingress
-                    .private_arguments
-                    .map(|reference| (ingress.invocation, reference))
-            })
-            .collect::<Vec<_>>();
+        let (retained, terminal) = local
+            .private_ingress_recovery()
+            .map_err(DurableStoreOpenErrorV2::CorruptStore)?;
         backend
-            .reconcile_private_ingresses(&retained)
+            .reconcile_private_ingresses(&retained, &terminal)
             .map_err(DurableStoreOpenErrorV2::Backend)?;
         Ok(Self {
             local,
@@ -1030,6 +1171,31 @@ where
         invocation: super::InvocationId,
         arguments: &[u8],
     ) -> Result<BlobRefV2, ()> {
+        self.persist_private_ingress_with_staging(
+            invocation,
+            arguments,
+            PrivateIngressStagingV2::Local,
+        )
+    }
+
+    pub(crate) fn persist_replicated_private_ingress(
+        &mut self,
+        invocation: super::InvocationId,
+        arguments: &[u8],
+    ) -> Result<BlobRefV2, ()> {
+        self.persist_private_ingress_with_staging(
+            invocation,
+            arguments,
+            PrivateIngressStagingV2::Replicated,
+        )
+    }
+
+    fn persist_private_ingress_with_staging(
+        &mut self,
+        invocation: super::InvocationId,
+        arguments: &[u8],
+        staging: PrivateIngressStagingV2,
+    ) -> Result<BlobRefV2, ()> {
         let reference = BlobRefV2::of_bytes(arguments);
         if arguments.is_empty() {
             return Err(());
@@ -1039,13 +1205,13 @@ where
             .load_private_ingress(invocation, &reference)
             .map_err(|_| ())?
         {
-            Some(existing) if existing == arguments => return Ok(reference),
+            Some(existing) if existing == arguments => {}
             Some(_) => return Err(()),
             None => {}
         }
         if !self
             .backend
-            .commit_private_ingress(invocation, &reference, arguments)
+            .commit_private_ingress(invocation, &reference, arguments, staging)
             .map_err(|_| ())?
         {
             return Err(());
@@ -1461,6 +1627,45 @@ impl LocalJamStoreV2 {
             }
         }
         Ok(pending)
+    }
+
+    /// Private-input ownership recovered from permanent guest ingress rows.
+    /// Unconsumed rows retain and authenticate their sidecar; consumed rows
+    /// are terminal evidence that any surviving sidecar must be retired.
+    fn private_ingress_recovery(
+        &self,
+    ) -> Result<
+        (
+            Vec<(super::InvocationId, BlobRefV2)>,
+            Vec<super::InvocationId>,
+        ),
+        LocalStoreReadErrorV2,
+    > {
+        let prefix = super::storage::ingress_storage_prefix();
+        let mut retained = Vec::new();
+        let mut terminal = Vec::new();
+        for (key, bytes) in self
+            .committed
+            .rows
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+        {
+            let record = IngressRecordV2::decode(bytes)
+                .map_err(|_| LocalStoreReadErrorV2::CorruptIngress)?;
+            let invocation = record.ingress.invocation;
+            if super::ingress_storage_key(invocation).as_slice() != key.as_slice() {
+                return Err(LocalStoreReadErrorV2::CorruptIngress);
+            }
+            let Some(reference) = record.ingress.private_arguments else {
+                continue;
+            };
+            if record.consumed {
+                terminal.push(invocation);
+            } else {
+                retained.push((invocation, reference));
+            }
+        }
+        Ok((retained, terminal))
     }
 
     /// Load the caller-owned durable request which an accumulated reply must
@@ -2259,6 +2464,7 @@ mod tests {
         fn reconcile_private_ingresses(
             &mut self,
             retained: &[(super::super::InvocationId, BlobRefV2)],
+            _terminal: &[super::super::InvocationId],
         ) -> Result<(), Self::Error> {
             if retained.is_empty() {
                 Ok(())
@@ -2599,7 +2805,12 @@ mod tests {
         let proof = b"durable proof side-CAS".to_vec();
         let proof_blob = BlobRefV2::of_bytes(&proof);
         let private_invocation = super::super::InvocationId([40; 32]);
-        let private_arguments = b"operator-private invocation arguments".to_vec();
+        let legacy_payload = b"operator-private invocation arguments";
+        let legacy_payload_reference = BlobRefV2::of_bytes(legacy_payload);
+        let mut private_arguments = LEGACY_PRIVATE_INGRESS_ARTIFACT_MAGIC.to_vec();
+        private_arguments.extend_from_slice(&legacy_payload_reference.hash.0);
+        private_arguments.extend_from_slice(&legacy_payload_reference.len.to_le_bytes());
+        private_arguments.extend_from_slice(legacy_payload);
         let private_reference = store
             .persist_private_ingress(private_invocation, &private_arguments)
             .unwrap();
@@ -2638,7 +2849,7 @@ mod tests {
         transaction.staged.rows.insert(
             super::super::ingress_storage_key(private_invocation),
             IngressRecordV2 {
-                ingress,
+                ingress: ingress.clone(),
                 consumed: false,
                 receipt,
             }
@@ -2649,6 +2860,11 @@ mod tests {
         let orphan_arguments = b"crash before guest admission".to_vec();
         let orphan_reference = store
             .persist_private_ingress(orphan_invocation, &orphan_arguments)
+            .unwrap();
+        let replicated_invocation = super::super::InvocationId([37; 32]);
+        let replicated_arguments = b"acknowledged Raft pre-admission input".to_vec();
+        let replicated_reference = store
+            .persist_replicated_private_ingress(replicated_invocation, &replicated_arguments)
             .unwrap();
         let verification = ProofVerificationRequestV2 {
             actor_program: ProgramId([41; 32]),
@@ -2712,6 +2928,14 @@ mod tests {
             .private_ingress_directory()
             .join("abandoned.v2-next");
         std::fs::write(&abandoned_temporary, b"partial private input").unwrap();
+        std::fs::write(
+            store
+                .backend
+                .legacy_private_ingress_path(private_invocation),
+            &private_arguments,
+        )
+        .unwrap();
+        std::fs::remove_file(store.backend.private_ingress_path(private_invocation)).unwrap();
         drop(store);
 
         let mut restarted = DurableJamStoreV2::open(FileCommittedImageStoreV2::new(&path)).unwrap();
@@ -2732,17 +2956,25 @@ mod tests {
         );
         assert_eq!(
             restarted.private_ingress(private_invocation, &private_reference),
-            Some(private_arguments),
-            "startup retains input owned by an unconsumed guest ingress",
+            Some(private_arguments.clone()),
+            "startup migrates Batch 60 raw input owned by an unconsumed guest ingress",
         );
         assert_eq!(
             restarted.private_ingress(orphan_invocation, &orphan_reference),
-            Some(orphan_arguments),
-            "startup retains an acknowledged pre-admission private input",
+            None,
+            "startup retires a Local crash-before-admission orphan",
         );
-        assert!(restarted.prune_private_ingress(orphan_invocation).unwrap());
+        assert_eq!(
+            restarted.private_ingress(replicated_invocation, &replicated_reference),
+            Some(replicated_arguments.clone()),
+            "startup retains an acknowledged replicated pre-admission input",
+        );
+        assert!(
+            std::fs::read(restarted.backend.private_ingress_path(private_invocation))
+                .unwrap()
+                .starts_with(PRIVATE_INGRESS_ARTIFACT_MAGIC)
+        );
         assert!(!abandoned_temporary.exists());
-        assert!(restarted.prune_private_ingress(private_invocation).unwrap());
         assert_eq!(restarted.proof_bytes(&proof_blob), Some(proof));
         assert_eq!(restarted.producer_record(actor, &tag), Some(entry.encode()));
         assert!(restarted.prune_producer_record(actor, &tag));
@@ -2751,6 +2983,34 @@ mod tests {
         assert!(path.with_file_name("service.v2.proofs").is_dir());
         assert!(path.with_file_name("service.v2.private-inputs").is_dir());
         assert!(path.with_file_name("service.v2.records").is_dir());
+
+        let mut transaction = restarted.begin().unwrap();
+        let mut consumed = restarted
+            .ingress_record(private_invocation)
+            .unwrap()
+            .unwrap();
+        consumed.consumed = true;
+        transaction.staged.rows.insert(
+            super::super::ingress_storage_key(private_invocation),
+            consumed.encode(),
+        );
+        restarted.commit(transaction).unwrap();
+        let (_, backend) = restarted.into_parts();
+        let mut restarted = DurableJamStoreV2::open(backend).unwrap();
+        assert_eq!(
+            restarted.private_ingress(private_invocation, &private_reference),
+            None,
+            "a consumed guest ingress retires a surviving terminal artifact on restart",
+        );
+        assert_eq!(
+            restarted.private_ingress(replicated_invocation, &replicated_reference),
+            Some(replicated_arguments),
+        );
+        assert!(
+            restarted
+                .prune_private_ingress(replicated_invocation)
+                .unwrap()
+        );
         drop(restarted);
 
         std::fs::write(&path, b"legacy-or-corrupt-image").unwrap();

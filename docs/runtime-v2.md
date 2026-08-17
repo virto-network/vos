@@ -921,9 +921,16 @@ receiver accepts it only from the canonical registry PeerId of the leader in
 its current local voter view, requires its own node prefix to remain in that
 same membership, rechecks the content address, and routes it to the owning
 root thread for durable side-CAS commit before acknowledging. Each committed
-sidecar is a self-authenticating artifact carrying its own hash and length, so
-restart reconciliation preserves an acknowledged pre-admission input even
-when the matching Raft `AdmitIngress` committed but has not yet applied.
+sidecar is a self-authenticating artifact carrying its own hash, length, and
+host-private staging class. Restart reconciliation retains a Raft-staged input
+even when the matching `AdmitIngress` committed but has not yet applied, but
+deletes a Local-staged input with no guest owner. Unconsumed guest ingress rows
+adopt and authenticate their inputs; consumed rows are terminal evidence and
+retry deletion after a crash or earlier cleanup failure. Batch 60's raw Local
+sidecars migrate atomically only when a matching unconsumed guest ingress
+proves ownership; raw orphans are retired. This sidecar-header evolution is
+outside the platform wire and service image, so it does not change the ABI,
+store schema, execution semantics, or canonical service PVM.
 Neither the request nor its bytes enter actor invocation wires, guest state,
 Raft entries, applied snapshots, or CRDT DAGs. Sender membership is rejected
 from the cached group view before registry work; per-peer and global
@@ -1065,10 +1072,11 @@ schema 34, and execution semantics v16 add commitment-only Local private
 ingress, durable host-side hydration, redacted workflow checkpoints, and the
 stronger no-suspend rule for every private-input slice. Replicated private
 input availability remains deliberately staged. On durable open, the
-producer side-CAS retains only content-addressed inputs belonging to
-guest-owned unconsumed ingress records; pre-admission or terminal artifacts
-and incomplete temporary writes are retired, while missing or corrupt live
-inputs fail startup. Task project
+producer side-CAS retains content-addressed inputs belonging to guest-owned
+unconsumed ingress records and explicitly Raft-staged inputs awaiting ordered
+admission. Local pre-admission orphans, guest-consumed terminal artifacts, and
+incomplete temporary writes are retired, while missing or corrupt live inputs
+fail startup. Task project
 inputs are ordinary Cargo binary targets (resolved from
 Cargo's JSON artifact stream), not actor-library builds. Reopen verifies every
 retained dependency against the durable program catalog, and Raft roots reject
