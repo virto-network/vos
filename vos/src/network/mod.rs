@@ -321,6 +321,23 @@ pub trait NetworkService: Send + Sync {
         None
     }
 
+    /// Persist one producer-private ingress preimage for an exact Raft
+    /// replication group. The concrete node must authenticate `peer` as a
+    /// current voter of that group and route the write through the owning
+    /// root's durable side-CAS. Default denies.
+    #[allow(clippy::too_many_arguments)]
+    fn store_private_ingress(
+        &self,
+        _peer: PeerId,
+        _replication_id: &[u8; 32],
+        _invocation: &[u8; 32],
+        _content_hash: &[u8; 32],
+        _content_len: u64,
+        _bytes: Vec<u8>,
+    ) -> bool {
+        false
+    }
+
     /// Raft-join admission: may the node at `prefix` — already bound to
     /// its noise-verified PeerId by the dispatch layer — be enrolled as a
     /// voter? The concrete `vos::node` impl checks the registry's
@@ -623,6 +640,15 @@ pub(in crate::network) enum NetworkCmd {
         hash: [u8; 32],
         reply: std_mpsc::Sender<Option<Vec<u8>>>,
     },
+    SendStorePrivateIngress {
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        invocation: [u8; 32],
+        content_hash: [u8; 32],
+        content_len: u64,
+        bytes: Vec<u8>,
+        reply: std_mpsc::Sender<bool>,
+    },
     /// Subscribe the local node to the gossipsub topic for a
     /// replication group. Idempotent — re-subscribing is a no-op.
     SubscribeRep {
@@ -722,6 +748,7 @@ enum OutboundReply {
     RaftStatus(std_mpsc::Sender<RaftStatusReply>),
     ProofBlob(std_mpsc::Sender<Option<Vec<u8>>>),
     ProgramBlob(std_mpsc::Sender<Option<Vec<u8>>>),
+    PrivateIngress(std_mpsc::Sender<bool>),
 }
 
 struct PendingInvoke {
@@ -1122,6 +1149,32 @@ impl Network {
         rx
     }
 
+    /// Ask one exact Noise peer to durably stage a private ingress preimage
+    /// for a Raft group. `true` means the receiving root verified the content
+    /// address and completed its side-CAS commit; it does not mean the public
+    /// ingress has been admitted yet.
+    pub fn send_store_private_ingress(
+        &self,
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        invocation: [u8; 32],
+        content_hash: [u8; 32],
+        content_len: u64,
+        bytes: Vec<u8>,
+    ) -> std_mpsc::Receiver<bool> {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self.cmd_tx.send(NetworkCmd::SendStorePrivateIngress {
+            target_peer,
+            replication_id,
+            invocation,
+            content_hash,
+            content_len,
+            bytes,
+            reply: tx,
+        });
+        rx
+    }
+
     /// Join a replication group's gossipsub topic and register a
     /// hint channel in one call. This is the typical path for a
     /// replica: it needs to *receive* head announcements to drive
@@ -1514,6 +1567,29 @@ async fn network_main(
                             .send_request(&target_peer, frame);
                         outbound_replies.insert(req_id, OutboundReply::ProgramBlob(reply));
                         debug!(%target_peer, "network: sent FetchProgramBlob");
+                    }
+                    Some(NetworkCmd::SendStorePrivateIngress {
+                        target_peer,
+                        replication_id,
+                        invocation,
+                        content_hash,
+                        content_len,
+                        bytes,
+                        reply,
+                    }) => {
+                        let frame = Frame::StorePrivateIngress {
+                            replication_id,
+                            invocation,
+                            content_hash,
+                            content_len,
+                            bytes,
+                        };
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, frame);
+                        outbound_replies.insert(req_id, OutboundReply::PrivateIngress(reply));
+                        debug!(%target_peer, "network: sent StorePrivateIngress");
                     }
                     Some(NetworkCmd::SubscribeRep { replication_id }) => {
                         let topic = gossip_topic(&replication_id);
@@ -2066,6 +2142,40 @@ fn handle_req_resp(
                             let _ = response_tx.send((channel, Frame::ProgramBlobReply { blob }));
                         });
                     }
+                    Frame::StorePrivateIngress {
+                        replication_id,
+                        invocation,
+                        content_hash,
+                        content_len,
+                        bytes,
+                    } => {
+                        if !sync_rate.allow_private_ingress(peer) {
+                            let _ = swarm.behaviour_mut().req_resp.send_response(
+                                channel,
+                                Frame::PrivateIngressStored { accepted: false },
+                            );
+                            return;
+                        }
+                        // Voter authentication and the durable side-CAS write
+                        // may probe the registry and fsync, so keep both off
+                        // the swarm thread. Noise supplies the exact `peer`.
+                        let svc = service.get().cloned();
+                        let response_tx = response_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let accepted = svc.is_some_and(|service| {
+                                service.store_private_ingress(
+                                    peer,
+                                    &replication_id,
+                                    &invocation,
+                                    &content_hash,
+                                    content_len,
+                                    bytes,
+                                )
+                            });
+                            let _ = response_tx
+                                .send((channel, Frame::PrivateIngressStored { accepted }));
+                        });
+                    }
                     Frame::RaftAppendReq {
                         replication_id,
                         term,
@@ -2422,6 +2532,12 @@ fn handle_req_resp(
                         let _ = tx.send(blob);
                     }
                     (
+                        Frame::PrivateIngressStored { accepted },
+                        Some(OutboundReply::PrivateIngress(tx)),
+                    ) => {
+                        let _ = tx.send(accepted);
+                    }
+                    (
                         Frame::RaftAppendResp {
                             term,
                             success,
@@ -2533,6 +2649,9 @@ struct SyncRateLimiter {
     /// Separate, much tighter window for `FetchProgramBlob`: each serve is a
     /// whole-ELF disk read (~150x a DAG node), so it gets its own small budget.
     program_blob: HashMap<PeerId, (std::time::Instant, u32)>,
+    /// Private sidecar writes fsync bounded payloads and therefore receive a
+    /// separate low-volume budget from read-only synchronization.
+    private_ingress: HashMap<PeerId, (std::time::Instant, u32)>,
 }
 
 /// Window length for the per-peer sync fetch budget.
@@ -2542,6 +2661,7 @@ const MAX_SYNC_FETCHES_PER_WINDOW: u32 = 1024;
 /// Max `FetchProgramBlob` requests served per peer per window — small, since a
 /// legitimate joiner fetches a bounded set of missing ELFs, not a stream.
 const MAX_PROGRAM_BLOB_FETCHES_PER_WINDOW: u32 = 16;
+const MAX_PRIVATE_INGRESS_STORES_PER_WINDOW: u32 = 64;
 /// Map-size threshold that triggers a sweep of expired windows, so a
 /// churn of one-shot PeerIds can't grow the table without bound.
 const SYNC_RATE_PRUNE_LEN: usize = 1024;
@@ -2559,6 +2679,14 @@ impl SyncRateLimiter {
             &mut self.program_blob,
             peer,
             MAX_PROGRAM_BLOB_FETCHES_PER_WINDOW,
+        )
+    }
+
+    fn allow_private_ingress(&mut self, peer: PeerId) -> bool {
+        Self::charge(
+            &mut self.private_ingress,
+            peer,
+            MAX_PRIVATE_INGRESS_STORES_PER_WINDOW,
         )
     }
 
@@ -3679,6 +3807,112 @@ mod tests {
             .expect("FetchNode reply for missing CID");
         assert_eq!(missing, None);
 
+        net_a.join();
+        net_b.join();
+    }
+
+    #[test]
+    fn private_ingress_upload_preserves_noise_peer_and_exact_binding() {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct Seen {
+            peer: PeerId,
+            replication_id: [u8; 32],
+            invocation: [u8; 32],
+            content_hash: [u8; 32],
+            content_len: u64,
+            bytes: Vec<u8>,
+        }
+
+        struct PrivateSink {
+            expected_peer: PeerId,
+            seen: Arc<Mutex<Option<Seen>>>,
+        }
+
+        impl NetworkService for PrivateSink {
+            fn store_private_ingress(
+                &self,
+                peer: PeerId,
+                replication_id: &[u8; 32],
+                invocation: &[u8; 32],
+                content_hash: &[u8; 32],
+                content_len: u64,
+                bytes: Vec<u8>,
+            ) -> bool {
+                if peer != self.expected_peer || content_len != bytes.len() as u64 {
+                    return false;
+                }
+                *self.seen.lock().unwrap() = Some(Seen {
+                    peer,
+                    replication_id: *replication_id,
+                    invocation: *invocation,
+                    content_hash: *content_hash,
+                    content_len,
+                    bytes,
+                });
+                true
+            }
+        }
+
+        let kp_a = identity::Keypair::generate_ed25519();
+        let kp_b = identity::Keypair::generate_ed25519();
+        let prefix_a = derive_node_prefix(&PeerId::from(kp_a.public()));
+        let prefix_b = derive_node_prefix(&PeerId::from(kp_b.public()));
+        let listen_addr: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+        let net_a = Network::start(NetworkConfig {
+            keypair: kp_a,
+            local_prefix: prefix_a,
+            listen: vec![listen_addr.clone()],
+            bootstrap: vec![],
+            auto_dial_mdns: true,
+        });
+        let a_listen = wait_for(
+            || net_a.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .expect("net_a binds");
+        let a_dial = a_listen.with(libp2p::multiaddr::Protocol::P2p(net_a.peer_id()));
+        let net_b = Network::start(NetworkConfig {
+            keypair: kp_b,
+            local_prefix: prefix_b,
+            listen: vec![listen_addr],
+            bootstrap: vec![a_dial],
+            auto_dial_mdns: true,
+        });
+        let seen = Arc::new(Mutex::new(None));
+        net_b.set_service(Arc::new(PrivateSink {
+            expected_peer: net_a.peer_id(),
+            seen: seen.clone(),
+        }));
+        let peer_b = wait_for(
+            || net_a.peer_for_prefix(net_b.local_prefix()),
+            Duration::from_secs(10),
+        )
+        .expect("Hello completes");
+        let bytes = b"private ingress preimage".to_vec();
+        assert!(
+            net_a
+                .send_store_private_ingress(
+                    peer_b,
+                    [0x61; 32],
+                    [0x62; 32],
+                    [0x63; 32],
+                    bytes.len() as u64,
+                    bytes.clone(),
+                )
+                .recv_timeout(Duration::from_secs(5))
+                .expect("private ingress acknowledgement")
+        );
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            Some(Seen {
+                peer: net_a.peer_id(),
+                replication_id: [0x61; 32],
+                invocation: [0x62; 32],
+                content_hash: [0x63; 32],
+                content_len: bytes.len() as u64,
+                bytes,
+            })
+        );
         net_a.join();
         net_b.join();
     }

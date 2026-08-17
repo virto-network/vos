@@ -59,6 +59,8 @@ const TAG_FETCH_PROOF_BLOB: u8 = 0x50;
 const TAG_PROOF_BLOB_REPLY: u8 = 0x51;
 const TAG_FETCH_PROGRAM_BLOB: u8 = 0x52;
 const TAG_PROGRAM_BLOB_REPLY: u8 = 0x53;
+const TAG_STORE_PRIVATE_INGRESS: u8 = 0x54;
+const TAG_PRIVATE_INGRESS_STORED: u8 = 0x55;
 
 /// CIDs are 32-byte blake2b hashes (matches `commit::Blake2b` in
 /// `vos`). A wider hasher would require a wire-format bump.
@@ -119,6 +121,11 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// length prefix; this cap stops a malicious peer from triggering
 /// gigabyte allocations by claiming an absurd chain length.
 const MAX_CHAIN_LEN: usize = 32;
+
+/// Matches service-v2's private actor-input window. Reject oversized
+/// sidecars at the network decoder before allocating work the guest can never
+/// consume.
+const MAX_PRIVATE_INGRESS_BYTES: usize = 64 * 1024;
 
 /// One frame on the wire. See module docs for tag layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,6 +323,19 @@ pub enum Frame {
     /// `MAX_FRAME_BYTES` like every other length-prefixed payload.
     ProgramBlobReply {
         blob: Option<Vec<u8>>,
+    },
+    /// Persist one commitment-only ingress preimage on an eligible Raft
+    /// voter before the leader proposes the matching admission.
+    StorePrivateIngress {
+        replication_id: [u8; REPLICATION_ID_BYTES],
+        invocation: [u8; 32],
+        content_hash: [u8; 32],
+        content_len: u64,
+        bytes: Vec<u8>,
+    },
+    /// Durable acknowledgement for [`Frame::StorePrivateIngress`].
+    PrivateIngressStored {
+        accepted: bool,
     },
 }
 
@@ -760,6 +780,25 @@ impl Frame {
                     }
                 }
             }
+            Frame::StorePrivateIngress {
+                replication_id,
+                invocation,
+                content_hash,
+                content_len,
+                bytes,
+            } => {
+                out.push(TAG_STORE_PRIVATE_INGRESS);
+                out.extend_from_slice(replication_id);
+                out.extend_from_slice(invocation);
+                out.extend_from_slice(content_hash);
+                out.extend_from_slice(&content_len.to_le_bytes());
+                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                out.extend_from_slice(bytes);
+            }
+            Frame::PrivateIngressStored { accepted } => {
+                out.push(TAG_PRIVATE_INGRESS_STORED);
+                out.push(u8::from(*accepted));
+            }
         }
         out
     }
@@ -1082,6 +1121,33 @@ impl Frame {
                 };
                 Frame::ProgramBlobReply { blob }
             }
+            TAG_STORE_PRIVATE_INGRESS => {
+                let replication_id = r.fixed::<REPLICATION_ID_BYTES>()?;
+                let invocation = r.fixed::<32>()?;
+                let content_hash = r.fixed::<32>()?;
+                let content_len = r.u64()?;
+                let bytes = r.bytes_with_len_prefix()?;
+                if bytes.is_empty()
+                    || bytes.len() > MAX_PRIVATE_INGRESS_BYTES
+                    || content_len != bytes.len() as u64
+                {
+                    return Err(FrameError::BadPrivateIngressLength(content_len));
+                }
+                Frame::StorePrivateIngress {
+                    replication_id,
+                    invocation,
+                    content_hash,
+                    content_len,
+                    bytes,
+                }
+            }
+            TAG_PRIVATE_INGRESS_STORED => Frame::PrivateIngressStored {
+                accepted: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    other => return Err(FrameError::BadOption(other)),
+                },
+            },
             other => return Err(FrameError::UnknownTag(other)),
         };
         if !r.is_empty() {
@@ -1097,6 +1163,7 @@ pub enum FrameError {
     UnknownTag(u8),
     ChainTooLong(usize),
     PayloadTooLarge(usize),
+    BadPrivateIngressLength(u64),
     TrailingBytes(usize),
     HeadsTooMany(usize),
     BadOption(u8),
@@ -1117,6 +1184,12 @@ impl core::fmt::Display for FrameError {
             }
             FrameError::PayloadTooLarge(n) => {
                 write!(f, "payload length {n} exceeds cap {MAX_FRAME_BYTES}")
+            }
+            FrameError::BadPrivateIngressLength(n) => {
+                write!(
+                    f,
+                    "private ingress length {n} is empty, mismatched, or exceeds its cap"
+                )
             }
             FrameError::TrailingBytes(n) => write!(f, "{n} trailing bytes after frame"),
             FrameError::HeadsTooMany(n) => {
@@ -1347,6 +1420,33 @@ mod tests {
         // Large blob — exercises the MAX_FRAME_BYTES lift.
         let big = vec![0x55u8; 2 * 1024 * 1024];
         roundtrip(Frame::ProofBlobReply { blob: Some(big) });
+    }
+
+    #[test]
+    fn private_ingress_roundtrip_and_bounds() {
+        let bytes = b"producer-private input".to_vec();
+        roundtrip(Frame::StorePrivateIngress {
+            replication_id: [0x61; 32],
+            invocation: [0x62; 32],
+            content_hash: [0x63; 32],
+            content_len: bytes.len() as u64,
+            bytes,
+        });
+        roundtrip(Frame::PrivateIngressStored { accepted: false });
+        roundtrip(Frame::PrivateIngressStored { accepted: true });
+
+        let oversized = Frame::StorePrivateIngress {
+            replication_id: [0x61; 32],
+            invocation: [0x62; 32],
+            content_hash: [0x63; 32],
+            content_len: (MAX_PRIVATE_INGRESS_BYTES + 1) as u64,
+            bytes: vec![0xAA; MAX_PRIVATE_INGRESS_BYTES + 1],
+        }
+        .encode();
+        assert!(matches!(
+            Frame::decode(&oversized),
+            Err(FrameError::BadPrivateIngressLength(_))
+        ));
     }
 
     #[test]
