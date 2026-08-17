@@ -921,8 +921,9 @@ receiver accepts it only from the canonical registry PeerId of the leader in
 its current local voter view, requires its own node prefix to remain in that
 same membership, rechecks the content address, and routes it to the owning
 root thread for durable side-CAS commit before acknowledging. Each committed
-sidecar is a self-authenticating artifact carrying its own hash, length, and
-host-private staging class. Restart reconciliation retains a Raft-staged input
+sidecar is a self-authenticating artifact whose dedicated digest binds the
+VPI3 version, invocation, host-private staging class, content hash, and
+declared length. Restart reconciliation retains a Raft-staged input
 even when the matching `AdmitIngress` committed but has not yet applied, but
 deletes a Local-staged input with no guest owner. Unconsumed guest ingress rows
 adopt and authenticate their inputs; consumed rows are terminal evidence and

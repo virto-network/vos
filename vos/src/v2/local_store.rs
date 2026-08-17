@@ -505,7 +505,7 @@ impl FileCommittedImageStoreV2 {
         }
         let mut file = options.open(&temporary)?;
         file.write_all(&encode_private_ingress_artifact(
-            staging, reference, arguments,
+            invocation, staging, reference, arguments,
         ))?;
         file.sync_all()?;
         drop(file);
@@ -552,23 +552,45 @@ const PRIVATE_INGRESS_ARTIFACT_MAGIC: &[u8; 4] = b"VPI3";
 const LEGACY_PRIVATE_INGRESS_ARTIFACT_MAGIC: &[u8; 4] = b"VPI2";
 
 fn encode_private_ingress_artifact(
+    invocation: super::InvocationId,
     staging: PrivateIngressStagingV2,
     reference: &BlobRefV2,
     bytes: &[u8],
 ) -> Vec<u8> {
-    let mut artifact = Vec::with_capacity(5 + 32 + 8 + bytes.len());
-    artifact.extend_from_slice(PRIVATE_INGRESS_ARTIFACT_MAGIC);
-    artifact.push(match staging {
+    let staging_byte = match staging {
         PrivateIngressStagingV2::Local => 0,
         PrivateIngressStagingV2::Replicated => 1,
-    });
+    };
+    let binding = private_ingress_artifact_binding(invocation, staging_byte, reference);
+    let mut artifact = Vec::with_capacity(5 + 32 + 8 + 32 + bytes.len());
+    artifact.extend_from_slice(PRIVATE_INGRESS_ARTIFACT_MAGIC);
+    artifact.push(staging_byte);
     artifact.extend_from_slice(&reference.hash.0);
     artifact.extend_from_slice(&reference.len.to_le_bytes());
+    artifact.extend_from_slice(&binding.0);
     artifact.extend_from_slice(bytes);
     artifact
 }
 
+fn private_ingress_artifact_binding(
+    invocation: super::InvocationId,
+    staging: u8,
+    reference: &BlobRefV2,
+) -> super::Hash {
+    super::Hash::digest(
+        b"vos/private-ingress-artifact/v3",
+        &[
+            PRIVATE_INGRESS_ARTIFACT_MAGIC,
+            &invocation.0,
+            &[staging],
+            &reference.hash.0,
+            &reference.len.to_le_bytes(),
+        ],
+    )
+}
+
 fn decode_private_ingress_artifact(
+    invocation: super::InvocationId,
     bytes: &[u8],
 ) -> Option<(PrivateIngressStagingV2, BlobRefV2, &[u8])> {
     if bytes.get(..4)? != PRIVATE_INGRESS_ARTIFACT_MAGIC {
@@ -581,9 +603,11 @@ fn decode_private_ingress_artifact(
     };
     let hash = super::Hash(bytes.get(5..37)?.try_into().ok()?);
     let len = u64::from_le_bytes(bytes.get(37..45)?.try_into().ok()?);
-    let payload = bytes.get(45..)?;
+    let binding = super::Hash(bytes.get(45..77)?.try_into().ok()?);
+    let payload = bytes.get(77..)?;
     let reference = BlobRefV2 { hash, len };
-    (!payload.is_empty()
+    (binding == private_ingress_artifact_binding(invocation, bytes[4], &reference)
+        && !payload.is_empty()
         && payload.len() <= super::ACTOR_PRIVATE_INPUT_MAX_BYTES
         && reference.matches(payload))
     .then_some((staging, reference, payload))
@@ -697,7 +721,8 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
     ) -> Result<Option<Vec<u8>>, Self::Error> {
         match std::fs::read(self.private_ingress_path(invocation)) {
             Ok(artifact) => {
-                let Some((_, stored_reference, bytes)) = decode_private_ingress_artifact(&artifact)
+                let Some((_, stored_reference, bytes)) =
+                    decode_private_ingress_artifact(invocation, &artifact)
                 else {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -734,7 +759,7 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
         match std::fs::read(&path) {
             Ok(existing) => {
                 let Some((stored_staging, stored_reference, bytes)) =
-                    decode_private_ingress_artifact(&existing)
+                    decode_private_ingress_artifact(invocation, &existing)
                 else {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -825,7 +850,7 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
             {
                 let expected = &retained[index].1;
                 let decoded = if current {
-                    decode_private_ingress_artifact(&artifact)
+                    decode_private_ingress_artifact(invocation, &artifact)
                         .map(|(_, reference, bytes)| (reference, bytes))
                 } else {
                     (artifact.len() <= super::ACTOR_PRIVATE_INPUT_MAX_BYTES
@@ -849,11 +874,10 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
                     let current_path = self.private_ingress_path(invocation);
                     match std::fs::read(&current_path) {
                         Ok(existing)
-                            if decode_private_ingress_artifact(&existing).is_some_and(
-                                |(_, reference, current_bytes)| {
+                            if decode_private_ingress_artifact(invocation, &existing)
+                                .is_some_and(|(_, reference, current_bytes)| {
                                     reference == *expected && current_bytes == bytes
-                                },
-                            ) => {}
+                                }) => {}
                         Ok(_) => {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
@@ -871,7 +895,7 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
                         Err(error) => return Err(error),
                     }
                     std::fs::remove_file(path)?;
-                } else if !decode_private_ingress_artifact(&artifact).is_some_and(
+                } else if !decode_private_ingress_artifact(invocation, &artifact).is_some_and(
                     |(staging, reference, _)| {
                         staging == PrivateIngressStagingV2::Local && reference == *expected
                     },
@@ -894,7 +918,7 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
                 std::fs::remove_file(path)?;
                 continue;
             }
-            match decode_private_ingress_artifact(&artifact) {
+            match decode_private_ingress_artifact(invocation, &artifact) {
                 Some((PrivateIngressStagingV2::Replicated, _, _)) => {}
                 Some((PrivateIngressStagingV2::Local, _, _)) => std::fs::remove_file(path)?,
                 None => {
@@ -2487,6 +2511,81 @@ mod tests {
             },
             super::super::ConsistencyModeV2::Local,
         )
+    }
+
+    #[test]
+    fn private_ingress_artifact_authenticates_lifecycle_and_invocation() {
+        let invocation = super::super::InvocationId([0xA1; 32]);
+        let other_invocation = super::super::InvocationId([0xA2; 32]);
+        let arguments = b"private ingress lifecycle binding";
+        let reference = BlobRefV2::of_bytes(arguments);
+
+        for (staging, forged) in [
+            (
+                PrivateIngressStagingV2::Local,
+                PrivateIngressStagingV2::Replicated,
+            ),
+            (
+                PrivateIngressStagingV2::Replicated,
+                PrivateIngressStagingV2::Local,
+            ),
+        ] {
+            let mut artifact =
+                encode_private_ingress_artifact(invocation, staging, &reference, arguments);
+            assert_eq!(
+                decode_private_ingress_artifact(invocation, &artifact)
+                    .map(|(decoded, _, _)| decoded),
+                Some(staging),
+            );
+            assert!(decode_private_ingress_artifact(other_invocation, &artifact).is_none());
+            artifact[4] = match forged {
+                PrivateIngressStagingV2::Local => 0,
+                PrivateIngressStagingV2::Replicated => 1,
+            };
+            assert!(
+                decode_private_ingress_artifact(invocation, &artifact).is_none(),
+                "changing {staging:?} into {forged:?} must invalidate the lifecycle binding",
+            );
+        }
+    }
+
+    #[test]
+    fn file_reconciliation_rejects_both_lifecycle_bit_transitions() {
+        for (case, staging, forged_byte) in [
+            (0_u8, PrivateIngressStagingV2::Local, 1_u8),
+            (1_u8, PrivateIngressStagingV2::Replicated, 0_u8),
+        ] {
+            let directory = std::env::temp_dir().join(alloc::format!(
+                "vos-v2-private-lifecycle-{}-{}-{case}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            let image_path = directory.join("service.v2");
+            let mut backend = FileCommittedImageStoreV2::new(&image_path);
+            let invocation = super::super::InvocationId([case.wrapping_add(0xB0); 32]);
+            let arguments = b"private lifecycle corruption regression";
+            let reference = BlobRefV2::of_bytes(arguments);
+            assert!(
+                backend
+                    .commit_private_ingress(invocation, &reference, arguments, staging)
+                    .unwrap()
+            );
+            let artifact_path = backend.private_ingress_path(invocation);
+            let mut artifact = std::fs::read(&artifact_path).unwrap();
+            artifact[4] = forged_byte;
+            std::fs::write(&artifact_path, artifact).unwrap();
+
+            let error = backend.reconcile_private_ingresses(&[], &[]).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(
+                artifact_path.exists(),
+                "corrupt lifecycle metadata must fail before retention or deletion policy",
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]
