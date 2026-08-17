@@ -297,6 +297,9 @@ pub trait ProofArtifactStoreV2 {
     }
 
     /// Persist producer-private invocation arguments before guest admission.
+    /// A successful implementation must also durably retain enough ownership
+    /// metadata for restart reconciliation to preserve the artifact until a
+    /// later guest ingress takes ownership or the host explicitly retires it.
     /// `false` means this backend does not provide the required sidecar.
     fn commit_private_ingress(
         &mut self,
@@ -315,11 +318,12 @@ pub trait ProofArtifactStoreV2 {
         Ok(false)
     }
 
-    /// Reconcile producer-private ingress artifacts with the exact set of
-    /// guest-admitted requests that still need their plaintext. Implementors
-    /// must remove every other committed or temporary artifact and validate
-    /// that every retained artifact matches its content address. `retained`
-    /// is strictly ordered by invocation identity without duplicates.
+    /// Reconcile producer-private ingress artifacts with guest-admitted
+    /// requests that still need their plaintext. Implementors must preserve
+    /// both those guest-owned artifacts and self-authenticating pre-admission
+    /// artifacts durably acknowledged by [`Self::commit_private_ingress`],
+    /// while removing incomplete temporary files. `retained` is strictly
+    /// ordered by invocation identity without duplicates.
     fn reconcile_private_ingresses(
         &mut self,
         retained: &[(super::InvocationId, BlobRefV2)],
@@ -487,6 +491,31 @@ fn decode_private_ingress_file_name(name: &str) -> Option<super::InvocationId> {
     Some(super::InvocationId(invocation))
 }
 
+const PRIVATE_INGRESS_ARTIFACT_MAGIC: &[u8; 4] = b"VPI2";
+
+fn encode_private_ingress_artifact(reference: &BlobRefV2, bytes: &[u8]) -> Vec<u8> {
+    let mut artifact = Vec::with_capacity(4 + 32 + 8 + bytes.len());
+    artifact.extend_from_slice(PRIVATE_INGRESS_ARTIFACT_MAGIC);
+    artifact.extend_from_slice(&reference.hash.0);
+    artifact.extend_from_slice(&reference.len.to_le_bytes());
+    artifact.extend_from_slice(bytes);
+    artifact
+}
+
+fn decode_private_ingress_artifact(bytes: &[u8]) -> Option<(BlobRefV2, &[u8])> {
+    if bytes.get(..4)? != PRIVATE_INGRESS_ARTIFACT_MAGIC {
+        return None;
+    }
+    let hash = super::Hash(bytes.get(4..36)?.try_into().ok()?);
+    let len = u64::from_le_bytes(bytes.get(36..44)?.try_into().ok()?);
+    let payload = bytes.get(44..)?;
+    let reference = BlobRefV2 { hash, len };
+    (!payload.is_empty()
+        && payload.len() <= super::ACTOR_PRIVATE_INPUT_MAX_BYTES
+        && reference.matches(payload))
+    .then_some((reference, payload))
+}
+
 impl CommittedImageStoreV2 for FileCommittedImageStoreV2 {
     type Error = std::io::Error;
 
@@ -580,11 +609,22 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
         reference: &BlobRefV2,
     ) -> Result<Option<Vec<u8>>, Self::Error> {
         match std::fs::read(self.private_ingress_path(invocation)) {
-            Ok(bytes) if reference.matches(&bytes) => Ok(Some(bytes)),
-            Ok(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "private ingress does not match its committed content address",
-            )),
+            Ok(artifact) => {
+                let Some((stored_reference, bytes)) = decode_private_ingress_artifact(&artifact)
+                else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "private ingress artifact is not canonical",
+                    ));
+                };
+                if stored_reference != *reference {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "private ingress does not match its committed content address",
+                    ));
+                }
+                Ok(Some(bytes.to_vec()))
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
@@ -604,6 +644,7 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
                 "private ingress does not match its committed content address",
             ));
         }
+        let artifact = encode_private_ingress_artifact(reference, arguments);
         let directory = self.private_ingress_directory();
         std::fs::create_dir_all(&directory)?;
         if let Some(parent) = directory.parent() {
@@ -611,7 +652,15 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
         }
         let path = self.private_ingress_path(invocation);
         match std::fs::read(&path) {
-            Ok(existing) if existing == arguments => return Ok(true),
+            Ok(existing)
+                if decode_private_ingress_artifact(&existing).is_some_and(
+                    |(stored_reference, bytes)| {
+                        stored_reference == *reference && bytes == arguments
+                    },
+                ) =>
+            {
+                return Ok(true);
+            }
             Ok(_) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
@@ -630,7 +679,7 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
             options.mode(0o600);
         }
         let mut file = options.open(&temporary)?;
-        file.write_all(arguments)?;
+        file.write_all(&artifact)?;
         file.sync_all()?;
         drop(file);
         std::fs::rename(&temporary, &path)?;
@@ -679,13 +728,7 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             let invocation = decode_private_ingress_file_name(&name);
-            let keep = invocation.and_then(|invocation| {
-                retained
-                    .binary_search_by_key(&invocation, |(candidate, _)| *candidate)
-                    .ok()
-                    .map(|index| (invocation, &retained[index].1))
-            });
-            let Some((invocation, reference)) = keep else {
+            let Some(invocation) = invocation else {
                 if entry.file_type()?.is_dir() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -695,14 +738,24 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
                 std::fs::remove_file(path)?;
                 continue;
             };
-            let bytes = std::fs::read(&path)?;
-            if !reference.matches(&bytes) {
+            let artifact = std::fs::read(&path)?;
+            let Some((stored_reference, _)) = decode_private_ingress_artifact(&artifact) else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "private ingress does not match its committed content address",
+                    "private ingress artifact is not canonical",
                 ));
+            };
+            if let Ok(index) =
+                retained.binary_search_by_key(&invocation, |(candidate, _)| *candidate)
+            {
+                if retained[index].1 != stored_reference {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "private ingress does not match its guest-owned content address",
+                    ));
+                }
+                present.insert(invocation);
             }
-            present.insert(invocation);
         }
         if retained
             .iter()
@@ -2670,6 +2723,13 @@ mod tests {
                 .any(|window| window == private_arguments),
             "private invocation input must stay outside the service image",
         );
+        assert!(
+            !expected
+                .encode()
+                .windows(orphan_arguments.len())
+                .any(|window| window == orphan_arguments),
+            "pre-admission private input must stay outside the service image",
+        );
         assert_eq!(
             restarted.private_ingress(private_invocation, &private_reference),
             Some(private_arguments),
@@ -2677,9 +2737,10 @@ mod tests {
         );
         assert_eq!(
             restarted.private_ingress(orphan_invocation, &orphan_reference),
-            None,
-            "startup retires private input that has no unconsumed guest ingress",
+            Some(orphan_arguments),
+            "startup retains an acknowledged pre-admission private input",
         );
+        assert!(restarted.prune_private_ingress(orphan_invocation).unwrap());
         assert!(!abandoned_temporary.exists());
         assert!(restarted.prune_private_ingress(private_invocation).unwrap());
         assert_eq!(restarted.proof_bytes(&proof_blob), Some(proof));
