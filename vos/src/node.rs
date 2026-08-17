@@ -7780,9 +7780,7 @@ where
         #[cfg(all(feature = "network", feature = "storage"))]
         if let Some(private_ingress) = private_ingress_registration.as_ref() {
             while let Ok(reply) = private_ingress.quiescence_receiver.try_recv() {
-                let quiescent = service
-                    .has_pending_private_ingress()
-                    .is_ok_and(|pending| !pending);
+                let quiescent = service.private_ingress_join_quiescent().unwrap_or(false);
                 let _ = reply.send(quiescent);
             }
             for _ in 0..4 {

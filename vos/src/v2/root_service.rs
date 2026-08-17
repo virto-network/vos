@@ -1748,6 +1748,19 @@ where
             .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)
     }
 
+    /// Establish a current-term read barrier, apply every entry through its
+    /// index, and only then decide whether voter promotion is safe. The node
+    /// holds the membership/private-ingress exclusion guard across this call
+    /// and the subsequent configuration proposal, so a prior-term admission
+    /// cannot become committed behind a stale quiescence observation.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    pub(crate) fn private_ingress_join_quiescent(
+        &mut self,
+    ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        self.prepare_admission_barrier()?;
+        self.has_pending_private_ingress().map(|pending| !pending)
+    }
+
     /// Retry host-only cleanup debt without changing the disposition of an
     /// invocation whose guest transition already committed.
     pub(crate) fn retry_private_ingress_retirement(&mut self) {

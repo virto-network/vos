@@ -1085,7 +1085,15 @@ producer side-CAS retains content-addressed inputs belonging to guest-owned
 unconsumed ingress records and explicitly Raft-staged inputs awaiting ordered
 admission. Local pre-admission orphans, guest-consumed terminal artifacts, and
 incomplete temporary writes are retired, while missing or corrupt live inputs
-fail startup. Task project
+fail startup. Ambiguous Raft staging is never deleted merely because one
+leader attempt timed out: the entry may already be committed elsewhere.
+Instead, a root refuses a new replicated staging write once 64 authenticated
+private-input artifacts are retained, bounding ambiguous Raft pre-admission
+plaintext to 4 MiB; exact retries remain idempotent at the limit and new
+private admissions fail closed until committed or operator-resolved state
+releases quota. Voter promotion holds the same admission/membership exclusion
+guard while a current-term read barrier applies every committed entry and the
+root proves that no guest-owned private ingress remains pending. Task project
 inputs are ordinary Cargo binary targets (resolved from
 Cargo's JSON artifact stream), not actor-library builds. Reopen verifies every
 retained dependency against the durable program catalog, and Raft roots reject

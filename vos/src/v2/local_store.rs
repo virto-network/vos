@@ -25,6 +25,11 @@ use super::{
     StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
 };
 
+/// Artifact-count ceiling for admitting a new replicated private input. Each
+/// payload is independently capped at 64 KiB, bounding ambiguous Raft
+/// pre-admission plaintext to 4 MiB while leaving exact retries admissible.
+pub(crate) const MAX_REPLICATED_PRIVATE_INGRESS_ARTIFACTS: usize = 64;
+
 fn proof_verification_for_attestation(
     attestation: &AttestationDeliveryV2,
 ) -> ProofVerificationRequestV2 {
@@ -295,6 +300,12 @@ pub trait ProofArtifactStoreV2 {
     ) -> Result<Option<Vec<u8>>, Self::Error> {
         Ok(None)
     }
+
+    /// Number of durable private-ingress artifacts currently retained by
+    /// this single-writer backend. The host uses this before creating a new
+    /// replicated pre-admission artifact so an unavailable voter cannot turn
+    /// ambiguous fanout attempts into unbounded plaintext retention.
+    fn private_ingress_artifact_count(&self) -> Result<usize, Self::Error>;
 
     /// Persist producer-private invocation arguments before guest admission.
     /// A successful implementation must also durably retain enough ownership
@@ -740,6 +751,40 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    fn private_ingress_artifact_count(&self) -> Result<usize, Self::Error> {
+        let directory = self.private_ingress_directory();
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let mut count = 0usize;
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some((invocation, true)) = decode_private_ingress_file_name(&name) else {
+                // Incomplete atomic-write files are not acknowledged durable
+                // artifacts and are removed by startup reconciliation.
+                continue;
+            };
+            let artifact = std::fs::read(entry.path())?;
+            if decode_private_ingress_artifact(invocation, &artifact).is_none() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "private ingress artifact is not canonical",
+                ));
+            }
+            count = count.checked_add(1).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "private ingress artifact count overflow",
+                )
+            })?;
+        }
+        Ok(count)
     }
 
     fn commit_private_ingress(
@@ -1221,17 +1266,27 @@ where
         staging: PrivateIngressStagingV2,
     ) -> Result<BlobRefV2, ()> {
         let reference = BlobRefV2::of_bytes(arguments);
-        if arguments.is_empty() {
+        if arguments.is_empty() || arguments.len() > super::ACTOR_PRIVATE_INPUT_MAX_BYTES {
             return Err(());
         }
-        match self
+        let already_present = match self
             .backend
             .load_private_ingress(invocation, &reference)
             .map_err(|_| ())?
         {
-            Some(existing) if existing == arguments => {}
+            Some(existing) if existing == arguments => true,
             Some(_) => return Err(()),
-            None => {}
+            None => false,
+        };
+        if staging == PrivateIngressStagingV2::Replicated
+            && !already_present
+            && self
+                .backend
+                .private_ingress_artifact_count()
+                .map_err(|_| ())?
+                >= MAX_REPLICATED_PRIVATE_INGRESS_ARTIFACTS
+        {
+            return Err(());
         }
         if !self
             .backend
@@ -2547,6 +2602,10 @@ mod tests {
             Ok(())
         }
 
+        fn private_ingress_artifact_count(&self) -> Result<usize, Self::Error> {
+            Ok(0)
+        }
+
         fn reconcile_private_ingresses(
             &mut self,
             retained: &[(super::super::InvocationId, BlobRefV2)],
@@ -2648,6 +2707,77 @@ mod tests {
             );
             std::fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn replicated_private_ingress_staging_is_durably_bounded() {
+        let directory = std::env::temp_dir().join(alloc::format!(
+            "vos-v2-private-quota-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let path = directory.join("service.v2");
+        let mut store = DurableJamStoreV2::open(FileCommittedImageStoreV2::new(&path)).unwrap();
+        let mut first = None;
+        for ordinal in 0..MAX_REPLICATED_PRIVATE_INGRESS_ARTIFACTS {
+            let mut invocation = [0_u8; 32];
+            invocation[..8].copy_from_slice(&(ordinal as u64).to_le_bytes());
+            let invocation = super::super::InvocationId(invocation);
+            let arguments = alloc::vec![ordinal as u8 + 1; 32];
+            let reference = store
+                .persist_replicated_private_ingress(invocation, &arguments)
+                .expect("artifact below the hard quota is retained");
+            first.get_or_insert((invocation, arguments, reference));
+        }
+        assert_eq!(
+            store.backend.private_ingress_artifact_count().unwrap(),
+            MAX_REPLICATED_PRIVATE_INGRESS_ARTIFACTS,
+        );
+        let (first_invocation, first_arguments, first_reference) = first.unwrap();
+        assert_eq!(
+            store
+                .persist_replicated_private_ingress(first_invocation, &first_arguments)
+                .unwrap(),
+            first_reference,
+            "an exact retry remains idempotent at the quota",
+        );
+        let overflow_invocation = super::super::InvocationId([0xFE; 32]);
+        assert!(
+            store
+                .persist_replicated_private_ingress(
+                    overflow_invocation,
+                    b"must wait for an ambiguous admission to resolve",
+                )
+                .is_err(),
+            "a new replicated artifact is refused at the hard durable quota",
+        );
+
+        let (_, backend) = store.into_parts();
+        let mut store = DurableJamStoreV2::open(backend).unwrap();
+        assert!(
+            store
+                .persist_replicated_private_ingress(
+                    overflow_invocation,
+                    b"must wait for an ambiguous admission to resolve",
+                )
+                .is_err(),
+            "restart cannot reset the durable quota",
+        );
+        assert!(store.prune_private_ingress(first_invocation).unwrap());
+        assert!(
+            store
+                .persist_replicated_private_ingress(
+                    overflow_invocation,
+                    b"must wait for an ambiguous admission to resolve",
+                )
+                .is_ok(),
+            "retiring a resolved artifact releases one quota slot",
+        );
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

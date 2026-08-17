@@ -256,6 +256,10 @@ impl ProofArtifactStoreV2 for SharedCommittedImages {
         Ok(())
     }
 
+    fn private_ingress_artifact_count(&self) -> Result<usize, Self::Error> {
+        Ok(0)
+    }
+
     fn reconcile_private_ingresses(
         &mut self,
         retained: &[(InvocationId, BlobRefV2)],
@@ -304,6 +308,10 @@ impl ProofArtifactStoreV2 for SharedProofCommittedImages {
         Ok(())
     }
 
+    fn private_ingress_artifact_count(&self) -> Result<usize, Self::Error> {
+        Ok(0)
+    }
+
     fn reconcile_private_ingresses(
         &mut self,
         retained: &[(InvocationId, BlobRefV2)],
@@ -342,6 +350,10 @@ impl ProofArtifactStoreV2 for SharedFailingCommittedImages {
 
     fn commit_proof(&mut self, _reference: &BlobRefV2, _proof: &[u8]) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    fn private_ingress_artifact_count(&self) -> Result<usize, Self::Error> {
+        Ok(0)
     }
 
     fn reconcile_private_ingresses(
@@ -465,6 +477,10 @@ impl ProofArtifactStoreV2 for FailableCommittedImages {
                 Ok(())
             }
         }
+    }
+
+    fn private_ingress_artifact_count(&self) -> Result<usize, Self::Error> {
+        Ok(self.private_ingresses.len())
     }
 
     fn load_private_ingress(
@@ -14451,25 +14467,45 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
         gas: GasAccountingV2::default(),
         proof: None,
     };
+    leader
+        .log_mut()
+        .commit_before_next_read_index(direct_linear_ingress(&promotion_tail).encode());
+    assert_eq!(leader.leadership_barrier_and_catch_up().unwrap(), 1);
+    assert!(
+        leader
+            .service()
+            .accumulate_host()
+            .pending_ingresses()
+            .unwrap()
+            .iter()
+            .any(|ingress| ingress.invocation == promotion_tail.invocation),
+        "a current-term barrier exposes a prior-term admission before join quiescence is decided",
+    );
+    let caught_up_header = leader
+        .service()
+        .accumulate_host()
+        .header()
+        .unwrap()
+        .unwrap();
+    assert_eq!(caught_up_header.revision, 0);
+    assert_eq!(
+        caught_up_header.admission_timeslot_high_water,
+        promotion_floor
+    );
     assert!(matches!(
         leader
-            .accumulate(&direct_linear_ingress(&promotion_tail))
+            .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+                work: promotion_tail,
+                transition: promotion_transition,
+                provided_blobs: vec![],
+            }))
             .unwrap()
             .result,
-        AccumulationResultV2::IngressAdmitted {
+        AccumulationResultV2::Accepted {
             duplicate: false,
             ..
         }
     ));
-    leader.log_mut().commit_before_next_read_index(
-        AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
-            work: promotion_tail,
-            transition: promotion_transition,
-            provided_blobs: vec![],
-        })
-        .encode(),
-    );
-    assert_eq!(leader.leadership_barrier_and_catch_up().unwrap(), 1);
     let caught_up_header = leader
         .service()
         .accumulate_host()
