@@ -1752,6 +1752,31 @@ where
         self.service.accumulate_host_mut()
     }
 
+    /// Persist one authenticated Raft private-ingress preimage outside the
+    /// service image. The node performs replication-group/voter
+    /// authentication before calling this root-owned boundary; this method
+    /// independently pins the content address and the service's private-input
+    /// size limit before acknowledging durability.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    pub(crate) fn stage_replicated_private_ingress(
+        &mut self,
+        invocation: super::InvocationId,
+        reference: &BlobRefV2,
+        bytes: &[u8],
+    ) -> bool {
+        if self.consistency != ConsistencyModeV2::Raft
+            || bytes.is_empty()
+            || bytes.len() > super::ACTOR_PRIVATE_INPUT_MAX_BYTES
+            || !reference.matches(bytes)
+        {
+            return false;
+        }
+        self.service
+            .accumulate_host_mut()
+            .persist_private_ingress(invocation, bytes)
+            .is_ok_and(|persisted| persisted == *reference)
+    }
+
     /// Read one producer-private Task record from this operator's durable
     /// sidecar. This host API is intentionally absent from actor messages,
     /// service snapshots, Raft logs, and replica transport.

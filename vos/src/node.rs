@@ -1244,6 +1244,9 @@ pub struct VosNode {
     /// current leader.
     #[cfg(all(feature = "network", feature = "storage"))]
     raft_hosts: RaftHosts,
+    /// Exact Raft group → root-owned private-ingress sidecar sink.
+    #[cfg(all(feature = "network", feature = "storage"))]
+    v2_private_ingress_routes: V2PrivateIngressRoutes,
     /// Short-lived leader cache plus one in-flight marker per Raft root.
     /// Resolution workers never run on the global envelope router, and
     /// repeated 250 ms durable redrives coalesce behind the same marker.
@@ -1358,6 +1361,32 @@ pub(crate) struct ReplicaSlot {
 
 /// Shared invoke-route table. Cheap to clone and pass to threads.
 type InvokeRoutes = Arc<Mutex<HashMap<u32, mpsc::Sender<InvokeRequest>>>>;
+
+/// Host-private sidecar request routed directly to one Raft root thread. It
+/// never shares the actor invocation channel or a guest-visible wire.
+#[cfg(all(feature = "network", feature = "storage"))]
+struct V2PrivateIngressUpload {
+    invocation: crate::v2::InvocationId,
+    reference: crate::v2::BlobRefV2,
+    bytes: Vec<u8>,
+    reply: mpsc::Sender<bool>,
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+struct V2PrivateIngressRoute {
+    tx: mpsc::Sender<V2PrivateIngressUpload>,
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+type V2PrivateIngressRoutes = Arc<RwLock<HashMap<[u8; 32], Arc<V2PrivateIngressRoute>>>>;
+
+#[cfg(all(feature = "network", feature = "storage"))]
+struct V2PrivateIngressRegistration {
+    replication_id: [u8; 32],
+    route: Arc<V2PrivateIngressRoute>,
+    receiver: mpsc::Receiver<V2PrivateIngressUpload>,
+    routes: V2PrivateIngressRoutes,
+}
 
 /// Shared map of raft-hosted agents: ServiceId word → replication
 /// group of the multi-mode worker spawned for it. The companion to
@@ -1575,6 +1604,8 @@ struct NodeService {
     /// the internal Raft origin-delegation envelope.
     #[cfg(feature = "storage")]
     raft_hosts: RaftHosts,
+    #[cfg(feature = "storage")]
+    v2_private_ingress_routes: V2PrivateIngressRoutes,
     shared_network: SharedNetwork,
     manifest: Arc<OnceLock<crate::network::ManifestReply>>,
     proof_blobs: ProofBlobStore,
@@ -2918,6 +2949,69 @@ impl crate::network::NetworkService for NodeService {
         std::fs::read(dir.join(proof_blob_filename(hash))).ok()
     }
 
+    #[cfg(feature = "storage")]
+    fn store_private_ingress(
+        &self,
+        peer: libp2p::PeerId,
+        replication_id: &[u8; 32],
+        invocation: &[u8; 32],
+        content_hash: &[u8; 32],
+        content_len: u64,
+        bytes: Vec<u8>,
+    ) -> bool {
+        if bytes.is_empty()
+            || bytes.len() > crate::v2::ACTOR_PRIVATE_INPUT_MAX_BYTES
+            || content_len != bytes.len() as u64
+        {
+            return false;
+        }
+        let Some(status) = self
+            .shared_network
+            .lock()
+            .ok()
+            .and_then(|network| network.as_ref()?.local_raft_status_cached(replication_id))
+        else {
+            return false;
+        };
+        let prefix = crate::network::derive_node_prefix(&peer);
+        let Some(member) = self.lookup_node_member(prefix) else {
+            return false;
+        };
+        if authenticated_v2_raft_leader_peer(&status, &member, prefix) != Some(peer) {
+            return false;
+        }
+        let reference = crate::v2::BlobRefV2 {
+            hash: crate::v2::Hash(*content_hash),
+            len: content_len,
+        };
+        if !reference.matches(&bytes) {
+            return false;
+        }
+        let Some(tx) = self
+            .v2_private_ingress_routes
+            .read()
+            .ok()
+            .and_then(|routes| routes.get(replication_id).map(|route| route.tx.clone()))
+        else {
+            return false;
+        };
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if tx
+            .send(V2PrivateIngressUpload {
+                invocation: crate::v2::InvocationId(*invocation),
+                reference,
+                bytes,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        reply_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or(false)
+    }
+
     /// Admit a Raft joiner only if it is enrolled as a `NODE_ROLE_VOTER`
     /// in the local space-registry. Fails **closed** — an unreachable or
     /// empty registry reply (`lookup_node_role` → `0` = "not enrolled")
@@ -3394,6 +3488,8 @@ impl VosNode {
             #[cfg(all(feature = "network", feature = "storage"))]
             raft_hosts: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(feature = "network", feature = "storage"))]
+            v2_private_ingress_routes: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(all(feature = "network", feature = "storage"))]
             v2_raft_transport_resolutions: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(feature = "network", feature = "storage"))]
             v2_raft_transport_ownership_generation: AtomicU64::new(0),
@@ -3580,6 +3676,8 @@ impl VosNode {
             replicas: self.crdt_replicas.clone(),
             #[cfg(feature = "storage")]
             raft_hosts: self.raft_hosts.clone(),
+            #[cfg(feature = "storage")]
+            v2_private_ingress_routes: self.v2_private_ingress_routes.clone(),
             shared_network: self.shared_network.clone(),
             manifest: self.manifest.clone(),
             proof_blobs: self.proof_blobs.clone(),
@@ -3932,6 +4030,21 @@ impl VosNode {
         let shared_network = self.shared_network.clone();
         let logical_timeslot = self.v2_logical_timeslot.clone();
         let outbox = self.outbox_tx.clone();
+        #[cfg(all(feature = "network", feature = "storage"))]
+        let private_ingress_registration = service.replication_id().map(|replication_id| {
+            let (tx, rx) = mpsc::channel();
+            let route = Arc::new(V2PrivateIngressRoute { tx });
+            self.v2_private_ingress_routes
+                .write()
+                .unwrap()
+                .insert(replication_id, route.clone());
+            V2PrivateIngressRegistration {
+                replication_id,
+                route,
+                receiver: rx,
+                routes: self.v2_private_ingress_routes.clone(),
+            }
+        });
         self.agents.push(AgentHandle {
             join: Some(thread::spawn(move || {
                 v2_root_service_thread(
@@ -3947,6 +4060,8 @@ impl VosNode {
                     #[cfg(feature = "network")]
                     shared_network,
                     proof_producer,
+                    #[cfg(all(feature = "network", feature = "storage"))]
+                    private_ingress_registration,
                     logical_timeslot,
                     shutdown,
                     activity,
@@ -7378,6 +7493,9 @@ fn v2_root_service_thread<B>(
     is_role_authority: bool,
     #[cfg(feature = "network")] shared_network: SharedNetwork,
     mut proof_producer: Option<V2NodeAttestationProofProducer>,
+    #[cfg(all(feature = "network", feature = "storage"))] private_ingress_registration: Option<
+        V2PrivateIngressRegistration,
+    >,
     logical_timeslot: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
@@ -7404,6 +7522,20 @@ where
         Err(failure) => warn!(%id, ?failure, "v2 root-tree startup catch-up failed"),
     }
     while error.is_none() && !shutdown.load(Ordering::Relaxed) {
+        #[cfg(all(feature = "network", feature = "storage"))]
+        if let Some(private_ingress) = private_ingress_registration.as_ref() {
+            for _ in 0..4 {
+                let Ok(upload) = private_ingress.receiver.try_recv() else {
+                    break;
+                };
+                let accepted = service.stage_replicated_private_ingress(
+                    upload.invocation,
+                    &upload.reference,
+                    &upload.bytes,
+                );
+                let _ = upload.reply.send(accepted);
+            }
+        }
         while let Ok(envelope) = inbox_rx.try_recv() {
             *activity.lock().unwrap() = Instant::now();
             handle_v2_root_transport(
@@ -7766,6 +7898,16 @@ where
         .write()
         .unwrap()
         .retain(|_, route| route.route != id.0);
+    #[cfg(all(feature = "network", feature = "storage"))]
+    if let Some(private_ingress) = private_ingress_registration.as_ref() {
+        let mut routes = private_ingress.routes.write().unwrap();
+        let owns_route = routes
+            .get(&private_ingress.replication_id)
+            .is_some_and(|route| Arc::ptr_eq(route, &private_ingress.route));
+        if owns_route {
+            routes.remove(&private_ingress.replication_id);
+        }
+    }
     AgentResult {
         id,
         panics: 0,
@@ -16325,6 +16467,8 @@ mod tests {
             replicas: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "storage")]
             raft_hosts: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "storage")]
+            v2_private_ingress_routes: Arc::new(RwLock::new(HashMap::new())),
             shared_network: Arc::new(Mutex::new(None)),
             manifest: Arc::new(OnceLock::new()),
             proof_blobs: Arc::new(RwLock::new(HashMap::new())),
@@ -16687,6 +16831,156 @@ mod tests {
             authenticated_v2_raft_leader_peer(&wrong_group, &enrolled, prefix).is_none(),
             "the same roster peer is not trusted outside the authority's exact Raft group",
         );
+    }
+
+    #[test]
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn private_ingress_store_requires_the_exact_raft_leader_and_root_sink() {
+        use crate::actors::codec::Encode;
+        use crate::network::{NetworkService, RaftAppendResult, RaftInstallSnapshotResult};
+        use crate::value::Value;
+
+        struct Status {
+            leader: u16,
+        }
+        impl crate::network::RaftRpcHandler for Status {
+            fn local_status(&self) -> Option<crate::network::RaftStatusReply> {
+                Some(crate::network::RaftStatusReply {
+                    present: true,
+                    role: crate::network::RaftRole::Follower,
+                    current_term: 7,
+                    commit_index: 9,
+                    last_log_index: 9,
+                    members: vec![self.leader],
+                    leader_hint: Some(self.leader),
+                })
+            }
+            fn append_entries(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                prev_log_index: u64,
+                _prev_log_term: u64,
+                _leader_commit: u64,
+                _entries: Vec<crate::network::RaftEntry>,
+            ) -> RaftAppendResult {
+                RaftAppendResult {
+                    term,
+                    success: false,
+                    match_index: prev_log_index,
+                }
+            }
+            fn request_vote(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                _last_log_index: u64,
+                _last_log_term: u64,
+            ) -> crate::network::RaftVoteResult {
+                crate::network::RaftVoteResult {
+                    term,
+                    vote_granted: false,
+                }
+            }
+            fn install_snapshot(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                _last_included_index: u64,
+                _last_included_term: u64,
+                _offset: u64,
+                _done: bool,
+                _snapshot: Vec<u8>,
+                _members: Vec<u16>,
+                _joint_old: Option<Vec<u16>>,
+            ) -> RaftInstallSnapshotResult {
+                RaftInstallSnapshotResult {
+                    term,
+                    bytes_received: 0,
+                }
+            }
+        }
+
+        let leader = libp2p::PeerId::random();
+        let leader_prefix = crate::network::derive_node_prefix(&leader);
+        let member = crate::registry::MemberRow {
+            kind: crate::registry::MEMBER_KIND_NODE,
+            key: leader.to_bytes(),
+            prefix: leader_prefix,
+            role: crate::registry::NODE_ROLE_VOTER,
+            proof_kind: 0,
+            proof_data: Vec::new(),
+        };
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let (registry_tx, registry_rx) = mpsc::channel::<InvokeRequest>();
+        routes
+            .lock()
+            .unwrap()
+            .insert(ServiceId::REGISTRY.0, registry_tx);
+        let registry = thread::spawn(move || {
+            let request = registry_rx.recv().unwrap();
+            let page = crate::registry::MemberPage {
+                members: vec![member],
+                next_kind: crate::registry::MEMBER_KIND_IDENTITY,
+                next_key: Vec::new(),
+                more: false,
+            };
+            let reply = Value::Bytes(page.encode()).encode();
+            let _ = request.reply.send(encode_invoke_envelope(
+                crate::actors::run::STATUS_DONE,
+                &[],
+                &reply,
+            ));
+        });
+
+        let replication_id = [0x61; 32];
+        let network = Arc::new(crate::network::Network::start(
+            crate::network::NetworkConfig::default(),
+        ));
+        network.register_raft_handler(
+            replication_id,
+            Arc::new(Status {
+                leader: leader_prefix,
+            }),
+        );
+        let mut service = lifecycle_service(
+            routes,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
+        );
+        service.shared_network = Arc::new(Mutex::new(Some(network.clone())));
+        let (sidecar_tx, sidecar_rx) = mpsc::channel();
+        service.v2_private_ingress_routes.write().unwrap().insert(
+            replication_id,
+            Arc::new(V2PrivateIngressRoute { tx: sidecar_tx }),
+        );
+        let bytes = b"exact private ingress".to_vec();
+        let reference = crate::v2::BlobRefV2::of_bytes(&bytes);
+        let invocation = crate::v2::InvocationId([0x62; 32]);
+        let expected_bytes = bytes.clone();
+        let expected_reference = reference.clone();
+        let sink = thread::spawn(move || {
+            let upload: V2PrivateIngressUpload = sidecar_rx.recv().unwrap();
+            assert_eq!(upload.invocation, invocation);
+            assert_eq!(upload.reference, expected_reference);
+            assert_eq!(upload.bytes, expected_bytes);
+            upload.reply.send(true).unwrap();
+        });
+        assert!(service.store_private_ingress(
+            leader,
+            &replication_id,
+            &invocation.0,
+            &reference.hash.0,
+            reference.len,
+            b"exact private ingress".to_vec(),
+        ));
+        sink.join().unwrap();
+        registry.join().unwrap();
+        drop(service);
+        Arc::try_unwrap(network).ok().unwrap().join();
     }
 
     #[test]
@@ -17267,6 +17561,8 @@ mod tests {
             replicas: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "storage")]
             raft_hosts: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "storage")]
+            v2_private_ingress_routes: Arc::new(RwLock::new(HashMap::new())),
             shared_network: Arc::new(Mutex::new(None)),
             manifest: Arc::new(OnceLock::new()),
             proof_blobs: Arc::new(RwLock::new(HashMap::new())),
