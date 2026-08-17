@@ -447,10 +447,13 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
   exact-traced and Local producers durably store the private record before
   commit, while Local guest state binds only the private-input commitment.
   Raft/CRDT packages with Task dependencies deliberately fail before genesis:
-  the remaining protocol work is authenticated distribution of that private
-  preimage to eligible producers, sidecar retrieval/pruning, and
-  leadership-transfer coverage. Only then can the public money path switch
-  from `apply_transfer` to the proven parent seam.
+  the bounded Noise-authenticated Raft sidecar store and durable
+  acknowledgement now exist, without placing plaintext in the replicated
+  log/image. The remaining Raft work is an all-voter pre-admission barrier,
+  joiner hydration before voter promotion, holder-wide retirement, and
+  leadership-transfer coverage. CRDT still needs a causal producer-
+  availability rule. Only then can the public money path switch from
+  `apply_transfer` to the proven parent seam.
 - *Generated parent glue.* D6's manual Clerk implementation establishes the
   contract; a later macro may generate the touched-leaf/proof/invoke/apply
   boilerplate for other actors without changing its trust model.
