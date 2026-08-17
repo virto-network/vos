@@ -2149,19 +2149,21 @@ fn handle_req_resp(
                         content_len,
                         bytes,
                     } => {
-                        if !sync_rate.allow_private_ingress(peer) {
+                        let Some(private_ingress_permit) = sync_rate.acquire_private_ingress(peer)
+                        else {
                             let _ = swarm.behaviour_mut().req_resp.send_response(
                                 channel,
                                 Frame::PrivateIngressStored { accepted: false },
                             );
                             return;
-                        }
+                        };
                         // Voter authentication and the durable side-CAS write
                         // may probe the registry and fsync, so keep both off
                         // the swarm thread. Noise supplies the exact `peer`.
                         let svc = service.get().cloned();
                         let response_tx = response_tx.clone();
                         tokio::task::spawn_blocking(move || {
+                            let _private_ingress_permit = private_ingress_permit;
                             let accepted = svc.is_some_and(|service| {
                                 service.store_private_ingress(
                                     peer,
@@ -2652,6 +2654,17 @@ struct SyncRateLimiter {
     /// Private sidecar writes fsync bounded payloads and therefore receive a
     /// separate low-volume budget from read-only synchronization.
     private_ingress: HashMap<PeerId, (std::time::Instant, u32)>,
+    /// Global blocking-work cap. Per-peer limits alone do not stop a rotating
+    /// set of Noise identities from exhausting the blocking executor.
+    private_ingress_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct PrivateIngressPermit(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for PrivateIngressPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 /// Window length for the per-peer sync fetch budget.
@@ -2661,7 +2674,8 @@ const MAX_SYNC_FETCHES_PER_WINDOW: u32 = 1024;
 /// Max `FetchProgramBlob` requests served per peer per window — small, since a
 /// legitimate joiner fetches a bounded set of missing ELFs, not a stream.
 const MAX_PROGRAM_BLOB_FETCHES_PER_WINDOW: u32 = 16;
-const MAX_PRIVATE_INGRESS_STORES_PER_WINDOW: u32 = 64;
+const MAX_PRIVATE_INGRESS_STORES_PER_WINDOW: u32 = 8;
+const MAX_PRIVATE_INGRESS_STORES_IN_FLIGHT: usize = 16;
 /// Map-size threshold that triggers a sweep of expired windows, so a
 /// churn of one-shot PeerIds can't grow the table without bound.
 const SYNC_RATE_PRUNE_LEN: usize = 1024;
@@ -2682,12 +2696,23 @@ impl SyncRateLimiter {
         )
     }
 
-    fn allow_private_ingress(&mut self, peer: PeerId) -> bool {
-        Self::charge(
+    fn acquire_private_ingress(&mut self, peer: PeerId) -> Option<PrivateIngressPermit> {
+        if !Self::charge(
             &mut self.private_ingress,
             peer,
             MAX_PRIVATE_INGRESS_STORES_PER_WINDOW,
-        )
+        ) {
+            return None;
+        }
+        let in_flight = self
+            .private_ingress_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if in_flight >= MAX_PRIVATE_INGRESS_STORES_IN_FLIGHT {
+            self.private_ingress_in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            return None;
+        }
+        Some(PrivateIngressPermit(self.private_ingress_in_flight.clone()))
     }
 
     /// Fixed-window charge against a per-peer counter map: reset a peer's count
@@ -3915,6 +3940,27 @@ mod tests {
         );
         net_a.join();
         net_b.join();
+    }
+
+    #[test]
+    fn private_ingress_blocking_work_has_a_global_bound() {
+        let mut limiter = SyncRateLimiter::default();
+        let permits = (0..MAX_PRIVATE_INGRESS_STORES_IN_FLIGHT)
+            .map(|_| {
+                limiter
+                    .acquire_private_ingress(PeerId::random())
+                    .expect("work below the global cap is admitted")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            limiter.acquire_private_ingress(PeerId::random()).is_none(),
+            "rotating Noise identities cannot exceed the global blocking-work cap",
+        );
+        drop(permits);
+        assert!(
+            limiter.acquire_private_ingress(PeerId::random()).is_some(),
+            "completed work releases its global permit",
+        );
     }
 
     /// Network-level test: outbound `send_invoke` on A dispatches

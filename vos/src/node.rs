@@ -1369,12 +1369,22 @@ struct V2PrivateIngressUpload {
     invocation: crate::v2::InvocationId,
     reference: crate::v2::BlobRefV2,
     bytes: Vec<u8>,
+    deadline: Instant,
+    state: Arc<Mutex<V2PrivateIngressUploadState>>,
     reply: mpsc::Sender<bool>,
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V2PrivateIngressUploadState {
+    Queued,
+    Persisting,
+    Cancelled,
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
 struct V2PrivateIngressRoute {
-    tx: mpsc::Sender<V2PrivateIngressUpload>,
+    tx: mpsc::SyncSender<V2PrivateIngressUpload>,
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
@@ -1386,6 +1396,71 @@ struct V2PrivateIngressRegistration {
     route: Arc<V2PrivateIngressRoute>,
     receiver: mpsc::Receiver<V2PrivateIngressUpload>,
     routes: V2PrivateIngressRoutes,
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+const V2_PRIVATE_INGRESS_QUEUE_CAPACITY: usize = 16;
+
+#[cfg(all(feature = "network", feature = "storage"))]
+const V2_PRIVATE_INGRESS_STAGE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn stage_v2_private_ingress_through_root(
+    tx: &mpsc::SyncSender<V2PrivateIngressUpload>,
+    invocation: crate::v2::InvocationId,
+    reference: crate::v2::BlobRefV2,
+    bytes: Vec<u8>,
+    timeout: Duration,
+) -> bool {
+    let state = Arc::new(Mutex::new(V2PrivateIngressUploadState::Queued));
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if tx
+        .try_send(V2PrivateIngressUpload {
+            invocation,
+            reference,
+            bytes,
+            deadline: Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(Instant::now),
+            state: state.clone(),
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    match reply_rx.recv_timeout(timeout) {
+        Ok(accepted) => accepted,
+        Err(mpsc::RecvTimeoutError::Disconnected) => false,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let mut state = state.lock().unwrap();
+            match *state {
+                V2PrivateIngressUploadState::Queued => {
+                    *state = V2PrivateIngressUploadState::Cancelled;
+                    false
+                }
+                V2PrivateIngressUploadState::Cancelled => false,
+                V2PrivateIngressUploadState::Persisting => {
+                    // Persistence crossed its non-cancellable durability
+                    // boundary before the timeout. Never report a negative
+                    // acknowledgement while that write may still commit.
+                    drop(state);
+                    reply_rx.recv().unwrap_or(false)
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn begin_v2_private_ingress_upload(upload: &V2PrivateIngressUpload) -> bool {
+    let mut state = upload.state.lock().unwrap();
+    if *state != V2PrivateIngressUploadState::Queued || Instant::now() >= upload.deadline {
+        *state = V2PrivateIngressUploadState::Cancelled;
+        return false;
+    }
+    *state = V2PrivateIngressUploadState::Persisting;
+    true
 }
 
 /// Shared map of raft-hosted agents: ServiceId word → replication
@@ -2965,15 +3040,23 @@ impl crate::network::NetworkService for NodeService {
         {
             return false;
         }
-        let Some(status) = self
-            .shared_network
-            .lock()
-            .ok()
-            .and_then(|network| network.as_ref()?.local_raft_status_cached(replication_id))
-        else {
+        let Some((status, local_prefix)) = self.shared_network.lock().ok().and_then(|network| {
+            let network = network.as_ref()?;
+            Some((
+                network.local_raft_status_cached(replication_id)?,
+                network.local_prefix(),
+            ))
+        }) else {
             return false;
         };
         let prefix = crate::network::derive_node_prefix(&peer);
+        if !status.present
+            || status.leader_hint != Some(prefix)
+            || !status.members.contains(&prefix)
+            || !status.members.contains(&local_prefix)
+        {
+            return false;
+        }
         let Some(member) = self.lookup_node_member(prefix) else {
             return false;
         };
@@ -2995,21 +3078,13 @@ impl crate::network::NetworkService for NodeService {
         else {
             return false;
         };
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if tx
-            .send(V2PrivateIngressUpload {
-                invocation: crate::v2::InvocationId(*invocation),
-                reference,
-                bytes,
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            return false;
-        }
-        reply_rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap_or(false)
+        stage_v2_private_ingress_through_root(
+            &tx,
+            crate::v2::InvocationId(*invocation),
+            reference,
+            bytes,
+            V2_PRIVATE_INGRESS_STAGE_TIMEOUT,
+        )
     }
 
     /// Admit a Raft joiner only if it is enrolled as a `NODE_ROLE_VOTER`
@@ -4032,7 +4107,7 @@ impl VosNode {
         let outbox = self.outbox_tx.clone();
         #[cfg(all(feature = "network", feature = "storage"))]
         let private_ingress_registration = service.replication_id().map(|replication_id| {
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = mpsc::sync_channel(V2_PRIVATE_INGRESS_QUEUE_CAPACITY);
             let route = Arc::new(V2PrivateIngressRoute { tx });
             self.v2_private_ingress_routes
                 .write()
@@ -7528,6 +7603,10 @@ where
                 let Ok(upload) = private_ingress.receiver.try_recv() else {
                     break;
                 };
+                if !begin_v2_private_ingress_upload(&upload) {
+                    let _ = upload.reply.send(false);
+                    continue;
+                }
                 let accepted = service.stage_replicated_private_ingress(
                     upload.invocation,
                     &upload.reference,
@@ -16842,6 +16921,7 @@ mod tests {
 
         struct Status {
             leader: u16,
+            members: Vec<u16>,
         }
         impl crate::network::RaftRpcHandler for Status {
             fn local_status(&self) -> Option<crate::network::RaftStatusReply> {
@@ -16851,7 +16931,7 @@ mod tests {
                     current_term: 7,
                     commit_index: 9,
                     last_log_index: 9,
-                    members: vec![self.leader],
+                    members: self.members.clone(),
                     leader_hint: Some(self.leader),
                 })
             }
@@ -16934,16 +17014,25 @@ mod tests {
                 &[],
                 &reply,
             ));
+            assert!(
+                matches!(
+                    registry_rx.recv_timeout(Duration::from_millis(200)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ),
+                "nonmembers must be rejected before registry work",
+            );
         });
 
         let replication_id = [0x61; 32];
         let network = Arc::new(crate::network::Network::start(
             crate::network::NetworkConfig::default(),
         ));
+        let receiver_prefix = network.local_prefix();
         network.register_raft_handler(
             replication_id,
             Arc::new(Status {
                 leader: leader_prefix,
+                members: vec![leader_prefix, receiver_prefix],
             }),
         );
         let mut service = lifecycle_service(
@@ -16952,7 +17041,7 @@ mod tests {
             Arc::new(std::sync::RwLock::new(HashMap::new())),
         );
         service.shared_network = Arc::new(Mutex::new(Some(network.clone())));
-        let (sidecar_tx, sidecar_rx) = mpsc::channel();
+        let (sidecar_tx, sidecar_rx) = mpsc::sync_channel(1);
         service.v2_private_ingress_routes.write().unwrap().insert(
             replication_id,
             Arc::new(V2PrivateIngressRoute { tx: sidecar_tx }),
@@ -16967,6 +17056,7 @@ mod tests {
             assert_eq!(upload.invocation, invocation);
             assert_eq!(upload.reference, expected_reference);
             assert_eq!(upload.bytes, expected_bytes);
+            assert!(begin_v2_private_ingress_upload(&upload));
             upload.reply.send(true).unwrap();
         });
         assert!(service.store_private_ingress(
@@ -16978,9 +17068,66 @@ mod tests {
             b"exact private ingress".to_vec(),
         ));
         sink.join().unwrap();
+        network.register_raft_handler(
+            replication_id,
+            Arc::new(Status {
+                leader: leader_prefix,
+                members: vec![receiver_prefix],
+            }),
+        );
+        assert!(
+            !service.store_private_ingress(
+                leader,
+                &replication_id,
+                &invocation.0,
+                &reference.hash.0,
+                reference.len,
+                b"exact private ingress".to_vec(),
+            ),
+            "a sender absent from the current membership is rejected before registry work",
+        );
+        network.register_raft_handler(
+            replication_id,
+            Arc::new(Status {
+                leader: leader_prefix,
+                members: vec![leader_prefix],
+            }),
+        );
+        assert!(
+            !service.store_private_ingress(
+                leader,
+                &replication_id,
+                &invocation.0,
+                &reference.hash.0,
+                reference.len,
+                b"exact private ingress".to_vec(),
+            ),
+            "a replica removed from the current membership cannot accept fresh plaintext",
+        );
         registry.join().unwrap();
         drop(service);
         Arc::try_unwrap(network).ok().unwrap().join();
+    }
+
+    #[test]
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn timed_out_private_ingress_never_crosses_the_durable_boundary_later() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let bytes = b"cancel before persistence".to_vec();
+        let reference = crate::v2::BlobRefV2::of_bytes(&bytes);
+        assert!(!stage_v2_private_ingress_through_root(
+            &tx,
+            crate::v2::InvocationId([0x71; 32]),
+            reference,
+            bytes,
+            Duration::from_millis(1),
+        ));
+        let upload = rx.recv().unwrap();
+        assert!(!begin_v2_private_ingress_upload(&upload));
+        assert_eq!(
+            *upload.state.lock().unwrap(),
+            V2PrivateIngressUploadState::Cancelled,
+        );
     }
 
     #[test]
