@@ -918,13 +918,22 @@ that gate. A bounded `StorePrivateIngress` request carries the exact Raft
 replication id, invocation id, content hash, declared length, and at most one
 64-KiB preimage over a Noise-authenticated request/response stream. The
 receiver accepts it only from the canonical registry PeerId of the leader in
-its current local voter view, rechecks the content address, and routes it to
-the owning root thread for durable side-CAS commit before acknowledging.
+its current local voter view, requires its own node prefix to remain in that
+same membership, rechecks the content address, and routes it to the owning
+root thread for durable side-CAS commit before acknowledging. Each committed
+sidecar is a self-authenticating artifact carrying its own hash and length, so
+restart reconciliation preserves an acknowledged pre-admission input even
+when the matching Raft `AdmitIngress` committed but has not yet applied.
 Neither the request nor its bytes enter actor invocation wires, guest state,
-Raft entries, applied snapshots, or CRDT DAGs; per-peer rate limits bound
-durable orphan creation. Re-enabling Raft Task packages additionally requires
-an all-current-voters availability barrier before `AdmitIngress`, hydration of
-a prepared joiner before voter promotion, and retry-safe retirement on every
+Raft entries, applied snapshots, or CRDT DAGs. Sender membership is rejected
+from the cached group view before registry work; per-peer and global
+blocking-work limits plus a bounded root queue prevent identity rotation or a
+stalled root from creating unbounded work. A queued upload is cancelled at
+its deadline before persistence, while a write that already crossed the
+durability boundary is awaited instead of being reported as a negative
+acknowledgement. Re-enabling Raft Task packages additionally requires an
+all-current-voters availability barrier before `AdmitIngress`, hydration of a
+prepared joiner before voter promotion, and retry-safe retirement on every
 holder. CRDT needs its separate causally authorized producer-availability
 rule. Until those pieces land, package validation continues to reject both
 replicated modes before genesis.
