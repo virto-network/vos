@@ -877,6 +877,7 @@ impl core::fmt::Debug for LocalJamStoreV2 {
 pub struct DurableJamStoreV2<B> {
     local: LocalJamStoreV2,
     backend: B,
+    private_ingress_retirement_debt: BTreeSet<super::InvocationId>,
 }
 
 /// Access to the committed local conformance image carried by an Accumulate
@@ -937,7 +938,11 @@ where
         backend
             .reconcile_private_ingresses(&retained)
             .map_err(DurableStoreOpenErrorV2::Backend)?;
-        Ok(Self { local, backend })
+        Ok(Self {
+            local,
+            backend,
+            private_ingress_retirement_debt: BTreeSet::new(),
+        })
     }
 
     pub fn backend(&self) -> &B {
@@ -950,6 +955,16 @@ where
 
     pub fn into_parts(self) -> (LocalJamStoreV2, B) {
         (self.local, self.backend)
+    }
+
+    /// Producer-private inputs whose guest transition committed but whose
+    /// host-side retirement has not yet succeeded. This is health/cleanup
+    /// state, never the disposition of the committed invocation.
+    pub fn private_ingress_retirement_debt(&self) -> Vec<super::InvocationId> {
+        self.private_ingress_retirement_debt
+            .iter()
+            .copied()
+            .collect()
     }
 }
 
@@ -1001,9 +1016,23 @@ where
         &mut self,
         invocation: super::InvocationId,
     ) -> Result<bool, ()> {
-        self.backend
-            .delete_private_ingress(invocation)
-            .map_err(|_| ())
+        match self.backend.delete_private_ingress(invocation) {
+            Ok(deleted) => {
+                self.private_ingress_retirement_debt.remove(&invocation);
+                Ok(deleted)
+            }
+            Err(_) => {
+                self.private_ingress_retirement_debt.insert(invocation);
+                Err(())
+            }
+        }
+    }
+
+    /// Retire a private input after guest Apply committed. Failure is tracked
+    /// as cleanup debt and must not rewrite the invocation's accepted result
+    /// into a caller-visible failure.
+    pub(crate) fn retire_private_ingress_after_commit(&mut self, invocation: super::InvocationId) {
+        let _ = self.prune_private_ingress(invocation);
     }
 
     /// Persist producer-private Task records before the corresponding

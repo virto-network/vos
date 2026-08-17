@@ -197,6 +197,7 @@ struct FailableCommittedImages {
     fail_next_proof_commit: bool,
     fail_next_record_commit: bool,
     fail_next_private_delete: bool,
+    private_delete_attempts: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -495,6 +496,7 @@ impl ProofArtifactStoreV2 for FailableCommittedImages {
     }
 
     fn delete_private_ingress(&mut self, invocation: InvocationId) -> Result<bool, Self::Error> {
+        self.private_delete_attempts += 1;
         if std::mem::take(&mut self.fail_next_private_delete) {
             return Err(());
         }
@@ -1578,10 +1580,23 @@ fn signed_task_refine_redacts_actor_memory_and_reopens_local_producer_sidecar() 
     ));
     assert_eq!(service.producer_record(actor, &tag), None);
     service.store_mut().backend_mut().fail_next_private_delete = true;
-    assert!(matches!(
-        service.invoke_admitted(request.invocation),
-        Err(LocalRootTreeInvokeErrorV2::PrivateIngressRetirementFailed)
-    ));
+    let committed = service
+        .invoke_admitted(request.invocation)
+        .expect("post-commit cleanup debt cannot rewrite an accepted invocation as failed");
+    assert!(!committed.duplicate);
+    assert_eq!(
+        committed
+            .published
+            .reply
+            .as_ref()
+            .and_then(|reply| Value::try_decode(&reply.result)),
+        Some(Value::U64(9)),
+    );
+    assert_eq!(
+        service.store().private_ingress_retirement_debt(),
+        vec![request.invocation],
+    );
+    assert_eq!(service.store().backend().private_delete_attempts, 1);
     let record_bytes = service
         .producer_record(actor, &tag)
         .expect("producer-private record committed before Apply proposal");
@@ -1606,11 +1621,23 @@ fn signed_task_refine_redacts_actor_memory_and_reopens_local_producer_sidecar() 
             .any(|window| window == record_bytes),
         "producer witness must not enter the recoverable service image",
     );
+    service.store_mut().backend_mut().fail_next_private_delete = true;
+    let recovered = service
+        .invoke_admitted(request.invocation)
+        .expect("invocation-only recovery remains successful while retrying cleanup debt");
+    assert!(recovered.duplicate);
+    assert_eq!(recovered.refine_gas_used, 0);
+    assert_eq!(recovered.accumulate_gas_used, 0);
+    assert_eq!(service.store().backend().private_delete_attempts, 2);
+    assert_eq!(
+        service.store().private_ingress_retirement_debt(),
+        vec![request.invocation],
+    );
     let mut backend = service.into_backend();
     assert_eq!(
         backend.private_ingresses.get(&request.invocation),
         Some(&request.arguments),
-        "a reported retirement failure leaves the artifact available for startup reconciliation",
+        "cleanup debt leaves the artifact available for startup reconciliation",
     );
     backend.private_ingresses.insert(
         InvocationId([0xD8; 32]),
@@ -1625,6 +1652,12 @@ fn signed_task_refine_redacts_actor_memory_and_reopens_local_producer_sidecar() 
     assert!(recovered.duplicate);
     assert_eq!(recovered.refine_gas_used, 0);
     assert_eq!(recovered.accumulate_gas_used, 0);
+    assert!(
+        reopened
+            .store()
+            .private_ingress_retirement_debt()
+            .is_empty()
+    );
     assert_eq!(
         recovered
             .published

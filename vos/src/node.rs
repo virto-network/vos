@@ -165,6 +165,80 @@ fn receive_v2_invocation_reply(
     }
 }
 
+fn send_v2_system_ingress(
+    route: &mpsc::Sender<InvokeRequest>,
+    ingress: &[u8],
+) -> Result<mpsc::Receiver<Vec<u8>>, crate::actors::client::ClientError> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    route
+        .send(InvokeRequest {
+            caller: crate::actors::Caller::System,
+            space_role: None,
+            actor_local_role: None,
+            #[cfg(all(feature = "network", feature = "storage"))]
+            delegated_origin: None,
+            role_authority_request: false,
+            msg: ingress.to_vec(),
+            reply: ReplyChannel::Sync(reply_tx),
+            chain: Vec::new(),
+        })
+        .map_err(|_| crate::actors::client::ClientError::Unreachable)?;
+    Ok(reply_rx)
+}
+
+/// Resolve an attested Raft invocation without turning an ambiguous transport
+/// failure into a caller-visible failure. `ingress` is the already-committed
+/// invocation wire, including its stable invocation ID. Every remote attempt
+/// and every local status/recovery redrive receives those exact bytes.
+///
+/// Proof production has no cancellation contract. Once the request has been
+/// handed to a remote leader, a disconnected request-response channel or its
+/// internal timeout cannot prove that Apply did not commit. Re-entering the
+/// local Raft route lets the current leader either finish the same request or
+/// recover its durable dedup result.
+#[cfg(all(feature = "network", feature = "storage"))]
+fn receive_v2_attested_with_exact_redrive<Remote, Local>(
+    ingress: &[u8],
+    mut redirect: V2RaftRedirect,
+    mut remote_attempt: Remote,
+    mut local_redrive: Local,
+) -> Result<Vec<u8>, crate::actors::client::ClientError>
+where
+    Remote: FnMut(V2RaftRedirect, &[u8]) -> Option<Vec<u8>>,
+    Local: FnMut(&[u8]) -> Option<Vec<u8>>,
+{
+    loop {
+        if let Some(envelope) = remote_attempt(redirect, ingress) {
+            if let Some(next) = decode_v2_raft_redirect(&envelope) {
+                redirect = next;
+                continue;
+            }
+            match decode_host_invoke_envelope(&envelope) {
+                // The network dispatcher represents its own expired blocking
+                // dispatch as an empty reply. That is an unknown outcome, not
+                // evidence that the invocation failed before commit.
+                Err(crate::actors::client::ClientError::Unreachable) => {}
+                terminal => return terminal,
+            }
+        }
+
+        if let Some(envelope) = local_redrive(ingress) {
+            if let Some(next) = decode_v2_raft_redirect(&envelope) {
+                redirect = next;
+                continue;
+            }
+            match decode_host_invoke_envelope(&envelope) {
+                Err(crate::actors::client::ClientError::Unreachable) => {}
+                terminal => return terminal,
+            }
+        }
+
+        // A stopped local route or disconnected network must not turn into a
+        // hot loop while the outcome remains ambiguous.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// The network ingress gate can spend this long consulting the registry to
 /// bind a compact voter slot back to its complete authenticated peer identity.
 #[cfg(feature = "network")]
@@ -5189,20 +5263,8 @@ impl VosNode {
             arguments,
             proof_requested,
         };
-        let (reply_tx, reply_rx) = mpsc::channel();
         let ingress_wire = crate::v2::V2Wire::encode(&ingress);
-        tx.send(InvokeRequest {
-            caller: crate::actors::Caller::System,
-            space_role: None,
-            actor_local_role: None,
-            #[cfg(all(feature = "network", feature = "storage"))]
-            delegated_origin: None,
-            role_authority_request: false,
-            msg: ingress_wire.clone(),
-            reply: ReplyChannel::Sync(reply_tx),
-            chain: Vec::new(),
-        })
-        .map_err(|_| crate::actors::client::ClientError::Unreachable)?;
+        let reply_rx = send_v2_system_ingress(&tx, &ingress_wire)?;
         // Proof production is synchronous and currently has no cancellation
         // contract. Once an attested invocation is handed to the root driver,
         // reporting a local timeout would allow its Apply to commit after the
@@ -5217,6 +5279,41 @@ impl VosNode {
                 .map_err(|_| crate::actors::client::ClientError::Unreachable)?
                 .clone()
                 .ok_or(crate::actors::client::ClientError::Unreachable)?;
+
+            if proof_requested {
+                let remote_route = route;
+                let local_route = tx.clone();
+                return receive_v2_attested_with_exact_redrive(
+                    &ingress_wire,
+                    redirect,
+                    |redirect, ingress| {
+                        let peer = network.peer_for_prefix(redirect.leader_prefix)?;
+                        let leader_route = ServiceId::new(
+                            redirect.leader_prefix,
+                            ServiceId(remote_route).local_id(),
+                        );
+                        let delegated =
+                            encode_v2_raft_delegation(redirect.origin, true, false, ingress);
+                        network
+                            .send_invoke(
+                                peer,
+                                ServiceId::REGISTRY.0,
+                                leader_route.0,
+                                Vec::new(),
+                                delegated,
+                            )
+                            .recv()
+                            .ok()
+                    },
+                    |ingress| {
+                        send_v2_system_ingress(&local_route, ingress)
+                            .ok()?
+                            .recv()
+                            .ok()
+                    },
+                );
+            }
+
             let peer = network
                 .peer_for_prefix(redirect.leader_prefix)
                 .ok_or(crate::actors::client::ClientError::Unreachable)?;
@@ -12572,6 +12669,58 @@ mod tests {
             receive_v2_invocation_reply(&rx, false, Instant::now()),
             Err(crate::actors::client::ClientError::Unreachable)
         ));
+    }
+
+    #[cfg(all(feature = "network", feature = "storage"))]
+    #[test]
+    fn redirected_attestation_redrives_the_exact_invocation_after_transport_loss() {
+        use crate::actors::run::STATUS_DONE;
+
+        let request = crate::v2::RootTreeInvocationV2 {
+            invocation: crate::v2::InvocationId([3; 32]),
+            target: crate::v2::ActorId([4; 32]),
+            method: "prove".into(),
+            arguments: b"private reference".to_vec(),
+            proof_requested: true,
+        };
+        let ingress = crate::v2::V2Wire::encode(&request);
+        let terminal = encode_invoke_envelope(STATUS_DONE, &[], b"committed proof");
+        let mut remote_wires = Vec::new();
+        let mut remote_prefixes = Vec::new();
+        let mut local_wires = Vec::new();
+
+        let result = receive_v2_attested_with_exact_redrive(
+            &ingress,
+            V2RaftRedirect {
+                leader_prefix: 41,
+                origin: crate::v2::Origin::System,
+            },
+            |redirect, wire| {
+                remote_prefixes.push(redirect.leader_prefix);
+                remote_wires.push(wire.to_vec());
+                match remote_wires.len() {
+                    1 => None,             // connection failure
+                    2 => Some(Vec::new()), // remote blocking-dispatch timeout
+                    _ => Some(terminal.clone()),
+                }
+            },
+            |wire| {
+                local_wires.push(wire.to_vec());
+                Some(encode_v2_raft_redirect(
+                    41 + local_wires.len() as u16,
+                    crate::v2::Origin::System,
+                ))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result, b"committed proof");
+        assert_eq!(remote_prefixes, [41, 42, 43]);
+        assert_eq!(
+            remote_wires,
+            [ingress.clone(), ingress.clone(), ingress.clone()]
+        );
+        assert_eq!(local_wires, [ingress.clone(), ingress]);
     }
 
     /// The extension-facing proof-blob CAS round trip: `EFFECT_BLOB_PUT`

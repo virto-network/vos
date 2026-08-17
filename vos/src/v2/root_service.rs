@@ -1243,8 +1243,7 @@ where
         {
             self.service
                 .accumulate_host_mut()
-                .prune_private_ingress(invocation)
-                .map_err(|_| LocalRootTreeInvokeErrorV2::PrivateIngressRetirementFailed)?;
+                .retire_private_ingress_after_commit(invocation);
         }
         Ok(())
     }
@@ -2708,12 +2707,14 @@ where
         let consumed = record.consumed;
         let (request, private_arguments) = self.request_from_admitted_ingress(record)?;
         if consumed {
-            return self
+            let committed = self
                 .recover_committed_invocation_with_private_reference(
                     &request,
                     private_arguments.as_ref(),
                 )?
-                .ok_or(LocalRootTreeInvokeErrorV2::DivergentInvocation);
+                .ok_or(LocalRootTreeInvokeErrorV2::DivergentInvocation)?;
+            self.retire_consumed_private_ingress(invocation)?;
+            return Ok(committed);
         }
         self.execute_admitted_after_barrier(request, private_arguments)
     }
@@ -2738,6 +2739,7 @@ where
             &request,
             private_arguments.as_ref(),
         )? {
+            self.retire_consumed_private_ingress(invocation)?;
             return Ok(committed);
         }
         if consumed {
@@ -3154,8 +3156,7 @@ where
         if private_ingress {
             self.service
                 .accumulate_host_mut()
-                .prune_private_ingress(input.invocation)
-                .map_err(|_| LocalRootTreeInvokeErrorV2::PrivateIngressRetirementFailed)?;
+                .retire_private_ingress_after_commit(input.invocation);
         }
         Ok(CommittedRootTreeSliceV2 {
             input,
@@ -3219,8 +3220,7 @@ where
         if private_ingress {
             self.service
                 .accumulate_host_mut()
-                .prune_private_ingress(input.invocation)
-                .map_err(|_| LocalRootTreeInvokeErrorV2::PrivateIngressRetirementFailed)?;
+                .retire_private_ingress_after_commit(input.invocation);
         }
         Ok(CommittedRootTreeSliceV2 {
             input,

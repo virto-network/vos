@@ -304,8 +304,12 @@ separate durable proof store and survive reopening alongside their publication.
 Because the installed producer API is synchronous and has no cancellation
 contract, node-level attested invocation waits for its terminal disposition
 instead of reporting an ordinary route timeout while proof production may
-still reach Apply. Bounded attested deadlines require a cancellable producer
-and an atomic cancel-before-commit handoff.
+still reach Apply. After a Raft redirect, request-response timeout or
+disconnection is likewise an unknown outcome: the node redrives the exact
+committed ingress wire, including its original invocation ID, through the
+local Raft route until the current leader returns or durably recovers a
+terminal disposition. Bounded attested deadlines require a cancellable
+producer and an atomic cancel-before-commit handoff.
 
 The application package is a portable typed `Attestation<T, M>`, not a bare
 claim. Its generated method marker binds the method and exact actor reply wire;
@@ -891,12 +895,16 @@ committed to the producing host's private sidecar before the transition
 commits and is never included in service state. Local ingress likewise stores
 only a content address in guest-owned rows: the durable host-private input
 sidecar commits the plaintext before admission, rehydrates it for Refine after
-restart, and retires it after the terminal Apply. The work hash and role scope
-bind that address. A private-input slice cannot suspend, so neither its durable
-workflow row nor a kernel snapshot can export hydrated bytes. Actor memory
-receives only the verifier-facing `ProvableRecord`; completed scheduler values
-are scrubbed. Recorded debug output is forbidden and capture is bounded per
-slice. Raft and CRDT packages containing Task dependencies remain rejected
+restart, and retires it after the terminal Apply. A post-commit retirement
+failure is tracked as cleanup debt and never rewrites the accepted invocation
+as failed; exact invocation recovery retries that debt, and durable open
+reconciles any remainder against guest-owned unconsumed ingress. The work hash
+and role scope bind that address. A private-input slice cannot suspend, so
+neither its durable workflow row nor a kernel snapshot can export hydrated
+bytes. Actor memory receives only the verifier-facing `ProvableRecord`;
+completed scheduler values are scrubbed. Recorded debug output is forbidden
+and capture is bounded per slice. Raft and CRDT packages containing Task
+dependencies remain rejected
 before genesis: replicating a commitment also requires a producer-availability
 and leader/failover protocol for the private preimage. Named actor-row witnesses
 and Task effects likewise remain fail-closed pending an authenticated typed
