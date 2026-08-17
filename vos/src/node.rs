@@ -197,45 +197,76 @@ fn send_v2_system_ingress(
 /// local Raft route lets the current leader either finish the same request or
 /// recover its durable dedup result.
 #[cfg(all(feature = "network", feature = "storage"))]
-fn receive_v2_attested_with_exact_redrive<Remote, Local>(
+enum V2AttestedRedriveAttempt {
+    /// No transport accepted the request, so this attempt cannot have
+    /// committed it.
+    NotSent,
+    /// A transport accepted the request but lost its terminal response.
+    Ambiguous,
+    Reply(Vec<u8>),
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn receive_v2_attested_with_exact_redrive<Remote, Local, Backoff>(
     ingress: &[u8],
     mut redirect: V2RaftRedirect,
     mut remote_attempt: Remote,
     mut local_redrive: Local,
+    mut backoff: Backoff,
 ) -> Result<Vec<u8>, crate::actors::client::ClientError>
 where
-    Remote: FnMut(V2RaftRedirect, &[u8]) -> Option<Vec<u8>>,
-    Local: FnMut(&[u8]) -> Option<Vec<u8>>,
+    Remote: FnMut(V2RaftRedirect, &[u8]) -> V2AttestedRedriveAttempt,
+    Local: FnMut(&[u8]) -> V2AttestedRedriveAttempt,
+    Backoff: FnMut(),
 {
+    let mut outcome_ambiguous = false;
     loop {
-        if let Some(envelope) = remote_attempt(redirect, ingress) {
-            if let Some(next) = decode_v2_raft_redirect(&envelope) {
-                redirect = next;
-                continue;
-            }
-            match decode_host_invoke_envelope(&envelope) {
-                // The network dispatcher represents its own expired blocking
-                // dispatch as an empty reply. That is an unknown outcome, not
-                // evidence that the invocation failed before commit.
-                Err(crate::actors::client::ClientError::Unreachable) => {}
-                terminal => return terminal,
+        match remote_attempt(redirect, ingress) {
+            V2AttestedRedriveAttempt::NotSent => {}
+            V2AttestedRedriveAttempt::Ambiguous => outcome_ambiguous = true,
+            V2AttestedRedriveAttempt::Reply(envelope) => {
+                if let Some(next) = decode_v2_raft_redirect(&envelope) {
+                    redirect = next;
+                    backoff();
+                    continue;
+                }
+                match decode_host_invoke_envelope(&envelope) {
+                    Ok(reply) => return Ok(reply),
+                    // The network dispatcher represents its own expired
+                    // blocking dispatch as an empty reply. That is an unknown
+                    // outcome, not evidence that Apply did not commit.
+                    Err(crate::actors::client::ClientError::Unreachable) => {
+                        outcome_ambiguous = true;
+                    }
+                    Err(error) if !outcome_ambiguous => return Err(error),
+                    // Once a prior attempt may have committed, a replacement
+                    // leader's verifier/barrier failure cannot resolve it.
+                    Err(_) => {}
+                }
             }
         }
 
-        if let Some(envelope) = local_redrive(ingress) {
-            if let Some(next) = decode_v2_raft_redirect(&envelope) {
-                redirect = next;
-                continue;
-            }
-            match decode_host_invoke_envelope(&envelope) {
-                Err(crate::actors::client::ClientError::Unreachable) => {}
-                terminal => return terminal,
+        match local_redrive(ingress) {
+            V2AttestedRedriveAttempt::NotSent => {}
+            V2AttestedRedriveAttempt::Ambiguous => outcome_ambiguous = true,
+            V2AttestedRedriveAttempt::Reply(envelope) => {
+                if let Some(next) = decode_v2_raft_redirect(&envelope) {
+                    redirect = next;
+                    backoff();
+                    continue;
+                }
+                match decode_host_invoke_envelope(&envelope) {
+                    Ok(reply) => return Ok(reply),
+                    Err(crate::actors::client::ClientError::Unreachable) => {
+                        outcome_ambiguous = true;
+                    }
+                    Err(error) if !outcome_ambiguous => return Err(error),
+                    Err(_) => {}
+                }
             }
         }
 
-        // A stopped local route or disconnected network must not turn into a
-        // hot loop while the outcome remains ambiguous.
-        std::thread::sleep(Duration::from_millis(100));
+        backoff();
     }
 }
 
@@ -5287,14 +5318,16 @@ impl VosNode {
                     &ingress_wire,
                     redirect,
                     |redirect, ingress| {
-                        let peer = network.peer_for_prefix(redirect.leader_prefix)?;
+                        let Some(peer) = network.peer_for_prefix(redirect.leader_prefix) else {
+                            return V2AttestedRedriveAttempt::NotSent;
+                        };
                         let leader_route = ServiceId::new(
                             redirect.leader_prefix,
                             ServiceId(remote_route).local_id(),
                         );
                         let delegated =
                             encode_v2_raft_delegation(redirect.origin, true, false, ingress);
-                        network
+                        match network
                             .send_invoke(
                                 peer,
                                 ServiceId::REGISTRY.0,
@@ -5303,14 +5336,21 @@ impl VosNode {
                                 delegated,
                             )
                             .recv()
-                            .ok()
+                        {
+                            Ok(envelope) => V2AttestedRedriveAttempt::Reply(envelope),
+                            Err(_) => V2AttestedRedriveAttempt::Ambiguous,
+                        }
                     },
                     |ingress| {
-                        send_v2_system_ingress(&local_route, ingress)
-                            .ok()?
-                            .recv()
-                            .ok()
+                        let Ok(reply) = send_v2_system_ingress(&local_route, ingress) else {
+                            return V2AttestedRedriveAttempt::NotSent;
+                        };
+                        match reply.recv() {
+                            Ok(envelope) => V2AttestedRedriveAttempt::Reply(envelope),
+                            Err(_) => V2AttestedRedriveAttempt::Ambiguous,
+                        }
                     },
+                    || std::thread::sleep(Duration::from_millis(100)),
                 );
             }
 
@@ -12674,7 +12714,7 @@ mod tests {
     #[cfg(all(feature = "network", feature = "storage"))]
     #[test]
     fn redirected_attestation_redrives_the_exact_invocation_after_transport_loss() {
-        use crate::actors::run::STATUS_DONE;
+        use crate::actors::run::{STATUS_DONE, STATUS_FORBIDDEN, STATUS_PANICKED};
 
         let request = crate::v2::RootTreeInvocationV2 {
             invocation: crate::v2::InvocationId([3; 32]),
@@ -12688,6 +12728,7 @@ mod tests {
         let mut remote_wires = Vec::new();
         let mut remote_prefixes = Vec::new();
         let mut local_wires = Vec::new();
+        let mut backoffs = 0;
 
         let result = receive_v2_attested_with_exact_redrive(
             &ingress,
@@ -12699,28 +12740,42 @@ mod tests {
                 remote_prefixes.push(redirect.leader_prefix);
                 remote_wires.push(wire.to_vec());
                 match remote_wires.len() {
-                    1 => None,             // connection failure
-                    2 => Some(Vec::new()), // remote blocking-dispatch timeout
-                    _ => Some(terminal.clone()),
+                    1 => V2AttestedRedriveAttempt::Ambiguous,
+                    2 => V2AttestedRedriveAttempt::Reply(Vec::new()),
+                    3 => V2AttestedRedriveAttempt::Reply(encode_invoke_envelope(
+                        STATUS_PANICKED,
+                        &[],
+                        &[],
+                    )),
+                    _ => V2AttestedRedriveAttempt::Reply(terminal.clone()),
                 }
             },
             |wire| {
                 local_wires.push(wire.to_vec());
-                Some(encode_v2_raft_redirect(
-                    41 + local_wires.len() as u16,
-                    crate::v2::Origin::System,
-                ))
+                let envelope = match local_wires.len() {
+                    1 => encode_v2_raft_redirect(42, crate::v2::Origin::System),
+                    2 => encode_invoke_envelope(STATUS_FORBIDDEN, &[], &[]),
+                    _ => encode_v2_raft_redirect(43, crate::v2::Origin::System),
+                };
+                V2AttestedRedriveAttempt::Reply(envelope)
             },
+            || backoffs += 1,
         )
         .unwrap();
 
         assert_eq!(result, b"committed proof");
-        assert_eq!(remote_prefixes, [41, 42, 43]);
+        assert_eq!(remote_prefixes, [41, 42, 42, 43]);
         assert_eq!(
             remote_wires,
-            [ingress.clone(), ingress.clone(), ingress.clone()]
+            [
+                ingress.clone(),
+                ingress.clone(),
+                ingress.clone(),
+                ingress.clone(),
+            ]
         );
-        assert_eq!(local_wires, [ingress.clone(), ingress]);
+        assert_eq!(local_wires, [ingress.clone(), ingress.clone(), ingress]);
+        assert_eq!(backoffs, 3, "redirects and ambiguous cycles back off");
     }
 
     /// The extension-facing proof-blob CAS round trip: `EFFECT_BLOB_PUT`

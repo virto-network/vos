@@ -307,9 +307,12 @@ instead of reporting an ordinary route timeout while proof production may
 still reach Apply. After a Raft redirect, request-response timeout or
 disconnection is likewise an unknown outcome: the node redrives the exact
 committed ingress wire, including its original invocation ID, through the
-local Raft route until the current leader returns or durably recovers a
-terminal disposition. Bounded attested deadlines require a cancellable
-producer and an atomic cancel-before-commit handoff.
+local Raft route until the current leader durably recovers the committed
+result. Once an outcome is unknown, a replacement replica's authorization,
+verifier, or barrier failure cannot resolve it and is not returned to the
+caller. Redirects and failed recovery cycles use a bounded backoff. Bounded
+attested deadlines require a cancellable producer and an atomic
+cancel-before-commit handoff.
 
 The application package is a portable typed `Attestation<T, M>`, not a bare
 claim. Its generated method marker binds the method and exact actor reply wire;
