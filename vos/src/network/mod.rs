@@ -346,6 +346,24 @@ pub trait NetworkService: Send + Sync {
     fn raft_join_authorized(&self, _prefix: u16) -> bool {
         false
     }
+
+    /// Authenticate and perform one membership change as one host-side
+    /// critical section. V2 roots override this to serialize the change with
+    /// private-ingress admission and to require a quiescent secret set before
+    /// the joining voter can enter joint consensus.
+    fn handle_raft_join(
+        &self,
+        _peer: PeerId,
+        replication_id: &[u8; 32],
+        joiner_prefix: u16,
+        handler: &dyn RaftRpcHandler,
+    ) -> RaftJoinResult {
+        if self.raft_join_authorized(joiner_prefix) {
+            handler.handle_join(replication_id, joiner_prefix)
+        } else {
+            RaftJoinResult::NotAuthorized
+        }
+    }
 }
 
 /// Local handler for inbound Raft RPCs. Mirrors [`SyncHandler`]'s
@@ -2388,26 +2406,25 @@ fn handle_req_resp(
                         tokio::task::spawn_blocking(move || {
                             let result = match handler {
                                 None => RaftJoinResult::UnknownGroup,
-                                // Admission: a peer may add itself only if an
-                                // admin enrolled it as a NODE_ROLE_VOTER in the
-                                // registry. Fail closed when the NodeService /
-                                // registry is unavailable.
-                                Some(h)
-                                    if svc
-                                        .as_ref()
-                                        .is_some_and(|s| s.raft_join_authorized(bound_prefix)) =>
-                                {
-                                    h.handle_join(&replication_id, bound_prefix)
-                                }
-                                Some(_) => {
-                                    warn!(
-                                        prefix = bound_prefix,
-                                        "network: RaftJoinReq refused — prefix is not an \
-                                         enrolled voter",
-                                    );
-                                    RaftJoinResult::NotAuthorized
-                                }
+                                Some(h) => svc.as_ref().map_or_else(
+                                    || RaftJoinResult::NotAuthorized,
+                                    |service| {
+                                        service.handle_raft_join(
+                                            peer,
+                                            &replication_id,
+                                            bound_prefix,
+                                            h.as_ref(),
+                                        )
+                                    },
+                                ),
                             };
+                            if result == RaftJoinResult::NotAuthorized {
+                                warn!(
+                                    prefix = bound_prefix,
+                                    "network: RaftJoinReq refused — prefix is not an \
+                                         enrolled voter",
+                                );
+                            }
                             let _ = response_tx.send((channel, Frame::RaftJoinResp { result }));
                         });
                     }

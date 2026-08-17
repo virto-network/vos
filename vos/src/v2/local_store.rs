@@ -2070,7 +2070,10 @@ impl CommittedServiceImageHostV2 for LocalJamStoreV2 {
     }
 }
 
-impl<B: CommittedImageStoreV2> CommittedServiceImageHostV2 for DurableJamStoreV2<B> {
+impl<B> CommittedServiceImageHostV2 for DurableJamStoreV2<B>
+where
+    B: CommittedImageStoreV2 + ProofArtifactStoreV2<Error = <B as CommittedImageStoreV2>::Error>,
+{
     fn committed_service_image(&self) -> Vec<u8> {
         self.local.snapshot_bytes()
     }
@@ -2080,10 +2083,29 @@ impl<B: CommittedImageStoreV2> CommittedServiceImageHostV2 for DurableJamStoreV2
         image: &[u8],
     ) -> Result<(), ServiceImageInstallErrorV2> {
         let replacement = self.local.validate_replacement(image)?;
+        let (retained, terminal) = LocalJamStoreV2::from_snapshot(replacement.clone())
+            .private_ingress_recovery()
+            .map_err(|_| ServiceImageInstallErrorV2::InvalidSnapshot)?;
+        // A snapshot never carries private bytes. Validate every live
+        // reference before making the image visible, without deleting a
+        // terminal artifact until the replacement image itself is durable.
+        for (invocation, reference) in &retained {
+            if self
+                .backend
+                .load_private_ingress(*invocation, reference)
+                .map_err(|_| ServiceImageInstallErrorV2::PersistenceRejected)?
+                .is_none()
+            {
+                return Err(ServiceImageInstallErrorV2::PersistenceRejected);
+            }
+        }
         self.backend
             .commit(image)
             .map_err(|_| ServiceImageInstallErrorV2::PersistenceRejected)?;
         self.local.committed = replacement;
+        for invocation in terminal {
+            self.retire_private_ingress_after_commit(invocation);
+        }
         Ok(())
     }
 }
@@ -2390,7 +2412,10 @@ impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
     }
 }
 
-impl<B: CommittedImageStoreV2> AccumulateProtocolHostV2 for DurableJamStoreV2<B> {
+impl<B> AccumulateProtocolHostV2 for DurableJamStoreV2<B>
+where
+    B: CommittedImageStoreV2 + ProofArtifactStoreV2<Error = <B as CommittedImageStoreV2>::Error>,
+{
     type Transaction = LocalJamTransactionV2;
 
     fn begin(&mut self) -> Result<Self::Transaction, ServicePvmErrorV2> {
@@ -2425,11 +2450,48 @@ impl<B: CommittedImageStoreV2> AccumulateProtocolHostV2 for DurableJamStoreV2<B>
         if self.local.proof_verifier.is_some() {
             transaction.staged.seal_proof_verifier_provenance();
         }
+        let prefix = super::storage::ingress_storage_prefix();
+        let mut newly_terminal = Vec::new();
+        for (key, bytes) in transaction
+            .staged
+            .rows
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+        {
+            let record = IngressRecordV2::decode(bytes)
+                .map_err(|_| ServicePvmErrorV2::AccumulateCommitRejected)?;
+            let invocation = record.ingress.invocation;
+            if super::ingress_storage_key(invocation).as_slice() != key.as_slice() {
+                return Err(ServicePvmErrorV2::AccumulateCommitRejected);
+            }
+            if !record.consumed || record.ingress.private_arguments.is_none() {
+                continue;
+            }
+            let was_terminal = self
+                .local
+                .committed
+                .rows
+                .get(key)
+                .map(|bytes| IngressRecordV2::decode(bytes))
+                .transpose()
+                .map_err(|_| ServicePvmErrorV2::AccumulateCommitRejected)?
+                .is_some_and(|old| old.consumed && old.ingress.private_arguments.is_some());
+            if !was_terminal {
+                newly_terminal.push(invocation);
+            }
+        }
         let image = transaction.staged.encode();
         self.backend
             .commit(&image)
             .map_err(|_| ServicePvmErrorV2::AccumulateCommitRejected)?;
         self.local.committed = transaction.staged;
+        // Every replica executes this boundary while applying the ordered
+        // entry. Retirement is therefore holder-wide, not a leader-only host
+        // epilogue. Failure is cleanup debt and cannot turn an already durable
+        // guest result into a caller-visible execution failure.
+        for invocation in newly_terminal {
+            self.retire_private_ingress_after_commit(invocation);
+        }
         Ok(())
     }
 }

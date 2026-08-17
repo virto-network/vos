@@ -292,16 +292,19 @@ const V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES: usize = 16;
 #[cfg(all(feature = "network", feature = "storage"))]
 const V2_RAFT_TRANSPORT_MAX_LEADER_HINTS: usize = 4;
 
-/// One end-to-end Raft invocation can consume one voter-authentication probe,
-/// one read barrier, and up to three proposal waits (fresh-root `Install`,
-/// `AdmitIngress`, and `Apply`). Reserve one further proposal window for
-/// physical guest execution, transit, and scheduling jitter. The caller
-/// applies this once across both the local follower and redirected leader hops
-/// rather than restarting a per-hop timeout.
+/// One end-to-end Raft invocation can consume voter authentication, one
+/// all-voter private-sidecar barrier, one read barrier, and up to three
+/// proposal waits (fresh-root `Install`, `AdmitIngress`, and `Apply`). Reserve
+/// one further proposal window for physical guest execution, transit, and
+/// scheduling jitter. The caller applies this once across both the local
+/// follower and redirected leader hops rather than restarting a per-hop
+/// timeout.
 #[cfg(all(feature = "storage", feature = "network"))]
 fn v2_raft_invoke_timeout(propose_timeout_ms: u64) -> Duration {
     Duration::from_millis(
-        V2_RAFT_VOTER_AUTH_TIMEOUT_MS.saturating_add(propose_timeout_ms.saturating_mul(5)),
+        V2_RAFT_VOTER_AUTH_TIMEOUT_MS
+            .saturating_add(V2_PRIVATE_INGRESS_STAGE_TIMEOUT_MS)
+            .saturating_add(propose_timeout_ms.saturating_mul(5)),
     )
 }
 
@@ -1385,6 +1388,35 @@ enum V2PrivateIngressUploadState {
 #[cfg(all(feature = "network", feature = "storage"))]
 struct V2PrivateIngressRoute {
     tx: mpsc::SyncSender<V2PrivateIngressUpload>,
+    quiescence_tx: mpsc::SyncSender<mpsc::Sender<bool>>,
+    barrier: V2PrivateIngressBarrier,
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+struct V2PrivateIngressBarrier(AtomicBool);
+
+#[cfg(all(feature = "network", feature = "storage"))]
+impl V2PrivateIngressBarrier {
+    fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    fn try_acquire(&self) -> Option<V2PrivateIngressBarrierGuard<'_>> {
+        self.0
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| V2PrivateIngressBarrierGuard(&self.0))
+    }
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+struct V2PrivateIngressBarrierGuard<'a>(&'a AtomicBool);
+
+#[cfg(all(feature = "network", feature = "storage"))]
+impl Drop for V2PrivateIngressBarrierGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
@@ -1395,6 +1427,7 @@ struct V2PrivateIngressRegistration {
     replication_id: [u8; 32],
     route: Arc<V2PrivateIngressRoute>,
     receiver: mpsc::Receiver<V2PrivateIngressUpload>,
+    quiescence_receiver: mpsc::Receiver<mpsc::Sender<bool>>,
     routes: V2PrivateIngressRoutes,
 }
 
@@ -1402,7 +1435,11 @@ struct V2PrivateIngressRegistration {
 const V2_PRIVATE_INGRESS_QUEUE_CAPACITY: usize = 16;
 
 #[cfg(all(feature = "network", feature = "storage"))]
-const V2_PRIVATE_INGRESS_STAGE_TIMEOUT: Duration = Duration::from_secs(5);
+const V2_PRIVATE_INGRESS_STAGE_TIMEOUT_MS: u64 = 5_000;
+
+#[cfg(all(feature = "network", feature = "storage"))]
+const V2_PRIVATE_INGRESS_STAGE_TIMEOUT: Duration =
+    Duration::from_millis(V2_PRIVATE_INGRESS_STAGE_TIMEOUT_MS);
 
 #[cfg(all(feature = "network", feature = "storage"))]
 fn stage_v2_private_ingress_through_root(
@@ -1461,6 +1498,105 @@ fn begin_v2_private_ingress_upload(upload: &V2PrivateIngressUpload) -> bool {
     }
     *state = V2PrivateIngressUploadState::Persisting;
     true
+}
+
+/// Durably stage one private ingress on every voter in the leader's exact
+/// steady-state membership before `AdmitIngress` can be proposed. Registry
+/// lookups bind compact voter slots to full PeerIds; requests fan out before
+/// waiting so one slow voter cannot consume every other voter's budget.
+#[cfg(all(feature = "network", feature = "storage"))]
+fn stage_v2_private_ingress_on_current_voters<B>(
+    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
+    request: &crate::v2::LocalWorkRequestV2,
+    reference: &crate::v2::BlobRefV2,
+    shared_network: &SharedNetwork,
+    invoke_routes: &InvokeRoutes,
+) -> bool
+where
+    B: crate::v2::CommittedImageStoreV2
+        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+{
+    let Some((local_prefix, voters)) = service.steady_raft_voters() else {
+        return false;
+    };
+    if service.replication_id().is_none()
+        || voters.is_empty()
+        || voters.binary_search(&local_prefix).is_err()
+        || !service.stage_replicated_private_ingress(
+            request.invocation,
+            reference,
+            &request.arguments,
+        )
+    {
+        return false;
+    }
+    let remote_voters = voters
+        .iter()
+        .copied()
+        .filter(|prefix| *prefix != local_prefix)
+        .collect::<Vec<_>>();
+    if remote_voters.is_empty() {
+        return service.steady_raft_voters() == Some((local_prefix, voters));
+    }
+    let Some(network) = shared_network
+        .lock()
+        .ok()
+        .and_then(|network| network.clone())
+    else {
+        return false;
+    };
+    if crate::network::derive_node_prefix(&network.peer_id()) != local_prefix {
+        return false;
+    }
+    let deadline = Instant::now() + V2_PRIVATE_INGRESS_STAGE_TIMEOUT;
+    let mut peers = Vec::with_capacity(remote_voters.len());
+    for (index, prefix) in remote_voters.iter().copied().enumerate() {
+        let remaining_voters = remote_voters.len().saturating_sub(index).max(1) as u32;
+        let budget = deadline
+            .saturating_duration_since(Instant::now())
+            .checked_div(remaining_voters)
+            .unwrap_or_default();
+        let Some(member) =
+            lookup_node_member_from_routes_with_timeout(invoke_routes, prefix, budget)
+        else {
+            return false;
+        };
+        let Ok(peer) = libp2p::PeerId::from_bytes(&member.key) else {
+            return false;
+        };
+        if !node_member_authenticates_voter(&member, prefix, &peer) {
+            return false;
+        }
+        peers.push(peer);
+    }
+    let replication_id = service
+        .replication_id()
+        .expect("Raft private ingress has a replication id");
+    let mut replies = peers
+        .into_iter()
+        .map(|peer| {
+            network.send_store_private_ingress(
+                peer,
+                replication_id,
+                request.invocation.0,
+                reference.hash.0,
+                reference.len,
+                request.arguments.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if replies.iter_mut().any(|reply| {
+        reply
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()
+            != Some(true)
+    }) {
+        return false;
+    }
+    // Leadership or membership changing after staging is safe only if the
+    // request is refused. The join path shares the admission barrier, while
+    // this final comparison also closes leadership-transfer races.
+    service.steady_raft_voters() == Some((local_prefix, voters))
 }
 
 /// Shared map of raft-hosted agents: ServiceId word → replication
@@ -3095,6 +3231,44 @@ impl crate::network::NetworkService for NodeService {
     fn raft_join_authorized(&self, prefix: u16) -> bool {
         self.lookup_node_role(prefix) == NODE_ROLE_REPLY_VOTER
     }
+
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn handle_raft_join(
+        &self,
+        peer: libp2p::PeerId,
+        replication_id: &[u8; 32],
+        joiner_prefix: u16,
+        handler: &dyn crate::network::RaftRpcHandler,
+    ) -> crate::network::RaftJoinResult {
+        let Some(member) = self.lookup_node_member(joiner_prefix) else {
+            return crate::network::RaftJoinResult::NotAuthorized;
+        };
+        if !node_member_authenticates_voter(&member, joiner_prefix, &peer) {
+            return crate::network::RaftJoinResult::NotAuthorized;
+        }
+        let route = self
+            .v2_private_ingress_routes
+            .read()
+            .ok()
+            .and_then(|routes| routes.get(replication_id).cloned());
+        let Some(route) = route else {
+            // Legacy/non-v2 groups retain their existing join contract.
+            return handler.handle_join(replication_id, joiner_prefix);
+        };
+        let Some(_barrier) = route.barrier.try_acquire() else {
+            return crate::network::RaftJoinResult::Busy;
+        };
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if route.quiescence_tx.try_send(reply_tx).is_err()
+            || reply_rx.recv_timeout(V2_PRIVATE_INGRESS_STAGE_TIMEOUT).ok() != Some(true)
+        {
+            return crate::network::RaftJoinResult::Busy;
+        }
+        // The guard remains held through `change_membership`: no private
+        // admission can race between the quiescence observation and the
+        // joint-configuration proposal.
+        handler.handle_join(replication_id, joiner_prefix)
+    }
 }
 
 /// Replay every log in the strategy's DAG against `runtime`'s
@@ -4108,7 +4282,12 @@ impl VosNode {
         #[cfg(all(feature = "network", feature = "storage"))]
         let private_ingress_registration = service.replication_id().map(|replication_id| {
             let (tx, rx) = mpsc::sync_channel(V2_PRIVATE_INGRESS_QUEUE_CAPACITY);
-            let route = Arc::new(V2PrivateIngressRoute { tx });
+            let (quiescence_tx, quiescence_rx) = mpsc::sync_channel(1);
+            let route = Arc::new(V2PrivateIngressRoute {
+                tx,
+                quiescence_tx,
+                barrier: V2PrivateIngressBarrier::new(),
+            });
             self.v2_private_ingress_routes
                 .write()
                 .unwrap()
@@ -4117,6 +4296,7 @@ impl VosNode {
                 replication_id,
                 route,
                 receiver: rx,
+                quiescence_receiver: quiescence_rx,
                 routes: self.v2_private_ingress_routes.clone(),
             }
         });
@@ -7599,6 +7779,12 @@ where
     while error.is_none() && !shutdown.load(Ordering::Relaxed) {
         #[cfg(all(feature = "network", feature = "storage"))]
         if let Some(private_ingress) = private_ingress_registration.as_ref() {
+            while let Ok(reply) = private_ingress.quiescence_receiver.try_recv() {
+                let quiescent = service
+                    .has_pending_private_ingress()
+                    .is_ok_and(|pending| !pending);
+                let _ = reply.send(quiescent);
+            }
             for _ in 0..4 {
                 let Ok(upload) = private_ingress.receiver.try_recv() else {
                     break;
@@ -7633,6 +7819,10 @@ where
             );
         }
         if last_transport_retry.elapsed() >= Duration::from_millis(250) {
+            // Every Raft follower applies the same terminal ingress
+            // transition. Retry host-side deletion debt without changing the
+            // committed invocation's disposition.
+            service.retry_private_ingress_retirement();
             retry_v2_root_transport(
                 id,
                 &root_name,
@@ -7899,6 +8089,47 @@ where
                 .disclosed_evidence(policy.policy);
             }
         }
+        #[cfg(all(feature = "network", feature = "storage"))]
+        let _private_ingress_barrier =
+            if service.consistency() == crate::v2::ConsistencyModeV2::Raft {
+                let reference = match service.private_ingress_reference_for_request(&request) {
+                    Ok(reference) => reference,
+                    Err(failure) => {
+                        error!(%id, ?failure, "v2 private-ingress classification failed");
+                        send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                        continue;
+                    }
+                };
+                if let Some(reference) = reference {
+                    let Some(registration) = private_ingress_registration.as_ref() else {
+                        error!(%id, "v2 Raft private ingress has no root-owned sidecar route");
+                        send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                        continue;
+                    };
+                    let Some(guard) = registration.route.barrier.try_acquire() else {
+                        // A membership change owns the same critical section.
+                        // No request has entered the log, so a normal retry is
+                        // safe and cannot observe a partial admission.
+                        send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                        continue;
+                    };
+                    if !stage_v2_private_ingress_on_current_voters(
+                        &mut service,
+                        &request,
+                        &reference,
+                        &shared_network,
+                        &invoke_routes,
+                    ) {
+                        send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                        continue;
+                    }
+                    Some(guard)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
         // Nothing catches up again between this allocation and the proposal.
         let final_slot =
             match allocate_v2_root_slot_after_barrier(&logical_timeslot, admission_floor) {
@@ -14942,12 +15173,12 @@ mod tests {
     fn raft_typed_invoke_budget_covers_every_bounded_stage() {
         assert_eq!(
             v2_raft_invoke_timeout(5_000),
-            Duration::from_secs(30),
-            "voter auth + read barrier + genesis + admission + apply + one margin window",
+            Duration::from_secs(35),
+            "voter auth + private staging + read barrier + genesis + admission + apply + margin",
         );
         assert_eq!(
             v2_raft_invoke_timeout(2_000),
-            Duration::from_secs(15),
+            Duration::from_secs(20),
             "the end-to-end budget follows the configured proposal timeout",
         );
     }
@@ -17042,9 +17273,14 @@ mod tests {
         );
         service.shared_network = Arc::new(Mutex::new(Some(network.clone())));
         let (sidecar_tx, sidecar_rx) = mpsc::sync_channel(1);
+        let (quiescence_tx, _quiescence_rx) = mpsc::sync_channel(1);
         service.v2_private_ingress_routes.write().unwrap().insert(
             replication_id,
-            Arc::new(V2PrivateIngressRoute { tx: sidecar_tx }),
+            Arc::new(V2PrivateIngressRoute {
+                tx: sidecar_tx,
+                quiescence_tx,
+                barrier: V2PrivateIngressBarrier::new(),
+            }),
         );
         let bytes = b"exact private ingress".to_vec();
         let reference = crate::v2::BlobRefV2::of_bytes(&bytes);
@@ -17128,6 +17364,131 @@ mod tests {
             *upload.state.lock().unwrap(),
             V2PrivateIngressUploadState::Cancelled,
         );
+    }
+
+    #[test]
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn raft_join_is_serialized_with_private_admission_and_requires_quiescence() {
+        use crate::actors::codec::Encode;
+        use crate::network::{NetworkService, RaftAppendResult, RaftJoinResult};
+        use crate::value::Value;
+        use std::sync::atomic::AtomicUsize;
+
+        struct JoinHandler(AtomicUsize);
+        impl crate::network::RaftRpcHandler for JoinHandler {
+            fn append_entries(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                prev_log_index: u64,
+                _prev_log_term: u64,
+                _leader_commit: u64,
+                _entries: Vec<crate::network::RaftEntry>,
+            ) -> RaftAppendResult {
+                RaftAppendResult {
+                    term,
+                    success: false,
+                    match_index: prev_log_index,
+                }
+            }
+
+            fn request_vote(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                _last_log_index: u64,
+                _last_log_term: u64,
+            ) -> crate::network::RaftVoteResult {
+                crate::network::RaftVoteResult {
+                    term,
+                    vote_granted: false,
+                }
+            }
+
+            fn handle_join(
+                &self,
+                _replication_id: &[u8; 32],
+                _joiner_prefix: u16,
+            ) -> RaftJoinResult {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                RaftJoinResult::Accepted { joint_index: 9 }
+            }
+        }
+
+        let joiner = libp2p::PeerId::random();
+        let prefix = crate::network::derive_node_prefix(&joiner);
+        let member = crate::registry::MemberRow {
+            kind: crate::registry::MEMBER_KIND_NODE,
+            key: joiner.to_bytes(),
+            prefix,
+            role: crate::registry::NODE_ROLE_VOTER,
+            proof_kind: 0,
+            proof_data: Vec::new(),
+        };
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let (registry_tx, registry_rx) = mpsc::channel::<InvokeRequest>();
+        routes
+            .lock()
+            .unwrap()
+            .insert(ServiceId::REGISTRY.0, registry_tx);
+        let registry = thread::spawn(move || {
+            for _ in 0..2 {
+                let request = registry_rx.recv().unwrap();
+                let page = crate::registry::MemberPage {
+                    members: vec![member.clone()],
+                    next_kind: crate::registry::MEMBER_KIND_IDENTITY,
+                    next_key: Vec::new(),
+                    more: false,
+                };
+                let reply = Value::Bytes(page.encode()).encode();
+                assert!(request.reply.send(encode_invoke_envelope(
+                    crate::actors::run::STATUS_DONE,
+                    &[],
+                    &reply,
+                )));
+            }
+        });
+        let service = lifecycle_service(
+            routes,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
+        );
+        let replication_id = [0x72; 32];
+        let (sidecar_tx, _sidecar_rx) = mpsc::sync_channel(1);
+        let (quiescence_tx, quiescence_rx) = mpsc::sync_channel(1);
+        let route = Arc::new(V2PrivateIngressRoute {
+            tx: sidecar_tx,
+            quiescence_tx,
+            barrier: V2PrivateIngressBarrier::new(),
+        });
+        service
+            .v2_private_ingress_routes
+            .write()
+            .unwrap()
+            .insert(replication_id, route.clone());
+        let handler = JoinHandler(AtomicUsize::new(0));
+
+        let admission = route.barrier.try_acquire().unwrap();
+        assert_eq!(
+            service.handle_raft_join(joiner, &replication_id, prefix, &handler),
+            RaftJoinResult::Busy,
+            "membership cannot change while private admission owns the barrier",
+        );
+        assert_eq!(handler.0.load(Ordering::Relaxed), 0);
+        drop(admission);
+
+        let quiescence = thread::spawn(move || {
+            quiescence_rx.recv().unwrap().send(true).unwrap();
+        });
+        assert_eq!(
+            service.handle_raft_join(joiner, &replication_id, prefix, &handler),
+            RaftJoinResult::Accepted { joint_index: 9 },
+        );
+        quiescence.join().unwrap();
+        registry.join().unwrap();
+        assert_eq!(handler.0.load(Ordering::Relaxed), 1);
     }
 
     #[test]

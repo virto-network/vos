@@ -27,9 +27,9 @@ use vos::v2::{
     CommittedAccumulateEntryV2, CommittedAccumulateLogV2, CommittedImageStoreV2,
     CommittedServiceImageHostV2, CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationChangeV2, ContinuationSnapshotV2, CrdtChangeV2, DeploymentId, DirectIngressV2,
-    DurableJamStoreV2, ExternalActorBindingV2, GasAccountingV2, GasScheduleV2, Hash,
-    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2, InvocationId,
-    JamServiceV2, LocalJamStoreHostV2, LocalJamStoreSnapshotV2, LocalJamStoreV2,
+    DurableJamStoreV2, ExternalActorBindingV2, FileCommittedImageStoreV2, GasAccountingV2,
+    GasScheduleV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2,
+    InvocationId, JamServiceV2, LocalJamStoreHostV2, LocalJamStoreSnapshotV2, LocalJamStoreV2,
     LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2,
     LocalRootTreeOpenErrorV2, LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2,
     LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
@@ -1848,13 +1848,112 @@ fn producer_record_capture_is_count_bounded_per_slice() {
 }
 
 #[test]
-fn replicated_task_dependencies_are_rejected_before_genesis_or_ingress() {
+fn raft_task_dependencies_use_private_ingress_while_crdt_remains_rejected() {
     let task_pvm = vec![0xa5; 4096];
-    let (config, _) = signed_task_dependency_config(task_pvm, ConsistencyModeV2::Raft);
+    let (config, _) = signed_task_dependency_config(task_pvm.clone(), ConsistencyModeV2::Raft);
+    assert!(config.validate().is_ok());
+    let (config, _) = signed_task_dependency_actor_config(
+        &crdt_counter_v2_elf(),
+        task_pvm,
+        0x1_0000,
+        4096,
+        ConsistencyModeV2::Crdt,
+    );
     assert_eq!(
         config.validate(),
         Err(LocalRootTreeConfigErrorV2::ReplicatedPrivateTaskUnsupported)
     );
+}
+
+#[test]
+fn single_voter_raft_task_ingress_is_private_durable_and_retryable() {
+    let task_pvm = grey_transpiler::assembler::Assembler::new().build();
+    let (config, _) = signed_task_dependency_config(task_pvm, ConsistencyModeV2::Raft);
+    let actor = config.root_actor;
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-raft-private-ingress-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let log_path = directory.join("raft.redb");
+    let log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    let mut service =
+        LocalRootTreeServiceV2::open_raft(config.clone(), FailableCommittedImages::default(), log)
+            .expect("single-voter Raft Task root installs");
+    let private_sentinel = [0xE1; 32];
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(
+        &Msg::new("start")
+            .with("private_sentinel", private_sentinel.to_vec())
+            .encode(),
+    );
+    let request = LocalWorkRequestV2 {
+        invocation: InvocationId([0xDE; 32]),
+        workflow_step: 0,
+        logical_timeslot: 13,
+        target: actor,
+        method: "start".into(),
+        arguments,
+        origin: Origin::Anonymous,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let committed = service
+        .invoke(request.clone())
+        .expect("single voter durably stages before admitting");
+    assert!(!committed.duplicate);
+    let ingress_record = service
+        .store()
+        .local_store()
+        .ingress_record(request.invocation)
+        .unwrap()
+        .expect("guest retains the redacted ingress identity");
+    assert!(ingress_record.consumed);
+    assert!(ingress_record.ingress.arguments.is_empty());
+    assert_eq!(
+        ingress_record.ingress.private_arguments,
+        Some(BlobRefV2::of_bytes(&request.arguments)),
+    );
+    assert!(service.store().backend().private_ingresses.is_empty());
+    assert!(
+        !service
+            .store()
+            .snapshot_bytes()
+            .windows(private_sentinel.len())
+            .any(|window| window == private_sentinel),
+        "private arguments never enter the replicated service image",
+    );
+
+    let backend = service.into_backend();
+    let committed_log_bytes = std::fs::read(&log_path).unwrap();
+    assert!(
+        !committed_log_bytes
+            .windows(private_sentinel.len())
+            .any(|window| window == private_sentinel),
+        "private argument constituents never enter the ordered Raft log",
+    );
+    let log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    let mut reopened = LocalRootTreeServiceV2::open_raft(config, backend, log)
+        .expect("Raft Task root reopens without a retired preimage");
+    let retry = reopened
+        .invoke(request)
+        .expect("exact committed retry needs no sidecar recreation");
+    assert!(retry.duplicate);
+    assert_eq!(retry.refine_gas_used, 0);
+    assert_eq!(retry.accumulate_gas_used, 0);
+    assert!(reopened.store().backend().private_ingresses.is_empty());
+    drop(reopened);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 fn signed_task_dependency_config(
@@ -3724,35 +3823,9 @@ fn node_registers_a_raft_root_through_the_canonical_request_log() {
 
 #[test]
 fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
-    let actor_elf = greeter_elf();
-    let signer = libp2p::identity::Keypair::generate_ed25519();
-    let (package, actor_name) = signed_test_package(&actor_elf, &signer);
-    let actor = ActorId([0xB1; 32]);
-    let config = LocalRootTreeConfigV2 {
-        role_authority: None,
-        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
-        service: ServiceIdentityV2 {
-            space: vos::v2::SpaceId([0xB2; 32]),
-            root_service: RootServiceId([0xB3; 32]),
-            deployment: package.deployment_id(),
-            service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
-            service_abi: vos::v2::ABI_VERSION,
-            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
-            gas_schedule: TEST_GAS_SCHEDULE,
-        },
-        package,
-        root_actor: actor,
-        actor_name,
-        consistency: ConsistencyModeV2::Raft,
-        initial_state: vec![],
-        external_actors: vec![],
-        install_authorization: AuthorizationEvidenceV2::SystemCapability {
-            capability: SystemCapabilityId([0xB4; 32]),
-            authenticator: vec![0xB5],
-        },
-        refine_gas: 1_000_000_000,
-        accumulate_gas: 5_000_000_000,
-    };
+    let task_pvm = grey_transpiler::assembler::Assembler::new().build();
+    let (config, _) = signed_task_dependency_config(task_pvm, ConsistencyModeV2::Raft);
+    let actor = config.root_actor;
 
     let key_a = libp2p::identity::Keypair::generate_ed25519();
     let peer_a = libp2p::PeerId::from(key_a.public());
@@ -3847,6 +3920,10 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
     std::fs::create_dir_all(&directory).unwrap();
     let db_a = Arc::new(redb::Database::create(directory.join("a.redb")).unwrap());
     let db_b = Arc::new(redb::Database::create(directory.join("b.redb")).unwrap());
+    let image_a = directory.join("a.service");
+    let image_b = directory.join("b.service");
+    let backend_a = FileCommittedImageStoreV2::new(&image_a);
+    let backend_b = FileCommittedImageStoreV2::new(&image_b);
     let replication_id = [0xB6; 32];
     let members = vec![prefix_a, prefix_b];
     // This test is about typed redirect/status preservation, not election
@@ -3923,12 +4000,8 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
         .unwrap();
     let local_id = 0x3600;
     if leader == prefix_a {
-        let service_a = LocalRootTreeServiceV2::open_raft(
-            config.clone(),
-            FailableCommittedImages::default(),
-            log_a,
-        )
-        .unwrap();
+        let service_a =
+            LocalRootTreeServiceV2::open_raft(config.clone(), backend_a.clone(), log_a).unwrap();
         node_a
             .register_v2_root_at_id(
                 "raft-root-a",
@@ -3938,8 +4011,7 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
             )
             .unwrap();
         let service_b =
-            LocalRootTreeServiceV2::open_raft(config, FailableCommittedImages::default(), log_b)
-                .unwrap();
+            LocalRootTreeServiceV2::open_raft(config, backend_b.clone(), log_b).unwrap();
         node_b
             .register_v2_root_at_id(
                 "raft-root-b",
@@ -3949,12 +4021,8 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
             )
             .unwrap();
     } else {
-        let service_b = LocalRootTreeServiceV2::open_raft(
-            config.clone(),
-            FailableCommittedImages::default(),
-            log_b,
-        )
-        .unwrap();
+        let service_b =
+            LocalRootTreeServiceV2::open_raft(config.clone(), backend_b.clone(), log_b).unwrap();
         node_b
             .register_v2_root_at_id(
                 "raft-root-b",
@@ -3964,8 +4032,7 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
             )
             .unwrap();
         let service_a =
-            LocalRootTreeServiceV2::open_raft(config, FailableCommittedImages::default(), log_a)
-                .unwrap();
+            LocalRootTreeServiceV2::open_raft(config, backend_a.clone(), log_a).unwrap();
         node_a
             .register_v2_root_at_id(
                 "raft-root-a",
@@ -4062,6 +4129,18 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
     let results_b = node_b.collect();
     assert!(results_a.into_iter().all(|result| result.is_ok()));
     assert!(results_b.into_iter().all(|result| result.is_ok()));
+    for image in [&image_a, &image_b] {
+        let mut name = image.file_name().unwrap().to_os_string();
+        name.push(".private-inputs");
+        let private_dir = image.with_file_name(name);
+        let retained = std::fs::read_dir(private_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(
+            retained, 0,
+            "every voter retires its private ingress after applying the terminal entry",
+        );
+    }
     client_network.join();
     std::fs::remove_dir_all(directory).unwrap();
 }

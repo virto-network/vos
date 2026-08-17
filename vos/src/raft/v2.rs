@@ -212,6 +212,35 @@ impl RaftAccumulateLogV2 {
         self.cfg.propose_timeout_ms
     }
 
+    /// Return the complete steady-state voter set only while this replica is
+    /// the current leader. Private ingress is staged outside the Raft log, so
+    /// callers must refuse a joint configuration rather than accidentally
+    /// omitting either half of its quorum.
+    pub(crate) fn steady_leader_voters(&self) -> Option<(u16, Vec<u16>)> {
+        match &self.role {
+            // The single-node strategy deliberately stores an empty static
+            // member list; its effective self-quorum is the local replica.
+            RoleV2::SingleNode => Some((self.cfg.me, vec![self.cfg.me])),
+            #[cfg(feature = "network")]
+            RoleV2::Multi { worker, .. } => {
+                let snapshot = worker.handler().snapshot()?;
+                if snapshot.role != super::worker::Role::Leader
+                    || snapshot.leader_hint != Some(self.cfg.me)
+                    || snapshot.joint_old.is_some()
+                {
+                    return None;
+                }
+                let mut members = snapshot.members;
+                members.sort_unstable();
+                members.dedup();
+                members
+                    .binary_search(&self.cfg.me)
+                    .ok()
+                    .map(|_| (self.cfg.me, members))
+            }
+        }
+    }
+
     /// Open a self-quorum log. Every proposal commits in one redb transaction,
     /// but service application and `last_applied` remain a separate ordered
     /// step so restart exercises the same replay contract as a real cluster.

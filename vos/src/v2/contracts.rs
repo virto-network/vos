@@ -2141,7 +2141,7 @@ impl DirectIngressV2 {
             && self.method == work.method
             && self.private_arguments == work.private_arguments
             && match self.private_arguments.as_ref() {
-                Some(reference) => reference.matches(&work.arguments),
+                Some(reference) => work.arguments.is_empty() || reference.matches(&work.arguments),
                 None => self.arguments == work.arguments,
             }
             && self.origin == work.origin
@@ -2653,7 +2653,7 @@ impl V2Wire for WorkEnvelopeV2 {
             return Err(DecodeError::NonCanonical);
         }
         let consistency = ConsistencyModeV2::decode(d)?;
-        if private_arguments.is_some() && consistency != ConsistencyModeV2::Local {
+        if private_arguments.is_some() && consistency == ConsistencyModeV2::Crdt {
             return Err(DecodeError::NonCanonical);
         }
         let base = decode_base(d)?;
@@ -6100,6 +6100,20 @@ mod tests {
         private.arguments = (80_u8..128).collect();
         private.private_arguments = Some(BlobRefV2::of_bytes(&private.arguments));
         assert_eq!(WorkEnvelopeV2::decode(&private.encode()).unwrap(), private);
+        let mut raft_private = private.clone();
+        raft_private.consistency = ConsistencyModeV2::Raft;
+        assert_eq!(
+            WorkEnvelopeV2::decode(&raft_private.encode()).unwrap(),
+            raft_private,
+            "Raft carries only the commitment while the host side-CAS supplies bytes",
+        );
+        let mut crdt_private = private.clone();
+        crdt_private.consistency = ConsistencyModeV2::Crdt;
+        assert_eq!(
+            WorkEnvelopeV2::decode(&crdt_private.encode()),
+            Err(DecodeError::NonCanonical),
+            "CRDT private-input availability remains fail-closed",
+        );
         let checkpoint = private.durable_work();
         assert!(checkpoint.arguments.is_empty());
         assert_eq!(checkpoint.hash(), private.hash());

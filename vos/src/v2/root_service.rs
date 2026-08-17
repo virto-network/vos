@@ -1120,15 +1120,11 @@ impl LocalRootTreeConfigV2 {
         if self.package.manifest.crdt != (self.consistency == ConsistencyModeV2::Crdt) {
             return Err(LocalRootTreeConfigErrorV2::InvalidConsistency);
         }
-        if matches!(
-            self.consistency,
-            ConsistencyModeV2::Raft | ConsistencyModeV2::Crdt
-        ) && !self.package.task_dependencies.is_empty()
+        if self.consistency == ConsistencyModeV2::Crdt && !self.package.task_dependencies.is_empty()
         {
-            // Local roots hydrate commitment-only ingress from one durable
-            // operator sidecar. Raft/CRDT still lack an authenticated
-            // availability/failover protocol for that private preimage, so a
-            // replica must not claim it can execute the signed dependency.
+            // Raft roots stage commitment-only ingress on every steady-state
+            // voter before admission. CRDT still lacks a causally authorized
+            // producer-availability rule for the private preimage.
             return Err(LocalRootTreeConfigErrorV2::ReplicatedPrivateTaskUnsupported);
         }
         if self.role_authority.as_ref().is_some_and(|authority| {
@@ -1673,7 +1669,10 @@ where
         &self,
         actor: ActorId,
     ) -> Result<bool, LocalRootTreeInvokeErrorV2> {
-        if self.consistency != ConsistencyModeV2::Local {
+        if !matches!(
+            self.consistency,
+            ConsistencyModeV2::Local | ConsistencyModeV2::Raft
+        ) {
             return Ok(false);
         }
         let header = self
@@ -1707,6 +1706,68 @@ where
             return Ok(record.ingress.private_arguments.is_some());
         }
         self.target_uses_private_ingress(request.target)
+    }
+
+    /// Content address that must be present on every current Raft voter
+    /// before this request may enter the replicated log.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    pub(crate) fn private_ingress_reference_for_request(
+        &self,
+        request: &LocalWorkRequestV2,
+    ) -> Result<Option<BlobRefV2>, LocalRootTreeInvokeErrorV2> {
+        if self
+            .service
+            .accumulate_host()
+            .ingress_record(request.invocation)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .is_some_and(|record| record.consumed)
+        {
+            // Exact committed retries authenticate the supplied plaintext
+            // against the permanent content address but never need to
+            // recreate a sidecar already retired by every replica.
+            return Ok(None);
+        }
+        self.request_uses_private_ingress(request)
+            .map(|required| required.then(|| BlobRefV2::of_bytes(&request.arguments)))
+    }
+
+    /// Whether guest-owned state still depends on a private ingress preimage.
+    /// Membership promotion uses this while excluding concurrent admissions;
+    /// a quiescent join needs no secret-bearing snapshot side channel.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    pub(crate) fn has_pending_private_ingress(&self) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+        self.service
+            .accumulate_host()
+            .local_store()
+            .pending_ingresses()
+            .map(|ingresses| {
+                ingresses
+                    .iter()
+                    .any(|ingress| ingress.private_arguments.is_some())
+            })
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)
+    }
+
+    /// Retry host-only cleanup debt without changing the disposition of an
+    /// invocation whose guest transition already committed.
+    pub(crate) fn retry_private_ingress_retirement(&mut self) {
+        let debt = self
+            .service
+            .accumulate_host()
+            .private_ingress_retirement_debt();
+        for invocation in debt {
+            self.service
+                .accumulate_host_mut()
+                .retire_private_ingress_after_commit(invocation);
+        }
+    }
+
+    pub(crate) fn steady_raft_voters(&self) -> Option<(u16, Vec<u16>)> {
+        match &self.service {
+            #[cfg(feature = "storage")]
+            RootTreeServiceDriverV2::Raft(service) => service.log().steady_leader_voters(),
+            RootTreeServiceDriverV2::Direct(_) => None,
+        }
     }
 
     fn owns_actor(&self, actor: ActorId) -> Result<bool, LocalRootTreeInvokeErrorV2> {
@@ -2632,12 +2693,42 @@ where
         if let Some(reference) = ingress.private_arguments.as_ref() {
             match existing_ingress.as_ref() {
                 None => {
-                    owns_private_ingress = true;
-                    let persisted = self
-                        .service
-                        .accumulate_host_mut()
-                        .persist_private_ingress(request.invocation, &request.arguments)
-                        .map_err(|_| LocalRootTreeInvokeErrorV2::PrivateIngressUnavailable)?;
+                    // Raft admission is allowed to consume only a sidecar
+                    // already acknowledged by the node's all-voter barrier.
+                    // A direct service caller cannot silently downgrade that
+                    // protocol to one local write.
+                    let persisted = if self.consistency == ConsistencyModeV2::Raft {
+                        let existing = self
+                            .service
+                            .accumulate_host()
+                            .private_ingress(request.invocation, reference)
+                            .filter(|bytes| bytes == &request.arguments)
+                            .map(|_| reference.clone());
+                        if let Some(existing) = existing {
+                            existing
+                        } else if self
+                            .steady_raft_voters()
+                            .is_some_and(|(me, voters)| voters.as_slice() == [me])
+                        {
+                            self.service
+                                .accumulate_host_mut()
+                                .persist_replicated_private_ingress(
+                                    request.invocation,
+                                    &request.arguments,
+                                )
+                                .map_err(|_| {
+                                    LocalRootTreeInvokeErrorV2::PrivateIngressUnavailable
+                                })?
+                        } else {
+                            return Err(LocalRootTreeInvokeErrorV2::PrivateIngressUnavailable);
+                        }
+                    } else {
+                        owns_private_ingress = true;
+                        self.service
+                            .accumulate_host_mut()
+                            .persist_private_ingress(request.invocation, &request.arguments)
+                            .map_err(|_| LocalRootTreeInvokeErrorV2::PrivateIngressUnavailable)?
+                    };
                     if persisted != *reference {
                         self.service
                             .accumulate_host_mut()
@@ -3128,12 +3219,21 @@ where
             .service
             .refine_actor_tree_after_barrier(&prepared.work, &prepared.imports)
             .map_err(RootTreeDriverErrorV2::into_invoke)?;
+        let PreparedWorkV2 {
+            mut work,
+            imports: _,
+        } = prepared;
         self.service
             .accumulate_host_mut()
             .persist_producer_records(&refined.producer_records)
             .map_err(|_| LocalRootTreeInvokeErrorV2::ProducerRecordUnavailable)?;
-        let input = prepared.work.input_id();
-        let private_ingress = prepared.work.private_arguments.is_some();
+        let input = work.input_id();
+        if work.private_arguments.is_some() {
+            // Refine consumes the hydrated preimage locally. Consensus and
+            // the guest Apply boundary carry only its authenticated content
+            // address, so plaintext never enters a Raft log entry.
+            work.arguments.clear();
+        }
         let mut provided_blobs = refined.exported_blobs;
         if let Some(proof) = proof_artifact {
             match provided_blobs
@@ -3150,7 +3250,7 @@ where
             .service
             .accumulate_with_receipt_verifications_after_barrier(
                 &AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
-                    work: prepared.work,
+                    work,
                     transition: refined.transition,
                     provided_blobs,
                 }),
@@ -3177,11 +3277,6 @@ where
             .find(|publication| publication.input == input);
         if published != PublishedEffectsV2::default() && publication.is_none() {
             return Err(LocalRootTreeInvokeErrorV2::MissingPublication);
-        }
-        if private_ingress {
-            self.service
-                .accumulate_host_mut()
-                .retire_private_ingress_after_commit(input.invocation);
         }
         Ok(CommittedRootTreeSliceV2 {
             input,
@@ -3212,19 +3307,22 @@ where
             .service
             .refine_actor_tree_after_barrier(&prepared.work, &prepared.imports)
             .map_err(RootTreeDriverErrorV2::into_invoke)?;
+        let PreparedWorkV2 { mut work, imports } = prepared;
         self.service
             .accumulate_host_mut()
             .persist_producer_records(&refined.producer_records)
             .map_err(|_| LocalRootTreeInvokeErrorV2::ProducerRecordUnavailable)?;
-        let input = prepared.work.input_id();
-        let private_ingress = prepared.work.private_arguments.is_some();
+        let input = work.input_id();
+        if work.private_arguments.is_some() {
+            work.arguments.clear();
+        }
         let committed = self.service.accumulate_attested_after_barrier(
             AccumulationEnvelopeV2 {
-                work: prepared.work,
+                work,
                 transition: refined.transition,
                 provided_blobs: refined.exported_blobs,
             },
-            &prepared.imports,
+            &imports,
             producer,
         )?;
         let publication = self
@@ -3241,11 +3339,6 @@ where
             || !committed.proof.proof_blob.matches(&committed.proof_bytes)
         {
             return Err(AttestedRootTreeInvokeErrorV2::CommitMismatch);
-        }
-        if private_ingress {
-            self.service
-                .accumulate_host_mut()
-                .retire_private_ingress_after_commit(input.invocation);
         }
         Ok(CommittedRootTreeSliceV2 {
             input,

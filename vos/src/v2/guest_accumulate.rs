@@ -423,10 +423,8 @@ fn upgrade_actor<S: GuestAccumulateStoreV2>(
         Ok(policies) => policies,
         Err(_) => return Ok(rejected(AccumulationRejectionV2::NonCanonical)),
     };
-    if matches!(
-        header.consistency,
-        ConsistencyModeV2::Raft | ConsistencyModeV2::Crdt
-    ) && !replacement_policies.task_dependencies.is_empty()
+    if header.consistency == ConsistencyModeV2::Crdt
+        && !replacement_policies.task_dependencies.is_empty()
     {
         return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
     }
@@ -553,7 +551,7 @@ fn admit_ingress<S: GuestAccumulateStoreV2>(
 
     if !ingress.base.mode_compatible(header.consistency)
         || (header.consistency == ConsistencyModeV2::Crdt) != ingress.crdt_change.is_some()
-        || ingress.private_arguments.is_some() && header.consistency != ConsistencyModeV2::Local
+        || ingress.private_arguments.is_some() && header.consistency == ConsistencyModeV2::Crdt
     {
         return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
     }
@@ -754,10 +752,7 @@ fn install<S: GuestAccumulateStoreV2>(
             Ok(policies) => policies,
             Err(_) => return Ok(rejected(AccumulationRejectionV2::NonCanonical)),
         };
-        if matches!(
-            genesis.consistency,
-            ConsistencyModeV2::Raft | ConsistencyModeV2::Crdt
-        ) && !policies.task_dependencies.is_empty()
+        if genesis.consistency == ConsistencyModeV2::Crdt && !policies.task_dependencies.is_empty()
         {
             return Ok(rejected(AccumulationRejectionV2::InvalidConsistency));
         }
@@ -5695,26 +5690,32 @@ mod tests {
         };
         let before = store.clone();
 
-        let mut replicated = genesis.clone();
-        replicated.consistency = ConsistencyModeV2::Raft;
+        let mut crdt = genesis.clone();
+        crdt.consistency = ConsistencyModeV2::Crdt;
+        crdt.actors[0].crdt = true;
         assert_eq!(
-            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Install(replicated),)
-                .unwrap(),
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Install(crdt)).unwrap(),
             rejected(AccumulationRejectionV2::InvalidConsistency),
-            "a replicated Task package must fail before availability or genesis writes",
+            "a CRDT Task package must fail before availability or genesis writes",
         );
         assert_eq!(store, before);
 
+        let mut replicated = genesis.clone();
+        replicated.consistency = ConsistencyModeV2::Raft;
         assert_eq!(
-            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Install(genesis.clone()))
-                .unwrap(),
+            execute_guest_accumulate(
+                &mut store,
+                &AccumulateRequestV2::Install(replicated.clone()),
+            )
+            .unwrap(),
             rejected(AccumulationRejectionV2::WrongProgram)
         );
         assert_eq!(store, before, "a partial dependency set must stage nothing");
 
         store.programs.insert(task_program, task_pvm);
         assert!(matches!(
-            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Install(genesis)).unwrap(),
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Install(replicated))
+                .unwrap(),
             AccumulationResultV2::Installed(_)
         ));
     }
@@ -5753,7 +5754,7 @@ mod tests {
     }
 
     #[test]
-    fn replicated_upgrade_cannot_introduce_private_task_dependencies() {
+    fn raft_upgrade_can_introduce_private_task_dependencies() {
         let mut store = MemStore::default();
         let (_, install) = install_fixture(&mut store, ConsistencyModeV2::Raft, b"state");
         let mut upgrade = upgrade_fixture(install.resulting_state_root.unwrap());
@@ -5769,14 +5770,14 @@ mod tests {
         });
         upgrade.role_policies = policies.encode();
         store.upgrade_allowlist.insert(upgrade.hash());
-        let before = store.clone();
-
-        assert_eq!(
+        assert!(matches!(
             execute_guest_accumulate(&mut store, &AccumulateRequestV2::UpgradeActor(upgrade))
                 .unwrap(),
-            rejected(AccumulationRejectionV2::InvalidConsistency),
-        );
-        assert_eq!(store, before);
+            AccumulationResultV2::ActorUpgraded {
+                duplicate: false,
+                ..
+            },
+        ));
     }
 
     #[test]

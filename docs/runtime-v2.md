@@ -906,12 +906,11 @@ and role scope bind that address. A private-input slice cannot suspend, so
 neither its durable workflow row nor a kernel snapshot can export hydrated
 bytes. Actor memory receives only the verifier-facing `ProvableRecord`;
 completed scheduler values are scrubbed. Recorded debug output is forbidden
-and capture is bounded per slice. Raft and CRDT packages containing Task
-dependencies remain rejected
-before genesis: replicating a commitment also requires a producer-availability
-and leader/failover protocol for the private preimage. Named actor-row witnesses
-and Task effects likewise remain fail-closed pending an authenticated typed
-import/effect contract.
+and capture is bounded per slice. Raft packages containing Task dependencies
+use the private-input availability protocol below; CRDT packages containing
+them remain rejected before genesis until causal replication has an equivalent
+producer-availability rule. Named actor-row witnesses and Task effects likewise
+remain fail-closed pending an authenticated typed import/effect contract.
 
 The first replicated-private-input boundary is explicit but does not yet open
 that gate. A bounded `StorePrivateIngress` request carries the exact Raft
@@ -939,12 +938,19 @@ blocking-work limits plus a bounded root queue prevent identity rotation or a
 stalled root from creating unbounded work. A queued upload is cancelled at
 its deadline before persistence, while a write that already crossed the
 durability boundary is awaited instead of being reported as a negative
-acknowledgement. Re-enabling Raft Task packages additionally requires an
-all-current-voters availability barrier before `AdmitIngress`, hydration of a
-prepared joiner before voter promotion, and retry-safe retirement on every
-holder. CRDT needs its separate causally authorized producer-availability
-rule. Until those pieces land, package validation continues to reject both
-replicated modes before genesis.
+acknowledgement. Raft Task packages are enabled only through an all-current-
+voters availability barrier before `AdmitIngress`. The leader authenticates
+every compact voter slot back to its complete registry PeerId, stages in
+parallel under one bounded deadline, and rechecks steady leadership before the
+proposal. Joint configurations fail closed. Membership changes share the same
+barrier and require no unconsumed private ingress, so promotion is explicitly
+deferred while an admitted private invocation awaits execution or proof
+production. This avoids shipping secrets to a prepared, not-yet-enrolled
+joiner. Every replica retires its artifact while applying the terminal guest row (and
+snapshot installation validates live artifacts before visibility), with
+cleanup debt retried independently. CRDT still needs a separate causally
+authorized producer-availability rule and continues to reject Task packages
+before genesis.
 
 `space up --service-pvm <exact-vos-service.pvm>` recognizes signed `.vos`
 catalog artifacts and opens each ordinary Local or Raft deployment as one
@@ -1067,12 +1073,14 @@ Task execution and its begin/end trace records; a v13 root cannot be reopened
 under a host that interprets INVOKE using the new contract. Execution
 semantics v15 binds mandatory witness injection, redacted actor-visible
 records, completed scheduler scrubbing, record-count and byte limits,
-recorded-debug rejection, and the no-suspend-after-record rule. It also keeps
-Raft/CRDT Task packages fail-closed until private ingress exists. ABI 12,
+recorded-debug rejection, and the no-suspend-after-record rule. ABI 12,
 schema 34, and execution semantics v16 add commitment-only Local private
 ingress, durable host-side hydration, redacted workflow checkpoints, and the
-stronger no-suspend rule for every private-input slice. Replicated private
-input availability remains deliberately staged. On durable open, the
+stronger no-suspend rule for every private-input slice. Execution semantics
+v17 admits signed Task dependencies for Raft Install/Upgrade under the
+host-authenticated all-voter private-input barrier while retaining the guest's
+CRDT rejection. CRDT private-input availability remains deliberately staged.
+On durable open, the
 producer side-CAS retains content-addressed inputs belonging to guest-owned
 unconsumed ingress records and explicitly Raft-staged inputs awaiting ordered
 admission. Local pre-admission orphans, guest-consumed terminal artifacts, and

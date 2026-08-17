@@ -444,19 +444,19 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
   `pvm-precompile` remains forbidden until that arithmetic is constrained in
   the AIR.
 - *Replicated clerk-ledger production cutover.* Signed Task execution is
-  exact-traced and Local producers durably store the private record before
-  commit, while Local guest state binds only the private-input commitment.
-  Raft/CRDT packages with Task dependencies deliberately fail before genesis:
-  the bounded Noise-authenticated Raft sidecar store and durable
-  acknowledgement now exist, without placing plaintext in the replicated
-  log/image. A self-authenticating pre-admission artifact survives restart,
-  removed receivers and non-leader senders fail closed, and bounded/cancellable
-  staging prevents a stalled root or rotating peers from creating unbounded
-  work. The remaining Raft work is an all-voter pre-admission barrier, joiner
-  hydration before voter promotion, holder-wide retirement, and leadership-
-  transfer coverage. CRDT still needs a causal producer-availability rule.
-  Only then can the public money path switch from `apply_transfer` to the
-  proven parent seam.
+  exact-traced and Local/Raft producers keep plaintext private ingress in a
+  durable side-CAS while guest state and Raft entries bind only its content
+  address. A Raft leader authenticates the complete steady voter roster,
+  obtains a durable acknowledgement from every voter before `AdmitIngress`,
+  and refuses admission during joint consensus. Membership changes share that
+  barrier and proceed only when private ingress is quiescent, so a prepared
+  joiner never needs a secret-bearing snapshot channel. Apply and snapshot
+  installation retire the sidecar independently on every holder, with bounded
+  cleanup-debt retries. Removed receivers, non-leader senders, stale rosters,
+  and unavailable voters all fail before admission. CRDT Task packages remain
+  rejected until they gain a causal producer-availability rule; the public
+  money path can switch once that separate CRDT choice (or a Raft-only
+  deployment decision) is made.
 - *Generated parent glue.* D6's manual Clerk implementation establishes the
   contract; a later macro may generate the touched-leaf/proof/invoke/apply
   boilerplate for other actors without changing its trust model.
