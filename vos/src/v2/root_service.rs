@@ -578,6 +578,7 @@ pub enum LocalRootTreeInvokeErrorV2 {
     ProofUnavailable,
     ProducerRecordUnavailable,
     PrivateIngressUnavailable,
+    PrivateIngressRetirementFailed,
     Schedule(ScheduleErrorV2),
     Service(ServiceDispatchError),
     #[cfg(feature = "storage")]
@@ -1226,6 +1227,26 @@ where
             .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
         prepared.work.private_arguments = private_arguments;
         Ok(prepared)
+    }
+
+    fn retire_consumed_private_ingress(
+        &mut self,
+        invocation: super::InvocationId,
+    ) -> Result<(), LocalRootTreeInvokeErrorV2> {
+        let record = self
+            .service
+            .accumulate_host()
+            .ingress_record(invocation)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?;
+        if record
+            .is_some_and(|record| record.consumed && record.ingress.private_arguments.is_some())
+        {
+            self.service
+                .accumulate_host_mut()
+                .prune_private_ingress(invocation)
+                .map_err(|_| LocalRootTreeInvokeErrorV2::PrivateIngressRetirementFailed)?;
+        }
+        Ok(())
     }
 
     fn recover_committed_invocation(
@@ -2511,6 +2532,7 @@ where
             return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
         }
         if let Some(committed) = self.recover_committed_invocation(&request)? {
+            self.retire_consumed_private_ingress(request.invocation)?;
             return Ok(committed);
         }
         let invocation = request.invocation;
@@ -2534,6 +2556,7 @@ where
             return Err(AttestedRootTreeInvokeErrorV2::InvalidPreparation);
         }
         if let Some(committed) = self.recover_committed_invocation(&request)? {
+            self.retire_consumed_private_ingress(request.invocation)?;
             return Ok(committed);
         }
         let invocation = request.invocation;
@@ -2576,32 +2599,65 @@ where
             request,
             self.request_uses_private_ingress(request)?,
         )?;
+        let existing_ingress = self
+            .service
+            .accumulate_host()
+            .ingress_record(request.invocation)
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?;
+        let mut owns_private_ingress = false;
         if let Some(reference) = ingress.private_arguments.as_ref() {
-            let already_consumed = self
-                .service
-                .accumulate_host()
-                .ingress_record(request.invocation)
-                .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
-                .is_some_and(|record| record.consumed && record.ingress.matches_retry(&ingress));
-            if !already_consumed {
-                let persisted = self
-                    .service
-                    .accumulate_host_mut()
-                    .persist_private_ingress(request.invocation, &request.arguments)
-                    .map_err(|_| LocalRootTreeInvokeErrorV2::PrivateIngressUnavailable)?;
-                if persisted != *reference {
-                    return Err(LocalRootTreeInvokeErrorV2::PrivateIngressUnavailable);
+            match existing_ingress.as_ref() {
+                None => {
+                    owns_private_ingress = true;
+                    let persisted = self
+                        .service
+                        .accumulate_host_mut()
+                        .persist_private_ingress(request.invocation, &request.arguments)
+                        .map_err(|_| LocalRootTreeInvokeErrorV2::PrivateIngressUnavailable)?;
+                    if persisted != *reference {
+                        self.service
+                            .accumulate_host_mut()
+                            .prune_private_ingress(request.invocation)
+                            .map_err(|_| {
+                                LocalRootTreeInvokeErrorV2::PrivateIngressRetirementFailed
+                            })?;
+                        return Err(LocalRootTreeInvokeErrorV2::PrivateIngressUnavailable);
+                    }
                 }
+                Some(record) if !record.consumed && record.ingress.matches_retry(&ingress) => {
+                    // The admitted request owns this artifact. An exact retry
+                    // may repair a missing process-local copy but must never
+                    // acquire cleanup ownership over it.
+                    let persisted = self
+                        .service
+                        .accumulate_host_mut()
+                        .persist_private_ingress(request.invocation, &request.arguments)
+                        .map_err(|_| LocalRootTreeInvokeErrorV2::PrivateIngressUnavailable)?;
+                    if persisted != *reference {
+                        return Err(LocalRootTreeInvokeErrorV2::PrivateIngressUnavailable);
+                    }
+                }
+                Some(_) => {}
             }
         }
         let private_ingress = ingress.private_arguments.is_some();
-        let accumulated = self
+        let accumulated = match self
             .service
             .accumulate_with_receipt_verifications_after_barrier(
                 &AccumulateRequestV2::AdmitIngress(ingress),
                 receipt_verifications,
-            )
-            .map_err(RootTreeDriverErrorV2::into_invoke)?;
+            ) {
+            Ok(accumulated) => accumulated,
+            Err(error) => {
+                if owns_private_ingress {
+                    self.service
+                        .accumulate_host_mut()
+                        .prune_private_ingress(request.invocation)
+                        .map_err(|_| LocalRootTreeInvokeErrorV2::PrivateIngressRetirementFailed)?;
+                }
+                return Err(RootTreeDriverErrorV2::into_invoke(error));
+            }
+        };
         match accumulated.result {
             AccumulationResultV2::IngressAdmitted {
                 invocation,
@@ -2609,18 +2665,20 @@ where
                 duplicate,
             } if invocation == request.invocation => Ok(duplicate),
             AccumulationResultV2::Rejected(rejection) => {
-                if private_ingress {
+                if private_ingress && owns_private_ingress {
                     self.service
                         .accumulate_host_mut()
-                        .prune_private_ingress(request.invocation);
+                        .prune_private_ingress(request.invocation)
+                        .map_err(|_| LocalRootTreeInvokeErrorV2::PrivateIngressRetirementFailed)?;
                 }
                 Err(LocalRootTreeInvokeErrorV2::Rejected(rejection))
             }
             _ => {
-                if private_ingress {
+                if private_ingress && owns_private_ingress {
                     self.service
                         .accumulate_host_mut()
-                        .prune_private_ingress(request.invocation);
+                        .prune_private_ingress(request.invocation)
+                        .map_err(|_| LocalRootTreeInvokeErrorV2::PrivateIngressRetirementFailed)?;
                 }
                 Err(LocalRootTreeInvokeErrorV2::UnexpectedResult)
             }
@@ -2710,6 +2768,7 @@ where
             return Err(LocalRootTreeInvokeErrorV2::ProofProducerRequired);
         }
         if let Some(committed) = self.recover_committed_invocation(&request)? {
+            self.retire_consumed_private_ingress(request.invocation)?;
             return Ok(committed);
         }
         let prepared = self.prepare_request(request, private_arguments)?;
@@ -3095,7 +3154,8 @@ where
         if private_ingress {
             self.service
                 .accumulate_host_mut()
-                .prune_private_ingress(input.invocation);
+                .prune_private_ingress(input.invocation)
+                .map_err(|_| LocalRootTreeInvokeErrorV2::PrivateIngressRetirementFailed)?;
         }
         Ok(CommittedRootTreeSliceV2 {
             input,
@@ -3159,7 +3219,8 @@ where
         if private_ingress {
             self.service
                 .accumulate_host_mut()
-                .prune_private_ingress(input.invocation);
+                .prune_private_ingress(input.invocation)
+                .map_err(|_| LocalRootTreeInvokeErrorV2::PrivateIngressRetirementFailed)?;
         }
         Ok(CommittedRootTreeSliceV2 {
             input,

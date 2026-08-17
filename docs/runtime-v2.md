@@ -301,6 +301,11 @@ runs read-only preparation against that caught-up image, and proposes only the
 final proved Apply; no second catch-up can intervene after the admission
 boundary. Pending proof bytes are retrievable by content address from the
 separate durable proof store and survive reopening alongside their publication.
+Because the installed producer API is synchronous and has no cancellation
+contract, node-level attested invocation waits for its terminal disposition
+instead of reporting an ordinary route timeout while proof production may
+still reach Apply. Bounded attested deadlines require a cancellable producer
+and an atomic cancel-before-commit handoff.
 
 The application package is a portable typed `Attestation<T, M>`, not a bare
 claim. Its generated method marker binds the method and exact actor reply wire;
@@ -1023,7 +1028,11 @@ Raft/CRDT Task packages fail-closed until private ingress exists. ABI 12,
 schema 34, and execution semantics v16 add commitment-only Local private
 ingress, durable host-side hydration, redacted workflow checkpoints, and the
 stronger no-suspend rule for every private-input slice. Replicated private
-input availability remains deliberately staged. Task project
+input availability remains deliberately staged. On durable open, the
+producer side-CAS retains only content-addressed inputs belonging to
+guest-owned unconsumed ingress records; pre-admission or terminal artifacts
+and incomplete temporary writes are retired, while missing or corrupt live
+inputs fail startup. Task project
 inputs are ordinary Cargo binary targets (resolved from
 Cargo's JSON artifact stream), not actor-library builds. Reopen verifies every
 retained dependency against the durable program catalog, and Raft roots reject

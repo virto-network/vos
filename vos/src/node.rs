@@ -148,11 +148,22 @@ type V2RaftTransportResolutions =
     Arc<Mutex<HashMap<V2RaftTransportResolutionKey, V2RaftTransportResolution>>>;
 
 const V2_LOCAL_INVOKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Attested ingress additionally runs exact Refine tracing, proof production,
-/// and verifier checks before the guest commit becomes visible. Keep its
-/// caller deadline distinct from the ordinary Local dispatch budget so a
-/// valid proof cannot commit after the caller has already reported failure.
-const V2_LOCAL_ATTESTED_INVOKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn receive_v2_invocation_reply(
+    reply: &mpsc::Receiver<Vec<u8>>,
+    proof_requested: bool,
+    deadline: Instant,
+) -> Result<Vec<u8>, crate::actors::client::ClientError> {
+    if proof_requested {
+        reply
+            .recv()
+            .map_err(|_| crate::actors::client::ClientError::Unreachable)
+    } else {
+        reply
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| crate::actors::client::ClientError::Unreachable)
+    }
+}
 
 /// The network ingress gate can spend this long consulting the registry to
 /// bind a compact voter slot back to its complete authenticated peer identity.
@@ -5156,13 +5167,8 @@ impl VosNode {
             .cloned()
             .ok_or(crate::actors::client::ClientError::NotFound)?;
         let route = binding.route;
-        let invoke_timeout = if proof_requested {
-            binding.invoke_timeout.max(V2_LOCAL_ATTESTED_INVOKE_TIMEOUT)
-        } else {
-            binding.invoke_timeout
-        };
         let deadline = Instant::now()
-            .checked_add(invoke_timeout)
+            .checked_add(binding.invoke_timeout)
             .ok_or(crate::actors::client::ClientError::Unreachable)?;
         let tx = self
             .invoke_routes
@@ -5197,9 +5203,12 @@ impl VosNode {
             chain: Vec::new(),
         })
         .map_err(|_| crate::actors::client::ClientError::Unreachable)?;
-        let envelope = reply_rx
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| crate::actors::client::ClientError::Unreachable)?;
+        // Proof production is synchronous and currently has no cancellation
+        // contract. Once an attested invocation is handed to the root driver,
+        // reporting a local timeout would allow its Apply to commit after the
+        // caller observed failure. Await its terminal disposition instead;
+        // ordinary work retains the bounded route timeout.
+        let envelope = receive_v2_invocation_reply(&reply_rx, proof_requested, deadline)?;
         #[cfg(all(feature = "network", feature = "storage"))]
         if let Some(redirect) = decode_v2_raft_redirect(&envelope) {
             let network = self
@@ -5213,16 +5222,15 @@ impl VosNode {
                 .ok_or(crate::actors::client::ClientError::Unreachable)?;
             let leader_route = ServiceId::new(redirect.leader_prefix, ServiceId(route).local_id());
             let delegated = encode_v2_raft_delegation(redirect.origin, true, false, &ingress_wire);
-            let leader_envelope = network
-                .send_invoke(
-                    peer,
-                    ServiceId::REGISTRY.0,
-                    leader_route.0,
-                    Vec::new(),
-                    delegated,
-                )
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .map_err(|_| crate::actors::client::ClientError::Unreachable)?;
+            let leader_reply = network.send_invoke(
+                peer,
+                ServiceId::REGISTRY.0,
+                leader_route.0,
+                Vec::new(),
+                delegated,
+            );
+            let leader_envelope =
+                receive_v2_invocation_reply(&leader_reply, proof_requested, deadline)?;
             return decode_host_invoke_envelope(&leader_envelope);
         }
         decode_host_invoke_envelope(&envelope)
@@ -12541,6 +12549,29 @@ mod tests {
         node.run();
         let results = node.collect();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn attested_v2_reply_does_not_time_out_a_non_cancellable_commit() {
+        let (tx, rx) = mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            tx.send(b"committed attestation".to_vec()).unwrap();
+        });
+        let expired = Instant::now()
+            .checked_add(Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(
+            receive_v2_invocation_reply(&rx, true, expired).unwrap(),
+            b"committed attestation",
+        );
+        sender.join().unwrap();
+
+        let (_tx, rx) = mpsc::channel();
+        assert!(matches!(
+            receive_v2_invocation_reply(&rx, false, Instant::now()),
+            Err(crate::actors::client::ClientError::Unreachable)
+        ));
     }
 
     /// The extension-facing proof-blob CAS round trip: `EFFECT_BLOB_PUT`

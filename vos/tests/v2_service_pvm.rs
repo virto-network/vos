@@ -21,27 +21,28 @@ use vos::node::{AgentResult, V2NodeRegistrationError, VosNode};
 use vos::raft::{RaftAccumulateLogV2, RaftConfig, RaftWorker, Role, WorkerConfig};
 use vos::v2::{
     AccumulateProtocolHostV2, AccumulateRequestV2, AccumulatedReplyV2, AccumulatedRoleAssertionV2,
-    AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationResultV2, ActorGenesisV2, ActorId,
-    ActorUpgradeV2, ActorWriteV2, AttestedRootTreeInvokeErrorV2, AuthorizationEvidenceV2,
-    BlobRefV2, CallId, CausalCallContextV2, CommittedAccumulateBatchV2, CommittedAccumulateEntryV2,
-    CommittedAccumulateLogV2, CommittedImageStoreV2, CommittedServiceImageHostV2,
-    CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2,
-    ContinuationSnapshotV2, CrdtChangeV2, DeploymentId, DirectIngressV2, DurableJamStoreV2,
-    ExternalActorBindingV2, GasAccountingV2, GasScheduleV2, Hash, ImportedActorV2, ImportedBlobV2,
-    ImportedProgramV2, InboxDrainOutcomeV2, InvocationId, JamServiceV2, LocalJamStoreHostV2,
-    LocalJamStoreSnapshotV2, LocalJamStoreV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2,
-    LocalRootTreeInvokeErrorV2, LocalRootTreeOpenErrorV2, LocalRootTreeServiceV2, LocalTransportV2,
-    LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2,
-    NoRefineProtocolHostV2, Origin, PackageManifestV2, PackageRolePoliciesV2,
-    PackageTaskDependencyV2, ProducerId, ProgramId, ProofArtifactStoreV2,
-    ProofVerificationRequestV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefineImportsV2,
-    RefineOutputV2, ReplicatedJamServiceV2, ReplicatedServiceErrorV2, ReplyRecordV2,
-    RoleAuthorityBindingV2, RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2,
-    RoleAuthorizationClaimV2, RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId,
-    RootTreeAttestedResultV2, RootTreeInvocationV2, ScheduleErrorV2, ServiceDispatchError,
-    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId,
-    SystemCapabilityId, TaskDependencyV2, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2,
-    WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
+    AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2,
+    ActorGenesisV2, ActorId, ActorUpgradeV2, ActorWriteV2, AttestedRootTreeInvokeErrorV2,
+    AuthorizationEvidenceV2, BlobRefV2, CallId, CausalCallContextV2, CommittedAccumulateBatchV2,
+    CommittedAccumulateEntryV2, CommittedAccumulateLogV2, CommittedImageStoreV2,
+    CommittedServiceImageHostV2, CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2,
+    ContinuationChangeV2, ContinuationSnapshotV2, CrdtChangeV2, DeploymentId, DirectIngressV2,
+    DurableJamStoreV2, ExternalActorBindingV2, GasAccountingV2, GasScheduleV2, Hash,
+    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2, InvocationId,
+    JamServiceV2, LocalJamStoreHostV2, LocalJamStoreSnapshotV2, LocalJamStoreV2,
+    LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2,
+    LocalRootTreeOpenErrorV2, LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2,
+    LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
+    PackageManifestV2, PackageRolePoliciesV2, PackageTaskDependencyV2, ProducerId, ProgramId,
+    ProofArtifactStoreV2, ProofVerificationRequestV2, PublishedEffectsV2,
+    ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2,
+    ReplicatedServiceErrorV2, ReplyRecordV2, RoleAuthorityBindingV2,
+    RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2, RoleAuthorizationClaimV2,
+    RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId, RootTreeAttestedResultV2,
+    RootTreeInvocationV2, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2,
+    ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId, SystemCapabilityId,
+    TaskDependencyV2, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2, WorkflowOperationV2,
+    artifact_hash, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     Decode, Encode,
@@ -195,6 +196,7 @@ struct FailableCommittedImages {
     fail_next_commit: bool,
     fail_next_proof_commit: bool,
     fail_next_record_commit: bool,
+    fail_next_private_delete: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -251,6 +253,13 @@ impl ProofArtifactStoreV2 for SharedCommittedImages {
     fn commit_proof(&mut self, _reference: &BlobRefV2, _proof: &[u8]) -> Result<(), Self::Error> {
         Ok(())
     }
+
+    fn reconcile_private_ingresses(
+        &mut self,
+        retained: &[(InvocationId, BlobRefV2)],
+    ) -> Result<(), Self::Error> {
+        if retained.is_empty() { Ok(()) } else { Err(()) }
+    }
 }
 
 impl CommittedImageStoreV2 for SharedProofCommittedImages {
@@ -291,6 +300,13 @@ impl ProofArtifactStoreV2 for SharedProofCommittedImages {
             .insert(reference.hash.0, proof.to_vec());
         Ok(())
     }
+
+    fn reconcile_private_ingresses(
+        &mut self,
+        retained: &[(InvocationId, BlobRefV2)],
+    ) -> Result<(), Self::Error> {
+        if retained.is_empty() { Ok(()) } else { Err(()) }
+    }
 }
 
 impl CommittedImageStoreV2 for SharedFailingCommittedImages {
@@ -322,6 +338,13 @@ impl ProofArtifactStoreV2 for SharedFailingCommittedImages {
 
     fn commit_proof(&mut self, _reference: &BlobRefV2, _proof: &[u8]) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    fn reconcile_private_ingresses(
+        &mut self,
+        retained: &[(InvocationId, BlobRefV2)],
+    ) -> Result<(), Self::Error> {
+        if retained.is_empty() { Ok(()) } else { Err(()) }
     }
 }
 
@@ -472,7 +495,30 @@ impl ProofArtifactStoreV2 for FailableCommittedImages {
     }
 
     fn delete_private_ingress(&mut self, invocation: InvocationId) -> Result<bool, Self::Error> {
+        if std::mem::take(&mut self.fail_next_private_delete) {
+            return Err(());
+        }
         Ok(self.private_ingresses.remove(&invocation).is_some())
+    }
+
+    fn reconcile_private_ingresses(
+        &mut self,
+        retained: &[(InvocationId, BlobRefV2)],
+    ) -> Result<(), Self::Error> {
+        for (invocation, reference) in retained {
+            let Some(arguments) = self.private_ingresses.get(invocation) else {
+                return Err(());
+            };
+            if !reference.matches(arguments) {
+                return Err(());
+            }
+        }
+        self.private_ingresses.retain(|invocation, _| {
+            retained
+                .binary_search_by_key(invocation, |(candidate, _)| *candidate)
+                .is_ok()
+        });
+        Ok(())
     }
 
     fn load_producer_record(
@@ -1473,6 +1519,23 @@ fn signed_task_refine_redacts_actor_memory_and_reopens_local_producer_sidecar() 
     );
     let mut service = LocalRootTreeServiceV2::open(config.clone(), backend)
         .expect("private ingress rehydrates after a durable reopen");
+    let mut divergent = request.clone();
+    divergent.method = "different_method".into();
+    assert!(matches!(
+        service.admit_ingress(&divergent),
+        Err(LocalRootTreeInvokeErrorV2::Rejected(
+            AccumulationRejectionV2::DivergentDuplicate
+        ))
+    ));
+    assert_eq!(
+        service
+            .store()
+            .backend()
+            .private_ingresses
+            .get(&request.invocation),
+        Some(&request.arguments),
+        "a divergent retry cannot retire the admitted invocation's private input",
+    );
     let mut prepared = LocalWorkSchedulerV2::prepare(service.store(), request.clone()).unwrap();
     prepared.work.private_arguments = Some(BlobRefV2::of_bytes(&request.arguments));
     let physical = ServicePvmV2::new(
@@ -1514,18 +1577,11 @@ fn signed_task_refine_redacts_actor_memory_and_reopens_local_producer_sidecar() 
         Err(LocalRootTreeInvokeErrorV2::ProducerRecordUnavailable)
     ));
     assert_eq!(service.producer_record(actor, &tag), None);
-    let committed = service
-        .invoke_admitted(request.invocation)
-        .expect("signed Task executes through exact Refine and Local Apply");
-    assert!(!committed.duplicate);
-    assert_eq!(
-        committed
-            .published
-            .reply
-            .as_ref()
-            .and_then(|reply| Value::try_decode(&reply.result)),
-        Some(Value::U64(9)),
-    );
+    service.store_mut().backend_mut().fail_next_private_delete = true;
+    assert!(matches!(
+        service.invoke_admitted(request.invocation),
+        Err(LocalRootTreeInvokeErrorV2::PrivateIngressRetirementFailed)
+    ));
     let record_bytes = service
         .producer_record(actor, &tag)
         .expect("producer-private record committed before Apply proposal");
@@ -1550,20 +1606,33 @@ fn signed_task_refine_redacts_actor_memory_and_reopens_local_producer_sidecar() 
             .any(|window| window == record_bytes),
         "producer witness must not enter the recoverable service image",
     );
-    let recovered = service
+    let mut backend = service.into_backend();
+    assert_eq!(
+        backend.private_ingresses.get(&request.invocation),
+        Some(&request.arguments),
+        "a reported retirement failure leaves the artifact available for startup reconciliation",
+    );
+    backend.private_ingresses.insert(
+        InvocationId([0xD8; 32]),
+        b"crash before guest admission".to_vec(),
+    );
+    let mut reopened = LocalRootTreeServiceV2::open(config, backend)
+        .expect("startup retires terminal and pre-admission private sidecars");
+    assert!(reopened.store().backend().private_ingresses.is_empty());
+    let recovered = reopened
         .invoke_admitted(request.invocation)
         .expect("invocation-only recovery needs no retired private preimage");
     assert!(recovered.duplicate);
     assert_eq!(recovered.refine_gas_used, 0);
     assert_eq!(recovered.accumulate_gas_used, 0);
-
-    let backend = service.into_backend();
-    assert!(
-        backend.private_ingresses.is_empty(),
-        "terminal execution retires the one-shot private ingress sidecar",
+    assert_eq!(
+        recovered
+            .published
+            .reply
+            .as_ref()
+            .and_then(|reply| Value::try_decode(&reply.result)),
+        Some(Value::U64(9)),
     );
-    let mut reopened = LocalRootTreeServiceV2::open(config, backend)
-        .expect("producer reopens after committed Task execution");
     assert_eq!(reopened.producer_record(actor, &tag), Some(record_bytes));
     assert!(reopened.prune_producer_record(actor, &tag));
     assert_eq!(reopened.producer_record(actor, &tag), None);

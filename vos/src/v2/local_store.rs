@@ -315,6 +315,16 @@ pub trait ProofArtifactStoreV2 {
         Ok(false)
     }
 
+    /// Reconcile producer-private ingress artifacts with the exact set of
+    /// guest-admitted requests that still need their plaintext. Implementors
+    /// must remove every other committed or temporary artifact and validate
+    /// that every retained artifact matches its content address. `retained`
+    /// is strictly ordered by invocation identity without duplicates.
+    fn reconcile_private_ingresses(
+        &mut self,
+        retained: &[(super::InvocationId, BlobRefV2)],
+    ) -> Result<(), Self::Error>;
+
     /// Load one producer-private Task record. The default keeps compatibility
     /// with proof-only test backends while reporting that no record exists.
     fn load_producer_record(
@@ -371,6 +381,7 @@ pub trait CommittedServiceImageHostV2 {
 pub enum DurableStoreOpenErrorV2<E> {
     Backend(E),
     InvalidSnapshot(DecodeError),
+    CorruptStore(LocalStoreReadErrorV2),
 }
 
 impl<E: core::fmt::Debug> core::fmt::Display for DurableStoreOpenErrorV2<E> {
@@ -456,6 +467,24 @@ impl FileCommittedImageStoreV2 {
         self.producer_record_directory()
             .join(std::str::from_utf8(&name).expect("lowercase hexadecimal is valid UTF-8"))
     }
+}
+
+fn decode_private_ingress_file_name(name: &str) -> Option<super::InvocationId> {
+    if name.len() != 64 {
+        return None;
+    }
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        }
+    }
+    let mut invocation = [0_u8; 32];
+    for (index, pair) in name.as_bytes().chunks_exact(2).enumerate() {
+        invocation[index] = nibble(pair[0])?.checked_shl(4)? | nibble(pair[1])?;
+    }
+    Some(super::InvocationId(invocation))
 }
 
 impl CommittedImageStoreV2 for FileCommittedImageStoreV2 {
@@ -622,6 +651,70 @@ impl ProofArtifactStoreV2 for FileCommittedImageStoreV2 {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),
         }
+    }
+
+    fn reconcile_private_ingresses(
+        &mut self,
+        retained: &[(super::InvocationId, BlobRefV2)],
+    ) -> Result<(), Self::Error> {
+        let directory = self.private_ingress_directory();
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if retained.is_empty() {
+                    return Ok(());
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "private ingress sidecar is missing",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+
+        let mut present = BTreeSet::new();
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let invocation = decode_private_ingress_file_name(&name);
+            let keep = invocation.and_then(|invocation| {
+                retained
+                    .binary_search_by_key(&invocation, |(candidate, _)| *candidate)
+                    .ok()
+                    .map(|index| (invocation, &retained[index].1))
+            });
+            let Some((invocation, reference)) = keep else {
+                if entry.file_type()?.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "private ingress sidecar contains an unexpected directory",
+                    ));
+                }
+                std::fs::remove_file(path)?;
+                continue;
+            };
+            let bytes = std::fs::read(&path)?;
+            if !reference.matches(&bytes) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "private ingress does not match its committed content address",
+                ));
+            }
+            present.insert(invocation);
+        }
+        if retained
+            .iter()
+            .any(|(invocation, _)| !present.contains(invocation))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "private ingress sidecar is missing",
+            ));
+        }
+        std::fs::File::open(directory)?.sync_all()?;
+        Ok(())
     }
 
     fn load_producer_record(
@@ -819,13 +912,31 @@ impl<B> LocalJamStoreHostV2 for DurableJamStoreV2<B> {
     }
 }
 
-impl<B: CommittedImageStoreV2> DurableJamStoreV2<B> {
-    pub fn open(mut backend: B) -> Result<Self, DurableStoreOpenErrorV2<B::Error>> {
+impl<B> DurableJamStoreV2<B>
+where
+    B: CommittedImageStoreV2 + ProofArtifactStoreV2<Error = <B as CommittedImageStoreV2>::Error>,
+{
+    pub fn open(
+        mut backend: B,
+    ) -> Result<Self, DurableStoreOpenErrorV2<<B as CommittedImageStoreV2>::Error>> {
         let local = match backend.load().map_err(DurableStoreOpenErrorV2::Backend)? {
             Some(bytes) => LocalJamStoreV2::from_snapshot_bytes(&bytes)
                 .map_err(DurableStoreOpenErrorV2::InvalidSnapshot)?,
             None => LocalJamStoreV2::new(),
         };
+        let retained = local
+            .pending_ingresses()
+            .map_err(DurableStoreOpenErrorV2::CorruptStore)?
+            .into_iter()
+            .filter_map(|ingress| {
+                ingress
+                    .private_arguments
+                    .map(|reference| (ingress.invocation, reference))
+            })
+            .collect::<Vec<_>>();
+        backend
+            .reconcile_private_ingresses(&retained)
+            .map_err(DurableStoreOpenErrorV2::Backend)?;
         Ok(Self { local, backend })
     }
 
@@ -886,10 +997,13 @@ where
             .filter(|bytes| reference.matches(bytes))
     }
 
-    pub(crate) fn prune_private_ingress(&mut self, invocation: super::InvocationId) -> bool {
+    pub(crate) fn prune_private_ingress(
+        &mut self,
+        invocation: super::InvocationId,
+    ) -> Result<bool, ()> {
         self.backend
             .delete_private_ingress(invocation)
-            .unwrap_or(false)
+            .map_err(|_| ())
     }
 
     /// Persist producer-private Task records before the corresponding
@@ -2045,6 +2159,33 @@ mod tests {
         }
     }
 
+    impl ProofArtifactStoreV2 for TestImageStore {
+        type Error = InjectedFailure;
+
+        fn load_proof(&self, _reference: &BlobRefV2) -> Result<Option<Vec<u8>>, Self::Error> {
+            Ok(None)
+        }
+
+        fn commit_proof(
+            &mut self,
+            _reference: &BlobRefV2,
+            _proof: &[u8],
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn reconcile_private_ingresses(
+            &mut self,
+            retained: &[(super::super::InvocationId, BlobRefV2)],
+        ) -> Result<(), Self::Error> {
+            if retained.is_empty() {
+                Ok(())
+            } else {
+                Err(InjectedFailure)
+            }
+        }
+    }
+
     fn valid_header() -> StoreHeaderV2 {
         StoreHeaderV2::current(
             super::super::ServiceIdentityV2 {
@@ -2380,6 +2521,53 @@ mod tests {
         let private_reference = store
             .persist_private_ingress(private_invocation, &private_arguments)
             .unwrap();
+        let header = store.header().unwrap().unwrap();
+        let ingress = DirectIngressV2 {
+            service: header.service.clone(),
+            invocation: private_invocation,
+            logical_timeslot: 1,
+            target: ActorId([39; 32]),
+            method: "private".into(),
+            arguments: Vec::new(),
+            private_arguments: Some(private_reference.clone()),
+            origin: super::super::Origin::Anonymous,
+            authorization: super::super::AuthorizationEvidenceV2::Public,
+            imported_blobs: Vec::new(),
+            proof_requested: false,
+            base: super::super::ConsistencyBaseV2::Linear {
+                revision: header.revision,
+                state_root: header.state_root.unwrap(),
+            },
+            base_causal_height: None,
+            crdt_change: None,
+        };
+        let receipt = AccumulationReceiptV2 {
+            service: header.service,
+            accepted_transition: ingress.commitment(),
+            reply_commitment: None,
+            outbox_commitment: None,
+            resulting_state_root: header.state_root,
+            resulting_crdt_heads: Vec::new(),
+            sequence: header.revision,
+            checkpoint: 0,
+            consistency: super::super::ConsistencyModeV2::Local,
+        };
+        let mut transaction = store.begin().unwrap();
+        transaction.staged.rows.insert(
+            super::super::ingress_storage_key(private_invocation),
+            IngressRecordV2 {
+                ingress,
+                consumed: false,
+                receipt,
+            }
+            .encode(),
+        );
+        store.commit(transaction).unwrap();
+        let orphan_invocation = super::super::InvocationId([38; 32]);
+        let orphan_arguments = b"crash before guest admission".to_vec();
+        let orphan_reference = store
+            .persist_private_ingress(orphan_invocation, &orphan_arguments)
+            .unwrap();
         let verification = ProofVerificationRequestV2 {
             actor_program: ProgramId([41; 32]),
             execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
@@ -2437,6 +2625,11 @@ mod tests {
             );
         }
         let expected = store.snapshot();
+        let abandoned_temporary = store
+            .backend
+            .private_ingress_directory()
+            .join("abandoned.v2-next");
+        std::fs::write(&abandoned_temporary, b"partial private input").unwrap();
         drop(store);
 
         let mut restarted = DurableJamStoreV2::open(FileCommittedImageStoreV2::new(&path)).unwrap();
@@ -2451,8 +2644,15 @@ mod tests {
         assert_eq!(
             restarted.private_ingress(private_invocation, &private_reference),
             Some(private_arguments),
+            "startup retains input owned by an unconsumed guest ingress",
         );
-        assert!(restarted.prune_private_ingress(private_invocation));
+        assert_eq!(
+            restarted.private_ingress(orphan_invocation, &orphan_reference),
+            None,
+            "startup retires private input that has no unconsumed guest ingress",
+        );
+        assert!(!abandoned_temporary.exists());
+        assert!(restarted.prune_private_ingress(private_invocation).unwrap());
         assert_eq!(restarted.proof_bytes(&proof_blob), Some(proof));
         assert_eq!(restarted.producer_record(actor, &tag), Some(entry.encode()));
         assert!(restarted.prune_producer_record(actor, &tag));
