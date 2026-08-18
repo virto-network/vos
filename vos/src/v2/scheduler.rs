@@ -144,7 +144,11 @@ impl LocalWorkSchedulerV2 {
             .iter()
             .flat_map(|actor| &actor.storage_rows)
             .filter_map(|row| row.value.as_ref())
-            .try_fold(0usize, |total, value| total.checked_add(value.len()))
+            .try_fold(0usize, |total, value| {
+                usize::try_from(value.len)
+                    .ok()
+                    .and_then(|len| total.checked_add(len))
+            })
             .ok_or(ScheduleErrorV2::NonCanonicalImports)?;
 
         for request in requests {
@@ -169,12 +173,33 @@ impl LocalWorkSchedulerV2 {
                 key: request.key.clone(),
             };
             let value = store.state_row(*state_root, &key)?;
-            if let Some(value) = value.as_ref() {
+            let value = if let Some(bytes) = value {
                 value_bytes = value_bytes
-                    .checked_add(value.len())
+                    .checked_add(bytes.len())
                     .filter(|total| *total <= super::MAX_ACTOR_STORAGE_WITNESS_BYTES)
                     .ok_or(ScheduleErrorV2::NonCanonicalImports)?;
-            }
+                let reference = BlobRefV2::of_bytes(&bytes);
+                match prepared
+                    .imports
+                    .blobs
+                    .binary_search_by_key(&reference.hash, |blob| blob.reference.hash)
+                {
+                    Ok(index)
+                        if prepared.imports.blobs[index].reference == reference
+                            && prepared.imports.blobs[index].bytes == bytes => {}
+                    Ok(_) => return Err(ScheduleErrorV2::NonCanonicalImports),
+                    Err(index) => prepared.imports.blobs.insert(
+                        index,
+                        ImportedBlobV2 {
+                            reference: reference.clone(),
+                            bytes,
+                        },
+                    ),
+                }
+                Some(reference)
+            } else {
+                None
+            };
             let index = actor
                 .storage_rows
                 .binary_search_by(|row| row.key.cmp(&request.key))

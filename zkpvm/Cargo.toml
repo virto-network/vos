@@ -85,7 +85,7 @@ curve25519-dalek = { version = "4.1", default-features = false, features = ["all
 # Dynamic-witness smoke test (voucher_check_smoke.rs) builds
 # cipher-clerk Public/Secret rkyv archives to feed voucher-check's
 # WITNESS_BUFFER region — exercises the per-voucher proof path.
-cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = ["viewing-keys", "voucher", "helpers"] }
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false, features = ["viewing-keys", "voucher", "helpers"] }
 rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck", "little_endian", "pointer_width_32"] }
 
 # Both examples demonstrate the prover end-to-end; mark them

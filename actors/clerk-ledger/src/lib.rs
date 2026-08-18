@@ -156,8 +156,8 @@ pub fn transfer_record_tag(id: &[u8; 16]) -> [u8; 32] {
 /// compiled to invoke. Production packages must carry this exact Task as a
 /// signed dependency; selecting a prover program is not mutable ledger state.
 pub const CLERK_APPLY_TASK_HASH: [u8; 32] = [
-    0x4d, 0xff, 0xb1, 0xb6, 0x41, 0x03, 0x52, 0xf4, 0x85, 0x49, 0xba, 0xf2, 0xdb, 0xda, 0x61, 0xa2,
-    0x56, 0x90, 0x4e, 0x55, 0xbd, 0xd4, 0xfd, 0xef, 0x87, 0x85, 0x59, 0xd4, 0xad, 0xa4, 0xf6, 0x01,
+    0x50, 0xdb, 0x7e, 0x1a, 0xac, 0x2e, 0xfa, 0xa1, 0xd1, 0x92, 0xea, 0x52, 0x38, 0xc4, 0x9c, 0x72,
+    0xd4, 0x9e, 0x96, 0xcb, 0xab, 0xfd, 0x0e, 0x27, 0x3f, 0x24, 0x89, 0xc3, 0xab, 0xfb, 0x09, 0x3e,
 ];
 
 /// Decode an rkyv archive or short-circuit with `Status::BadInput`.
@@ -341,9 +341,7 @@ impl ClerkLedger {
 
         let mut distinct_debits: Vec<CcAccountId> = Vec::new();
         for entry in &transfer.entries {
-            if entry.direction == Direction::Debit
-                && !distinct_debits.contains(&entry.account_id)
-            {
+            if entry.direction == Direction::Debit && !distinct_debits.contains(&entry.account_id) {
                 distinct_debits.push(entry.account_id);
             }
         }
@@ -764,10 +762,11 @@ impl ClerkLedger {
             .reply(task_id)
             .unwrap_or_else(|| panic!("clerk-apply completed without a reply"));
         let claim = <Value as vos::Decode>::try_decode(task_reply).and_then(|value| match value {
-                Value::Bytes(bytes) => ClerkTransitionClaim::decode(&bytes),
-                _ => None,
-            });
-        let claim = claim.unwrap_or_else(|| panic!("clerk-apply returned a malformed public claim"));
+            Value::Bytes(bytes) => ClerkTransitionClaim::decode(&bytes),
+            _ => None,
+        });
+        let claim =
+            claim.unwrap_or_else(|| panic!("clerk-apply returned a malformed public claim"));
         assert!(
             claim.root_before == root_before && claim.batch_digest == expected_digest,
             "clerk-apply public claim does not bind the requested transition"

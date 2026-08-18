@@ -542,7 +542,11 @@ impl ActorRefineRuntimeV2 {
             }
             private_inputs.insert(actor.actor, private);
             for row in &actor.storage_rows {
-                let value = row.value.clone();
+                let value = row
+                    .value
+                    .as_ref()
+                    .map(|reference| imported_blob_bytes(imports, reference).map(<[u8]>::to_vec))
+                    .transpose()?;
                 if storage_rows
                     .insert((actor.actor, row.key.clone()), value)
                     .is_some()
@@ -1058,6 +1062,9 @@ impl ActorRefineRuntimeV2 {
                 if output.actor != actor {
                     return Err(ServicePvmErrorV2::RefineHostRejected(slot));
                 }
+                if output.writes.iter().any(|write| write.actor != actor) {
+                    return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                }
                 if self.record_intents.get(&actor).copied().unwrap_or(0) != 0
                     || self.record_attempts.get(&actor).copied().unwrap_or(0)
                         != self.record_successes.get(&actor).copied().unwrap_or(0)
@@ -1154,6 +1161,17 @@ impl ActorRefineRuntimeV2 {
                     // transition, so an older child's deletion token cannot
                     // conflict with a later await in the same resumed slice.
                     output.checkpoint = None;
+                }
+                if !output.forbidden && private.change.is_none() {
+                    // Later inline calls in the same linear Refine slice must
+                    // observe the effects accepted from earlier calls. The
+                    // committed base witnesses remain unchanged; this map is
+                    // an invocation-local overlay and tombstones deliberately
+                    // shadow a present base row with `None`.
+                    for write in &output.writes {
+                        self.storage_rows
+                            .insert((actor, write.key.clone()), write.value.clone());
+                    }
                 }
                 self.outputs.push(output);
                 Ok(Some([crate::abi::error::HOST_OK, 0]))

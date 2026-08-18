@@ -41,7 +41,7 @@ check-cfg = ['cfg(feature, values("pvm", "service", "extension", "wasm"))']
 # `.cargo/config.toml`).
 [dependencies]
 vos = { path = "../../../../../vos", default-features = false, features = ["macros", "service"] }
-cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = [
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false, features = [
     "viewing-keys",
     "voucher",
 ] }

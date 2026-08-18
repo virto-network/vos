@@ -337,7 +337,11 @@ pub struct ImportedActorV2 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorStorageRowV2 {
     pub key: Vec<u8>,
-    pub value: Option<Vec<u8>>,
+    /// Content address of the row bytes supplied only to Refine. Keeping the
+    /// potentially large value out of `WorkEnvelopeV2` also keeps exact
+    /// resume tokens compact; guest Accumulate authenticates this reference
+    /// by hashing the row at the committed linear base.
+    pub value: Option<BlobRefV2>,
 }
 
 /// Host-local request emitted when speculative Refine discovers a row that
@@ -2582,6 +2586,11 @@ impl RefineImportsV2 {
             if let Some(continuation) = &actor.continuation {
                 self.require_blob(continuation)?;
             }
+            for row in &actor.storage_rows {
+                if let Some(value) = &row.value {
+                    self.require_blob(value)?;
+                }
+            }
         }
         for reference in &work.imported_blobs {
             self.require_blob(reference)?;
@@ -2732,7 +2741,11 @@ impl V2Wire for WorkEnvelopeV2 {
             .iter()
             .flat_map(|actor| &actor.storage_rows)
             .filter_map(|row| row.value.as_ref())
-            .try_fold(0usize, |total, value| total.checked_add(value.len()))
+            .try_fold(0usize, |total, value| {
+                usize::try_from(value.len)
+                    .ok()
+                    .and_then(|len| total.checked_add(len))
+            })
             .ok_or(DecodeError::LimitExceeded)?;
         if storage_witness_count > super::MAX_ACTOR_STORAGE_WITNESSES
             || storage_witness_bytes > super::MAX_ACTOR_STORAGE_WITNESS_BYTES
@@ -5371,7 +5384,7 @@ fn encode_imported_actor(e: &mut Encoder<'_>, value: &ImportedActorV2) {
     e.option(&value.continuation, encode_blob_ref);
     e.list(&value.storage_rows, |e, row| {
         e.bytes(&row.key);
-        e.option(&row.value, |e, value| e.bytes(value));
+        e.option(&row.value, encode_blob_ref);
     });
 }
 
@@ -5389,7 +5402,7 @@ fn decode_imported_actor(d: &mut Decoder<'_>) -> Result<ImportedActorV2, DecodeE
         storage_rows: d.list(|d| {
             Ok(ActorStorageRowV2 {
                 key: d.bytes()?,
-                value: d.option(Decoder::bytes)?,
+                value: d.option(decode_blob_ref)?,
             })
         })?,
     };
@@ -5972,6 +5985,7 @@ mod tests {
     #[test]
     fn actor_storage_witnesses_are_bounded_linear_and_canonical() {
         let mut valid = work();
+        let large_witness = vec![0xa5; 64 * 1024];
         valid.imported_actors[0].storage_rows = vec![
             ActorStorageRowV2 {
                 key: b"absent".to_vec(),
@@ -5979,10 +5993,29 @@ mod tests {
             },
             ActorStorageRowV2 {
                 key: b"present".to_vec(),
-                value: Some(b"value".to_vec()),
+                value: Some(BlobRefV2::of_bytes(&large_witness)),
             },
         ];
         assert_eq!(WorkEnvelopeV2::decode(&valid.encode()), Ok(valid.clone()));
+        let token = CheckpointTokenV2 {
+            input: valid.input_id(),
+            base: valid.base.clone(),
+            work_hash: valid.hash(),
+            resume_work: Some(Box::new(valid.clone())),
+            base_causal_height: None,
+            change: None,
+            expected: None,
+            replacement: Some(BlobRefV2::of_bytes(b"checkpoint")),
+            pending_call: None,
+            pending_actor: None,
+            previously_suspended: vec![],
+            suspended: vec![valid.target],
+        };
+        assert!(
+            token.encode().len() <= super::super::CHECKPOINT_TOKEN_CAPACITY,
+            "a 64-KiB row travels by compact content address, not inside the resume token"
+        );
+        assert_eq!(CheckpointTokenV2::decode(&token.encode()), Ok(token));
 
         let mut unsorted = valid.clone();
         unsorted.imported_actors[0].storage_rows.reverse();
@@ -6017,7 +6050,11 @@ mod tests {
             .storage_rows
             .push(ActorStorageRowV2 {
                 key: b"large".to_vec(),
-                value: Some(vec![0; super::super::MAX_ACTOR_STORAGE_WITNESS_BYTES + 1]),
+                value: Some(BlobRefV2::of_bytes(&vec![
+                    0;
+                    super::super::MAX_ACTOR_STORAGE_WITNESS_BYTES
+                        + 1
+                ])),
             });
         assert_eq!(
             WorkEnvelopeV2::decode(&too_large.encode()),

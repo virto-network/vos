@@ -23,10 +23,10 @@ use cipher_clerk::types::{
 };
 use vos::storage::CommittedMap;
 
-use crate::{ClerkLedger, ClerkLedgerRole};
 use crate::oracle::NoopOracle;
 use crate::smt::compute_state_root;
 use crate::view::LedgerView;
+use crate::{ClerkLedger, ClerkLedgerRole};
 
 const LEAF_DOMAIN: &[u8] = b"cipher-clerk/smt/leaf/v1";
 const NODE_DOMAIN: &[u8] = b"cipher-clerk/smt/node/v1";
@@ -431,12 +431,8 @@ fn parent_requires_the_proof_bound_public_claim_not_only_the_task_reply() {
     let anchor = [0u8; 32];
     let transition_digest = [4u8; 32];
     let app_public = claim.encode().to_vec();
-    let public_prime = vos::refine_payload::folded_public(
-        anchor_kind,
-        &anchor,
-        &transition_digest,
-        &app_public,
-    );
+    let public_prime =
+        vos::refine_payload::folded_public(anchor_kind, &anchor, &transition_digest, &app_public);
     let entry = ProofRecordEntry {
         input: ProvableInput {
             task_hash,
@@ -455,7 +451,10 @@ fn parent_requires_the_proof_bound_public_claim_not_only_the_task_reply() {
         },
     };
     assert!(ClerkLedger::record_matches_claim(
-        &entry, task_hash, &reply, claim
+        &entry.record,
+        task_hash,
+        &reply,
+        claim
     ));
 
     // Model a malicious Task that returns the expected claim but binds a
@@ -463,12 +462,13 @@ fn parent_requires_the_proof_bound_public_claim_not_only_the_task_reply() {
     // valid so the parent must catch the cross-channel mismatch itself.
     let mut forged = entry.clone();
     forged.record.app_public[0] ^= 1;
-    forged.record.io_hash = vos::zk::compute_io_hash(
-        &forged.record.public_prime(),
-        &forged.record.reply,
-    );
+    forged.record.io_hash =
+        vos::zk::compute_io_hash(&forged.record.public_prime(), &forged.record.reply);
     assert!(forged.record.io_consistent());
     assert!(!ClerkLedger::record_matches_claim(
-        &forged, task_hash, &reply, claim
+        &forged.record,
+        task_hash,
+        &reply,
+        claim
     ));
 }

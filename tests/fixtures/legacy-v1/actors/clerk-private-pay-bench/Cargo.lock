@@ -120,6 +120,7 @@ dependencies = [
 [[package]]
 name = "cipher-clerk"
 version = "0.1.0"
+source = "git+https://codeberg.org/Virto/CipherClerk.git?rev=e9a7b0851f183c14dbd1635dbf0437c86682ad6f#e9a7b0851f183c14dbd1635dbf0437c86682ad6f"
 dependencies = [
  "blake2",
  "chacha20poly1305",
@@ -502,6 +503,7 @@ checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 [[package]]
 name = "zkpvm-precompiles"
 version = "0.1.0"
+source = "git+https://codeberg.org/Virto/VOS.git?rev=9f5337fb39ccad5b779cf72cbd617e726e325aed#9f5337fb39ccad5b779cf72cbd617e726e325aed"
 dependencies = [
  "curve25519-dalek",
 ]

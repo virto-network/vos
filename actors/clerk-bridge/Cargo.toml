@@ -37,7 +37,7 @@ vos = { path = "../../vos", default-features = false, features = ["macros", "ext
 # stub. The signing path inside the actor is gated to verify-only;
 # the issuer-secret signing flow lives off-actor on the host side.
 [dependencies]
-cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = [
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false, features = [
     "viewing-keys",
     "voucher",
 ] }

@@ -3400,7 +3400,12 @@ fn apply<S: GuestAccumulateStoreV2>(
                         key: row.key.clone(),
                     })
                     .map_err(GuestAccumulateError::StateTree)?;
-                if committed != row.value {
+                let matches = match (&committed, &row.value) {
+                    (None, None) => true,
+                    (Some(bytes), Some(reference)) => reference.matches(bytes),
+                    _ => false,
+                };
+                if !matches {
                     return Ok(rejected(AccumulationRejectionV2::StaleStateRoot));
                 }
             }
@@ -6216,7 +6221,7 @@ mod tests {
             .storage_rows
             .push(super::super::ActorStorageRowV2 {
                 key: b"missing-at-base".to_vec(),
-                value: Some(b"forged".to_vec()),
+                value: Some(BlobRefV2::of_bytes(b"forged")),
             });
         let envelope = AccumulationEnvelopeV2 {
             transition: linear_transition(&work, b"after"),

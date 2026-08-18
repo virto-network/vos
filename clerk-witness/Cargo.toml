@@ -11,12 +11,12 @@ edition = "2024"
 
 [dependencies]
 vos = { path = "../vos", default-features = false }
-cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false }
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false }
 
 [dev-dependencies]
 # Host-side reference machinery for the parity tests: VecLedger +
 # keypair generation (signing pulls OsRng — host only).
-cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = [
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false, features = [
     "helpers",
     "signing",
 ] }

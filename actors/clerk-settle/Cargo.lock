@@ -120,6 +120,7 @@ dependencies = [
 [[package]]
 name = "cipher-clerk"
 version = "0.1.0"
+source = "git+https://codeberg.org/Virto/CipherClerk.git?rev=e9a7b0851f183c14dbd1635dbf0437c86682ad6f#e9a7b0851f183c14dbd1635dbf0437c86682ad6f"
 dependencies = [
  "blake2",
  "chacha20poly1305",

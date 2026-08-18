@@ -1,15 +1,21 @@
 use vos::prelude::*;
+use vos::storage::StorageMap;
 use vos::value::Value;
 
 #[actor]
 pub struct WorkflowV2 {
     value: u32,
+    #[storage(prefix = "workflow-v2/counters/")]
+    counters: StorageMap<u64, u32>,
 }
 
 #[messages]
 impl WorkflowV2 {
     fn new() -> Self {
-        Self { value: 0 }
+        Self {
+            value: 0,
+            counters: StorageMap::default(),
+        }
     }
 
     #[msg]
@@ -19,13 +25,29 @@ impl WorkflowV2 {
     }
 
     #[msg]
-    async fn spawn_child(
-        &mut self,
-        ctx: &mut Context<Self>,
-        name: String,
-        initial: u32,
-    ) -> bool {
-        let child = Self { value: initial };
+    fn storage_increment(&mut self) -> u32 {
+        let next = self.counters.get(&0).unwrap_or(0) + 1;
+        self.counters.insert(&0, &next);
+        next
+    }
+
+    /// Two calls to the same actor in one Refine slice pin storage
+    /// read-after-write behavior in the invocation-local linear overlay.
+    #[msg]
+    async fn call_child_storage_twice(&mut self, ctx: &mut Context<Self>) -> u32 {
+        let Ok(mut child) = ctx.child::<WorkflowV2Ref>("child").await else {
+            return 0;
+        };
+        let _ = child.storage_increment().await;
+        child.storage_increment().await.unwrap_or(0)
+    }
+
+    #[msg]
+    async fn spawn_child(&mut self, ctx: &mut Context<Self>, name: String, initial: u32) -> bool {
+        let child = Self {
+            value: initial,
+            counters: StorageMap::default(),
+        };
         ctx.spawn::<WorkflowV2Ref>(name, &child).await.is_ok()
     }
 

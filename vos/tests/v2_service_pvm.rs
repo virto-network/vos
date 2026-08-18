@@ -1329,6 +1329,79 @@ fn attested_root_fixture(
 }
 
 #[test]
+fn same_actor_storage_reads_observe_earlier_inline_writes() {
+    let (config, template) = attested_root_fixture(ConsistencyModeV2::Local, 0x3a);
+    let mut service =
+        LocalRootTreeServiceV2::open(config, FailableCommittedImages::default()).unwrap();
+
+    let mut spawn_arguments = vec![vos::value::TAG_DYNAMIC];
+    spawn_arguments.extend_from_slice(
+        &Msg::new("spawn_child")
+            .with("name", "child")
+            .with("initial", 0u32)
+            .encode(),
+    );
+    let spawned = service
+        .invoke(LocalWorkRequestV2 {
+            invocation: InvocationId([0x3b; 32]),
+            workflow_step: 0,
+            logical_timeslot: 12,
+            target: template.target,
+            method: "spawn_child".into(),
+            arguments: spawn_arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        })
+        .expect("the child is committed before inline storage calls");
+    assert_eq!(
+        spawned
+            .published
+            .reply
+            .as_ref()
+            .and_then(|reply| Value::try_decode(&reply.result)),
+        Some(Value::Bool(true))
+    );
+
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("call_child_storage_twice").encode());
+    let committed = service
+        .invoke(LocalWorkRequestV2 {
+            invocation: InvocationId([0x3c; 32]),
+            workflow_step: 0,
+            logical_timeslot: 13,
+            target: template.target,
+            method: "call_child_storage_twice".into(),
+            arguments,
+            origin: Origin::Anonymous,
+            authorization: AuthorizationEvidenceV2::Public,
+            causal_parent: None,
+            parent_call: None,
+            causal_context: None,
+            awaited_reply: None,
+            awaited_timeout: None,
+            imported_blobs: vec![],
+            proof_requested: false,
+        })
+        .expect("the root invokes the same child twice in one Refine slice");
+    assert_eq!(
+        committed
+            .published
+            .reply
+            .as_ref()
+            .and_then(|reply| Value::try_decode(&reply.result)),
+        Some(Value::U32(2)),
+        "the second read observes the first accepted write, not the base row"
+    );
+}
+
+#[test]
 fn attested_root_driver_recovers_queued_and_committed_proofs_across_restart() {
     let (config, request) = attested_root_fixture(ConsistencyModeV2::Local, 0x41);
     let mut service =

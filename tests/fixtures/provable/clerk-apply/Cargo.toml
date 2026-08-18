@@ -30,7 +30,7 @@ unexpected_cfgs = { level = "allow" }
 [dependencies]
 vos = { path = "../../../../vos", default-features = false, features = ["macros", "service"] }
 clerk-witness = { path = "../../../../clerk-witness", default-features = false }
-cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false }
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false }
 
 # The proof-producing Task deliberately uses cipher-clerk's software
 # Ristretto/scalar arithmetic. zkpvm's precompile AIR currently binds the

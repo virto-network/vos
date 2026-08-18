@@ -33,14 +33,14 @@ vos = { path = "../../vos", default-features = false, features = ["macros", "ext
 # The venue only VERIFIES claim signatures and reconciles — it never
 # signs — so `signing` stays a dev-only concern.
 [dependencies]
-cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = ["settlement"] }
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false, features = ["settlement"] }
 
 # Host-only: `signing` + `helpers` let the in-lib unit tests mint
 # signed `SettlementClaim`s (the worked cancellation example) to push
 # through the store + reconcile paths. dev-deps don't reach the PVM
 # build, so OsRng never lands in the riscv actor.
 [dev-dependencies]
-cipher-clerk = { path = "/home/daniel/src/virto/cipher-clerk", default-features = false, features = ["settlement", "signing", "helpers"] }
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false, features = ["settlement", "signing", "helpers"] }
 
 [profile.release]
 opt-level = "s"

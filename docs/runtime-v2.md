@@ -1074,7 +1074,7 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 35, continuation snapshot version 6, and platform ABI version 13
+Store schema 36, continuation snapshot version 6, and platform ABI version 14
 are therefore a clean break from earlier experimental v2 images. ABI 11 bound
 each actor's sorted, bounded Task dependency map into the signed package,
 guest-owned descriptor, work envelope, and Refine imports. Schema 33 rejects
@@ -1095,8 +1095,14 @@ v17 admits signed Task dependencies for Raft Install/Upgrade under the
 host-authenticated all-voter private-input barrier while retaining the guest's
 CRDT rejection. ABI 13, schema 35, and execution semantics v18 add bounded
 base-authenticated actor-storage point reads, explicit absence witnesses, and
-canonical last-write-wins actor effect export. They also pin the canonical
-Clerk actor/Task package used by the physical Raft production gate. CRDT
+canonical last-write-wins actor effect export. ABI 14, schema 36, and execution
+semantics v19 replace inline storage-row values with Refine-only
+content-addressed witnesses and overlay every accepted linear write/tombstone
+for later calls in the same slice. Resume tokens therefore remain compact while
+guest Accumulate still hashes each committed base row independently. They also
+pin the canonical Clerk actor/Task package and immutable CipherClerk revision
+`e9a7b0851f183c14dbd1635dbf0437c86682ad6f` used by the physical Raft
+production gate. CRDT
 private-input availability remains deliberately staged.
 On durable open, the
 producer side-CAS retains content-addressed inputs belonging to guest-owned
