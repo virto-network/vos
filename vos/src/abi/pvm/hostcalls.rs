@@ -105,6 +105,17 @@ pub fn actor_private_fetch(buf: &mut [u8]) -> u64 {
     )
 }
 
+/// Fetch the exact current work envelope into infrastructure guest memory.
+/// Application actors never receive this capability.
+#[inline]
+pub fn refine_work_fetch(buf: &mut [u8]) -> u64 {
+    ecall2(
+        hostcall::REFINE_WORK_FETCH,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    )
+}
+
 /// Export one canonical actor-slice output to the generic service scheduler.
 #[inline]
 pub fn actor_effect_export(bytes: &[u8]) -> u64 {

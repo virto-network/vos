@@ -2003,7 +2003,6 @@ mod tests {
             },
             base: crate::v2::ConsistencyBaseV2::Crdt { heads: vec![] },
             work_hash: crate::v2::Hash([0x45; 32]),
-            resume_work: None,
             base_causal_height: Some(0),
             change: Some(resumed),
             expected: Some(crate::v2::Hash([0x46; 32])),

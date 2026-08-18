@@ -112,7 +112,7 @@ impl LocalWorkSchedulerV2 {
     /// base root; absence is explicit. Refine is then restarted from its
     /// original machine state, so actors never observe the provisional
     /// HOST_NONE results.
-    pub(crate) fn hydrate_actor_storage_rows(
+    pub fn hydrate_actor_storage_rows(
         store: &LocalJamStoreV2,
         prepared: &mut PreparedWorkV2,
         requests: &[ActorStorageKeyV2],

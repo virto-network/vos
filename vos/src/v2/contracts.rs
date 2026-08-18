@@ -607,14 +607,12 @@ pub struct CheckpointTokenV2 {
     /// contains the envelope from the slice that created the checkpoint, so
     /// the host must bind the resumed slice explicitly.
     pub work_hash: Hash,
-    /// Current work envelope injected only when resuming an exact snapshot.
-    /// The restored service VM still holds the pre-suspension Rust frame, so
-    /// it must explicitly rebind that frame before emitting workflow state.
-    /// Initial step-0 checkpoint finalization carries `None`.
-    /// Heap-backed because exact resume decodes this complete envelope while
-    /// a compact actor guest is already holding a 4 KiB protocol buffer on
-    /// its stack. The canonical wire remains an ordinary optional byte frame.
-    pub resume_work: Option<Box<WorkEnvelopeV2>>,
+    // The exact work envelope is deliberately absent from this actor-visible
+    // control token. A restored infrastructure service VM fetches it over a
+    // host-private Refine channel and authenticates it against `work_hash`.
+    // This keeps as many as 256 storage-witness keys and references out of
+    // the fixed 4 KiB suspension buffer without weakening the committed
+    // read-set binding.
     /// Causal height of `base` for a CRDT slice. Linear slices carry `None`.
     pub base_causal_height: Option<u64>,
     /// Fresh allocator namespace installed after an exact CRDT resume.
@@ -5696,7 +5694,6 @@ fn encode_checkpoint_token(e: &mut Encoder<'_>, value: &CheckpointTokenV2) {
     e.u64(value.input.workflow_step);
     encode_base(e, &value.base);
     e.fixed(&value.work_hash.0);
-    e.option(&value.resume_work, |e, work| e.bytes(&work.encode()));
     e.option(&value.base_causal_height, |e, height| e.u64(*height));
     e.option(&value.change, |e, dispatch| {
         e.fixed(&dispatch.change.0);
@@ -5718,7 +5715,6 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, Dec
         },
         base: decode_base(d)?,
         work_hash: Hash(d.fixed()?),
-        resume_work: d.option(|d| Ok(Box::new(WorkEnvelopeV2::decode(&d.bytes()?)?)))?,
         base_causal_height: d.option(Decoder::u64)?,
         change: d.option(|d| {
             Ok(CrdtDispatchV2 {
@@ -5737,14 +5733,6 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointTokenV2, Dec
     if value.change.is_some() != is_crdt
         || value.base_causal_height.is_some() != is_crdt
         || value.change.is_some_and(|dispatch| dispatch.ordinal != 0)
-        || value.resume_work.as_ref().is_some_and(|work| {
-            work.input_id() != value.input
-                || work.base != value.base
-                || work.hash() != value.work_hash
-                || work.base_causal_height != value.base_causal_height
-                || CrdtChangeV2::derive_operation_scope(work)
-                    != value.change.map(|dispatch| dispatch.change)
-        })
         || value.expected.is_some() != !value.previously_suspended.is_empty()
         || value.replacement.is_some() != !value.suspended.is_empty()
         || value.pending_call.is_some() != value.pending_actor.is_some()
@@ -5985,23 +5973,24 @@ mod tests {
     #[test]
     fn actor_storage_witnesses_are_bounded_linear_and_canonical() {
         let mut valid = work();
-        let large_witness = vec![0xa5; 64 * 1024];
-        valid.imported_actors[0].storage_rows = vec![
-            ActorStorageRowV2 {
-                key: b"absent".to_vec(),
-                value: None,
-            },
-            ActorStorageRowV2 {
-                key: b"present".to_vec(),
-                value: Some(BlobRefV2::of_bytes(&large_witness)),
-            },
-        ];
+        valid.imported_actors[0].storage_rows = (0..super::super::MAX_ACTOR_STORAGE_WITNESSES)
+            .map(|index| {
+                let value = (index as u32).to_be_bytes();
+                ActorStorageRowV2 {
+                    key: value.to_vec(),
+                    value: Some(BlobRefV2::of_bytes(&value)),
+                }
+            })
+            .collect();
         assert_eq!(WorkEnvelopeV2::decode(&valid.encode()), Ok(valid.clone()));
+        assert!(
+            valid.encode().len() > super::super::CHECKPOINT_TOKEN_CAPACITY,
+            "the maximum canonical witness metadata reproduces the old token overflow"
+        );
         let token = CheckpointTokenV2 {
             input: valid.input_id(),
             base: valid.base.clone(),
             work_hash: valid.hash(),
-            resume_work: Some(Box::new(valid.clone())),
             base_causal_height: None,
             change: None,
             expected: None,
@@ -6013,7 +6002,7 @@ mod tests {
         };
         assert!(
             token.encode().len() <= super::super::CHECKPOINT_TOKEN_CAPACITY,
-            "a 64-KiB row travels by compact content address, not inside the resume token"
+            "storage witnesses travel over the private resume-work channel, not the control token"
         );
         assert_eq!(CheckpointTokenV2::decode(&token.encode()), Ok(token));
 
@@ -6694,7 +6683,6 @@ mod tests {
                 state_root: Hash([25; 32]),
             },
             work_hash: Hash([27; 32]),
-            resume_work: None,
             base_causal_height: None,
             change: None,
             expected: Some(Hash([26; 32])),
@@ -6707,28 +6695,6 @@ mod tests {
         assert_eq!(
             CheckpointTokenV2::decode(&checkpoint.encode()).unwrap(),
             checkpoint
-        );
-
-        let mut rebound_work = work();
-        rebound_work.invocation = checkpoint.input.invocation;
-        rebound_work.workflow_step = checkpoint.input.workflow_step;
-        rebound_work.base = checkpoint.base.clone();
-        let mut resumed_checkpoint = checkpoint.clone();
-        resumed_checkpoint.work_hash = rebound_work.hash();
-        resumed_checkpoint.resume_work = Some(Box::new(rebound_work));
-        assert_eq!(
-            CheckpointTokenV2::decode(&resumed_checkpoint.encode()).unwrap(),
-            resumed_checkpoint
-        );
-        let mut mismatched_resume = resumed_checkpoint;
-        mismatched_resume
-            .resume_work
-            .as_mut()
-            .unwrap()
-            .workflow_step += 1;
-        assert_eq!(
-            CheckpointTokenV2::decode(&mismatched_resume.encode()),
-            Err(DecodeError::NonCanonical)
         );
 
         let mut mismatched_change = checkpoint.clone();
@@ -6877,7 +6843,6 @@ mod tests {
                 state_root: Hash([52; 32]),
             },
             work_hash: Hash([55; 32]),
-            resume_work: None,
             base_causal_height: None,
             change: None,
             expected: Some(Hash([53; 32])),

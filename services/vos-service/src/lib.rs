@@ -133,20 +133,28 @@ mod guest {
         }
         let effects = ActorEffectBatchV2::decode(&effect_buffer[..effect_len])
             .unwrap_or_else(|_| fail_closed());
+        if let Some(checkpoint) = call_result.checkpoint.as_ref() {
+            if checkpoint.input != work.input_id() {
+                // A restored service frame still contains the work from the
+                // slice which created its continuation. Fetch the exact
+                // current envelope over an infrastructure-only capability;
+                // the actor-visible checkpoint remains bounded control data.
+                let resume_buffer = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        core::ptr::addr_of_mut!(TRANSITION_BUFFER).cast::<u8>(),
+                        TRANSITION_CAPACITY,
+                    )
+                };
+                let resume_len = hostcalls::refine_work_fetch(resume_buffer) as usize;
+                if resume_len == 0 || resume_len > resume_buffer.len() {
+                    fail_closed();
+                }
+                work = WorkEnvelopeV2::decode(&resume_buffer[..resume_len])
+                    .unwrap_or_else(|_| fail_closed());
+            }
+        }
         let actor_output = aggregate_actor_effects(&work, &call_result, effects);
         if let Some(checkpoint) = actor_output.checkpoint.as_ref() {
-            if checkpoint.input != work.input_id() {
-                work = *checkpoint
-                    .resume_work
-                    .clone()
-                    .unwrap_or_else(|| fail_closed());
-            } else if checkpoint
-                .resume_work
-                .as_ref()
-                .is_some_and(|resume_work| resume_work.as_ref() != &work)
-            {
-                fail_closed();
-            }
             if checkpoint.input != work.input_id()
                 || checkpoint.base != work.base
                 || checkpoint.work_hash != work.hash()

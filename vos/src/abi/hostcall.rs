@@ -67,6 +67,15 @@ pub const QUOTA: u32 = 28;
 /// the Task's later `INVOKE` would already have replicated the parent state.
 pub const PROVABLE_RECORD_INTENT: u32 = 109;
 
+/// Fetch the exact current Refine work envelope when a restored service VM
+/// must rebind a pre-suspension Rust frame.
+///
+/// The actor-visible checkpoint token carries only bounded control metadata;
+/// storage witnesses and other authenticated imports remain on this
+/// infrastructure-private channel. Refine-only and installed only in the
+/// generic service VM, never in application actors.
+pub const REFINE_WORK_FETCH: u32 = 108;
+
 /// Exchange invocation-private actor data with the generic VOS scheduler.
 ///
 /// An active application VM receives only its own state and authenticated
@@ -153,6 +162,7 @@ mod tests {
     #[test]
     fn vos_capabilities_never_use_jam_protocol_slots() {
         let supplied = [
+            REFINE_WORK_FETCH,
             PROVABLE_RECORD_INTENT,
             GROW_HEAP,
             DEBUG_WRITE,
@@ -186,6 +196,7 @@ mod tests {
             ..crate::v2::TARGET_ACTOR_HANDLE_SLOT + crate::v2::MAX_ROOT_TREE_ACTORS as u8;
         let occupied = [
             crate::crypto::ECALL_BLAKE2B_COMPRESS as u8,
+            REFINE_WORK_FETCH as u8,
             PROVABLE_RECORD_INTENT as u8,
             GROW_HEAP as u8,
             DEBUG_WRITE as u8,

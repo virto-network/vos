@@ -15,7 +15,7 @@ use super::{
     PublishedEffectsV2, ServiceIdentityV2, WorkEnvelopeV2, WorkInputIdV2,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 36;
+pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 37;
 
 /// Physical keys used directly in the JAM service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.

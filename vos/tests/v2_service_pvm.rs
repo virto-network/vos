@@ -10800,22 +10800,33 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
             ..
         }
     ));
-    let timeout_resume = LocalWorkSchedulerV2::prepare_timeout_resume(
+    let mut timeout_resume = LocalWorkSchedulerV2::prepare_timeout_resume(
         timeout_service.accumulate_host(),
         initial.work.invocation,
         100,
     )
     .unwrap()
     .expect("the timed-out first await is resumable");
-    let timeout_output = service
-        .refine_actor_tree_with_backend(
+    let timeout_output = loop {
+        match service.refine_actor_tree_with_backend(
             &timeout_resume.work.encode(),
             &timeout_resume.imports,
             100_000_000,
             &NoRefineProtocolHostV2,
             javm::PvmBackend::ForceInterpreter,
-        )
-        .unwrap();
+        ) {
+            Ok(output) => break output,
+            Err(ServicePvmErrorV2::ActorStorageWitnessRequired(requests)) => {
+                LocalWorkSchedulerV2::hydrate_actor_storage_rows(
+                    timeout_service.accumulate_host(),
+                    &mut timeout_resume,
+                    &requests,
+                )
+                .unwrap();
+            }
+            Err(error) => panic!("timeout resume Refine failed: {error:?}"),
+        }
+    };
     assert_eq!(
         service
             .refine_actor_tree_with_backend(
@@ -10934,7 +10945,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
             wrong_first_reply.reply.call_id
         ))
     );
-    let first_resume = LocalWorkSchedulerV2::prepare_resume(
+    let mut first_resume = LocalWorkSchedulerV2::prepare_resume(
         &reopened,
         initial.work.invocation,
         3,
@@ -10983,15 +10994,39 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
         before_expired_resume,
         "guest Accumulate must enforce the retained parent deadline after the inbox row is gone"
     );
-    let first_resumed_output = service
-        .refine_actor_tree_with_backend(
+    let first_resumed_output = loop {
+        match service.refine_actor_tree_with_backend(
             &first_resume.work.encode(),
             &first_resume.imports,
             100_000_000,
             &NoRefineProtocolHostV2,
             javm::PvmBackend::ForceInterpreter,
-        )
-        .unwrap();
+        ) {
+            Ok(output) => break output,
+            Err(ServicePvmErrorV2::ActorStorageWitnessRequired(requests)) => {
+                LocalWorkSchedulerV2::hydrate_actor_storage_rows(
+                    &reopened,
+                    &mut first_resume,
+                    &requests,
+                )
+                .unwrap();
+            }
+            Err(error) => panic!("first reply resume Refine failed: {error:?}"),
+        }
+    };
+    assert_eq!(
+        first_resume
+            .work
+            .imported_actors
+            .iter()
+            .map(|actor| actor.storage_rows.len())
+            .sum::<usize>(),
+        vos::v2::MAX_ACTOR_STORAGE_WITNESSES,
+    );
+    assert!(
+        first_resume.work.encode().len() > vos::v2::CHECKPOINT_TOKEN_CAPACITY,
+        "the physical resume must exceed the old inline-token capacity"
+    );
     assert_eq!(
         service
             .refine_actor_tree_with_backend(

@@ -447,6 +447,9 @@ pub struct ServicePvmV2 {
 /// transition itself.
 struct ActorRefineRuntimeV2 {
     target: super::ActorId,
+    /// Exact current service work, available only to infrastructure VM 0
+    /// when it must rebind a restored pre-suspension frame.
+    resume_work: Vec<u8>,
     program_layout: Vec<super::ContinuationProgramV2>,
     actor_by_vm: Vec<Option<super::ActorId>>,
     private_inputs: BTreeMap<super::ActorId, ActorPrivateInputV2>,
@@ -578,6 +581,7 @@ impl ActorRefineRuntimeV2 {
         }
         Ok(Self {
             target: work.target,
+            resume_work: work.encode(),
             program_layout,
             actor_by_vm,
             private_inputs,
@@ -1040,6 +1044,14 @@ impl ActorRefineRuntimeV2 {
                     .map(Some)
                     .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))
             }
+            crate::abi::hostcall::REFINE_WORK_FETCH => {
+                if kernel.active_vm != 0 || self.resume_work.is_empty() {
+                    return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                }
+                write_refine_protocol_bytes(kernel, &self.resume_work)
+                    .map(Some)
+                    .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))
+            }
             crate::abi::hostcall::ACTOR_EFFECT_EXPORT => {
                 if kernel.active_vm == 0 {
                     return Err(ServicePvmErrorV2::RefineHostRejected(slot));
@@ -1405,7 +1417,6 @@ impl ServicePvmV2 {
                 input: work.input_id(),
                 base: work.base.clone(),
                 work_hash: work.hash(),
-                resume_work: Some(alloc::boxed::Box::new(work.clone())),
                 base_causal_height: work.base_causal_height,
                 change: crdt_dispatch(&work, 0),
                 expected: Some(reference.hash),
@@ -2355,8 +2366,6 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                                 input: work.input_id(),
                                 base: work.base.clone(),
                                 work_hash: work.hash(),
-                                resume_work: (work.workflow_step != 0)
-                                    .then(|| alloc::boxed::Box::new(work.clone())),
                                 base_causal_height: work.base_causal_height,
                                 change: crdt_dispatch(work, 0),
                                 expected,
@@ -2410,6 +2419,7 @@ fn install_refine_scheduler_caps(kernel: &mut InvocationKernel) {
     // nondeterministic BOOT_CONTEXT/NOW_MS seams are intentionally absent from
     // v2 Refine.
     for slot in [
+        crate::abi::hostcall::REFINE_WORK_FETCH as u8,
         crate::abi::hostcall::ACTOR_PRIVATE_FETCH as u8,
         crate::crypto::ECALL_BLAKE2B_COMPRESS as u8,
         crate::abi::hostcall::GROW_HEAP as u8,
@@ -2546,6 +2556,7 @@ pub fn validate_actor_program_layout(program: &[u8]) -> Result<(), ServicePvmErr
             || cap.cap_index == super::ACTOR_SAVED_ARGS_CAP_SLOT
             || cap.cap_index == super::ACTOR_NESTED_IPC_CAP_SLOT
             || cap.cap_index == crate::abi::hostcall::ACTOR_PRIVATE_FETCH as u8
+            || cap.cap_index == crate::abi::hostcall::REFINE_WORK_FETCH as u8
             || cap.cap_index == crate::abi::hostcall::ACTOR_EFFECT_EXPORT as u8
             || cap.cap_index == crate::abi::hostcall::STORAGE_R as u8
             || cap.cap_index == crate::abi::hostcall::INVOKE as u8
@@ -2574,6 +2585,7 @@ fn refine_protocol_call_is_pure(slot: u8) -> bool {
     matches!(
         slot as u32,
         crate::abi::hostcall::GAS
+            | crate::abi::hostcall::REFINE_WORK_FETCH
             | crate::abi::hostcall::ACTOR_PRIVATE_FETCH
             | crate::abi::hostcall::ACTOR_EFFECT_EXPORT
             | crate::crypto::ECALL_BLAKE2B_COMPRESS

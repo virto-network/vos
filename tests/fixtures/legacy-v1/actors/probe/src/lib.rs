@@ -137,6 +137,13 @@ impl Probe {
         {
             self.seen += value;
         }
+        // The second suspension happens on workflow step 1. Authenticate the
+        // maximum number of distinct point reads first so the physical test
+        // proves storage-witness metadata never enters the 4 KiB checkpoint
+        // token used by this await.
+        for key in 0..vos::v2::MAX_ACTOR_STORAGE_WITNESSES as u64 {
+            self.seen += self.peer_values.get(&key).unwrap_or(0);
+        }
         self.seen += 10;
         if let Ok(vos::value::Value::U32(value)) = ctx
             .ask_actor(ActorId([45; 32]), &Msg::new("second_value"), Some(150))

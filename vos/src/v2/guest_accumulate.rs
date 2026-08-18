@@ -4916,7 +4916,6 @@ fn validate_awaited_outcome<S: GuestAccumulateStoreV2>(
             input: work.input_id(),
             base: work.base.clone(),
             work_hash: work.hash(),
-            resume_work: Some(alloc::boxed::Box::new(work.clone())),
             base_causal_height: work.base_causal_height,
             change: CrdtChangeV2::derive_operation_scope(work)
                 .map(|change| CrdtDispatchV2 { change, ordinal: 0 }),
@@ -8249,7 +8248,6 @@ mod tests {
                 input: oversized.input_id(),
                 base: oversized.base.clone(),
                 work_hash: oversized.hash(),
-                resume_work: Some(alloc::boxed::Box::new(oversized.clone())),
                 base_causal_height: oversized.base_causal_height,
                 change: None,
                 expected: Some(continuation.hash),
