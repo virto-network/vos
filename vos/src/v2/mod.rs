@@ -42,17 +42,17 @@ pub use contracts::{
     AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2,
     ActorCallRequestV2, ActorCallResultV2, ActorCrdtStateV2, ActorDirectoryV2, ActorEffectBatchV2,
     ActorGenesisV2, ActorPrivateInputV2, ActorSliceInputV2, ActorSliceOutputV2,
-    ActorSpawnRequestV2, ActorSpawnV2, ActorTreeImportV2, ActorUpgradeV2, ActorWriteV2,
-    AttestationDeliveryV2, AttestationProofManifestV2, AttestationResumeV2,
-    AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2, CallExpirationEnvelopeV2, CallTimeoutV2,
-    CausalCallContextV2, CheckpointTokenV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2, CrdtIngressV2, CrdtMaterializationV2,
-    CrdtOperationV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DeliveryEnvelopeV2, DirectIngressV2,
-    ExternalActorBindingV2, ExternalActorDirectoryV2, GasAccountingV2, GasScheduleV2,
-    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxRetirementV2, MessageRecordV2,
-    MethodPolicyV2, ProofArtifactIdV2, ProofCommitmentV2, ProofVerificationRequestV2,
-    PublicationAckV2, PublishedEffectsV2, ROLE_AUTHORITY_DECISION_METHOD_V2,
-    ROLE_AUTHORITY_INSTANCE_V2, ROLE_AUTHORITY_INVITE_METHOD_V2,
+    ActorSpawnRequestV2, ActorSpawnV2, ActorStorageKeyV2, ActorStorageRowV2, ActorTreeImportV2,
+    ActorUpgradeV2, ActorWriteV2, AttestationDeliveryV2, AttestationProofManifestV2,
+    AttestationResumeV2, AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2,
+    CallExpirationEnvelopeV2, CallTimeoutV2, CausalCallContextV2, CheckpointTokenV2,
+    ConsistencyBaseV2, ConsistencyModeV2, ContinuationChangeV2, CrdtChangeV2, CrdtDispatchV2,
+    CrdtIngressV2, CrdtMaterializationV2, CrdtOperationV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2,
+    DeliveryEnvelopeV2, DirectIngressV2, ExternalActorBindingV2, ExternalActorDirectoryV2,
+    GasAccountingV2, GasScheduleV2, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
+    InboxRetirementV2, MessageRecordV2, MethodPolicyV2, ProofArtifactIdV2, ProofCommitmentV2,
+    ProofVerificationRequestV2, PublicationAckV2, PublishedEffectsV2,
+    ROLE_AUTHORITY_DECISION_METHOD_V2, ROLE_AUTHORITY_INSTANCE_V2, ROLE_AUTHORITY_INVITE_METHOD_V2,
     ROLE_AUTHORITY_INVITE_REVOKE_METHOD_V2, ROLE_AUTHORITY_MUTATION_METHOD_V2,
     ReceiptVerificationRequestV2, RefineError, RefineImportsV2, RefineOutputV2, ReplyRecordV2,
     RoleAuthorityBindingV2, RoleAuthorityInviteRedemptionV2, RoleAuthorityInviteRevocationV2,
@@ -128,7 +128,7 @@ pub use transport::{
 pub use wire::{DecodeError, V2Wire};
 
 /// Platform wire/ABI version carried by v2 work, transitions, and receipts.
-pub const ABI_VERSION: u16 = 12;
+pub const ABI_VERSION: u16 = 13;
 /// Portable continuation format version.
 pub const SNAPSHOT_VERSION: u16 = 6;
 /// Attestation statement version required by runtime v2.
@@ -139,8 +139,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0x89, 0x88, 0x93, 0x08, 0xd4, 0x25, 0x49, 0xd5, 0xec, 0xbd, 0x0f, 0xfb, 0x69, 0x44, 0x12, 0xde,
-    0xd5, 0x11, 0xe5, 0xcd, 0xf2, 0x1c, 0x59, 0x71, 0xa5, 0xa7, 0x7d, 0x62, 0x50, 0x11, 0x22, 0x26,
+    0xc2, 0xf4, 0x39, 0xf7, 0xf6, 0xdb, 0x8a, 0xf9, 0xbf, 0x98, 0x0d, 0x01, 0xd1, 0x3c, 0xfc, 0x3b,
+    0x89, 0x56, 0x29, 0xbb, 0x64, 0xd3, 0x6b, 0x81, 0x75, 0xe9, 0xbc, 0x96, 0xd3, 0xd7, 0xbe, 0x14,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.
@@ -164,6 +164,19 @@ pub const MAX_ROOT_TREE_ACTORS: usize = 4;
 /// therefore do not consume the root tree's scarce JAR code-capability slots,
 /// but the package/work wires still need a deterministic bound.
 pub const MAX_PACKAGE_TASK_DEPENDENCIES: usize = 16;
+
+/// Maximum actor-local storage rows one Refine slice may authenticate.
+pub const MAX_ACTOR_STORAGE_WITNESSES: usize = 256;
+/// Maximum adaptive discovery/restart rounds for one Refine slice. One round
+/// may discover many independent reads; this caps host work when later reads
+/// are selected by values obtained in earlier rounds.
+pub const MAX_ACTOR_STORAGE_WITNESS_ROUNDS: usize = 16;
+/// Maximum physical actor-storage key accepted into one authenticated witness.
+pub const MAX_ACTOR_STORAGE_KEY_BYTES: usize = 4096;
+/// Maximum aggregate value bytes hydrated for actor storage reads in one
+/// Refine slice. Point reads remain bounded even when individual rows approach
+/// the storage layer's 64-KiB value ceiling.
+pub const MAX_ACTOR_STORAGE_WITNESS_BYTES: usize = 1024 * 1024;
 
 #[cfg(feature = "std")]
 const _: () = assert!(MAX_ROOT_TREE_ACTORS + 1 == javm::vm_pool::MAX_CODE_CAPS);
@@ -239,4 +252,4 @@ pub const JAR_REVISION: &str = "41d31e64b0f5d6c57a43769d7b8785556a311684";
 /// Consensus-visible execution semantics. Changing interpreter/recompiler or
 /// trace behavior requires a new identifier even if the public Rust API did
 /// not change.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v17");
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v18");

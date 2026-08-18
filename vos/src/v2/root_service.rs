@@ -28,9 +28,9 @@ use super::{
     PackageRolePoliciesV2, PreparedWorkV2, ProgramId, ProofArtifactStoreV2, PublicationAckV2,
     PublicationRecordV2, PublishedEffectsV2, RefinedServiceOutputV2, RoleAssertionEligibilityV2,
     RoleAuthorityBindingV2, RoleAuthorizationClaimV2, RoleCredentialV2, ScheduleErrorV2,
-    ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, StateKeyV2, V2Wire, VosPackageV2,
-    WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
-    delivery_storage_key,
+    ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, StateKeyV2,
+    V2Wire, VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key,
+    dedup_storage_key, delivery_storage_key,
 };
 
 #[cfg(feature = "storage")]
@@ -742,6 +742,19 @@ enum RootTreeDriverErrorV2 {
 }
 
 impl RootTreeDriverErrorV2 {
+    fn actor_storage_requests(&self) -> Option<&[super::ActorStorageKeyV2]> {
+        match self {
+            Self::Direct(ServiceDispatchError::Pvm(
+                ServicePvmErrorV2::ActorStorageWitnessRequired(requests),
+            )) => Some(requests),
+            #[cfg(feature = "storage")]
+            Self::Raft(ReplicatedServiceErrorV2::Dispatch(ServiceDispatchError::Pvm(
+                ServicePvmErrorV2::ActorStorageWitnessRequired(requests),
+            ))) => Some(requests),
+            _ => None,
+        }
+    }
+
     fn into_invoke(self) -> LocalRootTreeInvokeErrorV2 {
         match self {
             Self::Direct(error) => LocalRootTreeInvokeErrorV2::Service(error),
@@ -3228,10 +3241,7 @@ where
         receipt_verifications: &[super::ReceiptVerificationRequestV2],
         proof_artifact: Option<ImportedBlobV2>,
     ) -> Result<CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2> {
-        let refined = self
-            .service
-            .refine_actor_tree_after_barrier(&prepared.work, &prepared.imports)
-            .map_err(RootTreeDriverErrorV2::into_invoke)?;
+        let (prepared, refined) = self.refine_with_storage_witnesses_after_barrier(prepared)?;
         let PreparedWorkV2 {
             mut work,
             imports: _,
@@ -3316,10 +3326,7 @@ where
         if !prepared.work.proof_requested {
             return Err(AttestedRootTreeInvokeErrorV2::InvalidPreparation);
         }
-        let refined = self
-            .service
-            .refine_actor_tree_after_barrier(&prepared.work, &prepared.imports)
-            .map_err(RootTreeDriverErrorV2::into_invoke)?;
+        let (prepared, refined) = self.refine_with_storage_witnesses_after_barrier(prepared)?;
         let PreparedWorkV2 { mut work, imports } = prepared;
         self.service
             .accumulate_host_mut()
@@ -3368,6 +3375,39 @@ where
             refine_gas_used: refined.gas_used,
             accumulate_gas_used: committed.accumulate_gas_used,
         })
+    }
+
+    fn refine_with_storage_witnesses_after_barrier(
+        &self,
+        mut prepared: PreparedWorkV2,
+    ) -> Result<(PreparedWorkV2, RefinedServiceOutputV2), LocalRootTreeInvokeErrorV2> {
+        let mut discovery_rounds = 0usize;
+        loop {
+            match self
+                .service
+                .refine_actor_tree_after_barrier(&prepared.work, &prepared.imports)
+            {
+                Ok(refined) => return Ok((prepared, refined)),
+                Err(error) => {
+                    let Some(requests) = error.actor_storage_requests() else {
+                        return Err(error.into_invoke());
+                    };
+                    if discovery_rounds >= super::MAX_ACTOR_STORAGE_WITNESS_ROUNDS {
+                        return Err(LocalRootTreeInvokeErrorV2::Schedule(
+                            ScheduleErrorV2::ActorStorageWitnessLimit,
+                        ));
+                    }
+                    discovery_rounds += 1;
+                    let requests = requests.to_vec();
+                    LocalWorkSchedulerV2::hydrate_actor_storage_rows(
+                        self.service.accumulate_host().local_store(),
+                        &mut prepared,
+                        &requests,
+                    )
+                    .map_err(LocalRootTreeInvokeErrorV2::Schedule)?;
+                }
+            }
+        }
     }
 
     /// Commit only the current canonical head set. The node uses this cheap

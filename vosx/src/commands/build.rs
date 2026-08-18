@@ -181,6 +181,12 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
         "  deployment_id = {}",
         hex::encode(package.deployment_id().0)
     );
+    for (index, dependency) in package.task_dependencies.iter().enumerate() {
+        println!(
+            "  task[{index}]      = {}",
+            hex::encode(dependency.binding.task.0)
+        );
+    }
     Ok(())
 }
 
@@ -241,7 +247,14 @@ fn resolve_task_input(input: &Path) -> anyhow::Result<PathBuf> {
     }
     let build_root = std::fs::canonicalize(actor_build_root(&project)?)
         .with_context(|| format!("resolve Task build root for {}", input.display()))?;
-    let output = Command::new("cargo")
+    let source_root = canonical_source_root(&build_root);
+    // Own a source-root-relative target directory just as actor packaging
+    // does. Cargo's output path is part of rustc's invocation; inheriting an
+    // arbitrary CARGO_TARGET_DIR would otherwise perturb crate metadata and
+    // the linked Task identity even though JSON discovery found the right ELF.
+    let target_dir = build_root.join("target/vosx-canonical");
+    let mut command = Command::new("cargo");
+    command
         .args([
             "+nightly",
             "build",
@@ -251,6 +264,11 @@ fn resolve_task_input(input: &Path) -> anyhow::Result<PathBuf> {
         ])
         .arg(&manifest_path)
         .current_dir(&build_root)
+        .env("RUSTC_WRAPPER", std::env::current_exe()?)
+        .env(RUSTC_WRAPPER_MODE, "1")
+        .env(RUSTC_WRAPPER_SOURCE_ROOT, source_root)
+        .env("CARGO_TARGET_DIR", target_dir);
+    let output = command
         .output()
         .with_context(|| format!("run `cargo +nightly build` in {}", build_root.display()))?;
     if !output.status.success() {

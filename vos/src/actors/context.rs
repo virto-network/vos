@@ -1,5 +1,7 @@
 use super::Actor;
 use super::auth::{Caller, Forbidden, RoleByte, SpaceRole};
+#[cfg(feature = "pvm")]
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 /// One canonical application identity for a transport-authenticated peer.
@@ -1576,21 +1578,25 @@ impl<A: Actor> Context<A> {
             return Err(());
         }
 
-        let mut writes = Vec::new();
+        // Actor storage is an ordered key/value map, while one dispatch may
+        // touch the same row several times. Collapse to its final value here
+        // so the physical actor export is the sorted-unique transition the
+        // service guest authenticates. Insertion order still defines
+        // last-write-wins before the canonical map is emitted.
+        let mut writes = BTreeMap::new();
         for (key, value) in self.pending_writes.drain(..).chain(row_effects) {
             if key.is_empty() {
                 return Err(());
             }
-            writes.push(crate::v2::ActorWriteV2 { actor, key, value });
+            writes.insert(key, value);
         }
         if let Some(value) = state_write {
-            writes.push(crate::v2::ActorWriteV2 {
-                actor,
-                key: crate::lifecycle::STATE_KEY_BYTES.to_vec(),
-                value: Some(value),
-            });
+            writes.insert(crate::lifecycle::STATE_KEY_BYTES.to_vec(), Some(value));
         }
-        Ok(writes)
+        Ok(writes
+            .into_iter()
+            .map(|(key, value)| crate::v2::ActorWriteV2 { actor, key, value })
+            .collect())
     }
 
     /// Drain durable cross-root calls separately from actor state writes so

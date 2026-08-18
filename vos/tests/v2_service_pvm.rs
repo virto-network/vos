@@ -981,6 +981,18 @@ fn space_authority_elf() -> Vec<u8> {
     )
 }
 
+fn canonical_clerk_package() -> VosPackageV2 {
+    let bytes = required_elf(
+        "../target/v2-clerk/clerk-ledger.vos",
+        "just build-v2-pvm-test-artifacts",
+    );
+    let package = VosPackageV2::decode(&bytes).expect("canonical Clerk package decodes");
+    package
+        .validate()
+        .expect("canonical Clerk package signature and contents validate");
+    package
+}
+
 fn install_test_voter_registry(
     node: &mut VosNode,
     registry_pvm: Vec<u8>,
@@ -1078,6 +1090,7 @@ fn work(actor_program: ProgramId, state: BlobRefV2) -> WorkEnvelopeV2 {
             state,
             causal_states: vec![],
             continuation: None,
+            storage_rows: vec![],
         }],
         imported_blobs: vec![],
         proof_requested: false,
@@ -1170,6 +1183,7 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
         state: state.clone(),
         causal_states: vec![],
         continuation: None,
+        storage_rows: vec![],
     });
     let imports = RefineImportsV2 {
         programs: vec![ImportedProgramV2 {
@@ -1968,6 +1982,267 @@ fn single_voter_raft_task_ingress_is_private_durable_and_retryable() {
     assert_eq!(retry.refine_gas_used, 0);
     assert_eq!(retry.accumulate_gas_used, 0);
     assert!(reopened.store().backend().private_ingresses.is_empty());
+    drop(reopened);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+fn clerk_operator_request(
+    service: &mut LocalRootTreeServiceV2<FailableCommittedImages>,
+    actor: ActorId,
+    invocation: InvocationId,
+    logical_timeslot: u64,
+    message: Msg,
+) -> LocalWorkRequestV2 {
+    let method = message.name.clone();
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&message.encode());
+    let origin = Origin::Member(SubjectId([0x63; 32]));
+    let mut request = LocalWorkRequestV2 {
+        invocation,
+        workflow_step: 0,
+        logical_timeslot,
+        target: actor,
+        method: method.clone(),
+        arguments: arguments.clone(),
+        origin,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let policy = service
+        .root_method_policy(&method)
+        .unwrap()
+        .expect("Clerk package carries the requested method policy");
+    assert_eq!(
+        policy.actor_role,
+        Some(clerk_ledger::ClerkLedgerRole::Operator as u8)
+    );
+    let private_arguments = BlobRefV2::of_bytes(&arguments);
+    let mut scoped = LocalWorkSchedulerV2::prepare(service.store().local_store(), request.clone())
+        .unwrap()
+        .work;
+    scoped.private_arguments = Some(private_arguments.clone());
+    let credential = RoleCredentialV2 {
+        holder: origin,
+        scope: scoped.authorization_scope(),
+        space_role: None,
+        actor_role: Some(clerk_ledger::ClerkLedgerRole::Operator as u8),
+        authenticator: b"test authority over exact Clerk work scope".to_vec(),
+    };
+    request.authorization = credential.disclosed_evidence(policy.policy);
+    let mut authorized =
+        LocalWorkSchedulerV2::prepare(service.store().local_store(), request.clone())
+            .unwrap()
+            .work;
+    authorized.private_arguments = Some(private_arguments);
+    let verification = RoleCredentialVerificationRequestV2::for_work(&authorized)
+        .expect("disclosed Clerk operator credential is canonical");
+    service
+        .store_mut()
+        .local_store_mut()
+        .allow_role_credential(&verification);
+    request
+}
+
+fn clerk_status(committed: &vos::v2::CommittedRootTreeSliceV2) -> clerk_ledger::Status {
+    let reply = committed
+        .published
+        .reply
+        .as_ref()
+        .expect("Clerk handler publishes one direct reply");
+    let Value::Bytes(bytes) = Value::try_decode(&reply.result).expect("Clerk reply is a Value")
+    else {
+        panic!("Clerk status is encoded as Value::Bytes")
+    };
+    vos::rkyv::from_bytes::<clerk_ledger::Status, vos::rkyv::rancor::Error>(&bytes)
+        .expect("Clerk status archive decodes")
+}
+
+#[test]
+fn canonical_clerk_package_executes_a_private_provable_transfer_through_raft() {
+    use cipher_clerk::conventions::{BankCode, Iso4217};
+    use cipher_clerk::crypto::{Amount, Blinding, Keypair};
+    use cipher_clerk::ids::JournalId;
+    use cipher_clerk::kernel::CreateAccount as CcCreateAccount;
+    use cipher_clerk::types::{Account, Layer, Transfer};
+
+    let package = canonical_clerk_package();
+    let binding = package.task_dependencies[0].binding.clone();
+    assert_eq!(binding.task.0, clerk_ledger::CLERK_APPLY_TASK_HASH);
+    let actor_name = vos::metadata::decode(&package.schemas)
+        .expect("Clerk package carries generated actor metadata")
+        .actor_name;
+    let config = LocalRootTreeConfigV2 {
+        role_authority: None,
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        service: ServiceIdentityV2 {
+            space: vos::v2::SpaceId([121; 32]),
+            root_service: RootServiceId([122; 32]),
+            deployment: package.deployment_id(),
+            service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+            service_abi: vos::v2::ABI_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: TEST_GAS_SCHEDULE,
+        },
+        package,
+        root_actor: ActorId([123; 32]),
+        actor_name,
+        consistency: ConsistencyModeV2::Raft,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([124; 32]),
+            authenticator: vec![125],
+        },
+        refine_gas: TEST_GAS_SCHEDULE.refine,
+        accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
+    };
+    let actor = config.root_actor;
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-raft-clerk-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let log_path = directory.join("raft.redb");
+    let log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    let mut service =
+        LocalRootTreeServiceV2::open_raft(config.clone(), FailableCommittedImages::default(), log)
+            .expect("the signed Clerk Raft root installs with its Task dependency");
+
+    let registrar = Keypair::generate();
+    let journal = JournalId::random();
+    let bootstrap = clerk_operator_request(
+        &mut service,
+        actor,
+        InvocationId([0x64; 32]),
+        1,
+        Msg::new("bootstrap")
+            .with("journal_id", journal.0.to_vec())
+            .with("registrar_pubkey", registrar.public.0.to_vec())
+            .with("code", 1u32),
+    );
+    assert_eq!(
+        clerk_status(
+            &service
+                .invoke(bootstrap)
+                .expect("bootstrap commits through Raft")
+        ),
+        clerk_ledger::Status::Ok,
+    );
+
+    let alice_key = Keypair::generate();
+    let alice = Account::asset(journal, alice_key.public, Iso4217::USD, BankCode::Checking);
+    let pool = Account::asset(
+        journal,
+        Keypair::generate().public,
+        Iso4217::USD,
+        BankCode::Vault,
+    );
+    for (ordinal, account) in [alice.clone(), pool.clone()].into_iter().enumerate() {
+        let create = CcCreateAccount::signed(account, &registrar.secret);
+        let create_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&create)
+            .unwrap()
+            .to_vec();
+        let request = clerk_operator_request(
+            &mut service,
+            actor,
+            InvocationId([0x65 + ordinal as u8; 32]),
+            2 + ordinal as u64,
+            Msg::new("create_account")
+                .with("create_account_bytes", create_bytes)
+                .with("batch_seed_timestamp", 10u64 + ordinal as u64),
+        );
+        assert_eq!(
+            clerk_status(&service.invoke(request).expect("account creation commits")),
+            clerk_ledger::Status::Ok,
+        );
+    }
+
+    let blinding = Blinding::from_bytes([0x06; 32]).expect("test blinding is canonical");
+    let amount = Amount::commit(100, &blinding);
+    let transfer = Transfer::builder(journal)
+        .debit(&alice, Layer::Settled, amount)
+        .credit(&pool, Layer::Settled, amount)
+        .signed_with(&[(&alice, &alice_key.secret)]);
+    let transfer_id = transfer.id.0;
+    let transfer_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&transfer)
+        .unwrap()
+        .to_vec();
+    let openings = vec![clerk_ledger::Opening {
+        amount,
+        value: 100,
+        blinding,
+    }];
+    let openings_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&openings)
+        .unwrap()
+        .to_vec();
+    let apply = clerk_operator_request(
+        &mut service,
+        actor,
+        InvocationId([0x67; 32]),
+        4,
+        Msg::new("apply_transfer_provable")
+            .with("transfer_bytes", transfer_bytes)
+            .with("openings_bytes", openings_bytes.clone())
+            .with("batch_seed_timestamp", 20u64),
+    );
+    let committed = service
+        .invoke(apply.clone())
+        .expect("the real Clerk Task and live ledger mutation commit through Raft");
+    assert_eq!(clerk_status(&committed), clerk_ledger::Status::Ok);
+    let tag = clerk_ledger::transfer_record_tag(&transfer_id);
+    let record_bytes = service
+        .producer_record(actor, &tag)
+        .expect("the producing replica durably captures the proof record");
+    let record = vos::provable::ProofRecordEntry::decode(&record_bytes)
+        .expect("the captured Clerk record is canonical");
+    assert_eq!(record.record.task_hash, clerk_ledger::CLERK_APPLY_TASK_HASH);
+    assert!(record.record.io_consistent());
+
+    let retry = service
+        .invoke(apply.clone())
+        .expect("an exact Clerk retry reattaches without rerunning the Task");
+    assert!(retry.duplicate);
+    assert_eq!(retry.refine_gas_used, 0);
+    assert_eq!(retry.accumulate_gas_used, 0);
+
+    let backend = service.into_backend();
+    let image = backend
+        .image
+        .as_ref()
+        .expect("the Clerk service image is durable");
+    assert!(
+        !image
+            .windows(openings_bytes.len())
+            .any(|window| window == openings_bytes),
+        "private commitment openings never enter the replicated service image",
+    );
+    let raft_bytes = std::fs::read(&log_path).unwrap();
+    assert!(
+        !raft_bytes
+            .windows(openings_bytes.len())
+            .any(|window| window == openings_bytes),
+        "private commitment openings never enter the ordered Raft log",
+    );
+    let log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    let mut reopened = LocalRootTreeServiceV2::open_raft(config, backend, log)
+        .expect("the Clerk root and producer sidecar reopen together");
+    assert_eq!(reopened.producer_record(actor, &tag), Some(record_bytes));
+    let recovered = reopened
+        .invoke(apply)
+        .expect("the committed Clerk result recovers after restart");
+    assert!(recovered.duplicate);
+    assert_eq!(recovered.refine_gas_used, 0);
+    assert_eq!(recovered.accumulate_gas_used, 0);
     drop(reopened);
     std::fs::remove_dir_all(directory).unwrap();
 }
@@ -9930,6 +10205,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             state: new_child_state.clone(),
             causal_states: vec![],
             continuation: None,
+            storage_rows: vec![],
         });
     expanded
         .work
@@ -13005,7 +13281,7 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
     let mut source = install_service(
         source_identity,
         source_actor,
-        "await_peer",
+        "await_storage_peer",
         vec![external_binding(
             "peer",
             destination_identity.clone(),
@@ -13017,13 +13293,13 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
     let destination = install_service(
         destination_identity.clone(),
         destination_actor,
-        "peer_value",
+        "peer_value_storage",
         vec![],
     );
     let expiring_destination = install_service(
         destination_identity.clone(),
         destination_actor,
-        "peer_value",
+        "peer_value_storage",
         vec![],
     );
     let impostor_identity = ServiceIdentityV2 {
@@ -13031,10 +13307,15 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
         deployment: DeploymentId([97; 32]),
         ..destination_identity
     };
-    let impostor = install_service(impostor_identity, destination_actor, "peer_value", vec![]);
+    let impostor = install_service(
+        impostor_identity,
+        destination_actor,
+        "peer_value_storage",
+        vec![],
+    );
 
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
-    arguments.extend_from_slice(&Msg::new("await_peer").encode());
+    arguments.extend_from_slice(&Msg::new("await_storage_peer").encode());
     let source_work = LocalWorkSchedulerV2::prepare(
         source.accumulate_host(),
         LocalWorkRequestV2 {
@@ -13042,7 +13323,7 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
             workflow_step: 0,
             logical_timeslot: 1,
             target: source_actor,
-            method: "await_peer".into(),
+            method: "await_storage_peer".into(),
             arguments,
             origin: Origin::Anonymous,
             authorization: AuthorizationEvidenceV2::Public,

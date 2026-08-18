@@ -3393,6 +3393,17 @@ fn apply<S: GuestAccumulateStoreV2>(
             if committed_state != imported.state {
                 return Ok(rejected(AccumulationRejectionV2::StaleStateRoot));
             }
+            for row in &imported.storage_rows {
+                let committed = tree
+                    .get(&StateKeyV2::ActorRow {
+                        actor: imported.actor,
+                        key: row.key.clone(),
+                    })
+                    .map_err(GuestAccumulateError::StateTree)?;
+                if committed != row.value {
+                    return Ok(rejected(AccumulationRejectionV2::StaleStateRoot));
+                }
+            }
         }
     }
     let external_directory =
@@ -6189,10 +6200,40 @@ mod tests {
                 state: initial,
                 causal_states: vec![],
                 continuation: None,
+                storage_rows: vec![],
             }],
             imported_blobs: Vec::new(),
             proof_requested: false,
         }
+    }
+
+    #[test]
+    fn linear_apply_rejects_actor_storage_witness_not_bound_to_its_base() {
+        let mut store = MemStore::default();
+        let (initial, install) = install_fixture(&mut store, ConsistencyModeV2::Local, b"before");
+        let mut work = linear_work(initial, install.resulting_state_root.unwrap());
+        work.imported_actors[0]
+            .storage_rows
+            .push(super::super::ActorStorageRowV2 {
+                key: b"missing-at-base".to_vec(),
+                value: Some(b"forged".to_vec()),
+            });
+        let envelope = AccumulationEnvelopeV2 {
+            transition: linear_transition(&work, b"after"),
+            work: work.clone(),
+            provided_blobs: vec![],
+        };
+        seed_direct_ingress(&mut store, &work);
+        let before = store.clone();
+
+        assert_eq!(
+            execute_guest_accumulate(&mut store, &AccumulateRequestV2::Apply(envelope)).unwrap(),
+            rejected(AccumulationRejectionV2::StaleStateRoot),
+        );
+        assert_eq!(
+            store, before,
+            "a forged point-read witness must stage no guest state",
+        );
     }
 
     /// Legacy unit fixtures construct complete work envelopes directly so
@@ -6521,6 +6562,7 @@ mod tests {
                         state: initial.clone(),
                         causal_states: vec![],
                         continuation: None,
+                        storage_rows: vec![],
                     }),
             );
         let child_bytes = b"overflow-state".to_vec();
@@ -7465,6 +7507,7 @@ mod tests {
             state: initial,
             causal_states: Vec::new(),
             continuation: None,
+            storage_rows: Vec::new(),
         });
         let transition = linear_transition(&misnamed, b"after");
         let result = execute_guest_accumulate(
@@ -9675,6 +9718,7 @@ mod tests {
             state: initial,
             causal_states: vec![],
             continuation: None,
+            storage_rows: vec![],
         });
         let mut outgoing = awaited_message(&work, peer, Some(incoming.call_id), Some(9));
         outgoing.from = child;
@@ -9722,6 +9766,7 @@ mod tests {
                 state: initial,
                 causal_states: vec![],
                 continuation: None,
+                storage_rows: vec![],
             }],
             imported_blobs: Vec::new(),
             proof_requested: false,

@@ -51,7 +51,7 @@ build-v2-daemon-root-artifacts: build-vos-service
     cd examples/actors; cargo +nightly actor -p v2-counter
 
 # Build every guest consumed by the physical v2 service-PVM gate.
-build-v2-pvm-test-artifacts: build-v2-daemon-root-artifacts (build-actor "space-authority")
+build-v2-pvm-test-artifacts: build-v2-daemon-root-artifacts (build-actor "space-authority") build-clerk-apply
     cd tests/fixtures/legacy-v1/actors/greeter; cargo +nightly actor
     cd tests/fixtures/legacy-v1/actors/probe; cargo +nightly actor
     cd tests/fixtures/legacy-v1/actors/tally; cargo +nightly actor
@@ -70,7 +70,7 @@ build-test-artifacts: build-extensions build-pvm build-v2-pvm-test-artifacts bui
 # Build all built-in actors used by host tests.
 build-actors: (build-actor "space-registry") (build-actor "space-bridge") \
               (build-actor "space-authority") \
-              (build-actor "clerk-ledger") (build-actor "clerk-bridge") \
+              (build-actor "clerk-bridge") \
               (build-actor "clerk-settle") build-clerk-apply
     cargo build -p prover-extension
     cargo build -p prover-extension --release
@@ -83,9 +83,17 @@ build-voucher-check:
 build-witnessed-transfer:
     cd tests/fixtures/legacy-v1/actors/witnessed-transfer; cargo +nightly actor
 
-# Build the flagship #[actor(task, provable)] pure verifier.
-build-clerk-apply:
-    cd tests/fixtures/provable/clerk-apply; cargo +nightly build --release
+# Build the flagship Task through the same canonical wrapper used by its
+# production package. This also leaves the signed package under target/v2-clerk.
+build-clerk-apply: build-clerk-v2-package
+
+# Build the signed Clerk production package with its immutable proving Task.
+# The resulting `.vos` is the artifact installed by a service-v2 Local/Raft
+# root; neither the actor ELF nor the Task PVM is selected independently.
+build-clerk-v2-package:
+    cargo run -p vosx -- build actors/clerk-ledger --name clerk-ledger \
+      --version production-v2 --task tests/fixtures/provable/clerk-apply \
+      --out-dir target/v2-clerk
 
 # Refresh the bundled space-registry ELF shipped with vosx.
 refresh-bundled-registry: (build-actor "space-registry")

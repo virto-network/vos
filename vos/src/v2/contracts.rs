@@ -326,6 +326,26 @@ pub struct ImportedActorV2 {
     pub state: BlobRefV2,
     pub causal_states: Vec<BlobRefV2>,
     pub continuation: Option<BlobRefV2>,
+    /// Base-authenticated point reads discovered before the final Refine run.
+    /// A missing value is witnessed explicitly so an actor cannot confuse an
+    /// absent row with an omitted witness. Storage witnesses are linear-only;
+    /// CRDT actors use field-operation materializations instead.
+    pub storage_rows: Vec<ActorStorageRowV2>,
+}
+
+/// One actor-local storage row at the exact linear work base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorStorageRowV2 {
+    pub key: Vec<u8>,
+    pub value: Option<Vec<u8>>,
+}
+
+/// Host-local request emitted when speculative Refine discovers a row that
+/// was not yet carried by the authenticated work envelope.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ActorStorageKeyV2 {
+    pub actor: ActorId,
+    pub key: Vec<u8>,
 }
 
 /// Compact guest-owned binding for one content-addressed pure Task.
@@ -789,6 +809,7 @@ impl WorkEnvelopeV2 {
             actor.state = empty.clone();
             actor.causal_states.clear();
             actor.continuation = None;
+            actor.storage_rows.clear();
         }
         checkpoint
     }
@@ -858,6 +879,7 @@ impl WorkEnvelopeV2 {
             actor.state = empty.clone();
             actor.causal_states.clear();
             actor.continuation = None;
+            actor.storage_rows.clear();
         }
         Some(Hash::digest(b"vos/crdt-retry/v2", &[&normalized.encode()]))
     }
@@ -2700,8 +2722,26 @@ impl V2Wire for WorkEnvelopeV2 {
         }) {
             return Err(DecodeError::NonCanonical);
         }
+        let storage_witness_count = imported_actors
+            .iter()
+            .try_fold(0usize, |total, actor| {
+                total.checked_add(actor.storage_rows.len())
+            })
+            .ok_or(DecodeError::LimitExceeded)?;
+        let storage_witness_bytes = imported_actors
+            .iter()
+            .flat_map(|actor| &actor.storage_rows)
+            .filter_map(|row| row.value.as_ref())
+            .try_fold(0usize, |total, value| total.checked_add(value.len()))
+            .ok_or(DecodeError::LimitExceeded)?;
+        if storage_witness_count > super::MAX_ACTOR_STORAGE_WITNESSES
+            || storage_witness_bytes > super::MAX_ACTOR_STORAGE_WITNESS_BYTES
+        {
+            return Err(DecodeError::LimitExceeded);
+        }
         for actor in &imported_actors {
             ensure_sorted_unique(&actor.causal_states, |state| state.hash.0)?;
+            ensure_sorted_unique(&actor.storage_rows, |row| row.key.clone())?;
             if actor
                 .causal_states
                 .iter()
@@ -2711,6 +2751,10 @@ impl V2Wire for WorkEnvelopeV2 {
                     .first()
                     .is_some_and(|state| state.hash <= actor.state.hash)
                 || (consistency != ConsistencyModeV2::Crdt && !actor.causal_states.is_empty())
+                || (consistency == ConsistencyModeV2::Crdt && !actor.storage_rows.is_empty())
+                || actor.storage_rows.iter().any(|row| {
+                    row.key.is_empty() || row.key.len() > super::MAX_ACTOR_STORAGE_KEY_BYTES
+                })
             {
                 return Err(DecodeError::NonCanonical);
             }
@@ -5325,6 +5369,10 @@ fn encode_imported_actor(e: &mut Encoder<'_>, value: &ImportedActorV2) {
     encode_blob_ref(e, &value.state);
     e.list(&value.causal_states, encode_blob_ref);
     e.option(&value.continuation, encode_blob_ref);
+    e.list(&value.storage_rows, |e, row| {
+        e.bytes(&row.key);
+        e.option(&row.value, |e, value| e.bytes(value));
+    });
 }
 
 fn decode_imported_actor(d: &mut Decoder<'_>) -> Result<ImportedActorV2, DecodeError> {
@@ -5338,6 +5386,12 @@ fn decode_imported_actor(d: &mut Decoder<'_>) -> Result<ImportedActorV2, DecodeE
         state: decode_blob_ref(d)?,
         causal_states: d.list(decode_blob_ref)?,
         continuation: d.option(decode_blob_ref)?,
+        storage_rows: d.list(|d| {
+            Ok(ActorStorageRowV2 {
+                key: d.bytes()?,
+                value: d.option(Decoder::bytes)?,
+            })
+        })?,
     };
     validate_task_dependencies(&value.task_dependencies)?;
     Ok(value)
@@ -5907,11 +5961,68 @@ mod tests {
                 state: BlobRefV2::of_bytes(b"state"),
                 causal_states: vec![],
                 continuation: None,
+                storage_rows: vec![],
             }],
             external_actors: vec![],
             imported_blobs: vec![],
             proof_requested: false,
         }
+    }
+
+    #[test]
+    fn actor_storage_witnesses_are_bounded_linear_and_canonical() {
+        let mut valid = work();
+        valid.imported_actors[0].storage_rows = vec![
+            ActorStorageRowV2 {
+                key: b"absent".to_vec(),
+                value: None,
+            },
+            ActorStorageRowV2 {
+                key: b"present".to_vec(),
+                value: Some(b"value".to_vec()),
+            },
+        ];
+        assert_eq!(WorkEnvelopeV2::decode(&valid.encode()), Ok(valid.clone()));
+
+        let mut unsorted = valid.clone();
+        unsorted.imported_actors[0].storage_rows.reverse();
+        assert_eq!(
+            WorkEnvelopeV2::decode(&unsorted.encode()),
+            Err(DecodeError::NonCanonical),
+        );
+
+        let mut crdt = valid.clone();
+        crdt.consistency = ConsistencyModeV2::Crdt;
+        crdt.base = ConsistencyBaseV2::Crdt { heads: vec![] };
+        crdt.base_causal_height = Some(0);
+        assert_eq!(
+            WorkEnvelopeV2::decode(&crdt.encode()),
+            Err(DecodeError::NonCanonical),
+        );
+
+        let mut too_many = work();
+        too_many.imported_actors[0].storage_rows = (0..=super::super::MAX_ACTOR_STORAGE_WITNESSES)
+            .map(|index| ActorStorageRowV2 {
+                key: (index as u32).to_be_bytes().to_vec(),
+                value: None,
+            })
+            .collect();
+        assert_eq!(
+            WorkEnvelopeV2::decode(&too_many.encode()),
+            Err(DecodeError::LimitExceeded),
+        );
+
+        let mut too_large = work();
+        too_large.imported_actors[0]
+            .storage_rows
+            .push(ActorStorageRowV2 {
+                key: b"large".to_vec(),
+                value: Some(vec![0; super::super::MAX_ACTOR_STORAGE_WITNESS_BYTES + 1]),
+            });
+        assert_eq!(
+            WorkEnvelopeV2::decode(&too_large.encode()),
+            Err(DecodeError::LimitExceeded),
+        );
     }
 
     fn message(byte: u8, await_ordinal: u64) -> MessageRecordV2 {
@@ -6303,6 +6414,7 @@ mod tests {
             state: state.clone(),
             causal_states: vec![],
             continuation: None,
+            storage_rows: vec![],
         }];
         work.imported_blobs = vec![extra.clone()];
 

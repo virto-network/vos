@@ -20,8 +20,8 @@ use super::{
     ACCUMULATE_ENTRY_IC, ACTOR_EFFECT_BATCH_MAX_BYTES, ACTOR_IPC_BASE_PAGE, ACTOR_IPC_CAP_SLOT,
     ACTOR_PRIVATE_INPUT_MAX_BYTES, AccumulatedRoleAssertionV2, AccumulationResultV2,
     ActorEffectBatchV2, ActorPrivateInputV2, ActorSliceInputV2, ActorSliceOutputV2,
-    ActorTreeImportV2, AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2, CheckpointTokenV2,
-    ContinuationSnapshotV2, CrdtChangeV2, CrdtDispatchV2, Hash, ImportedBlobV2,
+    ActorStorageKeyV2, ActorTreeImportV2, AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2,
+    CheckpointTokenV2, ContinuationSnapshotV2, CrdtChangeV2, CrdtDispatchV2, Hash, ImportedBlobV2,
     MAX_ROOT_TREE_ACTORS, Origin, ProgramId, REFINE_ENTRY_IC, RefineImportsV2, RoleCredentialV2,
     TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
 };
@@ -90,7 +90,7 @@ pub struct RefineTraceV2 {
     pub code_hashes: Vec<Hash>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServicePvmErrorV2 {
     InvalidProgram,
     /// Local allocation or JIT setup failed before guest execution began.
@@ -131,6 +131,9 @@ pub enum ServicePvmErrorV2 {
     ActorInputTooLarge,
     ActorIpcExhausted,
     ActorIpcSetupFailed,
+    /// Speculative Refine discovered actor-local point reads which must be
+    /// authenticated against the work base before execution is restarted.
+    ActorStorageWitnessRequired(Vec<ActorStorageKeyV2>),
     InvalidVmLifecycle,
 }
 
@@ -454,6 +457,8 @@ struct ActorRefineRuntimeV2 {
     record_attempts: BTreeMap<super::ActorId, u32>,
     record_successes: BTreeMap<super::ActorId, u32>,
     staged_records: BTreeMap<(super::ActorId, [u8; 32]), crate::provable::ProvableRecord>,
+    storage_rows: BTreeMap<(super::ActorId, Vec<u8>), Option<Vec<u8>>>,
+    missing_storage_rows: BTreeSet<ActorStorageKeyV2>,
     producer_records: Vec<ProducedProvableRecordV2>,
     producer_record_bytes: usize,
     outputs: Vec<ActorSliceOutputV2>,
@@ -507,6 +512,7 @@ impl ActorRefineRuntimeV2 {
 
         let mut private_inputs = BTreeMap::new();
         let mut task_programs = BTreeMap::new();
+        let mut storage_rows = BTreeMap::new();
         for actor in work.imported_actors.iter().filter(|actor| {
             program_layout
                 .binary_search_by_key(&actor.actor, |binding| binding.actor)
@@ -535,6 +541,15 @@ impl ActorRefineRuntimeV2 {
                 return Err(ServicePvmErrorV2::ActorInputTooLarge);
             }
             private_inputs.insert(actor.actor, private);
+            for row in &actor.storage_rows {
+                let value = row.value.clone();
+                if storage_rows
+                    .insert((actor.actor, row.key.clone()), value)
+                    .is_some()
+                {
+                    return Err(ServicePvmErrorV2::InvalidRefineImports);
+                }
+            }
             for dependency in &actor.task_dependencies {
                 let imported = imports
                     .programs
@@ -569,6 +584,8 @@ impl ActorRefineRuntimeV2 {
             record_attempts: BTreeMap::new(),
             record_successes: BTreeMap::new(),
             staged_records: BTreeMap::new(),
+            storage_rows,
+            missing_storage_rows: BTreeSet::new(),
             producer_records: Vec::new(),
             producer_record_bytes: 0,
             outputs: Vec::new(),
@@ -579,6 +596,12 @@ impl ActorRefineRuntimeV2 {
 
     fn take_producer_records(&mut self) -> Vec<ProducedProvableRecordV2> {
         core::mem::take(&mut self.producer_records)
+    }
+
+    fn take_missing_storage_rows(&mut self) -> Vec<ActorStorageKeyV2> {
+        core::mem::take(&mut self.missing_storage_rows)
+            .into_iter()
+            .collect()
     }
 
     fn has_record_activity(&self) -> bool {
@@ -899,7 +922,30 @@ impl ActorRefineRuntimeV2 {
                     .strip_prefix(crate::provable::PROOFREC_PREFIX)
                     .and_then(|tag| <[u8; 32]>::try_from(tag).ok())
                 else {
-                    return Ok(Some([crate::abi::error::HOST_NONE, 0]));
+                    if key.is_empty() || key.len() > super::MAX_ACTOR_STORAGE_KEY_BYTES {
+                        return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                    }
+                    let lookup = (actor, key.clone());
+                    let Some(value) = self.storage_rows.get(&lookup) else {
+                        if self.missing_storage_rows.len() >= super::MAX_ACTOR_STORAGE_WITNESSES {
+                            return Err(ServicePvmErrorV2::ActorInputTooLarge);
+                        }
+                        self.missing_storage_rows
+                            .insert(ActorStorageKeyV2 { actor, key });
+                        return Ok(Some([crate::abi::error::HOST_NONE, 0]));
+                    };
+                    let Some(bytes) = value.as_ref() else {
+                        return Ok(Some([crate::abi::error::HOST_NONE, 0]));
+                    };
+                    let output_address = u32::try_from(kernel.active_reg(9))
+                        .map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
+                    let capacity = usize::try_from(kernel.active_reg(10))
+                        .map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
+                    let copy_len = bytes.len().min(capacity);
+                    if !kernel.write_data_cap_window(output_address, &bytes[..copy_len]) {
+                        return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                    }
+                    return Ok(Some([bytes.len() as u64, 0]));
                 };
                 let Some(record) = self.staged_records.get(&(actor, tag)) else {
                     return Ok(Some([crate::abi::error::HOST_NONE, 0]));
@@ -2134,6 +2180,12 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
         };
         match result {
             KernelResult::Halt => {
+                if let Some(runtime) = actor_runtime.as_mut() {
+                    let missing = runtime.take_missing_storage_rows();
+                    if !missing.is_empty() {
+                        return Err(ServicePvmErrorV2::ActorStorageWitnessRequired(missing));
+                    }
+                }
                 let bytes = read_output(&kernel)?;
                 let task_gas_used = actor_runtime
                     .as_ref()
@@ -2173,18 +2225,36 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                 });
             }
             KernelResult::Panic => {
+                if let Some(runtime) = actor_runtime.as_mut() {
+                    let missing = runtime.take_missing_storage_rows();
+                    if !missing.is_empty() {
+                        return Err(ServicePvmErrorV2::ActorStorageWitnessRequired(missing));
+                    }
+                }
                 return Err(ServicePvmErrorV2::Panic {
                     vm: kernel.active_vm,
                     pc: kernel.vm_arena.vm(kernel.active_vm).pc,
                 });
             }
             KernelResult::OutOfGas => {
+                if let Some(runtime) = actor_runtime.as_mut() {
+                    let missing = runtime.take_missing_storage_rows();
+                    if !missing.is_empty() {
+                        return Err(ServicePvmErrorV2::ActorStorageWitnessRequired(missing));
+                    }
+                }
                 return Err(ServicePvmErrorV2::OutOfGas {
                     vm: kernel.active_vm,
                     pc: kernel.vm_arena.vm(kernel.active_vm).pc,
                 });
             }
             KernelResult::PageFault(address) => {
+                if let Some(runtime) = actor_runtime.as_mut() {
+                    let missing = runtime.take_missing_storage_rows();
+                    if !missing.is_empty() {
+                        return Err(ServicePvmErrorV2::ActorStorageWitnessRequired(missing));
+                    }
+                }
                 return Err(ServicePvmErrorV2::PageFault {
                     vm: kernel.active_vm,
                     address,
@@ -2194,17 +2264,34 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                 if let Some(recorder) = trace.as_mut() {
                     recorder.protocol_call(slot, &kernel);
                 }
-                if let Some(runtime) = actor_runtime.as_mut()
-                    && let Some([result0, result1]) =
-                        runtime.handle(slot, &mut kernel, trace.as_mut())?
-                {
-                    kernel
-                        .resume_protocol_call(result0, result1)
-                        .map_err(|_| ServicePvmErrorV2::InvalidProtocolResume)?;
-                    if let Some(recorder) = trace.as_mut() {
-                        recorder.protocol_resume(slot, result0, result1);
+                if let Some(runtime) = actor_runtime.as_mut() {
+                    match runtime.handle(slot, &mut kernel, trace.as_mut()) {
+                        Ok(Some([result0, result1])) => {
+                            kernel
+                                .resume_protocol_call(result0, result1)
+                                .map_err(|_| ServicePvmErrorV2::InvalidProtocolResume)?;
+                            if let Some(recorder) = trace.as_mut() {
+                                recorder.protocol_resume(slot, result0, result1);
+                            }
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            let missing = runtime.take_missing_storage_rows();
+                            if !missing.is_empty() {
+                                return Err(ServicePvmErrorV2::ActorStorageWitnessRequired(
+                                    missing,
+                                ));
+                            }
+                            return Err(error);
+                        }
                     }
-                    continue;
+                }
+                if let Some(runtime) = actor_runtime.as_mut() {
+                    let missing = runtime.take_missing_storage_rows();
+                    if !missing.is_empty() {
+                        return Err(ServicePvmErrorV2::ActorStorageWitnessRequired(missing));
+                    }
                 }
                 if !refine_protocol_call_is_pure(slot) {
                     return Err(ServicePvmErrorV2::ForbiddenRefineProtocolCall(slot));

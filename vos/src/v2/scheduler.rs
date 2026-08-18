@@ -17,14 +17,15 @@ use super::contracts::crdt_change_blob_references;
 use super::guest_accumulate::materialized_continuations;
 use super::{
     AccumulatedReplyV2, AccumulatedTimeoutV2, ActorDirectoryV2, ActorGenesisV2, ActorId,
-    AuthorizationEvidenceV2, BlobRefV2, CallExpirationEnvelopeV2, CallId, CallTimeoutV2,
-    CausalCallContextV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2,
-    CrdtChangeV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2, DecodeError, DeliveryEnvelopeV2,
-    DeliveryRecordV2, DirectIngressV2, ExternalActorDirectoryV2, ImportedActorV2, ImportedBlobV2,
-    ImportedProgramV2, InboxRetirementV2, InvocationId, LocalJamStoreV2, LocalStoreReadErrorV2,
-    MessageRecordV2, Origin, RefineImportsV2, ServiceIdentityV2, StateKeyV2, V2Wire,
-    WorkEnvelopeV2, WorkflowCheckpointV2, WorkflowOperationV2, crdt_node_receipt_storage_key,
-    crdt_node_storage_key, delivery_storage_key,
+    ActorStorageKeyV2, ActorStorageRowV2, AuthorizationEvidenceV2, BlobRefV2,
+    CallExpirationEnvelopeV2, CallId, CallTimeoutV2, CausalCallContextV2, ConsistencyBaseV2,
+    ConsistencyModeV2, ContinuationSnapshotV2, CrdtChangeV2, CrdtSyncEnvelopeV2, CrdtSyncNodeV2,
+    DecodeError, DeliveryEnvelopeV2, DeliveryRecordV2, DirectIngressV2, ExternalActorDirectoryV2,
+    ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxRetirementV2, InvocationId,
+    LocalJamStoreV2, LocalStoreReadErrorV2, MessageRecordV2, Origin, RefineImportsV2,
+    ServiceIdentityV2, StateKeyV2, V2Wire, WorkEnvelopeV2, WorkflowCheckpointV2,
+    WorkflowOperationV2, crdt_node_receipt_storage_key, crdt_node_storage_key,
+    delivery_storage_key,
 };
 
 /// Caller-controlled portion of one local work item. The scheduler supplies
@@ -86,6 +87,7 @@ pub enum ScheduleErrorV2 {
     InvalidNodeReceipt(super::Hash),
     CorruptCausalDag,
     NonCanonicalImports,
+    ActorStorageWitnessLimit,
 }
 
 impl core::fmt::Display for ScheduleErrorV2 {
@@ -105,6 +107,89 @@ impl From<LocalStoreReadErrorV2> for ScheduleErrorV2 {
 pub struct LocalWorkSchedulerV2;
 
 impl LocalWorkSchedulerV2 {
+    /// Extend a prepared linear slice with the exact actor rows discovered by
+    /// a speculative Refine run. Every value is read at the work's committed
+    /// base root; absence is explicit. Refine is then restarted from its
+    /// original machine state, so actors never observe the provisional
+    /// HOST_NONE results.
+    pub(crate) fn hydrate_actor_storage_rows(
+        store: &LocalJamStoreV2,
+        prepared: &mut PreparedWorkV2,
+        requests: &[ActorStorageKeyV2],
+    ) -> Result<(), ScheduleErrorV2> {
+        let ConsistencyBaseV2::Linear { state_root, .. } = &prepared.work.base else {
+            return Err(ScheduleErrorV2::UnsupportedConsistency(
+                prepared.work.consistency,
+            ));
+        };
+        if requests.is_empty()
+            || requests.len() > super::MAX_ACTOR_STORAGE_WITNESSES
+            || requests.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(ScheduleErrorV2::NonCanonicalImports);
+        }
+
+        let existing_count = prepared
+            .work
+            .imported_actors
+            .iter()
+            .map(|actor| actor.storage_rows.len())
+            .sum::<usize>();
+        if existing_count.saturating_add(requests.len()) > super::MAX_ACTOR_STORAGE_WITNESSES {
+            return Err(ScheduleErrorV2::NonCanonicalImports);
+        }
+        let mut value_bytes = prepared
+            .work
+            .imported_actors
+            .iter()
+            .flat_map(|actor| &actor.storage_rows)
+            .filter_map(|row| row.value.as_ref())
+            .try_fold(0usize, |total, value| total.checked_add(value.len()))
+            .ok_or(ScheduleErrorV2::NonCanonicalImports)?;
+
+        for request in requests {
+            if request.key.is_empty() || request.key.len() > super::MAX_ACTOR_STORAGE_KEY_BYTES {
+                return Err(ScheduleErrorV2::NonCanonicalImports);
+            }
+            let actor = prepared
+                .work
+                .imported_actors
+                .iter_mut()
+                .find(|actor| actor.actor == request.actor)
+                .ok_or(ScheduleErrorV2::MissingActor(request.actor))?;
+            if actor
+                .storage_rows
+                .binary_search_by(|row| row.key.cmp(&request.key))
+                .is_ok()
+            {
+                return Err(ScheduleErrorV2::NonCanonicalImports);
+            }
+            let key = StateKeyV2::ActorRow {
+                actor: request.actor,
+                key: request.key.clone(),
+            };
+            let value = store.state_row(*state_root, &key)?;
+            if let Some(value) = value.as_ref() {
+                value_bytes = value_bytes
+                    .checked_add(value.len())
+                    .filter(|total| *total <= super::MAX_ACTOR_STORAGE_WITNESS_BYTES)
+                    .ok_or(ScheduleErrorV2::NonCanonicalImports)?;
+            }
+            let index = actor
+                .storage_rows
+                .binary_search_by(|row| row.key.cmp(&request.key))
+                .unwrap_err();
+            actor.storage_rows.insert(
+                index,
+                ActorStorageRowV2 {
+                    key: request.key.clone(),
+                    value,
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Bind stable caller input to the service's exact current linear revision
     /// or causal frontier. CRDT admission becomes a workflow DAG node before
     /// Refine runs; constructing this input is read-only.
@@ -885,6 +970,7 @@ impl LocalWorkSchedulerV2 {
             state: state.clone(),
             causal_states: states.clone(),
             continuation: continuation.clone(),
+            storage_rows: Vec::new(),
         });
 
         let mut programs = BTreeMap::new();
@@ -966,6 +1052,7 @@ impl LocalWorkSchedulerV2 {
                 state: sibling_state.clone(),
                 causal_states: sibling_states.clone(),
                 continuation: sibling_continuation.clone(),
+                storage_rows: Vec::new(),
             });
             let pvm = store
                 .program(descriptor.program)

@@ -84,6 +84,7 @@ tracing-log = "0.2"
 libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "mdns", "macros", "ping", "identify", "request-response", "gossipsub"] }
 
 [dev-dependencies]
+clerk-ledger = { path = "../actors/clerk-ledger", default-features = false }
 # Dev-only: the registry protocol (rows / status / canonical signing
 # bytes / the `RegistryRef` client) now lives in `vos::registry`, so the
 # shipped `vosx` binary carries no dependency on the space-registry actor

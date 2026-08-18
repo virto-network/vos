@@ -70,7 +70,17 @@ fn build_accepts_the_canonical_binary_task_project() {
     package.validate().expect("generated package is canonical");
     assert_eq!(package.task_dependencies.len(), 1);
     assert_eq!(
+        package.task_dependencies[0].binding.task.0,
+        clerk_ledger::CLERK_APPLY_TASK_HASH,
+        "the package builder and Clerk actor must agree on the immutable Task identity",
+    );
+    assert_eq!(
         package.task_dependencies[0].binding.witness_capacity,
         16 * 1024
+    );
+    assert!(
+        String::from_utf8_lossy(&built.stdout)
+            .contains(&hex::encode(clerk_ledger::CLERK_APPLY_TASK_HASH)),
+        "build output exposes the dependency pin for release/review tooling",
     );
 }

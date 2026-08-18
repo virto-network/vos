@@ -530,6 +530,7 @@ mod tests {
                 },
                 causal_states: vec![],
                 continuation: None,
+                storage_rows: vec![],
             }],
             external_actors: vec![],
             imported_blobs: vec![],
@@ -584,6 +585,7 @@ mod tests {
             },
             causal_states: vec![],
             continuation: None,
+            storage_rows: vec![],
         });
         snapshot.validate_resume_for(&work).unwrap();
 
@@ -619,6 +621,7 @@ mod tests {
             },
             causal_states: vec![],
             continuation: None,
+            storage_rows: vec![],
         });
         assert_eq!(
             snapshot.validate_checkpoint_for(&work),

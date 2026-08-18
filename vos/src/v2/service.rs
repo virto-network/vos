@@ -593,7 +593,7 @@ pub trait CommittedAccumulateLogV2 {
     ) -> Result<(), Self::Error>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceDispatchError {
     Pvm(ServicePvmErrorV2),
     ServiceProgramMismatch {
@@ -1340,7 +1340,7 @@ where
             if let Err(error) = outcome.as_ref()
                 && !error.is_deterministic_accumulate_failure()
             {
-                return Err(ReplicatedServiceErrorV2::Dispatch(*error));
+                return Err(ReplicatedServiceErrorV2::Dispatch(error.clone()));
             }
             let service_image = self.service.accumulate_host().committed_service_image();
             let proof_artifacts =

@@ -7764,6 +7764,7 @@ dependencies = [
  "anyhow",
  "bs58",
  "clap",
+ "clerk-ledger",
  "getrandom 0.2.17",
  "grey-transpiler",
  "hex",

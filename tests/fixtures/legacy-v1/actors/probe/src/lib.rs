@@ -15,17 +15,26 @@
 use vos::abi::service::ServiceId;
 use vos::agent::{TaskStatus, Tasks};
 use vos::prelude::*;
+use vos::storage::StorageMap;
 use vos::value::Value;
 
 #[actor]
 struct Probe {
     seen: u32,
+    /// Point-read fixture for the service-v2 transport path. The default is
+    /// deliberately absent so even the first peer call must authenticate a
+    /// storage-row absence against the destination's exact base.
+    #[storage(prefix = "probe/peer-values/")]
+    peer_values: StorageMap<u64, u32>,
 }
 
 #[messages]
 impl Probe {
     fn new() -> Self {
-        Probe { seen: 0 }
+        Probe {
+            seen: 0,
+            peer_values: Default::default(),
+        }
     }
 
     /// Count this message, then yield. A batch of `ping`s therefore
@@ -88,6 +97,32 @@ impl Probe {
     #[msg]
     async fn peer_value(&self) -> u32 {
         7
+    }
+
+    /// Storage-witness variant used to prove transport-driven Refine can
+    /// authenticate an absent destination row before executing the inbox.
+    #[msg]
+    async fn peer_value_storage(&self) -> u32 {
+        self.peer_values.get(&0).unwrap_or(7)
+    }
+
+    /// Durable-await counterpart to [`Self::peer_value_storage`]. Keeping the
+    /// method separate avoids making unrelated transport and Raft fixtures
+    /// depend on the storage-witness orchestration contract they do not test.
+    #[msg]
+    async fn await_storage_peer(&mut self, ctx: &mut Context<Self>) -> u32 {
+        self.seen += 1;
+        if let Ok(vos::value::Value::U32(value)) = ctx
+            .ask_actor(
+                ActorId([44; 32]),
+                &Msg::new("peer_value_storage"),
+                Some(100),
+            )
+            .await
+        {
+            self.seen += value;
+        }
+        self.seen
     }
 
     /// Two durable calls with mutations on both sides of the first resume.

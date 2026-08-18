@@ -14,8 +14,8 @@ use super::{
     AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2, AttestedServiceErrorV2,
     CallId, InvocationId, JamServiceV2, LocalJamStoreHostV2, LocalStoreReadErrorV2,
     LocalWorkSchedulerV2, NoRefineProtocolHostV2, ProofVerificationRequestV2, PublicationAckV2,
-    PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2, ScheduleErrorV2,
-    ServiceDispatchError, V2Wire,
+    PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefinedServiceOutputV2,
+    ScheduleErrorV2, ServiceDispatchError, ServicePvmErrorV2, V2Wire,
 };
 
 type LocalServiceV2<A> = JamServiceV2<NoRefineProtocolHostV2, A>;
@@ -125,6 +125,35 @@ impl From<ServiceDispatchError> for LocalTransportErrorV2 {
 pub struct LocalTransportV2;
 
 impl LocalTransportV2 {
+    fn refine_with_storage_witnesses<A>(
+        service: &LocalServiceV2<A>,
+        mut prepared: super::PreparedWorkV2,
+    ) -> Result<(super::PreparedWorkV2, RefinedServiceOutputV2), LocalTransportErrorV2>
+    where
+        A: LocalJamStoreHostV2 + AccumulateProtocolHostV2,
+    {
+        let mut discovery_rounds = 0usize;
+        loop {
+            match service.refine_actor_tree(&prepared.work, &prepared.imports) {
+                Ok(refined) => return Ok((prepared, refined)),
+                Err(ServiceDispatchError::Pvm(ServicePvmErrorV2::ActorStorageWitnessRequired(
+                    requests,
+                ))) => {
+                    if discovery_rounds >= super::MAX_ACTOR_STORAGE_WITNESS_ROUNDS {
+                        return Err(ScheduleErrorV2::ActorStorageWitnessLimit.into());
+                    }
+                    discovery_rounds += 1;
+                    LocalWorkSchedulerV2::hydrate_actor_storage_rows(
+                        service.accumulate_host().local_store(),
+                        &mut prepared,
+                        &requests,
+                    )?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     fn retire_expired_inbox<A>(
         destination: &mut LocalServiceV2<A>,
         call: CallId,
@@ -345,7 +374,7 @@ impl LocalTransportV2 {
             logical_timeslot,
             Some(awaited_reply.clone()),
         )?;
-        let refined = caller.refine_actor_tree(&prepared.work, &prepared.imports)?;
+        let (prepared, refined) = Self::refine_with_storage_witnesses(caller, prepared)?;
         let accumulated =
             caller.accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                 work: prepared.work,
@@ -432,7 +461,7 @@ impl LocalTransportV2 {
                 }
                 Err(error) => return Err(error.into()),
             };
-            let refined = destination.refine_actor_tree(&prepared.work, &prepared.imports)?;
+            let (prepared, refined) = Self::refine_with_storage_witnesses(destination, prepared)?;
             let accumulated =
                 destination.accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
                     work: prepared.work,
@@ -508,9 +537,7 @@ impl LocalTransportV2 {
                 }
                 Err(error) => return Err(LocalTransportErrorV2::Schedule(error).into()),
             };
-            let refined = destination
-                .refine_actor_tree(&prepared.work, &prepared.imports)
-                .map_err(LocalTransportErrorV2::Service)?;
+            let (prepared, refined) = Self::refine_with_storage_witnesses(destination, prepared)?;
             let envelope = AccumulationEnvelopeV2 {
                 work: prepared.work,
                 transition: refined.transition,

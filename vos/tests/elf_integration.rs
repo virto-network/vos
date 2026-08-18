@@ -6273,6 +6273,11 @@ fn clerk_ledger_bootstrap_and_create_account() {
         vos::zk::witness_symbol(&clerk_apply_elf).expect("clerk-apply exports __VOS_WITNESS");
     let clerk_apply_blob = transpile_actor(&clerk_apply_elf);
     let clerk_apply_hash = vos::provable::task_blob_hash(&clerk_apply_blob);
+    assert_eq!(
+        clerk_apply_hash,
+        clerk_ledger::CLERK_APPLY_TASK_HASH,
+        "the actor's immutable Task pin must match the canonical clerk-apply PVM",
+    );
 
     let mut node = VosNode::with_prefix(0);
     let ledger_id = node.register(AgentConfig::new(blob).with_task_blob(
@@ -6502,38 +6507,11 @@ fn clerk_ledger_bootstrap_and_create_account() {
     let host_observed_root_before =
         vos::block_on(ledger.state_root(&mut &node)).expect("invoke state_root pre-transfer");
 
-    // A root without the configured Task fails before changing ledger state
-    // or capturing a producer record.
-    assert_eq!(
-        vos::block_on(ledger.apply_transfer_provable(
-            &mut &node,
-            transfer_bytes.clone(),
-            openings_bytes.clone(),
-            transfer_ts,
-        ))
-        .expect("invoke apply_transfer_provable without Task"),
-        Status::ProofUnavailable,
-    );
-    assert_eq!(
-        vos::block_on(ledger.state_root(&mut &node)).expect("state root after refused proof"),
-        host_observed_root_before,
-    );
-    assert!(
-        vos::block_on(ledger.transfer_proof_record(&mut &node, transfer_id))
-            .expect("read absent proof record")
-            .is_empty(),
-    );
-
-    // Task selection is one-time and idempotent: an operator cannot swap the
-    // proving program after records have begun to accumulate.
+    // The compatibility method only confirms the immutable actor pin. An
+    // operator cannot select a different proving program at runtime.
     assert_eq!(
         vos::block_on(ledger.configure_provable_apply(&mut &node, clerk_apply_hash))
-            .expect("configure clerk-apply Task"),
-        Status::Ok,
-    );
-    assert_eq!(
-        vos::block_on(ledger.configure_provable_apply(&mut &node, clerk_apply_hash))
-            .expect("repeat clerk-apply Task configuration"),
+            .expect("confirm clerk-apply Task pin"),
         Status::Ok,
     );
     assert_eq!(
@@ -12599,7 +12577,7 @@ fn clerk_apply_elf_path() -> std::path::PathBuf {
         return std::path::PathBuf::from(p);
     }
     std::path::PathBuf::from(format!(
-        "{}/../tests/fixtures/provable/clerk-apply/target/riscv64em-javm/release/clerk-apply.elf",
+        "{}/../tests/fixtures/provable/clerk-apply/target/vosx-canonical/riscv64em-javm/release/clerk-apply.elf",
         env!("CARGO_MANIFEST_DIR"),
     ))
 }

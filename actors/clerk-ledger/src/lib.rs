@@ -152,6 +152,14 @@ pub fn transfer_record_tag(id: &[u8; 16]) -> [u8; 32] {
     vos::crypto::blake2b_hash::<32>(b"clerk-ledger/provable-transfer/v1", &[id])
 }
 
+/// Canonical content address of the pure `clerk-apply` Task this actor is
+/// compiled to invoke. Production packages must carry this exact Task as a
+/// signed dependency; selecting a prover program is not mutable ledger state.
+pub const CLERK_APPLY_TASK_HASH: [u8; 32] = [
+    0x4d, 0xff, 0xb1, 0xb6, 0x41, 0x03, 0x52, 0xf4, 0x85, 0x49, 0xba, 0xf2, 0xdb, 0xda, 0x61, 0xa2,
+    0x56, 0x90, 0x4e, 0x55, 0xbd, 0xd4, 0xfd, 0xef, 0x87, 0x85, 0x59, 0xd4, 0xad, 0xa4, 0xf6, 0x01,
+];
+
 /// Decode an rkyv archive or short-circuit with `Status::BadInput`.
 /// Macro form rather than a generic function because rkyv's
 /// `from_bytes` carries non-trivial where-clauses
@@ -248,11 +256,6 @@ pub struct ClerkLedger {
     /// publish nullifiers — the spent-set is a follow-up slice.
     #[storage]
     note_commitments: StorageVec<[u8; 32]>,
-    /// Content-address of the pure `clerk-apply` Task selected by the
-    /// operator. The runtime must also have the corresponding Task blob.
-    /// Package-level dependency installation remains a separate cutover
-    /// step; a missing blob fails before ledger mutation.
-    clerk_apply_task: Option<[u8; 32]>,
 }
 
 impl ClerkLedger {
@@ -372,7 +375,6 @@ impl ClerkLedger {
             pending_statuses: Default::default(),
             transfer_roots: Default::default(),
             note_commitments: Default::default(),
-            clerk_apply_task: None,
         }
     }
 
@@ -510,10 +512,9 @@ impl ClerkLedger {
             .collect()
     }
 
-    /// Select the content-addressed `clerk-apply` Task used by
-    /// [`Self::apply_transfer_provable`]. Configuration is explicit until
-    /// signed packages carry Task dependencies; a zero hash is never a valid
-    /// content address. Repeating the same configuration is idempotent.
+    /// Compatibility probe for tooling which previously configured the Task
+    /// after installation. The selection is now immutable: only the
+    /// actor-compiled canonical hash is accepted and no ledger state changes.
     #[msg(role = ClerkLedgerRole::Operator)]
     async fn configure_provable_apply(
         &mut self,
@@ -523,17 +524,9 @@ impl ClerkLedger {
         if !Self::authorize_proof_operator(ctx) {
             return Status::BadInput;
         }
-        if task_hash == [0u8; 32] {
-            return Status::BadInput;
-        }
-        match self.clerk_apply_task {
-            None => {
-                self.clerk_apply_task = Some(task_hash);
-                Status::Ok
-            }
-            Some(existing) if existing == task_hash => Status::Ok,
-            Some(_) => Status::BadInput,
-        }
+        (task_hash == CLERK_APPLY_TASK_HASH)
+            .then_some(Status::Ok)
+            .unwrap_or(Status::BadInput)
     }
 
     /// Accept a signed `cipher_clerk::types::Transfer` plus the
@@ -655,12 +648,12 @@ impl ClerkLedger {
     /// the live committed maps only when the Task's bound roots and batch
     /// digest match exactly.
     ///
-    /// This is the parent-side D6 contract. Service-v2 Local execution binds
-    /// the invocation to a private-input commitment, hydrates the exact Refine
-    /// trace from an operator sidecar, and persists the resulting witness to
-    /// the producer-private record sidecar before committing actor state.
-    /// Raft/CRDT Task packages remain fail-closed until private input
-    /// availability has its own replicated protocol.
+    /// This is the parent-side D6 contract. Service-v2 Local and Raft
+    /// execution bind the invocation to a private-input commitment, hydrate
+    /// the exact Refine trace from an operator sidecar, and persist the
+    /// resulting witness to the producer-private record sidecar before
+    /// committing actor state. CRDT Task packages remain fail-closed until
+    /// private input availability has a causal replication protocol.
     #[msg(role = ClerkLedgerRole::Operator)]
     async fn apply_transfer_provable(
         &mut self,
@@ -671,9 +664,7 @@ impl ClerkLedger {
         if self.journal_id.is_none() {
             return Status::NotBootstrapped;
         }
-        let Some(task_hash) = self.clerk_apply_task else {
-            return Status::ProofUnavailable;
-        };
+        let task_hash = CLERK_APPLY_TASK_HASH;
         let transfer: CcTransfer = decode_or_bad_input!(&transfer_bytes, CcTransfer);
         let openings: Vec<Opening> = decode_or_bad_input!(&openings_bytes, Vec<Opening>);
         if !self.transfer_signatures_valid(&transfer) {
