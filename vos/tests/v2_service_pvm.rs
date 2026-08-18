@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use vos::attestation::{
@@ -34,7 +34,8 @@ use vos::v2::{
     LocalRootTreeOpenErrorV2, LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2,
     LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
     PackageManifestV2, PackageRolePoliciesV2, PackageTaskDependencyV2, PrivateIngressStagingV2,
-    ProducerId, ProgramId, ProofArtifactStoreV2, ProofVerificationRequestV2, PublishedEffectsV2,
+    ProducerId, ProductionTrustDecisionV2, ProductionTrustErrorV2, ProductionTrustV2, ProgramId,
+    ProofArtifactStoreV2, ProofVerificationRequestV2, PublishedEffectsV2,
     ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2,
     ReplicatedServiceErrorV2, ReplyRecordV2, RoleAuthorityBindingV2,
     RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2, RoleAuthorizationClaimV2,
@@ -1326,6 +1327,160 @@ fn attested_root_fixture(
         proof_requested: true,
     };
     (config, request)
+}
+
+struct TestProductionTrust {
+    policy: Hash,
+    slot: AtomicU64,
+    allow: bool,
+}
+
+impl TestProductionTrust {
+    fn new(policy: u8, slot: u64, allow: bool) -> Self {
+        Self {
+            policy: Hash([policy; 32]),
+            slot: AtomicU64::new(slot),
+            allow,
+        }
+    }
+}
+
+impl ProductionTrustV2 for TestProductionTrust {
+    fn policy_id(&self) -> Hash {
+        self.policy
+    }
+
+    fn logical_timeslot(&self) -> Option<u64> {
+        Some(self.slot.load(Ordering::Relaxed))
+    }
+
+    fn verify_logical_timeslot(&self, logical_timeslot: u64) -> ProductionTrustDecisionV2 {
+        if !self.allow {
+            ProductionTrustDecisionV2::Denied
+        } else if logical_timeslot == self.slot.load(Ordering::Relaxed) {
+            ProductionTrustDecisionV2::Authorized
+        } else {
+            ProductionTrustDecisionV2::Denied
+        }
+    }
+
+    fn verify_proof(
+        &self,
+        _request: &ProofVerificationRequestV2,
+        _proof: &[u8],
+    ) -> ProductionTrustDecisionV2 {
+        if self.allow {
+            ProductionTrustDecisionV2::Authorized
+        } else {
+            ProductionTrustDecisionV2::Denied
+        }
+    }
+
+    fn verify_install(&self, _genesis: &ServiceGenesisV2) -> ProductionTrustDecisionV2 {
+        if self.allow {
+            ProductionTrustDecisionV2::Authorized
+        } else {
+            ProductionTrustDecisionV2::Denied
+        }
+    }
+
+    fn verify_upgrade(&self, _upgrade: &ActorUpgradeV2) -> ProductionTrustDecisionV2 {
+        if self.allow {
+            ProductionTrustDecisionV2::Authorized
+        } else {
+            ProductionTrustDecisionV2::Denied
+        }
+    }
+
+    fn verify_role_credential(
+        &self,
+        _request: &RoleCredentialVerificationRequestV2,
+    ) -> ProductionTrustDecisionV2 {
+        if self.allow {
+            ProductionTrustDecisionV2::Authorized
+        } else {
+            ProductionTrustDecisionV2::Denied
+        }
+    }
+
+    fn verify_receipt(&self, _request: &ReceiptVerificationRequestV2) -> ProductionTrustDecisionV2 {
+        if self.allow {
+            ProductionTrustDecisionV2::Authorized
+        } else {
+            ProductionTrustDecisionV2::Denied
+        }
+    }
+}
+
+#[test]
+fn production_root_requires_the_same_durable_trust_policy_after_restart() {
+    let (config, mut request) = attested_root_fixture(ConsistencyModeV2::Local, 0x39);
+    let backend = SharedCommittedImages::default();
+    let trust = Arc::new(TestProductionTrust::new(0x81, 77, true));
+    let mut service =
+        LocalRootTreeServiceV2::open_production(config.clone(), backend.clone(), trust.clone())
+            .expect("production authority approves physical guest installation");
+    assert_eq!(service.production_trust_policy_id(), Some(trust.policy));
+    request.method = "increment".into();
+    request.arguments = {
+        let mut arguments = vec![vos::value::TAG_DYNAMIC];
+        arguments.extend_from_slice(&Msg::new("increment").with("amount", 1_u32).encode());
+        arguments
+    };
+    request.proof_requested = false;
+    request.logical_timeslot = 76;
+    let before = service.store().header().unwrap().unwrap();
+    assert!(matches!(
+        service.invoke(request.clone()),
+        Err(LocalRootTreeInvokeErrorV2::Service(
+            ServiceDispatchError::Pvm(ServicePvmErrorV2::AccumulateHostRejected(slot)),
+        )) if slot == vos::abi::hostcall::ACCUMULATION_TIMESLOT as u8,
+    ));
+    assert_eq!(
+        service.store().header().unwrap().unwrap(),
+        before,
+        "an unverified embedded slot reaches neither guest state nor dedup",
+    );
+    request.logical_timeslot = 77;
+    service
+        .invoke(request)
+        .expect("the consensus-verified embedded slot reaches physical IC-5");
+    drop(service);
+
+    assert!(matches!(
+        LocalRootTreeServiceV2::open(config.clone(), backend.clone()),
+        Err(LocalRootTreeOpenErrorV2::ProductionTrust(
+            ProductionTrustErrorV2::TrustRequired,
+        )),
+    ));
+    assert!(matches!(
+        LocalRootTreeServiceV2::open_production(
+            config.clone(),
+            backend.clone(),
+            Arc::new(TestProductionTrust::new(0x82, 77, true)),
+        ),
+        Err(LocalRootTreeOpenErrorV2::ProductionTrust(
+            ProductionTrustErrorV2::PolicyMismatch,
+        )),
+    ));
+    let reopened = LocalRootTreeServiceV2::open_production(config, backend, trust)
+        .expect("the identical production policy reopens its sealed image");
+    assert_eq!(
+        reopened.production_trust_policy_id(),
+        Some(Hash([0x81; 32]))
+    );
+
+    let (denied_config, _) = attested_root_fixture(ConsistencyModeV2::Local, 0x38);
+    assert!(matches!(
+        LocalRootTreeServiceV2::open_production(
+            denied_config,
+            SharedCommittedImages::default(),
+            Arc::new(TestProductionTrust::new(0x83, 78, false)),
+        ),
+        Err(LocalRootTreeOpenErrorV2::InstallRejected(
+            AccumulationRejectionV2::Unauthorized,
+        )),
+    ));
 }
 
 #[test]

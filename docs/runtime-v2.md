@@ -232,8 +232,11 @@ that guest-owned publication state machine. For a Raft destination, the
 authenticated source-receipt decision is quorum-ordered beside `Deliver` or
 the resumed `Apply`, so a follower never depends on the leader's process-local
 receipt cache. Proof and attestation publications stay durable but are not
-admitted by this ordinary node route. The host-generated logical timeslot is still a local admission
-ordinal, not a consensus JAM slot.
+admitted by this ordinary node route. Roots opened through the default
+conformance profile still use a host-generated local admission ordinal. A
+production-profile root instead accepts only the exact slot returned by its
+installed JAM trust capability; it never substitutes wall time or increments
+that observation to manufacture a later slot.
 
 `RootTreeTransportV2` is the canonical node wire for an ordinary publication,
 reply, or exact publication acknowledgement. It carries no observation slot:
@@ -654,30 +657,68 @@ The actor-side resume branch rebinds and resets the restored CRDT operation
 allocator, so post-await operations cannot reuse the pre-await change
 namespace.
 
-Before that production cutover, the Install authorization capability must be
-backed by consensus-authoritative deployment state rather than the local
-conformance allowlist. That authority must bind the executing JAM service
-account and its current code identity to the exact signature-verified package
-and derived genesis, not trust the genesis's self-declared identity.
-`ROLE_CREDENTIAL_VERIFY` must use the consensus-authoritative role issuer
-rather than its local conformance allowlist. Installed `PROGRAM_LOOKUP`
-availability is already part of the recoverable service image: Install and
-Upgrade order the exact content-addressed program/genesis bytes and stage them
-atomically with IC-5, while snapshots carry the resulting catalog.
-`RECEIPT_VERIFY` must likewise use consensus-authoritative receipt finality
-rather than its local conformance allowlist for general delivery and reply
-paths. The automatic CRDT driver currently derives that verifier decision only
-after authenticating and sync-floor-authorizing an enrolled node's complete
-Noise identity; deployments which do not trust every authorized replica must
-carry an independently verifiable finality certificate instead. Direct
-role-authorized Raft ingress
+## Production trust profile
+
+`ProductionTrustV2` is the fail-closed host boundary for the trust inputs which
+cannot be invented by the service guest: the observed JAM slot and proof,
+Install, Upgrade, role-credential, and accumulation-receipt verification. Its
+nonzero `policy_id` is a stable commitment to the complete authority set and
+verification rules. The host seals that ID to every exact durable service
+image. Reopening without the capability, replacing it with another policy, or
+attempting to promote a nonempty conformance image fails before guest
+execution, snapshot replacement, or Raft replay.
+
+When this profile is installed, the process-local `allow_install`,
+`allow_upgrade`, `allow_role_credential`, `allow_receipt`, and `allow_proof`
+test seams cannot grant authority or replace its proof verifier. Receipt
+sidecars still order the verifier's exact public input through Raft; they do
+not authorize themselves, because each replica invokes the production policy
+before making the request visible to IC-5. A missing time observation or one
+behind the committed admission high-water stops admission and timeout driving.
+Repeated transitions may share one genuine JAM slot.
+The same policy re-verifies slots embedded in direct ingress, actor work, and
+delivery requests before proposal and again during follower replay; opening a
+production root does not leave the lower-level service API as a backdating
+bypass. Historical verification is a consensus lookup/certificate check, not
+an equality check against whatever slot happens to be current at replay time.
+Verifier decisions distinguish `Denied` from `Unavailable`: a deterministic
+denial is a guest-visible authorization result, while unavailable Install,
+Upgrade, or role authority returns a host failure so a committed Raft entry
+cannot advance its applied cursor as though every replica had denied it.
+
+The crash-recovery image uses the clean-break `VSS4` wire. Its production
+provenance commits `(policy_id, exact image bytes)` and is re-sealed only after
+the durable commit boundary succeeds. This host-image change does not alter a
+guest wire, the platform ABI, execution semantics, or the canonical service
+PVM. Snapshot replacement additionally requires the locally installed policy
+ID to match the incoming image.
+
+This repository does not yet contain a JAM/consensus authority implementation.
+`LocalRootTreeServiceV2::open_production` and `open_raft_production` require an
+embedding node to supply that capability before Install, recovery, or replay;
+the existing `vosx space up` wiring continues to select the explicitly
+documented conformance profile. In particular, a production provider must bind
+Install authorization to consensus-authoritative deployment state and the
+executing JAM service account, verify Upgrade against the same package
+authority, resolve roles from the canonical issuer, validate receipt finality
+from an independent consensus certificate/state view, and verify the exact
+proof public input under the policy's pinned proof system. Authenticated
+transport or possession of a receipt is not sufficient evidence for any of
+those decisions.
+
+Installed `PROGRAM_LOOKUP` availability is already part of the recoverable
+service image: Install and Upgrade order the exact content-addressed
+program/genesis bytes and stage them atomically with IC-5, while snapshots
+carry the resulting catalog. The automatic CRDT driver currently derives its
+conformance verifier decision only after authenticating and
+sync-floor-authorizing an enrolled node's complete Noise identity; deployments
+which do not trust every authorized replica must carry an independently
+verifiable finality certificate instead. Direct role-authorized Raft ingress
 already quorum-orders its exact authority verifier input beside admission and
 persists the accepted ingress in guest state. Every delivery, deadline, and
-expiration observation must come from the JAM slot. `PROOF_VERIFY`
-must use the workspace-pinned verifier and execution-semantics identity rather
-than the local proof allowlist. Its proof backend must consume or reproduce
-the canonical Refine trace committed by the proof request before attested
-execution becomes a production path.
+expiration observation in the production profile comes from its JAM slot
+provider. Its proof backend must consume or reproduce the canonical Refine
+trace committed by the proof request.
 Replicated service identity binds the exact Refine and Accumulate gas schedule.
 `OutOfGas` is therefore a deterministic cross-replica result only for replicas
 with that declared schedule; a mismatched host stops before advancing its
@@ -820,7 +861,7 @@ bound to the exact service image, reconstructs the exact proof-verification
 public inputs committed by every pending publication, and independently
 verifies each content-addressed artifact before durably hydrating the proof
 side-CAS or replacing its physical service image. The request-bound bundle uses
-the clean-break `VSS3` service-image and `VRS4` Raft-snapshot wires. Completed reply
+the clean-break `VSS4` service-image and `VRS4` Raft-snapshot wires. Completed reply
 admissions are permanent deduplication markers but do not retain proof bytes:
 their retry path resolves before proof lookup. Their verifier provenance remains
 bound to the complete image, so a snapshot-caught replica can restart without
