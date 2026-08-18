@@ -1,4 +1,4 @@
-//! Atomic local JAM storage host for the v2 conformance runtime.
+//! Atomic local JAM storage host for the v2 conformance and production profiles.
 //!
 //! This module implements only the physical storage and preimage protocol
 //! calls used by the canonical service PVM. It deliberately does not decode or
@@ -63,6 +63,11 @@ pub struct LocalJamStoreSnapshotV2 {
     /// was committed while the production proof verifier was installed.
     /// It is not actor state and is ignored by `same_service_state`.
     proof_verifier_provenance: Option<super::Hash>,
+    /// Host-policy identity and image seal for a service opened through the
+    /// production trust boundary. Unlike the conformance allowlists, this is
+    /// durable: a production image cannot later be reopened under a different
+    /// verifier set, or without one, and continue executing.
+    production_trust_provenance: Option<(super::Hash, super::Hash)>,
 }
 
 impl LocalJamStoreSnapshotV2 {
@@ -94,6 +99,21 @@ impl LocalJamStoreSnapshotV2 {
 
     fn seal_proof_verifier_provenance(&mut self) {
         self.proof_verifier_provenance = Some(self.expected_proof_verifier_provenance());
+    }
+
+    fn expected_production_trust_provenance(&self, policy: super::Hash) -> super::Hash {
+        let mut input = Vec::new();
+        self.encode_provenance_input(&mut input);
+        super::Hash::digest(b"vos/production-trust-provenance/v2", &[&policy.0, &input])
+    }
+
+    fn seal_production_trust_provenance(&mut self, policy: super::Hash) {
+        self.production_trust_provenance =
+            Some((policy, self.expected_production_trust_provenance(policy)));
+    }
+
+    fn production_trust_policy(&self) -> Option<super::Hash> {
+        self.production_trust_provenance.map(|(policy, _)| policy)
     }
 
     pub(crate) const fn has_proof_verifier_provenance(&self) -> bool {
@@ -185,13 +205,20 @@ impl LocalJamStoreSnapshotV2 {
 }
 
 impl V2Wire for LocalJamStoreSnapshotV2 {
-    const MAGIC: [u8; 4] = *b"VSS3";
+    const MAGIC: [u8; 4] = *b"VSS4";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         self.encode_provenance_input(out);
         Encoder(out).option(&self.proof_verifier_provenance, |encoder, provenance| {
             encoder.fixed(&provenance.0);
         });
+        Encoder(out).option(
+            &self.production_trust_provenance,
+            |encoder, (policy, provenance)| {
+                encoder.fixed(&policy.0);
+                encoder.fixed(&provenance.0);
+            },
+        );
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
@@ -204,6 +231,8 @@ impl V2Wire for LocalJamStoreSnapshotV2 {
             decode_content_map(decoder, |key, bytes| ProgramId::of_pvm(bytes).0 == *key)?;
         let proof_verifier_provenance =
             decoder.option(|decoder| Ok(super::Hash(decoder.fixed()?)))?;
+        let production_trust_provenance = decoder
+            .option(|decoder| Ok((super::Hash(decoder.fixed()?), super::Hash(decoder.fixed()?))))?;
         if rows.is_empty() != (commit_sequence == 0) {
             return Err(DecodeError::NonCanonical);
         }
@@ -219,10 +248,20 @@ impl V2Wire for LocalJamStoreSnapshotV2 {
             programs,
             commit_sequence,
             proof_verifier_provenance,
+            production_trust_provenance,
         };
         if snapshot
             .proof_verifier_provenance
             .is_some_and(|provenance| provenance != snapshot.expected_proof_verifier_provenance())
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        if snapshot
+            .production_trust_provenance
+            .is_some_and(|(policy, provenance)| {
+                policy == super::Hash::ZERO
+                    || provenance != snapshot.expected_production_trust_provenance(policy)
+            })
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -1089,6 +1128,74 @@ pub enum LocalStoreReadErrorV2 {
     CorruptPendingDeadline,
 }
 
+/// Consensus/JAM trust inputs required by a production v2 service host.
+///
+/// Implementations are host capabilities, not service state. Their stable
+/// `policy_id` is sealed into every durable image, while each decision is
+/// recomputed locally before IC-5 observes it. Returning `None` from
+/// `logical_timeslot` or `false` from a verifier fails closed; production
+/// execution never falls back to the conformance allowlists.
+pub trait ProductionTrustV2: Send + Sync + 'static {
+    /// Stable commitment to the authority set and verification rules.
+    fn policy_id(&self) -> super::Hash;
+
+    /// Current consensus-observed JAM slot. Repeated observations may return
+    /// the same slot, but must never move behind committed service state.
+    fn logical_timeslot(&self) -> Option<u64>;
+
+    /// Verify one slot already embedded in a request or committed Raft entry.
+    /// Production implementations use consensus history/certificates here;
+    /// comparing only with a process-local wall clock is not sufficient.
+    fn verify_logical_timeslot(&self, logical_timeslot: u64) -> ProductionTrustDecisionV2;
+
+    fn verify_proof(
+        &self,
+        request: &ProofVerificationRequestV2,
+        proof: &[u8],
+    ) -> ProductionTrustDecisionV2;
+
+    fn verify_install(&self, genesis: &ServiceGenesisV2) -> ProductionTrustDecisionV2;
+
+    fn verify_upgrade(&self, upgrade: &ActorUpgradeV2) -> ProductionTrustDecisionV2;
+
+    fn verify_role_credential(
+        &self,
+        request: &RoleCredentialVerificationRequestV2,
+    ) -> ProductionTrustDecisionV2;
+
+    fn verify_receipt(&self, request: &ReceiptVerificationRequestV2) -> ProductionTrustDecisionV2;
+}
+
+/// Three-way verifier result used to keep replicated availability failures
+/// distinct from deterministic authorization denials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductionTrustDecisionV2 {
+    Authorized,
+    Denied,
+    Unavailable,
+}
+
+impl ProductionTrustDecisionV2 {
+    const fn is_authorized(self) -> bool {
+        matches!(self, Self::Authorized)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductionTrustErrorV2 {
+    InvalidPolicy,
+    TrustRequired,
+    PolicyMismatch,
+}
+
+impl core::fmt::Display for ProductionTrustErrorV2 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "production VOS v2 trust boundary rejected: {self:?}")
+    }
+}
+
+impl core::error::Error for ProductionTrustErrorV2 {}
+
 impl core::fmt::Display for LocalStoreReadErrorV2 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "cannot read committed VOS v2 service state: {self:?}")
@@ -1117,6 +1224,13 @@ pub struct LocalJamStoreV2 {
     /// retained only for the explicit conformance harness, whose tests seed
     /// exact request hashes through the legacy local allowlist seam.
     proof_verifier: Option<Arc<ProofVerifierFnV2>>,
+    /// Production verifier/time capability. Its identity is sealed into the
+    /// durable image; `None` is the explicit conformance profile.
+    production_trust: Option<Arc<dyn ProductionTrustV2>>,
+    /// Policy ID sampled and validated exactly once when the capability is
+    /// installed. Later commits never trust a mutable implementation to
+    /// report a different identity.
+    production_trust_policy: Option<super::Hash>,
     proof_allowlist: BTreeSet<super::Hash>,
     role_credential_allowlist: BTreeSet<super::Hash>,
     upgrade_allowlist: BTreeSet<super::Hash>,
@@ -1134,6 +1248,7 @@ impl core::fmt::Debug for LocalJamStoreV2 {
             .field("proof_blobs", &self.proof_blobs.len())
             .field("private_witnesses", &self.private_witnesses.len())
             .field("proof_verifier_installed", &self.proof_verifier.is_some())
+            .field("production_trust", &self.production_trust_policy)
             .finish_non_exhaustive()
     }
 }
@@ -1478,10 +1593,13 @@ impl LocalJamStoreV2 {
                 programs: BTreeMap::new(),
                 commit_sequence: 0,
                 proof_verifier_provenance: None,
+                production_trust_provenance: None,
             },
             proof_blobs: BTreeMap::new(),
             private_witnesses: BTreeMap::new(),
             proof_verifier: None,
+            production_trust: None,
+            production_trust_policy: None,
             proof_allowlist: BTreeSet::new(),
             role_credential_allowlist: BTreeSet::new(),
             upgrade_allowlist: BTreeSet::new(),
@@ -1497,6 +1615,8 @@ impl LocalJamStoreV2 {
             proof_blobs: BTreeMap::new(),
             private_witnesses: BTreeMap::new(),
             proof_verifier: None,
+            production_trust: None,
+            production_trust_policy: None,
             proof_allowlist: BTreeSet::new(),
             role_credential_allowlist: BTreeSet::new(),
             upgrade_allowlist: BTreeSet::new(),
@@ -1531,6 +1651,14 @@ impl LocalJamStoreV2 {
             })
         {
             return Err(ServiceImageInstallErrorV2::ServiceMismatch);
+        }
+        match (
+            self.production_trust_policy_id(),
+            replacement.production_trust_policy(),
+        ) {
+            (Some(expected), Some(actual)) if expected == actual => {}
+            (None, None) => {}
+            _ => return Err(ServiceImageInstallErrorV2::InvalidSnapshot),
         }
         Ok(replacement)
     }
@@ -1966,6 +2094,62 @@ impl LocalJamStoreV2 {
             .map(Vec::as_slice)
     }
 
+    pub fn production_trust_policy_id(&self) -> Option<super::Hash> {
+        self.production_trust_policy
+    }
+
+    pub fn requires_production_trust(&self) -> bool {
+        self.committed.production_trust_policy().is_some() && self.production_trust.is_none()
+    }
+
+    /// Install the exact production authority set before any guest execution
+    /// or snapshot replacement. A non-empty conformance image has no durable
+    /// proof of which verifier admitted its history and is intentionally not
+    /// promotable in place.
+    pub fn install_production_trust(
+        &mut self,
+        trust: Arc<dyn ProductionTrustV2>,
+    ) -> Result<(), ProductionTrustErrorV2> {
+        let policy = trust.policy_id();
+        if policy == super::Hash::ZERO {
+            return Err(ProductionTrustErrorV2::InvalidPolicy);
+        }
+        match self.committed.production_trust_policy() {
+            Some(existing) if existing != policy => {
+                return Err(ProductionTrustErrorV2::PolicyMismatch);
+            }
+            None if !self.committed.rows.is_empty() => {
+                return Err(ProductionTrustErrorV2::PolicyMismatch);
+            }
+            _ => {}
+        }
+        self.role_credential_allowlist.clear();
+        self.upgrade_allowlist.clear();
+        self.receipt_allowlist.clear();
+        self.install_allowlist.clear();
+        let proof_trust = trust.clone();
+        self.proof_allowlist.clear();
+        self.proof_verifier = Some(Arc::new(move |request, proof| {
+            proof_trust.verify_proof(request, proof).is_authorized()
+        }));
+        self.production_trust = Some(trust);
+        self.production_trust_policy = Some(policy);
+        Ok(())
+    }
+
+    pub fn production_logical_timeslot(&self) -> Result<Option<u64>, ProductionTrustErrorV2> {
+        match self.production_trust.as_ref() {
+            Some(trust) => trust
+                .logical_timeslot()
+                .map(Some)
+                .ok_or(ProductionTrustErrorV2::TrustRequired),
+            None if self.committed.production_trust_policy().is_some() => {
+                Err(ProductionTrustErrorV2::TrustRequired)
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Make exact canonical actor code available to guest Accumulate.
     ///
     /// Program availability is part of the cloned service image, so reopening
@@ -1998,6 +2182,9 @@ impl LocalJamStoreV2 {
     }
 
     pub(crate) fn install_proof_verifier_arc(&mut self, verifier: Arc<ProofVerifierFnV2>) {
+        if self.production_trust.is_some() {
+            return;
+        }
         self.proof_allowlist.clear();
         self.proof_verifier = Some(verifier);
     }
@@ -2019,15 +2206,21 @@ impl LocalJamStoreV2 {
     /// Configure the conformance authority to accept one exact disclosed
     /// role credential verification request.
     pub fn allow_role_credential(&mut self, request: &RoleCredentialVerificationRequestV2) {
-        self.role_credential_allowlist.insert(request.hash());
+        if self.production_trust.is_none() {
+            self.role_credential_allowlist.insert(request.hash());
+        }
     }
 
     /// Authorize one exact actor upgrade. The replacement program is supplied
     /// separately as content-addressed request availability and must be
     /// present in the staged image before guest validation can accept it.
     pub fn allow_upgrade(&mut self, upgrade: &ActorUpgradeV2) -> bool {
-        self.upgrade_allowlist.insert(upgrade.hash());
-        true
+        if self.production_trust.is_some() {
+            false
+        } else {
+            self.upgrade_allowlist.insert(upgrade.hash());
+            true
+        }
     }
 
     /// Configure the conformance host to accept one exact finalized receipt.
@@ -2035,7 +2228,9 @@ impl LocalJamStoreV2 {
     /// Production hosts replace this process-local allowlist with the
     /// consensus receipt/finality verifier required by the runtime cutover.
     pub fn allow_receipt(&mut self, request: &ReceiptVerificationRequestV2) {
-        self.receipt_allowlist.insert(request.hash());
+        if self.production_trust.is_none() {
+            self.receipt_allowlist.insert(request.hash());
+        }
     }
 
     /// Authorize one exact canonical genesis for physical guest Install.
@@ -2044,7 +2239,9 @@ impl LocalJamStoreV2 {
     /// from the recoverable service image. Production hosts implement the
     /// same guest boundary from consensus-authoritative deployment state.
     pub fn allow_install(&mut self, genesis: &ServiceGenesisV2) {
-        self.install_allowlist.insert(install_hash(genesis));
+        if self.production_trust.is_none() {
+            self.install_allowlist.insert(install_hash(genesis));
+        }
     }
 }
 
@@ -2071,7 +2268,15 @@ impl AttestationProofHostV2 for LocalJamStoreV2 {
 
 impl super::ReceiptVerificationHostV2 for LocalJamStoreV2 {
     fn make_receipt_available(&mut self, request: &ReceiptVerificationRequestV2) -> bool {
-        self.allow_receipt(request);
+        if let Some(trust) = self.production_trust.as_ref() {
+            match trust.verify_receipt(request) {
+                ProductionTrustDecisionV2::Authorized => {}
+                ProductionTrustDecisionV2::Denied | ProductionTrustDecisionV2::Unavailable => {
+                    return false;
+                }
+            }
+        }
+        self.receipt_allowlist.insert(request.hash());
         true
     }
 }
@@ -2189,6 +2394,7 @@ pub struct LocalJamTransactionV2 {
     upgrade_allowlist: BTreeSet<super::Hash>,
     receipt_allowlist: BTreeSet<super::Hash>,
     install_allowlist: BTreeSet<super::Hash>,
+    production_trust: Option<Arc<dyn ProductionTrustV2>>,
 }
 
 impl LocalJamTransactionV2 {
@@ -2222,7 +2428,11 @@ impl LocalJamTransactionV2 {
         }
     }
 
-    fn role_credential_verification_status(&self, bytes: &[u8]) -> u64 {
+    fn role_credential_verification_status(
+        &self,
+        bytes: &[u8],
+        slot: u8,
+    ) -> Result<u64, ServicePvmErrorV2> {
         use crate::abi::error;
 
         let Ok(request) = RoleCredentialVerificationRequestV2::decode(bytes) else {
@@ -2230,13 +2440,23 @@ impl LocalJamTransactionV2 {
             // is an authorization denial, not a host failure: returning a
             // hard error here would prevent a replicated apply cursor from
             // advancing past a deterministically invalid entry.
-            return error::HOST_NONE;
+            return Ok(error::HOST_NONE);
         };
-        if self.role_credential_allowlist.contains(&request.hash()) {
+        let authorized = match self.production_trust.as_ref() {
+            Some(trust) => match trust.verify_role_credential(&request) {
+                ProductionTrustDecisionV2::Authorized => true,
+                ProductionTrustDecisionV2::Denied => false,
+                ProductionTrustDecisionV2::Unavailable => {
+                    return Err(ServicePvmErrorV2::AccumulateHostRejected(slot));
+                }
+            },
+            None => self.role_credential_allowlist.contains(&request.hash()),
+        };
+        Ok(if authorized {
             error::HOST_OK
         } else {
             error::HOST_NONE
-        }
+        })
     }
 }
 
@@ -2343,7 +2563,7 @@ impl AccumulateTransactionV2 for LocalJamTransactionV2 {
             }
             hostcall::ROLE_CREDENTIAL_VERIFY => {
                 let bytes = Self::read_guest_bytes(kernel, registers[7], registers[8], slot)?;
-                Ok([self.role_credential_verification_status(&bytes), 0])
+                Ok([self.role_credential_verification_status(&bytes, slot)?, 0])
             }
             hostcall::RECEIPT_VERIFY => {
                 let bytes = Self::read_guest_bytes(kernel, registers[7], registers[8], slot)?;
@@ -2364,10 +2584,29 @@ impl AccumulateTransactionV2 for LocalJamTransactionV2 {
                     .map_err(|_| ServicePvmErrorV2::AccumulateHostRejected(slot))?;
                 let authorized = match request {
                     super::AccumulateRequestV2::Install(genesis) => {
-                        self.install_allowlist.contains(&install_hash(&genesis))
+                        match self.production_trust.as_ref() {
+                            Some(trust) => match trust.verify_install(&genesis) {
+                                ProductionTrustDecisionV2::Authorized => true,
+                                ProductionTrustDecisionV2::Denied => false,
+                                ProductionTrustDecisionV2::Unavailable => {
+                                    return Err(ServicePvmErrorV2::AccumulateHostRejected(slot));
+                                }
+                            },
+                            None => self.install_allowlist.contains(&install_hash(&genesis)),
+                        }
                     }
                     super::AccumulateRequestV2::UpgradeActor(upgrade) => {
-                        self.upgrade_allowlist.contains(&upgrade.hash())
+                        let verified = match self.production_trust.as_ref() {
+                            Some(trust) => match trust.verify_upgrade(&upgrade) {
+                                ProductionTrustDecisionV2::Authorized => true,
+                                ProductionTrustDecisionV2::Denied => false,
+                                ProductionTrustDecisionV2::Unavailable => {
+                                    return Err(ServicePvmErrorV2::AccumulateHostRejected(slot));
+                                }
+                            },
+                            None => self.upgrade_allowlist.contains(&upgrade.hash()),
+                        };
+                        verified
                             && self
                                 .staged
                                 .programs
@@ -2392,6 +2631,28 @@ impl AccumulateTransactionV2 for LocalJamTransactionV2 {
 impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
     type Transaction = LocalJamTransactionV2;
 
+    fn verify_logical_timeslot(&self, logical_timeslot: u64) -> Result<(), ServicePvmErrorV2> {
+        let Some(trust) = self.production_trust.as_ref() else {
+            return if self.requires_production_trust() {
+                Err(ServicePvmErrorV2::AccumulateHostRejected(
+                    crate::abi::hostcall::ACCUMULATION_TIMESLOT as u8,
+                ))
+            } else {
+                Ok(())
+            };
+        };
+        if trust
+            .verify_logical_timeslot(logical_timeslot)
+            .is_authorized()
+        {
+            Ok(())
+        } else {
+            Err(ServicePvmErrorV2::AccumulateHostRejected(
+                crate::abi::hostcall::ACCUMULATION_TIMESLOT as u8,
+            ))
+        }
+    }
+
     fn begin(&mut self) -> Result<Self::Transaction, ServicePvmErrorV2> {
         self.begin_at(None)
     }
@@ -2409,6 +2670,11 @@ impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
         programs: &[super::ImportedProgramV2],
         blobs: &[super::ImportedBlobV2],
     ) -> Result<Self::Transaction, ServicePvmErrorV2> {
+        if self.requires_production_trust() {
+            return Err(ServicePvmErrorV2::AccumulateHostRejected(
+                crate::abi::hostcall::INSTALL_AUTH_VERIFY as u8,
+            ));
+        }
         let mut staged = self.committed.clone();
         for program in programs {
             if super::ProgramId::of_pvm(&program.pvm) != program.program
@@ -2449,6 +2715,7 @@ impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
             upgrade_allowlist: self.upgrade_allowlist.clone(),
             receipt_allowlist: self.receipt_allowlist.clone(),
             install_allowlist: self.install_allowlist.clone(),
+            production_trust: self.production_trust.clone(),
         })
     }
 
@@ -2462,6 +2729,10 @@ impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
         if self.proof_verifier.is_some() {
             transaction.staged.seal_proof_verifier_provenance();
         }
+        transaction.staged.production_trust_provenance = None;
+        if let Some(policy) = self.production_trust_policy {
+            transaction.staged.seal_production_trust_provenance(policy);
+        }
         self.committed = transaction.staged;
         Ok(())
     }
@@ -2472,6 +2743,10 @@ where
     B: CommittedImageStoreV2 + ProofArtifactStoreV2<Error = <B as CommittedImageStoreV2>::Error>,
 {
     type Transaction = LocalJamTransactionV2;
+
+    fn verify_logical_timeslot(&self, logical_timeslot: u64) -> Result<(), ServicePvmErrorV2> {
+        self.local.verify_logical_timeslot(logical_timeslot)
+    }
 
     fn begin(&mut self) -> Result<Self::Transaction, ServicePvmErrorV2> {
         self.local.begin()
@@ -2504,6 +2779,10 @@ where
         transaction.staged.proof_verifier_provenance = None;
         if self.local.proof_verifier.is_some() {
             transaction.staged.seal_proof_verifier_provenance();
+        }
+        transaction.staged.production_trust_provenance = None;
+        if let Some(policy) = self.local.production_trust_policy {
+            transaction.staged.seal_production_trust_provenance(policy);
         }
         let prefix = super::storage::ingress_storage_prefix();
         let mut newly_terminal = Vec::new();
@@ -2561,6 +2840,101 @@ fn install_hash(genesis: &ServiceGenesisV2) -> super::Hash {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+    struct TestProductionTrust {
+        policy: super::super::Hash,
+        logical_timeslot: AtomicU64,
+        time_available: AtomicBool,
+        allow: bool,
+        unavailable: bool,
+        receipt_checks: AtomicUsize,
+    }
+
+    impl TestProductionTrust {
+        fn new(policy: u8, logical_timeslot: u64, allow: bool) -> Self {
+            Self {
+                policy: super::super::Hash([policy; 32]),
+                logical_timeslot: AtomicU64::new(logical_timeslot),
+                time_available: AtomicBool::new(true),
+                allow,
+                unavailable: false,
+                receipt_checks: AtomicUsize::new(0),
+            }
+        }
+
+        fn unavailable(policy: u8, logical_timeslot: u64) -> Self {
+            Self {
+                policy: super::super::Hash([policy; 32]),
+                logical_timeslot: AtomicU64::new(logical_timeslot),
+                time_available: AtomicBool::new(true),
+                allow: false,
+                unavailable: true,
+                receipt_checks: AtomicUsize::new(0),
+            }
+        }
+
+        fn decision(&self) -> ProductionTrustDecisionV2 {
+            if self.unavailable {
+                ProductionTrustDecisionV2::Unavailable
+            } else if self.allow {
+                ProductionTrustDecisionV2::Authorized
+            } else {
+                ProductionTrustDecisionV2::Denied
+            }
+        }
+    }
+
+    impl ProductionTrustV2 for TestProductionTrust {
+        fn policy_id(&self) -> super::super::Hash {
+            self.policy
+        }
+
+        fn logical_timeslot(&self) -> Option<u64> {
+            self.time_available
+                .load(Ordering::Relaxed)
+                .then(|| self.logical_timeslot.load(Ordering::Relaxed))
+        }
+
+        fn verify_logical_timeslot(&self, logical_timeslot: u64) -> ProductionTrustDecisionV2 {
+            if logical_timeslot == self.logical_timeslot.load(Ordering::Relaxed) {
+                self.decision()
+            } else {
+                ProductionTrustDecisionV2::Denied
+            }
+        }
+
+        fn verify_proof(
+            &self,
+            _request: &ProofVerificationRequestV2,
+            _proof: &[u8],
+        ) -> ProductionTrustDecisionV2 {
+            self.decision()
+        }
+
+        fn verify_install(&self, _genesis: &ServiceGenesisV2) -> ProductionTrustDecisionV2 {
+            self.decision()
+        }
+
+        fn verify_upgrade(&self, _upgrade: &ActorUpgradeV2) -> ProductionTrustDecisionV2 {
+            self.decision()
+        }
+
+        fn verify_role_credential(
+            &self,
+            _request: &RoleCredentialVerificationRequestV2,
+        ) -> ProductionTrustDecisionV2 {
+            self.decision()
+        }
+
+        fn verify_receipt(
+            &self,
+            _request: &ReceiptVerificationRequestV2,
+        ) -> ProductionTrustDecisionV2 {
+            self.receipt_checks.fetch_add(1, Ordering::Relaxed);
+            self.decision()
+        }
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct InjectedFailure;
@@ -2632,6 +3006,152 @@ mod tests {
             },
             super::super::ConsistencyModeV2::Local,
         )
+    }
+
+    fn receipt_verification() -> ReceiptVerificationRequestV2 {
+        let header = valid_header();
+        ReceiptVerificationRequestV2 {
+            expected_producer: ActorId([5; 32]),
+            receipt: AccumulationReceiptV2 {
+                service: header.service,
+                accepted_transition: super::super::Hash([6; 32]),
+                reply_commitment: None,
+                outbox_commitment: None,
+                resulting_state_root: header.state_root,
+                resulting_crdt_heads: Vec::new(),
+                sequence: 1,
+                checkpoint: 0,
+                consistency: super::super::ConsistencyModeV2::Local,
+            },
+        }
+    }
+
+    #[test]
+    fn production_trust_cannot_be_replaced_by_conformance_grants() {
+        let trust = Arc::new(TestProductionTrust::new(0x71, 9, false));
+        let mut store = LocalJamStoreV2::new();
+        store.install_production_trust(trust.clone()).unwrap();
+
+        let receipt = receipt_verification();
+        store.allow_receipt(&receipt);
+        assert!(store.receipt_allowlist.is_empty());
+        assert!(
+            !super::super::ReceiptVerificationHostV2::make_receipt_available(&mut store, &receipt,)
+        );
+        assert_eq!(trust.receipt_checks.load(Ordering::Relaxed), 1);
+        assert!(store.receipt_allowlist.is_empty());
+
+        let proof = b"production verifier must decide";
+        let proof_blob = BlobRefV2::of_bytes(proof);
+        let proof_request = ProofVerificationRequestV2 {
+            actor_program: ProgramId([7; 32]),
+            execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+            statement: super::super::Hash([8; 32]),
+            trace: super::super::Hash([9; 32]),
+            proof_blob: proof_blob.clone(),
+        };
+        store.allow_proof(&proof_request);
+        store.install_proof_verifier(|_, _| true);
+        assert!(!store.make_proof_available(&proof_request, proof));
+        assert_eq!(store.proof_bytes(&proof_blob), None);
+
+        assert_eq!(store.production_logical_timeslot(), Ok(Some(9)));
+        trust.time_available.store(false, Ordering::Relaxed);
+        assert_eq!(
+            store.production_logical_timeslot(),
+            Err(ProductionTrustErrorV2::TrustRequired),
+        );
+    }
+
+    #[test]
+    fn unavailable_production_authority_is_a_retryable_host_failure() {
+        let mut store = LocalJamStoreV2::new();
+        store
+            .install_production_trust(Arc::new(TestProductionTrust::unavailable(0x77, 13)))
+            .unwrap();
+        let credential = b"canonical disclosed credential".to_vec();
+        let request = RoleCredentialVerificationRequestV2 {
+            service: valid_header().service,
+            actor: ActorId([0x78; 32]),
+            policy: super::super::Hash([0x79; 32]),
+            scope: super::super::Hash([0x7A; 32]),
+            credential_commitment: super::super::Hash::digest(
+                b"vos/credential-commitment/v2",
+                &[&credential],
+            ),
+            credential,
+        };
+        let slot = crate::abi::hostcall::ROLE_CREDENTIAL_VERIFY as u8;
+        let transaction = store.begin().unwrap();
+        assert_eq!(
+            transaction.role_credential_verification_status(&request.encode(), slot),
+            Err(ServicePvmErrorV2::AccumulateHostRejected(slot)),
+            "unavailable authority must not become a deterministic denial that advances Raft",
+        );
+    }
+
+    #[test]
+    fn production_trust_provenance_is_bound_across_restart() {
+        let trust = Arc::new(TestProductionTrust::new(0x72, 11, true));
+        let mut store = LocalJamStoreV2::new();
+        store.install_production_trust(trust.clone()).unwrap();
+        let mut transaction = store.begin().unwrap();
+        transaction.staged.rows.insert(
+            super::super::header_storage_key().to_vec(),
+            valid_header().encode(),
+        );
+        store.commit(transaction).unwrap();
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.production_trust_policy(), Some(trust.policy));
+
+        let mut restarted = LocalJamStoreV2::from_snapshot_bytes(&store.snapshot_bytes()).unwrap();
+        assert!(restarted.requires_production_trust());
+        assert!(
+            restarted.begin().is_err(),
+            "sealed state cannot run unbound"
+        );
+        assert_eq!(
+            restarted.install_production_trust(Arc::new(TestProductionTrust::new(0x73, 11, true,))),
+            Err(ProductionTrustErrorV2::PolicyMismatch),
+        );
+        restarted.install_production_trust(trust).unwrap();
+        assert!(restarted.begin().is_ok());
+
+        let mut forged_policy = snapshot.clone();
+        let (_, seal) = forged_policy.production_trust_provenance.unwrap();
+        forged_policy.production_trust_provenance = Some((super::super::Hash([0x74; 32]), seal));
+        assert_eq!(
+            LocalJamStoreSnapshotV2::decode(&forged_policy.encode()),
+            Err(DecodeError::NonCanonical),
+        );
+
+        let mut forged_seal = snapshot;
+        let (policy, _) = forged_seal.production_trust_provenance.unwrap();
+        forged_seal.production_trust_provenance = Some((policy, super::super::Hash([0x75; 32])));
+        assert_eq!(
+            LocalJamStoreSnapshotV2::decode(&forged_seal.encode()),
+            Err(DecodeError::NonCanonical),
+        );
+    }
+
+    #[test]
+    fn nonempty_conformance_images_cannot_be_promoted_in_place() {
+        assert_eq!(
+            LocalJamStoreV2::new()
+                .install_production_trust(Arc::new(TestProductionTrust::new(0, 12, true),)),
+            Err(ProductionTrustErrorV2::InvalidPolicy),
+        );
+        let mut store = LocalJamStoreV2::new();
+        let mut transaction = store.begin().unwrap();
+        transaction.staged.rows.insert(
+            super::super::header_storage_key().to_vec(),
+            valid_header().encode(),
+        );
+        store.commit(transaction).unwrap();
+        assert_eq!(
+            store.install_production_trust(Arc::new(TestProductionTrust::new(0x76, 12, true,))),
+            Err(ProductionTrustErrorV2::PolicyMismatch),
+        );
     }
 
     #[test]
@@ -2885,8 +3405,11 @@ mod tests {
         let transaction = store.begin().unwrap();
 
         assert_eq!(
-            transaction.role_credential_verification_status(b"not a canonical request"),
-            crate::abi::error::HOST_NONE
+            transaction.role_credential_verification_status(
+                b"not a canonical request",
+                crate::abi::hostcall::ROLE_CREDENTIAL_VERIFY as u8,
+            ),
+            Ok(crate::abi::error::HOST_NONE),
         );
     }
 

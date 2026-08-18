@@ -70,6 +70,8 @@ pub enum V2NodeRegistrationError {
     ActorAlreadyRegistered(crate::v2::ActorId),
     CorruptServiceStore,
     LogicalTimeslotExhausted,
+    LogicalTimeslotUnavailable,
+    LogicalTimeslotRegressed,
 }
 
 /// Authenticated mapping from a canonical actor identity to its physical
@@ -7575,9 +7577,8 @@ where
     let floor = service
         .prepare_admission_barrier()
         .map_err(|error| format!("admission barrier failed: {error}"))?;
-    restore_v2_logical_timeslot(logical_timeslot, floor)
-        .map_err(|error| format!("logical-timeslot restoration failed: {error}"))?;
-    Ok(next_v2_logical_timeslot(logical_timeslot))
+    allocate_v2_root_slot_after_barrier(service, logical_timeslot, floor)
+        .map_err(|error| format!("logical-timeslot allocation failed: {error:?}"))
 }
 
 /// Allocate the final slot after a previously established service barrier.
@@ -7585,7 +7586,37 @@ where
 /// fetch-max plus allocation therefore orders delivery strictly after that
 /// work without running another service catch-up between allocation and the
 /// proposal.
-fn allocate_v2_root_slot_after_barrier(
+fn allocate_v2_root_slot_after_barrier<B>(
+    service: &crate::v2::LocalRootTreeServiceV2<B>,
+    logical_timeslot: &AtomicU64,
+    admission_floor: u64,
+) -> Result<u64, V2NodeRegistrationError>
+where
+    B: crate::v2::CommittedImageStoreV2
+        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+{
+    let observed = service
+        .production_logical_timeslot()
+        .map_err(|_| V2NodeRegistrationError::LogicalTimeslotUnavailable)?;
+    allocate_v2_observed_slot_after_barrier(logical_timeslot, admission_floor, observed)
+}
+
+fn allocate_v2_observed_slot_after_barrier(
+    logical_timeslot: &AtomicU64,
+    admission_floor: u64,
+    observed: Option<u64>,
+) -> Result<u64, V2NodeRegistrationError> {
+    if let Some(observed) = observed {
+        if observed < admission_floor {
+            return Err(V2NodeRegistrationError::LogicalTimeslotRegressed);
+        }
+        logical_timeslot.fetch_max(observed, Ordering::Relaxed);
+        return Ok(observed);
+    }
+    allocate_v2_conformance_slot_after_barrier(logical_timeslot, admission_floor)
+}
+
+fn allocate_v2_conformance_slot_after_barrier(
     logical_timeslot: &AtomicU64,
     admission_floor: u64,
 ) -> Result<u64, V2NodeRegistrationError> {
@@ -8130,7 +8161,8 @@ where
             };
         // Nothing catches up again between this allocation and the proposal.
         let final_slot =
-            match allocate_v2_root_slot_after_barrier(&logical_timeslot, admission_floor) {
+            match allocate_v2_root_slot_after_barrier(&service, &logical_timeslot, admission_floor)
+            {
                 Ok(slot) => slot,
                 Err(failure) => {
                     error!(%id, ?failure, "v2 root-tree admission clock restoration failed");
@@ -8534,8 +8566,11 @@ fn handle_v2_root_transport<B>(
             // allocation and before proposal. The final slot observes any
             // node-clock advancement caused by the authority execution above,
             // so deadline validation uses the true delivery order.
-            let slot = match allocate_v2_root_slot_after_barrier(logical_timeslot, admission_floor)
-            {
+            let slot = match allocate_v2_root_slot_after_barrier(
+                service,
+                logical_timeslot,
+                admission_floor,
+            ) {
                 Ok(slot) => slot,
                 Err(failure) => {
                     warn!(%id, ?failure, "could not allocate trusted v2 delivery slot");
@@ -9421,13 +9456,23 @@ fn retry_v2_root_transport<B>(
     );
     #[cfg(not(all(feature = "network", feature = "storage")))]
     let _ = (invoke_routes, root_name);
+    let observed_timeslot = match service.production_logical_timeslot() {
+        Ok(Some(slot)) => Some(slot),
+        Ok(None) => Some(
+            logical_timeslot
+                .load(Ordering::Relaxed)
+                .max(v2_wall_timeslot()),
+        ),
+        Err(failure) => {
+            warn!(%id, ?failure, "production JAM timeslot is unavailable");
+            None
+        }
+    };
     let should_expire = service
         .next_pending_call_deadline()
         .ok()
         .flatten()
-        .is_some_and(|deadline| {
-            logical_timeslot.load(Ordering::Relaxed) >= deadline || v2_wall_timeslot() >= deadline
-        });
+        .is_some_and(|deadline| observed_timeslot.is_some_and(|slot| slot >= deadline));
     if should_expire {
         match prepare_v2_root_slot(service, logical_timeslot) {
             Ok(expiration_slot) => {
@@ -14108,12 +14153,36 @@ mod tests {
         assert_eq!(authority_slot, provisional);
         let deadline = authority_slot.saturating_add(1);
         assert!(provisional < deadline, "the provisional claim is live");
-        let delivery_slot =
-            allocate_v2_root_slot_after_barrier(&clock, floor).expect("slot remains available");
+        let delivery_slot = allocate_v2_conformance_slot_after_barrier(&clock, floor)
+            .expect("slot remains available");
         assert!(delivery_slot > authority_slot);
         assert!(
             delivery_slot >= deadline,
             "guest delivery must now classify this call as expired"
+        );
+    }
+
+    #[test]
+    fn production_slots_are_exact_consensus_observations_and_never_regress() {
+        let clock = AtomicU64::new(100);
+        assert_eq!(
+            allocate_v2_observed_slot_after_barrier(&clock, 120, Some(121)),
+            Ok(121),
+        );
+        assert_eq!(clock.load(Ordering::Relaxed), 121);
+        assert_eq!(
+            allocate_v2_observed_slot_after_barrier(&clock, 121, Some(121)),
+            Ok(121),
+            "several transitions may share one consensus JAM slot",
+        );
+        assert_eq!(
+            allocate_v2_observed_slot_after_barrier(&clock, 121, Some(120)),
+            Err(V2NodeRegistrationError::LogicalTimeslotRegressed),
+        );
+        assert_eq!(
+            clock.load(Ordering::Relaxed),
+            121,
+            "a stale provider observation cannot move the local floor backward",
         );
     }
 

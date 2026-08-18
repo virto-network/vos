@@ -25,12 +25,13 @@ use super::{
     ExternalActorDirectoryV2, ImportedBlobV2, ImportedProgramV2, JamServiceV2, LocalJamStoreHostV2,
     LocalJamStoreV2, LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
     MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin, PackageError,
-    PackageRolePoliciesV2, PreparedWorkV2, ProgramId, ProofArtifactStoreV2, PublicationAckV2,
-    PublicationRecordV2, PublishedEffectsV2, RefinedServiceOutputV2, RoleAssertionEligibilityV2,
-    RoleAuthorityBindingV2, RoleAuthorizationClaimV2, RoleCredentialV2, ScheduleErrorV2,
-    ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, StateKeyV2,
-    V2Wire, VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key,
-    dedup_storage_key, delivery_storage_key,
+    PackageRolePoliciesV2, PreparedWorkV2, ProductionTrustErrorV2, ProductionTrustV2, ProgramId,
+    ProofArtifactStoreV2, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
+    RefinedServiceOutputV2, RoleAssertionEligibilityV2, RoleAuthorityBindingV2,
+    RoleAuthorizationClaimV2, RoleCredentialV2, ScheduleErrorV2, ServiceDispatchError,
+    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, StateKeyV2, V2Wire, VosPackageV2,
+    WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
+    delivery_storage_key,
 };
 
 #[cfg(feature = "storage")]
@@ -562,6 +563,7 @@ pub enum LocalRootTreeOpenErrorV2<E> {
     ExistingActorMismatch,
     MissingInstalledProgram(ProgramId),
     ProofHistoryUnavailable,
+    ProductionTrust(ProductionTrustErrorV2),
 }
 
 impl<E: core::fmt::Debug> core::fmt::Display for LocalRootTreeOpenErrorV2<E> {
@@ -940,10 +942,14 @@ where
                     )
                 })?;
                 for verification in receipt_verifications {
-                    super::ReceiptVerificationHostV2::make_receipt_available(
+                    if !super::ReceiptVerificationHostV2::make_receipt_available(
                         service.accumulate_host_mut(),
                         verification,
-                    );
+                    ) {
+                        return Err(RootTreeDriverErrorV2::Direct(
+                            super::ServiceDispatchError::InvalidAvailabilityArtifacts,
+                        ));
+                    }
                 }
                 service
                     .accumulate(request)
@@ -1514,7 +1520,29 @@ where
                 LocalRootTreeConfigErrorV2::ReplicationDriverRequired,
             ));
         }
-        Self::open_with_driver(config, backend, RootTreeDriverConfigV2::Direct, None)
+        Self::open_with_driver(config, backend, RootTreeDriverConfigV2::Direct, None, None)
+    }
+
+    /// Open a direct root under a durable production authority profile.
+    /// Existing conformance images are intentionally rejected rather than
+    /// promoted without re-verifiable installation/receipt history.
+    pub fn open_production(
+        config: LocalRootTreeConfigV2,
+        backend: B,
+        trust: Arc<dyn ProductionTrustV2>,
+    ) -> Result<Self, LocalRootTreeOpenErrorV2<<B as CommittedImageStoreV2>::Error>> {
+        if config.consistency == ConsistencyModeV2::Raft {
+            return Err(LocalRootTreeOpenErrorV2::InvalidConfig(
+                LocalRootTreeConfigErrorV2::ReplicationDriverRequired,
+            ));
+        }
+        Self::open_with_driver(
+            config,
+            backend,
+            RootTreeDriverConfigV2::Direct,
+            None,
+            Some(trust),
+        )
     }
 
     /// Open a Raft root tree whose genesis and every later mutation are
@@ -1530,7 +1558,36 @@ where
                 LocalRootTreeConfigErrorV2::InvalidConsistency,
             ));
         }
-        Self::open_with_driver(config, backend, RootTreeDriverConfigV2::Raft(log), None)
+        Self::open_with_driver(
+            config,
+            backend,
+            RootTreeDriverConfigV2::Raft(log),
+            None,
+            None,
+        )
+    }
+
+    /// Open a Raft root with the production trust profile installed before
+    /// snapshot recovery, log replay, or genesis proposal.
+    #[cfg(feature = "storage")]
+    pub fn open_raft_production(
+        config: LocalRootTreeConfigV2,
+        backend: B,
+        log: RaftAccumulateLogV2,
+        trust: Arc<dyn ProductionTrustV2>,
+    ) -> Result<Self, LocalRootTreeOpenErrorV2<<B as CommittedImageStoreV2>::Error>> {
+        if config.consistency != ConsistencyModeV2::Raft {
+            return Err(LocalRootTreeOpenErrorV2::InvalidConfig(
+                LocalRootTreeConfigErrorV2::InvalidConsistency,
+            ));
+        }
+        Self::open_with_driver(
+            config,
+            backend,
+            RootTreeDriverConfigV2::Raft(log),
+            None,
+            Some(trust),
+        )
     }
 
     /// Open a Raft root with its proof verifier installed before snapshot or
@@ -1554,6 +1611,7 @@ where
             backend,
             RootTreeDriverConfigV2::Raft(log),
             Some(proof_verifier),
+            None,
         )
     }
 
@@ -1562,6 +1620,7 @@ where
         backend: B,
         driver: RootTreeDriverConfigV2,
         proof_verifier: Option<Arc<super::local_store::ProofVerifierFnV2>>,
+        production_trust: Option<Arc<dyn ProductionTrustV2>>,
     ) -> Result<Self, LocalRootTreeOpenErrorV2<<B as CommittedImageStoreV2>::Error>> {
         let (expected_root, genesis) = config
             .installation()
@@ -1576,11 +1635,22 @@ where
         .map_err(|_| {
             LocalRootTreeOpenErrorV2::InvalidConfig(LocalRootTreeConfigErrorV2::InvalidGenesis)
         })?;
-        let production_proof_verifier = proof_verifier.is_some();
+        let production_proof_verifier = proof_verifier.is_some() || production_trust.is_some();
         let mut store =
             DurableJamStoreV2::open(backend).map_err(LocalRootTreeOpenErrorV2::Store)?;
+        if let Some(trust) = production_trust {
+            store
+                .install_production_trust(trust)
+                .map_err(LocalRootTreeOpenErrorV2::ProductionTrust)?;
+        } else if store.requires_production_trust() {
+            return Err(LocalRootTreeOpenErrorV2::ProductionTrust(
+                ProductionTrustErrorV2::TrustRequired,
+            ));
+        }
         if let Some(proof_verifier) = proof_verifier {
             store.install_proof_verifier_arc(proof_verifier);
+        }
+        if production_proof_verifier {
             store
                 .ensure_proof_verifier_provenance()
                 .map_err(|_| LocalRootTreeOpenErrorV2::ProofHistoryUnavailable)?;
@@ -1668,6 +1738,16 @@ where
 
     pub fn identity(&self) -> &ServiceIdentityV2 {
         &self.identity
+    }
+
+    pub fn production_trust_policy_id(&self) -> Option<super::Hash> {
+        self.service.accumulate_host().production_trust_policy_id()
+    }
+
+    pub(crate) fn production_logical_timeslot(
+        &self,
+    ) -> Result<Option<u64>, ProductionTrustErrorV2> {
+        self.service.accumulate_host().production_logical_timeslot()
     }
 
     pub fn role_authority(&self) -> Option<&RoleAuthorityBindingV2> {

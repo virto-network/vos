@@ -367,6 +367,13 @@ pub trait AccumulateTransactionV2 {
 pub trait AccumulateProtocolHostV2 {
     type Transaction: AccumulateTransactionV2;
 
+    /// Authenticate one logical timeslot already embedded in a canonical
+    /// request. Conformance hosts accept it; production hosts bind it to
+    /// consensus history before either proposing or replaying the request.
+    fn verify_logical_timeslot(&self, _logical_timeslot: u64) -> Result<(), ServicePvmErrorV2> {
+        Ok(())
+    }
+
     fn begin(&mut self) -> Result<Self::Transaction, ServicePvmErrorV2>;
 
     /// Begin one transaction with an authenticated ambient JAM timeslot.

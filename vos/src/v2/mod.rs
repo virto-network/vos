@@ -74,8 +74,8 @@ pub use identity::{
 pub use local_store::{
     CommittedImageStoreV2, CommittedServiceImageHostV2, DurableJamStoreV2, DurableStoreOpenErrorV2,
     FileCommittedImageStoreV2, LocalJamStoreHostV2, LocalJamStoreSnapshotV2, LocalJamStoreV2,
-    LocalStoreReadErrorV2, PrivateIngressStagingV2, ProofArtifactStoreV2,
-    ServiceImageInstallErrorV2,
+    LocalStoreReadErrorV2, PrivateIngressStagingV2, ProductionTrustDecisionV2,
+    ProductionTrustErrorV2, ProductionTrustV2, ProofArtifactStoreV2, ServiceImageInstallErrorV2,
 };
 pub use package::{
     DeploymentSignatureV2, PackageDiagnosticsV2, PackageError, PackageManifestV2,

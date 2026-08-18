@@ -246,6 +246,33 @@ fn requires_logical_timeslot(request: &AccumulateRequestV2) -> bool {
     )
 }
 
+fn embedded_logical_timeslot(request: &AccumulateRequestV2) -> Option<u64> {
+    match request {
+        AccumulateRequestV2::AdmitIngress(ingress) => Some(ingress.logical_timeslot),
+        AccumulateRequestV2::Apply(envelope) | AccumulateRequestV2::PrepareAttested(envelope) => {
+            Some(envelope.work.logical_timeslot)
+        }
+        AccumulateRequestV2::Deliver(delivery) => Some(delivery.logical_timeslot),
+        _ => None,
+    }
+}
+
+fn verify_request_logical_timeslots<A: AccumulateProtocolHostV2>(
+    host: &A,
+    request: &AccumulateRequestV2,
+    ambient: Option<u64>,
+) -> Result<(), ServicePvmErrorV2> {
+    if let Some(logical_timeslot) = embedded_logical_timeslot(request) {
+        host.verify_logical_timeslot(logical_timeslot)?;
+    }
+    if let Some(logical_timeslot) = ambient
+        && Some(logical_timeslot) != embedded_logical_timeslot(request)
+    {
+        host.verify_logical_timeslot(logical_timeslot)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefinedServiceOutputV2 {
     pub transition: TransitionV2,
@@ -835,6 +862,8 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
         request: &AccumulateRequestV2,
     ) -> Result<AccumulatedServiceOutputV2, ServiceDispatchError> {
         self.validate_service_identity(request.service())?;
+        verify_request_logical_timeslots(&self.accumulate_host, request, None)
+            .map_err(ServiceDispatchError::Pvm)?;
         let output = self
             .pvm
             .accumulate(
@@ -860,6 +889,8 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
         self.validate_service_identity(request.service())?;
         validate_accumulate_availability(request, programs, blobs)
             .map_err(|_| ServiceDispatchError::InvalidAvailabilityArtifacts)?;
+        verify_request_logical_timeslots(&self.accumulate_host, request, None)
+            .map_err(ServiceDispatchError::Pvm)?;
         let output = self
             .pvm
             .accumulate_with_availability(
@@ -898,6 +929,8 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
         self.validate_service_identity(request.service())?;
         validate_accumulate_availability(request, programs, blobs)
             .map_err(|_| ServiceDispatchError::InvalidAvailabilityArtifacts)?;
+        verify_request_logical_timeslots(&self.accumulate_host, request, Some(logical_timeslot))
+            .map_err(ServiceDispatchError::Pvm)?;
         let output = self
             .pvm
             .accumulate_at_with_availability(
@@ -1314,6 +1347,14 @@ where
             if requires_logical_timeslot(&request) != entry.logical_timeslot.is_some() {
                 return Err(ReplicatedServiceErrorV2::InvalidCommittedLog);
             }
+            verify_request_logical_timeslots(
+                self.service.accumulate_host(),
+                &request,
+                entry.logical_timeslot,
+            )
+            .map_err(|error| {
+                ReplicatedServiceErrorV2::Dispatch(ServiceDispatchError::Pvm(error))
+            })?;
             // Proof hydration is a durable local precondition, not a guest
             // semantic decision. A failed side-CAS write must leave this entry
             // unapplied so exact catch-up can retry it.
@@ -1590,6 +1631,10 @@ where
         if !time_dependent && logical_timeslot.is_some() {
             return Err(ReplicatedServiceErrorV2::UnexpectedLogicalTimeslot);
         }
+        verify_request_logical_timeslots(self.service.accumulate_host(), request, logical_timeslot)
+            .map_err(|error| {
+                ReplicatedServiceErrorV2::Dispatch(ServiceDispatchError::Pvm(error))
+            })?;
         if matches!(request, AccumulateRequestV2::PrepareAttested(_)) {
             return self
                 .service
