@@ -692,6 +692,7 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
                 index: shared.entries.len() as u64 + 1,
                 request,
                 logical_timeslot: None,
+                production_trust_policy: None,
                 availability_programs: vec![],
                 availability_blobs: vec![],
                 receipt_verifications: vec![],
@@ -705,6 +706,7 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
         &mut self,
         request: &[u8],
         logical_timeslot: Option<u64>,
+        production_trust_policy: Option<Hash>,
         programs: &[ImportedProgramV2],
         blobs: &[ImportedBlobV2],
         receipt_verifications: &[ReceiptVerificationRequestV2],
@@ -718,6 +720,7 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
                 index: shared.entries.len() as u64 + 1,
                 request,
                 logical_timeslot: None,
+                production_trust_policy: None,
                 availability_programs: vec![],
                 availability_blobs: vec![],
                 receipt_verifications: vec![],
@@ -728,6 +731,7 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
             index: shared.entries.len() as u64 + 1,
             request: request.to_vec(),
             logical_timeslot,
+            production_trust_policy,
             availability_programs: programs.to_vec(),
             availability_blobs: blobs.to_vec(),
             receipt_verifications: receipt_verifications.to_vec(),
@@ -1357,7 +1361,7 @@ impl ProductionTrustV2 for TestProductionTrust {
     fn verify_logical_timeslot(&self, logical_timeslot: u64) -> ProductionTrustDecisionV2 {
         if !self.allow {
             ProductionTrustDecisionV2::Denied
-        } else if logical_timeslot == self.slot.load(Ordering::Relaxed) {
+        } else if logical_timeslot <= self.slot.load(Ordering::Relaxed) {
             ProductionTrustDecisionV2::Authorized
         } else {
             ProductionTrustDecisionV2::Denied
@@ -1442,9 +1446,20 @@ fn production_root_requires_the_same_durable_trust_policy_after_restart() {
         "an unverified embedded slot reaches neither guest state nor dedup",
     );
     request.logical_timeslot = 77;
+    let mut regressed = request.clone();
     service
         .invoke(request)
         .expect("the consensus-verified embedded slot reaches physical IC-5");
+    trust.slot.store(76, Ordering::Relaxed);
+    regressed.invocation = InvocationId([0x7c; 32]);
+    regressed.logical_timeslot = 76;
+    assert!(matches!(
+        service.invoke(regressed),
+        Err(LocalRootTreeInvokeErrorV2::Service(
+            ServiceDispatchError::Pvm(ServicePvmErrorV2::AccumulateHostRejected(slot)),
+        )) if slot == vos::abi::hostcall::ACCUMULATION_TIMESLOT as u8,
+    ));
+    trust.slot.store(77, Ordering::Relaxed);
     drop(service);
 
     assert!(matches!(
@@ -1481,6 +1496,121 @@ fn production_root_requires_the_same_durable_trust_policy_after_restart() {
             AccumulationRejectionV2::Unauthorized,
         )),
     ));
+}
+
+#[test]
+fn raft_replay_rejects_a_different_production_trust_policy_before_genesis() {
+    let actor_pvm = actor_pvm(0);
+    let actor_program = ProgramId::of_pvm(&actor_pvm);
+    let initial_bytes = Vec::new();
+    let initial_state = BlobRefV2::of_bytes(&initial_bytes);
+    let actor = ActorId([0x84; 32]);
+    let service = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([0x85; 32]),
+        root_service: RootServiceId([0x86; 32]),
+        deployment: DeploymentId([0x87; 32]),
+        service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
+    };
+    let genesis = ServiceGenesisV2 {
+        role_authority: None,
+        external_actors: vec![],
+        service: service.clone(),
+        consistency: ConsistencyModeV2::Raft,
+        actors: vec![ActorGenesisV2 {
+            actor,
+            name: "root".into(),
+            parent: None,
+            producer: ProducerId([0x88; 32]),
+            deployment: service.deployment,
+            program: actor_program,
+            initial_state: initial_state.clone(),
+            crdt: false,
+            role_policies: role_policies(vec![MethodPolicyV2 {
+                method: "start".into(),
+                schema: Hash([0x89; 32]),
+                policy: public_policy_hash(),
+                public: true,
+                attested: false,
+                space_role: None,
+                actor_role: None,
+            }]),
+        }],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([0x8a; 32]),
+            authenticator: vec![0x8b],
+        },
+    };
+    let programs = vec![ImportedProgramV2 {
+        program: actor_program,
+        pvm: actor_pvm,
+    }];
+    let blobs = vec![ImportedBlobV2 {
+        reference: initial_state,
+        bytes: initial_bytes,
+    }];
+    let shared = Arc::new(Mutex::new(SharedCommittedLog::default()));
+    let make_replica = |policy: u8, leader: bool| {
+        let mut host = LocalJamStoreV2::default();
+        host.install_production_trust(Arc::new(TestProductionTrust::new(policy, 20, true)))
+            .unwrap();
+        ReplicatedJamServiceV2::new(
+            JamServiceV2::new(
+                CANONICAL_SERVICE_PVM.to_vec(),
+                vos::v2::VOS_SERVICE_PROGRAM_ID,
+                NoRefineProtocolHostV2,
+                host,
+                TEST_GAS_SCHEDULE.refine,
+                TEST_GAS_SCHEDULE.accumulate,
+            )
+            .unwrap(),
+            TestCommittedLog::new(shared.clone(), leader),
+        )
+    };
+    let mut leader = make_replica(0x91, true);
+    assert!(matches!(
+        leader
+            .accumulate_with_availability(
+                &AccumulateRequestV2::Install(genesis),
+                &programs,
+                &blobs,
+            )
+            .unwrap()
+            .result,
+        AccumulationResultV2::Installed(_),
+    ));
+    assert_eq!(
+        shared.lock().unwrap().entries[0].production_trust_policy,
+        Some(Hash([0x91; 32])),
+    );
+
+    let mut matching_follower = make_replica(0x91, false);
+    assert_eq!(matching_follower.catch_up().unwrap(), 1);
+    assert!(
+        matching_follower
+            .service()
+            .accumulate_host()
+            .header()
+            .unwrap()
+            .is_some()
+    );
+
+    let mut mismatched_follower = make_replica(0x92, false);
+    assert!(matches!(
+        mismatched_follower.catch_up(),
+        Err(ReplicatedServiceErrorV2::InvalidCommittedLog),
+    ));
+    assert_eq!(mismatched_follower.log_mut().applied_index().unwrap(), 0);
+    assert!(
+        mismatched_follower
+            .service()
+            .accumulate_host()
+            .header()
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -14144,6 +14274,7 @@ fn raft_delivery_and_reply_verifiers_replay_before_physical_accumulate() {
         .propose_at_with_availability(
             &delivery_request.encode(),
             None,
+            None,
             &[],
             &[],
             core::slice::from_ref(&delivery_verification),
@@ -14232,6 +14363,7 @@ fn raft_delivery_and_reply_verifiers_replay_before_physical_accumulate() {
         .log_mut()
         .propose_at_with_availability(
             &resume_request.encode(),
+            None,
             None,
             &[],
             &[],
@@ -14507,6 +14639,7 @@ fn raft_authority_receipts_replay_on_a_fresh_follower_before_actor_apply() {
             .propose_at_with_availability(
                 &ingress.encode(),
                 None,
+                None,
                 &[],
                 &[],
                 core::slice::from_ref(&forged_verification),
@@ -14525,6 +14658,7 @@ fn raft_authority_receipts_replay_on_a_fresh_follower_before_actor_apply() {
         .log_mut()
         .propose_at_with_availability(
             &ingress.encode(),
+            None,
             None,
             &[],
             &[],
@@ -14749,6 +14883,7 @@ fn raft_authority_receipts_replay_on_a_fresh_follower_before_actor_apply() {
         .log_mut()
         .propose_at_with_availability(
             &delivery_request.encode(),
+            None,
             None,
             &[],
             &[],

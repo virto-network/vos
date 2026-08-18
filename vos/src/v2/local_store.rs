@@ -2631,6 +2631,45 @@ impl AccumulateTransactionV2 for LocalJamTransactionV2 {
 impl AccumulateProtocolHostV2 for LocalJamStoreV2 {
     type Transaction = LocalJamTransactionV2;
 
+    fn production_trust_policy_id(&self) -> Option<super::Hash> {
+        self.production_trust_policy
+    }
+
+    fn verify_current_logical_timeslot(
+        &self,
+        logical_timeslot: u64,
+    ) -> Result<(), ServicePvmErrorV2> {
+        let Some(trust) = self.production_trust.as_ref() else {
+            return if self.requires_production_trust() {
+                Err(ServicePvmErrorV2::AccumulateHostRejected(
+                    crate::abi::hostcall::ACCUMULATION_TIMESLOT as u8,
+                ))
+            } else {
+                Ok(())
+            };
+        };
+        let durable_floor = self
+            .header()
+            .map_err(|_| {
+                ServicePvmErrorV2::AccumulateHostRejected(
+                    crate::abi::hostcall::ACCUMULATION_TIMESLOT as u8,
+                )
+            })?
+            .map_or(0, |header| header.admission_timeslot_high_water);
+        if trust.logical_timeslot() == Some(logical_timeslot)
+            && logical_timeslot >= durable_floor
+            && trust
+                .verify_logical_timeslot(logical_timeslot)
+                .is_authorized()
+        {
+            Ok(())
+        } else {
+            Err(ServicePvmErrorV2::AccumulateHostRejected(
+                crate::abi::hostcall::ACCUMULATION_TIMESLOT as u8,
+            ))
+        }
+    }
+
     fn verify_logical_timeslot(&self, logical_timeslot: u64) -> Result<(), ServicePvmErrorV2> {
         let Some(trust) = self.production_trust.as_ref() else {
             return if self.requires_production_trust() {
@@ -2743,6 +2782,17 @@ where
     B: CommittedImageStoreV2 + ProofArtifactStoreV2<Error = <B as CommittedImageStoreV2>::Error>,
 {
     type Transaction = LocalJamTransactionV2;
+
+    fn production_trust_policy_id(&self) -> Option<super::Hash> {
+        self.local.production_trust_policy_id()
+    }
+
+    fn verify_current_logical_timeslot(
+        &self,
+        logical_timeslot: u64,
+    ) -> Result<(), ServicePvmErrorV2> {
+        self.local.verify_current_logical_timeslot(logical_timeslot)
+    }
 
     fn verify_logical_timeslot(&self, logical_timeslot: u64) -> Result<(), ServicePvmErrorV2> {
         self.local.verify_logical_timeslot(logical_timeslot)

@@ -7616,6 +7616,10 @@ fn allocate_v2_observed_slot_after_barrier(
     allocate_v2_conformance_slot_after_barrier(logical_timeslot, admission_floor)
 }
 
+fn v2_root_slot_failure_is_terminal(failure: V2NodeRegistrationError) -> bool {
+    matches!(failure, V2NodeRegistrationError::LogicalTimeslotExhausted)
+}
+
 fn allocate_v2_conformance_slot_after_barrier(
     logical_timeslot: &AtomicU64,
     admission_floor: u64,
@@ -8165,10 +8169,13 @@ where
             {
                 Ok(slot) => slot,
                 Err(failure) => {
-                    error!(%id, ?failure, "v2 root-tree admission clock restoration failed");
+                    warn!(%id, ?failure, "v2 root-tree admission clock restoration failed");
                     send_v2_status(req.reply, crate::STATUS_PANICKED, id);
-                    error = Some(format!("v2 root-tree clock restoration failed: {failure}"));
-                    break;
+                    if v2_root_slot_failure_is_terminal(failure) {
+                        error = Some(format!("v2 root-tree clock exhausted: {failure:?}"));
+                        break;
+                    }
+                    continue;
                 }
             };
         request.logical_timeslot = final_slot;
@@ -14184,6 +14191,15 @@ mod tests {
             121,
             "a stale provider observation cannot move the local floor backward",
         );
+        assert!(!v2_root_slot_failure_is_terminal(
+            V2NodeRegistrationError::LogicalTimeslotUnavailable,
+        ));
+        assert!(!v2_root_slot_failure_is_terminal(
+            V2NodeRegistrationError::LogicalTimeslotRegressed,
+        ));
+        assert!(v2_root_slot_failure_is_terminal(
+            V2NodeRegistrationError::LogicalTimeslotExhausted,
+        ));
     }
 
     #[test]

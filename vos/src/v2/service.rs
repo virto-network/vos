@@ -257,7 +257,7 @@ fn embedded_logical_timeslot(request: &AccumulateRequestV2) -> Option<u64> {
     }
 }
 
-fn verify_request_logical_timeslots<A: AccumulateProtocolHostV2>(
+fn verify_replayed_logical_timeslots<A: AccumulateProtocolHostV2>(
     host: &A,
     request: &AccumulateRequestV2,
     ambient: Option<u64>,
@@ -269,6 +269,30 @@ fn verify_request_logical_timeslots<A: AccumulateProtocolHostV2>(
         && Some(logical_timeslot) != embedded_logical_timeslot(request)
     {
         host.verify_logical_timeslot(logical_timeslot)?;
+    }
+    Ok(())
+}
+
+fn verify_admitted_logical_timeslots<A: AccumulateProtocolHostV2>(
+    host: &A,
+    request: &AccumulateRequestV2,
+    ambient: Option<u64>,
+) -> Result<(), ServicePvmErrorV2> {
+    let embedded = embedded_logical_timeslot(request);
+    if let Some(logical_timeslot) = embedded {
+        if matches!(
+            request,
+            AccumulateRequestV2::AdmitIngress(_) | AccumulateRequestV2::Deliver(_)
+        ) {
+            host.verify_current_logical_timeslot(logical_timeslot)?;
+        } else {
+            host.verify_logical_timeslot(logical_timeslot)?;
+        }
+    }
+    if let Some(logical_timeslot) = ambient
+        && Some(logical_timeslot) != embedded
+    {
+        host.verify_current_logical_timeslot(logical_timeslot)?;
     }
     Ok(())
 }
@@ -433,6 +457,10 @@ pub struct CommittedAccumulateEntryV2 {
     pub index: u64,
     pub request: Vec<u8>,
     pub logical_timeslot: Option<u64>,
+    /// Consensus-visible commitment to the production verifier set used for
+    /// this root. Every entry carries the same value; conformance groups carry
+    /// `None`.
+    pub production_trust_policy: Option<super::Hash>,
     /// Canonical content bytes required to make this entry independently
     /// replayable on a replica with an empty node-local cache.
     pub availability_programs: Vec<ImportedProgramV2>,
@@ -576,6 +604,7 @@ pub trait CommittedAccumulateLogV2 {
         &mut self,
         request: &[u8],
         logical_timeslot: Option<u64>,
+        production_trust_policy: Option<super::Hash>,
         programs: &[ImportedProgramV2],
         blobs: &[ImportedBlobV2],
         receipt_verifications: &[ReceiptVerificationRequestV2],
@@ -586,7 +615,7 @@ pub trait CommittedAccumulateLogV2 {
         request: &[u8],
         logical_timeslot: Option<u64>,
     ) -> Result<CommittedAccumulateEntryV2, Self::Error> {
-        self.propose_at_with_availability(request, logical_timeslot, &[], &[], &[])
+        self.propose_at_with_availability(request, logical_timeslot, None, &[], &[], &[])
     }
 
     fn propose(&mut self, request: &[u8]) -> Result<CommittedAccumulateEntryV2, Self::Error> {
@@ -862,7 +891,7 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
         request: &AccumulateRequestV2,
     ) -> Result<AccumulatedServiceOutputV2, ServiceDispatchError> {
         self.validate_service_identity(request.service())?;
-        verify_request_logical_timeslots(&self.accumulate_host, request, None)
+        verify_admitted_logical_timeslots(&self.accumulate_host, request, None)
             .map_err(ServiceDispatchError::Pvm)?;
         let output = self
             .pvm
@@ -889,7 +918,7 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
         self.validate_service_identity(request.service())?;
         validate_accumulate_availability(request, programs, blobs)
             .map_err(|_| ServiceDispatchError::InvalidAvailabilityArtifacts)?;
-        verify_request_logical_timeslots(&self.accumulate_host, request, None)
+        verify_admitted_logical_timeslots(&self.accumulate_host, request, None)
             .map_err(ServiceDispatchError::Pvm)?;
         let output = self
             .pvm
@@ -929,7 +958,7 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
         self.validate_service_identity(request.service())?;
         validate_accumulate_availability(request, programs, blobs)
             .map_err(|_| ServiceDispatchError::InvalidAvailabilityArtifacts)?;
-        verify_request_logical_timeslots(&self.accumulate_host, request, Some(logical_timeslot))
+        verify_admitted_logical_timeslots(&self.accumulate_host, request, Some(logical_timeslot))
             .map_err(ServiceDispatchError::Pvm)?;
         let output = self
             .pvm
@@ -942,6 +971,46 @@ impl<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2> JamServiceV2<R, A> {
                 blobs,
             )
             .map_err(ServiceDispatchError::Pvm)?;
+        let result = AccumulationResultV2::decode(&output.bytes)
+            .map_err(|_| ServiceDispatchError::InvalidAccumulateOutput)?;
+        Ok(AccumulatedServiceOutputV2 {
+            result,
+            gas_used: output.gas_used,
+        })
+    }
+
+    /// Execute an already committed entry after its logical time was checked
+    /// against consensus history. This deliberately does not require the
+    /// slot to remain the provider's current observation: follower replay and
+    /// restart catch-up are historical operations.
+    fn accumulate_replayed_with_availability(
+        &mut self,
+        request: &AccumulateRequestV2,
+        logical_timeslot: Option<u64>,
+        programs: &[ImportedProgramV2],
+        blobs: &[ImportedBlobV2],
+    ) -> Result<AccumulatedServiceOutputV2, ServiceDispatchError> {
+        self.validate_service_identity(request.service())?;
+        validate_accumulate_availability(request, programs, blobs)
+            .map_err(|_| ServiceDispatchError::InvalidAvailabilityArtifacts)?;
+        let output = match logical_timeslot {
+            Some(logical_timeslot) => self.pvm.accumulate_at_with_availability(
+                &request.encode(),
+                self.gas_schedule.accumulate,
+                &mut self.accumulate_host,
+                logical_timeslot,
+                programs,
+                blobs,
+            ),
+            None => self.pvm.accumulate_with_availability(
+                &request.encode(),
+                self.gas_schedule.accumulate,
+                &mut self.accumulate_host,
+                programs,
+                blobs,
+            ),
+        }
+        .map_err(ServiceDispatchError::Pvm)?;
         let result = AccumulationResultV2::decode(&output.bytes)
             .map_err(|_| ServiceDispatchError::InvalidAccumulateOutput)?;
         Ok(AccumulatedServiceOutputV2 {
@@ -1327,6 +1396,7 @@ where
                 && capture.is_some_and(|target| {
                     target.request.as_slice() != entry.request.as_slice()
                         || target.logical_timeslot != entry.logical_timeslot
+                        || target.production_trust_policy != entry.production_trust_policy
                         || target.availability_programs != entry.availability_programs
                         || target.availability_blobs != entry.availability_blobs
                         || target.receipt_verifications != entry.receipt_verifications
@@ -1336,6 +1406,11 @@ where
             }
             let request = AccumulateRequestV2::decode(&entry.request)
                 .map_err(|_| ReplicatedServiceErrorV2::InvalidCommittedLog)?;
+            if entry.production_trust_policy
+                != self.service.accumulate_host().production_trust_policy_id()
+            {
+                return Err(ReplicatedServiceErrorV2::InvalidCommittedLog);
+            }
             validate_accumulate_availability(
                 &request,
                 &entry.availability_programs,
@@ -1347,7 +1422,7 @@ where
             if requires_logical_timeslot(&request) != entry.logical_timeslot.is_some() {
                 return Err(ReplicatedServiceErrorV2::InvalidCommittedLog);
             }
-            verify_request_logical_timeslots(
+            verify_replayed_logical_timeslots(
                 self.service.accumulate_host(),
                 &request,
                 entry.logical_timeslot,
@@ -1365,19 +1440,12 @@ where
                 &entry.receipt_verifications,
             )
             .map_err(|_| ReplicatedServiceErrorV2::ReceiptUnavailable)?;
-            let outcome = match entry.logical_timeslot {
-                Some(logical_timeslot) => self.service.accumulate_at_with_availability(
-                    &request,
-                    logical_timeslot,
-                    &entry.availability_programs,
-                    &entry.availability_blobs,
-                ),
-                None => self.service.accumulate_with_availability(
-                    &request,
-                    &entry.availability_programs,
-                    &entry.availability_blobs,
-                ),
-            };
+            let outcome = self.service.accumulate_replayed_with_availability(
+                &request,
+                entry.logical_timeslot,
+                &entry.availability_programs,
+                &entry.availability_blobs,
+            );
             if let Err(error) = outcome.as_ref()
                 && !error.is_deterministic_accumulate_failure()
             {
@@ -1631,10 +1699,12 @@ where
         if !time_dependent && logical_timeslot.is_some() {
             return Err(ReplicatedServiceErrorV2::UnexpectedLogicalTimeslot);
         }
-        verify_request_logical_timeslots(self.service.accumulate_host(), request, logical_timeslot)
-            .map_err(|error| {
-                ReplicatedServiceErrorV2::Dispatch(ServiceDispatchError::Pvm(error))
-            })?;
+        verify_admitted_logical_timeslots(
+            self.service.accumulate_host(),
+            request,
+            logical_timeslot,
+        )
+        .map_err(|error| ReplicatedServiceErrorV2::Dispatch(ServiceDispatchError::Pvm(error)))?;
         if matches!(request, AccumulateRequestV2::PrepareAttested(_)) {
             return self
                 .service
@@ -1643,13 +1713,24 @@ where
         }
         ensure_request_proof_available(self.service.accumulate_host_mut(), request)
             .map_err(|_| ReplicatedServiceErrorV2::ProofUnavailable)?;
+        // A sidecar is consensus input only after the leader's installed
+        // production authority has accepted it. Followers repeat this check
+        // during replay; doing it here prevents a denied request from becoming
+        // a committed poison entry that no replica can advance past.
+        ensure_request_receipts_available(
+            self.service.accumulate_host_mut(),
+            receipt_verifications,
+        )
+        .map_err(|_| ReplicatedServiceErrorV2::ReceiptUnavailable)?;
 
         let request_bytes = request.encode();
+        let production_trust_policy = self.service.accumulate_host().production_trust_policy_id();
         let entry = self
             .log
             .propose_at_with_availability(
                 &request_bytes,
                 logical_timeslot,
+                production_trust_policy,
                 programs,
                 blobs,
                 receipt_verifications,
@@ -1662,6 +1743,7 @@ where
         if entry.index <= applied
             || entry.request != request_bytes
             || entry.logical_timeslot != logical_timeslot
+            || entry.production_trust_policy != production_trust_policy
             || entry.availability_programs.as_slice() != programs
             || entry.availability_blobs.as_slice() != blobs
             || entry.receipt_verifications.as_slice() != receipt_verifications

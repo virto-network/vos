@@ -673,14 +673,20 @@ When this profile is installed, the process-local `allow_install`,
 test seams cannot grant authority or replace its proof verifier. Receipt
 sidecars still order the verifier's exact public input through Raft; they do
 not authorize themselves, because each replica invokes the production policy
-before making the request visible to IC-5. A missing time observation or one
+before making the request visible to IC-5. The leader performs that same
+verification before proposal, so a production-denied sidecar cannot become a
+committed poison entry. A missing time observation or one
 behind the committed admission high-water stops admission and timeout driving.
 Repeated transitions may share one genuine JAM slot.
-The same policy re-verifies slots embedded in direct ingress, actor work, and
-delivery requests before proposal and again during follower replay; opening a
-production root does not leave the lower-level service API as a backdating
-bypass. Historical verification is a consensus lookup/certificate check, not
-an equality check against whatever slot happens to be current at replay time.
+New direct ingress and delivery require the exact current observation and may
+not fall below the durable admission high-water. Actor work derived from an
+already admitted durable input uses historical verification. Follower replay
+also uses historical verification for every embedded or ambient slot; opening
+a production root therefore does not leave the lower-level service API as a
+backdating bypass while still permitting a valid old log entry to replay after
+the current slot advances. Historical verification is a consensus
+lookup/certificate check, not an equality check against whatever slot happens
+to be current at replay time.
 Verifier decisions distinguish `Denied` from `Unavailable`: a deterministic
 denial is a guest-visible authorization result, while unavailable Install,
 Upgrade, or role authority returns a host failure so a committed Raft entry
@@ -691,7 +697,10 @@ provenance commits `(policy_id, exact image bytes)` and is re-sealed only after
 the durable commit boundary succeeds. This host-image change does not alter a
 guest wire, the platform ABI, execution semantics, or the canonical service
 PVM. Snapshot replacement additionally requires the locally installed policy
-ID to match the incoming image.
+ID to match the incoming image. Every consensus-visible Raft application entry
+also carries that exact ID (or `None` for conformance), so an empty voter must
+match the group policy before it can replay genesis or advance its applied
+cursor.
 
 This repository does not yet contain a JAM/consensus authority implementation.
 `LocalRootTreeServiceV2::open_production` and `open_raft_production` require an
@@ -831,8 +840,9 @@ authority receipt-verification request. A replicated delivery carries its
 canonical source verification and, when role-authorized, the assertion
 verification in strict hash order. An empty or incomplete sidecar is rejected
 even if the leader's process-local verifier already knows those receipts. The
-replicated payload uses the
-clean-break `VRQ4` wire; retired
+replicated payload uses the clean-break `VRQ5` wire. It binds the selected
+production trust policy alongside the request, logical-time provenance,
+availability artifacts, and receipt-verification sidecars; retired
 payloads fail loud rather than being interpreted without their availability or
 receipt-verification sidecars. Raft
 does not replicate an `EffectLog` or a leader-produced post-state image.

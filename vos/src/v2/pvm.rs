@@ -367,9 +367,27 @@ pub trait AccumulateTransactionV2 {
 pub trait AccumulateProtocolHostV2 {
     type Transaction: AccumulateTransactionV2;
 
+    /// Consensus-visible identity of the production verifier set. Replicated
+    /// hosts order this value beside every request; conformance hosts use
+    /// `None`.
+    fn production_trust_policy_id(&self) -> Option<Hash> {
+        None
+    }
+
+    /// Authenticate a slot selected for a new admission. Production hosts
+    /// require the current consensus observation and reject values below the
+    /// durable service high-water. Historical replay uses
+    /// [`Self::verify_logical_timeslot`] instead.
+    fn verify_current_logical_timeslot(
+        &self,
+        logical_timeslot: u64,
+    ) -> Result<(), ServicePvmErrorV2> {
+        self.verify_logical_timeslot(logical_timeslot)
+    }
+
     /// Authenticate one logical timeslot already embedded in a canonical
-    /// request. Conformance hosts accept it; production hosts bind it to
-    /// consensus history before either proposing or replaying the request.
+    /// committed request. Conformance hosts accept it; production hosts bind
+    /// it to consensus history during replay.
     fn verify_logical_timeslot(&self, _logical_timeslot: u64) -> Result<(), ServicePvmErrorV2> {
         Ok(())
     }
