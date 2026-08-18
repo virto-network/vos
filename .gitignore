@@ -9,3 +9,4 @@ data/
 node.key
 *.local.toml
 .claude/
+.worktrees/
