@@ -1,8 +1,9 @@
 # `#[provable]` — proofs of actor transitions
 
-Status: **W1–W4, the parent-side Clerk delegation, signed Local service-v2 Task
-execution, and producer-local durable record storage are implemented; private
-replicated ingress and Clerk catalog/node cutover remain**.
+Status: **W1–W4, the parent-side Clerk delegation, signed Local/Raft
+service-v2 Task execution, all-voter private ingress, producer-local durable
+record storage, and the canonical Clerk package/Raft-root path are
+implemented. CRDT private-Task availability remains staged**.
 The first draft
 tried to make a provable Task re-anchor its invoking parent's committed
 `0x02` composite and verify committed reads in-circuit against it. A
@@ -418,6 +419,14 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
   v16. Recorded execution also rejects debug output and enforces per-slice
   count/byte bounds. Named parent-row imports and effectful Tasks remain fail-closed until
   they receive an authenticated typed transition contract.
+- **Canonical Clerk deployment artifact.** `just build-clerk-v2-package`
+  builds `clerk-ledger`, derives the immutable canonical `clerk-apply` Task
+  content address, and signs both into one `.vos` artifact for a Local or Raft
+  root. The actor no longer stores a mutable prover-program selector. A
+  physical single-voter Raft gate boots the real ledger, creates accounts,
+  executes the real private provable transfer, verifies the producer record,
+  proves zero-gas exact retry and restart recovery, and scans both the service
+  image and ordered log for the private openings.
 
 - **Precompile safety boundary.** `handle_precompile_ecall` can accelerate
   non-recorded Task and Refine execution, with Refine preserving phi[7]/phi[8]
@@ -443,7 +452,7 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
   longer rely on the unconstrained curve/scalar ECALL outputs. Re-enabling
   `pvm-precompile` remains forbidden until that arithmetic is constrained in
   the AIR.
-- *Replicated clerk-ledger production cutover.* Signed Task execution is
+- *CRDT clerk-ledger cutover.* Signed Task execution is
   exact-traced and Local/Raft producers keep plaintext private ingress in a
   durable side-CAS while guest state and Raft entries bind only its content
   address. A Raft leader authenticates the complete steady voter roster,
@@ -454,9 +463,9 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
   installation retire the sidecar independently on every holder, with bounded
   cleanup-debt retries. Removed receivers, non-leader senders, stale rosters,
   and unavailable voters all fail before admission. CRDT Task packages remain
-  rejected until they gain a causal producer-availability rule; the public
-  money path can switch once that separate CRDT choice (or a Raft-only
-  deployment decision) is made.
+  rejected until they gain a causal producer-availability rule. Clerk's
+  canonical package is therefore production-eligible for Local/Raft roots;
+  a CRDT deployment must wait for that separate causal availability design.
 - *Generated parent glue.* D6's manual Clerk implementation establishes the
   contract; a later macro may generate the touched-leaf/proof/invoke/apply
   boilerplate for other actors without changing its trust model.

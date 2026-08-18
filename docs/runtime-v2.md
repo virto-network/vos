@@ -909,11 +909,12 @@ completed scheduler values are scrubbed. Recorded debug output is forbidden
 and capture is bounded per slice. Raft packages containing Task dependencies
 use the private-input availability protocol below; CRDT packages containing
 them remain rejected before genesis until causal replication has an equivalent
-producer-availability rule. Named actor-row witnesses and Task effects likewise
-remain fail-closed pending an authenticated typed import/effect contract.
+producer-availability rule. Task-visible named parent-row imports and Task
+effects likewise remain fail-closed pending an authenticated typed
+import/effect contract.
 
-The first replicated-private-input boundary is explicit but does not yet open
-that gate. A bounded `StorePrivateIngress` request carries the exact Raft
+Raft private-input availability is an enforced all-voter protocol. A bounded
+`StorePrivateIngress` request carries the exact Raft
 replication id, invocation id, content hash, declared length, and at most one
 64-KiB preimage over a Noise-authenticated request/response stream. The
 receiver accepts it only from the canonical registry PeerId of the leader in
@@ -951,6 +952,19 @@ snapshot installation validates live artifacts before visibility), with
 cleanup debt retried independently. CRDT still needs a separate causally
 authorized producer-availability rule and continues to reject Task packages
 before genesis.
+
+Ordinary actor-local `STORAGE_R` is available to Local and Raft roots without
+trusting the host's live view. Refine first runs speculatively and reports the
+sorted point reads it discovers. The scheduler reads each row—or explicit
+absence—from the exact committed linear base, adds at most 256 rows and 1 MiB
+of values to the work envelope, and restarts the original machine for at most
+16 adaptive discovery rounds. Guest
+Accumulate re-reads every row at that base before accepting the transition.
+The actor never observes the provisional missing results, and a forged,
+stale, duplicate, oversized, or CRDT storage witness fails closed. Actor
+writes are collapsed to their final value per key and exported in canonical
+key order, so repeated writes in one dispatch remain last-write-wins without
+creating a non-canonical physical transition.
 
 `space up --service-pvm <exact-vos-service.pvm>` recognizes signed `.vos`
 catalog artifacts and opens each ordinary Local or Raft deployment as one
@@ -1060,7 +1074,7 @@ CRDT direct ingress is itself a guest-authenticated workflow DAG node. Its
 exact causal base, stable invocation identity, authorization input, and
 accumulation receipt replicate before actor Refine runs; synchronized replicas
 rematerialize the same queued/consumed ingress record through physical IC-5.
-Store schema 34, continuation snapshot version 6, and platform ABI version 12
+Store schema 35, continuation snapshot version 6, and platform ABI version 13
 are therefore a clean break from earlier experimental v2 images. ABI 11 bound
 each actor's sorted, bounded Task dependency map into the signed package,
 guest-owned descriptor, work envelope, and Refine imports. Schema 33 rejects
@@ -1079,7 +1093,11 @@ ingress, durable host-side hydration, redacted workflow checkpoints, and the
 stronger no-suspend rule for every private-input slice. Execution semantics
 v17 admits signed Task dependencies for Raft Install/Upgrade under the
 host-authenticated all-voter private-input barrier while retaining the guest's
-CRDT rejection. CRDT private-input availability remains deliberately staged.
+CRDT rejection. ABI 13, schema 35, and execution semantics v18 add bounded
+base-authenticated actor-storage point reads, explicit absence witnesses, and
+canonical last-write-wins actor effect export. They also pin the canonical
+Clerk actor/Task package used by the physical Raft production gate. CRDT
+private-input availability remains deliberately staged.
 On durable open, the
 producer side-CAS retains content-addressed inputs belonging to guest-owned
 unconsumed ingress records and explicitly Raft-staged inputs awaiting ordered
