@@ -150,8 +150,14 @@ fn spawn_up_with_service_and_trust(
 struct TestProductionTrustSidecar {
     path: PathBuf,
     stop: Arc<AtomicBool>,
-    seen: Arc<Mutex<Vec<u8>>>,
+    observations: Arc<Mutex<TestProductionTrustObservations>>,
     thread: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct TestProductionTrustObservations {
+    tags: Vec<u8>,
+    installs: Vec<vos::v2::ServiceGenesisV2>,
 }
 
 impl TestProductionTrustSidecar {
@@ -160,10 +166,17 @@ impl TestProductionTrustSidecar {
     const VERSION: u16 = 1;
     const QUERY_POLICY: u8 = 0;
     const CURRENT_TIMESLOT: u8 = 1;
+    const VERIFY_TIMESLOT: u8 = 2;
+    const VERIFY_PROOF: u8 = 3;
     const VERIFY_INSTALL: u8 = 4;
+    const VERIFY_UPGRADE: u8 = 5;
+    const VERIFY_ROLE: u8 = 6;
+    const VERIFY_RECEIPT: u8 = 7;
     const AUTHORIZED: u8 = 0;
+    const DENIED: u8 = 1;
     const TIMESLOT: u8 = 4;
     const POLICY: u8 = 5;
+    const LOGICAL_TIMESLOT: u64 = 1_000;
 
     fn start(path: PathBuf, policy: vos::v2::Hash) -> Self {
         let listener = UnixListener::bind(&path).expect("bind production trust sidecar");
@@ -171,9 +184,9 @@ impl TestProductionTrustSidecar {
             .set_nonblocking(true)
             .expect("make production trust sidecar nonblocking");
         let stop = Arc::new(AtomicBool::new(false));
-        let seen = Arc::new(Mutex::new(Vec::new()));
+        let observations = Arc::new(Mutex::new(TestProductionTrustObservations::default()));
         let thread_stop = stop.clone();
-        let thread_seen = seen.clone();
+        let thread_observations = observations.clone();
         let handle = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
                 let (mut stream, _) = match listener.accept() {
@@ -209,15 +222,14 @@ impl TestProductionTrustSidecar {
                 let tag = request[6];
                 let payload_len = u32::from_le_bytes(request[7..11].try_into().unwrap()) as usize;
                 assert_eq!(payload_len, request.len() - 11);
-                thread_seen.lock().unwrap().push(tag);
 
                 let request_hash =
                     vos::v2::Hash::digest(b"vos/production-trust-socket/request/v1", &[&request]);
-                let result = match tag {
-                    Self::QUERY_POLICY => Self::POLICY,
-                    Self::CURRENT_TIMESLOT => Self::TIMESLOT,
-                    _ => Self::AUTHORIZED,
-                };
+                let result = Self::classify(
+                    tag,
+                    &request[11..],
+                    &mut thread_observations.lock().unwrap(),
+                );
                 let mut response = Vec::with_capacity(79);
                 response.extend_from_slice(&Self::RESPONSE_MAGIC);
                 response.extend_from_slice(&Self::VERSION.to_le_bytes());
@@ -229,7 +241,7 @@ impl TestProductionTrustSidecar {
                     // the observation stable across the node's allocation and
                     // IC-5 verification calls; changing it between those two
                     // reads must fail closed.
-                    response.extend_from_slice(&1_000_u64.to_le_bytes());
+                    response.extend_from_slice(&Self::LOGICAL_TIMESLOT.to_le_bytes());
                 }
                 if stream
                     .write_all(&(response.len() as u32).to_le_bytes())
@@ -243,13 +255,75 @@ impl TestProductionTrustSidecar {
         Self {
             path,
             stop,
-            seen,
+            observations,
             thread: Some(handle),
         }
     }
 
+    fn classify(tag: u8, payload: &[u8], observations: &mut TestProductionTrustObservations) -> u8 {
+        use vos::v2::V2Wire;
+
+        let valid = match tag {
+            Self::QUERY_POLICY if payload.is_empty() => {
+                observations.tags.push(tag);
+                return Self::POLICY;
+            }
+            Self::CURRENT_TIMESLOT if payload.is_empty() => {
+                observations.tags.push(tag);
+                return Self::TIMESLOT;
+            }
+            Self::VERIFY_TIMESLOT => payload
+                .try_into()
+                .map(u64::from_le_bytes)
+                .is_ok_and(|slot| slot == Self::LOGICAL_TIMESLOT),
+            Self::VERIFY_PROOF => Self::decode_pair(payload).is_some_and(|(request, proof)| {
+                vos::v2::ProofVerificationRequestV2::decode(request)
+                    .is_ok_and(|request| request.proof_blob.matches(proof))
+            }),
+            Self::VERIFY_INSTALL => match vos::v2::ServiceGenesisV2::decode(payload) {
+                Ok(genesis) => {
+                    observations.installs.push(genesis);
+                    true
+                }
+                Err(_) => false,
+            },
+            Self::VERIFY_UPGRADE => vos::v2::ActorUpgradeV2::decode(payload).is_ok(),
+            Self::VERIFY_ROLE => {
+                vos::v2::RoleCredentialVerificationRequestV2::decode(payload).is_ok()
+            }
+            Self::VERIFY_RECEIPT => vos::v2::ReceiptVerificationRequestV2::decode(payload).is_ok(),
+            _ => false,
+        };
+        if valid {
+            observations.tags.push(tag);
+            Self::AUTHORIZED
+        } else {
+            Self::DENIED
+        }
+    }
+
+    fn decode_pair(payload: &[u8]) -> Option<(&[u8], &[u8])> {
+        let left_len = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?) as usize;
+        let left_end = 4_usize.checked_add(left_len)?;
+        let right_len_end = left_end.checked_add(4)?;
+        let right_len =
+            u32::from_le_bytes(payload.get(left_end..right_len_end)?.try_into().ok()?) as usize;
+        let right_end = right_len_end.checked_add(right_len)?;
+        (right_end == payload.len())
+            .then(|| (&payload[4..left_end], &payload[right_len_end..right_end]))
+    }
+
     fn saw(&self, tag: u8) -> bool {
-        self.seen.lock().unwrap().contains(&tag)
+        self.observations.lock().unwrap().tags.contains(&tag)
+    }
+
+    fn saw_install_for(&self, actor_name: &str) -> bool {
+        self.observations
+            .lock()
+            .unwrap()
+            .installs
+            .iter()
+            .any(|genesis| genesis.actors.iter().any(|actor| actor.name == actor_name))
     }
 }
 
@@ -820,6 +894,32 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
 
 #[test]
 fn signed_v2_package_runs_under_production_trust_and_recovers() {
+    let mut malformed_observations = TestProductionTrustObservations::default();
+    assert_eq!(
+        TestProductionTrustSidecar::classify(
+            TestProductionTrustSidecar::QUERY_POLICY,
+            b"unexpected",
+            &mut malformed_observations,
+        ),
+        TestProductionTrustSidecar::DENIED,
+    );
+    assert_eq!(
+        TestProductionTrustSidecar::classify(
+            TestProductionTrustSidecar::VERIFY_INSTALL,
+            b"not a canonical genesis",
+            &mut malformed_observations,
+        ),
+        TestProductionTrustSidecar::DENIED,
+    );
+    assert_eq!(
+        TestProductionTrustSidecar::classify(0xff, &[], &mut malformed_observations),
+        TestProductionTrustSidecar::DENIED,
+    );
+    assert!(
+        malformed_observations.tags.is_empty() && malformed_observations.installs.is_empty(),
+        "denied authority requests must not be recorded as valid observations",
+    );
+
     let space = "v2-production";
     let data = TempDir::new("v2-production-data");
     let config = TempDir::new("v2-production-config");
@@ -940,7 +1040,10 @@ fn signed_v2_package_runs_under_production_trust_and_recovers() {
     assert_eq!(incremented.trim(), "U64(7)");
     assert!(sidecar.saw(TestProductionTrustSidecar::QUERY_POLICY));
     assert!(sidecar.saw(TestProductionTrustSidecar::CURRENT_TIMESLOT));
-    assert!(sidecar.saw(TestProductionTrustSidecar::VERIFY_INSTALL));
+    assert!(
+        sidecar.saw_install_for("production-counter"),
+        "the independent authority did not decode and authorize the production-counter Install",
+    );
 
     // A production-sealed image cannot be reopened by omitting the authority.
     // The daemon itself remains available for legacy/control-plane traffic,
@@ -959,9 +1062,11 @@ fn signed_v2_package_runs_under_production_trust_and_recovers() {
     poll_until(
         15,
         || {
-            fs::read_to_string(&conformance_log)
-                .unwrap_or_default()
-                .contains("ProductionTrust(TrustRequired)")
+            let log = fs::read_to_string(&conformance_log).unwrap_or_default();
+            log.lines().any(|line| {
+                line.contains("agent 'production-counter' v2 route failed to register")
+                    && line.contains("ProductionTrust(TrustRequired)")
+            })
         },
         || {
             format!(
@@ -970,7 +1075,7 @@ fn signed_v2_package_runs_under_production_trust_and_recovers() {
             )
         },
     );
-    let _reported = vosx(
+    let refused = vosx(
         data.path(),
         config.path(),
         &[
@@ -981,6 +1086,11 @@ fn signed_v2_package_runs_under_production_trust_and_recovers() {
             "increment",
             "by=100",
         ],
+    );
+    assert!(
+        !refused.status.success(),
+        "a call to the specifically refused production-counter route unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&refused.stdout),
     );
     assert!(
         !fs::read_to_string(&conformance_log)

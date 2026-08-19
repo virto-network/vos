@@ -414,6 +414,7 @@ impl DaemonClient {
             .map_err(|_| anyhow::anyhow!("v2 target cache is unavailable"))?
             .get(&target.0)
             .cloned();
+        let is_v2_invocation = v2_target.is_some() && !is_reserved_host_operation(&msg.name);
         let payload =
             if let Some(v2_target) = v2_target.filter(|_| !is_reserved_host_operation(&msg.name)) {
                 let mut nonce = [0; 32];
@@ -429,13 +430,18 @@ impl DaemonClient {
                 payload
             };
 
-        self.node
+        let reply = self
+            .node
             .invoke_with_timeout(target, payload, timeout)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "daemon at {target} didn't reply within {timeout:?} (target unreachable or timed out)",
                 )
-            })
+            })?;
+        if is_v2_invocation && reply.is_empty() {
+            anyhow::bail!("v2 target at {target} refused the invocation or is not attached");
+        }
+        Ok(reply)
     }
 
     fn remember_v2_target(&self, route: ServiceId, agent: &AgentRow) -> anyhow::Result<()> {
