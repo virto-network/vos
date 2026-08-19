@@ -317,13 +317,16 @@ impl TestProductionTrustSidecar {
         self.observations.lock().unwrap().tags.contains(&tag)
     }
 
-    fn saw_install_for(&self, actor_name: &str) -> bool {
+    fn saw_install_for(&self, actor_name: &str, consistency: vos::v2::ConsistencyModeV2) -> bool {
         self.observations
             .lock()
             .unwrap()
             .installs
             .iter()
-            .any(|genesis| genesis.actors.iter().any(|actor| actor.name == actor_name))
+            .any(|genesis| {
+                genesis.consistency == consistency
+                    && genesis.actors.iter().any(|actor| actor.name == actor_name)
+            })
     }
 }
 
@@ -364,6 +367,38 @@ fn counter_package_fixture(output_dir: &Path) -> PathBuf {
         ],
     );
     let package = output_dir.join("onboarding-counter.vos");
+    assert!(package.is_file(), "vosx build must emit the signed package");
+    package
+}
+
+fn crdt_counter_package_fixture(output_dir: &Path) -> PathBuf {
+    let actor_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../tests/fixtures/v2/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter_v2.elf",
+    );
+    assert!(
+        actor_elf.is_file(),
+        "build the v2 CRDT counter first: `just build-v2-registry-fixtures` ({})",
+        actor_elf.display(),
+    );
+    let build_data = output_dir.join("build-data");
+    let build_config = output_dir.join("build-config");
+    let actor = actor_elf.to_string_lossy().into_owned();
+    let out = output_dir.to_string_lossy().into_owned();
+    vosx_ok(
+        &build_data,
+        &build_config,
+        &[
+            "build",
+            &actor,
+            "--name",
+            "production-crdt-counter",
+            "--version",
+            "0.1.0",
+            "--out-dir",
+            &out,
+        ],
+    );
+    let package = output_dir.join("production-crdt-counter.vos");
     assert!(package.is_file(), "vosx build must emit the signed package");
     package
 }
@@ -893,7 +928,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
 }
 
 #[test]
-fn signed_v2_package_runs_under_production_trust_and_recovers() {
+fn signed_v2_roots_run_under_production_trust_and_recover() {
     let mut malformed_observations = TestProductionTrustObservations::default();
     assert_eq!(
         TestProductionTrustSidecar::classify(
@@ -924,6 +959,7 @@ fn signed_v2_package_runs_under_production_trust_and_recovers() {
     let data = TempDir::new("v2-production-data");
     let config = TempDir::new("v2-production-config");
     let dist = TempDir::new("v2-production-dist");
+    let crdt_dist = TempDir::new("v2-production-crdt-dist");
     let sidecar_dir = TempDir::new("v2-production-sidecar");
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let service_pvm = workspace.join("services/vos-service/vos-service.pvm");
@@ -932,6 +968,7 @@ fn signed_v2_package_runs_under_production_trust_and_recovers() {
         "build the canonical service first: `just build-vos-service`",
     );
     let package = counter_package_fixture(dist.path());
+    let crdt_package = crdt_counter_package_fixture(crdt_dist.path());
 
     vosx_ok(data.path(), config.path(), &["space", "new", space]);
 
@@ -1008,6 +1045,46 @@ fn signed_v2_package_runs_under_production_trust_and_recovers() {
             "local",
         ],
     );
+    vosx_ok(
+        data.path(),
+        config.path(),
+        &[
+            "space",
+            "install",
+            space,
+            "onboarding-counter:0.1.0",
+            "--name",
+            "production-raft-counter",
+            "--consistency",
+            "raft",
+        ],
+    );
+    let crdt_package_source = crdt_package.to_string_lossy().into_owned();
+    vosx_ok(
+        data.path(),
+        config.path(),
+        &[
+            "space",
+            "publish",
+            space,
+            "production-crdt-counter:0.1.0",
+            &crdt_package_source,
+        ],
+    );
+    vosx_ok(
+        data.path(),
+        config.path(),
+        &[
+            "space",
+            "install",
+            space,
+            "production-crdt-counter:0.1.0",
+            "--name",
+            "production-crdt-counter",
+            "--consistency",
+            "crdt",
+        ],
+    );
     poll_until(
         30,
         || {
@@ -1038,11 +1115,79 @@ fn signed_v2_package_runs_under_production_trust_and_recovers() {
         ],
     );
     assert_eq!(incremented.trim(), "U64(7)");
+    poll_until(
+        30,
+        || {
+            let output = vosx(
+                data.path(),
+                config.path(),
+                &["space", "call", space, "production-raft-counter", "value"],
+            );
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "U64(0)"
+        },
+        || {
+            format!(
+                "the production daemon never attached the Raft root; log:\n{}",
+                fs::read_to_string(&first_log).unwrap_or_default(),
+            )
+        },
+    );
+    let raft_incremented = vosx_ok(
+        data.path(),
+        config.path(),
+        &[
+            "space",
+            "call",
+            space,
+            "production-raft-counter",
+            "increment",
+            "by=11",
+        ],
+    );
+    assert_eq!(raft_incremented.trim(), "U64(11)");
+    poll_until(
+        30,
+        || {
+            let output = vosx(
+                data.path(),
+                config.path(),
+                &["space", "call", space, "production-crdt-counter", "get"],
+            );
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "U64(0)"
+        },
+        || {
+            format!(
+                "the production daemon never attached the CRDT root; log:\n{}",
+                fs::read_to_string(&first_log).unwrap_or_default(),
+            )
+        },
+    );
+    let crdt_incremented = vosx_ok(
+        data.path(),
+        config.path(),
+        &["space", "call", space, "production-crdt-counter", "inc"],
+    );
+    assert_eq!(crdt_incremented.trim(), "()");
+    let crdt_value = vosx_ok(
+        data.path(),
+        config.path(),
+        &["space", "call", space, "production-crdt-counter", "get"],
+    );
+    assert_eq!(crdt_value.trim(), "U64(1)");
     assert!(sidecar.saw(TestProductionTrustSidecar::QUERY_POLICY));
     assert!(sidecar.saw(TestProductionTrustSidecar::CURRENT_TIMESLOT));
+    assert!(sidecar.saw(TestProductionTrustSidecar::VERIFY_TIMESLOT));
     assert!(
-        sidecar.saw_install_for("production-counter"),
+        sidecar.saw_install_for("production-counter", vos::v2::ConsistencyModeV2::Local,),
         "the independent authority did not decode and authorize the production-counter Install",
+    );
+    assert!(
+        sidecar.saw_install_for("production-raft-counter", vos::v2::ConsistencyModeV2::Raft,),
+        "the independent authority did not decode and authorize the Raft Install",
+    );
+    assert!(
+        sidecar.saw_install_for("production-crdt-counter", vos::v2::ConsistencyModeV2::Crdt,),
+        "the independent authority did not decode and authorize the CRDT Install",
     );
 
     // A production-sealed image cannot be reopened by omitting the authority.
@@ -1060,13 +1205,24 @@ fn signed_v2_package_runs_under_production_trust_and_recovers() {
     ));
     wait_for_endpoint(data.path(), &conformance_log, "v2-production-no-authority");
     poll_until(
-        15,
+        40,
         || {
             let log = fs::read_to_string(&conformance_log).unwrap_or_default();
-            log.lines().any(|line| {
-                line.contains("agent 'production-counter' v2 route failed to register")
-                    && line.contains("ProductionTrust(TrustRequired)")
-            })
+            let local_and_crdt_refused = ["production-counter", "production-crdt-counter"]
+                .into_iter()
+                .all(|name| {
+                    log.lines().any(|line| {
+                        line.contains(&format!("agent '{name}' v2 route failed to register"))
+                            && line.contains("ProductionTrust(TrustRequired)")
+                    })
+                });
+            let raft_private = log
+                .find("v2 root tree 'production-raft-counter' spawned")
+                .is_some_and(|offset| {
+                    log[offset..]
+                        .contains("persisted v2 Raft voter is retrying service open/replay")
+                });
+            local_and_crdt_refused && raft_private
         },
         || {
             format!(
@@ -1092,6 +1248,21 @@ fn signed_v2_package_runs_under_production_trust_and_recovers() {
         "a call to the specifically refused production-counter route unexpectedly succeeded: {}",
         String::from_utf8_lossy(&refused.stdout),
     );
+    for (name, method) in [
+        ("production-raft-counter", "value"),
+        ("production-crdt-counter", "get"),
+    ] {
+        let refused = vosx(
+            data.path(),
+            config.path(),
+            &["space", "call", space, name, method],
+        );
+        assert!(
+            !refused.status.success(),
+            "a call to the specifically refused {name} route unexpectedly succeeded: {}",
+            String::from_utf8_lossy(&refused.stdout),
+        );
+    }
     assert!(
         !fs::read_to_string(&conformance_log)
             .unwrap_or_default()
@@ -1116,14 +1287,23 @@ fn signed_v2_package_runs_under_production_trust_and_recovers() {
     ));
     wait_for_endpoint(data.path(), &recovery_log, "v2-production-recovery");
     poll_until(
-        30,
+        40,
         || {
-            let output = vosx(
-                data.path(),
-                config.path(),
-                &["space", "call", space, "production-counter", "value"],
-            );
-            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "U64(7)"
+            [
+                ("production-counter", "value", "U64(7)"),
+                ("production-raft-counter", "value", "U64(11)"),
+                ("production-crdt-counter", "get", "U64(1)"),
+            ]
+            .into_iter()
+            .all(|(name, method, expected)| {
+                let output = vosx(
+                    data.path(),
+                    config.path(),
+                    &["space", "call", space, name, method],
+                );
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).trim() == expected
+            })
         },
         || {
             format!(

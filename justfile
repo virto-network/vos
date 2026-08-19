@@ -151,8 +151,8 @@ test-v2-daemon-root: build-v2-daemon-root-artifacts
 
 # Run the production-profile daemon gate against an independent VTA1/VTR1
 # authority sidecar, including fail-closed startup and sealed-image recovery.
-test-v2-production-daemon: build-v2-daemon-root-artifacts
-    cargo test -p vosx --test onboarding_e2e signed_v2_package_runs_under_production_trust_and_recovers -- --nocapture --test-threads=1
+test-v2-production-daemon: build-v2-daemon-root-artifacts build-v2-registry-fixtures
+    cargo test -p vosx --test onboarding_e2e signed_v2_roots_run_under_production_trust_and_recover -- --nocapture --test-threads=1
 
 # Run a single test by name.
 test-one name: build-extensions

@@ -57,7 +57,9 @@ wire and policy contract are described in
 [`docs/runtime-v2.md`](docs/runtime-v2.md). `vosx run`
 remains a legacy one-shot ELF/PVM runner and does not install `.vos` packages.
 The physical production-profile acceptance gate is `just
-test-v2-production-daemon`.
+test-v2-production-daemon`; it covers signed Local, single-voter Raft, and
+CRDT roots across durable restart under one independently implemented trust
+protocol.
 
 ## Consistency modes
 
