@@ -4898,6 +4898,27 @@ impl VosNode {
             prepared.runtime.cleanup(&self.v2_private_ingress_routes);
             return Err(V2RaftNodeRegistrationError::Registration(error));
         }
+        // A healthy application image is not membership authority. The
+        // latest effective configuration may only be a speculative joint
+        // inclusion recovered from the log. Keep that replica live and
+        // private until Raft proves a committed final voter set containing
+        // this node, exactly as the application-recovery path does.
+        if !prepared.runtime.membership_committed_final_local_voter() {
+            if prepared.runtime.retain_replica {
+                prepared.service = Some(service);
+                return self.recover_persisted_v2_raft_root(
+                    name,
+                    id,
+                    network_reachable,
+                    proof_producer,
+                    prepared,
+                );
+            }
+            prepared.runtime.cleanup(&self.v2_private_ingress_routes);
+            return Err(V2RaftNodeRegistrationError::Promotion(
+                "local replica is not a committed final voter".into(),
+            ));
+        }
         self.raft_hosts.lock().unwrap().insert(id.0, replication_id);
         Ok(self.attach_v2_root_unchecked(name, service, id, network_reachable, proof_producer))
     }

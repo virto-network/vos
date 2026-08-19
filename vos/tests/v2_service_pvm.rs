@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use vos::attestation::{
@@ -2249,7 +2249,7 @@ fn speculative_removal_keeps_persisted_voter_while_recovery_retries() {
 }
 
 #[test]
-fn speculative_joint_inclusion_stays_private_until_final_membership_commits() {
+fn immediate_registration_keeps_speculative_joint_inclusion_private() {
     use vos_raft::{ActiveConfigRecord, LogEntry, Meta, Storage, WriteBatch};
 
     let key = libp2p::identity::Keypair::generate_ed25519();
@@ -2341,11 +2341,9 @@ fn speculative_joint_inclusion_stays_private_until_final_membership_commits() {
     .unwrap();
     drop(storage);
 
-    let promotion_called = Arc::new(AtomicBool::new(false));
-    let promotion_observer = promotion_called.clone();
     let mut node = VosNode::with_prefix(member);
     node.attach_network(network);
-    node.register_v2_raft_root_at_id_after_local_attach_production(
+    node.register_v2_raft_root_at_id_production(
         "speculatively-included-recovering-voter-v2".into(),
         config,
         backend,
@@ -2361,12 +2359,8 @@ fn speculative_joint_inclusion_stays_private_until_final_membership_commits() {
         route,
         true,
         trust,
-        move |_, _, _| {
-            promotion_observer.store(true, Ordering::Release);
-            Ok(())
-        },
     )
-    .expect("speculative inclusion keeps the replica private and recoverable");
+    .expect("immediate registration keeps speculative inclusion private and recoverable");
 
     std::thread::sleep(Duration::from_millis(250));
     assert!(node.has_agent(route), "the private route remains reserved");
@@ -2379,11 +2373,6 @@ fn speculative_joint_inclusion_stays_private_until_final_membership_commits() {
         ),
         "uncommitted joint inclusion must not publish the actor route",
     );
-    assert!(
-        !promotion_called.load(Ordering::Acquire),
-        "restart recovery must not reinterpret speculative inclusion as a completed promotion",
-    );
-
     assert!(node.collect().iter().all(AgentResult::is_ok));
     std::fs::remove_dir_all(directory).unwrap();
 }
