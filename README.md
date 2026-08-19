@@ -58,8 +58,9 @@ wire and policy contract are described in
 remains a legacy one-shot ELF/PVM runner and does not install `.vos` packages.
 The physical production-profile acceptance gate is `just
 test-v2-production-daemon`; it covers signed Local, single-voter Raft, and
-CRDT roots across durable restart under one independently implemented trust
-protocol.
+CRDT roots across durable restart, plus authenticated two-daemon CRDT
+convergence and receiving-side receipt verification, under independently
+connected implementations of the trust protocol.
 
 ## Consistency modes
 

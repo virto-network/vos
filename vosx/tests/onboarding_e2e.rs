@@ -100,6 +100,14 @@ fn spawned_v2_root_id(log: &Path, name: &str) -> Option<String> {
         .find_map(|line| line.split_once(&marker).map(|(_, id)| id.trim().to_owned()))
 }
 
+fn daemon_peer_id(log: &Path) -> Option<String> {
+    fs::read_to_string(log).ok()?.lines().find_map(|line| {
+        line.split_once("node identity ")
+            .and_then(|(_, rest)| rest.split_once(" (prefix"))
+            .map(|(peer, _)| peer.to_owned())
+    })
+}
+
 /// Run a one-shot `vosx` client command against a config/data home.
 fn vosx(data_home: &Path, config_home: &Path, args: &[&str]) -> Output {
     Command::new(vosx_bin())
@@ -166,6 +174,7 @@ struct TestProductionTrustSidecar {
 struct TestProductionTrustObservations {
     tags: Vec<u8>,
     installs: Vec<vos::v2::ServiceGenesisV2>,
+    receipts: Vec<vos::v2::ReceiptVerificationRequestV2>,
 }
 
 impl TestProductionTrustSidecar {
@@ -299,7 +308,13 @@ impl TestProductionTrustSidecar {
             Self::VERIFY_ROLE => {
                 vos::v2::RoleCredentialVerificationRequestV2::decode(payload).is_ok()
             }
-            Self::VERIFY_RECEIPT => vos::v2::ReceiptVerificationRequestV2::decode(payload).is_ok(),
+            Self::VERIFY_RECEIPT => match vos::v2::ReceiptVerificationRequestV2::decode(payload) {
+                Ok(request) => {
+                    observations.receipts.push(request);
+                    true
+                }
+                Err(_) => false,
+            },
             _ => false,
         };
         if valid {
@@ -335,6 +350,24 @@ impl TestProductionTrustSidecar {
                 genesis.consistency == consistency
                     && genesis.actors.iter().any(|actor| actor.name == actor_name)
             })
+    }
+
+    fn saw_receipt_for(&self, actor_name: &str, consistency: vos::v2::ConsistencyModeV2) -> bool {
+        let observations = self.observations.lock().unwrap();
+        let Some(service) = observations
+            .installs
+            .iter()
+            .find(|genesis| {
+                genesis.consistency == consistency
+                    && genesis.actors.iter().any(|actor| actor.name == actor_name)
+            })
+            .map(|genesis| &genesis.service)
+        else {
+            return false;
+        };
+        observations.receipts.iter().any(|request| {
+            request.receipt.service == *service && request.receipt.consistency == consistency
+        })
     }
 }
 
@@ -409,6 +442,42 @@ fn crdt_counter_package_fixture(output_dir: &Path) -> PathBuf {
     let package = output_dir.join("production-crdt-counter.vos");
     assert!(package.is_file(), "vosx build must emit the signed package");
     package
+}
+
+fn assert_bundled_space_authority_matches_fresh_build(output_dir: &Path) {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let actor_elf =
+        workspace.join("actors/space-authority/target/riscv64em-javm/release/space_authority.elf");
+    assert!(
+        actor_elf.is_file(),
+        "build the canonical authority first: `just build-actor space-authority`",
+    );
+    let build_data = output_dir.join("authority-build-data");
+    let build_config = output_dir.join("authority-build-config");
+    let actor = actor_elf.to_string_lossy().into_owned();
+    let out = output_dir.to_string_lossy().into_owned();
+    vosx_ok(
+        &build_data,
+        &build_config,
+        &[
+            "build",
+            &actor,
+            "--name",
+            "space-authority",
+            "--version",
+            "artifact-only",
+            "--out-dir",
+            &out,
+        ],
+    );
+    let fresh = fs::read(output_dir.join("space-authority.pvm"))
+        .expect("fresh authority build emits its PVM");
+    let bundled = fs::read(workspace.join("vosx/blobs/space_authority.pvm"))
+        .expect("vosx ships the canonical authority PVM");
+    assert_eq!(
+        bundled, fresh,
+        "the bundled space-authority PVM must match a fresh canonical actor build",
+    );
 }
 
 fn wait_for_endpoint(data_home: &Path, log_path: &Path, who: &str) -> PathBuf {
@@ -1317,6 +1386,259 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
             format!(
                 "the original production policy did not recover the pre-refusal committed state; log:\n{}",
                 fs::read_to_string(&recovery_log).unwrap_or_default(),
+            )
+        },
+    );
+}
+
+#[test]
+fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
+    let space = "v2-production-crdt-network";
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let service_pvm = workspace.join("services/vos-service/vos-service.pvm");
+    assert!(
+        service_pvm.is_file(),
+        "build the canonical service first: `just build-vos-service`",
+    );
+
+    let data_a = TempDir::new("production-crdt-a-data");
+    let config_a = TempDir::new("production-crdt-a-config");
+    let data_b = TempDir::new("production-crdt-b-data");
+    let config_b = TempDir::new("production-crdt-b-config");
+    let dist = TempDir::new("production-crdt-network-dist");
+    let sidecar_dir = TempDir::new("production-crdt-sidecars");
+    assert_bundled_space_authority_matches_fresh_build(dist.path());
+    let package = crdt_counter_package_fixture(dist.path());
+    let policy = vos::v2::Hash([0x69; 32]);
+    let trust_a_path = sidecar_dir.path().join("authority-a.sock");
+    let trust_b_path = sidecar_dir.path().join("authority-b.sock");
+    let trust_a = TestProductionTrustSidecar::start(trust_a_path.clone(), policy);
+    let trust_b = TestProductionTrustSidecar::start(trust_b_path.clone(), policy);
+
+    vosx_ok(data_a.path(), config_a.path(), &["space", "new", space]);
+    let log_a = data_a.path().join("production-crdt-a.stderr");
+    let _daemon_a = Daemon(spawn_up_with_service_and_trust(
+        data_a.path(),
+        config_a.path(),
+        space,
+        &log_a,
+        Some(&service_pvm),
+        Some(&trust_a_path),
+    ));
+    wait_for_endpoint(data_a.path(), &log_a, "production CRDT A");
+
+    vosx_ok(
+        data_a.path(),
+        config_a.path(),
+        &[
+            "space",
+            "publish",
+            space,
+            "production-crdt-counter:0.1.0",
+            package.to_str().expect("package path is UTF-8"),
+        ],
+    );
+    vosx_ok(
+        data_a.path(),
+        config_a.path(),
+        &[
+            "space",
+            "install",
+            space,
+            "production-crdt-counter:0.1.0",
+            "--name",
+            "production-crdt-counter",
+            "--consistency",
+            "crdt",
+            "--sync",
+            "member",
+        ],
+    );
+    poll_until(
+        40,
+        || {
+            let output = vosx(
+                data_a.path(),
+                config_a.path(),
+                &["space", "call", space, "production-crdt-counter", "get"],
+            );
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "U64(0)"
+        },
+        || {
+            format!(
+                "production CRDT root did not attach on A; log:\n{}",
+                fs::read_to_string(&log_a).unwrap_or_default(),
+            )
+        },
+    );
+
+    let invite = vosx_ok(
+        data_a.path(),
+        config_a.path(),
+        &["space", "invite", space, "--role", "member"],
+    );
+    let token = invite
+        .lines()
+        .next()
+        .expect("invite prints the token first")
+        .trim()
+        .to_owned();
+    let log_b = data_b.path().join("production-crdt-b.stderr");
+    let daemon_b = Daemon(spawn_up_with_service_and_trust(
+        data_b.path(),
+        config_b.path(),
+        &token,
+        &log_b,
+        Some(&service_pvm),
+        Some(&trust_b_path),
+    ));
+    let endpoint_b = wait_for_endpoint(data_b.path(), &log_b, "production CRDT B");
+    let pending_invite = endpoint_b
+        .parent()
+        .expect("B endpoint has a space directory")
+        .join(".pending-invite.token");
+    poll_until(
+        60,
+        || !pending_invite.exists(),
+        || {
+            format!(
+                "B did not complete canonical production onboarding; B log:\n{}\nA log:\n{}",
+                fs::read_to_string(&log_b).unwrap_or_default(),
+                fs::read_to_string(&log_a).unwrap_or_default(),
+            )
+        },
+    );
+    let peer_b = daemon_peer_id(&log_b).expect("B's startup log names its authenticated PeerId");
+    vosx_ok(
+        data_a.path(),
+        config_a.path(),
+        &[
+            "space", "members", space, "add-node", &peer_b, "--role", "observer",
+        ],
+    );
+    poll_until(
+        60,
+        || {
+            let output = vosx(
+                data_b.path(),
+                config_b.path(),
+                &["space", "call", space, "production-crdt-counter", "get"],
+            );
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "U64(0)"
+        },
+        || {
+            format!(
+                "B did not install and expose the production CRDT root; log:\n{}",
+                fs::read_to_string(&log_b).unwrap_or_default(),
+            )
+        },
+    );
+
+    assert_eq!(
+        vosx_ok(
+            data_a.path(),
+            config_a.path(),
+            &["space", "call", space, "production-crdt-counter", "inc"],
+        )
+        .trim(),
+        "()",
+    );
+    poll_until(
+        60,
+        || {
+            let output = vosx(
+                data_b.path(),
+                config_b.path(),
+                &["space", "call", space, "production-crdt-counter", "get"],
+            );
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "U64(1)"
+        },
+        || {
+            format!(
+                "A's production CRDT mutation did not converge on B; B log:\n{}\nA log:\n{}",
+                fs::read_to_string(&log_b).unwrap_or_default(),
+                fs::read_to_string(&log_a).unwrap_or_default(),
+            )
+        },
+    );
+    assert!(
+        trust_b.saw_receipt_for("production-crdt-counter", vos::v2::ConsistencyModeV2::Crdt,),
+        "B did not independently verify the counter's synchronized receipt",
+    );
+
+    assert_eq!(
+        vosx_ok(
+            data_b.path(),
+            config_b.path(),
+            &["space", "call", space, "production-crdt-counter", "inc"],
+        )
+        .trim(),
+        "()",
+    );
+    poll_until(
+        60,
+        || {
+            let output = vosx(
+                data_a.path(),
+                config_a.path(),
+                &["space", "call", space, "production-crdt-counter", "get"],
+            );
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "U64(2)"
+        },
+        || {
+            format!(
+                "B's production CRDT mutation did not converge on A; B log:\n{}\nA log:\n{}",
+                fs::read_to_string(&log_b).unwrap_or_default(),
+                fs::read_to_string(&log_a).unwrap_or_default(),
+            )
+        },
+    );
+    assert!(
+        trust_a.saw_receipt_for("production-crdt-counter", vos::v2::ConsistencyModeV2::Crdt,),
+        "A did not independently verify the counter's synchronized receipt",
+    );
+
+    drop(daemon_b);
+    let _ = fs::remove_file(&endpoint_b);
+    let restart_at = std::time::SystemTime::now();
+    let restart_log_b = data_b.path().join("production-crdt-b-restart.stderr");
+    let _restarted_b = Daemon(spawn_up_with_service_and_trust(
+        data_b.path(),
+        config_b.path(),
+        space,
+        &restart_log_b,
+        Some(&service_pvm),
+        Some(&trust_b_path),
+    ));
+    poll_until(
+        30,
+        || {
+            find_endpoint(data_b.path())
+                .and_then(|path| fs::metadata(path).ok())
+                .and_then(|metadata| metadata.modified().ok())
+                .is_some_and(|modified| modified >= restart_at)
+        },
+        || {
+            format!(
+                "B did not republish its endpoint after restart; log:\n{}",
+                fs::read_to_string(&restart_log_b).unwrap_or_default(),
+            )
+        },
+    );
+    poll_until(
+        60,
+        || {
+            let output = vosx(
+                data_b.path(),
+                config_b.path(),
+                &["space", "call", space, "production-crdt-counter", "get"],
+            );
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "U64(2)"
+        },
+        || {
+            format!(
+                "B did not recover the converged production CRDT state; log:\n{}",
+                fs::read_to_string(&restart_log_b).unwrap_or_default(),
             )
         },
     );

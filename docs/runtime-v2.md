@@ -764,7 +764,15 @@ historical slot verification rather than authorizing unknown request tags.
 The same scenario proves that an unavailable authority fails before endpoint
 publication, every production-sealed image refuses to attach through the
 conformance profile, and restoring the original policy recovers the exact
-pre-failure state in all three consistency modes.
+pre-failure state in all three consistency modes. A companion gate boots two
+independently connected production daemons, redeems and explicitly enrolls the
+second node as a CRDT observer, and mutates the same signed CRDT root in both
+directions. Each receiver independently submits the synchronized root's exact
+receipt-verification input to its authority before accepting the causal delta;
+the second replica then restarts from disk and recovers the converged value.
+The gate also rebuilds `space-authority` and requires byte identity with the
+PVM bundled by `vosx`, so onboarding cannot silently execute an actor compiled
+against a retired runtime contract.
 
 The request kind values in that order are `0..=7`. Response values are
 `0=Authorized`, `1=Denied`, `2=Unavailable`, `3=no-current-slot`,

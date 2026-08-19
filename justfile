@@ -149,10 +149,11 @@ test-pvm: build-test-artifacts
 test-v2-daemon-root: build-v2-daemon-root-artifacts
     cargo test -p vosx --test onboarding_e2e signed_v2_package_runs_and_reopens_through_the_space_daemon -- --nocapture --test-threads=1
 
-# Run the production-profile daemon gate against an independent VTA1/VTR1
-# authority sidecar, including fail-closed startup and sealed-image recovery.
-test-v2-production-daemon: build-v2-daemon-root-artifacts build-v2-registry-fixtures
+# Run the production-profile daemon gates against independent VTA1/VTR1
+# authority sidecars, including fail-closed recovery and two-node CRDT sync.
+test-v2-production-daemon: build-v2-daemon-root-artifacts build-v2-registry-fixtures (build-actor "space-authority")
     cargo test -p vosx --test onboarding_e2e signed_v2_roots_run_under_production_trust_and_recover -- --nocapture --test-threads=1
+    cargo test -p vosx --test onboarding_e2e production_crdt_root_converges_across_enrolled_daemons_and_restart -- --nocapture --test-threads=1
 
 # Run a single test by name.
 test-one name: build-extensions
