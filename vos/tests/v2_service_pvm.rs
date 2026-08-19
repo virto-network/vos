@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use vos::attestation::{
@@ -2242,6 +2242,146 @@ fn speculative_removal_keeps_persisted_voter_while_recovery_retries() {
     assert!(
         node.has_agent(route),
         "application recovery keeps its private route reservation",
+    );
+
+    assert!(node.collect().iter().all(AgentResult::is_ok));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn speculative_joint_inclusion_stays_private_until_final_membership_commits() {
+    use vos_raft::{ActiveConfigRecord, LogEntry, Meta, Storage, WriteBatch};
+
+    let key = libp2p::identity::Keypair::generate_ed25519();
+    let peer = libp2p::PeerId::from(key.public());
+    let member = vos::network::derive_node_prefix(&peer);
+    let survivor = if member == u16::MAX {
+        member - 1
+    } else {
+        member + 1
+    };
+    let replication_id = [0xa8; 32];
+    let route = ServiceId::new(member, 0x3399);
+    let network = vos::network::Network::start(vos::network::NetworkConfig {
+        keypair: key,
+        local_prefix: member,
+        listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+        bootstrap: vec![],
+        auto_dial_mdns: false,
+    });
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-speculative-inclusion-recovery-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+
+    let (config, _) = attested_root_fixture(ConsistencyModeV2::Raft, 0xa9);
+    let actor = config.root_actor;
+    let trust = Arc::new(TestProductionTrust::new(0xaa, 77, true));
+    let backend = TransientOpenCommittedImages::default();
+    let db = Arc::new(redb::Database::create(directory.join("raft.redb")).unwrap());
+    vos::raft::log::seed_active_config(&db, &[member]).unwrap();
+    let install_raft_config = RaftConfig {
+        me: member,
+        members: vec![member],
+        election_timeout_ms: (10, 30),
+        heartbeat_interval_ms: 5,
+        replication_id,
+        propose_timeout_ms: 2_000,
+    };
+    drop(
+        LocalRootTreeServiceV2::open_raft_production(
+            config.clone(),
+            backend.clone(),
+            RaftAccumulateLogV2::from_db_arc(db.clone(), install_raft_config).unwrap(),
+            trust.clone(),
+        )
+        .expect("the application image exists before the modeled restart"),
+    );
+
+    let last_index = vos::raft::RaftLog::open(db.clone()).unwrap().last_index();
+    let committed_final_index = last_index + 1;
+    let speculative_joint_index = committed_final_index + 1;
+    let persisted_meta = vos::raft::RaftMeta::load(&db).unwrap();
+    let meta = Meta {
+        current_term: persisted_meta.current_term,
+        voted_for: persisted_meta.voted_for,
+        commit_index: committed_final_index,
+        snap_last_index: persisted_meta.snap_last_index,
+        snap_last_term: persisted_meta.snap_last_term,
+    };
+    let mut storage = vos::raft::RedbStorage::open(db.clone()).unwrap();
+    vos::block_on(storage.commit_batch(WriteBatch {
+        appends: vec![
+            LogEntry::config_change(
+                committed_final_index,
+                meta.current_term,
+                None,
+                vec![survivor],
+            ),
+            LogEntry::config_change(
+                speculative_joint_index,
+                meta.current_term,
+                Some(vec![survivor]),
+                vec![member, survivor],
+            ),
+        ],
+        meta: Some(meta),
+        active_config: Some(ActiveConfigRecord {
+            log_index: Some(speculative_joint_index),
+            current: vec![member, survivor],
+            joint_old: Some(vec![survivor]),
+        }),
+        ..Default::default()
+    }))
+    .unwrap();
+    drop(storage);
+
+    let promotion_called = Arc::new(AtomicBool::new(false));
+    let promotion_observer = promotion_called.clone();
+    let mut node = VosNode::with_prefix(member);
+    node.attach_network(network);
+    node.register_v2_raft_root_at_id_after_local_attach_production(
+        "speculatively-included-recovering-voter-v2".into(),
+        config,
+        backend,
+        db,
+        RaftConfig {
+            me: member,
+            members: vec![survivor],
+            election_timeout_ms: (30_000, 40_000),
+            heartbeat_interval_ms: 20,
+            replication_id,
+            propose_timeout_ms: 2_000,
+        },
+        route,
+        true,
+        trust,
+        move |_, _, _| {
+            promotion_observer.store(true, Ordering::Release);
+            Ok(())
+        },
+    )
+    .expect("speculative inclusion keeps the replica private and recoverable");
+
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(node.has_agent(route), "the private route remains reserved");
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&Msg::new("increment").with("amount", 1_u32).encode());
+    assert!(
+        matches!(
+            node.invoke_actor(actor, arguments),
+            Err(ClientError::NotFound)
+        ),
+        "uncommitted joint inclusion must not publish the actor route",
+    );
+    assert!(
+        !promotion_called.load(Ordering::Acquire),
+        "restart recovery must not reinterpret speculative inclusion as a completed promotion",
     );
 
     assert!(node.collect().iter().all(AgentResult::is_ok));
@@ -5571,6 +5711,7 @@ fn raft_follower_registers_before_genesis_and_restores_caught_up_admission_time(
         snapshot.encode(),
         vec![0xBEEF],
         None,
+        Some(source_index),
     );
     assert_eq!(installed.term, 1);
     let election_deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
@@ -16897,6 +17038,7 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
         snapshot.encode(),
         raft_config.members.clone(),
         None,
+        Some(0),
     );
     assert_eq!(installed.term, 1);
 

@@ -207,6 +207,7 @@ impl Transport<u16> for VosTransport {
             req.data,
             req.members,
             req.joint_old,
+            req.active_config_index,
         );
         let r = recv_timeout(rx, RPC_TIMEOUT)
             .await

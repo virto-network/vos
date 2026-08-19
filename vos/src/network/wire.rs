@@ -233,6 +233,9 @@ pub enum Frame {
         snapshot: Vec<u8>,
         members: Vec<u16>,
         joint_old: Option<Vec<u16>>,
+        /// Exact log/snapshot index that established `members` and
+        /// `joint_old`; absent when membership is intentionally omitted.
+        active_config_index: Option<u64>,
     },
     /// Reply to [`Frame::RaftInstallSnapshotReq`].
     RaftInstallSnapshotResp {
@@ -644,6 +647,7 @@ impl Frame {
                 snapshot,
                 members,
                 joint_old,
+                active_config_index,
             } => {
                 out.push(TAG_RAFT_INSTALL_REQ);
                 out.extend_from_slice(replication_id);
@@ -666,6 +670,13 @@ impl Frame {
                         for member in old {
                             out.extend_from_slice(&member.to_le_bytes());
                         }
+                    }
+                    None => out.push(0),
+                }
+                match active_config_index {
+                    Some(index) => {
+                        out.push(1);
+                        out.extend_from_slice(&index.to_le_bytes());
                     }
                     None => out.push(0),
                 }
@@ -1020,6 +1031,11 @@ impl Frame {
                     }
                     other => return Err(FrameError::BadOption(other)),
                 };
+                let active_config_index = match r.u8()? {
+                    0 => None,
+                    1 => Some(r.u64()?),
+                    other => return Err(FrameError::BadOption(other)),
+                };
                 Frame::RaftInstallSnapshotReq {
                     replication_id,
                     term,
@@ -1031,6 +1047,7 @@ impl Frame {
                     snapshot,
                     members,
                     joint_old,
+                    active_config_index,
                 }
             }
             TAG_RAFT_INSTALL_RESP => Frame::RaftInstallSnapshotResp {
@@ -1676,6 +1693,7 @@ mod tests {
             snapshot: b"opaque actor state".to_vec(),
             members: vec![1, 2],
             joint_old: Some(vec![1]),
+            active_config_index: Some(100),
         });
         // Empty snapshot — degenerate but valid.
         roundtrip(Frame::RaftInstallSnapshotReq {
@@ -1689,6 +1707,7 @@ mod tests {
             snapshot: vec![],
             members: vec![],
             joint_old: None,
+            active_config_index: None,
         });
     }
 

@@ -245,6 +245,9 @@ impl<N: NodeId> Clone for Inbox<N> {
 impl<N: NodeId> Inbox<N> {
     /// Send a message into the worker. `Err` only if the worker
     /// has shut down (the receiver has been dropped).
+    // Preserve the unsent command for callers that need ownership recovery;
+    // snapshot commands intentionally carry a bounded chunk and membership.
+    #[allow(clippy::result_large_err)]
     pub fn send(&self, msg: RaftMsg<N>) -> Result<(), RaftMsg<N>> {
         self.inner.unbounded_send(msg).map_err(|e| e.into_inner())
     }
@@ -2206,6 +2209,21 @@ where
     // Final chunk — commit the assembled snapshot atomically.
     let snapshot = state.incoming_snapshot.take().expect("set above").buffer;
 
+    // Membership and its provenance are one atomic claim. Reject incomplete
+    // or future provenance before advancing any durable snapshot boundary.
+    // An omitted claim remains useful for state catch-up, but cannot confer
+    // new membership authority.
+    let supplied_config_index = match (req.members.is_empty(), req.active_config_index) {
+        (false, Some(index)) if index <= req.last_included_index => Some(index),
+        (true, None) if req.joint_old.is_none() => None,
+        _ => {
+            return Ok(InstallSnapshotResp {
+                term: state.meta.current_term,
+                bytes_received: 0,
+            });
+        }
+    };
+
     state.meta.snap_last_index = req.last_included_index;
     state.meta.snap_last_term = req.last_included_term;
     state.meta.commit_index = state.meta.commit_index.max(req.last_included_index);
@@ -2216,18 +2234,18 @@ where
     // advance:
     //
     // 1. If the leader supplied `members` (and possibly
-    //    `joint_old`), they ARE the authoritative membership at
-    //    `last_included_index`. Adopt them — this is the only
-    //    path by which a fresh follower whose first activity is
+    //    `joint_old`) with exact provenance, they ARE the authoritative
+    //    membership at the supplied configuration index. Adopt them — this
+    //    is the only path by which a fresh follower whose first activity is
     //    an InstallSnapshot can learn the cluster's current
-    //    shape. `members.is_empty()` means the leader is from
-    //    an older crate version and didn't supply them; fall
-    //    back to keeping the existing `effective_cfg`.
+    //    shape. `members.is_empty()` means the sender omitted membership;
+    //    fall back to keeping the existing
+    //    `effective_cfg` without manufacturing committed provenance.
     // 2. Persist the resulting `effective_cfg` to the
     //    `active_config` row so a future reboot whose log scan
     //    finds nothing (compacted away) can still recover.
-    // 3. `active_config_index` / `pending_joint_entry` pointing
-    //    at a now-compacted entry are invalidated.
+    // 3. `active_config_index` / `pending_joint_entry` pointing at
+    //    speculative evidence covered by an omission are invalidated.
     let mut new_effective_cfg: Option<ActiveConfig<N>> = None;
     if !req.members.is_empty() {
         new_effective_cfg = Some(ActiveConfig {
@@ -2237,12 +2255,17 @@ where
     }
     let active_config_for_batch = Some(match &new_effective_cfg {
         Some(cfg) => ActiveConfigRecord {
-            log_index: Some(req.last_included_index),
+            log_index: supplied_config_index,
             current: cfg.current.clone(),
             joint_old: cfg.joint_old.clone(),
         },
         None => ActiveConfigRecord {
-            log_index: state.active_config_index,
+            // Preserve only evidence that was already committed before this
+            // install. Advancing the snapshot commit boundary must not turn a
+            // locally speculative configuration into committed evidence.
+            log_index: state
+                .active_config_index
+                .filter(|index| *index <= meta_snapshot.commit_index),
             current: state.effective_cfg.current.clone(),
             joint_old: state.effective_cfg.joint_old.clone(),
         },
@@ -2263,9 +2286,9 @@ where
     }
     if let Some(cfg) = new_effective_cfg {
         state.effective_cfg = cfg;
-        // The snapshot boundary is durable evidence for this membership
-        // even though the originating ConfigChange was compacted away.
-        state.active_config_index = Some(req.last_included_index);
+        // Preserve the exact configuration provenance supplied by the
+        // snapshot leader even though the originating entry was compacted.
+        state.active_config_index = supplied_config_index;
         // A joint-phase view recovered via snapshot can't
         // auto-finalize from this replica either — leader-side
         // joint_idx isn't known to us, so wait for a leader-
@@ -2273,9 +2296,12 @@ where
         state.pending_joint_entry = None;
         rebuild_leader_tracking(state);
     } else {
-        // An older leader omitted membership, so retain exactly the evidence
-        // already attached to the local view; do not promote legacy or
-        // speculative configuration into committed-removal evidence.
+        // Membership was omitted. Retain only evidence that was committed
+        // before the install; do not let the new commit boundary promote a
+        // speculative local configuration into authoritative evidence.
+        state.active_config_index = state
+            .active_config_index
+            .filter(|index| *index <= meta_snapshot.commit_index);
         if state
             .pending_joint_entry
             .is_some_and(|idx| idx <= req.last_included_index)
@@ -3113,13 +3139,18 @@ where
             // follower commits the install atomically with the
             // active_config write, and intermediate chunks would
             // pay the bandwidth twice for no benefit.
-            let (members, joint_old) = if was_final {
+            let (members, joint_old, active_config_index) = if was_final
+                && state
+                    .active_config_index
+                    .is_some_and(|index| index <= snap_idx)
+            {
                 (
                     state.effective_cfg.current.clone(),
                     state.effective_cfg.joint_old.clone(),
+                    state.active_config_index,
                 )
             } else {
-                (Vec::new(), None)
+                (Vec::new(), None, None)
             };
             let req = InstallSnapshotReq {
                 leader: me,
@@ -3131,6 +3162,7 @@ where
                 data: chunk,
                 members,
                 joint_old,
+                active_config_index,
             };
             let transport = state.transport.clone();
             let fut: RpcFut<N> = Box::pin(async move {
@@ -3771,6 +3803,7 @@ mod tests {
                 data: alloc::vec![0xAA; 32],
                 members: Vec::new(),
                 joint_old: None,
+                active_config_index: None,
             },
         ));
         assert_eq!(resp.term, 5);
@@ -3976,6 +4009,7 @@ mod tests {
             data: alloc::vec![0xAA; 16],
             members: Vec::new(),
             joint_old: None,
+            active_config_index: None,
         };
 
         let r1 = block_on(h.handle_inbound_install(0xBBBB, req()));
@@ -4016,6 +4050,7 @@ mod tests {
                 data: alloc::vec![0xBB; 8],
                 members: Vec::new(),
                 joint_old: None,
+                active_config_index: None,
             },
         ));
         assert_eq!(r3.term, 7);

@@ -363,6 +363,7 @@ proptest! {
                             data: vec![0xFF; 4],
                             members: Vec::new(),
                             joint_old: None,
+                            active_config_index: None,
                         },
                     ));
                 }

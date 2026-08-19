@@ -218,6 +218,7 @@ fn partial_snapshot_chunk_persists_higher_term_before_acknowledgement() {
             data: vec![0xA5; 8],
             members: Vec::new(),
             joint_old: None,
+            active_config_index: None,
         },
     ));
     assert_eq!(response.term, 7);
@@ -271,6 +272,7 @@ fn installed_snapshot_retry_recovers_a_lost_final_response() {
         data: vec![0x5A; 8],
         members: vec![1, 9],
         joint_old: None,
+        active_config_index: Some(20),
     };
 
     // Model the earlier chunk without retaining a transport response.
@@ -323,6 +325,7 @@ fn snapshot_stream_requests_rewind_after_midstream_restart() {
             data: vec![0xA5; 8],
             members: Vec::new(),
             joint_old: None,
+            active_config_index: None,
         },
     ));
     assert_eq!(first.bytes_received, 8);
@@ -349,6 +352,7 @@ fn snapshot_stream_requests_rewind_after_midstream_restart() {
             data: vec![0x5A; 8],
             members: vec![1, 9],
             joint_old: None,
+            active_config_index: Some(20),
         },
     ));
     assert_eq!(rewind.bytes_received, 0);
@@ -995,6 +999,7 @@ fn install_snapshot_persists_effective_cfg_after_compaction() {
             data: vec![0xCC; 8],
             members: Vec::new(),
             joint_old: None,
+            active_config_index: None,
         },
     ));
     assert_eq!(resp.bytes_received, 8);
@@ -1068,6 +1073,7 @@ fn install_snapshot_adopts_leader_supplied_membership_on_fresh_follower() {
             data: vec![0xAB; 16],
             members: vec![1u16, 2, 3],
             joint_old: None,
+            active_config_index: Some(37),
         },
     ));
     assert_eq!(resp.bytes_received, 16);
@@ -1078,11 +1084,76 @@ fn install_snapshot_adopts_leader_supplied_membership_on_fresh_follower() {
     assert_eq!(
         persisted,
         Some(ActiveConfigRecord {
-            log_index: Some(100),
+            log_index: Some(37),
             current: vec![1u16, 2, 3],
             joint_old: None,
         }),
         "follower must adopt leader-supplied membership, not silently \
          retain cfg.members; got {persisted:?}",
+    );
+}
+
+/// Installing a state-only snapshot may move the commit boundary beyond a
+/// locally speculative configuration. That boundary movement must not turn
+/// the old configuration index into committed membership evidence.
+#[test]
+fn snapshot_without_membership_clears_speculative_local_provenance() {
+    let storage = SharedStorage::new();
+    storage.with_inner(|inner| {
+        inner.meta = Meta {
+            current_term: 3,
+            voted_for: None,
+            commit_index: 2,
+            snap_last_index: 0,
+            snap_last_term: 0,
+        };
+        inner.active_config = Some(ActiveConfigRecord {
+            log_index: Some(5),
+            current: vec![1u16, 9],
+            joint_old: Some(vec![9]),
+        });
+    });
+
+    let worker = Worker::spawn_with(
+        storage.clone(),
+        Arc::new(NoopT),
+        snapshot_test_config(1),
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    worker.wait_init().expect("worker initializes");
+    let before = block_on(worker.handler().snapshot()).unwrap();
+    assert_eq!(before.active_config_index, Some(5));
+    assert_eq!(before.commit_index, 2);
+
+    let response = block_on(worker.handler().handle_inbound_install(
+        9,
+        InstallSnapshotReq {
+            leader: 9,
+            term: 4,
+            last_included_index: 10,
+            last_included_term: 3,
+            offset: 0,
+            done: true,
+            data: vec![0xCD; 16],
+            members: Vec::new(),
+            joint_old: None,
+            active_config_index: None,
+        },
+    ));
+    assert_eq!(response.bytes_received, 16);
+    worker.shutdown();
+
+    assert_eq!(storage.read_meta().commit_index, 10);
+    assert_eq!(
+        storage.read_active_config(),
+        Some(ActiveConfigRecord {
+            log_index: None,
+            current: vec![1u16, 9],
+            joint_old: Some(vec![9]),
+        }),
+        "snapshot installation must preserve the membership view without \
+         fabricating committed provenance",
     );
 }

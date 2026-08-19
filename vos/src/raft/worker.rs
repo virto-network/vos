@@ -544,6 +544,7 @@ impl RaftRpcHandler for WorkerHandle {
         snapshot: Vec<u8>,
         members: Vec<u16>,
         joint_old: Option<Vec<u16>>,
+        active_config_index: Option<u64>,
     ) -> RaftInstallSnapshotResult {
         let req = InstallSnapshotReq {
             leader: from_prefix,
@@ -555,6 +556,7 @@ impl RaftRpcHandler for WorkerHandle {
             data: snapshot,
             members,
             joint_old,
+            active_config_index,
         };
         let resp = block_on(self.inner.handle_inbound_install(from_prefix, req));
         RaftInstallSnapshotResult {
@@ -923,6 +925,7 @@ mod tests {
             snapshot_bytes[..split].to_vec(),
             Vec::new(),
             None,
+            None,
         );
         assert_eq!(first.term, 7);
         assert_eq!(first.bytes_received, split as u64);
@@ -937,6 +940,7 @@ mod tests {
             snapshot_bytes[split..].to_vec(),
             vec![0xAAAA, 0xBBBB],
             None,
+            Some(3),
         );
         assert_eq!(resp.term, 7);
         assert_eq!(resp.bytes_received, snapshot_bytes.len() as u64);
@@ -988,6 +992,7 @@ mod tests {
             b"v1".to_vec(),
             vec![0xAAAA, 0xBBBB],
             None,
+            Some(5),
         );
         let _ = h.install_snapshot(
             &[0xC0; 32],
@@ -1000,6 +1005,7 @@ mod tests {
             b"v2".to_vec(),
             vec![0xAAAA, 0xBBBB],
             None,
+            Some(3),
         );
 
         worker.shutdown();

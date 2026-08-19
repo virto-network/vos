@@ -428,6 +428,7 @@ pub trait RaftRpcHandler: Send + Sync {
         _snapshot: Vec<u8>,
         _members: Vec<u16>,
         _joint_old: Option<Vec<u16>>,
+        _active_config_index: Option<u64>,
     ) -> RaftInstallSnapshotResult {
         RaftInstallSnapshotResult {
             term,
@@ -726,6 +727,7 @@ pub(in crate::network) enum NetworkCmd {
         snapshot: Vec<u8>,
         members: Vec<u16>,
         joint_old: Option<Vec<u16>>,
+        active_config_index: Option<u64>,
         reply: std_mpsc::Sender<RaftInstallSnapshotResult>,
     },
     /// Send a [`Frame::RaftJoinReq`] to a peer to add the local
@@ -1072,6 +1074,7 @@ impl Network {
         snapshot: Vec<u8>,
         members: Vec<u16>,
         joint_old: Option<Vec<u16>>,
+        active_config_index: Option<u64>,
     ) -> std_mpsc::Receiver<RaftInstallSnapshotResult> {
         let (tx, rx) = std_mpsc::channel();
         let _ = self.cmd_tx.send(NetworkCmd::SendRaftInstallSnapshot {
@@ -1086,6 +1089,7 @@ impl Network {
             snapshot,
             members,
             joint_old,
+            active_config_index,
             reply: tx,
         });
         rx
@@ -1710,6 +1714,7 @@ async fn network_main(
                         snapshot,
                         members,
                         joint_old,
+                        active_config_index,
                         reply,
                     }) => {
                         let frame = Frame::RaftInstallSnapshotReq {
@@ -1723,6 +1728,7 @@ async fn network_main(
                             snapshot,
                             members,
                             joint_old,
+                            active_config_index,
                         };
                         let req_id = swarm
                             .behaviour_mut()
@@ -2320,6 +2326,7 @@ fn handle_req_resp(
                         snapshot,
                         members,
                         joint_old,
+                        active_config_index,
                     } => {
                         // Install logic writes redb (state row +
                         // raft_meta + raft_log truncate), so a
@@ -2344,6 +2351,7 @@ fn handle_req_resp(
                                     snapshot,
                                     members,
                                     joint_old,
+                                    active_config_index,
                                 ),
                                 None => {
                                     warn!(
@@ -4479,6 +4487,7 @@ mod tests {
                 snapshot: Vec<u8>,
                 members: Vec<u16>,
                 _joint_old: Option<Vec<u16>>,
+                _active_config_index: Option<u64>,
             ) -> RaftInstallSnapshotResult {
                 let bytes_received = offset + snapshot.len() as u64;
                 self.install_calls
@@ -4599,6 +4608,7 @@ mod tests {
             vec![0xA5; 7],
             Vec::new(),
             None,
+            None,
         );
         let first = first
             .recv_timeout(Duration::from_secs(5))
@@ -4616,6 +4626,7 @@ mod tests {
             vec![0x5A; 5],
             vec![prefix_a, prefix_b],
             None,
+            Some(12),
         );
         let final_chunk = final_chunk
             .recv_timeout(Duration::from_secs(5))

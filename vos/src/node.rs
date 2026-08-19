@@ -1797,7 +1797,11 @@ struct V2RaftRecoveryRuntime<B> {
     pending_route: Arc<V2PrivateIngressRoute>,
     proof_verifier: Option<V2NodeAttestationProofVerifier>,
     production_trust: Option<Arc<dyn crate::v2::ProductionTrustV2>>,
-    persisted_voter: bool,
+    /// The persisted configuration cannot prove that this replica is outside
+    /// the last committed voter set. This is a retention predicate only: a
+    /// speculative configuration may require the worker for quorum recovery
+    /// without authorizing publication of the application route.
+    retain_replica: bool,
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
@@ -1856,6 +1860,19 @@ where
                 && snapshot
                     .joint_old
                     .is_none_or(|members| !members.contains(&self.raft_config.me))
+        })
+    }
+
+    /// Route publication requires stronger evidence than worker retention:
+    /// the latest effective configuration must be a committed, final
+    /// (non-joint) voter set that contains this replica.
+    fn membership_committed_final_local_voter(&self) -> bool {
+        self.worker.handler().snapshot().is_some_and(|snapshot| {
+            snapshot
+                .active_config_index
+                .is_some_and(|index| index <= snapshot.commit_index)
+                && snapshot.joint_old.is_none()
+                && snapshot.members.contains(&self.raft_config.me)
         })
     }
 }
@@ -4831,7 +4848,7 @@ impl VosNode {
         if let Some(expected_policy) = expected_policy {
             let installed = match service.catch_up() {
                 Ok(installed) => installed,
-                Err(_error) if prepared.runtime.persisted_voter => {
+                Err(_error) if prepared.runtime.retain_replica => {
                     prepared.service = Some(service);
                     return self.recover_persisted_v2_raft_root(
                         name,
@@ -4847,7 +4864,7 @@ impl VosNode {
                 }
             };
             if !installed {
-                if prepared.runtime.persisted_voter {
+                if prepared.runtime.retain_replica {
                     prepared.service = Some(service);
                     return self.recover_persisted_v2_raft_root(
                         name,
@@ -4863,7 +4880,7 @@ impl VosNode {
                 ));
             }
             if service.production_trust_policy_id() != Some(expected_policy) {
-                if prepared.runtime.persisted_voter {
+                if prepared.runtime.retain_replica {
                     prepared.service = Some(service);
                     return self.recover_persisted_v2_raft_root(
                         name,
@@ -4908,7 +4925,7 @@ impl VosNode {
             + Send
             + 'static,
     {
-        debug_assert!(prepared.runtime.persisted_voter);
+        debug_assert!(prepared.runtime.retain_replica);
         let actor = prepared.runtime.config.root_actor;
         if self.routes.contains_key(&id.0)
             || self.agent_info.read().unwrap().contains_key(&id.0)
@@ -4973,7 +4990,8 @@ impl VosNode {
                     && prepared.runtime.expected_policy.is_none_or(|expected| {
                         service.production_trust_policy_id() == Some(expected)
                     })
-                    && restore_v2_root_logical_timeslot(service, &logical_timeslot).is_ok();
+                    && restore_v2_root_logical_timeslot(service, &logical_timeslot).is_ok()
+                    && prepared.runtime.membership_committed_final_local_voter();
                 if recovered {
                     break;
                 }
@@ -5303,7 +5321,7 @@ impl VosNode {
             proof_verifier,
             production_trust,
         )?;
-        if prepared.runtime.persisted_voter {
+        if prepared.runtime.retain_replica {
             return self.recover_persisted_v2_raft_root(
                 name,
                 id,
@@ -5464,7 +5482,7 @@ impl VosNode {
         let persisted_commit_index = crate::raft::log::RaftMeta::load(&db)
             .map_err(V2RaftNodeRegistrationError::Log)?
             .commit_index;
-        let persisted_voter = persisted_config.is_some_and(|record| {
+        let retain_replica = persisted_config.is_some_and(|record| {
             record.current.contains(&raft_config.me)
                 || record
                     .joint_old
@@ -5552,14 +5570,14 @@ impl VosNode {
             pending_route,
             proof_verifier,
             production_trust,
-            persisted_voter,
+            retain_replica,
         };
         match runtime.open() {
             Ok(service) => Ok(PreparedV2RaftRoot {
                 service: Some(service),
                 runtime,
             }),
-            Err(error) if runtime.persisted_voter => {
+            Err(error) if runtime.retain_replica => {
                 let reason = match error {
                     V2RaftRecoveryOpenError::Log(_) => "Raft log open failed",
                     V2RaftRecoveryOpenError::Service(_) => "service image open/replay failed",
@@ -18066,6 +18084,7 @@ mod tests {
                 _snapshot: Vec<u8>,
                 _members: Vec<u16>,
                 _joint_old: Option<Vec<u16>>,
+                _active_config_index: Option<u64>,
             ) -> RaftInstallSnapshotResult {
                 RaftInstallSnapshotResult {
                     term,
