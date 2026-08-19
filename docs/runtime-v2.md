@@ -719,19 +719,28 @@ those decisions.
 
 The sidecar protocol is deliberately small and independent of the guest ABI.
 One Unix connection carries one length-prefixed request and one length-prefixed
-response. A request is `VTA1 | u16(version=1) | u8(kind) | u32(payload_len) |
-payload`; kinds are policy, current slot, historical-slot verification, proof,
-Install, Upgrade, role credential, and receipt. Structured payloads are their
-canonical `V2Wire` bytes; proof verification carries two length-prefixed fields
-for the request and proof artifact. A response is `VTR1 | u16(version=1) |
-request_hash[32] | policy_id[32] | u8(result) | [u64(slot)]`, where
-`request_hash = H("vos/production-trust-socket/request/v1", request)` and the
-result is Authorized, Denied, Unavailable, no-current-slot, current-slot, or
-policy. The daemon samples a nonzero policy during startup and requires that
-exact policy and request hash on every later response. Malformed frames,
-timeouts, disconnects, a changed policy, or a missing current slot fail closed;
-there is no fallback to process-local allowlists. Each frame is bounded to 64
-MiB and I/O is bounded to five seconds.
+response. All integers in this protocol are little-endian. A request is `VTA1 |
+u16_le(version=1) | u8(kind) | u32_le(payload_len) | payload`; kinds are policy,
+current slot, historical-slot verification, proof, Install, Upgrade, role
+credential, and receipt. Structured payloads are their canonical `V2Wire`
+bytes; proof verification carries two length-prefixed fields for the request
+and proof artifact. A response is `VTR1 | u16_le(version=1) |
+request_hash[32] | policy_id[32] | u8(result) | [u64_le(slot)]`, where
+`request_hash` is the 32-byte unkeyed BLAKE2b digest (digest length parameter
+32, standard fanout/depth parameters) of the literal ASCII bytes
+`vos/production-trust-socket/request/v1` immediately followed by the complete
+request bytes, with no delimiter or outer length. The result is Authorized,
+Denied, Unavailable, no-current-slot, current-slot, or policy. The daemon
+samples a nonzero policy during startup and requires that exact policy and
+request hash on every later response. Malformed frames, timeouts, disconnects,
+a changed policy, or a missing current slot fail closed; there is no fallback
+to process-local allowlists. Each frame is bounded to 64 MiB. One absolute
+five-second deadline covers socket connection, the complete request write, and
+the complete response read; partial progress never renews it.
+
+As a cross-implementation vector, the empty policy query request is
+`5654413101000000000000` in hexadecimal and its `request_hash` is
+`a5ee8be4abb996fd3735970cd7b5a53632afef7cb7a548e1314d9c6ef39ece35`.
 
 The request kind values in that order are `0..=7`. Response values are
 `0=Authorized`, `1=Denied`, `2=Unavailable`, `3=no-current-slot`,

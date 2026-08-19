@@ -56,6 +56,9 @@ redb = "2"
 # `kill -0` to detect stale endpoint files left by a crashed
 # `space up` daemon.
 libc = "0.2"
+# Bounded Unix-domain connect for the production trust sidecar. Reads and
+# writes use shrinking std socket timeouts against the same absolute deadline.
+socket2 = "0.6"
 # OS entropy for the chronos beacon feed (the leader samples 32
 # fresh bytes per advance; a draw failure skips the pass rather
 # than ever feeding zero entropy).

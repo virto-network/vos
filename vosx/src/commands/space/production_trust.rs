@@ -7,7 +7,7 @@
 //! change the verifier set of an already-open service.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::io::{Read, Write};
@@ -197,34 +197,109 @@ fn encode_pair(left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(unix)]
 fn exchange(path: &Path, request: &[u8]) -> Result<TrustResponse, ProductionTrustSocketError> {
+    exchange_with_timeout(path, request, IO_TIMEOUT)
+}
+
+#[cfg(unix)]
+fn exchange_with_timeout(
+    path: &Path,
+    request: &[u8],
+    timeout: Duration,
+) -> Result<TrustResponse, ProductionTrustSocketError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(ProductionTrustSocketError::InvalidResponse)?;
     let request_hash = Hash::digest(b"vos/production-trust-socket/request/v1", &[request]);
-    let mut stream = UnixStream::connect(path).map_err(ProductionTrustSocketError::Connect)?;
-    stream
-        .set_read_timeout(Some(IO_TIMEOUT))
-        .map_err(ProductionTrustSocketError::Io)?;
-    stream
-        .set_write_timeout(Some(IO_TIMEOUT))
-        .map_err(ProductionTrustSocketError::Io)?;
+    let mut stream = connect_until(path, deadline).map_err(ProductionTrustSocketError::Connect)?;
     let request_len =
         u32::try_from(request.len()).map_err(|_| ProductionTrustSocketError::InvalidResponse)?;
-    stream
-        .write_all(&request_len.to_le_bytes())
-        .and_then(|()| stream.write_all(request))
+    write_all_until(&mut stream, &request_len.to_le_bytes(), deadline)
+        .and_then(|()| write_all_until(&mut stream, request, deadline))
         .map_err(ProductionTrustSocketError::Io)?;
 
     let mut len = [0u8; 4];
-    stream
-        .read_exact(&mut len)
-        .map_err(ProductionTrustSocketError::Io)?;
+    read_exact_until(&mut stream, &mut len, deadline).map_err(ProductionTrustSocketError::Io)?;
     let len = u32::from_le_bytes(len) as usize;
     if len < 71 || len > 79 {
         return Err(ProductionTrustSocketError::InvalidResponse);
     }
     let mut response = vec![0; len];
-    stream
-        .read_exact(&mut response)
+    read_exact_until(&mut stream, &mut response, deadline)
         .map_err(ProductionTrustSocketError::Io)?;
     decode_response(&response, request_hash)
+}
+
+#[cfg(unix)]
+fn connect_until(path: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    let address = socket2::SockAddr::unix(path)?;
+    socket.connect_timeout(&address, remaining(deadline)?)?;
+    ensure_before_deadline(deadline)?;
+    Ok(socket.into())
+}
+
+#[cfg(unix)]
+fn remaining(deadline: Instant) -> std::io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "production trust sidecar deadline elapsed",
+        ))
+    } else {
+        Ok(remaining)
+    }
+}
+
+#[cfg(unix)]
+fn ensure_before_deadline(deadline: Instant) -> std::io::Result<()> {
+    remaining(deadline).map(|_| ())
+}
+
+#[cfg(unix)]
+fn write_all_until(
+    stream: &mut UnixStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        stream.set_write_timeout(Some(remaining(deadline)?))?;
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "production trust sidecar accepted no request bytes",
+                ));
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_exact_until(
+    stream: &mut UnixStream,
+    mut bytes: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        stream.set_read_timeout(Some(remaining(deadline)?))?;
+        match stream.read(bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "production trust sidecar closed before its response completed",
+                ));
+            }
+            Ok(read) => bytes = &mut bytes[read..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -330,6 +405,16 @@ mod tests {
     }
 
     #[test]
+    fn policy_query_matches_the_documented_hash_vector() {
+        let request = encode_request(QUERY_POLICY, &[]).unwrap();
+        assert_eq!(hex::encode(&request), "5654413101000000000000");
+        assert_eq!(
+            hex::encode(Hash::digest(b"vos/production-trust-socket/request/v1", &[&request]).0),
+            "a5ee8be4abb996fd3735970cd7b5a53632afef7cb7a548e1314d9c6ef39ece35",
+        );
+    }
+
+    #[test]
     fn reconnect_policy_change_fails_closed() {
         let path = temp_socket("policy-change");
         let server = respond_once(path.clone(), Hash([8; 32]), POLICY, None, false);
@@ -365,6 +450,44 @@ mod tests {
             trust.verify_logical_timeslot(77),
             ProductionTrustDecisionV2::Unavailable,
         );
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn one_deadline_bounds_a_trickled_response() {
+        let path = temp_socket("trickle");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut len = [0u8; 4];
+            stream.read_exact(&mut len).unwrap();
+            let mut request = vec![0; u32::from_le_bytes(len) as usize];
+            stream.read_exact(&mut request).unwrap();
+            let request_hash = Hash::digest(b"vos/production-trust-socket/request/v1", &[&request]);
+            let mut response = Vec::new();
+            response.extend_from_slice(&RESPONSE_MAGIC);
+            response.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+            response.extend_from_slice(&request_hash.0);
+            response.extend_from_slice(&Hash([11; 32]).0);
+            response.push(AUTHORIZED);
+            let len = u32::try_from(response.len()).unwrap();
+            stream.write_all(&len.to_le_bytes()).unwrap();
+            for byte in response {
+                if stream.write_all(&[byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let request = encode_request(VERIFY_TIMESLOT, &7_u64.to_le_bytes()).unwrap();
+        let started = Instant::now();
+        assert!(
+            exchange_with_timeout(&path, &request, Duration::from_millis(75)).is_err(),
+            "a trickling peer must not renew the operation deadline"
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
         server.join().unwrap();
         let _ = std::fs::remove_file(path);
     }

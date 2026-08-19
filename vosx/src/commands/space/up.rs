@@ -2173,6 +2173,105 @@ fn v2_config_from_row(
     })
 }
 
+#[derive(Debug)]
+struct RetryableV2RootRegistration(String);
+
+impl core::fmt::Display for RetryableV2RootRegistration {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RetryableV2RootRegistration {}
+
+fn is_retryable_v2_registration_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<RetryableV2RootRegistration>()
+        .is_some()
+}
+
+fn v2_registration_error(message: String, retryable: bool) -> anyhow::Error {
+    if retryable {
+        anyhow::Error::new(RetryableV2RootRegistration(message))
+    } else {
+        anyhow::anyhow!(message)
+    }
+}
+
+fn retryable_production_dispatch(error: &vos::v2::ServiceDispatchError) -> bool {
+    matches!(
+        error,
+        vos::v2::ServiceDispatchError::Pvm(
+            vos::v2::ServicePvmErrorV2::AccumulateHostRejected(_)
+                | vos::v2::ServicePvmErrorV2::KernelResourceUnavailable
+                | vos::v2::ServicePvmErrorV2::AccumulateCommitRejected
+        )
+    )
+}
+
+fn retryable_replicated_open_error<E>(error: &vos::v2::ReplicatedServiceErrorV2<E>) -> bool {
+    matches!(
+        error,
+        vos::v2::ReplicatedServiceErrorV2::Dispatch(error)
+            if retryable_production_dispatch(error)
+    ) || matches!(
+        error,
+        vos::v2::ReplicatedServiceErrorV2::ProofUnavailable
+            | vos::v2::ReplicatedServiceErrorV2::ReceiptUnavailable
+    )
+}
+
+fn retryable_production_open_error<E>(error: &vos::v2::LocalRootTreeOpenErrorV2<E>) -> bool {
+    match error {
+        vos::v2::LocalRootTreeOpenErrorV2::Service(error) => retryable_production_dispatch(error),
+        vos::v2::LocalRootTreeOpenErrorV2::Replication(error) => {
+            retryable_replicated_open_error(error)
+        }
+        // Production history validation deliberately folds verifier denial
+        // and unavailability into this fail-closed error. Retrying is safe and
+        // lets a recovered authority complete the validation; a truly absent
+        // artifact remains damped without being mistaken for bad config.
+        vos::v2::LocalRootTreeOpenErrorV2::ProofHistoryUnavailable => true,
+        _ => false,
+    }
+}
+
+fn retryable_production_invoke_error(error: &vos::v2::LocalRootTreeInvokeErrorV2) -> bool {
+    match error {
+        vos::v2::LocalRootTreeInvokeErrorV2::Service(error) => retryable_production_dispatch(error),
+        vos::v2::LocalRootTreeInvokeErrorV2::Replication(error) => {
+            retryable_replicated_open_error(error)
+        }
+        vos::v2::LocalRootTreeInvokeErrorV2::ProofUnavailable => true,
+        _ => false,
+    }
+}
+
+fn retryable_v2_node_registration_error(error: &vos::node::V2NodeRegistrationError) -> bool {
+    matches!(
+        error,
+        vos::node::V2NodeRegistrationError::LogicalTimeslotUnavailable
+            | vos::node::V2NodeRegistrationError::LogicalTimeslotRegressed
+    )
+}
+
+fn retryable_production_raft_registration_error(
+    error: &vos::node::V2RaftNodeRegistrationError<std::io::Error>,
+) -> bool {
+    match error {
+        vos::node::V2RaftNodeRegistrationError::Open(error) => {
+            retryable_production_open_error(error)
+        }
+        vos::node::V2RaftNodeRegistrationError::CatchUp(error) => {
+            retryable_production_invoke_error(error)
+        }
+        vos::node::V2RaftNodeRegistrationError::Registration(error) => {
+            retryable_v2_node_registration_error(error)
+        }
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn register_v2_root_from_row(
     node: &mut VosNode,
@@ -2187,6 +2286,7 @@ fn register_v2_root_from_row(
     network_reachable: bool,
     production_trust: Option<std::sync::Arc<dyn vos::v2::ProductionTrustV2>>,
 ) -> anyhow::Result<ServiceId> {
+    let production = production_trust.is_some();
     let backend = vos::v2::FileCommittedImageStoreV2::new(state_path);
     if config.consistency == vos::v2::ConsistencyModeV2::Raft {
         let seed = raft_seed.ok_or_else(|| {
@@ -2220,7 +2320,11 @@ fn register_v2_root_from_row(
                         trust,
                     )
                     .map_err(|error| {
-                        anyhow::anyhow!("register production v2 Raft root tree: {error}")
+                        let retryable = retryable_production_raft_registration_error(&error);
+                        v2_registration_error(
+                            format!("register production v2 Raft root tree: {error}"),
+                            retryable,
+                        )
                     }),
                 None => node
                     .register_v2_raft_root_at_id(
@@ -2266,7 +2370,11 @@ fn register_v2_root_from_row(
                             },
                         )
                         .map_err(|error| {
-                            anyhow::anyhow!("register production v2 Raft root tree: {error}")
+                            let retryable = retryable_production_raft_registration_error(&error);
+                            v2_registration_error(
+                                format!("register production v2 Raft root tree: {error}"),
+                                retryable,
+                            )
                         }),
                     None => node
                         .register_v2_raft_root_at_id_after_local_attach(
@@ -2301,15 +2409,28 @@ fn register_v2_root_from_row(
     }
 
     let service = match production_trust {
-        Some(trust) => vos::v2::LocalRootTreeServiceV2::open_production(config, backend, trust)
-            .map_err(|error| {
-                anyhow::anyhow!("open production v2 root tree '{instance_name}': {error:?}")
-            })?,
+        Some(trust) => {
+            match vos::v2::LocalRootTreeServiceV2::open_production(config, backend, trust) {
+                Ok(service) => service,
+                Err(error) => {
+                    let retryable = retryable_production_open_error(&error);
+                    return Err(v2_registration_error(
+                        format!("open production v2 root tree '{instance_name}': {error:?}"),
+                        retryable,
+                    ));
+                }
+            }
+        }
         None => vos::v2::LocalRootTreeServiceV2::open(config, backend)
             .map_err(|error| anyhow::anyhow!("open v2 root tree '{instance_name}': {error:?}"))?,
     };
     node.register_v2_root_at_id(instance_name, service, svc_id, network_reachable)
-        .map_err(|error| anyhow::anyhow!("register v2 root tree: {error}"))
+        .map_err(|error| {
+            v2_registration_error(
+                format!("register v2 root tree: {error}"),
+                production && retryable_v2_node_registration_error(&error),
+            )
+        })
 }
 
 fn legacy_raft_db_path(data_dir: &Path, svc_id: ServiceId) -> PathBuf {
@@ -2855,6 +2976,10 @@ enum RowNote {
     /// row is skipped outright — no point re-running the failing
     /// work every pass.
     Failed,
+    /// A fail-closed production authority or another retryable host boundary
+    /// was unavailable while opening the root. Warned once, but unlike a
+    /// malformed package/configuration the row is retried on every pass.
+    RegistrationWaiting,
     /// Program blob not cached yet. Warned once; the (cheap)
     /// cache probe keeps retrying, so the row spawns if the blob
     /// appears later.
@@ -2869,6 +2994,14 @@ enum RowNote {
     /// so the node can't sync it and doesn't spawn it. Logged once;
     /// re-evaluated each pass, so it spawns if a grant later lands.
     BelowFloor,
+}
+
+fn v2_registration_note(error: &anyhow::Error) -> RowNote {
+    if is_retryable_v2_registration_error(error) {
+        RowNote::RegistrationWaiting
+    } else {
+        RowNote::Failed
+    }
 }
 
 /// Does this node clear a row's sync floor? `is_member` is [`node_is_member`]'s
@@ -3155,13 +3288,21 @@ fn reconcile_installed_agents(
                     production_trust.clone(),
                 ) {
                     Ok(id) => {
+                        damped.remove(&key(RowNote::RegistrationWaiting));
                         spawned_this_pass += 1;
                         tracing::info!("v2 root tree '{}' spawned as {id}", a.instance_name);
                     }
                     Err(error) => {
-                        if damped.insert(key(RowNote::Failed)) {
+                        let retryable = is_retryable_v2_registration_error(&error);
+                        let note = v2_registration_note(&error);
+                        if damped.insert(key(note)) {
                             tracing::warn!(
                                 "agent '{}' v2 route failed to register: {error}",
+                                a.instance_name,
+                            );
+                        } else if retryable {
+                            tracing::debug!(
+                                "agent '{}' v2 route remains deferred: {error}",
                                 a.instance_name,
                             );
                         }
@@ -3370,6 +3511,68 @@ mod tests {
             _request: &ReceiptVerificationRequestV2,
         ) -> ProductionTrustDecisionV2 {
             ProductionTrustDecisionV2::Authorized
+        }
+    }
+
+    #[derive(Clone)]
+    struct SwitchProductionTrust {
+        policy: Hash,
+        available: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl SwitchProductionTrust {
+        fn decision(&self) -> ProductionTrustDecisionV2 {
+            if self.available.load(std::sync::atomic::Ordering::Relaxed) {
+                ProductionTrustDecisionV2::Authorized
+            } else {
+                ProductionTrustDecisionV2::Unavailable
+            }
+        }
+    }
+
+    impl ProductionTrustV2 for SwitchProductionTrust {
+        fn policy_id(&self) -> Hash {
+            self.policy
+        }
+
+        fn logical_timeslot(&self) -> Option<u64> {
+            self.available
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .then_some(100)
+        }
+
+        fn verify_logical_timeslot(&self, _slot: u64) -> ProductionTrustDecisionV2 {
+            self.decision()
+        }
+
+        fn verify_proof(
+            &self,
+            _request: &ProofVerificationRequestV2,
+            _proof: &[u8],
+        ) -> ProductionTrustDecisionV2 {
+            self.decision()
+        }
+
+        fn verify_install(&self, _genesis: &ServiceGenesisV2) -> ProductionTrustDecisionV2 {
+            self.decision()
+        }
+
+        fn verify_upgrade(&self, _upgrade: &ActorUpgradeV2) -> ProductionTrustDecisionV2 {
+            self.decision()
+        }
+
+        fn verify_role_credential(
+            &self,
+            _request: &RoleCredentialVerificationRequestV2,
+        ) -> ProductionTrustDecisionV2 {
+            self.decision()
+        }
+
+        fn verify_receipt(
+            &self,
+            _request: &ReceiptVerificationRequestV2,
+        ) -> ProductionTrustDecisionV2 {
+            self.decision()
         }
     }
 
@@ -3729,9 +3932,35 @@ mod tests {
         let config = *config;
         let reopen_config = config.clone();
         let policy = Hash([34; 32]);
-        let trust = std::sync::Arc::new(AllowProductionTrust(policy));
+        let available = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trust = std::sync::Arc::new(SwitchProductionTrust {
+            policy,
+            available: available.clone(),
+        });
         let route = ServiceId::new(35, 36);
         let mut node = VosNode::with_prefix(35);
+        let unavailable = register_v2_root_from_row(
+            &mut node,
+            &directory,
+            row.instance_name.clone(),
+            row.replication_id,
+            config.clone(),
+            state_path.clone(),
+            None,
+            35,
+            route,
+            network_reachable,
+            Some(trust.clone()),
+        )
+        .unwrap_err();
+        assert!(is_retryable_v2_registration_error(&unavailable));
+        assert!(matches!(
+            v2_registration_note(&unavailable),
+            RowNote::RegistrationWaiting
+        ));
+        assert!(!node.has_agent(route));
+
+        available.store(true, std::sync::atomic::Ordering::Relaxed);
         register_v2_root_from_row(
             &mut node,
             &directory,
