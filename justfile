@@ -149,6 +149,11 @@ test-pvm: build-test-artifacts
 test-v2-daemon-root: build-v2-daemon-root-artifacts
     cargo test -p vosx --test onboarding_e2e signed_v2_package_runs_and_reopens_through_the_space_daemon -- --nocapture --test-threads=1
 
+# Run the production-profile daemon gate against an independent VTA1/VTR1
+# authority sidecar, including fail-closed startup and sealed-image recovery.
+test-v2-production-daemon: build-v2-daemon-root-artifacts
+    cargo test -p vosx --test onboarding_e2e signed_v2_package_runs_under_production_trust_and_recovers -- --nocapture --test-threads=1
+
 # Run a single test by name.
 test-one name: build-extensions
     cargo test -p vos {{name}} -- --nocapture
@@ -212,6 +217,7 @@ check-all:
     just build-v2-pvm-test-artifacts
     cargo test -p vos --test v2_service_pvm -- --nocapture --test-threads=1
     just test-v2-examples
+    just test-v2-production-daemon
 
 # Lint with clippy.
 lint:

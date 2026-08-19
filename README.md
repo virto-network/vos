@@ -56,6 +56,8 @@ every v2 root through a fail-closed local JAM/consensus authority sidecar; its
 wire and policy contract are described in
 [`docs/runtime-v2.md`](docs/runtime-v2.md). `vosx run`
 remains a legacy one-shot ELF/PVM runner and does not install `.vos` packages.
+The physical production-profile acceptance gate is `just
+test-v2-production-daemon`.
 
 ## Consistency modes
 

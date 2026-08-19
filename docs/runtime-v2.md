@@ -754,6 +754,15 @@ fail-closed error; that class is retried with the bounded schedule above, so a
 persistent denial remains damped rather than being mislabeled as a
 distinguishable hard decision.
 
+`just test-v2-production-daemon` is the physical cutover gate. It builds the
+canonical actor and service artifacts, runs the real space daemon against an
+independent implementation of the documented `VTA1`/`VTR1` Unix protocol,
+installs and mutates a signed root, and restarts it from durable bytes. The
+same scenario proves that an unavailable authority fails before endpoint
+publication, a production-sealed image does not attach through the
+conformance profile, and restoring the original policy recovers the exact
+pre-failure actor state.
+
 The request kind values in that order are `0..=7`. Response values are
 `0=Authorized`, `1=Denied`, `2=Unavailable`, `3=no-current-slot`,
 `4=current-slot` (followed by one little-endian `u64`), and `5=policy`.

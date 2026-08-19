@@ -25,8 +25,13 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
+
+use std::io::{Read, Write};
+use std::os::unix::net::UnixListener;
 
 fn vosx_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_vosx"))
@@ -107,11 +112,25 @@ fn spawn_up_with_service(
     log_path: &Path,
     service_pvm: Option<&Path>,
 ) -> Child {
+    spawn_up_with_service_and_trust(data_home, config_home, arg, log_path, service_pvm, None)
+}
+
+fn spawn_up_with_service_and_trust(
+    data_home: &Path,
+    config_home: &Path,
+    arg: &str,
+    log_path: &Path,
+    service_pvm: Option<&Path>,
+    production_trust_socket: Option<&Path>,
+) -> Child {
     let log_file = fs::File::create(log_path).expect("create log");
     let mut command = Command::new(vosx_bin());
     command.args(["space", "up", arg]);
     if let Some(path) = service_pvm {
         command.arg("--service-pvm").arg(path);
+    }
+    if let Some(path) = production_trust_socket {
+        command.arg("--production-trust-socket").arg(path);
     }
     command
         .env("XDG_DATA_HOME", data_home)
@@ -123,6 +142,125 @@ fn spawn_up_with_service(
         .stderr(log_file)
         .spawn()
         .expect("spawn vosx space up")
+}
+
+/// Minimal independent implementation of the documented VTA1/VTR1 authority
+/// protocol. Keeping this outside the daemon crate makes the acceptance test
+/// exercise the public wire rather than its private codec helpers.
+struct TestProductionTrustSidecar {
+    path: PathBuf,
+    stop: Arc<AtomicBool>,
+    seen: Arc<Mutex<Vec<u8>>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl TestProductionTrustSidecar {
+    const REQUEST_MAGIC: [u8; 4] = *b"VTA1";
+    const RESPONSE_MAGIC: [u8; 4] = *b"VTR1";
+    const VERSION: u16 = 1;
+    const QUERY_POLICY: u8 = 0;
+    const CURRENT_TIMESLOT: u8 = 1;
+    const VERIFY_INSTALL: u8 = 4;
+    const AUTHORIZED: u8 = 0;
+    const TIMESLOT: u8 = 4;
+    const POLICY: u8 = 5;
+
+    fn start(path: PathBuf, policy: vos::v2::Hash) -> Self {
+        let listener = UnixListener::bind(&path).expect("bind production trust sidecar");
+        listener
+            .set_nonblocking(true)
+            .expect("make production trust sidecar nonblocking");
+        let stop = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let thread_stop = stop.clone();
+        let thread_seen = seen.clone();
+        let handle = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("production trust sidecar accept: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("bound production trust request read");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .expect("bound production trust response write");
+                let mut frame_len = [0; 4];
+                if stream.read_exact(&mut frame_len).is_err() {
+                    continue;
+                }
+                let frame_len = u32::from_le_bytes(frame_len) as usize;
+                assert!(
+                    frame_len <= 64 * 1024 * 1024,
+                    "authority request is bounded"
+                );
+                let mut request = vec![0; frame_len];
+                if stream.read_exact(&mut request).is_err() {
+                    continue;
+                }
+                assert!(request.len() >= 11, "authority request header");
+                assert_eq!(request[..4], Self::REQUEST_MAGIC);
+                assert_eq!(u16::from_le_bytes([request[4], request[5]]), Self::VERSION);
+                let tag = request[6];
+                let payload_len = u32::from_le_bytes(request[7..11].try_into().unwrap()) as usize;
+                assert_eq!(payload_len, request.len() - 11);
+                thread_seen.lock().unwrap().push(tag);
+
+                let request_hash =
+                    vos::v2::Hash::digest(b"vos/production-trust-socket/request/v1", &[&request]);
+                let result = match tag {
+                    Self::QUERY_POLICY => Self::POLICY,
+                    Self::CURRENT_TIMESLOT => Self::TIMESLOT,
+                    _ => Self::AUTHORIZED,
+                };
+                let mut response = Vec::with_capacity(79);
+                response.extend_from_slice(&Self::RESPONSE_MAGIC);
+                response.extend_from_slice(&Self::VERSION.to_le_bytes());
+                response.extend_from_slice(&request_hash.0);
+                response.extend_from_slice(&policy.0);
+                response.push(result);
+                if result == Self::TIMESLOT {
+                    // One JAM slot admits multiple service transitions. Keep
+                    // the observation stable across the node's allocation and
+                    // IC-5 verification calls; changing it between those two
+                    // reads must fail closed.
+                    response.extend_from_slice(&1_000_u64.to_le_bytes());
+                }
+                if stream
+                    .write_all(&(response.len() as u32).to_le_bytes())
+                    .and_then(|()| stream.write_all(&response))
+                    .is_err()
+                {
+                    continue;
+                }
+            }
+        });
+        Self {
+            path,
+            stop,
+            seen,
+            thread: Some(handle),
+        }
+    }
+
+    fn saw(&self, tag: u8) -> bool {
+        self.seen.lock().unwrap().contains(&tag)
+    }
+}
+
+impl Drop for TestProductionTrustSidecar {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.thread.take() {
+            handle.join().expect("join production trust sidecar");
+        }
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 fn counter_package_fixture(output_dir: &Path) -> PathBuf {
@@ -677,6 +815,212 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
             .join(old_image.file_name().unwrap())
             .is_file(),
         "deleted installation image was not moved to recoverable trash",
+    );
+}
+
+#[test]
+fn signed_v2_package_runs_under_production_trust_and_recovers() {
+    let space = "v2-production";
+    let data = TempDir::new("v2-production-data");
+    let config = TempDir::new("v2-production-config");
+    let dist = TempDir::new("v2-production-dist");
+    let sidecar_dir = TempDir::new("v2-production-sidecar");
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let service_pvm = workspace.join("services/vos-service/vos-service.pvm");
+    assert!(
+        service_pvm.is_file(),
+        "build the canonical service first: `just build-vos-service`",
+    );
+    let package = counter_package_fixture(dist.path());
+
+    vosx_ok(data.path(), config.path(), &["space", "new", space]);
+
+    // Selecting production mode is fail-closed before the endpoint is
+    // published: the daemon cannot silently fall back to conformance when the
+    // configured authority is absent.
+    let trust_socket = sidecar_dir.path().join("authority.sock");
+    let unavailable_log = data.path().join("v2-production-unavailable.stderr");
+    let mut unavailable = spawn_up_with_service_and_trust(
+        data.path(),
+        config.path(),
+        space,
+        &unavailable_log,
+        Some(&service_pvm),
+        Some(&trust_socket),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let unavailable_status = loop {
+        if let Some(status) = unavailable.try_wait().expect("poll rejected daemon") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = unavailable.kill();
+            let _ = unavailable.wait();
+            panic!(
+                "daemon did not fail closed while its production authority was absent; log:\n{}",
+                fs::read_to_string(&unavailable_log).unwrap_or_default(),
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(!unavailable_status.success());
+    assert!(
+        find_endpoint(data.path()).is_none(),
+        "an unavailable production authority must fail before route publication",
+    );
+
+    let policy = vos::v2::Hash([0x67; 32]);
+    let sidecar = TestProductionTrustSidecar::start(trust_socket.clone(), policy);
+    let first_log = data.path().join("v2-production-first.stderr");
+    let first = Daemon(spawn_up_with_service_and_trust(
+        data.path(),
+        config.path(),
+        space,
+        &first_log,
+        Some(&service_pvm),
+        Some(&trust_socket),
+    ));
+    let endpoint = wait_for_endpoint(data.path(), &first_log, "v2-production-first");
+
+    let package_source = package.to_string_lossy().into_owned();
+    vosx_ok(
+        data.path(),
+        config.path(),
+        &[
+            "space",
+            "publish",
+            space,
+            "onboarding-counter:0.1.0",
+            &package_source,
+        ],
+    );
+    vosx_ok(
+        data.path(),
+        config.path(),
+        &[
+            "space",
+            "install",
+            space,
+            "onboarding-counter:0.1.0",
+            "--name",
+            "production-counter",
+            "--consistency",
+            "local",
+        ],
+    );
+    poll_until(
+        30,
+        || {
+            let output = vosx(
+                data.path(),
+                config.path(),
+                &["space", "call", space, "production-counter", "value"],
+            );
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "U64(0)"
+        },
+        || {
+            format!(
+                "the production daemon never attached the signed root; log:\n{}",
+                fs::read_to_string(&first_log).unwrap_or_default(),
+            )
+        },
+    );
+    let incremented = vosx_ok(
+        data.path(),
+        config.path(),
+        &[
+            "space",
+            "call",
+            space,
+            "production-counter",
+            "increment",
+            "by=7",
+        ],
+    );
+    assert_eq!(incremented.trim(), "U64(7)");
+    assert!(sidecar.saw(TestProductionTrustSidecar::QUERY_POLICY));
+    assert!(sidecar.saw(TestProductionTrustSidecar::CURRENT_TIMESLOT));
+    assert!(sidecar.saw(TestProductionTrustSidecar::VERIFY_INSTALL));
+
+    // A production-sealed image cannot be reopened by omitting the authority.
+    // The daemon itself remains available for legacy/control-plane traffic,
+    // while the v2 route stays fail-closed.
+    drop(first);
+    let _ = fs::remove_file(&endpoint);
+    let conformance_log = data.path().join("v2-production-no-authority.stderr");
+    let conformance = Daemon(spawn_up_with_service(
+        data.path(),
+        config.path(),
+        space,
+        &conformance_log,
+        Some(&service_pvm),
+    ));
+    wait_for_endpoint(data.path(), &conformance_log, "v2-production-no-authority");
+    poll_until(
+        15,
+        || {
+            fs::read_to_string(&conformance_log)
+                .unwrap_or_default()
+                .contains("ProductionTrust(TrustRequired)")
+        },
+        || {
+            format!(
+                "the sealed root was not visibly refused without its authority; log:\n{}",
+                fs::read_to_string(&conformance_log).unwrap_or_default(),
+            )
+        },
+    );
+    let _reported = vosx(
+        data.path(),
+        config.path(),
+        &[
+            "space",
+            "call",
+            space,
+            "production-counter",
+            "increment",
+            "by=100",
+        ],
+    );
+    assert!(
+        !fs::read_to_string(&conformance_log)
+            .unwrap_or_default()
+            .contains("v2 root tree 'production-counter' spawned"),
+        "a production image must never attach through the conformance profile",
+    );
+
+    // Restoring the exact policy reattaches the durable route and recovers the
+    // already committed state rather than reinstalling a fresh service.
+    drop(conformance);
+    if let Some(endpoint) = find_endpoint(data.path()) {
+        let _ = fs::remove_file(endpoint);
+    }
+    let recovery_log = data.path().join("v2-production-recovery.stderr");
+    let _recovered = Daemon(spawn_up_with_service_and_trust(
+        data.path(),
+        config.path(),
+        space,
+        &recovery_log,
+        Some(&service_pvm),
+        Some(&trust_socket),
+    ));
+    wait_for_endpoint(data.path(), &recovery_log, "v2-production-recovery");
+    poll_until(
+        30,
+        || {
+            let output = vosx(
+                data.path(),
+                config.path(),
+                &["space", "call", space, "production-counter", "value"],
+            );
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "U64(7)"
+        },
+        || {
+            format!(
+                "the original production policy did not recover the pre-refusal committed state; log:\n{}",
+                fs::read_to_string(&recovery_log).unwrap_or_default(),
+            )
+        },
     );
 }
 
