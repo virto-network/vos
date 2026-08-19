@@ -1779,13 +1779,14 @@ fn fresh_production_joiner_must_match_policy_before_voter_promotion() {
             .expect("the bundled registry transpiles");
     install_test_voter_registry(
         &mut leader,
-        registry_pvm,
+        registry_pvm.clone(),
         &[
             (leader_prefix, leader_peer.to_bytes()),
             (joiner_prefix, joiner_peer.to_bytes()),
         ],
     );
     leader.attach_network(leader_network);
+    let leader_network = leader.network().unwrap();
     leader
         .register_v2_raft_root_at_id_production(
             "policy-bound-leader-v2".into(),
@@ -1812,14 +1813,24 @@ fn fresh_production_joiner_must_match_policy_before_voter_promotion() {
     });
 
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    while joiner_network.peer_for_prefix(leader_prefix).is_none()
+    while (joiner_network.peer_for_prefix(leader_prefix).is_none()
+        || leader_network.peer_for_prefix(joiner_prefix).is_none())
         && std::time::Instant::now() < deadline
     {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(joiner_network.peer_for_prefix(leader_prefix).is_some());
+    assert!(leader_network.peer_for_prefix(joiner_prefix).is_some());
 
     let mut joiner = VosNode::with_prefix(joiner_prefix);
+    install_test_voter_registry(
+        &mut joiner,
+        registry_pvm,
+        &[
+            (leader_prefix, leader_peer.to_bytes()),
+            (joiner_prefix, joiner_peer.to_bytes()),
+        ],
+    );
     joiner.attach_network(joiner_network);
     let joiner_network = joiner.network().unwrap();
     let joiner_route = ServiceId::new(joiner_prefix, 0x3395);
@@ -1843,6 +1854,20 @@ fn fresh_production_joiner_must_match_policy_before_voter_promotion() {
             true,
             Arc::new(TestProductionTrust::new(0x9e, 77, true)),
             move |_, _, policy| {
+                let pending_result = leader_network
+                    .send_raft_join_req_with_policy(
+                        joiner_peer,
+                        replication_id,
+                        leader_prefix,
+                        None,
+                    )
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+                if pending_result != vos::network::RaftJoinResult::PolicyMismatch {
+                    return Err(format!(
+                        "pending production replica admitted a policy-less join: {pending_result:?}"
+                    ));
+                }
                 let result = joiner_network
                     .send_raft_join_req_with_policy(
                         leader_peer,
@@ -1883,6 +1908,88 @@ fn fresh_production_joiner_must_match_policy_before_voter_promotion() {
     leader_shutdown.store(true, Ordering::Relaxed);
     assert!(leader_runner.join().unwrap().iter().all(AgentResult::is_ok));
     assert!(joiner.collect().iter().all(AgentResult::is_ok));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn promoted_voter_keeps_raft_handler_while_application_catch_up_retries() {
+    let key = libp2p::identity::Keypair::generate_ed25519();
+    let peer = libp2p::PeerId::from(key.public());
+    let member = vos::network::derive_node_prefix(&peer);
+    let other_member = if member == u16::MAX {
+        member - 1
+    } else {
+        member + 1
+    };
+    let replication_id = [0x9f; 32];
+    let route = ServiceId::new(member, 0x3396);
+    let network = vos::network::Network::start(vos::network::NetworkConfig {
+        keypair: key,
+        local_prefix: member,
+        listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+        bootstrap: vec![],
+        auto_dial_mdns: false,
+    });
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-promoted-catch-up-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+
+    let mut node = VosNode::with_prefix(member);
+    node.attach_network(network);
+    let promotion_committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let callback_committed = promotion_committed.clone();
+    node.register_v2_raft_root_at_id_after_local_attach_production(
+        "promoted-recovering-voter-v2".into(),
+        attested_root_fixture(ConsistencyModeV2::Raft, 0xa0).0,
+        FileCommittedImageStoreV2::new(directory.join("service.image")),
+        Arc::new(redb::Database::create(directory.join("raft.redb")).unwrap()),
+        RaftConfig {
+            me: member,
+            members: vec![other_member],
+            election_timeout_ms: (30_000, 40_000),
+            heartbeat_interval_ms: 20,
+            replication_id,
+            propose_timeout_ms: 2_000,
+        },
+        route,
+        true,
+        Arc::new(TestProductionTrust::new(0xa1, 77, true)),
+        move |_, _, _| {
+            // Returning success is the callback contract that final
+            // membership has committed. This fresh follower deliberately has
+            // no application genesis yet, so its first catch-up cannot make
+            // the root publishable.
+            callback_committed.store(true, Ordering::Release);
+            Ok(())
+        },
+    )
+    .expect("the promoted follower is retained privately while catching up");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !promotion_committed.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(promotion_committed.load(Ordering::Acquire));
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        node.network()
+            .unwrap()
+            .local_raft_status(&replication_id)
+            .is_some(),
+        "a committed voter must keep serving Raft while application catch-up retries",
+    );
+    assert!(
+        node.has_agent(route),
+        "the route remains reserved until the promoted root is publishable",
+    );
+
+    assert!(node.collect().iter().all(AgentResult::is_ok));
     std::fs::remove_dir_all(directory).unwrap();
 }
 

@@ -1053,17 +1053,23 @@ retired incarnation. On the next boot, images, proof side-CAS directories,
 producer-private Task-record directories, and Raft databases whose incarnation
 is no longer present move to recoverable trash.
 
-A joining v2 Raft root starts its worker, registers the inbound Raft handler,
-opens its durable service, and validates its still-unpublished route before it
-asks the leader for voter promotion. Promotion is node-owned background state,
-not work performed by the router or reconciliation callback. A definite
-pre-request refusal returns the row to deferred reconciliation; once a request
-has an ambiguous outcome, the prepared worker stays available and retries
-idempotently until final non-joint membership is visible. Shutdown cancels and
-joins that worker, and the route becomes public only after successful final
-membership, a final committed-log catch-up, and local validation of the
-policy-bearing service genesis. Immediate production registration likewise
-requires an installed, policy-matching image before exposing a route. Calls
+A joining v2 Raft root publishes fail-closed pending policy metadata before it
+activates the inbound Raft handler, then opens its durable service and validates
+its still-unpublished route before it asks the leader for voter promotion.
+Policy-less or mismatched joins therefore cannot use the handler-startup window
+as a legacy group, and private-ingress staging/quiescence remains unavailable
+until the live root replaces that pending registration. Promotion is node-owned
+background state, not work performed by the router or reconciliation callback.
+A definite pre-request refusal returns the row to deferred reconciliation;
+once a request has an ambiguous outcome, the prepared worker stays available
+and retries idempotently until final non-joint membership is visible. After
+final membership commits, application catch-up or policy validation failures
+also keep that voter and its Raft handler alive while recovery retries; only
+node shutdown or a consensus membership removal may tear it down. The route
+becomes public only after successful final membership, a final committed-log
+catch-up, and local validation of the policy-bearing service genesis.
+Immediate production registration likewise requires an installed,
+policy-matching image before exposing a route. Calls
 that reach a follower receive a transport-level leader
 redirect which both the raw node API and generated typed actor handles follow.
 Remote peers reconnect to the leader directly and therefore retain their

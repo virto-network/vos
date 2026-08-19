@@ -1431,6 +1431,38 @@ impl Drop for V2PrivateIngressBarrierGuard<'_> {
 type V2PrivateIngressRoutes = Arc<RwLock<HashMap<[u8; 32], Arc<V2PrivateIngressRoute>>>>;
 
 #[cfg(all(feature = "network", feature = "storage"))]
+fn pending_v2_private_ingress_route(
+    production_trust_policy: Option<[u8; 32]>,
+) -> Arc<V2PrivateIngressRoute> {
+    // Pending registration deliberately drops both receivers. Private-input
+    // staging and quiescence therefore fail immediately while the exact V2
+    // policy metadata remains visible to join admission.
+    let (tx, _receiver) = mpsc::sync_channel(1);
+    let (quiescence_tx, _quiescence_receiver) = mpsc::sync_channel(1);
+    Arc::new(V2PrivateIngressRoute {
+        tx,
+        quiescence_tx,
+        barrier: V2PrivateIngressBarrier::new(),
+        production_trust_policy,
+    })
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn remove_v2_private_ingress_route_if(
+    routes: &V2PrivateIngressRoutes,
+    replication_id: &[u8; 32],
+    expected: &Arc<V2PrivateIngressRoute>,
+) {
+    let mut routes = routes.write().unwrap();
+    if routes
+        .get(replication_id)
+        .is_some_and(|route| Arc::ptr_eq(route, expected))
+    {
+        routes.remove(replication_id);
+    }
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
 struct V2PrivateIngressRegistration {
     replication_id: [u8; 32],
     route: Arc<V2PrivateIngressRoute>,
@@ -1632,6 +1664,7 @@ type PreparedV2RaftRoot<B> = (
     [u8; 32],
     Arc<dyn crate::network::RaftRpcHandler>,
     Option<crate::v2::Hash>,
+    Arc<V2PrivateIngressRoute>,
 );
 
 /// Shared host-side reverse map: `local_id` (`id.0 & 0xFFFF`) →
@@ -4572,26 +4605,43 @@ impl VosNode {
             + Send
             + 'static,
     {
-        let (mut service, _worker, _network, replication_id, handler, expected_policy) = self
-            .prepare_v2_raft_root(
-                config,
-                backend,
-                db,
-                raft_config,
-                proof_verifier,
-                production_trust,
-            )?;
+        let (
+            mut service,
+            _worker,
+            _network,
+            replication_id,
+            handler,
+            expected_policy,
+            pending_route,
+        ) = self.prepare_v2_raft_root(
+            config,
+            backend,
+            db,
+            raft_config,
+            proof_verifier,
+            production_trust,
+        )?;
         if let Some(expected_policy) = expected_policy {
             let installed = service.catch_up().map_err(|error| {
                 if let Some(network) = _network.as_ref() {
                     network.unregister_raft_handler_if(&replication_id, &handler);
                 }
+                remove_v2_private_ingress_route_if(
+                    &self.v2_private_ingress_routes,
+                    &replication_id,
+                    &pending_route,
+                );
                 V2RaftNodeRegistrationError::CatchUp(error)
             })?;
             if !installed {
                 if let Some(network) = _network.as_ref() {
                     network.unregister_raft_handler_if(&replication_id, &handler);
                 }
+                remove_v2_private_ingress_route_if(
+                    &self.v2_private_ingress_routes,
+                    &replication_id,
+                    &pending_route,
+                );
                 return Err(V2RaftNodeRegistrationError::CatchUp(
                     crate::v2::LocalRootTreeInvokeErrorV2::ServiceNotInstalled,
                 ));
@@ -4600,6 +4650,11 @@ impl VosNode {
                 if let Some(network) = _network.as_ref() {
                     network.unregister_raft_handler_if(&replication_id, &handler);
                 }
+                remove_v2_private_ingress_route_if(
+                    &self.v2_private_ingress_routes,
+                    &replication_id,
+                    &pending_route,
+                );
                 return Err(V2RaftNodeRegistrationError::ProductionPolicyMismatch);
             }
         }
@@ -4607,6 +4662,11 @@ impl VosNode {
             if let Some(network) = _network.as_ref() {
                 network.unregister_raft_handler_if(&replication_id, &handler);
             }
+            remove_v2_private_ingress_route_if(
+                &self.v2_private_ingress_routes,
+                &replication_id,
+                &pending_route,
+            );
             return Err(V2RaftNodeRegistrationError::Registration(error));
         }
         self.raft_hosts.lock().unwrap().insert(id.0, replication_id);
@@ -4887,19 +4947,31 @@ impl VosNode {
             + Send
             + 'static,
     {
-        let (mut service, worker_handle, network, replication_id, handler, expected_policy) = self
-            .prepare_v2_raft_root(
-                config,
-                backend,
-                db,
-                raft_config,
-                proof_verifier,
-                production_trust,
-            )?;
+        let (
+            mut service,
+            worker_handle,
+            network,
+            replication_id,
+            handler,
+            expected_policy,
+            pending_route,
+        ) = self.prepare_v2_raft_root(
+            config,
+            backend,
+            db,
+            raft_config,
+            proof_verifier,
+            production_trust,
+        )?;
         if let Err(error) = self.validate_v2_root_registration(&service, id) {
             if let Some(network) = network.as_ref() {
                 network.unregister_raft_handler_if(&replication_id, &handler);
             }
+            remove_v2_private_ingress_route_if(
+                &self.v2_private_ingress_routes,
+                &replication_id,
+                &pending_route,
+            );
             return Err(V2RaftNodeRegistrationError::Registration(error));
         }
 
@@ -4912,24 +4984,41 @@ impl VosNode {
         let shutdown = self.shutdown.clone();
         let cleanup_network = network.clone();
         let cleanup_handler = handler.clone();
+        let pending_routes = self.v2_private_ingress_routes.clone();
+        let cleanup_pending_route = pending_route.clone();
         let join = thread::spawn(move || {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let promotion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 promote(&worker_handle, &shutdown, expected_policy)
             }))
             .unwrap_or_else(|_| Err("prepared v2 Raft root promotion panicked".into()));
-            let outcome = outcome.and_then(|()| {
-                let installed = service
-                    .catch_up()
-                    .map_err(|error| format!("post-promotion catch-up failed: {error}"))?;
-                if !installed {
-                    return Err("post-promotion catch-up did not install service genesis".into());
+            let outcome = promotion.and_then(|()| {
+                // `Ok(())` means final membership is committed. From here on
+                // this worker is quorum state, not disposable registration
+                // scaffolding. Keep serving Raft and retry application
+                // catch-up until the local root is safe to publish or the
+                // entire node shuts down.
+                let mut next_warning = Instant::now();
+                loop {
+                    if shutdown.load(Ordering::Relaxed) {
+                        return Err(
+                            "node shut down while promoted v2 Raft root was catching up".into()
+                        );
+                    }
+                    let recovery = match service.catch_up() {
+                        Ok(true)
+                            if expected_policy.is_none_or(|expected| {
+                                service.production_trust_policy_id() == Some(expected)
+                            }) => return Ok(()),
+                        Ok(true) => "production trust policy still mismatches".to_owned(),
+                        Ok(false) => "service genesis is not installed yet".to_owned(),
+                        Err(error) => format!("catch-up failed: {error}"),
+                    };
+                    if Instant::now() >= next_warning {
+                        warn!(%id, %recovery, "promoted v2 Raft root remains private while recovering");
+                        next_warning = Instant::now() + Duration::from_secs(5);
+                    }
+                    thread::sleep(Duration::from_millis(100));
                 }
-                if let Some(expected) = expected_policy
-                    && service.production_trust_policy_id() != Some(expected)
-                {
-                    return Err("post-promotion production trust policy mismatch".into());
-                }
-                Ok(())
             });
             if outcome.is_ok() && !shutdown.load(Ordering::Relaxed) {
                 let ready_network = network.clone();
@@ -4941,6 +5030,11 @@ impl VosNode {
                         if let Some(network) = ready_network.as_ref() {
                             network.unregister_raft_handler_if(&replication_id, &ready_handler);
                         }
+                        remove_v2_private_ingress_route_if(
+                            &node.v2_private_ingress_routes,
+                            &replication_id,
+                            &pending_route,
+                        );
                         ready_pending_ids.lock().unwrap().remove(&id.0);
                         ready_pending_actors.lock().unwrap().remove(&actor);
                         return;
@@ -4964,6 +5058,11 @@ impl VosNode {
             if let Some(network) = cleanup_network.as_ref() {
                 network.unregister_raft_handler_if(&replication_id, &cleanup_handler);
             }
+            remove_v2_private_ingress_route_if(
+                &pending_routes,
+                &replication_id,
+                &cleanup_pending_route,
+            );
             pending_ids.lock().unwrap().remove(&id.0);
             pending_actors.lock().unwrap().remove(&actor);
             if let Err(error) = outcome {
@@ -5003,15 +5102,34 @@ impl VosNode {
             ))
         })?;
         let replication_id = raft_config.replication_id;
+        let expected_policy = production_trust.as_ref().map(|trust| trust.policy_id());
+        let pending_route = pending_v2_private_ingress_route(expected_policy.map(Into::into));
+        {
+            let mut routes = self.v2_private_ingress_routes.write().unwrap();
+            if routes.contains_key(&replication_id) {
+                return Err(V2RaftNodeRegistrationError::ReplicationHandlerOccupied(
+                    replication_id,
+                ));
+            }
+            routes.insert(replication_id, pending_route.clone());
+        }
         let network = self
             .shared_network
             .lock()
             .ok()
             .and_then(|guard| guard.clone());
         let reservation = if let Some(network) = network.as_ref() {
-            Some(network.reserve_raft_handler(replication_id).ok_or(
-                V2RaftNodeRegistrationError::ReplicationHandlerOccupied(replication_id),
-            )?)
+            let Some(reservation) = network.reserve_raft_handler(replication_id) else {
+                remove_v2_private_ingress_route_if(
+                    &self.v2_private_ingress_routes,
+                    &replication_id,
+                    &pending_route,
+                );
+                return Err(V2RaftNodeRegistrationError::ReplicationHandlerOccupied(
+                    replication_id,
+                ));
+            };
+            Some(reservation)
         } else {
             None
         };
@@ -5034,6 +5152,11 @@ impl VosNode {
             && !network.activate_raft_handler(reservation, handler.clone())
         {
             worker.shutdown();
+            remove_v2_private_ingress_route_if(
+                &self.v2_private_ingress_routes,
+                &replication_id,
+                &pending_route,
+            );
             return Err(V2RaftNodeRegistrationError::ReplicationHandlerOccupied(
                 replication_id,
             ));
@@ -5046,6 +5169,11 @@ impl VosNode {
             if let Some(network) = network.as_ref() {
                 network.unregister_raft_handler_if(&replication_id, &handler);
             }
+            remove_v2_private_ingress_route_if(
+                &self.v2_private_ingress_routes,
+                &replication_id,
+                &pending_route,
+            );
         };
         let log = match crate::raft::RaftAccumulateLogV2::from_worker(
             db,
@@ -5059,7 +5187,6 @@ impl VosNode {
                 return Err(V2RaftNodeRegistrationError::Log(error));
             }
         };
-        let expected_policy = production_trust.as_ref().map(|trust| trust.policy_id());
         let opened = match production_trust {
             Some(trust) => {
                 crate::v2::LocalRootTreeServiceV2::open_raft_production(config, backend, log, trust)
@@ -5085,6 +5212,7 @@ impl VosNode {
             replication_id,
             handler,
             expected_policy,
+            pending_route,
         ))
     }
 
