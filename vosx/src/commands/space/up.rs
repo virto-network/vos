@@ -481,6 +481,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let local_cfg = subscriptions::load(&data_dir).unwrap_or_default();
     let agent_policies = agent_policies_from_local(&local_cfg)?;
     let device_secret_agents = device_secret_agents_from_local(&local_cfg);
+    // Shared across bootstrap and runtime reconciliation. Bootstrap opens at
+    // most one v2 root synchronously; remaining rows inherit the same global
+    // window/backoff and are opened only after the endpoint is published.
+    let mut v2_registration_backoff = V2RegistrationBackoff::default();
 
     // Register node-local `.so` extensions from `local.toml`, returning
     // each one's effective relay caps for the endpoint descriptor
@@ -504,6 +508,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         &agent_policies,
         pinned_v2_service.as_ref(),
         production_trust.clone(),
+        &mut v2_registration_backoff,
     )?;
 
     // Provision device-local secret seeds for agents that declared
@@ -532,6 +537,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 entry.name,
             );
         }
+        tracing::warn!(
+            "--once opens at most one v2 root during bootstrap; any additional v2 roots require \
+             a long-running `space up {}` reconciliation pass",
+            entry.name,
+        );
         tracing::info!("--once: exiting when registry goes idle");
         node.run();
     } else {
@@ -558,7 +568,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         // before it can sync anything — the cert IS the auth.
         let mut redeem_warned = false;
         let mut damped = std::collections::HashSet::new();
-        let mut v2_registration_backoff = V2RegistrationBackoff::default();
         let mut boot_grace = BootGrace::new();
         // Program-blob fetches in flight, shared with the background fetch
         // tasks the reconcile pass spawns for uncached rows.
@@ -1388,6 +1397,7 @@ fn spawn_installed_agents(
     policies: &AgentPolicies,
     pinned_v2_service: Option<&PinnedV2Service>,
     production_trust: Option<std::sync::Arc<dyn vos::v2::ProductionTrustV2>>,
+    v2_registration_backoff: &mut V2RegistrationBackoff,
 ) -> anyhow::Result<()> {
     use std::collections::HashSet;
     use vos::registry::{RegistryRef, Status};
@@ -1441,6 +1451,7 @@ fn spawn_installed_agents(
     // requires membership are narrowed out on a non-member. The runtime
     // reconciler re-evaluates each pass, so a row spawns if a grant lands later.
     let is_member = node_is_member(node, &reg, local_prefix);
+    let mut v2_registration_attempts = 0usize;
     let mut spawn_rows = agents.iter().collect::<Vec<_>>();
     spawn_rows.sort_by_key(|row| {
         (row.instance_name != vos::v2::ROLE_AUTHORITY_INSTANCE_V2)
@@ -1549,6 +1560,19 @@ fn spawn_installed_agents(
                 state_path,
                 network_reachable,
             } => {
+                let registration_key = (a.instance_name.clone(), a.program_hash);
+                if !take_v2_registration_attempt(
+                    &mut v2_registration_attempts,
+                    v2_registration_backoff,
+                    &registration_key,
+                    std::time::Instant::now(),
+                ) {
+                    tracing::debug!(
+                        "v2 root tree '{}' deferred until post-publication reconciliation",
+                        a.instance_name,
+                    );
+                    continue;
+                }
                 let svc_id = instance_service_id(&a.instance_name, local_prefix);
                 match register_v2_root_from_row(
                     node,
@@ -1563,15 +1587,27 @@ fn spawn_installed_agents(
                     network_reachable,
                     production_trust.clone(),
                 ) {
-                    Ok(id) => tracing::info!(
-                        "v2 root tree '{}' as {id} ({})",
-                        a.instance_name,
-                        crate::commands::space::common::consistency_name(a.consistency),
-                    ),
-                    Err(error) => tracing::warn!(
-                        "skipping agent '{}' — v2 route failed to register: {error}",
-                        a.instance_name,
-                    ),
+                    Ok(id) => {
+                        v2_registration_backoff
+                            .success(&registration_key, std::time::Instant::now());
+                        tracing::info!(
+                            "v2 root tree '{}' as {id} ({})",
+                            a.instance_name,
+                            crate::commands::space::common::consistency_name(a.consistency),
+                        );
+                    }
+                    Err(error) => {
+                        let retryable = is_retryable_v2_registration_error(&error);
+                        v2_registration_backoff.finish(
+                            registration_key,
+                            retryable,
+                            std::time::Instant::now(),
+                        );
+                        tracing::warn!(
+                            "skipping agent '{}' — v2 route failed to register: {error}",
+                            a.instance_name,
+                        );
+                    }
                 }
             }
             RowConfig::MissingBlob => {
@@ -3031,6 +3067,19 @@ impl V2RegistrationBackoff {
     }
 }
 
+fn take_v2_registration_attempt(
+    attempts: &mut usize,
+    backoff: &V2RegistrationBackoff,
+    key: &V2RegistrationKey,
+    now: std::time::Instant,
+) -> bool {
+    if *attempts >= MAX_V2_REGISTRATION_ATTEMPTS_PER_PASS || !backoff.ready(key, now) {
+        return false;
+    }
+    *attempts += 1;
+    true
+}
+
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 enum RowNote {
     /// Hard per-row failure (transpile error, cache IO, bad
@@ -3339,12 +3388,14 @@ fn reconcile_installed_agents(
                 network_reachable,
             } => {
                 let registration_key = (a.instance_name.clone(), a.program_hash);
-                if v2_registration_attempts >= MAX_V2_REGISTRATION_ATTEMPTS_PER_PASS
-                    || !v2_registration_backoff.ready(&registration_key, std::time::Instant::now())
-                {
+                if !take_v2_registration_attempt(
+                    &mut v2_registration_attempts,
+                    v2_registration_backoff,
+                    &registration_key,
+                    std::time::Instant::now(),
+                ) {
                     continue;
                 }
-                v2_registration_attempts += 1;
                 match register_v2_root_from_row(
                     node,
                     data_dir,
@@ -4080,16 +4131,34 @@ mod tests {
         let now = std::time::Instant::now();
         let mut backoff = V2RegistrationBackoff::default();
         assert!(backoff.ready(&first, now));
+        let mut attempts = 0;
+        assert!(take_v2_registration_attempt(
+            &mut attempts,
+            &backoff,
+            &first,
+            now,
+        ));
+        assert!(
+            !take_v2_registration_attempt(&mut attempts, &backoff, &second, now),
+            "bootstrap and reconciliation both admit only one open per pass"
+        );
 
         backoff.finish(first.clone(), true, now);
         assert!(!backoff.ready(&first, now));
         assert!(!backoff.ready(&second, now));
 
         let next_pass = now + V2_REGISTRATION_GLOBAL_RETRY_GAP;
+        attempts = 0;
         assert!(
             backoff.ready(&second, next_pass),
             "another row becomes eligible after the global router window"
         );
+        assert!(take_v2_registration_attempt(
+            &mut attempts,
+            &backoff,
+            &second,
+            next_pass,
+        ));
         assert!(
             !backoff.ready(&first, next_pass),
             "the failed row remains under its longer per-row backoff"

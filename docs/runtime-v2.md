@@ -742,12 +742,17 @@ As a cross-implementation vector, the empty policy query request is
 `5654413101000000000000` in hexadecimal and its `request_hash` is
 `a5ee8be4abb996fd3735970cd7b5a53632afef7cb7a548e1314d9c6ef39ece35`.
 
-Root registration happens from the daemon's routing reconciliation hook, so
-authority outages are retryable but strictly scheduled: at most one v2 root is
-opened per pass, every attempt is followed by a two-second router window, and
-one failing row backs off exponentially from ten seconds to five minutes.
-Malformed configuration and deterministic authorization denial remain hard
-row failures rather than entering this retry loop.
+Bootstrap and routing reconciliation share one registration scheduler. At most
+one v2 root is opened synchronously before endpoint publication; on a
+long-running daemon, remaining roots are deferred to post-publication passes.
+Every attempt is followed by a
+two-second router window, and one retryable row backs off exponentially from
+ten seconds to five minutes. Malformed configuration and deterministic Install
+or Upgrade denial remain hard row failures. Historical proof/receipt
+validation currently folds authority denial and unavailability into the same
+fail-closed error; that class is retried with the bounded schedule above, so a
+persistent denial remains damped rather than being mislabeled as a
+distinguishable hard decision.
 
 The request kind values in that order are `0..=7`. Response values are
 `0=Authorized`, `1=Denied`, `2=Unavailable`, `3=no-current-slot`,
