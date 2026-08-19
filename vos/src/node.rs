@@ -4362,6 +4362,48 @@ impl VosNode {
             network_reachable,
             None,
             None,
+            None,
+        )
+    }
+
+    /// Attach a Raft-backed root whose recovery, replay, and new admissions
+    /// all use one fail-closed production trust policy. The capability is
+    /// installed before the worker's committed log can be applied, so an
+    /// empty or lagging replica cannot transiently execute through the local
+    /// conformance allowlists.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_v2_raft_root_at_id_production<B>(
+        &mut self,
+        name: String,
+        config: crate::v2::LocalRootTreeConfigV2,
+        backend: B,
+        db: Arc<redb::Database>,
+        raft_config: crate::raft::RaftConfig,
+        id: ServiceId,
+        network_reachable: bool,
+        trust: Arc<dyn crate::v2::ProductionTrustV2>,
+    ) -> Result<
+        ServiceId,
+        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+    >
+    where
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+            + Send
+            + 'static,
+    {
+        self.register_v2_raft_root_at_id_inner(
+            name,
+            config,
+            backend,
+            db,
+            raft_config,
+            id,
+            network_reachable,
+            None,
+            None,
+            Some(trust),
         )
     }
 
@@ -4404,6 +4446,51 @@ impl VosNode {
             network_reachable,
             Some(verifier),
             Some(producer),
+            None,
+        )
+    }
+
+    /// Production-trust counterpart of
+    /// [`Self::register_v2_raft_root_at_id_with_producer`]. Proof production
+    /// remains leader-local, while the supplied production policy verifies
+    /// the resulting public input on the leader before proposal and on every
+    /// replica during replay.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_v2_raft_root_at_id_production_with_producer<B, P>(
+        &mut self,
+        name: String,
+        config: crate::v2::LocalRootTreeConfigV2,
+        backend: B,
+        db: Arc<redb::Database>,
+        raft_config: crate::raft::RaftConfig,
+        id: ServiceId,
+        network_reachable: bool,
+        trust: Arc<dyn crate::v2::ProductionTrustV2>,
+        producer: P,
+    ) -> Result<
+        ServiceId,
+        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+    >
+    where
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+            + Send
+            + 'static,
+        P: crate::AttestationProofBackendV2 + Send + 'static,
+    {
+        let producer = V2NodeAttestationProofProducer::new(producer);
+        self.register_v2_raft_root_at_id_inner(
+            name,
+            config,
+            backend,
+            db,
+            raft_config,
+            id,
+            network_reachable,
+            None,
+            Some(producer),
+            Some(trust),
         )
     }
 
@@ -4441,6 +4528,7 @@ impl VosNode {
             network_reachable,
             Some(v2_node_attestation_proof_verifier(verifier)),
             None,
+            None,
         )
     }
 
@@ -4457,6 +4545,7 @@ impl VosNode {
         network_reachable: bool,
         proof_verifier: Option<V2NodeAttestationProofVerifier>,
         proof_producer: Option<V2NodeAttestationProofProducer>,
+        production_trust: Option<Arc<dyn crate::v2::ProductionTrustV2>>,
     ) -> Result<
         ServiceId,
         V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
@@ -4467,9 +4556,14 @@ impl VosNode {
             + Send
             + 'static,
     {
-        let proof_verifier = proof_verifier.unwrap_or_else(v2_deny_all_proof_verifier);
-        let (service, _worker, _network, replication_id, handler) =
-            self.prepare_v2_raft_root(config, backend, db, raft_config, proof_verifier)?;
+        let (service, _worker, _network, replication_id, handler) = self.prepare_v2_raft_root(
+            config,
+            backend,
+            db,
+            raft_config,
+            proof_verifier,
+            production_trust,
+        )?;
         if let Err(error) = self.validate_v2_root_registration(&service, id) {
             if let Some(network) = _network.as_ref() {
                 network.unregister_raft_handler_if(&replication_id, &handler);
@@ -4521,6 +4615,50 @@ impl VosNode {
             network_reachable,
             None,
             None,
+            None,
+            promote,
+        )
+    }
+
+    /// Prepare a production-trust Raft replica before voter promotion. The
+    /// unopened route cannot participate in membership until the exact trust
+    /// policy has accepted snapshot recovery, committed replay, and service
+    /// genesis locally.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_v2_raft_root_at_id_after_local_attach_production<B, F>(
+        &mut self,
+        name: String,
+        config: crate::v2::LocalRootTreeConfigV2,
+        backend: B,
+        db: Arc<redb::Database>,
+        raft_config: crate::raft::RaftConfig,
+        id: ServiceId,
+        network_reachable: bool,
+        trust: Arc<dyn crate::v2::ProductionTrustV2>,
+        promote: F,
+    ) -> Result<
+        ServiceId,
+        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+    >
+    where
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+            + Send
+            + 'static,
+        F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool) -> Result<(), String> + Send + 'static,
+    {
+        self.register_v2_raft_root_at_id_after_local_attach_inner(
+            name,
+            config,
+            backend,
+            db,
+            raft_config,
+            id,
+            network_reachable,
+            None,
+            None,
+            Some(trust),
             promote,
         )
     }
@@ -4568,6 +4706,53 @@ impl VosNode {
             network_reachable,
             Some(verifier),
             Some(producer),
+            None,
+            promote,
+        )
+    }
+
+    /// Producer-capable production counterpart of
+    /// [`Self::register_v2_raft_root_at_id_after_local_attach_production`].
+    /// The producer and trust capability remain private to the prepared
+    /// replica and move into the root thread only after promotion succeeds.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_v2_raft_root_at_id_after_local_attach_production_with_producer<B, P, F>(
+        &mut self,
+        name: String,
+        config: crate::v2::LocalRootTreeConfigV2,
+        backend: B,
+        db: Arc<redb::Database>,
+        raft_config: crate::raft::RaftConfig,
+        id: ServiceId,
+        network_reachable: bool,
+        trust: Arc<dyn crate::v2::ProductionTrustV2>,
+        producer: P,
+        promote: F,
+    ) -> Result<
+        ServiceId,
+        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+    >
+    where
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+            + Send
+            + 'static,
+        P: crate::AttestationProofBackendV2 + Send + 'static,
+        F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool) -> Result<(), String> + Send + 'static,
+    {
+        let producer = V2NodeAttestationProofProducer::new(producer);
+        self.register_v2_raft_root_at_id_after_local_attach_inner(
+            name,
+            config,
+            backend,
+            db,
+            raft_config,
+            id,
+            network_reachable,
+            None,
+            Some(producer),
+            Some(trust),
             promote,
         )
     }
@@ -4610,6 +4795,7 @@ impl VosNode {
             network_reachable,
             Some(v2_node_attestation_proof_verifier(verifier)),
             None,
+            None,
             promote,
         )
     }
@@ -4627,6 +4813,7 @@ impl VosNode {
         network_reachable: bool,
         proof_verifier: Option<V2NodeAttestationProofVerifier>,
         proof_producer: Option<V2NodeAttestationProofProducer>,
+        production_trust: Option<Arc<dyn crate::v2::ProductionTrustV2>>,
         promote: F,
     ) -> Result<
         ServiceId,
@@ -4639,9 +4826,15 @@ impl VosNode {
             + 'static,
         F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool) -> Result<(), String> + Send + 'static,
     {
-        let proof_verifier = proof_verifier.unwrap_or_else(v2_deny_all_proof_verifier);
-        let (service, worker_handle, network, replication_id, handler) =
-            self.prepare_v2_raft_root(config, backend, db, raft_config, proof_verifier)?;
+        let (service, worker_handle, network, replication_id, handler) = self
+            .prepare_v2_raft_root(
+                config,
+                backend,
+                db,
+                raft_config,
+                proof_verifier,
+                production_trust,
+            )?;
         if let Err(error) = self.validate_v2_root_registration(&service, id) {
             if let Some(network) = network.as_ref() {
                 network.unregister_raft_handler_if(&replication_id, &handler);
@@ -4713,7 +4906,8 @@ impl VosNode {
         backend: B,
         db: Arc<redb::Database>,
         raft_config: crate::raft::RaftConfig,
-        proof_verifier: V2NodeAttestationProofVerifier,
+        proof_verifier: Option<V2NodeAttestationProofVerifier>,
+        production_trust: Option<Arc<dyn crate::v2::ProductionTrustV2>>,
     ) -> Result<
         PreparedV2RaftRoot<B>,
         V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
@@ -4790,12 +4984,18 @@ impl VosNode {
                 return Err(V2RaftNodeRegistrationError::Log(error));
             }
         };
-        let service = match crate::v2::LocalRootTreeServiceV2::open_raft_with_proof_verifier(
-            config,
-            backend,
-            log,
-            proof_verifier,
-        ) {
+        let opened = match production_trust {
+            Some(trust) => {
+                crate::v2::LocalRootTreeServiceV2::open_raft_production(config, backend, log, trust)
+            }
+            None => crate::v2::LocalRootTreeServiceV2::open_raft_with_proof_verifier(
+                config,
+                backend,
+                log,
+                proof_verifier.unwrap_or_else(v2_deny_all_proof_verifier),
+            ),
+        };
+        let service = match opened {
             Ok(service) => service,
             Err(error) => {
                 cleanup();

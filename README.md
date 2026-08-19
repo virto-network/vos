@@ -48,9 +48,11 @@ cargo run -p vosx -- build examples/actors/counter \
 just test-v2-examples
 ```
 
-The production node still runs the legacy runtime; the v2 scheduler and
-guest-owned Accumulate path are currently exercised through the conformance
-gates described in [`docs/runtime-v2.md`](docs/runtime-v2.md). `vosx run`
+The space daemon installs signed v2 packages through the generic service PVM
+for Local, Raft, and CRDT roots, while legacy catalog rows continue on the old
+host. Its current trust inputs use the explicitly documented conformance
+profile; production embeddings must supply the fail-closed JAM/consensus
+policy described in [`docs/runtime-v2.md`](docs/runtime-v2.md). `vosx run`
 remains a legacy one-shot ELF/PVM runner and does not install `.vos` packages.
 
 ## Consistency modes

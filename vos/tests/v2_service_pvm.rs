@@ -1614,6 +1614,116 @@ fn raft_replay_rejects_a_different_production_trust_policy_before_genesis() {
 }
 
 #[test]
+fn node_raft_registration_installs_production_trust_before_replay_and_promotion() {
+    let (config, request) = attested_root_fixture(ConsistencyModeV2::Raft, 0x93);
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-node-production-trust-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let db = Arc::new(redb::Database::create(directory.join("raft.redb")).unwrap());
+    let backend = SharedProofCommittedImages::default();
+    let member = 0x93u16;
+    let route = ServiceId::new(member, 0x3393);
+    let raft_config = RaftConfig {
+        me: member,
+        members: vec![member],
+        election_timeout_ms: (10, 30),
+        heartbeat_interval_ms: 5,
+        replication_id: [0x94; 32],
+        propose_timeout_ms: 2_000,
+    };
+    let trust = Arc::new(TestProductionTrust::new(0x95, 77, true));
+    let proof = canonical_test_proof_manifest(0x96);
+
+    let mut node = VosNode::with_prefix(member);
+    node.register_v2_raft_root_at_id_production_with_producer(
+        "production-attested-root-v2".into(),
+        config.clone(),
+        backend.clone(),
+        db.clone(),
+        raft_config.clone(),
+        route,
+        false,
+        trust.clone(),
+        CanonicalTestProofProducer {
+            proof: proof.clone(),
+            calls: 0,
+        },
+    )
+    .expect("the node installs production trust before Raft genesis");
+    std::thread::sleep(Duration::from_millis(350));
+    let attested = node
+        .invoke_actor_attested(request.target, request.arguments)
+        .expect("the production policy verifies the leader-produced proof");
+    assert_eq!(attested.value, Value::U32(7));
+    assert_eq!(attested.proof, proof);
+    assert!(node.collect().iter().all(AgentResult::is_ok));
+
+    let mut mismatched = VosNode::with_prefix(member);
+    let reopened = mismatched.register_v2_raft_root_at_id_production(
+        "production-attested-root-v2".into(),
+        config,
+        backend,
+        db,
+        raft_config,
+        route,
+        false,
+        Arc::new(TestProductionTrust::new(0x97, 77, true)),
+    );
+    assert!(matches!(
+        reopened,
+        Err(vos::node::V2RaftNodeRegistrationError::Open(
+            LocalRootTreeOpenErrorV2::ProductionTrust(ProductionTrustErrorV2::PolicyMismatch),
+        )),
+    ));
+    assert!(
+        mismatched.collect().is_empty(),
+        "a mismatched policy never exposes a root route",
+    );
+
+    let (denied_config, _) = attested_root_fixture(ConsistencyModeV2::Raft, 0x98);
+    let denied_db = Arc::new(redb::Database::create(directory.join("denied-join.redb")).unwrap());
+    let promoted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let callback_ran = promoted.clone();
+    let mut denied = VosNode::with_prefix(member);
+    let denied_open = denied.register_v2_raft_root_at_id_after_local_attach_production(
+        "denied-production-joiner-v2".into(),
+        denied_config,
+        SharedProofCommittedImages::default(),
+        denied_db,
+        RaftConfig {
+            me: member,
+            members: vec![member],
+            election_timeout_ms: (10, 30),
+            heartbeat_interval_ms: 5,
+            replication_id: [0x99; 32],
+            propose_timeout_ms: 2_000,
+        },
+        ServiceId::new(member, 0x3394),
+        false,
+        Arc::new(TestProductionTrust::new(0x9a, 77, false)),
+        move |_, _| {
+            callback_ran.store(true, Ordering::Relaxed);
+            Ok(())
+        },
+    );
+    assert!(matches!(
+        denied_open,
+        Err(vos::node::V2RaftNodeRegistrationError::Open(
+            LocalRootTreeOpenErrorV2::InstallRejected(AccumulationRejectionV2::Unauthorized),
+        )),
+    ));
+    assert!(!promoted.load(Ordering::Relaxed));
+    assert!(denied.collect().is_empty());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn same_actor_storage_reads_observe_earlier_inline_writes() {
     let (config, template) = attested_root_fixture(ConsistencyModeV2::Local, 0x3a);
     let mut service =

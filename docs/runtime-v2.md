@@ -715,6 +715,18 @@ proof public input under the policy's pinned proof system. Authenticated
 transport or possession of a receipt is not sufficient evidence for any of
 those decisions.
 
+`VosNode` preserves that boundary for both already-open direct roots and roots
+whose Raft worker is owned by the node. The
+`register_v2_raft_root_at_id_production*` entry points install the production
+capability before snapshot recovery or committed-log replay. Their prepared
+joiner counterparts do the same before the promotion callback can modify group
+membership or publish the route. Producer-capable variants retain a local
+proof producer for a future leader, but proof acceptance still goes through
+the installed production policy on the proposing leader and every replaying
+replica; the producer's own verifier cannot replace that policy. Existing
+registration methods remain the explicit conformance profile and cannot reopen
+an image sealed by a production policy.
+
 Installed `PROGRAM_LOOKUP` availability is already part of the recoverable
 service image: Install and Upgrade order the exact content-addressed
 program/genesis bytes and stage them atomically with IC-5, while snapshots
