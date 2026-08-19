@@ -33,6 +33,20 @@ use crate::config::NodeId;
 use crate::log_entry::LogEntry;
 use crate::meta::Meta;
 
+/// Durable active-membership view.
+///
+/// `log_index` identifies the log/snapshot boundary that made this view
+/// effective.  Consumers must compare it with the durable `commit_index`
+/// before treating exclusion from the view as a committed removal.
+/// `None` represents legacy or otherwise unknown provenance and must not be
+/// used as proof of a committed removal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveConfigRecord<N: NodeId> {
+    pub log_index: Option<u64>,
+    pub current: Vec<N>,
+    pub joint_old: Option<Vec<N>>,
+}
+
 /// Atomic write — every field that's `Some` lands together; a
 /// crash mid-batch leaves either the pre-batch or the post-batch
 /// state on disk, never a partial mix.
@@ -65,7 +79,7 @@ pub struct WriteBatch<N: NodeId> {
     /// place.
     pub meta: Option<Meta<N>>,
     /// Persist the active cluster configuration alongside this
-    /// batch. `Some((current, joint_old))` writes the
+    /// batch. `Some(record)` writes the
     /// configuration; `None` leaves the persisted view in place.
     /// Storage backends that don't support cross-snapshot
     /// membership recovery may ignore this field — the worker
@@ -78,7 +92,7 @@ pub struct WriteBatch<N: NodeId> {
     /// receiving a `ConfigChange` in `AppendEntries`, follower
     /// installing a snapshot). Backends that do persist it can
     /// surface the value at restart via [`Storage::active_config`].
-    pub active_config: Option<(Vec<N>, Option<Vec<N>>)>,
+    pub active_config: Option<ActiveConfigRecord<N>>,
 }
 
 // Manual impl so the empty-batch shorthand `..Default::default()`
@@ -170,7 +184,7 @@ pub trait Storage<N: NodeId>: Send + 'static {
 
     /// Read the persisted active cluster configuration, if the
     /// backend supports cross-snapshot membership recovery.
-    /// Returns `Some((current, joint_old))` for the most-recently-
+    /// Returns the most-recently-
     /// persisted view; `None` when the backend doesn't support
     /// this row OR no value has been written.
     ///
@@ -187,7 +201,7 @@ pub trait Storage<N: NodeId>: Send + 'static {
     #[allow(clippy::type_complexity)]
     fn active_config(
         &self,
-    ) -> impl core::future::Future<Output = Result<Option<(Vec<N>, Option<Vec<N>>)>, Self::Error>> + Send
+    ) -> impl core::future::Future<Output = Result<Option<ActiveConfigRecord<N>>, Self::Error>> + Send
     {
         async { Ok(None) }
     }
@@ -215,7 +229,7 @@ pub struct MemStorage<N: NodeId> {
     /// Persisted active configuration view — mirrors what the
     /// worker most recently wrote via `WriteBatch::active_config`.
     /// `None` until a `ConfigChange` has been observed.
-    active_config: Option<(Vec<N>, Option<Vec<N>>)>,
+    active_config: Option<ActiveConfigRecord<N>>,
 }
 
 impl<N: NodeId> Default for MemStorage<N> {
@@ -307,7 +321,7 @@ impl<N: NodeId> Storage<N> for MemStorage<N> {
         Ok(self.meta.clone())
     }
 
-    async fn active_config(&self) -> Result<Option<(Vec<N>, Option<Vec<N>>)>, Self::Error> {
+    async fn active_config(&self) -> Result<Option<ActiveConfigRecord<N>>, Self::Error> {
         Ok(self.active_config.clone())
     }
 

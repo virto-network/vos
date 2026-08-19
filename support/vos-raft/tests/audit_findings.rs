@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use futures_executor::block_on;
 use vos_raft::{
-    AppendEntriesReq, InstallSnapshotReq, LogEntry, MemStorage, Meta, RequestVoteReq, Role,
-    StdClock, StdRng, Storage, Transport, Worker, WriteBatch,
+    ActiveConfigRecord, AppendEntriesReq, InstallSnapshotReq, LogEntry, MemStorage, Meta,
+    RequestVoteReq, Role, StdClock, StdRng, Storage, Transport, Worker, WriteBatch,
 };
 
 // ── Shared storage harness ──────────────────────────────────────
@@ -29,7 +29,7 @@ struct StorageInner {
     log: BTreeMap<u64, LogEntry<u16>>,
     state: Vec<u8>,
     meta: Meta<u16>,
-    active_config: Option<(Vec<u16>, Option<Vec<u16>>)>,
+    active_config: Option<ActiveConfigRecord<u16>>,
 }
 
 #[derive(Clone)]
@@ -49,7 +49,7 @@ impl SharedStorage {
         f(&mut g)
     }
 
-    fn read_active_config(&self) -> Option<(Vec<u16>, Option<Vec<u16>>)> {
+    fn read_active_config(&self) -> Option<ActiveConfigRecord<u16>> {
         self.inner.lock().unwrap().active_config.clone()
     }
 
@@ -114,7 +114,7 @@ impl Storage<u16> for SharedStorage {
     async fn load_meta(&self) -> Result<Meta<u16>, Self::Error> {
         Ok(self.inner.lock().unwrap().meta.clone())
     }
-    async fn active_config(&self) -> Result<Option<(Vec<u16>, Option<Vec<u16>>)>, Self::Error> {
+    async fn active_config(&self) -> Result<Option<ActiveConfigRecord<u16>>, Self::Error> {
         Ok(self.inner.lock().unwrap().active_config.clone())
     }
     async fn commit_batch(&mut self, batch: WriteBatch<u16>) -> Result<(), Self::Error> {
@@ -397,7 +397,11 @@ fn truncate_dropping_originating_config_change_invalidates_persisted_view() {
     // Pre-populate: persisted view = ([1,2,3,4], None) and a
     // live-log CC entry at idx=1 (term=1) that produced it.
     storage.with_inner(|g| {
-        g.active_config = Some((vec![1u16, 2, 3, 4], None));
+        g.active_config = Some(ActiveConfigRecord {
+            log_index: Some(1),
+            current: vec![1u16, 2, 3, 4],
+            joint_old: None,
+        });
         g.log
             .insert(1, LogEntry::config_change(1, 1, None, vec![1u16, 2, 3, 4]));
         g.meta = Meta {
@@ -410,7 +414,14 @@ fn truncate_dropping_originating_config_change_invalidates_persisted_view() {
     });
 
     // Sanity: persisted view round-trips.
-    assert_eq!(storage.read_active_config(), Some((vec![1, 2, 3, 4], None)),);
+    assert_eq!(
+        storage.read_active_config(),
+        Some(ActiveConfigRecord {
+            log_index: Some(1),
+            current: vec![1, 2, 3, 4],
+            joint_old: None,
+        }),
+    );
 
     let storage_handle = storage.clone();
 
@@ -468,7 +479,7 @@ fn truncate_dropping_originating_config_change_invalidates_persisted_view() {
     // worker would adopt this stale view.
     let persisted_after = storage.read_active_config();
     assert!(
-        !matches!(persisted_after, Some((ref m, _)) if m == &vec![1u16, 2, 3, 4]),
+        !matches!(persisted_after, Some(ref record) if record.current == vec![1u16, 2, 3, 4]),
         "persisted active_config must NOT keep claiming [1,2,3,4] after the \
          CC entry that produced it was truncated; got {persisted_after:?}",
     );
@@ -841,7 +852,7 @@ fn no_op_append_failure_keeps_us_out_of_leader_role() {
         async fn load_meta(&self) -> Result<Meta<u16>, Self::Error> {
             Ok(self.inner.load_meta().await.unwrap())
         }
-        async fn active_config(&self) -> Result<Option<(Vec<u16>, Option<Vec<u16>>)>, Self::Error> {
+        async fn active_config(&self) -> Result<Option<ActiveConfigRecord<u16>>, Self::Error> {
             Ok(self.inner.active_config().await.unwrap())
         }
         async fn commit_batch(&mut self, batch: WriteBatch<u16>) -> Result<(), Self::Error> {
@@ -946,7 +957,11 @@ fn install_snapshot_persists_effective_cfg_after_compaction() {
             snap_last_term: 0,
         };
         // Persisted active_config matches log.
-        g.active_config = Some((vec![1u16, 2, 3], None));
+        g.active_config = Some(ActiveConfigRecord {
+            log_index: Some(5),
+            current: vec![1u16, 2, 3],
+            joint_old: None,
+        });
     });
 
     let storage_handle = storage.clone();
@@ -994,7 +1009,11 @@ fn install_snapshot_persists_effective_cfg_after_compaction() {
     let persisted = storage.read_active_config();
     assert_eq!(
         persisted,
-        Some((vec![1u16, 2, 3], None)),
+        Some(ActiveConfigRecord {
+            log_index: Some(5),
+            current: vec![1u16, 2, 3],
+            joint_old: None,
+        }),
         "persisted active_config must reflect the post-install \
          effective_cfg, not vanish or revert to cfg.members; got {persisted:?}",
     );
@@ -1058,7 +1077,11 @@ fn install_snapshot_adopts_leader_supplied_membership_on_fresh_follower() {
     let persisted = storage.read_active_config();
     assert_eq!(
         persisted,
-        Some((vec![1u16, 2, 3], None)),
+        Some(ActiveConfigRecord {
+            log_index: Some(100),
+            current: vec![1u16, 2, 3],
+            joint_old: None,
+        }),
         "follower must adopt leader-supplied membership, not silently \
          retain cfg.members; got {persisted:?}",
     );

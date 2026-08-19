@@ -2144,6 +2144,111 @@ fn persisted_voter_keeps_raft_handler_while_service_open_retries() {
 }
 
 #[test]
+fn speculative_removal_keeps_persisted_voter_while_recovery_retries() {
+    use vos_raft::{ActiveConfigRecord, LogEntry, Meta, Storage, WriteBatch};
+
+    let key = libp2p::identity::Keypair::generate_ed25519();
+    let peer = libp2p::PeerId::from(key.public());
+    let member = vos::network::derive_node_prefix(&peer);
+    let survivor = if member == u16::MAX {
+        member - 1
+    } else {
+        member + 1
+    };
+    let replication_id = [0xa5; 32];
+    let route = ServiceId::new(member, 0x3398);
+    let network = vos::network::Network::start(vos::network::NetworkConfig {
+        keypair: key,
+        local_prefix: member,
+        listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+        bootstrap: vec![],
+        auto_dial_mdns: false,
+    });
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-speculative-removal-recovery-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let db = Arc::new(redb::Database::create(directory.join("raft.redb")).unwrap());
+    vos::raft::log::seed_active_config(&db, &[member, survivor]).unwrap();
+
+    // Persist the committed joint configuration followed by its speculative
+    // final removal. Raft must operate against the latest view, but the node
+    // must retain the local handler because the committed joint configuration
+    // still requires it.
+    let mut storage = vos::raft::RedbStorage::open(db.clone()).unwrap();
+    vos::block_on(storage.commit_batch(WriteBatch {
+        appends: vec![
+            LogEntry::config_change(1, 1, Some(vec![member, survivor]), vec![survivor]),
+            LogEntry::config_change(2, 1, None, vec![survivor]),
+        ],
+        meta: Some(Meta {
+            current_term: 1,
+            voted_for: None,
+            commit_index: 1,
+            snap_last_index: 0,
+            snap_last_term: 0,
+        }),
+        active_config: Some(ActiveConfigRecord {
+            log_index: Some(2),
+            current: vec![survivor],
+            joint_old: None,
+        }),
+        ..Default::default()
+    }))
+    .unwrap();
+    drop(storage);
+    assert_eq!(vos::raft::RaftMeta::load(&db).unwrap().commit_index, 1);
+
+    let backend = TransientOpenCommittedImages::default();
+    backend.fail_loads(1_000);
+    let observer = backend.clone();
+    let mut node = VosNode::with_prefix(member);
+    node.attach_network(network);
+    node.register_v2_raft_root_at_id_production(
+        "speculatively-removed-recovering-voter-v2".into(),
+        attested_root_fixture(ConsistencyModeV2::Raft, 0xa6).0,
+        backend,
+        db,
+        RaftConfig {
+            me: member,
+            members: vec![member, survivor],
+            election_timeout_ms: (30_000, 40_000),
+            heartbeat_interval_ms: 20,
+            replication_id,
+            propose_timeout_ms: 2_000,
+        },
+        route,
+        true,
+        Arc::new(TestProductionTrust::new(0xa7, 77, true)),
+    )
+    .expect("an uncommitted removal cannot tear down a persisted voter");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while observer.load_attempts() < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let status = node
+        .network()
+        .unwrap()
+        .local_raft_status(&replication_id)
+        .expect("the voter required by committed membership remains available");
+    assert_eq!(status.commit_index, 1);
+    assert_eq!(status.members, vec![survivor]);
+    assert!(
+        node.has_agent(route),
+        "application recovery keeps its private route reservation",
+    );
+
+    assert!(node.collect().iter().all(AgentResult::is_ok));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn same_actor_storage_reads_observe_earlier_inline_writes() {
     let (config, template) = attested_root_fixture(ConsistencyModeV2::Local, 0x3a);
     let mut service =

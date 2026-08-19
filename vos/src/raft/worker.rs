@@ -204,6 +204,10 @@ pub struct WorkerSnapshot {
     /// Joint-consensus indicator. `Some(prev_members)` while a
     /// configuration change is in flight; `None` in steady state.
     pub joint_old: Option<Vec<u16>>,
+    /// Log/snapshot index that established the active membership view.
+    /// `None` means exclusion from the view is not durable evidence of a
+    /// committed removal.
+    pub active_config_index: Option<u64>,
     /// Best-effort leader hint. `Some(prefix)` once we've seen a
     /// current-term `AppendEntries` (or self if we are leader).
     /// `None` between elections. Followers use it to redirect
@@ -222,6 +226,7 @@ impl From<vos_raft::WorkerSnapshot<u16>> for WorkerSnapshot {
             snap_last_index: s.snap_last_index,
             members: s.members,
             joint_old: s.joint_old,
+            active_config_index: s.active_config_index,
             leader_hint: s.leader_hint,
         }
     }

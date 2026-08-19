@@ -30,15 +30,16 @@ const META_COMMIT_INDEX: &str = "commit_index";
 const META_LAST_APPLIED: &str = "last_applied";
 const META_SNAP_INDEX: &str = "snap_last_index";
 const META_SNAP_TERM: &str = "snap_last_term";
-/// Active cluster configuration row. Value layout:
-/// `[joint_flag: u8]` then, when the flag is 1, the joint-old
-/// list, then the current list — each list is
+/// Active cluster configuration row. Current value layout:
+/// `["VAC2"][evidence_index: u64 LE][joint_flag: u8]` then, when the flag is
+/// 1, the joint-old list, then the current list — each list is
 /// `[len: u16 LE][prefix: u16 LE × len]`. Written whenever the
 /// worker adopts a new effective configuration (see
 /// `WriteBatch::active_config`) and seeded host-side for solo
 /// bootstraps so a restart never falls back to a stale static
 /// member seed.
 const META_ACTIVE_CONFIG: &str = "active_config";
+const ACTIVE_CONFIG_V2_MAGIC: &[u8; 4] = b"VAC2";
 
 /// One Raft log entry. Index is 1-based and contiguous.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -594,11 +595,20 @@ fn decode_prefix_list(bytes: &[u8], pos: &mut usize) -> Result<Vec<u16>, CommitE
 /// joint-consensus transition is in flight.
 pub fn write_active_config_in_txn(
     txn: &redb::WriteTransaction,
+    log_index: Option<u64>,
     current: &[u16],
     joint_old: Option<&[u16]>,
 ) -> Result<(), CommitError> {
-    let mut buf =
-        Vec::with_capacity(1 + joint_old.map_or(0, |j| 2 + 2 * j.len()) + 2 + 2 * current.len());
+    let mut buf = Vec::with_capacity(
+        ACTIVE_CONFIG_V2_MAGIC.len()
+            + 8
+            + 1
+            + joint_old.map_or(0, |j| 2 + 2 * j.len())
+            + 2
+            + 2 * current.len(),
+    );
+    buf.extend_from_slice(ACTIVE_CONFIG_V2_MAGIC);
+    buf.extend_from_slice(&log_index.unwrap_or(u64::MAX).to_le_bytes());
     buf.push(joint_old.is_some() as u8);
     if let Some(prev) = joint_old {
         encode_prefix_list(&mut buf, prev);
@@ -615,7 +625,7 @@ pub fn write_active_config_in_txn(
 #[allow(clippy::type_complexity)]
 pub fn load_active_config(
     db: &Database,
-) -> Result<Option<(Vec<u16>, Option<Vec<u16>>)>, CommitError> {
+) -> Result<Option<vos_raft::ActiveConfigRecord<u16>>, CommitError> {
     let txn = db.begin_read()?;
     let table = match txn.open_table(RAFT_META) {
         Ok(t) => t,
@@ -626,10 +636,22 @@ pub fn load_active_config(
         return Ok(None);
     };
     let bytes = row.value();
+    let (log_index, mut pos) = if bytes.starts_with(ACTIVE_CONFIG_V2_MAGIC) {
+        let index = bytes
+            .get(4..12)
+            .ok_or_else(|| CommitError::Config("active_config row: truncated index".into()))?;
+        let index = u64::from_le_bytes(index.try_into().expect("eight-byte slice"));
+        ((index != u64::MAX).then_some(index), 12)
+    } else {
+        // Legacy rows did not retain the configuration entry index. They are
+        // still usable for replication, but must never prove that a local
+        // voter's exclusion was committed.
+        (None, 0)
+    };
     let flag = *bytes
-        .first()
+        .get(pos)
         .ok_or_else(|| CommitError::Config("active_config row: empty".into()))?;
-    let mut pos = 1;
+    pos += 1;
     let joint_old = match flag {
         0 => None,
         1 => Some(decode_prefix_list(bytes, &mut pos)?),
@@ -646,7 +668,11 @@ pub fn load_active_config(
             bytes.len() - pos,
         )));
     }
-    Ok(Some((current, joint_old)))
+    Ok(Some(vos_raft::ActiveConfigRecord {
+        log_index,
+        current,
+        joint_old,
+    }))
 }
 
 /// Persist `members` as the active configuration iff no
@@ -663,7 +689,7 @@ pub fn seed_active_config(db: &Database, members: &[u16]) -> Result<bool, Commit
         return Ok(false);
     }
     let txn = db.begin_write()?;
-    write_active_config_in_txn(&txn, members, None)?;
+    write_active_config_in_txn(&txn, Some(0), members, None)?;
     txn.commit()?;
     Ok(true)
 }
@@ -888,23 +914,59 @@ mod tests {
         assert!(seed_active_config(&db, &[0xAAAA]).unwrap());
         assert_eq!(
             load_active_config(&db).unwrap(),
-            Some((alloc::vec![0xAAAA], None)),
+            Some(vos_raft::ActiveConfigRecord {
+                log_index: Some(0),
+                current: alloc::vec![0xAAAA],
+                joint_old: None,
+            }),
         );
         // …and refuses to clobber an existing row.
         assert!(!seed_active_config(&db, &[0xBBBB]).unwrap());
         assert_eq!(
             load_active_config(&db).unwrap(),
-            Some((alloc::vec![0xAAAA], None)),
+            Some(vos_raft::ActiveConfigRecord {
+                log_index: Some(0),
+                current: alloc::vec![0xAAAA],
+                joint_old: None,
+            }),
         );
 
         // A joint-phase write (the worker's adoption path)
         // overwrites the seed and round-trips both lists.
         let txn = db.begin_write().unwrap();
-        write_active_config_in_txn(&txn, &[0xAAAA, 0xBBBB], Some(&[0xAAAA])).unwrap();
+        write_active_config_in_txn(&txn, Some(7), &[0xAAAA, 0xBBBB], Some(&[0xAAAA])).unwrap();
         txn.commit().unwrap();
         assert_eq!(
             load_active_config(&db).unwrap(),
-            Some((alloc::vec![0xAAAA, 0xBBBB], Some(alloc::vec![0xAAAA]))),
+            Some(vos_raft::ActiveConfigRecord {
+                log_index: Some(7),
+                current: alloc::vec![0xAAAA, 0xBBBB],
+                joint_old: Some(alloc::vec![0xAAAA]),
+            }),
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_active_config_has_no_committed_removal_evidence() {
+        let (db, dir) = temp_db();
+        let txn = db.begin_write().unwrap();
+        let mut legacy = alloc::vec![0]; // steady configuration
+        encode_prefix_list(&mut legacy, &[0xBBBB]);
+        txn.open_table(RAFT_META)
+            .unwrap()
+            .insert(META_ACTIVE_CONFIG, legacy.as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+
+        assert_eq!(
+            load_active_config(&db).unwrap(),
+            Some(vos_raft::ActiveConfigRecord {
+                log_index: None,
+                current: alloc::vec![0xBBBB],
+                joint_old: None,
+            }),
+            "legacy membership remains usable but cannot prove removal committed",
         );
         let _ = std::fs::remove_dir_all(dir);
     }

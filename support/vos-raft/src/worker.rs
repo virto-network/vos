@@ -48,7 +48,7 @@ use crate::rpc::{
     AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, PreVoteReq,
     PreVoteResp, RequestVoteReq, RequestVoteResp,
 };
-use crate::storage::{Storage, WriteBatch};
+use crate::storage::{ActiveConfigRecord, Storage, WriteBatch};
 use crate::transport::Transport;
 
 /// Reasons a [`WorkerHandle::propose`] can fail.
@@ -153,6 +153,9 @@ pub struct WorkerSnapshot<N: NodeId> {
     /// Joint-consensus indicator. `Some(prev_members)` while a
     /// configuration change is in flight; `None` in steady state.
     pub joint_old: Option<Vec<N>>,
+    /// Log or snapshot index that established `members`/`joint_old`.
+    /// `None` means the storage backend could not supply durable provenance.
+    pub active_config_index: Option<u64>,
     /// Best-effort hint at who the current leader is. Updated
     /// from observed `AppendEntries` (leader self-identifies).
     /// `None` when the replica hasn't seen a leader since the
@@ -1066,9 +1069,9 @@ where
     /// and to avoid re-finalizing on a stale historical joint
     /// entry that happens to target the same member set.
     pending_joint_entry: Option<u64>,
-    /// Index of the log entry that produced `effective_cfg`.
-    /// `None` when `effective_cfg` comes from the static
-    /// `Config::members` fallback. Lets log-mutation paths
+    /// Index of the log or installed snapshot that established
+    /// `effective_cfg`. `None` only for legacy persisted data that lacked
+    /// provenance. Lets log-mutation paths
     /// skip re-scanning the entire live log on every truncate
     /// — only a truncate that drops below this index actually
     /// invalidates the cached active config.
@@ -1130,6 +1133,7 @@ where
             snap_last_index: self.storage.snap_last_index(),
             members: self.effective_cfg.current.clone(),
             joint_old: self.effective_cfg.joint_old.clone(),
+            active_config_index: self.active_config_index,
             leader_hint: self.seen_leader,
         }
     }
@@ -1221,18 +1225,18 @@ where
 }
 
 /// Result of scanning the live log for the most recent
-/// `ConfigChange`. `active_config_index` is the index of the
-/// scanned `ConfigChange` entry (None when the fallback to
-/// `cfg.members` is in effect), used by callers to decide
+/// `ConfigChange`. `active_config_index` is the durable evidence index
+/// (`0` for the initial `cfg.members`; None only for a legacy row),
+/// used by callers to decide
 /// whether a future log mutation requires a fresh scan.
 struct ConfigRecovery<N: NodeId> {
     active: ActiveConfig<N>,
     /// Index of the joint `ConfigChange` entry, when joint
     /// finalization is pending.
     pending_joint: Option<u64>,
-    /// Index of the entry that produced `active`. None when
-    /// `active` came from the static `cfg.members` fallback
-    /// (no `ConfigChange` exists in the live log).
+    /// Durable boundary that established `active`: a log/snapshot index,
+    /// `0` for static genesis membership, or `None` for legacy persisted
+    /// data without provenance.
     active_config_index: Option<u64>,
 }
 
@@ -1292,22 +1296,23 @@ where
     }
     // No `ConfigChange` in the live log. On the boot path, the
     // persisted active_config row is the only place a
-    // recently-compacted membership view can live. Adopt it as
-    // the steady fallback; we can't anchor an
-    // `active_config_index` to a compacted entry, so a future
-    // joint auto-finalize requires a fresh leader-issued joint
-    // ConfigChange.
-    if consult_persisted && let Some((current, joint_old)) = storage.active_config().await? {
+    // recently-compacted membership view can live. New rows retain the
+    // log/snapshot boundary that established the view; legacy rows remain
+    // usable but deliberately carry no committed-removal evidence.
+    if consult_persisted && let Some(record) = storage.active_config().await? {
         return Ok(ConfigRecovery {
-            active: ActiveConfig { current, joint_old },
+            active: ActiveConfig {
+                current: record.current,
+                joint_old: record.joint_old,
+            },
             pending_joint: None,
-            active_config_index: None,
+            active_config_index: record.log_index,
         });
     }
     Ok(ConfigRecovery {
         active: ActiveConfig::steady(cfg.members.clone()),
         pending_joint: None,
-        active_config_index: None,
+        active_config_index: Some(0),
     })
 }
 
@@ -1847,7 +1852,7 @@ where
     // The persisted view follows the in-memory view atomically —
     // if storage rejects the batch, both stay at their pre-call
     // values via `meta_snapshot` rollback.
-    let mut active_config_for_batch: Option<(Vec<N>, Option<Vec<N>>)> = None;
+    let mut active_config_for_batch: Option<ActiveConfigRecord<N>> = None;
     let mut post_active_view: Option<(ActiveConfig<N>, Option<u64>, Option<u64>)> = None;
     if appended_a_config {
         for (i, e) in req.entries.iter().enumerate().rev() {
@@ -1862,7 +1867,11 @@ where
                 } else {
                     None
                 };
-                active_config_for_batch = Some((members.clone(), joint_old.clone()));
+                active_config_for_batch = Some(ActiveConfigRecord {
+                    log_index: Some(entry_index),
+                    current: members.clone(),
+                    joint_old: joint_old.clone(),
+                });
                 post_active_view = Some((active, Some(entry_index), pending));
                 break;
             }
@@ -1893,7 +1902,11 @@ where
                 joint_old: joint_old.clone(),
             };
             let pending = if active.is_joint() { Some(idx) } else { None };
-            active_config_for_batch = Some((members, joint_old));
+            active_config_for_batch = Some(ActiveConfigRecord {
+                log_index: Some(idx),
+                current: members,
+                joint_old,
+            });
             post_active_view = Some((active, Some(idx), pending));
         } else {
             // No surviving ConfigChange — fall back to the
@@ -1901,8 +1914,12 @@ where
             // it so the next reboot reads the post-truncate view
             // rather than the stale speculative one.
             let fallback = ActiveConfig::steady(state.cfg.members.clone());
-            active_config_for_batch = Some((fallback.current.clone(), None));
-            post_active_view = Some((fallback, None, None));
+            active_config_for_batch = Some(ActiveConfigRecord {
+                log_index: Some(0),
+                current: fallback.current.clone(),
+                joint_old: None,
+            });
+            post_active_view = Some((fallback, Some(0), None));
         }
     }
     if let Err(e) = state
@@ -2219,15 +2236,17 @@ where
         });
     }
     let active_config_for_batch = Some(match &new_effective_cfg {
-        Some(cfg) => (cfg.current.clone(), cfg.joint_old.clone()),
-        None => (
-            state.effective_cfg.current.clone(),
-            state.effective_cfg.joint_old.clone(),
-        ),
+        Some(cfg) => ActiveConfigRecord {
+            log_index: Some(req.last_included_index),
+            current: cfg.current.clone(),
+            joint_old: cfg.joint_old.clone(),
+        },
+        None => ActiveConfigRecord {
+            log_index: state.active_config_index,
+            current: state.effective_cfg.current.clone(),
+            joint_old: state.effective_cfg.joint_old.clone(),
+        },
     });
-    let snap_invalidates_cfg_idx = state
-        .active_config_index
-        .is_some_and(|idx| idx <= req.last_included_index);
     if let Err(e) = state
         .storage
         .commit_batch(WriteBatch {
@@ -2244,19 +2263,19 @@ where
     }
     if let Some(cfg) = new_effective_cfg {
         state.effective_cfg = cfg;
-        // The membership view we just adopted has no anchoring
-        // log entry on this replica (the snapshot subsumed
-        // whatever ConfigChange produced it). Subsequent
-        // truncates can't invalidate it via the live-log path.
-        state.active_config_index = None;
+        // The snapshot boundary is durable evidence for this membership
+        // even though the originating ConfigChange was compacted away.
+        state.active_config_index = Some(req.last_included_index);
         // A joint-phase view recovered via snapshot can't
         // auto-finalize from this replica either — leader-side
         // joint_idx isn't known to us, so wait for a leader-
         // emitted joint-or-final ConfigChange to re-prime.
         state.pending_joint_entry = None;
         rebuild_leader_tracking(state);
-    } else if snap_invalidates_cfg_idx {
-        state.active_config_index = None;
+    } else {
+        // An older leader omitted membership, so retain exactly the evidence
+        // already attached to the local view; do not promote legacy or
+        // speculative configuration into committed-removal evidence.
         if state
             .pending_joint_entry
             .is_some_and(|idx| idx <= req.last_included_index)
@@ -2569,7 +2588,11 @@ where
             // Persist the joint view alongside the entry so a
             // restart that compacts past this entry can still
             // recover the joint state via Storage::active_config.
-            active_config: Some((new_members.clone(), Some(old_members.clone()))),
+            active_config: Some(ActiveConfigRecord {
+                log_index: Some(new_index),
+                current: new_members.clone(),
+                joint_old: Some(old_members.clone()),
+            }),
             ..Default::default()
         })
         .await
@@ -2977,7 +3000,11 @@ where
             // Persist the steady view so post-compaction recovery
             // sees the post-transition members rather than the
             // pre-transition cfg.members fallback.
-            active_config: Some((final_members.clone(), None)),
+            active_config: Some(ActiveConfigRecord {
+                log_index: Some(new_index),
+                current: final_members.clone(),
+                joint_old: None,
+            }),
             ..Default::default()
         })
         .await?;
@@ -3445,6 +3472,7 @@ mod tests {
             snap_last_index: 0,
             members: alloc::vec![0xAAAA, 0xBBBB],
             joint_old: None,
+            active_config_index: Some(11),
             leader_hint: Some(0xAAAA),
         };
         let handle = WorkerHandle {

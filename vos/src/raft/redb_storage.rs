@@ -270,7 +270,9 @@ impl Storage<u16> for RedbStorage {
         Ok(meta_from_raft(&self.meta))
     }
 
-    async fn active_config(&self) -> Result<Option<(Vec<u16>, Option<Vec<u16>>)>, Self::Error> {
+    async fn active_config(
+        &self,
+    ) -> Result<Option<vos_raft::ActiveConfigRecord<u16>>, Self::Error> {
         super::log::load_active_config(&self.db)
     }
 
@@ -402,12 +404,17 @@ impl Storage<u16> for RedbStorage {
                 let raft_meta = raft_from_meta(&self.meta, m);
                 raft_meta.write_worker_fields_in_txn(&txn)?;
             }
-            if let Some((current, joint_old)) = &new_config {
+            if let Some(config) = &new_config {
                 // Persisting the adopted configuration in the
                 // same txn keeps it atomic with the log mutation
                 // that produced it, and lets boot recovery survive
                 // compaction past the last `ConfigChange` entry.
-                super::log::write_active_config_in_txn(&txn, current, joint_old.as_deref())?;
+                super::log::write_active_config_in_txn(
+                    &txn,
+                    config.log_index,
+                    &config.current,
+                    config.joint_old.as_deref(),
+                )?;
             }
 
             txn.commit()?;
@@ -932,13 +939,21 @@ mod tests {
                     Some(alloc::vec![0xAAAA]),
                     alloc::vec![0xAAAA, 0xBBBB],
                 )],
-                active_config: Some((alloc::vec![0xAAAA, 0xBBBB], Some(alloc::vec![0xAAAA]))),
+                active_config: Some(vos_raft::ActiveConfigRecord {
+                    log_index: Some(1),
+                    current: alloc::vec![0xAAAA, 0xBBBB],
+                    joint_old: Some(alloc::vec![0xAAAA]),
+                }),
                 ..Default::default()
             }))
             .unwrap();
             assert_eq!(
                 block_on(s.active_config()).unwrap(),
-                Some((alloc::vec![0xAAAA, 0xBBBB], Some(alloc::vec![0xAAAA]))),
+                Some(vos_raft::ActiveConfigRecord {
+                    log_index: Some(1),
+                    current: alloc::vec![0xAAAA, 0xBBBB],
+                    joint_old: Some(alloc::vec![0xAAAA]),
+                }),
             );
         }
         {
@@ -946,7 +961,11 @@ mod tests {
             let s = RedbStorage::open(db).unwrap();
             assert_eq!(
                 block_on(s.active_config()).unwrap(),
-                Some((alloc::vec![0xAAAA, 0xBBBB], Some(alloc::vec![0xAAAA]))),
+                Some(vos_raft::ActiveConfigRecord {
+                    log_index: Some(1),
+                    current: alloc::vec![0xAAAA, 0xBBBB],
+                    joint_old: Some(alloc::vec![0xAAAA]),
+                }),
                 "active config must survive restart",
             );
         }

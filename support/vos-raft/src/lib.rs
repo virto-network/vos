@@ -104,7 +104,7 @@ pub use rpc::{
     AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, PreVoteReq,
     PreVoteResp, RequestVoteReq, RequestVoteResp,
 };
-pub use storage::{MemStorage, Storage, WriteBatch};
+pub use storage::{ActiveConfigRecord, MemStorage, Storage, WriteBatch};
 pub use transport::Transport;
 
 #[cfg(feature = "std")]

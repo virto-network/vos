@@ -2138,7 +2138,7 @@ fn change_membership_with_empty_members_returns_empty_config() {
 /// `cfg.members` as a stale fallback.
 #[test]
 fn cross_snapshot_membership_recovery_via_persisted_view() {
-    use vos_raft::{Storage, WriteBatch};
+    use vos_raft::{ActiveConfigRecord, Storage, WriteBatch};
 
     // Build a MemStorage by hand and persist a "joint phase
     // recently committed" view: current = [1,2,3,4],
@@ -2149,7 +2149,11 @@ fn cross_snapshot_membership_recovery_via_persisted_view() {
     let post_transition: Vec<u16> = vec![1, 2, 3, 4];
     let pre_transition: Vec<u16> = vec![1, 2, 3];
     block_on(storage.commit_batch(WriteBatch {
-        active_config: Some((post_transition.clone(), Some(pre_transition.clone()))),
+        active_config: Some(ActiveConfigRecord {
+            log_index: Some(10),
+            current: post_transition.clone(),
+            joint_old: Some(pre_transition.clone()),
+        }),
         ..Default::default()
     }))
     .unwrap();
@@ -2159,7 +2163,11 @@ fn cross_snapshot_membership_recovery_via_persisted_view() {
     let persisted = block_on(storage.active_config()).unwrap();
     assert_eq!(
         persisted,
-        Some((post_transition.clone(), Some(pre_transition.clone()))),
+        Some(ActiveConfigRecord {
+            log_index: Some(10),
+            current: post_transition.clone(),
+            joint_old: Some(pre_transition.clone()),
+        }),
         "persisted active_config view must round-trip through MemStorage",
     );
 

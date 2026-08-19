@@ -1064,9 +1064,13 @@ A definite pre-request refusal returns the row to deferred reconciliation;
 once a request has an ambiguous outcome, the prepared worker stays available
 and retries idempotently until final non-joint membership is visible. After
 final membership commits, application catch-up or policy validation failures
-also keep that voter and its Raft handler alive while recovery retries; only
-node shutdown or a consensus membership removal may tear it down. The route
-becomes public only after successful final membership, a final committed-log
+also keep that voter and its Raft handler alive while recovery retries. The
+persisted active configuration and worker status retain the configuration's
+log/snapshot index; exclusion permits teardown only after that index is at or
+below the durable commit index. A speculative removal therefore cannot discard
+a voter still required by the committed joint configuration. Only node
+shutdown or a committed consensus membership removal may tear it down. The
+route becomes public only after successful final membership, a final committed-log
 catch-up, and local validation of the policy-bearing service genesis.
 Immediate production registration likewise requires an installed,
 policy-matching image before exposing a route. Restart reads the persisted

@@ -1849,7 +1849,10 @@ where
 
     fn membership_definitively_removed_local_voter(&self) -> bool {
         self.worker.handler().snapshot().is_some_and(|snapshot| {
-            !snapshot.members.contains(&self.raft_config.me)
+            snapshot
+                .active_config_index
+                .is_some_and(|index| index <= snapshot.commit_index)
+                && !snapshot.members.contains(&self.raft_config.me)
                 && snapshot
                     .joint_old
                     .is_none_or(|members| !members.contains(&self.raft_config.me))
@@ -5456,12 +5459,23 @@ impl VosNode {
         })?;
         let replication_id = raft_config.replication_id;
         let expected_policy = production_trust.as_ref().map(|trust| trust.policy_id());
-        let persisted_voter = crate::raft::log::load_active_config(&db)
+        let persisted_config =
+            crate::raft::log::load_active_config(&db).map_err(V2RaftNodeRegistrationError::Log)?;
+        let persisted_commit_index = crate::raft::log::RaftMeta::load(&db)
             .map_err(V2RaftNodeRegistrationError::Log)?
-            .is_some_and(|(current, joint_old)| {
-                current.contains(&raft_config.me)
-                    || joint_old.is_some_and(|members| members.contains(&raft_config.me))
-            });
+            .commit_index;
+        let persisted_voter = persisted_config.is_some_and(|record| {
+            record.current.contains(&raft_config.me)
+                || record
+                    .joint_old
+                    .is_some_and(|members| members.contains(&raft_config.me))
+                // A legacy row or a configuration newer than commit_index
+                // cannot prove that removal committed. Retain the worker so
+                // it can still satisfy the last committed joint quorum.
+                || record
+                    .log_index
+                    .is_none_or(|index| index > persisted_commit_index)
+        });
         let pending_route = pending_v2_private_ingress_route(expected_policy.map(Into::into));
         {
             let mut routes = self.v2_private_ingress_routes.write().unwrap();

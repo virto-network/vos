@@ -53,7 +53,7 @@ pub fn persisted_membership(
     }
     let db = redb::Database::create(db_path)
         .map_err(|e| crate::commit::CommitError::Config(alloc::format!("open raft db: {e}")))?;
-    Ok(log::load_active_config(&db)?.map(|(current, _joint)| current))
+    Ok(log::load_active_config(&db)?.map(|record| record.current))
 }
 
 /// Anchor a brand-new group's configuration before its first
