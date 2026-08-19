@@ -92,6 +92,14 @@ fn find_endpoint(root: &Path) -> Option<PathBuf> {
     None
 }
 
+fn spawned_v2_root_id(log: &Path, name: &str) -> Option<String> {
+    let marker = format!("v2 root tree '{name}' spawned as ");
+    fs::read_to_string(log)
+        .ok()?
+        .lines()
+        .find_map(|line| line.split_once(&marker).map(|(_, id)| id.trim().to_owned()))
+}
+
 /// Run a one-shot `vosx` client command against a config/data home.
 fn vosx(data_home: &Path, config_home: &Path, args: &[&str]) -> Output {
     Command::new(vosx_bin())
@@ -1189,6 +1197,8 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
         sidecar.saw_install_for("production-crdt-counter", vos::v2::ConsistencyModeV2::Crdt,),
         "the independent authority did not decode and authorize the CRDT Install",
     );
+    let raft_service_id = spawned_v2_root_id(&first_log, "production-raft-counter")
+        .expect("the production Raft counter spawn log must expose its concrete service id");
 
     // A production-sealed image cannot be reopened by omitting the authority.
     // The daemon itself remains available for legacy/control-plane traffic,
@@ -1216,12 +1226,10 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
                             && line.contains("ProductionTrust(TrustRequired)")
                     })
                 });
-            let raft_private = log
-                .find("v2 root tree 'production-raft-counter' spawned")
-                .is_some_and(|offset| {
-                    log[offset..]
-                        .contains("persisted v2 Raft voter is retrying service open/replay")
-                });
+            let raft_private = log.lines().any(|line| {
+                line.contains("persisted v2 Raft voter is retrying service open/replay")
+                    && line.contains(&format!("id={raft_service_id}"))
+            });
             local_and_crdt_refused && raft_private
         },
         || {
