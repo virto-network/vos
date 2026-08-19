@@ -702,11 +702,13 @@ also carries that exact ID (or `None` for conformance), so an empty voter must
 match the group policy before it can replay genesis or advance its applied
 cursor.
 
-This repository does not yet contain a JAM/consensus authority implementation.
+This repository does not contain a JAM/consensus authority implementation.
 `LocalRootTreeServiceV2::open_production` and `open_raft_production` require an
-embedding node to supply that capability before Install, recovery, or replay;
-the existing `vosx space up` wiring continues to select the explicitly
-documented conformance profile. In particular, a production provider must bind
+embedding node to supply that capability before Install, recovery, or replay.
+`vosx space up --production-trust-socket <path>` supplies the same capability
+through an operator-selected local Unix-domain sidecar; omitting the option
+retains the explicitly documented conformance profile. In particular, a
+production provider must bind
 Install authorization to consensus-authoritative deployment state and the
 executing JAM service account, verify Upgrade against the same package
 authority, resolve roles from the canonical issuer, validate receipt finality
@@ -714,6 +716,30 @@ from an independent consensus certificate/state view, and verify the exact
 proof public input under the policy's pinned proof system. Authenticated
 transport or possession of a receipt is not sufficient evidence for any of
 those decisions.
+
+The sidecar protocol is deliberately small and independent of the guest ABI.
+One Unix connection carries one length-prefixed request and one length-prefixed
+response. A request is `VTA1 | u16(version=1) | u8(kind) | u32(payload_len) |
+payload`; kinds are policy, current slot, historical-slot verification, proof,
+Install, Upgrade, role credential, and receipt. Structured payloads are their
+canonical `V2Wire` bytes; proof verification carries two length-prefixed fields
+for the request and proof artifact. A response is `VTR1 | u16(version=1) |
+request_hash[32] | policy_id[32] | u8(result) | [u64(slot)]`, where
+`request_hash = H("vos/production-trust-socket/request/v1", request)` and the
+result is Authorized, Denied, Unavailable, no-current-slot, current-slot, or
+policy. The daemon samples a nonzero policy during startup and requires that
+exact policy and request hash on every later response. Malformed frames,
+timeouts, disconnects, a changed policy, or a missing current slot fail closed;
+there is no fallback to process-local allowlists. Each frame is bounded to 64
+MiB and I/O is bounded to five seconds.
+
+The request kind values in that order are `0..=7`. Response values are
+`0=Authorized`, `1=Denied`, `2=Unavailable`, `3=no-current-slot`,
+`4=current-slot` (followed by one little-endian `u64`), and `5=policy`.
+Historical-slot verification carries one little-endian `u64`. Every other
+single structured payload is its complete canonical encoding. Both lengths in
+the proof pair are little-endian `u32`; the outer transport length is likewise
+one little-endian `u32` and is not included in `request_hash`.
 
 `VosNode` preserves that boundary for both already-open direct roots and roots
 whose Raft worker is owned by the node. The

@@ -39,6 +39,7 @@ pub mod members;
 pub mod new;
 pub mod op_sign;
 pub mod payload_codec;
+mod production_trust;
 pub mod programs;
 pub mod publish;
 pub mod raft_status;
@@ -140,6 +141,10 @@ pub enum SpaceCommand {
         /// v2 packages. Without it, v2 rows remain installed but are skipped.
         #[arg(long, value_name = "FILE")]
         service_pvm: Option<PathBuf>,
+        /// Unix socket for the fail-closed JAM/consensus trust authority.
+        /// When set, all v2 roots use the production profile.
+        #[arg(long, value_name = "SOCKET")]
+        production_trust_socket: Option<PathBuf>,
     },
     /// Stop a running `space up` daemon by signalling its PID.
     /// SIGTERM by default (daemon flushes state, removes the
@@ -372,12 +377,14 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             listen,
             connect,
             service_pvm,
+            production_trust_socket,
         } => up::run(up::Args {
             query: space,
             once,
             listen,
             connect,
             service_pvm,
+            production_trust_socket,
         }),
         SpaceCommand::Down {
             space,

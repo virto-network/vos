@@ -51,8 +51,10 @@ just test-v2-examples
 The space daemon installs signed v2 packages through the generic service PVM
 for Local, Raft, and CRDT roots, while legacy catalog rows continue on the old
 host. Its current trust inputs use the explicitly documented conformance
-profile; production embeddings must supply the fail-closed JAM/consensus
-policy described in [`docs/runtime-v2.md`](docs/runtime-v2.md). `vosx run`
+profile by default. `space up --production-trust-socket <path>` instead opens
+every v2 root through a fail-closed local JAM/consensus authority sidecar; its
+wire and policy contract are described in
+[`docs/runtime-v2.md`](docs/runtime-v2.md). `vosx run`
 remains a legacy one-shot ELF/PVM runner and does not install `.vos` packages.
 
 ## Consistency modes

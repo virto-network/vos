@@ -31,6 +31,7 @@ pub struct Args {
     pub listen: Vec<String>,
     pub connect: Vec<String>,
     pub service_pvm: Option<PathBuf>,
+    pub production_trust_socket: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -282,6 +283,19 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
     let mut pending_token = load_pending_token(&data_dir)?;
     let pinned_v2_service = load_pinned_v2_service(args.service_pvm.as_deref())?;
+    let production_trust = args
+        .production_trust_socket
+        .as_deref()
+        .map(super::production_trust::SocketProductionTrustV2::open)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("open production trust authority: {error}"))?
+        .map(|trust| std::sync::Arc::new(trust) as std::sync::Arc<dyn vos::v2::ProductionTrustV2>);
+    if let Some(trust) = production_trust.as_ref() {
+        tracing::info!(
+            policy = %hex::encode(trust.policy_id().0),
+            "v2 roots use the fail-closed production trust profile",
+        );
+    }
 
     // Verify the genesis CrdtEvent against the advertised
     // space_id BEFORE registering the agent (which opens the
@@ -489,6 +503,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         hyperspace.is_some(),
         &agent_policies,
         pinned_v2_service.as_ref(),
+        production_trust.clone(),
     )?;
 
     // Provision device-local secret seeds for agents that declared
@@ -618,6 +633,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 &in_flight,
                 &agent_policies,
                 pinned_v2_service.as_ref(),
+                production_trust.clone(),
             ) {
                 Ok(()) => query_warned = false,
                 // Usually a stopped/wedged registry; the condition
@@ -1369,6 +1385,7 @@ fn spawn_installed_agents(
     has_hyperspace: bool,
     policies: &AgentPolicies,
     pinned_v2_service: Option<&PinnedV2Service>,
+    production_trust: Option<std::sync::Arc<dyn vos::v2::ProductionTrustV2>>,
 ) -> anyhow::Result<()> {
     use std::collections::HashSet;
     use vos::registry::{RegistryRef, Status};
@@ -1542,6 +1559,7 @@ fn spawn_installed_agents(
                     local_prefix,
                     svc_id,
                     network_reachable,
+                    production_trust.clone(),
                 ) {
                     Ok(id) => tracing::info!(
                         "v2 root tree '{}' as {id} ({})",
@@ -2167,6 +2185,7 @@ fn register_v2_root_from_row(
     local_prefix: u16,
     svc_id: ServiceId,
     network_reachable: bool,
+    production_trust: Option<std::sync::Arc<dyn vos::v2::ProductionTrustV2>>,
 ) -> anyhow::Result<ServiceId> {
     let backend = vos::v2::FileCommittedImageStoreV2::new(state_path);
     if config.consistency == vos::v2::ConsistencyModeV2::Raft {
@@ -2188,44 +2207,92 @@ fn register_v2_root_from_row(
             ..vos::raft::RaftConfig::default()
         };
         return match seed {
-            RaftSeed::Members(members) => node
-                .register_v2_raft_root_at_id(
-                    instance_name,
-                    config,
-                    backend,
-                    db,
-                    make_config(members),
-                    svc_id,
-                    network_reachable,
-                )
-                .map_err(|error| anyhow::anyhow!("register v2 Raft root tree: {error}")),
+            RaftSeed::Members(members) => match production_trust {
+                Some(trust) => node
+                    .register_v2_raft_root_at_id_production(
+                        instance_name,
+                        config,
+                        backend,
+                        db,
+                        make_config(members),
+                        svc_id,
+                        network_reachable,
+                        trust,
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!("register production v2 Raft root tree: {error}")
+                    }),
+                None => node
+                    .register_v2_raft_root_at_id(
+                        instance_name,
+                        config,
+                        backend,
+                        db,
+                        make_config(members),
+                        svc_id,
+                        network_reachable,
+                    )
+                    .map_err(|error| anyhow::anyhow!("register v2 Raft root tree: {error}")),
+            },
             RaftSeed::Join { leader, known } => {
                 let network = node
                     .network()
                     .ok_or_else(|| anyhow::anyhow!("v2 Raft join requires an attached network"))?;
                 let promotion_name = instance_name.clone();
-                node.register_v2_raft_root_at_id_after_local_attach(
-                    instance_name,
-                    config,
-                    backend,
-                    db,
-                    make_config(known.clone()),
-                    svc_id,
-                    network_reachable,
-                    move |worker, shutdown| {
-                        promote_prepared_v2_raft_root(
-                            &network,
-                            &promotion_name,
-                            replication_id,
-                            local_prefix,
-                            leader,
-                            known,
-                            worker,
-                            shutdown,
+                let raft_config = make_config(known.clone());
+                match production_trust {
+                    Some(trust) => node
+                        .register_v2_raft_root_at_id_after_local_attach_production(
+                            instance_name,
+                            config,
+                            backend,
+                            db,
+                            raft_config,
+                            svc_id,
+                            network_reachable,
+                            trust,
+                            move |worker, shutdown, policy| {
+                                promote_prepared_v2_raft_root(
+                                    &network,
+                                    &promotion_name,
+                                    replication_id,
+                                    local_prefix,
+                                    leader,
+                                    known,
+                                    worker,
+                                    shutdown,
+                                    Some(policy),
+                                )
+                            },
                         )
-                    },
-                )
-                .map_err(|error| anyhow::anyhow!("register v2 Raft root tree: {error}"))
+                        .map_err(|error| {
+                            anyhow::anyhow!("register production v2 Raft root tree: {error}")
+                        }),
+                    None => node
+                        .register_v2_raft_root_at_id_after_local_attach(
+                            instance_name,
+                            config,
+                            backend,
+                            db,
+                            raft_config,
+                            svc_id,
+                            network_reachable,
+                            move |worker, shutdown| {
+                                promote_prepared_v2_raft_root(
+                                    &network,
+                                    &promotion_name,
+                                    replication_id,
+                                    local_prefix,
+                                    leader,
+                                    known,
+                                    worker,
+                                    shutdown,
+                                    None,
+                                )
+                            },
+                        )
+                        .map_err(|error| anyhow::anyhow!("register v2 Raft root tree: {error}")),
+                }
             }
             RaftSeed::Defer(reason) => Err(anyhow::anyhow!(
                 "v2 Raft root tree '{instance_name}' remains deferred: {reason}"
@@ -2233,8 +2300,14 @@ fn register_v2_root_from_row(
         };
     }
 
-    let service = vos::v2::LocalRootTreeServiceV2::open(config, backend)
-        .map_err(|error| anyhow::anyhow!("open v2 root tree '{instance_name}': {error:?}"))?;
+    let service = match production_trust {
+        Some(trust) => vos::v2::LocalRootTreeServiceV2::open_production(config, backend, trust)
+            .map_err(|error| {
+                anyhow::anyhow!("open production v2 root tree '{instance_name}': {error:?}")
+            })?,
+        None => vos::v2::LocalRootTreeServiceV2::open(config, backend)
+            .map_err(|error| anyhow::anyhow!("open v2 root tree '{instance_name}': {error:?}"))?,
+    };
     node.register_v2_root_at_id(instance_name, service, svc_id, network_reachable)
         .map_err(|error| anyhow::anyhow!("register v2 root tree: {error}"))
 }
@@ -2555,6 +2628,7 @@ fn request_raft_join(
     local_prefix: u16,
     mut leader: u16,
     known: Vec<u16>,
+    production_trust_policy: Option<vos::v2::Hash>,
 ) -> anyhow::Result<Result<AcceptedRaftJoin, RejectedRaftJoin>> {
     use vos::network::RaftJoinResult;
 
@@ -2565,7 +2639,12 @@ fn request_raft_join(
                 membership_may_have_changed: false,
             }));
         };
-        let rx = net.send_raft_join_req(peer, replication_id, local_prefix);
+        let rx = net.send_raft_join_req_with_policy(
+            peer,
+            replication_id,
+            local_prefix,
+            production_trust_policy.map(|policy| policy.0),
+        );
         match rx.recv_timeout(RAFT_JOIN_TIMEOUT) {
             Ok(RaftJoinResult::Accepted { joint_index }) => {
                 let mut members = match net
@@ -2662,6 +2741,7 @@ fn join_raft_group(
             local_prefix,
             leader,
             known,
+            None,
         )? {
             Ok(joined) => RaftSeed::Members(joined.members),
             Err(rejection) => RaftSeed::Defer(rejection.reason),
@@ -2678,6 +2758,7 @@ fn promote_prepared_v2_raft_root(
     known: Vec<u16>,
     worker: &vos::raft::WorkerHandle,
     shutdown: &std::sync::atomic::AtomicBool,
+    production_trust_policy: Option<vos::v2::Hash>,
 ) -> Result<(), String> {
     let mut membership_may_have_changed = false;
     let accepted = loop {
@@ -2691,6 +2772,7 @@ fn promote_prepared_v2_raft_root(
             local_prefix,
             leader,
             known.clone(),
+            production_trust_policy,
         )
         .map_err(|error| error.to_string())?
         {
@@ -2874,6 +2956,7 @@ fn reconcile_installed_agents(
     in_flight: &InFlightBlobs,
     policies: &AgentPolicies,
     pinned_v2_service: Option<&PinnedV2Service>,
+    production_trust: Option<std::sync::Arc<dyn vos::v2::ProductionTrustV2>>,
 ) -> anyhow::Result<()> {
     use vos::registry::{RegistryRef, Status};
 
@@ -3069,6 +3152,7 @@ fn reconcile_installed_agents(
                     local_prefix,
                     svc_id,
                     network_reachable,
+                    production_trust.clone(),
                 ) {
                     Ok(id) => {
                         spawned_this_pass += 1;
@@ -3232,9 +3316,62 @@ mod tests {
     use vos::metadata::{ActorMeta, MessageMeta};
     use vos::network::{RaftRole, RaftStatusReply};
     use vos::v2::{
-        DeploymentSignatureV2, PackageManifestV2, PackageRolePoliciesV2, ProducerId, ProgramId,
-        V2Wire, VosPackageV2, artifact_hash,
+        ActorUpgradeV2, DeploymentSignatureV2, Hash, PackageManifestV2, PackageRolePoliciesV2,
+        ProducerId, ProductionTrustDecisionV2, ProductionTrustErrorV2, ProductionTrustV2,
+        ProgramId, ProofVerificationRequestV2, ReceiptVerificationRequestV2,
+        RoleCredentialVerificationRequestV2, ServiceGenesisV2, V2Wire, VosPackageV2, artifact_hash,
     };
+
+    #[derive(Clone)]
+    struct AllowProductionTrust(Hash);
+
+    impl ProductionTrustV2 for AllowProductionTrust {
+        fn policy_id(&self) -> Hash {
+            self.0
+        }
+
+        fn logical_timeslot(&self) -> Option<u64> {
+            Some(100)
+        }
+
+        fn verify_logical_timeslot(&self, slot: u64) -> ProductionTrustDecisionV2 {
+            if slot <= 100 {
+                ProductionTrustDecisionV2::Authorized
+            } else {
+                ProductionTrustDecisionV2::Denied
+            }
+        }
+
+        fn verify_proof(
+            &self,
+            _request: &ProofVerificationRequestV2,
+            _proof: &[u8],
+        ) -> ProductionTrustDecisionV2 {
+            ProductionTrustDecisionV2::Authorized
+        }
+
+        fn verify_install(&self, _genesis: &ServiceGenesisV2) -> ProductionTrustDecisionV2 {
+            ProductionTrustDecisionV2::Authorized
+        }
+
+        fn verify_upgrade(&self, _upgrade: &ActorUpgradeV2) -> ProductionTrustDecisionV2 {
+            ProductionTrustDecisionV2::Authorized
+        }
+
+        fn verify_role_credential(
+            &self,
+            _request: &RoleCredentialVerificationRequestV2,
+        ) -> ProductionTrustDecisionV2 {
+            ProductionTrustDecisionV2::Authorized
+        }
+
+        fn verify_receipt(
+            &self,
+            _request: &ReceiptVerificationRequestV2,
+        ) -> ProductionTrustDecisionV2 {
+            ProductionTrustDecisionV2::Authorized
+        }
+    }
 
     const V2_META: ActorMeta = ActorMeta {
         actor_name: "counter",
@@ -3537,6 +3674,201 @@ mod tests {
             panic!("v2 package fell through to the legacy runtime")
         };
         assert_eq!(config.consistency, vos::v2::ConsistencyModeV2::Raft);
+    }
+
+    #[test]
+    fn daemon_local_registration_uses_the_supplied_production_policy() {
+        let directory = std::env::temp_dir().join(format!(
+            "vosx-v2-production-local-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let service_pvm = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../services/vos-service/vos-service.pvm"),
+        )
+        .unwrap();
+        let package = signed_v2_package(vos::v2::VOS_SERVICE_PROGRAM_ID);
+        let row = vos::registry::AgentRow {
+            instance_name: "production-counter".into(),
+            program_hash: [31; 32],
+            program_name: "counter".into(),
+            program_version: "2.0.0".into(),
+            replication_id: [32; 32],
+            consistency: Consistency::Local as u8,
+            network_reachable: false,
+            sync_role: vos::registry::SyncFloor::Public,
+            install_args: vec![],
+            install_payloads: vec![],
+        };
+        let pinned = PinnedV2Service {
+            pvm: std::sync::Arc::new(service_pvm),
+        };
+        let RowConfig::V2 {
+            config,
+            state_path,
+            network_reachable,
+        } = v2_config_from_row(
+            &directory,
+            [33; 32],
+            &row,
+            std::slice::from_ref(&row),
+            &AgentPolicies::new(),
+            Consistency::Local,
+            package.encode(),
+            Some(&pinned),
+            &[],
+        )
+        .unwrap()
+        else {
+            panic!("signed package did not resolve to a v2 root")
+        };
+        let config = *config;
+        let reopen_config = config.clone();
+        let policy = Hash([34; 32]);
+        let trust = std::sync::Arc::new(AllowProductionTrust(policy));
+        let route = ServiceId::new(35, 36);
+        let mut node = VosNode::with_prefix(35);
+        register_v2_root_from_row(
+            &mut node,
+            &directory,
+            row.instance_name,
+            row.replication_id,
+            config,
+            state_path.clone(),
+            None,
+            35,
+            route,
+            network_reachable,
+            Some(trust.clone()),
+        )
+        .unwrap();
+        assert!(node.has_agent(route));
+        assert!(node.collect().iter().all(vos::node::AgentResult::is_ok));
+
+        let backend = vos::v2::FileCommittedImageStoreV2::new(state_path.clone());
+        assert!(matches!(
+            vos::v2::LocalRootTreeServiceV2::open(reopen_config.clone(), backend),
+            Err(vos::v2::LocalRootTreeOpenErrorV2::ProductionTrust(
+                ProductionTrustErrorV2::TrustRequired,
+            )),
+        ));
+        let reopened = vos::v2::LocalRootTreeServiceV2::open_production(
+            reopen_config,
+            vos::v2::FileCommittedImageStoreV2::new(state_path),
+            trust,
+        )
+        .unwrap();
+        assert_eq!(reopened.production_trust_policy_id(), Some(policy));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn daemon_raft_registration_orders_the_supplied_production_policy() {
+        let directory = std::env::temp_dir().join(format!(
+            "vosx-v2-production-raft-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let service_pvm = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../services/vos-service/vos-service.pvm"),
+        )
+        .unwrap();
+        let package = signed_v2_package(vos::v2::VOS_SERVICE_PROGRAM_ID);
+        let replication_id = [42; 32];
+        let row = vos::registry::AgentRow {
+            instance_name: "production-raft-counter".into(),
+            program_hash: [41; 32],
+            program_name: "counter".into(),
+            program_version: "2.0.0".into(),
+            replication_id,
+            consistency: Consistency::Raft as u8,
+            network_reachable: false,
+            sync_role: vos::registry::SyncFloor::Public,
+            install_args: vec![],
+            install_payloads: vec![],
+        };
+        let pinned = PinnedV2Service {
+            pvm: std::sync::Arc::new(service_pvm),
+        };
+        let RowConfig::V2 {
+            config,
+            state_path,
+            network_reachable,
+        } = v2_config_from_row(
+            &directory,
+            [43; 32],
+            &row,
+            std::slice::from_ref(&row),
+            &AgentPolicies::new(),
+            Consistency::Raft,
+            package.encode(),
+            Some(&pinned),
+            &[],
+        )
+        .unwrap()
+        else {
+            panic!("signed package did not resolve to a v2 Raft root")
+        };
+        let root_service = config.service.root_service;
+        let reopen_config = (*config).clone();
+        let reopen_state_path = state_path.clone();
+        let policy = Hash([44; 32]);
+        let member = 45;
+        let route = ServiceId::new(member, 46);
+        let mut node = VosNode::with_prefix(member);
+        register_v2_root_from_row(
+            &mut node,
+            &directory,
+            row.instance_name,
+            replication_id,
+            *config,
+            state_path,
+            Some(RaftSeed::Members(vec![member])),
+            member,
+            route,
+            network_reachable,
+            Some(std::sync::Arc::new(AllowProductionTrust(policy))),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        assert!(node.has_agent(route));
+        assert!(node.collect().iter().all(vos::node::AgentResult::is_ok));
+
+        let raft_config = vos::raft::RaftConfig {
+            me: member,
+            members: vec![member],
+            replication_id,
+            ..vos::raft::RaftConfig::default()
+        };
+        let raft_path = v2_raft_db_path(&directory, root_service);
+        let log = vos::raft::RaftAccumulateLogV2::open(&raft_path, raft_config.clone()).unwrap();
+        assert!(matches!(
+            vos::v2::LocalRootTreeServiceV2::open_raft(
+                reopen_config.clone(),
+                vos::v2::FileCommittedImageStoreV2::new(reopen_state_path.clone()),
+                log,
+            ),
+            Err(vos::v2::LocalRootTreeOpenErrorV2::ProductionTrust(
+                ProductionTrustErrorV2::TrustRequired,
+            )),
+        ));
+        let reopened = vos::v2::LocalRootTreeServiceV2::open_raft_production(
+            reopen_config,
+            vos::v2::FileCommittedImageStoreV2::new(reopen_state_path),
+            vos::raft::RaftAccumulateLogV2::open(&raft_path, raft_config).unwrap(),
+            std::sync::Arc::new(AllowProductionTrust(policy)),
+        )
+        .unwrap();
+        assert_eq!(reopened.production_trust_policy_id(), Some(policy));
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
