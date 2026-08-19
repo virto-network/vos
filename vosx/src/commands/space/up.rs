@@ -558,6 +558,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         // before it can sync anything — the cert IS the auth.
         let mut redeem_warned = false;
         let mut damped = std::collections::HashSet::new();
+        let mut v2_registration_backoff = V2RegistrationBackoff::default();
         let mut boot_grace = BootGrace::new();
         // Program-blob fetches in flight, shared with the background fetch
         // tasks the reconcile pass spawns for uncached rows.
@@ -629,6 +630,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 has_hyperspace,
                 &local_cfg,
                 &mut damped,
+                &mut v2_registration_backoff,
                 &mut boot_grace,
                 &in_flight,
                 &agent_policies,
@@ -2962,12 +2964,72 @@ fn wait_for_raft_promotion_retry(
 /// registry rows can amplify into local threads. Remaining rows
 /// spawn on subsequent passes.
 const MAX_SPAWNS_PER_PASS: usize = 4;
+/// Registration opens durable stores and may synchronously consult the
+/// production authority. Keep that blocking boundary to one root per router
+/// pass; ordinary legacy spawns retain their separate cap above.
+const MAX_V2_REGISTRATION_ATTEMPTS_PER_PASS: usize = 1;
+const V2_REGISTRATION_GLOBAL_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(2);
+const V2_REGISTRATION_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(10);
+const V2_REGISTRATION_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// A row condition already reported (and, for hard failures,
 /// permanently skipped): the damping key is `(instance_name,
 /// program_hash, kind)`, so reinstalling the same name with a new
 /// blob re-attempts and re-reports.
 type RowDamping = std::collections::HashSet<(String, [u8; 32], RowNote)>;
+type V2RegistrationKey = (String, [u8; 32]);
+
+#[derive(Debug, Clone, Copy)]
+struct V2RegistrationRetry {
+    failures: u8,
+    not_before: std::time::Instant,
+}
+
+#[derive(Debug, Default)]
+struct V2RegistrationBackoff {
+    rows: std::collections::HashMap<V2RegistrationKey, V2RegistrationRetry>,
+    global_not_before: Option<std::time::Instant>,
+}
+
+impl V2RegistrationBackoff {
+    fn ready(&self, key: &V2RegistrationKey, now: std::time::Instant) -> bool {
+        self.global_not_before
+            .is_none_or(|deadline| now >= deadline)
+            && self
+                .rows
+                .get(key)
+                .is_none_or(|retry| now >= retry.not_before)
+    }
+
+    fn finish(&mut self, key: V2RegistrationKey, retryable: bool, now: std::time::Instant) {
+        self.global_not_before = now.checked_add(V2_REGISTRATION_GLOBAL_RETRY_GAP);
+        if !retryable {
+            self.rows.remove(&key);
+            return;
+        }
+        let failures = self
+            .rows
+            .get(&key)
+            .map_or(1, |retry| retry.failures.saturating_add(1));
+        let multiplier = 1_u64 << u32::from(failures.saturating_sub(1).min(5));
+        let delay = V2_REGISTRATION_RETRY_BASE
+            .checked_mul(u32::try_from(multiplier).expect("bounded retry multiplier"))
+            .unwrap_or(V2_REGISTRATION_RETRY_MAX)
+            .min(V2_REGISTRATION_RETRY_MAX);
+        self.rows.insert(
+            key,
+            V2RegistrationRetry {
+                failures,
+                not_before: now.checked_add(delay).unwrap_or(now),
+            },
+        );
+    }
+
+    fn success(&mut self, key: &V2RegistrationKey, now: std::time::Instant) {
+        self.global_not_before = now.checked_add(V2_REGISTRATION_GLOBAL_RETRY_GAP);
+        self.rows.remove(key);
+    }
+}
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 enum RowNote {
@@ -3085,6 +3147,7 @@ fn reconcile_installed_agents(
     has_hyperspace: bool,
     local_cfg: &crate::commands::space::subscriptions::LocalConfig,
     damped: &mut RowDamping,
+    v2_registration_backoff: &mut V2RegistrationBackoff,
     boot_grace: &mut BootGrace,
     in_flight: &InFlightBlobs,
     policies: &AgentPolicies,
@@ -3103,6 +3166,7 @@ fn reconcile_installed_agents(
     // whose sync floor requires membership are narrowed out below.
     let is_member = node_is_member(node, &reg, local_prefix);
     let mut spawned_this_pass = 0usize;
+    let mut v2_registration_attempts = 0usize;
     let mut spawn_rows = agents.iter().collect::<Vec<_>>();
     spawn_rows.sort_by_key(|row| {
         (row.instance_name != vos::v2::ROLE_AUTHORITY_INSTANCE_V2)
@@ -3274,6 +3338,13 @@ fn reconcile_installed_agents(
                 state_path,
                 network_reachable,
             } => {
+                let registration_key = (a.instance_name.clone(), a.program_hash);
+                if v2_registration_attempts >= MAX_V2_REGISTRATION_ATTEMPTS_PER_PASS
+                    || !v2_registration_backoff.ready(&registration_key, std::time::Instant::now())
+                {
+                    continue;
+                }
+                v2_registration_attempts += 1;
                 match register_v2_root_from_row(
                     node,
                     data_dir,
@@ -3288,12 +3359,19 @@ fn reconcile_installed_agents(
                     production_trust.clone(),
                 ) {
                     Ok(id) => {
+                        v2_registration_backoff
+                            .success(&registration_key, std::time::Instant::now());
                         damped.remove(&key(RowNote::RegistrationWaiting));
                         spawned_this_pass += 1;
                         tracing::info!("v2 root tree '{}' spawned as {id}", a.instance_name);
                     }
                     Err(error) => {
                         let retryable = is_retryable_v2_registration_error(&error);
+                        v2_registration_backoff.finish(
+                            registration_key,
+                            retryable,
+                            std::time::Instant::now(),
+                        );
                         let note = v2_registration_note(&error);
                         if damped.insert(key(note)) {
                             tracing::warn!(
@@ -3993,6 +4071,30 @@ mod tests {
         .unwrap();
         assert_eq!(reopened.production_trust_policy_id(), Some(policy));
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn retryable_v2_registration_leaves_a_router_window_and_advances_to_other_rows() {
+        let first = ("first".to_owned(), [1; 32]);
+        let second = ("second".to_owned(), [2; 32]);
+        let now = std::time::Instant::now();
+        let mut backoff = V2RegistrationBackoff::default();
+        assert!(backoff.ready(&first, now));
+
+        backoff.finish(first.clone(), true, now);
+        assert!(!backoff.ready(&first, now));
+        assert!(!backoff.ready(&second, now));
+
+        let next_pass = now + V2_REGISTRATION_GLOBAL_RETRY_GAP;
+        assert!(
+            backoff.ready(&second, next_pass),
+            "another row becomes eligible after the global router window"
+        );
+        assert!(
+            !backoff.ready(&first, next_pass),
+            "the failed row remains under its longer per-row backoff"
+        );
+        assert!(backoff.ready(&first, now + V2_REGISTRATION_RETRY_BASE));
     }
 
     #[test]

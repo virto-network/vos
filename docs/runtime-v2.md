@@ -742,6 +742,13 @@ As a cross-implementation vector, the empty policy query request is
 `5654413101000000000000` in hexadecimal and its `request_hash` is
 `a5ee8be4abb996fd3735970cd7b5a53632afef7cb7a548e1314d9c6ef39ece35`.
 
+Root registration happens from the daemon's routing reconciliation hook, so
+authority outages are retryable but strictly scheduled: at most one v2 root is
+opened per pass, every attempt is followed by a two-second router window, and
+one failing row backs off exponentially from ten seconds to five minutes.
+Malformed configuration and deterministic authorization denial remain hard
+row failures rather than entering this retry loop.
+
 The request kind values in that order are `0..=7`. Response values are
 `0=Authorized`, `1=Denied`, `2=Unavailable`, `3=no-current-slot`,
 `4=current-slot` (followed by one little-endian `u64`), and `5=policy`.
