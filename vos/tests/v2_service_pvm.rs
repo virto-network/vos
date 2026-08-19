@@ -233,6 +233,71 @@ impl SharedFailingCommittedImages {
     }
 }
 
+#[derive(Debug, Default)]
+struct TransientOpenImageState {
+    image: Option<Vec<u8>>,
+    load_attempts: usize,
+    remaining_load_failures: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TransientOpenCommittedImages(Arc<Mutex<TransientOpenImageState>>);
+
+impl TransientOpenCommittedImages {
+    fn fail_loads(&self, count: usize) {
+        let mut state = self.0.lock().unwrap();
+        state.load_attempts = 0;
+        state.remaining_load_failures = count;
+    }
+
+    fn load_attempts(&self) -> usize {
+        self.0.lock().unwrap().load_attempts
+    }
+}
+
+impl CommittedImageStoreV2 for TransientOpenCommittedImages {
+    type Error = ();
+
+    fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        let mut state = self.0.lock().unwrap();
+        state.load_attempts += 1;
+        if state.remaining_load_failures > 0 {
+            state.remaining_load_failures -= 1;
+            return Err(());
+        }
+        Ok(state.image.clone())
+    }
+
+    fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+        self.0.lock().unwrap().image = Some(image.to_vec());
+        Ok(())
+    }
+}
+
+impl ProofArtifactStoreV2 for TransientOpenCommittedImages {
+    type Error = ();
+
+    fn load_proof(&self, _reference: &BlobRefV2) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(None)
+    }
+
+    fn commit_proof(&mut self, _reference: &BlobRefV2, _proof: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn private_ingress_artifact_count(&self) -> Result<usize, Self::Error> {
+        Ok(0)
+    }
+
+    fn reconcile_private_ingresses(
+        &mut self,
+        retained: &[(InvocationId, BlobRefV2)],
+        _terminal: &[InvocationId],
+    ) -> Result<(), Self::Error> {
+        if retained.is_empty() { Ok(()) } else { Err(()) }
+    }
+}
+
 impl CommittedImageStoreV2 for SharedCommittedImages {
     type Error = ();
 
@@ -1990,6 +2055,91 @@ fn promoted_voter_keeps_raft_handler_while_application_catch_up_retries() {
     );
 
     assert!(node.collect().iter().all(AgentResult::is_ok));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn persisted_voter_keeps_raft_handler_while_service_open_retries() {
+    let key = libp2p::identity::Keypair::generate_ed25519();
+    let peer = libp2p::PeerId::from(key.public());
+    let member = vos::network::derive_node_prefix(&peer);
+    let replication_id = [0xa2; 32];
+    let route = ServiceId::new(member, 0x3397);
+    let network = vos::network::Network::start(vos::network::NetworkConfig {
+        keypair: key,
+        local_prefix: member,
+        listen: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+        bootstrap: vec![],
+        auto_dial_mdns: false,
+    });
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-persisted-open-recovery-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let db = Arc::new(redb::Database::create(directory.join("raft.redb")).unwrap());
+    vos::raft::log::seed_active_config(&db, &[member]).unwrap();
+    let backend = TransientOpenCommittedImages::default();
+    let config = attested_root_fixture(ConsistencyModeV2::Raft, 0xa3).0;
+    let raft_config = RaftConfig {
+        me: member,
+        members: vec![member],
+        election_timeout_ms: (10, 30),
+        heartbeat_interval_ms: 5,
+        replication_id,
+        propose_timeout_ms: 2_000,
+    };
+    let trust = Arc::new(TestProductionTrust::new(0xa4, 77, true));
+    let log = RaftAccumulateLogV2::from_db_arc(db.clone(), raft_config.clone()).unwrap();
+    let installed = LocalRootTreeServiceV2::open_raft_production(
+        config.clone(),
+        backend.clone(),
+        log,
+        trust.clone(),
+    )
+    .expect("the persisted voter has a policy-bound service image");
+    drop(installed);
+    backend.fail_loads(3);
+    let observer = backend.clone();
+
+    let mut node = VosNode::with_prefix(member);
+    node.attach_network(network);
+    node.register_v2_raft_root_at_id_production(
+        "persisted-recovering-voter-v2".into(),
+        config,
+        backend,
+        db,
+        raft_config,
+        route,
+        true,
+        trust,
+    )
+    .expect("a persisted voter remains registered while service open retries");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while observer.load_attempts() < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(observer.load_attempts() >= 2, "service open was retried");
+    assert!(
+        node.network()
+            .unwrap()
+            .local_raft_status(&replication_id)
+            .is_some(),
+        "the persisted voter serves Raft throughout application recovery",
+    );
+    assert!(
+        node.has_agent(route),
+        "the recovering root reserves but does not expose its route",
+    );
+
+    node.run_until_idle(Duration::from_millis(250));
+    assert!(node.collect().iter().all(AgentResult::is_ok));
+    assert!(observer.0.lock().unwrap().image.is_some());
     std::fs::remove_dir_all(directory).unwrap();
 }
 

@@ -203,8 +203,8 @@ enum RoleV2 {
     SingleNode,
     #[cfg(feature = "network")]
     Multi {
-        worker: RaftWorker,
-        apply_rx: std_mpsc::Receiver<u64>,
+        worker: Arc<RaftWorker>,
+        apply_rx: Arc<std::sync::Mutex<std_mpsc::Receiver<u64>>>,
     },
 }
 
@@ -285,6 +285,25 @@ impl RaftAccumulateLogV2 {
         cfg: RaftConfig,
         worker: RaftWorker,
         apply_rx: std_mpsc::Receiver<u64>,
+    ) -> Result<Self, CommitError> {
+        Self::from_shared_worker(
+            db,
+            cfg,
+            Arc::new(worker),
+            Arc::new(std::sync::Mutex::new(apply_rx)),
+        )
+    }
+
+    /// Attach another application adapter to an already-running worker.
+    /// Node restart recovery uses this to retry opening the service image
+    /// without ever dropping a worker whose persisted configuration already
+    /// counts the local replica toward quorum.
+    #[cfg(feature = "network")]
+    pub(crate) fn from_shared_worker(
+        db: Arc<Database>,
+        cfg: RaftConfig,
+        worker: Arc<RaftWorker>,
+        apply_rx: Arc<std::sync::Mutex<std_mpsc::Receiver<u64>>>,
     ) -> Result<Self, CommitError> {
         Ok(Self {
             log: RaftLog::open(db.clone())?,
@@ -429,7 +448,7 @@ impl RaftAccumulateLogV2 {
                     self.cfg.propose_timeout_ms,
                 )));
             }
-            match apply_rx.recv_timeout(remaining) {
+            match apply_rx.lock().unwrap().recv_timeout(remaining) {
                 Ok(committed) if committed >= index => break,
                 Ok(_) => continue,
                 Err(std_mpsc::RecvTimeoutError::Timeout) => {

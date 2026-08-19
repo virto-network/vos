@@ -1657,15 +1657,215 @@ type RaftHosts = Arc<Mutex<HashMap<u32, [u8; 32]>>>;
 type PendingV2RootReady = Box<dyn FnOnce(&mut VosNode) + Send>;
 
 #[cfg(all(feature = "network", feature = "storage"))]
-type PreparedV2RaftRoot<B> = (
-    crate::v2::LocalRootTreeServiceV2<B>,
-    crate::raft::WorkerHandle,
-    Option<Arc<crate::network::Network>>,
-    [u8; 32],
-    Arc<dyn crate::network::RaftRpcHandler>,
-    Option<crate::v2::Hash>,
-    Arc<V2PrivateIngressRoute>,
-);
+struct NodeCommittedImageStoreV2<B>(Arc<Mutex<B>>);
+
+#[cfg(all(feature = "network", feature = "storage"))]
+impl<B> Clone for NodeCommittedImageStoreV2<B> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+impl<B: crate::v2::CommittedImageStoreV2> crate::v2::CommittedImageStoreV2
+    for NodeCommittedImageStoreV2<B>
+{
+    type Error = B::Error;
+
+    fn load(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.0.lock().unwrap().load()
+    }
+
+    fn commit(&mut self, image: &[u8]) -> Result<(), Self::Error> {
+        self.0.lock().unwrap().commit(image)
+    }
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+impl<B> crate::v2::ProofArtifactStoreV2 for NodeCommittedImageStoreV2<B>
+where
+    B: crate::v2::CommittedImageStoreV2
+        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+{
+    type Error = <B as crate::v2::CommittedImageStoreV2>::Error;
+
+    fn load_proof(&self, reference: &crate::v2::BlobRefV2) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.0.lock().unwrap().load_proof(reference)
+    }
+
+    fn commit_proof(
+        &mut self,
+        reference: &crate::v2::BlobRefV2,
+        proof: &[u8],
+    ) -> Result<(), Self::Error> {
+        self.0.lock().unwrap().commit_proof(reference, proof)
+    }
+
+    fn load_private_ingress(
+        &self,
+        invocation: crate::v2::InvocationId,
+        reference: &crate::v2::BlobRefV2,
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.0
+            .lock()
+            .unwrap()
+            .load_private_ingress(invocation, reference)
+    }
+
+    fn private_ingress_artifact_count(&self) -> Result<usize, Self::Error> {
+        self.0.lock().unwrap().private_ingress_artifact_count()
+    }
+
+    fn commit_private_ingress(
+        &mut self,
+        invocation: crate::v2::InvocationId,
+        reference: &crate::v2::BlobRefV2,
+        arguments: &[u8],
+        staging: crate::v2::PrivateIngressStagingV2,
+    ) -> Result<bool, Self::Error> {
+        self.0
+            .lock()
+            .unwrap()
+            .commit_private_ingress(invocation, reference, arguments, staging)
+    }
+
+    fn delete_private_ingress(
+        &mut self,
+        invocation: crate::v2::InvocationId,
+    ) -> Result<bool, Self::Error> {
+        self.0.lock().unwrap().delete_private_ingress(invocation)
+    }
+
+    fn reconcile_private_ingresses(
+        &mut self,
+        retained: &[(crate::v2::InvocationId, crate::v2::BlobRefV2)],
+        terminal: &[crate::v2::InvocationId],
+    ) -> Result<(), Self::Error> {
+        self.0
+            .lock()
+            .unwrap()
+            .reconcile_private_ingresses(retained, terminal)
+    }
+
+    fn load_producer_record(
+        &self,
+        actor: crate::v2::ActorId,
+        tag: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.0.lock().unwrap().load_producer_record(actor, tag)
+    }
+
+    fn commit_producer_record(
+        &mut self,
+        actor: crate::v2::ActorId,
+        tag: &[u8; 32],
+        record: &[u8],
+    ) -> Result<bool, Self::Error> {
+        self.0
+            .lock()
+            .unwrap()
+            .commit_producer_record(actor, tag, record)
+    }
+
+    fn delete_producer_record(
+        &mut self,
+        actor: crate::v2::ActorId,
+        tag: &[u8; 32],
+    ) -> Result<bool, Self::Error> {
+        self.0.lock().unwrap().delete_producer_record(actor, tag)
+    }
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+enum V2RaftRecoveryOpenError<E> {
+    Log(crate::commit::CommitError),
+    Service(crate::v2::LocalRootTreeOpenErrorV2<E>),
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+struct V2RaftRecoveryRuntime<B> {
+    config: crate::v2::LocalRootTreeConfigV2,
+    backend: NodeCommittedImageStoreV2<B>,
+    db: Arc<redb::Database>,
+    raft_config: crate::raft::RaftConfig,
+    worker: Arc<crate::raft::RaftWorker>,
+    apply_rx: Arc<Mutex<mpsc::Receiver<u64>>>,
+    network: Option<Arc<crate::network::Network>>,
+    replication_id: [u8; 32],
+    handler: Arc<dyn crate::network::RaftRpcHandler>,
+    expected_policy: Option<crate::v2::Hash>,
+    pending_route: Arc<V2PrivateIngressRoute>,
+    proof_verifier: Option<V2NodeAttestationProofVerifier>,
+    production_trust: Option<Arc<dyn crate::v2::ProductionTrustV2>>,
+    persisted_voter: bool,
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+impl<B> V2RaftRecoveryRuntime<B>
+where
+    B: crate::v2::CommittedImageStoreV2
+        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+        + Send
+        + 'static,
+{
+    fn open(
+        &self,
+    ) -> Result<
+        crate::v2::LocalRootTreeServiceV2<NodeCommittedImageStoreV2<B>>,
+        V2RaftRecoveryOpenError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+    > {
+        let log = crate::raft::RaftAccumulateLogV2::from_shared_worker(
+            self.db.clone(),
+            self.raft_config.clone(),
+            self.worker.clone(),
+            self.apply_rx.clone(),
+        )
+        .map_err(V2RaftRecoveryOpenError::Log)?;
+        match self.production_trust.as_ref() {
+            Some(trust) => crate::v2::LocalRootTreeServiceV2::open_raft_production(
+                self.config.clone(),
+                self.backend.clone(),
+                log,
+                trust.clone(),
+            ),
+            None => crate::v2::LocalRootTreeServiceV2::open_raft_with_proof_verifier(
+                self.config.clone(),
+                self.backend.clone(),
+                log,
+                self.proof_verifier
+                    .clone()
+                    .unwrap_or_else(v2_deny_all_proof_verifier),
+            ),
+        }
+        .map_err(V2RaftRecoveryOpenError::Service)
+    }
+
+    fn cleanup(&self, routes: &V2PrivateIngressRoutes) {
+        if let Some(network) = self.network.as_ref() {
+            network.unregister_raft_handler_if(&self.replication_id, &self.handler);
+        }
+        remove_v2_private_ingress_route_if(routes, &self.replication_id, &self.pending_route);
+    }
+
+    fn membership_definitively_removed_local_voter(&self) -> bool {
+        self.worker.handler().snapshot().is_some_and(|snapshot| {
+            !snapshot.members.contains(&self.raft_config.me)
+                && snapshot
+                    .joint_old
+                    .is_none_or(|members| !members.contains(&self.raft_config.me))
+        })
+    }
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+struct PreparedV2RaftRoot<B>
+where
+    B: crate::v2::CommittedImageStoreV2
+        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+{
+    service: Option<crate::v2::LocalRootTreeServiceV2<NodeCommittedImageStoreV2<B>>>,
+    runtime: V2RaftRecoveryRuntime<B>,
+}
 
 /// Shared host-side reverse map: `local_id` (`id.0 & 0xFFFF`) →
 /// installed instance name. The companion to `InvokeRoutes` for the
@@ -4605,15 +4805,7 @@ impl VosNode {
             + Send
             + 'static,
     {
-        let (
-            mut service,
-            _worker,
-            _network,
-            replication_id,
-            handler,
-            expected_policy,
-            pending_route,
-        ) = self.prepare_v2_raft_root(
+        let mut prepared = self.prepare_v2_raft_root(
             config,
             backend,
             db,
@@ -4621,56 +4813,209 @@ impl VosNode {
             proof_verifier,
             production_trust,
         )?;
+        if prepared.service.is_none() {
+            return self.recover_persisted_v2_raft_root(
+                name,
+                id,
+                network_reachable,
+                proof_producer,
+                prepared,
+            );
+        }
+        let mut service = prepared.service.take().unwrap();
+        let replication_id = prepared.runtime.replication_id;
+        let expected_policy = prepared.runtime.expected_policy;
         if let Some(expected_policy) = expected_policy {
-            let installed = service.catch_up().map_err(|error| {
-                if let Some(network) = _network.as_ref() {
-                    network.unregister_raft_handler_if(&replication_id, &handler);
+            let installed = match service.catch_up() {
+                Ok(installed) => installed,
+                Err(_error) if prepared.runtime.persisted_voter => {
+                    prepared.service = Some(service);
+                    return self.recover_persisted_v2_raft_root(
+                        name,
+                        id,
+                        network_reachable,
+                        proof_producer,
+                        prepared,
+                    );
                 }
-                remove_v2_private_ingress_route_if(
-                    &self.v2_private_ingress_routes,
-                    &replication_id,
-                    &pending_route,
-                );
-                V2RaftNodeRegistrationError::CatchUp(error)
-            })?;
+                Err(error) => {
+                    prepared.runtime.cleanup(&self.v2_private_ingress_routes);
+                    return Err(V2RaftNodeRegistrationError::CatchUp(error));
+                }
+            };
             if !installed {
-                if let Some(network) = _network.as_ref() {
-                    network.unregister_raft_handler_if(&replication_id, &handler);
+                if prepared.runtime.persisted_voter {
+                    prepared.service = Some(service);
+                    return self.recover_persisted_v2_raft_root(
+                        name,
+                        id,
+                        network_reachable,
+                        proof_producer,
+                        prepared,
+                    );
                 }
-                remove_v2_private_ingress_route_if(
-                    &self.v2_private_ingress_routes,
-                    &replication_id,
-                    &pending_route,
-                );
+                prepared.runtime.cleanup(&self.v2_private_ingress_routes);
                 return Err(V2RaftNodeRegistrationError::CatchUp(
                     crate::v2::LocalRootTreeInvokeErrorV2::ServiceNotInstalled,
                 ));
             }
             if service.production_trust_policy_id() != Some(expected_policy) {
-                if let Some(network) = _network.as_ref() {
-                    network.unregister_raft_handler_if(&replication_id, &handler);
+                if prepared.runtime.persisted_voter {
+                    prepared.service = Some(service);
+                    return self.recover_persisted_v2_raft_root(
+                        name,
+                        id,
+                        network_reachable,
+                        proof_producer,
+                        prepared,
+                    );
                 }
-                remove_v2_private_ingress_route_if(
-                    &self.v2_private_ingress_routes,
-                    &replication_id,
-                    &pending_route,
-                );
+                prepared.runtime.cleanup(&self.v2_private_ingress_routes);
                 return Err(V2RaftNodeRegistrationError::ProductionPolicyMismatch);
             }
         }
         if let Err(error) = self.validate_v2_root_registration(&service, id) {
-            if let Some(network) = _network.as_ref() {
-                network.unregister_raft_handler_if(&replication_id, &handler);
-            }
-            remove_v2_private_ingress_route_if(
-                &self.v2_private_ingress_routes,
-                &replication_id,
-                &pending_route,
-            );
+            prepared.runtime.cleanup(&self.v2_private_ingress_routes);
             return Err(V2RaftNodeRegistrationError::Registration(error));
         }
         self.raft_hosts.lock().unwrap().insert(id.0, replication_id);
         Ok(self.attach_v2_root_unchecked(name, service, id, network_reachable, proof_producer))
+    }
+
+    /// Keep an already-configured voter private but live while its service
+    /// image is reopened and caught up. Persisted membership is consensus
+    /// ownership: a transient application error cannot unregister the Raft
+    /// handler or drop the worker that the remaining voters count for quorum.
+    #[cfg(all(feature = "storage", feature = "network"))]
+    #[allow(clippy::too_many_arguments)]
+    fn recover_persisted_v2_raft_root<B>(
+        &mut self,
+        name: String,
+        id: ServiceId,
+        network_reachable: bool,
+        proof_producer: Option<V2NodeAttestationProofProducer>,
+        mut prepared: PreparedV2RaftRoot<B>,
+    ) -> Result<
+        ServiceId,
+        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+    >
+    where
+        B: crate::v2::CommittedImageStoreV2
+            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
+            + Send
+            + 'static,
+    {
+        debug_assert!(prepared.runtime.persisted_voter);
+        let actor = prepared.runtime.config.root_actor;
+        if self.routes.contains_key(&id.0)
+            || self.agent_info.read().unwrap().contains_key(&id.0)
+            || self.invoke_routes.lock().unwrap().contains_key(&id.0)
+            || self.pending_v2_root_ids.lock().unwrap().contains(&id.0)
+        {
+            prepared.runtime.cleanup(&self.v2_private_ingress_routes);
+            return Err(V2RaftNodeRegistrationError::Registration(
+                V2NodeRegistrationError::ServiceRouteOccupied(id),
+            ));
+        }
+        if self.v2_actor_routes.read().unwrap().contains_key(&actor)
+            || self.pending_v2_root_actors.lock().unwrap().contains(&actor)
+        {
+            prepared.runtime.cleanup(&self.v2_private_ingress_routes);
+            return Err(V2RaftNodeRegistrationError::Registration(
+                V2NodeRegistrationError::ActorAlreadyRegistered(actor),
+            ));
+        }
+
+        self.pending_v2_root_ids.lock().unwrap().insert(id.0);
+        self.pending_v2_root_actors.lock().unwrap().insert(actor);
+        let ready_tx = self.pending_v2_root_ready_tx.clone();
+        let pending_ids = self.pending_v2_root_ids.clone();
+        let pending_actors = self.pending_v2_root_actors.clone();
+        let shutdown = self.shutdown.clone();
+        let logical_timeslot = self.v2_logical_timeslot.clone();
+        let pending_routes = self.v2_private_ingress_routes.clone();
+        let join = thread::spawn(move || {
+            let mut next_warning = Instant::now();
+            loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    prepared.runtime.cleanup(&pending_routes);
+                    pending_ids.lock().unwrap().remove(&id.0);
+                    pending_actors.lock().unwrap().remove(&actor);
+                    return;
+                }
+                if prepared
+                    .runtime
+                    .membership_definitively_removed_local_voter()
+                {
+                    prepared.runtime.cleanup(&pending_routes);
+                    pending_ids.lock().unwrap().remove(&id.0);
+                    pending_actors.lock().unwrap().remove(&actor);
+                    return;
+                }
+                if prepared.service.is_none() {
+                    match prepared.runtime.open() {
+                        Ok(service) => prepared.service = Some(service),
+                        Err(_) => {
+                            if Instant::now() >= next_warning {
+                                warn!(%id, "persisted v2 Raft voter is retrying service open/replay");
+                                next_warning = Instant::now() + Duration::from_secs(5);
+                            }
+                            thread::sleep(Duration::from_millis(100));
+                            continue;
+                        }
+                    }
+                }
+                let service = prepared.service.as_mut().unwrap();
+                let recovered = service.catch_up().is_ok_and(|installed| installed)
+                    && prepared.runtime.expected_policy.is_none_or(|expected| {
+                        service.production_trust_policy_id() == Some(expected)
+                    })
+                    && restore_v2_root_logical_timeslot(service, &logical_timeslot).is_ok();
+                if recovered {
+                    break;
+                }
+                if Instant::now() >= next_warning {
+                    warn!(%id, "persisted v2 Raft voter remains private while catch-up retries");
+                    next_warning = Instant::now() + Duration::from_secs(5);
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+
+            let service = prepared.service.take().unwrap();
+            let runtime = prepared.runtime;
+            let ready_handler = runtime.handler.clone();
+            let ready_network = runtime.network.clone();
+            let pending_route = runtime.pending_route.clone();
+            let replication_id = runtime.replication_id;
+            let ready_pending_ids = pending_ids.clone();
+            let ready_pending_actors = pending_actors.clone();
+            let ready: PendingV2RootReady = Box::new(move |node| {
+                if node.shutdown.load(Ordering::Relaxed) {
+                    if let Some(network) = ready_network.as_ref() {
+                        network.unregister_raft_handler_if(&replication_id, &ready_handler);
+                    }
+                    remove_v2_private_ingress_route_if(
+                        &node.v2_private_ingress_routes,
+                        &replication_id,
+                        &pending_route,
+                    );
+                    ready_pending_ids.lock().unwrap().remove(&id.0);
+                    ready_pending_actors.lock().unwrap().remove(&actor);
+                    return;
+                }
+                node.raft_hosts.lock().unwrap().insert(id.0, replication_id);
+                node.attach_v2_root_unchecked(name, service, id, network_reachable, proof_producer);
+                ready_pending_ids.lock().unwrap().remove(&id.0);
+                ready_pending_actors.lock().unwrap().remove(&actor);
+            });
+            if ready_tx.send(ready).is_err() {
+                runtime.cleanup(&pending_routes);
+                pending_ids.lock().unwrap().remove(&id.0);
+                pending_actors.lock().unwrap().remove(&actor);
+            }
+        });
+        self.pending_v2_root_threads.push(join);
+        Ok(id)
     }
 
     /// Start and validate a Raft replica before an optional voter-promotion
@@ -4947,15 +5292,7 @@ impl VosNode {
             + Send
             + 'static,
     {
-        let (
-            mut service,
-            worker_handle,
-            network,
-            replication_id,
-            handler,
-            expected_policy,
-            pending_route,
-        ) = self.prepare_v2_raft_root(
+        let mut prepared = self.prepare_v2_raft_root(
             config,
             backend,
             db,
@@ -4963,15 +5300,27 @@ impl VosNode {
             proof_verifier,
             production_trust,
         )?;
-        if let Err(error) = self.validate_v2_root_registration(&service, id) {
-            if let Some(network) = network.as_ref() {
-                network.unregister_raft_handler_if(&replication_id, &handler);
-            }
-            remove_v2_private_ingress_route_if(
-                &self.v2_private_ingress_routes,
-                &replication_id,
-                &pending_route,
+        if prepared.runtime.persisted_voter {
+            return self.recover_persisted_v2_raft_root(
+                name,
+                id,
+                network_reachable,
+                proof_producer,
+                prepared,
             );
+        }
+        let mut service = prepared
+            .service
+            .take()
+            .expect("a new joiner must open before voter promotion");
+        let worker_handle = prepared.runtime.worker.handler();
+        let network = prepared.runtime.network.clone();
+        let replication_id = prepared.runtime.replication_id;
+        let handler = prepared.runtime.handler.clone();
+        let expected_policy = prepared.runtime.expected_policy;
+        let pending_route = prepared.runtime.pending_route.clone();
+        if let Err(error) = self.validate_v2_root_registration(&service, id) {
+            prepared.runtime.cleanup(&self.v2_private_ingress_routes);
             return Err(V2RaftNodeRegistrationError::Registration(error));
         }
 
@@ -4986,6 +5335,9 @@ impl VosNode {
         let cleanup_handler = handler.clone();
         let pending_routes = self.v2_private_ingress_routes.clone();
         let cleanup_pending_route = pending_route.clone();
+        // Keep the shared worker/apply receiver alive independently of the
+        // service while the promotion callback runs.
+        let recovery_runtime = prepared.runtime;
         let join = thread::spawn(move || {
             let promotion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 promote(&worker_handle, &shutdown, expected_policy)
@@ -5068,6 +5420,7 @@ impl VosNode {
             if let Err(error) = outcome {
                 warn!(%id, %error, "prepared v2 Raft root promotion deferred");
             }
+            drop(recovery_runtime);
         });
         self.pending_v2_root_threads.push(join);
         Ok(id)
@@ -5103,6 +5456,12 @@ impl VosNode {
         })?;
         let replication_id = raft_config.replication_id;
         let expected_policy = production_trust.as_ref().map(|trust| trust.policy_id());
+        let persisted_voter = crate::raft::log::load_active_config(&db)
+            .map_err(V2RaftNodeRegistrationError::Log)?
+            .is_some_and(|(current, joint_old)| {
+                current.contains(&raft_config.me)
+                    || joint_old.is_some_and(|members| members.contains(&raft_config.me))
+            });
         let pending_route = pending_v2_private_ingress_route(expected_policy.map(Into::into));
         {
             let mut routes = self.v2_private_ingress_routes.write().unwrap();
@@ -5165,55 +5524,47 @@ impl VosNode {
         // now a no-op. Any earlier panic/error would instead remove only the
         // still-owned placeholder through its Drop implementation.
         drop(reservation);
-        let cleanup = || {
-            if let Some(network) = network.as_ref() {
-                network.unregister_raft_handler_if(&replication_id, &handler);
-            }
-            remove_v2_private_ingress_route_if(
-                &self.v2_private_ingress_routes,
-                &replication_id,
-                &pending_route,
-            );
-        };
-        let log = match crate::raft::RaftAccumulateLogV2::from_worker(
+        let runtime = V2RaftRecoveryRuntime {
+            config,
+            backend: NodeCommittedImageStoreV2(Arc::new(Mutex::new(backend))),
             db,
             raft_config,
-            worker,
-            apply_rx,
-        ) {
-            Ok(log) => log,
-            Err(error) => {
-                cleanup();
-                return Err(V2RaftNodeRegistrationError::Log(error));
-            }
-        };
-        let opened = match production_trust {
-            Some(trust) => {
-                crate::v2::LocalRootTreeServiceV2::open_raft_production(config, backend, log, trust)
-            }
-            None => crate::v2::LocalRootTreeServiceV2::open_raft_with_proof_verifier(
-                config,
-                backend,
-                log,
-                proof_verifier.unwrap_or_else(v2_deny_all_proof_verifier),
-            ),
-        };
-        let service = match opened {
-            Ok(service) => service,
-            Err(error) => {
-                cleanup();
-                return Err(V2RaftNodeRegistrationError::Open(error));
-            }
-        };
-        Ok((
-            service,
-            worker_handle,
+            worker: Arc::new(worker),
+            apply_rx: Arc::new(Mutex::new(apply_rx)),
             network,
             replication_id,
             handler,
             expected_policy,
             pending_route,
-        ))
+            proof_verifier,
+            production_trust,
+            persisted_voter,
+        };
+        match runtime.open() {
+            Ok(service) => Ok(PreparedV2RaftRoot {
+                service: Some(service),
+                runtime,
+            }),
+            Err(error) if runtime.persisted_voter => {
+                let reason = match error {
+                    V2RaftRecoveryOpenError::Log(_) => "Raft log open failed",
+                    V2RaftRecoveryOpenError::Service(_) => "service image open/replay failed",
+                };
+                warn!(?replication_id, %reason, "persisted v2 Raft voter remains private while recovery retries");
+                Ok(PreparedV2RaftRoot {
+                    service: None,
+                    runtime,
+                })
+            }
+            Err(V2RaftRecoveryOpenError::Log(error)) => {
+                runtime.cleanup(&self.v2_private_ingress_routes);
+                Err(V2RaftNodeRegistrationError::Log(error))
+            }
+            Err(V2RaftRecoveryOpenError::Service(error)) => {
+                runtime.cleanup(&self.v2_private_ingress_routes);
+                Err(V2RaftNodeRegistrationError::Open(error))
+            }
+        }
     }
 
     /// Bind an externally owned v2 actor to an authenticated physical route.

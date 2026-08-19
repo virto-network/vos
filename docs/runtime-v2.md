@@ -1069,7 +1069,13 @@ node shutdown or a consensus membership removal may tear it down. The route
 becomes public only after successful final membership, a final committed-log
 catch-up, and local validation of the policy-bearing service genesis.
 Immediate production registration likewise requires an installed,
-policy-matching image before exposing a route. Calls
+policy-matching image before exposing a route. Restart reads the persisted
+joint and steady membership before opening the application image. If either
+configuration already counts the local replica, service-image load, replay,
+production-authority, and subsequent catch-up failures enter the same private
+background recovery lifecycle: the worker and handler remain live for quorum,
+the fail-closed policy registration remains installed, and the public route is
+withheld until recovery succeeds. Calls
 that reach a follower receive a transport-level leader
 redirect which both the raw node API and generated typed actor handles follow.
 Remote peers reconnect to the leader directly and therefore retain their
