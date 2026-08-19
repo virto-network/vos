@@ -356,6 +356,7 @@ pub trait NetworkService: Send + Sync {
         _peer: PeerId,
         replication_id: &[u8; 32],
         joiner_prefix: u16,
+        _production_trust_policy: Option<[u8; 32]>,
         handler: &dyn RaftRpcHandler,
     ) -> RaftJoinResult {
         if self.raft_join_authorized(joiner_prefix) {
@@ -734,6 +735,7 @@ pub(in crate::network) enum NetworkCmd {
         target_peer: PeerId,
         replication_id: [u8; 32],
         joiner_prefix: u16,
+        production_trust_policy: Option<[u8; 32]>,
         reply: std_mpsc::Sender<RaftJoinResult>,
     },
     /// Send a [`Frame::ManifestReq`] to a bootnode. Reply yields
@@ -1737,11 +1739,13 @@ async fn network_main(
                         target_peer,
                         replication_id,
                         joiner_prefix,
+                        production_trust_policy,
                         reply,
                     }) => {
                         let frame = Frame::RaftJoinReq {
                             replication_id,
                             joiner_prefix,
+                            production_trust_policy,
                         };
                         let req_id = swarm
                             .behaviour_mut()
@@ -2369,6 +2373,7 @@ fn handle_req_resp(
                     Frame::RaftJoinReq {
                         replication_id,
                         joiner_prefix,
+                        production_trust_policy,
                     } => {
                         // A join makes the requester a Raft VOTER (it then
                         // replicates and votes on the channel/registry/
@@ -2413,6 +2418,7 @@ fn handle_req_resp(
                                             peer,
                                             &replication_id,
                                             bound_prefix,
+                                            production_trust_policy,
                                             h.as_ref(),
                                         )
                                     },

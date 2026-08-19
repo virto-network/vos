@@ -2624,6 +2624,15 @@ fn request_raft_join(
                     membership_may_have_changed: false,
                 }));
             }
+            Ok(RaftJoinResult::PolicyMismatch) => {
+                return Ok(Err(RejectedRaftJoin {
+                    reason: format!(
+                        "agent '{}' uses a different production trust policy than its Raft group",
+                        instance_name,
+                    ),
+                    membership_may_have_changed: false,
+                }));
+            }
             Err(_) => {
                 return Ok(Err(RejectedRaftJoin {
                     reason: "join request timed out".into(),

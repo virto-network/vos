@@ -1707,7 +1707,7 @@ fn node_raft_registration_installs_production_trust_before_replay_and_promotion(
         ServiceId::new(member, 0x3394),
         false,
         Arc::new(TestProductionTrust::new(0x9a, 77, false)),
-        move |_, _| {
+        move |_, _, _| {
             callback_ran.store(true, Ordering::Relaxed);
             Ok(())
         },
@@ -1720,6 +1720,169 @@ fn node_raft_registration_installs_production_trust_before_replay_and_promotion(
     ));
     assert!(!promoted.load(Ordering::Relaxed));
     assert!(denied.collect().is_empty());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn fresh_production_joiner_must_match_policy_before_voter_promotion() {
+    let (config, _) = attested_root_fixture(ConsistencyModeV2::Raft, 0x9b);
+    let leader_key = libp2p::identity::Keypair::generate_ed25519();
+    let leader_peer = libp2p::PeerId::from(leader_key.public());
+    let leader_prefix = vos::network::derive_node_prefix(&leader_peer);
+    let (joiner_key, joiner_peer, joiner_prefix) = loop {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let peer = libp2p::PeerId::from(key.public());
+        let prefix = vos::network::derive_node_prefix(&peer);
+        if prefix != leader_prefix {
+            break (key, peer, prefix);
+        }
+    };
+    let listen: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let leader_network = vos::network::Network::start(vos::network::NetworkConfig {
+        keypair: leader_key,
+        local_prefix: leader_prefix,
+        listen: vec![listen.clone()],
+        bootstrap: vec![],
+        auto_dial_mdns: false,
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let leader_address = loop {
+        if let Some(address) = leader_network.listen_addrs().into_iter().next() {
+            break address.with(libp2p::multiaddr::Protocol::P2p(leader_peer));
+        }
+        assert!(std::time::Instant::now() < deadline, "leader did not bind");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let joiner_network = vos::network::Network::start(vos::network::NetworkConfig {
+        keypair: joiner_key,
+        local_prefix: joiner_prefix,
+        listen: vec![listen],
+        bootstrap: vec![leader_address],
+        auto_dial_mdns: false,
+    });
+
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-fresh-production-policy-join-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let replication_id = [0x9c; 32];
+    let route = ServiceId::new(leader_prefix, 0x3395);
+
+    let mut leader = VosNode::with_prefix(leader_prefix);
+    let registry_pvm =
+        grey_transpiler::link_elf(include_bytes!("../../vosx/blobs/space_registry.elf"))
+            .expect("the bundled registry transpiles");
+    install_test_voter_registry(
+        &mut leader,
+        registry_pvm,
+        &[
+            (leader_prefix, leader_peer.to_bytes()),
+            (joiner_prefix, joiner_peer.to_bytes()),
+        ],
+    );
+    leader.attach_network(leader_network);
+    leader
+        .register_v2_raft_root_at_id_production(
+            "policy-bound-leader-v2".into(),
+            config.clone(),
+            FileCommittedImageStoreV2::new(directory.join("leader.service")),
+            Arc::new(redb::Database::create(directory.join("leader.redb")).unwrap()),
+            RaftConfig {
+                me: leader_prefix,
+                members: vec![leader_prefix],
+                election_timeout_ms: (10, 30),
+                heartbeat_interval_ms: 5,
+                replication_id,
+                propose_timeout_ms: 2_000,
+            },
+            route,
+            true,
+            Arc::new(TestProductionTrust::new(0x9d, 77, true)),
+        )
+        .expect("the production leader seals its policy before serving joins");
+    let leader_shutdown = leader.shutdown_handle();
+    let leader_runner = std::thread::spawn(move || {
+        leader.run_forever();
+        leader.collect()
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while joiner_network.peer_for_prefix(leader_prefix).is_none()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(joiner_network.peer_for_prefix(leader_prefix).is_some());
+
+    let mut joiner = VosNode::with_prefix(joiner_prefix);
+    joiner.attach_network(joiner_network);
+    let joiner_network = joiner.network().unwrap();
+    let joiner_route = ServiceId::new(joiner_prefix, 0x3395);
+    let promotion_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let callback_finished = promotion_finished.clone();
+    joiner
+        .register_v2_raft_root_at_id_after_local_attach_production(
+            "policy-mismatched-joiner-v2".into(),
+            config,
+            FileCommittedImageStoreV2::new(directory.join("joiner.service")),
+            Arc::new(redb::Database::create(directory.join("joiner.redb")).unwrap()),
+            RaftConfig {
+                me: joiner_prefix,
+                members: vec![leader_prefix],
+                election_timeout_ms: (30_000, 40_000),
+                heartbeat_interval_ms: 20,
+                replication_id,
+                propose_timeout_ms: 2_000,
+            },
+            joiner_route,
+            true,
+            Arc::new(TestProductionTrust::new(0x9e, 77, true)),
+            move |_, _, policy| {
+                let result = joiner_network
+                    .send_raft_join_req_with_policy(
+                        leader_peer,
+                        replication_id,
+                        joiner_prefix,
+                        Some(policy.into()),
+                    )
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+                callback_finished.store(true, Ordering::Relaxed);
+                match result {
+                    vos::network::RaftJoinResult::PolicyMismatch => {
+                        Err("production policy mismatch".into())
+                    }
+                    other => Err(format!("unexpected join result: {other:?}")),
+                }
+            },
+        )
+        .expect("the fresh follower is prepared without exposing a route");
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while !promotion_finished.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(promotion_finished.load(Ordering::Relaxed));
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while joiner.has_agent(joiner_route) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!joiner.has_agent(joiner_route));
+    let status = joiner
+        .network()
+        .unwrap()
+        .send_raft_status_req(leader_peer, replication_id)
+        .recv_timeout(Duration::from_secs(5))
+        .expect("leader status remains available");
+    assert_eq!(status.members, vec![leader_prefix]);
+
+    leader_shutdown.store(true, Ordering::Relaxed);
+    assert!(leader_runner.join().unwrap().iter().all(AgentResult::is_ok));
+    assert!(joiner.collect().iter().all(AgentResult::is_ok));
     std::fs::remove_dir_all(directory).unwrap();
 }
 

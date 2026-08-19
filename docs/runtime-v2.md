@@ -719,8 +719,11 @@ those decisions.
 whose Raft worker is owned by the node. The
 `register_v2_raft_root_at_id_production*` entry points install the production
 capability before snapshot recovery or committed-log replay. Their prepared
-joiner counterparts do the same before the promotion callback can modify group
-membership or publish the route. Producer-capable variants retain a local
+joiner counterparts additionally put the configured policy commitment in the
+authenticated join request. The leader compares it with the policy of the
+locally installed root before appending joint membership, so a headerless
+follower cannot enter the voter set merely because it has not replayed genesis
+yet. Producer-capable variants retain a local
 proof producer for a future leader, but proof acceptance still goes through
 the installed production policy on the proposing leader and every replaying
 replica; the producer's own verifier cannot replace that policy. Existing
@@ -1058,7 +1061,10 @@ pre-request refusal returns the row to deferred reconciliation; once a request
 has an ambiguous outcome, the prepared worker stays available and retries
 idempotently until final non-joint membership is visible. Shutdown cancels and
 joins that worker, and the route becomes public only after successful final
-membership. Calls that reach a follower receive a transport-level leader
+membership, a final committed-log catch-up, and local validation of the
+policy-bearing service genesis. Immediate production registration likewise
+requires an installed, policy-matching image before exposing a route. Calls
+that reach a follower receive a transport-level leader
 redirect which both the raw node API and generated typed actor handles follow.
 Remote peers reconnect to the leader directly and therefore retain their
 Noise-authenticated member identity. For local `System` and actor calls, the

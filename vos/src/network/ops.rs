@@ -39,11 +39,25 @@ impl Network {
         replication_id: [u8; 32],
         joiner_prefix: u16,
     ) -> std_mpsc::Receiver<RaftJoinResult> {
+        self.send_raft_join_req_with_policy(target_peer, replication_id, joiner_prefix, None)
+    }
+
+    /// Production counterpart of [`Self::send_raft_join_req`]. The policy
+    /// commitment is authenticated by the destination root before its Raft
+    /// worker may append a joint-membership entry.
+    pub fn send_raft_join_req_with_policy(
+        &self,
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        joiner_prefix: u16,
+        production_trust_policy: Option<[u8; 32]>,
+    ) -> std_mpsc::Receiver<RaftJoinResult> {
         let (tx, rx) = std_mpsc::channel();
         let _ = self.cmd_tx.send(NetworkCmd::SendRaftJoin {
             target_peer,
             replication_id,
             joiner_prefix,
+            production_trust_policy,
             reply: tx,
         });
         rx

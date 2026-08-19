@@ -248,6 +248,12 @@ pub enum Frame {
     RaftJoinReq {
         replication_id: [u8; REPLICATION_ID_BYTES],
         joiner_prefix: u16,
+        /// Production trust policy the joining replica will use while
+        /// replaying this group's application log. `None` identifies a
+        /// conformance/legacy group. Leaders reject a value that differs
+        /// from their locally installed root policy before changing
+        /// membership.
+        production_trust_policy: Option<[u8; 32]>,
     },
     /// Reply to [`Frame::RaftJoinReq`].
     RaftJoinResp {
@@ -377,6 +383,9 @@ pub enum RaftJoinResult {
     /// so it must NOT retry. Distinct from `UnknownGroup` (which means
     /// "try another bootnode").
     NotAuthorized,
+    /// The joiner's production verifier/authority policy differs from the
+    /// policy sealed by the group it asked to join.
+    PolicyMismatch,
 }
 
 /// One log entry carried inside an [`Frame::RaftAppendReq`].
@@ -672,10 +681,18 @@ impl Frame {
             Frame::RaftJoinReq {
                 replication_id,
                 joiner_prefix,
+                production_trust_policy,
             } => {
                 out.push(TAG_RAFT_JOIN_REQ);
                 out.extend_from_slice(replication_id);
                 out.extend_from_slice(&joiner_prefix.to_le_bytes());
+                match production_trust_policy {
+                    Some(policy) => {
+                        out.push(1);
+                        out.extend_from_slice(policy);
+                    }
+                    None => out.push(0),
+                }
             }
             Frame::RaftJoinResp { result } => {
                 out.push(TAG_RAFT_JOIN_RESP);
@@ -697,6 +714,7 @@ impl Frame {
                     RaftJoinResult::UnknownGroup => out.push(2),
                     RaftJoinResult::Busy => out.push(3),
                     RaftJoinResult::NotAuthorized => out.push(4),
+                    RaftJoinResult::PolicyMismatch => out.push(5),
                 }
             }
             Frame::ManifestReq => {
@@ -1022,6 +1040,11 @@ impl Frame {
             TAG_RAFT_JOIN_REQ => Frame::RaftJoinReq {
                 replication_id: r.fixed::<REPLICATION_ID_BYTES>()?,
                 joiner_prefix: r.u16()?,
+                production_trust_policy: match r.u8()? {
+                    0 => None,
+                    1 => Some(r.fixed::<32>()?),
+                    other => return Err(FrameError::BadOption(other)),
+                },
             },
             TAG_RAFT_JOIN_RESP => {
                 let variant = r.u8()?;
@@ -1040,6 +1063,7 @@ impl Frame {
                     2 => RaftJoinResult::UnknownGroup,
                     3 => RaftJoinResult::Busy,
                     4 => RaftJoinResult::NotAuthorized,
+                    5 => RaftJoinResult::PolicyMismatch,
                     other => return Err(FrameError::BadOption(other)),
                 };
                 Frame::RaftJoinResp { result }

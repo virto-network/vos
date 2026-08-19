@@ -325,6 +325,8 @@ pub enum V2RaftNodeRegistrationError<E> {
     Open(crate::v2::LocalRootTreeOpenErrorV2<E>),
     Registration(V2NodeRegistrationError),
     ReplicationHandlerOccupied([u8; 32]),
+    CatchUp(crate::v2::LocalRootTreeInvokeErrorV2),
+    ProductionPolicyMismatch,
     Promotion(String),
 }
 
@@ -1392,6 +1394,10 @@ struct V2PrivateIngressRoute {
     tx: mpsc::SyncSender<V2PrivateIngressUpload>,
     quiescence_tx: mpsc::SyncSender<mpsc::Sender<bool>>,
     barrier: V2PrivateIngressBarrier,
+    /// Expected replay-verification policy for this exact application group.
+    /// Membership admission compares it with the authenticated join request
+    /// before calling `change_membership`.
+    production_trust_policy: Option<[u8; 32]>,
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
@@ -1625,6 +1631,7 @@ type PreparedV2RaftRoot<B> = (
     Option<Arc<crate::network::Network>>,
     [u8; 32],
     Arc<dyn crate::network::RaftRpcHandler>,
+    Option<crate::v2::Hash>,
 );
 
 /// Shared host-side reverse map: `local_id` (`id.0 & 0xFFFF`) →
@@ -3240,6 +3247,7 @@ impl crate::network::NetworkService for NodeService {
         peer: libp2p::PeerId,
         replication_id: &[u8; 32],
         joiner_prefix: u16,
+        production_trust_policy: Option<[u8; 32]>,
         handler: &dyn crate::network::RaftRpcHandler,
     ) -> crate::network::RaftJoinResult {
         let Some(member) = self.lookup_node_member(joiner_prefix) else {
@@ -3255,8 +3263,15 @@ impl crate::network::NetworkService for NodeService {
             .and_then(|routes| routes.get(replication_id).cloned());
         let Some(route) = route else {
             // Legacy/non-v2 groups retain their existing join contract.
-            return handler.handle_join(replication_id, joiner_prefix);
+            return if production_trust_policy.is_none() {
+                handler.handle_join(replication_id, joiner_prefix)
+            } else {
+                crate::network::RaftJoinResult::PolicyMismatch
+            };
         };
+        if route.production_trust_policy != production_trust_policy {
+            return crate::network::RaftJoinResult::PolicyMismatch;
+        }
         let Some(_barrier) = route.barrier.try_acquire() else {
             return crate::network::RaftJoinResult::Busy;
         };
@@ -4289,6 +4304,7 @@ impl VosNode {
                 tx,
                 quiescence_tx,
                 barrier: V2PrivateIngressBarrier::new(),
+                production_trust_policy: service.production_trust_policy_id().map(Into::into),
             });
             self.v2_private_ingress_routes
                 .write()
@@ -4556,14 +4572,37 @@ impl VosNode {
             + Send
             + 'static,
     {
-        let (service, _worker, _network, replication_id, handler) = self.prepare_v2_raft_root(
-            config,
-            backend,
-            db,
-            raft_config,
-            proof_verifier,
-            production_trust,
-        )?;
+        let (mut service, _worker, _network, replication_id, handler, expected_policy) = self
+            .prepare_v2_raft_root(
+                config,
+                backend,
+                db,
+                raft_config,
+                proof_verifier,
+                production_trust,
+            )?;
+        if let Some(expected_policy) = expected_policy {
+            let installed = service.catch_up().map_err(|error| {
+                if let Some(network) = _network.as_ref() {
+                    network.unregister_raft_handler_if(&replication_id, &handler);
+                }
+                V2RaftNodeRegistrationError::CatchUp(error)
+            })?;
+            if !installed {
+                if let Some(network) = _network.as_ref() {
+                    network.unregister_raft_handler_if(&replication_id, &handler);
+                }
+                return Err(V2RaftNodeRegistrationError::CatchUp(
+                    crate::v2::LocalRootTreeInvokeErrorV2::ServiceNotInstalled,
+                ));
+            }
+            if service.production_trust_policy_id() != Some(expected_policy) {
+                if let Some(network) = _network.as_ref() {
+                    network.unregister_raft_handler_if(&replication_id, &handler);
+                }
+                return Err(V2RaftNodeRegistrationError::ProductionPolicyMismatch);
+            }
+        }
         if let Err(error) = self.validate_v2_root_registration(&service, id) {
             if let Some(network) = _network.as_ref() {
                 network.unregister_raft_handler_if(&replication_id, &handler);
@@ -4616,7 +4655,7 @@ impl VosNode {
             None,
             None,
             None,
-            promote,
+            move |worker, shutdown, _| promote(worker, shutdown),
         )
     }
 
@@ -4646,7 +4685,9 @@ impl VosNode {
             + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
             + Send
             + 'static,
-        F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool) -> Result<(), String> + Send + 'static,
+        F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool, crate::v2::Hash) -> Result<(), String>
+            + Send
+            + 'static,
     {
         self.register_v2_raft_root_at_id_after_local_attach_inner(
             name,
@@ -4659,7 +4700,13 @@ impl VosNode {
             None,
             None,
             Some(trust),
-            promote,
+            move |worker, shutdown, policy| {
+                promote(
+                    worker,
+                    shutdown,
+                    policy.expect("production preparation always has a policy"),
+                )
+            },
         )
     }
 
@@ -4707,7 +4754,7 @@ impl VosNode {
             Some(verifier),
             Some(producer),
             None,
-            promote,
+            move |worker, shutdown, _| promote(worker, shutdown),
         )
     }
 
@@ -4739,7 +4786,9 @@ impl VosNode {
             + Send
             + 'static,
         P: crate::AttestationProofBackendV2 + Send + 'static,
-        F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool) -> Result<(), String> + Send + 'static,
+        F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool, crate::v2::Hash) -> Result<(), String>
+            + Send
+            + 'static,
     {
         let producer = V2NodeAttestationProofProducer::new(producer);
         self.register_v2_raft_root_at_id_after_local_attach_inner(
@@ -4753,7 +4802,13 @@ impl VosNode {
             None,
             Some(producer),
             Some(trust),
-            promote,
+            move |worker, shutdown, policy| {
+                promote(
+                    worker,
+                    shutdown,
+                    policy.expect("production preparation always has a policy"),
+                )
+            },
         )
     }
 
@@ -4796,7 +4851,7 @@ impl VosNode {
             Some(v2_node_attestation_proof_verifier(verifier)),
             None,
             None,
-            promote,
+            move |worker, shutdown, _| promote(worker, shutdown),
         )
     }
 
@@ -4824,9 +4879,15 @@ impl VosNode {
             + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
             + Send
             + 'static,
-        F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool) -> Result<(), String> + Send + 'static,
+        F: FnOnce(
+                &crate::raft::WorkerHandle,
+                &AtomicBool,
+                Option<crate::v2::Hash>,
+            ) -> Result<(), String>
+            + Send
+            + 'static,
     {
-        let (service, worker_handle, network, replication_id, handler) = self
+        let (mut service, worker_handle, network, replication_id, handler, expected_policy) = self
             .prepare_v2_raft_root(
                 config,
                 backend,
@@ -4853,9 +4914,23 @@ impl VosNode {
         let cleanup_handler = handler.clone();
         let join = thread::spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                promote(&worker_handle, &shutdown)
+                promote(&worker_handle, &shutdown, expected_policy)
             }))
             .unwrap_or_else(|_| Err("prepared v2 Raft root promotion panicked".into()));
+            let outcome = outcome.and_then(|()| {
+                let installed = service
+                    .catch_up()
+                    .map_err(|error| format!("post-promotion catch-up failed: {error}"))?;
+                if !installed {
+                    return Err("post-promotion catch-up did not install service genesis".into());
+                }
+                if let Some(expected) = expected_policy
+                    && service.production_trust_policy_id() != Some(expected)
+                {
+                    return Err("post-promotion production trust policy mismatch".into());
+                }
+                Ok(())
+            });
             if outcome.is_ok() && !shutdown.load(Ordering::Relaxed) {
                 let ready_network = network.clone();
                 let ready_pending_ids = pending_ids.clone();
@@ -4984,6 +5059,7 @@ impl VosNode {
                 return Err(V2RaftNodeRegistrationError::Log(error));
             }
         };
+        let expected_policy = production_trust.as_ref().map(|trust| trust.policy_id());
         let opened = match production_trust {
             Some(trust) => {
                 crate::v2::LocalRootTreeServiceV2::open_raft_production(config, backend, log, trust)
@@ -5002,7 +5078,14 @@ impl VosNode {
                 return Err(V2RaftNodeRegistrationError::Open(error));
             }
         };
-        Ok((service, worker_handle, network, replication_id, handler))
+        Ok((
+            service,
+            worker_handle,
+            network,
+            replication_id,
+            handler,
+            expected_policy,
+        ))
     }
 
     /// Bind an externally owned v2 actor to an authenticated physical route.
@@ -17563,6 +17646,7 @@ mod tests {
                 tx: sidecar_tx,
                 quiescence_tx,
                 barrier: V2PrivateIngressBarrier::new(),
+                production_trust_policy: None,
             }),
         );
         let bytes = b"exact private ingress".to_vec();
@@ -17745,6 +17829,7 @@ mod tests {
             tx: sidecar_tx,
             quiescence_tx,
             barrier: V2PrivateIngressBarrier::new(),
+            production_trust_policy: None,
         });
         service
             .v2_private_ingress_routes
@@ -17755,7 +17840,7 @@ mod tests {
 
         let admission = route.barrier.try_acquire().unwrap();
         assert_eq!(
-            service.handle_raft_join(joiner, &replication_id, prefix, &handler),
+            service.handle_raft_join(joiner, &replication_id, prefix, None, &handler),
             RaftJoinResult::Busy,
             "membership cannot change while private admission owns the barrier",
         );
@@ -17766,7 +17851,7 @@ mod tests {
             quiescence_rx.recv().unwrap().send(true).unwrap();
         });
         assert_eq!(
-            service.handle_raft_join(joiner, &replication_id, prefix, &handler),
+            service.handle_raft_join(joiner, &replication_id, prefix, None, &handler),
             RaftJoinResult::Accepted { joint_index: 9 },
         );
         quiescence.join().unwrap();
