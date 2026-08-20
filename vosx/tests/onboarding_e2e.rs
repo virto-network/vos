@@ -352,7 +352,11 @@ impl TestProductionTrustSidecar {
             })
     }
 
-    fn saw_receipt_for(&self, actor_name: &str, consistency: vos::v2::ConsistencyModeV2) -> bool {
+    fn receipt_digests_for(
+        &self,
+        actor_name: &str,
+        consistency: vos::v2::ConsistencyModeV2,
+    ) -> Vec<vos::v2::Hash> {
         let observations = self.observations.lock().unwrap();
         let Some(service) = observations
             .installs
@@ -363,11 +367,46 @@ impl TestProductionTrustSidecar {
             })
             .map(|genesis| &genesis.service)
         else {
-            return false;
+            return Vec::new();
         };
-        observations.receipts.iter().any(|request| {
-            request.receipt.service == *service && request.receipt.consistency == consistency
-        })
+        observations
+            .receipts
+            .iter()
+            .filter(|request| {
+                request.receipt.service == *service && request.receipt.consistency == consistency
+            })
+            .map(vos::v2::ReceiptVerificationRequestV2::hash)
+            .collect()
+    }
+
+    fn newest_receipt_digest_since(
+        &self,
+        actor_name: &str,
+        consistency: vos::v2::ConsistencyModeV2,
+        baseline: &[vos::v2::Hash],
+    ) -> Option<vos::v2::Hash> {
+        let observations = self.observations.lock().unwrap();
+        let service = observations
+            .installs
+            .iter()
+            .find(|genesis| {
+                genesis.consistency == consistency
+                    && genesis.actors.iter().any(|actor| actor.name == actor_name)
+            })?
+            .service
+            .clone();
+        observations
+            .receipts
+            .iter()
+            .filter(|request| {
+                request.receipt.service == service && request.receipt.consistency == consistency
+            })
+            .filter_map(|request| {
+                let digest = request.hash();
+                (!baseline.contains(&digest)).then_some((request.receipt.sequence, digest))
+            })
+            .max_by_key(|(sequence, _)| *sequence)
+            .map(|(_, digest)| digest)
     }
 }
 
@@ -1417,7 +1456,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
 
     vosx_ok(data_a.path(), config_a.path(), &["space", "new", space]);
     let log_a = data_a.path().join("production-crdt-a.stderr");
-    let _daemon_a = Daemon(spawn_up_with_service_and_trust(
+    let daemon_a = Daemon(spawn_up_with_service_and_trust(
         data_a.path(),
         config_a.path(),
         space,
@@ -1534,6 +1573,11 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
         },
     );
 
+    let mut receipts_before_a_mutation =
+        trust_a.receipt_digests_for("production-crdt-counter", vos::v2::ConsistencyModeV2::Crdt);
+    receipts_before_a_mutation.extend(
+        trust_b.receipt_digests_for("production-crdt-counter", vos::v2::ConsistencyModeV2::Crdt),
+    );
     assert_eq!(
         vosx_ok(
             data_a.path(),
@@ -1542,6 +1586,19 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
         )
         .trim(),
         "()",
+    );
+    poll_until(
+        60,
+        || {
+            trust_b
+                .newest_receipt_digest_since(
+                    "production-crdt-counter",
+                    vos::v2::ConsistencyModeV2::Crdt,
+                    &receipts_before_a_mutation,
+                )
+                .is_some()
+        },
+        || "B did not independently verify a new receipt for A's counter mutation".to_owned(),
     );
     poll_until(
         60,
@@ -1561,11 +1618,21 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
             )
         },
     );
-    assert!(
-        trust_b.saw_receipt_for("production-crdt-counter", vos::v2::ConsistencyModeV2::Crdt,),
-        "B did not independently verify the counter's synchronized receipt",
+    // `inc` is the last source-side operation before the receiver reaches 1,
+    // so the highest-sequence receipt not present at either authority's
+    // baseline is the exact tested mutation, rather than an echoed receipt.
+    let a_mutation_receipt = trust_b
+        .newest_receipt_digest_since(
+            "production-crdt-counter",
+            vos::v2::ConsistencyModeV2::Crdt,
+            &receipts_before_a_mutation,
+        )
+        .expect("B retained the exact newly verified A mutation receipt");
+    let mut receipts_before_b_mutation =
+        trust_a.receipt_digests_for("production-crdt-counter", vos::v2::ConsistencyModeV2::Crdt);
+    receipts_before_b_mutation.extend(
+        trust_b.receipt_digests_for("production-crdt-counter", vos::v2::ConsistencyModeV2::Crdt),
     );
-
     assert_eq!(
         vosx_ok(
             data_b.path(),
@@ -1574,6 +1641,19 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
         )
         .trim(),
         "()",
+    );
+    poll_until(
+        60,
+        || {
+            trust_a
+                .newest_receipt_digest_since(
+                    "production-crdt-counter",
+                    vos::v2::ConsistencyModeV2::Crdt,
+                    &receipts_before_b_mutation,
+                )
+                .is_some()
+        },
+        || "A did not independently verify a new receipt for B's counter mutation".to_owned(),
     );
     poll_until(
         60,
@@ -1593,11 +1673,18 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
             )
         },
     );
-    assert!(
-        trust_a.saw_receipt_for("production-crdt-counter", vos::v2::ConsistencyModeV2::Crdt,),
-        "A did not independently verify the counter's synchronized receipt",
+    let b_mutation_receipt = trust_a
+        .newest_receipt_digest_since(
+            "production-crdt-counter",
+            vos::v2::ConsistencyModeV2::Crdt,
+            &receipts_before_b_mutation,
+        )
+        .expect("A retained the exact newly verified B mutation receipt");
+    assert_ne!(
+        a_mutation_receipt, b_mutation_receipt,
+        "the two independently verified mutations must have distinct receipt digests",
     );
-
+    drop(daemon_a);
     drop(daemon_b);
     let _ = fs::remove_file(&endpoint_b);
     let restart_at = std::time::SystemTime::now();
