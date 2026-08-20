@@ -26,6 +26,7 @@ struct RaftStatusView {
     last_log_index: u64,
     leader: Option<u16>,
     members: Vec<u16>,
+    joint_old: Option<Vec<u16>>,
     /// The prefix of the daemon that answered — so the reader can tell
     /// which node's view this is (and whether it is itself the leader).
     daemon_prefix: u16,
@@ -61,6 +62,7 @@ pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
                 last_log_index: reply.last_log_index,
                 leader: reply.leader_hint,
                 members: reply.members.clone(),
+                joint_old: reply.joint_old.clone(),
                 daemon_prefix,
             });
             return Ok(());
@@ -113,6 +115,13 @@ fn print_text(instance: &str, daemon_prefix: u16, reply: &RaftStatusReply) {
             })
             .collect();
         println!("members    {}", rendered.join(", "));
+    }
+    if let Some(old) = &reply.joint_old {
+        let rendered = old
+            .iter()
+            .map(|prefix| format!("{prefix:#06x}"))
+            .collect::<Vec<_>>();
+        println!("joint-old  {}", rendered.join(", "));
     }
 }
 

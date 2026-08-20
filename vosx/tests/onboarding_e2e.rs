@@ -134,6 +134,7 @@ struct TestRaftStatus {
     role: String,
     leader: Option<u16>,
     members: Vec<u16>,
+    joint_old: Option<Vec<u16>>,
     daemon_prefix: u16,
     commit_index: u64,
     last_applied: u64,
@@ -167,6 +168,16 @@ fn production_raft_status(
             .iter()
             .map(|member| member.as_u64().and_then(|value| u16::try_from(value).ok()))
             .collect::<Option<Vec<_>>>()?,
+        joint_old: match value.get("joint_old")? {
+            serde_json::Value::Null => None,
+            serde_json::Value::Array(members) => Some(
+                members
+                    .iter()
+                    .map(|member| member.as_u64().and_then(|value| u16::try_from(value).ok()))
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            _ => return None,
+        },
         daemon_prefix: value
             .get("daemon_prefix")?
             .as_u64()
@@ -2194,7 +2205,10 @@ fn production_raft_root_survives_voter_join_leader_loss_and_catch_up() {
             .all(|status| {
                 status.is_some_and(|mut status| {
                     status.members.sort_unstable();
-                    status.present && status.leader.is_some() && status.members == expected_members
+                    status.present
+                        && status.leader.is_some()
+                        && status.members == expected_members
+                        && status.joint_old.is_none()
                 })
             })
         },
@@ -2242,16 +2256,27 @@ fn production_raft_root_survives_voter_join_leader_loss_and_catch_up() {
         trust_c.tag_count(TestProductionTrustSidecar::VERIFY_TIMESLOT),
     ];
 
-    let call_on = |prefix: u16, args: &[&str]| -> String {
-        if prefix == prefix_a {
-            vosx_ok(data_a.path(), config_a.path(), args)
+    let try_call_on = |prefix: u16, args: &[&str]| -> Result<String, String> {
+        let output = if prefix == prefix_a {
+            vosx(data_a.path(), config_a.path(), args)
         } else if prefix == prefix_b {
-            vosx_ok(data_b.path(), config_b.path(), args)
+            vosx(data_b.path(), config_b.path(), args)
         } else if prefix == prefix_c {
-            vosx_ok(data_c.path(), config_c.path(), args)
+            vosx(data_c.path(), config_c.path(), args)
         } else {
-            panic!("unknown test daemon prefix {prefix:#06x}")
+            return Err(format!("unknown test daemon prefix {prefix:#06x}"));
+        };
+        if !output.status.success() {
+            return Err(format!(
+                "`vosx {}` failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr),
+            ));
         }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    let call_on = |prefix: u16, args: &[&str]| -> String {
+        try_call_on(prefix, args).unwrap_or_else(|error| panic!("{error}"))
     };
     assert_eq!(
         call_on(
@@ -2266,7 +2291,8 @@ fn production_raft_root_survives_voter_join_leader_loss_and_catch_up() {
         60,
         || {
             [prefix_a, prefix_b, prefix_c].into_iter().all(|prefix| {
-                call_on(prefix, &["space", "call", space, root, "value"]).trim() == "U64(5)"
+                try_call_on(prefix, &["space", "call", space, root, "value"])
+                    .is_ok_and(|value| value.trim() == "U64(5)")
             })
         },
         || "the initial follower-routed mutation did not reach every voter".to_owned(),
@@ -2351,7 +2377,8 @@ fn production_raft_root_survives_voter_join_leader_loss_and_catch_up() {
         60,
         || {
             survivors.iter().all(|prefix| {
-                call_on(*prefix, &["space", "call", space, root, "value"]).trim() == "U64(12)"
+                try_call_on(*prefix, &["space", "call", space, root, "value"])
+                    .is_ok_and(|value| value.trim() == "U64(12)")
             })
         },
         || "the post-failover mutation did not reach the surviving quorum".to_owned(),

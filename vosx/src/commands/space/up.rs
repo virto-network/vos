@@ -2709,6 +2709,92 @@ fn canonical_raft_voter_peer(
     (vos::network::derive_node_prefix(&peer) == prefix).then_some(peer)
 }
 
+fn committed_final_membership_contains(
+    snapshot: &vos::raft::worker::WorkerSnapshot,
+    local_prefix: u16,
+) -> bool {
+    snapshot.joint_old.is_none()
+        && snapshot.members.contains(&local_prefix)
+        && snapshot
+            .active_config_index
+            .is_some_and(|index| index <= snapshot.commit_index)
+}
+
+fn select_authenticated_raft_leader(
+    observations: Vec<(u16, vos::network::RaftStatusReply)>,
+    voter_peer_ids: &[(u16, Vec<u8>)],
+) -> Option<u16> {
+    observations
+        .into_iter()
+        .filter_map(|(reporter, status)| {
+            if !status.present || !status.is_active_voter(reporter) {
+                return None;
+            }
+            let leader = if status.role == vos::network::RaftRole::Leader
+                && status.leader_hint == Some(reporter)
+            {
+                reporter
+            } else {
+                status.leader_hint?
+            };
+            if !status.is_active_voter(leader)
+                || canonical_raft_voter_peer(voter_peer_ids, leader).is_none()
+            {
+                return None;
+            }
+            let direct = leader == reporter && status.role == vos::network::RaftRole::Leader;
+            Some((
+                (
+                    status.current_term,
+                    direct,
+                    status.commit_index,
+                    status.last_log_index,
+                ),
+                leader,
+            ))
+        })
+        .max_by_key(|(rank, _)| *rank)
+        .map(|(_, leader)| leader)
+}
+
+/// Probe a rotating bounded window of canonical voters after an ambiguous
+/// join. A dead original leader cannot pin the prepared replica forever, and
+/// ambient prefix owners are never candidates.
+fn rediscover_raft_leader(
+    net: &std::sync::Arc<vos::network::Network>,
+    replication_id: [u8; 32],
+    local_prefix: u16,
+    voter_peer_ids: &[(u16, Vec<u8>)],
+    cursor: &mut usize,
+) -> Option<u16> {
+    let candidates = voter_peer_ids
+        .iter()
+        .filter_map(|(prefix, _)| {
+            if *prefix == local_prefix {
+                return None;
+            }
+            canonical_raft_voter_peer(voter_peer_ids, *prefix).map(|peer| (*prefix, peer))
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+    let start = *cursor % candidates.len();
+    let count = candidates.len().min(MAX_RAFT_PROBES);
+    let mut observations = Vec::with_capacity(count);
+    for offset in 0..count {
+        let (prefix, peer) = candidates[(start + offset) % candidates.len()];
+        if let Ok(status) = net
+            .send_raft_status_req(peer, replication_id)
+            .recv_timeout(RAFT_PROBE_TIMEOUT)
+        {
+            observations.push((prefix, status));
+        }
+    }
+    *cursor = (start + count) % candidates.len();
+    select_authenticated_raft_leader(observations, voter_peer_ids)
+}
+
 /// Run the membership protocol for one raft row: read the voter
 /// set, probe connected voters for the group, join a live group
 /// through its leader, or anchor + bootstrap a brand-new one.
@@ -2988,7 +3074,7 @@ fn promote_prepared_v2_raft_root(
     instance_name: &str,
     replication_id: [u8; 32],
     local_prefix: u16,
-    leader: u16,
+    mut leader: u16,
     known: Vec<u16>,
     voter_peer_ids: Vec<(u16, Vec<u8>)>,
     worker: &vos::raft::WorkerHandle,
@@ -2996,9 +3082,31 @@ fn promote_prepared_v2_raft_root(
     production_trust_policy: Option<vos::v2::Hash>,
 ) -> Result<(), String> {
     let mut membership_may_have_changed = false;
+    let mut discovery_cursor = 0;
     let accepted = loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("node shut down while Raft voter promotion was pending".into());
+        }
+        if membership_may_have_changed {
+            if let Some(snapshot) = worker.snapshot() {
+                if committed_final_membership_contains(&snapshot, local_prefix) {
+                    return Ok(());
+                }
+                if let Some(hint) = snapshot.leader_hint
+                    && canonical_raft_voter_peer(&voter_peer_ids, hint).is_some()
+                {
+                    leader = hint;
+                }
+            }
+            if let Some(discovered) = rediscover_raft_leader(
+                net,
+                replication_id,
+                local_prefix,
+                &voter_peer_ids,
+                &mut discovery_cursor,
+            ) {
+                leader = discovered;
+            }
         }
         match request_raft_join(
             net,
@@ -3042,8 +3150,7 @@ fn promote_prepared_v2_raft_root(
             return Err("node shut down before Raft voter promotion finalized".into());
         }
         if let Some(snapshot) = worker.snapshot()
-            && snapshot.members.contains(&local_prefix)
-            && snapshot.joint_old.is_none()
+            && committed_final_membership_contains(&snapshot, local_prefix)
             && snapshot.commit_index >= accepted.joint_index.saturating_add(1)
         {
             return Ok(());
@@ -4602,6 +4709,59 @@ mod tests {
         assert!(
             canonical_raft_voter_peer(&mismatched, prefix).is_none(),
             "the roster entry must itself derive the claimed compact slot"
+        );
+    }
+
+    #[test]
+    fn ambiguous_promotion_selects_the_new_authenticated_leader() {
+        let first = libp2p::PeerId::random();
+        let first_prefix = vos::network::derive_node_prefix(&first);
+        let second = loop {
+            let candidate = libp2p::PeerId::random();
+            if vos::network::derive_node_prefix(&candidate) != first_prefix {
+                break candidate;
+            }
+        };
+        let second_prefix = vos::network::derive_node_prefix(&second);
+        let roster = vec![
+            (first_prefix, first.to_bytes()),
+            (second_prefix, second.to_bytes()),
+        ];
+        let observations = vec![
+            (
+                first_prefix,
+                RaftStatusReply {
+                    present: true,
+                    role: RaftRole::Follower,
+                    current_term: 7,
+                    commit_index: 11,
+                    last_applied: 11,
+                    last_log_index: 11,
+                    members: vec![first_prefix, second_prefix],
+                    joint_old: None,
+                    leader_hint: Some(first_prefix),
+                },
+            ),
+            (
+                second_prefix,
+                RaftStatusReply {
+                    present: true,
+                    role: RaftRole::Leader,
+                    current_term: 8,
+                    commit_index: 12,
+                    last_applied: 12,
+                    last_log_index: 12,
+                    members: vec![first_prefix, second_prefix],
+                    joint_old: None,
+                    leader_hint: Some(second_prefix),
+                },
+            ),
+        ];
+
+        assert_eq!(
+            select_authenticated_raft_leader(observations, &roster),
+            Some(second_prefix),
+            "a failed original leader cannot pin an ambiguous prepared join"
         );
     }
 
