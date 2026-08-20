@@ -342,6 +342,7 @@ impl WorkerHandle {
             last_applied,
             last_log_index: snap.last_log_index,
             members: snap.members,
+            joint_old: snap.joint_old,
             leader_hint: snap.leader_hint,
         }
     }
@@ -735,6 +736,53 @@ mod tests {
             h.local_status().is_none(),
             "a stopped worker must invalidate the last published status"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn status_preserves_old_voters_during_joint_consensus() {
+        let (db, dir) = temp_db();
+        let old_leader = 0xA001;
+        let retained = 0xB002;
+        let peer = 0xC003;
+        let worker = RaftWorker::spawn(
+            db,
+            WorkerConfig {
+                me: retained,
+                members: alloc::vec![old_leader, retained, peer],
+                ..cfg(retained)
+            },
+            None,
+            None,
+        );
+        let h = worker.handler();
+        let response = h.append_entries(
+            &[0xC0; 32],
+            old_leader,
+            4,
+            0,
+            0,
+            0,
+            alloc::vec![RaftEntry::config_change(
+                4,
+                Some(alloc::vec![old_leader, retained, peer]),
+                alloc::vec![retained, peer],
+            )],
+        );
+        assert!(response.success);
+
+        let status = h.local_status().expect("running worker publishes status");
+        assert_eq!(status.members, alloc::vec![retained, peer]);
+        assert_eq!(
+            status.joint_old,
+            Some(alloc::vec![old_leader, retained, peer])
+        );
+        assert!(
+            status.is_active_voter(old_leader),
+            "the old-only leader remains authorized until the final config commits"
+        );
+
+        worker.shutdown();
         let _ = std::fs::remove_dir_all(dir);
     }
 

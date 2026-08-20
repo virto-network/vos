@@ -2724,7 +2724,7 @@ impl NodeService {
             return false;
         };
         let prefix = crate::network::derive_node_prefix(caller);
-        status.members.contains(&prefix)
+        status.is_active_voter(prefix)
             && self
                 .lookup_node_member(prefix)
                 .is_some_and(|member| node_member_authenticates_voter(&member, prefix, caller))
@@ -2898,7 +2898,7 @@ fn authenticated_v2_raft_leader_peer(
 ) -> Option<libp2p::PeerId> {
     if !status.present
         || status.leader_hint != Some(leader_prefix)
-        || !status.members.contains(&leader_prefix)
+        || !status.is_active_voter(leader_prefix)
     {
         return None;
     }
@@ -3496,8 +3496,8 @@ impl crate::network::NetworkService for NodeService {
         let prefix = crate::network::derive_node_prefix(&peer);
         if !status.present
             || status.leader_hint != Some(prefix)
-            || !status.members.contains(&prefix)
-            || !status.members.contains(&local_prefix)
+            || !status.is_active_voter(prefix)
+            || !status.is_active_voter(local_prefix)
         {
             return false;
         }
@@ -3538,7 +3538,7 @@ impl crate::network::NetworkService for NodeService {
             .lock()
             .ok()
             .and_then(|network| network.as_ref()?.local_raft_status_cached(replication_id))?;
-        if !status.present || !status.members.contains(&prefix) {
+        if !status.present || !status.is_active_voter(prefix) {
             return None;
         }
         let member = self.lookup_node_member(prefix)?;
@@ -8102,7 +8102,7 @@ fn raft_route_peer_is_current_leader(
             status.present
                 && status.role == crate::network::RaftRole::Leader
                 && status.leader_hint == Some(prefix)
-                && status.members.contains(&prefix)
+                && status.is_active_voter(prefix)
         })
 }
 
@@ -8180,7 +8180,7 @@ fn resolve_v2_raft_leader_route_before(
         if let Some(prefix) = status.leader_hint {
             push_v2_raft_prefix_candidate(&mut candidates, prefix);
         }
-        for &prefix in &status.members {
+        for prefix in status.active_voters() {
             if candidates.len() >= V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES {
                 break;
             }
@@ -8345,7 +8345,7 @@ fn ranked_v2_raft_leader_observations(
 ) -> Vec<(u16, crate::network::RaftStatusReply)> {
     let mut observations = observations
         .into_iter()
-        .filter(|(reporter, status)| status.present && status.members.contains(reporter))
+        .filter(|(reporter, status)| status.present && status.is_active_voter(*reporter))
         .collect::<Vec<_>>();
     observations.sort_unstable_by_key(|(reporter, status)| {
         let self_reported_leader = status.role == crate::network::RaftRole::Leader
@@ -15568,6 +15568,7 @@ mod tests {
                 last_applied: 12,
                 last_log_index: 12,
                 members: vec![0x2222],
+                joint_old: None,
                 leader_hint: Some(0x2222),
             })
             .unwrap();
@@ -15595,6 +15596,7 @@ mod tests {
             last_applied: 11,
             last_log_index: 11,
             members: vec![0x1111, 0x2222],
+            joint_old: None,
             leader_hint: Some(0x1111),
         };
         let current = crate::network::RaftStatusReply {
@@ -15605,6 +15607,7 @@ mod tests {
             last_applied: 12,
             last_log_index: 12,
             members: vec![0x1111, 0x2222],
+            joint_old: None,
             leader_hint: Some(0x2222),
         };
         let ranked = ranked_v2_raft_leader_observations(vec![(0x1111, stale), (0x2222, current)]);
@@ -15726,6 +15729,7 @@ mod tests {
                 last_applied: 19,
                 last_log_index: 19,
                 members: vec![follower_prefix, leader_prefix],
+                joint_old: None,
                 leader_hint: Some(leader_prefix),
             },
         )];
@@ -15989,6 +15993,7 @@ mod tests {
                     last_applied: 11,
                     last_log_index: 11,
                     members: self.members.clone(),
+                    joint_old: None,
                     leader_hint: Some(leader),
                 }
             }
@@ -18153,6 +18158,7 @@ mod tests {
             last_applied: 11,
             last_log_index: 11,
             members: vec![prefix],
+            joint_old: None,
             leader_hint: Some(prefix),
         };
         assert_eq!(
@@ -18228,6 +18234,7 @@ mod tests {
                     last_applied: 8,
                     last_log_index: 8,
                     members: vec![self.leader],
+                    joint_old: None,
                     leader_hint: Some(self.leader),
                 }
             }
@@ -18420,6 +18427,7 @@ mod tests {
                     last_applied: 9,
                     last_log_index: 9,
                     members: self.members.clone(),
+                    joint_old: None,
                     leader_hint: Some(self.leader),
                 })
             }
@@ -18864,6 +18872,7 @@ mod tests {
                     last_applied: 1,
                     last_log_index: 1,
                     members: vec![self.voter],
+                    joint_old: None,
                     leader_hint: Some(self.voter),
                 }
             }

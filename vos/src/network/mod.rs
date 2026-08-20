@@ -103,6 +103,10 @@ pub struct RaftStatusReply {
     pub last_applied: u64,
     pub last_log_index: u64,
     pub members: Vec<u16>,
+    /// Prior voter set while a joint configuration is active. Consensus RPCs
+    /// are authorized against `members ∪ joint_old`; an old-only voter can
+    /// still be the leader responsible for committing the final transition.
+    pub joint_old: Option<Vec<u16>>,
     pub leader_hint: Option<u16>,
 }
 
@@ -164,6 +168,26 @@ impl RaftRole {
 }
 
 impl RaftStatusReply {
+    /// Whether `prefix` is a voter in the complete active configuration.
+    pub fn is_active_voter(&self, prefix: u16) -> bool {
+        self.members.contains(&prefix)
+            || self
+                .joint_old
+                .as_ref()
+                .is_some_and(|old| old.contains(&prefix))
+    }
+
+    /// Sorted, deduplicated union of the new and old joint voter sets.
+    pub fn active_voters(&self) -> Vec<u16> {
+        let mut voters = self.members.clone();
+        if let Some(old) = &self.joint_old {
+            voters.extend(old);
+        }
+        voters.sort_unstable();
+        voters.dedup();
+        voters
+    }
+
     /// Construct a "no, I don't host this group" reply.
     pub fn absent() -> Self {
         Self {
@@ -174,6 +198,7 @@ impl RaftStatusReply {
             last_applied: 0,
             last_log_index: 0,
             members: Vec::new(),
+            joint_old: None,
             leader_hint: None,
         }
     }
@@ -591,7 +616,7 @@ fn authenticated_raft_rpc_handler(
     let Some(status) = handler.local_status() else {
         return Err((0, "local worker status unavailable"));
     };
-    if !status.present || !status.members.contains(&claimed_prefix) {
+    if !status.present || !status.is_active_voter(claimed_prefix) {
         return Err((status.current_term, "claimed slot is not a current voter"));
     }
     let expected = registration
@@ -2727,6 +2752,7 @@ fn handle_req_resp(
                                     last_applied: reply.last_applied,
                                     last_log_index: reply.last_log_index,
                                     members: reply.members,
+                                    joint_old: reply.joint_old,
                                     leader_hint: reply.leader_hint,
                                 },
                             ));
@@ -2868,6 +2894,7 @@ fn handle_req_resp(
                             last_applied,
                             last_log_index,
                             members,
+                            joint_old,
                             leader_hint,
                         },
                         Some(OutboundReply::RaftStatus(tx)),
@@ -2880,6 +2907,7 @@ fn handle_req_resp(
                             last_applied,
                             last_log_index,
                             members,
+                            joint_old,
                             leader_hint,
                         });
                     }
@@ -3172,6 +3200,7 @@ mod tests {
                     last_applied: 6,
                     last_log_index: 8,
                     members: vec![0x1111, 0x2222],
+                    joint_old: None,
                     leader_hint: Some(0x2222),
                 })
             }
@@ -4688,6 +4717,7 @@ mod tests {
                     last_applied: 0,
                     last_log_index: 0,
                     members: self.members.clone(),
+                    joint_old: None,
                     leader_hint: None,
                 })
             }
@@ -4938,6 +4968,7 @@ mod tests {
                     last_applied: 0,
                     last_log_index: 0,
                     members: self.members.clone(),
+                    joint_old: None,
                     leader_hint: None,
                 })
             }
@@ -5124,6 +5155,7 @@ mod tests {
                     last_applied: 0,
                     last_log_index: 0,
                     members: self.members.clone(),
+                    joint_old: None,
                     leader_hint: None,
                 })
             }
@@ -5677,6 +5709,55 @@ mod tests {
             }
             if StdInstant::now() >= until {
                 panic!("replicas did not converge within deadline; snaps: {snaps:?}",);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        // Remove the current leader through the real libp2p transport. During
+        // the joint phase that leader is absent from the new `members` set but
+        // remains in `joint_old`; followers must authenticate its final
+        // AppendEntries/Snapshot traffic against the complete union. Rejecting
+        // the old-only leader here leaves the transition permanently joint.
+        let remaining = [prefix_a, prefix_b, prefix_c]
+            .into_iter()
+            .filter(|prefix| *prefix != leader_prefix)
+            .collect::<Vec<_>>();
+        let joint_index = leader_handle
+            .change_membership(remaining.clone())
+            .expect("leader starts self-removal");
+        let until = StdInstant::now() + Duration::from_secs(10);
+        loop {
+            let leader_snapshot = leader_handle.snapshot();
+            let remaining_snapshots = remaining
+                .iter()
+                .map(|prefix| match *prefix {
+                    p if p == prefix_a => w_a.handler().snapshot(),
+                    p if p == prefix_b => w_b.handler().snapshot(),
+                    _ => w_c.handler().snapshot(),
+                })
+                .collect::<Vec<_>>();
+            // The removed node need not receive the final configuration after
+            // it steps down; the retained voters are the authoritative group.
+            // It must stop leading, while every retained voter commits the
+            // final non-joint entry.
+            let finalized = leader_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.role != Role::Leader)
+                && remaining_snapshots.iter().all(|snapshot| {
+                    snapshot.as_ref().is_some_and(|snapshot| {
+                        snapshot.joint_old.is_none()
+                            && snapshot.members == remaining
+                            && snapshot.commit_index >= joint_index.saturating_add(1)
+                    })
+                });
+            if finalized {
+                break;
+            }
+            if StdInstant::now() >= until {
+                panic!(
+                    "leader self-removal did not finalize; leader={leader_snapshot:?}, \
+                     remaining={remaining_snapshots:?}"
+                );
             }
             std::thread::sleep(Duration::from_millis(25));
         }

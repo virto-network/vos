@@ -296,6 +296,7 @@ pub enum Frame {
         last_applied: u64,
         last_log_index: u64,
         members: Vec<u16>,
+        joint_old: Option<Vec<u16>>,
         leader_hint: Option<u16>,
     },
     /// Point-fetch a content-addressed proof blob by its 32-byte
@@ -757,6 +758,7 @@ impl Frame {
                 last_applied,
                 last_log_index,
                 members,
+                joint_old,
                 leader_hint,
             } => {
                 out.push(TAG_RAFT_STATUS_RESP);
@@ -769,6 +771,16 @@ impl Frame {
                 out.extend_from_slice(&(members.len() as u16).to_le_bytes());
                 for m in members {
                     out.extend_from_slice(&m.to_le_bytes());
+                }
+                match joint_old {
+                    Some(old) => {
+                        out.push(1);
+                        out.extend_from_slice(&(old.len() as u16).to_le_bytes());
+                        for member in old {
+                            out.extend_from_slice(&member.to_le_bytes());
+                        }
+                    }
+                    None => out.push(0),
                 }
                 match leader_hint {
                     Some(h) => {
@@ -1127,6 +1139,21 @@ impl Frame {
                 for _ in 0..n {
                     members.push(r.u16()?);
                 }
+                let joint_old = match r.u8()? {
+                    0 => None,
+                    1 => {
+                        let n = r.u16()? as usize;
+                        if n > MAX_RAFT_MEMBERS {
+                            return Err(FrameError::RaftMembersTooMany(n));
+                        }
+                        let mut old = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            old.push(r.u16()?);
+                        }
+                        Some(old)
+                    }
+                    other => return Err(FrameError::BadOption(other)),
+                };
                 let leader_hint = match r.u8()? {
                     0 => None,
                     1 => Some(r.u16()?),
@@ -1140,6 +1167,7 @@ impl Frame {
                     last_applied,
                     last_log_index,
                     members,
+                    joint_old,
                     leader_hint,
                 }
             }
@@ -1599,6 +1627,7 @@ mod tests {
             last_applied: 13,
             last_log_index: 18,
             members: vec![0x1111, 0x2222],
+            joint_old: Some(vec![0x3333]),
             leader_hint: Some(0x2222),
         });
     }

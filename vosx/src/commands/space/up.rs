@@ -1509,7 +1509,11 @@ fn spawn_installed_agents(
             }
             let db_path = raft_db_path_for_row(data_dir, svc_id, &prepared);
             match raft_members_for_row(node, &db_path, &a, local_prefix, &mut boot_grace) {
-                Ok(RaftSeed::Join { leader, known, .. }) if !is_v2 => {
+                Ok(RaftSeed::Join {
+                    leader,
+                    known,
+                    voter_peer_ids,
+                }) if !is_v2 => {
                     let Some(network) = node.network() else {
                         tracing::info!(
                             "agent '{}' (raft) deferred: no network attached",
@@ -1517,7 +1521,14 @@ fn spawn_installed_agents(
                         );
                         continue;
                     };
-                    match join_raft_group(&network, &a, local_prefix, leader, known)? {
+                    match join_raft_group(
+                        &network,
+                        &a,
+                        local_prefix,
+                        leader,
+                        known,
+                        voter_peer_ids,
+                    )? {
                         seed @ RaftSeed::Members { .. } => Some(seed),
                         RaftSeed::Defer(reason) => {
                             tracing::info!("agent '{}' (raft) deferred: {reason}", a.instance_name);
@@ -2389,6 +2400,7 @@ fn register_v2_root_from_row(
                     .network()
                     .ok_or_else(|| anyhow::anyhow!("v2 Raft join requires an attached network"))?;
                 let promotion_name = instance_name.clone();
+                let promotion_voter_peer_ids = voter_peer_ids.clone();
                 let raft_config = make_config(known.clone(), voter_peer_ids);
                 match production_trust {
                     Some(trust) => node
@@ -2409,6 +2421,7 @@ fn register_v2_root_from_row(
                                     local_prefix,
                                     leader,
                                     known,
+                                    promotion_voter_peer_ids,
                                     worker,
                                     shutdown,
                                     Some(policy),
@@ -2439,6 +2452,7 @@ fn register_v2_root_from_row(
                                     local_prefix,
                                     leader,
                                     known,
+                                    promotion_voter_peer_ids,
                                     worker,
                                     shutdown,
                                     None,
@@ -2532,10 +2546,9 @@ fn actor_blob_from_catalog(
         .map_err(|error| anyhow::anyhow!("transpile legacy {instance_name}: {error:?}"))
 }
 
-/// Per-voter wait for a `RaftStatusReq` answer. Probes run on the
-/// router thread (routing paused) against already-connected peers
-/// only, so the worst case per pass is a handful of sub-second
-/// waits on connected-but-slow voters.
+/// Per-voter wait for a `RaftStatusReq` answer. Probes run on the router
+/// thread (routing paused) against exact registry-authenticated PeerIds, so
+/// the worst case per pass is a handful of sub-second waits.
 const RAFT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
 
 /// Wait for a `RaftJoinReq` answer — the leader appends a joint
@@ -2614,22 +2627,22 @@ fn decide_raft_spawn(
     let live: Vec<&(u16, vos::network::RaftStatusReply)> =
         probes.iter().filter(|(_, r)| r.present).collect();
     for (_, reply) in &live {
-        if reply.members.contains(&local) {
+        if reply.is_active_voter(local) {
             // The group already counts us as a member (a wiped db
             // rejoining): spawn and let the leader catch us up.
-            return RaftPlan::Spawn(reply.members.clone());
+            return RaftPlan::Spawn(reply.active_voters());
         }
     }
     if let Some((v, reply)) = live.iter().find(|(_, r)| r.role == RaftRole::Leader) {
         return RaftPlan::Join {
             leader: *v,
-            known: reply.members.clone(),
+            known: reply.active_voters(),
         };
     }
     if let Some((_, reply)) = live.iter().find(|(_, r)| r.leader_hint.is_some()) {
         return RaftPlan::Join {
             leader: reply.leader_hint.expect("filtered on is_some"),
-            known: reply.members.clone(),
+            known: reply.active_voters(),
         };
     }
     if !live.is_empty() {
@@ -2681,6 +2694,20 @@ enum RaftSeed {
 /// set. Entries are removed when the row spawns or the decision
 /// changes away from bootstrap.
 type BootGrace = std::collections::HashMap<(String, [u8; 32]), u32>;
+
+/// Resolve one compact voter slot through the canonical registry roster.
+/// Onboarding must never consult the global Hello prefix map: collisions are
+/// expected in 16 bits and its first owner is not an identity assertion.
+fn canonical_raft_voter_peer(
+    voter_peer_ids: &[(u16, Vec<u8>)],
+    prefix: u16,
+) -> Option<libp2p::PeerId> {
+    let bytes = voter_peer_ids
+        .iter()
+        .find_map(|(candidate, bytes)| (*candidate == prefix).then_some(bytes))?;
+    let peer = libp2p::PeerId::from_bytes(bytes).ok()?;
+    (vos::network::derive_node_prefix(&peer) == prefix).then_some(peer)
+}
 
 /// Run the membership protocol for one raft row: read the voter
 /// set, probe connected voters for the group, join a live group
@@ -2742,16 +2769,9 @@ fn raft_members_for_row(
             .filter(|&&v| v != local_prefix)
             .take(MAX_RAFT_PROBES)
         {
-            let Some(peer) = net.peer_for_prefix(v) else {
-                continue; // not connected — can't confirm anything about it
+            let Some(peer) = canonical_raft_voter_peer(&voter_peer_ids, v) else {
+                continue;
             };
-            let canonical = voter_peer_ids
-                .iter()
-                .find_map(|(prefix, bytes)| (*prefix == v).then_some(bytes))
-                .and_then(|bytes| libp2p::PeerId::from_bytes(bytes).ok());
-            if canonical != Some(peer) {
-                continue; // a lossy-prefix collision is not a voter probe
-            }
             if let Ok(reply) = net
                 .send_raft_status_req(peer, a.replication_id)
                 .recv_timeout(RAFT_PROBE_TIMEOUT)
@@ -2836,14 +2856,15 @@ fn request_raft_join(
     local_prefix: u16,
     mut leader: u16,
     known: Vec<u16>,
+    voter_peer_ids: &[(u16, Vec<u8>)],
     production_trust_policy: Option<vos::v2::Hash>,
 ) -> anyhow::Result<Result<AcceptedRaftJoin, RejectedRaftJoin>> {
     use vos::network::RaftJoinResult;
 
     for _redirect in 0..2 {
-        let Some(peer) = net.peer_for_prefix(leader) else {
+        let Some(peer) = canonical_raft_voter_peer(voter_peer_ids, leader) else {
             return Ok(Err(RejectedRaftJoin {
-                reason: format!("raft leader {leader:#06x} is not connected"),
+                reason: format!("raft leader {leader:#06x} has no canonical enrolled PeerId"),
                 membership_may_have_changed: false,
             }));
         };
@@ -2859,7 +2880,7 @@ fn request_raft_join(
                     .send_raft_status_req(peer, replication_id)
                     .recv_timeout(RAFT_PROBE_TIMEOUT)
                 {
-                    Ok(st) if st.present && !st.members.is_empty() => st.members,
+                    Ok(st) if st.present && !st.active_voters().is_empty() => st.active_voters(),
                     _ => known,
                 };
                 members.push(local_prefix);
@@ -2940,6 +2961,7 @@ fn join_raft_group(
     local_prefix: u16,
     leader: u16,
     known: Vec<u16>,
+    voter_peer_ids: Vec<(u16, Vec<u8>)>,
 ) -> anyhow::Result<RaftSeed> {
     Ok(
         match request_raft_join(
@@ -2949,11 +2971,12 @@ fn join_raft_group(
             local_prefix,
             leader,
             known,
+            &voter_peer_ids,
             None,
         )? {
             Ok(joined) => RaftSeed::Members {
                 members: joined.members,
-                voter_peer_ids: Vec::new(),
+                voter_peer_ids,
             },
             Err(rejection) => RaftSeed::Defer(rejection.reason),
         },
@@ -2967,6 +2990,7 @@ fn promote_prepared_v2_raft_root(
     local_prefix: u16,
     leader: u16,
     known: Vec<u16>,
+    voter_peer_ids: Vec<(u16, Vec<u8>)>,
     worker: &vos::raft::WorkerHandle,
     shutdown: &std::sync::atomic::AtomicBool,
     production_trust_policy: Option<vos::v2::Hash>,
@@ -2983,6 +3007,7 @@ fn promote_prepared_v2_raft_root(
             local_prefix,
             leader,
             known.clone(),
+            &voter_peer_ids,
             production_trust_policy,
         )
         .map_err(|error| error.to_string())?
@@ -3359,11 +3384,22 @@ fn reconcile_installed_agents(
             }
             let db_path = raft_db_path_for_row(data_dir, svc_id, &prepared);
             match raft_members_for_row(node, &db_path, &a, local_prefix, boot_grace) {
-                Ok(RaftSeed::Join { leader, known, .. }) if !is_v2 => {
+                Ok(RaftSeed::Join {
+                    leader,
+                    known,
+                    voter_peer_ids,
+                }) if !is_v2 => {
                     let Some(network) = node.network() else {
                         continue;
                     };
-                    match join_raft_group(&network, &a, local_prefix, leader, known)? {
+                    match join_raft_group(
+                        &network,
+                        &a,
+                        local_prefix,
+                        leader,
+                        known,
+                        voter_peer_ids,
+                    )? {
                         seed @ RaftSeed::Members { .. } => {
                             damped.remove(&key(RowNote::RaftWaiting));
                             Some(seed)
@@ -4523,6 +4559,7 @@ mod tests {
             last_applied: 1,
             last_log_index: 1,
             members,
+            joint_old: None,
             leader_hint,
         }
     }
@@ -4536,8 +4573,36 @@ mod tests {
             last_applied: 0,
             last_log_index: 0,
             members: Vec::new(),
+            joint_old: None,
             leader_hint: None,
         }
+    }
+
+    #[test]
+    fn raft_onboarding_resolves_the_canonical_full_peer_identity() {
+        let voter = libp2p::PeerId::random();
+        let prefix = vos::network::derive_node_prefix(&voter);
+        let different_peer = loop {
+            let candidate = libp2p::PeerId::random();
+            if vos::network::derive_node_prefix(&candidate) != prefix {
+                break candidate;
+            }
+        };
+        let roster = vec![(prefix, voter.to_bytes())];
+
+        assert_eq!(canonical_raft_voter_peer(&roster, prefix), Some(voter));
+        assert_ne!(
+            canonical_raft_voter_peer(&roster, prefix),
+            Some(different_peer),
+            "ambient prefix ownership cannot replace the enrolled voter"
+        );
+        assert!(canonical_raft_voter_peer(&roster, prefix ^ 1).is_none());
+
+        let mismatched = vec![(prefix, different_peer.to_bytes())];
+        assert!(
+            canonical_raft_voter_peer(&mismatched, prefix).is_none(),
+            "the roster entry must itself derive the claimed compact slot"
+        );
     }
 
     #[test]
