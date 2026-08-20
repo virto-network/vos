@@ -2118,13 +2118,22 @@ const SYNC_FLOOR_TTL: Duration = Duration::from_secs(30);
 impl NodeService {
     #[cfg(feature = "storage")]
     fn target_is_local_v2_raft_root(&self, target: u32, target_unscoped: u32) -> bool {
-        self.v2_actor_routes.read().ok().is_some_and(|routes| {
-            routes.values().any(|route| {
+        self.local_v2_raft_root_route(target, target_unscoped)
+            .is_some()
+    }
+
+    #[cfg(feature = "storage")]
+    fn local_v2_raft_root_route(&self, target: u32, target_unscoped: u32) -> Option<V2ActorRoute> {
+        self.v2_actor_routes
+            .read()
+            .ok()?
+            .values()
+            .find(|route| {
                 route.consistency == crate::v2::ConsistencyModeV2::Raft
                     && route.authenticated_peer.is_none()
                     && (route.route == target || (route.route & 0xFFFF) == target_unscoped)
             })
-        })
+            .cloned()
     }
 
     /// Drive one exact invite through the canonical Raft authority and, only
@@ -2294,7 +2303,7 @@ impl NodeService {
         if let Some(redirect) = decode_v2_raft_redirect(&envelope) {
             let network = self.shared_network.lock().ok()?.clone()?;
             let status = network.local_raft_status(&route.replication_id?)?;
-            return send_v2_authority_invoke_exact(
+            return send_v2_raft_invoke_exact(
                 &network,
                 &self.invoke_routes,
                 route,
@@ -2902,7 +2911,7 @@ fn authenticated_v2_raft_leader_peer(
 /// change is returned here and reauthenticated before another send.
 #[cfg(all(feature = "network", feature = "storage"))]
 #[allow(clippy::too_many_arguments)]
-fn send_v2_authority_invoke_exact(
+fn send_v2_raft_invoke_exact(
     network: &crate::network::Network,
     invoke_routes: &InvokeRoutes,
     route: &V2ActorRoute,
@@ -3070,9 +3079,9 @@ impl crate::network::NetworkService for NodeService {
         // A follower forwarding a local System/Actor call cannot rely on the
         // new Noise hop for identity: that hop authenticates the follower,
         // not the original caller. Accept its delegated origin only from a
-        // current voter of this exact root's Raft group. Ordinary network
-        // redirects do not use this wrapper; the transport reconnects the
-        // original peer directly and the leader derives Member normally.
+        // current voter of this exact root's Raft group. A local follower
+        // proxies that authenticated wrapper to the exact current leader;
+        // ordinary remote callers never get to construct it themselves.
         #[cfg(feature = "storage")]
         let (delegated_origin, preserve_envelope, role_authority_request) =
             match decode_v2_raft_delegation(&msg) {
@@ -3212,6 +3221,10 @@ impl crate::network::NetworkService for NodeService {
         let Some(tx) = tx else {
             return Vec::new().into();
         };
+        #[cfg(feature = "storage")]
+        let raft_redrive = self
+            .local_v2_raft_root_route(to, to_unscoped)
+            .map(|route| (route, msg.clone()));
         let (reply_tx, reply_rx) = mpsc::channel();
         // libp2p noise verified the PeerId at connect time; the
         // multihash bytes are what the registry's grant table
@@ -3333,6 +3346,38 @@ impl crate::network::NetworkService for NodeService {
             Some(env) => {
                 #[cfg(feature = "storage")]
                 if let Some(redirect) = decode_v2_raft_redirect(&env) {
+                    // A one-shot client normally knows only the daemon it
+                    // dialled. Returning a compact leader prefix asks that
+                    // unauthenticated client-side map to discover and trust a
+                    // different peer which it may never have connected to.
+                    // The follower already has the authenticated Raft group
+                    // and canonical NODE roster, so proxy the exact ingress
+                    // while delegating the origin the guest just derived.
+                    if let Some((route, ingress)) = raft_redrive {
+                        let forwarded = self
+                            .shared_network
+                            .lock()
+                            .ok()
+                            .and_then(|network| network.clone())
+                            .and_then(|network| {
+                                let replication_id = route.replication_id?;
+                                let status = network.local_raft_status(&replication_id)?;
+                                let deadline = Instant::now().checked_add(route.invoke_timeout)?;
+                                send_v2_raft_invoke_exact(
+                                    &network,
+                                    &self.invoke_routes,
+                                    &route,
+                                    status,
+                                    redirect.leader_prefix,
+                                    redirect.origin,
+                                    preserve_envelope,
+                                    role_authority_request,
+                                    &ingress,
+                                    deadline,
+                                )
+                            });
+                        return forwarded.unwrap_or_default().into();
+                    }
                     return crate::network::NetworkInvokeResponse::Redirect {
                         leader_prefix: redirect.leader_prefix,
                     };
@@ -8510,7 +8555,7 @@ fn request_v2_role_assertion(
         let network = shared_network.lock().map_err(|_| ())?.clone().ok_or(())?;
         let replication_id = route.replication_id.ok_or(())?;
         let status = network.local_raft_status(&replication_id).ok_or(())?;
-        send_v2_authority_invoke_exact(
+        send_v2_raft_invoke_exact(
             &network,
             invoke_routes,
             &route,

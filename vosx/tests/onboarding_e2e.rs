@@ -108,6 +108,72 @@ fn daemon_peer_id(log: &Path) -> Option<String> {
     })
 }
 
+fn endpoint_prefix(endpoint: &Path) -> u16 {
+    let body = fs::read_to_string(endpoint).expect("read daemon endpoint");
+    let endpoint: toml::Value = toml::from_str(&body).expect("decode daemon endpoint");
+    endpoint["prefix"]
+        .as_integer()
+        .and_then(|prefix| u16::try_from(prefix).ok())
+        .expect("daemon endpoint carries a u16 prefix")
+}
+
+fn endpoint_connect_addr(endpoint: &Path) -> String {
+    let body = fs::read_to_string(endpoint).expect("read daemon endpoint");
+    let endpoint: toml::Value = toml::from_str(&body).expect("decode daemon endpoint");
+    endpoint["multiaddrs"]
+        .as_array()
+        .and_then(|addresses| addresses.first())
+        .and_then(toml::Value::as_str)
+        .expect("daemon endpoint advertises a listen address")
+        .to_owned()
+}
+
+#[derive(Debug)]
+struct TestRaftStatus {
+    present: bool,
+    role: String,
+    leader: Option<u16>,
+    members: Vec<u16>,
+    daemon_prefix: u16,
+    commit_index: u64,
+}
+
+fn production_raft_status(
+    data_home: &Path,
+    config_home: &Path,
+    space: &str,
+    instance: &str,
+) -> Option<TestRaftStatus> {
+    let output = vosx(
+        data_home,
+        config_home,
+        &["--format", "json", "space", "raft-status", space, instance],
+    );
+    if !output.status.success() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    Some(TestRaftStatus {
+        present: value.get("present")?.as_bool()?,
+        role: value.get("role")?.as_str()?.to_owned(),
+        leader: value
+            .get("leader")?
+            .as_u64()
+            .and_then(|prefix| u16::try_from(prefix).ok()),
+        members: value
+            .get("members")?
+            .as_array()?
+            .iter()
+            .map(|member| member.as_u64().and_then(|value| u16::try_from(value).ok()))
+            .collect::<Option<Vec<_>>>()?,
+        daemon_prefix: value
+            .get("daemon_prefix")?
+            .as_u64()
+            .and_then(|prefix| u16::try_from(prefix).ok())?,
+        commit_index: value.get("commit_index")?.as_u64()?,
+    })
+}
+
 /// Run a one-shot `vosx` client command against a config/data home.
 fn vosx(data_home: &Path, config_home: &Path, args: &[&str]) -> Output {
     Command::new(vosx_bin())
@@ -139,6 +205,26 @@ fn spawn_up_with_service_and_trust(
     service_pvm: Option<&Path>,
     production_trust_socket: Option<&Path>,
 ) -> Child {
+    spawn_up_with_service_trust_and_connects(
+        data_home,
+        config_home,
+        arg,
+        log_path,
+        service_pvm,
+        production_trust_socket,
+        &[],
+    )
+}
+
+fn spawn_up_with_service_trust_and_connects(
+    data_home: &Path,
+    config_home: &Path,
+    arg: &str,
+    log_path: &Path,
+    service_pvm: Option<&Path>,
+    production_trust_socket: Option<&Path>,
+    connect: &[&str],
+) -> Child {
     let log_file = fs::File::create(log_path).expect("create log");
     let mut command = Command::new(vosx_bin());
     command.args(["space", "up", arg]);
@@ -147,6 +233,9 @@ fn spawn_up_with_service_and_trust(
     }
     if let Some(path) = production_trust_socket {
         command.arg("--production-trust-socket").arg(path);
+    }
+    for address in connect {
+        command.arg("--connect").arg(address);
     }
     command
         .env("XDG_DATA_HOME", data_home)
@@ -338,6 +427,16 @@ impl TestProductionTrustSidecar {
 
     fn saw(&self, tag: u8) -> bool {
         self.observations.lock().unwrap().tags.contains(&tag)
+    }
+
+    fn tag_count(&self, tag: u8) -> usize {
+        self.observations
+            .lock()
+            .unwrap()
+            .tags
+            .iter()
+            .filter(|observed| **observed == tag)
+            .count()
     }
 
     fn saw_install_for(&self, actor_name: &str, consistency: vos::v2::ConsistencyModeV2) -> bool {
@@ -549,14 +648,18 @@ fn assert_bundled_space_authority_matches_fresh_build(output_dir: &Path) {
 }
 
 fn wait_for_endpoint(data_home: &Path, log_path: &Path, who: &str) -> PathBuf {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // Production restarts open and policy-check each durable root before
+    // publishing the endpoint. A voter hosting both the canonical authority
+    // and an application Raft root can legitimately take longer than the old
+    // 15-second single-root budget on an unoptimized test build.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(p) = find_endpoint(data_home) {
             return p;
         }
         if Instant::now() >= deadline {
             panic!(
-                "daemon {who} didn't write an endpoint within 15s — log:\n{}",
+                "daemon {who} didn't write an endpoint within 30s — log:\n{}",
                 fs::read_to_string(log_path).unwrap_or_default(),
             );
         }
@@ -1849,6 +1952,559 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
             )
         },
     );
+}
+
+#[test]
+fn production_raft_root_survives_voter_join_leader_loss_and_catch_up() {
+    let space = "v2-production-raft-network";
+    let root = "production-raft-cluster-counter";
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let service_pvm = workspace.join("services/vos-service/vos-service.pvm");
+    assert!(
+        service_pvm.is_file(),
+        "build the canonical service first: `just build-vos-service`",
+    );
+
+    let data_a = TempDir::new("production-raft-a-data");
+    let config_a = TempDir::new("production-raft-a-config");
+    let data_b = TempDir::new("production-raft-b-data");
+    let config_b = TempDir::new("production-raft-b-config");
+    let data_c = TempDir::new("production-raft-c-data");
+    let config_c = TempDir::new("production-raft-c-config");
+    let dist = TempDir::new("production-raft-network-dist");
+    let sidecar_dir = TempDir::new("production-raft-sidecars");
+    let package = counter_package_fixture(dist.path());
+    let policy = vos::v2::Hash([0x70; 32]);
+    let trust_a_path = sidecar_dir.path().join("authority-a.sock");
+    let trust_b_path = sidecar_dir.path().join("authority-b.sock");
+    let trust_c_path = sidecar_dir.path().join("authority-c.sock");
+    let trust_a = TestProductionTrustSidecar::start(trust_a_path.clone(), policy);
+    let trust_b = TestProductionTrustSidecar::start(trust_b_path.clone(), policy);
+    let trust_c = TestProductionTrustSidecar::start(trust_c_path.clone(), policy);
+
+    vosx_ok(data_a.path(), config_a.path(), &["space", "new", space]);
+    let log_a = data_a.path().join("production-raft-a.stderr");
+    let mut daemon_a = Some(Daemon(spawn_up_with_service_and_trust(
+        data_a.path(),
+        config_a.path(),
+        space,
+        &log_a,
+        Some(&service_pvm),
+        Some(&trust_a_path),
+    )));
+    let endpoint_a = wait_for_endpoint(data_a.path(), &log_a, "production Raft A");
+    let prefix_a = endpoint_prefix(&endpoint_a);
+
+    vosx_ok(
+        data_a.path(),
+        config_a.path(),
+        &[
+            "space",
+            "publish",
+            space,
+            "onboarding-counter:0.1.0",
+            package.to_str().expect("package path is UTF-8"),
+        ],
+    );
+    vosx_ok(
+        data_a.path(),
+        config_a.path(),
+        &[
+            "space",
+            "install",
+            space,
+            "onboarding-counter:0.1.0",
+            "--name",
+            root,
+            "--consistency",
+            "raft",
+            "--sync",
+            "member",
+        ],
+    );
+    poll_until(
+        40,
+        || {
+            production_raft_status(data_a.path(), config_a.path(), space, root)
+                .is_some_and(|status| status.present && status.role == "leader")
+        },
+        || {
+            format!(
+                "the initial production Raft root did not elect on A; log:\n{}",
+                fs::read_to_string(&log_a).unwrap_or_default(),
+            )
+        },
+    );
+
+    let invite_b = vosx_ok(
+        data_a.path(),
+        config_a.path(),
+        &["space", "invite", space, "--role", "member"],
+    );
+    let token_b = invite_b
+        .lines()
+        .next()
+        .expect("B invite prints its token first")
+        .trim()
+        .to_owned();
+    let log_b = data_b.path().join("production-raft-b.stderr");
+    let mut daemon_b = Some(Daemon(spawn_up_with_service_and_trust(
+        data_b.path(),
+        config_b.path(),
+        &token_b,
+        &log_b,
+        Some(&service_pvm),
+        Some(&trust_b_path),
+    )));
+    let endpoint_b = wait_for_endpoint(data_b.path(), &log_b, "production Raft B");
+    let prefix_b = endpoint_prefix(&endpoint_b);
+    let pending_b = endpoint_b
+        .parent()
+        .expect("B endpoint has a space directory")
+        .join(".pending-invite.token");
+    poll_until(
+        60,
+        || !pending_b.exists(),
+        || {
+            format!(
+                "B did not complete production onboarding; B log:\n{}\nA log:\n{}",
+                fs::read_to_string(&log_b).unwrap_or_default(),
+                fs::read_to_string(&log_a).unwrap_or_default(),
+            )
+        },
+    );
+    let peer_b = daemon_peer_id(&log_b).expect("B startup names its authenticated PeerId");
+    vosx_ok(
+        data_a.path(),
+        config_a.path(),
+        &[
+            "space", "members", space, "add-node", &peer_b, "--role", "voter",
+        ],
+    );
+    poll_until(
+        90,
+        || {
+            production_raft_status(data_b.path(), config_b.path(), space, root).is_some_and(
+                |status| {
+                    status.present
+                        && status.members.len() == 2
+                        && status.members.contains(&prefix_a)
+                        && status.members.contains(&prefix_b)
+                },
+            )
+        },
+        || {
+            format!(
+                "B did not join the production Raft group; B log:\n{}\nA log:\n{}",
+                fs::read_to_string(&log_b).unwrap_or_default(),
+                fs::read_to_string(&log_a).unwrap_or_default(),
+            )
+        },
+    );
+
+    let invite_c = vosx_ok(
+        data_a.path(),
+        config_a.path(),
+        &["space", "invite", space, "--role", "member"],
+    );
+    let token_c = invite_c
+        .lines()
+        .next()
+        .expect("C invite prints its token first")
+        .trim()
+        .to_owned();
+    let log_c = data_c.path().join("production-raft-c.stderr");
+    let mut daemon_c = Some(Daemon(spawn_up_with_service_and_trust(
+        data_c.path(),
+        config_c.path(),
+        &token_c,
+        &log_c,
+        Some(&service_pvm),
+        Some(&trust_c_path),
+    )));
+    let endpoint_c = wait_for_endpoint(data_c.path(), &log_c, "production Raft C");
+    let prefix_c = endpoint_prefix(&endpoint_c);
+    let pending_c = endpoint_c
+        .parent()
+        .expect("C endpoint has a space directory")
+        .join(".pending-invite.token");
+    poll_until(
+        60,
+        || !pending_c.exists(),
+        || {
+            format!(
+                "C did not complete production onboarding; C log:\n{}\nA log:\n{}",
+                fs::read_to_string(&log_c).unwrap_or_default(),
+                fs::read_to_string(&log_a).unwrap_or_default(),
+            )
+        },
+    );
+    let peer_c = daemon_peer_id(&log_c).expect("C startup names its authenticated PeerId");
+    // Membership carries authenticated voter identities, not dial addresses.
+    // The test disables mDNS, so establish the B<->C path explicitly after
+    // canonical invite redemption and before promoting C. Restarting B here
+    // also proves an already-committed production voter can reopen privately
+    // before its route returns.
+    drop(daemon_b.take());
+    let _ = fs::remove_file(&endpoint_b);
+    let c_connect = endpoint_connect_addr(&endpoint_c);
+    daemon_b = Some(Daemon(spawn_up_with_service_trust_and_connects(
+        data_b.path(),
+        config_b.path(),
+        space,
+        &log_b,
+        Some(&service_pvm),
+        Some(&trust_b_path),
+        &[&c_connect],
+    )));
+    let restarted_endpoint_b = wait_for_endpoint(
+        data_b.path(),
+        &log_b,
+        "production Raft B after mesh attachment",
+    );
+    assert_eq!(
+        endpoint_prefix(&restarted_endpoint_b),
+        prefix_b,
+        "restarting a committed voter preserves its authenticated prefix",
+    );
+    vosx_ok(
+        data_a.path(),
+        config_a.path(),
+        &[
+            "space", "members", space, "add-node", &peer_c, "--role", "voter",
+        ],
+    );
+
+    let expected_members = {
+        let mut members = vec![prefix_a, prefix_b, prefix_c];
+        members.sort_unstable();
+        members
+    };
+    poll_until(
+        120,
+        || {
+            [
+                production_raft_status(data_a.path(), config_a.path(), space, root),
+                production_raft_status(data_b.path(), config_b.path(), space, root),
+                production_raft_status(data_c.path(), config_c.path(), space, root),
+            ]
+            .into_iter()
+            .all(|status| {
+                status.is_some_and(|mut status| {
+                    status.members.sort_unstable();
+                    status.present && status.leader.is_some() && status.members == expected_members
+                })
+            })
+        },
+        || {
+            format!(
+                "the three-voter production Raft group did not become steady; \
+                 A log:\n{}\nB log:\n{}\nC log:\n{}",
+                fs::read_to_string(&log_a).unwrap_or_default(),
+                fs::read_to_string(&log_b).unwrap_or_default(),
+                fs::read_to_string(&log_c).unwrap_or_default(),
+            )
+        },
+    );
+    // A log-replaying joiner re-runs Install verification, while a snapshot
+    // joiner authenticates the snapshot's sealed provenance under the exact
+    // production policy. Either path must consult that voter's authority.
+    assert!(
+        trust_b.saw(TestProductionTrustSidecar::QUERY_POLICY),
+        "B did not authenticate the production policy",
+    );
+    assert!(
+        trust_c.saw(TestProductionTrustSidecar::QUERY_POLICY),
+        "C did not authenticate the production policy",
+    );
+
+    let status_a = production_raft_status(data_a.path(), config_a.path(), space, root)
+        .expect("A reports the steady Raft group");
+    let status_b = production_raft_status(data_b.path(), config_b.path(), space, root)
+        .expect("B reports the steady Raft group");
+    let status_c = production_raft_status(data_c.path(), config_c.path(), space, root)
+        .expect("C reports the steady Raft group");
+    assert_eq!(status_a.daemon_prefix, prefix_a);
+    assert_eq!(status_b.daemon_prefix, prefix_b);
+    assert_eq!(status_c.daemon_prefix, prefix_c);
+    assert_eq!(status_a.leader, status_b.leader);
+    assert_eq!(status_a.leader, status_c.leader);
+    let original_leader = status_a.leader.expect("the steady group has a leader");
+    let first_follower = [prefix_a, prefix_b, prefix_c]
+        .into_iter()
+        .find(|prefix| *prefix != original_leader)
+        .expect("a three-voter group has a follower");
+    let slot_baselines = [
+        trust_a.tag_count(TestProductionTrustSidecar::VERIFY_TIMESLOT),
+        trust_b.tag_count(TestProductionTrustSidecar::VERIFY_TIMESLOT),
+        trust_c.tag_count(TestProductionTrustSidecar::VERIFY_TIMESLOT),
+    ];
+
+    let call_on = |prefix: u16, args: &[&str]| -> String {
+        if prefix == prefix_a {
+            vosx_ok(data_a.path(), config_a.path(), args)
+        } else if prefix == prefix_b {
+            vosx_ok(data_b.path(), config_b.path(), args)
+        } else if prefix == prefix_c {
+            vosx_ok(data_c.path(), config_c.path(), args)
+        } else {
+            panic!("unknown test daemon prefix {prefix:#06x}")
+        }
+    };
+    assert_eq!(
+        call_on(
+            first_follower,
+            &["space", "call", space, root, "increment", "by=5",],
+        )
+        .trim(),
+        "U64(5)",
+        "the typed client must follow the production follower redirect",
+    );
+    poll_until(
+        60,
+        || {
+            [prefix_a, prefix_b, prefix_c].into_iter().all(|prefix| {
+                call_on(prefix, &["space", "call", space, root, "value"]).trim() == "U64(5)"
+            })
+        },
+        || "the initial follower-routed mutation did not reach every voter".to_owned(),
+    );
+    assert!(
+        trust_a.tag_count(TestProductionTrustSidecar::VERIFY_TIMESLOT) > slot_baselines[0]
+            && trust_b.tag_count(TestProductionTrustSidecar::VERIFY_TIMESLOT) > slot_baselines[1]
+            && trust_c.tag_count(TestProductionTrustSidecar::VERIFY_TIMESLOT) > slot_baselines[2],
+        "the target mutation must cause fresh historical-slot verification on every voter",
+    );
+
+    if original_leader == prefix_a {
+        drop(daemon_a.take());
+    } else if original_leader == prefix_b {
+        drop(daemon_b.take());
+    } else if original_leader == prefix_c {
+        drop(daemon_c.take());
+    } else {
+        panic!("the elected leader is not one of the enrolled voters");
+    }
+    let survivors: Vec<u16> = [prefix_a, prefix_b, prefix_c]
+        .into_iter()
+        .filter(|prefix| *prefix != original_leader)
+        .collect();
+    poll_until(
+        90,
+        || {
+            let statuses: Vec<TestRaftStatus> = survivors
+                .iter()
+                .filter_map(|prefix| {
+                    if *prefix == prefix_a {
+                        production_raft_status(data_a.path(), config_a.path(), space, root)
+                    } else if *prefix == prefix_b {
+                        production_raft_status(data_b.path(), config_b.path(), space, root)
+                    } else {
+                        production_raft_status(data_c.path(), config_c.path(), space, root)
+                    }
+                })
+                .collect();
+            statuses.len() == 2
+                && statuses.iter().all(|status| status.present)
+                && statuses[0].leader.is_some()
+                && statuses[0].leader == statuses[1].leader
+                && statuses[0].leader != Some(original_leader)
+        },
+        || {
+            format!(
+                "the surviving production voters did not elect after leader loss; \
+                 A log:\n{}\nB log:\n{}\nC log:\n{}",
+                fs::read_to_string(&log_a).unwrap_or_default(),
+                fs::read_to_string(&log_b).unwrap_or_default(),
+                fs::read_to_string(&log_c).unwrap_or_default(),
+            )
+        },
+    );
+    let failover_status = if survivors[0] == prefix_a {
+        production_raft_status(data_a.path(), config_a.path(), space, root)
+    } else if survivors[0] == prefix_b {
+        production_raft_status(data_b.path(), config_b.path(), space, root)
+    } else {
+        production_raft_status(data_c.path(), config_c.path(), space, root)
+    }
+    .expect("a surviving voter reports the replacement leader");
+    let replacement_leader = failover_status
+        .leader
+        .expect("the surviving quorum elected a replacement leader");
+    let failover_follower = survivors
+        .iter()
+        .copied()
+        .find(|prefix| *prefix != replacement_leader)
+        .expect("the surviving quorum includes a follower");
+    assert_eq!(
+        call_on(
+            failover_follower,
+            &["space", "call", space, root, "increment", "by=7",],
+        )
+        .trim(),
+        "U64(12)",
+        "a follower redirect must survive production leadership transfer",
+    );
+    poll_until(
+        60,
+        || {
+            survivors.iter().all(|prefix| {
+                call_on(*prefix, &["space", "call", space, root, "value"]).trim() == "U64(12)"
+            })
+        },
+        || "the post-failover mutation did not reach the surviving quorum".to_owned(),
+    );
+    let committed_after_failover = survivors
+        .iter()
+        .filter_map(|prefix| {
+            if *prefix == prefix_a {
+                production_raft_status(data_a.path(), config_a.path(), space, root)
+            } else if *prefix == prefix_b {
+                production_raft_status(data_b.path(), config_b.path(), space, root)
+            } else {
+                production_raft_status(data_c.path(), config_c.path(), space, root)
+            }
+        })
+        .map(|status| status.commit_index)
+        .max()
+        .expect("the surviving quorum reports a commit index");
+
+    let (retired_data, retired_config, retired_trust, retired_log) = if original_leader == prefix_a
+    {
+        (data_a.path(), config_a.path(), &trust_a_path, &log_a)
+    } else if original_leader == prefix_b {
+        (data_b.path(), config_b.path(), &trust_b_path, &log_b)
+    } else {
+        (data_c.path(), config_c.path(), &trust_c_path, &log_c)
+    };
+    let retired_slot_baseline = if original_leader == prefix_a {
+        trust_a.tag_count(TestProductionTrustSidecar::VERIFY_TIMESLOT)
+    } else if original_leader == prefix_b {
+        trust_b.tag_count(TestProductionTrustSidecar::VERIFY_TIMESLOT)
+    } else {
+        trust_c.tag_count(TestProductionTrustSidecar::VERIFY_TIMESLOT)
+    };
+    if let Some(endpoint) = find_endpoint(retired_data) {
+        let _ = fs::remove_file(endpoint);
+    }
+    // Discovery is deliberately disabled in this gate, so restore the retired
+    // voter with explicit addresses for both live peers. That lets it catch up
+    // from either voter and follow the current leader without smuggling an
+    // automatic-discovery assumption into the Raft recovery assertion.
+    let recovery_connects = survivors
+        .iter()
+        .map(|prefix| {
+            if *prefix == prefix_a {
+                endpoint_connect_addr(&endpoint_a)
+            } else if *prefix == prefix_b {
+                endpoint_connect_addr(&endpoint_b)
+            } else {
+                endpoint_connect_addr(&endpoint_c)
+            }
+        })
+        .collect::<Vec<_>>();
+    let recovery_connect_refs = recovery_connects
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let restart_log = retired_data.join("production-raft-restarted-leader.stderr");
+    let restarted_old_leader = Daemon(spawn_up_with_service_trust_and_connects(
+        retired_data,
+        retired_config,
+        space,
+        &restart_log,
+        Some(&service_pvm),
+        Some(retired_trust),
+        &recovery_connect_refs,
+    ));
+    wait_for_endpoint(
+        retired_data,
+        &restart_log,
+        "restarted production Raft voter",
+    );
+    poll_until(
+        90,
+        || {
+            production_raft_status(retired_data, retired_config, space, root).is_some_and(
+                |status| {
+                    status.present
+                        && status.members.len() == 3
+                        && status.commit_index >= committed_after_failover
+                },
+            )
+        },
+        || {
+            format!(
+                "the restarted voter did not catch up through its production policy; \
+                 restart log:\n{}\nold log:\n{}",
+                fs::read_to_string(&restart_log).unwrap_or_default(),
+                fs::read_to_string(retired_log).unwrap_or_default(),
+            )
+        },
+    );
+    poll_until(
+        90,
+        || {
+            let output = vosx(
+                retired_data,
+                retired_config,
+                &["space", "call", space, root, "value"],
+            );
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "U64(12)"
+        },
+        || {
+            format!(
+                "the restarted voter did not attach the caught-up root; restart log:\n{}",
+                fs::read_to_string(&restart_log).unwrap_or_default(),
+            )
+        },
+    );
+    let retired_slot_count = if original_leader == prefix_a {
+        trust_a.tag_count(TestProductionTrustSidecar::VERIFY_TIMESLOT)
+    } else if original_leader == prefix_b {
+        trust_b.tag_count(TestProductionTrustSidecar::VERIFY_TIMESLOT)
+    } else {
+        trust_c.tag_count(TestProductionTrustSidecar::VERIFY_TIMESLOT)
+    };
+    assert!(
+        retired_slot_count > retired_slot_baseline,
+        "the restarted voter must verify the target's post-failover slot history",
+    );
+
+    // Keep the restarted old leader and the other survivor alive, but remove
+    // the replacement leader. A second election demonstrates that the caught-
+    // up voter is an active quorum participant rather than a read-only route.
+    if replacement_leader == prefix_a {
+        drop(daemon_a.take());
+    } else if replacement_leader == prefix_b {
+        drop(daemon_b.take());
+    } else if replacement_leader == prefix_c {
+        drop(daemon_c.take());
+    }
+    let final_survivor = survivors
+        .iter()
+        .copied()
+        .find(|prefix| *prefix != replacement_leader)
+        .expect("one original follower remains beside the restarted voter");
+    poll_until(
+        90,
+        || {
+            production_raft_status(retired_data, retired_config, space, root)
+                .and_then(|status| status.leader)
+                .is_some_and(|leader| leader != replacement_leader)
+        },
+        || "the quorum including the restarted voter did not elect again".to_owned(),
+    );
+    assert_eq!(
+        call_on(
+            final_survivor,
+            &["space", "call", space, root, "increment", "by=3",],
+        )
+        .trim(),
+        "U64(15)",
+        "the quorum containing the restarted voter must keep accepting work",
+    );
+    drop(restarted_old_leader);
 }
 
 /// Run a `vosx` command and assert it succeeded, returning stdout.

@@ -769,10 +769,21 @@ independently connected production daemons, redeems and explicitly enrolls the
 second node as a CRDT observer, and mutates the same signed CRDT root in both
 directions. Each receiver independently submits the synchronized root's exact
 receipt-verification input to its authority before accepting the causal delta;
-the second replica then restarts from disk and recovers the converged value.
-The gate also rebuilds `space-authority` and requires byte identity with the
-PVM bundled by `vosx`, so onboarding cannot silently execute an actor compiled
-against a retired runtime contract.
+the second replica then restarts from disk and recovers the converged value. A
+three-daemon Raft gate explicitly promotes two fresh voters under the same
+production policy, submits work through a follower, removes the current
+leader, and requires the surviving quorum to elect and commit. It then reopens
+the retired voter from disk, proves catch-up to the post-failover value, removes
+the replacement leader, and commits again with the restarted voter in the
+quorum. Peer discovery is disabled in that test and voter addresses are
+explicit, so it exercises authenticated full-PeerId forwarding without
+claiming that automatic topology discovery has landed. Snapshot joiners verify
+the sealed production provenance and exact policy; log replay independently
+re-runs historical checks. Every voter must observe historical JAM-slot
+verification before the gate completes. The gate also rebuilds
+`space-authority` and requires byte identity with the PVM bundled by `vosx`, so
+onboarding cannot silently execute an actor compiled against a retired runtime
+contract.
 
 The request kind values in that order are `0..=7`. Response values are
 `0=Authorized`, `1=Denied`, `2=Unavailable`, `3=no-current-slot`,
