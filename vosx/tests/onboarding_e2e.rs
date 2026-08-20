@@ -369,13 +369,27 @@ impl TestProductionTrustSidecar {
         else {
             return Vec::new();
         };
-        observations
-            .receipts
-            .iter()
-            .filter(|request| {
-                request.receipt.service == *service && request.receipt.consistency == consistency
-            })
-            .map(vos::v2::ReceiptVerificationRequestV2::hash)
+        let mut digests = Vec::new();
+        for request in observations.receipts.iter().filter(|request| {
+            request.receipt.service == *service && request.receipt.consistency == consistency
+        }) {
+            let digest = request.hash();
+            if !digests.contains(&digest) {
+                digests.push(digest);
+            }
+        }
+        digests
+    }
+
+    fn new_receipt_digests_since(
+        &self,
+        actor_name: &str,
+        consistency: vos::v2::ConsistencyModeV2,
+        baseline: &[vos::v2::Hash],
+    ) -> Vec<vos::v2::Hash> {
+        self.receipt_digests_for(actor_name, consistency)
+            .into_iter()
+            .filter(|digest| !baseline.contains(digest))
             .collect()
     }
 
@@ -408,6 +422,21 @@ impl TestProductionTrustSidecar {
             .max_by_key(|(sequence, _)| *sequence)
             .map(|(_, digest)| digest)
     }
+}
+
+fn combined_receipt_digests_for(
+    left: &TestProductionTrustSidecar,
+    right: &TestProductionTrustSidecar,
+    actor_name: &str,
+    consistency: vos::v2::ConsistencyModeV2,
+) -> Vec<vos::v2::Hash> {
+    let mut digests = left.receipt_digests_for(actor_name, consistency);
+    for digest in right.receipt_digests_for(actor_name, consistency) {
+        if !digests.contains(&digest) {
+            digests.push(digest);
+        }
+    }
+    digests
 }
 
 impl Drop for TestProductionTrustSidecar {
@@ -1573,10 +1602,34 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
         },
     );
 
-    let mut receipts_before_a_mutation =
-        trust_a.receipt_digests_for("production-crdt-counter", vos::v2::ConsistencyModeV2::Crdt);
-    receipts_before_a_mutation.extend(
-        trust_b.receipt_digests_for("production-crdt-counter", vos::v2::ConsistencyModeV2::Crdt),
+    // Each successful readiness call commits an ingress change and its Apply
+    // change. Wait until all four exact receipts have crossed the wire before
+    // taking the mutation baseline; otherwise a later echo could masquerade
+    // as `inc`.
+    poll_until(
+        60,
+        || {
+            combined_receipt_digests_for(
+                &trust_a,
+                &trust_b,
+                "production-crdt-counter",
+                vos::v2::ConsistencyModeV2::Crdt,
+            )
+            .len()
+                >= 4
+        },
+        || "the initial A and B readiness receipts did not fully synchronize".to_owned(),
+    );
+    let receipts_before_a_mutation = combined_receipt_digests_for(
+        &trust_a,
+        &trust_b,
+        "production-crdt-counter",
+        vos::v2::ConsistencyModeV2::Crdt,
+    );
+    assert_eq!(
+        receipts_before_a_mutation.len(),
+        4,
+        "only the two readiness invocations precede the A mutation baseline",
     );
     assert_eq!(
         vosx_ok(
@@ -1591,15 +1644,23 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
         60,
         || {
             trust_b
-                .newest_receipt_digest_since(
+                .new_receipt_digests_since(
                     "production-crdt-counter",
                     vos::v2::ConsistencyModeV2::Crdt,
                     &receipts_before_a_mutation,
                 )
-                .is_some()
+                .len()
+                >= 2
         },
         || "B did not independently verify a new receipt for A's counter mutation".to_owned(),
     );
+    let receipts_before_b_state_reads = combined_receipt_digests_for(
+        &trust_a,
+        &trust_b,
+        "production-crdt-counter",
+        vos::v2::ConsistencyModeV2::Crdt,
+    );
+    let mut successful_b_state_reads = 0_usize;
     poll_until(
         60,
         || {
@@ -1608,6 +1669,9 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
                 config_b.path(),
                 &["space", "call", space, "production-crdt-counter", "get"],
             );
+            if output.status.success() {
+                successful_b_state_reads += 1;
+            }
             output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "U64(1)"
         },
         || {
@@ -1618,20 +1682,64 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
             )
         },
     );
-    // `inc` is the last source-side operation before the receiver reaches 1,
-    // so the highest-sequence receipt not present at either authority's
-    // baseline is the exact tested mutation, rather than an echoed receipt.
+    assert!(
+        successful_b_state_reads > 0,
+        "observing the converged state performs at least one B-side read",
+    );
+    let a_mutation_receipts = trust_b.new_receipt_digests_since(
+        "production-crdt-counter",
+        vos::v2::ConsistencyModeV2::Crdt,
+        &receipts_before_a_mutation,
+    );
+    assert_eq!(
+        a_mutation_receipts.len(),
+        2,
+        "A's inc contributes exactly its admitted-ingress and Apply receipts",
+    );
+    // Quiescence above rules out concurrent unaccounted branches. Within the
+    // one invocation, Apply causally follows admission, so its higher sequence
+    // identifies the exact mutation receipt without relying on a global CRDT
+    // height tie-break.
     let a_mutation_receipt = trust_b
         .newest_receipt_digest_since(
             "production-crdt-counter",
             vos::v2::ConsistencyModeV2::Crdt,
             &receipts_before_a_mutation,
         )
-        .expect("B retained the exact newly verified A mutation receipt");
-    let mut receipts_before_b_mutation =
-        trust_a.receipt_digests_for("production-crdt-counter", vos::v2::ConsistencyModeV2::Crdt);
-    receipts_before_b_mutation.extend(
-        trust_b.receipt_digests_for("production-crdt-counter", vos::v2::ConsistencyModeV2::Crdt),
+        .expect("B retained A's exact newly verified mutation receipt");
+    let expected_b_state_receipts = successful_b_state_reads
+        .checked_mul(2)
+        .expect("state-read receipt count is bounded by the poll deadline");
+    poll_until(
+        60,
+        || {
+            trust_a
+                .new_receipt_digests_since(
+                    "production-crdt-counter",
+                    vos::v2::ConsistencyModeV2::Crdt,
+                    &receipts_before_b_state_reads,
+                )
+                .len()
+                >= expected_b_state_receipts
+        },
+        || "A did not account for every B-side state read before the next baseline".to_owned(),
+    );
+    assert_eq!(
+        trust_a
+            .new_receipt_digests_since(
+                "production-crdt-counter",
+                vos::v2::ConsistencyModeV2::Crdt,
+                &receipts_before_b_state_reads,
+            )
+            .len(),
+        expected_b_state_receipts,
+        "only the counted B-side state reads occur between mutation baselines",
+    );
+    let receipts_before_b_mutation = combined_receipt_digests_for(
+        &trust_a,
+        &trust_b,
+        "production-crdt-counter",
+        vos::v2::ConsistencyModeV2::Crdt,
     );
     assert_eq!(
         vosx_ok(
@@ -1646,12 +1754,13 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
         60,
         || {
             trust_a
-                .newest_receipt_digest_since(
+                .new_receipt_digests_since(
                     "production-crdt-counter",
                     vos::v2::ConsistencyModeV2::Crdt,
                     &receipts_before_b_mutation,
                 )
-                .is_some()
+                .len()
+                >= 2
         },
         || "A did not independently verify a new receipt for B's counter mutation".to_owned(),
     );
@@ -1673,13 +1782,24 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
             )
         },
     );
+    assert_eq!(
+        trust_a
+            .new_receipt_digests_since(
+                "production-crdt-counter",
+                vos::v2::ConsistencyModeV2::Crdt,
+                &receipts_before_b_mutation,
+            )
+            .len(),
+        2,
+        "B's inc contributes exactly its admitted-ingress and Apply receipts",
+    );
     let b_mutation_receipt = trust_a
         .newest_receipt_digest_since(
             "production-crdt-counter",
             vos::v2::ConsistencyModeV2::Crdt,
             &receipts_before_b_mutation,
         )
-        .expect("A retained the exact newly verified B mutation receipt");
+        .expect("A retained B's exact newly verified mutation receipt");
     assert_ne!(
         a_mutation_receipt, b_mutation_receipt,
         "the two independently verified mutations must have distinct receipt digests",
