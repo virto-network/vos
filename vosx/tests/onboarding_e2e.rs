@@ -2103,6 +2103,7 @@ fn production_raft_root_survives_voter_join_leader_loss_and_catch_up() {
                         && status.members.len() == 2
                         && status.members.contains(&prefix_a)
                         && status.members.contains(&prefix_b)
+                        && status.joint_old.is_none()
                 },
             )
         },

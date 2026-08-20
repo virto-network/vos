@@ -2923,7 +2923,6 @@ fn raft_members_for_row(
 /// votes until the log catches up) and fall back to the probed
 /// `known` view when the re-probe fails.
 struct AcceptedRaftJoin {
-    joint_index: u64,
     members: Vec<u16>,
 }
 
@@ -2961,7 +2960,7 @@ fn request_raft_join(
             production_trust_policy.map(|policy| policy.0),
         );
         match rx.recv_timeout(RAFT_JOIN_TIMEOUT) {
-            Ok(RaftJoinResult::Accepted { joint_index }) => {
+            Ok(RaftJoinResult::Accepted { joint_index: _ }) => {
                 let mut members = match net
                     .send_raft_status_req(peer, replication_id)
                     .recv_timeout(RAFT_PROBE_TIMEOUT)
@@ -2977,10 +2976,7 @@ fn request_raft_join(
                     instance_name,
                     members.len(),
                 );
-                return Ok(Ok(AcceptedRaftJoin {
-                    joint_index,
-                    members,
-                }));
+                return Ok(Ok(AcceptedRaftJoin { members }));
             }
             Ok(RaftJoinResult::NotLeader {
                 leader_hint: Some(h),
@@ -3083,7 +3079,7 @@ fn promote_prepared_v2_raft_root(
 ) -> Result<(), String> {
     let mut membership_may_have_changed = false;
     let mut discovery_cursor = 0;
-    let accepted = loop {
+    loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("node shut down while Raft voter promotion was pending".into());
         }
@@ -3120,7 +3116,16 @@ fn promote_prepared_v2_raft_root(
         )
         .map_err(|error| error.to_string())?
         {
-            Ok(accepted) => break accepted,
+            Ok(_accepted) => {
+                // Accepted means the leader appended the joint entry; it does
+                // not mean that entry reached either quorum. Treat the result
+                // as ambiguous until this worker observes a committed final
+                // configuration. If the accepting leader dies first, the
+                // next iteration rediscovers a surviving canonical voter and
+                // repeats the idempotent join against its replacement.
+                membership_may_have_changed = true;
+                wait_for_raft_promotion_retry(shutdown, RAFT_PROBE_TIMEOUT)?;
+            }
             Err(rejection)
                 if !membership_may_have_changed && !rejection.membership_may_have_changed =>
             {
@@ -3144,21 +3149,6 @@ fn promote_prepared_v2_raft_root(
                 wait_for_raft_promotion_retry(shutdown, RAFT_PROBE_TIMEOUT)?;
             }
         }
-    };
-    loop {
-        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err("node shut down before Raft voter promotion finalized".into());
-        }
-        if let Some(snapshot) = worker.snapshot()
-            && committed_final_membership_contains(&snapshot, local_prefix)
-            && snapshot.commit_index >= accepted.joint_index.saturating_add(1)
-        {
-            return Ok(());
-        }
-        // Do not abandon an accepted join: the existing cluster may already
-        // require this worker's vote. Route publication waits here until the
-        // final (non-joint) configuration is locally committed.
-        wait_for_raft_promotion_retry(shutdown, std::time::Duration::from_millis(25))?;
     }
 }
 
