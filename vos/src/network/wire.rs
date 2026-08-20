@@ -293,6 +293,7 @@ pub enum Frame {
         role: u8, // 0 = Follower, 1 = PreCandidate, 2 = Candidate, 3 = Leader
         current_term: u64,
         commit_index: u64,
+        last_applied: u64,
         last_log_index: u64,
         members: Vec<u16>,
         leader_hint: Option<u16>,
@@ -753,6 +754,7 @@ impl Frame {
                 role,
                 current_term,
                 commit_index,
+                last_applied,
                 last_log_index,
                 members,
                 leader_hint,
@@ -762,6 +764,7 @@ impl Frame {
                 out.push(*role);
                 out.extend_from_slice(&current_term.to_le_bytes());
                 out.extend_from_slice(&commit_index.to_le_bytes());
+                out.extend_from_slice(&last_applied.to_le_bytes());
                 out.extend_from_slice(&last_log_index.to_le_bytes());
                 out.extend_from_slice(&(members.len() as u16).to_le_bytes());
                 for m in members {
@@ -1114,6 +1117,7 @@ impl Frame {
                 let role = r.u8()?;
                 let current_term = r.u64()?;
                 let commit_index = r.u64()?;
+                let last_applied = r.u64()?;
                 let last_log_index = r.u64()?;
                 let n = r.u16()? as usize;
                 if n > MAX_RAFT_MEMBERS {
@@ -1133,6 +1137,7 @@ impl Frame {
                     role,
                     current_term,
                     commit_index,
+                    last_applied,
                     last_log_index,
                     members,
                     leader_hint,
@@ -1583,6 +1588,20 @@ mod tests {
     }
 
     // ── Raft frames ─────────────────────────────────────────────
+
+    #[test]
+    fn raft_status_roundtrip_preserves_distinct_applied_cursor() {
+        roundtrip(Frame::RaftStatusResp {
+            present: true,
+            role: 0,
+            current_term: 9,
+            commit_index: 17,
+            last_applied: 13,
+            last_log_index: 18,
+            members: vec![0x1111, 0x2222],
+            leader_hint: Some(0x2222),
+        });
+    }
 
     #[test]
     fn raft_append_req_roundtrip_empty_entries_is_heartbeat() {

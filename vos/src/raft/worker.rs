@@ -22,7 +22,7 @@
 //! itself; the tests here verify the integration between vos's
 //! [`RaftRpcHandler`] trait, [`RedbStorage`], and the generic core.
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use std::sync::mpsc as std_mpsc;
 
@@ -35,6 +35,7 @@ use crate::network::{
     RaftRole, RaftRpcHandler, RaftStatusReply, RaftVoteResult,
 };
 
+use super::RaftMeta;
 use super::redb_storage::RedbStorage;
 use super::vos_transport::VosTransport;
 
@@ -238,6 +239,7 @@ impl From<vos_raft::WorkerSnapshot<u16>> for WorkerSnapshot {
 /// [`shutdown`]: Self::shutdown
 pub struct RaftWorker {
     inner: vos_raft::Worker<u16>,
+    db: Weak<Database>,
 }
 
 impl RaftWorker {
@@ -256,6 +258,7 @@ impl RaftWorker {
         network: Option<Arc<Network>>,
         apply_notifier: Option<std_mpsc::Sender<u64>>,
     ) -> Self {
+        let weak_db = Arc::downgrade(&db);
         let storage = RedbStorage::open(db).expect("open RedbStorage");
         let rep_id = cfg.replication_id;
         let raft_cfg = cfg.into_raft();
@@ -274,7 +277,7 @@ impl RaftWorker {
                 vos_raft::Worker::spawn(storage, transport, raft_cfg, apply_notifier)
             }
         };
-        Self { inner }
+        Self { inner, db: weak_db }
     }
 
     /// Cheap clone-able handle that implements [`RaftRpcHandler`].
@@ -283,6 +286,7 @@ impl RaftWorker {
     pub fn handler(&self) -> WorkerHandle {
         WorkerHandle {
             inner: self.inner.handler(),
+            db: self.db.clone(),
         }
     }
 
@@ -303,6 +307,7 @@ impl RaftWorker {
 #[derive(Clone)]
 pub struct WorkerHandle {
     inner: vos_raft::WorkerHandle<u16>,
+    db: Weak<Database>,
 }
 
 impl WorkerHandle {
@@ -319,7 +324,10 @@ impl WorkerHandle {
         block_on(self.inner.snapshot()).map(WorkerSnapshot::from)
     }
 
-    fn status_from_snapshot(snap: vos_raft::WorkerSnapshot<u16>) -> RaftStatusReply {
+    fn status_from_snapshot(
+        snap: vos_raft::WorkerSnapshot<u16>,
+        last_applied: u64,
+    ) -> RaftStatusReply {
         let role = match snap.role {
             vos_raft::Role::Follower => RaftRole::Follower,
             vos_raft::Role::PreCandidate => RaftRole::PreCandidate,
@@ -331,6 +339,7 @@ impl WorkerHandle {
             role,
             current_term: snap.current_term,
             commit_index: snap.commit_index,
+            last_applied,
             last_log_index: snap.last_log_index,
             members: snap.members,
             leader_hint: snap.leader_hint,
@@ -424,7 +433,17 @@ impl WorkerHandle {
 /// has its own dedicated thread to make progress.
 impl RaftRpcHandler for WorkerHandle {
     fn local_status(&self) -> Option<RaftStatusReply> {
-        self.inner.cached_snapshot().map(Self::status_from_snapshot)
+        let snap = self.inner.cached_snapshot()?;
+        let db = self.db.upgrade()?;
+        // The worker publishes its lock-free consensus snapshot separately
+        // from the application's atomic state/cursor transaction. If those
+        // publications cross, retain the Raft invariant in this observation;
+        // the next worker snapshot exposes the full durable cursor.
+        let last_applied = RaftMeta::load(&db)
+            .ok()?
+            .last_applied
+            .min(snap.commit_index);
+        Some(Self::status_from_snapshot(snap, last_applied))
     }
 
     fn append_entries(
@@ -733,6 +752,12 @@ mod tests {
         let resp = h.append_entries(&[0xC0; 32], 0xBBBB, 3, 0, 0, 2, entries);
         assert!(resp.success);
         assert_eq!(resp.match_index, 2);
+        let status = h.local_status().expect("running worker publishes status");
+        assert_eq!(status.commit_index, 2);
+        assert_eq!(
+            status.last_applied, 0,
+            "replication progress must not masquerade as application progress"
+        );
         worker.shutdown();
         let log = RaftLog::open(db.clone()).unwrap();
         assert_eq!(log.last_index(), 2);

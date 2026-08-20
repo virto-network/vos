@@ -136,6 +136,7 @@ struct TestRaftStatus {
     members: Vec<u16>,
     daemon_prefix: u16,
     commit_index: u64,
+    last_applied: u64,
 }
 
 fn production_raft_status(
@@ -171,6 +172,7 @@ fn production_raft_status(
             .as_u64()
             .and_then(|prefix| u16::try_from(prefix).ok())?,
         commit_index: value.get("commit_index")?.as_u64()?,
+        last_applied: value.get("last_applied")?.as_u64()?,
     })
 }
 
@@ -2430,6 +2432,7 @@ fn production_raft_root_survives_voter_join_leader_loss_and_catch_up() {
                     status.present
                         && status.members.len() == 3
                         && status.commit_index >= committed_after_failover
+                        && status.last_applied >= committed_after_failover
                 },
             )
         },

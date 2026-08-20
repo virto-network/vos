@@ -91,15 +91,16 @@ pub struct RaftInstallSnapshotResult {
 
 /// Reply to a [`RaftStatusReq`](Frame::RaftStatusReq) — a peer's
 /// view of one Raft replication group. Mirrors
-/// `vos_raft::WorkerSnapshot` minus the storage cursor that
-/// only matters internally. `present = false` means the peer
-/// isn't running the requested group.
+/// `vos_raft::WorkerSnapshot` plus the application-owned durable applied
+/// cursor. `present = false` means the peer isn't running the requested
+/// group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RaftStatusReply {
     pub present: bool,
     pub role: RaftRole,
     pub current_term: u64,
     pub commit_index: u64,
+    pub last_applied: u64,
     pub last_log_index: u64,
     pub members: Vec<u16>,
     pub leader_hint: Option<u16>,
@@ -170,6 +171,7 @@ impl RaftStatusReply {
             role: RaftRole::Follower,
             current_term: 0,
             commit_index: 0,
+            last_applied: 0,
             last_log_index: 0,
             members: Vec::new(),
             leader_hint: None,
@@ -1335,6 +1337,14 @@ impl Network {
         self.prefix_map.lock().ok()?.get(&prefix).copied()
     }
 
+    /// Model the post-handshake prefix-map state in adversarial unit tests.
+    /// Production callers can only populate this map through authenticated
+    /// Hello processing and its first-owner collision rule.
+    #[cfg(test)]
+    pub(crate) fn set_prefix_owner_for_test(&self, prefix: u16, peer: PeerId) {
+        self.prefix_map.lock().unwrap().insert(prefix, peer);
+    }
+
     /// Snapshot of every peer + its `node_prefix`, in no
     /// particular order. Same population as
     /// [`connected_peers`](Self::connected_peers); useful for
@@ -2480,6 +2490,7 @@ fn handle_req_resp(
                                     role: reply.role.to_wire(),
                                     current_term: reply.current_term,
                                     commit_index: reply.commit_index,
+                                    last_applied: reply.last_applied,
                                     last_log_index: reply.last_log_index,
                                     members: reply.members,
                                     leader_hint: reply.leader_hint,
@@ -2620,6 +2631,7 @@ fn handle_req_resp(
                             role,
                             current_term,
                             commit_index,
+                            last_applied,
                             last_log_index,
                             members,
                             leader_hint,
@@ -2631,6 +2643,7 @@ fn handle_req_resp(
                             role: RaftRole::from_wire(role),
                             current_term,
                             commit_index,
+                            last_applied,
                             last_log_index,
                             members,
                             leader_hint,
@@ -2922,6 +2935,7 @@ mod tests {
                     role: RaftRole::Follower,
                     current_term: 3,
                     commit_index: 7,
+                    last_applied: 6,
                     last_log_index: 8,
                     members: vec![0x1111, 0x2222],
                     leader_hint: Some(0x2222),

@@ -6544,34 +6544,40 @@ impl VosNode {
                 .ok_or(crate::actors::client::ClientError::Unreachable)?;
 
             if proof_requested {
-                let remote_route = route;
                 let local_route = tx.clone();
+                let replication_id = binding.replication_id;
+                let remote_binding = binding.clone();
                 return receive_v2_attested_with_exact_redrive(
                     &ingress_wire,
                     redirect,
                     |redirect, ingress| {
-                        let Some(peer) = network.peer_for_prefix(redirect.leader_prefix) else {
+                        let Some(replication_id) = replication_id else {
                             return V2AttestedRedriveAttempt::NotSent;
                         };
-                        let leader_route = ServiceId::new(
+                        let Some(status) = network.local_raft_status(&replication_id) else {
+                            return V2AttestedRedriveAttempt::NotSent;
+                        };
+                        let Some(deadline) =
+                            Instant::now().checked_add(remote_binding.invoke_timeout)
+                        else {
+                            return V2AttestedRedriveAttempt::NotSent;
+                        };
+                        send_v2_raft_invoke_exact(
+                            &network,
+                            &self.invoke_routes,
+                            &remote_binding,
+                            status,
                             redirect.leader_prefix,
-                            ServiceId(remote_route).local_id(),
-                        );
-                        let delegated =
-                            encode_v2_raft_delegation(redirect.origin, true, false, ingress);
-                        match network
-                            .send_invoke(
-                                peer,
-                                ServiceId::REGISTRY.0,
-                                leader_route.0,
-                                Vec::new(),
-                                delegated,
-                            )
-                            .recv()
-                        {
-                            Ok(envelope) => V2AttestedRedriveAttempt::Reply(envelope),
-                            Err(_) => V2AttestedRedriveAttempt::Ambiguous,
-                        }
+                            redirect.origin,
+                            true,
+                            false,
+                            ingress,
+                            deadline,
+                        )
+                        .map_or(
+                            V2AttestedRedriveAttempt::Ambiguous,
+                            V2AttestedRedriveAttempt::Reply,
+                        )
                     },
                     |ingress| {
                         let Ok(reply) = send_v2_system_ingress(&local_route, ingress) else {
@@ -6586,20 +6592,25 @@ impl VosNode {
                 );
             }
 
-            let peer = network
-                .peer_for_prefix(redirect.leader_prefix)
+            let replication_id = binding
+                .replication_id
                 .ok_or(crate::actors::client::ClientError::Unreachable)?;
-            let leader_route = ServiceId::new(redirect.leader_prefix, ServiceId(route).local_id());
-            let delegated = encode_v2_raft_delegation(redirect.origin, true, false, &ingress_wire);
-            let leader_reply = network.send_invoke(
-                peer,
-                ServiceId::REGISTRY.0,
-                leader_route.0,
-                Vec::new(),
-                delegated,
-            );
-            let leader_envelope =
-                receive_v2_invocation_reply(&leader_reply, proof_requested, deadline)?;
+            let status = network
+                .local_raft_status(&replication_id)
+                .ok_or(crate::actors::client::ClientError::Unreachable)?;
+            let leader_envelope = send_v2_raft_invoke_exact(
+                &network,
+                &self.invoke_routes,
+                &binding,
+                status,
+                redirect.leader_prefix,
+                redirect.origin,
+                true,
+                false,
+                &ingress_wire,
+                deadline,
+            )
+            .ok_or(crate::actors::client::ClientError::Unreachable)?;
             return decode_host_invoke_envelope(&leader_envelope);
         }
         decode_host_invoke_envelope(&envelope)
@@ -6623,6 +6634,7 @@ impl VosNode {
         msg: Vec<u8>,
         timeout: Duration,
     ) -> Option<Vec<u8>> {
+        let deadline = Instant::now().checked_add(timeout)?;
         // 1. Local. Same fallback `dispatch_invoke` uses: when
         //    `target` carries this node's prefix but the agent
         //    was registered as unscoped (`ServiceId(0, local_id)`),
@@ -6667,23 +6679,38 @@ impl VosNode {
             // envelope (status + state + reply); host callers
             // don't care about YIELDED/DONE so unwrap to just
             // reply bytes.
-            let envelope = reply_rx.recv_timeout(timeout).ok()?;
+            let envelope = reply_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .ok()?;
             #[cfg(all(feature = "network", feature = "storage"))]
             if let Some(redirect) = decode_v2_raft_redirect(&envelope) {
                 let net = self.shared_network.lock().ok().and_then(|g| g.clone())?;
-                let peer = net.peer_for_prefix(redirect.leader_prefix)?;
-                let leader_target = ServiceId::new(redirect.leader_prefix, target.local_id()).0;
-                let delegated = encode_v2_raft_delegation(redirect.origin, false, false, &msg);
-                return net
-                    .send_invoke(
-                        peer,
-                        ServiceId::REGISTRY.0,
-                        leader_target,
-                        Vec::new(),
-                        delegated,
-                    )
-                    .recv_timeout(timeout)
-                    .ok();
+                let binding = self
+                    .v2_actor_routes
+                    .read()
+                    .ok()?
+                    .values()
+                    .find(|route| {
+                        route.consistency == crate::v2::ConsistencyModeV2::Raft
+                            && route.authenticated_peer.is_none()
+                            && (route.route == target.0
+                                || (route.route & 0xFFFF) == target.local_id() as u32)
+                    })
+                    .cloned()?;
+                let replication_id = binding.replication_id?;
+                let status = net.local_raft_status(&replication_id)?;
+                return send_v2_raft_invoke_exact(
+                    &net,
+                    &self.invoke_routes,
+                    &binding,
+                    status,
+                    redirect.leader_prefix,
+                    redirect.origin,
+                    false,
+                    false,
+                    &msg,
+                    deadline,
+                );
             }
             return unwrap_invoke_envelope(&envelope);
         }
@@ -6703,7 +6730,9 @@ impl VosNode {
                     // Daemon's `dispatch_invoke` already strips
                     // the envelope back to raw reply bytes, so
                     // we just forward them.
-                    return reply_rx.recv_timeout(timeout).ok();
+                    return reply_rx
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .ok();
                 }
             }
         }
@@ -15489,6 +15518,7 @@ mod tests {
                 role: crate::network::RaftRole::Leader,
                 current_term: 9,
                 commit_index: 12,
+                last_applied: 12,
                 last_log_index: 12,
                 members: vec![0x2222],
                 leader_hint: Some(0x2222),
@@ -15515,6 +15545,7 @@ mod tests {
             role: crate::network::RaftRole::Follower,
             current_term: 7,
             commit_index: 11,
+            last_applied: 11,
             last_log_index: 11,
             members: vec![0x1111, 0x2222],
             leader_hint: Some(0x1111),
@@ -15524,6 +15555,7 @@ mod tests {
             role: crate::network::RaftRole::Leader,
             current_term: 8,
             commit_index: 12,
+            last_applied: 12,
             last_log_index: 12,
             members: vec![0x1111, 0x2222],
             leader_hint: Some(0x2222),
@@ -15644,6 +15676,7 @@ mod tests {
                 role: crate::network::RaftRole::Follower,
                 current_term: 12,
                 commit_index: 19,
+                last_applied: 19,
                 last_log_index: 19,
                 members: vec![follower_prefix, leader_prefix],
                 leader_hint: Some(leader_prefix),
@@ -15906,6 +15939,7 @@ mod tests {
                     },
                     current_term: 7,
                     commit_index: 11,
+                    last_applied: 11,
                     last_log_index: 11,
                     members: self.members.clone(),
                     leader_hint: Some(leader),
@@ -18069,6 +18103,7 @@ mod tests {
             role: crate::network::RaftRole::Follower,
             current_term: 7,
             commit_index: 11,
+            last_applied: 11,
             last_log_index: 11,
             members: vec![prefix],
             leader_hint: Some(prefix),
@@ -18084,6 +18119,237 @@ mod tests {
             authenticated_v2_raft_leader_peer(&wrong_group, &enrolled, prefix).is_none(),
             "the same roster peer is not trusted outside the authority's exact Raft group",
         );
+    }
+
+    #[test]
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn public_raft_invokes_ignore_a_colliding_prefix_owner() {
+        use crate::actors::codec::Encode;
+        use crate::actors::run::STATUS_DONE;
+        use crate::network::{
+            NetworkConfig, NetworkService, RaftAppendResult, RaftRpcHandler, RaftStatusReply,
+            RaftVoteResult,
+        };
+        use crate::value::{Msg, TAG_DYNAMIC, Value};
+        use libp2p::{Multiaddr, PeerId, identity};
+
+        struct Status {
+            leader: u16,
+        }
+        impl RaftRpcHandler for Status {
+            fn local_status(&self) -> Option<RaftStatusReply> {
+                Some(self.handle_status(&[0; 32]))
+            }
+
+            fn append_entries(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                prev_log_index: u64,
+                _prev_log_term: u64,
+                _leader_commit: u64,
+                _entries: Vec<crate::network::RaftEntry>,
+            ) -> RaftAppendResult {
+                RaftAppendResult {
+                    term,
+                    success: false,
+                    match_index: prev_log_index,
+                }
+            }
+
+            fn request_vote(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                _last_log_index: u64,
+                _last_log_term: u64,
+            ) -> RaftVoteResult {
+                RaftVoteResult {
+                    term,
+                    vote_granted: false,
+                }
+            }
+
+            fn handle_status(&self, _replication_id: &[u8; 32]) -> RaftStatusReply {
+                RaftStatusReply {
+                    present: true,
+                    role: crate::network::RaftRole::Follower,
+                    current_term: 4,
+                    commit_index: 8,
+                    last_applied: 8,
+                    last_log_index: 8,
+                    members: vec![self.leader],
+                    leader_hint: Some(self.leader),
+                }
+            }
+        }
+
+        struct Leader;
+        impl NetworkService for Leader {
+            fn dispatch_invoke(
+                &self,
+                _caller_peer_id: Option<PeerId>,
+                _from: u32,
+                _to: u32,
+                _chain: Vec<u32>,
+                msg: Vec<u8>,
+            ) -> Vec<u8> {
+                assert!(msg.starts_with(&V2_RAFT_DELEGATION_MAGIC));
+                if msg.get(4) == Some(&1) {
+                    encode_invoke_envelope(STATUS_DONE, &[], b"exact leader")
+                } else {
+                    b"exact leader".to_vec()
+                }
+            }
+        }
+
+        let caller_key = identity::Keypair::generate_ed25519();
+        let voter_key = identity::Keypair::generate_ed25519();
+        let caller_peer = PeerId::from(caller_key.public());
+        let voter_peer = PeerId::from(voter_key.public());
+        let caller_prefix = crate::network::derive_node_prefix(&caller_peer);
+        let voter_prefix = crate::network::derive_node_prefix(&voter_peer);
+        assert_ne!(caller_prefix, voter_prefix);
+
+        let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+        let caller_network = crate::network::Network::start(NetworkConfig {
+            keypair: caller_key,
+            local_prefix: caller_prefix,
+            listen: vec![listen.clone()],
+            bootstrap: vec![],
+            auto_dial_mdns: false,
+        });
+        let listen_deadline = Instant::now() + Duration::from_secs(5);
+        let caller_address = loop {
+            if let Some(address) = caller_network.listen_addrs().into_iter().next() {
+                break address.with(libp2p::multiaddr::Protocol::P2p(caller_peer));
+            }
+            assert!(Instant::now() < listen_deadline, "caller binds");
+            thread::sleep(Duration::from_millis(10));
+        };
+        let voter_network = crate::network::Network::start(NetworkConfig {
+            keypair: voter_key,
+            local_prefix: voter_prefix,
+            listen: vec![listen],
+            bootstrap: vec![caller_address],
+            auto_dial_mdns: false,
+        });
+        voter_network.set_service(Arc::new(Leader));
+        let peer_deadline = Instant::now() + Duration::from_secs(10);
+        while caller_network.peer_for_prefix(voter_prefix) != Some(voter_peer) {
+            assert!(
+                Instant::now() < peer_deadline,
+                "caller authenticates the enrolled voter"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let replication_id = [0xA7; 32];
+        caller_network.register_raft_handler(
+            replication_id,
+            Arc::new(Status {
+                leader: voter_prefix,
+            }),
+        );
+
+        let actor = crate::v2::ActorId([0xA8; 32]);
+        let route = ServiceId::new(caller_prefix, 0xA9);
+        let service = crate::v2::ServiceIdentityV2 {
+            space: crate::v2::SpaceId([1; 32]),
+            root_service: crate::v2::RootServiceId([2; 32]),
+            deployment: crate::v2::DeploymentId([3; 32]),
+            service_program: crate::v2::VOS_SERVICE_PROGRAM_ID,
+            service_abi: crate::v2::ABI_VERSION,
+            execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
+        };
+        let mut node = VosNode::with_prefix(caller_prefix);
+        node.v2_actor_routes.write().unwrap().insert(
+            actor,
+            V2ActorRoute {
+                route: route.0,
+                service,
+                consistency: crate::v2::ConsistencyModeV2::Raft,
+                replication_id: Some(replication_id),
+                is_role_authority: false,
+                invoke_timeout: Duration::from_secs(5),
+                authenticated_peer: None,
+            },
+        );
+
+        let (root_tx, root_rx) = mpsc::channel::<InvokeRequest>();
+        node.invoke_routes.lock().unwrap().insert(route.0, root_tx);
+        let root = thread::spawn(move || {
+            for _ in 0..3 {
+                let request = root_rx.recv().unwrap();
+                assert!(request.reply.send(encode_v2_raft_redirect(
+                    voter_prefix,
+                    crate::v2::Origin::System,
+                )));
+            }
+        });
+
+        let (registry_tx, registry_rx) = mpsc::channel::<InvokeRequest>();
+        node.invoke_routes
+            .lock()
+            .unwrap()
+            .insert(ServiceId::REGISTRY.0, registry_tx);
+        let member = crate::registry::MemberRow {
+            kind: crate::registry::MEMBER_KIND_NODE,
+            key: voter_peer.to_bytes(),
+            prefix: voter_prefix,
+            role: crate::registry::NODE_ROLE_VOTER,
+            proof_kind: 0,
+            proof_data: Vec::new(),
+        };
+        let registry = thread::spawn(move || {
+            for _ in 0..3 {
+                let request = registry_rx.recv().unwrap();
+                let page = crate::registry::MemberPage {
+                    members: vec![member.clone()],
+                    next_kind: crate::registry::MEMBER_KIND_NODE,
+                    next_key: Vec::new(),
+                    more: false,
+                };
+                assert!(request.reply.send(encode_invoke_envelope(
+                    STATUS_DONE,
+                    &[],
+                    &Value::Bytes(page.encode()).encode(),
+                )));
+            }
+        });
+
+        node.attach_network(caller_network);
+        let attached = node.shared_network.lock().unwrap().clone().unwrap();
+        let colliding_peer = PeerId::random();
+        assert_ne!(colliding_peer, voter_peer);
+        // Model a real first-connected prefix collision without spending ~2^16
+        // key generations in every test run. The public paths must ignore this
+        // lossy owner and select the roster's complete voter PeerId.
+        attached.set_prefix_owner_for_test(voter_prefix, colliding_peer);
+        assert_eq!(attached.peer_for_prefix(voter_prefix), Some(colliding_peer));
+
+        let mut arguments = vec![TAG_DYNAMIC];
+        arguments.extend_from_slice(&Msg::new("ping").encode());
+        assert_eq!(
+            node.invoke_actor(actor, arguments.clone()).unwrap(),
+            b"exact leader"
+        );
+        assert_eq!(
+            node.invoke_actor_wire(actor, arguments, true).unwrap(),
+            b"exact leader"
+        );
+        assert_eq!(
+            node.invoke_with_timeout(route, b"raw".to_vec(), Duration::from_secs(5)),
+            Some(b"exact leader".to_vec())
+        );
+
+        root.join().unwrap();
+        registry.join().unwrap();
+        let _ = node.collect();
+        voter_network.join();
     }
 
     #[test]
@@ -18104,6 +18370,7 @@ mod tests {
                     role: crate::network::RaftRole::Follower,
                     current_term: 7,
                     commit_index: 9,
+                    last_applied: 9,
                     last_log_index: 9,
                     members: self.members.clone(),
                     leader_hint: Some(self.leader),
@@ -18539,6 +18806,7 @@ mod tests {
                     role: RaftRole::Leader,
                     current_term: 1,
                     commit_index: 1,
+                    last_applied: 1,
                     last_log_index: 1,
                     members: vec![self.voter],
                     leader_hint: Some(self.voter),

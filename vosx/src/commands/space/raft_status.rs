@@ -1,5 +1,5 @@
 //! `space raft-status` — the connected daemon's view of an agent's
-//! Raft group: role, term, leader, and members.
+//! Raft group: role, term, replicated/applied cursors, leader, and members.
 //!
 //! Keyed off the agent's `replication_id` (from the registry) and
 //! answered by a `RaftStatusReq` frame to the daemon. Leader targeting
@@ -22,6 +22,7 @@ struct RaftStatusView {
     role: &'static str,
     current_term: u64,
     commit_index: u64,
+    last_applied: u64,
     last_log_index: u64,
     leader: Option<u16>,
     members: Vec<u16>,
@@ -56,6 +57,7 @@ pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
                 role: role_label(reply.role),
                 current_term: reply.current_term,
                 commit_index: reply.commit_index,
+                last_applied: reply.last_applied,
                 last_log_index: reply.last_log_index,
                 leader: reply.leader_hint,
                 members: reply.members.clone(),
@@ -79,8 +81,8 @@ fn print_text(instance: &str, daemon_prefix: u16, reply: &RaftStatusReply) {
     println!("role       {}", role_label(reply.role));
     println!("term       {}", reply.current_term);
     println!(
-        "log        commit={} last={}",
-        reply.commit_index, reply.last_log_index
+        "log        commit={} applied={} last={}",
+        reply.commit_index, reply.last_applied, reply.last_log_index
     );
     match reply.leader_hint {
         Some(p) => {
