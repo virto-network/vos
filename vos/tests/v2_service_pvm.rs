@@ -1697,6 +1697,7 @@ fn node_raft_registration_installs_production_trust_before_replay_and_promotion(
     let raft_config = RaftConfig {
         me: member,
         members: vec![member],
+        voter_peer_ids: Vec::new(),
         election_timeout_ms: (10, 30),
         heartbeat_interval_ms: 5,
         replication_id: [0x94; 32],
@@ -1764,6 +1765,7 @@ fn node_raft_registration_installs_production_trust_before_replay_and_promotion(
         RaftConfig {
             me: member,
             members: vec![member],
+            voter_peer_ids: Vec::new(),
             election_timeout_ms: (10, 30),
             heartbeat_interval_ms: 5,
             replication_id: [0x99; 32],
@@ -1861,6 +1863,7 @@ fn fresh_production_joiner_must_match_policy_before_voter_promotion() {
             RaftConfig {
                 me: leader_prefix,
                 members: vec![leader_prefix],
+                voter_peer_ids: Vec::new(),
                 election_timeout_ms: (10, 30),
                 heartbeat_interval_ms: 5,
                 replication_id,
@@ -1910,6 +1913,7 @@ fn fresh_production_joiner_must_match_policy_before_voter_promotion() {
             RaftConfig {
                 me: joiner_prefix,
                 members: vec![leader_prefix],
+                voter_peer_ids: Vec::new(),
                 election_timeout_ms: (30_000, 40_000),
                 heartbeat_interval_ms: 20,
                 replication_id,
@@ -2017,6 +2021,7 @@ fn promoted_voter_keeps_raft_handler_while_application_catch_up_retries() {
         RaftConfig {
             me: member,
             members: vec![other_member],
+            voter_peer_ids: Vec::new(),
             election_timeout_ms: (30_000, 40_000),
             heartbeat_interval_ms: 20,
             replication_id,
@@ -2088,6 +2093,7 @@ fn persisted_voter_keeps_raft_handler_while_service_open_retries() {
     let raft_config = RaftConfig {
         me: member,
         members: vec![member],
+        voter_peer_ids: Vec::new(),
         election_timeout_ms: (10, 30),
         heartbeat_interval_ms: 5,
         replication_id,
@@ -2217,6 +2223,7 @@ fn speculative_removal_keeps_persisted_voter_while_recovery_retries() {
         RaftConfig {
             me: member,
             members: vec![member, survivor],
+            voter_peer_ids: Vec::new(),
             election_timeout_ms: (30_000, 40_000),
             heartbeat_interval_ms: 20,
             replication_id,
@@ -2288,6 +2295,7 @@ fn immediate_registration_keeps_speculative_joint_inclusion_private() {
     let install_raft_config = RaftConfig {
         me: member,
         members: vec![member],
+        voter_peer_ids: Vec::new(),
         election_timeout_ms: (10, 30),
         heartbeat_interval_ms: 5,
         replication_id,
@@ -2351,6 +2359,7 @@ fn immediate_registration_keeps_speculative_joint_inclusion_private() {
         RaftConfig {
             me: member,
             members: vec![survivor],
+            voter_peer_ids: Vec::new(),
             election_timeout_ms: (30_000, 40_000),
             heartbeat_interval_ms: 20,
             replication_id,
@@ -5186,6 +5195,7 @@ fn node_registers_a_raft_root_through_the_canonical_request_log() {
         RaftConfig {
             me: member,
             members: vec![member],
+            voter_peer_ids: Vec::new(),
             election_timeout_ms: (10, 30),
             heartbeat_interval_ms: 5,
             replication_id: [0xA6; 32],
@@ -5354,6 +5364,7 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
     let raft_config = |me| RaftConfig {
         me,
         members: members.clone(),
+        voter_peer_ids: Vec::new(),
         election_timeout_ms: election_timeout_for(me),
         heartbeat_interval_ms: 20,
         replication_id,
@@ -5653,6 +5664,7 @@ fn raft_follower_registers_before_genesis_and_restores_caught_up_admission_time(
     let raft_config = RaftConfig {
         me: 0xBEEF,
         members: vec![0xBEEF],
+        voter_peer_ids: Vec::new(),
         election_timeout_ms: (5_000, 6_000),
         heartbeat_interval_ms: 100,
         replication_id: [0xE2; 32],
@@ -6041,6 +6053,7 @@ fn raft_registration_reverifies_current_conformance_proof_history_before_exposin
     let raft_config = RaftConfig {
         me: member,
         members: vec![member],
+        voter_peer_ids: Vec::new(),
         election_timeout_ms: (10, 30),
         heartbeat_interval_ms: 5,
         replication_id: [0x77; 32],
@@ -6111,6 +6124,7 @@ fn node_attested_raft_root_orders_the_proved_apply() {
         RaftConfig {
             me: member,
             members: vec![member],
+            voter_peer_ids: Vec::new(),
             election_timeout_ms: (10, 30),
             heartbeat_interval_ms: 5,
             replication_id: [0x78; 32],
@@ -6301,6 +6315,7 @@ fn node_raft_transport_orders_attested_inbox_and_reply_proof_on_both_roots() {
     let raft_config = |replication_id| RaftConfig {
         me: member,
         members: vec![member],
+        voter_peer_ids: Vec::new(),
         election_timeout_ms: (10, 30),
         heartbeat_interval_ms: 5,
         replication_id,
@@ -6442,6 +6457,7 @@ fn promoted_raft_voter_keeps_its_producer_after_taking_leadership() {
         RaftConfig {
             me: member,
             members: vec![member],
+            voter_peer_ids: Vec::new(),
             election_timeout_ms: (10, 30),
             heartbeat_interval_ms: 5,
             replication_id: [0xFA; 32],
@@ -6463,6 +6479,7 @@ fn promoted_raft_voter_keeps_its_producer_after_taking_leadership() {
         RaftConfig {
             me: member,
             members: vec![member],
+            voter_peer_ids: Vec::new(),
             // Ensure preparation observes a follower. The promotion callback
             // then waits for this replica to take leadership before its route
             // and proof capability become public together.
@@ -6915,6 +6932,7 @@ fn node_routes_networkless_single_voter_raft_roots() {
     let raft_config = |replication_id| RaftConfig {
         me: member,
         members: vec![member],
+        voter_peer_ids: Vec::new(),
         election_timeout_ms: (25, 50),
         heartbeat_interval_ms: 10,
         replication_id,
@@ -7111,6 +7129,7 @@ fn node_routes_raft_cross_root_reply_between_different_leaders() {
     let raft_config = |me, replication_id| RaftConfig {
         me,
         members: vec![me],
+        voter_peer_ids: Vec::new(),
         election_timeout_ms: (50, 100),
         heartbeat_interval_ms: 20,
         replication_id,
@@ -16999,6 +17018,7 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
     let raft_config = RaftConfig {
         me: 0xBBBB,
         members: vec![0xAAAA, 0xBBBB],
+        voter_peer_ids: Vec::new(),
         election_timeout_ms: (5_000, 10_000),
         heartbeat_interval_ms: 500,
         replication_id: [0xD1; 32],

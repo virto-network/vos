@@ -74,6 +74,12 @@ pub struct RaftConfig {
     /// non-empty list is treated as advisory until election
     /// machinery is enabled.
     pub members: Vec<u16>,
+    /// Canonical full Noise identities for compact voter slots. The daemon
+    /// obtains these from the authenticated registry roster and the node
+    /// installs them atomically with the group's RPC handler. Prefixes remain
+    /// Raft's compact on-disk membership representation; they are never
+    /// sufficient transport authentication on their own.
+    pub voter_peer_ids: Vec<(u16, Vec<u8>)>,
     /// Randomized election-timeout window (low, high) in milliseconds.
     /// Ignored in single-node mode.
     pub election_timeout_ms: (u64, u64),
@@ -95,6 +101,7 @@ impl Default for RaftConfig {
         Self {
             me: 0,
             members: Vec::new(),
+            voter_peer_ids: Vec::new(),
             election_timeout_ms: (150, 300),
             heartbeat_interval_ms: 50,
             replication_id: [0u8; 32],
@@ -611,6 +618,7 @@ mod tests {
         RaftConfig {
             me,
             members,
+            voter_peer_ids: Vec::new(),
             // Tiny timeouts so the single-member self-quorum
             // election fires before the test's propose call.
             election_timeout_ms: (10, 30),

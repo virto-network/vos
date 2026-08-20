@@ -325,6 +325,7 @@ pub enum V2RaftNodeRegistrationError<E> {
     Open(crate::v2::LocalRootTreeOpenErrorV2<E>),
     Registration(V2NodeRegistrationError),
     ReplicationHandlerOccupied([u8; 32]),
+    InvalidVoterIdentity(u16),
     CatchUp(crate::v2::LocalRootTreeInvokeErrorV2),
     ProductionPolicyMismatch,
     Promotion(String),
@@ -3530,6 +3531,21 @@ impl crate::network::NetworkService for NodeService {
         )
     }
 
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn raft_voter_peer(&self, replication_id: &[u8; 32], prefix: u16) -> Option<libp2p::PeerId> {
+        let status = self
+            .shared_network
+            .lock()
+            .ok()
+            .and_then(|network| network.as_ref()?.local_raft_status_cached(replication_id))?;
+        if !status.present || !status.members.contains(&prefix) {
+            return None;
+        }
+        let member = self.lookup_node_member(prefix)?;
+        let peer = libp2p::PeerId::from_bytes(&member.key).ok()?;
+        node_member_authenticates_voter(&member, prefix, &peer).then_some(peer)
+    }
+
     /// Admit a Raft joiner only if it is enrolled as a `NODE_ROLE_VOTER`
     /// in the local space-registry. Fails **closed** — an unreachable or
     /// empty registry reply (`lookup_node_role` → `0` = "not enrolled")
@@ -3552,6 +3568,17 @@ impl crate::network::NetworkService for NodeService {
             return crate::network::RaftJoinResult::NotAuthorized;
         };
         if !node_member_authenticates_voter(&member, joiner_prefix, &peer) {
+            return crate::network::RaftJoinResult::NotAuthorized;
+        }
+        let bound = self
+            .shared_network
+            .lock()
+            .ok()
+            .and_then(|network| network.clone())
+            .is_some_and(|network| {
+                network.bind_raft_voter_peer(*replication_id, joiner_prefix, peer)
+            });
+        if !bound {
             return crate::network::RaftJoinResult::NotAuthorized;
         }
         let route = self
@@ -5541,6 +5568,22 @@ impl VosNode {
                 error,
             ))
         })?;
+        let mut voter_peers = Vec::with_capacity(raft_config.voter_peer_ids.len());
+        let mut voter_slots = BTreeMap::new();
+        for (prefix, bytes) in &raft_config.voter_peer_ids {
+            let peer = libp2p::PeerId::from_bytes(bytes)
+                .map_err(|_| V2RaftNodeRegistrationError::InvalidVoterIdentity(*prefix))?;
+            if crate::network::derive_node_prefix(&peer) != *prefix {
+                return Err(V2RaftNodeRegistrationError::InvalidVoterIdentity(*prefix));
+            }
+            if voter_slots
+                .insert(*prefix, peer)
+                .is_some_and(|existing| existing != peer)
+            {
+                return Err(V2RaftNodeRegistrationError::InvalidVoterIdentity(*prefix));
+            }
+        }
+        voter_peers.extend(voter_slots);
         let replication_id = raft_config.replication_id;
         let expected_policy = production_trust.as_ref().map(|trust| trust.policy_id());
         let persisted_config =
@@ -5606,7 +5649,11 @@ impl VosNode {
         let worker_handle = worker.handler();
         let handler: Arc<dyn crate::network::RaftRpcHandler> = Arc::new(worker_handle.clone());
         if let (Some(network), Some(reservation)) = (network.as_ref(), reservation.as_ref())
-            && !network.activate_raft_handler(reservation, handler.clone())
+            && !network.activate_raft_handler_with_voters(
+                reservation,
+                handler.clone(),
+                &voter_peers,
+            )
         {
             worker.shutdown();
             remove_v2_private_ingress_route_if(
@@ -18681,11 +18728,16 @@ mod tests {
             .write()
             .unwrap()
             .insert(replication_id, route.clone());
-        let handler = JoinHandler(AtomicUsize::new(0));
+        let handler = Arc::new(JoinHandler(AtomicUsize::new(0)));
+        let network = Arc::new(crate::network::Network::start(
+            crate::network::NetworkConfig::default(),
+        ));
+        network.register_raft_handler(replication_id, handler.clone());
+        *service.shared_network.lock().unwrap() = Some(network.clone());
 
         let admission = route.barrier.try_acquire().unwrap();
         assert_eq!(
-            service.handle_raft_join(joiner, &replication_id, prefix, None, &handler),
+            service.handle_raft_join(joiner, &replication_id, prefix, None, handler.as_ref()),
             RaftJoinResult::Busy,
             "membership cannot change while private admission owns the barrier",
         );
@@ -18696,12 +18748,15 @@ mod tests {
             quiescence_rx.recv().unwrap().send(true).unwrap();
         });
         assert_eq!(
-            service.handle_raft_join(joiner, &replication_id, prefix, None, &handler),
+            service.handle_raft_join(joiner, &replication_id, prefix, None, handler.as_ref()),
             RaftJoinResult::Accepted { joint_index: 9 },
         );
         quiescence.join().unwrap();
         registry.join().unwrap();
         assert_eq!(handler.0.load(Ordering::Relaxed), 1);
+        *service.shared_network.lock().unwrap() = None;
+        drop(service);
+        Arc::try_unwrap(network).ok().unwrap().join();
     }
 
     #[test]

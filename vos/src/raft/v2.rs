@@ -970,6 +970,7 @@ mod tests {
         let cfg = RaftConfig {
             me: 0xA11C,
             members: vec![0xA11C],
+            voter_peer_ids: Vec::new(),
             election_timeout_ms: (10, 30),
             heartbeat_interval_ms: 5,
             replication_id: [0xA1; 32],

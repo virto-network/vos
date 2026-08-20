@@ -1509,7 +1509,7 @@ fn spawn_installed_agents(
             }
             let db_path = raft_db_path_for_row(data_dir, svc_id, &prepared);
             match raft_members_for_row(node, &db_path, &a, local_prefix, &mut boot_grace) {
-                Ok(RaftSeed::Join { leader, known }) if !is_v2 => {
+                Ok(RaftSeed::Join { leader, known, .. }) if !is_v2 => {
                     let Some(network) = node.network() else {
                         tracing::info!(
                             "agent '{}' (raft) deferred: no network attached",
@@ -1518,7 +1518,7 @@ fn spawn_installed_agents(
                         continue;
                     };
                     match join_raft_group(&network, &a, local_prefix, leader, known)? {
-                        RaftSeed::Members(members) => Some(RaftSeed::Members(members)),
+                        seed @ RaftSeed::Members { .. } => Some(seed),
                         RaftSeed::Defer(reason) => {
                             tracing::info!("agent '{}' (raft) deferred: {reason}", a.instance_name);
                             continue;
@@ -1526,7 +1526,7 @@ fn spawn_installed_agents(
                         RaftSeed::Join { .. } => unreachable!(),
                     }
                 }
-                Ok(seed @ (RaftSeed::Members(_) | RaftSeed::Join { .. })) => Some(seed),
+                Ok(seed @ (RaftSeed::Members { .. } | RaftSeed::Join { .. })) => Some(seed),
                 Ok(RaftSeed::Defer(reason)) => {
                     tracing::info!(
                         "agent '{}' (raft) deferred to the runtime reconciler: {reason}",
@@ -1545,7 +1545,7 @@ fn spawn_installed_agents(
         match prepared {
             RowConfig::Ready(cfg) => {
                 let mut cfg = *cfg;
-                if let Some(RaftSeed::Members(members)) = raft_seed {
+                if let Some(RaftSeed::Members { members, .. }) = raft_seed {
                     cfg.members = members;
                 }
                 let id = node.register_at_id(cfg, svc_id);
@@ -2338,21 +2338,25 @@ fn register_v2_root_from_row(
             redb::Database::create(&raft_path)
                 .map_err(|error| anyhow::anyhow!("open {}: {error}", raft_path.display()))?,
         );
-        let make_config = |members| vos::raft::RaftConfig {
+        let make_config = |members, voter_peer_ids| vos::raft::RaftConfig {
             me: local_prefix,
             members,
+            voter_peer_ids,
             replication_id,
             ..vos::raft::RaftConfig::default()
         };
         return match seed {
-            RaftSeed::Members(members) => match production_trust {
+            RaftSeed::Members {
+                members,
+                voter_peer_ids,
+            } => match production_trust {
                 Some(trust) => node
                     .register_v2_raft_root_at_id_production(
                         instance_name,
                         config,
                         backend,
                         db,
-                        make_config(members),
+                        make_config(members, voter_peer_ids),
                         svc_id,
                         network_reachable,
                         trust,
@@ -2370,18 +2374,22 @@ fn register_v2_root_from_row(
                         config,
                         backend,
                         db,
-                        make_config(members),
+                        make_config(members, voter_peer_ids),
                         svc_id,
                         network_reachable,
                     )
                     .map_err(|error| anyhow::anyhow!("register v2 Raft root tree: {error}")),
             },
-            RaftSeed::Join { leader, known } => {
+            RaftSeed::Join {
+                leader,
+                known,
+                voter_peer_ids,
+            } => {
                 let network = node
                     .network()
                     .ok_or_else(|| anyhow::anyhow!("v2 Raft join requires an attached network"))?;
                 let promotion_name = instance_name.clone();
-                let raft_config = make_config(known.clone());
+                let raft_config = make_config(known.clone(), voter_peer_ids);
                 match production_trust {
                     Some(trust) => node
                         .register_v2_raft_root_at_id_after_local_attach_production(
@@ -2654,13 +2662,17 @@ fn decide_raft_spawn(
 /// Outcome of [`raft_members_for_row`]: either the member seed to
 /// spawn with, or the reason the row stays deferred this pass.
 enum RaftSeed {
-    Members(Vec<u16>),
+    Members {
+        members: Vec<u16>,
+        voter_peer_ids: Vec<(u16, Vec<u8>)>,
+    },
     /// A live group exists, but this replica is not a voter yet. The v2 path
     /// starts its worker and validates its route before sending the join;
     /// legacy roots complete the old eager handshake immediately before spawn.
     Join {
         leader: u16,
         known: Vec<u16>,
+        voter_peer_ids: Vec<(u16, Vec<u8>)>,
     },
     Defer(String),
 }
@@ -2695,6 +2707,26 @@ fn raft_members_for_row(
         .collect();
     voters.sort_unstable();
     voters.dedup();
+    let mut voter_peer_ids = rows
+        .iter()
+        .filter(|member| member.kind == MEMBER_KIND_NODE && member.role == NODE_ROLE_VOTER)
+        .map(|member| (member.prefix, member.key.clone()))
+        .collect::<Vec<_>>();
+    voter_peer_ids.sort_by_key(|(prefix, _)| *prefix);
+    if voter_peer_ids
+        .windows(2)
+        .any(|pair| pair[0].0 == pair[1].0 && pair[0].1 != pair[1].1)
+    {
+        anyhow::bail!("registry contains conflicting full PeerIds for one Raft voter prefix");
+    }
+    voter_peer_ids.dedup();
+    for (prefix, bytes) in &voter_peer_ids {
+        let peer = libp2p::PeerId::from_bytes(bytes)
+            .map_err(|_| anyhow::anyhow!("voter {prefix:#06x} has an invalid PeerId"))?;
+        if vos::network::derive_node_prefix(&peer) != *prefix {
+            anyhow::bail!("voter {prefix:#06x} does not match its full authenticated PeerId");
+        }
+    }
 
     let anchored = db_path.exists()
         && vos::raft::persisted_membership(&db_path)
@@ -2713,6 +2745,13 @@ fn raft_members_for_row(
             let Some(peer) = net.peer_for_prefix(v) else {
                 continue; // not connected — can't confirm anything about it
             };
+            let canonical = voter_peer_ids
+                .iter()
+                .find_map(|(prefix, bytes)| (*prefix == v).then_some(bytes))
+                .and_then(|bytes| libp2p::PeerId::from_bytes(bytes).ok());
+            if canonical != Some(peer) {
+                continue; // a lossy-prefix collision is not a voter probe
+            }
             if let Ok(reply) = net
                 .send_raft_status_req(peer, a.replication_id)
                 .recv_timeout(RAFT_PROBE_TIMEOUT)
@@ -2728,7 +2767,10 @@ fn raft_members_for_row(
         boot_grace.remove(&grace_key);
     }
     match plan {
-        RaftPlan::Spawn(members) => Ok(RaftSeed::Members(members)),
+        RaftPlan::Spawn(members) => Ok(RaftSeed::Members {
+            members,
+            voter_peer_ids,
+        }),
         RaftPlan::Defer(reason) => Ok(RaftSeed::Defer(reason)),
         RaftPlan::Bootstrap { contested } => {
             if contested {
@@ -2755,9 +2797,16 @@ fn raft_members_for_row(
             }
             vos::raft::seed_initial_config(db_path, &[local_prefix])
                 .map_err(|e| anyhow::anyhow!("seed raft config for '{}': {e}", a.instance_name))?;
-            Ok(RaftSeed::Members(vec![local_prefix]))
+            Ok(RaftSeed::Members {
+                members: vec![local_prefix],
+                voter_peer_ids,
+            })
         }
-        RaftPlan::Join { leader, known } => Ok(RaftSeed::Join { leader, known }),
+        RaftPlan::Join { leader, known } => Ok(RaftSeed::Join {
+            leader,
+            known,
+            voter_peer_ids,
+        }),
     }
 }
 
@@ -2902,7 +2951,10 @@ fn join_raft_group(
             known,
             None,
         )? {
-            Ok(joined) => RaftSeed::Members(joined.members),
+            Ok(joined) => RaftSeed::Members {
+                members: joined.members,
+                voter_peer_ids: Vec::new(),
+            },
             Err(rejection) => RaftSeed::Defer(rejection.reason),
         },
     )
@@ -3307,14 +3359,14 @@ fn reconcile_installed_agents(
             }
             let db_path = raft_db_path_for_row(data_dir, svc_id, &prepared);
             match raft_members_for_row(node, &db_path, &a, local_prefix, boot_grace) {
-                Ok(RaftSeed::Join { leader, known }) if !is_v2 => {
+                Ok(RaftSeed::Join { leader, known, .. }) if !is_v2 => {
                     let Some(network) = node.network() else {
                         continue;
                     };
                     match join_raft_group(&network, &a, local_prefix, leader, known)? {
-                        RaftSeed::Members(members) => {
+                        seed @ RaftSeed::Members { .. } => {
                             damped.remove(&key(RowNote::RaftWaiting));
-                            Some(RaftSeed::Members(members))
+                            Some(seed)
                         }
                         RaftSeed::Defer(reason) => {
                             if damped.insert(key(RowNote::RaftWaiting)) {
@@ -3328,7 +3380,7 @@ fn reconcile_installed_agents(
                         RaftSeed::Join { .. } => unreachable!(),
                     }
                 }
-                Ok(seed @ (RaftSeed::Members(_) | RaftSeed::Join { .. })) => {
+                Ok(seed @ (RaftSeed::Members { .. } | RaftSeed::Join { .. })) => {
                     damped.remove(&key(RowNote::RaftWaiting));
                     Some(seed)
                 }
@@ -3353,7 +3405,7 @@ fn reconcile_installed_agents(
         match prepared {
             RowConfig::Ready(cfg) => {
                 let mut cfg = *cfg;
-                if let Some(RaftSeed::Members(members)) = raft_seed {
+                if let Some(RaftSeed::Members { members, .. }) = raft_seed {
                     cfg.members = members;
                 }
                 let id = node.register_at_id(cfg, svc_id);
@@ -4231,7 +4283,10 @@ mod tests {
             replication_id,
             *config,
             state_path,
-            Some(RaftSeed::Members(vec![member])),
+            Some(RaftSeed::Members {
+                members: vec![member],
+                voter_peer_ids: Vec::new(),
+            }),
             member,
             route,
             network_reachable,

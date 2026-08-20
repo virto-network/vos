@@ -10,17 +10,16 @@
 //!
 //! ## Identity mapping
 //!
-//! vos addresses peers by their 16-bit `node_prefix`, not by libp2p
-//! `PeerId`. The adapter resolves the prefix through
-//! [`Network::peer_for_prefix`] on every call. A peer that hasn't
-//! exchanged a `Hello` frame with us yet (so its prefix isn't in the
-//! map) surfaces as a transport error — Raft tolerates that the same
-//! way it would tolerate a dropped packet.
+//! The Raft core addresses voters by their compact 16-bit `node_prefix`,
+//! while libp2p authenticates complete `PeerId`s. The adapter resolves each
+//! voter through the replication group's immutable, registry-authenticated
+//! binding table. It never consults Hello's lossy global prefix map: a
+//! connected peer which collides on 16 bits must not receive or answer
+//! consensus RPCs for the enrolled voter.
 //!
 //! [`Network::send_raft_append`]: crate::network::Network::send_raft_append
 //! [`Network::send_raft_vote`]: crate::network::Network::send_raft_vote
 //! [`Network::send_raft_install_snapshot`]: crate::network::Network::send_raft_install_snapshot
-//! [`Network::peer_for_prefix`]: crate::network::Network::peer_for_prefix
 
 use alloc::sync::Arc;
 use core::time::Duration;
@@ -43,10 +42,8 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(2);
 /// Reasons the libp2p side couldn't deliver an outbound RPC.
 #[derive(Debug)]
 pub enum VosTransportError {
-    /// We don't have a `PeerId` for `peer_prefix` yet — typically
-    /// because the Hello handshake hasn't completed. Worker treats
-    /// this the same as a dropped packet (it'll retry on the next
-    /// heartbeat tick).
+    /// The node service could not authenticate a complete enrolled PeerId for
+    /// this group voter. Worker treats it like a dropped packet and retries.
     UnknownPeer(u16),
     /// The reply channel disconnected or timed out before yielding
     /// a response. Treated as "no answer" by the worker.
@@ -60,7 +57,10 @@ impl core::fmt::Display for VosTransportError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::UnknownPeer(p) => {
-                write!(f, "vos transport: no PeerId mapped for prefix {p:04x}")
+                write!(
+                    f,
+                    "vos transport: no authenticated voter for prefix {p:04x}"
+                )
             }
             Self::NoReply => write!(f, "vos transport: no reply within timeout"),
             Self::EntryTooLarge => write!(f, "vos transport: Raft entry exceeds frame cap"),
@@ -101,7 +101,7 @@ impl Transport<u16> for VosTransport {
     ) -> Result<AppendEntriesResp, Self::Error> {
         let peer_id = self
             .network
-            .peer_for_prefix(peer)
+            .raft_voter_peer(&self.replication_id, peer)
             .ok_or(VosTransportError::UnknownPeer(peer))?;
         // Convert each `vos_raft::LogEntry` to the wire form,
         // preserving the `EntryKind` variant. `Data` entries
@@ -167,7 +167,7 @@ impl Transport<u16> for VosTransport {
     ) -> Result<RequestVoteResp, Self::Error> {
         let peer_id = self
             .network
-            .peer_for_prefix(peer)
+            .raft_voter_peer(&self.replication_id, peer)
             .ok_or(VosTransportError::UnknownPeer(peer))?;
         let rx = self.network.send_raft_vote(
             peer_id,
@@ -193,7 +193,7 @@ impl Transport<u16> for VosTransport {
     ) -> Result<InstallSnapshotResp, Self::Error> {
         let peer_id = self
             .network
-            .peer_for_prefix(peer)
+            .raft_voter_peer(&self.replication_id, peer)
             .ok_or(VosTransportError::UnknownPeer(peer))?;
         let rx = self.network.send_raft_install_snapshot(
             peer_id,

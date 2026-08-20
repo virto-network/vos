@@ -340,6 +340,16 @@ pub trait NetworkService: Send + Sync {
         false
     }
 
+    /// Resolve one compact Raft voter slot to the canonical, complete
+    /// Noise identity enrolled for that slot. Implementations must also
+    /// verify that `prefix` belongs to the named replication group's current
+    /// effective membership. The network caches the first successful binding
+    /// for the lifetime of the local group registration and refuses any
+    /// conflicting replacement.
+    fn raft_voter_peer(&self, _replication_id: &[u8; 32], _prefix: u16) -> Option<PeerId> {
+        None
+    }
+
     /// Raft-join admission: may the node at `prefix` — already bound to
     /// its noise-verified PeerId by the dispatch layer — be enrolled as a
     /// voter? The concrete `vos::node` impl checks the registry's
@@ -472,14 +482,158 @@ type PrefixMap = Arc<Mutex<HashMap<u16, PeerId>>>;
 /// matches the frame's. Pre-multi-group code stored a single
 /// `Option<Arc<...>>`; multi-group dispatch (one Raft cluster per
 /// `[[agent]] consistency = "raft"`) needs the map.
-type RaftHandlerMap = Arc<Mutex<BTreeMap<[u8; 32], Arc<dyn RaftRpcHandler>>>>;
+struct RaftHandlerRegistration {
+    handler: Arc<dyn RaftRpcHandler>,
+    /// Canonical full identities for this group's compact voter slots. This
+    /// is deliberately separate from [`PrefixMap`]: Hello's global 16-bit
+    /// routing hint is lossy and cannot authenticate consensus traffic.
+    voter_peers: Mutex<BTreeMap<u16, PeerId>>,
+}
+
+impl RaftHandlerRegistration {
+    fn new(handler: Arc<dyn RaftRpcHandler>, local_prefix: u16, local_peer: PeerId) -> Self {
+        Self {
+            handler,
+            voter_peers: Mutex::new(BTreeMap::from([(local_prefix, local_peer)])),
+        }
+    }
+
+    fn with_voters(
+        handler: Arc<dyn RaftRpcHandler>,
+        local_prefix: u16,
+        local_peer: PeerId,
+        voters: &[(u16, PeerId)],
+    ) -> Option<Self> {
+        let mut voter_peers = BTreeMap::from([(local_prefix, local_peer)]);
+        for &(prefix, peer) in voters {
+            if derive_node_prefix(&peer) != prefix {
+                return None;
+            }
+            match voter_peers.entry(prefix) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(peer);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if *entry.get() == peer => {}
+                std::collections::btree_map::Entry::Occupied(_) => return None,
+            }
+        }
+        Some(Self {
+            handler,
+            voter_peers: Mutex::new(voter_peers),
+        })
+    }
+}
+
+type RaftHandlerMap = Arc<Mutex<BTreeMap<[u8; 32], Arc<RaftHandlerRegistration>>>>;
+
+fn bind_raft_voter_peer(
+    handlers: &RaftHandlerMap,
+    replication_id: [u8; 32],
+    prefix: u16,
+    peer: PeerId,
+) -> bool {
+    let registration = handlers
+        .lock()
+        .ok()
+        .and_then(|handlers| handlers.get(&replication_id).cloned());
+    let Some(registration) = registration else {
+        return false;
+    };
+    bind_raft_voter_peer_registration(&registration, prefix, peer)
+}
+
+fn bind_raft_voter_peer_registration(
+    registration: &RaftHandlerRegistration,
+    prefix: u16,
+    peer: PeerId,
+) -> bool {
+    if derive_node_prefix(&peer) != prefix {
+        return false;
+    }
+    let Ok(mut voter_peers) = registration.voter_peers.lock() else {
+        return false;
+    };
+    match voter_peers.entry(prefix) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(peer);
+            true
+        }
+        std::collections::btree_map::Entry::Occupied(entry) => *entry.get() == peer,
+    }
+}
+
+fn resolve_raft_voter_peer(
+    handlers: &RaftHandlerMap,
+    service: &Arc<OnceLock<Arc<dyn NetworkService>>>,
+    replication_id: &[u8; 32],
+    prefix: u16,
+) -> Option<PeerId> {
+    let registration = handlers.lock().ok()?.get(replication_id).cloned()?;
+    if let Some(peer) = registration.voter_peers.lock().ok()?.get(&prefix).copied() {
+        return Some(peer);
+    }
+    let peer = service.get()?.raft_voter_peer(replication_id, prefix)?;
+    bind_raft_voter_peer(handlers, *replication_id, prefix, peer).then_some(peer)
+}
+
+fn authenticated_raft_rpc_handler(
+    registration: Option<Arc<RaftHandlerRegistration>>,
+    handlers: &RaftHandlerMap,
+    service: &Arc<OnceLock<Arc<dyn NetworkService>>>,
+    replication_id: &[u8; 32],
+    claimed_prefix: u16,
+    peer: PeerId,
+) -> Result<Arc<dyn RaftRpcHandler>, (u64, &'static str)> {
+    let Some(registration) = registration else {
+        return Err((0, "unknown replication group"));
+    };
+    let handler = &registration.handler;
+    let Some(status) = handler.local_status() else {
+        return Err((0, "local worker status unavailable"));
+    };
+    if !status.present || !status.members.contains(&claimed_prefix) {
+        return Err((status.current_term, "claimed slot is not a current voter"));
+    }
+    let expected = registration
+        .voter_peers
+        .lock()
+        .ok()
+        .and_then(|voters| voters.get(&claimed_prefix).copied())
+        .or_else(|| {
+            let peer = service
+                .get()?
+                .raft_voter_peer(replication_id, claimed_prefix)?;
+            bind_raft_voter_peer_registration(&registration, claimed_prefix, peer).then_some(peer)
+        });
+    let Some(expected) = expected else {
+        return Err((status.current_term, "canonical voter identity unavailable"));
+    };
+    if expected != peer {
+        return Err((
+            status.current_term,
+            "Noise PeerId does not match voter binding",
+        ));
+    }
+    let still_registered = handlers
+        .lock()
+        .ok()
+        .and_then(|handlers| handlers.get(replication_id).cloned())
+        .is_some_and(|current| Arc::ptr_eq(&current, &registration));
+    if !still_registered {
+        return Err((
+            status.current_term,
+            "replication handler changed during authentication",
+        ));
+    }
+    Ok(handler.clone())
+}
 
 /// Ownership token for a not-yet-started Raft replica. The fail-closed
 /// placeholder occupies the replication id before worker/database startup;
 /// dropping an unactivated token removes only that exact placeholder.
 pub(crate) struct RaftHandlerReservation {
     replication_id: [u8; 32],
-    placeholder: Arc<dyn RaftRpcHandler>,
+    placeholder: Arc<RaftHandlerRegistration>,
     handlers: RaftHandlerMap,
 }
 
@@ -862,8 +1016,15 @@ impl Network {
         replication_id: [u8; 32],
         handler: Arc<dyn RaftRpcHandler>,
     ) {
-        if let Ok(mut g) = self.raft_handlers.lock() {
-            g.insert(replication_id, handler);
+        if let Ok(mut handlers) = self.raft_handlers.lock() {
+            handlers.insert(
+                replication_id,
+                Arc::new(RaftHandlerRegistration::new(
+                    handler,
+                    self.local_prefix,
+                    self.peer_id,
+                )),
+            );
         }
     }
 
@@ -877,7 +1038,11 @@ impl Network {
         let Ok(mut handlers) = self.raft_handlers.lock() else {
             return None;
         };
-        let placeholder: Arc<dyn RaftRpcHandler> = Arc::new(ReservedRaftHandler);
+        let placeholder = Arc::new(RaftHandlerRegistration::new(
+            Arc::new(ReservedRaftHandler),
+            self.local_prefix,
+            self.peer_id,
+        ));
         match handlers.entry(replication_id) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(placeholder.clone());
@@ -893,14 +1058,33 @@ impl Network {
 
     /// Replace one exact preparation reservation with its live worker
     /// handler. Returns `false` if ownership changed in the meantime.
+    #[cfg(test)]
     pub(crate) fn activate_raft_handler(
         &self,
         reservation: &RaftHandlerReservation,
         handler: Arc<dyn RaftRpcHandler>,
     ) -> bool {
+        self.activate_raft_handler_with_voters(reservation, handler, &[])
+    }
+
+    /// Activate a reserved group together with its registry-authenticated
+    /// full voter identities. The handler and identity table become visible
+    /// in one map replacement, so no inbound or outbound consensus RPC can
+    /// observe a prefix-only activation window.
+    pub(crate) fn activate_raft_handler_with_voters(
+        &self,
+        reservation: &RaftHandlerReservation,
+        handler: Arc<dyn RaftRpcHandler>,
+        voters: &[(u16, PeerId)],
+    ) -> bool {
         if !Arc::ptr_eq(&self.raft_handlers, &reservation.handlers) {
             return false;
         }
+        let Some(registration) =
+            RaftHandlerRegistration::with_voters(handler, self.local_prefix, self.peer_id, voters)
+        else {
+            return false;
+        };
         let Ok(mut handlers) = self.raft_handlers.lock() else {
             return false;
         };
@@ -910,7 +1094,7 @@ impl Network {
         if !Arc::ptr_eq(current, &reservation.placeholder) {
             return false;
         }
-        *current = handler;
+        *current = Arc::new(registration);
         true
     }
 
@@ -938,7 +1122,7 @@ impl Network {
         };
         if handlers
             .get(replication_id)
-            .is_some_and(|current| Arc::ptr_eq(current, expected))
+            .is_some_and(|current| Arc::ptr_eq(&current.handler, expected))
         {
             handlers.remove(replication_id);
             true
@@ -972,7 +1156,7 @@ impl Network {
             .lock()
             .ok()?
             .get(replication_id)
-            .cloned()?;
+            .map(|registration| registration.handler.clone())?;
         let reply = handler.handle_status(replication_id);
         reply.present.then_some(reply)
     }
@@ -988,7 +1172,7 @@ impl Network {
             .lock()
             .ok()?
             .get(replication_id)
-            .cloned()?;
+            .map(|registration| registration.handler.clone())?;
         handler.local_status()
     }
 
@@ -1000,6 +1184,25 @@ impl Network {
             .lock()
             .ok()
             .is_some_and(|handlers| handlers.contains_key(replication_id))
+    }
+
+    /// Install one immutable, group-scoped voter identity. Equal repeats are
+    /// idempotent; a conflicting full PeerId is refused until the group is
+    /// unregistered and opened again.
+    pub(crate) fn bind_raft_voter_peer(
+        &self,
+        replication_id: [u8; 32],
+        prefix: u16,
+        peer: PeerId,
+    ) -> bool {
+        bind_raft_voter_peer(&self.raft_handlers, replication_id, prefix, peer)
+    }
+
+    /// Resolve an outbound Raft destination through the group-scoped exact
+    /// identity table. Cache misses are authenticated by the installed node
+    /// service; the global lossy prefix map is never consulted.
+    pub(crate) fn raft_voter_peer(&self, replication_id: &[u8; 32], prefix: u16) -> Option<PeerId> {
+        resolve_raft_voter_peer(&self.raft_handlers, &self.service, replication_id, prefix)
     }
 
     // Operator-tooling senders (manifest fetch, raft join, raft
@@ -2233,14 +2436,23 @@ fn handle_req_resp(
                         // up the handler keyed by `replication_id`
                         // so multiple Raft clusters can coexist on
                         // one node.
-                        let handler = raft_handlers
+                        let registration = raft_handlers
                             .lock()
                             .ok()
                             .and_then(|g| g.get(&replication_id).cloned());
+                        let service = service.clone();
+                        let raft_handlers = raft_handlers.clone();
                         let response_tx = response_tx.clone();
                         tokio::task::spawn_blocking(move || {
-                            let resp = match handler {
-                                Some(h) => h.append_entries(
+                            let resp = match authenticated_raft_rpc_handler(
+                                registration,
+                                &raft_handlers,
+                                &service,
+                                &replication_id,
+                                leader_prefix,
+                                peer,
+                            ) {
+                                Ok(h) => h.append_entries(
                                     &replication_id,
                                     leader_prefix,
                                     term,
@@ -2249,18 +2461,19 @@ fn handle_req_resp(
                                     leader_commit,
                                     entries,
                                 ),
-                                None => {
-                                    warn!(
+                                Err((local_term, reason)) => {
+                                    debug!(
+                                        %peer,
                                         leader_prefix,
+                                        reason,
                                         rep_id = format!(
                                             "{:02x}{:02x}..",
                                             replication_id[0], replication_id[1]
                                         ),
-                                        "network: inbound RaftAppendReq for unknown \
-                                         replication group; replying success=false",
+                                        "network: refused unauthenticated RaftAppendReq",
                                     );
                                     RaftAppendResult {
-                                        term,
+                                        term: local_term,
                                         success: false,
                                         match_index: 0,
                                     }
@@ -2286,32 +2499,42 @@ fn handle_req_resp(
                         // Vote logic touches redb (writes voted_for /
                         // current_term), so dispatch on a blocking task.
                         // Routed by `replication_id` like AppendEntries.
-                        let handler = raft_handlers
+                        let registration = raft_handlers
                             .lock()
                             .ok()
                             .and_then(|g| g.get(&replication_id).cloned());
+                        let service = service.clone();
+                        let raft_handlers = raft_handlers.clone();
                         let response_tx = response_tx.clone();
                         tokio::task::spawn_blocking(move || {
-                            let resp = match handler {
-                                Some(h) => h.request_vote(
+                            let resp = match authenticated_raft_rpc_handler(
+                                registration,
+                                &raft_handlers,
+                                &service,
+                                &replication_id,
+                                candidate_prefix,
+                                peer,
+                            ) {
+                                Ok(h) => h.request_vote(
                                     &replication_id,
                                     candidate_prefix,
                                     term,
                                     last_log_index,
                                     last_log_term,
                                 ),
-                                None => {
-                                    warn!(
+                                Err((local_term, reason)) => {
+                                    debug!(
+                                        %peer,
                                         candidate_prefix,
+                                        reason,
                                         rep_id = format!(
                                             "{:02x}{:02x}..",
                                             replication_id[0], replication_id[1]
                                         ),
-                                        "network: inbound RaftVoteReq for unknown \
-                                         replication group; vote_granted=false",
+                                        "network: refused unauthenticated RaftVoteReq",
                                     );
                                     RaftVoteResult {
-                                        term,
+                                        term: local_term,
                                         vote_granted: false,
                                     }
                                 }
@@ -2343,14 +2566,23 @@ fn handle_req_resp(
                         // blocking task is the right shape. Routed
                         // by `replication_id` like the other Raft
                         // RPCs.
-                        let handler = raft_handlers
+                        let registration = raft_handlers
                             .lock()
                             .ok()
                             .and_then(|g| g.get(&replication_id).cloned());
+                        let service = service.clone();
+                        let raft_handlers = raft_handlers.clone();
                         let response_tx = response_tx.clone();
                         tokio::task::spawn_blocking(move || {
-                            let resp = match handler {
-                                Some(h) => h.install_snapshot(
+                            let resp = match authenticated_raft_rpc_handler(
+                                registration,
+                                &raft_handlers,
+                                &service,
+                                &replication_id,
+                                leader_prefix,
+                                peer,
+                            ) {
+                                Ok(h) => h.install_snapshot(
                                     &replication_id,
                                     leader_prefix,
                                     term,
@@ -2363,18 +2595,20 @@ fn handle_req_resp(
                                     joint_old,
                                     active_config_index,
                                 ),
-                                None => {
-                                    warn!(
+                                Err((local_term, reason)) => {
+                                    debug!(
+                                        %peer,
                                         leader_prefix,
+                                        reason,
                                         rep_id = format!(
                                             "{:02x}{:02x}..",
                                             replication_id[0], replication_id[1]
                                         ),
-                                        "network: inbound RaftInstallSnapshotReq for unknown \
-                                         replication group; replying with our term",
+                                        "network: refused unauthenticated \
+                                         RaftInstallSnapshotReq",
                                     );
                                     RaftInstallSnapshotResult {
-                                        term,
+                                        term: local_term,
                                         bytes_received: 0,
                                     }
                                 }
@@ -2420,10 +2654,10 @@ fn handle_req_resp(
                         // admission check below probes the local registry
                         // (a blocking local round-trip) — both off the swarm
                         // thread.
-                        let handler = raft_handlers
-                            .lock()
-                            .ok()
-                            .and_then(|g| g.get(&replication_id).cloned());
+                        let handler = raft_handlers.lock().ok().and_then(|g| {
+                            g.get(&replication_id)
+                                .map(|registration| registration.handler.clone())
+                        });
                         let svc = service.get().cloned();
                         let response_tx = response_tx.clone();
                         tokio::task::spawn_blocking(move || {
@@ -2473,10 +2707,10 @@ fn handle_req_resp(
                         // Status query needs a snapshot from the
                         // worker — that round-trips through its
                         // inbox, so dispatch on a blocking task.
-                        let handler = raft_handlers
-                            .lock()
-                            .ok()
-                            .and_then(|g| g.get(&replication_id).cloned());
+                        let handler = raft_handlers.lock().ok().and_then(|g| {
+                            g.get(&replication_id)
+                                .map(|registration| registration.handler.clone())
+                        });
                         let response_tx = response_tx.clone();
                         tokio::task::spawn_blocking(move || {
                             let reply = match handler {
@@ -3052,7 +3286,7 @@ mod tests {
             .get(&replication_id)
             .cloned()
             .unwrap();
-        assert!(Arc::ptr_eq(&registered, &replacement));
+        assert!(Arc::ptr_eq(&registered.handler, &replacement));
         assert!(network.unregister_raft_handler_if(&replication_id, &replacement));
         network.join();
     }
@@ -3107,7 +3341,7 @@ mod tests {
             .get(&replication_id)
             .cloned()
             .unwrap();
-        assert!(Arc::ptr_eq(&registered_before, &live));
+        assert!(Arc::ptr_eq(&registered_before.handler, &live));
 
         assert!(network.unregister_raft_handler_if(&replication_id, &live));
         let reservation = network.reserve_raft_handler(replication_id).unwrap();
@@ -3124,7 +3358,7 @@ mod tests {
             .get(&replication_id)
             .cloned()
             .unwrap();
-        assert!(Arc::ptr_eq(&registered_after, &duplicate));
+        assert!(Arc::ptr_eq(&registered_after.handler, &duplicate));
         assert!(network.unregister_raft_handler_if(&replication_id, &duplicate));
         let abandoned = network.reserve_raft_handler(replication_id).unwrap();
         drop(abandoned);
@@ -4431,18 +4665,33 @@ mod tests {
             vote_calls: StdMutex<Vec<(u16, u64, u64, u64)>>,
             install_calls: StdMutex<Vec<(u64, bool, usize, Vec<u16>)>>,
             term: AtomicU64,
+            members: Vec<u16>,
         }
         impl StubHandler {
-            fn new(initial_term: u64) -> Self {
+            fn new(initial_term: u64, members: Vec<u16>) -> Self {
                 Self {
                     append_calls: StdMutex::new(Vec::new()),
                     vote_calls: StdMutex::new(Vec::new()),
                     install_calls: StdMutex::new(Vec::new()),
                     term: AtomicU64::new(initial_term),
+                    members,
                 }
             }
         }
         impl RaftRpcHandler for StubHandler {
+            fn local_status(&self) -> Option<RaftStatusReply> {
+                Some(RaftStatusReply {
+                    present: true,
+                    role: RaftRole::Follower,
+                    current_term: self.term.load(Ordering::Relaxed),
+                    commit_index: 0,
+                    last_applied: 0,
+                    last_log_index: 0,
+                    members: self.members.clone(),
+                    leader_hint: None,
+                })
+            }
+
             fn append_entries(
                 &self,
                 _replication_id: &[u8; 32],
@@ -4545,8 +4794,9 @@ mod tests {
 
         // Install the stub on B — A is the leader-side caller.
         let rep_id = [0xC0u8; 32];
-        let handler = Arc::new(StubHandler::new(7));
+        let handler = Arc::new(StubHandler::new(7, vec![prefix_a, prefix_b]));
         net_b.register_raft_handler(rep_id, handler.clone());
+        assert!(net_b.bind_raft_voter_peer(rep_id, prefix_a, net_a.peer_id()));
 
         // Wait for the Hello handshake so A has a PeerId for B.
         wait_for(
@@ -4657,7 +4907,7 @@ mod tests {
         // ── No-handler fallback: a peer with no handler installed
         // returns success=false / vote_granted=false (not a hang). ──
         // Reverse the direction: B asks A, but A has no handler.
-        let target_a = net_b.peer_for_prefix(prefix_a).unwrap();
+        let target_a = net_a.peer_id();
         let rx = net_b.send_raft_append(target_a, rep_id, 1, prefix_b, 0, 0, 0, vec![]);
         let resp = rx
             .recv_timeout(Duration::from_secs(5))
@@ -4667,6 +4917,346 @@ mod tests {
 
         net_a.join();
         net_b.join();
+    }
+
+    #[test]
+    fn raft_rpcs_reject_a_peer_forging_an_enrolled_voter_prefix() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+        struct GuardedHandler {
+            term: AtomicU64,
+            calls: AtomicUsize,
+            members: Vec<u16>,
+        }
+        impl RaftRpcHandler for GuardedHandler {
+            fn local_status(&self) -> Option<RaftStatusReply> {
+                Some(RaftStatusReply {
+                    present: true,
+                    role: RaftRole::Follower,
+                    current_term: self.term.load(Ordering::Relaxed),
+                    commit_index: 0,
+                    last_applied: 0,
+                    last_log_index: 0,
+                    members: self.members.clone(),
+                    leader_hint: None,
+                })
+            }
+
+            fn append_entries(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                prev_log_index: u64,
+                _prev_log_term: u64,
+                _leader_commit: u64,
+                entries: Vec<RaftEntry>,
+            ) -> RaftAppendResult {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.term.fetch_max(term, Ordering::Relaxed);
+                RaftAppendResult {
+                    term,
+                    success: true,
+                    match_index: prev_log_index + entries.len() as u64,
+                }
+            }
+
+            fn request_vote(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                _last_log_index: u64,
+                _last_log_term: u64,
+            ) -> RaftVoteResult {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.term.fetch_max(term, Ordering::Relaxed);
+                RaftVoteResult {
+                    term,
+                    vote_granted: true,
+                }
+            }
+
+            fn install_snapshot(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                _last_included_index: u64,
+                _last_included_term: u64,
+                offset: u64,
+                _done: bool,
+                snapshot: Vec<u8>,
+                _members: Vec<u16>,
+                _joint_old: Option<Vec<u16>>,
+                _active_config_index: Option<u64>,
+            ) -> RaftInstallSnapshotResult {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.term.fetch_max(term, Ordering::Relaxed);
+                RaftInstallSnapshotResult {
+                    term,
+                    bytes_received: offset + snapshot.len() as u64,
+                }
+            }
+        }
+
+        let receiver_key = identity::Keypair::generate_ed25519();
+        let voter_key = identity::Keypair::generate_ed25519();
+        let attacker_key = identity::Keypair::generate_ed25519();
+        let receiver_peer = PeerId::from(receiver_key.public());
+        let voter_peer = PeerId::from(voter_key.public());
+        let attacker_peer = PeerId::from(attacker_key.public());
+        let receiver_prefix = derive_node_prefix(&receiver_peer);
+        let voter_prefix = derive_node_prefix(&voter_peer);
+        let attacker_prefix = derive_node_prefix(&attacker_peer);
+        if [receiver_prefix, voter_prefix, attacker_prefix]
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .len()
+            != 3
+        {
+            return;
+        }
+
+        let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+        let receiver = Network::start(NetworkConfig {
+            keypair: receiver_key,
+            local_prefix: receiver_prefix,
+            listen: vec![listen],
+            bootstrap: vec![],
+            auto_dial_mdns: false,
+        });
+        let receiver_addr = wait_for(
+            || receiver.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .with(libp2p::multiaddr::Protocol::P2p(receiver_peer));
+        let attacker = Network::start(NetworkConfig {
+            keypair: attacker_key,
+            local_prefix: attacker_prefix,
+            listen: Vec::new(),
+            bootstrap: vec![receiver_addr],
+            auto_dial_mdns: false,
+        });
+        wait_for(
+            || receiver.peer_for_prefix(attacker_prefix).map(|_| ()),
+            Duration::from_secs(10),
+        )
+        .expect("attacker connects");
+
+        let replication_id = [0xC3; 32];
+        let handler = Arc::new(GuardedHandler {
+            term: AtomicU64::new(7),
+            calls: AtomicUsize::new(0),
+            members: vec![receiver_prefix, voter_prefix],
+        });
+        receiver.register_raft_handler(replication_id, handler.clone());
+        assert!(receiver.bind_raft_voter_peer(replication_id, voter_prefix, voter_peer));
+        // Model the precise collision hazard: generic routing points the
+        // victim's compact slot at the attacker, but consensus authentication
+        // remains pinned to the enrolled full PeerId above.
+        receiver.set_prefix_owner_for_test(voter_prefix, attacker_peer);
+
+        let append = attacker
+            .send_raft_append(
+                receiver_peer,
+                replication_id,
+                99,
+                voter_prefix,
+                0,
+                0,
+                0,
+                Vec::new(),
+            )
+            .recv_timeout(Duration::from_secs(5))
+            .expect("forged append receives a refusal");
+        assert_eq!(append.term, 7);
+        assert!(!append.success);
+        let vote = attacker
+            .send_raft_vote(receiver_peer, replication_id, 99, voter_prefix, 0, 0)
+            .recv_timeout(Duration::from_secs(5))
+            .expect("forged vote receives a refusal");
+        assert_eq!(vote.term, 7);
+        assert!(!vote.vote_granted);
+        let snapshot = attacker
+            .send_raft_install_snapshot(
+                receiver_peer,
+                replication_id,
+                99,
+                voter_prefix,
+                0,
+                0,
+                0,
+                true,
+                vec![0xAA],
+                vec![receiver_prefix, voter_prefix],
+                None,
+                Some(0),
+            )
+            .recv_timeout(Duration::from_secs(5))
+            .expect("forged snapshot receives a refusal");
+        assert_eq!(snapshot.term, 7);
+        assert_eq!(snapshot.bytes_received, 0);
+        assert_eq!(handler.term.load(Ordering::Relaxed), 7);
+        assert_eq!(handler.calls.load(Ordering::Relaxed), 0);
+
+        receiver.join();
+        attacker.join();
+    }
+
+    #[test]
+    fn colliding_peer_cannot_supply_a_missing_voters_quorum() {
+        use crate::raft::{RaftWorker, Role, WorkerConfig};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FalseVoter {
+            calls: AtomicUsize,
+            members: Vec<u16>,
+        }
+        impl RaftRpcHandler for FalseVoter {
+            fn local_status(&self) -> Option<RaftStatusReply> {
+                Some(RaftStatusReply {
+                    present: true,
+                    role: RaftRole::Follower,
+                    current_term: 1,
+                    commit_index: 0,
+                    last_applied: 0,
+                    last_log_index: 0,
+                    members: self.members.clone(),
+                    leader_hint: None,
+                })
+            }
+
+            fn append_entries(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                prev_log_index: u64,
+                _prev_log_term: u64,
+                _leader_commit: u64,
+                entries: Vec<RaftEntry>,
+            ) -> RaftAppendResult {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                RaftAppendResult {
+                    term,
+                    success: true,
+                    match_index: prev_log_index + entries.len() as u64,
+                }
+            }
+
+            fn request_vote(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                _last_log_index: u64,
+                _last_log_term: u64,
+            ) -> RaftVoteResult {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                RaftVoteResult {
+                    term,
+                    vote_granted: true,
+                }
+            }
+        }
+
+        let local_key = identity::Keypair::generate_ed25519();
+        let absent_key = identity::Keypair::generate_ed25519();
+        let attacker_key = identity::Keypair::generate_ed25519();
+        let local_peer = PeerId::from(local_key.public());
+        let absent_peer = PeerId::from(absent_key.public());
+        let attacker_peer = PeerId::from(attacker_key.public());
+        let local_prefix = derive_node_prefix(&local_peer);
+        let absent_prefix = derive_node_prefix(&absent_peer);
+        let attacker_prefix = derive_node_prefix(&attacker_peer);
+        if [local_prefix, absent_prefix, attacker_prefix]
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .len()
+            != 3
+        {
+            return;
+        }
+
+        let listen: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+        let local = Arc::new(Network::start(NetworkConfig {
+            keypair: local_key,
+            local_prefix,
+            listen: vec![listen],
+            bootstrap: vec![],
+            auto_dial_mdns: false,
+        }));
+        let local_addr = wait_for(
+            || local.listen_addrs().into_iter().next(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .with(libp2p::multiaddr::Protocol::P2p(local_peer));
+        let attacker = Arc::new(Network::start(NetworkConfig {
+            keypair: attacker_key,
+            local_prefix: attacker_prefix,
+            listen: Vec::new(),
+            bootstrap: vec![local_addr],
+            auto_dial_mdns: false,
+        }));
+        wait_for(
+            || local.peer_for_prefix(attacker_prefix).map(|_| ()),
+            Duration::from_secs(10),
+        )
+        .expect("attacker connects");
+
+        let replication_id = [0xC4; 32];
+        let false_voter = Arc::new(FalseVoter {
+            calls: AtomicUsize::new(0),
+            members: vec![local_prefix, absent_prefix],
+        });
+        attacker.register_raft_handler(replication_id, false_voter.clone());
+        assert!(attacker.bind_raft_voter_peer(replication_id, local_prefix, local_peer));
+
+        let dir = std::env::temp_dir().join(format!(
+            "vos_raft_false_quorum_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(redb::Database::create(dir.join("local.redb")).unwrap());
+        let worker = RaftWorker::spawn(
+            db,
+            WorkerConfig {
+                me: local_prefix,
+                members: vec![local_prefix, absent_prefix],
+                replication_id,
+                election_timeout_ms: (40, 80),
+                heartbeat_interval_ms: 20,
+            },
+            Some(local.clone()),
+            None,
+        );
+        local.register_raft_handler(replication_id, Arc::new(worker.handler()));
+        assert!(local.bind_raft_voter_peer(replication_id, absent_prefix, absent_peer));
+        local.set_prefix_owner_for_test(absent_prefix, attacker_peer);
+
+        std::thread::sleep(Duration::from_millis(350));
+        assert_ne!(worker.role(), Role::Leader);
+        assert_eq!(
+            false_voter.calls.load(Ordering::Relaxed),
+            0,
+            "the colliding responder must never receive the absent voter's RPCs",
+        );
+
+        worker.shutdown();
+        if let Ok(network) = Arc::try_unwrap(local) {
+            network.join();
+        }
+        if let Ok(network) = Arc::try_unwrap(attacker) {
+            network.join();
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Raft election: three networked nodes spin up Raft
@@ -4788,6 +5378,11 @@ mod tests {
         net_a.register_raft_handler(rep_id, Arc::new(w_a.handler()));
         net_b.register_raft_handler(rep_id, Arc::new(w_b.handler()));
         net_c.register_raft_handler(rep_id, Arc::new(w_c.handler()));
+        for network in [&net_a, &net_b, &net_c] {
+            assert!(network.bind_raft_voter_peer(rep_id, prefix_a, net_a.peer_id()));
+            assert!(network.bind_raft_voter_peer(rep_id, prefix_b, net_b.peer_id()));
+            assert!(network.bind_raft_voter_peer(rep_id, prefix_c, net_c.peer_id()));
+        }
 
         // Heartbeats keep followers' timers reset, so leadership
         // is *stable* — once a Leader emerges it stays Leader and
@@ -5004,6 +5599,14 @@ mod tests {
         net_a.register_raft_handler(rep_id, Arc::new(w_a.handler()));
         net_b.register_raft_handler(rep_id, Arc::new(w_b.handler()));
         net_c.register_raft_handler(rep_id, Arc::new(w_c.handler()));
+        for network in [&net_a, &net_b, &net_c] {
+            assert!(network.bind_raft_voter_peer(rep_id, prefix_a, net_a.peer_id()));
+            assert!(network.bind_raft_voter_peer(rep_id, prefix_b, net_b.peer_id()));
+            assert!(network.bind_raft_voter_peer(rep_id, prefix_c, net_c.peer_id()));
+        }
+        // Model a first-owner collision in Hello's lossy routing table. Raft
+        // must continue to address B through the exact group binding above.
+        net_a.set_prefix_owner_for_test(prefix_b, PeerId::random());
 
         // ── Wait for a leader. ────────────────────────────────
         let until = StdInstant::now() + Duration::from_secs(5);
