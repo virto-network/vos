@@ -57,7 +57,7 @@ fn main() {
         "bundled_space_authority.pvm",
         "VOSX_BUNDLED_SPACE_AUTHORITY_PVM",
         "v2 role-gated roots will remain pending",
-        "just refresh-bundled-authority",
+        "restore vosx/blobs/space_authority.pvm from the release source tree",
     );
 }
 

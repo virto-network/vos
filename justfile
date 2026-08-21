@@ -100,14 +100,15 @@ refresh-bundled-registry: (build-actor "space-registry")
     cp actors/space-registry/target/riscv64em-javm/release/space_registry.elf \
        vosx/blobs/space_registry.elf
 
-# Refresh the exact canonical PVM used to construct each space's root-signed
-# authority package. The temporary .vos is discarded: package signing belongs
-# to the space root at first startup, so every peer installs the same bytes.
-refresh-bundled-authority: (build-actor "space-authority")
+# Build a candidate authority PVM for an explicit UpgradeActor migration. The
+# bundled Batch 70 PVM is a durable identity and must not be replaced in-place:
+# doing so changes the root-signed package and replication incarnation of every
+# already-sealed space.
+build-authority-upgrade-candidate: (build-actor "space-authority")
     cargo run -p vosx -- build actors/space-authority --name space-authority \
       --version artifact-only --out-dir target/bundled-space-authority
-    cp target/bundled-space-authority/space-authority.pvm \
-       vosx/blobs/space_authority.pvm
+    @echo "candidate: target/bundled-space-authority/space-authority.pvm"
+    @echo "install only through a reviewed UpgradeActor migration"
 
 # Refresh the bundled dev-project ELF shipped with vosx.
 refresh-bundled-dev-project: (build-actor "dev-project")

@@ -159,8 +159,9 @@ stands in for the on-chain settlement venue Wave 2 makes real.
   conformance fallback whenever a service PVM is supplied.
 - **Release and operations**: package the pinned service/authority artifacts,
   define backup and restore for root images plus private side stores, exercise
-  rolling voter replacement, and turn the production daemon scenario into a
-  release gate.
+  rolling voter replacement, define the explicit `UpgradeActor` procedure for
+  the frozen Batch 70 authority identity, and turn the production daemon
+  scenario into a release gate.
 
 **Keystone fast-follows (non-blocking; merged code is green)**
 - Ristretto host precompiles remain outside the trusted proof boundary. The

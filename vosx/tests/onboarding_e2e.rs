@@ -633,38 +633,19 @@ fn crdt_counter_package_fixture(output_dir: &Path) -> PathBuf {
     package
 }
 
-fn assert_bundled_space_authority_matches_fresh_build(output_dir: &Path) {
+fn assert_bundled_space_authority_preserves_batch_70_program() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    let actor_project = workspace.join("actors/space-authority");
-    assert!(
-        actor_project.join("Cargo.toml").is_file(),
-        "the canonical authority project must be present",
-    );
-    let build_data = output_dir.join("authority-build-data");
-    let build_config = output_dir.join("authority-build-config");
-    let actor = actor_project.to_string_lossy().into_owned();
-    let out = output_dir.to_string_lossy().into_owned();
-    vosx_ok(
-        &build_data,
-        &build_config,
-        &[
-            "build",
-            &actor,
-            "--name",
-            "space-authority",
-            "--version",
-            "artifact-only",
-            "--out-dir",
-            &out,
-        ],
-    );
-    let fresh = fs::read(output_dir.join("space-authority.pvm"))
-        .expect("fresh authority build emits its PVM");
     let bundled = fs::read(workspace.join("vosx/blobs/space_authority.pvm"))
         .expect("vosx ships the canonical authority PVM");
     assert_eq!(
-        bundled, fresh,
-        "the bundled space-authority PVM must match a fresh canonical actor build",
+        hex::encode(vos::v2::ProgramId::of_pvm(&bundled).0),
+        "16d0488cd51bfb70f5697cb909c7eb2a76772673936f3db69ff396868f7713e3",
+        "the built-in authority program is a durable protocol identity; source rebuilds require an explicit UpgradeActor migration",
+    );
+    assert_eq!(
+        hex::encode(vos::crypto::blake2b_hash::<32>(&[], &[&bundled])),
+        "86872e83d3bb445cbf2b477e81d51aaaa5c21e0a7555e90226000d09aeca0842",
+        "the Batch 70 authority bytes must remain exact so sealed spaces can reopen",
     );
 }
 
@@ -927,6 +908,37 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
         "build the canonical service first: `just build-vos-service`",
     );
 
+    let invalid_data = TempDir::new("v2-root-invalid-profile-data");
+    let invalid_config = TempDir::new("v2-root-invalid-profile-config");
+    let invalid_recipe = dist.path().join("invalid-profile.toml");
+    fs::write(
+        &invalid_recipe,
+        "space = \"invalid-profile\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let recipe = invalid_recipe.to_string_lossy().into_owned();
+    let service = service_pvm.to_string_lossy().into_owned();
+    let implicit_trust = vosx(
+        invalid_data.path(),
+        invalid_config.path(),
+        &["space", "up", &recipe, "--once", "--service-pvm", &service],
+    );
+    assert!(
+        !implicit_trust.status.success()
+            && String::from_utf8_lossy(&implicit_trust.stderr)
+                .contains("--production-trust-socket"),
+        "a signed v2 service must not select conformance implicitly: {}",
+        String::from_utf8_lossy(&implicit_trust.stderr),
+    );
+    assert!(
+        fs::read_dir(invalid_data.path()).unwrap().next().is_none()
+            && fs::read_dir(invalid_config.path())
+                .unwrap()
+                .next()
+                .is_none(),
+        "invalid trust selection must fail before recipe onboarding writes an index, key, or pending token",
+    );
+
     let actor = actor_elf.to_string_lossy().into_owned();
     let out = dist.path().to_string_lossy().into_owned();
     vosx_ok(
@@ -965,21 +977,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
         upgrade_package.is_file(),
         "vosx build must emit the upgrade package",
     );
-
     vosx_ok(data.path(), config.path(), &["space", "new", space]);
-    let service = service_pvm.to_string_lossy().into_owned();
-    let implicit_trust = vosx(
-        data.path(),
-        config.path(),
-        &["space", "up", space, "--once", "--service-pvm", &service],
-    );
-    assert!(
-        !implicit_trust.status.success()
-            && String::from_utf8_lossy(&implicit_trust.stderr)
-                .contains("--production-trust-socket"),
-        "a signed v2 service must not select conformance implicitly: {}",
-        String::from_utf8_lossy(&implicit_trust.stderr),
-    );
     let first_log = data.path().join("v2-root-first.stderr");
     let first = Daemon(spawn_up_with_service(
         data.path(),
@@ -1612,7 +1610,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
     let config_b = TempDir::new("production-crdt-b-config");
     let dist = TempDir::new("production-crdt-network-dist");
     let sidecar_dir = TempDir::new("production-crdt-sidecars");
-    assert_bundled_space_authority_matches_fresh_build(dist.path());
+    assert_bundled_space_authority_preserves_batch_70_program();
     let package = crdt_counter_package_fixture(dist.path());
     let policy = vos::v2::Hash([0x69; 32]);
     let trust_a_path = sidecar_dir.path().join("authority-a.sock");

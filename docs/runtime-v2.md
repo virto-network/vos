@@ -783,10 +783,13 @@ explicit, so it exercises authenticated full-PeerId forwarding without
 claiming that automatic topology discovery has landed. Snapshot joiners verify
 the sealed production provenance and exact policy; log replay independently
 re-runs historical checks. Every voter must observe historical JAM-slot
-verification before the gate completes. The gate also rebuilds
-`space-authority` and requires byte identity with the PVM bundled by `vosx`, so
-onboarding cannot silently execute an actor compiled against a retired runtime
-contract.
+verification before the gate completes. The bundled `space-authority` PVM is a
+durable protocol identity: its Batch 70 program ID, exact bytes, deterministic
+root-signed package hash, and derived replication incarnation are pinned by
+regression tests so already-sealed spaces reopen unchanged. A source rebuild
+is not installed implicitly; changing that actor requires an explicit
+`UpgradeActor` migration which preserves the existing authority incarnation
+until the upgrade commits.
 
 The request kind values in that order are `0..=7`. Response values are
 `0=Authorized`, `1=Denied`, `2=Unavailable`, `3=no-current-slot`,

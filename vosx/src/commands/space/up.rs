@@ -263,6 +263,34 @@ fn ensure_v2_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::Resul
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
+    // Validate and open the requested v2 execution profile before resolving
+    // the trivalent target. Target resolution may scaffold a recipe space,
+    // create its node identity, or persist an invite bearer, so an invalid
+    // trust selection must fail before any of those durable mutations.
+    validate_v2_trust_mode(
+        args.service_pvm.is_some(),
+        args.production_trust_socket.is_some(),
+        args.allow_v2_conformance,
+    )?;
+    let pinned_v2_service = load_pinned_v2_service(args.service_pvm.as_deref())?;
+    let production_trust = args
+        .production_trust_socket
+        .as_deref()
+        .map(super::production_trust::SocketProductionTrustV2::open)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("open production trust authority: {error}"))?
+        .map(|trust| std::sync::Arc::new(trust) as std::sync::Arc<dyn vos::v2::ProductionTrustV2>);
+    if let Some(trust) = production_trust.as_ref() {
+        tracing::info!(
+            policy = %hex::encode(trust.policy_id().0),
+            "v2 roots use the fail-closed production trust profile",
+        );
+    } else if pinned_v2_service.is_some() {
+        tracing::warn!(
+            "signed v2 roots use the conformance-only trust seam; this mode is not production-safe",
+        );
+    }
+
     // Trivalent positional (decision 1): an existing `.toml` recipe
     // (create-if-missing + genesis apply), a `vos1…` invite token
     // (join-if-needed + auto-redeem), or a known space name / id. Any of
@@ -306,29 +334,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         );
     }
     let mut pending_token = load_pending_token(&data_dir)?;
-    let pinned_v2_service = load_pinned_v2_service(args.service_pvm.as_deref())?;
-    let production_trust = args
-        .production_trust_socket
-        .as_deref()
-        .map(super::production_trust::SocketProductionTrustV2::open)
-        .transpose()
-        .map_err(|error| anyhow::anyhow!("open production trust authority: {error}"))?
-        .map(|trust| std::sync::Arc::new(trust) as std::sync::Arc<dyn vos::v2::ProductionTrustV2>);
-    validate_v2_trust_mode(
-        pinned_v2_service.is_some(),
-        production_trust.is_some(),
-        args.allow_v2_conformance,
-    )?;
-    if let Some(trust) = production_trust.as_ref() {
-        tracing::info!(
-            policy = %hex::encode(trust.policy_id().0),
-            "v2 roots use the fail-closed production trust profile",
-        );
-    } else if pinned_v2_service.is_some() {
-        tracing::warn!(
-            "signed v2 roots use the conformance-only trust seam; this mode is not production-safe",
-        );
-    }
 
     // Verify the genesis CrdtEvent against the advertised
     // space_id BEFORE registering the agent (which opens the
@@ -4079,6 +4084,31 @@ mod tests {
         assert_eq!(
             binding.actor,
             v2_root_actor_id(root_service, vos::v2::ROLE_AUTHORITY_INSTANCE_V2)
+        );
+    }
+
+    #[test]
+    fn canonical_role_authority_preserves_the_batch_70_incarnation() {
+        let root = Keypair::ed25519_from_bytes([7; 32]).unwrap();
+        let package = root_signed_role_authority_package(&root).unwrap();
+        let package_hash = BlobHash::of(&package.encode()).0;
+        let replication_id = crate::commands::space::common::auto_replication_id(
+            &[92; 32],
+            vos::v2::ROLE_AUTHORITY_INSTANCE_V2,
+            &package_hash,
+        );
+
+        assert_eq!(
+            hex::encode(package.manifest.actor_program.0),
+            "16d0488cd51bfb70f5697cb909c7eb2a76772673936f3db69ff396868f7713e3",
+        );
+        assert_eq!(
+            hex::encode(package_hash),
+            "8a4913b7bc2a881ad42894ca900992eebca0c704bfe94e5da41e0adf0ff1939a",
+        );
+        assert_eq!(
+            hex::encode(replication_id),
+            "c57bf093bdb6cf27f4755938a106845f4590e8e052536e4ac808d80bc46831c6",
         );
     }
 
