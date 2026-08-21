@@ -1357,10 +1357,12 @@ directory and updates the spaces index. The default destination is derived
 from the archived `SpaceId`, never the old machine's absolute path. Existing
 state is refused unless `--replace` is explicit; replacement renames it to a
 reported recovery path and rolls it back if index activation fails. A global
-index lock serializes concurrent restores, which reload and revalidate the
-latest name and data-directory ownership before activation. `--replace` never
-permits one space to overwrite another indexed space's directory. Restore does
-not silently delete the retained directory.
+index lock shared by every creator, recipe/token mutation, restore, and forget
+serializes each read-modify-write transaction. Restore reloads and revalidates
+the latest name and data-directory ownership before activation. `--replace`
+never permits one space to overwrite, contain, or be contained by another
+indexed space's directory. Restore does not silently delete the retained
+directory.
 
 The archive contains `node.key` and may contain plaintext private ingress and
 prover witnesses. It is therefore a secret operator artifact even though its

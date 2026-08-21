@@ -799,7 +799,7 @@ fn resolve_recipe(path: &str) -> anyhow::Result<String> {
         tracing::info!("created space '{name}' from recipe {path}");
     }
 
-    let mut index = spaces_index::load()?;
+    let mut index = spaces_index::LockedSpacesIndex::acquire()?;
     let entry = index
         .spaces
         .iter_mut()
@@ -811,7 +811,7 @@ fn resolve_recipe(path: &str) -> anyhow::Result<String> {
     {
         entry.hyperspace = hs.clone();
     }
-    spaces_index::save(&index)?;
+    index.save()?;
     Ok(name)
 }
 
@@ -832,7 +832,7 @@ fn resolve_token(token_str: &str) -> anyhow::Result<String> {
         tracing::info!("joined space '{}' from invite token", payload.name);
     }
 
-    let mut index = spaces_index::load()?;
+    let mut index = spaces_index::LockedSpacesIndex::acquire()?;
     let entry = index
         .spaces
         .iter_mut()
@@ -844,7 +844,7 @@ fn resolve_token(token_str: &str) -> anyhow::Result<String> {
         }
     }
     let data_dir = PathBuf::from(&entry.data_dir);
-    spaces_index::save(&index)?;
+    index.save()?;
     save_pending_token(&data_dir, token_str)?;
     // Return the space_id, not the name: the token's space is unambiguous
     // by id, and a name can collide with another already-known space.
@@ -859,6 +859,12 @@ fn join_scaffold(payload: &crate::token::InvitePayload) -> anyhow::Result<()> {
     let (registry_hash, _bytes, _label) =
         crate::commands::space::new::resolve_registry_source(None)?;
     let space_dir = crate::paths::space_dir(&payload.space_id);
+    let mut index = spaces_index::LockedSpacesIndex::acquire()?;
+    let mut entry = spaces_index::entry_for(&payload.space_id, &payload.name);
+    entry.data_dir = space_dir.to_string_lossy().to_string();
+    entry.registry_hash = registry_hash.to_hex();
+    entry.bootnodes = payload.bootnodes.clone();
+    index.validate_upsert(&entry)?;
     if !space_dir.exists() {
         std::fs::create_dir_all(&space_dir)?;
         std::fs::create_dir_all(space_dir.join("agents"))?;
@@ -868,13 +874,8 @@ fn join_scaffold(payload: &crate::token::InvitePayload) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("encode keypair: {e}"))?;
         std::fs::write(space_dir.join("node.key"), key_bytes)?;
     }
-    let mut index = spaces_index::load().unwrap_or_default();
-    let mut entry = spaces_index::entry_for(&payload.space_id, &payload.name);
-    entry.data_dir = space_dir.to_string_lossy().to_string();
-    entry.registry_hash = registry_hash.to_hex();
-    entry.bootnodes = payload.bootnodes.clone();
     spaces_index::upsert(&mut index, entry);
-    spaces_index::save(&index)?;
+    index.save()?;
     Ok(())
 }
 
@@ -1180,10 +1181,10 @@ fn clear_pending(
     space_id_hex: &str,
     clear: impl FnOnce(&mut spaces_index::SpaceEntry),
 ) -> anyhow::Result<()> {
-    let mut index = spaces_index::load()?;
+    let mut index = spaces_index::LockedSpacesIndex::acquire()?;
     if let Some(entry) = index.spaces.iter_mut().find(|e| e.id == space_id_hex) {
         clear(entry);
-        spaces_index::save(&index)?;
+        index.save()?;
     }
     Ok(())
 }

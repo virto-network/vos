@@ -572,13 +572,13 @@ fn restore_archive(
         }
         restored_entry.name = name.into();
     }
+    restored_entry.data_dir = destination.to_string_lossy().into_owned();
     // Different space locks intentionally permit independent backups, but
     // index activation is one global read-modify-write transaction. Hold a
     // stable sibling lock through the reload, destination ownership checks,
     // directory activation, and atomic index replacement.
-    let _index_lock = spaces_index::ExclusiveIndexLock::acquire(index_path)?;
-    let mut index = spaces_index::load_from(index_path)?;
-    validate_restore_ownership(&index, &restored_entry, destination)?;
+    let mut index = spaces_index::LockedSpacesIndex::acquire_from(index_path)?;
+    index.validate_upsert(&restored_entry)?;
 
     let destination_exists = path_entry_exists(destination)?;
     if destination_exists && fs::symlink_metadata(destination)?.file_type().is_symlink() {
@@ -656,63 +656,16 @@ fn restore_archive(
     }
     partial.disarm();
 
-    restored_entry.data_dir = destination.to_string_lossy().into_owned();
     spaces_index::upsert(&mut index, restored_entry);
-    if let Err(error) = save_index_atomically(&index, index_path) {
+    if let Err(error) = index.save() {
         return Err(rollback_error(
-            error,
+            error.into(),
             destination,
             &stage,
             replaced.as_deref(),
         ));
     }
     Ok(replaced)
-}
-
-fn validate_restore_ownership(
-    index: &spaces_index::SpacesIndex,
-    restored: &SpaceEntry,
-    destination: &Path,
-) -> anyhow::Result<()> {
-    for existing in &index.spaces {
-        if existing.id == restored.id {
-            if !paths_equivalent(Path::new(&existing.data_dir), destination)? {
-                anyhow::bail!(
-                    "space {} is already indexed at {}; restore it there or use a fresh config root",
-                    restored.id,
-                    existing.data_dir,
-                );
-            }
-            continue;
-        }
-        if existing.name == restored.name {
-            anyhow::bail!(
-                "another indexed space already uses name '{}'",
-                restored.name
-            );
-        }
-        if paths_equivalent(Path::new(&existing.data_dir), destination)? {
-            anyhow::bail!(
-                "restore destination {} belongs to indexed space '{}' ({})",
-                destination.display(),
-                existing.name,
-                existing.id,
-            );
-        }
-    }
-    Ok(())
-}
-
-fn paths_equivalent(left: &Path, right: &Path) -> anyhow::Result<bool> {
-    Ok(normalized_absolute(left)? == normalized_absolute(right)?)
-}
-
-fn normalized_absolute(path: &Path) -> anyhow::Result<PathBuf> {
-    if path_entry_exists(path)? {
-        return fs::canonicalize(path)
-            .map_err(|error| anyhow::anyhow!("resolve {}: {error}", path.display()));
-    }
-    lexical_absolute(path)
 }
 
 fn lexical_absolute(path: &Path) -> anyhow::Result<PathBuf> {
@@ -734,35 +687,6 @@ fn lexical_absolute(path: &Path) -> anyhow::Result<PathBuf> {
         }
     }
     Ok(normalized)
-}
-
-fn save_index_atomically(index: &spaces_index::SpacesIndex, path: &Path) -> anyhow::Result<()> {
-    let parent = usable_parent(path);
-    fs::create_dir_all(parent)?;
-    let body = toml::to_string_pretty(index)?;
-    let temporary = temporary_sibling(path, "index-partial")?;
-    fs::write(&temporary, body.as_bytes())?;
-    let temporary_file = fs::File::open(&temporary)?;
-    temporary_file.sync_all()?;
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(anyhow::anyhow!(
-            "activate spaces index {} -> {}: {error}",
-            temporary.display(),
-            path.display(),
-        ));
-    }
-    // The new index file itself is durable before rename. If a platform does
-    // not support directory fsync, do not report the already-activated
-    // restore as failed and tempt the caller into a second recovery action.
-    if let Err(error) = sync_directory(parent) {
-        tracing::warn!(
-            path = %parent.display(),
-            %error,
-            "could not fsync the spaces-index directory after atomic restore activation",
-        );
-    }
-    Ok(())
 }
 
 fn restore_blobs_to_cache(
@@ -1292,11 +1216,57 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("belongs to indexed space"));
+        assert!(error.to_string().contains("overlaps indexed space"));
         assert_eq!(fs::read(destination.join("owner")).unwrap(), b"keep me");
         let index = spaces_index::load_from(&index_path).unwrap();
         assert_eq!(index.spaces.len(), 1);
         assert_eq!(index.spaces[0].id, other.id);
+    }
+
+    #[test]
+    fn restore_refuses_ancestor_and_descendant_of_an_indexed_data_directory() {
+        let temp = TempDir::new("nested-destination");
+        let (entry, _data, cache) = fixture(&temp.0);
+        let archive = temp.0.join("backup");
+        create_archive(&entry, &archive, &cache).unwrap();
+
+        let owned_parent = temp.0.join("owned-parent");
+        let owned = owned_parent.join("owned-space");
+        fs::create_dir_all(&owned).unwrap();
+        fs::write(owned.join("owner"), b"keep me").unwrap();
+        let index_path = temp.0.join("spaces.toml");
+        let other = SpaceEntry {
+            id: hex::encode([0x75; 32]),
+            name: "other-nested".into(),
+            created_at: "2026-08-21T00:00:00Z".into(),
+            data_dir: owned.to_string_lossy().into_owned(),
+            registry_hash: entry.registry_hash.clone(),
+            bootnodes: Vec::new(),
+            hyperspace: String::new(),
+            pending_recipe: String::new(),
+        };
+        spaces_index::save_to(
+            &spaces_index::SpacesIndex {
+                spaces: vec![other],
+            },
+            &index_path,
+        )
+        .unwrap();
+
+        for destination in [owned.join("nested-a"), owned_parent.clone()] {
+            let error = restore_archive(
+                &archive,
+                &destination,
+                &temp.0.join("restored-cache"),
+                &index_path,
+                None,
+                true,
+                None,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("overlaps indexed space"));
+        }
+        assert_eq!(fs::read(owned.join("owner")).unwrap(), b"keep me");
     }
 
     #[test]

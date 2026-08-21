@@ -21,7 +21,7 @@ use crate::blob_store::{self, BlobSource};
 use crate::commands::space::op_sign::op_auth;
 use crate::output;
 use crate::paths;
-use crate::spaces_index::{self, SpaceEntry, SpacesIndex};
+use crate::spaces_index::{self, SpaceEntry};
 
 #[derive(Serialize)]
 struct CreatedView<'a> {
@@ -66,10 +66,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             .unwrap_or_else(|_| recipe.clone())
             .to_string_lossy()
             .to_string();
-        let mut index = spaces_index::load()?;
+        let mut index = spaces_index::LockedSpacesIndex::acquire()?;
         if let Some(entry) = index.spaces.iter_mut().find(|e| e.id == s.entry.id) {
             entry.pending_recipe = abs;
-            spaces_index::save(&index)?;
+            index.save()?;
         }
     }
 
@@ -250,6 +250,11 @@ pub(crate) fn scaffold(
     //    guard once the rename succeeds — the destination dir
     //    is now legitimate state, not a temp leftover.
     let final_dir = data_dir.unwrap_or_else(|| paths::space_dir(&space_id));
+    let mut index = spaces_index::LockedSpacesIndex::acquire()?;
+    let mut entry = spaces_index::entry_for(&space_id, name);
+    entry.data_dir = final_dir.to_string_lossy().to_string();
+    entry.registry_hash = registry_hash.to_hex();
+    index.validate_upsert(&entry)?;
     if final_dir.exists() {
         anyhow::bail!("space data dir already exists: {}", final_dir.display(),);
     }
@@ -273,12 +278,8 @@ pub(crate) fn scaffold(
     std::fs::write(&key_path, key_bytes)?;
 
     // 10. Append to the spaces index.
-    let mut index = spaces_index::load().unwrap_or_else(|_| SpacesIndex::default());
-    let mut entry = spaces_index::entry_for(&space_id, name);
-    entry.data_dir = final_dir.to_string_lossy().to_string();
-    entry.registry_hash = registry_hash.to_hex();
     spaces_index::upsert(&mut index, entry.clone());
-    spaces_index::save(&index)?;
+    index.save()?;
 
     Ok(Scaffolded {
         entry,

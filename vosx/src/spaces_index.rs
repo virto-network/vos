@@ -8,7 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
@@ -84,6 +85,56 @@ impl ExclusiveIndexLock {
     }
 }
 
+/// The only runtime read-modify-write boundary for `spaces.toml`.
+///
+/// Holding the guard across both load and atomic save prevents a concurrent
+/// creator, invite join, recipe update, restore, or forget from replacing a
+/// newer index with a stale snapshot.
+pub(crate) struct LockedSpacesIndex {
+    _lock: ExclusiveIndexLock,
+    path: PathBuf,
+    index: SpacesIndex,
+}
+
+impl LockedSpacesIndex {
+    pub(crate) fn acquire() -> Result<Self, IndexError> {
+        Self::acquire_from(&spaces_index_path())
+    }
+
+    pub(crate) fn acquire_from(path: &Path) -> Result<Self, IndexError> {
+        let lock = ExclusiveIndexLock::acquire(path)?;
+        let index = load_from(path)?;
+        Ok(Self {
+            _lock: lock,
+            path: path.to_path_buf(),
+            index,
+        })
+    }
+
+    pub(crate) fn validate_upsert(&self, candidate: &SpaceEntry) -> Result<(), IndexError> {
+        validate_upsert(&self.index, candidate)
+    }
+
+    pub(crate) fn save(self) -> Result<(), IndexError> {
+        validate_data_directories(&self.index)?;
+        save_to_atomically(&self.index, &self.path)
+    }
+}
+
+impl Deref for LockedSpacesIndex {
+    type Target = SpacesIndex;
+
+    fn deref(&self) -> &Self::Target {
+        &self.index
+    }
+}
+
+impl DerefMut for LockedSpacesIndex {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.index
+    }
+}
+
 fn index_lock_path(path: &Path) -> Result<PathBuf, IndexError> {
     let file_name = path.file_name().ok_or_else(|| {
         IndexError::Io(io::Error::new(
@@ -120,6 +171,7 @@ pub enum IndexError {
     Decode(toml::de::Error),
     Encode(toml::ser::Error),
     NotFound(String),
+    Conflict(String),
 }
 
 impl core::fmt::Display for IndexError {
@@ -129,8 +181,124 @@ impl core::fmt::Display for IndexError {
             IndexError::Decode(e) => write!(f, "spaces index decode: {e}"),
             IndexError::Encode(e) => write!(f, "spaces index encode: {e}"),
             IndexError::NotFound(s) => write!(f, "no space matching '{s}' in index"),
+            IndexError::Conflict(s) => write!(f, "spaces index conflict: {s}"),
         }
     }
+}
+
+fn validate_upsert(index: &SpacesIndex, candidate: &SpaceEntry) -> Result<(), IndexError> {
+    for existing in &index.spaces {
+        if existing.id == candidate.id {
+            if !paths_equal(
+                Path::new(&existing.data_dir),
+                Path::new(&candidate.data_dir),
+            )? {
+                return Err(IndexError::Conflict(format!(
+                    "space {} is already indexed at {}; restore or update it there",
+                    candidate.id, existing.data_dir,
+                )));
+            }
+            continue;
+        }
+        if existing.name == candidate.name {
+            return Err(IndexError::Conflict(format!(
+                "another indexed space already uses name '{}'",
+                candidate.name,
+            )));
+        }
+        if paths_overlap(
+            Path::new(&existing.data_dir),
+            Path::new(&candidate.data_dir),
+        )? {
+            return Err(IndexError::Conflict(format!(
+                "data directory {} overlaps indexed space '{}' ({}) at {}",
+                candidate.data_dir, existing.name, existing.id, existing.data_dir,
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_data_directories(index: &SpacesIndex) -> Result<(), IndexError> {
+    for (position, left) in index.spaces.iter().enumerate() {
+        for right in &index.spaces[position + 1..] {
+            if paths_overlap(Path::new(&left.data_dir), Path::new(&right.data_dir))? {
+                return Err(IndexError::Conflict(format!(
+                    "data directories for '{}' ({}) and '{}' ({}) overlap",
+                    left.name, left.data_dir, right.name, right.data_dir,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn paths_equal(left: &Path, right: &Path) -> Result<bool, IndexError> {
+    Ok(normalized_absolute(left)? == normalized_absolute(right)?)
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> Result<bool, IndexError> {
+    let left = normalized_absolute(left)?;
+    let right = normalized_absolute(right)?;
+    Ok(left.starts_with(&right) || right.starts_with(&left))
+}
+
+fn normalized_absolute(path: &Path) -> Result<PathBuf, IndexError> {
+    if path.as_os_str().is_empty() {
+        return Err(IndexError::Conflict(
+            "space data directory cannot be empty".into(),
+        ));
+    }
+    let absolute = lexical_absolute(path)?;
+    let mut existing = absolute.as_path();
+    let mut suffix = Vec::new();
+    loop {
+        match fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let file_name = existing.file_name().ok_or_else(|| {
+                    IndexError::Conflict(format!(
+                        "data directory has no existing ancestor: {}",
+                        path.display(),
+                    ))
+                })?;
+                suffix.push(file_name.to_os_string());
+                existing = existing.parent().ok_or_else(|| {
+                    IndexError::Conflict(format!(
+                        "data directory has no existing ancestor: {}",
+                        path.display(),
+                    ))
+                })?;
+            }
+            Err(error) => return Err(IndexError::Io(error)),
+        }
+    }
+    let mut normalized = fs::canonicalize(existing)?;
+    for component in suffix.into_iter().rev() {
+        normalized.push(component);
+    }
+    Ok(normalized)
+}
+
+fn lexical_absolute(path: &Path) -> Result<PathBuf, IndexError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::Normal(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
 }
 
 impl std::error::Error for IndexError {}
@@ -157,17 +325,63 @@ pub fn load_from(path: &Path) -> Result<SpacesIndex, IndexError> {
     toml::from_str(&s).map_err(IndexError::Decode)
 }
 
-/// Write the index, creating parent directories as needed.
-pub fn save(index: &SpacesIndex) -> Result<(), IndexError> {
-    save_to(index, &spaces_index_path())
-}
-
+/// Test-only raw writer for constructing fixtures. Runtime mutations must use
+/// [`LockedSpacesIndex`] so a stale read can never overwrite another writer.
+#[cfg(test)]
 pub fn save_to(index: &SpacesIndex, path: &Path) -> Result<(), IndexError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let body = toml::to_string_pretty(index).map_err(IndexError::Encode)?;
     fs::write(path, body).map_err(IndexError::Io)
+}
+
+fn save_to_atomically(index: &SpacesIndex, path: &Path) -> Result<(), IndexError> {
+    if let Some(parent) = usable_parent(path) {
+        fs::create_dir_all(parent)?;
+    }
+    let body = toml::to_string_pretty(index).map_err(IndexError::Encode)?;
+    let file_name = path.file_name().ok_or_else(|| {
+        IndexError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "spaces index path needs a final component",
+        ))
+    })?;
+    let mut nonce = [0u8; 8];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|error| IndexError::Io(io::Error::other(error.to_string())))?;
+    let temporary = path.with_file_name(format!(
+        ".{}.partial.{}.{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        hex::encode(nonce),
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    if let Err(error) = file
+        .write_all(body.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err(IndexError::Io(error));
+    }
+    drop(file);
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(IndexError::Io(error));
+    }
+    // The file is durable before activation. Directory fsync is best-effort:
+    // once rename succeeds, reporting failure could make a caller repeat an
+    // already-committed index mutation.
+    #[cfg(unix)]
+    if let Some(parent) = usable_parent(path)
+        && let Ok(directory) = File::open(parent)
+    {
+        let _ = directory.sync_all();
+    }
+    Ok(())
 }
 
 /// Append a new entry, replacing any existing one with the same
@@ -327,6 +541,53 @@ mod tests {
         );
         assert_eq!(idx.spaces.len(), 1);
         assert_eq!(idx.spaces[0].name, "v2");
+    }
+
+    #[test]
+    fn locked_writers_reload_after_the_previous_atomic_save() {
+        let path = tmp_path("locked-writers");
+        let mut first = LockedSpacesIndex::acquire_from(&path).unwrap();
+        let first_entry = SpaceEntry {
+            id: "11".repeat(32),
+            name: "first".into(),
+            created_at: "2026-08-21T00:00:00Z".into(),
+            data_dir: "/tmp/first".into(),
+            registry_hash: String::new(),
+            bootnodes: Vec::new(),
+            hyperspace: String::new(),
+            pending_recipe: String::new(),
+        };
+        upsert(&mut first, first_entry.clone());
+
+        let second_path = path.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let mut index = LockedSpacesIndex::acquire_from(&second_path).unwrap();
+            assert!(index.spaces.iter().any(|entry| entry.id == first_entry.id));
+            upsert(
+                &mut index,
+                SpaceEntry {
+                    id: "22".repeat(32),
+                    name: "second".into(),
+                    created_at: "2026-08-21T00:00:00Z".into(),
+                    data_dir: "/tmp/second".into(),
+                    registry_hash: String::new(),
+                    bootnodes: Vec::new(),
+                    hyperspace: String::new(),
+                    pending_recipe: String::new(),
+                },
+            );
+            index.save().unwrap();
+        });
+        started_rx.recv().unwrap();
+        first.save().unwrap();
+        second.join().unwrap();
+
+        let saved = load_from(&path).unwrap();
+        assert_eq!(saved.spaces.len(), 2);
+        let _ = fs::remove_file(index_lock_path(&path).unwrap());
+        let _ = fs::remove_file(path);
     }
 
     #[test]

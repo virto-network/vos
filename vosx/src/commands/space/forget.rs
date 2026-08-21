@@ -10,9 +10,9 @@ use std::io::{self, Write};
 
 use serde::Serialize;
 
+use crate::commands::space::space_lock::SpaceDataLock;
 use crate::output;
 use crate::spaces_index;
-use crate::{commands::space::space_lock::SpaceDataLock, paths};
 
 pub struct Args {
     pub space: String,
@@ -69,9 +69,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // lock after acquiring the immutable space-id lock so neither a running
     // daemon nor a concurrent restore can lose ownership underneath us.
     let _space_lock = SpaceDataLock::exclusive(&space_id)?;
-    let index_path = paths::spaces_index_path();
-    let _index_lock = spaces_index::ExclusiveIndexLock::acquire(&index_path)?;
-    let mut index = spaces_index::load_from(&index_path)?;
+    let mut index = spaces_index::LockedSpacesIndex::acquire()?;
     let current = index
         .spaces
         .iter()
@@ -89,7 +87,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("remove {}: {e}", data_dir.display()))?;
     }
     index.spaces.retain(|e| e.id != entry.id);
-    spaces_index::save_to(&index, &index_path)?;
+    index.save()?;
 
     if output::is_json() {
         output::print_json(&ForgottenView {

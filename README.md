@@ -85,9 +85,10 @@ live daemon cannot be copied, replaced, or unlinked. Restore verifies every
 archive byte and its mandatory node identity, registry database, and declared
 registry blob before activating it. It never overwrites an existing data
 directory unless `--replace` is given, and never overwrites a directory owned
-by another indexed space; replacement renames the old directory aside and
-reports its recovery path. Concurrent index activation is serialized. Cache
-objects are public, immutable artifacts and use independent
+by another indexed space or any ancestor/descendant of its data directory;
+replacement renames the old directory aside and reports its recovery path.
+Every spaces-index mutation shares one cross-process lock. Cache objects are
+public, immutable artifacts and use independent
 copy-on-write clones when the filesystem supports them, avoiding an immediate
 second physical copy without tying archive integrity to the live cache inode.
 Private side stores and `node.key` are sensitive: keep the backup on encrypted,
