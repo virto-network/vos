@@ -4657,6 +4657,7 @@ mod tests {
             last_log_index: 1,
             members,
             joint_old: None,
+            active_config_index: Some(1),
             leader_hint,
         }
     }
@@ -4671,6 +4672,7 @@ mod tests {
             last_log_index: 0,
             members: Vec::new(),
             joint_old: None,
+            active_config_index: None,
             leader_hint: None,
         }
     }
@@ -4729,6 +4731,7 @@ mod tests {
                     last_log_index: 11,
                     members: vec![first_prefix, second_prefix],
                     joint_old: None,
+                    active_config_index: Some(10),
                     leader_hint: Some(first_prefix),
                 },
             ),
@@ -4743,6 +4746,7 @@ mod tests {
                     last_log_index: 12,
                     members: vec![first_prefix, second_prefix],
                     joint_old: None,
+                    active_config_index: Some(12),
                     leader_hint: Some(second_prefix),
                 },
             ),

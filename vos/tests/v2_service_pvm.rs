@@ -5080,6 +5080,7 @@ fn node_registers_a_raft_root_through_the_canonical_request_log() {
                 last_log_index: 11,
                 members: vec![0xA109],
                 joint_old: None,
+                active_config_index: Some(11),
                 leader_hint: Some(0xA109),
             }
         }

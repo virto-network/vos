@@ -343,6 +343,7 @@ impl WorkerHandle {
             last_log_index: snap.last_log_index,
             members: snap.members,
             joint_old: snap.joint_old,
+            active_config_index: snap.active_config_index,
             leader_hint: snap.leader_hint,
         }
     }

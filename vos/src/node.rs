@@ -15569,6 +15569,7 @@ mod tests {
                 last_log_index: 12,
                 members: vec![0x2222],
                 joint_old: None,
+                active_config_index: Some(12),
                 leader_hint: Some(0x2222),
             })
             .unwrap();
@@ -15597,6 +15598,7 @@ mod tests {
             last_log_index: 11,
             members: vec![0x1111, 0x2222],
             joint_old: None,
+            active_config_index: Some(11),
             leader_hint: Some(0x1111),
         };
         let current = crate::network::RaftStatusReply {
@@ -15608,6 +15610,7 @@ mod tests {
             last_log_index: 12,
             members: vec![0x1111, 0x2222],
             joint_old: None,
+            active_config_index: Some(12),
             leader_hint: Some(0x2222),
         };
         let ranked = ranked_v2_raft_leader_observations(vec![(0x1111, stale), (0x2222, current)]);
@@ -15730,6 +15733,7 @@ mod tests {
                 last_log_index: 19,
                 members: vec![follower_prefix, leader_prefix],
                 joint_old: None,
+                active_config_index: Some(19),
                 leader_hint: Some(leader_prefix),
             },
         )];
@@ -15994,6 +15998,7 @@ mod tests {
                     last_log_index: 11,
                     members: self.members.clone(),
                     joint_old: None,
+                    active_config_index: Some(11),
                     leader_hint: Some(leader),
                 }
             }
@@ -18159,6 +18164,7 @@ mod tests {
             last_log_index: 11,
             members: vec![prefix],
             joint_old: None,
+            active_config_index: Some(11),
             leader_hint: Some(prefix),
         };
         assert_eq!(
@@ -18235,6 +18241,7 @@ mod tests {
                     last_log_index: 8,
                     members: vec![self.leader],
                     joint_old: None,
+                    active_config_index: Some(8),
                     leader_hint: Some(self.leader),
                 }
             }
@@ -18428,6 +18435,7 @@ mod tests {
                     last_log_index: 9,
                     members: self.members.clone(),
                     joint_old: None,
+                    active_config_index: Some(9),
                     leader_hint: Some(self.leader),
                 })
             }
@@ -18873,6 +18881,7 @@ mod tests {
                     last_log_index: 1,
                     members: vec![self.voter],
                     joint_old: None,
+                    active_config_index: Some(1),
                     leader_hint: Some(self.voter),
                 }
             }

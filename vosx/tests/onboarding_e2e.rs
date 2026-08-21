@@ -135,6 +135,7 @@ struct TestRaftStatus {
     leader: Option<u16>,
     members: Vec<u16>,
     joint_old: Option<Vec<u16>>,
+    active_config_index: Option<u64>,
     daemon_prefix: u16,
     commit_index: u64,
     last_applied: u64,
@@ -176,6 +177,11 @@ fn production_raft_status(
                     .map(|member| member.as_u64().and_then(|value| u16::try_from(value).ok()))
                     .collect::<Option<Vec<_>>>()?,
             ),
+            _ => return None,
+        },
+        active_config_index: match value.get("active_config_index")? {
+            serde_json::Value::Null => None,
+            serde_json::Value::Number(index) => index.as_u64(),
             _ => return None,
         },
         daemon_prefix: value
@@ -2104,6 +2110,9 @@ fn production_raft_root_survives_voter_join_leader_loss_and_catch_up() {
                         && status.members.contains(&prefix_a)
                         && status.members.contains(&prefix_b)
                         && status.joint_old.is_none()
+                        && status
+                            .active_config_index
+                            .is_some_and(|index| index <= status.commit_index)
                 },
             )
         },
@@ -2210,6 +2219,9 @@ fn production_raft_root_survives_voter_join_leader_loss_and_catch_up() {
                         && status.leader.is_some()
                         && status.members == expected_members
                         && status.joint_old.is_none()
+                        && status
+                            .active_config_index
+                            .is_some_and(|index| index <= status.commit_index)
                 })
             })
         },

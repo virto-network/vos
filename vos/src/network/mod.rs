@@ -107,6 +107,10 @@ pub struct RaftStatusReply {
     /// are authorized against `members ∪ joint_old`; an old-only voter can
     /// still be the leader responsible for committing the final transition.
     pub joint_old: Option<Vec<u16>>,
+    /// Log or snapshot index that established the active membership view.
+    /// The final configuration is durably committed only when this is
+    /// `Some(index)` and `index <= commit_index`.
+    pub active_config_index: Option<u64>,
     pub leader_hint: Option<u16>,
 }
 
@@ -199,6 +203,7 @@ impl RaftStatusReply {
             last_log_index: 0,
             members: Vec::new(),
             joint_old: None,
+            active_config_index: None,
             leader_hint: None,
         }
     }
@@ -2753,6 +2758,7 @@ fn handle_req_resp(
                                     last_log_index: reply.last_log_index,
                                     members: reply.members,
                                     joint_old: reply.joint_old,
+                                    active_config_index: reply.active_config_index,
                                     leader_hint: reply.leader_hint,
                                 },
                             ));
@@ -2895,6 +2901,7 @@ fn handle_req_resp(
                             last_log_index,
                             members,
                             joint_old,
+                            active_config_index,
                             leader_hint,
                         },
                         Some(OutboundReply::RaftStatus(tx)),
@@ -2908,6 +2915,7 @@ fn handle_req_resp(
                             last_log_index,
                             members,
                             joint_old,
+                            active_config_index,
                             leader_hint,
                         });
                     }
@@ -3201,6 +3209,7 @@ mod tests {
                     last_log_index: 8,
                     members: vec![0x1111, 0x2222],
                     joint_old: None,
+                    active_config_index: Some(7),
                     leader_hint: Some(0x2222),
                 })
             }
@@ -4718,6 +4727,7 @@ mod tests {
                     last_log_index: 0,
                     members: self.members.clone(),
                     joint_old: None,
+                    active_config_index: Some(0),
                     leader_hint: None,
                 })
             }
@@ -4969,6 +4979,7 @@ mod tests {
                     last_log_index: 0,
                     members: self.members.clone(),
                     joint_old: None,
+                    active_config_index: Some(0),
                     leader_hint: None,
                 })
             }
@@ -5156,6 +5167,7 @@ mod tests {
                     last_log_index: 0,
                     members: self.members.clone(),
                     joint_old: None,
+                    active_config_index: Some(0),
                     leader_hint: None,
                 })
             }

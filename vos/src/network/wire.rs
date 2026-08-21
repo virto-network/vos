@@ -297,6 +297,7 @@ pub enum Frame {
         last_log_index: u64,
         members: Vec<u16>,
         joint_old: Option<Vec<u16>>,
+        active_config_index: Option<u64>,
         leader_hint: Option<u16>,
     },
     /// Point-fetch a content-addressed proof blob by its 32-byte
@@ -759,6 +760,7 @@ impl Frame {
                 last_log_index,
                 members,
                 joint_old,
+                active_config_index,
                 leader_hint,
             } => {
                 out.push(TAG_RAFT_STATUS_RESP);
@@ -779,6 +781,13 @@ impl Frame {
                         for member in old {
                             out.extend_from_slice(&member.to_le_bytes());
                         }
+                    }
+                    None => out.push(0),
+                }
+                match active_config_index {
+                    Some(index) => {
+                        out.push(1);
+                        out.extend_from_slice(&index.to_le_bytes());
                     }
                     None => out.push(0),
                 }
@@ -1154,6 +1163,11 @@ impl Frame {
                     }
                     other => return Err(FrameError::BadOption(other)),
                 };
+                let active_config_index = match r.u8()? {
+                    0 => None,
+                    1 => Some(r.u64()?),
+                    other => return Err(FrameError::BadOption(other)),
+                };
                 let leader_hint = match r.u8()? {
                     0 => None,
                     1 => Some(r.u16()?),
@@ -1168,6 +1182,7 @@ impl Frame {
                     last_log_index,
                     members,
                     joint_old,
+                    active_config_index,
                     leader_hint,
                 }
             }
@@ -1628,6 +1643,7 @@ mod tests {
             last_log_index: 18,
             members: vec![0x1111, 0x2222],
             joint_old: Some(vec![0x3333]),
+            active_config_index: Some(16),
             leader_hint: Some(0x2222),
         });
     }
