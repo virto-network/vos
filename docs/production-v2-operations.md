@@ -1,0 +1,113 @@
+# Production v2 release operations
+
+This runbook covers the artifacts and offline state that an operator needs to
+move a production v2 node without changing protocol identity. It is deliberately
+conservative: an operation that would rewrite a sealed identity without a
+guest-owned transition is refused.
+
+## Release artifact set
+
+Package the committed canonical service with the frozen space authority:
+
+```sh
+just package-v2-production-release target/production-v2-release
+cargo run -p vosx -- release verify target/production-v2-release
+```
+
+The output directory contains exactly:
+
+- `vos-service.pvm`, whose `ProgramId` must equal
+  `VOS_SERVICE_PROGRAM_ID`;
+- `space-authority.pvm`, whose bytes and `ProgramId` must equal the frozen
+  Batch 70 authority identity; and
+- `manifest.json`, which binds both file sizes, raw BLAKE2b-256 digests,
+  program identities, the v2 ABI, store schema, and execution-semantics ID.
+
+`vosx release verify` rejects symlinks, extra files, missing files, version
+drift, and changed artifact bytes. Run it on the destination host after copying
+the directory. Start the daemon with the verified `vos-service.pvm`; never
+select a service PVM from an unverified build cache.
+
+The authority PVM is included for disaster recovery and identity inspection.
+Normal startup uses the copy embedded in the release `vosx` binary and verifies
+the same frozen digest during the binary build.
+
+Before publishing the directory, run `just test-v2-release-operations`. The
+gate consumes the packaged service in a real Local root backup/reopen and moves
+a stopped production Raft voter through an offline archive into fresh machine
+roots before requiring catch-up, a new election, and another commit.
+
+## Move an existing voter to another machine
+
+This is an identity-preserving machine replacement, not a Raft membership
+change. It is safe while the other voters keep committing because the restored
+node catches up through ordinary Raft log or snapshot transfer.
+
+1. Confirm the remaining voters form a quorum and record
+   `vosx space raft-status <space> <root>` for each Raft root.
+2. Stop the source daemon. Do not start it again after copying its state.
+3. Create an offline archive while the daemon-held data lock is free:
+
+   ```sh
+   vosx space backup <space> /secure/offline/<space>.vos-backup
+   ```
+
+4. Copy the archive and a verified production release directory to the new
+   machine. Treat the archive as secret: it contains the node identity,
+   production policy, private ingress/proof/producer stores, and application
+   state.
+5. Restore into fresh data, config, and cache roots:
+
+   ```sh
+   vosx space restore /secure/offline/<space>.vos-backup --name <space>
+   vosx space up <space> \
+     --service-pvm /opt/vos-release/vos-service.pvm \
+     --production-trust-socket /run/vos-authority.sock \
+     --connect <surviving-voter-multiaddr>
+   ```
+
+6. Wait until `last_applied >= commit_index`, `joint_old` is absent, and
+   `active_config_index <= commit_index`. Then make a read through the restored
+   node and a write through a different voter.
+
+The archive preserves `node.key`, so the replacement has the same full Noise
+`PeerId` and compact Raft slot. Running the source and replacement concurrently
+would duplicate one consensus identity and is forbidden. To replace a voter
+with a *new* identity, first enroll and fully promote the new voter. Automated
+removal of the old identity is not yet an operator surface; removing only its
+registry row does not rewrite existing Raft configurations.
+
+## Frozen authority upgrades
+
+The bundled Batch 70 `space-authority` is a durable actor deployment. Rebuilding
+its source produces an upgrade candidate, not a replacement release blob:
+
+```sh
+just build-authority-upgrade-candidate
+```
+
+Do not copy that output over `vosx/blobs/space_authority.pvm`, and do not use
+`vosx space upgrade` for a signed v2 package. The catalog command intentionally
+refuses that operation because it cannot prove the actor is idle or mutate the
+guest-owned descriptor.
+
+The only valid migration is one canonical `UpgradeActor` request per affected
+Local or Raft authority root. A future operator command must perform all of the
+following as one authenticated workflow:
+
+1. verify the signed candidate package and make its PVM available on every
+   Raft voter;
+2. resolve the authority actor and bind its current deployment/program as the
+   expected pair;
+3. obtain an exact linear read base after the current-term barrier;
+4. obtain production authorization for the complete `UpgradeActor` bytes;
+5. propose the transition and wait for the final applied index on every voter;
+6. verify the actor deployment, program, producer, and method policies from
+   guest-owned state before distributing a release that expects the new
+   authority.
+
+Guest Accumulate already enforces the exact base, authenticated request,
+replacement program availability, and the absence of continuations or pinned
+authorized inboxes. CRDT upgrades remain unsupported. Until the operator
+command and a cross-version rehearsal land, the production procedure is to
+retain the frozen authority and restore it from the verified release bundle.

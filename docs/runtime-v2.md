@@ -775,10 +775,11 @@ receipt-verification input to its authority before accepting the causal delta;
 the second replica then restarts from disk and recovers the converged value. A
 three-daemon Raft gate explicitly promotes two fresh voters under the same
 production policy, submits work through a follower, removes the current
-leader, and requires the surviving quorum to elect and commit. It then reopens
-the retired voter from disk, proves catch-up to the post-failover value, removes
-the replacement leader, and commits again with the restarted voter in the
-quorum. Peer discovery is disabled in that test and voter addresses are
+leader, and requires the surviving quorum to elect and commit. It then archives
+the retired voter and restores it into fresh data, config, and cache roots,
+proves catch-up to the post-failover value, removes the replacement leader, and
+commits again with the relocated voter in the quorum. Peer discovery is
+disabled in that test and voter addresses are
 explicit, so it exercises authenticated full-PeerId forwarding without
 claiming that automatic topology discovery has landed. Snapshot joiners verify
 the sealed production provenance and exact policy; log replay independently
@@ -790,6 +791,13 @@ regression tests so already-sealed spaces reopen unchanged. A source rebuild
 is not installed implicitly; changing that actor requires an explicit
 `UpgradeActor` migration which preserves the existing authority incarnation
 until the upgrade commits.
+
+`just package-v2-production-release` writes the canonical service PVM and
+frozen authority PVM beside a `VOSR1` manifest. `vosx release verify` binds the
+file sizes, raw BLAKE2b-256 digests, program identities, ABI, store schema, and
+execution semantics and rejects symlinks or surplus files. The complete
+identity-preserving machine-replacement and authority-upgrade runbook is
+`docs/production-v2-operations.md`.
 
 The request kind values in that order are `0..=7`. Response values are
 `0=Authorized`, `1=Denied`, `2=Unavailable`, `3=no-current-slot`,

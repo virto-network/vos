@@ -110,6 +110,14 @@ build-authority-upgrade-candidate: (build-actor "space-authority")
     @echo "candidate: target/bundled-space-authority/space-authority.pvm"
     @echo "install only through a reviewed UpgradeActor migration"
 
+# Assemble the two protocol-pinned production PVMs with a strict manifest.
+# The command refuses to replace an existing directory so a release operator
+# cannot silently mutate an artifact set that has already been distributed.
+package-v2-production-release out="target/production-v2-release":
+    cargo run -p vosx -- release bundle \
+      --service-pvm services/vos-service/vos-service.pvm --out "{{out}}"
+    cargo run -p vosx -- release verify "{{out}}"
+
 # Refresh the bundled dev-project ELF shipped with vosx.
 refresh-bundled-dev-project: (build-actor "dev-project")
     cp actors/dev-project/target/riscv64em-javm/release/dev_project.elf \
@@ -151,8 +159,14 @@ test-pvm: build-test-artifacts
 test-v2-daemon-root: build-v2-daemon-root-artifacts
     cargo test -p vosx --test onboarding_e2e signed_v2_package_runs_and_reopens_through_the_space_daemon -- --nocapture --test-threads=1
 
-# Stable release-check name; retain test-v2-daemon-root for existing callers.
-test-v2-release-operations: test-v2-daemon-root
+# Exercise a stopped production voter moving to fresh machine roots and then
+# rejoining/catching up under the same full node identity.
+test-v2-production-raft-relocation: build-v2-daemon-root-artifacts
+    cargo test -p vosx --test onboarding_e2e production_raft_root_survives_voter_join_leader_loss_and_backup_relocation -- --nocapture --test-threads=1
+
+# Stable release check: exact artifact bundle + Local offline restore +
+# production Raft voter relocation/failover.
+test-v2-release-operations: test-v2-daemon-root test-v2-production-raft-relocation
 
 # Run the production-profile daemon gates against independent VTA1/VTR1
 # authority sidecars, including fail-closed recovery, two-node CRDT sync, and
@@ -160,7 +174,7 @@ test-v2-release-operations: test-v2-daemon-root
 test-v2-production-daemon: build-v2-daemon-root-artifacts build-v2-registry-fixtures (build-actor "space-authority")
     cargo test -p vosx --test onboarding_e2e signed_v2_roots_run_under_production_trust_and_recover -- --nocapture --test-threads=1
     cargo test -p vosx --test onboarding_e2e production_crdt_root_converges_across_enrolled_daemons_and_restart -- --nocapture --test-threads=1
-    cargo test -p vosx --test onboarding_e2e production_raft_root_survives_voter_join_leader_loss_and_catch_up -- --nocapture --test-threads=1
+    cargo test -p vosx --test onboarding_e2e production_raft_root_survives_voter_join_leader_loss_and_backup_relocation -- --nocapture --test-threads=1
 
 # Run a single test by name.
 test-one name: build-extensions

@@ -2,6 +2,8 @@
 //!
 //! - `run` — raw PVM/ELF execution, no space context.
 //! - `service_pvm` — build and validate the protocol infrastructure PVM.
+//! - `production_release` — package and independently verify the pinned
+//!   production service/authority artifacts.
 //! - `space::*` — everything space-related: lifecycle (new,
 //!   list, info, up, join, delete), program/agent management
 //!   (publish, install, upgrade, uninstall, programs, agents),
@@ -14,6 +16,7 @@
 pub mod build;
 pub mod dynamic;
 pub mod new_project;
+pub mod production_release;
 pub mod run;
 pub mod service_pvm;
 pub mod space;

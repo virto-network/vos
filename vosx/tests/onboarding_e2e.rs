@@ -927,15 +927,68 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
     let upgrade_dist = TempDir::new("v2-root-upgrade-dist");
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let actor_elf = workspace.join("examples/actors/target/riscv64em-javm/release/v2_counter.elf");
-    let service_pvm = workspace.join("services/vos-service/vos-service.pvm");
+    let committed_service_pvm = workspace.join("services/vos-service/vos-service.pvm");
     assert!(
         actor_elf.is_file(),
         "build the v2 daemon actor first: `cd examples/actors && cargo +nightly actor -p v2-counter`",
     );
     assert!(
-        service_pvm.is_file(),
+        committed_service_pvm.is_file(),
         "build the canonical service first: `just build-vos-service`",
     );
+
+    // Release operations consume a self-describing directory, not an
+    // uncorrelated pair of files copied from build trees. Build and verify the
+    // bundle with the shipped CLI, then use that exact service artifact for
+    // the physical daemon/reopen path below.
+    let release_dir = dist.path().join("production-v2-release");
+    let committed_service = committed_service_pvm.to_string_lossy().into_owned();
+    let release_arg = release_dir.to_string_lossy().into_owned();
+    vosx_ok(
+        data.path(),
+        config.path(),
+        &[
+            "release",
+            "bundle",
+            "--service-pvm",
+            &committed_service,
+            "--out",
+            &release_arg,
+        ],
+    );
+    let verified = vosx_ok(
+        data.path(),
+        config.path(),
+        &["release", "verify", &release_arg],
+    );
+    assert!(
+        verified.contains(&format!("ABI {}", vos::v2::ABI_VERSION))
+            && verified.contains(&format!("schema {}", vos::v2::SERVICE_STORE_SCHEMA_VERSION,)),
+        "release verification must report the pinned protocol: {verified}",
+    );
+    let authority_path = release_dir.join("space-authority.pvm");
+    let authority = fs::read(&authority_path).expect("release contains its authority PVM");
+    let mut corrupted_authority = authority.clone();
+    corrupted_authority[0] ^= 0x80;
+    fs::write(&authority_path, corrupted_authority).unwrap();
+    let rejected = vosx(
+        data.path(),
+        config.path(),
+        &["release", "verify", &release_arg],
+    );
+    assert!(
+        !rejected.status.success()
+            && String::from_utf8_lossy(&rejected.stderr).contains("frozen Batch-70"),
+        "release verification must reject changed authority bytes: {}",
+        String::from_utf8_lossy(&rejected.stderr),
+    );
+    fs::write(&authority_path, authority).unwrap();
+    vosx_ok(
+        data.path(),
+        config.path(),
+        &["release", "verify", &release_arg],
+    );
+    let service_pvm = release_dir.join("vos-service.pvm");
 
     let invalid_data = TempDir::new("v2-root-invalid-profile-data");
     let invalid_config = TempDir::new("v2-root-invalid-profile-config");
@@ -2076,7 +2129,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
 }
 
 #[test]
-fn production_raft_root_survives_voter_join_leader_loss_and_catch_up() {
+fn production_raft_root_survives_voter_join_leader_loss_and_backup_relocation() {
     let space = "v2-production-raft-network";
     let root = "production-raft-cluster-counter";
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -2531,10 +2584,34 @@ fn production_raft_root_survives_voter_join_leader_loss_and_catch_up() {
     if let Some(endpoint) = find_endpoint(retired_data) {
         let _ = fs::remove_file(endpoint);
     }
-    // Discovery is deliberately disabled in this gate, so restore the retired
-    // voter with explicit addresses for both live peers. That lets it catch up
-    // from either voter and follow the current leader without smuggling an
-    // automatic-discovery assumption into the Raft recovery assertion.
+    // Treat the stopped voter as a machine being replaced, not merely a
+    // process being restarted in place. Its offline VOSB1 archive carries the
+    // complete Raft/application image, immutable programs, production policy,
+    // private side stores, and node identity into fresh data/config/cache
+    // roots. Keeping the same node identity is what makes this a safe rolling
+    // relocation: the cluster sees its existing voter return, never two
+    // machines claiming one voter concurrently.
+    let voter_backup = dist.path().join("retired-voter.vos-backup");
+    let voter_backup_arg = voter_backup.to_string_lossy().into_owned();
+    vosx_ok(
+        retired_data,
+        retired_config,
+        &["space", "backup", space, &voter_backup_arg],
+    );
+    let replacement_data = TempDir::new("production-raft-replacement-data");
+    let replacement_config = TempDir::new("production-raft-replacement-config");
+    vosx_ok(
+        replacement_data.path(),
+        replacement_config.path(),
+        &["space", "restore", &voter_backup_arg, "--name", space],
+    );
+    let retired_data = replacement_data.path();
+    let retired_config = replacement_config.path();
+    // Discovery is deliberately disabled in this gate, so start the restored
+    // voter on its replacement machine with explicit addresses for both live
+    // peers. That lets it catch up from either voter and follow the current
+    // leader without smuggling an automatic-discovery assumption into the
+    // Raft recovery assertion.
     let recovery_connects = survivors
         .iter()
         .map(|prefix| {

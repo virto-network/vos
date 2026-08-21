@@ -159,13 +159,16 @@ stands in for the on-chain settlement venue Wave 2 makes real.
   operate it as a supervised local service; and rehearse policy rotation and
   unavailable-authority recovery. The daemon now refuses an implicit
   conformance fallback whenever a service PVM is supplied.
-- **Release and operations**: verified offline backup/restore now covers root
+- **Release and operations**: verified offline backup/restore covers root
   images, node identity, local policy, every private side store, and immutable
-  program artifacts under the same daemon-held data lock; its physical reopen
-  path is an always-runnable release gate. Remaining here is packaging the
-  pinned service/authority artifacts, exercising rolling voter replacement,
-  and defining the explicit `UpgradeActor` procedure for the frozen Batch 70
-  authority identity.
+  program artifacts under the same daemon-held data lock. The pinned service
+  and frozen Batch 70 authority now ship as one strictly verified release
+  directory, and the physical Raft gate moves a stopped voter through an
+  offline archive into fresh machine roots before catch-up. The operator
+  procedure and safety preconditions for the guest-owned `UpgradeActor` path
+  are explicit in `docs/production-v2-operations.md`; the remaining product
+  work is its authenticated CLI/daemon entry point and new-identity voter
+  removal (identity-preserving machine replacement is gated today).
 
 **Keystone fast-follows (non-blocking; merged code is green)**
 - Ristretto host precompiles remain outside the trusted proof boundary. The

@@ -123,6 +123,11 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Package or verify the protocol-pinned production runtime artifacts.
+    Release {
+        #[command(subcommand)]
+        command: commands::production_release::ReleaseCommand,
+    },
     /// Run a single PVM/ELF program with no recipe (one-shot).
     /// No registry, no networking — just boot the kernel,
     /// deliver the supplied work items, halt.
@@ -298,6 +303,11 @@ fn main() {
                 report_error(error);
             }
         }
+        Some(Command::Release { command }) => {
+            if let Err(error) = commands::production_release::run(command) {
+                report_error(error);
+            }
+        }
         Some(Command::Run {
             program,
             payload,
@@ -405,6 +415,7 @@ fn should_dynamic_dispatch(argv: &[String]) -> bool {
         "new",
         "build",
         "service-pvm",
+        "release",
         "run",
         "space",
         "zk",
@@ -520,7 +531,18 @@ mod routing_tests {
 
     #[test]
     fn builtin_verbs_use_clap_path() {
-        for v in ["run", "space", "help-schema", "help"] {
+        for v in [
+            "new",
+            "build",
+            "service-pvm",
+            "release",
+            "run",
+            "space",
+            "zk",
+            "help-schema",
+            "help",
+            "whoami",
+        ] {
             assert!(!should_dynamic_dispatch(&s(&[v])), "verb={v}");
         }
         // `ai` and `dev` are no longer builtins — `vosx ai generate …`
