@@ -80,11 +80,14 @@ vosx space up a-restored --service-pvm ./dist/vos-service.pvm \
   --production-trust-socket /run/vos/production-trust.sock
 ```
 
-`space up`, backup, and restore share a space-ID lock, so a live daemon cannot
-be copied or replaced. Restore verifies every archive byte before activating
-it. It never overwrites an existing data directory unless `--replace` is
-given; replacement renames the old directory aside and reports its recovery
-path. Cache objects are public, immutable artifacts and use independent
+`space up`, backup, restore, and `space forget` share a space-ID lock, so a
+live daemon cannot be copied, replaced, or unlinked. Restore verifies every
+archive byte and its mandatory node identity, registry database, and declared
+registry blob before activating it. It never overwrites an existing data
+directory unless `--replace` is given, and never overwrites a directory owned
+by another indexed space; replacement renames the old directory aside and
+reports its recovery path. Concurrent index activation is serialized. Cache
+objects are public, immutable artifacts and use independent
 copy-on-write clones when the filesystem supports them, avoiding an immediate
 second physical copy without tying archive integrity to the live cache inode.
 Private side stores and `node.key` are sensitive: keep the backup on encrypted,

@@ -12,6 +12,7 @@ use serde::Serialize;
 
 use crate::output;
 use crate::spaces_index;
+use crate::{commands::space::space_lock::SpaceDataLock, paths};
 
 pub struct Args {
     pub space: String,
@@ -26,8 +27,11 @@ struct ForgottenView<'a> {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let mut index = spaces_index::load()?;
+    let index = spaces_index::load()?;
     let entry = spaces_index::find(&index, &args.space)?.clone();
+    let space_id = entry
+        .id_bytes()
+        .ok_or_else(|| anyhow::anyhow!("space id in index is not 32 bytes of hex"))?;
 
     let data_dir = std::path::PathBuf::from(&entry.data_dir);
 
@@ -60,12 +64,32 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
     }
 
+    // Deletion is a mutation of the same state protected for the daemon,
+    // backup, and restore. Re-resolve the index under its global transaction
+    // lock after acquiring the immutable space-id lock so neither a running
+    // daemon nor a concurrent restore can lose ownership underneath us.
+    let _space_lock = SpaceDataLock::exclusive(&space_id)?;
+    let index_path = paths::spaces_index_path();
+    let _index_lock = spaces_index::ExclusiveIndexLock::acquire(&index_path)?;
+    let mut index = spaces_index::load_from(&index_path)?;
+    let current = index
+        .spaces
+        .iter()
+        .find(|candidate| candidate.id == entry.id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("space index changed while forget was acquiring its lock; retry")
+        })?
+        .clone();
+    if current.data_dir != entry.data_dir || current.name != entry.name {
+        anyhow::bail!("space index changed while forget was acquiring its lock; retry");
+    }
+
     if data_dir.exists() {
         std::fs::remove_dir_all(&data_dir)
             .map_err(|e| anyhow::anyhow!("remove {}: {e}", data_dir.display()))?;
     }
     index.spaces.retain(|e| e.id != entry.id);
-    spaces_index::save(&index)?;
+    spaces_index::save_to(&index, &index_path)?;
 
     if output::is_json() {
         output::print_json(&ForgottenView {

@@ -23,6 +23,7 @@ const ARCHIVE_FORMAT: &str = "VOSB1";
 const ARCHIVE_VERSION: u32 = 1;
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ARCHIVE_FILES: usize = 100_000;
+const NODE_KEY_WIRE: &str = "data/node.key";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BackupManifest {
@@ -111,6 +112,7 @@ pub fn run_restore(
     let destination = data_dir
         .map(PathBuf::from)
         .unwrap_or_else(|| crate::paths::space_dir(&space_id));
+    let destination = lexical_absolute(&destination)?;
     refuse_live_daemon(&destination)?;
     let replaced = restore_archive(
         archive,
@@ -155,14 +157,20 @@ fn create_archive(entry: &SpaceEntry, output: &Path, cache_dir: &Path) -> anyhow
         );
     }
     let data_dir = PathBuf::from(&entry.data_dir);
-    if !data_dir.is_dir() {
+    let data_metadata = fs::symlink_metadata(&data_dir).map_err(|error| {
+        anyhow::anyhow!(
+            "inspect space data directory {}: {error}",
+            data_dir.display()
+        )
+    })?;
+    if data_metadata.file_type().is_symlink() || !data_metadata.is_dir() {
         anyhow::bail!(
-            "space data directory does not exist: {}",
+            "space data directory must be a real directory, not a symlink: {}",
             data_dir.display()
         );
     }
     reject_nested_output(output, &data_dir, cache_dir)?;
-    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let parent = usable_parent(output);
     fs::create_dir_all(parent)
         .map_err(|error| anyhow::anyhow!("create {}: {error}", parent.display()))?;
     let stage = temporary_sibling(output, "backup-partial")?;
@@ -215,7 +223,7 @@ fn reject_nested_output(output: &Path, data_dir: &Path, cache_dir: &Path) -> any
     let data = fs::canonicalize(data_dir)
         .map_err(|error| anyhow::anyhow!("resolve {}: {error}", data_dir.display()))?;
     let cache = fs::canonicalize(cache_dir).ok();
-    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let parent = usable_parent(output);
     fs::create_dir_all(parent)
         .map_err(|error| anyhow::anyhow!("create {}: {error}", parent.display()))?;
     let parent = fs::canonicalize(parent)
@@ -281,6 +289,14 @@ fn copy_cache_into_archive(
     archive_root: &Path,
     files: &mut Vec<BackupFile>,
 ) -> anyhow::Result<()> {
+    let cache_metadata = fs::symlink_metadata(cache_dir)
+        .map_err(|error| anyhow::anyhow!("inspect blob cache {}: {error}", cache_dir.display()))?;
+    if cache_metadata.file_type().is_symlink() || !cache_metadata.is_dir() {
+        anyhow::bail!(
+            "blob cache must be a real directory, not a symlink: {}",
+            cache_dir.display(),
+        );
+    }
     let entries = match fs::read_dir(cache_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -390,6 +406,11 @@ fn try_reflink(_source: &Path, _destination: &Path) -> anyhow::Result<bool> {
 }
 
 fn verify_archive(archive: &Path) -> anyhow::Result<BackupManifest> {
+    let archive_metadata = fs::symlink_metadata(archive)
+        .map_err(|error| anyhow::anyhow!("inspect backup root {}: {error}", archive.display()))?;
+    if archive_metadata.file_type().is_symlink() || !archive_metadata.is_dir() {
+        anyhow::bail!("backup root must be a real directory");
+    }
     let manifest_path = archive.join(MANIFEST_FILE);
     let manifest_metadata = fs::symlink_metadata(&manifest_path)
         .map_err(|error| anyhow::anyhow!("inspect {}: {error}", manifest_path.display()))?;
@@ -417,6 +438,11 @@ fn verify_archive(archive: &Path) -> anyhow::Result<BackupManifest> {
         .space
         .id_bytes()
         .ok_or_else(|| anyhow::anyhow!("backup manifest contains an invalid space id"))?;
+    let registry_hash = BlobHash::from_hex(&manifest.space.registry_hash)
+        .map_err(|_| anyhow::anyhow!("backup manifest contains an invalid registry blob hash"))?;
+    if registry_hash.to_hex() != manifest.space.registry_hash {
+        anyhow::bail!("backup manifest registry blob hash is not canonical lowercase hex");
+    }
     let mut previous: Option<&str> = None;
     let mut expected = BTreeSet::new();
     for file in &manifest.files {
@@ -448,6 +474,16 @@ fn verify_archive(archive: &Path) -> anyhow::Result<BackupManifest> {
     if actual != expected {
         anyhow::bail!("backup contains files absent from its integrity manifest");
     }
+    let registry_db = registry_db_wire();
+    let registry_blob = format!("blobs/{}", manifest.space.registry_hash);
+    for required in [NODE_KEY_WIRE, registry_db.as_str(), registry_blob.as_str()] {
+        if !expected.contains(required) {
+            anyhow::bail!("backup is structurally incomplete: missing {required}");
+        }
+        if fs::metadata(wire_to_path(archive, required)?)?.len() == 0 {
+            anyhow::bail!("backup is structurally incomplete: {required} is empty");
+        }
+    }
     Ok(manifest)
 }
 
@@ -469,11 +505,22 @@ fn archive_file_set(archive: &Path) -> anyhow::Result<BTreeSet<String>> {
     let mut files = Vec::new();
     for prefix in ["data", "blobs"] {
         let root = archive.join(prefix);
-        if root.exists() {
-            collect_wire_files(&root, prefix, &mut files)?;
+        let metadata = fs::symlink_metadata(&root).map_err(|error| {
+            anyhow::anyhow!("backup is missing required {prefix}/ directory: {error}")
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            anyhow::bail!("backup {prefix}/ root must be a real directory");
         }
+        collect_wire_files(&root, prefix, &mut files)?;
     }
     Ok(files.into_iter().collect())
+}
+
+fn registry_db_wire() -> String {
+    format!(
+        "data/agents/{:08x}.redb",
+        vos::abi::service::ServiceId::REGISTRY.0,
+    )
 }
 
 fn collect_wire_files(root: &Path, prefix: &str, files: &mut Vec<String>) -> anyhow::Result<()> {
@@ -518,6 +565,21 @@ fn restore_archive(
         anyhow::bail!("backup manifest changed while restore was acquiring its lock");
     }
     reject_restore_overlap(archive, destination)?;
+    let mut restored_entry = manifest.space.clone();
+    if let Some(name) = name {
+        if name.is_empty() {
+            anyhow::bail!("restored space name cannot be empty");
+        }
+        restored_entry.name = name.into();
+    }
+    // Different space locks intentionally permit independent backups, but
+    // index activation is one global read-modify-write transaction. Hold a
+    // stable sibling lock through the reload, destination ownership checks,
+    // directory activation, and atomic index replacement.
+    let _index_lock = spaces_index::ExclusiveIndexLock::acquire(index_path)?;
+    let mut index = spaces_index::load_from(index_path)?;
+    validate_restore_ownership(&index, &restored_entry, destination)?;
+
     let destination_exists = path_entry_exists(destination)?;
     if destination_exists && fs::symlink_metadata(destination)?.file_type().is_symlink() {
         anyhow::bail!("restore destination must not be a symlink");
@@ -528,37 +590,7 @@ fn restore_archive(
             destination.display(),
         );
     }
-    let mut index = spaces_index::load_from(index_path)?;
-    let mut restored_entry = manifest.space.clone();
-    if let Some(name) = name {
-        if name.is_empty() {
-            anyhow::bail!("restored space name cannot be empty");
-        }
-        restored_entry.name = name.into();
-    }
-    if let Some(existing) = index
-        .spaces
-        .iter()
-        .find(|existing| existing.id == restored_entry.id)
-        && Path::new(&existing.data_dir) != destination
-    {
-        anyhow::bail!(
-            "space {} is already indexed at {}; restore it there or use a fresh config root",
-            restored_entry.id,
-            existing.data_dir,
-        );
-    }
-    if index
-        .spaces
-        .iter()
-        .any(|existing| existing.name == restored_entry.name && existing.id != restored_entry.id)
-    {
-        anyhow::bail!(
-            "another indexed space already uses name '{}'",
-            restored_entry.name,
-        );
-    }
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let parent = usable_parent(destination);
     fs::create_dir_all(parent)
         .map_err(|error| anyhow::anyhow!("create {}: {error}", parent.display()))?;
     let stage = temporary_sibling(destination, "restore-partial")?;
@@ -637,8 +669,75 @@ fn restore_archive(
     Ok(replaced)
 }
 
+fn validate_restore_ownership(
+    index: &spaces_index::SpacesIndex,
+    restored: &SpaceEntry,
+    destination: &Path,
+) -> anyhow::Result<()> {
+    for existing in &index.spaces {
+        if existing.id == restored.id {
+            if !paths_equivalent(Path::new(&existing.data_dir), destination)? {
+                anyhow::bail!(
+                    "space {} is already indexed at {}; restore it there or use a fresh config root",
+                    restored.id,
+                    existing.data_dir,
+                );
+            }
+            continue;
+        }
+        if existing.name == restored.name {
+            anyhow::bail!(
+                "another indexed space already uses name '{}'",
+                restored.name
+            );
+        }
+        if paths_equivalent(Path::new(&existing.data_dir), destination)? {
+            anyhow::bail!(
+                "restore destination {} belongs to indexed space '{}' ({})",
+                destination.display(),
+                existing.name,
+                existing.id,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> anyhow::Result<bool> {
+    Ok(normalized_absolute(left)? == normalized_absolute(right)?)
+}
+
+fn normalized_absolute(path: &Path) -> anyhow::Result<PathBuf> {
+    if path_entry_exists(path)? {
+        return fs::canonicalize(path)
+            .map_err(|error| anyhow::anyhow!("resolve {}: {error}", path.display()));
+    }
+    lexical_absolute(path)
+}
+
+fn lexical_absolute(path: &Path) -> anyhow::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    Ok(normalized)
+}
+
 fn save_index_atomically(index: &spaces_index::SpacesIndex, path: &Path) -> anyhow::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = usable_parent(path);
     fs::create_dir_all(parent)?;
     let body = toml::to_string_pretty(index)?;
     let temporary = temporary_sibling(path, "index-partial")?;
@@ -736,7 +835,7 @@ fn rollback_restore(
     }
     fs::remove_dir_all(stage)
         .map_err(|error| anyhow::anyhow!("remove failed restore {}: {error}", stage.display()))?;
-    sync_directory(destination.parent().unwrap_or_else(|| Path::new(".")))?;
+    sync_directory(usable_parent(destination))?;
     Ok(())
 }
 
@@ -761,7 +860,10 @@ fn copy_verified_file(source: &Path, destination: &Path, file: &BackupFile) -> a
     if metadata.len() != file.bytes || hex::encode(hash_file(source)?) != file.blake2b_256 {
         anyhow::bail!("backup changed during restore: {}", file.path);
     }
-    if let Some(parent) = destination.parent() {
+    if let Some(parent) = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent)?;
     }
     fs::copy(source, destination)?;
@@ -778,7 +880,7 @@ fn copy_verified_file(source: &Path, destination: &Path, file: &BackupFile) -> a
 fn reject_restore_overlap(archive: &Path, destination: &Path) -> anyhow::Result<()> {
     let archive = fs::canonicalize(archive)
         .map_err(|error| anyhow::anyhow!("resolve {}: {error}", archive.display()))?;
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let parent = usable_parent(destination);
     fs::create_dir_all(parent)?;
     let parent = fs::canonicalize(parent)?;
     let candidate = parent.join(
@@ -861,6 +963,12 @@ fn path_entry_exists(path: &Path) -> anyhow::Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+fn usable_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 fn wire_path(prefix: &str, relative: &Path) -> anyhow::Result<String> {
@@ -963,10 +1071,20 @@ mod tests {
     fn fixture(root: &Path) -> (SpaceEntry, PathBuf, PathBuf) {
         let data = root.join("source");
         let cache = root.join("cache");
+        fs::create_dir_all(data.join("agents")).unwrap();
         fs::create_dir_all(data.join("v2-services/root.image.proofs")).unwrap();
         fs::create_dir_all(data.join("v2-services/root.image.records")).unwrap();
         fs::create_dir_all(&cache).unwrap();
         fs::write(data.join("node.key"), b"secret-node-key").unwrap();
+        fs::write(
+            data.join(
+                registry_db_wire()
+                    .strip_prefix("data/")
+                    .expect("registry DB lives below data"),
+            ),
+            b"registry-redb",
+        )
+        .unwrap();
         fs::write(
             data.join("v2-services/root.image"),
             b"committed-service-image",
@@ -1133,5 +1251,151 @@ mod tests {
             fs::read(destination.join("node.key")).unwrap(),
             b"secret-node-key"
         );
+    }
+
+    #[test]
+    fn restore_refuses_a_directory_owned_by_another_indexed_space() {
+        let temp = TempDir::new("owned-destination");
+        let (entry, _data, cache) = fixture(&temp.0);
+        let archive = temp.0.join("backup");
+        create_archive(&entry, &archive, &cache).unwrap();
+
+        let destination = temp.0.join("other-space");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("owner"), b"keep me").unwrap();
+        let index_path = temp.0.join("spaces.toml");
+        let other = SpaceEntry {
+            id: hex::encode([0x73; 32]),
+            name: "other".into(),
+            created_at: "2026-08-21T00:00:00Z".into(),
+            data_dir: destination.to_string_lossy().into_owned(),
+            registry_hash: entry.registry_hash.clone(),
+            bootnodes: Vec::new(),
+            hyperspace: String::new(),
+            pending_recipe: String::new(),
+        };
+        spaces_index::save_to(
+            &spaces_index::SpacesIndex {
+                spaces: vec![other.clone()],
+            },
+            &index_path,
+        )
+        .unwrap();
+
+        let error = restore_archive(
+            &archive,
+            &destination,
+            &temp.0.join("restored-cache"),
+            &index_path,
+            None,
+            true,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("belongs to indexed space"));
+        assert_eq!(fs::read(destination.join("owner")).unwrap(), b"keep me");
+        let index = spaces_index::load_from(&index_path).unwrap();
+        assert_eq!(index.spaces.len(), 1);
+        assert_eq!(index.spaces[0].id, other.id);
+    }
+
+    #[test]
+    fn concurrent_restores_preserve_both_index_entries() {
+        let temp = TempDir::new("concurrent-index");
+        let (first, _first_data, first_cache) = fixture(&temp.0.join("first"));
+        let (mut second, _second_data, second_cache) = fixture(&temp.0.join("second"));
+        second.id = hex::encode([0x74; 32]);
+        second.name = "second-backup".into();
+        let first_archive = temp.0.join("first-backup");
+        let second_archive = temp.0.join("second-backup");
+        create_archive(&first, &first_archive, &first_cache).unwrap();
+        create_archive(&second, &second_archive, &second_cache).unwrap();
+
+        let index = temp.0.join("spaces.toml");
+        let first_destination = temp.0.join("first-restored");
+        let second_destination = temp.0.join("second-restored");
+        let first_cache = temp.0.join("first-restored-cache");
+        let second_cache = temp.0.join("second-restored-cache");
+        let first_index = index.clone();
+        let second_index = index.clone();
+        let first_join = std::thread::spawn(move || {
+            restore_archive(
+                &first_archive,
+                &first_destination,
+                &first_cache,
+                &first_index,
+                None,
+                false,
+                None,
+            )
+        });
+        let second_join = std::thread::spawn(move || {
+            restore_archive(
+                &second_archive,
+                &second_destination,
+                &second_cache,
+                &second_index,
+                None,
+                false,
+                None,
+            )
+        });
+        first_join.join().unwrap().unwrap();
+        second_join.join().unwrap().unwrap();
+
+        let index = spaces_index::load_from(&index).unwrap();
+        assert_eq!(index.spaces.len(), 2);
+        assert!(index.spaces.iter().any(|entry| entry.id == first.id));
+        assert!(index.spaces.iter().any(|entry| entry.id == second.id));
+    }
+
+    #[test]
+    fn structurally_incomplete_archive_is_rejected() {
+        let temp = TempDir::new("incomplete");
+        let (entry, _data, _cache) = fixture(&temp.0);
+        let archive = temp.0.join("backup");
+        fs::create_dir_all(archive.join("data")).unwrap();
+        fs::create_dir_all(archive.join("blobs")).unwrap();
+        fs::write(
+            archive.join(MANIFEST_FILE),
+            serde_json::to_vec_pretty(&BackupManifest {
+                format: ARCHIVE_FORMAT.into(),
+                version: ARCHIVE_VERSION,
+                space: entry,
+                files: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let error = verify_archive(&archive).unwrap_err();
+        assert!(error.to_string().contains("structurally incomplete"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_data_and_blob_roots_must_not_be_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        for prefix in ["data", "blobs"] {
+            let temp = TempDir::new(&format!("root-symlink-{prefix}"));
+            let (entry, _data, cache) = fixture(&temp.0);
+            let archive = temp.0.join("backup");
+            create_archive(&entry, &archive, &cache).unwrap();
+            let root = archive.join(prefix);
+            let external = temp.0.join(format!("external-{prefix}"));
+            fs::rename(&root, &external).unwrap();
+            symlink(&external, &root).unwrap();
+            let error = verify_archive(&archive).unwrap_err();
+            assert!(error.to_string().contains("must be a real directory"));
+        }
+    }
+
+    #[test]
+    fn bare_relative_backup_and_restore_paths_have_a_real_parent() {
+        let temp = TempDir::new("relative-parent");
+        let (_entry, data, cache) = fixture(&temp.0);
+        assert_eq!(usable_parent(Path::new("backup-dir")), Path::new("."));
+        reject_nested_output(Path::new("backup-dir"), &data, &cache).unwrap();
+        reject_restore_overlap(&temp.0, Path::new("restored-dir")).unwrap();
     }
 }

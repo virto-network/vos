@@ -206,6 +206,7 @@ fn vosx(data_home: &Path, config_home: &Path, args: &[&str]) -> Output {
         .args(args)
         .env("XDG_DATA_HOME", data_home)
         .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_CACHE_HOME", data_home.join("cache"))
         .env("VOSX_DISABLE_MDNS", "1")
         .env("NO_COLOR", "1")
         .output()
@@ -269,6 +270,7 @@ fn spawn_up_with_service_trust_and_connects(
     command
         .env("XDG_DATA_HOME", data_home)
         .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_CACHE_HOME", data_home.join("cache"))
         .env("RUST_LOG", "info")
         .env("VOSX_DISABLE_MDNS", "1")
         .env("NO_COLOR", "1")
@@ -1114,6 +1116,17 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
             && String::from_utf8_lossy(&live_backup.stderr).contains("space data is in use"),
         "a live daemon must hold the backup/restore data lock: {}",
         String::from_utf8_lossy(&live_backup.stderr),
+    );
+    let live_forget = vosx(
+        data.path(),
+        config.path(),
+        &["space", "forget", space, "--yes"],
+    );
+    assert!(
+        !live_forget.status.success()
+            && String::from_utf8_lossy(&live_forget.stderr).contains("space data is in use"),
+        "space forget must not unlink a running daemon's state: {}",
+        String::from_utf8_lossy(&live_forget.stderr),
     );
 
     drop(first);

@@ -7,9 +7,11 @@
 //! redbs in `data_root()` are the substantive state).
 
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use fs2::FileExt;
 
 use crate::paths::{space_id_hex, spaces_index_path};
 
@@ -56,6 +58,45 @@ pub struct SpaceEntry {
     /// before the recipe-vocabulary rename.
     #[serde(default, alias = "pending_manifest")]
     pub pending_recipe: String,
+}
+
+/// Cross-process serialization for read-modify-write changes to one spaces
+/// index. The lock uses a stable sibling inode because the index itself may be
+/// replaced atomically while the guard is held.
+pub(crate) struct ExclusiveIndexLock {
+    _file: File,
+}
+
+impl ExclusiveIndexLock {
+    pub(crate) fn acquire(path: &Path) -> Result<Self, IndexError> {
+        let lock_path = index_lock_path(path)?;
+        if let Some(parent) = usable_parent(&lock_path) {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        FileExt::lock_exclusive(&file)?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn index_lock_path(path: &Path) -> Result<PathBuf, IndexError> {
+    let file_name = path.file_name().ok_or_else(|| {
+        IndexError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "spaces index path needs a final component",
+        ))
+    })?;
+    Ok(path.with_file_name(format!(".{}.lock", file_name.to_string_lossy())))
+}
+
+fn usable_parent(path: &Path) -> Option<&Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
 }
 
 impl SpaceEntry {

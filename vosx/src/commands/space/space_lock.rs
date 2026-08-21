@@ -47,7 +47,7 @@ impl SpaceDataLock {
         };
         acquired.map_err(|error| {
             anyhow::anyhow!(
-                "space data is in use (lock {}): {error}; stop `space up` before backup or restore",
+                "space data is in use (lock {}): {error}; stop `space up` before changing its files",
                 path.display(),
             )
         })?;
