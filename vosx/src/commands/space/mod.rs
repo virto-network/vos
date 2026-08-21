@@ -143,8 +143,22 @@ pub enum SpaceCommand {
         service_pvm: Option<PathBuf>,
         /// Unix socket for the fail-closed JAM/consensus trust authority.
         /// When set, all v2 roots use the production profile.
-        #[arg(long, value_name = "SOCKET")]
+        #[arg(
+            long,
+            value_name = "SOCKET",
+            requires = "service_pvm",
+            conflicts_with = "allow_v2_conformance"
+        )]
         production_trust_socket: Option<PathBuf>,
+        /// Explicitly run signed v2 roots under the conformance-only trust
+        /// seam. This is for development and protocol tests; production
+        /// operators must supply --production-trust-socket instead.
+        #[arg(
+            long,
+            requires = "service_pvm",
+            conflicts_with = "production_trust_socket"
+        )]
+        allow_v2_conformance: bool,
     },
     /// Stop a running `space up` daemon by signalling its PID.
     /// SIGTERM by default (daemon flushes state, removes the
@@ -378,6 +392,7 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             connect,
             service_pvm,
             production_trust_socket,
+            allow_v2_conformance,
         } => up::run(up::Args {
             query: space,
             once,
@@ -385,6 +400,7 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             connect,
             service_pvm,
             production_trust_socket,
+            allow_v2_conformance,
         }),
         SpaceCommand::Down {
             space,

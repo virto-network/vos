@@ -249,6 +249,9 @@ fn spawn_up_with_service_trust_and_connects(
     command.args(["space", "up", arg]);
     if let Some(path) = service_pvm {
         command.arg("--service-pvm").arg(path);
+        if production_trust_socket.is_none() {
+            command.arg("--allow-v2-conformance");
+        }
     }
     if let Some(path) = production_trust_socket {
         command.arg("--production-trust-socket").arg(path);
@@ -632,15 +635,14 @@ fn crdt_counter_package_fixture(output_dir: &Path) -> PathBuf {
 
 fn assert_bundled_space_authority_matches_fresh_build(output_dir: &Path) {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    let actor_elf =
-        workspace.join("actors/space-authority/target/riscv64em-javm/release/space_authority.elf");
+    let actor_project = workspace.join("actors/space-authority");
     assert!(
-        actor_elf.is_file(),
-        "build the canonical authority first: `just build-actor space-authority`",
+        actor_project.join("Cargo.toml").is_file(),
+        "the canonical authority project must be present",
     );
     let build_data = output_dir.join("authority-build-data");
     let build_config = output_dir.join("authority-build-config");
-    let actor = actor_elf.to_string_lossy().into_owned();
+    let actor = actor_project.to_string_lossy().into_owned();
     let out = output_dir.to_string_lossy().into_owned();
     vosx_ok(
         &build_data,
@@ -965,6 +967,19 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
     );
 
     vosx_ok(data.path(), config.path(), &["space", "new", space]);
+    let service = service_pvm.to_string_lossy().into_owned();
+    let implicit_trust = vosx(
+        data.path(),
+        config.path(),
+        &["space", "up", space, "--once", "--service-pvm", &service],
+    );
+    assert!(
+        !implicit_trust.status.success()
+            && String::from_utf8_lossy(&implicit_trust.stderr)
+                .contains("--production-trust-socket"),
+        "a signed v2 service must not select conformance implicitly: {}",
+        String::from_utf8_lossy(&implicit_trust.stderr),
+    );
     let first_log = data.path().join("v2-root-first.stderr");
     let first = Daemon(spawn_up_with_service(
         data.path(),

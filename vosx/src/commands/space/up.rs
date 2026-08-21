@@ -32,6 +32,7 @@ pub struct Args {
     pub connect: Vec<String>,
     pub service_pvm: Option<PathBuf>,
     pub production_trust_socket: Option<PathBuf>,
+    pub allow_v2_conformance: bool,
 }
 
 #[derive(Clone)]
@@ -61,6 +62,29 @@ fn load_pinned_v2_service(path: Option<&Path>) -> anyhow::Result<Option<PinnedV2
     Ok(Some(PinnedV2Service {
         pvm: std::sync::Arc::new(pvm),
     }))
+}
+
+fn validate_v2_trust_mode(
+    has_service_pvm: bool,
+    has_production_trust: bool,
+    allow_conformance: bool,
+) -> anyhow::Result<()> {
+    if has_production_trust && allow_conformance {
+        anyhow::bail!(
+            "choose exactly one v2 trust profile: --production-trust-socket or \
+             --allow-v2-conformance",
+        );
+    }
+    if !has_service_pvm && (has_production_trust || allow_conformance) {
+        anyhow::bail!("a v2 trust profile requires --service-pvm <exact-vos-service.pvm>",);
+    }
+    if has_service_pvm && !has_production_trust && !allow_conformance {
+        anyhow::bail!(
+            "--service-pvm requires --production-trust-socket <socket>; use \
+             --allow-v2-conformance only for development and protocol tests",
+        );
+    }
+    Ok(())
 }
 
 fn role_authority_package_version(actor_program: vos::v2::ProgramId) -> String {
@@ -290,10 +314,19 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .transpose()
         .map_err(|error| anyhow::anyhow!("open production trust authority: {error}"))?
         .map(|trust| std::sync::Arc::new(trust) as std::sync::Arc<dyn vos::v2::ProductionTrustV2>);
+    validate_v2_trust_mode(
+        pinned_v2_service.is_some(),
+        production_trust.is_some(),
+        args.allow_v2_conformance,
+    )?;
     if let Some(trust) = production_trust.as_ref() {
         tracing::info!(
             policy = %hex::encode(trust.policy_id().0),
             "v2 roots use the fail-closed production trust profile",
+        );
+    } else if pinned_v2_service.is_some() {
+        tracing::warn!(
+            "signed v2 roots use the conformance-only trust seam; this mode is not production-safe",
         );
     }
 
@@ -3767,6 +3800,19 @@ fn sweep_orphan_v2_services(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_service_requires_an_explicit_trust_profile() {
+        assert!(validate_v2_trust_mode(false, false, false).is_ok());
+        assert!(validate_v2_trust_mode(true, true, false).is_ok());
+        assert!(validate_v2_trust_mode(true, false, true).is_ok());
+
+        let missing = validate_v2_trust_mode(true, false, false).unwrap_err();
+        assert!(missing.to_string().contains("--production-trust-socket"));
+        assert!(validate_v2_trust_mode(false, true, false).is_err());
+        assert!(validate_v2_trust_mode(false, false, true).is_err());
+        assert!(validate_v2_trust_mode(true, true, true).is_err());
+    }
     use libp2p::identity::Keypair;
     use vos::metadata::{ActorMeta, MessageMeta};
     use vos::network::{RaftRole, RaftStatusReply};

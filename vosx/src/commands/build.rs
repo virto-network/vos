@@ -353,10 +353,11 @@ fn resolve_program_input(input: &Path) -> anyhow::Result<PathBuf> {
     let build_root = std::fs::canonicalize(actor_build_root(&project)?)
         .with_context(|| format!("resolve actor build root for {}", input.display()))?;
     let source_root = canonical_source_root(&build_root);
-    // Own the artifact location. Inheriting CARGO_TARGET_DIR or a configured
-    // target-dir and then reading build_root/target could sign an unrelated
-    // stale ELF even though Cargo successfully built fresh code elsewhere.
-    let target_dir = build_root.join("target");
+    // Own an isolated canonical artifact location. Reusing the ordinary
+    // actor target can make Cargo accept an ELF compiled without this rustc
+    // wrapper, so the supposedly canonical ProgramId then depends on the
+    // checkout path of the preceding `cargo actor` invocation.
+    let target_dir = build_root.join("target/vosx-canonical");
     let mut command = Command::new("cargo");
     command.args(["+nightly", "actor"]);
     if build_root != project {
