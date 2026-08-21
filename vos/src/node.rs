@@ -180,6 +180,7 @@ fn send_v2_system_ingress(
             #[cfg(all(feature = "network", feature = "storage"))]
             delegated_origin: None,
             role_authority_request: false,
+            root_upgrade_request: false,
             msg: ingress.to_vec(),
             reply: ReplyChannel::Sync(reply_tx),
             chain: Vec::new(),
@@ -1033,6 +1034,10 @@ struct InvokeRequest {
     /// Ordinary actor calls cannot set it; a cross-node hop carries it only
     /// inside voter-authenticated Raft delegation.
     role_authority_request: bool,
+    /// Host-private marker for a root upgrade authenticated as an Admin by
+    /// the serving daemon. Raft redirects preserve it only inside the
+    /// full-PeerId voter-authenticated delegation wire.
+    root_upgrade_request: bool,
     msg: Vec<u8>,
     reply: ReplyChannel,
     // Read by agent_thread via `&req.chain` before moving `req`
@@ -2015,6 +2020,7 @@ impl InvokeHandle {
             #[cfg(all(feature = "network", feature = "storage"))]
             delegated_origin: None,
             role_authority_request: false,
+            root_upgrade_request: false,
             msg,
             reply: ReplyChannel::Sync(reply_tx),
             chain: Vec::new(),
@@ -2293,6 +2299,7 @@ impl NodeService {
             actor_local_role: None,
             delegated_origin: None,
             role_authority_request: false,
+            root_upgrade_request: false,
             msg: ingress.clone(),
             reply: ReplyChannel::Sync(reply_tx),
             chain: Vec::new(),
@@ -2311,6 +2318,7 @@ impl NodeService {
                 status,
                 redirect.leader_prefix,
                 redirect.origin,
+                false,
                 false,
                 false,
                 &ingress,
@@ -2781,6 +2789,7 @@ fn registry_probe_reply_with_timeout(
             #[cfg(all(feature = "network", feature = "storage"))]
             delegated_origin: None,
             role_authority_request: false,
+            root_upgrade_request: false,
             msg: payload,
             reply: ReplyChannel::Sync(reply_tx),
             chain: vec![],
@@ -2921,6 +2930,7 @@ fn send_v2_raft_invoke_exact(
     origin: crate::v2::Origin,
     preserve_envelope: bool,
     role_authority_request: bool,
+    root_upgrade_request: bool,
     ingress: &[u8],
     deadline: Instant,
 ) -> Option<Vec<u8>> {
@@ -2933,8 +2943,13 @@ fn send_v2_raft_invoke_exact(
         let member = lookup_node_member_from_routes(invoke_routes, leader_prefix)?;
         let peer = authenticated_v2_raft_leader_peer(&status, &member, leader_prefix)?;
         let leader_route = ServiceId::new(leader_prefix, ServiceId(route.route).local_id()).0;
-        let delegated =
-            encode_v2_raft_delegation(origin, preserve_envelope, role_authority_request, ingress);
+        let delegated = encode_v2_raft_delegation(
+            origin,
+            preserve_envelope,
+            role_authority_request,
+            root_upgrade_request,
+            ingress,
+        );
         let response = network
             .send_invoke_exact(
                 peer,
@@ -3084,7 +3099,7 @@ impl crate::network::NetworkService for NodeService {
         // proxies that authenticated wrapper to the exact current leader;
         // ordinary remote callers never get to construct it themselves.
         #[cfg(feature = "storage")]
-        let (delegated_origin, preserve_envelope, role_authority_request) =
+        let (delegated_origin, preserve_envelope, role_authority_request, root_upgrade_request) =
             match decode_v2_raft_delegation(&msg) {
                 Ok(Some(delegated))
                     if caller_peer_id.as_ref().is_some_and(|peer| {
@@ -3096,18 +3111,21 @@ impl crate::network::NetworkService for NodeService {
                         Some(delegated.origin),
                         delegated.preserve_envelope,
                         delegated.role_authority_request,
+                        delegated.root_upgrade_request,
                     )
                 }
                 Ok(Some(_)) | Err(()) => {
                     warn!(target = to, peer = ?caller_peer_id, "refused unauthenticated Raft origin delegation");
                     return Vec::new().into();
                 }
-                Ok(None) => (None, false, false),
+                Ok(None) => (None, false, false, false),
             };
         #[cfg(not(feature = "storage"))]
         let preserve_envelope = false;
         #[cfg(not(feature = "storage"))]
         let role_authority_request = false;
+        #[cfg(not(feature = "storage"))]
+        let root_upgrade_request = false;
         #[cfg(feature = "storage")]
         let authenticated_raft_delegation =
             delegated_origin.is_some() && self.target_is_local_v2_raft_root(to, to_unscoped);
@@ -3247,7 +3265,7 @@ impl crate::network::NetworkService for NodeService {
         // is the correct deny-by-omission.
         let (space_role, actor_local_role) = if authenticated_raft_delegation {
             // The full-PeerId voter check above is the authority boundary for
-            // VRD2. The canonical v2 root ingress accepts only public methods
+            // authenticated delegation. The canonical v2 root ingress accepts only public methods
             // and consumes `delegated_origin`, not host role bytes. Re-probing
             // the forwarding node's space/actor roles is therefore both
             // semantically irrelevant and two extra serial 5-second waits.
@@ -3319,6 +3337,7 @@ impl crate::network::NetworkService for NodeService {
                 #[cfg(all(feature = "network", feature = "storage"))]
                 delegated_origin,
                 role_authority_request,
+                root_upgrade_request,
                 msg,
                 reply: ReplyChannel::Sync(reply_tx),
                 chain,
@@ -3373,6 +3392,7 @@ impl crate::network::NetworkService for NodeService {
                                     redirect.origin,
                                     preserve_envelope,
                                     role_authority_request,
+                                    redirect.root_upgrade_request || root_upgrade_request,
                                     &ingress,
                                     deadline,
                                 )
@@ -6618,6 +6638,7 @@ impl VosNode {
                             redirect.origin,
                             true,
                             false,
+                            false,
                             ingress,
                             deadline,
                         )
@@ -6653,6 +6674,7 @@ impl VosNode {
                 redirect.leader_prefix,
                 redirect.origin,
                 true,
+                false,
                 false,
                 &ingress_wire,
                 deadline,
@@ -6717,6 +6739,7 @@ impl VosNode {
                 #[cfg(all(feature = "network", feature = "storage"))]
                 delegated_origin: None,
                 role_authority_request: false,
+                root_upgrade_request: false,
                 msg: msg.clone(),
                 reply: ReplyChannel::Sync(reply_tx),
                 chain: Vec::new(),
@@ -6755,6 +6778,7 @@ impl VosNode {
                     redirect.origin,
                     false,
                     false,
+                    redirect.root_upgrade_request,
                     &msg,
                     deadline,
                 );
@@ -7227,13 +7251,14 @@ fn send_v2_status(reply: ReplyChannel, status: u8, id: ServiceId) {
 const V2_RAFT_REDIRECT_STATUS: u8 = 0xFE;
 
 #[cfg(all(feature = "storage", feature = "network"))]
-const V2_RAFT_DELEGATION_MAGIC: [u8; 4] = *b"VRD3";
+const V2_RAFT_DELEGATION_MAGIC: [u8; 4] = *b"VRD4";
 
 #[cfg(all(feature = "storage", feature = "network"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct V2RaftRedirect {
     leader_prefix: u16,
     origin: crate::v2::Origin,
+    root_upgrade_request: bool,
 }
 
 #[cfg(all(feature = "storage", feature = "network"))]
@@ -7246,6 +7271,7 @@ struct V2RaftDelegatedIngress {
     /// Host-private protocol marker forwarded only after the source peer has
     /// been authenticated as a voter of this exact root's Raft group.
     role_authority_request: bool,
+    root_upgrade_request: bool,
     ingress: Vec<u8>,
 }
 
@@ -7285,11 +7311,16 @@ fn decode_v2_origin(wire: &[u8], cursor: &mut usize) -> Option<crate::v2::Origin
 }
 
 #[cfg(all(feature = "storage", feature = "network"))]
-fn encode_v2_raft_redirect(leader_prefix: u16, origin: crate::v2::Origin) -> Vec<u8> {
-    let mut wire = Vec::with_capacity(36);
+fn encode_v2_raft_redirect(
+    leader_prefix: u16,
+    origin: crate::v2::Origin,
+    root_upgrade_request: bool,
+) -> Vec<u8> {
+    let mut wire = Vec::with_capacity(37);
     wire.push(V2_RAFT_REDIRECT_STATUS);
     wire.extend_from_slice(&leader_prefix.to_le_bytes());
     encode_v2_origin(&mut wire, origin);
+    wire.push(u8::from(root_upgrade_request));
     wire
 }
 
@@ -7301,9 +7332,16 @@ fn decode_v2_raft_redirect(wire: &[u8]) -> Option<V2RaftRedirect> {
     let leader_prefix = u16::from_le_bytes([wire[1], wire[2]]);
     let mut cursor = 3;
     let origin = decode_v2_origin(wire, &mut cursor)?;
+    let root_upgrade_request = match wire.get(cursor) {
+        Some(0) => false,
+        Some(1) => true,
+        _ => return None,
+    };
+    cursor += 1;
     (cursor == wire.len()).then_some(V2RaftRedirect {
         leader_prefix,
         origin,
+        root_upgrade_request,
     })
 }
 
@@ -7312,12 +7350,14 @@ fn encode_v2_raft_delegation(
     origin: crate::v2::Origin,
     preserve_envelope: bool,
     role_authority_request: bool,
+    root_upgrade_request: bool,
     ingress: &[u8],
 ) -> Vec<u8> {
-    let mut wire = Vec::with_capacity(7 + 32 + ingress.len());
+    let mut wire = Vec::with_capacity(8 + 32 + ingress.len());
     wire.extend_from_slice(&V2_RAFT_DELEGATION_MAGIC);
     wire.push(u8::from(preserve_envelope));
     wire.push(u8::from(role_authority_request));
+    wire.push(u8::from(root_upgrade_request));
     encode_v2_origin(&mut wire, origin);
     wire.extend_from_slice(ingress);
     wire
@@ -7338,7 +7378,12 @@ fn decode_v2_raft_delegation(wire: &[u8]) -> Result<Option<V2RaftDelegatedIngres
         Some(1) => true,
         _ => return Err(()),
     };
-    let mut cursor = 6;
+    let root_upgrade_request = match wire.get(6) {
+        Some(0) => false,
+        Some(1) => true,
+        _ => return Err(()),
+    };
+    let mut cursor = 7;
     let origin = decode_v2_origin(wire, &mut cursor).ok_or(())?;
     let ingress = wire
         .get(cursor..)
@@ -7348,6 +7393,7 @@ fn decode_v2_raft_delegation(wire: &[u8]) -> Result<Option<V2RaftDelegatedIngres
         origin,
         preserve_envelope,
         role_authority_request,
+        root_upgrade_request,
         ingress: ingress.to_vec(),
     }))
 }
@@ -8617,6 +8663,7 @@ fn request_v2_role_assertion(
         #[cfg(all(feature = "network", feature = "storage"))]
         delegated_origin: None,
         role_authority_request: true,
+        root_upgrade_request: false,
         msg: ingress_wire.clone(),
         reply: ReplyChannel::Sync(reply_tx),
         chain: Vec::new(),
@@ -8640,6 +8687,7 @@ fn request_v2_role_assertion(
             crate::v2::Origin::System,
             true,
             true,
+            false,
             &ingress_wire,
             deadline,
         )
@@ -8820,18 +8868,7 @@ where
                 continue;
             }
         };
-        if ingress.target != service.root_actor()
-            || ingress.arguments.first() != Some(&crate::value::TAG_DYNAMIC)
-        {
-            send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
-            continue;
-        }
-        let Some(message) = <crate::value::Msg as Decode>::try_decode(&ingress.arguments[1..])
-        else {
-            send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
-            continue;
-        };
-        if message.name != ingress.method {
+        if ingress.target != service.root_actor() {
             send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
             continue;
         }
@@ -8850,6 +8887,60 @@ where
             send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
             continue;
         };
+        if ingress.method == crate::v2::ROOT_UPGRADE_METHOD_V2 {
+            let authorized = req.root_upgrade_request
+                || matches!(req.caller, crate::actors::Caller::System)
+                || req.space_role.is_some_and(|role| role >= AUTH_ROLE_ADMIN);
+            let upgrade = crate::v2::RootTreeUpgradeRequestV2::decode(&ingress.arguments);
+            if ingress.proof_requested || !authorized || upgrade.is_err() {
+                send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                continue;
+            }
+            match service.upgrade_root(upgrade.expect("checked above")) {
+                Ok(result) => {
+                    let reply = result.encode();
+                    let envelope = encode_invoke_envelope(crate::STATUS_DONE, &[], &reply);
+                    let _ = send_reply_capped(req.reply, envelope, id);
+                }
+                Err(crate::v2::LocalRootTreeInvokeErrorV2::Rejected(
+                    crate::v2::AccumulationRejectionV2::Unauthorized,
+                ))
+                | Err(crate::v2::LocalRootTreeInvokeErrorV2::UpgradeUnsupported) => {
+                    send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                }
+                #[cfg(all(feature = "storage", feature = "network"))]
+                Err(failure @ crate::v2::LocalRootTreeInvokeErrorV2::Replication(_)) => {
+                    warn!(%id, ?failure, "v2 root upgrade leader barrier failed");
+                    if let Some(leader_prefix) = service.admission_leader_hint() {
+                        let _ = send_reply_capped(
+                            req.reply,
+                            encode_v2_raft_redirect(leader_prefix, origin, true),
+                            id,
+                        );
+                    } else {
+                        send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                    }
+                }
+                Err(failure) => {
+                    error!(%id, ?failure, "v2 root upgrade failed");
+                    send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                }
+            }
+            continue;
+        }
+        if ingress.arguments.first() != Some(&crate::value::TAG_DYNAMIC) {
+            send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
+            continue;
+        }
+        let Some(message) = <crate::value::Msg as Decode>::try_decode(&ingress.arguments[1..])
+        else {
+            send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
+            continue;
+        };
+        if message.name != ingress.method {
+            send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
+            continue;
+        }
         // A role check is not a sufficient leadership gate: Raft exposes
         // Leader before the promotion no-op reaches quorum. The service read
         // barrier waits for that current-term entry and catches up the complete
@@ -8862,7 +8953,7 @@ where
                 if let Some(leader_prefix) = service.admission_leader_hint() {
                     let _ = send_reply_capped(
                         req.reply,
-                        encode_v2_raft_redirect(leader_prefix, origin),
+                        encode_v2_raft_redirect(leader_prefix, origin, false),
                         id,
                     );
                     continue;
@@ -10657,6 +10748,7 @@ fn agent_thread(
                 #[cfg(all(feature = "network", feature = "storage"))]
                 delegated_origin: None,
                 role_authority_request: false,
+                root_upgrade_request: false,
                 msg: msg.to_vec(),
                 reply: ReplyChannel::Sync(reply_tx),
                 chain: chain_snapshot,
@@ -11317,7 +11409,6 @@ pub(crate) const AUTH_ROLE_NONE: u8 = 0;
 /// Wire-byte for the space-level ADMIN grant (the highest role). Mirrors
 /// `space_registry::AUTH_ROLE_ADMIN`; used by the `__stop` lifecycle gate
 /// — only an admin may stop an agent host-side.
-#[cfg(feature = "network")]
 pub(crate) const AUTH_ROLE_ADMIN: u8 = 3;
 
 /// Wire-byte for the lowest grant tier (read / Member). Mirrors
@@ -13094,6 +13185,7 @@ async fn route_invoke(
             #[cfg(all(feature = "network", feature = "storage"))]
             delegated_origin: None,
             role_authority_request: false,
+            root_upgrade_request: false,
             msg: payload,
             reply: ReplyChannel::Async(reply_tx),
             chain: Vec::new(),
@@ -13224,7 +13316,7 @@ fn agent_forward_to_raft_leader(
     let peer = net.peer_for_prefix(leader)?;
     let to = ((leader as u32) << 16) | (target & 0xFFFF);
     if let Some(origin) = delegated_origin {
-        payload = encode_v2_raft_delegation(origin, false, false, &payload);
+        payload = encode_v2_raft_delegation(origin, false, false, false, &payload);
     }
     debug!(%from_id, target, leader, "agent ask: forwarding follower-dropped raft write to leader");
     let rx = net.send_invoke(peer, from_id.0, to, Vec::new(), payload);
@@ -13262,7 +13354,7 @@ async fn forward_to_raft_leader(
     let peer = net.peer_for_prefix(leader)?;
     let to = ((leader as u32) << 16) | (target & 0xFFFF);
     if let Some(origin) = delegated_origin {
-        payload = encode_v2_raft_delegation(origin, false, false, &payload);
+        payload = encode_v2_raft_delegation(origin, false, false, false, &payload);
     }
     debug!(
         %extension_id, target, leader,
@@ -14173,6 +14265,7 @@ mod tests {
             V2RaftRedirect {
                 leader_prefix: 41,
                 origin: crate::v2::Origin::System,
+                root_upgrade_request: false,
             },
             |redirect, wire| {
                 remote_prefixes.push(redirect.leader_prefix);
@@ -14191,9 +14284,9 @@ mod tests {
             |wire| {
                 local_wires.push(wire.to_vec());
                 let envelope = match local_wires.len() {
-                    1 => encode_v2_raft_redirect(42, crate::v2::Origin::System),
+                    1 => encode_v2_raft_redirect(42, crate::v2::Origin::System, false),
                     2 => encode_invoke_envelope(STATUS_FORBIDDEN, &[], &[]),
-                    _ => encode_v2_raft_redirect(43, crate::v2::Origin::System),
+                    _ => encode_v2_raft_redirect(43, crate::v2::Origin::System, false),
                 };
                 V2AttestedRedriveAttempt::Reply(envelope)
             },
@@ -16299,45 +16392,72 @@ mod tests {
             crate::v2::Origin::Member(crate::v2::SubjectId([7; 32])),
             crate::v2::Origin::Actor(crate::v2::ActorId([8; 32])),
         ] {
-            let redirect = encode_v2_raft_redirect(41, origin);
+            let redirect = encode_v2_raft_redirect(41, origin, false);
             assert_eq!(
                 decode_v2_raft_redirect(&redirect),
                 Some(V2RaftRedirect {
                     leader_prefix: 41,
                     origin,
+                    root_upgrade_request: false,
                 }),
                 "the follower's authenticated origin survives leader selection",
             );
-            let delegated = encode_v2_raft_delegation(origin, true, false, b"root ingress");
+            let delegated = encode_v2_raft_delegation(origin, true, false, false, b"root ingress");
             assert_eq!(
                 decode_v2_raft_delegation(&delegated),
                 Ok(Some(V2RaftDelegatedIngress {
                     origin,
                     preserve_envelope: true,
                     role_authority_request: false,
+                    root_upgrade_request: false,
                     ingress: b"root ingress".to_vec(),
                 })),
             );
         }
-        let authority =
-            encode_v2_raft_delegation(crate::v2::Origin::System, true, true, b"authority ingress");
+        let authority = encode_v2_raft_delegation(
+            crate::v2::Origin::System,
+            true,
+            true,
+            false,
+            b"authority ingress",
+        );
         assert_eq!(
             decode_v2_raft_delegation(&authority),
             Ok(Some(V2RaftDelegatedIngress {
                 origin: crate::v2::Origin::System,
                 preserve_envelope: true,
                 role_authority_request: true,
+                root_upgrade_request: false,
                 ingress: b"authority ingress".to_vec(),
             })),
             "the host-private marker survives only inside authenticated Raft delegation",
+        );
+        let upgrade = encode_v2_raft_delegation(
+            crate::v2::Origin::System,
+            true,
+            false,
+            true,
+            b"upgrade ingress",
+        );
+        assert_eq!(
+            decode_v2_raft_delegation(&upgrade),
+            Ok(Some(V2RaftDelegatedIngress {
+                origin: crate::v2::Origin::System,
+                preserve_envelope: true,
+                role_authority_request: false,
+                root_upgrade_request: true,
+                ingress: b"upgrade ingress".to_vec(),
+            })),
+            "the upgrade marker survives only inside authenticated Raft delegation",
         );
         assert!(
             decode_v2_raft_delegation(b"ordinary ingress")
                 .unwrap()
                 .is_none()
         );
-        assert!(decode_v2_raft_delegation(b"VRD3\x02\x00bad").is_err());
-        assert!(decode_v2_raft_delegation(b"VRD3\x00\x02bad").is_err());
+        assert!(decode_v2_raft_delegation(b"VRD4\x02\x00\x00bad").is_err());
+        assert!(decode_v2_raft_delegation(b"VRD4\x00\x02\x00bad").is_err());
+        assert!(decode_v2_raft_delegation(b"VRD4\x00\x00\x02bad").is_err());
         assert!(
             decode_v2_raft_delegation(b"VRD2\x00\x03old")
                 .unwrap()
@@ -18348,6 +18468,7 @@ mod tests {
                 assert!(request.reply.send(encode_v2_raft_redirect(
                     voter_prefix,
                     crate::v2::Origin::System,
+                    false,
                 )));
             }
         });
@@ -19009,13 +19130,14 @@ mod tests {
 
         let mut ingress = vec![TAG_DYNAMIC];
         ingress.extend_from_slice(&Msg::new("start").encode());
-        let delegated = encode_v2_raft_delegation(crate::v2::Origin::System, true, false, &ingress);
+        let delegated =
+            encode_v2_raft_delegation(crate::v2::Origin::System, true, false, false, &ingress);
         let reply = service.dispatch_invoke(Some(voter), 0, target.0, Vec::new(), delegated);
         assert!(!reply.is_empty());
         assert_eq!(
             probes.lock().unwrap().as_slice(),
             &["members".to_string()],
-            "VRD2 authenticates the voter once and never probes its irrelevant host roles",
+            "authenticated delegation probes the voter once and never probes irrelevant host roles",
         );
 
         drop(service);

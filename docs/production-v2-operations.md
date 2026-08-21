@@ -95,14 +95,15 @@ its source produces an upgrade candidate, not a replacement release blob:
 just build-authority-upgrade-candidate
 ```
 
-Do not copy that output over `vosx/blobs/space_authority.pvm`, and do not use
-`vosx space upgrade` for a signed v2 package. The catalog command intentionally
-refuses that operation because it cannot prove the actor is idle or mutate the
-guest-owned descriptor.
+Do not copy that output over `vosx/blobs/space_authority.pvm`. Ordinary signed
+v2 Local and Raft roots may use `vosx space upgrade`, which drives the
+guest-owned transition before its catalog compare-and-swap. The command still
+refuses `space-authority`: its catalog deployment is also the stable trust
+binding consumed by every dependent root.
 
-The only valid migration is one canonical `UpgradeActor` request per affected
-Local or Raft authority root. A future operator command must perform all of the
-following as one authenticated workflow:
+The only valid authority migration is one canonical `UpgradeActor` request per
+affected Raft authority root. A future authority-specific migration must
+perform all of the following as one authenticated workflow:
 
 1. verify the signed candidate package and make its PVM available on every
    Raft voter;
@@ -115,8 +116,12 @@ following as one authenticated workflow:
    guest-owned state before distributing a release that expects the new
    authority.
 
-Guest Accumulate already enforces the exact base, authenticated request,
+The ordinary-root command already implements the corresponding signed-package
+availability, authenticated transition, catalog ordering, and exact retry
+recovery. Guest Accumulate enforces the exact base, authenticated request,
 replacement program availability, and the absence of continuations or pinned
-authorized inboxes. CRDT upgrades remain unsupported. Until the operator
-command and a cross-version rehearsal land, the production procedure is to
+authorized inboxes. CRDT roots and roots exposing attested methods remain
+unsupported; the latter need a guest-owned migration for dependent roots'
+deployment-pinned external bindings. Until the authority-specific command and
+a cross-version authority rehearsal land, the production procedure is to
 retain the frozen authority and restore it from the verified release bundle.

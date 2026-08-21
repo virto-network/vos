@@ -40,10 +40,10 @@ use vos::v2::{
     ReplicatedServiceErrorV2, ReplyRecordV2, RoleAuthorityBindingV2,
     RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2, RoleAuthorizationClaimV2,
     RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId, RootTreeAttestedResultV2,
-    RootTreeInvocationV2, ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2,
-    ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId, SystemCapabilityId,
-    TaskDependencyV2, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2, WorkflowOperationV2,
-    artifact_hash, public_policy_hash, space_role_policy_hash,
+    RootTreeInvocationV2, RootTreeUpgradeRequestV2, ScheduleErrorV2, ServiceDispatchError,
+    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, ServicePvmV2, StateKeyV2, SubjectId,
+    SystemCapabilityId, TaskDependencyV2, TransitionV2, V2Wire, VosPackageV2, WorkEnvelopeV2,
+    WorkflowOperationV2, artifact_hash, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     Decode, Encode,
@@ -5509,8 +5509,9 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
         arguments: forged_arguments,
         proof_requested: false,
     };
-    let mut forged_delegation = b"VRD2".to_vec();
-    forged_delegation.extend_from_slice(&[1, 3]); // preserve envelope + Origin::System
+    let mut forged_delegation = b"VRD4".to_vec();
+    // preserve envelope + no authority/upgrade marker + Origin::System
+    forged_delegation.extend_from_slice(&[1, 0, 0, 3]);
     forged_delegation.extend_from_slice(&forged_ingress.encode());
     let leader_peer = client_network.peer_for_prefix(leader).unwrap();
     let refused = client_network
@@ -5886,6 +5887,243 @@ fn node_routes_canonical_actor_ids_through_the_guest_owned_root_service() {
         reopened.pending_publications().unwrap().is_empty(),
         "the direct reply is acknowledged only after its channel accepts it"
     );
+}
+
+#[test]
+fn root_upgrade_is_exactly_once_and_reopens_across_the_catalog_cutover() {
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&greeter_elf(), &signer);
+    let actor = ActorId([0x61; 32]);
+    let original_service = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([0x62; 32]),
+        root_service: RootServiceId([0x63; 32]),
+        deployment: package.deployment_id(),
+        service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
+    };
+    let config = LocalRootTreeConfigV2 {
+        role_authority: None,
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package: package.clone(),
+        service: original_service.clone(),
+        root_actor: actor,
+        actor_name,
+        consistency: ConsistencyModeV2::Local,
+        initial_state: b"preserved application state".to_vec(),
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([0x64; 32]),
+            authenticator: vec![0x65],
+        },
+        refine_gas: TEST_GAS_SCHEDULE.refine,
+        accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
+    };
+    let backend = SharedCommittedImages::default();
+    let mut service = LocalRootTreeServiceV2::open(config.clone(), backend.clone()).unwrap();
+    let before_header = service.store().header().unwrap().unwrap();
+    let before_state = service
+        .store()
+        .state_row(
+            before_header.service_root,
+            &StateKeyV2::ActorRow {
+                actor,
+                key: vos::actors::lifecycle::STATE_KEY_BYTES.to_vec(),
+            },
+        )
+        .unwrap();
+
+    let mut replacement = package.clone();
+    replacement.manifest.version = "2.1.0".into();
+    replacement.deployment_signature.signature = signer
+        .sign(&replacement.signing_message())
+        .expect("sign replacement package");
+    replacement.validate().unwrap();
+    let request = RootTreeUpgradeRequestV2 {
+        expected_deployment: package.deployment_id(),
+        expected_program: package.manifest.actor_program,
+        replacement: replacement.clone(),
+    };
+    let upgraded = service.upgrade_root(request.clone()).unwrap();
+    assert!(matches!(
+        upgraded,
+        AccumulationResultV2::ActorUpgraded {
+            deployment,
+            duplicate: false,
+            ..
+        } if deployment == replacement.deployment_id()
+    ));
+    let after_header = service.store().header().unwrap().unwrap();
+    assert_eq!(after_header.service, original_service);
+    assert_eq!(
+        service
+            .store()
+            .state_row(
+                after_header.service_root,
+                &StateKeyV2::ActorRow {
+                    actor,
+                    key: vos::actors::lifecycle::STATE_KEY_BYTES.to_vec(),
+                },
+            )
+            .unwrap(),
+        before_state,
+        "UpgradeActor preserves application state"
+    );
+    drop(service);
+
+    // Crash before the catalog CAS: the old package still opens because the
+    // permanent guest record proves the exact old -> new descriptor edge.
+    let mut pre_catalog = LocalRootTreeServiceV2::open(config.clone(), backend.clone()).unwrap();
+    assert!(matches!(
+        pre_catalog.upgrade_root(request.clone()).unwrap(),
+        AccumulationResultV2::ActorUpgraded {
+            deployment,
+            duplicate: true,
+            ..
+        } if deployment == replacement.deployment_id()
+    ));
+    let rollback = RootTreeUpgradeRequestV2 {
+        expected_deployment: replacement.deployment_id(),
+        expected_program: replacement.manifest.actor_program,
+        replacement: package.clone(),
+    };
+    assert!(matches!(
+        pre_catalog.upgrade_root(rollback).unwrap(),
+        AccumulationResultV2::ActorUpgraded {
+            deployment,
+            duplicate: false,
+            ..
+        } if deployment == package.deployment_id()
+    ));
+    assert!(matches!(
+        pre_catalog.upgrade_root(request).unwrap(),
+        AccumulationResultV2::ActorUpgraded {
+            deployment,
+            duplicate: false,
+            ..
+        } if deployment == replacement.deployment_id()
+    ));
+    drop(pre_catalog);
+
+    // After the registry CAS, configuration names the replacement actor
+    // package while the root service keeps its genesis deployment identity.
+    let mut replacement_config = config;
+    replacement_config.package = replacement.clone();
+    replacement_config.service.deployment = replacement.deployment_id();
+    let reopened = LocalRootTreeServiceV2::open(replacement_config, backend).unwrap();
+    assert_eq!(reopened.identity(), &original_service);
+    assert_eq!(
+        reopened
+            .root_method_policy("start")
+            .unwrap()
+            .map(|policy| policy.public),
+        Some(true)
+    );
+}
+
+#[test]
+fn production_raft_root_upgrade_is_ordered_once_and_reopens_at_the_committed_package() {
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&greeter_elf(), &signer);
+    let actor = ActorId([0x66; 32]);
+    let config = LocalRootTreeConfigV2 {
+        role_authority: None,
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package: package.clone(),
+        service: ServiceIdentityV2 {
+            space: vos::v2::SpaceId([0x67; 32]),
+            root_service: RootServiceId([0x68; 32]),
+            deployment: package.deployment_id(),
+            service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+            service_abi: vos::v2::ABI_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: TEST_GAS_SCHEDULE,
+        },
+        root_actor: actor,
+        actor_name,
+        consistency: ConsistencyModeV2::Raft,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([0x69; 32]),
+            authenticator: vec![0x6A],
+        },
+        refine_gas: TEST_GAS_SCHEDULE.refine,
+        accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
+    };
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-root-upgrade-raft-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let log_path = directory.join("raft.redb");
+    let log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    let backend = FailableCommittedImages::default();
+    let trust = Arc::new(TestProductionTrust::new(0x6B, 100, true));
+    let mut service =
+        LocalRootTreeServiceV2::open_raft_production(config.clone(), backend, log, trust.clone())
+            .expect("single-voter production Raft root installs");
+
+    let mut replacement = package.clone();
+    replacement.manifest.version = "2.1.0".into();
+    replacement.deployment_signature.signature = signer
+        .sign(&replacement.signing_message())
+        .expect("sign replacement package");
+    replacement.validate().unwrap();
+    let request = RootTreeUpgradeRequestV2 {
+        expected_deployment: package.deployment_id(),
+        expected_program: package.manifest.actor_program,
+        replacement: replacement.clone(),
+    };
+    assert!(matches!(
+        service.upgrade_root(request.clone()).unwrap(),
+        AccumulationResultV2::ActorUpgraded {
+            deployment,
+            duplicate: false,
+            ..
+        } if deployment == replacement.deployment_id()
+    ));
+    let backend = service.into_backend();
+
+    let mut log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    assert_eq!(
+        log.applied_index().unwrap(),
+        2,
+        "genesis and one upgrade commit"
+    );
+    assert!(log.committed_after(2).unwrap().entries.is_empty());
+    drop(log);
+
+    let mut replacement_config = config;
+    replacement_config.package = replacement.clone();
+    replacement_config.service.deployment = replacement.deployment_id();
+    let log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    let mut reopened =
+        LocalRootTreeServiceV2::open_raft_production(replacement_config, backend, log, trust)
+            .expect("Raft root reopens through the committed upgrade history");
+    assert!(matches!(
+        reopened.upgrade_root(request).unwrap(),
+        AccumulationResultV2::ActorUpgraded {
+            deployment,
+            duplicate: true,
+            ..
+        } if deployment == replacement.deployment_id()
+    ));
+    drop(reopened);
+
+    let mut log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    assert_eq!(
+        log.applied_index().unwrap(),
+        2,
+        "an exact retry never appends a second upgrade"
+    );
+    drop(log);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

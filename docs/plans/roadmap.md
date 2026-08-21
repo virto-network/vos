@@ -166,9 +166,11 @@ stands in for the on-chain settlement venue Wave 2 makes real.
   directory, and the physical Raft gate moves a stopped voter through an
   offline archive into fresh machine roots before catch-up. The operator
   procedure and safety preconditions for the guest-owned `UpgradeActor` path
-  are explicit in `docs/production-v2-operations.md`; the remaining product
-  work is its authenticated CLI/daemon entry point and new-identity voter
-  removal (identity-preserving machine replacement is gated today).
+  are explicit in `docs/production-v2-operations.md`. Ordinary Local and Raft
+  roots now have an authenticated CLI/daemon entry point with exact retry and
+  restart recovery. Remaining product work is the canonical-authority binding
+  migration and new-identity voter removal (identity-preserving machine
+  replacement is gated today).
 
 **Keystone fast-follows (non-blocking; merged code is green)**
 - Ristretto host precompiles remain outside the trusted proof boundary. The

@@ -127,8 +127,18 @@ fn is_reserved_host_operation(method: &str) -> bool {
     matches!(method, "__stop" | "__describe")
 }
 
-fn upgrade_uses_v2_package(from: &[u8], to: &[u8]) -> bool {
-    from.get(..4) == Some(b"VOSP") || to.get(..4) == Some(b"VOSP")
+fn decode_exact_v2_package(bytes: &[u8], label: &str) -> anyhow::Result<vos::v2::VosPackageV2> {
+    use vos::v2::V2Wire;
+
+    let package = vos::v2::VosPackageV2::decode(bytes)
+        .map_err(|error| anyhow::anyhow!("decode {label} signed v2 package: {error}"))?;
+    package
+        .validate()
+        .map_err(|error| anyhow::anyhow!("validate {label} signed v2 package: {error}"))?;
+    if package.encode() != bytes {
+        anyhow::bail!("{label} signed v2 package is not canonical");
+    }
+    Ok(package)
 }
 
 fn role_grant_mutation(
@@ -697,6 +707,8 @@ impl DaemonClient {
         program_version: String,
         program_hash: Vec<u8>,
     ) -> anyhow::Result<Status> {
+        use vos::v2::V2Wire as _;
+
         // Compare-and-swap base: read the instance's live program hash so
         // the registry rejects this upgrade if the instance has moved on
         // (a replayed/superseded upgrade can't roll the version back).
@@ -725,10 +737,74 @@ impl DaemonClient {
                     hex::encode(to_hash),
                 )
             })?;
-        if upgrade_uses_v2_package(&from_artifact, &to_artifact) {
-            anyhow::bail!(
-                "signed v2 package upgrades are not catalog mutations; guest-owned UpgradeActor support must land before this installation can be upgraded",
-            );
+        let from_v2 = from_artifact.get(..4) == Some(b"VOSP");
+        let to_v2 = to_artifact.get(..4) == Some(b"VOSP");
+        if from_v2 != to_v2 {
+            anyhow::bail!("upgrade cannot cross the legacy/v2 runtime boundary");
+        }
+        if from_v2 {
+            if instance_name == vos::v2::ROLE_AUTHORITY_INSTANCE_V2 {
+                anyhow::bail!(
+                    "the canonical space-authority remains frozen; its stable trust binding requires a separate migration workflow",
+                );
+            }
+            let from_package = decode_exact_v2_package(&from_artifact, "installed")?;
+            let to_package = decode_exact_v2_package(&to_artifact, "replacement")?;
+            let target = self.resolve_target(&instance_name)?;
+            let actor = self
+                .v2_targets
+                .lock()
+                .map_err(|_| anyhow::anyhow!("v2 target cache is unavailable"))?
+                .get(&target.0)
+                .map(|target| target.actor)
+                .ok_or_else(|| anyhow::anyhow!("installed root is not a signed v2 target"))?;
+            let request = vos::v2::RootTreeUpgradeRequestV2 {
+                expected_deployment: from_package.deployment_id(),
+                expected_program: from_package.manifest.actor_program,
+                replacement: to_package.clone(),
+            };
+            let mut nonce = [0; 32];
+            getrandom::getrandom(&mut nonce)
+                .map_err(|error| anyhow::anyhow!("mint v2 upgrade invocation ID: {error}"))?;
+            let ingress = vos::v2::RootTreeInvocationV2 {
+                invocation: vos::v2::InvocationId::derive(b"vosx/root-upgrade/v2", &nonce),
+                target: actor,
+                method: vos::v2::ROOT_UPGRADE_METHOD_V2.into(),
+                arguments: vos::v2::V2Wire::encode(&request),
+                proof_requested: false,
+            };
+            let reply = self
+                .node
+                .invoke_with_timeout(
+                    target,
+                    vos::v2::V2Wire::encode(&ingress),
+                    Duration::from_secs(120),
+                )
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "v2 root upgrade was refused or its durable disposition could not be recovered"
+                    )
+                })?;
+            let result = vos::v2::AccumulationResultV2::decode(&reply)
+                .map_err(|error| anyhow::anyhow!("decode v2 root upgrade result: {error}"))?;
+            match result {
+                vos::v2::AccumulationResultV2::ActorUpgraded {
+                    actor: committed_actor,
+                    previous_deployment,
+                    previous_program,
+                    deployment,
+                    program,
+                    ..
+                } if committed_actor == actor
+                    && previous_deployment == from_package.deployment_id()
+                    && previous_program == from_package.manifest.actor_program
+                    && deployment == to_package.deployment_id()
+                    && program == to_package.manifest.actor_program => {}
+                vos::v2::AccumulationResultV2::Rejected(rejection) => {
+                    anyhow::bail!("guest rejected v2 root upgrade: {rejection:?}")
+                }
+                _ => anyhow::bail!("v2 root returned a mismatched upgrade result"),
+            }
         }
         vos::block_on(self.registry().upgrade(
             &mut &self.node,
@@ -1241,10 +1317,9 @@ mod tests {
     }
 
     #[test]
-    fn catalog_upgrade_rejects_either_v2_endpoint() {
-        assert!(upgrade_uses_v2_package(b"VOSP\x02\0old", b"legacy"));
-        assert!(upgrade_uses_v2_package(b"legacy", b"VOSP\x02\0new"));
-        assert!(!upgrade_uses_v2_package(b"legacy-a", b"legacy-b"));
+    fn root_upgrade_control_method_is_outside_the_actor_namespace() {
+        assert!(vos::v2::ROOT_UPGRADE_METHOD_V2.starts_with('\0'));
+        assert!(!is_reserved_host_operation(vos::v2::ROOT_UPGRADE_METHOD_V2));
     }
 
     #[test]

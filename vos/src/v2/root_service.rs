@@ -18,20 +18,20 @@ use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateRequestV2, AccumulatedRoleAssertionV2, AccumulatedServiceOutputV2,
     AccumulationEnvelopeV2, AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2,
-    ActorDirectoryV2, ActorGenesisV2, ActorId, AttestedServiceErrorV2, AuthorizationEvidenceV2,
-    BlobRefV2, CausalCallContextV2, CommittedImageStoreV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationSnapshotV2, CrdtChangeV2, CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryRecordV2,
-    DirectIngressV2, DurableJamStoreV2, DurableStoreOpenErrorV2, ExternalActorBindingV2,
-    ExternalActorDirectoryV2, ImportedBlobV2, ImportedProgramV2, JamServiceV2, LocalJamStoreHostV2,
-    LocalJamStoreV2, LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
-    MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin, PackageError,
-    PackageRolePoliciesV2, PreparedWorkV2, ProductionTrustErrorV2, ProductionTrustV2, ProgramId,
-    ProofArtifactStoreV2, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
-    RefinedServiceOutputV2, RoleAssertionEligibilityV2, RoleAuthorityBindingV2,
-    RoleAuthorizationClaimV2, RoleCredentialV2, ScheduleErrorV2, ServiceDispatchError,
-    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, StateKeyV2, V2Wire, VosPackageV2,
-    WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
-    delivery_storage_key,
+    ActorDirectoryV2, ActorGenesisV2, ActorId, ActorUpgradeRecordV2, ActorUpgradeV2,
+    AttestedServiceErrorV2, AuthorizationEvidenceV2, BlobRefV2, CausalCallContextV2,
+    CommittedImageStoreV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2,
+    CrdtChangeV2, CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryRecordV2, DirectIngressV2,
+    DurableJamStoreV2, DurableStoreOpenErrorV2, ExternalActorBindingV2, ExternalActorDirectoryV2,
+    ImportedBlobV2, ImportedProgramV2, JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2,
+    LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2,
+    MethodPolicyV2, NoRefineProtocolHostV2, Origin, PackageError, PackageRolePoliciesV2,
+    PreparedWorkV2, ProductionTrustErrorV2, ProductionTrustV2, ProgramId, ProofArtifactStoreV2,
+    PublicationAckV2, PublicationRecordV2, PublishedEffectsV2, RefinedServiceOutputV2,
+    RoleAssertionEligibilityV2, RoleAuthorityBindingV2, RoleAuthorizationClaimV2, RoleCredentialV2,
+    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
+    StateKeyV2, SystemCapabilityId, V2Wire, VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2,
+    crdt_node_storage_key, dedup_storage_key, delivery_storage_key,
 };
 
 #[cfg(feature = "storage")]
@@ -40,6 +40,10 @@ use super::{ReplicatedJamServiceV2, ReplicatedServiceErrorV2};
 use crate::commit::CommitError;
 #[cfg(feature = "storage")]
 use crate::raft::RaftAccumulateLogV2;
+
+/// Reserved daemon control method used only by the authenticated v2 root
+/// upgrade path. The NUL prefix cannot collide with a Rust actor message.
+pub const ROOT_UPGRADE_METHOD_V2: &str = "\0vos/upgrade-root/v2";
 
 /// Strict host ingress for one direct invocation of a registered v2 root.
 ///
@@ -54,6 +58,43 @@ pub struct RootTreeInvocationV2 {
     pub method: String,
     pub arguments: Vec<u8>,
     pub proof_requested: bool,
+}
+
+/// Host-control payload for one guest-owned root actor upgrade. The daemon
+/// authenticates the operator separately; these bytes bind the expected
+/// installed package and the complete signed replacement package across
+/// local dispatch and Raft redirects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootTreeUpgradeRequestV2 {
+    pub expected_deployment: super::DeploymentId,
+    pub expected_program: ProgramId,
+    pub replacement: VosPackageV2,
+}
+
+impl V2Wire for RootTreeUpgradeRequestV2 {
+    const MAGIC: [u8; 4] = *b"VRU2";
+
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        let mut encoder = Encoder(out);
+        encoder.fixed(&self.expected_deployment.0);
+        encoder.fixed(&self.expected_program.0);
+        encoder.bytes(&self.replacement.encode());
+    }
+
+    fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
+        let value = Self {
+            expected_deployment: super::DeploymentId(decoder.fixed()?),
+            expected_program: ProgramId(decoder.fixed()?),
+            replacement: VosPackageV2::decode(&decoder.bytes()?)?,
+        };
+        if value.expected_deployment == super::DeploymentId::ZERO
+            || value.expected_program == ProgramId::ZERO
+            || value.replacement.deployment_id() == value.expected_deployment
+        {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
 }
 
 /// Host-facing result for one attested root invocation. The actor reply and
@@ -597,6 +638,13 @@ pub enum LocalRootTreeInvokeErrorV2 {
     ExistingServiceMismatch,
     ExistingActorMismatch,
     MissingInstalledProgram(ProgramId),
+    InvalidUpgradePackage(PackageError),
+    InvalidUpgradeSignature,
+    InvalidUpgradeProgramLayout,
+    InvalidUpgradeTarget,
+    UpgradeUnsupported,
+    UpgradeEntryTooLarge,
+    ProductionTrustUnavailable,
 }
 
 impl core::fmt::Display for LocalRootTreeInvokeErrorV2 {
@@ -1102,6 +1150,73 @@ fn installation_availability(
         bytes: config.initial_state.clone(),
     }];
     (programs, blobs)
+}
+
+fn package_program_availability(package: &VosPackageV2) -> Vec<ImportedProgramV2> {
+    let mut programs = vec![ImportedProgramV2 {
+        program: package.manifest.actor_program,
+        pvm: package.actor_pvm.clone(),
+    }];
+    programs.extend(
+        package
+            .task_dependencies
+            .iter()
+            .map(|dependency| ImportedProgramV2 {
+                program: dependency.binding.program,
+                pvm: dependency.pvm.clone(),
+            }),
+    );
+    programs.sort_by_key(|program| program.program);
+    programs.dedup_by_key(|program| program.program);
+    programs
+}
+
+fn same_service_incarnation_except_deployment(
+    left: &ServiceIdentityV2,
+    right: &ServiceIdentityV2,
+) -> bool {
+    left.space == right.space
+        && left.root_service == right.root_service
+        && left.service_program == right.service_program
+        && left.service_abi == right.service_abi
+        && left.execution_semantics == right.execution_semantics
+        && left.gas_schedule == right.gas_schedule
+}
+
+fn same_immutable_actor_identity(left: &ActorGenesisV2, right: &ActorGenesisV2) -> bool {
+    left.actor == right.actor
+        && left.name == right.name
+        && left.parent == right.parent
+        && left.initial_state == right.initial_state
+        && left.crdt == right.crdt
+}
+
+fn upgrade_history_connects(
+    records: &[ActorUpgradeRecordV2],
+    actor: ActorId,
+    expected_deployment: super::DeploymentId,
+    expected_program: ProgramId,
+    actual_deployment: super::DeploymentId,
+    actual_program: ProgramId,
+) -> bool {
+    let target = (actual_deployment, actual_program);
+    let mut frontier = vec![(expected_deployment, expected_program)];
+    let mut visited = Vec::new();
+    while let Some(current) = frontier.pop() {
+        if current == target {
+            return true;
+        }
+        if visited.contains(&current) {
+            continue;
+        }
+        visited.push(current);
+        frontier.extend(records.iter().filter_map(|record| {
+            (record.actor == actor
+                && (record.previous_deployment, record.previous_program) == current)
+                .then_some((record.deployment, record.program))
+        }));
+    }
+    false
 }
 
 impl LocalRootTreeConfigV2 {
@@ -2179,7 +2294,7 @@ where
         }
     }
 
-    fn validate_installed(&self) -> Result<bool, LocalRootTreeInvokeErrorV2> {
+    fn validate_installed(&mut self) -> Result<bool, LocalRootTreeInvokeErrorV2> {
         let Some(header) = self
             .service
             .accumulate_host()
@@ -2188,18 +2303,10 @@ where
         else {
             return Ok(false);
         };
-        if header.service != self.identity || header.consistency != self.consistency {
-            return Err(LocalRootTreeInvokeErrorV2::ExistingServiceMismatch);
-        }
-        if self
-            .service
-            .accumulate_host()
-            .program(self.expected_root.program)
-            .is_none()
+        if !same_service_incarnation_except_deployment(&header.service, &self.identity)
+            || header.consistency != self.consistency
         {
-            return Err(LocalRootTreeInvokeErrorV2::MissingInstalledProgram(
-                self.expected_root.program,
-            ));
+            return Err(LocalRootTreeInvokeErrorV2::ExistingServiceMismatch);
         }
         let directory = self
             .service
@@ -2237,13 +2344,36 @@ where
             .transpose()
             .map_err(|_| LocalRootTreeInvokeErrorV2::ExistingActorMismatch)?;
         let descriptor = descriptor.ok_or(LocalRootTreeInvokeErrorV2::ExistingActorMismatch)?;
-        if descriptor != self.expected_root
+        let upgrade_records = self
+            .service
+            .accumulate_host()
+            .actor_upgrade_records()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?;
+        if !same_immutable_actor_identity(&descriptor, &self.expected_root)
+            || !upgrade_history_connects(
+                &upgrade_records,
+                descriptor.actor,
+                self.expected_root.deployment,
+                self.expected_root.program,
+                descriptor.deployment,
+                descriptor.program,
+            )
             || external.as_ref().is_none_or(|directory| {
                 directory.actors.as_slice() != self.expected_external_actors.as_slice()
             })
             || role_authority != self.expected_role_authority
         {
             return Err(LocalRootTreeInvokeErrorV2::ExistingActorMismatch);
+        }
+        if self
+            .service
+            .accumulate_host()
+            .program(descriptor.program)
+            .is_none()
+        {
+            return Err(LocalRootTreeInvokeErrorV2::MissingInstalledProgram(
+                descriptor.program,
+            ));
         }
         let policies = PackageRolePoliciesV2::decode(&descriptor.role_policies)
             .map_err(|_| LocalRootTreeInvokeErrorV2::ExistingActorMismatch)?;
@@ -2259,7 +2389,224 @@ where
                 ));
             }
         }
+        // The service account identity is fixed at genesis. A catalog row may
+        // point at the actor's later signed deployment, so installed state is
+        // authoritative for the stable service identity after the upgrade
+        // history above proves how the actor descriptor reached this point.
+        self.identity = header.service.clone();
+        self.genesis.service = header.service;
         Ok(true)
+    }
+
+    /// Replace the root actor's signed package through the canonical
+    /// guest-owned `UpgradeActor` transition. Callers must authenticate this
+    /// host-control operation before entering this method. The replacement is
+    /// verified, made available to every replica in the same ordered entry,
+    /// and committed only after a current-term barrier.
+    pub fn upgrade_root(
+        &mut self,
+        request: RootTreeUpgradeRequestV2,
+    ) -> Result<AccumulationResultV2, LocalRootTreeInvokeErrorV2> {
+        if self.consistency == ConsistencyModeV2::Crdt
+            || self.expected_root.name == super::ROLE_AUTHORITY_INSTANCE_V2
+        {
+            return Err(LocalRootTreeInvokeErrorV2::UpgradeUnsupported);
+        }
+        request
+            .replacement
+            .validate()
+            .map_err(LocalRootTreeInvokeErrorV2::InvalidUpgradePackage)?;
+        verify_package_signature(&request.replacement)
+            .map_err(|_| LocalRootTreeInvokeErrorV2::InvalidUpgradeSignature)?;
+        super::validate_actor_program_layout(&request.replacement.actor_pvm)
+            .map_err(|_| LocalRootTreeInvokeErrorV2::InvalidUpgradeProgramLayout)?;
+
+        self.prepare_admission_barrier()?;
+        let header = self
+            .service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeErrorV2::ServiceNotInstalled)?;
+        let descriptor = self
+            .service
+            .accumulate_host()
+            .state_row(
+                header.service_root,
+                &StateKeyV2::ActorDescriptor(self.root_actor),
+            )
+            .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+            .and_then(|bytes| ActorGenesisV2::decode(&bytes).ok())
+            .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        let replacement_deployment = request.replacement.deployment_id();
+        let replacement_program = request.replacement.manifest.actor_program;
+        let current_policies = PackageRolePoliciesV2::decode(&descriptor.role_policies)
+            .map_err(|_| LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+        let replacement_policies =
+            PackageRolePoliciesV2::decode(&request.replacement.role_policies)
+                .map_err(|_| LocalRootTreeInvokeErrorV2::InvalidUpgradeTarget)?;
+        if current_policies
+            .methods
+            .iter()
+            .any(|policy| policy.attested)
+            || replacement_policies
+                .methods
+                .iter()
+                .any(|policy| policy.attested)
+        {
+            return Err(LocalRootTreeInvokeErrorV2::UpgradeUnsupported);
+        }
+        if request.replacement.manifest.crdt != descriptor.crdt
+            || request.replacement.manifest.service_program != self.identity.service_program
+            || (self.expected_role_authority.is_none()
+                && replacement_policies
+                    .methods
+                    .iter()
+                    .any(|policy| !policy.public))
+        {
+            return Err(LocalRootTreeInvokeErrorV2::InvalidUpgradeTarget);
+        }
+
+        // A lost response may leave the guest descriptor already upgraded
+        // while the registry still points at the old package. Reconnect that
+        // exact retry from the permanent guest record before constructing a
+        // new base-dependent request.
+        if descriptor.deployment == replacement_deployment
+            && descriptor.program == replacement_program
+        {
+            let record = self
+                .service
+                .accumulate_host()
+                .actor_upgrade_records()
+                .map_err(LocalRootTreeInvokeErrorV2::CorruptStore)?
+                .into_iter()
+                .filter(|record| {
+                    record.actor == self.root_actor
+                        && record.previous_deployment == request.expected_deployment
+                        && record.previous_program == request.expected_program
+                        && record.deployment == replacement_deployment
+                        && record.program == replacement_program
+                })
+                .max_by_key(|record| record.receipt.sequence)
+                .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
+            if descriptor.producer != request.replacement.deployment_signature.producer
+                || descriptor.role_policies != request.replacement.role_policies
+            {
+                return Err(LocalRootTreeInvokeErrorV2::CorruptWorkflow);
+            }
+            return Ok(AccumulationResultV2::ActorUpgraded {
+                actor: record.actor,
+                previous_deployment: record.previous_deployment,
+                previous_program: record.previous_program,
+                deployment: record.deployment,
+                program: record.program,
+                receipt: record.receipt,
+                duplicate: true,
+            });
+        }
+
+        if descriptor.deployment != request.expected_deployment
+            || descriptor.program != request.expected_program
+            || replacement_deployment == descriptor.deployment
+        {
+            return Err(LocalRootTreeInvokeErrorV2::InvalidUpgradeTarget);
+        }
+        let base = ConsistencyBaseV2::Linear {
+            revision: header.revision,
+            state_root: header
+                .state_root
+                .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?,
+        };
+        let request_hash =
+            super::Hash::digest(b"vos/root-upgrade-authenticator/v2", &[&request.encode()]);
+        let upgrade = ActorUpgradeV2 {
+            service: self.identity.clone(),
+            actor: self.root_actor,
+            expected_deployment: request.expected_deployment,
+            expected_program: request.expected_program,
+            replacement_deployment,
+            replacement_program,
+            producer: request.replacement.deployment_signature.producer,
+            role_policies: request.replacement.role_policies.clone(),
+            base,
+            authorization: AuthorizationEvidenceV2::SystemCapability {
+                capability: SystemCapabilityId(
+                    super::Hash::digest(
+                        b"vos/root-upgrade-capability/v2",
+                        &[&self.identity.root_service.0, &self.root_actor.0],
+                    )
+                    .0,
+                ),
+                authenticator: request_hash.0.to_vec(),
+            },
+        };
+        let programs = package_program_availability(&request.replacement);
+        if self
+            .service
+            .accumulate_host()
+            .production_trust_policy_id()
+            .is_none()
+        {
+            self.service.accumulate_host_mut().allow_upgrade(&upgrade);
+        } else if self.consistency == ConsistencyModeV2::Raft {
+            match self
+                .service
+                .accumulate_host()
+                .verify_upgrade_for_proposal(&upgrade)
+            {
+                super::ProductionTrustDecisionV2::Authorized => {}
+                super::ProductionTrustDecisionV2::Denied => {
+                    return Err(LocalRootTreeInvokeErrorV2::Rejected(
+                        AccumulationRejectionV2::Unauthorized,
+                    ));
+                }
+                super::ProductionTrustDecisionV2::Unavailable => {
+                    return Err(LocalRootTreeInvokeErrorV2::ProductionTrustUnavailable);
+                }
+            }
+        }
+        #[cfg(feature = "storage")]
+        if self.consistency == ConsistencyModeV2::Raft
+            && !crate::raft::v2::accumulate_entry_fits_network_frame(
+                &AccumulateRequestV2::UpgradeActor(upgrade.clone()),
+                None,
+                &programs,
+                &[],
+                &[],
+            )
+            .map_err(|_| LocalRootTreeInvokeErrorV2::UpgradeEntryTooLarge)?
+        {
+            return Err(LocalRootTreeInvokeErrorV2::UpgradeEntryTooLarge);
+        }
+        let accumulated = self
+            .service
+            .accumulate_with_availability_after_barrier(
+                &AccumulateRequestV2::UpgradeActor(upgrade),
+                &programs,
+                &[],
+            )
+            .map_err(RootTreeDriverErrorV2::into_invoke)?;
+        match accumulated.result {
+            result @ AccumulationResultV2::ActorUpgraded {
+                actor,
+                previous_deployment,
+                previous_program,
+                deployment,
+                program,
+                ..
+            } if actor == self.root_actor
+                && previous_deployment == request.expected_deployment
+                && previous_program == request.expected_program
+                && deployment == replacement_deployment
+                && program == replacement_program =>
+            {
+                Ok(result)
+            }
+            AccumulationResultV2::Rejected(rejection) => {
+                Err(LocalRootTreeInvokeErrorV2::Rejected(rejection))
+            }
+            _ => Err(LocalRootTreeInvokeErrorV2::UnexpectedResult),
+        }
     }
 
     /// Read one installed method policy from the canonical signed artifact
@@ -3807,6 +4154,58 @@ mod tests {
                 Err(DecodeError::NonCanonical)
             );
         }
+    }
+
+    #[test]
+    fn root_upgrade_control_wire_binds_the_expected_and_replacement_packages() {
+        let actor_pvm = vec![0x41];
+        let role_policies = PackageRolePoliciesV2 {
+            methods: vec![],
+            task_dependencies: vec![],
+        }
+        .encode();
+        let package = VosPackageV2 {
+            manifest: super::super::PackageManifestV2 {
+                name: "replacement".into(),
+                version: "2.1.0".into(),
+                service_abi: super::super::ABI_VERSION,
+                snapshot_version: super::super::SNAPSHOT_VERSION,
+                execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
+                service_program: super::super::VOS_SERVICE_PROGRAM_ID,
+                actor_program: ProgramId::of_pvm(&actor_pvm),
+                crdt: false,
+                interfaces_hash: super::super::artifact_hash(b"interfaces", &[]),
+                role_policies_hash: super::super::artifact_hash(b"role-policies", &role_policies),
+                schemas_hash: super::super::artifact_hash(b"schemas", &[]),
+                task_dependencies_hash: super::super::task_dependencies_hash(&[]),
+            },
+            actor_pvm,
+            generated_interfaces: vec![],
+            role_policies,
+            schemas: vec![],
+            task_dependencies: vec![],
+            diagnostics: None,
+            deployment_signature: super::super::DeploymentSignatureV2 {
+                producer: super::super::ProducerId([0x44; 32]),
+                public_key: vec![0x45],
+                signature: vec![0x46],
+            },
+        };
+        let request = RootTreeUpgradeRequestV2 {
+            expected_deployment: super::super::DeploymentId([0x42; 32]),
+            expected_program: ProgramId([0x43; 32]),
+            replacement: package,
+        };
+        assert_eq!(
+            RootTreeUpgradeRequestV2::decode(&request.encode()).unwrap(),
+            request
+        );
+        let mut trailing = request.encode();
+        trailing.push(0);
+        assert_eq!(
+            RootTreeUpgradeRequestV2::decode(&trailing),
+            Err(DecodeError::TrailingBytes)
+        );
     }
 
     fn committed_role_decision() -> (

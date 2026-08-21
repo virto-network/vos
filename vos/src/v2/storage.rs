@@ -889,6 +889,11 @@ pub fn actor_upgrade_storage_key(upgrade: Hash) -> Vec<u8> {
 }
 
 #[cfg(feature = "std")]
+pub(crate) const fn actor_upgrade_storage_prefix() -> &'static [u8] {
+    ACTOR_UPGRADE_STORAGE_PREFIX
+}
+
+#[cfg(feature = "std")]
 pub(crate) const fn pending_call_deadline_storage_prefix() -> &'static [u8] {
     PENDING_CALL_DEADLINE_STORAGE_PREFIX
 }

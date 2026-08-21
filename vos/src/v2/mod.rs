@@ -94,8 +94,9 @@ pub use pvm::{
 pub use root_service::{
     AttestedRootTreeInvokeErrorV2, CommittedCrdtSyncV2, CommittedRootTreeSliceV2,
     LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2,
-    LocalRootTreeOpenErrorV2, LocalRootTreeServiceV2, RootTreeAttestedResultV2,
-    RootTreeIngressRecoveryV2, RootTreeInvocationV2, RootTreeTransportV2,
+    LocalRootTreeOpenErrorV2, LocalRootTreeServiceV2, ROOT_UPGRADE_METHOD_V2,
+    RootTreeAttestedResultV2, RootTreeIngressRecoveryV2, RootTreeInvocationV2, RootTreeTransportV2,
+    RootTreeUpgradeRequestV2,
 };
 #[cfg(feature = "std")]
 pub use scheduler::{LocalWorkRequestV2, LocalWorkSchedulerV2, PreparedWorkV2, ScheduleErrorV2};

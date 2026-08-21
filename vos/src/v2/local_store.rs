@@ -18,11 +18,12 @@ use crate::attestation::AttestationProofHostV2;
 use super::wire::{DecodeError, Decoder, Encoder};
 use super::{
     AccumulateProtocolHostV2, AccumulateTransactionV2, AccumulatedTimeoutV2, AccumulationReceiptV2,
-    ActorId, ActorUpgradeV2, AttestationDeliveryV2, BlobRefV2, DedupRecordV2, DeliveryRecordV2,
-    DirectIngressV2, IngressRecordV2, MessageRecordV2, ProgramId, ProofVerificationRequestV2,
-    PublicationRecordV2, ReceiptVerificationRequestV2, ReplyAdmissionRecordV2,
-    RoleCredentialVerificationRequestV2, ServiceGenesisV2, ServicePvmErrorV2, ServiceStateTreeV2,
-    StateKeyV2, StateTreeStore, StoreHeaderV2, StoreOpenError, V2Wire,
+    ActorId, ActorUpgradeRecordV2, ActorUpgradeV2, AttestationDeliveryV2, BlobRefV2, DedupRecordV2,
+    DeliveryRecordV2, DirectIngressV2, IngressRecordV2, MessageRecordV2, ProgramId,
+    ProofVerificationRequestV2, PublicationRecordV2, ReceiptVerificationRequestV2,
+    ReplyAdmissionRecordV2, RoleCredentialVerificationRequestV2, ServiceGenesisV2,
+    ServicePvmErrorV2, ServiceStateTreeV2, StateKeyV2, StateTreeStore, StoreHeaderV2,
+    StoreOpenError, V2Wire,
 };
 
 /// Artifact-count ceiling for admitting a new replicated private input. Each
@@ -1126,6 +1127,7 @@ pub enum LocalStoreReadErrorV2 {
     CorruptReplyRoute,
     CorruptExpiration,
     CorruptPendingDeadline,
+    CorruptUpgrade,
 }
 
 /// Consensus/JAM trust inputs required by a production v2 service host.
@@ -1753,6 +1755,35 @@ impl LocalJamStoreV2 {
             .collect()
     }
 
+    /// Recover the permanent, guest-authenticated upgrade history. The host
+    /// uses these rows only to reconnect an exact operator retry after the
+    /// descriptor has already changed; it never derives a new transition
+    /// from them.
+    pub fn actor_upgrade_records(
+        &self,
+    ) -> Result<Vec<ActorUpgradeRecordV2>, LocalStoreReadErrorV2> {
+        let Some(header) = self.header()? else {
+            return Ok(Vec::new());
+        };
+        let prefix = super::storage::actor_upgrade_storage_prefix();
+        self.committed
+            .rows
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .map(|(key, bytes)| {
+                let record = ActorUpgradeRecordV2::decode(bytes)
+                    .map_err(|_| LocalStoreReadErrorV2::CorruptUpgrade)?;
+                if super::actor_upgrade_storage_key(record.upgrade).as_slice() != key.as_slice()
+                    || record.receipt.service != header.service
+                    || record.receipt.consistency != header.consistency
+                {
+                    return Err(LocalStoreReadErrorV2::CorruptUpgrade);
+                }
+                Ok(record)
+            })
+            .collect()
+    }
+
     /// Recover finalized inbox admissions not yet consumed by actor
     /// execution. The original admission timeslot is guest-owned physical
     /// bookkeeping and survives a snapshot reopen.
@@ -2221,6 +2252,26 @@ impl LocalJamStoreV2 {
             self.upgrade_allowlist.insert(upgrade.hash());
             true
         }
+    }
+
+    /// Verify an upgrade before a Raft leader is allowed to append it. Guest
+    /// replay performs the same check on every replica; this earlier decision
+    /// prevents a denied or temporarily unverifiable request from becoming a
+    /// committed cursor-blocking entry.
+    pub(crate) fn verify_upgrade_for_proposal(
+        &self,
+        upgrade: &ActorUpgradeV2,
+    ) -> ProductionTrustDecisionV2 {
+        self.production_trust.as_ref().map_or_else(
+            || {
+                if self.upgrade_allowlist.contains(&upgrade.hash()) {
+                    ProductionTrustDecisionV2::Authorized
+                } else {
+                    ProductionTrustDecisionV2::Denied
+                }
+            },
+            |trust| trust.verify_upgrade(upgrade),
+        )
     }
 
     /// Configure the conformance host to accept one exact finalized receipt.

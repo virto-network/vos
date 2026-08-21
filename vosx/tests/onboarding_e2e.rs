@@ -1145,16 +1145,24 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
         config.path(),
         &["space", "publish", space, "counter:0.2.0", &upgrade_source],
     );
-    let refused_upgrade = vosx(
+    let upgraded = vosx_ok(
         data.path(),
         config.path(),
         &["space", "upgrade", space, "counter", "counter:0.2.0"],
     );
-    assert!(!refused_upgrade.status.success());
     assert!(
-        String::from_utf8_lossy(&refused_upgrade.stderr).contains("guest-owned UpgradeActor"),
-        "v2 catalog upgrade must fail before mutating the registry: {}",
-        String::from_utf8_lossy(&refused_upgrade.stderr),
+        upgraded.contains("upgraded counter"),
+        "the authenticated operator workflow must commit UpgradeActor before the catalog CAS: {upgraded}",
+    );
+    let after_upgrade = vosx_ok(
+        data.path(),
+        config.path(),
+        &["space", "call", space, "counter", "value"],
+    );
+    assert_eq!(
+        after_upgrade.trim(),
+        "U64(3)",
+        "a package-only v2 upgrade must preserve actor state"
     );
 
     let backup_archive = dist.path().join("v2-root.vos-backup");
