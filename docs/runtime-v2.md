@@ -706,9 +706,12 @@ This repository does not contain a JAM/consensus authority implementation.
 `LocalRootTreeServiceV2::open_production` and `open_raft_production` require an
 embedding node to supply that capability before Install, recovery, or replay.
 `vosx space up --production-trust-socket <path>` supplies the same capability
-through an operator-selected local Unix-domain sidecar; omitting the option
-retains the explicitly documented conformance profile. In particular, a
-production provider must bind
+through an operator-selected local Unix-domain sidecar. Supplying
+`--service-pvm` without a trust selector is rejected: operators must choose
+`--production-trust-socket` or explicitly opt into the development-only
+`--allow-v2-conformance` seam. The two flags are mutually exclusive, and the
+conformance seam is not production-safe. In particular, a production provider
+must bind
 Install authorization to consensus-authoritative deployment state and the
 executing JAM service account, verify Upgrade against the same package
 authority, resolve roles from the canonical issuer, validate receipt finality
@@ -1111,12 +1114,14 @@ key order, so repeated writes in one dispatch remain last-write-wins without
 creating a non-canonical physical transition.
 
 `space up --service-pvm <exact-vos-service.pvm>` recognizes signed `.vos`
-catalog artifacts and opens each ordinary Local or Raft deployment as one
-durable root-tree service. Raft rows resolve membership only after their exact
-package and root configuration pass validation, then order genesis and every
-mutation as canonical IC-5 request bytes. It verifies the package signature,
-capability layout, and protocol-pinned service `ProgramId`; it never extracts
-the actor PVM into the
+catalog artifacts when paired with exactly one trust selector:
+`--production-trust-socket <path>` or the development-only
+`--allow-v2-conformance`. It opens each ordinary Local or Raft deployment as
+one durable root-tree service. Raft rows resolve membership only after their
+exact package and root configuration pass validation, then order genesis and
+every mutation as canonical IC-5 request bytes. It verifies the package
+signature, capability layout, and protocol-pinned service `ProgramId`; it
+never extracts the actor PVM into the
 legacy runtime or retranspiles an ELF. Missing or invalid service artifacts
 skip only the affected row, so an installed package cannot prevent the rest of
 a space from starting. Package classification precedes every legacy Raft seed,

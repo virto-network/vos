@@ -50,9 +50,11 @@ just test-v2-examples
 
 The space daemon installs signed v2 packages through the generic service PVM
 for Local, Raft, and CRDT roots, while legacy catalog rows continue on the old
-host. Its current trust inputs use the explicitly documented conformance
-profile by default. `space up --production-trust-socket <path>` instead opens
-every v2 root through a fail-closed local JAM/consensus authority sidecar; its
+host. Supplying `--service-pvm` requires an explicit trust profile:
+`--production-trust-socket <path>` opens every v2 root through a fail-closed
+local JAM/consensus authority sidecar. The development-only
+`--allow-v2-conformance` flag selects the protocol conformance seam instead;
+it is never selected implicitly and is not production-safe. The production
 wire and policy contract are described in
 [`docs/runtime-v2.md`](docs/runtime-v2.md). `vosx run`
 remains a legacy one-shot ELF/PVM runner and does not install `.vos` packages.
@@ -98,6 +100,7 @@ registry.
 # host A — create with a genesis recipe, boot, then invite a member
 vosx space new a --recipe ./my-space.toml
 vosx space up a --service-pvm ./dist/vos-service.pvm \
+  --production-trust-socket /run/vos/production-trust.sock \
   --listen /ip4/0.0.0.0/tcp/4811 &   # first boot seals canonical authority
 vosx space info a            # prints the node's bootnode hint:
                              #   /ip4/.../tcp/4811/p2p/<peer-id>
@@ -106,9 +109,13 @@ vosx space invite a --role member --bootnode <bootnode-hint>
 
 # host B — redeem the token: join-if-needed + boot + auto-redeem
 vosx space up "<paste-the-vos1-token>" \
-  --service-pvm ./dist/vos-service.pvm &
+  --service-pvm ./dist/vos-service.pvm \
+  --production-trust-socket /run/vos/production-trust.sock &
                              # or  vosx space up -  to read the token from stdin
 ```
+
+For local protocol development only, replace `--production-trust-socket` with
+`--allow-v2-conformance`. Production deployments must provide an authority.
 
 The TOML recipe is a devhelper, not the runtime source of truth —
 the registry is. A recipe is consumed once at genesis (the space's

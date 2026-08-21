@@ -5,7 +5,7 @@ the bank-federation demo, remaining work). Part 4 is the folded reference —
 the load-bearing essentials of the design contracts and domain docs. Full
 byte-level history for any of these lives in git.
 
-## 1. What landed (2026-07, on master + pushed)
+## 1. What landed (2026-08, on master + pushed)
 
 The VOS-core execution model was rebuilt so that **live execution ≡ traced
 execution ≡ a proof that commits to the state transition**, under a working
@@ -42,6 +42,23 @@ bank federation, without regressing it.
 - **jar (github.com/olanod/jar)**: JAM-alignment Phase 0 (hard-fork policy)
   + Phase 1 (host-owned SP, args ω7/ω8, refine IC 0 / accumulate IC 5,
   two-slot jump prologue; jar1 conformance gate holds, gp072 untouched).
+- **V2 production root stack**: request-byte Raft replay and snapshot catch-up,
+  CRDT causal execution and bounded anti-entropy, nested root-tree calls,
+  durable deadlines, authenticated Local/Raft/CRDT transport, role authority,
+  signed canonical packages, portable attestations, attested retries, idle
+  upgrades, and child spawn. The daemon runs signed Local, Raft, and CRDT roots
+  under one pinned service PVM and gates production registration on an external
+  JAM/consensus trust policy.
+- **Provable actor path**: durable bounded `ProvableRecord` capture, exact
+  live-versus-traced transition checks, portable proof verification, canonical
+  Task dependencies, software-arithmetic Clerk programs, point storage with
+  authenticated witnesses, and producer-private ingress/record storage. Local
+  and all-voter Raft private Task inputs are fail-closed and recoverable;
+  CRDT private Task availability remains deliberately unsupported.
+
+The former `worktree-provable` line was audited against this state. Its useful
+W1–W4 storage, proof-record, registry-pagination, and example-layout work has
+landed in later reviewed forms; it is not a source of commits to cherry-pick.
 
 ## 2. The bank-federation demo (the last step to a runnable demo)
 
@@ -135,47 +152,39 @@ stands in for the on-chain settlement venue Wave 2 makes real.
   dispatcher (docs + jobs + signing in `.vos_meta`), move system-actor
   protocol (registry/chronos) into `vos`, end with zero actor/extension
   crate deps in `vosx`.
-- **B4 verify-side proving**: capture a `ProvableRecord` (anchor,
-  `transition_digest`, `app_public`, roots) per provable invocation and a
-  `verify_call` that reconstructs `public'` (§4.1) and checks the bound
-  io-hash. **Trap:** the guest digests effects *including* the final
-  `Write{STATE_KEY}`; the reconstruction must digest the same
-  (pre-`take_state_write`) or every check fails.
+- **Production authority deployment**: connect the documented trust protocol
+  to the real JAM/consensus slot, package, role, receipt, and proof authorities;
+  operate it as a supervised local service; and rehearse policy rotation and
+  unavailable-authority recovery. The daemon now refuses an implicit
+  conformance fallback whenever a service PVM is supplied.
+- **Release and operations**: package the pinned service/authority artifacts,
+  define backup and restore for root images plus private side stores, exercise
+  rolling voter replacement, and turn the production daemon scenario into a
+  release gate.
 
 **Keystone fast-follows (non-blocking; merged code is green)**
-- Ristretto precompiles fail-loud in live Task mode (the tracer handles
-  them) → add host handlers to `handle_task_hostcall`, or document
-  trace-only. cipher-clerk value-transfer proving needs this.
+- Ristretto host precompiles remain outside the trusted proof boundary. The
+  production Clerk and voucher programs use software curve arithmetic; do not
+  restore a precompile-backed verifier pin until those ECALLs are constrained
+  in the proof system.
 - Always-run regression fixtures for guest-side money-path behaviors
   (fieldless-self-tell anchor, mid-chain panic reply-drop, child-invoke
   rollback) — currently ELF-gated.
-- **A10 pre-req**: FIXED — the effect log records each depth-1
-  invoke's absorbed effects alongside its output, and the replay
-  short-circuit re-absorbs them (`replay_reabsorbs_task_effects` is
-  the gate). Tasks can now run on replicated agents.
+- CRDT private Task inputs need a causally authenticated availability and
+  retirement protocol before Task-bearing CRDT packages can be enabled. This
+  is a staged extension, not a requirement for the production Raft Clerk.
 
 **VOS-core continuation**
-- **Actor storage scale-out** → `docs/plans/actor-storage.md`: typed
-  storage handles (`StorageMap`/`StorageVec`/`StorageSet`) over the
-  existing agent KV — per-key rows instead of the monolithic state blob,
-  touched-set-bounded guest memory, **no new hostcalls** (JAM keeps
-  `STORAGE_R` accumulate-only; iteration is self-indexed pages, and the
-  W4 SMT doubles as the ordered index). W1 delete effect + ordered
-  `ServiceStorage`; W2 prelude types + `#[storage]` fields; W3
-  space-registry + clerk-bridge adoption; W4 `anchor_kind 0x02`
-  committed storage (B6 / `vos::zk::state`) + clerk-ledger at 10k
-  accounts.
-- **`#[provable]` actor transitions** → `docs/plans/provable.md`:
-  promote the cipher-clerk/voucher-check proof pattern into the
-  framework. A provable Task is a pure VERIFIER — it checks witnessed
-  inputs against an app-named `root_before` via a `vos::zk::state::
-  BatchProof` (inclusion + non-inclusion in-circuit), computes
-  `root_after`, and binds `(root_before, root_after, app-public)` via
-  `bind_public`; the parent applies the mutation live against the
-  attested roots. Plus the durable/split `ProvableRecord` (B4 verify
-  half), a witness-free `verify_record`, and an append-versioned
-  catalog. Design settled after a 4-lens review killed the first draft's
-  `0x02`-in-Task anchor approach (unsound + unbuildable).
+- **Actor storage ergonomics** → `docs/plans/actor-storage.md`: point-row
+  storage, authenticated read witnesses, canonical writes, and the Clerk
+  production path are landed. Remaining work is the broader typed
+  `StorageVec`/`StorageSet`, iteration/index ergonomics, schema migration, and
+  operational compaction story; it does not require another execution model.
+- **Provable actor ergonomics** → `docs/plans/provable.md`: the exact Task
+  trace, record capture, proof binding, software-crypto Clerk, and canonical
+  dependency package path are landed. Remaining work is API simplification,
+  proof-service operations, and selectively enabling additional consistency
+  modes after their private-input availability contracts exist.
 - A11 `vos::task` step-machine combinators; A12 determinism tiers (record
   NOW_MS / deny BOOT_CONTEXT under Crdt/Raft; hostcall-tier marker in
   `.vos_meta`); A13 DAG checkpointing (bounded replay); A15 guest
