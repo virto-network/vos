@@ -6,10 +6,9 @@
 //! together; selecting either artifact from a developer build directory would
 //! make a deployment unreproducible or an existing space impossible to open.
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, bail};
 use clap::Subcommand;
@@ -114,32 +113,17 @@ fn bundle(service_path: &Path, output: &Path) -> anyhow::Result<()> {
 }
 
 fn verify(directory: &Path) -> anyhow::Result<ReleaseManifest> {
-    let metadata = fs::symlink_metadata(directory)
+    // `symlink_metadata("release-link/")` follows the final directory
+    // symlink on Unix. Rebuild the lexical path first so the final separator
+    // cannot change which object is inspected, and use that path for every
+    // subsequent operation.
+    let directory = normalize_release_directory(directory)?;
+    let metadata = fs::symlink_metadata(&directory)
         .with_context(|| format!("inspect release directory {}", directory.display()))?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
         bail!("release path must be a real directory, not a symlink");
     }
-    let expected_names = BTreeSet::from([
-        MANIFEST_FILE.to_owned(),
-        SERVICE_FILE.to_owned(),
-        AUTHORITY_FILE.to_owned(),
-    ]);
-    let mut actual_names = BTreeSet::new();
-    for entry in fs::read_dir(directory)
-        .with_context(|| format!("read release directory {}", directory.display()))?
-    {
-        let entry = entry.context("read release directory entry")?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("release contains a non-UTF-8 file name"))?;
-        actual_names.insert(name);
-    }
-    if actual_names != expected_names {
-        bail!(
-            "release directory must contain exactly {MANIFEST_FILE}, {SERVICE_FILE}, and {AUTHORITY_FILE}",
-        );
-    }
+    verify_directory_shape(&directory)?;
 
     let manifest_bytes = read_regular_bounded(&directory.join(MANIFEST_FILE), MAX_MANIFEST_BYTES)?;
     let manifest: ReleaseManifest =
@@ -208,7 +192,19 @@ fn read_regular_bounded(path: &Path, max: u64) -> anyhow::Result<Vec<u8>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        // The type check must happen on the opened object to avoid a
+        // check/open race. O_NONBLOCK makes opening an expected-name FIFO
+        // return immediately so fstat can reject it instead of hanging the
+        // release verifier.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("inspect regular file {}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            bail!("{} must be a regular file", path.display());
+        }
     }
     let file = options
         .open(path)
@@ -234,6 +230,58 @@ fn read_regular_bounded(path: &Path, max: u64) -> anyhow::Result<Vec<u8>> {
         bail!("{} grew beyond the {max}-byte limit", path.display());
     }
     Ok(bytes)
+}
+
+fn normalize_release_directory(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                bail!("release directory path must not contain `..`");
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        normalized.push(".");
+    }
+    Ok(normalized)
+}
+
+fn verify_directory_shape(directory: &Path) -> anyhow::Result<()> {
+    let mut seen = [false; 3];
+    let mut count = 0usize;
+    for entry in fs::read_dir(directory)
+        .with_context(|| format!("read release directory {}", directory.display()))?
+    {
+        let entry = entry.context("read release directory entry")?;
+        count += 1;
+        if count > seen.len() {
+            bail!(
+                "release directory must contain exactly {MANIFEST_FILE}, {SERVICE_FILE}, and {AUTHORITY_FILE}",
+            );
+        }
+        let name = entry.file_name();
+        let index = match name.to_str() {
+            Some(MANIFEST_FILE) => 0,
+            Some(SERVICE_FILE) => 1,
+            Some(AUTHORITY_FILE) => 2,
+            Some(_) => bail!("release directory contains an unexpected entry"),
+            None => bail!("release contains a non-UTF-8 file name"),
+        };
+        if std::mem::replace(&mut seen[index], true) {
+            bail!("release directory contains a duplicate entry");
+        }
+    }
+    if count != seen.len() || !seen.into_iter().all(|present| present) {
+        bail!(
+            "release directory must contain exactly {MANIFEST_FILE}, {SERVICE_FILE}, and {AUTHORITY_FILE}",
+        );
+    }
+    Ok(())
 }
 
 fn path_exists(path: &Path) -> anyhow::Result<bool> {
@@ -264,6 +312,30 @@ impl Drop for PartialDirectory {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "vosx-release-{label}-{}-{}",
+                std::process::id(),
+                NEXT_TEMP.fetch_add(1, Ordering::Relaxed),
+            ));
+            fs::create_dir(&path).expect("create release test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn manifest_binds_protocol_versions_and_both_artifacts() {
         let manifest = manifest_for(b"service", b"authority");
@@ -278,5 +350,50 @@ mod tests {
     #[test]
     fn authority_pin_rejects_changed_bytes() {
         assert!(validate_authority(b"not the frozen authority").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expected_name_fifo_is_rejected_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::time::{Duration, Instant};
+
+        let temp = TestDir::new("fifo");
+        let fifo = temp.0.join(MANIFEST_FILE);
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path has no NUL");
+        // SAFETY: `fifo_c` is a live, NUL-terminated path and the mode has no
+        // platform-dependent pointers or ownership requirements.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        assert!(read_regular_bounded(&fifo, MAX_MANIFEST_BYTES).is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "special-file rejection must not wait for a writer",
+        );
+    }
+
+    #[test]
+    fn directory_scan_rejects_the_first_surplus_entry() {
+        let temp = TestDir::new("surplus");
+        for name in [MANIFEST_FILE, SERVICE_FILE, AUTHORITY_FILE, "surplus"] {
+            fs::write(temp.0.join(name), b"x").expect("write test entry");
+        }
+        assert!(verify_directory_shape(&temp.0).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trailing_separator_does_not_hide_a_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestDir::new("directory-symlink");
+        let target = temp.0.join("target");
+        fs::create_dir(&target).expect("create symlink target");
+        let link = temp.0.join("release-link");
+        symlink(&target, &link).expect("create directory symlink");
+        let trailing = PathBuf::from(format!("{}/", link.display()));
+        let error = verify(&trailing).expect_err("directory symlink must be rejected");
+        assert!(error.to_string().contains("real directory"));
     }
 }

@@ -2358,27 +2358,38 @@ fn production_raft_root_survives_voter_join_leader_loss_and_backup_relocation() 
         members.sort_unstable();
         members
     };
+    let mut original_leader = None;
     poll_until(
         120,
         || {
-            [
+            let statuses = [
                 production_raft_status(data_a.path(), config_a.path(), space, root),
                 production_raft_status(data_b.path(), config_b.path(), space, root),
                 production_raft_status(data_c.path(), config_c.path(), space, root),
-            ]
-            .into_iter()
-            .all(|status| {
-                status.is_some_and(|mut status| {
-                    status.members.sort_unstable();
-                    status.present
-                        && status.leader.is_some()
-                        && status.members == expected_members
-                        && status.joint_old.is_none()
-                        && status
-                            .active_config_index
-                            .is_some_and(|index| index <= status.commit_index)
-                })
-            })
+            ];
+            let Some(common_leader) = statuses[0].as_ref().and_then(|status| status.leader) else {
+                return false;
+            };
+            let steady = statuses
+                .into_iter()
+                .zip([prefix_a, prefix_b, prefix_c])
+                .all(|(status, expected_prefix)| {
+                    status.is_some_and(|mut status| {
+                        status.members.sort_unstable();
+                        status.present
+                            && status.daemon_prefix == expected_prefix
+                            && status.leader == Some(common_leader)
+                            && status.members == expected_members
+                            && status.joint_old.is_none()
+                            && status
+                                .active_config_index
+                                .is_some_and(|index| index <= status.commit_index)
+                    })
+                });
+            if steady {
+                original_leader = Some(common_leader);
+            }
+            steady
         },
         || {
             format!(
@@ -2402,18 +2413,7 @@ fn production_raft_root_survives_voter_join_leader_loss_and_backup_relocation() 
         "C did not authenticate the production policy",
     );
 
-    let status_a = production_raft_status(data_a.path(), config_a.path(), space, root)
-        .expect("A reports the steady Raft group");
-    let status_b = production_raft_status(data_b.path(), config_b.path(), space, root)
-        .expect("B reports the steady Raft group");
-    let status_c = production_raft_status(data_c.path(), config_c.path(), space, root)
-        .expect("C reports the steady Raft group");
-    assert_eq!(status_a.daemon_prefix, prefix_a);
-    assert_eq!(status_b.daemon_prefix, prefix_b);
-    assert_eq!(status_c.daemon_prefix, prefix_c);
-    assert_eq!(status_a.leader, status_b.leader);
-    assert_eq!(status_a.leader, status_c.leader);
-    let original_leader = status_a.leader.expect("the steady group has a leader");
+    let original_leader = original_leader.expect("the readiness poll captured a common leader");
     let first_follower = [prefix_a, prefix_b, prefix_c]
         .into_iter()
         .find(|prefix| *prefix != original_leader)
@@ -2643,6 +2643,10 @@ fn production_raft_root_survives_voter_join_leader_loss_and_backup_relocation() 
         &restart_log,
         "restarted production Raft voter",
     );
+    // `raft-status` is served by this daemon and cannot redirect. Crossing the
+    // survivor-recorded post-failover index therefore proves the restored
+    // state machine itself applied the marker, independently of the actor read
+    // below (which may legitimately follow the leader).
     poll_until(
         90,
         || {

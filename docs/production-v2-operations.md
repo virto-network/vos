@@ -46,17 +46,22 @@ node catches up through ordinary Raft log or snapshot transfer.
 1. Confirm the remaining voters form a quorum and record
    `vosx space raft-status <space> <root>` for each Raft root.
 2. Stop the source daemon. Do not start it again after copying its state.
-3. Create an offline archive while the daemon-held data lock is free:
+3. Through a surviving voter, commit a fresh, application-visible marker after
+   the source has stopped. Record both the marker and a survivor's resulting
+   `commit_index` as `REJOIN_INDEX`. This is the cluster high-water the stale
+   backup must reach; the stopped voter's own `commit_index` is not evidence of
+   catch-up.
+4. Create an offline archive while the daemon-held data lock is free:
 
    ```sh
    vosx space backup <space> /secure/offline/<space>.vos-backup
    ```
 
-4. Copy the archive and a verified production release directory to the new
+5. Copy the archive and a verified production release directory to the new
    machine. Treat the archive as secret: it contains the node identity,
    production policy, private ingress/proof/producer stores, and application
    state.
-5. Restore into fresh data, config, and cache roots:
+6. Restore into fresh data, config, and cache roots:
 
    ```sh
    vosx space restore /secure/offline/<space>.vos-backup --name <space>
@@ -66,9 +71,13 @@ node catches up through ordinary Raft log or snapshot transfer.
      --connect <surviving-voter-multiaddr>
    ```
 
-6. Wait until `last_applied >= commit_index`, `joint_old` is absent, and
-   `active_config_index <= commit_index`. Then make a read through the restored
-   node and a write through a different voter.
+7. Query `vosx space raft-status` against the restored daemon itself. This
+   status is local and is not redirected. Require `last_applied >= REJOIN_INDEX`,
+   `joint_old` to be absent, and `active_config_index <= commit_index`. Crossing
+   `REJOIN_INDEX` is the local observation that the post-stop marker has been
+   applied. Do not use an ordinary actor read as catch-up evidence because a
+   follower may transparently redirect it. After this local proof, confirm the
+   marker through the application and make a write through a different voter.
 
 The archive preserves `node.key`, so the replacement has the same full Noise
 `PeerId` and compact Raft slot. Running the source and replacement concurrently
