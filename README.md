@@ -65,6 +65,37 @@ and receipt verification, plus three-voter Raft onboarding, follower ingress,
 leader failover, and restarted-voter catch-up under independently connected
 implementations of the trust protocol.
 
+## Offline backup and restore
+
+Stop the space daemon, then archive the complete space—not just its redb
+files. The `VOSB1` directory includes the node identity, Local/Raft/CRDT
+state, v2 root images, proof/private-input/prover-record side stores, local
+policy, and the content-addressed program cache under a per-file BLAKE2b-256
+manifest:
+
+```bash
+vosx space backup a /backups/a-2026-08-21.vos-backup
+vosx space restore /backups/a-2026-08-21.vos-backup --name a-restored
+vosx space up a-restored --service-pvm ./dist/vos-service.pvm \
+  --production-trust-socket /run/vos/production-trust.sock
+```
+
+`space up`, backup, and restore share a space-ID lock, so a live daemon cannot
+be copied or replaced. Restore verifies every archive byte before activating
+it. It never overwrites an existing data directory unless `--replace` is
+given; replacement renames the old directory aside and reports its recovery
+path. Cache objects are public, immutable artifacts and use independent
+copy-on-write clones when the filesystem supports them, avoiding an immediate
+second physical copy without tying archive integrity to the live cache inode.
+Private side stores and `node.key` are sensitive: keep the backup on encrypted,
+access-controlled storage. The manifest detects corruption; preserve the
+printed manifest digest separately if it must also be authenticated against a
+hostile archive provider. `just test-v2-release-operations` exercises a
+committed signed root through backup, fresh-directory restore, and reopen.
+The operator signing identity, canonical service PVM, and production-trust
+authority are deployment-level inputs rather than space data; back them up and
+restore them through their own key/artifact procedures.
+
 ## Consistency modes
 
 Each `[[agent]]` in a recipe picks a `consistency` mode:

@@ -59,6 +59,8 @@ bank federation, without regressing it.
 The former `worktree-provable` line was audited against this state. Its useful
 W1–W4 storage, proof-record, registry-pagination, and example-layout work has
 landed in later reviewed forms; it is not a source of commits to cherry-pick.
+The commit-by-commit disposition is retained in
+[`worktree-provable-audit.md`](worktree-provable-audit.md).
 
 ## 2. The bank-federation demo (the last step to a runnable demo)
 
@@ -157,11 +159,13 @@ stands in for the on-chain settlement venue Wave 2 makes real.
   operate it as a supervised local service; and rehearse policy rotation and
   unavailable-authority recovery. The daemon now refuses an implicit
   conformance fallback whenever a service PVM is supplied.
-- **Release and operations**: package the pinned service/authority artifacts,
-  define backup and restore for root images plus private side stores, exercise
-  rolling voter replacement, define the explicit `UpgradeActor` procedure for
-  the frozen Batch 70 authority identity, and turn the production daemon
-  scenario into a release gate.
+- **Release and operations**: verified offline backup/restore now covers root
+  images, node identity, local policy, every private side store, and immutable
+  program artifacts under the same daemon-held data lock; its physical reopen
+  path is an always-runnable release gate. Remaining here is packaging the
+  pinned service/authority artifacts, exercising rolling voter replacement,
+  and defining the explicit `UpgradeActor` procedure for the frozen Batch 70
+  authority identity.
 
 **Keystone fast-follows (non-blocking; merged code is green)**
 - Ristretto host precompiles remain outside the trusted proof boundary. The

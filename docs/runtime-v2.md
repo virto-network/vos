@@ -1311,6 +1311,63 @@ binding, bind the executing Refine and Accumulate gas limits into service
 identity, and support guest-owned atomic same-package child creation. Actor and
 service guests must be rebuilt together; an earlier-ABI artifact is rejected
 rather than interpreted as this wire.
+
+## Offline root backup and restore
+
+`vosx space backup <space> <new-directory>` is the coherent persistence
+boundary for an operator-managed space. `space up` holds an exclusive advisory
+lock keyed by immutable `SpaceId` for its complete lifetime; backup takes the
+corresponding shared lock and also refuses a live legacy endpoint. The daemon
+must therefore be stopped before any bytes are copied. The lock file lives
+outside the mutable data directory, so restore cannot evade it by renaming the
+directory being protected.
+
+The `VOSB1` archive is an inspectable directory with a strictly sorted
+`manifest.json`. It contains every regular file below the space data root
+except the ephemeral `.endpoint`: registry and actor redb databases, Raft
+metadata/logs, CRDT DAGs, v2 applied images, proof artifacts, producer-private
+records, private-ingress artifacts and lifecycle headers, node identity, and
+node-local policy. It also includes the immutable content-addressed blob cache,
+so a machine can reopen packages without relying on the source machine or a
+currently reachable peer. Cache objects use independent copy-on-write clones
+when supported, avoiding duplicate blocks without letting later live-cache
+corruption alter an archive through a shared inode. Other filesystems fall
+back to ordinary copies. Data files are always copied because redb and root
+images are mutable after the daemon restarts.
+
+Every manifest row binds the canonical relative path, exact length,
+BLAKE2b-256 digest, and (on Unix) permission bits. Symlinks, special files,
+unknown roots, duplicate/noncanonical paths, and cache objects whose filename
+does not equal their content digest fail closed. Backup is assembled under a
+temporary sibling, verified in full, and only then renamed to its requested
+path. A space whose one-shot genesis recipe is still pending is refused because
+that external recipe is not durable space state; boot it once before backup.
+The printed manifest digest can be retained out of band when the storage
+provider is not trusted; the in-archive manifest by itself establishes
+self-consistency and corruption detection, not an external signature.
+
+`vosx space restore <archive>` verifies the complete source before creating an
+active data directory, copies and re-verifies each file through a temporary
+sibling, reinstalls content-addressed blobs, then atomically activates the data
+directory and updates the spaces index. The default destination is derived
+from the archived `SpaceId`, never the old machine's absolute path. Existing
+state is refused unless `--replace` is explicit; replacement renames it to a
+reported recovery path and rolls it back if index activation fails. Restore
+does not silently delete the retained directory.
+
+The archive contains `node.key` and may contain plaintext private ingress and
+prover witnesses. It is therefore a secret operator artifact even though its
+program-cache entries are public: encrypt it at rest, restrict access, and use
+an authenticated transfer channel. The global operator signing identity, the
+canonical service PVM selected on `space up`, and the external production-trust
+authority are deployment-level inputs and are deliberately not copied out of
+their own custody domains by a per-space backup. Their keys/artifacts need
+separate recovery procedures. A restored Raft voter is still subject to the
+normal committed-membership and production-policy gates before route
+publication. `just test-v2-release-operations` physically commits a signed
+root, proves live backup is locked out, restores it into fresh XDG roots, and
+reopens the exact actor state.
+
 ## CRDT boundary
 
 Only `#[actor(crdt)]` packages may select CRDT consistency. Their replicated
