@@ -1,6 +1,4 @@
-//! Bundles the pre-built space-registry actor ELF into the vosx
-//! binary so `space new` / `space up <token>` work out of the box
-//! without `--registry`.
+//! Bundles pre-built platform actors into the vosx binary.
 //!
 //! Two source paths, tried in order:
 //!
@@ -18,6 +16,12 @@
 //! writes an empty placeholder so the runtime `include_bytes!`
 //! always resolves; `space new` falls back to requiring `--registry`
 //! and prints a helpful message pointing at the build step.
+//!
+//! The canonical space authority is deliberately different: its bytes
+//! are a durable protocol identity sealed into existing spaces. It is
+//! always loaded from the committed release blob and checked against its
+//! frozen digest. A source rebuild is an upgrade candidate, never an
+//! implicit replacement for that identity.
 
 use std::env;
 use std::fs;
@@ -49,15 +53,45 @@ fn main() {
         "cd actors/dev-project && cargo actor",
     );
 
-    bundle_actor(
-        &manifest_dir,
-        &out_dir,
-        "space-authority",
-        "space_authority.pvm",
-        "bundled_space_authority.pvm",
-        "VOSX_BUNDLED_SPACE_AUTHORITY_PVM",
-        "v2 role-gated roots will remain pending",
-        "restore vosx/blobs/space_authority.pvm from the release source tree",
+    bundle_frozen_space_authority(&manifest_dir, &out_dir);
+}
+
+const SPACE_AUTHORITY_BLAKE2B_256: [u8; 32] = [
+    0x86, 0x87, 0x2e, 0x83, 0xd3, 0xbb, 0x44, 0x5c, 0xbf, 0x2b, 0x47, 0x7e, 0x81, 0xd5, 0x1a, 0xaa,
+    0xa5, 0xc2, 0x1e, 0x0a, 0x75, 0x55, 0xe9, 0x02, 0x26, 0x00, 0x0d, 0x09, 0xae, 0xca, 0x08, 0x42,
+];
+
+/// Bundle the release authority identity without consulting developer output.
+/// Existing sealed spaces derive their canonical authority incarnation from
+/// these exact bytes, so silently preferring a newer local build would make
+/// them impossible to reopen.
+fn bundle_frozen_space_authority(manifest_dir: &Path, out_dir: &Path) {
+    let source = manifest_dir.join("blobs/space_authority.pvm");
+    let bytes = fs::read(&source).unwrap_or_else(|e| {
+        panic!(
+            "read frozen canonical authority {}: {e}; restore the committed release blob",
+            source.display()
+        )
+    });
+    let digest = blake2b_simd::Params::new().hash_length(32).hash(&bytes);
+    assert_eq!(
+        digest.as_bytes(),
+        SPACE_AUTHORITY_BLAKE2B_256,
+        "frozen canonical authority {} does not match its release digest; source rebuilds must use the explicit UpgradeActor path",
+        source.display(),
+    );
+
+    let dest = out_dir.join("bundled_space_authority.pvm");
+    fs::write(&dest, &bytes).unwrap_or_else(|e| panic!("write bundled_space_authority.pvm: {e}"));
+    println!(
+        "cargo:warning=vosx: bundled frozen space-authority ({} bytes) from {}",
+        bytes.len(),
+        source.display(),
+    );
+    println!("cargo:rerun-if-changed={}", source.display());
+    println!(
+        "cargo:rustc-env=VOSX_BUNDLED_SPACE_AUTHORITY_PVM={}",
+        dest.display()
     );
 }
 

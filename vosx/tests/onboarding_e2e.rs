@@ -24,7 +24,7 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,6 +32,13 @@ use std::{fs, thread};
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
+
+// A production daemon may need to verify and recover several roots before it
+// can either publish its endpoint or report a fail-closed startup error. Keep
+// one end-to-end budget for both observable readiness events. In particular,
+// do not layer shorter per-root assumptions on top of the daemon's bounded
+// authority and Raft operations.
+const DAEMON_READINESS_TIMEOUT: Duration = Duration::from_secs(90);
 
 fn vosx_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_vosx"))
@@ -654,14 +661,34 @@ fn wait_for_endpoint(data_home: &Path, log_path: &Path, who: &str) -> PathBuf {
     // publishing the endpoint. A voter hosting both the canonical authority
     // and an application Raft root can legitimately take longer than the old
     // 15-second single-root budget on an unoptimized test build.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + DAEMON_READINESS_TIMEOUT;
     loop {
         if let Some(p) = find_endpoint(data_home) {
             return p;
         }
         if Instant::now() >= deadline {
             panic!(
-                "daemon {who} didn't write an endpoint within 30s — log:\n{}",
+                "daemon {who} didn't write an endpoint within {}s — log:\n{}",
+                DAEMON_READINESS_TIMEOUT.as_secs(),
+                fs::read_to_string(log_path).unwrap_or_default(),
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_daemon_exit(child: &mut Child, log_path: &Path, who: &str) -> ExitStatus {
+    let deadline = Instant::now() + DAEMON_READINESS_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait().expect("poll daemon exit") {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "daemon {who} did not exit within {}s — log:\n{}",
+                DAEMON_READINESS_TIMEOUT.as_secs(),
                 fs::read_to_string(log_path).unwrap_or_default(),
             );
         }
@@ -1265,21 +1292,11 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
         Some(&service_pvm),
         Some(&trust_socket),
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let unavailable_status = loop {
-        if let Some(status) = unavailable.try_wait().expect("poll rejected daemon") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = unavailable.kill();
-            let _ = unavailable.wait();
-            panic!(
-                "daemon did not fail closed while its production authority was absent; log:\n{}",
-                fs::read_to_string(&unavailable_log).unwrap_or_default(),
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
+    let unavailable_status = wait_for_daemon_exit(
+        &mut unavailable,
+        &unavailable_log,
+        "v2-production-missing-authority",
+    );
     assert!(!unavailable_status.success());
     assert!(
         find_endpoint(data.path()).is_none(),

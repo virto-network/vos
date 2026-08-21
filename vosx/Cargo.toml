@@ -86,6 +86,11 @@ tracing-log = "0.2"
 # rest of the network plumbing is owned by `vos::network`.
 libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "mdns", "macros", "ping", "identify", "request-response", "gossipsub"] }
 
+[build-dependencies]
+# The bundled authority PVM is a durable protocol identity. Verify the frozen
+# release blob during every build before embedding it in vosx.
+blake2b_simd = { version = "1", default-features = false }
+
 [dev-dependencies]
 clerk-ledger = { path = "../actors/clerk-ledger", default-features = false }
 # Dev-only: the registry protocol (rows / status / canonical signing
