@@ -63,6 +63,11 @@ socket2 = "0.6"
 # fresh bytes per advance; a draw failure skips the pass rather
 # than ever feeding zero entropy).
 getrandom = "0.2"
+# Cross-process advisory lock shared by daemon startup and offline
+# backup/restore. This prevents raw redb/image copies racing a live commit.
+fs2 = "0.4"
+# Streaming BLAKE2b-256 for multi-GiB redb/image backup verification.
+blake2b_simd = { version = "1", default-features = false }
 
 # CLI / serde
 clap = { version = "4", features = ["derive"] }

@@ -333,6 +333,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             data_dir.display(),
         );
     }
+    // Hold the immutable space-id lock for the complete daemon lifetime.
+    // Offline backup takes a shared lock and restore takes the same exclusive
+    // lock, so neither can copy/replace redb images or private side stores
+    // while this process is opening, replaying, or committing them. The lock
+    // lives outside `data_dir`, allowing restore to rename that directory
+    // without changing the protected inode.
+    let _space_data_lock = super::space_lock::SpaceDataLock::exclusive(&space_id)?;
     let mut pending_token = load_pending_token(&data_dir)?;
 
     // Verify the genesis CrdtEvent against the advertised

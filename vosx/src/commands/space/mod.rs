@@ -22,6 +22,7 @@ use std::path::PathBuf;
 
 pub mod agents;
 pub mod apply;
+pub mod backup;
 pub mod call;
 pub mod caps;
 pub mod client;
@@ -45,6 +46,7 @@ pub mod publish;
 pub mod raft_status;
 pub mod reconcile;
 pub mod role;
+mod space_lock;
 pub mod subscriptions;
 pub mod uninstall;
 pub mod unpublish;
@@ -174,6 +176,33 @@ pub enum SpaceCommand {
         /// (optionally, with `--force`) escalating.
         #[arg(long, default_value_t = 5)]
         grace: u64,
+    },
+    /// Create a verified, self-contained offline backup of one space.
+    /// The daemon must be stopped; active state, private side stores, node
+    /// identity, local policy, and the content-addressed program cache are
+    /// copied under one integrity manifest.
+    Backup {
+        /// Space id or name from the local spaces index.
+        space: String,
+        /// New directory to create. Existing paths are never overwritten.
+        output: PathBuf,
+    },
+    /// Verify and restore a `space backup` directory. Existing state is
+    /// preserved under a recoverable sibling path when `--replace` is used.
+    Restore {
+        /// Backup directory containing `manifest.json`.
+        backup: PathBuf,
+        /// Destination data directory. Defaults to the normal XDG path for
+        /// the archived space id, not the source machine's absolute path.
+        #[arg(long, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
+        /// Replace an existing destination after verification. The previous
+        /// directory is renamed aside and reported; it is never deleted.
+        #[arg(long)]
+        replace: bool,
+        /// Override the archived display name in the local spaces index.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Query a space's registry and emit a round-trippable
     /// TOML recipe to stdout.
@@ -411,6 +440,13 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             force,
             grace_secs: grace,
         }),
+        SpaceCommand::Backup { space, output } => backup::run_backup(&space, &output),
+        SpaceCommand::Restore {
+            backup: archive,
+            data_dir,
+            replace,
+            name,
+        } => backup::run_restore(&archive, data_dir.as_deref(), replace, name.as_deref()),
         SpaceCommand::Export { space } => export::run(export::Args { query: space }),
         SpaceCommand::Apply {
             space,
