@@ -250,9 +250,9 @@ pub(crate) fn scaffold(
     //    guard once the rename succeeds — the destination dir
     //    is now legitimate state, not a temp leftover.
     let final_dir = data_dir.unwrap_or_else(|| paths::space_dir(&space_id));
+    let final_dir = spaces_index::normalize_data_directory(&final_dir)?;
     let mut index = spaces_index::LockedSpacesIndex::acquire()?;
-    let mut entry = spaces_index::entry_for(&space_id, name);
-    entry.data_dir = final_dir.to_string_lossy().to_string();
+    let mut entry = spaces_index::entry_for_at(&space_id, name, &final_dir)?;
     entry.registry_hash = registry_hash.to_hex();
     index.validate_upsert(&entry)?;
     if final_dir.exists() {

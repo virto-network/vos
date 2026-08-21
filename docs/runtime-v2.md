@@ -1361,7 +1361,12 @@ index lock shared by every creator, recipe/token mutation, restore, and forget
 serializes each read-modify-write transaction. Restore reloads and revalidates
 the latest name and data-directory ownership before activation. `--replace`
 never permits one space to overwrite, contain, or be contained by another
-indexed space's directory. Restore does not silently delete the retained
+indexed space's directory. The index stores only canonical absolute data
+paths; legacy relative entries fail loudly instead of being reinterpreted
+against a command's current directory. Space data must also be disjoint from
+the vosx configuration and shared blob-cache control trees, preserving the
+stable lock/index inodes while a directory is replaced. Creation and restore
+enforce the same boundary. Restore does not silently delete the retained
 directory.
 
 The archive contains `node.key` and may contain plaintext private ingress and

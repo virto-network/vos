@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
 
-use crate::paths::{space_id_hex, spaces_index_path};
+use crate::paths::{blob_cache_dir, config_root, space_id_hex, spaces_index_path};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct SpacesIndex {
@@ -112,10 +112,12 @@ impl LockedSpacesIndex {
     }
 
     pub(crate) fn validate_upsert(&self, candidate: &SpaceEntry) -> Result<(), IndexError> {
+        validate_stored_data_directory(candidate)?;
         validate_upsert(&self.index, candidate)
     }
 
     pub(crate) fn save(self) -> Result<(), IndexError> {
+        validate_stored_data_directories(&self.index)?;
         validate_data_directories(&self.index)?;
         save_to_atomically(&self.index, &self.path)
     }
@@ -233,6 +235,69 @@ fn validate_data_directories(index: &SpacesIndex) -> Result<(), IndexError> {
     Ok(())
 }
 
+fn validate_stored_data_directories(index: &SpacesIndex) -> Result<(), IndexError> {
+    for entry in &index.spaces {
+        validate_stored_data_directory(entry)?;
+    }
+    Ok(())
+}
+
+fn validate_stored_data_directory(entry: &SpaceEntry) -> Result<(), IndexError> {
+    let stored = Path::new(&entry.data_dir);
+    if !stored.is_absolute() {
+        return Err(IndexError::Conflict(format!(
+            "space '{}' ({}) uses legacy relative data directory '{}'; replace it in spaces.toml with the absolute canonical path before continuing",
+            entry.name, entry.id, entry.data_dir,
+        )));
+    }
+    let normalized = normalize_data_directory(stored)?;
+    if normalized != stored {
+        return Err(IndexError::Conflict(format!(
+            "space '{}' ({}) data directory '{}' is not canonical; replace it in spaces.toml with '{}' before continuing",
+            entry.name,
+            entry.id,
+            entry.data_dir,
+            normalized.display(),
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve a proposed space data directory once, before it is persisted.
+///
+/// The returned path is absolute, lexically normalized, and resolved through
+/// every existing ancestor. Keeping that stable identity in `spaces.toml`
+/// prevents ownership checks from changing with the caller's working
+/// directory. Space state must also remain disjoint from the configuration
+/// and shared blob-cache control trees: replacing either tree would replace
+/// the stable lock inodes used to serialize restore and index mutations.
+pub(crate) fn normalize_data_directory(path: &Path) -> Result<PathBuf, IndexError> {
+    let lexical = lexical_absolute(path)?;
+    if let Ok(metadata) = fs::symlink_metadata(&lexical)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(IndexError::Conflict(format!(
+            "space data directory must not be a symlink: {}",
+            path.display(),
+        )));
+    }
+    let normalized = normalized_absolute(&lexical)?;
+    for (label, reserved) in [
+        ("vosx configuration", config_root()),
+        ("shared blob cache", blob_cache_dir()),
+    ] {
+        let reserved = normalized_absolute(&reserved)?;
+        if normalized.starts_with(&reserved) || reserved.starts_with(&normalized) {
+            return Err(IndexError::Conflict(format!(
+                "space data directory {} overlaps the {label} control tree at {}",
+                normalized.display(),
+                reserved.display(),
+            )));
+        }
+    }
+    Ok(normalized)
+}
+
 fn paths_equal(left: &Path, right: &Path) -> Result<bool, IndexError> {
     Ok(normalized_absolute(left)? == normalized_absolute(right)?)
 }
@@ -322,7 +387,9 @@ pub fn load_from(path: &Path) -> Result<SpacesIndex, IndexError> {
         Err(e) => return Err(IndexError::Io(e)),
     };
     let s = String::from_utf8_lossy(&bytes);
-    toml::from_str(&s).map_err(IndexError::Decode)
+    let index = toml::from_str(&s).map_err(IndexError::Decode)?;
+    validate_stored_data_directories(&index)?;
+    Ok(index)
 }
 
 /// Test-only raw writer for constructing fixtures. Runtime mutations must use
@@ -415,12 +482,20 @@ pub fn find<'a>(index: &'a SpacesIndex, query: &str) -> Result<&'a SpaceEntry, I
 /// from the space_id. Persistent listen prefs aren't on the
 /// entry — they live in `<data_dir>/local.toml` (per-node
 /// override, see `subscriptions::LocalConfig`).
-pub fn entry_for(id_bytes: &[u8; 32], name: &str) -> SpaceEntry {
+pub fn entry_for(id_bytes: &[u8; 32], name: &str) -> Result<SpaceEntry, IndexError> {
+    entry_for_at(id_bytes, name, &crate::paths::space_dir(id_bytes))
+}
+
+pub(crate) fn entry_for_at(
+    id_bytes: &[u8; 32],
+    name: &str,
+    data_dir: &Path,
+) -> Result<SpaceEntry, IndexError> {
     let id = space_id_hex(id_bytes);
-    let data_dir = crate::paths::space_dir(id_bytes)
+    let data_dir = normalize_data_directory(data_dir)?
         .to_string_lossy()
         .to_string();
-    SpaceEntry {
+    Ok(SpaceEntry {
         id,
         name: name.to_string(),
         created_at: now_iso8601(),
@@ -429,7 +504,7 @@ pub fn entry_for(id_bytes: &[u8; 32], name: &str) -> SpaceEntry {
         bootnodes: Vec::new(),
         hyperspace: String::new(),
         pending_recipe: String::new(),
-    }
+    })
 }
 
 /// `yyyy-mm-ddThh:mm:ssZ` UTC — bit-identical to the previous
@@ -500,7 +575,7 @@ mod tests {
         let p = tmp_path("nohs");
         std::fs::write(
             &p,
-            "[[space]]\nid = \"aa\"\nname = \"old\"\ncreated_at = \"\"\n",
+            "[[space]]\nid = \"aa\"\nname = \"old\"\ncreated_at = \"\"\ndata_dir = \"/tmp/old\"\n",
         )
         .unwrap();
         let idx = load_from(&p).unwrap();
@@ -624,7 +699,56 @@ mod tests {
     #[test]
     fn entry_for_uses_default_data_dir() {
         let id = [0xCDu8; 32];
-        let entry = entry_for(&id, "demo");
+        let entry = entry_for(&id, "demo").unwrap();
         assert!(entry.data_dir.contains(&space_id_hex(&id)));
+        assert!(Path::new(&entry.data_dir).is_absolute());
+    }
+
+    #[test]
+    fn relative_legacy_data_directory_is_rejected() {
+        let path = tmp_path("relative-entry");
+        let index = SpacesIndex {
+            spaces: vec![SpaceEntry {
+                id: "33".repeat(32),
+                name: "relative".into(),
+                created_at: "2026-08-21T00:00:00Z".into(),
+                data_dir: "owner-relative".into(),
+                registry_hash: String::new(),
+                bootnodes: Vec::new(),
+                hyperspace: String::new(),
+                pending_recipe: String::new(),
+            }],
+        };
+        save_to(&index, &path).unwrap();
+
+        let error = load_from(&path).unwrap_err().to_string();
+        assert!(error.contains("legacy relative data directory"), "{error}");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn proposed_relative_data_directory_is_stored_as_canonical_absolute() {
+        let relative = Path::new("target/vosx-relative-space");
+        let normalized = normalize_data_directory(relative).unwrap();
+        assert!(normalized.is_absolute());
+        assert_eq!(normalized, normalized_absolute(relative).unwrap());
+    }
+
+    #[test]
+    fn space_data_directories_cannot_overlap_control_trees() {
+        let mut candidates = vec![
+            config_root(),
+            config_root().join("nested-space"),
+            blob_cache_dir(),
+            blob_cache_dir().join("nested-space"),
+        ];
+        candidates.push(config_root().parent().unwrap().to_path_buf());
+        candidates.push(blob_cache_dir().parent().unwrap().to_path_buf());
+        for candidate in candidates {
+            let error = normalize_data_directory(&candidate)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("control tree"), "{candidate:?}: {error}");
+        }
     }
 }

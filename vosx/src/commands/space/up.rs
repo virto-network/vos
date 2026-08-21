@@ -858,10 +858,9 @@ fn resolve_token(token_str: &str) -> anyhow::Result<String> {
 fn join_scaffold(payload: &crate::token::InvitePayload) -> anyhow::Result<()> {
     let (registry_hash, _bytes, _label) =
         crate::commands::space::new::resolve_registry_source(None)?;
-    let space_dir = crate::paths::space_dir(&payload.space_id);
     let mut index = spaces_index::LockedSpacesIndex::acquire()?;
-    let mut entry = spaces_index::entry_for(&payload.space_id, &payload.name);
-    entry.data_dir = space_dir.to_string_lossy().to_string();
+    let mut entry = spaces_index::entry_for(&payload.space_id, &payload.name)?;
+    let space_dir = PathBuf::from(&entry.data_dir);
     entry.registry_hash = registry_hash.to_hex();
     entry.bootnodes = payload.bootnodes.clone();
     index.validate_upsert(&entry)?;

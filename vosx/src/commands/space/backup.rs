@@ -112,7 +112,7 @@ pub fn run_restore(
     let destination = data_dir
         .map(PathBuf::from)
         .unwrap_or_else(|| crate::paths::space_dir(&space_id));
-    let destination = lexical_absolute(&destination)?;
+    let destination = spaces_index::normalize_data_directory(&destination)?;
     refuse_live_daemon(&destination)?;
     let replaced = restore_archive(
         archive,
@@ -558,13 +558,14 @@ fn restore_archive(
     replace: bool,
     name: Option<&str>,
 ) -> anyhow::Result<Option<PathBuf>> {
+    let destination = spaces_index::normalize_data_directory(destination)?;
     let manifest = verify_archive(archive)?;
     if let Some(expected) = expected_manifest
         && hash_file(&archive.join(MANIFEST_FILE))? != expected
     {
         anyhow::bail!("backup manifest changed while restore was acquiring its lock");
     }
-    reject_restore_overlap(archive, destination)?;
+    reject_restore_overlap(archive, &destination)?;
     let mut restored_entry = manifest.space.clone();
     if let Some(name) = name {
         if name.is_empty() {
@@ -580,8 +581,8 @@ fn restore_archive(
     let mut index = spaces_index::LockedSpacesIndex::acquire_from(index_path)?;
     index.validate_upsert(&restored_entry)?;
 
-    let destination_exists = path_entry_exists(destination)?;
-    if destination_exists && fs::symlink_metadata(destination)?.file_type().is_symlink() {
+    let destination_exists = path_entry_exists(&destination)?;
+    if destination_exists && fs::symlink_metadata(&destination)?.file_type().is_symlink() {
         anyhow::bail!("restore destination must not be a symlink");
     }
     if destination_exists && !replace {
@@ -590,10 +591,10 @@ fn restore_archive(
             destination.display(),
         );
     }
-    let parent = usable_parent(destination);
+    let parent = usable_parent(&destination);
     fs::create_dir_all(parent)
         .map_err(|error| anyhow::anyhow!("create {}: {error}", parent.display()))?;
-    let stage = temporary_sibling(destination, "restore-partial")?;
+    let stage = temporary_sibling(&destination, "restore-partial")?;
     fs::create_dir(&stage)
         .map_err(|error| anyhow::anyhow!("create {}: {error}", stage.display()))?;
     set_directory_private(&stage)?;
@@ -617,8 +618,8 @@ fn restore_archive(
     sync_tree_directories(&stage)?;
 
     let replaced = if destination_exists {
-        let replaced = temporary_sibling(destination, "restore-replaced")?;
-        fs::rename(destination, &replaced).map_err(|error| {
+        let replaced = temporary_sibling(&destination, "restore-replaced")?;
+        fs::rename(&destination, &replaced).map_err(|error| {
             anyhow::anyhow!(
                 "retain existing state {} -> {}: {error}",
                 destination.display(),
@@ -629,9 +630,9 @@ fn restore_archive(
     } else {
         None
     };
-    if let Err(error) = fs::rename(&stage, destination) {
+    if let Err(error) = fs::rename(&stage, &destination) {
         if let Some(replaced) = &replaced {
-            if let Err(rollback) = fs::rename(replaced, destination) {
+            if let Err(rollback) = fs::rename(replaced, &destination) {
                 return Err(anyhow::anyhow!(
                     "activate restored state {} -> {}: {error}; restoring retained state {} also failed: {rollback}",
                     stage.display(),
@@ -649,7 +650,7 @@ fn restore_archive(
     if let Err(error) = sync_directory(parent) {
         return Err(rollback_error(
             error,
-            destination,
+            &destination,
             &stage,
             replaced.as_deref(),
         ));
@@ -660,33 +661,12 @@ fn restore_archive(
     if let Err(error) = index.save() {
         return Err(rollback_error(
             error.into(),
-            destination,
+            &destination,
             &stage,
             replaced.as_deref(),
         ));
     }
     Ok(replaced)
-}
-
-fn lexical_absolute(path: &Path) -> anyhow::Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
-                normalized.push(component.as_os_str());
-            }
-        }
-    }
-    Ok(normalized)
 }
 
 fn restore_blobs_to_cache(
