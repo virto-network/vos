@@ -146,9 +146,13 @@ test-extensions: build-extensions
 test-pvm: build-test-artifacts
     cargo test -p vos --test elf_integration -- --nocapture --test-threads=1
 
-# Run the signed-package → daemon → durable-reopen acceptance path.
+# Run the signed-package → daemon → offline backup → fresh-directory restore
+# → durable-reopen release-operations acceptance path.
 test-v2-daemon-root: build-v2-daemon-root-artifacts
     cargo test -p vosx --test onboarding_e2e signed_v2_package_runs_and_reopens_through_the_space_daemon -- --nocapture --test-threads=1
+
+# Stable release-check name; retain test-v2-daemon-root for existing callers.
+test-v2-release-operations: test-v2-daemon-root
 
 # Run the production-profile daemon gates against independent VTA1/VTR1
 # authority sidecars, including fail-closed recovery, two-node CRDT sync, and
@@ -221,6 +225,7 @@ check-all:
     just build-v2-pvm-test-artifacts
     cargo test -p vos --test v2_service_pvm -- --nocapture --test-threads=1
     just test-v2-examples
+    just test-v2-release-operations
     just test-v2-production-daemon
 
 # Lint with clippy.

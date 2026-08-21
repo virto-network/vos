@@ -1102,7 +1102,66 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
         String::from_utf8_lossy(&refused_upgrade.stderr),
     );
 
+    let backup_archive = dist.path().join("v2-root.vos-backup");
+    let backup_arg = backup_archive.to_string_lossy().into_owned();
+    let live_backup = vosx(
+        data.path(),
+        config.path(),
+        &["space", "backup", space, &backup_arg],
+    );
+    assert!(
+        !live_backup.status.success()
+            && String::from_utf8_lossy(&live_backup.stderr).contains("space data is in use"),
+        "a live daemon must hold the backup/restore data lock: {}",
+        String::from_utf8_lossy(&live_backup.stderr),
+    );
+
     drop(first);
+
+    // The offline archive must reopen as a complete, independent space—not
+    // merely reproduce a set of files. Restore into fresh XDG roots, attach
+    // the canonical service guest, and observe the committed actor value.
+    vosx_ok(
+        data.path(),
+        config.path(),
+        &["space", "backup", space, &backup_arg],
+    );
+    let restored_data = TempDir::new("v2-root-restored-data");
+    let restored_config = TempDir::new("v2-root-restored-config");
+    let restored_name = "v2-root-restored";
+    vosx_ok(
+        restored_data.path(),
+        restored_config.path(),
+        &["space", "restore", &backup_arg, "--name", restored_name],
+    );
+    let restored_log = restored_data.path().join("v2-root-restored.stderr");
+    let restored = Daemon(spawn_up_with_service(
+        restored_data.path(),
+        restored_config.path(),
+        restored_name,
+        &restored_log,
+        Some(&service_pvm),
+    ));
+    wait_for_endpoint(restored_data.path(), &restored_log, restored_name);
+    poll_until(
+        30,
+        || {
+            let output = vosx(
+                restored_data.path(),
+                restored_config.path(),
+                &["space", "call", restored_name, "counter", "value"],
+            );
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "U64(3)"
+        },
+        || {
+            format!(
+                "the restored v2 root did not reopen its committed actor state; log:\n{}",
+                fs::read_to_string(&restored_log).unwrap_or_default(),
+            )
+        },
+    );
+    drop(restored);
+
     let restart_at = std::time::SystemTime::now();
     let second_log = data.path().join("v2-root-second.stderr");
     let second = Daemon(spawn_up_with_service(
