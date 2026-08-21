@@ -282,6 +282,7 @@ pub(crate) fn normalize_data_directory(path: &Path) -> Result<PathBuf, IndexErro
         )));
     }
     let normalized = normalized_absolute(&lexical)?;
+    data_directory_string(&normalized)?;
     for (label, reserved) in [
         ("vosx configuration", config_root()),
         ("shared blob cache", blob_cache_dir()),
@@ -296,6 +297,18 @@ pub(crate) fn normalize_data_directory(path: &Path) -> Result<PathBuf, IndexErro
         }
     }
     Ok(normalized)
+}
+
+/// Encode a normalized data directory for the TOML index without changing
+/// its filesystem identity. TOML strings are UTF-8, so accepting another OS
+/// representation would make the persisted owner point somewhere else.
+pub(crate) fn data_directory_string(path: &Path) -> Result<String, IndexError> {
+    path.to_str().map(str::to_owned).ok_or_else(|| {
+        IndexError::Conflict(format!(
+            "space data directory is not valid UTF-8 and cannot be represented in spaces.toml: {}",
+            path.display(),
+        ))
+    })
 }
 
 fn paths_equal(left: &Path, right: &Path) -> Result<bool, IndexError> {
@@ -389,6 +402,7 @@ pub fn load_from(path: &Path) -> Result<SpacesIndex, IndexError> {
     let s = String::from_utf8_lossy(&bytes);
     let index = toml::from_str(&s).map_err(IndexError::Decode)?;
     validate_stored_data_directories(&index)?;
+    validate_data_directories(&index)?;
     Ok(index)
 }
 
@@ -492,9 +506,8 @@ pub(crate) fn entry_for_at(
     data_dir: &Path,
 ) -> Result<SpaceEntry, IndexError> {
     let id = space_id_hex(id_bytes);
-    let data_dir = normalize_data_directory(data_dir)?
-        .to_string_lossy()
-        .to_string();
+    let data_dir = normalize_data_directory(data_dir)?;
+    let data_dir = data_directory_string(&data_dir)?;
     Ok(SpaceEntry {
         id,
         name: name.to_string(),
@@ -724,6 +737,58 @@ mod tests {
         let error = load_from(&path).unwrap_err().to_string();
         assert!(error.contains("legacy relative data directory"), "{error}");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn overlapping_legacy_data_directories_are_rejected_on_load() {
+        let path = tmp_path("overlapping-entries");
+        let parent = tmp_path("overlapping-owner");
+        let index = SpacesIndex {
+            spaces: vec![
+                SpaceEntry {
+                    id: "44".repeat(32),
+                    name: "parent".into(),
+                    created_at: "2026-08-21T00:00:00Z".into(),
+                    data_dir: parent.to_string_lossy().into_owned(),
+                    registry_hash: String::new(),
+                    bootnodes: Vec::new(),
+                    hyperspace: String::new(),
+                    pending_recipe: String::new(),
+                },
+                SpaceEntry {
+                    id: "55".repeat(32),
+                    name: "child".into(),
+                    created_at: "2026-08-21T00:00:00Z".into(),
+                    data_dir: parent.join("child").to_string_lossy().into_owned(),
+                    registry_hash: String::new(),
+                    bootnodes: Vec::new(),
+                    hyperspace: String::new(),
+                    pending_recipe: String::new(),
+                },
+            ],
+        };
+        save_to(&index, &path).unwrap();
+
+        let error = load_from(&path).unwrap_err().to_string();
+        assert!(error.contains("overlap"), "{error}");
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_data_directory_is_rejected_before_creation() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let parent = tmp_path("non-utf8-parent");
+        fs::create_dir_all(&parent).unwrap();
+        let destination = parent.join(std::ffi::OsString::from_vec(vec![b's', 0xff]));
+
+        let error = entry_for_at(&[0x66; 32], "non-utf8", &destination)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not valid UTF-8"), "{error}");
+        assert!(!destination.exists());
+        fs::remove_dir(parent).unwrap();
     }
 
     #[test]

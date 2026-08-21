@@ -573,7 +573,7 @@ fn restore_archive(
         }
         restored_entry.name = name.into();
     }
-    restored_entry.data_dir = destination.to_string_lossy().into_owned();
+    restored_entry.data_dir = spaces_index::data_directory_string(&destination)?;
     // Different space locks intentionally permit independent backups, but
     // index activation is one global read-modify-write transaction. Hold a
     // stable sibling lock through the reload, destination ownership checks,

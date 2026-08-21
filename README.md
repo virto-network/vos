@@ -87,9 +87,10 @@ registry blob before activating it. It never overwrites an existing data
 directory unless `--replace` is given, and never overwrites a directory owned
 by another indexed space or any ancestor/descendant of its data directory;
 replacement renames the old directory aside and reports its recovery path.
-Indexed data paths are canonical absolute paths—legacy relative entries are
-rejected—and cannot overlap the vosx configuration or shared blob-cache
-control trees. Every spaces-index mutation shares one cross-process lock.
+Indexed data paths are canonical absolute UTF-8 paths—legacy relative,
+overlapping, and non-representable entries are rejected on load—and cannot
+overlap the vosx configuration or shared blob-cache control trees. Every
+spaces-index mutation shares one cross-process lock.
 Cache objects are public, immutable artifacts and use independent
 copy-on-write clones when the filesystem supports them, avoiding an immediate
 second physical copy without tying archive integrity to the live cache inode.
