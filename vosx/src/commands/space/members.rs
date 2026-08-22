@@ -356,7 +356,8 @@ fn remove_node(space: &str, prefix: u32, replacement: Option<u32>) -> anyhow::Re
         // roots. Under the runbook's publish/install quiescence, demoting it
         // before the scan ensures later installations cannot re-enrol the
         // retiring slot. Existing groups continue authenticating its exact
-        // PeerId while their durable membership still names the slot.
+        // PeerId from the observer row, and its anchored daemon replica
+        // remains private until their durable retirement confirmation.
         if old.role == NODE_ROLE_VOTER {
             match client.add_node(old.prefix as u32, old.key.clone(), NODE_ROLE_OBSERVER)? {
                 Status::Ok => old.role = NODE_ROLE_OBSERVER,

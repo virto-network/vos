@@ -2727,15 +2727,17 @@ fn decide_raft_spawn(
 ) -> RaftPlan {
     use vos::network::RaftRole;
 
+    if anchored {
+        // The persisted active config supersedes the seed; the
+        // registry voter set is only a bootstrap hint. In particular, a
+        // retiring observer must reopen its private endpoint until the group
+        // durably confirms that it learned finality.
+        return RaftPlan::Spawn(voters.to_vec());
+    }
     if !voters.contains(&local) {
         return RaftPlan::Defer(
             "this node is not a voter (enroll it with `vosx space members add-node`)".into(),
         );
-    }
-    if anchored {
-        // The persisted active config supersedes the seed; the
-        // voter set just has to be non-empty to spawn the worker.
-        return RaftPlan::Spawn(voters.to_vec());
     }
     if voters == [local] {
         return RaftPlan::Bootstrap { contested: false };
@@ -2926,7 +2928,7 @@ fn raft_members_for_row(
     local_prefix: u16,
     boot_grace: &mut BootGrace,
 ) -> anyhow::Result<RaftSeed> {
-    use vos::registry::{MEMBER_KIND_NODE, NODE_ROLE_VOTER, RegistryRef};
+    use vos::registry::{MEMBER_KIND_NODE, NODE_ROLE_OBSERVER, NODE_ROLE_VOTER, RegistryRef};
 
     let reg = RegistryRef::at(ServiceId::REGISTRY);
     let rows = vos::block_on(reg.members_all(&mut &*node))
@@ -2940,7 +2942,10 @@ fn raft_members_for_row(
     voters.dedup();
     let mut voter_peer_ids = rows
         .iter()
-        .filter(|member| member.kind == MEMBER_KIND_NODE && member.role == NODE_ROLE_VOTER)
+        .filter(|member| {
+            member.kind == MEMBER_KIND_NODE
+                && matches!(member.role, NODE_ROLE_VOTER | NODE_ROLE_OBSERVER)
+        })
         .map(|member| (member.prefix, member.key.clone()))
         .collect::<Vec<_>>();
     voter_peer_ids.sort_by_key(|(prefix, _)| *prefix);
@@ -5175,6 +5180,14 @@ mod tests {
         // current voter set so the worker spawns in multi-mode.
         let plan = decide_raft_spawn(0x0001, &[0x0001, 0x0002], true, &[], 1);
         assert_eq!(plan, RaftPlan::Spawn(vec![0x0001, 0x0002]));
+    }
+
+    #[test]
+    fn anchored_retiring_observer_reopens_private_replica() {
+        // The persisted log, not the already-demoted registry row, decides
+        // whether this endpoint is still needed to acknowledge finality.
+        let plan = decide_raft_spawn(0x0001, &[0x0002], true, &[], 1);
+        assert_eq!(plan, RaftPlan::Spawn(vec![0x0002]));
     }
 
     #[test]

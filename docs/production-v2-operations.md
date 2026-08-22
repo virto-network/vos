@@ -103,14 +103,16 @@ with a *new* identity:
 The command signs each root's replication ID, complete registry-bound PeerIds,
 compact slots, and current membership index with the operator identity. A
 follower may relay that authorization but cannot invent or alter it. It first
-demotes the old NODE row to observer so
-newly installed roots cannot enroll it, while existing groups continue to
-authenticate that exact identity until their membership no longer names it.
-It serializes each change with private-ingress
-admission, requires the replacement to be a committed voter, and waits for a
-committed final non-joint configuration before moving to the next Raft root.
-Only after every installed Raft root has retired the old slot does it remove
-the old NODE row from the registry. The multi-root operation is deliberately
+demotes the old NODE row to observer so newly installed roots cannot enrol it,
+but retains that exact PeerId binding and the retiring private Raft endpoint
+while each existing group commits both the final membership and a second
+consensus-visible confirmation that the retiring replica learned that
+finality. It serializes each change with private-ingress admission, requires the replacement to be a
+committed voter, and waits for a
+committed final non-joint configuration plus its retirement confirmation
+before moving to the next Raft root. Only after every installed Raft root has
+retired the old slot does it remove the old NODE row from the registry. The
+multi-root operation is deliberately
 resumable rather than falsely atomic: if the command loses a reply or stops
 halfway, rerun the same command while the old registry row still exists.
 Completed roots return an idempotent terminal result; unfinished roots resume

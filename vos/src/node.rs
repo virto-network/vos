@@ -1866,6 +1866,7 @@ where
                 && snapshot
                     .joint_old
                     .is_none_or(|members| !members.contains(&self.raft_config.me))
+                && snapshot.retirement_final_index.is_none()
         })
     }
 
@@ -5838,7 +5839,7 @@ impl VosNode {
         let persisted_commit_index = crate::raft::log::RaftMeta::load(&db)
             .map_err(V2RaftNodeRegistrationError::Log)?
             .commit_index;
-        let retain_replica = persisted_config.is_some_and(|record| {
+        let mut retain_replica = persisted_config.is_some_and(|record| {
             record.current.contains(&raft_config.me)
                 || record
                     .joint_old
@@ -5894,6 +5895,13 @@ impl VosNode {
             Some(apply_tx),
         );
         let worker_handle = worker.handler();
+        // A removed replica remains a required private transport endpoint
+        // until the surviving group commits its retirement-confirmation row.
+        // The live log pair is more precise than the persisted active-config
+        // row, which already contains the final membership at this point.
+        retain_replica |= worker_handle.snapshot().is_some_and(|snapshot| {
+            snapshot.retirement_final_index.is_some() && !snapshot.members.contains(&raft_config.me)
+        });
         let handler: Arc<dyn crate::network::RaftRpcHandler> = Arc::new(worker_handle.clone());
         if let (Some(network), Some(reservation)) = (network.as_ref(), reservation.as_ref())
             && !network.activate_raft_handler_with_voters(

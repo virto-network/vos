@@ -209,6 +209,9 @@ pub struct WorkerSnapshot {
     /// `None` means exclusion from the view is not durable evidence of a
     /// committed removal.
     pub active_config_index: Option<u64>,
+    /// Initial final-configuration index still awaiting the replicated
+    /// retiring-voter confirmation barrier.
+    pub retirement_final_index: Option<u64>,
     /// Best-effort leader hint. `Some(prefix)` once we've seen a
     /// current-term `AppendEntries` (or self if we are leader).
     /// `None` between elections. Followers use it to redirect
@@ -228,6 +231,7 @@ impl From<vos_raft::WorkerSnapshot<u16>> for WorkerSnapshot {
             members: s.members,
             joint_old: s.joint_old,
             active_config_index: s.active_config_index,
+            retirement_final_index: s.retirement_final_index,
             leader_hint: s.leader_hint,
         }
     }
@@ -590,7 +594,10 @@ impl RaftRpcHandler for WorkerHandle {
             .active_config_index
             .is_some_and(|index| index <= snap.commit_index);
         if !snap.members.contains(&old_prefix) {
-            return if config_is_committed && snap.members.contains(&replacement_prefix) {
+            return if config_is_committed
+                && snap.members.contains(&replacement_prefix)
+                && snap.retirement_final_index.is_none()
+            {
                 RaftReplaceVoterResult::Complete
             } else {
                 RaftReplaceVoterResult::ReplacementNotReady

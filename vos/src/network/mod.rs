@@ -6076,6 +6076,7 @@ mod tests {
                         && snapshot
                             .active_config_index
                             .is_some_and(|index| index <= snapshot.commit_index)
+                        && snapshot.retirement_final_index.is_none()
                 });
             if complete {
                 break;

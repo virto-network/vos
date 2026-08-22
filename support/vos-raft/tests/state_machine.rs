@@ -2233,6 +2233,7 @@ fn retiring_follower_activates_final_from_leader_commit() {
     assert_eq!(before.members, vec![NEW]);
     assert_eq!(before.joint_old, Some(vec![OLD, NEW]));
     assert_eq!(before.active_config_index, Some(2));
+    assert_eq!(before.retirement_final_index, Some(3));
 
     let response = block_on(worker.handler().handle_inbound_append(
         NEW,
@@ -2252,6 +2253,84 @@ fn retiring_follower_activates_final_from_leader_commit() {
     assert_eq!(after.members, vec![NEW]);
     assert_eq!(after.joint_old, None);
     assert_eq!(after.active_config_index, Some(3));
+    assert_eq!(after.retirement_final_index, Some(3));
+
+    worker.shutdown();
+}
+
+/// A follower may already store the uncommitted source final when the next
+/// AppendEntries brings only the confirmation row. Its still-joint effective
+/// view must not cause that second row to be mistaken for another source
+/// final, or retirement debt would survive a committed confirmation forever.
+#[test]
+fn follower_recognizes_confirmation_after_already_present_final() {
+    use vos_raft::ActiveConfigRecord;
+
+    const OLD: u16 = 1;
+    const NEW: u16 = 2;
+    const TERM: u64 = 7;
+
+    let mut storage = MemStorage::<u16>::new();
+    block_on(storage.commit_batch(WriteBatch {
+        appends: vec![
+            LogEntry::data(1, TERM, b"pre-transition".to_vec()),
+            LogEntry::config_change(2, TERM, Some(vec![OLD, NEW]), vec![NEW]),
+            LogEntry::config_change(3, TERM, None, vec![NEW]),
+        ],
+        meta: Some(Meta {
+            current_term: TERM,
+            voted_for: None,
+            commit_index: 2,
+            snap_last_index: 0,
+            snap_last_term: 0,
+        }),
+        active_config: Some(ActiveConfigRecord {
+            log_index: Some(3),
+            current: vec![NEW],
+            joint_old: None,
+        }),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes));
+    let mut config = cfg(OLD, vec![OLD, NEW]);
+    config.pre_vote = false;
+    config.election_timeout_ms = (5_000, 6_000);
+    let worker = Worker::spawn_with(
+        storage,
+        transport,
+        config,
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    worker.wait_init().expect("retiring follower recovers");
+
+    let before = block_on(worker.handler().snapshot()).expect("snapshot before confirmation");
+    assert_eq!(before.joint_old, Some(vec![OLD, NEW]));
+    assert_eq!(before.retirement_final_index, Some(3));
+
+    let response = block_on(worker.handler().handle_inbound_append(
+        NEW,
+        AppendEntriesReq {
+            leader: NEW,
+            term: TERM,
+            prev_log_index: 3,
+            prev_log_term: TERM,
+            leader_commit: 4,
+            entries: vec![LogEntry::config_change(4, TERM, None, vec![NEW])],
+        },
+    ));
+    assert!(response.success, "confirmation append must be accepted");
+
+    let after = block_on(worker.handler().snapshot()).expect("snapshot after confirmation");
+    assert_eq!(after.commit_index, 4);
+    assert_eq!(after.members, vec![NEW]);
+    assert_eq!(after.joint_old, None);
+    assert_eq!(after.active_config_index, Some(4));
+    assert_eq!(after.retirement_final_index, None);
 
     worker.shutdown();
 }
@@ -2335,6 +2414,8 @@ fn replacement_leader_notifies_a_recovered_retiring_follower() {
     let new_before = block_on(new.handler().snapshot()).unwrap();
     assert!(old_before.joint_old.is_some());
     assert!(new_before.joint_old.is_none());
+    assert_eq!(old_before.retirement_final_index, Some(3));
+    assert_eq!(new_before.retirement_final_index, Some(3));
 
     wait_until(
         || {
@@ -2347,6 +2428,7 @@ fn replacement_leader_notifies_a_recovered_retiring_follower() {
                         && new.commit_index >= 3
                         && new.members == vec![NEW]
                         && new.joint_old.is_none()
+                        && new.retirement_final_index.is_none()
                         && old.commit_index >= 3
                         && old.members == vec![NEW]
                         && old.joint_old.is_none()
@@ -2359,6 +2441,65 @@ fn replacement_leader_notifies_a_recovered_retiring_follower() {
 
     old.shutdown();
     new.shutdown();
+}
+
+/// The acknowledgement barrier is a replicated, committed steady-config row,
+/// not a process-local flag. A later leader must therefore recover with no
+/// retirement delivery debt even after every original process has stopped.
+#[test]
+fn committed_retirement_confirmation_survives_restart() {
+    use vos_raft::ActiveConfigRecord;
+
+    const OLD: u16 = 1;
+    const NEW: u16 = 2;
+    const TERM: u64 = 7;
+
+    let mut storage = MemStorage::<u16>::new();
+    block_on(storage.commit_batch(WriteBatch {
+        appends: vec![
+            LogEntry::data(1, TERM, b"pre-transition".to_vec()),
+            LogEntry::config_change(2, TERM, Some(vec![OLD, NEW]), vec![NEW]),
+            LogEntry::config_change(3, TERM, None, vec![NEW]),
+            LogEntry::config_change(4, TERM, None, vec![NEW]),
+        ],
+        meta: Some(Meta {
+            current_term: TERM,
+            voted_for: None,
+            commit_index: 4,
+            snap_last_index: 0,
+            snap_last_term: 0,
+        }),
+        active_config: Some(ActiveConfigRecord {
+            log_index: Some(4),
+            current: vec![NEW],
+            joint_old: None,
+        }),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes));
+    let mut config = cfg(NEW, vec![OLD, NEW]);
+    config.pre_vote = false;
+    config.election_timeout_ms = (5_000, 6_000);
+    let worker = Worker::spawn_with(
+        storage,
+        transport,
+        config,
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    worker.wait_init().expect("replacement restarts");
+
+    let snapshot = block_on(worker.handler().snapshot()).expect("recovered snapshot");
+    assert_eq!(snapshot.members, vec![NEW]);
+    assert_eq!(snapshot.joint_old, None);
+    assert_eq!(snapshot.active_config_index, Some(4));
+    assert_eq!(snapshot.retirement_final_index, None);
+
+    worker.shutdown();
 }
 
 /// `change_membership` called against a follower returns

@@ -2504,6 +2504,24 @@ fn production_raft_root_survives_voter_join_leader_loss_and_backup_relocation() 
     let call_on = |prefix: u16, args: &[&str]| -> String {
         try_call_on(prefix, args).unwrap_or_else(|error| panic!("{error}"))
     };
+    poll_until(
+        60,
+        || {
+            [prefix_a, prefix_b, prefix_c].into_iter().all(|prefix| {
+                try_call_on(prefix, &["space", "call", space, root, "value"])
+                    .is_ok_and(|value| value.trim() == "U64(0)")
+            })
+        },
+        || {
+            format!(
+                "the steady Raft handlers did not publish every actor route; \
+                 A log:\n{}\nB log:\n{}\nC log:\n{}",
+                fs::read_to_string(&log_a).unwrap_or_default(),
+                fs::read_to_string(&log_b).unwrap_or_default(),
+                fs::read_to_string(&log_c).unwrap_or_default(),
+            )
+        },
+    );
     assert_eq!(
         call_on(
             first_follower,
