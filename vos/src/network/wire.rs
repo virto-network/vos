@@ -50,6 +50,10 @@ const TAG_MANIFEST_RESP: u8 = 0x43;
 // and whether followers are caught up.
 const TAG_RAFT_STATUS_REQ: u8 = 0x44;
 const TAG_RAFT_STATUS_RESP: u8 = 0x45;
+// Authenticated operator request for retiring one voter after its replacement
+// is already a committed member of the group.
+const TAG_RAFT_REPLACE_VOTER_REQ: u8 = 0x46;
+const TAG_RAFT_REPLACE_VOTER_RESP: u8 = 0x47;
 // Content-addressed proof-blob fetch. Consumers ship the 32-byte
 // hash of a proof they want; producers (or any node that has the
 // bytes cached) serve them back. Large STARK payloads (~1.4 MiB
@@ -83,6 +87,11 @@ const MAX_HEADS: usize = 256;
 /// a bigger payload should be split across multiple RPCs.
 /// Bounds the per-frame allocation a malicious peer can force.
 const MAX_RAFT_ENTRIES: usize = 1024;
+
+/// libp2p PeerIds are currently much smaller than this. Keep the management
+/// wire bounded independently of the frame cap so malformed requests cannot
+/// allocate attacker-selected identity blobs.
+const MAX_RAFT_VOTER_PEER_ID_BYTES: usize = 128;
 
 /// Cap on the number of voters listed inside a single
 /// `RaftEntryKind::ConfigChange` (per-list — applies to
@@ -300,6 +309,23 @@ pub enum Frame {
         active_config_index: Option<u64>,
         leader_hint: Option<u16>,
     },
+    /// Retire `old_prefix` only after `replacement_prefix` is already a
+    /// committed voter. Complete PeerIds bind both compact slots to the
+    /// registry's authenticated node rows; prefixes alone are not identities.
+    RaftReplaceVoterReq {
+        replication_id: [u8; REPLICATION_ID_BYTES],
+        old_prefix: u16,
+        old_peer: Vec<u8>,
+        replacement_prefix: u16,
+        replacement_peer: Vec<u8>,
+        /// The original Noise-authenticated operator. A follower proxy keeps
+        /// this value while the next hop is authenticated as a current voter.
+        operator_peer: Vec<u8>,
+    },
+    /// Reply to [`Frame::RaftReplaceVoterReq`].
+    RaftReplaceVoterResp {
+        result: RaftReplaceVoterResult,
+    },
     /// Point-fetch a content-addressed proof blob by its 32-byte
     /// hash. Sent as a request; reply rides back as
     /// [`Frame::ProofBlobReply`]. The hash is domain-tagged
@@ -392,6 +418,33 @@ pub enum RaftJoinResult {
     /// The joiner's production verifier/authority policy differs from the
     /// policy sealed by the group it asked to join.
     PolicyMismatch,
+}
+
+/// Outcome of a production voter-replacement request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RaftReplaceVoterResult {
+    /// The joint configuration excluding the old voter was appended. The
+    /// caller must continue polling/retrying until [`Self::Complete`].
+    Accepted {
+        joint_index: u64,
+    },
+    /// A committed, non-joint configuration excludes the old voter and still
+    /// includes the named replacement.
+    Complete,
+    /// The receiver is not leader; retry through the exact enrolled voter
+    /// identified by this compact hint.
+    NotLeader {
+        leader_hint: Option<u16>,
+    },
+    UnknownGroup,
+    Busy,
+    NotAuthorized,
+    /// One or both full PeerIds do not match the registry rows for the slots.
+    IdentityMismatch,
+    /// The replacement is not yet a committed voter of the group.
+    ReplacementNotReady,
+    /// Refused because it would leave no voter in the group.
+    WouldEmpty,
 }
 
 /// One log entry carried inside an [`Frame::RaftAppendReq`].
@@ -799,6 +852,51 @@ impl Frame {
                     None => out.push(0),
                 }
             }
+            Frame::RaftReplaceVoterReq {
+                replication_id,
+                old_prefix,
+                old_peer,
+                replacement_prefix,
+                replacement_peer,
+                operator_peer,
+            } => {
+                out.push(TAG_RAFT_REPLACE_VOTER_REQ);
+                out.extend_from_slice(replication_id);
+                out.extend_from_slice(&old_prefix.to_le_bytes());
+                out.extend_from_slice(&(old_peer.len() as u32).to_le_bytes());
+                out.extend_from_slice(old_peer);
+                out.extend_from_slice(&replacement_prefix.to_le_bytes());
+                out.extend_from_slice(&(replacement_peer.len() as u32).to_le_bytes());
+                out.extend_from_slice(replacement_peer);
+                out.extend_from_slice(&(operator_peer.len() as u32).to_le_bytes());
+                out.extend_from_slice(operator_peer);
+            }
+            Frame::RaftReplaceVoterResp { result } => {
+                out.push(TAG_RAFT_REPLACE_VOTER_RESP);
+                match result {
+                    RaftReplaceVoterResult::Accepted { joint_index } => {
+                        out.push(0);
+                        out.extend_from_slice(&joint_index.to_le_bytes());
+                    }
+                    RaftReplaceVoterResult::Complete => out.push(1),
+                    RaftReplaceVoterResult::NotLeader { leader_hint } => {
+                        out.push(2);
+                        match leader_hint {
+                            Some(prefix) => {
+                                out.push(1);
+                                out.extend_from_slice(&prefix.to_le_bytes());
+                            }
+                            None => out.push(0),
+                        }
+                    }
+                    RaftReplaceVoterResult::UnknownGroup => out.push(3),
+                    RaftReplaceVoterResult::Busy => out.push(4),
+                    RaftReplaceVoterResult::NotAuthorized => out.push(5),
+                    RaftReplaceVoterResult::IdentityMismatch => out.push(6),
+                    RaftReplaceVoterResult::ReplacementNotReady => out.push(7),
+                    RaftReplaceVoterResult::WouldEmpty => out.push(8),
+                }
+            }
             Frame::FetchProofBlob { hash } => {
                 out.push(TAG_FETCH_PROOF_BLOB);
                 out.extend_from_slice(hash);
@@ -1186,6 +1284,55 @@ impl Frame {
                     leader_hint,
                 }
             }
+            TAG_RAFT_REPLACE_VOTER_REQ => {
+                let replication_id = r.fixed::<REPLICATION_ID_BYTES>()?;
+                let old_prefix = r.u16()?;
+                let old_peer = r.bytes_with_len_prefix()?;
+                let replacement_prefix = r.u16()?;
+                let replacement_peer = r.bytes_with_len_prefix()?;
+                let operator_peer = r.bytes_with_len_prefix()?;
+                if old_peer.is_empty()
+                    || old_peer.len() > MAX_RAFT_VOTER_PEER_ID_BYTES
+                    || replacement_peer.is_empty()
+                    || replacement_peer.len() > MAX_RAFT_VOTER_PEER_ID_BYTES
+                    || operator_peer.is_empty()
+                    || operator_peer.len() > MAX_RAFT_VOTER_PEER_ID_BYTES
+                {
+                    return Err(FrameError::BadRaftVoterPeerIdLength);
+                }
+                Frame::RaftReplaceVoterReq {
+                    replication_id,
+                    old_prefix,
+                    old_peer,
+                    replacement_prefix,
+                    replacement_peer,
+                    operator_peer,
+                }
+            }
+            TAG_RAFT_REPLACE_VOTER_RESP => {
+                let result = match r.u8()? {
+                    0 => RaftReplaceVoterResult::Accepted {
+                        joint_index: r.u64()?,
+                    },
+                    1 => RaftReplaceVoterResult::Complete,
+                    2 => {
+                        let leader_hint = match r.u8()? {
+                            0 => None,
+                            1 => Some(r.u16()?),
+                            other => return Err(FrameError::BadOption(other)),
+                        };
+                        RaftReplaceVoterResult::NotLeader { leader_hint }
+                    }
+                    3 => RaftReplaceVoterResult::UnknownGroup,
+                    4 => RaftReplaceVoterResult::Busy,
+                    5 => RaftReplaceVoterResult::NotAuthorized,
+                    6 => RaftReplaceVoterResult::IdentityMismatch,
+                    7 => RaftReplaceVoterResult::ReplacementNotReady,
+                    8 => RaftReplaceVoterResult::WouldEmpty,
+                    other => return Err(FrameError::BadOption(other)),
+                };
+                Frame::RaftReplaceVoterResp { result }
+            }
             TAG_FETCH_PROOF_BLOB => Frame::FetchProofBlob {
                 hash: r.fixed::<32>()?,
             },
@@ -1258,6 +1405,7 @@ pub enum FrameError {
     BadOption(u8),
     RaftEntriesTooMany(usize),
     RaftMembersTooMany(usize),
+    BadRaftVoterPeerIdLength,
     BadRaftEntryKind(u8),
     ManifestTooManyBlobs(usize),
     ManifestBadName,
@@ -1294,6 +1442,10 @@ impl core::fmt::Display for FrameError {
                     "raft member list length {n} exceeds cap {MAX_RAFT_MEMBERS}"
                 )
             }
+            FrameError::BadRaftVoterPeerIdLength => write!(
+                f,
+                "Raft voter replacement PeerId is empty or exceeds {MAX_RAFT_VOTER_PEER_ID_BYTES} bytes"
+            ),
             FrameError::BadRaftEntryKind(b) => {
                 write!(f, "invalid raft entry kind discriminant {b}")
             }
@@ -1535,6 +1687,48 @@ mod tests {
         assert!(matches!(
             Frame::decode(&oversized),
             Err(FrameError::BadPrivateIngressLength(_))
+        ));
+    }
+
+    #[test]
+    fn raft_replace_voter_roundtrip_and_bounds() {
+        roundtrip(Frame::RaftReplaceVoterReq {
+            replication_id: [0x71; 32],
+            old_prefix: 0x1001,
+            old_peer: vec![0x12; 38],
+            replacement_prefix: 0x1002,
+            replacement_peer: vec![0x13; 38],
+            operator_peer: vec![0x14; 38],
+        });
+        for result in [
+            RaftReplaceVoterResult::Accepted { joint_index: 19 },
+            RaftReplaceVoterResult::Complete,
+            RaftReplaceVoterResult::NotLeader {
+                leader_hint: Some(0x1002),
+            },
+            RaftReplaceVoterResult::NotLeader { leader_hint: None },
+            RaftReplaceVoterResult::UnknownGroup,
+            RaftReplaceVoterResult::Busy,
+            RaftReplaceVoterResult::NotAuthorized,
+            RaftReplaceVoterResult::IdentityMismatch,
+            RaftReplaceVoterResult::ReplacementNotReady,
+            RaftReplaceVoterResult::WouldEmpty,
+        ] {
+            roundtrip(Frame::RaftReplaceVoterResp { result });
+        }
+
+        let oversized = Frame::RaftReplaceVoterReq {
+            replication_id: [0x71; 32],
+            old_prefix: 0x1001,
+            old_peer: vec![0x12; MAX_RAFT_VOTER_PEER_ID_BYTES + 1],
+            replacement_prefix: 0x1002,
+            replacement_peer: vec![0x13; 38],
+            operator_peer: vec![0x14; 38],
+        }
+        .encode();
+        assert!(matches!(
+            Frame::decode(&oversized),
+            Err(FrameError::BadRaftVoterPeerIdLength)
         ));
     }
 

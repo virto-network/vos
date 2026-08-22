@@ -16,6 +16,7 @@ mod wire;
 pub(crate) use wire::raft_append_prefix_len;
 pub use wire::{
     Frame, FrameError, MAX_FRAME_BYTES, ManifestBlob, RaftEntry, RaftEntryKind, RaftJoinResult,
+    RaftReplaceVoterResult,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -407,6 +408,25 @@ pub trait NetworkService: Send + Sync {
             RaftJoinResult::NotAuthorized
         }
     }
+
+    /// Authenticate and drive one production voter replacement. The caller is
+    /// the Noise peer on this hop; `operator_peer` is equal to it for the
+    /// external request and may differ only when an authenticated current
+    /// voter proxies the request to the exact leader.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_raft_replace_voter(
+        &self,
+        _caller: PeerId,
+        _operator_peer: PeerId,
+        _replication_id: &[u8; 32],
+        _old_prefix: u16,
+        _old_peer: PeerId,
+        _replacement_prefix: u16,
+        _replacement_peer: PeerId,
+        _handler: &dyn RaftRpcHandler,
+    ) -> RaftReplaceVoterResult {
+        RaftReplaceVoterResult::NotAuthorized
+    }
 }
 
 /// Local handler for inbound Raft RPCs. Mirrors [`SyncHandler`]'s
@@ -488,6 +508,18 @@ pub trait RaftRpcHandler: Send + Sync {
     /// can poll for `commit_index >= joint_index + 1`.
     fn handle_join(&self, _replication_id: &[u8; 32], _joiner_prefix: u16) -> RaftJoinResult {
         RaftJoinResult::NotLeader { leader_hint: None }
+    }
+
+    /// Remove one voter after its replacement is already committed. The
+    /// network/node layers authenticate identities and operator authority;
+    /// this method owns only the Raft transition and idempotent state test.
+    fn handle_replace_voter(
+        &self,
+        _replication_id: &[u8; 32],
+        _old_prefix: u16,
+        _replacement_prefix: u16,
+    ) -> RaftReplaceVoterResult {
+        RaftReplaceVoterResult::NotLeader { leader_hint: None }
     }
 
     /// Inbound `RaftStatusReq` — answer "what's your view of
@@ -926,6 +958,18 @@ pub(in crate::network) enum NetworkCmd {
         production_trust_policy: Option<[u8; 32]>,
         reply: std_mpsc::Sender<RaftJoinResult>,
     },
+    /// Send an authenticated operator request to replace one committed voter
+    /// with another already-promoted voter.
+    SendRaftReplaceVoter {
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        old_prefix: u16,
+        old_peer: Vec<u8>,
+        replacement_prefix: u16,
+        replacement_peer: Vec<u8>,
+        operator_peer: Vec<u8>,
+        reply: std_mpsc::Sender<RaftReplaceVoterResult>,
+    },
     /// Send a [`Frame::ManifestReq`] to a bootnode. Reply yields
     /// the bootnode's space.toml + actor blobs.
     SendManifestReq {
@@ -952,6 +996,7 @@ enum OutboundReply {
     RaftVote(std_mpsc::Sender<RaftVoteResult>),
     RaftInstallSnapshot(std_mpsc::Sender<RaftInstallSnapshotResult>),
     RaftJoin(std_mpsc::Sender<RaftJoinResult>),
+    RaftReplaceVoter(std_mpsc::Sender<RaftReplaceVoterResult>),
     Manifest(std_mpsc::Sender<ManifestReply>),
     RaftStatus(std_mpsc::Sender<RaftStatusReply>),
     ProofBlob(std_mpsc::Sender<Option<Vec<u8>>>),
@@ -2003,6 +2048,33 @@ async fn network_main(
                         outbound_replies.insert(req_id, OutboundReply::RaftJoin(reply));
                         debug!(%target_peer, joiner_prefix, "network: sent RaftJoinReq");
                     }
+                    Some(NetworkCmd::SendRaftReplaceVoter {
+                        target_peer,
+                        replication_id,
+                        old_prefix,
+                        old_peer,
+                        replacement_prefix,
+                        replacement_peer,
+                        operator_peer,
+                        reply,
+                    }) => {
+                        let frame = Frame::RaftReplaceVoterReq {
+                            replication_id,
+                            old_prefix,
+                            old_peer,
+                            replacement_prefix,
+                            replacement_peer,
+                            operator_peer,
+                        };
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, frame);
+                        outbound_replies
+                            .insert(req_id, OutboundReply::RaftReplaceVoter(reply));
+                        debug!(%target_peer, old_prefix, replacement_prefix,
+                            "network: sent RaftReplaceVoterReq");
+                    }
                     Some(NetworkCmd::SendManifestReq { target_peer, reply }) => {
                         let req_id = swarm
                             .behaviour_mut()
@@ -2716,6 +2788,62 @@ fn handle_req_resp(
                             let _ = response_tx.send((channel, Frame::RaftJoinResp { result }));
                         });
                     }
+                    Frame::RaftReplaceVoterReq {
+                        replication_id,
+                        old_prefix,
+                        old_peer,
+                        replacement_prefix,
+                        replacement_peer,
+                        operator_peer,
+                    } => {
+                        let Some(_permit) = sync_rate.acquire_raft_membership(peer) else {
+                            let _ = swarm.behaviour_mut().req_resp.send_response(
+                                channel,
+                                Frame::RaftReplaceVoterResp {
+                                    result: RaftReplaceVoterResult::Busy,
+                                },
+                            );
+                            return;
+                        };
+                        // Membership replacement touches durable Raft state
+                        // and may synchronously consult the registry/root
+                        // sidecar, so keep it off the swarm thread just like
+                        // join admission.
+                        let handler = raft_handlers.lock().ok().and_then(|g| {
+                            g.get(&replication_id)
+                                .map(|registration| registration.handler.clone())
+                        });
+                        let svc = service.get().cloned();
+                        let response_tx = response_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _permit = _permit;
+                            let identities = (
+                                PeerId::from_bytes(&old_peer),
+                                PeerId::from_bytes(&replacement_peer),
+                                PeerId::from_bytes(&operator_peer),
+                            );
+                            let result = match (handler, svc, identities) {
+                                (None, _, _) => RaftReplaceVoterResult::UnknownGroup,
+                                (
+                                    Some(handler),
+                                    Some(service),
+                                    (Ok(old_peer), Ok(replacement_peer), Ok(operator_peer)),
+                                ) => service.handle_raft_replace_voter(
+                                    peer,
+                                    operator_peer,
+                                    &replication_id,
+                                    old_prefix,
+                                    old_peer,
+                                    replacement_prefix,
+                                    replacement_peer,
+                                    handler.as_ref(),
+                                ),
+                                _ => RaftReplaceVoterResult::IdentityMismatch,
+                            };
+                            let _ =
+                                response_tx.send((channel, Frame::RaftReplaceVoterResp { result }));
+                        });
+                    }
                     Frame::ManifestReq => {
                         // Manifest handler just reads in-memory
                         // bytes; serve inline.
@@ -2883,6 +3011,12 @@ fn handle_req_resp(
                         let _ = tx.send(result);
                     }
                     (
+                        Frame::RaftReplaceVoterResp { result },
+                        Some(OutboundReply::RaftReplaceVoter(tx)),
+                    ) => {
+                        let _ = tx.send(result);
+                    }
+                    (
                         Frame::ManifestResp { toml_bytes, blobs },
                         Some(OutboundReply::Manifest(tx)),
                     ) => {
@@ -2968,9 +3102,14 @@ struct SyncRateLimiter {
     /// Private sidecar writes fsync bounded payloads and therefore receive a
     /// separate low-volume budget from read-only synchronization.
     private_ingress: HashMap<PeerId, (std::time::Instant, u32)>,
+    /// Operator membership requests can perform several bounded registry
+    /// probes and therefore share the same strict blocking-work discipline as
+    /// private ingress staging.
+    raft_membership: HashMap<PeerId, (std::time::Instant, u32)>,
     /// Global blocking-work cap. Per-peer limits alone do not stop a rotating
     /// set of Noise identities from exhausting the blocking executor.
     private_ingress_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    raft_membership_in_flight: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct PrivateIngressPermit(Arc<std::sync::atomic::AtomicUsize>);
@@ -2990,6 +3129,8 @@ const MAX_SYNC_FETCHES_PER_WINDOW: u32 = 1024;
 const MAX_PROGRAM_BLOB_FETCHES_PER_WINDOW: u32 = 16;
 const MAX_PRIVATE_INGRESS_STORES_PER_WINDOW: u32 = 8;
 const MAX_PRIVATE_INGRESS_STORES_IN_FLIGHT: usize = 16;
+const MAX_RAFT_MEMBERSHIP_REQUESTS_PER_WINDOW: u32 = 4;
+const MAX_RAFT_MEMBERSHIP_REQUESTS_IN_FLIGHT: usize = 8;
 /// Map-size threshold that triggers a sweep of expired windows, so a
 /// churn of one-shot PeerIds can't grow the table without bound.
 const SYNC_RATE_PRUNE_LEN: usize = 1024;
@@ -3027,6 +3168,25 @@ impl SyncRateLimiter {
             return None;
         }
         Some(PrivateIngressPermit(self.private_ingress_in_flight.clone()))
+    }
+
+    fn acquire_raft_membership(&mut self, peer: PeerId) -> Option<PrivateIngressPermit> {
+        if !Self::charge(
+            &mut self.raft_membership,
+            peer,
+            MAX_RAFT_MEMBERSHIP_REQUESTS_PER_WINDOW,
+        ) {
+            return None;
+        }
+        let in_flight = self
+            .raft_membership_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if in_flight >= MAX_RAFT_MEMBERSHIP_REQUESTS_IN_FLIGHT {
+            self.raft_membership_in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            return None;
+        }
+        Some(PrivateIngressPermit(self.raft_membership_in_flight.clone()))
     }
 
     /// Fixed-window charge against a per-peer counter map: reset a peer's count
@@ -4277,6 +4437,41 @@ mod tests {
         assert!(
             limiter.acquire_private_ingress(PeerId::random()).is_some(),
             "completed work releases its global permit",
+        );
+    }
+
+    #[test]
+    fn raft_membership_blocking_work_has_per_peer_and_global_bounds() {
+        let mut limiter = SyncRateLimiter::default();
+        let noisy_peer = PeerId::random();
+        let noisy_permits = (0..MAX_RAFT_MEMBERSHIP_REQUESTS_PER_WINDOW)
+            .map(|_| {
+                limiter
+                    .acquire_raft_membership(noisy_peer)
+                    .expect("work below the per-peer cap is admitted")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            limiter.acquire_raft_membership(noisy_peer).is_none(),
+            "one operator cannot monopolize blocking membership work",
+        );
+        drop(noisy_permits);
+
+        let permits = (0..MAX_RAFT_MEMBERSHIP_REQUESTS_IN_FLIGHT)
+            .map(|_| {
+                limiter
+                    .acquire_raft_membership(PeerId::random())
+                    .expect("work below the global cap is admitted")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            limiter.acquire_raft_membership(PeerId::random()).is_none(),
+            "rotating identities cannot exceed the global membership-work cap",
+        );
+        drop(permits);
+        assert!(
+            limiter.acquire_raft_membership(PeerId::random()).is_some(),
+            "completed membership work releases its global permit",
         );
     }
 
@@ -5628,7 +5823,11 @@ mod tests {
                         me,
                         members: vec![prefix_a, prefix_b, prefix_c],
                         replication_id: [0xC2; 32],
-                        election_timeout_ms: (50, 150),
+                        // This test also exercises a membership transition.
+                        // Leave enough election headroom for the parallel
+                        // library suite so CPU contention does not replace a
+                        // healthy leader between discovery and proposal.
+                        election_timeout_ms: (300, 600),
                         heartbeat_interval_ms: 20,
                     },
                     Some(network),
@@ -5734,9 +5933,12 @@ mod tests {
             .into_iter()
             .filter(|prefix| *prefix != leader_prefix)
             .collect::<Vec<_>>();
-        let joint_index = leader_handle
-            .change_membership(remaining.clone())
-            .expect("leader starts self-removal");
+        let replacement_prefix = remaining[0];
+        let joint_index =
+            match leader_handle.handle_replace_voter(&rep_id, leader_prefix, replacement_prefix) {
+                RaftReplaceVoterResult::Accepted { joint_index } => joint_index,
+                other => panic!("leader did not accept its authenticated replacement: {other:?}"),
+            };
         let until = StdInstant::now() + Duration::from_secs(10);
         loop {
             let leader_snapshot = leader_handle.snapshot();
@@ -5771,6 +5973,34 @@ mod tests {
                      remaining={remaining_snapshots:?}"
                 );
             }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        // A lost response/retry reaches whichever retained voter is now
+        // leader and observes a committed terminal disposition instead of
+        // starting another configuration change.
+        let until = StdInstant::now() + Duration::from_secs(5);
+        loop {
+            let complete = remaining.iter().find_map(|prefix| {
+                let handle = match *prefix {
+                    p if p == prefix_a => w_a.handler(),
+                    p if p == prefix_b => w_b.handler(),
+                    _ => w_c.handler(),
+                };
+                handle
+                    .snapshot()
+                    .filter(|snapshot| snapshot.role == Role::Leader)
+                    .map(|_| {
+                        handle.handle_replace_voter(&rep_id, leader_prefix, replacement_prefix)
+                    })
+            });
+            if complete == Some(RaftReplaceVoterResult::Complete) {
+                break;
+            }
+            assert!(
+                StdInstant::now() < until,
+                "replacement retry did not reach committed completion: {complete:?}"
+            );
             std::thread::sleep(Duration::from_millis(25));
         }
 

@@ -19,7 +19,9 @@ use std::sync::mpsc as std_mpsc;
 
 use libp2p::PeerId;
 
-use super::{ManifestReply, Network, NetworkCmd, RaftJoinResult, RaftStatusReply};
+use super::{
+    ManifestReply, Network, NetworkCmd, RaftJoinResult, RaftReplaceVoterResult, RaftStatusReply,
+};
 
 impl Network {
     /// Send a [`Frame::RaftJoinReq`] to a bootnode. The receiver
@@ -58,6 +60,36 @@ impl Network {
             replication_id,
             joiner_prefix,
             production_trust_policy,
+            reply: tx,
+        });
+        rx
+    }
+
+    /// Ask one replica to retire `old_prefix` after
+    /// `replacement_prefix` has joined. The complete identities are carried
+    /// beside the compact slots and checked against the destination's
+    /// registry. `operator_peer` is the original authenticated operator and
+    /// survives a voter-to-leader proxy hop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_raft_replace_voter_req(
+        &self,
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        old_prefix: u16,
+        old_peer: Vec<u8>,
+        replacement_prefix: u16,
+        replacement_peer: Vec<u8>,
+        operator_peer: Vec<u8>,
+    ) -> std_mpsc::Receiver<RaftReplaceVoterResult> {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self.cmd_tx.send(NetworkCmd::SendRaftReplaceVoter {
+            target_peer,
+            replication_id,
+            old_prefix,
+            old_peer,
+            replacement_prefix,
+            replacement_peer,
+            operator_peer,
             reply: tx,
         });
         rx

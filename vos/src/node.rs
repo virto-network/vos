@@ -1610,7 +1610,7 @@ where
         let Ok(peer) = libp2p::PeerId::from_bytes(&member.key) else {
             return false;
         };
-        if !node_member_authenticates_voter(&member, prefix, &peer) {
+        if !node_member_authenticates_active_slot(&member, prefix, &peer) {
             return false;
         }
         peers.push(peer);
@@ -2733,9 +2733,9 @@ impl NodeService {
         };
         let prefix = crate::network::derive_node_prefix(caller);
         status.is_active_voter(prefix)
-            && self
-                .lookup_node_member(prefix)
-                .is_some_and(|member| node_member_authenticates_voter(&member, prefix, caller))
+            && self.lookup_node_member(prefix).is_some_and(|member| {
+                node_member_authenticates_active_slot(&member, prefix, caller)
+            })
     }
 
     /// Render an agent's describe JSON by id (the `__describe` primitive's
@@ -2884,16 +2884,29 @@ fn registry_probe_u8(routes: &InvokeRoutes, payload: Vec<u8>) -> Option<u8> {
 /// membership check; the registry row supplies the non-truncatable identity
 /// needed for delegation authority.
 #[cfg(all(feature = "network", feature = "storage"))]
-fn node_member_authenticates_voter(
+fn node_member_authenticates_active_slot(
     member: &crate::registry::MemberRow,
     expected_prefix: u16,
     peer: &libp2p::PeerId,
 ) -> bool {
     member.kind == crate::registry::MEMBER_KIND_NODE
-        && member.role == crate::registry::NODE_ROLE_VOTER
+        && matches!(
+            member.role,
+            crate::registry::NODE_ROLE_VOTER | crate::registry::NODE_ROLE_OBSERVER
+        )
         && member.prefix == expected_prefix
         && crate::network::derive_node_prefix(peer) == expected_prefix
         && member.key == peer.to_bytes()
+}
+
+#[cfg(all(feature = "network", feature = "storage"))]
+fn node_member_authenticates_voter(
+    member: &crate::registry::MemberRow,
+    expected_prefix: u16,
+    peer: &libp2p::PeerId,
+) -> bool {
+    member.role == crate::registry::NODE_ROLE_VOTER
+        && node_member_authenticates_active_slot(member, expected_prefix, peer)
 }
 
 /// Bind a Raft leader hint to the complete registry-authenticated peer. The
@@ -2912,7 +2925,7 @@ fn authenticated_v2_raft_leader_peer(
         return None;
     }
     let peer = libp2p::PeerId::from_bytes(&member.key).ok()?;
-    node_member_authenticates_voter(member, leader_prefix, &peer).then_some(peer)
+    node_member_authenticates_active_slot(member, leader_prefix, &peer).then_some(peer)
 }
 
 /// Follow authority redirects without ever entering the network's generic
@@ -3563,7 +3576,7 @@ impl crate::network::NetworkService for NodeService {
         }
         let member = self.lookup_node_member(prefix)?;
         let peer = libp2p::PeerId::from_bytes(&member.key).ok()?;
-        node_member_authenticates_voter(&member, prefix, &peer).then_some(peer)
+        node_member_authenticates_active_slot(&member, prefix, &peer).then_some(peer)
     }
 
     /// Admit a Raft joiner only if it is enrolled as a `NODE_ROLE_VOTER`
@@ -3630,6 +3643,154 @@ impl crate::network::NetworkService for NodeService {
         // admission can race between the quiescence observation and the
         // joint-configuration proposal.
         handler.handle_join(replication_id, joiner_prefix)
+    }
+
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn handle_raft_replace_voter(
+        &self,
+        caller: libp2p::PeerId,
+        operator_peer: libp2p::PeerId,
+        replication_id: &[u8; 32],
+        old_prefix: u16,
+        old_peer: libp2p::PeerId,
+        replacement_prefix: u16,
+        replacement_peer: libp2p::PeerId,
+        handler: &dyn crate::network::RaftRpcHandler,
+    ) -> crate::network::RaftReplaceVoterResult {
+        use crate::network::RaftReplaceVoterResult;
+
+        let Some(status) = handler.local_status() else {
+            return RaftReplaceVoterResult::UnknownGroup;
+        };
+        let caller_prefix = crate::network::derive_node_prefix(&caller);
+        let caller_is_voter = status.is_active_voter(caller_prefix)
+            && self
+                .lookup_node_member(caller_prefix)
+                .is_some_and(|member| {
+                    node_member_authenticates_active_slot(&member, caller_prefix, &caller)
+                });
+        // The first hop is self-authenticated by Noise. A later hop may carry
+        // a distinct operator only when the forwarding caller is an exact
+        // current voter of this group.
+        if caller != operator_peer && !caller_is_voter {
+            return RaftReplaceVoterResult::NotAuthorized;
+        }
+        if self.lookup_caller_role(Some(&operator_peer)) < AUTH_ROLE_ADMIN {
+            return RaftReplaceVoterResult::NotAuthorized;
+        }
+        if crate::network::derive_node_prefix(&old_peer) != old_prefix
+            || crate::network::derive_node_prefix(&replacement_peer) != replacement_prefix
+        {
+            return RaftReplaceVoterResult::IdentityMismatch;
+        }
+        let old_matches = self.lookup_node_member(old_prefix).is_some_and(|member| {
+            node_member_authenticates_active_slot(&member, old_prefix, &old_peer)
+        });
+        let replacement_matches =
+            self.lookup_node_member(replacement_prefix)
+                .is_some_and(|member| {
+                    node_member_authenticates_voter(&member, replacement_prefix, &replacement_peer)
+                });
+        if !old_matches || !replacement_matches {
+            return RaftReplaceVoterResult::IdentityMismatch;
+        }
+
+        let proxy_once = |leader_prefix: u16| {
+            // A proxied request never proxies again. This bounds leadership
+            // churn to one exact-peer hop; the operator can safely retry the
+            // idempotent request through its connected daemon.
+            if caller != operator_peer {
+                return None;
+            }
+            let network = self
+                .shared_network
+                .lock()
+                .ok()
+                .and_then(|network| network.clone())?;
+            let leader = self.raft_voter_peer(replication_id, leader_prefix)?;
+            let reply = network.send_raft_replace_voter_req(
+                leader,
+                *replication_id,
+                old_prefix,
+                old_peer.to_bytes(),
+                replacement_prefix,
+                replacement_peer.to_bytes(),
+                operator_peer.to_bytes(),
+            );
+            reply.recv_timeout(V2_PRIVATE_INGRESS_STAGE_TIMEOUT).ok()
+        };
+
+        // Let the leader make the replacement-readiness observation. A
+        // follower may have a healthy exact route to its leader without a
+        // direct connection to the newly promoted replacement.
+        if status.role != crate::network::RaftRole::Leader {
+            return status.leader_hint.and_then(proxy_once).unwrap_or(
+                RaftReplaceVoterResult::NotLeader {
+                    leader_hint: status.leader_hint,
+                },
+            );
+        }
+
+        // Membership replication alone is not enough for a production
+        // replacement: the new machine must have applied at least the final
+        // configuration that admitted it before an old application replica is
+        // retired. Query the exact replacement PeerId, never the prefix map.
+        let replacement_status = self
+            .shared_network
+            .lock()
+            .ok()
+            .and_then(|network| network.clone())
+            .and_then(|network| {
+                if network.peer_id() == replacement_peer {
+                    network.local_raft_status_cached(replication_id)
+                } else {
+                    network
+                        .send_raft_status_req(replacement_peer, *replication_id)
+                        .recv_timeout(V2_PRIVATE_INGRESS_STAGE_TIMEOUT)
+                        .ok()
+                }
+            });
+        let replacement_ready = replacement_status.is_some_and(|status| {
+            status.present
+                && status.members.contains(&replacement_prefix)
+                && status.joint_old.is_none()
+                && status.active_config_index.is_some_and(|index| {
+                    index <= status.commit_index && index <= status.last_applied
+                })
+        });
+        if !replacement_ready {
+            return RaftReplaceVoterResult::ReplacementNotReady;
+        }
+
+        let route = self
+            .v2_private_ingress_routes
+            .read()
+            .ok()
+            .and_then(|routes| routes.get(replication_id).cloned());
+        let Some(route) = route else {
+            // This production surface is intentionally limited to v2 roots;
+            // legacy groups have no durable private-input quiescence contract.
+            return RaftReplaceVoterResult::UnknownGroup;
+        };
+        let Some(barrier) = route.barrier.try_acquire() else {
+            return RaftReplaceVoterResult::Busy;
+        };
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if route.quiescence_tx.try_send(reply_tx).is_err()
+            || reply_rx.recv_timeout(V2_PRIVATE_INGRESS_STAGE_TIMEOUT).ok() != Some(true)
+        {
+            return RaftReplaceVoterResult::Busy;
+        }
+        let result = handler.handle_replace_voter(replication_id, old_prefix, replacement_prefix);
+        drop(barrier);
+        match result {
+            RaftReplaceVoterResult::NotLeader {
+                leader_hint: Some(leader),
+            } => proxy_once(leader).unwrap_or(RaftReplaceVoterResult::NotLeader {
+                leader_hint: Some(leader),
+            }),
+            other => other,
+        }
     }
 }
 
@@ -8137,7 +8298,7 @@ fn raft_route_peer_is_current_leader(
     let Some(member) = lookup_node_member_from_routes(invoke_routes, prefix) else {
         return false;
     };
-    if !node_member_authenticates_voter(&member, prefix, &peer) {
+    if !node_member_authenticates_active_slot(&member, prefix, &peer) {
         return false;
     }
     network
@@ -8358,7 +8519,7 @@ fn authenticate_v2_raft_peer_candidate(
     }
     let member = lookup_node_member_from_routes_with_timeout(invoke_routes, prefix, budget)?;
     let peer = expected_peer.or_else(|| libp2p::PeerId::from_bytes(&member.key).ok())?;
-    node_member_authenticates_voter(&member, prefix, &peer).then_some((peer, member))
+    node_member_authenticates_active_slot(&member, prefix, &peer).then_some((peer, member))
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
@@ -18274,6 +18435,10 @@ mod tests {
             ..row
         };
         assert!(!node_member_authenticates_voter(&observer, prefix, &voter));
+        assert!(
+            node_member_authenticates_active_slot(&observer, prefix, &voter),
+            "a demoted retiring node remains authenticated only while consensus names its slot",
+        );
 
         let status = crate::network::RaftStatusReply {
             present: true,
@@ -18893,6 +19058,286 @@ mod tests {
         assert_eq!(handler.0.load(Ordering::Relaxed), 1);
         *service.shared_network.lock().unwrap() = None;
         drop(service);
+        Arc::try_unwrap(network).ok().unwrap().join();
+    }
+
+    #[test]
+    #[cfg(all(feature = "network", feature = "storage"))]
+    fn raft_voter_replacement_binds_identities_and_private_quiescence() {
+        use crate::actors::codec::Encode;
+        use crate::network::{
+            NetworkService, RaftAppendResult, RaftReplaceVoterResult, RaftRole, RaftStatusReply,
+        };
+        use crate::value::Value;
+        use std::sync::atomic::AtomicUsize;
+
+        struct ReplaceHandler(AtomicUsize, RaftStatusReply);
+        impl crate::network::RaftRpcHandler for ReplaceHandler {
+            fn local_status(&self) -> Option<RaftStatusReply> {
+                Some(self.1.clone())
+            }
+
+            fn append_entries(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                prev_log_index: u64,
+                _prev_log_term: u64,
+                _leader_commit: u64,
+                _entries: Vec<crate::network::RaftEntry>,
+            ) -> RaftAppendResult {
+                RaftAppendResult {
+                    term,
+                    success: false,
+                    match_index: prev_log_index,
+                }
+            }
+
+            fn request_vote(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                term: u64,
+                _last_log_index: u64,
+                _last_log_term: u64,
+            ) -> crate::network::RaftVoteResult {
+                crate::network::RaftVoteResult {
+                    term,
+                    vote_granted: false,
+                }
+            }
+
+            fn handle_replace_voter(
+                &self,
+                _replication_id: &[u8; 32],
+                _old_prefix: u16,
+                _replacement_prefix: u16,
+            ) -> RaftReplaceVoterResult {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                RaftReplaceVoterResult::Accepted { joint_index: 12 }
+            }
+        }
+
+        let operator = libp2p::PeerId::random();
+        let network = Arc::new(crate::network::Network::start(
+            crate::network::NetworkConfig::default(),
+        ));
+        let replacement = network.peer_id();
+        let old = loop {
+            let candidate = libp2p::PeerId::random();
+            if crate::network::derive_node_prefix(&candidate)
+                != crate::network::derive_node_prefix(&replacement)
+            {
+                break candidate;
+            }
+        };
+        let old_prefix = crate::network::derive_node_prefix(&old);
+        let replacement_prefix = crate::network::derive_node_prefix(&replacement);
+        let remote_replacement = loop {
+            let candidate = libp2p::PeerId::random();
+            let prefix = crate::network::derive_node_prefix(&candidate);
+            if prefix != old_prefix && prefix != replacement_prefix {
+                break candidate;
+            }
+        };
+        let remote_replacement_prefix = crate::network::derive_node_prefix(&remote_replacement);
+        let rows = vec![
+            crate::registry::MemberRow {
+                kind: crate::registry::MEMBER_KIND_NODE,
+                key: old.to_bytes(),
+                prefix: old_prefix,
+                // The CLI first demotes the retiring identity so no newly
+                // installed root can enroll it during the multi-root scan.
+                role: crate::registry::NODE_ROLE_OBSERVER,
+                proof_kind: 0,
+                proof_data: Vec::new(),
+            },
+            crate::registry::MemberRow {
+                kind: crate::registry::MEMBER_KIND_NODE,
+                key: replacement.to_bytes(),
+                prefix: replacement_prefix,
+                role: crate::registry::NODE_ROLE_VOTER,
+                proof_kind: 0,
+                proof_data: Vec::new(),
+            },
+            crate::registry::MemberRow {
+                kind: crate::registry::MEMBER_KIND_NODE,
+                key: remote_replacement.to_bytes(),
+                prefix: remote_replacement_prefix,
+                role: crate::registry::NODE_ROLE_VOTER,
+                proof_kind: 0,
+                proof_data: Vec::new(),
+            },
+        ];
+        let routes: InvokeRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let (registry_tx, registry_rx) = mpsc::channel::<InvokeRequest>();
+        routes
+            .lock()
+            .unwrap()
+            .insert(ServiceId::REGISTRY.0, registry_tx);
+        let registry_rows = rows.clone();
+        let registry = thread::spawn(move || {
+            while let Ok(request) = registry_rx.recv() {
+                let msg = intercepted_msg(&request.msg).unwrap();
+                let value = match msg.name.as_str() {
+                    "peer_role" => Value::U8(AUTH_ROLE_ADMIN),
+                    "members" => {
+                        let after = msg.args.get_bytes("after_key").unwrap();
+                        let wanted = if after.is_empty() {
+                            0
+                        } else {
+                            u16::from_be_bytes(after.try_into().unwrap()).saturating_add(1)
+                        };
+                        let page = crate::registry::MemberPage {
+                            members: registry_rows
+                                .iter()
+                                .filter(|row| row.prefix == wanted)
+                                .cloned()
+                                .collect(),
+                            next_kind: crate::registry::MEMBER_KIND_IDENTITY,
+                            next_key: Vec::new(),
+                            more: false,
+                        };
+                        Value::Bytes(page.encode())
+                    }
+                    other => panic!("unexpected registry probe {other}"),
+                };
+                assert!(request.reply.send(encode_invoke_envelope(
+                    crate::actors::run::STATUS_DONE,
+                    &[],
+                    &value.encode(),
+                )));
+            }
+        });
+        let service = lifecycle_service(
+            routes,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
+        );
+        let replication_id = [0x73; 32];
+        let (sidecar_tx, _sidecar_rx) = mpsc::sync_channel(1);
+        let (quiescence_tx, quiescence_rx) = mpsc::sync_channel(1);
+        let route = Arc::new(V2PrivateIngressRoute {
+            tx: sidecar_tx,
+            quiescence_tx,
+            barrier: V2PrivateIngressBarrier::new(),
+            production_trust_policy: None,
+        });
+        service
+            .v2_private_ingress_routes
+            .write()
+            .unwrap()
+            .insert(replication_id, route.clone());
+        let handler = Arc::new(ReplaceHandler(
+            AtomicUsize::new(0),
+            RaftStatusReply {
+                present: true,
+                role: RaftRole::Leader,
+                current_term: 3,
+                commit_index: 8,
+                last_applied: 8,
+                last_log_index: 8,
+                members: vec![old_prefix, replacement_prefix],
+                joint_old: None,
+                active_config_index: Some(4),
+                leader_hint: Some(old_prefix),
+            },
+        ));
+        network.register_raft_handler(replication_id, handler.clone());
+        *service.shared_network.lock().unwrap() = Some(network.clone());
+
+        let follower_handler = ReplaceHandler(
+            AtomicUsize::new(0),
+            RaftStatusReply {
+                role: RaftRole::Follower,
+                leader_hint: None,
+                ..handler.1.clone()
+            },
+        );
+        assert_eq!(
+            service.handle_raft_replace_voter(
+                operator,
+                operator,
+                &replication_id,
+                old_prefix,
+                old,
+                remote_replacement_prefix,
+                remote_replacement,
+                &follower_handler,
+            ),
+            RaftReplaceVoterResult::NotLeader { leader_hint: None },
+            "a follower redirects before requiring its own direct route to the replacement",
+        );
+
+        assert_eq!(
+            service.handle_raft_replace_voter(
+                libp2p::PeerId::random(),
+                operator,
+                &replication_id,
+                old_prefix,
+                old,
+                replacement_prefix,
+                replacement,
+                handler.as_ref(),
+            ),
+            RaftReplaceVoterResult::NotAuthorized,
+            "only the operator itself or an exact current-voter proxy may carry the request",
+        );
+
+        assert_eq!(
+            service.handle_raft_replace_voter(
+                operator,
+                operator,
+                &replication_id,
+                old_prefix,
+                replacement,
+                replacement_prefix,
+                old,
+                handler.as_ref(),
+            ),
+            RaftReplaceVoterResult::IdentityMismatch,
+            "swapping full identities must fail even though both slots are voters",
+        );
+
+        let admission = route.barrier.try_acquire().unwrap();
+        assert_eq!(
+            service.handle_raft_replace_voter(
+                operator,
+                operator,
+                &replication_id,
+                old_prefix,
+                old,
+                replacement_prefix,
+                replacement,
+                handler.as_ref(),
+            ),
+            RaftReplaceVoterResult::Busy,
+        );
+        assert_eq!(handler.0.load(Ordering::Relaxed), 0);
+        drop(admission);
+
+        let quiescence = thread::spawn(move || {
+            quiescence_rx.recv().unwrap().send(true).unwrap();
+        });
+        assert_eq!(
+            service.handle_raft_replace_voter(
+                operator,
+                operator,
+                &replication_id,
+                old_prefix,
+                old,
+                replacement_prefix,
+                replacement,
+                handler.as_ref(),
+            ),
+            RaftReplaceVoterResult::Accepted { joint_index: 12 },
+        );
+        quiescence.join().unwrap();
+        assert_eq!(handler.0.load(Ordering::Relaxed), 1);
+        *service.shared_network.lock().unwrap() = None;
+        drop(service);
+        registry.join().unwrap();
         Arc::try_unwrap(network).ok().unwrap().join();
     }
 

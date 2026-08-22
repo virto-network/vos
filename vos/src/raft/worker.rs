@@ -32,7 +32,7 @@ use redb::Database;
 use crate::commit::CommitError;
 use crate::network::{
     Network, RaftAppendResult, RaftEntry, RaftEntryKind, RaftInstallSnapshotResult, RaftJoinResult,
-    RaftRole, RaftRpcHandler, RaftStatusReply, RaftVoteResult,
+    RaftReplaceVoterResult, RaftRole, RaftRpcHandler, RaftStatusReply, RaftVoteResult,
 };
 
 use super::RaftMeta;
@@ -550,6 +550,73 @@ impl RaftRpcHandler for WorkerHandle {
             }
             Err(vos_raft::ChangeMembershipError::InProgress) => RaftJoinResult::Busy,
             Err(_) => RaftJoinResult::Busy,
+        }
+    }
+
+    fn handle_replace_voter(
+        &self,
+        _replication_id: &[u8; 32],
+        old_prefix: u16,
+        replacement_prefix: u16,
+    ) -> RaftReplaceVoterResult {
+        let Some(snap) = block_on(self.inner.snapshot()) else {
+            return RaftReplaceVoterResult::NotLeader { leader_hint: None };
+        };
+        if snap.role != vos_raft::Role::Leader {
+            return RaftReplaceVoterResult::NotLeader {
+                leader_hint: snap.leader_hint,
+            };
+        }
+        if old_prefix == replacement_prefix {
+            return RaftReplaceVoterResult::ReplacementNotReady;
+        }
+
+        if let Some(old_members) = &snap.joint_old {
+            // Idempotent retry of the same in-flight removal. The generic
+            // worker will append the final configuration after this joint
+            // entry commits, so the operator keeps polling/retrying.
+            if old_members.contains(&old_prefix)
+                && !snap.members.contains(&old_prefix)
+                && snap.members.contains(&replacement_prefix)
+            {
+                return RaftReplaceVoterResult::Accepted {
+                    joint_index: snap.active_config_index.unwrap_or(0),
+                };
+            }
+            return RaftReplaceVoterResult::Busy;
+        }
+
+        let config_is_committed = snap
+            .active_config_index
+            .is_some_and(|index| index <= snap.commit_index);
+        if !snap.members.contains(&old_prefix) {
+            return if config_is_committed && snap.members.contains(&replacement_prefix) {
+                RaftReplaceVoterResult::Complete
+            } else {
+                RaftReplaceVoterResult::ReplacementNotReady
+            };
+        }
+        if !config_is_committed || !snap.members.contains(&replacement_prefix) {
+            return RaftReplaceVoterResult::ReplacementNotReady;
+        }
+        if snap.members.len() <= 1 {
+            return RaftReplaceVoterResult::WouldEmpty;
+        }
+
+        let new_members = snap
+            .members
+            .iter()
+            .copied()
+            .filter(|prefix| *prefix != old_prefix)
+            .collect();
+        match block_on(self.inner.change_membership(new_members)) {
+            Ok(joint_index) => RaftReplaceVoterResult::Accepted { joint_index },
+            Err(vos_raft::ChangeMembershipError::NotLeader) => RaftReplaceVoterResult::NotLeader {
+                leader_hint: snap.leader_hint,
+            },
+            Err(vos_raft::ChangeMembershipError::EmptyConfig) => RaftReplaceVoterResult::WouldEmpty,
+            Err(vos_raft::ChangeMembershipError::InProgress) => RaftReplaceVoterResult::Busy,
+            Err(_) => RaftReplaceVoterResult::Busy,
         }
     }
 

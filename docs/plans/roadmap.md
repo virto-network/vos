@@ -164,13 +164,15 @@ stands in for the on-chain settlement venue Wave 2 makes real.
   program artifacts under the same daemon-held data lock. The pinned service
   and frozen Batch 70 authority now ship as one strictly verified release
   directory, and the physical Raft gate moves a stopped voter through an
-  offline archive into fresh machine roots before catch-up. The operator
-  procedure and safety preconditions for the guest-owned `UpgradeActor` path
-  are explicit in `docs/production-v2-operations.md`. Ordinary Local and Raft
-  roots now have an authenticated CLI/daemon entry point with exact retry and
-  restart recovery. Remaining product work is the canonical-authority binding
-  migration and new-identity voter removal (identity-preserving machine
-  replacement is gated today).
+  offline archive into fresh machine roots before catch-up. New-identity voter
+  replacement now uses full PeerIds, private-ingress quiescence, committed
+  final membership, and an idempotent multi-root CLI workflow. The operator
+  procedures and safety preconditions for both voter replacement and the
+  guest-owned `UpgradeActor` path are explicit in
+  `docs/production-v2-operations.md`. Ordinary Local and Raft roots now have an
+  authenticated CLI/daemon entry point with exact retry and restart recovery.
+  The remaining release-operations product item is the canonical-authority
+  binding migration.
 
 **Keystone fast-follows (non-blocking; merged code is green)**
 - Ristretto host precompiles remain outside the trusted proof boundary. The

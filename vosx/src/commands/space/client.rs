@@ -170,6 +170,11 @@ fn role_revoke_mutation(
 }
 
 impl DaemonClient {
+    fn daemon_peer_id(&self) -> anyhow::Result<libp2p::PeerId> {
+        libp2p::PeerId::from_str(&self.endpoint.peer_id)
+            .map_err(|error| anyhow::anyhow!("invalid daemon PeerId in endpoint: {error}"))
+    }
+
     /// Resolve `query` to a space, read its endpoint file, and
     /// dial the running daemon. Errors fast if no daemon is
     /// running or the dial fails.
@@ -589,15 +594,40 @@ impl DaemonClient {
             .node
             .network()
             .ok_or_else(|| anyhow::anyhow!("client has no network attached"))?;
-        let peer = net.peer_for_prefix(self.daemon_prefix).ok_or_else(|| {
-            anyhow::anyhow!(
-                "daemon peer (prefix {:#06x}) not connected",
-                self.daemon_prefix
-            )
-        })?;
+        // The endpoint records the full identity we dialled. Never resolve
+        // this management request through the collision-prone prefix map.
+        let peer = self.daemon_peer_id()?;
         net.send_raft_status_req(peer, replication_id)
             .recv_timeout(invoke_timeout())
             .map_err(|_| anyhow::anyhow!("no raft-status reply from daemon within timeout"))
+    }
+
+    /// Drive one idempotent production voter replacement through the daemon.
+    /// A follower proxies to its exact authenticated leader while preserving
+    /// this client's Noise-authenticated operator identity.
+    pub fn replace_raft_voter(
+        &self,
+        replication_id: [u8; 32],
+        old: &MemberRow,
+        replacement: &MemberRow,
+    ) -> anyhow::Result<vos::network::RaftReplaceVoterResult> {
+        let net = self
+            .node
+            .network()
+            .ok_or_else(|| anyhow::anyhow!("client has no network attached"))?;
+        let daemon = self.daemon_peer_id()?;
+        let operator = libp2p::PeerId::from(self.signer.public());
+        net.send_raft_replace_voter_req(
+            daemon,
+            replication_id,
+            old.prefix,
+            old.key.clone(),
+            replacement.prefix,
+            replacement.key.clone(),
+            operator.to_bytes(),
+        )
+        .recv_timeout(Duration::from_secs(60))
+        .map_err(|_| anyhow::anyhow!("no Raft voter-replacement reply within 60 seconds"))
     }
 
     /// Fetch the raw `.vos_meta` blob the registry has on file

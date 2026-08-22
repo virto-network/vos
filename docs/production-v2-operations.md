@@ -82,9 +82,38 @@ node catches up through ordinary Raft log or snapshot transfer.
 The archive preserves `node.key`, so the replacement has the same full Noise
 `PeerId` and compact Raft slot. Running the source and replacement concurrently
 would duplicate one consensus identity and is forbidden. To replace a voter
-with a *new* identity, first enroll and fully promote the new voter. Automated
-removal of the old identity is not yet an operator surface; removing only its
-registry row does not rewrite existing Raft configurations.
+with a *new* identity:
+
+1. enroll the new node as a voter and let it join every Raft root;
+2. on the new node, require `joint_old` to be absent,
+   `active_config_index <= commit_index`, and `last_applied >=
+   active_config_index` for every root;
+3. quiesce package publish/install operations and wait for the registry view on
+   every connected operator node to contain the same old and replacement NODE
+   bindings; the command scans one materialized catalog and must not race a new
+   root installed from a lagging view;
+4. stop the old daemon permanently; and
+5. through any surviving daemon, run:
+
+   ```sh
+   vosx space members <space> remove-node <OLD_PREFIX> \
+     --replacement <NEW_PREFIX>
+   ```
+
+The command uses the complete registry-bound PeerIds for both slots, not their
+16-bit prefixes as identity. It first demotes the old NODE row to observer so
+newly installed roots cannot enroll it, while existing groups continue to
+authenticate that exact identity until their membership no longer names it.
+It serializes each change with private-ingress
+admission, requires the replacement to be a committed voter, and waits for a
+committed final non-joint configuration before moving to the next Raft root.
+Only after every installed Raft root has retired the old slot does it remove
+the old NODE row from the registry. The multi-root operation is deliberately
+resumable rather than falsely atomic: if the command loses a reply or stops
+halfway, rerun the same command while the old registry row still exists.
+Completed roots return an idempotent terminal result; unfinished roots resume
+joint consensus. Never remove the registry row manually first, because that
+row is what authenticates the retiring slot during the transition.
 
 ## Frozen authority upgrades
 

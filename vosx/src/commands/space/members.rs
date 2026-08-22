@@ -7,6 +7,8 @@
 //! accepting it) is a separate consumer concern.
 
 use clap::Subcommand;
+use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 use vos::registry::{
     MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, NODE_ROLE_OBSERVER, NODE_ROLE_VOTER,
@@ -127,6 +129,10 @@ pub enum MembersCommand {
     RemoveNode {
         /// 16-bit prefix.
         prefix: u32,
+        /// Already-promoted voter that replaces this node in every Raft root.
+        /// Required when the retiring node is still in any active group.
+        #[arg(long, value_name = "PREFIX")]
+        replacement: Option<u32>,
     },
     /// Add an Identity member (a key that authors signed
     /// messages, gated by a Merkle/ZK inclusion proof).
@@ -163,7 +169,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             prefix,
             role,
         } => add_node(&args.space, &peer_id, prefix, &role),
-        MembersCommand::RemoveNode { prefix } => remove_node(&args.space, prefix),
+        MembersCommand::RemoveNode {
+            prefix,
+            replacement,
+        } => remove_node(&args.space, prefix, replacement),
         MembersCommand::AddIdentity {
             public_key,
             proof_kind,
@@ -308,24 +317,143 @@ fn add_node(
     })
 }
 
-fn remove_node(space: &str, prefix: u32) -> anyhow::Result<()> {
-    DaemonClient::with_connect(space, |client| match client.remove_node(prefix)? {
-        Status::Ok => {
-            if output::is_json() {
-                #[derive(Serialize)]
-                struct V {
-                    prefix: u16,
-                }
-                output::print_json(&V {
-                    prefix: prefix as u16,
-                });
-            } else {
-                println!("removed node prefix=0x{:04x}", prefix as u16);
+fn remove_node(space: &str, prefix: u32, replacement: Option<u32>) -> anyhow::Result<()> {
+    if prefix > u16::MAX as u32 {
+        anyhow::bail!("node prefix {prefix} exceeds u16");
+    }
+    if replacement.is_some_and(|replacement| replacement > u16::MAX as u32) {
+        anyhow::bail!("replacement prefix exceeds u16");
+    }
+    if replacement == Some(prefix) {
+        anyhow::bail!("replacement voter must differ from the retiring voter");
+    }
+
+    DaemonClient::with_connect(space, |client| {
+        let members = client.members()?;
+        let mut old = members
+            .iter()
+            .find(|row| row.kind == MEMBER_KIND_NODE && row.prefix == prefix as u16)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no node with prefix 0x{:04x}", prefix as u16))?;
+        let replacement_row = match replacement {
+            Some(replacement) => Some(
+                members
+                    .iter()
+                    .find(|row| {
+                        row.kind == MEMBER_KIND_NODE
+                            && row.role == NODE_ROLE_VOTER
+                            && row.prefix == replacement as u16
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("replacement 0x{replacement:04x} is not an enrolled voter")
+                    })?,
+            ),
+            None => None,
+        };
+
+        // A voter row is also the input used when configuring newly installed
+        // roots. Under the runbook's publish/install quiescence, demoting it
+        // before the scan ensures later installations cannot re-enrol the
+        // retiring slot. Existing groups continue authenticating its exact
+        // PeerId while their durable membership still names the slot.
+        if old.role == NODE_ROLE_VOTER {
+            match client.add_node(old.prefix as u32, old.key.clone(), NODE_ROLE_OBSERVER)? {
+                Status::Ok => old.role = NODE_ROLE_OBSERVER,
+                other => anyhow::bail!(
+                    "could not mark voter 0x{:04x} as retiring: add_node returned {other}",
+                    old.prefix,
+                ),
             }
-            Ok(())
         }
-        Status::NotFound => anyhow::bail!("no node with prefix 0x{:04x}", prefix as u16),
-        other => anyhow::bail!("remove_node returned status {other}"),
+        let raft_roots = client
+            .agents()?
+            .into_iter()
+            .filter(|agent| agent.consistency == 3)
+            .map(|agent| (agent.instance_name, agent.replication_id))
+            .collect::<Vec<_>>();
+
+        let mut active_roots = Vec::new();
+        for (name, replication_id) in &raft_roots {
+            let status = client.raft_status(*replication_id)?;
+            if !status.present {
+                anyhow::bail!(
+                    "daemon is not hosting Raft root '{name}'; run removal through a surviving voter"
+                );
+            }
+            if status.is_active_voter(old.prefix) {
+                active_roots.push((name.clone(), *replication_id));
+            }
+        }
+
+        if !active_roots.is_empty() {
+            let replacement = replacement_row.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "node 0x{:04x} is still a voter in {} Raft root(s); enroll and promote a replacement, then repeat with --replacement <prefix>",
+                    old.prefix,
+                    active_roots.len(),
+                )
+            })?;
+
+            // A catalog should not name the same replication group twice, but
+            // deduplicate defensively so a malformed/legacy row cannot make
+            // the operator race the same membership transition with itself.
+            let mut seen = BTreeSet::new();
+            for (name, replication_id) in active_roots {
+                if !seen.insert(replication_id) {
+                    continue;
+                }
+                let deadline = Instant::now() + Duration::from_secs(180);
+                loop {
+                    use vos::network::RaftReplaceVoterResult as Result;
+                    match client.replace_raft_voter(replication_id, &old, &replacement)? {
+                        Result::Complete => break,
+                        Result::Accepted { .. }
+                        | Result::Busy
+                        | Result::NotLeader { .. }
+                        | Result::UnknownGroup
+                        | Result::ReplacementNotReady
+                            if Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(250));
+                        }
+                        Result::NotAuthorized => anyhow::bail!(
+                            "operator is not authorized to replace voters in Raft root '{name}'"
+                        ),
+                        Result::IdentityMismatch => anyhow::bail!(
+                            "registry identity changed while replacing voter in Raft root '{name}'"
+                        ),
+                        Result::WouldEmpty => {
+                            anyhow::bail!("refused to leave Raft root '{name}' without a voter")
+                        }
+                        other => anyhow::bail!(
+                            "Raft root '{name}' did not commit voter replacement within 180 seconds (last result: {other:?})"
+                        ),
+                    }
+                }
+            }
+        }
+
+        match client.remove_node(prefix)? {
+            Status::Ok => {
+                if output::is_json() {
+                    #[derive(Serialize)]
+                    struct V {
+                        prefix: u16,
+                        replacement: Option<u16>,
+                    }
+                    output::print_json(&V {
+                        prefix: prefix as u16,
+                        replacement: replacement.map(|value| value as u16),
+                    });
+                } else {
+                    println!("removed node prefix=0x{:04x}", prefix as u16);
+                }
+                Ok(())
+            }
+            Status::NotFound => anyhow::bail!("no node with prefix 0x{:04x}", prefix as u16),
+            other => anyhow::bail!("remove_node returned status {other}"),
+        }
     })
 }
 
