@@ -977,6 +977,10 @@ enum RpcOutcome<N: NodeId> {
     Append {
         from: N,
         result: Option<AppendEntriesResp>,
+        /// Commit index carried by the exact request that produced this
+        /// response. A retired peer has learned finality only after
+        /// acknowledging a request at or beyond its final config index.
+        leader_commit: u64,
     },
     Vote {
         from: N,
@@ -1073,6 +1077,12 @@ where
     /// explicit lets a retiring leader recover the joint quorum after a crash
     /// without appending a duplicate final row.
     pending_joint_entry: Option<u64>,
+    /// Peers removed by a final configuration that still need one decisive
+    /// commit notification. They remain transport targets only and never
+    /// contribute to quorum or vote calculations. The live joint/final log
+    /// pair reconstructs this map after a crash and remains uncompacted until
+    /// each notice is acknowledged.
+    retiring_voters: BTreeMap<N, u64>,
     /// Index of the log or installed snapshot that established
     /// `effective_cfg`. `None` only for legacy persisted data that lacked
     /// provenance. Lets log-mutation paths
@@ -1242,6 +1252,9 @@ struct ConfigRecovery<N: NodeId> {
     /// `0` for static genesis membership, or `None` for legacy persisted
     /// data without provenance.
     active_config_index: Option<u64>,
+    /// Old-only voters from a live joint/final pair, keyed by the final
+    /// configuration index they still need to observe as committed.
+    retiring_voters: BTreeMap<N, u64>,
 }
 
 /// Walk the live log tail looking for the most recent
@@ -1287,15 +1300,8 @@ where
             )
         }) && let crate::log_entry::EntryKind::ConfigChange { joint_old, members } = &latest.kind
         {
-            // A retiring leader may have appended, but not committed, the
-            // final configuration that excludes itself. Recovering that final
-            // row as effective makes the old node ineligible to campaign,
-            // while the replacement still holds the preceding joint view and
-            // cannot elect itself. Retain the joint view until the final entry
-            // commits; the pending index tells auto-finalization to activate
-            // the already-appended final rather than append a duplicate.
-            if joint_old.is_none() && latest.index > commit_index && !members.contains(&cfg.me) {
-                let prior_joint = entries[..latest_pos].iter().rev().find_map(|entry| {
+            let prior_joint = if joint_old.is_none() {
+                let from_log = entries[..latest_pos].iter().rev().find_map(|entry| {
                     let crate::log_entry::EntryKind::ConfigChange {
                         joint_old: Some(old),
                         members: joint_members,
@@ -1303,7 +1309,7 @@ where
                     else {
                         return None;
                     };
-                    (joint_members == members && old.contains(&cfg.me)).then_some((
+                    (joint_members == members).then_some((
                         ActiveConfig {
                             current: joint_members.clone(),
                             joint_old: Some(old.clone()),
@@ -1311,10 +1317,10 @@ where
                         entry.index,
                     ))
                 });
-                let persisted_joint = if prior_joint.is_none() && consult_persisted {
+                if from_log.is_none() && consult_persisted {
                     storage.active_config().await?.and_then(|record| {
                         let old = record.joint_old?;
-                        (record.current == *members && old.contains(&cfg.me)).then_some((
+                        (record.current == *members).then_some((
                             ActiveConfig {
                                 current: record.current,
                                 joint_old: Some(old),
@@ -1323,13 +1329,41 @@ where
                         ))
                     })
                 } else {
-                    None
-                };
-                if let Some((active, active_index)) = prior_joint.or(persisted_joint) {
+                    from_log
+                }
+            } else {
+                None
+            };
+            let mut retiring_voters = BTreeMap::new();
+            if let Some((prior, _)) = &prior_joint
+                && let Some(old) = &prior.joint_old
+            {
+                for voter in old {
+                    if *voter != cfg.me && !members.contains(voter) {
+                        retiring_voters.insert(*voter, latest.index);
+                    }
+                }
+            }
+
+            // A retiring leader may have appended, but not committed, the
+            // final configuration that excludes itself. Recovering that final
+            // row as effective makes the old node ineligible to campaign,
+            // while the replacement still holds the preceding joint view and
+            // cannot elect itself. Retain the joint view until the final entry
+            // commits; the pending index tells auto-finalization to activate
+            // the already-appended final rather than append a duplicate.
+            if joint_old.is_none() && latest.index > commit_index && !members.contains(&cfg.me) {
+                if let Some((active, active_index)) = prior_joint
+                    && active
+                        .joint_old
+                        .as_ref()
+                        .is_some_and(|old| old.contains(&cfg.me))
+                {
                     return Ok(ConfigRecovery {
                         active,
                         pending_joint: Some(latest.index),
                         active_config_index: Some(active_index),
+                        retiring_voters,
                     });
                 }
             }
@@ -1347,6 +1381,7 @@ where
                 active,
                 pending_joint,
                 active_config_index: Some(latest.index),
+                retiring_voters,
             });
         }
     }
@@ -1363,12 +1398,14 @@ where
             },
             pending_joint: None,
             active_config_index: record.log_index,
+            retiring_voters: BTreeMap::new(),
         });
     }
     Ok(ConfigRecovery {
         active: ActiveConfig::steady(cfg.members.clone()),
         pending_joint: None,
         active_config_index: Some(0),
+        retiring_voters: BTreeMap::new(),
     })
 }
 
@@ -1491,6 +1528,7 @@ where
         incoming_snapshot: None,
         effective_cfg: recovery.active,
         pending_joint_entry: recovery.pending_joint,
+        retiring_voters: recovery.retiring_voters,
         active_config_index: recovery.active_config_index,
         current_term_first_index: None,
         seen_leader: None,
@@ -1715,8 +1753,9 @@ async fn handle_rpc_outcome<N, S, T, C, R, A>(
         RpcOutcome::Append {
             from,
             result: Some(resp),
+            leader_commit,
         } => {
-            let _ = handle_append_response(state, from, resp).await;
+            let _ = handle_append_response(state, from, resp, leader_commit).await;
         }
         RpcOutcome::Vote {
             from,
@@ -1914,10 +1953,41 @@ where
     // values via `meta_snapshot` rollback.
     let mut active_config_for_batch: Option<ActiveConfigRecord<N>> = None;
     let mut post_active_view: Option<(ActiveConfig<N>, Option<u64>, Option<u64>)> = None;
+    let mut retiring_after_batch = state.retiring_voters.clone();
+    if let Some(truncate) = truncate_after {
+        retiring_after_batch.retain(|_, final_index| *final_index <= truncate);
+    }
     if appended_a_config {
         for (i, e) in req.entries.iter().enumerate().rev() {
             if let crate::log_entry::EntryKind::ConfigChange { joint_old, members } = &e.kind {
                 let entry_index = req.prev_log_index + 1 + i as u64;
+                if joint_old.is_none() {
+                    let prior_old = state
+                        .effective_cfg
+                        .joint_old
+                        .as_ref()
+                        .filter(|_| state.effective_cfg.current == *members)
+                        .cloned()
+                        .or_else(|| {
+                            req.entries[..i].iter().rev().find_map(|prior| {
+                                let crate::log_entry::EntryKind::ConfigChange {
+                                    joint_old: Some(old),
+                                    members: joint_members,
+                                } = &prior.kind
+                                else {
+                                    return None;
+                                };
+                                (joint_members == members).then_some(old.clone())
+                            })
+                        });
+                    if let Some(old) = prior_old {
+                        for voter in old {
+                            if voter != state.cfg.me && !members.contains(&voter) {
+                                retiring_after_batch.insert(voter, entry_index);
+                            }
+                        }
+                    }
+                }
                 let active = ActiveConfig {
                     current: members.clone(),
                     joint_old: joint_old.clone(),
@@ -2040,6 +2110,8 @@ where
         state.fire_apply_notification();
     }
 
+    let retiring_changed = retiring_after_batch != state.retiring_voters;
+    state.retiring_voters = retiring_after_batch;
     if let Some((active, idx, pending)) = post_active_view {
         state.effective_cfg = active;
         state.active_config_index = idx;
@@ -2054,6 +2126,8 @@ where
         } else {
             None
         };
+    } else if retiring_changed {
+        rebuild_leader_tracking(state);
     }
 
     Ok(AppendEntriesResp {
@@ -2388,6 +2462,13 @@ where
         state.meta = meta_snapshot;
         return Err(e);
     }
+    // Any locally reconstructed notice at or below the installed snapshot is
+    // superseded with its source log pair. A leader with a genuinely pending
+    // notice pins compaction below that pair, so an authoritative snapshot can
+    // cross this boundary only after the notice has been acknowledged.
+    state
+        .retiring_voters
+        .retain(|_, final_index| *final_index > req.last_included_index);
     if let Some(cfg) = new_effective_cfg {
         state.effective_cfg = cfg;
         // Preserve the exact configuration provenance supplied by the
@@ -2427,6 +2508,7 @@ async fn handle_append_response<N, S, T, C, R, A>(
     state: &mut WorkerState<N, S, T, C, R, A>,
     from: N,
     resp: AppendEntriesResp,
+    sent_leader_commit: u64,
 ) -> Result<(), S::Error>
 where
     N: NodeId,
@@ -2466,6 +2548,17 @@ where
         // commit_index of one or more pending read_index
         // requests. Resolve any that meet the threshold.
         try_resolve_pending_reads(state).await;
+        let learned_final = state
+            .retiring_voters
+            .get(&from)
+            .copied()
+            .is_some_and(|final_index| {
+                sent_leader_commit >= final_index && resp.match_index >= final_index
+            });
+        if learned_final {
+            state.retiring_voters.remove(&from);
+            rebuild_leader_tracking(state);
+        }
     } else {
         let cur = leader.next_index.get(&from).copied().unwrap_or(1);
         let new_next = cur.saturating_sub(1).max(1);
@@ -2748,7 +2841,8 @@ where
 /// After the active configuration changes (joint entry
 /// adopted, joint entry truncated, or auto-progression to
 /// non-joint), refresh `LeaderState`'s per-peer maps so newly
-/// added members get tracked and removed members are dropped.
+/// added members and pending finality-notice recipients are tracked, while
+/// fully retired members are dropped.
 fn rebuild_leader_tracking<N, S, T, C, R, A>(state: &mut WorkerState<N, S, T, C, R, A>)
 where
     N: NodeId,
@@ -2763,7 +2857,10 @@ where
     let Some(leader) = state.leader.as_mut() else {
         return;
     };
-    let members = state.effective_cfg.all_members();
+    let mut members = state.effective_cfg.all_members();
+    members.extend(state.retiring_voters.keys().copied());
+    members.sort_unstable();
+    members.dedup();
     // Add tracking for any newly-known peer.
     for m in &members {
         if *m == me {
@@ -2772,8 +2869,8 @@ where
         leader.next_index.entry(*m).or_insert(last + 1);
         leader.match_index.entry(*m).or_insert(0);
     }
-    // Drop tracking for peers that left the active configuration
-    // entirely.
+    // Drop tracking only after a peer has left the active configuration and
+    // acknowledged its finality notice.
     leader.next_index.retain(|m, _| members.contains(m));
     leader.match_index.retain(|m, _| members.contains(m));
     leader.snapshot_send.retain(|m, _| members.contains(m));
@@ -2959,6 +3056,7 @@ where
     state.votes_received.clear();
     let members = state.effective_cfg.all_members();
     state.leader = Some(LeaderState::fresh(&members, state.cfg.me, last));
+    rebuild_leader_tracking(state);
     // Self-as-leader: surface through `WorkerSnapshot::leader_hint`
     // so `vosx ps` and join-RPC handlers can answer "the leader
     // is us" without inspecting `role` separately.
@@ -3160,6 +3258,7 @@ where
     // Append the final non-joint entry.
     let term = state.meta.current_term;
     let new_index = state.storage.last_index() + 1;
+    let retiring = joint_old.unwrap_or_default();
     let final_members = members;
     let entry = LogEntry {
         index: new_index,
@@ -3176,6 +3275,11 @@ where
             ..Default::default()
         })
         .await?;
+    for voter in retiring {
+        if voter != state.cfg.me && !final_members.contains(&voter) {
+            state.retiring_voters.insert(voter, new_index);
+        }
+    }
     // Keep the joint view effective and persisted until this exact final row
     // commits. If the retiring leader crashes now, boot recovery can campaign
     // under the joint quorum and replicate the already-appended final row.
@@ -3218,10 +3322,14 @@ where
         None => return Ok(()),
     };
 
-    // Heartbeat to every member of the active configuration —
-    // joint mode includes both old and new sets so quorum from
-    // BOTH can advance commit_index during the transition.
-    let peers = state.effective_cfg.all_members();
+    // Heartbeat to every member of the active configuration. Joint mode
+    // includes both sets for quorum. Recently retired voters are transport-
+    // only recipients until they acknowledge the committed final row; their
+    // match indices never participate in the active configuration's quorum.
+    let mut peers = state.effective_cfg.all_members();
+    peers.extend(state.retiring_voters.keys().copied());
+    peers.sort_unstable();
+    peers.dedup();
     for peer in peers {
         if peer == me {
             continue;
@@ -3327,7 +3435,11 @@ where
         let transport = state.transport.clone();
         let fut: RpcFut<N> = Box::pin(async move {
             let result = transport.send_append(peer, req).await.ok();
-            RpcOutcome::Append { from: peer, result }
+            RpcOutcome::Append {
+                from: peer,
+                result,
+                leader_commit,
+            }
         });
         pending.push(fut);
     }
@@ -3383,7 +3495,14 @@ where
         .applied_index()
         .await?
         .unwrap_or(committed_floor);
-    let floor = committed_floor.min(applied_floor);
+    let mut floor = committed_floor.min(applied_floor);
+    if let Some(final_index) = state.retiring_voters.values().copied().min() {
+        // Keep the joint/final pair (`final_index - 1`, `final_index`) live so
+        // a crash can reconstruct outstanding finality notices. Once every
+        // retired peer acknowledges the final commit, ordinary compaction is
+        // free to pass this boundary.
+        floor = floor.min(final_index.saturating_sub(2));
+    }
     let snap = state.storage.snap_last_index();
     if floor <= snap || floor.saturating_sub(snap) < state.cfg.compact_hysteresis {
         return Ok(());

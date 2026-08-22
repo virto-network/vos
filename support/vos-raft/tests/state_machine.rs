@@ -2256,6 +2256,111 @@ fn retiring_follower_activates_final_from_leader_commit() {
     worker.shutdown();
 }
 
+/// If the replacement received the final row before the old leader crashed,
+/// it can elect itself from the final configuration. It must nevertheless
+/// keep the retiring peer as a transport-only target long enough to deliver
+/// the committed final index; otherwise the old endpoint remains permanently
+/// joint and cannot report the terminal replacement disposition.
+#[test]
+fn replacement_leader_notifies_a_recovered_retiring_follower() {
+    use vos_raft::ActiveConfigRecord;
+
+    const OLD: u16 = 1;
+    const NEW: u16 = 2;
+    const TERM: u64 = 7;
+
+    let crashed_image = || {
+        let mut storage = MemStorage::<u16>::new();
+        block_on(storage.commit_batch(WriteBatch {
+            appends: vec![
+                LogEntry::data(1, TERM, b"pre-transition".to_vec()),
+                LogEntry::config_change(2, TERM, Some(vec![OLD, NEW]), vec![NEW]),
+                LogEntry::config_change(3, TERM, None, vec![NEW]),
+            ],
+            meta: Some(Meta {
+                current_term: TERM,
+                voted_for: None,
+                commit_index: 2,
+                snap_last_index: 0,
+                snap_last_term: 0,
+            }),
+            // Model both sides having persisted the speculative final view.
+            // Recovery treats OLD and NEW differently: OLD retains joint
+            // election eligibility, while NEW may lead under the final set.
+            active_config: Some(ActiveConfigRecord {
+                log_index: Some(3),
+                current: vec![NEW],
+                joint_old: None,
+            }),
+            ..Default::default()
+        }))
+        .unwrap();
+        storage
+    };
+
+    let old_storage = crashed_image();
+    let new_storage = crashed_image();
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+
+    let mut old_cfg = cfg(OLD, vec![OLD, NEW]);
+    old_cfg.pre_vote = false;
+    old_cfg.election_timeout_ms = (500, 600);
+    let old = Worker::spawn_with(
+        old_storage,
+        transport.clone(),
+        old_cfg,
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    old.wait_init().expect("old worker recovers");
+    routes.lock().unwrap().insert(OLD, old.handler());
+
+    let mut new_cfg = cfg(NEW, vec![OLD, NEW]);
+    new_cfg.pre_vote = false;
+    new_cfg.election_timeout_ms = (80, 100);
+    let new = Worker::spawn_with(
+        new_storage,
+        transport,
+        new_cfg,
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    new.wait_init().expect("replacement worker recovers");
+    routes.lock().unwrap().insert(NEW, new.handler());
+
+    let old_before = block_on(old.handler().snapshot()).unwrap();
+    let new_before = block_on(new.handler().snapshot()).unwrap();
+    assert!(old_before.joint_old.is_some());
+    assert!(new_before.joint_old.is_none());
+
+    wait_until(
+        || {
+            let old_snapshot = block_on(old.handler().snapshot());
+            let new_snapshot = block_on(new.handler().snapshot());
+            matches!(
+                (old_snapshot, new_snapshot),
+                (Some(old), Some(new))
+                    if new.role == Role::Leader
+                        && new.commit_index >= 3
+                        && new.members == vec![NEW]
+                        && new.joint_old.is_none()
+                        && old.commit_index >= 3
+                        && old.members == vec![NEW]
+                        && old.joint_old.is_none()
+                        && old.active_config_index == Some(3)
+            )
+        },
+        Duration::from_secs(8),
+        "replacement leader delivers finality to retiring follower",
+    );
+
+    old.shutdown();
+    new.shutdown();
+}
+
 /// `change_membership` called against a follower returns
 /// `NotLeader`. The caller is expected to forward the request
 /// to the cluster's current leader.
