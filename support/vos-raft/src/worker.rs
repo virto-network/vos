@@ -1982,6 +1982,44 @@ where
             post_active_view = Some((fallback, Some(0), None));
         }
     }
+
+    // Recovery can deliberately retain the joint view while an already-
+    // appended final row is still speculative. A later heartbeat may advance
+    // `leader_commit` across that row without appending another config entry.
+    // Activate the final view in the SAME batch as the commit-index advance;
+    // otherwise the follower can durably report commit_index >= final while
+    // continuing to authenticate and schedule against the preceding joint
+    // configuration forever. Do not inspect a pending row that this request
+    // is about to truncate.
+    let committed_pending_entry = if post_active_view.is_none()
+        && state.effective_cfg.is_joint()
+        && let Some(pending_idx) = state.pending_joint_entry
+        && pending_idx <= state.meta.commit_index
+        && truncate_after.is_none_or(|truncate| truncate >= pending_idx)
+    {
+        match state.storage.entries(pending_idx, pending_idx).await {
+            Ok(entries) => entries.into_iter().next().map(|entry| (pending_idx, entry)),
+            Err(error) => {
+                state.meta = meta_snapshot;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    if let Some((pending_idx, pending_entry)) = committed_pending_entry
+        && let crate::log_entry::EntryKind::ConfigChange {
+            joint_old: None,
+            members,
+        } = pending_entry.kind
+    {
+        active_config_for_batch = Some(ActiveConfigRecord {
+            log_index: Some(pending_idx),
+            current: members.clone(),
+            joint_old: None,
+        });
+        post_active_view = Some((ActiveConfig::steady(members), Some(pending_idx), None));
+    }
     if let Err(e) = state
         .storage
         .commit_batch(WriteBatch {

@@ -2178,6 +2178,84 @@ fn retiring_leader_recovers_uncommitted_final_configuration() {
     new.shutdown();
 }
 
+/// A recovered retiring replica can remain a follower while the surviving
+/// leader commits the final row. Advancing `leader_commit` across that
+/// already-present row must retire the local joint view even though the
+/// heartbeat appends no new `ConfigChange`.
+#[test]
+fn retiring_follower_activates_final_from_leader_commit() {
+    use vos_raft::ActiveConfigRecord;
+
+    const OLD: u16 = 1;
+    const NEW: u16 = 2;
+    const TERM: u64 = 7;
+
+    let mut storage = MemStorage::<u16>::new();
+    block_on(storage.commit_batch(WriteBatch {
+        appends: vec![
+            LogEntry::data(1, TERM, b"pre-transition".to_vec()),
+            LogEntry::config_change(2, TERM, Some(vec![OLD, NEW]), vec![NEW]),
+            LogEntry::config_change(3, TERM, None, vec![NEW]),
+        ],
+        meta: Some(Meta {
+            current_term: TERM,
+            voted_for: None,
+            commit_index: 2,
+            snap_last_index: 0,
+            snap_last_term: 0,
+        }),
+        active_config: Some(ActiveConfigRecord {
+            log_index: Some(3),
+            current: vec![NEW],
+            joint_old: None,
+        }),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes));
+    let mut config = cfg(OLD, vec![OLD, NEW]);
+    config.pre_vote = false;
+    config.election_timeout_ms = (5_000, 6_000);
+    let worker = Worker::spawn_with(
+        storage,
+        transport,
+        config,
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    worker.wait_init().expect("retiring follower recovers");
+
+    let before = block_on(worker.handler().snapshot()).expect("snapshot before commit notice");
+    assert_eq!(before.commit_index, 2);
+    assert_eq!(before.members, vec![NEW]);
+    assert_eq!(before.joint_old, Some(vec![OLD, NEW]));
+    assert_eq!(before.active_config_index, Some(2));
+
+    let response = block_on(worker.handler().handle_inbound_append(
+        NEW,
+        AppendEntriesReq {
+            leader: NEW,
+            term: TERM,
+            prev_log_index: 3,
+            prev_log_term: TERM,
+            leader_commit: 3,
+            entries: Vec::new(),
+        },
+    ));
+    assert!(response.success, "commit heartbeat must be accepted");
+
+    let after = block_on(worker.handler().snapshot()).expect("snapshot after commit notice");
+    assert_eq!(after.commit_index, 3);
+    assert_eq!(after.members, vec![NEW]);
+    assert_eq!(after.joint_old, None);
+    assert_eq!(after.active_config_index, Some(3));
+
+    worker.shutdown();
+}
+
 /// `change_membership` called against a follower returns
 /// `NotLeader`. The caller is expected to forward the request
 /// to the cluster's current leader.
