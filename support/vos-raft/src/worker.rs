@@ -2971,6 +2971,21 @@ where
     // Append the final non-joint ConfigChange entry; leader
     // stays leader through the transition.
     auto_finalize_joint_config(state).await?;
+    // A leader removed by the final configuration must remain leader until
+    // that exact final entry commits. Stepping down when it is merely appended
+    // strands a two-voter {old,new} -> {new} transition: the replacement has
+    // not necessarily received the newer entry yet, while the old node's log
+    // is too new to grant it a vote. Once committed, the new configuration is
+    // authoritative and the retired node can safely stop leading.
+    let final_config_committed = state
+        .active_config_index
+        .is_some_and(|index| index <= state.meta.commit_index);
+    if state.role == Role::Leader
+        && final_config_committed
+        && !state.effective_cfg.all_members().contains(&state.cfg.me)
+    {
+        step_down(state);
+    }
     Ok(())
 }
 
@@ -3034,8 +3049,6 @@ where
             ..Default::default()
         })
         .await?;
-    let me = state.cfg.me;
-    let me_was_voter = final_members.contains(&me);
     state.effective_cfg = ActiveConfig::steady(final_members);
     // Joint phase retired — clear the pending index so a
     // subsequent change_membership starts fresh.
@@ -3052,16 +3065,9 @@ where
     // next heartbeat ack will advance commit_index for the
     // multi-node case; solo finalize-and-commit is one beat
     // late, which is acceptable.)
-    // If the membership change removed us from the new
-    // configuration, retire (Ongaro thesis §4.3): the leader
-    // keeps serving long enough to replicate the final
-    // non-joint entry, then steps down so the next leader
-    // emerges from the new set. Without this the removed
-    // leader runs forever, blocking elections in the new set
-    // until its term-mismatch eventually wins out.
-    if !me_was_voter {
-        step_down(state);
-    }
+    // Do not step down merely because the final configuration was appended.
+    // `try_advance_commit_index` retires a removed leader only after this
+    // exact entry commits under the active quorum rules.
     Ok(())
 }
 

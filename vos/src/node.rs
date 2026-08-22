@@ -2909,6 +2909,45 @@ fn node_member_authenticates_voter(
         && node_member_authenticates_active_slot(member, expected_prefix, peer)
 }
 
+#[cfg(all(feature = "network", feature = "storage"))]
+#[allow(clippy::too_many_arguments)]
+fn verifies_raft_voter_replacement_operator(
+    operator: &libp2p::PeerId,
+    replication_id: &[u8; 32],
+    old_prefix: u16,
+    old_peer: &libp2p::PeerId,
+    replacement_prefix: u16,
+    replacement_peer: &libp2p::PeerId,
+    operation_epoch: u64,
+    signature: &[u8; 64],
+) -> bool {
+    let Some(public_key) = crate::registry::ed25519_pubkey_from_peer_id(&operator.to_bytes())
+    else {
+        return false;
+    };
+    let message = crate::registry::raft_voter_replacement_signed_bytes(
+        replication_id,
+        old_prefix,
+        &old_peer.to_bytes(),
+        replacement_prefix,
+        &replacement_peer.to_bytes(),
+        operation_epoch,
+    );
+    let provider = futures_rustls::rustls::crypto::ring::default_provider();
+    let Some(verifier) = provider
+        .signature_verification_algorithms
+        .mapping
+        .iter()
+        .find(|(scheme, _)| *scheme == futures_rustls::rustls::SignatureScheme::ED25519)
+        .and_then(|(_, algorithms)| algorithms.first())
+    else {
+        return false;
+    };
+    verifier
+        .verify_signature(&public_key, &message, signature)
+        .is_ok()
+}
+
 /// Bind a Raft leader hint to the complete registry-authenticated peer. The
 /// network's prefix map is deliberately absent: a colliding connected peer
 /// must never participate in authority finality or response selection.
@@ -3655,6 +3694,8 @@ impl crate::network::NetworkService for NodeService {
         old_peer: libp2p::PeerId,
         replacement_prefix: u16,
         replacement_peer: libp2p::PeerId,
+        operation_epoch: u64,
+        operator_signature: [u8; 64],
         handler: &dyn crate::network::RaftRpcHandler,
     ) -> crate::network::RaftReplaceVoterResult {
         use crate::network::RaftReplaceVoterResult;
@@ -3675,6 +3716,18 @@ impl crate::network::NetworkService for NodeService {
         if caller != operator_peer && !caller_is_voter {
             return RaftReplaceVoterResult::NotAuthorized;
         }
+        if !verifies_raft_voter_replacement_operator(
+            &operator_peer,
+            replication_id,
+            old_prefix,
+            &old_peer,
+            replacement_prefix,
+            &replacement_peer,
+            operation_epoch,
+            &operator_signature,
+        ) {
+            return RaftReplaceVoterResult::NotAuthorized;
+        }
         if self.lookup_caller_role(Some(&operator_peer)) < AUTH_ROLE_ADMIN {
             return RaftReplaceVoterResult::NotAuthorized;
         }
@@ -3693,6 +3746,17 @@ impl crate::network::NetworkService for NodeService {
                 });
         if !old_matches || !replacement_matches {
             return RaftReplaceVoterResult::IdentityMismatch;
+        }
+        // A fresh replacement begins only against the exact committed steady
+        // configuration the operator observed and signed. Once that exact
+        // transition is joint or complete, the same signature remains valid
+        // for idempotent polling. Re-enrolling the old voter creates a newer
+        // configuration index and invalidates the historical authorization.
+        if status.joint_old.is_none()
+            && status.members.contains(&old_prefix)
+            && status.active_config_index != Some(operation_epoch)
+        {
+            return RaftReplaceVoterResult::NotAuthorized;
         }
 
         let proxy_once = |leader_prefix: u16| {
@@ -3716,6 +3780,8 @@ impl crate::network::NetworkService for NodeService {
                 replacement_prefix,
                 replacement_peer.to_bytes(),
                 operator_peer.to_bytes(),
+                operation_epoch,
+                operator_signature,
             );
             reply.recv_timeout(V2_PRIVATE_INGRESS_STAGE_TIMEOUT).ok()
         };
@@ -19119,7 +19185,8 @@ mod tests {
             }
         }
 
-        let operator = libp2p::PeerId::random();
+        let operator_key = libp2p::identity::Keypair::generate_ed25519();
+        let operator = libp2p::PeerId::from(operator_key.public());
         let network = Arc::new(crate::network::Network::start(
             crate::network::NetworkConfig::default(),
         ));
@@ -19142,6 +19209,28 @@ mod tests {
             }
         };
         let remote_replacement_prefix = crate::network::derive_node_prefix(&remote_replacement);
+        let operation_epoch = 4;
+        let sign_replacement =
+            |replacement_prefix: u16, replacement_peer: &libp2p::PeerId, epoch: u64| -> [u8; 64] {
+                let message = crate::registry::raft_voter_replacement_signed_bytes(
+                    &[0x73; 32],
+                    old_prefix,
+                    &old.to_bytes(),
+                    replacement_prefix,
+                    &replacement_peer.to_bytes(),
+                    epoch,
+                );
+                operator_key.sign(&message).unwrap().try_into().unwrap()
+            };
+        let operator_signature =
+            sign_replacement(replacement_prefix, &replacement, operation_epoch);
+        let remote_operator_signature = sign_replacement(
+            remote_replacement_prefix,
+            &remote_replacement,
+            operation_epoch,
+        );
+        let stale_operator_signature =
+            sign_replacement(replacement_prefix, &replacement, operation_epoch - 1);
         let rows = vec![
             crate::registry::MemberRow {
                 kind: crate::registry::MEMBER_KIND_NODE,
@@ -19264,10 +19353,29 @@ mod tests {
                 old,
                 remote_replacement_prefix,
                 remote_replacement,
+                operation_epoch,
+                remote_operator_signature,
                 &follower_handler,
             ),
             RaftReplaceVoterResult::NotLeader { leader_hint: None },
             "a follower redirects before requiring its own direct route to the replacement",
+        );
+
+        assert_eq!(
+            service.handle_raft_replace_voter(
+                operator,
+                operator,
+                &replication_id,
+                old_prefix,
+                old,
+                replacement_prefix,
+                replacement,
+                operation_epoch - 1,
+                stale_operator_signature,
+                handler.as_ref(),
+            ),
+            RaftReplaceVoterResult::NotAuthorized,
+            "an authorization from an older membership epoch cannot start a new transition",
         );
 
         assert_eq!(
@@ -19279,10 +19387,29 @@ mod tests {
                 old,
                 replacement_prefix,
                 replacement,
+                operation_epoch,
+                operator_signature,
                 handler.as_ref(),
             ),
             RaftReplaceVoterResult::NotAuthorized,
             "only the operator itself or an exact current-voter proxy may carry the request",
+        );
+
+        assert_eq!(
+            service.handle_raft_replace_voter(
+                old,
+                operator,
+                &replication_id,
+                old_prefix,
+                old,
+                replacement_prefix,
+                replacement,
+                operation_epoch,
+                [0u8; 64],
+                handler.as_ref(),
+            ),
+            RaftReplaceVoterResult::NotAuthorized,
+            "a current voter cannot claim a known admin without that admin's signature",
         );
 
         assert_eq!(
@@ -19294,10 +19421,12 @@ mod tests {
                 replacement,
                 replacement_prefix,
                 old,
+                operation_epoch,
+                operator_signature,
                 handler.as_ref(),
             ),
-            RaftReplaceVoterResult::IdentityMismatch,
-            "swapping full identities must fail even though both slots are voters",
+            RaftReplaceVoterResult::NotAuthorized,
+            "the operator signature binds both complete identities and slots",
         );
 
         let admission = route.barrier.try_acquire().unwrap();
@@ -19310,6 +19439,8 @@ mod tests {
                 old,
                 replacement_prefix,
                 replacement,
+                operation_epoch,
+                operator_signature,
                 handler.as_ref(),
             ),
             RaftReplaceVoterResult::Busy,
@@ -19329,6 +19460,8 @@ mod tests {
                 old,
                 replacement_prefix,
                 replacement,
+                operation_epoch,
+                operator_signature,
                 handler.as_ref(),
             ),
             RaftReplaceVoterResult::Accepted { joint_index: 12 },

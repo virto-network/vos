@@ -68,8 +68,8 @@ impl Network {
     /// Ask one replica to retire `old_prefix` after
     /// `replacement_prefix` has joined. The complete identities are carried
     /// beside the compact slots and checked against the destination's
-    /// registry. `operator_peer` is the original authenticated operator and
-    /// survives a voter-to-leader proxy hop.
+    /// registry. `operator_peer` and its bound signature identify the original
+    /// authenticated operator and survive a voter-to-leader proxy hop.
     #[allow(clippy::too_many_arguments)]
     pub fn send_raft_replace_voter_req(
         &self,
@@ -80,6 +80,8 @@ impl Network {
         replacement_prefix: u16,
         replacement_peer: Vec<u8>,
         operator_peer: Vec<u8>,
+        operation_epoch: u64,
+        operator_signature: [u8; 64],
     ) -> std_mpsc::Receiver<RaftReplaceVoterResult> {
         let (tx, rx) = std_mpsc::channel();
         let _ = self.cmd_tx.send(NetworkCmd::SendRaftReplaceVoter {
@@ -90,6 +92,8 @@ impl Network {
             replacement_prefix,
             replacement_peer,
             operator_peer,
+            operation_epoch,
+            operator_signature,
             reply: tx,
         });
         rx

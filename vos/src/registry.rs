@@ -530,6 +530,31 @@ pub const REGISTRY_OP_DOMAIN: &[u8] = b"vos-registry-op/v1";
 /// ed25519 signature length.
 pub const OP_SIG_LEN: usize = 64;
 
+/// Canonical authorization for replacing one Raft voter with an
+/// already-promoted identity. The active configuration index is the operation
+/// epoch: an authorization minted for one steady membership cannot be replayed
+/// after the old identity is later re-enrolled by another configuration.
+pub fn raft_voter_replacement_signed_bytes(
+    replication_id: &[u8; 32],
+    old_prefix: u16,
+    old_peer: &[u8],
+    replacement_prefix: u16,
+    replacement_peer: &[u8],
+    operation_epoch: u64,
+) -> Vec<u8> {
+    canonical_op_bytes(
+        "replace_raft_voter",
+        &[
+            replication_id,
+            &old_prefix.to_le_bytes(),
+            old_peer,
+            &replacement_prefix.to_le_bytes(),
+            replacement_peer,
+            &operation_epoch.to_le_bytes(),
+        ],
+    )
+}
+
 /// Root-signed cutover barrier. Once committed, the registry refuses legacy
 /// role grants and markerless invite redemption and accepts only evidence
 /// bound to this exact authority incarnation.

@@ -610,6 +610,7 @@ impl DaemonClient {
         replication_id: [u8; 32],
         old: &MemberRow,
         replacement: &MemberRow,
+        operation_epoch: u64,
     ) -> anyhow::Result<vos::network::RaftReplaceVoterResult> {
         let net = self
             .node
@@ -617,6 +618,20 @@ impl DaemonClient {
             .ok_or_else(|| anyhow::anyhow!("client has no network attached"))?;
         let daemon = self.daemon_peer_id()?;
         let operator = libp2p::PeerId::from(self.signer.public());
+        let signed = vos::registry::raft_voter_replacement_signed_bytes(
+            &replication_id,
+            old.prefix,
+            &old.key,
+            replacement.prefix,
+            &replacement.key,
+            operation_epoch,
+        );
+        let operator_signature: [u8; vos::registry::OP_SIG_LEN] = self
+            .signer
+            .sign(&signed)
+            .map_err(|error| anyhow::anyhow!("sign Raft voter replacement: {error}"))?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("operator produced a non-Ed25519 signature"))?;
         net.send_raft_replace_voter_req(
             daemon,
             replication_id,
@@ -625,6 +640,8 @@ impl DaemonClient {
             replacement.prefix,
             replacement.key.clone(),
             operator.to_bytes(),
+            operation_epoch,
+            operator_signature,
         )
         .recv_timeout(Duration::from_secs(60))
         .map_err(|_| anyhow::anyhow!("no Raft voter-replacement reply within 60 seconds"))

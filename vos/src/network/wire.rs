@@ -92,6 +92,7 @@ const MAX_RAFT_ENTRIES: usize = 1024;
 /// wire bounded independently of the frame cap so malformed requests cannot
 /// allocate attacker-selected identity blobs.
 const MAX_RAFT_VOTER_PEER_ID_BYTES: usize = 128;
+const RAFT_VOTER_OPERATOR_SIGNATURE_BYTES: usize = 64;
 
 /// Cap on the number of voters listed inside a single
 /// `RaftEntryKind::ConfigChange` (per-list — applies to
@@ -321,6 +322,11 @@ pub enum Frame {
         /// The original Noise-authenticated operator. A follower proxy keeps
         /// this value while the next hop is authenticated as a current voter.
         operator_peer: Vec<u8>,
+        /// Active configuration index authorized by the operator.
+        operation_epoch: u64,
+        /// Ed25519 signature over the domain-separated group, identities,
+        /// compact slots, and operation epoch.
+        operator_signature: [u8; RAFT_VOTER_OPERATOR_SIGNATURE_BYTES],
     },
     /// Reply to [`Frame::RaftReplaceVoterReq`].
     RaftReplaceVoterResp {
@@ -859,6 +865,8 @@ impl Frame {
                 replacement_prefix,
                 replacement_peer,
                 operator_peer,
+                operation_epoch,
+                operator_signature,
             } => {
                 out.push(TAG_RAFT_REPLACE_VOTER_REQ);
                 out.extend_from_slice(replication_id);
@@ -870,6 +878,8 @@ impl Frame {
                 out.extend_from_slice(replacement_peer);
                 out.extend_from_slice(&(operator_peer.len() as u32).to_le_bytes());
                 out.extend_from_slice(operator_peer);
+                out.extend_from_slice(&operation_epoch.to_le_bytes());
+                out.extend_from_slice(operator_signature);
             }
             Frame::RaftReplaceVoterResp { result } => {
                 out.push(TAG_RAFT_REPLACE_VOTER_RESP);
@@ -1291,6 +1301,8 @@ impl Frame {
                 let replacement_prefix = r.u16()?;
                 let replacement_peer = r.bytes_with_len_prefix()?;
                 let operator_peer = r.bytes_with_len_prefix()?;
+                let operation_epoch = r.u64()?;
+                let operator_signature = r.fixed::<RAFT_VOTER_OPERATOR_SIGNATURE_BYTES>()?;
                 if old_peer.is_empty()
                     || old_peer.len() > MAX_RAFT_VOTER_PEER_ID_BYTES
                     || replacement_peer.is_empty()
@@ -1307,6 +1319,8 @@ impl Frame {
                     replacement_prefix,
                     replacement_peer,
                     operator_peer,
+                    operation_epoch,
+                    operator_signature,
                 }
             }
             TAG_RAFT_REPLACE_VOTER_RESP => {
@@ -1699,6 +1713,8 @@ mod tests {
             replacement_prefix: 0x1002,
             replacement_peer: vec![0x13; 38],
             operator_peer: vec![0x14; 38],
+            operation_epoch: 18,
+            operator_signature: [0x15; RAFT_VOTER_OPERATOR_SIGNATURE_BYTES],
         });
         for result in [
             RaftReplaceVoterResult::Accepted { joint_index: 19 },
@@ -1724,6 +1740,8 @@ mod tests {
             replacement_prefix: 0x1002,
             replacement_peer: vec![0x13; 38],
             operator_peer: vec![0x14; 38],
+            operation_epoch: 18,
+            operator_signature: [0x15; RAFT_VOTER_OPERATOR_SIGNATURE_BYTES],
         }
         .encode();
         assert!(matches!(

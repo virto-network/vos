@@ -382,7 +382,12 @@ fn remove_node(space: &str, prefix: u32, replacement: Option<u32>) -> anyhow::Re
                 );
             }
             if status.is_active_voter(old.prefix) {
-                active_roots.push((name.clone(), *replication_id));
+                let operation_epoch = status.active_config_index.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Raft root '{name}' has no authenticated membership epoch; wait for recovery before replacing a voter"
+                    )
+                })?;
+                active_roots.push((name.clone(), *replication_id, operation_epoch));
             }
         }
 
@@ -399,14 +404,19 @@ fn remove_node(space: &str, prefix: u32, replacement: Option<u32>) -> anyhow::Re
             // deduplicate defensively so a malformed/legacy row cannot make
             // the operator race the same membership transition with itself.
             let mut seen = BTreeSet::new();
-            for (name, replication_id) in active_roots {
+            for (name, replication_id, operation_epoch) in active_roots {
                 if !seen.insert(replication_id) {
                     continue;
                 }
                 let deadline = Instant::now() + Duration::from_secs(180);
                 loop {
                     use vos::network::RaftReplaceVoterResult as Result;
-                    match client.replace_raft_voter(replication_id, &old, &replacement)? {
+                    match client.replace_raft_voter(
+                        replication_id,
+                        &old,
+                        &replacement,
+                        operation_epoch,
+                    )? {
                         Result::Complete => break,
                         Result::Accepted { .. }
                         | Result::Busy

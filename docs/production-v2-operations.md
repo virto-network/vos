@@ -92,16 +92,18 @@ with a *new* identity:
    every connected operator node to contain the same old and replacement NODE
    bindings; the command scans one materialized catalog and must not race a new
    root installed from a lagging view;
-4. stop the old daemon permanently; and
-5. through any surviving daemon, run:
+4. while the old daemon is still online, run through any group member:
 
    ```sh
    vosx space members <space> remove-node <OLD_PREFIX> \
      --replacement <NEW_PREFIX>
    ```
+5. only after the command reports success, stop the old daemon permanently.
 
-The command uses the complete registry-bound PeerIds for both slots, not their
-16-bit prefixes as identity. It first demotes the old NODE row to observer so
+The command signs each root's replication ID, complete registry-bound PeerIds,
+compact slots, and current membership index with the operator identity. A
+follower may relay that authorization but cannot invent or alter it. It first
+demotes the old NODE row to observer so
 newly installed roots cannot enroll it, while existing groups continue to
 authenticate that exact identity until their membership no longer names it.
 It serializes each change with private-ingress

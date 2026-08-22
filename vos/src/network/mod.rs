@@ -412,7 +412,7 @@ pub trait NetworkService: Send + Sync {
     /// Authenticate and drive one production voter replacement. The caller is
     /// the Noise peer on this hop; `operator_peer` is equal to it for the
     /// external request and may differ only when an authenticated current
-    /// voter proxies the request to the exact leader.
+    /// voter proxies the operator's signed request to the exact leader.
     #[allow(clippy::too_many_arguments)]
     fn handle_raft_replace_voter(
         &self,
@@ -423,6 +423,8 @@ pub trait NetworkService: Send + Sync {
         _old_peer: PeerId,
         _replacement_prefix: u16,
         _replacement_peer: PeerId,
+        _operation_epoch: u64,
+        _operator_signature: [u8; 64],
         _handler: &dyn RaftRpcHandler,
     ) -> RaftReplaceVoterResult {
         RaftReplaceVoterResult::NotAuthorized
@@ -968,6 +970,8 @@ pub(in crate::network) enum NetworkCmd {
         replacement_prefix: u16,
         replacement_peer: Vec<u8>,
         operator_peer: Vec<u8>,
+        operation_epoch: u64,
+        operator_signature: [u8; 64],
         reply: std_mpsc::Sender<RaftReplaceVoterResult>,
     },
     /// Send a [`Frame::ManifestReq`] to a bootnode. Reply yields
@@ -2056,6 +2060,8 @@ async fn network_main(
                         replacement_prefix,
                         replacement_peer,
                         operator_peer,
+                        operation_epoch,
+                        operator_signature,
                         reply,
                     }) => {
                         let frame = Frame::RaftReplaceVoterReq {
@@ -2065,6 +2071,8 @@ async fn network_main(
                             replacement_prefix,
                             replacement_peer,
                             operator_peer,
+                            operation_epoch,
+                            operator_signature,
                         };
                         let req_id = swarm
                             .behaviour_mut()
@@ -2795,6 +2803,8 @@ fn handle_req_resp(
                         replacement_prefix,
                         replacement_peer,
                         operator_peer,
+                        operation_epoch,
+                        operator_signature,
                     } => {
                         let Some(_permit) = sync_rate.acquire_raft_membership(peer) else {
                             let _ = swarm.behaviour_mut().req_resp.send_response(
@@ -2836,6 +2846,8 @@ fn handle_req_resp(
                                     old_peer,
                                     replacement_prefix,
                                     replacement_peer,
+                                    operation_epoch,
+                                    operator_signature,
                                     handler.as_ref(),
                                 ),
                                 _ => RaftReplaceVoterResult::IdentityMismatch,
@@ -6003,6 +6015,84 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(25));
         }
+
+        // Exercise the minimum supported replacement topology exactly:
+        // {old,new} -> {new}. The retiring leader must stay online until the
+        // final one-voter configuration is replicated and committed; stepping
+        // down when merely appending that entry leaves the replacement unable
+        // to win an election with its shorter log.
+        let until = StdInstant::now() + Duration::from_secs(5);
+        let (second_removed, second_removed_handle) = loop {
+            let leader = remaining.iter().find_map(|prefix| {
+                let handle = match *prefix {
+                    p if p == prefix_a => w_a.handler(),
+                    p if p == prefix_b => w_b.handler(),
+                    _ => w_c.handler(),
+                };
+                handle
+                    .snapshot()
+                    .filter(|snapshot| snapshot.role == Role::Leader)
+                    .map(|_| (*prefix, handle))
+            });
+            if let Some(leader) = leader {
+                break leader;
+            }
+            assert!(
+                StdInstant::now() < until,
+                "two-voter group did not elect a leader"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let sole_survivor = remaining
+            .iter()
+            .copied()
+            .find(|prefix| *prefix != second_removed)
+            .unwrap();
+        let second_joint_index = match second_removed_handle.handle_replace_voter(
+            &rep_id,
+            second_removed,
+            sole_survivor,
+        ) {
+            RaftReplaceVoterResult::Accepted { joint_index } => joint_index,
+            other => panic!("two-voter leader refused its replacement: {other:?}"),
+        };
+        let survivor_handle = match sole_survivor {
+            p if p == prefix_a => w_a.handler(),
+            p if p == prefix_b => w_b.handler(),
+            _ => w_c.handler(),
+        };
+        let until = StdInstant::now() + Duration::from_secs(10);
+        loop {
+            let retired = second_removed_handle.snapshot();
+            let survivor = survivor_handle.snapshot();
+            let complete = retired
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.role != Role::Leader)
+                && survivor.as_ref().is_some_and(|snapshot| {
+                    snapshot.role == Role::Leader
+                        && snapshot.joint_old.is_none()
+                        && snapshot.members == vec![sole_survivor]
+                        && snapshot.commit_index >= second_joint_index.saturating_add(1)
+                        && snapshot
+                            .active_config_index
+                            .is_some_and(|index| index <= snapshot.commit_index)
+                });
+            if complete {
+                break;
+            }
+            if StdInstant::now() >= until {
+                panic!(
+                    "two-voter replacement did not commit before leader retirement; \
+                     retired={retired:?}, survivor={survivor:?}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(
+            survivor_handle.handle_replace_voter(&rep_id, second_removed, sole_survivor),
+            RaftReplaceVoterResult::Complete,
+            "the sole survivor reports an idempotent terminal replacement",
+        );
 
         // ── Probe each replica's redb directly. ──────────────
         // We need the workers stopped before opening the redb
