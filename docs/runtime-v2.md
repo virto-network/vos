@@ -1037,7 +1037,11 @@ ordered availability entry. Every applied voter can therefore reconstruct a
 lost node-local catalog cache from its committed service image. A voter that
 crashed after quorum commitment but before state-machine application instead
 recovers the exact package from its locally committed Raft log or installed
-snapshot before registering the worker, then applies the outstanding entry.
+snapshot before registering the worker, then applies the outstanding entry. A
+survivor that acknowledged the entry but missed the leader's commit heartbeat
+may use the exact catalog-addressed package from its durable appended tail to
+start Raft; this artifact recovery does not advance the local commit or applied
+cursor.
 The daemon commits the guest transition before changing the registry pointer.
 A permanent
 upgrade record reconnects a lost response or crash in that interval, including

@@ -122,7 +122,11 @@ recovery. Guest Accumulate enforces the exact base, authenticated request,
 replacement program availability, and the absence of continuations or pinned
 authorized inboxes. A restarting voter recovers a catalog package from its
 committed Raft log or installed snapshot even when the corresponding service
-image had not applied the upgrade before the crash. Raft upgrades require the
+image had not applied the upgrade before the crash. If a survivor acknowledged
+the upgrade but missed the leader's commit heartbeat, the exact
+catalog-addressed package may also be recovered from its durable appended tail
+solely to start Raft; only the later Raft commit index can authorize guest
+application. Raft upgrades require the
 sealed production trust policy;
 the process-local conformance allowlist is deliberately refused because it
 cannot replay on followers. CRDT roots, roots exposing attested methods, and

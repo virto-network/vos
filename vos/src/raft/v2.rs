@@ -137,11 +137,11 @@ fn matching_catalog_package(
         return Ok(None);
     }
     let package = VosPackageV2::decode(bytes).map_err(|_| {
-        CommitError::Config("committed Raft catalog artifact is not a canonical v2 package".into())
+        CommitError::Config("Raft catalog artifact is not a canonical v2 package".into())
     })?;
     if package.validate().is_err() || package.encode() != bytes {
         return Err(CommitError::Config(
-            "committed Raft catalog artifact failed v2 package validation".into(),
+            "Raft catalog artifact failed v2 package validation".into(),
         ));
     }
     Ok(Some(bytes.to_vec()))
@@ -162,20 +162,23 @@ fn package_from_service_image(
     Ok(None)
 }
 
-/// Recover one exact signed-package artifact from committed local Raft
-/// storage before the application worker is started.
+/// Recover one exact signed-package artifact from durable local Raft storage
+/// before the application worker is started.
 ///
-/// A follower may have quorum-committed an upgrade without yet applying it to
-/// its service image. Daemon restart still needs the replacement package in
-/// order to reconstruct and register that state machine, so this read-only
-/// bootstrap path examines only the committed log prefix and the installed
-/// snapshot boundary. Uncommitted entries are never considered. The caller
-/// remains responsible for verifying the package signature and catalog row
-/// after recovery, before exposing the root.
+/// A follower may have acknowledged an upgrade which the leader subsequently
+/// quorum-committed without receiving the heartbeat that advances the
+/// follower's local `commit_index`. Daemon restart still needs the replacement
+/// package in order to reconstruct and start that state machine. This read-only
+/// bootstrap path may therefore inspect the complete durable appended tail,
+/// but returns bytes only when their content address exactly matches the
+/// already-authenticated catalog row. It never advances `commit_index` or
+/// `last_applied`; Raft remains solely responsible for deciding whether the
+/// matching entry is committed and may reach guest Accumulate. The caller also
+/// verifies the package signature and catalog row before exposing the root.
 ///
 /// This must be called before opening the Raft worker because redb owns an
 /// exclusive file lock.
-pub fn recover_committed_package_artifact(
+pub fn recover_catalog_package_artifact(
     db_path: &std::path::Path,
     expected_catalog_hash: [u8; 32],
 ) -> Result<Option<Vec<u8>>, CommitError> {
@@ -188,7 +191,11 @@ pub fn recover_committed_package_artifact(
     let meta = RaftMeta::load(&db)?;
     let log = RaftLog::open(db.clone())?;
 
-    let entries = log.entries(meta.snap_last_index.saturating_add(1), meta.commit_index)?;
+    // Prefer the newest matching artifact. The range deliberately ends at the
+    // durable log tail rather than the follower's possibly-stale commit index:
+    // these bytes only break the worker-start bootstrap cycle and are never
+    // interpreted as evidence that the containing entry committed.
+    let entries = log.entries(meta.snap_last_index.saturating_add(1), log.last_index())?;
     for entry in entries.into_iter().rev() {
         let Some(entry) = RaftAccumulateLogV2::decode_entry(entry)? else {
             continue;

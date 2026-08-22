@@ -2192,10 +2192,10 @@ fn recover_v2_catalog_artifact(
     };
     if artifact.is_none() && consistency == Consistency::Raft {
         let raft_path = v2_raft_db_path(data_dir, root_service);
-        artifact = vos::raft::v2::recover_committed_package_artifact(&raft_path, row.program_hash)
+        artifact = vos::raft::v2::recover_catalog_package_artifact(&raft_path, row.program_hash)
             .map_err(|error| {
                 anyhow::anyhow!(
-                    "recover v2 package from committed Raft storage {}: {error}",
+                    "recover v2 package from durable Raft storage {}: {error}",
                     raft_path.display(),
                 )
             })?;
@@ -4350,7 +4350,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_unapplied_raft_upgrade_recovers_package_before_registration() {
+    fn three_voter_appended_upgrade_recovers_package_before_registration() {
         use vos::v2::CommittedAccumulateLogV2 as _;
 
         let directory = std::env::temp_dir().join(format!(
@@ -4404,13 +4404,15 @@ mod tests {
         let service_identity = config.service.clone();
         let root_actor = config.root_actor;
         let raft_path = v2_raft_db_path(&directory, service_identity.root_service);
+        let voters = [0xD101, 0xD102, 0xD103];
+        assert!(vos::raft::seed_initial_config(&raft_path, &voters).unwrap());
         let policy = Hash([0xD3; 32]);
         let trust = std::sync::Arc::new(AllowProductionTrust(policy));
         let log =
             vos::raft::v2::RaftAccumulateLogV2::open(&raft_path, vos::raft::RaftConfig::default())
                 .unwrap();
         let service = vos::v2::LocalRootTreeServiceV2::open_raft_production(
-            config,
+            config.clone(),
             vos::v2::FileCommittedImageStoreV2::new(state_path.clone()),
             log,
             trust.clone(),
@@ -4419,6 +4421,7 @@ mod tests {
         let header = service.store().header().unwrap().unwrap();
         assert_eq!(header.revision, 0);
         drop(service);
+        let original_service_image = std::fs::read(&state_path).unwrap();
 
         let mut replacement = original.clone();
         replacement.manifest.version = "2.1.0".into();
@@ -4486,6 +4489,51 @@ mod tests {
         assert_eq!(log.applied_index().unwrap(), 1);
         drop(log);
 
+        let log =
+            vos::raft::v2::RaftAccumulateLogV2::open(&raft_path, vos::raft::RaftConfig::default())
+                .unwrap();
+        let upgraded_leader = vos::v2::LocalRootTreeServiceV2::open_raft_production(
+            config,
+            vos::v2::FileCommittedImageStoreV2::new(state_path.clone()),
+            log,
+            trust.clone(),
+        )
+        .expect("the quorum-committed leader applies before moving the catalog");
+        assert_eq!(
+            upgraded_leader.store().header().unwrap().unwrap().revision,
+            1
+        );
+        drop(upgraded_leader);
+
+        // Reproduce the three-voter persistence window rather than relying on
+        // the single-node adapter's immediate local commit. The lost leader
+        // has committed N+1. Both surviving voters durably appended and
+        // acknowledged N+1, but crashed before the leader's next heartbeat
+        // advanced their local commit_index from N.
+        let lost_leader_path = directory.join("lost-leader.raft.redb");
+        let second_survivor_path = directory.join("second-survivor.raft.redb");
+        std::fs::copy(&raft_path, &lost_leader_path).unwrap();
+        std::fs::copy(&raft_path, &second_survivor_path).unwrap();
+        for survivor_path in [&raft_path, &second_survivor_path] {
+            let db = redb::Database::open(survivor_path).unwrap();
+            let mut meta = vos::raft::RaftMeta::load(&db).unwrap();
+            assert_eq!(meta.commit_index, 2);
+            assert_eq!(meta.last_applied, 2);
+            meta.commit_index = 1;
+            meta.last_applied = 1;
+            let txn = db.begin_write().unwrap();
+            meta.write_in_txn(&txn).unwrap();
+            txn.commit().unwrap();
+        }
+        for voter_path in [&lost_leader_path, &raft_path, &second_survivor_path] {
+            assert_eq!(
+                vos::raft::persisted_membership(voter_path).unwrap(),
+                Some(voters.to_vec()),
+            );
+        }
+        std::fs::remove_file(&lost_leader_path).unwrap();
+        std::fs::write(&state_path, original_service_image).unwrap();
+
         row.program_hash = BlobHash::of(&package_wire).0;
         row.program_name = replacement.manifest.name.clone();
         row.program_version = replacement.manifest.version.clone();
@@ -4505,8 +4553,29 @@ mod tests {
         };
         assert!(
             cache_path.is_file(),
-            "configuration resolution must recover the exact package before registration",
+            "configuration resolution must recover the catalog-authenticated package from the appended tail before registration",
         );
+        {
+            let db = redb::Database::open(&raft_path).unwrap();
+            let meta = vos::raft::RaftMeta::load(&db).unwrap();
+            let log = vos::raft::RaftLog::open(std::sync::Arc::new(db)).unwrap();
+            assert_eq!(meta.commit_index, 1);
+            assert_eq!(meta.last_applied, 1);
+            assert_eq!(log.last_index(), 2);
+        }
+
+        // Artifact bootstrap cannot itself commit or apply the upgrade. Model
+        // the restarted survivor winning an election and learning that N+1 is
+        // committed, after which ordinary physical-guest catch-up owns the
+        // state transition.
+        {
+            let db = redb::Database::open(&raft_path).unwrap();
+            let mut meta = vos::raft::RaftMeta::load(&db).unwrap();
+            meta.commit_index = 2;
+            let txn = db.begin_write().unwrap();
+            meta.write_in_txn(&txn).unwrap();
+            txn.commit().unwrap();
+        }
         let log =
             vos::raft::v2::RaftAccumulateLogV2::open(&raft_path, vos::raft::RaftConfig::default())
                 .unwrap();
