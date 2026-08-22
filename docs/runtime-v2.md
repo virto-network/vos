@@ -1034,8 +1034,12 @@ remote space Admin, verifies the complete signed replacement package and
 capability layout, establishes the current-term barrier, and carries the exact
 canonical package, actor PVM, and every signed Task dependency in the same
 ordered availability entry. Every applied voter can therefore reconstruct a
-lost node-local catalog cache from its committed service image. The daemon
-commits the guest transition before changing the registry pointer. A permanent
+lost node-local catalog cache from its committed service image. A voter that
+crashed after quorum commitment but before state-machine application instead
+recovers the exact package from its locally committed Raft log or installed
+snapshot before registering the worker, then applies the outstanding entry.
+The daemon commits the guest transition before changing the registry pointer.
+A permanent
 upgrade record reconnects a lost response or crash in that interval, including
 a retry after the catalog CAS already succeeded; reopening accepts either
 catalog side only when those guest records form an exact path to the current

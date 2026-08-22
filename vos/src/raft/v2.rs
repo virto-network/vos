@@ -22,7 +22,7 @@ use crate::v2::{
     AccumulateRequestV2, CommittedAccumulateBatchV2, CommittedAccumulateEntryV2,
     CommittedAccumulateLogV2, CommittedProofArtifactV2, CommittedServiceSnapshotV2, Hash,
     ImportedBlobV2, ImportedProgramV2, LocalJamStoreSnapshotV2, ProgramId,
-    ReceiptVerificationRequestV2, V2Wire,
+    ReceiptVerificationRequestV2, V2Wire, VosPackageV2,
 };
 
 use super::log::{LogEntry, RaftLog, RaftMeta};
@@ -127,6 +127,95 @@ pub(crate) fn accumulate_entry_fits_network_frame(
         .len()
         .checked_add(RAFT_APPEND_SINGLE_DATA_ENTRY_OVERHEAD)
         .is_some_and(|frame_len| frame_len <= RAFT_NETWORK_FRAME_MAX_BYTES))
+}
+
+fn matching_catalog_package(
+    bytes: &[u8],
+    expected_catalog_hash: [u8; 32],
+) -> Result<Option<Vec<u8>>, CommitError> {
+    if crate::crypto::blake2b_hash::<32>(&[], &[bytes]) != expected_catalog_hash {
+        return Ok(None);
+    }
+    let package = VosPackageV2::decode(bytes).map_err(|_| {
+        CommitError::Config("committed Raft catalog artifact is not a canonical v2 package".into())
+    })?;
+    if package.validate().is_err() || package.encode() != bytes {
+        return Err(CommitError::Config(
+            "committed Raft catalog artifact failed v2 package validation".into(),
+        ));
+    }
+    Ok(Some(bytes.to_vec()))
+}
+
+fn package_from_service_image(
+    service_image: &[u8],
+    expected_catalog_hash: [u8; 32],
+) -> Result<Option<Vec<u8>>, CommitError> {
+    let snapshot = LocalJamStoreSnapshotV2::decode(service_image).map_err(|_| {
+        CommitError::Config("committed Raft service snapshot is not canonical".into())
+    })?;
+    for bytes in snapshot.content_blobs() {
+        if let Some(package) = matching_catalog_package(bytes, expected_catalog_hash)? {
+            return Ok(Some(package));
+        }
+    }
+    Ok(None)
+}
+
+/// Recover one exact signed-package artifact from committed local Raft
+/// storage before the application worker is started.
+///
+/// A follower may have quorum-committed an upgrade without yet applying it to
+/// its service image. Daemon restart still needs the replacement package in
+/// order to reconstruct and register that state machine, so this read-only
+/// bootstrap path examines only the committed log prefix and the installed
+/// snapshot boundary. Uncommitted entries are never considered. The caller
+/// remains responsible for verifying the package signature and catalog row
+/// after recovery, before exposing the root.
+///
+/// This must be called before opening the Raft worker because redb owns an
+/// exclusive file lock.
+pub fn recover_committed_package_artifact(
+    db_path: &std::path::Path,
+    expected_catalog_hash: [u8; 32],
+) -> Result<Option<Vec<u8>>, CommitError> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let db = Arc::new(Database::open(db_path).map_err(|error| {
+        CommitError::Config(alloc::format!("open Raft db for package recovery: {error}"))
+    })?);
+    let meta = RaftMeta::load(&db)?;
+    let log = RaftLog::open(db.clone())?;
+
+    let entries = log.entries(meta.snap_last_index.saturating_add(1), meta.commit_index)?;
+    for entry in entries.into_iter().rev() {
+        let Some(entry) = RaftAccumulateLogV2::decode_entry(entry)? else {
+            continue;
+        };
+        for artifact in &entry.availability_blobs {
+            if let Some(package) = matching_catalog_package(&artifact.bytes, expected_catalog_hash)?
+            {
+                return Ok(Some(package));
+            }
+        }
+    }
+
+    if meta.snap_last_index == 0 {
+        return Ok(None);
+    }
+    let state = super::redb_storage::read_state_bytes(&db)?;
+    let snapshot = CommittedServiceSnapshotV2::decode(&state).map_err(|_| {
+        CommitError::Config("installed Raft service snapshot is not canonical".into())
+    })?;
+    if snapshot.applied_index != meta.snap_last_index {
+        return Err(CommitError::Config(alloc::format!(
+            "installed Raft service snapshot index {} does not match committed boundary {}",
+            snapshot.applied_index,
+            meta.snap_last_index,
+        )));
+    }
+    package_from_service_image(&snapshot.service_image, expected_catalog_hash)
 }
 
 impl V2Wire for RaftAccumulatePayloadV2 {

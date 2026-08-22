@@ -2054,16 +2054,16 @@ fn agent_config_from_row(
     pinned_v2_service: Option<&PinnedV2Service>,
     root_peer_id: &[u8],
 ) -> anyhow::Result<RowConfig> {
+    let Some(consistency) = consistency_from_u8(a.consistency) else {
+        return Ok(RowConfig::BadConsistency);
+    };
     let program_hash = BlobHash(a.program_hash);
     let artifact = match blob_store::cache_get(&program_hash)? {
         Some(b) => b,
-        None => match recover_v2_catalog_artifact(data_dir, space_id, a)? {
+        None => match recover_v2_catalog_artifact(data_dir, space_id, a, consistency)? {
             Some(bytes) => bytes,
             None => return Ok(RowConfig::MissingBlob),
         },
-    };
-    let Some(consistency) = consistency_from_u8(a.consistency) else {
-        return Ok(RowConfig::BadConsistency);
     };
     if catalog_artifact_support(&artifact) == RowCatalogSupport::V2Package {
         return Ok(
@@ -2142,15 +2142,17 @@ fn agent_config_from_row(
     Ok(RowConfig::Ready(Box::new(cfg)))
 }
 
-/// Recover an upgraded root's exact signed package from its committed service
-/// image when the node-local catalog cache was lost. Upgrade availability is
-/// ordered before the registry CAS, so every applied Raft voter (and a Local
-/// root) retains these bytes independently of the operator that initiated the
-/// change.
+/// Recover an upgraded root's exact signed package when the node-local catalog
+/// cache was lost. Applied roots retain it in the committed service image; a
+/// Raft voter which crashed after commitment but before application recovers
+/// it from the committed log or installed snapshot before its worker starts.
+/// Upgrade availability is ordered before the registry CAS, so recovery never
+/// depends on the initiating operator remaining online.
 fn recover_v2_catalog_artifact(
     data_dir: &Path,
     space_id: [u8; 32],
     row: &vos::registry::AgentRow,
+    consistency: Consistency,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     use vos::v2::V2Wire;
 
@@ -2163,8 +2165,8 @@ fn recover_v2_catalog_artifact(
         .join("v2-services")
         .join(format!("{}.image", hex::encode(root_service.0)));
     let image = match std::fs::read(&image_path) {
-        Ok(image) => image,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(image) => Some(image),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             return Err(anyhow::anyhow!(
                 "read v2 service image {} while recovering catalog artifact: {error}",
@@ -2172,19 +2174,36 @@ fn recover_v2_catalog_artifact(
             ));
         }
     };
-    let snapshot = vos::v2::LocalJamStoreSnapshotV2::decode(&image).map_err(|error| {
-        anyhow::anyhow!(
-            "decode v2 service image {} while recovering catalog artifact: {error}",
-            image_path.display(),
-        )
-    })?;
-    let Some(artifact) = snapshot
-        .content_blobs()
-        .find(|bytes| bytes.get(..4) == Some(b"VOSP") && BlobHash::of(bytes).0 == row.program_hash)
-        .map(ToOwned::to_owned)
-    else {
+    let mut artifact = if let Some(image) = image {
+        let snapshot = vos::v2::LocalJamStoreSnapshotV2::decode(&image).map_err(|error| {
+            anyhow::anyhow!(
+                "decode v2 service image {} while recovering catalog artifact: {error}",
+                image_path.display(),
+            )
+        })?;
+        snapshot
+            .content_blobs()
+            .find(|bytes| {
+                bytes.get(..4) == Some(b"VOSP") && BlobHash::of(bytes).0 == row.program_hash
+            })
+            .map(ToOwned::to_owned)
+    } else {
+        None
+    };
+    if artifact.is_none() && consistency == Consistency::Raft {
+        let raft_path = v2_raft_db_path(data_dir, root_service);
+        artifact = vos::raft::v2::recover_committed_package_artifact(&raft_path, row.program_hash)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "recover v2 package from committed Raft storage {}: {error}",
+                    raft_path.display(),
+                )
+            })?;
+    }
+    let Some(artifact) = artifact else {
         return Ok(None);
     };
+    validate_exact_v2_package(&artifact, &row.instance_name)?;
     let cached = blob_store::cache_put(&artifact)
         .map_err(|error| anyhow::anyhow!("cache recovered v2 package: {error}"))?;
     if cached.0 != row.program_hash {
@@ -4328,6 +4347,185 @@ mod tests {
             panic!("v2 package fell through to the legacy runtime")
         };
         assert_eq!(config.consistency, vos::v2::ConsistencyModeV2::Raft);
+    }
+
+    #[test]
+    fn committed_unapplied_raft_upgrade_recovers_package_before_registration() {
+        use vos::v2::CommittedAccumulateLogV2 as _;
+
+        let directory = std::env::temp_dir().join(format!(
+            "vosx-v2-unapplied-upgrade-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(directory.join("v2-services")).unwrap();
+        let service_pvm = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../services/vos-service/vos-service.pvm"),
+        )
+        .unwrap();
+        let pinned = PinnedV2Service {
+            pvm: std::sync::Arc::new(service_pvm),
+        };
+        let original = signed_v2_package(vos::v2::VOS_SERVICE_PROGRAM_ID);
+        let mut row = vos::registry::AgentRow {
+            instance_name: "counter".into(),
+            program_hash: BlobHash::of(&original.encode()).0,
+            program_name: original.manifest.name.clone(),
+            program_version: original.manifest.version.clone(),
+            replication_id: [0xD1; 32],
+            consistency: Consistency::Raft as u8,
+            network_reachable: false,
+            sync_role: vos::registry::SyncFloor::Public,
+            install_args: vec![],
+            install_payloads: vec![],
+        };
+        let space_id = [0xD2; 32];
+        let RowConfig::V2 {
+            config, state_path, ..
+        } = v2_config_from_row(
+            &directory,
+            space_id,
+            &row,
+            std::slice::from_ref(&row),
+            &AgentPolicies::new(),
+            Consistency::Raft,
+            original.encode(),
+            Some(&pinned),
+            &[],
+        )
+        .unwrap()
+        else {
+            panic!("signed package did not resolve to a v2 Raft root")
+        };
+        let config = *config;
+        let service_identity = config.service.clone();
+        let root_actor = config.root_actor;
+        let raft_path = v2_raft_db_path(&directory, service_identity.root_service);
+        let policy = Hash([0xD3; 32]);
+        let trust = std::sync::Arc::new(AllowProductionTrust(policy));
+        let log =
+            vos::raft::v2::RaftAccumulateLogV2::open(&raft_path, vos::raft::RaftConfig::default())
+                .unwrap();
+        let service = vos::v2::LocalRootTreeServiceV2::open_raft_production(
+            config,
+            vos::v2::FileCommittedImageStoreV2::new(state_path.clone()),
+            log,
+            trust.clone(),
+        )
+        .expect("physical guest applies genesis before the simulated crash window");
+        let header = service.store().header().unwrap().unwrap();
+        assert_eq!(header.revision, 0);
+        drop(service);
+
+        let mut replacement = original.clone();
+        replacement.manifest.version = "2.1.0".into();
+        let replacement_signer = Keypair::generate_ed25519();
+        replacement.deployment_signature.public_key = replacement_signer.public().encode_protobuf();
+        replacement.deployment_signature.producer =
+            ProducerId::of_public_key(&replacement.deployment_signature.public_key);
+        replacement.deployment_signature.signature = vec![0];
+        replacement.deployment_signature.signature = replacement_signer
+            .sign(&replacement.signing_message())
+            .unwrap();
+        let package_wire = replacement.encode();
+        let upgrade_wire = vos::v2::RootTreeUpgradeRequestV2 {
+            expected_deployment: original.deployment_id(),
+            expected_program: original.manifest.actor_program,
+            replacement: replacement.clone(),
+        }
+        .encode();
+        let upgrade = vos::v2::ActorUpgradeV2 {
+            service: service_identity.clone(),
+            actor: root_actor,
+            expected_deployment: original.deployment_id(),
+            expected_program: original.manifest.actor_program,
+            replacement_deployment: replacement.deployment_id(),
+            replacement_program: replacement.manifest.actor_program,
+            producer: replacement.deployment_signature.producer,
+            role_policies: replacement.role_policies.clone(),
+            base: vos::v2::ConsistencyBaseV2::Linear {
+                revision: header.revision,
+                state_root: header.state_root.unwrap(),
+            },
+            authorization: vos::v2::AuthorizationEvidenceV2::SystemCapability {
+                capability: vos::v2::SystemCapabilityId(
+                    Hash::digest(
+                        b"vos/root-upgrade-capability/v2",
+                        &[&service_identity.root_service.0, &root_actor.0],
+                    )
+                    .0,
+                ),
+                authenticator: Hash::digest(b"vos/root-upgrade-authenticator/v2", &[&upgrade_wire])
+                    .0
+                    .to_vec(),
+            },
+        };
+        let mut log =
+            vos::raft::v2::RaftAccumulateLogV2::open(&raft_path, vos::raft::RaftConfig::default())
+                .unwrap();
+        let committed = log
+            .propose_at_with_availability(
+                &vos::v2::AccumulateRequestV2::UpgradeActor(upgrade).encode(),
+                None,
+                Some(policy),
+                &[vos::v2::ImportedProgramV2 {
+                    program: replacement.manifest.actor_program,
+                    pvm: replacement.actor_pvm.clone(),
+                }],
+                &[vos::v2::ImportedBlobV2 {
+                    reference: vos::v2::BlobRefV2::of_bytes(&package_wire),
+                    bytes: package_wire.clone(),
+                }],
+                &[],
+            )
+            .expect("the replacement package reaches the committed Raft log");
+        assert_eq!(committed.index, 2);
+        assert_eq!(log.applied_index().unwrap(), 1);
+        drop(log);
+
+        row.program_hash = BlobHash::of(&package_wire).0;
+        row.program_name = replacement.manifest.name.clone();
+        row.program_version = replacement.manifest.version.clone();
+        let cache_path = blob_store::cache_path_for(&BlobHash(row.program_hash));
+        let _ = std::fs::remove_file(&cache_path);
+        let RowConfig::V2 { config, .. } = agent_config_from_row(
+            &directory,
+            space_id,
+            &row,
+            std::slice::from_ref(&row),
+            &AgentPolicies::new(),
+            Some(&pinned),
+            &[],
+        )
+        .unwrap() else {
+            panic!("the recovered catalog package did not reconstruct root configuration")
+        };
+        assert!(
+            cache_path.is_file(),
+            "configuration resolution must recover the exact package before registration",
+        );
+        let log =
+            vos::raft::v2::RaftAccumulateLogV2::open(&raft_path, vos::raft::RaftConfig::default())
+                .unwrap();
+        let recovered = vos::v2::LocalRootTreeServiceV2::open_raft_production(
+            *config,
+            vos::v2::FileCommittedImageStoreV2::new(state_path),
+            log,
+            trust,
+        )
+        .expect("registration catches the physical guest up through the committed upgrade");
+        assert_eq!(
+            recovered.store().header().unwrap().unwrap().revision,
+            1,
+            "the previously unapplied entry is now materialized",
+        );
+        drop(recovered);
+
+        let _ = std::fs::remove_file(cache_path);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

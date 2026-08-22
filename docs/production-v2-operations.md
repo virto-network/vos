@@ -120,7 +120,10 @@ The ordinary-root command already implements the corresponding signed-package
 availability, authenticated transition, catalog ordering, and exact retry
 recovery. Guest Accumulate enforces the exact base, authenticated request,
 replacement program availability, and the absence of continuations or pinned
-authorized inboxes. Raft upgrades require the sealed production trust policy;
+authorized inboxes. A restarting voter recovers a catalog package from its
+committed Raft log or installed snapshot even when the corresponding service
+image had not applied the upgrade before the crash. Raft upgrades require the
+sealed production trust policy;
 the process-local conformance allowlist is deliberately refused because it
 cannot replay on followers. CRDT roots, roots exposing attested methods, and
 changes which add or remove the root's role-authority requirement remain
