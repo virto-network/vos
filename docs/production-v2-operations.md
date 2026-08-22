@@ -120,8 +120,11 @@ The ordinary-root command already implements the corresponding signed-package
 availability, authenticated transition, catalog ordering, and exact retry
 recovery. Guest Accumulate enforces the exact base, authenticated request,
 replacement program availability, and the absence of continuations or pinned
-authorized inboxes. CRDT roots and roots exposing attested methods remain
-unsupported; the latter need a guest-owned migration for dependent roots'
-deployment-pinned external bindings. Until the authority-specific command and
-a cross-version authority rehearsal land, the production procedure is to
-retain the frozen authority and restore it from the verified release bundle.
+authorized inboxes. Raft upgrades require the sealed production trust policy;
+the process-local conformance allowlist is deliberately refused because it
+cannot replay on followers. CRDT roots, roots exposing attested methods, and
+changes which add or remove the root's role-authority requirement remain
+unsupported. Those shapes need guest-owned binding migrations before an
+in-place upgrade can be safe. Until the authority-specific command and a
+cross-version authority rehearsal land, the production procedure is to retain
+the frozen authority and restore it from the verified release bundle.

@@ -739,6 +739,7 @@ impl DaemonClient {
             })?;
         let from_v2 = from_artifact.get(..4) == Some(b"VOSP");
         let to_v2 = to_artifact.get(..4) == Some(b"VOSP");
+        let terminal_catalog_retry = from_hash == to_hash;
         if from_v2 != to_v2 {
             anyhow::bail!("upgrade cannot cross the legacy/v2 runtime boundary");
         }
@@ -794,17 +795,23 @@ impl DaemonClient {
                     previous_program,
                     deployment,
                     program,
+                    duplicate,
                     ..
                 } if committed_actor == actor
-                    && previous_deployment == from_package.deployment_id()
-                    && previous_program == from_package.manifest.actor_program
                     && deployment == to_package.deployment_id()
-                    && program == to_package.manifest.actor_program => {}
+                    && program == to_package.manifest.actor_program
+                    && ((!terminal_catalog_retry
+                        && previous_deployment == from_package.deployment_id()
+                        && previous_program == from_package.manifest.actor_program)
+                        || (terminal_catalog_retry && duplicate)) => {}
                 vos::v2::AccumulationResultV2::Rejected(rejection) => {
                     anyhow::bail!("guest rejected v2 root upgrade: {rejection:?}")
                 }
                 _ => anyhow::bail!("v2 root returned a mismatched upgrade result"),
             }
+        }
+        if terminal_catalog_retry {
+            return Ok(Status::Ok);
         }
         vos::block_on(self.registry().upgrade(
             &mut &self.node,

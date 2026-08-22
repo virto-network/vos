@@ -72,6 +72,13 @@ pub struct LocalJamStoreSnapshotV2 {
 }
 
 impl LocalJamStoreSnapshotV2 {
+    /// Exact content-addressed application blobs retained in this committed
+    /// image. Hosts use this read-only view to recover catalog artifacts that
+    /// were ordered with an actor upgrade before the registry pointer moved.
+    pub fn content_blobs(&self) -> impl Iterator<Item = &[u8]> {
+        self.blobs.values().map(Vec::as_slice)
+    }
+
     fn encode_provenance_input(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
         encoder.u64(self.commit_sequence);

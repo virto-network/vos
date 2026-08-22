@@ -1031,21 +1031,27 @@ the upgrade commits.
 `vosx space upgrade` exposes this transition for ordinary Local and Raft root
 actors. The daemon requires its trusted local operator or an authenticated
 remote space Admin, verifies the complete signed replacement package and
-capability layout, establishes the current-term barrier, and carries the actor
-plus every signed Task dependency in the same ordered availability entry. It
+capability layout, establishes the current-term barrier, and carries the exact
+canonical package, actor PVM, and every signed Task dependency in the same
+ordered availability entry. Every applied voter can therefore reconstruct a
+lost node-local catalog cache from its committed service image. The daemon
 commits the guest transition before changing the registry pointer. A permanent
-upgrade record reconnects a lost response or crash in that interval; reopening
-accepts either catalog side only when those guest records form an exact path to
-the current descriptor. The service identity remains the genesis identity even
-after the catalog names the new actor deployment.
+upgrade record reconnects a lost response or crash in that interval, including
+a retry after the catalog CAS already succeeded; reopening accepts either
+catalog side only when those guest records form an exact path to the current
+descriptor. The service identity remains the genesis identity even after the
+catalog names the new actor deployment.
 
 CRDT actor upgrades currently fail closed with `InvalidConsistency`. Program
 metadata needs an explicit causal operation and complete-ancestry activation;
 the runtime does not pretend that a linear descriptor rewrite is a CRDT merge.
-Roots whose current or replacement package exposes attested methods also fail
-closed: existing cross-root attested handles pin the actor deployment and
-program in their immutable external directory. Updating those bindings needs
-its own guest-owned migration before an in-place target upgrade can be safe.
+Raft roots without a sealed production trust policy fail closed because a
+leader's process-local conformance allowlist cannot replay on followers. Roots
+whose current or replacement package exposes attested methods, or whose upgrade
+would add or remove the root's role-authority requirement, also fail closed.
+Existing attested handles and authority bindings are immutable external trust
+inputs; updating either needs its own guest-owned migration before an in-place
+target upgrade can be safe.
 
 ## Packages and identity
 

@@ -1154,6 +1154,15 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
         upgraded.contains("upgraded counter"),
         "the authenticated operator workflow must commit UpgradeActor before the catalog CAS: {upgraded}",
     );
+    let repeated_upgrade = vosx_ok(
+        data.path(),
+        config.path(),
+        &["space", "upgrade", space, "counter", "counter:0.2.0"],
+    );
+    assert!(
+        repeated_upgrade.contains("upgraded counter"),
+        "a lost catalog-CAS response must recover as a terminal exact retry: {repeated_upgrade}",
+    );
     let after_upgrade = vosx_ok(
         data.path(),
         config.path(),
@@ -1191,6 +1200,47 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
     );
 
     drop(first);
+
+    // Simulate losing the upgrading operator's catalog cache. The committed
+    // service image must carry the exact package independently, allowing the
+    // same voter to reconstruct its cache before root-service reopen.
+    let upgrade_bytes = fs::read(&upgrade_package).unwrap();
+    let upgrade_hash = vos::crypto::blake2b_hash::<32>(&[], &[&upgrade_bytes]);
+    let cached_upgrade = data
+        .path()
+        .join("cache/vosx/blobs")
+        .join(hex::encode(upgrade_hash));
+    fs::remove_file(&cached_upgrade).expect("remove the replacement package from the local cache");
+    let recovery_log = data.path().join("v2-root-cache-recovery.stderr");
+    let recovered = Daemon(spawn_up_with_service(
+        data.path(),
+        config.path(),
+        space,
+        &recovery_log,
+        Some(&service_pvm),
+    ));
+    poll_until(
+        30,
+        || {
+            let output = vosx(
+                data.path(),
+                config.path(),
+                &["space", "call", space, "counter", "value"],
+            );
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "U64(3)"
+        },
+        || {
+            format!(
+                "the root did not recover its signed package from committed availability; log:\n{}",
+                fs::read_to_string(&recovery_log).unwrap_or_default(),
+            )
+        },
+    );
+    assert!(
+        cached_upgrade.is_file(),
+        "reopen must reconstruct the exact catalog cache artifact"
+    );
+    drop(recovered);
 
     // The offline archive must reopen as a complete, independent space—not
     // merely reproduce a set of files. Restore into fresh XDG roots, attach

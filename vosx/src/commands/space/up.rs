@@ -2057,7 +2057,10 @@ fn agent_config_from_row(
     let program_hash = BlobHash(a.program_hash);
     let artifact = match blob_store::cache_get(&program_hash)? {
         Some(b) => b,
-        None => return Ok(RowConfig::MissingBlob),
+        None => match recover_v2_catalog_artifact(data_dir, space_id, a)? {
+            Some(bytes) => bytes,
+            None => return Ok(RowConfig::MissingBlob),
+        },
     };
     let Some(consistency) = consistency_from_u8(a.consistency) else {
         return Ok(RowConfig::BadConsistency);
@@ -2137,6 +2140,57 @@ fn agent_config_from_row(
         }
     }
     Ok(RowConfig::Ready(Box::new(cfg)))
+}
+
+/// Recover an upgraded root's exact signed package from its committed service
+/// image when the node-local catalog cache was lost. Upgrade availability is
+/// ordered before the registry CAS, so every applied Raft voter (and a Local
+/// root) retains these bytes independently of the operator that initiated the
+/// change.
+fn recover_v2_catalog_artifact(
+    data_dir: &Path,
+    space_id: [u8; 32],
+    row: &vos::registry::AgentRow,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    use vos::v2::V2Wire;
+
+    let root_service = v2_root_service_id(
+        vos::v2::SpaceId(space_id),
+        &row.instance_name,
+        row.replication_id,
+    );
+    let image_path = data_dir
+        .join("v2-services")
+        .join(format!("{}.image", hex::encode(root_service.0)));
+    let image = match std::fs::read(&image_path) {
+        Ok(image) => image,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "read v2 service image {} while recovering catalog artifact: {error}",
+                image_path.display(),
+            ));
+        }
+    };
+    let snapshot = vos::v2::LocalJamStoreSnapshotV2::decode(&image).map_err(|error| {
+        anyhow::anyhow!(
+            "decode v2 service image {} while recovering catalog artifact: {error}",
+            image_path.display(),
+        )
+    })?;
+    let Some(artifact) = snapshot
+        .content_blobs()
+        .find(|bytes| bytes.get(..4) == Some(b"VOSP") && BlobHash::of(bytes).0 == row.program_hash)
+        .map(ToOwned::to_owned)
+    else {
+        return Ok(None);
+    };
+    let cached = blob_store::cache_put(&artifact)
+        .map_err(|error| anyhow::anyhow!("cache recovered v2 package: {error}"))?;
+    if cached.0 != row.program_hash {
+        anyhow::bail!("recovered v2 package changed content address while caching");
+    }
+    Ok(Some(artifact))
 }
 
 fn v2_config_from_row(

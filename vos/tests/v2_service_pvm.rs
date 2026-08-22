@@ -5954,6 +5954,12 @@ fn root_upgrade_is_exactly_once_and_reopens_across_the_catalog_cutover() {
             ..
         } if deployment == replacement.deployment_id()
     ));
+    let package_reference = BlobRefV2::of_bytes(&replacement.encode());
+    assert_eq!(
+        service.store().blob(&package_reference),
+        Some(replacement.encode().as_slice()),
+        "the exact signed package is committed before the catalog can move",
+    );
     let after_header = service.store().header().unwrap().unwrap();
     assert_eq!(after_header.service, original_service);
     assert_eq!(
@@ -6011,7 +6017,7 @@ fn root_upgrade_is_exactly_once_and_reopens_across_the_catalog_cutover() {
     let mut replacement_config = config;
     replacement_config.package = replacement.clone();
     replacement_config.service.deployment = replacement.deployment_id();
-    let reopened = LocalRootTreeServiceV2::open(replacement_config, backend).unwrap();
+    let mut reopened = LocalRootTreeServiceV2::open(replacement_config, backend).unwrap();
     assert_eq!(reopened.identity(), &original_service);
     assert_eq!(
         reopened
@@ -6020,6 +6026,118 @@ fn root_upgrade_is_exactly_once_and_reopens_across_the_catalog_cutover() {
             .map(|policy| policy.public),
         Some(true)
     );
+    let terminal_retry = RootTreeUpgradeRequestV2 {
+        expected_deployment: replacement.deployment_id(),
+        expected_program: replacement.manifest.actor_program,
+        replacement,
+    };
+    assert!(matches!(
+        reopened.upgrade_root(terminal_retry).unwrap(),
+        AccumulationResultV2::ActorUpgraded {
+            duplicate: true,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn conformance_raft_and_role_authority_shape_changes_are_refused_before_upgrade() {
+    let signer = libp2p::identity::Keypair::generate_ed25519();
+    let (package, actor_name) = signed_test_package(&greeter_elf(), &signer);
+    let actor = ActorId([0xB1; 32]);
+    let mut config = LocalRootTreeConfigV2 {
+        role_authority: None,
+        service_pvm: CANONICAL_SERVICE_PVM.to_vec(),
+        package: package.clone(),
+        service: ServiceIdentityV2 {
+            space: vos::v2::SpaceId([0xB2; 32]),
+            root_service: RootServiceId([0xB3; 32]),
+            deployment: package.deployment_id(),
+            service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+            service_abi: vos::v2::ABI_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: TEST_GAS_SCHEDULE,
+        },
+        root_actor: actor,
+        actor_name,
+        consistency: ConsistencyModeV2::Raft,
+        initial_state: vec![],
+        external_actors: vec![],
+        install_authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([0xB4; 32]),
+            authenticator: vec![0xB5],
+        },
+        refine_gas: TEST_GAS_SCHEDULE.refine,
+        accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
+    };
+    let mut replacement = package.clone();
+    replacement.manifest.version = "2.1.0".into();
+    replacement.deployment_signature.signature = signer
+        .sign(&replacement.signing_message())
+        .expect("sign replacement package");
+    let request = RootTreeUpgradeRequestV2 {
+        expected_deployment: package.deployment_id(),
+        expected_program: package.manifest.actor_program,
+        replacement,
+    };
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-conformance-upgrade-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let log_path = directory.join("raft.redb");
+    let log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    let mut raft =
+        LocalRootTreeServiceV2::open_raft(config.clone(), FailableCommittedImages::default(), log)
+            .unwrap();
+    assert!(matches!(
+        raft.upgrade_root(request),
+        Err(LocalRootTreeInvokeErrorV2::UpgradeUnsupported)
+    ));
+    drop(raft);
+    let mut log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    assert_eq!(log.applied_index().unwrap(), 1, "only genesis was ordered");
+    drop(log);
+    std::fs::remove_dir_all(directory).unwrap();
+
+    let protected_signer = libp2p::identity::Keypair::generate_ed25519();
+    let (protected, protected_name) = signed_test_package(&cycle_v2_elf(), &protected_signer);
+    let authority = RoleAuthorityBindingV2 {
+        service: ServiceIdentityV2 {
+            space: vos::v2::SpaceId([0xB6; 32]),
+            root_service: RootServiceId([0xB7; 32]),
+            deployment: vos::v2::DeploymentId([0xB8; 32]),
+            service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+            service_abi: vos::v2::ABI_VERSION,
+            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            gas_schedule: TEST_GAS_SCHEDULE,
+        },
+        actor: ActorId([0xB9; 32]),
+    };
+    config.role_authority = Some(authority);
+    config.package = protected.clone();
+    config.service.space = vos::v2::SpaceId([0xB6; 32]);
+    config.service.root_service = RootServiceId([0xBA; 32]);
+    config.service.deployment = protected.deployment_id();
+    config.root_actor = ActorId([0xBB; 32]);
+    config.actor_name = protected_name;
+    config.consistency = ConsistencyModeV2::Local;
+    let mut protected_root =
+        LocalRootTreeServiceV2::open(config, FailableCommittedImages::default()).unwrap();
+    let public_signer = libp2p::identity::Keypair::generate_ed25519();
+    let (public, _) = signed_test_package(&greeter_elf(), &public_signer);
+    assert!(matches!(
+        protected_root.upgrade_root(RootTreeUpgradeRequestV2 {
+            expected_deployment: protected.deployment_id(),
+            expected_program: protected.manifest.actor_program,
+            replacement: public,
+        }),
+        Err(LocalRootTreeInvokeErrorV2::InvalidUpgradeTarget)
+    ));
 }
 
 #[test]

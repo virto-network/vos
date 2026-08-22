@@ -30,8 +30,8 @@ use super::{
     PublicationAckV2, PublicationRecordV2, PublishedEffectsV2, RefinedServiceOutputV2,
     RoleAssertionEligibilityV2, RoleAuthorityBindingV2, RoleAuthorizationClaimV2, RoleCredentialV2,
     ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
-    StateKeyV2, SystemCapabilityId, V2Wire, VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2,
-    crdt_node_storage_key, dedup_storage_key, delivery_storage_key,
+    StateKeyV2, V2Wire, VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key,
+    dedup_storage_key, delivery_storage_key,
 };
 
 #[cfg(feature = "storage")]
@@ -72,7 +72,7 @@ pub struct RootTreeUpgradeRequestV2 {
 }
 
 impl V2Wire for RootTreeUpgradeRequestV2 {
-    const MAGIC: [u8; 4] = *b"VRU2";
+    const MAGIC: [u8; 4] = super::service::ROOT_UPGRADE_REQUEST_MAGIC;
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
@@ -89,7 +89,6 @@ impl V2Wire for RootTreeUpgradeRequestV2 {
         };
         if value.expected_deployment == super::DeploymentId::ZERO
             || value.expected_program == ProgramId::ZERO
-            || value.replacement.deployment_id() == value.expected_deployment
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -2445,6 +2444,12 @@ where
         let replacement_policies =
             PackageRolePoliciesV2::decode(&request.replacement.role_policies)
                 .map_err(|_| LocalRootTreeInvokeErrorV2::InvalidUpgradeTarget)?;
+        let current_requires_authority =
+            current_policies.methods.iter().any(|policy| !policy.public);
+        let replacement_requires_authority = replacement_policies
+            .methods
+            .iter()
+            .any(|policy| !policy.public);
         if current_policies
             .methods
             .iter()
@@ -2458,11 +2463,8 @@ where
         }
         if request.replacement.manifest.crdt != descriptor.crdt
             || request.replacement.manifest.service_program != self.identity.service_program
-            || (self.expected_role_authority.is_none()
-                && replacement_policies
-                    .methods
-                    .iter()
-                    .any(|policy| !policy.public))
+            || current_requires_authority != replacement_requires_authority
+            || current_requires_authority != self.expected_role_authority.is_some()
         {
             return Err(LocalRootTreeInvokeErrorV2::InvalidUpgradeTarget);
         }
@@ -2482,10 +2484,12 @@ where
                 .into_iter()
                 .filter(|record| {
                     record.actor == self.root_actor
-                        && record.previous_deployment == request.expected_deployment
-                        && record.previous_program == request.expected_program
                         && record.deployment == replacement_deployment
                         && record.program == replacement_program
+                        && ((request.expected_deployment == replacement_deployment
+                            && request.expected_program == replacement_program)
+                            || (record.previous_deployment == request.expected_deployment
+                                && record.previous_program == request.expected_program))
                 })
                 .max_by_key(|record| record.receipt.sequence)
                 .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?;
@@ -2517,8 +2521,12 @@ where
                 .state_root
                 .ok_or(LocalRootTreeInvokeErrorV2::CorruptWorkflow)?,
         };
-        let request_hash =
-            super::Hash::digest(b"vos/root-upgrade-authenticator/v2", &[&request.encode()]);
+        let package_wire = request.replacement.encode();
+        let request_hash = super::service::root_upgrade_authenticator(
+            request.expected_deployment,
+            request.expected_program,
+            &package_wire,
+        );
         let upgrade = ActorUpgradeV2 {
             service: self.identity.clone(),
             actor: self.root_actor,
@@ -2530,23 +2538,23 @@ where
             role_policies: request.replacement.role_policies.clone(),
             base,
             authorization: AuthorizationEvidenceV2::SystemCapability {
-                capability: SystemCapabilityId(
-                    super::Hash::digest(
-                        b"vos/root-upgrade-capability/v2",
-                        &[&self.identity.root_service.0, &self.root_actor.0],
-                    )
-                    .0,
+                capability: super::service::root_upgrade_capability(
+                    &self.identity,
+                    self.root_actor,
                 ),
                 authenticator: request_hash.0.to_vec(),
             },
         };
         let programs = package_program_availability(&request.replacement);
-        if self
-            .service
-            .accumulate_host()
-            .production_trust_policy_id()
-            .is_none()
-        {
+        let package_blob = ImportedBlobV2 {
+            reference: BlobRefV2::of_bytes(&package_wire),
+            bytes: package_wire,
+        };
+        let production_policy = self.service.accumulate_host().production_trust_policy_id();
+        if self.consistency == ConsistencyModeV2::Raft && production_policy.is_none() {
+            return Err(LocalRootTreeInvokeErrorV2::UpgradeUnsupported);
+        }
+        if production_policy.is_none() {
             self.service.accumulate_host_mut().allow_upgrade(&upgrade);
         } else if self.consistency == ConsistencyModeV2::Raft {
             match self
@@ -2571,7 +2579,7 @@ where
                 &AccumulateRequestV2::UpgradeActor(upgrade.clone()),
                 None,
                 &programs,
-                &[],
+                core::slice::from_ref(&package_blob),
                 &[],
             )
             .map_err(|_| LocalRootTreeInvokeErrorV2::UpgradeEntryTooLarge)?
@@ -2583,7 +2591,7 @@ where
             .accumulate_with_availability_after_barrier(
                 &AccumulateRequestV2::UpgradeActor(upgrade),
                 &programs,
-                &[],
+                core::slice::from_ref(&package_blob),
             )
             .map_err(RootTreeDriverErrorV2::into_invoke)?;
         match accumulated.result {
@@ -4199,6 +4207,16 @@ mod tests {
         assert_eq!(
             RootTreeUpgradeRequestV2::decode(&request.encode()).unwrap(),
             request
+        );
+        let terminal_retry = RootTreeUpgradeRequestV2 {
+            expected_deployment: request.replacement.deployment_id(),
+            expected_program: request.replacement.manifest.actor_program,
+            replacement: request.replacement.clone(),
+        };
+        assert_eq!(
+            RootTreeUpgradeRequestV2::decode(&terminal_retry.encode()).unwrap(),
+            terminal_retry,
+            "an already-committed catalog CAS uses an equal-base status query",
         );
         let mut trailing = request.encode();
         trailing.push(0);

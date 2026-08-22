@@ -22,8 +22,39 @@ use super::{
     ProofVerificationRequestV2, PublishedEffectsV2, ReceiptVerificationHostV2,
     ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, RefineProtocolHostV2,
     RefineTraceV2, RoleCredentialV2, ServiceIdentityV2, ServiceImageInstallErrorV2,
-    ServicePvmErrorV2, ServicePvmOutputV2, ServicePvmV2, TransitionV2, V2Wire, WorkEnvelopeV2,
+    ServicePvmErrorV2, ServicePvmOutputV2, ServicePvmV2, SystemCapabilityId, TransitionV2, V2Wire,
+    VosPackageV2, WorkEnvelopeV2,
 };
+
+pub(crate) const ROOT_UPGRADE_REQUEST_MAGIC: [u8; 4] = *b"VRU2";
+
+pub(crate) fn root_upgrade_capability(
+    service: &ServiceIdentityV2,
+    actor: super::ActorId,
+) -> SystemCapabilityId {
+    SystemCapabilityId(
+        super::Hash::digest(
+            b"vos/root-upgrade-capability/v2",
+            &[&service.root_service.0, &actor.0],
+        )
+        .0,
+    )
+}
+
+pub(crate) fn root_upgrade_authenticator(
+    expected_deployment: super::DeploymentId,
+    expected_program: ProgramId,
+    package_wire: &[u8],
+) -> super::Hash {
+    let mut request = Vec::new();
+    request.extend_from_slice(&ROOT_UPGRADE_REQUEST_MAGIC);
+    request.extend_from_slice(&super::ABI_VERSION.to_le_bytes());
+    let mut encoder = Encoder(&mut request);
+    encoder.fixed(&expected_deployment.0);
+    encoder.fixed(&expected_program.0);
+    encoder.bytes(package_wire);
+    super::Hash::digest(b"vos/root-upgrade-authenticator/v2", &[&request])
+}
 
 fn validate_accumulate_availability(
     request: &AccumulateRequestV2,
@@ -70,6 +101,36 @@ fn validate_accumulate_availability(
         }
         AccumulateRequestV2::UpgradeActor(upgrade) => {
             let policies = super::PackageRolePoliciesV2::decode(&upgrade.role_policies)?;
+            let expected_blobs = match &upgrade.authorization {
+                AuthorizationEvidenceV2::SystemCapability {
+                    capability,
+                    authenticator,
+                } if *capability == root_upgrade_capability(&upgrade.service, upgrade.actor) => {
+                    let [artifact] = blobs else {
+                        return Err(DecodeError::NonCanonical);
+                    };
+                    let package = VosPackageV2::decode(&artifact.bytes)?;
+                    if package.validate().is_err()
+                        || package.encode() != artifact.bytes
+                        || package.deployment_id() != upgrade.replacement_deployment
+                        || package.manifest.actor_program != upgrade.replacement_program
+                        || package.manifest.service_program != upgrade.service.service_program
+                        || package.deployment_signature.producer != upgrade.producer
+                        || package.role_policies != upgrade.role_policies
+                        || authenticator.as_slice()
+                            != root_upgrade_authenticator(
+                                upgrade.expected_deployment,
+                                upgrade.expected_program,
+                                &artifact.bytes,
+                            )
+                            .0
+                    {
+                        return Err(DecodeError::NonCanonical);
+                    }
+                    vec![artifact.reference.clone()]
+                }
+                _ => Vec::new(),
+            };
             (
                 core::iter::once(upgrade.replacement_program)
                     .chain(
@@ -79,7 +140,7 @@ fn validate_accumulate_availability(
                             .map(|dependency| dependency.program),
                     )
                     .collect(),
-                Vec::new(),
+                expected_blobs,
             )
         }
         _ => (Vec::new(), Vec::new()),
