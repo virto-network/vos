@@ -1054,23 +1054,24 @@ where
     incoming_snapshot: Option<IncomingSnapshot<N>>,
     /// The effective cluster configuration the worker uses for
     /// quorum decisions, vote counting, heartbeat targets, and
-    /// peer enumeration. Tracks the LATEST `ConfigChange` log
-    /// entry seen — even uncommitted (Ongaro thesis §4.3 — leader
-    /// uses the latest seen, not the latest committed, so it
-    /// stops counting itself in a removal as soon as the entry
-    /// hits the log). Falls back to `cfg.members` when no
-    /// `ConfigChange` has been seen.
+    /// peer enumeration. Normally tracks the latest `ConfigChange` log entry
+    /// seen, even when uncommitted. One liveness-critical exception applies:
+    /// a leader being retired keeps the preceding joint view until its final
+    /// removal row commits, so a crash cannot leave the replacement with a
+    /// shorter log and neither node eligible to lead. This is a stricter
+    /// quorum than the speculative final view, never a weaker one. Falls back
+    /// to `cfg.members` when no `ConfigChange` has been seen.
     ///
     /// `current` is the membership the cluster transitions *to*;
     /// `joint_old` is `Some(old)` while a joint configuration is
     /// in flight (quorum requires majority from BOTH sets).
     effective_cfg: ActiveConfig<N>,
-    /// Log index of the in-flight joint `ConfigChange` entry,
-    /// when one is awaiting finalization. `None` between
-    /// transitions. The leader uses this to detect when the
-    /// joint phase has committed (commit_index >= the index)
-    /// and to avoid re-finalizing on a stale historical joint
-    /// entry that happens to target the same member set.
+    /// Log index of the in-flight membership `ConfigChange` entry. While the
+    /// joint row is uncommitted, this points at that row; after the joint row
+    /// commits and the final row is appended, it points at the final row until
+    /// that row commits. `None` between transitions. Keeping both phases
+    /// explicit lets a retiring leader recover the joint quorum after a crash
+    /// without appending a duplicate final row.
     pending_joint_entry: Option<u64>,
     /// Index of the log or installed snapshot that established
     /// `effective_cfg`. `None` only for legacy persisted data that lacked
@@ -1266,6 +1267,7 @@ struct ConfigRecovery<N: NodeId> {
 async fn recover_active_config<N, S>(
     storage: &S,
     cfg: &Config<N>,
+    commit_index: u64,
     consult_persisted: bool,
 ) -> Result<ConfigRecovery<N>, S::Error>
 where
@@ -1278,23 +1280,74 @@ where
     // sits in the live tail.
     if last > snap {
         let entries = storage.entries(snap + 1, last).await?;
-        for e in entries.iter().rev() {
-            if let crate::log_entry::EntryKind::ConfigChange { joint_old, members } = &e.kind {
-                let active = ActiveConfig {
-                    current: members.clone(),
-                    joint_old: joint_old.clone(),
-                };
-                let pending_joint = if active.is_joint() {
-                    Some(e.index)
+        if let Some((latest_pos, latest)) = entries.iter().enumerate().rev().find(|(_, entry)| {
+            matches!(
+                &entry.kind,
+                crate::log_entry::EntryKind::ConfigChange { .. }
+            )
+        }) && let crate::log_entry::EntryKind::ConfigChange { joint_old, members } = &latest.kind
+        {
+            // A retiring leader may have appended, but not committed, the
+            // final configuration that excludes itself. Recovering that final
+            // row as effective makes the old node ineligible to campaign,
+            // while the replacement still holds the preceding joint view and
+            // cannot elect itself. Retain the joint view until the final entry
+            // commits; the pending index tells auto-finalization to activate
+            // the already-appended final rather than append a duplicate.
+            if joint_old.is_none() && latest.index > commit_index && !members.contains(&cfg.me) {
+                let prior_joint = entries[..latest_pos].iter().rev().find_map(|entry| {
+                    let crate::log_entry::EntryKind::ConfigChange {
+                        joint_old: Some(old),
+                        members: joint_members,
+                    } = &entry.kind
+                    else {
+                        return None;
+                    };
+                    (joint_members == members && old.contains(&cfg.me)).then_some((
+                        ActiveConfig {
+                            current: joint_members.clone(),
+                            joint_old: Some(old.clone()),
+                        },
+                        entry.index,
+                    ))
+                });
+                let persisted_joint = if prior_joint.is_none() && consult_persisted {
+                    storage.active_config().await?.and_then(|record| {
+                        let old = record.joint_old?;
+                        (record.current == *members && old.contains(&cfg.me)).then_some((
+                            ActiveConfig {
+                                current: record.current,
+                                joint_old: Some(old),
+                            },
+                            record.log_index.unwrap_or(0),
+                        ))
+                    })
                 } else {
                     None
                 };
-                return Ok(ConfigRecovery {
-                    active,
-                    pending_joint,
-                    active_config_index: Some(e.index),
-                });
+                if let Some((active, active_index)) = prior_joint.or(persisted_joint) {
+                    return Ok(ConfigRecovery {
+                        active,
+                        pending_joint: Some(latest.index),
+                        active_config_index: Some(active_index),
+                    });
+                }
             }
+
+            let active = ActiveConfig {
+                current: members.clone(),
+                joint_old: joint_old.clone(),
+            };
+            let pending_joint = if active.is_joint() {
+                Some(latest.index)
+            } else {
+                None
+            };
+            return Ok(ConfigRecovery {
+                active,
+                pending_joint,
+                active_config_index: Some(latest.index),
+            });
         }
     }
     // No `ConfigChange` in the live log. On the boot path, the
@@ -1418,7 +1471,7 @@ where
     // On boot, prefer the persisted active config (if the
     // backend supports it) so a leader that compacted past the
     // last ConfigChange entry doesn't lose the membership view.
-    let recovery = recover_active_config(&storage, &cfg, true).await?;
+    let recovery = recover_active_config(&storage, &cfg, meta.commit_index, true).await?;
     let status_valid_for = Duration::from_millis(
         cfg.election_timeout_ms
             .1
@@ -1838,6 +1891,10 @@ where
         (Some(_), None) => false,
         (None, _) => false,
     };
+    let truncate_invalidated_pending = match (truncate_after, state.pending_joint_entry) {
+        (Some(ta), Some(idx)) => ta < idx,
+        _ => false,
+    };
     // Pre-compute the post-write membership view and roll any
     // change into the same atomic batch as the log mutation.
     // Three cases warrant a refresh:
@@ -1950,6 +2007,15 @@ where
         state.active_config_index = idx;
         state.pending_joint_entry = pending;
         rebuild_leader_tracking(state);
+    } else if truncate_invalidated_pending {
+        // A speculative final row can be overwritten while the preceding
+        // joint row remains live. Re-arm finalization on that joint row rather
+        // than retaining an index that no longer exists.
+        state.pending_joint_entry = if state.effective_cfg.is_joint() {
+            state.active_config_index
+        } else {
+            None
+        };
     }
 
     Ok(AppendEntriesResp {
@@ -2989,13 +3055,11 @@ where
     Ok(())
 }
 
-/// If the leader is in a joint configuration AND a
-/// `ConfigChange` entry committing the joint config sits at or
-/// below `commit_index`, append the final non-joint
-/// `ConfigChange` entry to retire the joint phase. The leader
-/// uses `commit_index` to decide because Ongaro's protocol
-/// requires the joint config to be committed (durable across
-/// crashes of any single replica) before issuing the final.
+/// Advance one committed membership-transition phase. A committed joint row
+/// causes the final row to be appended. A committed final row makes the final
+/// configuration effective and durable. Until that second point, a retiring
+/// leader deliberately retains the joint quorum so it remains eligible to
+/// recover and replicate the final row after a crash.
 async fn auto_finalize_joint_config<N, S, T, C, R, A>(
     state: &mut WorkerState<N, S, T, C, R, A>,
 ) -> Result<(), S::Error>
@@ -3010,22 +3074,55 @@ where
     if state.role != Role::Leader || !state.effective_cfg.is_joint() {
         return Ok(());
     }
-    // Finalize only when the *specific* joint entry we appended
-    // (or recovered) has committed. Matching by member-set
-    // equality would misfire on stale historical joint entries
-    // that happen to target the same set after multiple
-    // transition cycles.
-    let Some(joint_idx) = state.pending_joint_entry else {
+    // Advance only the specific transition entry we appended or recovered.
+    // Matching by member-set equality would misfire on a stale historical
+    // transition that happens to target the same set.
+    let Some(pending_idx) = state.pending_joint_entry else {
         return Ok(());
     };
-    if state.meta.commit_index < joint_idx {
+    if state.meta.commit_index < pending_idx {
+        return Ok(());
+    }
+
+    let Some(pending_entry) = state
+        .storage
+        .entries(pending_idx, pending_idx)
+        .await?
+        .into_iter()
+        .next()
+    else {
+        return Ok(());
+    };
+    let crate::log_entry::EntryKind::ConfigChange { joint_old, members } = pending_entry.kind
+    else {
+        return Ok(());
+    };
+
+    if joint_old.is_none() {
+        // The final row is now committed. Only now make it the effective view
+        // and allow a removed leader to step down.
+        state
+            .storage
+            .commit_batch(WriteBatch {
+                active_config: Some(ActiveConfigRecord {
+                    log_index: Some(pending_idx),
+                    current: members.clone(),
+                    joint_old: None,
+                }),
+                ..Default::default()
+            })
+            .await?;
+        state.effective_cfg = ActiveConfig::steady(members);
+        state.pending_joint_entry = None;
+        state.active_config_index = Some(pending_idx);
+        rebuild_leader_tracking(state);
         return Ok(());
     }
 
     // Append the final non-joint entry.
     let term = state.meta.current_term;
     let new_index = state.storage.last_index() + 1;
-    let final_members = state.effective_cfg.current.clone();
+    let final_members = members;
     let entry = LogEntry {
         index: new_index,
         term,
@@ -3038,25 +3135,13 @@ where
         .storage
         .commit_batch(WriteBatch {
             appends: alloc::vec![entry],
-            // Persist the steady view so post-compaction recovery
-            // sees the post-transition members rather than the
-            // pre-transition cfg.members fallback.
-            active_config: Some(ActiveConfigRecord {
-                log_index: Some(new_index),
-                current: final_members.clone(),
-                joint_old: None,
-            }),
             ..Default::default()
         })
         .await?;
-    state.effective_cfg = ActiveConfig::steady(final_members);
-    // Joint phase retired — clear the pending index so a
-    // subsequent change_membership starts fresh.
-    state.pending_joint_entry = None;
-    // Cache the new active-config-entry index for the H1
-    // log-mutation fast path.
-    state.active_config_index = Some(new_index);
-    rebuild_leader_tracking(state);
+    // Keep the joint view effective and persisted until this exact final row
+    // commits. If the retiring leader crashes now, boot recovery can campaign
+    // under the joint quorum and replicate the already-appended final row.
+    state.pending_joint_entry = Some(new_index);
     // (We don't call `try_advance_commit_index` here, even
     // though the just-written final entry would commit
     // immediately in a solo cluster: this function is itself

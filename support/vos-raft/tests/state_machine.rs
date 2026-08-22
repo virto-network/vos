@@ -2047,6 +2047,137 @@ fn change_membership_removing_leader_makes_it_step_down() {
     );
 }
 
+/// Reproduce the durable crash window in a two-voter replacement:
+///
+/// 1. the old leader has committed the joint `{old,new}` configuration;
+/// 2. it has appended and persisted the final `{new}` configuration;
+/// 3. it crashes before that final row reaches the replacement.
+///
+/// The retiring node must recover under the joint configuration, win one
+/// final election with the replacement's vote, replicate the existing final
+/// row, and step down only after it commits. Recovering the speculative final
+/// row as already effective leaves both replicas permanently leaderless.
+#[test]
+fn retiring_leader_recovers_uncommitted_final_configuration() {
+    use vos_raft::ActiveConfigRecord;
+
+    const OLD: u16 = 1;
+    const NEW: u16 = 2;
+    const TERM: u64 = 7;
+
+    let joint = LogEntry::config_change(2, TERM, Some(vec![OLD, NEW]), vec![NEW]);
+    let final_entry = LogEntry::config_change(3, TERM, None, vec![NEW]);
+
+    // This is the exact old-leader disk image at the crash: the final row is
+    // present but commit_index still stops at the joint row. The persisted
+    // active view deliberately models the pre-fix behavior that wrote the
+    // speculative final configuration early.
+    let mut old_storage = MemStorage::<u16>::new();
+    block_on(old_storage.commit_batch(WriteBatch {
+        appends: vec![
+            LogEntry::data(1, TERM, b"pre-transition".to_vec()),
+            joint.clone(),
+            final_entry,
+        ],
+        meta: Some(Meta {
+            current_term: TERM,
+            voted_for: None,
+            commit_index: 2,
+            snap_last_index: 0,
+            snap_last_term: 0,
+        }),
+        active_config: Some(ActiveConfigRecord {
+            log_index: Some(3),
+            current: vec![NEW],
+            joint_old: None,
+        }),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    // The replacement has only the committed joint prefix, so it still needs
+    // OLD's vote and cannot finish the transition by itself.
+    let mut new_storage = MemStorage::<u16>::new();
+    block_on(new_storage.commit_batch(WriteBatch {
+        appends: vec![LogEntry::data(1, TERM, b"pre-transition".to_vec()), joint],
+        meta: Some(Meta {
+            current_term: TERM,
+            voted_for: None,
+            commit_index: 2,
+            snap_last_index: 0,
+            snap_last_term: 0,
+        }),
+        active_config: Some(ActiveConfigRecord {
+            log_index: Some(2),
+            current: vec![NEW],
+            joint_old: Some(vec![OLD, NEW]),
+        }),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes.clone()));
+
+    let mut old_cfg = cfg(OLD, vec![OLD, NEW]);
+    old_cfg.pre_vote = false;
+    old_cfg.election_timeout_ms = (80, 100);
+    let old = Worker::spawn_with(
+        old_storage,
+        transport.clone(),
+        old_cfg,
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    old.wait_init().expect("old worker recovers");
+    routes.lock().unwrap().insert(OLD, old.handler());
+
+    // Observe the recovery decision before the election timer fires.
+    let recovered = block_on(old.handler().snapshot()).expect("old snapshot");
+    assert_eq!(recovered.members, vec![NEW]);
+    assert_eq!(recovered.joint_old, Some(vec![OLD, NEW]));
+    assert_eq!(recovered.active_config_index, Some(2));
+
+    let mut new_cfg = cfg(NEW, vec![OLD, NEW]);
+    new_cfg.pre_vote = false;
+    new_cfg.election_timeout_ms = (500, 600);
+    let new = Worker::spawn_with(
+        new_storage,
+        transport,
+        new_cfg,
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    new.wait_init().expect("new worker recovers");
+    routes.lock().unwrap().insert(NEW, new.handler());
+
+    wait_until(
+        || {
+            let old_snapshot = block_on(old.handler().snapshot());
+            let new_snapshot = block_on(new.handler().snapshot());
+            matches!(
+                (old_snapshot, new_snapshot),
+                (Some(old), Some(new))
+                    if old.commit_index >= 3
+                        && new.commit_index >= 3
+                        && old.members == vec![NEW]
+                        && new.members == vec![NEW]
+                        && old.joint_old.is_none()
+                        && new.joint_old.is_none()
+                        && new.role == Role::Leader
+                        && old.role != Role::Leader
+            )
+        },
+        Duration::from_secs(8),
+        "retiring leader replicates and commits the recovered final config",
+    );
+
+    old.shutdown();
+    new.shutdown();
+}
+
 /// `change_membership` called against a follower returns
 /// `NotLeader`. The caller is expected to forward the request
 /// to the cluster's current leader.
