@@ -2039,11 +2039,50 @@ where
             retiring_acks_after_batch.clear();
         }
     }
+    // If truncation removes the row behind the cached effective view, derive
+    // the classifier's base from the surviving log before interpreting newly
+    // appended configurations. In particular, a replacement final can follow
+    // a surviving joint row even though the pre-truncation cache still names
+    // the speculative final that is being overwritten.
+    let truncated_base_config = if truncate_invalidated_cfg {
+        let snap = state.storage.snap_last_index();
+        let scan_end =
+            truncate_after.expect("truncate_invalidated_cfg implies Some(truncate_after)");
+        let mut found: Option<(u64, ActiveConfig<N>)> = None;
+        if scan_end > snap {
+            let surviving = match state.storage.entries(snap + 1, scan_end).await {
+                Ok(entries) => entries,
+                Err(error) => {
+                    state.meta = meta_snapshot;
+                    return Err(error);
+                }
+            };
+            for entry in surviving.iter().rev() {
+                if let crate::log_entry::EntryKind::ConfigChange { joint_old, members } =
+                    &entry.kind
+                {
+                    found = Some((
+                        entry.index,
+                        ActiveConfig {
+                            current: members.clone(),
+                            joint_old: joint_old.clone(),
+                        },
+                    ));
+                    break;
+                }
+            }
+        }
+        Some(found.unwrap_or_else(|| (0, ActiveConfig::steady(state.cfg.members.clone()))))
+    } else {
+        None
+    };
     if appended_a_config {
         // Interpret only newly appended rows. Reprocessing an already-present
         // source final as if it were a second consecutive final would forge a
         // retirement confirmation on an ordinary heartbeat retry.
-        let mut retirement_view = state.effective_cfg.clone();
+        let mut retirement_view = truncated_base_config
+            .as_ref()
+            .map_or_else(|| state.effective_cfg.clone(), |(_, active)| active.clone());
         for e in &appends {
             if let crate::log_entry::EntryKind::ConfigChange { joint_old, members } = &e.kind {
                 if let Some(old) = joint_old {
@@ -2109,51 +2148,14 @@ where
                 break;
             }
         }
-    } else if truncate_invalidated_cfg {
-        let snap = state.storage.snap_last_index();
-        let scan_end =
-            truncate_after.expect("truncate_invalidated_cfg implies Some(truncate_after)");
-        let mut found: Option<(u64, Option<Vec<N>>, Vec<N>)> = None;
-        if scan_end > snap {
-            let surviving = match state.storage.entries(snap + 1, scan_end).await {
-                Ok(e) => e,
-                Err(e) => {
-                    state.meta = meta_snapshot;
-                    return Err(e);
-                }
-            };
-            for e in surviving.iter().rev() {
-                if let crate::log_entry::EntryKind::ConfigChange { joint_old, members } = &e.kind {
-                    found = Some((e.index, joint_old.clone(), members.clone()));
-                    break;
-                }
-            }
-        }
-        if let Some((idx, joint_old, members)) = found {
-            let active = ActiveConfig {
-                current: members.clone(),
-                joint_old: joint_old.clone(),
-            };
-            let pending = if active.is_joint() { Some(idx) } else { None };
-            active_config_for_batch = Some(ActiveConfigRecord {
-                log_index: Some(idx),
-                current: members,
-                joint_old,
-            });
-            post_active_view = Some((active, Some(idx), pending));
-        } else {
-            // No surviving ConfigChange — fall back to the
-            // static `cfg.members` (steady, non-joint). Persist
-            // it so the next reboot reads the post-truncate view
-            // rather than the stale speculative one.
-            let fallback = ActiveConfig::steady(state.cfg.members.clone());
-            active_config_for_batch = Some(ActiveConfigRecord {
-                log_index: Some(0),
-                current: fallback.current.clone(),
-                joint_old: None,
-            });
-            post_active_view = Some((fallback, Some(0), None));
-        }
+    } else if let Some((idx, active)) = truncated_base_config {
+        let pending = active.is_joint().then_some(idx);
+        active_config_for_batch = Some(ActiveConfigRecord {
+            log_index: Some(idx),
+            current: active.current.clone(),
+            joint_old: active.joint_old.clone(),
+        });
+        post_active_view = Some((active, Some(idx), pending));
     }
 
     // Recovery can deliberately retain the joint view while an already-

@@ -2335,6 +2335,93 @@ fn follower_recognizes_confirmation_after_already_present_final() {
     worker.shutdown();
 }
 
+/// Replacing a speculative final must classify the new final from the joint
+/// configuration that survives truncation, not from the stale cached final
+/// view. Otherwise this follower can later lead without the retirement debt.
+#[test]
+fn replaced_speculative_final_preserves_retirement_debt() {
+    use vos_raft::ActiveConfigRecord;
+
+    const OLD: u16 = 1;
+    const FOLLOWER: u16 = 2;
+    const LEADER: u16 = 3;
+    const REPLACEMENT: u16 = 4;
+    const OLD_TERM: u64 = 7;
+    const NEW_TERM: u64 = 8;
+
+    let old_members = vec![OLD, FOLLOWER, LEADER];
+    let new_members = vec![FOLLOWER, LEADER, REPLACEMENT];
+    let mut storage = MemStorage::<u16>::new();
+    block_on(storage.commit_batch(WriteBatch {
+        appends: vec![
+            LogEntry::data(1, OLD_TERM, b"pre-transition".to_vec()),
+            LogEntry::config_change(2, OLD_TERM, Some(old_members.clone()), new_members.clone()),
+            LogEntry::config_change(3, OLD_TERM, None, new_members.clone()),
+        ],
+        meta: Some(Meta {
+            current_term: OLD_TERM,
+            voted_for: None,
+            commit_index: 2,
+            snap_last_index: 0,
+            snap_last_term: 0,
+        }),
+        active_config: Some(ActiveConfigRecord {
+            log_index: Some(3),
+            current: new_members.clone(),
+            joint_old: None,
+        }),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let routes: Routes = Arc::new(Mutex::new(BTreeMap::new()));
+    let transport = Arc::new(MockTransport::new(routes));
+    let mut config = cfg(FOLLOWER, old_members);
+    config.pre_vote = false;
+    config.election_timeout_ms = (5_000, 6_000);
+    let worker = Worker::spawn_with(
+        storage,
+        transport,
+        config,
+        (),
+        StdClock,
+        StdRng::from_entropy(),
+    );
+    worker
+        .wait_init()
+        .expect("follower recovers speculative final");
+    assert_eq!(
+        block_on(worker.handler().snapshot())
+            .expect("snapshot before replacement")
+            .retirement_final_index,
+        Some(3),
+    );
+
+    let response = block_on(worker.handler().handle_inbound_append(
+        LEADER,
+        AppendEntriesReq {
+            leader: LEADER,
+            term: NEW_TERM,
+            prev_log_index: 2,
+            prev_log_term: OLD_TERM,
+            leader_commit: 2,
+            entries: vec![
+                LogEntry::data(3, NEW_TERM, b"promotion-noop".to_vec()),
+                LogEntry::config_change(4, NEW_TERM, None, new_members.clone()),
+            ],
+        },
+    ));
+    assert!(response.success, "replacement tail must be accepted");
+
+    let after = block_on(worker.handler().snapshot()).expect("snapshot after replacement");
+    assert_eq!(after.members, new_members);
+    assert_eq!(after.joint_old, None);
+    assert_eq!(after.active_config_index, Some(4));
+    assert_eq!(after.retirement_final_index, Some(4));
+
+    worker.shutdown();
+}
+
 /// If the replacement received the final row before the old leader crashed,
 /// it can elect itself from the final configuration. It must nevertheless
 /// keep the retiring peer as a transport-only target long enough to deliver
