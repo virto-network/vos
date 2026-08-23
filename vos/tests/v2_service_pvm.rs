@@ -6141,9 +6141,15 @@ fn conformance_raft_and_role_authority_shape_changes_are_refused_before_upgrade(
 }
 
 #[test]
-fn production_raft_root_upgrade_is_ordered_once_and_reopens_at_the_committed_package() {
+fn production_raft_authority_upgrade_is_ordered_once_and_preserves_service_identity() {
     let signer = libp2p::identity::Keypair::generate_ed25519();
-    let (package, actor_name) = signed_test_package(&greeter_elf(), &signer);
+    let (mut package, _) = signed_test_package(&greeter_elf(), &signer);
+    package.manifest.name = vos::v2::ROLE_AUTHORITY_INSTANCE_V2.into();
+    package.deployment_signature.signature = signer
+        .sign(&package.signing_message())
+        .expect("sign authority package");
+    package.validate().unwrap();
+    let actor_name = vos::v2::ROLE_AUTHORITY_INSTANCE_V2.into();
     let actor = ActorId([0x66; 32]);
     let config = LocalRootTreeConfigV2 {
         role_authority: None,
@@ -6206,6 +6212,11 @@ fn production_raft_root_upgrade_is_ordered_once_and_reopens_at_the_committed_pac
             ..
         } if deployment == replacement.deployment_id()
     ));
+    assert_eq!(
+        service.identity(),
+        &config.service,
+        "upgrading the authority actor preserves its genesis service identity"
+    );
     let backend = service.into_backend();
 
     let mut log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();

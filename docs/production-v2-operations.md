@@ -119,24 +119,32 @@ Completed roots return an idempotent terminal result; unfinished roots resume
 joint consensus. Never remove the registry row manually first, because that
 row is what authenticates the retiring slot during the transition.
 
-## Frozen authority upgrades
+## Canonical authority upgrades
 
 The bundled Batch 70 `space-authority` is a durable actor deployment. Rebuilding
 its source produces an upgrade candidate, not a replacement release blob:
 
 ```sh
 just build-authority-upgrade-candidate
+vosx space publish <space> space-authority:artifact-only \
+  target/bundled-space-authority/space-authority.vos
+vosx space upgrade <space> space-authority space-authority:artifact-only
 ```
 
-Do not copy that output over `vosx/blobs/space_authority.pvm`. Ordinary signed
-v2 Local and Raft roots may use `vosx space upgrade`, which drives the
-guest-owned transition before its catalog compare-and-swap. The command still
-refuses `space-authority`: its catalog deployment is also the stable trust
-binding consumed by every dependent root.
+Run the build/publish step with the immutable space-root identity; a package
+signed by an ordinary administrator or voter is refused before `UpgradeActor`
+is proposed.
 
-The only valid authority migration is one canonical `UpgradeActor` request per
-affected Raft authority root. A future authority-specific migration must
-perform all of the following as one authenticated workflow:
+Do not copy that output over `vosx/blobs/space_authority.pvm`. Ordinary signed
+v2 Local and Raft roots use `vosx space upgrade`, which drives the guest-owned
+transition before its catalog compare-and-swap. `space-authority` uses that
+same transition with additional checks: both the installed and replacement
+packages must be signed by the immutable space root and must preserve the
+exact platform schemas, generated interfaces, role policies, Task dependency
+surface, and Raft consistency.
+
+The migration is one canonical `UpgradeActor` request against the existing
+Raft authority root. The command:
 
 1. verify the signed candidate package and make its PVM available on every
    Raft voter;
@@ -144,10 +152,17 @@ perform all of the following as one authenticated workflow:
    expected pair;
 3. obtain an exact linear read base after the current-term barrier;
 4. obtain production authorization for the complete `UpgradeActor` bytes;
-5. propose the transition and wait for the final applied index on every voter;
-6. verify the actor deployment, program, producer, and method policies from
-   guest-owned state before distributing a release that expects the new
-   authority.
+5. proposes the transition with the signed package and PVM in the ordered
+   availability sidecar, then waits for its durable disposition;
+6. compare-and-swaps the catalog only after the guest commits the exact actor
+   deployment and program.
+
+The authority service identity and replication incarnation do not change.
+Dependent roots remain bound to the frozen genesis service deployment while
+the authority's guest-owned actor descriptor advances to the replacement
+deployment. On restart, the daemon resolves that stable service binding and
+uses the permanent upgrade record to validate the catalog's newer actor
+package.
 
 The ordinary-root command already implements the corresponding signed-package
 availability, authenticated transition, catalog ordering, and exact retry
@@ -159,12 +174,11 @@ image had not applied the upgrade before the crash. If a survivor acknowledged
 the upgrade but missed the leader's commit heartbeat, the exact
 catalog-addressed package may also be recovered from its durable appended tail
 solely to start Raft; only the later Raft commit index can authorize guest
-application. Raft upgrades require the
-sealed production trust policy;
+application. Raft upgrades require the sealed production trust policy;
 the process-local conformance allowlist is deliberately refused because it
 cannot replay on followers. CRDT roots, roots exposing attested methods, and
 changes which add or remove the root's role-authority requirement remain
 unsupported. Those shapes need guest-owned binding migrations before an
-in-place upgrade can be safe. Until the authority-specific command and a
-cross-version authority rehearsal land, the production procedure is to retain
-the frozen authority and restore it from the verified release bundle.
+in-place upgrade can be safe. Keep the bundled Batch 70 PVM unchanged: it is
+the recovery/genesis artifact for existing spaces, not an implicit upgrade
+channel.

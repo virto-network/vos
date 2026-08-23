@@ -171,8 +171,9 @@ stands in for the on-chain settlement venue Wave 2 makes real.
   guest-owned `UpgradeActor` path are explicit in
   `docs/production-v2-operations.md`. Ordinary Local and Raft roots now have an
   authenticated CLI/daemon entry point with exact retry and restart recovery.
-  The remaining release-operations product item is the canonical-authority
-  binding migration.
+  Canonical-authority upgrades now reuse that guest-owned path while preserving
+  the frozen service binding and enforcing the immutable-root signature plus
+  exact platform contract at the daemon boundary.
 
 **Keystone fast-follows (non-blocking; merged code is green)**
 - Ristretto host precompiles remain outside the trusted proof boundary. The

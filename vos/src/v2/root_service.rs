@@ -2406,9 +2406,7 @@ where
         &mut self,
         request: RootTreeUpgradeRequestV2,
     ) -> Result<AccumulationResultV2, LocalRootTreeInvokeErrorV2> {
-        if self.consistency == ConsistencyModeV2::Crdt
-            || self.expected_root.name == super::ROLE_AUTHORITY_INSTANCE_V2
-        {
+        if self.consistency == ConsistencyModeV2::Crdt {
             return Err(LocalRootTreeInvokeErrorV2::UpgradeUnsupported);
         }
         request

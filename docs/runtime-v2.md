@@ -790,7 +790,11 @@ root-signed package hash, and derived replication incarnation are pinned by
 regression tests so already-sealed spaces reopen unchanged. A source rebuild
 is not installed implicitly; changing that actor requires an explicit
 `UpgradeActor` migration which preserves the existing authority incarnation
-until the upgrade commits.
+and service identity while advancing only the guest-owned actor deployment.
+The daemon accepts that migration only when both packages are signed by the
+immutable space root and preserve the exact canonical authority contract;
+dependent roots continue resolving the frozen genesis service deployment
+after the catalog moves to the upgraded actor package.
 
 `just package-v2-production-release` writes the canonical service PVM and
 frozen authority PVM beside a `VOSR1` manifest. `vosx release verify` binds the

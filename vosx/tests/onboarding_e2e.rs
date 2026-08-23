@@ -642,6 +642,54 @@ fn crdt_counter_package_fixture(output_dir: &Path) -> PathBuf {
     package
 }
 
+fn authority_upgrade_package_fixture(
+    data_home: &Path,
+    config_home: &Path,
+    output_dir: &Path,
+) -> PathBuf {
+    let actor_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../actors/space-authority/target/riscv64em-javm/release/space_authority.elf");
+    assert!(
+        actor_elf.is_file(),
+        "build the authority candidate first: `just build-authority-upgrade-candidate` ({})",
+        actor_elf.display(),
+    );
+    let actor = actor_elf.to_string_lossy().into_owned();
+    let out = output_dir.to_string_lossy().into_owned();
+    vosx_ok(
+        data_home,
+        config_home,
+        &[
+            "build",
+            &actor,
+            "--name",
+            vos::v2::ROLE_AUTHORITY_INSTANCE_V2,
+            "--version",
+            "migration-v2",
+            "--out-dir",
+            &out,
+        ],
+    );
+    let package = output_dir.join("space-authority.vos");
+    assert!(
+        package.is_file(),
+        "vosx build must emit the root-signed authority candidate"
+    );
+    let candidate = <vos::v2::VosPackageV2 as vos::v2::V2Wire>::decode(
+        &fs::read(&package).expect("read authority candidate"),
+    )
+    .expect("decode authority candidate");
+    let frozen =
+        fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("blobs/space_authority.pvm"))
+            .expect("read frozen authority PVM");
+    assert_ne!(
+        candidate.manifest.actor_program,
+        vos::v2::ProgramId::of_pvm(&frozen),
+        "the migration gate must exercise a real authority code change",
+    );
+    package
+}
+
 fn assert_bundled_space_authority_preserves_batch_70_program() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let bundled = fs::read(workspace.join("vosx/blobs/space_authority.pvm"))
@@ -1450,6 +1498,7 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
     let config = TempDir::new("v2-production-config");
     let dist = TempDir::new("v2-production-dist");
     let crdt_dist = TempDir::new("v2-production-crdt-dist");
+    let authority_dist = TempDir::new("v2-production-authority-dist");
     let sidecar_dir = TempDir::new("v2-production-sidecar");
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let service_pvm = workspace.join("services/vos-service/vos-service.pvm");
@@ -1461,6 +1510,9 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
     let crdt_package = crdt_counter_package_fixture(crdt_dist.path());
 
     vosx_ok(data.path(), config.path(), &["space", "new", space]);
+    assert_bundled_space_authority_preserves_batch_70_program();
+    let authority_candidate =
+        authority_upgrade_package_fixture(data.path(), config.path(), authority_dist.path());
 
     // Selecting production mode is fail-closed before the endpoint is
     // published: the daemon cannot silently fall back to conformance when the
@@ -1498,6 +1550,49 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
         Some(&trust_socket),
     ));
     let endpoint = wait_for_endpoint(data.path(), &first_log, "v2-production-first");
+
+    let authority_source = authority_candidate.to_string_lossy().into_owned();
+    vosx_ok(
+        data.path(),
+        config.path(),
+        &[
+            "space",
+            "publish",
+            space,
+            "space-authority:migration-v2",
+            &authority_source,
+        ],
+    );
+    let authority_upgraded = vosx_ok(
+        data.path(),
+        config.path(),
+        &[
+            "space",
+            "upgrade",
+            space,
+            vos::v2::ROLE_AUTHORITY_INSTANCE_V2,
+            "space-authority:migration-v2",
+        ],
+    );
+    assert!(
+        authority_upgraded.contains("upgraded space-authority"),
+        "the immutable-root package must migrate through guest UpgradeActor before the catalog moves: {authority_upgraded}",
+    );
+    let authority_retry = vosx_ok(
+        data.path(),
+        config.path(),
+        &[
+            "space",
+            "upgrade",
+            space,
+            vos::v2::ROLE_AUTHORITY_INSTANCE_V2,
+            "space-authority:migration-v2",
+        ],
+    );
+    assert!(
+        authority_retry.contains("upgraded space-authority"),
+        "an exact authority migration retry must recover the durable disposition: {authority_retry}",
+    );
 
     let package_source = package.to_string_lossy().into_owned();
     vosx_ok(

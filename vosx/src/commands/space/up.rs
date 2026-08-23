@@ -95,12 +95,11 @@ fn role_authority_package_version(actor_program: vos::v2::ProgramId) -> String {
     )
 }
 
-/// Construct the canonical authority package for the current service ABI.
-/// The immutable space root signs these exact actor bytes once; peers consume
-/// the signed package from the registry and never author substitutes.
-fn root_signed_role_authority_package(
-    root: &libp2p::identity::Keypair,
-) -> anyhow::Result<vos::v2::VosPackageV2> {
+/// Construct the frozen authority package contents for the current service
+/// ABI. The signature wrapper is intentionally supplied separately: it is not
+/// part of [`vos::v2::DeploymentId`], while these manifest and PVM bytes are
+/// the stable genesis identity consumed by every dependent root.
+fn frozen_role_authority_package(public_key: Vec<u8>) -> anyhow::Result<vos::v2::VosPackageV2> {
     use vos::v2::{V2Wire, artifact_hash};
 
     let actor_pvm = crate::bundled::space_authority_pvm()
@@ -115,8 +114,7 @@ fn root_signed_role_authority_package(
         .ok_or_else(|| anyhow::anyhow!("canonical space-authority metadata is invalid"))?;
     let role_policies = vos::v2::PackageRolePoliciesV2::from_metadata(&metadata)?.encode();
     let actor_program = vos::v2::ProgramId::of_pvm(&actor_pvm);
-    let public_key = root.public().encode_protobuf();
-    let mut package = vos::v2::VosPackageV2 {
+    Ok(vos::v2::VosPackageV2 {
         manifest: vos::v2::PackageManifestV2 {
             name: vos::v2::ROLE_AUTHORITY_INSTANCE_V2.into(),
             version: role_authority_package_version(actor_program),
@@ -142,7 +140,20 @@ fn root_signed_role_authority_package(
             public_key,
             signature: vec![0],
         },
-    };
+    })
+}
+
+fn frozen_role_authority_deployment() -> anyhow::Result<vos::v2::DeploymentId> {
+    Ok(frozen_role_authority_package(Vec::new())?.deployment_id())
+}
+
+/// Construct the canonical authority package for the current service ABI.
+/// The immutable space root signs these exact actor bytes once; peers consume
+/// the signed package from the registry and never author substitutes.
+fn root_signed_role_authority_package(
+    root: &libp2p::identity::Keypair,
+) -> anyhow::Result<vos::v2::VosPackageV2> {
+    let mut package = frozen_role_authority_package(root.public().encode_protobuf())?;
     package.deployment_signature.signature = root
         .sign(&package.signing_message())
         .map_err(|error| anyhow::anyhow!("sign canonical space-authority package: {error}"))?;
@@ -1928,34 +1939,53 @@ fn package_requires_role_authority(package: &vos::v2::VosPackageV2) -> anyhow::R
     Ok(policies.methods.iter().any(|method| !method.public))
 }
 
-fn validate_role_authority_deployment(
+pub(super) fn validate_role_authority_deployment(
     package: &vos::v2::VosPackageV2,
     root_peer_id: &[u8],
     consistency: Consistency,
 ) -> anyhow::Result<()> {
     use vos::v2::V2Wire;
 
+    package
+        .validate()
+        .map_err(|error| anyhow::anyhow!("validate space-authority package: {error}"))?;
+    vos::v2::validate_actor_program_layout(&package.actor_pvm).map_err(|error| {
+        anyhow::anyhow!("space-authority actor PVM capability layout is invalid: {error}")
+    })?;
     if consistency != Consistency::Raft {
         anyhow::bail!(
             "{} must use Raft consistency",
             vos::v2::ROLE_AUTHORITY_INSTANCE_V2
         );
     }
-    let canonical_pvm = crate::bundled::space_authority_pvm().ok_or_else(|| {
-        anyhow::anyhow!("vosx was built without the canonical space-authority PVM")
-    })?;
-    if package.manifest.name != vos::v2::ROLE_AUTHORITY_INSTANCE_V2
-        || package.manifest.version
-            != role_authority_package_version(vos::v2::ProgramId::of_pvm(canonical_pvm))
-        || package.actor_pvm != canonical_pvm
+    let frozen = frozen_role_authority_package(Vec::new())?;
+    if package.manifest.name != vos::v2::ROLE_AUTHORITY_INSTANCE_V2 {
+        anyhow::bail!("installed space-authority has the wrong package name");
+    }
+    // Authority upgrades may replace code, version, and the resulting actor
+    // deployment. They may not silently change the wire/API surface trusted
+    // by the registry, daemon, or already-installed dependent roots.
+    if package.generated_interfaces != frozen.generated_interfaces
+        || package.role_policies != frozen.role_policies
+        || package.schemas != frozen.schemas
+        || package.task_dependencies != frozen.task_dependencies
+        || package.manifest.crdt != frozen.manifest.crdt
     {
-        anyhow::bail!("installed space-authority is not the canonical platform deployment");
+        anyhow::bail!("space-authority package changes the canonical platform contract");
     }
     let deployment_key =
         libp2p::identity::PublicKey::try_decode_protobuf(&package.deployment_signature.public_key)
             .map_err(|error| anyhow::anyhow!("decode space-authority deployment key: {error}"))?;
-    if root_peer_id.is_empty() || libp2p::PeerId::from(deployment_key).to_bytes() != root_peer_id {
+    if root_peer_id.is_empty()
+        || libp2p::PeerId::from(deployment_key.clone()).to_bytes() != root_peer_id
+    {
         anyhow::bail!("space-authority package was not signed by the immutable space root");
+    }
+    if !deployment_key.verify(
+        &package.signing_message(),
+        &package.deployment_signature.signature,
+    ) {
+        anyhow::bail!("space-authority deployment signature is invalid");
     }
     let policies = vos::v2::PackageRolePoliciesV2::decode(&package.role_policies)
         .map_err(|error| anyhow::anyhow!("decode space-authority policies: {error}"))?;
@@ -2029,7 +2059,10 @@ fn resolve_v2_role_authority_with(
             service: vos::v2::ServiceIdentityV2 {
                 space,
                 root_service,
-                deployment: package.deployment_id(),
+                // Actor upgrades preserve the authority service account's
+                // genesis identity. Dependent roots bind that stable service
+                // identity, not the catalog's current actor deployment.
+                deployment: frozen_role_authority_deployment()?,
                 service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
                 service_abi: vos::v2::ABI_VERSION,
                 execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
@@ -4169,6 +4202,48 @@ mod tests {
         assert_eq!(
             binding.actor,
             v2_root_actor_id(root_service, vos::v2::ROLE_AUTHORITY_INSTANCE_V2)
+        );
+
+        // A root-signed implementation/package revision with the exact
+        // platform contract is a valid authority actor upgrade. Dependent
+        // roots continue binding the frozen service deployment rather than
+        // following the catalog's new actor deployment.
+        let mut candidate = package.clone();
+        candidate.manifest.version = "authority-candidate-v2".into();
+        candidate.deployment_signature.signature = root
+            .sign(&candidate.signing_message())
+            .expect("sign authority candidate");
+        candidate.validate().unwrap();
+        assert_ne!(candidate.deployment_id(), package.deployment_id());
+        validate_role_authority_deployment(&candidate, &root_peer, Consistency::Raft).unwrap();
+        let candidate_wire = candidate.encode();
+        let candidate_hash = BlobHash::of(&candidate_wire).0;
+        let mut upgraded_row = row.clone();
+        upgraded_row.program_hash = candidate_hash;
+        upgraded_row.program_version = candidate.manifest.version.clone();
+        let upgraded = resolve_v2_role_authority_with(
+            space_id,
+            std::slice::from_ref(&upgraded_row),
+            &root_peer,
+            |hash| Ok((hash == candidate_hash).then(|| candidate_wire.clone())),
+        )
+        .unwrap();
+        let RoleAuthorityResolution::Ready(upgraded) = upgraded else {
+            panic!("upgraded root-signed authority did not resolve")
+        };
+        assert_eq!(upgraded.service.deployment, package.deployment_id());
+
+        let mut incompatible = candidate;
+        incompatible.generated_interfaces = vec![1];
+        incompatible.manifest.interfaces_hash =
+            artifact_hash(b"interfaces", &incompatible.generated_interfaces);
+        incompatible.deployment_signature.signature = root
+            .sign(&incompatible.signing_message())
+            .expect("sign incompatible authority candidate");
+        incompatible.validate().unwrap();
+        assert!(
+            validate_role_authority_deployment(&incompatible, &root_peer, Consistency::Raft)
+                .is_err()
         );
     }
 

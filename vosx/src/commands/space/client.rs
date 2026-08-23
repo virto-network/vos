@@ -759,13 +759,13 @@ impl DaemonClient {
         // Compare-and-swap base: read the instance's live program hash so
         // the registry rejects this upgrade if the instance has moved on
         // (a replayed/superseded upgrade can't roll the version back).
-        let from_hash: [u8; 32] = vos::block_on(
+        let installed = vos::block_on(
             self.registry()
                 .agent(&mut &self.node, instance_name.clone()),
         )
         .map_err(|e| anyhow::anyhow!("registry.agent(): {e}"))?
-        .map(|row| row.program_hash)
         .ok_or_else(|| anyhow::anyhow!("upgrade: instance '{instance_name}' is not installed"))?;
+        let from_hash = installed.program_hash;
         let to_hash: [u8; 32] = program_hash
             .as_slice()
             .try_into()
@@ -791,13 +791,24 @@ impl DaemonClient {
             anyhow::bail!("upgrade cannot cross the legacy/v2 runtime boundary");
         }
         if from_v2 {
-            if instance_name == vos::v2::ROLE_AUTHORITY_INSTANCE_V2 {
-                anyhow::bail!(
-                    "the canonical space-authority remains frozen; its stable trust binding requires a separate migration workflow",
-                );
-            }
             let from_package = decode_exact_v2_package(&from_artifact, "installed")?;
             let to_package = decode_exact_v2_package(&to_artifact, "replacement")?;
+            if instance_name == vos::v2::ROLE_AUTHORITY_INSTANCE_V2 {
+                let root_peer_id = vos::block_on(self.registry().root(&mut &self.node))
+                    .map_err(|error| anyhow::anyhow!("registry.root(): {error}"))?;
+                let consistency = super::common::consistency_from_u8(installed.consistency)
+                    .ok_or_else(|| anyhow::anyhow!("space-authority has unknown consistency"))?;
+                super::up::validate_role_authority_deployment(
+                    &from_package,
+                    &root_peer_id,
+                    consistency,
+                )?;
+                super::up::validate_role_authority_deployment(
+                    &to_package,
+                    &root_peer_id,
+                    consistency,
+                )?;
+            }
             let target = self.resolve_target(&instance_name)?;
             let actor = self
                 .v2_targets
