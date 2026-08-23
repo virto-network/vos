@@ -5250,7 +5250,19 @@ fn node_registers_a_raft_root_through_the_canonical_request_log() {
 #[test]
 fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
     let task_pvm = grey_transpiler::assembler::Assembler::new().build();
-    let (config, _) = signed_task_dependency_config(task_pvm, ConsistencyModeV2::Raft);
+    let (mut config, _) = signed_task_dependency_config(task_pvm, ConsistencyModeV2::Raft);
+    let authority_signer = libp2p::identity::Keypair::generate_ed25519();
+    config.actor_name = vos::v2::ROLE_AUTHORITY_INSTANCE_V2.into();
+    config.package.manifest.name = vos::v2::ROLE_AUTHORITY_INSTANCE_V2.into();
+    config.package.deployment_signature.public_key = authority_signer.public().encode_protobuf();
+    config.package.deployment_signature.producer =
+        ProducerId::of_public_key(&config.package.deployment_signature.public_key);
+    config.package.deployment_signature.signature = authority_signer
+        .sign(&config.package.signing_message())
+        .expect("sign authority redirect fixture");
+    config.service.deployment = config.package.deployment_id();
+    config.package.validate().unwrap();
+    let authority_package = config.package.clone();
     let actor = config.root_actor;
 
     let key_a = libp2p::identity::Keypair::generate_ed25519();
@@ -5425,10 +5437,16 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
         .unwrap();
     let log_b = RaftAccumulateLogV2::from_worker(db_b, raft_config(prefix_b), worker_b, apply_b_rx)
         .unwrap();
+    let trust = Arc::new(TestProductionTrust::new(0xB6, 100, true));
     let local_id = 0x3600;
     if leader == prefix_a {
-        let service_a =
-            LocalRootTreeServiceV2::open_raft(config.clone(), backend_a.clone(), log_a).unwrap();
+        let service_a = LocalRootTreeServiceV2::open_raft_production(
+            config.clone(),
+            backend_a.clone(),
+            log_a,
+            trust.clone(),
+        )
+        .unwrap();
         node_a
             .register_v2_root_at_id(
                 "raft-root-a",
@@ -5438,7 +5456,8 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
             )
             .unwrap();
         let service_b =
-            LocalRootTreeServiceV2::open_raft(config, backend_b.clone(), log_b).unwrap();
+            LocalRootTreeServiceV2::open_raft_production(config, backend_b.clone(), log_b, trust)
+                .unwrap();
         node_b
             .register_v2_root_at_id(
                 "raft-root-b",
@@ -5448,8 +5467,13 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
             )
             .unwrap();
     } else {
-        let service_b =
-            LocalRootTreeServiceV2::open_raft(config.clone(), backend_b.clone(), log_b).unwrap();
+        let service_b = LocalRootTreeServiceV2::open_raft_production(
+            config.clone(),
+            backend_b.clone(),
+            log_b,
+            trust.clone(),
+        )
+        .unwrap();
         node_b
             .register_v2_root_at_id(
                 "raft-root-b",
@@ -5459,7 +5483,8 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
             )
             .unwrap();
         let service_a =
-            LocalRootTreeServiceV2::open_raft(config, backend_a.clone(), log_a).unwrap();
+            LocalRootTreeServiceV2::open_raft_production(config, backend_a.clone(), log_a, trust)
+                .unwrap();
         node_a
             .register_v2_root_at_id(
                 "raft-root-a",
@@ -5525,6 +5550,79 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
         .recv_timeout(Duration::from_secs(10))
         .expect("the leader answers an unauthorized delegation fail-closed");
     assert!(refused.is_empty());
+
+    // A genuinely enrolled voter may carry the host-private upgrade marker,
+    // but that marker authenticates only the forwarding hop. It cannot replace
+    // the immutable space-root package signature enforced by the root driver.
+    let attacker = libp2p::identity::Keypair::generate_ed25519();
+    let mut attacker_signed = authority_package.clone();
+    attacker_signed.manifest.version = "voter-forged-authority".into();
+    attacker_signed.deployment_signature.public_key = attacker.public().encode_protobuf();
+    attacker_signed.deployment_signature.producer =
+        ProducerId::of_public_key(&attacker_signed.deployment_signature.public_key);
+    attacker_signed.deployment_signature.signature = attacker
+        .sign(&attacker_signed.signing_message())
+        .expect("sign voter-forged authority package");
+    attacker_signed.validate().unwrap();
+    let upgrade_ingress = RootTreeInvocationV2 {
+        invocation: InvocationId([0xB9; 32]),
+        target: actor,
+        method: vos::v2::ROOT_UPGRADE_METHOD_V2.into(),
+        arguments: RootTreeUpgradeRequestV2 {
+            expected_deployment: authority_package.deployment_id(),
+            expected_program: authority_package.manifest.actor_program,
+            replacement: attacker_signed,
+        }
+        .encode(),
+        proof_requested: false,
+    };
+    let mut delegated_upgrade = b"VRD4".to_vec();
+    // preserve envelope + no authority marker + upgrade marker + System origin
+    delegated_upgrade.extend_from_slice(&[1, 0, 1, 3]);
+    delegated_upgrade.extend_from_slice(&upgrade_ingress.encode());
+    let (forwarding_network, leader_peer) = if leader == prefix_a {
+        (
+            network_b.clone(),
+            network_b.peer_for_prefix(prefix_a).unwrap(),
+        )
+    } else {
+        (
+            network_a.clone(),
+            network_a.peer_for_prefix(prefix_b).unwrap(),
+        )
+    };
+    let leader_handle = if leader == prefix_a {
+        &handle_a
+    } else {
+        &handle_b
+    };
+    let committed_before = leader_handle
+        .snapshot()
+        .expect("leader status before forged delegated upgrade")
+        .commit_index;
+    let refused = forwarding_network
+        .send_invoke(
+            leader_peer,
+            ServiceId::REGISTRY.0,
+            ServiceId::new(leader, local_id).0,
+            Vec::new(),
+            delegated_upgrade,
+        )
+        .recv_timeout(Duration::from_secs(10))
+        .expect("leader answers the voter-delegated forged upgrade fail-closed");
+    assert_ne!(
+        refused.first().copied(),
+        Some(vos::actors::run::STATUS_DONE),
+        "the leader must not report a committed upgrade: {refused:?}",
+    );
+    assert_eq!(
+        leader_handle
+            .snapshot()
+            .expect("leader status after forged delegated upgrade")
+            .commit_index,
+        committed_before,
+        "the voter-delegated forged authority upgrade never enters Raft",
+    );
 
     let follower_node = if follower == prefix_a {
         &node_a
@@ -6187,11 +6285,15 @@ fn production_raft_authority_upgrade_is_ordered_once_and_preserves_service_ident
     std::fs::create_dir_all(&directory).unwrap();
     let log_path = directory.join("raft.redb");
     let log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
-    let backend = FailableCommittedImages::default();
+    let backend = SharedCommittedImages::default();
     let trust = Arc::new(TestProductionTrust::new(0x6B, 100, true));
-    let mut service =
-        LocalRootTreeServiceV2::open_raft_production(config.clone(), backend, log, trust.clone())
-            .expect("single-voter production Raft root installs");
+    let service = LocalRootTreeServiceV2::open_raft_production(
+        config.clone(),
+        backend.clone(),
+        log,
+        trust.clone(),
+    )
+    .expect("single-voter production Raft root installs");
 
     let mut replacement = package.clone();
     replacement.manifest.version = "2.1.0".into();
@@ -6204,6 +6306,73 @@ fn production_raft_authority_upgrade_is_ordered_once_and_preserves_service_ident
         expected_program: package.manifest.actor_program,
         replacement: replacement.clone(),
     };
+
+    // The reserved method is intentionally reachable by host System/Admin
+    // callers. That caller authorization must not substitute for the
+    // immutable space-root signer check at the service proposal boundary.
+    let attacker = libp2p::identity::Keypair::generate_ed25519();
+    let mut attacker_signed = replacement.clone();
+    attacker_signed.manifest.version = "attacker-signed".into();
+    attacker_signed.deployment_signature.public_key = attacker.public().encode_protobuf();
+    attacker_signed.deployment_signature.producer =
+        ProducerId::of_public_key(&attacker_signed.deployment_signature.public_key);
+    attacker_signed.deployment_signature.signature = attacker
+        .sign(&attacker_signed.signing_message())
+        .expect("sign attacker authority package");
+    attacker_signed.validate().unwrap();
+    let attacker_request = RootTreeUpgradeRequestV2 {
+        expected_deployment: package.deployment_id(),
+        expected_program: package.manifest.actor_program,
+        replacement: attacker_signed,
+    };
+    let route = ServiceId::new(0, 0x36A0);
+    let mut node = VosNode::new();
+    node.register_v2_root_at_id("raw-authority-upgrade", service, route, true)
+        .unwrap();
+    let raw_system_ingress = RootTreeInvocationV2 {
+        invocation: InvocationId([0x6C; 32]),
+        target: actor,
+        method: vos::v2::ROOT_UPGRADE_METHOD_V2.into(),
+        arguments: attacker_request.encode(),
+        proof_requested: false,
+    };
+    assert!(
+        node.invoke_with_timeout(route, raw_system_ingress.encode(), Duration::from_secs(10))
+            .is_none(),
+        "a raw privileged caller cannot install an attacker-signed authority",
+    );
+    assert!(node.collect().into_iter().all(|result| result.is_ok()));
+
+    let mut log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    assert_eq!(
+        log.applied_index().unwrap(),
+        1,
+        "the rejected raw upgrade never enters the Raft log",
+    );
+    drop(log);
+
+    let log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    let mut service =
+        LocalRootTreeServiceV2::open_raft_production(config.clone(), backend, log, trust.clone())
+            .expect("authority root reopens after rejecting raw ingress");
+    let mut incompatible = replacement.clone();
+    incompatible.generated_interfaces.push(0xFF);
+    incompatible.manifest.interfaces_hash =
+        artifact_hash(b"interfaces", &incompatible.generated_interfaces);
+    incompatible.deployment_signature.signature = signer
+        .sign(&incompatible.signing_message())
+        .expect("sign contract-incompatible authority package");
+    incompatible.validate().unwrap();
+    assert!(matches!(
+        service.upgrade_root(RootTreeUpgradeRequestV2 {
+            expected_deployment: package.deployment_id(),
+            expected_program: package.manifest.actor_program,
+            replacement: incompatible,
+        }),
+        Err(LocalRootTreeInvokeErrorV2::InvalidUpgradeTarget)
+    ));
+    // Voter-authenticated redirects enter this exact service method with a
+    // host-private marker; they cannot bypass the same contract policy.
     assert!(matches!(
         service.upgrade_root(request.clone()).unwrap(),
         AccumulationResultV2::ActorUpgraded {

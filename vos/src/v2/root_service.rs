@@ -1086,6 +1086,45 @@ pub struct LocalRootTreeServiceV2<B> {
     expected_root: ActorGenesisV2,
     expected_external_actors: Vec<ExternalActorBindingV2>,
     expected_role_authority: Option<RoleAuthorityBindingV2>,
+    /// Host-enforced upgrade boundary for the reserved canonical authority.
+    /// The guest-owned descriptor retains the current code/policy state, but
+    /// the immutable space-root signer and platform contract originate in the
+    /// canonical package used to open this service account. Keeping only the
+    /// compact signed commitments avoids retaining one-shot package/PVM bytes.
+    authority_upgrade_policy: Option<AuthorityUpgradePolicyV2>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthorityUpgradePolicyV2 {
+    public_key: Vec<u8>,
+    interfaces: super::Hash,
+    role_policies: super::Hash,
+    schemas: super::Hash,
+    task_dependencies: super::Hash,
+    crdt: bool,
+}
+
+impl AuthorityUpgradePolicyV2 {
+    fn from_package(package: &VosPackageV2) -> Self {
+        Self {
+            public_key: package.deployment_signature.public_key.clone(),
+            interfaces: package.manifest.interfaces_hash,
+            role_policies: package.manifest.role_policies_hash,
+            schemas: package.manifest.schemas_hash,
+            task_dependencies: package.manifest.task_dependencies_hash,
+            crdt: package.manifest.crdt,
+        }
+    }
+
+    fn accepts(&self, package: &VosPackageV2) -> bool {
+        package.manifest.name == super::ROLE_AUTHORITY_INSTANCE_V2
+            && package.deployment_signature.public_key == self.public_key
+            && package.manifest.interfaces_hash == self.interfaces
+            && package.manifest.role_policies_hash == self.role_policies
+            && package.manifest.schemas_hash == self.schemas
+            && package.manifest.task_dependencies_hash == self.task_dependencies
+            && package.manifest.crdt == self.crdt
+    }
 }
 
 fn verify_ed25519_signature(public_key_wire: &[u8], message: &[u8], signature: &[u8]) -> bool {
@@ -1226,6 +1265,11 @@ impl LocalRootTreeConfigV2 {
             .validate()
             .map_err(LocalRootTreeConfigErrorV2::InvalidPackage)?;
         verify_package_signature(&self.package)?;
+        if self.actor_name == super::ROLE_AUTHORITY_INSTANCE_V2
+            && self.package.manifest.name != super::ROLE_AUTHORITY_INSTANCE_V2
+        {
+            return Err(LocalRootTreeConfigErrorV2::InvalidGenesis);
+        }
         super::validate_actor_program_layout(&self.package.actor_pvm)
             .map_err(|_| LocalRootTreeConfigErrorV2::InvalidActorProgramLayout)?;
         if self.root_actor == ActorId::ZERO {
@@ -1739,6 +1783,8 @@ where
         let (expected_root, genesis) = config
             .installation()
             .map_err(LocalRootTreeOpenErrorV2::InvalidConfig)?;
+        let authority_upgrade_policy = (expected_root.name == super::ROLE_AUTHORITY_INSTANCE_V2)
+            .then(|| AuthorityUpgradePolicyV2::from_package(&config.package));
         let install_request = AccumulateRequestV2::Install(genesis.clone());
         let (install_programs, install_blobs) = installation_availability(&config, &expected_root);
         super::CommittedAccumulateEntryV2::validate_availability(
@@ -1799,6 +1845,7 @@ where
             expected_root,
             expected_external_actors: config.external_actors,
             expected_role_authority: config.role_authority,
+            authority_upgrade_policy,
         };
         root.ensure_installed().map_err(|error| match error {
             LocalRootTreeInvokeErrorV2::Service(error) => LocalRootTreeOpenErrorV2::Service(error),
@@ -2417,6 +2464,13 @@ where
             .map_err(|_| LocalRootTreeInvokeErrorV2::InvalidUpgradeSignature)?;
         super::validate_actor_program_layout(&request.replacement.actor_pvm)
             .map_err(|_| LocalRootTreeInvokeErrorV2::InvalidUpgradeProgramLayout)?;
+        if self
+            .authority_upgrade_policy
+            .as_ref()
+            .is_some_and(|policy| !policy.accepts(&request.replacement))
+        {
+            return Err(LocalRootTreeInvokeErrorV2::InvalidUpgradeTarget);
+        }
 
         self.prepare_admission_barrier()?;
         let header = self

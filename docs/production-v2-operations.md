@@ -141,7 +141,10 @@ transition before its catalog compare-and-swap. `space-authority` uses that
 same transition with additional checks: both the installed and replacement
 packages must be signed by the immutable space root and must preserve the
 exact platform schemas, generated interfaces, role policies, Task dependency
-surface, and Raft consistency.
+surface, and Raft consistency. These are not CLI-only checks: the root driver
+retains the immutable signer key and compact contract commitments and rejects
+any raw Admin, System, or voter-delegated proposal that does not match them
+before the Raft admission barrier and production verifier.
 
 The migration is one canonical `UpgradeActor` request against the existing
 Raft authority root. The command:
