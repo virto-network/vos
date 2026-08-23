@@ -1,0 +1,16 @@
+format = 1
+
+# The service PVM and canonical Clerk package were last intentionally pinned
+# together after the compact Refine-work capability landed. Later host-only
+# changes must not silently mutate either production identity.
+source_revision = "84c5fcc6caff05bd16e0aa4503e1fbdd59140f61"
+guest_toolchain = "nightly-2026-03-20"
+host_toolchain = "nightly-2025-05-09"
+
+service_program_id = "721f70f17b1295263a4af976f186d27c50e15a28a48427e7c4df179db83ad4cb"
+service_elf_blake2b_256 = "8160b2a17359c1aa6febba6a5e7f7fa431b25083aadd6f8b1b03799bd8f783ce"
+service_pvm_blake2b_256 = "d3448b0ff0b3d570d3e0fd01e46dc06b72d109ff31bcccb77f0f4a15279fd80e"
+
+clerk_actor_program_id = "29bef455b6f64de0504464532531b9c86164d9344a8f70522911e3636d7d9dc2"
+clerk_deployment_id = "90a69fe1c792ae59c79217743ebd1883f8d701c1128d5c73a83069306a73188a"
+clerk_task_hash = "6370634cba70a9af3ab8c97a7e9307f98af98bb338a93a35afe06f8ab3ce1c85"

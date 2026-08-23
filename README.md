@@ -33,10 +33,11 @@ their current implementation status—are documented in
 ## Quick start
 
 ```bash
-# Build the protocol-pinned generic service once.
-cd services/vos-service && cargo +nightly actor && cd ../..
+# Reproduce the protocol-pinned generic service from its recorded source and
+# toolchains. The recipe requires the pinned revision in local git history.
+just build-vos-service
 cargo run -p vosx -- service-pvm \
-  services/vos-service/target/riscv64em-javm/release/vos_service.elf \
+  target/pinned-v2-artifacts/vos_service.elf \
   --out dist/vos-service.pvm
 
 # Build one canonical application PVM and its signed .vos package. The package
@@ -47,6 +48,12 @@ cargo run -p vosx -- build examples/actors/counter \
 # Exercise all four public scenarios, including their canonical actor builds.
 just test-v2-examples
 ```
+
+The immutable artifact provenance is recorded in
+[`support/v2-production-artifacts.toml`](support/v2-production-artifacts.toml).
+Building current service sources is deliberately separate (`just
+build-vos-service-candidate`): that output is an upgrade candidate with a new
+identity, never an in-place replacement for the production pin.
 
 The space daemon installs signed v2 packages through the generic service PVM
 for Local, Raft, and CRDT roots, while legacy catalog rows continue on the old

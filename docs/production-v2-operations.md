@@ -7,6 +7,19 @@ guest-owned transition is refused.
 
 ## Release artifact set
 
+The committed service PVM is reproduced with:
+
+```sh
+just build-vos-service
+```
+
+That command does not compile moving HEAD. It exports the immutable source
+revision and invokes the date-pinned host/guest toolchains recorded in
+`support/v2-production-artifacts.toml`; the physical service gate requires the
+result to match the committed PVM byte-for-byte. A clone must therefore retain
+or fetch that revision. Use `just build-vos-service-candidate` for current
+sources when preparing an explicit identity migration.
+
 Package the committed canonical service with the frozen space authority:
 
 ```sh

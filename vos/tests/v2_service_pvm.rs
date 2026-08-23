@@ -878,6 +878,10 @@ fn authorize_install<A: LocalJamStoreHostV2>(
 const CANONICAL_SERVICE_PVM: &[u8] = include_bytes!("../../services/vos-service/vos-service.pvm");
 const SERVICE_BUILD_CONFIG: &str = include_str!("../../services/vos-service/.cargo/config.toml");
 const SERVICE_RUSTC_WRAPPER: &str = include_str!("../../services/vos-service/rustc-remap.sh");
+const SERVICE_TOOLCHAIN: &str = include_str!("../../services/vos-service/rust-toolchain.toml");
+const PRODUCTION_ARTIFACT_PROVENANCE: &str =
+    include_str!("../../support/v2-production-artifacts.toml");
+const PINNED_ARTIFACT_BUILDER: &str = include_str!("../../scripts/build-pinned-v2-artifacts.sh");
 
 fn required_elf(relative_path: &str, build_command: &str) -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative_path);
@@ -899,74 +903,10 @@ fn missing_required_guest_is_a_hard_failure() {
 }
 
 fn service_elf() -> Vec<u8> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let service_dir = manifest_dir.join("../services/vos-service");
-    let path = service_dir.join("target/riscv64em-javm/release/vos_service.elf");
-    let elf = required_elf(
-        "../services/vos-service/target/riscv64em-javm/release/vos_service.elf",
-        "just build-v2-pvm-test-artifacts",
-    );
-    let built_at = std::fs::metadata(&path)
-        .and_then(|metadata| metadata.modified())
-        .expect("read canonical service artifact modification time");
-    let inputs = [
-        manifest_dir.join("src"),
-        manifest_dir.join("Cargo.toml"),
-        manifest_dir.join("../Cargo.toml"),
-        manifest_dir.join("../Cargo.lock"),
-        service_dir.join("src"),
-        service_dir.join("Cargo.toml"),
-        service_dir.join("Cargo.lock"),
-        service_dir.join("riscv64em-javm.json"),
-        service_dir.join("rust-toolchain.toml"),
-        service_dir.join(".cargo/config.toml"),
-        service_dir.join("rustc-remap.sh"),
-    ];
-    if let Some(newer) = newer_build_input(&inputs, built_at) {
-        panic!(
-            "canonical service artifact is stale: {} is newer than {}; rebuild with \
-             `just build-vos-service`",
-            newer.display(),
-            path.display(),
-        );
-    }
-    elf
-}
-
-fn newer_build_input(inputs: &[PathBuf], built_at: std::time::SystemTime) -> Option<PathBuf> {
-    let mut pending = inputs.to_vec();
-    while let Some(path) = pending.pop() {
-        let metadata = std::fs::metadata(&path).unwrap_or_else(|error| {
-            panic!(
-                "inspect canonical service build input {}: {error}",
-                path.display()
-            )
-        });
-        if metadata.is_dir() {
-            let entries = std::fs::read_dir(&path).unwrap_or_else(|error| {
-                panic!(
-                    "enumerate canonical service build input {}: {error}",
-                    path.display()
-                )
-            });
-            pending.extend(entries.map(|entry| {
-                entry
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "enumerate canonical service build input {}: {error}",
-                            path.display()
-                        )
-                    })
-                    .path()
-            }));
-        } else if metadata
-            .modified()
-            .is_ok_and(|modified| modified > built_at)
-        {
-            return Some(path);
-        }
-    }
-    None
+    required_elf(
+        "../target/pinned-v2-artifacts/vos_service.elf",
+        "just build-vos-service",
+    )
 }
 
 #[test]
@@ -1000,6 +940,67 @@ fn canonical_service_build_pins_path_independent_crate_identity() {
     assert!(SERVICE_BUILD_CONFIG.contains("-Zremap-cwd-prefix=."));
     assert!(SERVICE_RUSTC_WRAPPER.contains("-Cmetadata=vos-service-v2"));
     assert!(SERVICE_RUSTC_WRAPPER.contains("--remap-path-prefix=$repository_root=vos-source"));
+}
+
+#[test]
+fn canonical_production_artifacts_pin_source_and_toolchains() {
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+
+        bytes.iter().fold(String::new(), |mut output, byte| {
+            write!(output, "{byte:02x}").expect("format byte as hex");
+            output
+        })
+    }
+
+    assert!(
+        PRODUCTION_ARTIFACT_PROVENANCE
+            .contains("source_revision = \"84c5fcc6caff05bd16e0aa4503e1fbdd59140f61\"")
+    );
+    assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("guest_toolchain = \"nightly-2026-03-20\""));
+    assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("host_toolchain = \"nightly-2025-05-09\""));
+    assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
+        "service_program_id = \"721f70f17b1295263a4af976f186d27c50e15a28a48427e7c4df179db83ad4cb\""
+    ));
+    assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
+        "service_elf_blake2b_256 = \"8160b2a17359c1aa6febba6a5e7f7fa431b25083aadd6f8b1b03799bd8f783ce\""
+    ));
+    assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
+        "clerk_actor_program_id = \"29bef455b6f64de0504464532531b9c86164d9344a8f70522911e3636d7d9dc2\""
+    ));
+    assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
+        "clerk_deployment_id = \"90a69fe1c792ae59c79217743ebd1883f8d701c1128d5c73a83069306a73188a\""
+    ));
+    assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
+        "clerk_task_hash = \"6370634cba70a9af3ab8c97a7e9307f98af98bb338a93a35afe06f8ab3ce1c85\""
+    ));
+    assert!(SERVICE_TOOLCHAIN.contains("channel = \"nightly-2026-03-20\""));
+    for key in [
+        "source_revision",
+        "guest_toolchain",
+        "host_toolchain",
+        "service_elf_blake2b_256",
+        "service_pvm_blake2b_256",
+        "clerk_actor_program_id",
+        "clerk_deployment_id",
+        "clerk_task_hash",
+    ] {
+        assert!(PINNED_ARTIFACT_BUILDER.contains(key));
+    }
+
+    let clerk = canonical_clerk_package();
+    assert_eq!(
+        hex(&clerk.manifest.actor_program.0),
+        "29bef455b6f64de0504464532531b9c86164d9344a8f70522911e3636d7d9dc2",
+    );
+    assert_eq!(
+        hex(&clerk.deployment_id().0),
+        "90a69fe1c792ae59c79217743ebd1883f8d701c1128d5c73a83069306a73188a",
+    );
+    assert_eq!(
+        hex(&clerk.task_dependencies[0].binding.task.0),
+        "6370634cba70a9af3ab8c97a7e9307f98af98bb338a93a35afe06f8ab3ce1c85",
+    );
 }
 
 fn greeter_elf() -> Vec<u8> {

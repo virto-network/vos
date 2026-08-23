@@ -420,9 +420,11 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
   count/byte bounds. Named parent-row imports and effectful Tasks remain fail-closed until
   they receive an authenticated typed transition contract.
 - **Canonical Clerk deployment artifact.** `just build-clerk-v2-package`
-  builds `clerk-ledger`, derives the immutable canonical `clerk-apply` Task
-  content address, and signs both into one `.vos` artifact for a Local or Raft
-  root. The actor no longer stores a mutable prover-program selector. A
+  exports the source revision and invokes the date-pinned host/guest
+  toolchains recorded in `support/v2-production-artifacts.toml`, builds
+  `clerk-ledger`, derives the immutable canonical `clerk-apply` Task content
+  address, and signs both into one `.vos` artifact for a Local or Raft root.
+  The actor no longer stores a mutable prover-program selector. A
   physical single-voter Raft gate boots the real ledger, creates accounts,
   executes the real private provable transfer, verifies the producer record,
   proves zero-gas exact retry and restart recovery, and scans both the service

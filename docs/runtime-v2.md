@@ -1265,22 +1265,25 @@ canonical PVM bytes are unchanged.
 
 The infrastructure PVM is committed at
 `services/vos-service/vos-service.pvm`; its identity is
-`VOS_SERVICE_PROGRAM_ID`. To reproduce it, build and validate the guest:
+`VOS_SERVICE_PROGRAM_ID`. Its source revision and host/guest toolchains are
+recorded in `support/v2-production-artifacts.toml`. To reproduce it from that
+immutable provenance and validate the guest:
 
 ```sh
-cd services/vos-service
-cargo +nightly actor
-cd ../..
+just build-vos-service
 cargo run -p vosx -- service-pvm \
-  services/vos-service/target/riscv64em-javm/release/vos_service.elf \
+  target/pinned-v2-artifacts/vos_service.elf \
   --out target/vos-service.pvm
 ```
 
-The guest build remaps its checkout directory and pins Rust crate metadata so
-path-derived symbol hashes cannot perturb the linked program. The v2 service
-integration gate transpiles a fresh ELF and requires byte identity with the
-committed PVM, in addition to checking its pinned `ProgramId` and GP entry
-layout.
+The recipe exports the pinned source revision into a disposable tree, invokes
+the recorded date-pinned toolchains, remaps the checkout directory, and pins
+Rust crate metadata so path-derived symbol hashes cannot perturb the linked
+program. The v2 service integration gate transpiles that reproduced ELF and
+requires byte identity with the committed PVM, in addition to checking its
+pinned `ProgramId` and GP entry layout. `just build-vos-service-candidate`
+builds current sources separately for a reviewed migration; current HEAD is
+not silently substituted for the production source pin.
 
 This is a clean storage and wire break. A v1 store or package must be reset and
 reinstalled; there is no v1 decoder or migration in a v2 service.

@@ -44,7 +44,7 @@ build-v2-registry-fixtures:
 
 # Build the protocol-pinned generic VOS service guest.
 build-vos-service:
-    cd services/vos-service; cargo +nightly actor
+    scripts/build-pinned-v2-artifacts.sh service
 
 # Build the package/service pair consumed by the physical daemon-root test.
 build-v2-daemon-root-artifacts: build-vos-service
@@ -91,9 +91,13 @@ build-clerk-apply: build-clerk-v2-package
 # The resulting `.vos` is the artifact installed by a service-v2 Local/Raft
 # root; neither the actor ELF nor the Task PVM is selected independently.
 build-clerk-v2-package:
-    cargo run -p vosx -- build actors/clerk-ledger --name clerk-ledger \
-      --version production-v2 --task tests/fixtures/provable/clerk-apply \
-      --out-dir target/v2-clerk
+    scripts/build-pinned-v2-artifacts.sh clerk
+
+# Build current sources only as an explicit migration candidate. This never
+# replaces the committed production PVM or the pinned fresh-build fixture.
+build-vos-service-candidate:
+    cd services/vos-service; cargo actor
+    @echo "candidate ELF: services/vos-service/target/riscv64em-javm/release/vos_service.elf"
 
 # Refresh the bundled space-registry ELF shipped with vosx.
 refresh-bundled-registry: (build-actor "space-registry")

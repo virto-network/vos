@@ -24,3 +24,9 @@ start from master and the roadmap, using the rescued tip only as historical
 design input. In particular, the remaining CRDT-private-Task protocol and
 proof-constrained crypto precompiles are explicit future slices, not missing
 branch integration.
+
+Batch 77 repeated this audit against the production line and found no
+additional patch to integrate. It separately closed reproducibility of the
+already-landed service and Clerk identities by recording their exact source
+revision and toolchains; that artifact work is not a resurrection of the
+rescued runtime branch.
