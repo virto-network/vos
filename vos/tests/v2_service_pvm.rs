@@ -909,6 +909,13 @@ fn service_elf() -> Vec<u8> {
     )
 }
 
+fn freshly_transpiled_service_pvm() -> Vec<u8> {
+    required_elf(
+        "../target/pinned-v2-artifacts/vos-service.pvm",
+        "just build-vos-service",
+    )
+}
+
 #[test]
 fn canonical_service_artifact_has_the_protocol_identity() {
     assert_eq!(
@@ -924,11 +931,10 @@ fn canonical_service_artifact_has_the_protocol_identity() {
 
 #[test]
 fn canonical_service_artifact_matches_a_fresh_build() {
-    let elf = service_elf();
-    let fresh = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
+    let fresh = freshly_transpiled_service_pvm();
     assert!(
         fresh == CANONICAL_SERVICE_PVM,
-        "fresh vos-service build differs: fresh ProgramId {:?}, committed ProgramId {:?}",
+        "pinned source/transpiler output differs: fresh ProgramId {:?}, committed ProgramId {:?}",
         ProgramId::of_pvm(&fresh),
         ProgramId::of_pvm(CANONICAL_SERVICE_PVM)
     );
@@ -979,6 +985,7 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
         "source_revision",
         "guest_toolchain",
         "host_toolchain",
+        "service_program_id",
         "service_elf_blake2b_256",
         "service_pvm_blake2b_256",
         "clerk_actor_program_id",
@@ -987,6 +994,10 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
     ] {
         assert!(PINNED_ARTIFACT_BUILDER.contains(key));
     }
+    assert!(PINNED_ARTIFACT_BUILDER.contains("service-pvm"));
+    assert!(PINNED_ARTIFACT_BUILDER.contains("fresh_service_pvm"));
+    assert!(PINNED_ARTIFACT_BUILDER.contains("explicit libp2p signer key path"));
+    assert!(PINNED_ARTIFACT_BUILDER.contains("clerk-test"));
 
     let clerk = canonical_clerk_package();
     assert_eq!(

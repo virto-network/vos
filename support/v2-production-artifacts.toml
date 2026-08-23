@@ -1,8 +1,9 @@
 format = 1
 
-# The service PVM and canonical Clerk package were last intentionally pinned
-# together after the compact Refine-work capability landed. Later host-only
-# changes must not silently mutate either production identity.
+# The service PVM and canonical Clerk package content were last intentionally
+# pinned together after the compact Refine-work capability landed. The Clerk
+# `.vos` signature wrapper is operator-specific and is intentionally not a
+# repository-global artifact identity; releases select its signer explicitly.
 source_revision = "84c5fcc6caff05bd16e0aa4503e1fbdd59140f61"
 guest_toolchain = "nightly-2026-03-20"
 host_toolchain = "nightly-2025-05-09"

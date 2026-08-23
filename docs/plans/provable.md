@@ -419,12 +419,16 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
   v16. Recorded execution also rejects debug output and enforces per-slice
   count/byte bounds. Named parent-row imports and effectful Tasks remain fail-closed until
   they receive an authenticated typed transition contract.
-- **Canonical Clerk deployment artifact.** `just build-clerk-v2-package`
-  exports the source revision and invokes the date-pinned host/guest
+- **Canonical Clerk deployment content and operator signature.** The pinned
+  recipe exports the source revision and invokes the date-pinned host/guest
   toolchains recorded in `support/v2-production-artifacts.toml`, builds
-  `clerk-ledger`, derives the immutable canonical `clerk-apply` Task content
-  address, and signs both into one `.vos` artifact for a Local or Raft root.
-  The actor no longer stores a mutable prover-program selector. A
+  `clerk-ledger`, and derives the immutable actor ProgramId, DeploymentId, and
+  `clerk-apply` Task content address. `just build-clerk-v2-package
+  /secure/operator/identity.key` then signs that content using only the
+  explicitly named producer key. Exact `.vos` bytes are operator-specific and
+  their digest becomes catalog/release metadata; they are not mislabeled as a
+  repository-global reproducibility pin. The actor no longer stores a mutable
+  prover-program selector. A
   physical single-voter Raft gate boots the real ledger, creates accounts,
   executes the real private provable transfer, verifies the producer record,
   proves zero-gas exact retry and restart recovery, and scans both the service

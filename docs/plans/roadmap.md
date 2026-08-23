@@ -61,10 +61,13 @@ W1–W4 storage, proof-record, registry-pagination, and example-layout work has
 landed in later reviewed forms; it is not a source of commits to cherry-pick.
 The commit-by-commit disposition is retained in
 [`worktree-provable-audit.md`](worktree-provable-audit.md).
-The canonical service and Clerk identities now also have one reproducible
-historical-source recipe: `support/v2-production-artifacts.toml` pins the exact
-source revision and date-specific host/guest toolchains, while current-source
-builds are explicitly labeled migration candidates.
+The canonical service and Clerk content identities now also have one
+reproducible historical-source recipe: `support/v2-production-artifacts.toml`
+pins the exact source revision and date-specific host/guest toolchains, while
+current-source builds are explicitly labeled migration candidates. The
+operator-specific Clerk `.vos` signature is a separate, explicit release step;
+its exact digest belongs to that operator's catalog rather than the global
+source manifest.
 
 ## 2. The bank-federation demo (the last step to a runnable demo)
 

@@ -36,9 +36,7 @@ their current implementation status—are documented in
 # Reproduce the protocol-pinned generic service from its recorded source and
 # toolchains. The recipe requires the pinned revision in local git history.
 just build-vos-service
-cargo run -p vosx -- service-pvm \
-  target/pinned-v2-artifacts/vos_service.elf \
-  --out dist/vos-service.pvm
+cp target/pinned-v2-artifacts/vos-service.pvm dist/vos-service.pvm
 
 # Build one canonical application PVM and its signed .vos package. The package
 # pins the service program above; developers do not implement Refine/Accumulate.
@@ -54,6 +52,15 @@ The immutable artifact provenance is recorded in
 Building current service sources is deliberately separate (`just
 build-vos-service-candidate`): that output is an upgrade candidate with a new
 identity, never an in-place replacement for the production pin.
+
+Clerk's executable/package content is pinned by its ProgramId, DeploymentId,
+and Task hash, while its final `.vos` signature is operator-specific. Build a
+release wrapper by naming the signing key explicitly—ambient XDG identity is
+never consulted by this recipe:
+
+```bash
+just build-clerk-v2-package /secure/operator/identity.key
+```
 
 The space daemon installs signed v2 packages through the generic service PVM
 for Local, Raft, and CRDT roots, while legacy catalog rows continue on the old

@@ -83,15 +83,18 @@ build-voucher-check:
 build-witnessed-transfer:
     cd tests/fixtures/legacy-v1/actors/witnessed-transfer; cargo +nightly actor
 
-# Build the flagship Task through the same canonical wrapper used by its
-# production package. This also leaves the signed package under target/v2-clerk.
-build-clerk-apply: build-clerk-v2-package
+# Build the flagship Task and a signed package for physical tests. The signer
+# is deliberately ephemeral: tests assert the pinned content identity, never
+# treat this wrapper as a production release artifact.
+build-clerk-apply:
+    scripts/build-pinned-v2-artifacts.sh clerk-test
 
 # Build the signed Clerk production package with its immutable proving Task.
-# The resulting `.vos` is the artifact installed by a service-v2 Local/Raft
-# root; neither the actor ELF nor the Task PVM is selected independently.
-build-clerk-v2-package:
-    scripts/build-pinned-v2-artifacts.sh clerk
+# Package content is reproducible and pinned by ProgramId/DeploymentId/Task
+# hash; the exact `.vos` wrapper is operator-specific and therefore requires
+# an explicit libp2p identity key rather than consulting ambient XDG state.
+build-clerk-v2-package signer:
+    scripts/build-pinned-v2-artifacts.sh clerk "{{signer}}"
 
 # Build current sources only as an explicit migration candidate. This never
 # replaces the committed production PVM or the pinned fresh-build fixture.

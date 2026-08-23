@@ -1271,19 +1271,20 @@ immutable provenance and validate the guest:
 
 ```sh
 just build-vos-service
-cargo run -p vosx -- service-pvm \
-  target/pinned-v2-artifacts/vos_service.elf \
-  --out target/vos-service.pvm
+cmp target/pinned-v2-artifacts/vos-service.pvm \
+  services/vos-service/vos-service.pvm
 ```
 
 The recipe exports the pinned source revision into a disposable tree, invokes
-the recorded date-pinned toolchains, remaps the checkout directory, and pins
-Rust crate metadata so path-derived symbol hashes cannot perturb the linked
-program. The v2 service integration gate transpiles that reproduced ELF and
-requires byte identity with the committed PVM, in addition to checking its
-pinned `ProgramId` and GP entry layout. `just build-vos-service-candidate`
-builds current sources separately for a reviewed migration; current HEAD is
-not silently substituted for the production source pin.
+the recorded date-pinned toolchains, remaps the checkout directory, pins Rust
+crate metadata so path-derived symbol hashes cannot perturb the linked program,
+and invokes that same revision's `service-pvm` transpiler. It validates the
+fresh ELF and PVM digests, reads the pinned `ProgramId` from the transpiler
+output, and requires byte identity with the committed PVM. The v2 service
+integration gate consumes that fresh PVM rather than retranspiling with moving
+HEAD. `just build-vos-service-candidate` builds current sources separately for
+a reviewed migration; current HEAD is not silently substituted for the
+production source pin.
 
 This is a clean storage and wire break. A v1 store or package must be reset and
 reinstalled; there is no v1 decoder or migration in a v2 service.

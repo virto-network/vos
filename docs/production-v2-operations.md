@@ -15,10 +15,28 @@ just build-vos-service
 
 That command does not compile moving HEAD. It exports the immutable source
 revision and invokes the date-pinned host/guest toolchains recorded in
-`support/v2-production-artifacts.toml`; the physical service gate requires the
-result to match the committed PVM byte-for-byte. A clone must therefore retain
-or fetch that revision. Use `just build-vos-service-candidate` for current
-sources when preparing an explicit identity migration.
+`support/v2-production-artifacts.toml`, runs that revision's transpiler, checks
+the fresh PVM digest and ProgramId, and requires it to match the committed PVM
+byte-for-byte. The fresh output is
+`target/pinned-v2-artifacts/vos-service.pvm`. A clone must therefore retain or
+fetch that revision. Use `just build-vos-service-candidate` for current sources
+when preparing an explicit identity migration.
+
+Clerk has two distinct identities at release time. Its ProgramId, DeploymentId,
+and Task hash bind reproducible package content. The outer `.vos` bytes also
+carry the producer's key and deterministic signature, so they are intentionally
+operator-specific rather than a repository-global digest. Select that signer
+explicitly:
+
+```sh
+just build-clerk-v2-package /secure/operator/identity.key
+```
+
+The command does not consult or create an ambient XDG identity. Record and
+publish the printed signed-package digest with the operator's release metadata;
+the catalog thereafter retains those exact signed bytes. Test recipes instead
+use a clearly labeled ephemeral signer and never treat their `.vos` as a
+release artifact.
 
 Package the committed canonical service with the frozen space authority:
 
