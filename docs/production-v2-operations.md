@@ -90,8 +90,12 @@ this sidecar. Treat it like the node key and private-ingress store: encrypt the
 archive, never run two restored copies of one voter, and verify the signer
 public key before restoring traffic. CRDT roots reject this option.
 Uninstall/reinstallation moves a retired root's seed into recoverable trash
-with its image, Raft database, proofs, and private records; it is no longer
-included in active-root backups.
+with its image, Raft database, proofs, and private records. This removes the
+seed from the active service directory, but an offline whole-space backup
+recursively includes `trash/` and therefore retains retired seeds. Protect
+those archives as containing both active and recoverable retired signer keys;
+removing a retired seed from future backups requires an explicit,
+irreversible trash-pruning decision by the operator.
 
 ## Move an existing voter to another machine
 
