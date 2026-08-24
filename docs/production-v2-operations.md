@@ -181,8 +181,11 @@ row is what authenticates the retiring slot during the transition.
 
 ## Canonical authority upgrades
 
-The bundled Batch 70 `space-authority` is a durable actor deployment. Rebuilding
-its source produces an upgrade candidate, not a replacement release blob:
+The bundled Batch 70 `space-authority` PVM is a durable actor-program artifact.
+Its package, deployment, and derived replication identity are pinned per
+platform ABI because the package manifest also binds the service PVM, ABI, and
+execution semantics. Rebuilding its source within one ABI produces an upgrade
+candidate, not a replacement release blob:
 
 ```sh
 just build-authority-upgrade-candidate
@@ -220,12 +223,21 @@ Raft authority root. The command:
 6. compare-and-swaps the catalog only after the guest commits the exact actor
    deployment and program.
 
-The authority service identity and replication incarnation do not change.
+Within the same platform ABI, the authority service identity and replication
+incarnation do not change.
 Dependent roots remain bound to the frozen genesis service deployment while
 the authority's guest-owned actor descriptor advances to the replacement
 deployment. On restart, the daemon resolves that stable service binding and
 uses the permanent upgrade record to validate the catalog's newer actor
 package.
+
+An ABI/store clean break is not an authority actor upgrade. It creates a new
+canonical authority package, deployment, and auto-derived replication
+incarnation even though the bundled actor PVM remains byte-identical. A space
+sealed under ABI 16 must be operated with its ABI-16 release or cleanly
+reinstalled for ABI 17; the daemon rejects the old cutover marker rather than
+rewriting it. No in-place service-image migration across that boundary is
+currently supported.
 
 The ordinary-root command already implements the corresponding signed-package
 availability, authenticated transition, catalog ordering, and exact retry

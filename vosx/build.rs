@@ -62,9 +62,11 @@ const SPACE_AUTHORITY_BLAKE2B_256: [u8; 32] = [
 ];
 
 /// Bundle the release authority identity without consulting developer output.
-/// Existing sealed spaces derive their canonical authority incarnation from
-/// these exact bytes, so silently preferring a newer local build would make
-/// them impossible to reopen.
+/// Same-ABI sealed spaces derive their canonical authority incarnation partly
+/// from these exact bytes; the surrounding package identity additionally
+/// binds that release's service ABI, program, and semantics. Silently
+/// preferring a newer local actor build would therefore break even a same-ABI
+/// reopen.
 fn bundle_frozen_space_authority(manifest_dir: &Path, out_dir: &Path) {
     let source = manifest_dir.join("blobs/space_authority.pvm");
     let bytes = fs::read(&source).unwrap_or_else(|e| {

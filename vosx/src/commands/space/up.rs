@@ -97,8 +97,10 @@ fn role_authority_package_version(actor_program: vos::v2::ProgramId) -> String {
 
 /// Construct the frozen authority package contents for the current service
 /// ABI. The signature wrapper is intentionally supplied separately: it is not
-/// part of [`vos::v2::DeploymentId`], while these manifest and PVM bytes are
-/// the stable genesis identity consumed by every dependent root.
+/// part of [`vos::v2::DeploymentId`]. The actor PVM is stable across releases,
+/// while the package, deployment, and derived replication identities are
+/// deliberately ABI-scoped because the manifest binds the service program,
+/// ABI, and execution semantics.
 fn frozen_role_authority_package(public_key: Vec<u8>) -> anyhow::Result<vos::v2::VosPackageV2> {
     use vos::v2::{V2Wire, artifact_hash};
 
@@ -214,7 +216,9 @@ fn ensure_v2_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::Resul
             other => anyhow::bail!("sealing canonical role-authority cutover returned {other}"),
         }
     } else if cutover.as_slice() != replication_id {
-        anyhow::bail!("registry is sealed to a different canonical role-authority incarnation");
+        anyhow::bail!(
+            "registry is sealed to a different canonical role-authority incarnation; authority package identities are ABI-scoped, so reopen with the release that sealed this space or perform the documented clean reinstall"
+        );
     }
 
     if vos::block_on(reg.agent(&mut &*node, vos::v2::ROLE_AUTHORITY_INSTANCE_V2.into()))
@@ -4527,7 +4531,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_role_authority_pins_the_abi_16_incarnation() {
+    fn canonical_role_authority_pins_the_abi_17_incarnation() {
         let root = Keypair::ed25519_from_bytes([7; 32]).unwrap();
         let package = root_signed_role_authority_package(&root).unwrap();
         let package_hash = BlobHash::of(&package.encode()).0;
@@ -4537,18 +4541,38 @@ mod tests {
             &package_hash,
         );
 
+        assert_eq!(package.manifest.service_abi, 17);
         assert_eq!(
             hex::encode(package.manifest.actor_program.0),
             "16d0488cd51bfb70f5697cb909c7eb2a76772673936f3db69ff396868f7713e3",
         );
         assert_eq!(
+            hex::encode(package.deployment_id().0),
+            "c3a7a5cc5a6950a2d8be2cab8f8245d020057fd0b76a5496fa95ca9029862104",
+        );
+        assert_eq!(
             hex::encode(package_hash),
-            "4e41e7e56b7c9f5e772467f07d5b96c806cfb552ccc20c00fc909d6ba875c1e9",
+            "a7bf5956660ff9a903490e611727484d19608655ff6af4ff6fd81d8fe02159c4",
         );
         assert_eq!(
             hex::encode(replication_id),
-            "bc6d61dbb282bbe0dcdbe2fd72cb65074c441d7c759af531951216b52bd35d42",
+            "63c41545d501c54ec172ce44f4b662eba84405b13c7a48ee44e1f0e17f9b3089",
         );
+        // ABI 17 is a clean service/storage break. It must not accidentally
+        // reuse the deterministic ABI-16 package or replication identities
+        // for the same root key and test space.
+        let abi_16_package_hash: [u8; 32] =
+            hex::decode("4e41e7e56b7c9f5e772467f07d5b96c806cfb552ccc20c00fc909d6ba875c1e9")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let abi_16_replication_id: [u8; 32] =
+            hex::decode("bc6d61dbb282bbe0dcdbe2fd72cb65074c441d7c759af531951216b52bd35d42")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        assert_ne!(package_hash, abi_16_package_hash);
+        assert_ne!(replication_id, abi_16_replication_id);
     }
 
     #[test]

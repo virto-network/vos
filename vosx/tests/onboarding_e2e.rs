@@ -702,7 +702,7 @@ fn assert_bundled_space_authority_preserves_batch_70_program() {
     assert_eq!(
         hex::encode(vos::crypto::blake2b_hash::<32>(&[], &[&bundled])),
         "86872e83d3bb445cbf2b477e81d51aaaa5c21e0a7555e90226000d09aeca0842",
-        "the Batch 70 authority bytes must remain exact so sealed spaces can reopen",
+        "the Batch 70 authority bytes must remain exact so same-ABI sealed spaces can reopen",
     );
 }
 

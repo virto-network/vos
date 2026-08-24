@@ -785,12 +785,18 @@ claiming that automatic topology discovery has landed. Snapshot joiners verify
 the sealed production provenance and exact policy; log replay independently
 re-runs historical checks. Every voter must observe historical JAM-slot
 verification before the gate completes. The bundled `space-authority` PVM is a
-durable protocol identity: its Batch 70 program ID, exact bytes, deterministic
-root-signed package hash, and derived replication incarnation are pinned by
-regression tests so already-sealed spaces reopen unchanged. A source rebuild
-is not installed implicitly; changing that actor requires an explicit
-`UpgradeActor` migration which preserves the existing authority incarnation
-and service identity while advancing only the guest-owned actor deployment.
+durable protocol identity: its Batch 70 program ID and exact bytes remain
+frozen. The root-signed authority package, deployment, and derived replication
+incarnation are separately pinned for each platform ABI because their manifest
+binds the service PVM, ABI, and execution semantics. Spaces sealed by the same
+ABI therefore reopen unchanged; an ABI clean break deliberately produces a
+different authority incarnation and is rejected rather than silently
+reinterpreted. Such a space must be reopened with the release that sealed it
+or cleanly reinstalled under the new ABI; there is no in-place service/store
+migration across this boundary. Within one ABI, a source rebuild is not
+installed implicitly: changing authority actor code uses an explicit
+`UpgradeActor` migration which preserves that ABI's authority incarnation and
+service identity while advancing only the guest-owned actor deployment.
 The CLI validates both artifacts, and the root driver independently accepts a
 proposal only when the replacement is signed by the immutable space root and
 preserves the exact canonical authority contract. That proposal-boundary
@@ -1346,7 +1352,13 @@ across roots, so actor identity without a source service fails closed; another
 root cannot create or reuse the lock merely by choosing the bridge's ActorId
 and naming the ledger in its own directory. ABI 17, schema 39, and execution
 semantics v22 add that source service to the host-private actor input and
-require it exactly for actor origins. That
+require it exactly for actor origins. This is a clean service/store boundary
+from ABI 16: although the frozen authority PVM bytes do not change, the
+authority package manifest binds the new service ProgramId, ABI, and semantics,
+so its deployment, signed package hash, and auto-derived replication
+incarnation change as well. ABI-16 authority roots must remain on their sealing
+release or be cleanly reinstalled; startup never aliases the ABI-16 incarnation
+to ABI 17. That
 anchor certifies one ordinary, non-voided transfer whose rows all use
 `Layer::Settled`, one amount commitment, and the bridge package's configured
 currency. Returning that anchor atomically records an append-only voucher lock
