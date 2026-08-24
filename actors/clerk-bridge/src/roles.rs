@@ -1,19 +1,14 @@
 //! The clerk-bridge role hierarchy + per-space role mapping.
 //!
 //! The bridge's verify-and-open handlers (`submit_voucher`,
-//! `redeem_voucher`) and its setup handlers (`bootstrap`, `register_peer`,
-//! `set_prover`) stay ungated `#[msg]`: the voucher path authenticates by
-//! the issuer's signature, not by space membership, exactly as documented
-//! on the actor. Only the **operator controls** that steer settlement
-//! accounting — `window_rotate` (bracket a settlement window) and
-//! `anchor_reset` (post-settlement wedge recovery) — are role-gated.
+//! `redeem_voucher`) stay ungated: the voucher path authenticates by the
+//! issuer's signature, not by space membership. Setup, issuer signing, claim
+//! signing, and settlement-window controls are operator-gated.
 //!
-//! `Caller::System` and `Caller::Actor` map to `SpaceRole::Admin` and
-//! bypass these checks, so the bank operator driving via the daemon is
-//! unaffected — the gate bites external peers. Under Raft leader-forward
-//! the caller is attributed to the forwarding node's peer, so a voter
-//! node's peer must hold the `Admin`/`Developer` grant (see the
-//! clerk-ledger gate for the same rule).
+//! The signing-control handlers additionally reject the legacy same-node
+//! `Caller::Actor` bypass: only `System` or an authenticated member carrying
+//! `Operator` may bind keys, change peer trust, issue, or sign claims. Under
+//! Raft leader-forward the peer must hold the `Admin`/`Developer` grant.
 
 /// Ordered: `Operator` >= `Member` >= `None`.
 #[derive(

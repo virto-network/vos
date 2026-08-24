@@ -1,15 +1,14 @@
 //! Clerk bridge — per-bank cross-clerk voucher ingress actor.
 //!
-//! Each bank space runs ONE clerk-bridge agent. It's the
-//! verify-and-dedup gateway for incoming vouchers from peer banks:
-//! resolve which peer signed, check the signature against that
-//! peer's clerk pubkey, open the sealed envelope to recover the
-//! (value, blinding) opening, dedup against previously-seen
-//! vouchers, and hand the opening back to the host caller. The
-//! caller (a bank operator) decides whether to credit the local
-//! recipient via an L0 inflow transfer on clerk-ledger or via an
-//! L3 note-pool submit — clerk-bridge is verify-only and stays
-//! out of the kernel-transfer-building business.
+//! Each bank space runs one clerk-bridge actor. It is both sides of the
+//! cross-bank boundary:
+//! - issuer: bind the root's host-private device key, confirm an accepted
+//!   transfer through the authenticated clerk-ledger handle, sign exactly one
+//!   voucher, and accumulate the positive settlement term;
+//! - receiver: verify/open/deduplicate peer vouchers, optionally redeem them
+//!   into clerk-ledger, and accumulate the negative settlement term;
+//! - close: combine both terms for a closed window and DEVICE_SIGN the
+//!   canonical bilateral settlement claim.
 //!
 //! ## Role in the federation
 //!
@@ -31,9 +30,10 @@
 //!
 //! ## State (persisted as actor rkyv archive)
 //!
-//! - `local_ledger_id`: ServiceId of this bank's clerk-ledger.
-//!   `0` means not-bootstrapped. Carried for diagnostics + future
-//!   cross-actor dispatch (which this slice does not yet do).
+//! - `local_ledger_id`: compatibility/diagnostic ServiceId. Production issuer
+//!   dispatch uses the signed package's `clerk-ledger` external binding.
+//! - `device_signer_pubkey`: guest-owned public identity for the host-private
+//!   DEVICE_SIGN capability. The secret never enters actor state.
 //! - `ivk_secret_bytes`: this bank's incoming-viewing-key secret,
 //!   canonical 32-byte Ristretto scalar. Used per-call to
 //!   reconstruct an `IncomingViewingKey` and open envelopes.
@@ -58,6 +58,11 @@
 //!   on clerk-ledger. (`redeem_voucher` DOES own the full ingress:
 //!   it validates the inflow and dispatches to
 //!   `clerk-ledger.apply_transfer` atomically.)
+//! - **Recipient encryption remains caller-built.** `issue_voucher` accepts a
+//!   zero-signature voucher template because the recipient-specific envelope
+//!   requires its public viewing key and fresh encryption randomness. The
+//!   bridge does not trust its financial fields: it rebinds the amount and
+//!   before/after roots to immutable ledger state before signing.
 //! - **Receiver-side state-root anchor (best-effort, not finality).**
 //!   Each peer entry carries `last_root_after`: once the bridge
 //!   accepts a voucher from a peer, that peer's NEXT voucher must
@@ -75,7 +80,8 @@
 //!   don't advance the cursor, that channel can wedge until
 //!   settlement. Best-effort linearization, not settlement finality.
 
-use cipher_clerk::crypto::AuthKey;
+use cipher_clerk::crypto::{Amount, AuthKey, Signature, verify_signature};
+use cipher_clerk::settlement::SettlementClaim;
 use cipher_clerk::types::Transfer as CcTransfer;
 use cipher_clerk::viewing_keys::IncomingViewingKey;
 use cipher_clerk::voucher::Voucher;
@@ -167,6 +173,29 @@ pub enum Status {
     /// External-mode vouchers fall through the signature check
     /// (same trust model as Signature-mode vouchers).
     ProofInvalid = 10,
+    /// This root was opened without the host-private device signer required
+    /// to issue vouchers and settlement claims.
+    DeviceSignerUnavailable = 11,
+    /// The active host-private signer does not match the guest-owned bank key
+    /// bound by `bind_device_signer`.
+    DeviceSignerMismatch = 12,
+    /// This transfer was already issued under a different peer, window, or
+    /// voucher template. One accepted transfer can contribute to settlement
+    /// exactly once.
+    IssuanceConflict = 13,
+    /// Settlement claims may be signed only after `window_rotate` has closed
+    /// the requested window.
+    WindowOpen = 14,
+    /// The authenticated clerk-ledger binding was missing, unreachable, or
+    /// did not confirm the voucher's transfer/commitment/root tuple.
+    LedgerUnavailable = 15,
+    /// A peer-key rotation conflicts with the key already pinned by activity
+    /// in the current settlement window.
+    PeerKeyConflict = 16,
+    /// The caller is neither the host system nor an authenticated bank
+    /// operator. Same-node actors deliberately receive no signing-control
+    /// bypass.
+    Unauthorized = 17,
 }
 
 // ── Wire types ──────────────────────────────────────────────────
@@ -271,6 +300,48 @@ pub struct RedeemReply {
     pub ledger_status: u8,
 }
 
+/// Result of turning an accepted ledger transfer plus caller-built encrypted
+/// envelope into a bank-signed voucher.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct IssueVoucherReply {
+    pub status: Status,
+    /// Canonical `Voucher::to_bytes()` on success; empty on rejection.
+    pub voucher: Vec<u8>,
+    /// Stable receiver-side dedup identity on success; all zero on rejection.
+    pub redemption_key: [u8; 32],
+    /// Settlement window receiving the issuer term.
+    pub window: u64,
+}
+
+/// Result of signing one closed bilateral settlement window.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct SignClaimReply {
+    pub status: Status,
+    /// Canonical `SettlementClaim::to_bytes()` on success; empty otherwise.
+    pub claim: Vec<u8>,
+}
+
+/// Durable exactly-once voucher issuance record. The request hash binds the
+/// transfer, peer, and complete zero-signature template; retaining the exact
+/// signed bytes makes response-loss retries independent of current signer
+/// availability or later peer-key rotation.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct IssuedVoucherEntry {
+    pub request_hash: [u8; 32],
+    pub voucher: Vec<u8>,
+    pub redemption_key: [u8; 32],
+    pub window: u64,
+}
+
 // ── Decode helpers ──────────────────────────────────────────────
 
 /// Convert a `Vec<u8>` to a fixed-size byte array. Returns `None`
@@ -304,14 +375,18 @@ macro_rules! decode_or_else {
 )]
 pub struct ClerkBridge {
     /// Local clerk-ledger ServiceId, packed as u32. `0` means
-    /// not-yet-bootstrapped — every non-bootstrap handler
-    /// short-circuits with Status::NotBootstrapped.
+    /// not-yet-bootstrapped. Retained for compatibility/diagnostics; issuer
+    /// dispatch resolves only the authenticated `clerk-ledger` binding.
     local_ledger_id: u32,
     /// This bank's IVK secret, raw canonical-scalar bytes. The
     /// `IncomingViewingKey` type itself isn't rkyv-archivable
     /// (it wraps a curve scalar), so we keep the bytes and
     /// reconstruct per call.
     ivk_secret_bytes: [u8; 32],
+    /// Guest-owned bank signing identity. The secret remains in the root host;
+    /// every signing operation compares the host-returned public key with this
+    /// immutable binding before accepting its signature.
+    device_signer_pubkey: Option<AuthKey>,
     /// Sorted-by-`name` ascending. Lookups via `partition_point`.
     peers: Vec<PeerEntry>,
     /// Sorted dedup set of voucher transfer-triples. Each entry
@@ -359,6 +434,103 @@ pub struct ClerkBridge {
     /// many windows the bridge has ever tracked.
     #[storage]
     window_nets: StorageMap<[u8; 32], [u8; 32]>,
+    /// Issuer-term accumulators: the positive sum of vouchers this bank
+    /// issued to `(peer, currency, window)`. Combined with `window_nets`
+    /// (the negative receiver term) when signing a settlement claim.
+    #[storage]
+    issuer_nets: StorageMap<[u8; 32], [u8; 32]>,
+    /// Peer signing key pinned when the first issuer or receiver term enters a
+    /// window. Historical claims remain bound to that key even if the peer is
+    /// rotated at the start of a later empty window.
+    #[storage]
+    window_peer_keys: StorageMap<[u8; 32], [u8; 32]>,
+    /// Exactly-once issuance record keyed by accepted ledger transfer id.
+    #[storage]
+    issued_vouchers: StorageMap<[u8; 16], IssuedVoucherEntry>,
+}
+
+impl ClerkBridge {
+    const DEVICE_BINDING_PROBE: &'static [u8] = b"clerk-bridge/device-binding/v1";
+
+    /// Signer configuration controls the bank identity used on external
+    /// vouchers and settlement claims. Do not inherit the legacy same-node
+    /// Actor role bypass: only System or an authenticated operator member may
+    /// establish it.
+    fn authorize_signer_operator(ctx: &mut Context<Self>) -> bool {
+        let allowed = match ctx.origin() {
+            Origin::System => true,
+            Origin::Member(_) => ctx.has_role(ClerkBridgeRole::Operator),
+            Origin::Anonymous | Origin::Actor(_) => false,
+        };
+        if !allowed {
+            ctx.__mark_forbidden();
+        }
+        allowed
+    }
+
+    fn device_signature(
+        &self,
+        ctx: &mut Context<Self>,
+        payload: &[u8],
+    ) -> core::result::Result<Signature, Status> {
+        let expected = self
+            .device_signer_pubkey
+            .ok_or(Status::DeviceSignerUnavailable)?;
+        let signed = ctx
+            .device_sign(payload)
+            .ok_or(Status::DeviceSignerUnavailable)?;
+        if signed.public_key != expected.0 {
+            return Err(Status::DeviceSignerMismatch);
+        }
+        let signature = Signature {
+            r: signed.signature_r,
+            s: signed.signature_s,
+        };
+        if !verify_signature(&expected, payload, &signature) {
+            return Err(Status::DeviceSignerMismatch);
+        }
+        Ok(signature)
+    }
+
+    fn issuance_request_hash(
+        peer_name: &[u8],
+        transfer_id: &[u8; 16],
+        voucher_template: &[u8],
+    ) -> [u8; 32] {
+        vos::crypto::blake2b_hash::<32>(
+            b"clerk-bridge/issue-voucher/v1",
+            &[
+                &(peer_name.len() as u64).to_le_bytes(),
+                peer_name,
+                transfer_id,
+                voucher_template,
+            ],
+        )
+    }
+
+    fn pinned_peer_key(&self, peer_name: &[u8], currency: u32, window: u64) -> Option<AuthKey> {
+        self.window_peer_keys
+            .get(&window::peer_key_key(peer_name, currency, window))
+            .map(AuthKey)
+    }
+
+    fn peer_key_compatible(
+        &self,
+        peer_name: &[u8],
+        currency: u32,
+        window: u64,
+        peer_key: AuthKey,
+    ) -> bool {
+        self.pinned_peer_key(peer_name, currency, window)
+            .is_none_or(|pinned| pinned == peer_key)
+    }
+
+    fn pin_peer_key(&mut self, peer_name: &[u8], currency: u32, window: u64, peer_key: AuthKey) {
+        self.window_peer_keys.insert(
+            &window::peer_key_key(peer_name, currency, window),
+            &peer_key.0,
+        );
+    }
 }
 
 #[messages]
@@ -367,11 +539,15 @@ impl ClerkBridge {
         Self {
             local_ledger_id: 0,
             ivk_secret_bytes: [0u8; 32],
+            device_signer_pubkey: None,
             peers: Vec::new(),
             received: StorageSet::default(),
             prover_id: 0,
             allowlist: Vec::new(),
             window_nets: StorageMap::default(),
+            issuer_nets: StorageMap::default(),
+            window_peer_keys: StorageMap::default(),
+            issued_vouchers: StorageMap::default(),
         }
     }
 
@@ -395,8 +571,16 @@ impl ClerkBridge {
     ///     bootstrap "succeeded".
     ///   - `Status::AlreadyBootstrapped` if conflicting arguments
     ///     are supplied to a re-call.
-    #[msg]
-    async fn bootstrap(&mut self, local_ledger_id: u32, ivk_secret: Vec<u8>) -> Status {
+    #[msg(role = ClerkBridgeRole::Operator)]
+    async fn bootstrap(
+        &mut self,
+        ctx: &mut Context<Self>,
+        local_ledger_id: u32,
+        ivk_secret: Vec<u8>,
+    ) -> Status {
+        if !Self::authorize_signer_operator(ctx) {
+            return Status::Unauthorized;
+        }
         let Some(secret_bytes) = try_array::<32>(ivk_secret) else {
             return Status::BadInput;
         };
@@ -417,6 +601,59 @@ impl ClerkBridge {
         }
     }
 
+    /// Bind this bank actor to the public half of its host-private device
+    /// signer. The live signer must prove the same key during binding and on
+    /// every later voucher/claim signature. Identical replays are idempotent;
+    /// changing the bank identity requires an explicit actor/package upgrade.
+    #[msg(role = ClerkBridgeRole::Operator)]
+    async fn bind_device_signer(
+        &mut self,
+        ctx: &mut Context<Self>,
+        public_key: [u8; 32],
+    ) -> Status {
+        if !Self::authorize_signer_operator(ctx) {
+            return Status::Unauthorized;
+        }
+        let Some(signed) = ctx.device_sign(Self::DEVICE_BINDING_PROBE) else {
+            return Status::DeviceSignerUnavailable;
+        };
+        let signature = Signature {
+            r: signed.signature_r,
+            s: signed.signature_s,
+        };
+        if signed.public_key != public_key
+            || !verify_signature(&AuthKey(public_key), Self::DEVICE_BINDING_PROBE, &signature)
+        {
+            return Status::DeviceSignerMismatch;
+        }
+        match self.device_signer_pubkey {
+            None => {
+                self.device_signer_pubkey = Some(AuthKey(public_key));
+                Status::Ok
+            }
+            Some(existing) if existing.0 == public_key => Status::Ok,
+            Some(_) => Status::DeviceSignerMismatch,
+        }
+    }
+
+    /// Public discovery of the active host signer identity. This does not
+    /// configure guest state; operators compare it with their provisioned
+    /// key and then call `bind_device_signer` through authenticated ingress.
+    #[msg]
+    async fn device_signer_public_key(&self, ctx: &mut Context<Self>) -> Vec<u8> {
+        ctx.device_sign(Self::DEVICE_BINDING_PROBE)
+            .map(|signature| signature.public_key.to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Guest-owned bank identity currently bound for vouchers and claims.
+    #[msg]
+    async fn bound_device_signer_public_key(&self) -> Vec<u8> {
+        self.device_signer_pubkey
+            .map(|key| key.0.to_vec())
+            .unwrap_or_default()
+    }
+
     /// Configure the general `prover` extension to dispatch
     /// Mode::External voucher proofs to, together with the trusted
     /// canonical commitment `allowlist` (the concatenation of the
@@ -435,8 +672,16 @@ impl ClerkBridge {
     /// the wire ABI stays additive: existing callers that don't know
     /// about prover dispatch keep working with `prover_id` defaulted to
     /// 0.
-    #[msg]
-    async fn set_prover(&mut self, prover_id: u32, allowlist: Vec<u8>) -> Status {
+    #[msg(role = ClerkBridgeRole::Operator)]
+    async fn set_prover(
+        &mut self,
+        ctx: &mut Context<Self>,
+        prover_id: u32,
+        allowlist: Vec<u8>,
+    ) -> Status {
+        if !Self::authorize_signer_operator(ctx) {
+            return Status::Unauthorized;
+        }
         if self.local_ledger_id == 0 {
             return Status::NotBootstrapped;
         }
@@ -465,13 +710,17 @@ impl ClerkBridge {
     /// node to ask for proof blobs before fanning out. `0` means
     /// "unknown" and is the right value for in-process tests
     /// without a network; the host falls back to broadcast.
-    #[msg]
+    #[msg(role = ClerkBridgeRole::Operator)]
     async fn register_peer(
         &mut self,
+        ctx: &mut Context<Self>,
         peer_name: Vec<u8>,
         clerk_pubkey: Vec<u8>,
         node_prefix: u32,
     ) -> Status {
+        if !Self::authorize_signer_operator(ctx) {
+            return Status::Unauthorized;
+        }
         if self.local_ledger_id == 0 {
             return Status::NotBootstrapped;
         }
@@ -495,6 +744,16 @@ impl ClerkBridge {
             // its signing key; rewinding to None on a rotation would
             // reopen the fork/replay window the anchor closes.
             Ok(i) => {
+                if self.peers[i].clerk_pubkey != entry.clerk_pubkey
+                    && !self.peer_key_compatible(
+                        &entry.name,
+                        DEMO_CURRENCY,
+                        self.peers[i].window,
+                        entry.clerk_pubkey,
+                    )
+                {
+                    return Status::PeerKeyConflict;
+                }
                 self.peers[i].clerk_pubkey = entry.clerk_pubkey;
                 self.peers[i].node_prefix = entry.node_prefix;
             }
@@ -513,6 +772,207 @@ impl ClerkBridge {
     #[msg]
     async fn redeemed_count(&self) -> u32 {
         self.received.len() as u32
+    }
+
+    /// Whether this bridge has durably accepted one exact voucher identity.
+    /// The demo's quiescence barrier checks every issuer-returned redemption
+    /// key at the peer before closing the window.
+    #[msg]
+    async fn voucher_received(&self, redemption_key: [u8; 32]) -> bool {
+        self.received.contains(&redemption_key)
+    }
+
+    /// Number of accepted ledger transfers turned into signed vouchers.
+    #[msg]
+    async fn issued_count(&self) -> u32 {
+        self.issued_vouchers.len() as u32
+    }
+
+    /// Sign a caller-built, recipient-encrypted voucher template only after
+    /// the bound clerk-ledger confirms its commitment and state-root pair.
+    ///
+    /// `voucher_template` is canonical `Voucher::to_bytes()` with an all-zero
+    /// signature. The caller owns envelope encryption because it has the
+    /// opening and recipient IVK; it cannot choose the signed roots or an
+    /// unrelated commitment. One accepted transfer may be issued exactly
+    /// once. Exact response-loss retries return the stored voucher without
+    /// consulting the current signer or ledger again.
+    #[msg(role = ClerkBridgeRole::Operator)]
+    async fn issue_voucher(
+        &mut self,
+        ctx: &mut Context<Self>,
+        transfer_id: [u8; 16],
+        peer_name: Vec<u8>,
+        voucher_template: Vec<u8>,
+    ) -> IssueVoucherReply {
+        if !Self::authorize_signer_operator(ctx) {
+            return issue_reply(Status::Unauthorized);
+        }
+        if self.local_ledger_id == 0 {
+            return issue_reply(Status::NotBootstrapped);
+        }
+        if self.device_signer_pubkey.is_none() {
+            return issue_reply(Status::DeviceSignerUnavailable);
+        }
+        let request_hash = Self::issuance_request_hash(&peer_name, &transfer_id, &voucher_template);
+        if let Some(existing) = self.issued_vouchers.get(&transfer_id) {
+            return if existing.request_hash == request_hash {
+                IssueVoucherReply {
+                    status: Status::Ok,
+                    voucher: existing.voucher,
+                    redemption_key: existing.redemption_key,
+                    window: existing.window,
+                }
+            } else {
+                issue_reply(Status::IssuanceConflict)
+            };
+        }
+
+        let Some(mut voucher) = Voucher::from_bytes(&voucher_template) else {
+            return issue_reply(Status::BadInput);
+        };
+        if voucher.signature != Signature::ZERO || voucher.amount_commit.to_point().is_none() {
+            return issue_reply(Status::BadInput);
+        }
+
+        // The package's authenticated external-actor directory, not the
+        // legacy route integer, selects the ledger root. A missing binding is
+        // a clean denial rather than a fallback to an arbitrary same-node
+        // service.
+        let anchor = {
+            let Ok(mut ledger) = ctx.actor::<ClerkLedgerRef>("clerk-ledger").await else {
+                return issue_reply(Status::LedgerUnavailable);
+            };
+            match ledger
+                .voucher_anchor(transfer_id, voucher.amount_commit.0)
+                .await
+            {
+                Ok(Some(anchor)) => anchor,
+                _ => return issue_reply(Status::LedgerUnavailable),
+            }
+        };
+        if voucher.state_root_before != anchor.root_before
+            || voucher.state_root_after != anchor.root_after
+            || voucher.amount_commit.0 != anchor.amount_commit
+        {
+            return issue_reply(Status::LedgerUnavailable);
+        }
+
+        // The ledger query may have suspended. Select and pin the peer/window
+        // only after resumption so the voucher cannot be inserted into a
+        // window that was concurrently closed while awaiting the anchor.
+        let (peer_key, window) = match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
+            Ok(i) => (self.peers[i].clerk_pubkey, self.peers[i].window),
+            Err(_) => return issue_reply(Status::UnknownPeer),
+        };
+        if !self.peer_key_compatible(&peer_name, DEMO_CURRENCY, window, peer_key) {
+            return issue_reply(Status::PeerKeyConflict);
+        }
+
+        let payload = voucher.signing_payload();
+        voucher.signature = match self.device_signature(ctx, &payload) {
+            Ok(signature) => signature,
+            Err(status) => return issue_reply(status),
+        };
+        let expected = self
+            .device_signer_pubkey
+            .expect("the signer binding was checked above");
+        if voucher.verify_signature(&expected).is_err() {
+            return issue_reply(Status::DeviceSignerMismatch);
+        }
+
+        let voucher_bytes = voucher.to_bytes();
+        let redemption_key = voucher.redemption_key();
+        self.pin_peer_key(&peer_name, DEMO_CURRENCY, window, peer_key);
+        window::accumulate_pos(
+            &mut self.issuer_nets,
+            &peer_name,
+            DEMO_CURRENCY,
+            window,
+            &voucher.amount_commit,
+        );
+        self.issued_vouchers.insert(
+            &transfer_id,
+            &IssuedVoucherEntry {
+                request_hash,
+                voucher: voucher_bytes.clone(),
+                redemption_key,
+                window,
+            },
+        );
+        IssueVoucherReply {
+            status: Status::Ok,
+            voucher: voucher_bytes,
+            redemption_key,
+            window,
+        }
+    }
+
+    /// Sign the net-flow claim for one closed settlement window.
+    ///
+    /// The claim is derived entirely from guest-owned state:
+    /// `issuer_net + receiver_net`, the bank's bound device key, and the peer
+    /// key pinned by the first voucher activity in that window. The canonical
+    /// bracket is `[window, window + 1]`; callers cannot substitute claim
+    /// fields or a different peer identity.
+    #[msg(role = ClerkBridgeRole::Operator)]
+    async fn sign_claim(
+        &self,
+        ctx: &mut Context<Self>,
+        peer_name: Vec<u8>,
+        currency: u32,
+        window: u64,
+    ) -> SignClaimReply {
+        if !Self::authorize_signer_operator(ctx) {
+            return claim_reply(Status::Unauthorized);
+        }
+        let current_window = match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
+            Ok(i) => self.peers[i].window,
+            Err(_) => return claim_reply(Status::UnknownPeer),
+        };
+        if window >= current_window {
+            return claim_reply(Status::WindowOpen);
+        }
+        let Some(window_end) = window.checked_add(1) else {
+            return claim_reply(Status::BadInput);
+        };
+        let Some(claimant) = self.device_signer_pubkey else {
+            return claim_reply(Status::DeviceSignerUnavailable);
+        };
+        let Some(peer) = self.pinned_peer_key(&peer_name, currency, window) else {
+            return claim_reply(Status::BadInput);
+        };
+        let issuer = self
+            .issuer_nets
+            .get(&window::window_key(&peer_name, currency, window))
+            .map(Amount)
+            .unwrap_or(Amount::ZERO);
+        let receiver = window::window_net(&self.window_nets, &peer_name, currency, window)
+            .map(Amount)
+            .unwrap_or(Amount::ZERO);
+        let Some(net_flow) = window::checked_add(&issuer, &receiver) else {
+            return claim_reply(Status::BadInput);
+        };
+        let mut claim = SettlementClaim {
+            claimant_clerk: claimant,
+            peer_clerk: peer,
+            currency,
+            window_start: window,
+            window_end,
+            net_flow,
+            signature: Signature::ZERO,
+        };
+        claim.signature = match self.device_signature(ctx, &claim.signing_payload()) {
+            Ok(signature) => signature,
+            Err(status) => return claim_reply(status),
+        };
+        if claim.verify_signature().is_err() {
+            return claim_reply(Status::DeviceSignerMismatch);
+        }
+        SignClaimReply {
+            status: Status::Ok,
+            claim: claim.to_bytes(),
+        }
     }
 
     /// Verify + open a voucher. Walks the full ingress check chain
@@ -635,6 +1095,24 @@ impl ClerkBridge {
             return reply(Status::VoucherInvalid);
         }
 
+        // External proof dispatch may have suspended this workflow. Re-read
+        // the peer and require that neither its key nor current window changed
+        // before committing acceptance under the values verified above.
+        let (peer_index, window) = match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
+            Ok(i)
+                if self.peers[i].clerk_pubkey == peer_clerk_pubkey
+                    && self.peer_key_compatible(
+                        &peer_name,
+                        DEMO_CURRENCY,
+                        self.peers[i].window,
+                        peer_clerk_pubkey,
+                    ) =>
+            {
+                (i, self.peers[i].window)
+            }
+            _ => return reply(Status::VoucherInvalid),
+        };
+
         // Commit to the dedup set after a successful open. From
         // here the host caller has the opening and can credit the
         // recipient; a second submit with the same triple would
@@ -642,6 +1120,7 @@ impl ClerkBridge {
         // Idempotent: the replay check above already returned, so this is
         // a fresh triple; `insert` returns whether it was new.
         self.received.insert(&dedup_key);
+        self.pin_peer_key(&peer_name, DEMO_CURRENCY, window, peer_clerk_pubkey);
         // Advance the per-peer anchor to this voucher's post-state, and
         // fold the accepted commit into the current window's receiver term
         // — the two move together so the settlement sum and the anchor
@@ -649,17 +1128,14 @@ impl ClerkBridge {
         // voucher leaves both where the last accepted one left them.
         // Re-resolve by name: the earlier lookup's borrow is gone and its
         // index may be stale after the await.
-        if let Ok(pi) = self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
-            self.peers[pi].last_root_after = Some(voucher.state_root_after);
-            let window = self.peers[pi].window;
-            window::accumulate_neg(
-                &mut self.window_nets,
-                &peer_name,
-                DEMO_CURRENCY,
-                window,
-                &voucher.amount_commit,
-            );
-        }
+        self.peers[peer_index].last_root_after = Some(voucher.state_root_after);
+        window::accumulate_neg(
+            &mut self.window_nets,
+            &peer_name,
+            DEMO_CURRENCY,
+            window,
+            &voucher.amount_commit,
+        );
 
         SubmitVoucherReply {
             status: Status::Ok,
@@ -717,12 +1193,13 @@ impl ClerkBridge {
         if self.local_ledger_id == 0 {
             return early_redeem(Status::NotBootstrapped);
         }
-        let (peer_clerk_pubkey, peer_prefix, expected_root) =
+        let (peer_clerk_pubkey, peer_prefix, expected_root, redemption_window) =
             match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
                 Ok(i) => (
                     self.peers[i].clerk_pubkey,
                     self.peers[i].node_prefix,
                     self.peers[i].last_root_after,
+                    self.peers[i].window,
                 ),
                 Err(_) => return early_redeem(Status::UnknownPeer),
             };
@@ -806,6 +1283,14 @@ impl ClerkBridge {
         if voucher.amount_commit.to_point().is_none() {
             return early_redeem(Status::VoucherInvalid);
         }
+        if !self.peer_key_compatible(
+            &peer_name,
+            DEMO_CURRENCY,
+            redemption_window,
+            peer_clerk_pubkey,
+        ) {
+            return early_redeem(Status::VoucherInvalid);
+        }
 
         // Cross-actor dispatch: invoke clerk-ledger's
         // apply_transfer handler on the same node. The mailbox
@@ -836,18 +1321,23 @@ impl ClerkBridge {
             // retry with a corrected inflow. The replay check above
             // already returned, so this triple is fresh.
             self.received.insert(&dedup_key);
+            self.pin_peer_key(
+                &peer_name,
+                DEMO_CURRENCY,
+                redemption_window,
+                peer_clerk_pubkey,
+            );
             // Advance the per-peer anchor to this voucher's post-state and
             // fold the accepted commit into the current window's receiver
             // term, atomically with the ledger accept (the rejection paths
             // above never reach here, so both only move on acceptance).
             if let Ok(pi) = self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
                 self.peers[pi].last_root_after = Some(voucher.state_root_after);
-                let window = self.peers[pi].window;
                 window::accumulate_neg(
                     &mut self.window_nets,
                     &peer_name,
                     DEMO_CURRENCY,
-                    window,
+                    redemption_window,
                     &voucher.amount_commit,
                 );
             }
@@ -869,7 +1359,10 @@ impl ClerkBridge {
     /// claim production. Operator-gated — bracketing a window is bank-
     /// operator authority, the same authority as S4's `anchor_reset`.
     #[msg(role = ClerkBridgeRole::Operator)]
-    async fn window_rotate(&mut self, peer_name: Vec<u8>) -> Status {
+    async fn window_rotate(&mut self, ctx: &mut Context<Self>, peer_name: Vec<u8>) -> Status {
+        if !Self::authorize_signer_operator(ctx) {
+            return Status::Unauthorized;
+        }
         if self.local_ledger_id == 0 {
             return Status::NotBootstrapped;
         }
@@ -916,7 +1409,15 @@ impl ClerkBridge {
     /// can't see the venue's settled log); same authority as
     /// `window_rotate`.
     #[msg(role = ClerkBridgeRole::Operator)]
-    async fn anchor_reset(&mut self, peer_name: Vec<u8>, root: [u8; 32]) -> Status {
+    async fn anchor_reset(
+        &mut self,
+        ctx: &mut Context<Self>,
+        peer_name: Vec<u8>,
+        root: [u8; 32],
+    ) -> Status {
+        if !Self::authorize_signer_operator(ctx) {
+            return Status::Unauthorized;
+        }
         if self.local_ledger_id == 0 {
             return Status::NotBootstrapped;
         }
@@ -930,12 +1431,60 @@ impl ClerkBridge {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vos::Caller;
+    use vos::actors::context::ServiceId;
+
+    #[test]
+    fn signing_controls_reject_the_legacy_actor_bypass() {
+        let mut actor = Context::<ClerkBridge>::new(ServiceId(7));
+        actor.set_caller(Caller::Actor(ServiceId(9)));
+        actor.set_caller_roles(None, Some(ClerkBridgeRole::Operator as u8));
+        assert!(
+            !ClerkBridge::authorize_signer_operator(&mut actor),
+            "a same-node actor must not configure or use the bank signer"
+        );
+
+        let mut anonymous = Context::<ClerkBridge>::new(ServiceId(7));
+        assert!(!ClerkBridge::authorize_signer_operator(&mut anonymous));
+
+        let mut member = Context::<ClerkBridge>::new(ServiceId(7));
+        member.set_caller(Caller::Peer(vec![0xA5; 32]));
+        member.set_caller_roles(None, Some(ClerkBridgeRole::Operator as u8));
+        assert!(ClerkBridge::authorize_signer_operator(&mut member));
+
+        let mut system = Context::<ClerkBridge>::new(ServiceId(7));
+        system.set_caller(Caller::System);
+        assert!(ClerkBridge::authorize_signer_operator(&mut system));
+    }
+}
+
 /// Build an error reply with empty value+blinding.
 fn reply(status: Status) -> SubmitVoucherReply {
     SubmitVoucherReply {
         status,
         value: 0,
         blinding: Vec::new(),
+    }
+}
+
+/// Build a rejected issuance reply without leaving stale success fields.
+fn issue_reply(status: Status) -> IssueVoucherReply {
+    IssueVoucherReply {
+        status,
+        voucher: Vec::new(),
+        redemption_key: [0u8; 32],
+        window: u64::MAX,
+    }
+}
+
+/// Build a rejected settlement-claim reply.
+fn claim_reply(status: Status) -> SignClaimReply {
+    SignClaimReply {
+        status,
+        claim: Vec::new(),
     }
 }
 

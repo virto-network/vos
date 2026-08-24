@@ -27,17 +27,18 @@ use vos::v2::{
     CommittedAccumulateEntryV2, CommittedAccumulateLogV2, CommittedImageStoreV2,
     CommittedServiceImageHostV2, CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2,
     ContinuationChangeV2, ContinuationSnapshotV2, CrdtChangeV2, DeploymentId, DeviceSecretV2,
-    DirectIngressV2, DurableJamStoreV2, ExternalActorBindingV2, FileCommittedImageStoreV2,
-    GasAccountingV2, GasScheduleV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
-    InboxDrainOutcomeV2, InvocationId, JamServiceV2, LocalJamStoreHostV2, LocalJamStoreSnapshotV2,
-    LocalJamStoreV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2,
-    LocalRootTreeOpenErrorV2, LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2,
-    LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
-    PackageManifestV2, PackageRolePoliciesV2, PackageTaskDependencyV2, PrivateIngressStagingV2,
-    ProducerId, ProductionTrustDecisionV2, ProductionTrustErrorV2, ProductionTrustV2, ProgramId,
+    DeviceSignerRefineHostV2, DirectIngressV2, DurableJamStoreV2, ExternalActorBindingV2,
+    FileCommittedImageStoreV2, GasAccountingV2, GasScheduleV2, Hash, ImportedActorV2,
+    ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2, InvocationId, JamServiceV2,
+    LocalJamStoreHostV2, LocalJamStoreSnapshotV2, LocalJamStoreV2, LocalRootTreeConfigErrorV2,
+    LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2, LocalRootTreeOpenErrorV2,
+    LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2, LocalWorkSchedulerV2,
+    MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin, PackageManifestV2,
+    PackageRolePoliciesV2, PackageTaskDependencyV2, PrivateIngressStagingV2, ProducerId,
+    ProductionTrustDecisionV2, ProductionTrustErrorV2, ProductionTrustV2, ProgramId,
     ProofArtifactStoreV2, ProofVerificationRequestV2, PublishedEffectsV2,
-    ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, ReplicatedJamServiceV2,
-    ReplicatedServiceErrorV2, ReplyRecordV2, RoleAuthorityBindingV2,
+    ReceiptVerificationRequestV2, RefineImportsV2, RefineOutputV2, RefineProtocolHostV2,
+    ReplicatedJamServiceV2, ReplicatedServiceErrorV2, ReplyRecordV2, RoleAuthorityBindingV2,
     RoleAuthorityInviteRedemptionV2, RoleAuthorityMutationV2, RoleAuthorizationClaimV2,
     RoleCredentialV2, RoleCredentialVerificationRequestV2, RootServiceId, RootTreeAttestedResultV2,
     RootTreeInvocationV2, RootTreeUpgradeRequestV2, ScheduleErrorV2, ServiceDispatchError,
@@ -104,10 +105,9 @@ fn direct_linear_ingress(work: &WorkEnvelopeV2) -> AccumulateRequestV2 {
     })
 }
 
-fn admit_linear_work<A>(
-    service: &mut JamServiceV2<NoRefineProtocolHostV2, A>,
-    work: &WorkEnvelopeV2,
-) where
+fn admit_linear_work<R, A>(service: &mut JamServiceV2<R, A>, work: &WorkEnvelopeV2)
+where
+    R: RefineProtocolHostV2,
     A: AccumulateProtocolHostV2,
 {
     let admitted = service
@@ -862,8 +862,8 @@ impl CommittedAccumulateLogV2 for TestCommittedLog {
     }
 }
 
-fn authorize_install<A: LocalJamStoreHostV2>(
-    service: &mut JamServiceV2<NoRefineProtocolHostV2, A>,
+fn authorize_install<R, A: LocalJamStoreHostV2>(
+    service: &mut JamServiceV2<R, A>,
     request: &AccumulateRequestV2,
 ) {
     let AccumulateRequestV2::Install(genesis) = request else {
@@ -1062,6 +1062,20 @@ fn cycle_v2_elf() -> Vec<u8> {
 fn space_authority_elf() -> Vec<u8> {
     required_elf(
         "../actors/space-authority/target/riscv64em-javm/release/space_authority.elf",
+        "just build-v2-pvm-test-artifacts",
+    )
+}
+
+fn clerk_ledger_elf() -> Vec<u8> {
+    required_elf(
+        "../actors/clerk-ledger/target/riscv64em-javm/release/clerk_ledger.elf",
+        "just build-v2-pvm-test-artifacts",
+    )
+}
+
+fn clerk_bridge_elf() -> Vec<u8> {
+    required_elf(
+        "../actors/clerk-bridge/target/riscv64em-javm/release/clerk_bridge.elf",
         "just build-v2-pvm-test-artifacts",
     )
 }
@@ -3432,6 +3446,138 @@ fn clerk_status(committed: &vos::v2::CommittedRootTreeSliceV2) -> clerk_ledger::
         .expect("Clerk status archive decodes")
 }
 
+fn physical_operator_request<R, A>(
+    service: &mut JamServiceV2<R, A>,
+    actor: ActorId,
+    invocation: InvocationId,
+    logical_timeslot: u64,
+    message: Msg,
+    actor_role: Option<u8>,
+) -> LocalWorkRequestV2
+where
+    R: RefineProtocolHostV2,
+    A: LocalJamStoreHostV2 + AccumulateProtocolHostV2,
+{
+    let method = message.name.clone();
+    let mut arguments = vec![vos::value::TAG_DYNAMIC];
+    arguments.extend_from_slice(&message.encode());
+    let origin = Origin::Member(SubjectId([0x79; 32]));
+    let mut request = LocalWorkRequestV2 {
+        invocation,
+        workflow_step: 0,
+        logical_timeslot,
+        target: actor,
+        method: method.clone(),
+        arguments,
+        origin,
+        authorization: AuthorizationEvidenceV2::Public,
+        causal_parent: None,
+        parent_call: None,
+        causal_context: None,
+        awaited_reply: None,
+        awaited_timeout: None,
+        imported_blobs: vec![],
+        proof_requested: false,
+    };
+    let store = service.accumulate_host().local_store();
+    let header = store.header().unwrap().expect("installed service header");
+    let descriptor = store
+        .state_row(header.service_root, &StateKeyV2::ActorDescriptor(actor))
+        .unwrap()
+        .and_then(|bytes| ActorGenesisV2::decode(&bytes).ok())
+        .expect("installed actor descriptor");
+    let policies = PackageRolePoliciesV2::decode(&descriptor.role_policies)
+        .expect("installed role policies decode");
+    let policy = policies
+        .methods
+        .iter()
+        .find(|candidate| candidate.method == method)
+        .expect("requested method is signed into the package");
+    assert_eq!(policy.actor_role, actor_role);
+    if actor_role.is_none() {
+        assert!(policy.public);
+        return request;
+    }
+    let actor_role = actor_role.expect("checked above");
+    let scoped = LocalWorkSchedulerV2::prepare(store, request.clone())
+        .unwrap()
+        .work;
+    let credential = RoleCredentialV2 {
+        holder: origin,
+        scope: scoped.authorization_scope(),
+        space_role: None,
+        actor_role: Some(actor_role),
+        authenticator: b"physical operator authority over exact work scope".to_vec(),
+    };
+    request.authorization = credential.disclosed_evidence(policy.policy);
+    let authorized = LocalWorkSchedulerV2::prepare(store, request.clone())
+        .unwrap()
+        .work;
+    let verification = RoleCredentialVerificationRequestV2::for_work(&authorized)
+        .expect("physical operator credential is canonical");
+    service
+        .accumulate_host_mut()
+        .local_store_mut()
+        .allow_role_credential(&verification);
+    request
+}
+
+fn invoke_physical_actor<R, A>(
+    service: &mut JamServiceV2<R, A>,
+    request: LocalWorkRequestV2,
+) -> PublishedEffectsV2
+where
+    R: RefineProtocolHostV2,
+    A: LocalJamStoreHostV2 + AccumulateProtocolHostV2,
+{
+    let mut prepared =
+        LocalWorkSchedulerV2::prepare(service.accumulate_host().local_store(), request)
+            .expect("physical actor request schedules");
+    admit_linear_work(service, &prepared.work);
+    let refined = loop {
+        match service.refine_actor_tree(&prepared.work, &prepared.imports) {
+            Ok(refined) => break refined,
+            Err(ServiceDispatchError::Pvm(ServicePvmErrorV2::ActorStorageWitnessRequired(
+                requests,
+            ))) => LocalWorkSchedulerV2::hydrate_actor_storage_rows(
+                service.accumulate_host().local_store(),
+                &mut prepared,
+                &requests,
+            )
+            .expect("storage witnesses hydrate"),
+            Err(error) => panic!("physical actor Refine failed: {error:?}"),
+        }
+    };
+    match service
+        .accumulate(&AccumulateRequestV2::Apply(AccumulationEnvelopeV2 {
+            work: prepared.work,
+            transition: refined.transition,
+            provided_blobs: refined.exported_blobs,
+        }))
+        .expect("physical actor Accumulate completes")
+        .result
+    {
+        AccumulationResultV2::Accepted {
+            published,
+            duplicate: false,
+            ..
+        } => published,
+        other => panic!("physical actor Apply was not accepted: {other:?}"),
+    }
+}
+
+fn physical_reply_bytes(published: &PublishedEffectsV2) -> Vec<u8> {
+    let result = &published
+        .reply
+        .as_ref()
+        .expect("physical handler publishes a reply")
+        .result;
+    let Value::Bytes(bytes) = Value::try_decode(result).expect("physical reply is a Value") else {
+        panic!("physical reply is encoded as Value::Bytes")
+    };
+    bytes
+}
+
 #[test]
 fn canonical_clerk_package_executes_a_private_provable_transfer_through_raft() {
     use cipher_clerk::conventions::{BankCode, Iso4217};
@@ -3615,6 +3761,448 @@ fn canonical_clerk_package_executes_a_private_provable_transfer_through_raft() {
     assert_eq!(recovered.accumulate_gas_used, 0);
     drop(reopened);
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim() {
+    use cipher_clerk::conventions::{BankCode, Iso4217};
+    use cipher_clerk::crypto::{Amount, Blinding, Keypair, Signature};
+    use cipher_clerk::ids::JournalId;
+    use cipher_clerk::kernel::CreateAccount as CcCreateAccount;
+    use cipher_clerk::proof::Proof;
+    use cipher_clerk::settlement::SettlementClaim;
+    use cipher_clerk::types::{Account, Layer, Transfer};
+    use cipher_clerk::viewing_keys::{EncryptedEnvelope, IncomingViewingKey};
+    use cipher_clerk::voucher::Voucher;
+
+    let package_signer = libp2p::identity::Keypair::generate_ed25519();
+    let (ledger_package, ledger_name) = signed_test_package(&clerk_ledger_elf(), &package_signer);
+    let (bridge_package, bridge_name) = signed_test_package(&clerk_bridge_elf(), &package_signer);
+    let ledger_actor = ActorId([0x41; 32]);
+    let bridge_actor = ActorId([0x42; 32]);
+    let ledger_identity = ServiceIdentityV2 {
+        space: vos::v2::SpaceId([0x43; 32]),
+        root_service: RootServiceId([0x44; 32]),
+        deployment: ledger_package.deployment_id(),
+        service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+        service_abi: vos::v2::ABI_VERSION,
+        execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+        gas_schedule: TEST_GAS_SCHEDULE,
+    };
+    let bridge_identity = ServiceIdentityV2 {
+        root_service: RootServiceId([0x45; 32]),
+        deployment: bridge_package.deployment_id(),
+        ..ledger_identity.clone()
+    };
+    let initial = Vec::new();
+    let initial_ref = BlobRefV2::of_bytes(&initial);
+
+    let mut ledger_store = LocalJamStoreV2::default();
+    assert_eq!(ledger_store.import_blob(initial.clone()), initial_ref);
+    assert_eq!(
+        ledger_store.import_program(ledger_package.actor_pvm.clone()),
+        ledger_package.manifest.actor_program,
+    );
+    let mut ledger = JamServiceV2::new(
+        CANONICAL_SERVICE_PVM.to_vec(),
+        vos::v2::VOS_SERVICE_PROGRAM_ID,
+        NoRefineProtocolHostV2,
+        ledger_store,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
+    )
+    .unwrap();
+    let ledger_install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        role_authority: None,
+        external_actors: vec![],
+        service: ledger_identity.clone(),
+        consistency: ConsistencyModeV2::Local,
+        actors: vec![ActorGenesisV2 {
+            actor: ledger_actor,
+            name: ledger_name,
+            parent: None,
+            producer: ledger_package.deployment_signature.producer,
+            deployment: ledger_identity.deployment,
+            program: ledger_package.manifest.actor_program,
+            initial_state: initial_ref.clone(),
+            crdt: false,
+            role_policies: ledger_package.role_policies.clone(),
+        }],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([0x46; 32]),
+            authenticator: vec![0x47],
+        },
+    });
+    authorize_install(&mut ledger, &ledger_install);
+    assert!(matches!(
+        ledger.accumulate(&ledger_install).unwrap().result,
+        AccumulationResultV2::Installed(_)
+    ));
+
+    let device_secret = DeviceSecretV2::new([0x48; 32]);
+    let bank_public = device_secret.public_key();
+    let mut bridge_store = LocalJamStoreV2::default();
+    assert_eq!(bridge_store.import_blob(initial), initial_ref);
+    assert_eq!(
+        bridge_store.import_program(bridge_package.actor_pvm.clone()),
+        bridge_package.manifest.actor_program,
+    );
+    let mut bridge = JamServiceV2::new(
+        CANONICAL_SERVICE_PVM.to_vec(),
+        vos::v2::VOS_SERVICE_PROGRAM_ID,
+        DeviceSignerRefineHostV2::new(Some(device_secret)),
+        bridge_store,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
+    )
+    .unwrap();
+    let bridge_install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        role_authority: None,
+        external_actors: vec![external_binding(
+            "clerk-ledger",
+            ledger_identity.clone(),
+            ledger_actor,
+            ledger_package.deployment_signature.producer,
+            ledger_package.manifest.actor_program,
+        )],
+        service: bridge_identity,
+        consistency: ConsistencyModeV2::Local,
+        actors: vec![ActorGenesisV2 {
+            actor: bridge_actor,
+            name: bridge_name,
+            parent: None,
+            producer: bridge_package.deployment_signature.producer,
+            deployment: bridge_package.deployment_id(),
+            program: bridge_package.manifest.actor_program,
+            initial_state: initial_ref,
+            crdt: false,
+            role_policies: bridge_package.role_policies.clone(),
+        }],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([0x49; 32]),
+            authenticator: vec![0x4a],
+        },
+    });
+    authorize_install(&mut bridge, &bridge_install);
+    assert!(matches!(
+        bridge.accumulate(&bridge_install).unwrap().result,
+        AccumulationResultV2::Installed(_)
+    ));
+
+    let ledger_status = |published: &PublishedEffectsV2| {
+        vos::rkyv::from_bytes::<clerk_ledger::Status, vos::rkyv::rancor::Error>(
+            &physical_reply_bytes(published),
+        )
+        .unwrap()
+    };
+    let bridge_status = |published: &PublishedEffectsV2| {
+        vos::rkyv::from_bytes::<clerk_bridge::Status, vos::rkyv::rancor::Error>(
+            &physical_reply_bytes(published),
+        )
+        .unwrap()
+    };
+
+    let registrar = Keypair::generate();
+    let journal = JournalId::random();
+    let boot = physical_operator_request(
+        &mut ledger,
+        ledger_actor,
+        InvocationId([0x4b; 32]),
+        1,
+        Msg::new("bootstrap")
+            .with("journal_id", journal.0.to_vec())
+            .with("registrar_pubkey", registrar.public.0.to_vec())
+            .with("code", 1u32),
+        Some(clerk_ledger::ClerkLedgerRole::Operator as u8),
+    );
+    assert_eq!(
+        ledger_status(&invoke_physical_actor(&mut ledger, boot)),
+        clerk_ledger::Status::Ok
+    );
+    let alice_key = Keypair::generate();
+    let alice = Account::asset(journal, alice_key.public, Iso4217::USD, BankCode::Checking);
+    let pool = Account::asset(
+        journal,
+        Keypair::generate().public,
+        Iso4217::USD,
+        BankCode::Vault,
+    );
+    for (ordinal, account) in [alice.clone(), pool.clone()].into_iter().enumerate() {
+        let create = CcCreateAccount::signed(account, &registrar.secret);
+        let create = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&create)
+            .unwrap()
+            .to_vec();
+        let request = physical_operator_request(
+            &mut ledger,
+            ledger_actor,
+            InvocationId([0x4c + ordinal as u8; 32]),
+            2 + ordinal as u64,
+            Msg::new("create_account")
+                .with("create_account_bytes", create)
+                .with("batch_seed_timestamp", 10u64 + ordinal as u64),
+            Some(clerk_ledger::ClerkLedgerRole::Operator as u8),
+        );
+        assert_eq!(
+            ledger_status(&invoke_physical_actor(&mut ledger, request)),
+            clerk_ledger::Status::Ok
+        );
+    }
+    let root_before_request = physical_operator_request(
+        &mut ledger,
+        ledger_actor,
+        InvocationId([0x4e; 32]),
+        4,
+        Msg::new("state_root"),
+        Some(clerk_ledger::ClerkLedgerRole::Member as u8),
+    );
+    let root_before: [u8; 32] =
+        physical_reply_bytes(&invoke_physical_actor(&mut ledger, root_before_request))
+            .try_into()
+            .unwrap();
+
+    let blinding = Blinding::from_bytes([0x05; 32]).unwrap();
+    let amount = Amount::commit(17, &blinding);
+    let transfer = Transfer::builder(journal)
+        .debit(&alice, Layer::Settled, amount)
+        .credit(&pool, Layer::Settled, amount)
+        .signed_with(&[(&alice, &alice_key.secret)]);
+    let transfer_id = transfer.id.0;
+    let transfer_bytes = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&transfer)
+        .unwrap()
+        .to_vec();
+    let openings = vec![clerk_ledger::Opening {
+        amount,
+        value: 17,
+        blinding,
+    }];
+    let openings = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&openings)
+        .unwrap()
+        .to_vec();
+    let apply = physical_operator_request(
+        &mut ledger,
+        ledger_actor,
+        InvocationId([0x4f; 32]),
+        5,
+        Msg::new("apply_transfer")
+            .with("transfer_bytes", transfer_bytes)
+            .with("openings_bytes", openings)
+            .with("batch_seed_timestamp", 20u64),
+        Some(clerk_ledger::ClerkLedgerRole::Operator as u8),
+    );
+    assert_eq!(
+        ledger_status(&invoke_physical_actor(&mut ledger, apply)),
+        clerk_ledger::Status::Ok
+    );
+    let root_after_request = physical_operator_request(
+        &mut ledger,
+        ledger_actor,
+        InvocationId([0x50; 32]),
+        6,
+        Msg::new("state_root"),
+        Some(clerk_ledger::ClerkLedgerRole::Member as u8),
+    );
+    let root_after: [u8; 32] =
+        physical_reply_bytes(&invoke_physical_actor(&mut ledger, root_after_request))
+            .try_into()
+            .unwrap();
+    assert_ne!(root_before, root_after);
+
+    let receiver_ivk = IncomingViewingKey::from_bytes(&[1u8; 32]).unwrap();
+    let peer = Keypair::generate();
+    let bridge_boot = physical_operator_request(
+        &mut bridge,
+        bridge_actor,
+        InvocationId([0x51; 32]),
+        1,
+        Msg::new("bootstrap")
+            .with("local_ledger_id", 0x3500u32)
+            .with("ivk_secret", receiver_ivk.to_bytes().to_vec()),
+        Some(clerk_bridge::ClerkBridgeRole::Operator as u8),
+    );
+    assert_eq!(
+        bridge_status(&invoke_physical_actor(&mut bridge, bridge_boot)),
+        clerk_bridge::Status::Ok
+    );
+    let bind = physical_operator_request(
+        &mut bridge,
+        bridge_actor,
+        InvocationId([0x52; 32]),
+        2,
+        Msg::new("bind_device_signer").with("public_key", bank_public.to_vec()),
+        Some(clerk_bridge::ClerkBridgeRole::Operator as u8),
+    );
+    assert_eq!(
+        bridge_status(&invoke_physical_actor(&mut bridge, bind)),
+        clerk_bridge::Status::Ok
+    );
+    let register = physical_operator_request(
+        &mut bridge,
+        bridge_actor,
+        InvocationId([0x53; 32]),
+        3,
+        Msg::new("register_peer")
+            .with("peer_name", b"bank-b".to_vec())
+            .with("clerk_pubkey", peer.public.0.to_vec())
+            .with("node_prefix", 0u32),
+        Some(clerk_bridge::ClerkBridgeRole::Operator as u8),
+    );
+    assert_eq!(
+        bridge_status(&invoke_physical_actor(&mut bridge, register)),
+        clerk_bridge::Status::Ok
+    );
+
+    let voucher_template = Voucher {
+        amount_commit: amount,
+        envelope: EncryptedEnvelope::seal(17, &blinding, &receiver_ivk.public()).unwrap(),
+        state_root_before: root_before,
+        state_root_after: root_after,
+        proof: Proof::default(),
+        signature: Signature::ZERO,
+    }
+    .to_bytes();
+    let issue_message = Msg::new("issue_voucher")
+        .with("transfer_id", transfer_id.to_vec())
+        .with("peer_name", b"bank-b".to_vec())
+        .with("voucher_template", voucher_template.clone());
+    let issue = physical_operator_request(
+        &mut bridge,
+        bridge_actor,
+        InvocationId([0x54; 32]),
+        4,
+        issue_message.clone(),
+        Some(clerk_bridge::ClerkBridgeRole::Operator as u8),
+    );
+    let suspended = invoke_physical_actor(&mut bridge, issue);
+    let [message] = suspended.outbox.as_slice() else {
+        panic!("voucher issuance must suspend on one authenticated ledger query")
+    };
+    let call = message.call_id;
+    let bridge_publication = LocalTransportV2::pending_publications(&bridge)
+        .unwrap()
+        .into_iter()
+        .find(|publication| {
+            publication
+                .published
+                .outbox
+                .iter()
+                .any(|row| row.call_id == call)
+        })
+        .unwrap();
+    LocalTransportV2::deliver(&bridge, &mut ledger, &bridge_publication, call, 10).unwrap();
+    let drained = LocalTransportV2::drain_pending(&mut ledger, 11).unwrap();
+    assert!(matches!(
+        drained.as_slice(),
+        [InboxDrainOutcomeV2::Committed(_)]
+    ));
+    let ledger_publication = LocalTransportV2::pending_publications(&ledger)
+        .unwrap()
+        .into_iter()
+        .find(|publication| {
+            publication
+                .published
+                .reply
+                .as_ref()
+                .is_some_and(|r| r.call_id == call)
+        })
+        .unwrap();
+    let resumed =
+        LocalTransportV2::resume_reply(&ledger, &mut bridge, &ledger_publication, 12).unwrap();
+    let issued =
+        vos::rkyv::from_bytes::<clerk_bridge::IssueVoucherReply, vos::rkyv::rancor::Error>(
+            &physical_reply_bytes(&resumed.published),
+        )
+        .unwrap();
+    assert_eq!(issued.status, clerk_bridge::Status::Ok);
+    assert_eq!(issued.window, 0);
+    let voucher = Voucher::from_bytes(&issued.voucher).unwrap();
+    assert_eq!(voucher.amount_commit, amount);
+    assert_eq!(voucher.state_root_before, root_before);
+    assert_eq!(voucher.state_root_after, root_after);
+    voucher
+        .verify_signature(&cipher_clerk::crypto::AuthKey(bank_public))
+        .unwrap();
+    assert_eq!(issued.redemption_key, voucher.redemption_key());
+
+    // A fresh invocation after response loss reuses the actor-owned issuance
+    // record. It must not query the ledger or add the amount twice.
+    let retry = physical_operator_request(
+        &mut bridge,
+        bridge_actor,
+        InvocationId([0x55; 32]),
+        13,
+        issue_message,
+        Some(clerk_bridge::ClerkBridgeRole::Operator as u8),
+    );
+    let retried = invoke_physical_actor(&mut bridge, retry);
+    assert!(retried.outbox.is_empty());
+    let retried =
+        vos::rkyv::from_bytes::<clerk_bridge::IssueVoucherReply, vos::rkyv::rancor::Error>(
+            &physical_reply_bytes(&retried),
+        )
+        .unwrap();
+    assert_eq!(retried, issued);
+
+    // Reusing the transfer id with any different request is a terminal
+    // conflict, not a second ledger query or another issuer accumulator
+    // update.
+    let mut divergent_template = voucher_template;
+    divergent_template.push(0xff);
+    let divergent = physical_operator_request(
+        &mut bridge,
+        bridge_actor,
+        InvocationId([0x56; 32]),
+        14,
+        Msg::new("issue_voucher")
+            .with("transfer_id", transfer_id.to_vec())
+            .with("peer_name", b"bank-b".to_vec())
+            .with("voucher_template", divergent_template),
+        Some(clerk_bridge::ClerkBridgeRole::Operator as u8),
+    );
+    let divergent = invoke_physical_actor(&mut bridge, divergent);
+    assert!(divergent.outbox.is_empty());
+    let divergent = vos::rkyv::from_bytes::<
+        clerk_bridge::IssueVoucherReply,
+        vos::rkyv::rancor::Error,
+    >(&physical_reply_bytes(&divergent))
+    .unwrap();
+    assert_eq!(divergent.status, clerk_bridge::Status::IssuanceConflict);
+
+    let rotate = physical_operator_request(
+        &mut bridge,
+        bridge_actor,
+        InvocationId([0x57; 32]),
+        15,
+        Msg::new("window_rotate").with("peer_name", b"bank-b".to_vec()),
+        Some(clerk_bridge::ClerkBridgeRole::Operator as u8),
+    );
+    assert_eq!(
+        bridge_status(&invoke_physical_actor(&mut bridge, rotate)),
+        clerk_bridge::Status::Ok
+    );
+    let sign = physical_operator_request(
+        &mut bridge,
+        bridge_actor,
+        InvocationId([0x58; 32]),
+        16,
+        Msg::new("sign_claim")
+            .with("peer_name", b"bank-b".to_vec())
+            .with("currency", clerk_bridge::DEMO_CURRENCY)
+            .with("window", 0u64),
+        Some(clerk_bridge::ClerkBridgeRole::Operator as u8),
+    );
+    let signed = invoke_physical_actor(&mut bridge, sign);
+    let signed = vos::rkyv::from_bytes::<clerk_bridge::SignClaimReply, vos::rkyv::rancor::Error>(
+        &physical_reply_bytes(&signed),
+    )
+    .unwrap();
+    assert_eq!(signed.status, clerk_bridge::Status::Ok);
+    let claim = SettlementClaim::from_bytes(&signed.claim).unwrap();
+    assert_eq!(claim.claimant_clerk.0, bank_public);
+    assert_eq!(claim.peer_clerk, peer.public);
+    assert_eq!(claim.currency, clerk_bridge::DEMO_CURRENCY);
+    assert_eq!((claim.window_start, claim.window_end), (0, 1));
+    assert_eq!(claim.net_flow, amount, "issuance contributes exactly once");
+    claim.verify_signature().unwrap();
 }
 
 fn signed_task_dependency_config(

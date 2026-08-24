@@ -51,7 +51,7 @@ build-v2-daemon-root-artifacts: build-vos-service
     cd examples/actors; cargo +nightly actor -p v2-counter
 
 # Build every guest consumed by the physical v2 service-PVM gate.
-build-v2-pvm-test-artifacts: build-v2-daemon-root-artifacts (build-actor "space-authority") build-clerk-apply
+build-v2-pvm-test-artifacts: build-v2-daemon-root-artifacts (build-actor "space-authority") (build-actor "clerk-ledger") (build-actor "clerk-bridge") build-clerk-apply
     cd tests/fixtures/legacy-v1/actors/greeter; cargo +nightly actor
     cd tests/fixtures/legacy-v1/actors/probe; cargo +nightly actor
     cd tests/fixtures/legacy-v1/actors/tally; cargo +nightly actor

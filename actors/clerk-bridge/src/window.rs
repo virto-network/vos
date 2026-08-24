@@ -35,6 +35,17 @@ pub(crate) fn window_key(peer_name: &[u8], currency: u32, window: u64) -> [u8; 3
     )
 }
 
+/// Separate row domain for the peer signing key pinned to a settlement
+/// window. It deliberately cannot alias either net-flow map even though every
+/// map has its own storage prefix: callers may safely reuse the key outside
+/// this actor when auditing a claim.
+pub(crate) fn peer_key_key(peer_name: &[u8], currency: u32, window: u64) -> [u8; 32] {
+    vos::crypto::blake2b_hash::<32>(
+        b"clerk-bridge/window-peer-key/v1",
+        &[peer_name, &currency.to_be_bytes(), &window.to_be_bytes()],
+    )
+}
+
 /// Fold an accepted voucher's `amount_commit` into the receiver term for
 /// `(peer_name, currency, window)`: `neg_sum ← neg_sum ⊖ commit`. Called at
 /// exactly the accept points that advance the F2 `last_root_after` anchor,
@@ -53,6 +64,20 @@ pub(crate) fn accumulate_neg(
     nets.insert(&key, &updated.0);
 }
 
+/// Fold an issued voucher into the positive issuer term for one window.
+pub(crate) fn accumulate_pos(
+    nets: &mut StorageMap<[u8; 32], [u8; 32]>,
+    peer_name: &[u8],
+    currency: u32,
+    window: u64,
+    commit: &Amount,
+) {
+    let key = window_key(peer_name, currency, window);
+    let current = nets.get(&key).map(Amount).unwrap_or(Amount::ZERO);
+    let updated = add_commit(&current, commit);
+    nets.insert(&key, &updated.0);
+}
+
 /// The stored receiver term for `(peer_name, currency, window)`, or `None`
 /// if nothing has accumulated there yet.
 pub(crate) fn window_net(
@@ -62,6 +87,22 @@ pub(crate) fn window_net(
     window: u64,
 ) -> Option<[u8; 32]> {
     nets.get(&window_key(peer_name, currency, window))
+}
+
+/// Add two canonical commitment points. Invalid stored bytes fail closed to
+/// `None`; unlike the receiver hot path, claim production must not silently
+/// replace corrupt durable state with the identity.
+pub(crate) fn checked_add(a: &Amount, b: &Amount) -> Option<Amount> {
+    Some(Amount::from_point(&(a.to_point()? + b.to_point()?)))
+}
+
+fn add_commit(a: &Amount, b: &Amount) -> Amount {
+    match (a.to_point(), b.to_point()) {
+        (Some(pa), Some(pb)) => Amount::from_point(&(pa + pb)),
+        (Some(pa), None) => Amount::from_point(&pa),
+        (None, Some(pb)) => Amount::from_point(&pb),
+        (None, None) => Amount::ZERO,
+    }
 }
 
 /// `a ⊖ b` over the Pedersen group. A degenerate (non-decompressable)
@@ -137,6 +178,22 @@ mod tests {
     }
 
     #[test]
+    fn issuer_and_receiver_terms_compose_without_revealing_openings() {
+        let outbound = Amount::commit(17, &Blinding([4u8; 32]));
+        let inbound = Amount::commit(9, &Blinding([5u8; 32]));
+        let issuer = add_commit(&Amount::ZERO, &outbound);
+        let receiver = sub_commit(&Amount::ZERO, &inbound);
+        let net = checked_add(&issuer, &receiver).expect("canonical points add");
+        assert_eq!(net, sub_commit(&outbound, &inbound));
+        assert!(
+            checked_add(&net, &sub_commit(&inbound, &outbound))
+                .unwrap()
+                .is_zero(),
+            "the two banks' opposite claims reconcile to the identity",
+        );
+    }
+
+    #[test]
     fn window_key_separates_windows_peers_and_currencies() {
         // Distinct discriminants must land on distinct rows so terms never
         // cross-contaminate; identical ones must collide so folds accumulate.
@@ -159,6 +216,11 @@ mod tests {
             window_key(b"peer", USD, 0),
             window_key(b"peer", USD, 0),
             "the same triple is the same row, so accepts accumulate",
+        );
+        assert_ne!(
+            window_key(b"peer", USD, 0),
+            peer_key_key(b"peer", USD, 0),
+            "net rows and historical peer-key rows use separate domains",
         );
     }
 }

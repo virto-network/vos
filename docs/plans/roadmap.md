@@ -60,6 +60,11 @@ bank federation, without regressing it.
   into guest memory, snapshots, or replication logs. The daemon provisions a
   `0600` per-root sidecar; actor code must bind the returned public key to its
   guest-owned bank identity. CRDT signing remains fail-closed.
+- **Production Clerk issuer/claim path**: clerk-bridge binds that device key,
+  obtains an exact amount/root anchor from clerk-ledger through its signed
+  external-actor directory, issues each accepted transfer once, accumulates
+  issuer and receiver terms in guest-owned point rows, pins historical peer
+  keys per window, and signs canonical closed-window settlement claims.
 
 The former `worktree-provable` line was audited against this state. Its useful
 W1–W4 storage, proof-record, registry-pagination, and example-layout work has
@@ -81,27 +86,22 @@ Goal: bank A (a space) pays bank B (a space), settling on a third parent
 replication. Setup lives in `/home/daniel/src/bloque/bank-federation`.
 
 **Architecture: pure VOS actors + `vosx` + scripts. No new tool, no crypto
-CLI.** Voucher/claim signing moves *into the clerk actors* (they already
-link cipher-clerk and the bridge already holds a secret and verifies
-signatures — signing is the mirror of what it does today):
-- **`issue_voucher`** handler on the issuing side — clerk-ledger already
-  computes `amount_commit`, `root_before`, `root_after` at transfer time;
-  given the bank's clerk key it returns signed voucher bytes.
-- **issuer-side accumulation** on the bridge — the mirror of the receiver
-  `window_net` accumulator it already keeps.
-- **`sign_claim`** handler — composes `issuer ⊕ receiver` net-flow and
-  signs the `SettlementClaim`.
-- **Key custody (landed platform seam):** device-secret provisioning
-  (node-local, *not* Raft-replicated), so the clerk secret stays off the log while ledger
-  state replicates. Each bank's actor signs with its own key — preserves
-  the "two independent banks, one key each" honesty (a single signer would
-  make the venue's zero-sum check verify a script against itself).
+CLI.** The actor side is landed: `clerk-bridge.issue_voucher` authenticates
+the destination peer and an immutable `clerk-ledger.voucher_anchor`, signs
+through the host-private device capability, and accumulates the issuer term
+exactly once. `clerk-bridge.sign_claim` composes issuer ⊕ receiver state and
+signs the closed window. The node-local secret never enters actor state or
+Raft; each bank retains its independent key. Recipient-envelope construction
+remains caller-side because it needs the recipient viewing key and encryption
+randomness, while every financial field is re-bound by the actor before it
+signs.
 
 Then the whole driver is `vosx space call` + nushell/just scripts.
 
 **Money flow per step:**
 1. `vosx space call clerk-ledger apply_transfer …` (debit bank A's ledger)
-2. `vosx space call clerk-ledger issue_voucher <transfer_id> peer=bank-b`
+2. build the recipient-encrypted zero-signature template, then
+   `vosx space call clerk-bridge issue_voucher <transfer_id> peer=bank-b …`
    → signed voucher anchored to the *actor's* real roots
 3. `vosx space call clerk-bridge submit_voucher voucher=@voucher.bin
    peer_name=bank-a` (B verifies + accumulates the receiver term)
@@ -158,9 +158,8 @@ stands in for the on-chain settlement venue Wave 2 makes real.
 ## 3. Remaining work (prioritized)
 
 **Near-term / demo-adjacent**
-- **The demo** (§2): the in-actor signing handlers (`issue_voucher`,
-  issuer accumulation, `sign_claim`) on the landed device-signer seam + bloque scripts +
-  runbook.
+- **The demo** (§2): wire the landed signing/settlement actor surface into the
+  bloque topology scripts, quiescence checks, and operator runbook.
 - **vosx decoupling** → [vosx-decoupling.md](vosx-decoupling.md): retire the
   hardcoded `ai`/`dev`/`console` commands in favor of the metadata-driven
   dispatcher (docs + jobs + signing in `.vos_meta`), move system-actor

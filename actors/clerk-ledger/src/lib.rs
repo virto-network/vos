@@ -89,7 +89,7 @@ use clerk_witness::{
 use vos::prelude::*;
 
 pub use status::Status;
-pub use wire::{Opening, PendingStatusEntry, TransferRootEntry};
+pub use wire::{LedgerVoucherAnchor, Opening, PendingStatusEntry, TransferRootEntry};
 
 use cipher_clerk::state_root::{
     account_leaf_content, composite_root_from_subroots, external_id_leaf_content,
@@ -268,6 +268,23 @@ impl ClerkLedger {
             Origin::System => true,
             Origin::Member(_) => ctx.has_role(ClerkLedgerRole::Operator),
             Origin::Anonymous | Origin::Actor(_) => false,
+        };
+        if !allowed {
+            ctx.__mark_forbidden();
+        }
+        allowed
+    }
+
+    /// Voucher anchors are opaque commitments, but they still prove whether a
+    /// caller-chosen transfer id exists. Expose them only to another
+    /// authenticated actor selected by installation authority, the local
+    /// System boundary, or an authenticated ledger operator. Anonymous/public
+    /// ingress cannot use this as a transfer-id oracle.
+    fn authorize_voucher_anchor(ctx: &mut Context<Self>) -> bool {
+        let allowed = match ctx.origin() {
+            Origin::Actor(_) | Origin::System => true,
+            Origin::Member(_) => ctx.has_role(ClerkLedgerRole::Operator),
+            Origin::Anonymous => false,
         };
         if !allowed {
             ctx.__mark_forbidden();
@@ -883,17 +900,58 @@ impl ClerkLedger {
     /// failed mid-dispatch). Each Vec is exactly 32 bytes when
     /// present.
     ///
-    /// This is the host-side voucher builder's entry point: after
-    /// `apply_transfer` returns `Status::Ok`, query the two roots,
-    /// then construct a `cipher_clerk::voucher::Voucher` with
-    /// `state_root_before` / `state_root_after` set from this pair
-    /// and `signature` produced by the bank's clerk-key off-actor.
-    /// Keeping the signing key out of replicated actor state.
+    /// This remains a diagnostic/compatibility read. Production issuance uses
+    /// `voucher_anchor` through an authenticated external-actor binding so the
+    /// bridge binds both roots and the exact amount before DEVICE_SIGN.
     #[msg(role = ClerkLedgerRole::Member)]
     async fn transfer_state_roots(&self, id: [u8; 16]) -> Option<(Vec<u8>, Vec<u8>)> {
         self.transfer_roots
             .get(&id)
             .map(|e| (e.root_before.to_vec(), e.root_after.to_vec()))
+    }
+
+    /// Return the exact accepted-transfer anchor needed for voucher issuance.
+    ///
+    /// A voucher represents one confidential amount. Multi-amount and pending
+    /// finalization transfers are therefore deliberately ineligible: the
+    /// accepted transfer must contain both a debit and credit row and every
+    /// row must carry the caller-selected commitment. The bridge supplies the
+    /// commitment from its zero-signature voucher template; this method binds
+    /// it to immutable ledger state before any bank signature is produced.
+    #[msg]
+    async fn voucher_anchor(
+        &self,
+        ctx: &mut Context<Self>,
+        id: [u8; 16],
+        amount_commit: [u8; 32],
+    ) -> Option<LedgerVoucherAnchor> {
+        if !Self::authorize_voucher_anchor(ctx) {
+            return None;
+        }
+        let transfer = self.transfers.get(&id)?;
+        let roots = self.transfer_roots.get(&id)?;
+        let has_debit = transfer
+            .entries
+            .iter()
+            .any(|entry| entry.direction == Direction::Debit);
+        let has_credit = transfer
+            .entries
+            .iter()
+            .any(|entry| entry.direction == Direction::Credit);
+        if !has_debit
+            || !has_credit
+            || !transfer
+                .entries
+                .iter()
+                .all(|entry| entry.amount.0 == amount_commit)
+        {
+            return None;
+        }
+        Some(LedgerVoucherAnchor {
+            amount_commit,
+            root_before: roots.root_before,
+            root_after: roots.root_after,
+        })
     }
 
     #[msg(role = ClerkLedgerRole::Member)]

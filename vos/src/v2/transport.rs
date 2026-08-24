@@ -13,12 +13,12 @@ use super::{
     AccumulateProtocolHostV2, AccumulateRequestV2, AccumulatedReplyV2, AccumulationEnvelopeV2,
     AccumulationReceiptV2, AccumulationRejectionV2, AccumulationResultV2, AttestedServiceErrorV2,
     CallId, InvocationId, JamServiceV2, LocalJamStoreHostV2, LocalStoreReadErrorV2,
-    LocalWorkSchedulerV2, NoRefineProtocolHostV2, ProofVerificationRequestV2, PublicationAckV2,
-    PublicationRecordV2, PublishedEffectsV2, ReceiptVerificationRequestV2, RefinedServiceOutputV2,
+    LocalWorkSchedulerV2, ProofVerificationRequestV2, PublicationAckV2, PublicationRecordV2,
+    PublishedEffectsV2, ReceiptVerificationRequestV2, RefineProtocolHostV2, RefinedServiceOutputV2,
     ScheduleErrorV2, ServiceDispatchError, ServicePvmErrorV2, V2Wire,
 };
 
-type LocalServiceV2<A> = JamServiceV2<NoRefineProtocolHostV2, A>;
+type LocalServiceV2<R, A> = JamServiceV2<R, A>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommittedDeliveryV2 {
@@ -125,11 +125,12 @@ impl From<ServiceDispatchError> for LocalTransportErrorV2 {
 pub struct LocalTransportV2;
 
 impl LocalTransportV2 {
-    fn refine_with_storage_witnesses<A>(
-        service: &LocalServiceV2<A>,
+    fn refine_with_storage_witnesses<R, A>(
+        service: &LocalServiceV2<R, A>,
         mut prepared: super::PreparedWorkV2,
     ) -> Result<(super::PreparedWorkV2, RefinedServiceOutputV2), LocalTransportErrorV2>
     where
+        R: RefineProtocolHostV2,
         A: LocalJamStoreHostV2 + AccumulateProtocolHostV2,
     {
         let mut discovery_rounds = 0usize;
@@ -154,12 +155,13 @@ impl LocalTransportV2 {
         }
     }
 
-    fn retire_expired_inbox<A>(
-        destination: &mut LocalServiceV2<A>,
+    fn retire_expired_inbox<R, A>(
+        destination: &mut LocalServiceV2<R, A>,
         call: CallId,
         logical_timeslot: u64,
     ) -> Result<InboxDrainOutcomeV2, LocalTransportErrorV2>
     where
+        R: RefineProtocolHostV2,
         A: LocalJamStoreHostV2 + AccumulateProtocolHostV2,
     {
         let retirement = LocalWorkSchedulerV2::prepare_inbox_retirement(
@@ -188,8 +190,8 @@ impl LocalTransportV2 {
     }
 
     /// Recover source effects in canonical guest row order.
-    pub fn pending_publications<A: LocalJamStoreHostV2>(
-        source: &LocalServiceV2<A>,
+    pub fn pending_publications<R, A: LocalJamStoreHostV2>(
+        source: &LocalServiceV2<R, A>,
     ) -> Result<Vec<PublicationRecordV2>, LocalTransportErrorV2> {
         Ok(source
             .accumulate_host()
@@ -204,15 +206,16 @@ impl LocalTransportV2 {
     /// service image. The destination guest still checks the exact sender,
     /// full-outbox commitment, service identity, deadline, base and call
     /// deduplication.
-    pub fn deliver<S, D>(
-        source: &LocalServiceV2<S>,
-        destination: &mut LocalServiceV2<D>,
+    pub fn deliver<SR, S, DR, D>(
+        source: &LocalServiceV2<SR, S>,
+        destination: &mut LocalServiceV2<DR, D>,
         publication: &PublicationRecordV2,
         call: CallId,
         logical_timeslot: u64,
     ) -> Result<CommittedDeliveryV2, LocalTransportErrorV2>
     where
         S: LocalJamStoreHostV2,
+        DR: RefineProtocolHostV2,
         D: LocalJamStoreHostV2 + AccumulateProtocolHostV2,
     {
         let canonical = committed_publication(source, publication)?;
@@ -263,13 +266,14 @@ impl LocalTransportV2 {
     /// A prior exact admission is returned as a duplicate from the permanent
     /// reply-admission record. This remains possible after later workflow
     /// slices overwrite the latest checkpoint.
-    pub fn resume_reply<P, C>(
-        producer: &LocalServiceV2<P>,
-        caller: &mut LocalServiceV2<C>,
+    pub fn resume_reply<PR, P, CR, C>(
+        producer: &LocalServiceV2<PR, P>,
+        caller: &mut LocalServiceV2<CR, C>,
         publication: &PublicationRecordV2,
         logical_timeslot: u64,
     ) -> Result<CommittedReplyResumeV2, LocalTransportErrorV2>
     where
+        CR: RefineProtocolHostV2,
         P: LocalJamStoreHostV2 + AttestationProofHostV2,
         C: LocalJamStoreHostV2 + AccumulateProtocolHostV2 + AttestationProofHostV2,
     {
@@ -421,11 +425,12 @@ impl LocalTransportV2 {
     /// Suspended targets remain committed for later resolution. Expired rows
     /// are retired through a separate slot-authenticated guest transaction;
     /// other scheduling failures indicate corrupt orchestration state.
-    pub fn drain_pending<A>(
-        destination: &mut LocalServiceV2<A>,
+    pub fn drain_pending<R, A>(
+        destination: &mut LocalServiceV2<R, A>,
         logical_timeslot: u64,
     ) -> Result<Vec<InboxDrainOutcomeV2>, LocalTransportErrorV2>
     where
+        R: RefineProtocolHostV2,
         A: LocalJamStoreHostV2 + AccumulateProtocolHostV2,
     {
         let pending = destination
@@ -494,12 +499,13 @@ impl LocalTransportV2 {
     ///
     /// Proof metadata is published by guest Accumulate from the installed
     /// actor descriptor; the transport cannot supply a producer label.
-    pub fn drain_pending_attested<A, P>(
-        destination: &mut LocalServiceV2<A>,
+    pub fn drain_pending_attested<R, A, P>(
+        destination: &mut LocalServiceV2<R, A>,
         logical_timeslot: u64,
         proof_producer: &mut P,
     ) -> Result<Vec<InboxDrainOutcomeV2>, AttestedTransportErrorV2<P::Error>>
     where
+        R: RefineProtocolHostV2,
         A: LocalJamStoreHostV2 + AccumulateProtocolHostV2 + AttestationProofHostV2,
         P: AttestationProofProducerV2,
     {
@@ -582,8 +588,8 @@ impl LocalTransportV2 {
 
     /// Remove one recoverable publication through guest Accumulate after its
     /// external consumer has durably accepted it.
-    pub fn acknowledge<A: AccumulateProtocolHostV2>(
-        source: &mut LocalServiceV2<A>,
+    pub fn acknowledge<R: RefineProtocolHostV2, A: AccumulateProtocolHostV2>(
+        source: &mut LocalServiceV2<R, A>,
         publication: &PublicationRecordV2,
     ) -> Result<bool, LocalTransportErrorV2> {
         let output = source.accumulate(&AccumulateRequestV2::AcknowledgePublication(
@@ -603,8 +609,8 @@ impl LocalTransportV2 {
     }
 }
 
-fn committed_publication<A: LocalJamStoreHostV2>(
-    source: &LocalServiceV2<A>,
+fn committed_publication<R, A: LocalJamStoreHostV2>(
+    source: &LocalServiceV2<R, A>,
     publication: &PublicationRecordV2,
 ) -> Result<PublicationRecordV2, LocalTransportErrorV2> {
     let canonical = PublicationRecordV2::decode(&publication.encode())

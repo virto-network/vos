@@ -1335,7 +1335,14 @@ replay-stable. Host work is bounded to eight signatures per Refine slice and
 must compare that public key with its guest-owned configured identity. Device
 signing remains unavailable to CRDT roots because the host-private key is not
 a causally authenticated CRDT input. CRDT private-input availability remains
-deliberately staged.
+deliberately staged. The production Clerk bridge binds that public identity
+with `bind_device_signer`; its operator-only signing surface rejects the
+legacy same-node actor bypass. `issue_voucher` first awaits an exact
+`voucher_anchor` from the package-authenticated clerk-ledger binding, then
+signs and accumulates the issuer commitment in one accepted slice. Exact
+retries return the stored voucher without signing or accumulating twice.
+`sign_claim` is limited to closed windows and derives every field from
+guest-owned issuer/receiver terms plus the peer key pinned for that window.
 On durable open, the
 producer side-CAS retains content-addressed inputs belonging to guest-owned
 unconsumed ingress records and explicitly Raft-staged inputs awaiting ordered

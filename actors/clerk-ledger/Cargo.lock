@@ -3921,6 +3921,7 @@ dependencies = [
  "async-io",
  "async-trait",
  "blake2b_simd",
+ "cipher-clerk",
  "clap",
  "dlmalloc",
  "futures-channel",
@@ -3936,6 +3937,7 @@ dependencies = [
  "merkle-crdt",
  "object",
  "pollster",
+ "rand_chacha 0.3.1",
  "redb",
  "rkyv",
  "rustls-pemfile",
@@ -3947,6 +3949,7 @@ dependencies = [
  "vos-macros",
  "vos-raft",
  "vrf",
+ "zeroize",
  "zkpvm-precompiles",
 ]
 

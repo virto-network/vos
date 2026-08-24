@@ -41,17 +41,30 @@ pub(crate) const PENDING_STATUS_VOIDED: u8 = 2;
 /// 32-byte fields are the composite SMT roots just before and just
 /// after the kernel applied the transfer.
 ///
-/// These are the bytes a `cipher_clerk::voucher::Voucher` signs
-/// over — a downstream host-side voucher builder reads them via
-/// the `transfer_state_roots` handler immediately after
-/// `apply_transfer` returns `Status::Ok`, then constructs + signs
-/// a Voucher off-actor.
+/// These are the bytes a `cipher_clerk::voucher::Voucher` signs over. The
+/// public diagnostic remains available through `transfer_state_roots`; the
+/// production issuer path uses `voucher_anchor`, which additionally binds the
+/// single amount commitment before `clerk-bridge` signs through DEVICE_SIGN.
 #[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
 )]
 #[rkyv(crate = vos::rkyv)]
 pub struct TransferRootEntry {
     pub id: [u8; 16],
+    pub root_before: [u8; 32],
+    pub root_after: [u8; 32],
+}
+
+/// Public, opaque evidence that one accepted transfer carried exactly one
+/// amount commitment across all of its double-entry rows. This is the narrow
+/// cross-root surface used by `clerk-bridge` when it turns a caller-built,
+/// recipient-encrypted voucher template into a bank-signed voucher.
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+pub struct LedgerVoucherAnchor {
+    pub amount_commit: [u8; 32],
     pub root_before: [u8; 32],
     pub root_after: [u8; 32],
 }
