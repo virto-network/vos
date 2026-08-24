@@ -456,6 +456,173 @@ impl RefineProtocolHostV2 for NoRefineProtocolHostV2 {
     }
 }
 
+/// Host-private seed for one root's application device signer.
+///
+/// The wrapper deliberately redacts `Debug` and clears its backing bytes on
+/// drop. It is process configuration only: no V2 wire encoder exists, so it
+/// cannot be inserted into work, Raft entries, CRDT nodes, snapshots, or
+/// continuations by accident.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DeviceSecretV2([u8; 32]);
+
+impl DeviceSecretV2 {
+    pub const fn new(seed: [u8; 32]) -> Self {
+        Self(seed)
+    }
+
+    fn seed(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Public identity matching this seed, safe to persist in guest-owned
+    /// actor configuration and compare with [`crate::DeviceSignature`].
+    pub fn public_key(&self) -> [u8; 32] {
+        derive_device_signer(self).public_key().0
+    }
+}
+
+impl core::fmt::Debug for DeviceSecretV2 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DeviceSecretV2(<redacted>)")
+    }
+}
+
+impl Drop for DeviceSecretV2 {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.zeroize();
+    }
+}
+
+/// Refine host which exposes only public Schnorr signing results to actor VMs.
+///
+/// Arbitrary 32-byte operator seeds are deterministically mapped to a
+/// canonical cipher-clerk scalar. Schnorr nonces are deterministically and
+/// domain-separately derived from the seed and payload, so the same seed
+/// identifies the same bank and produces replay-stable transitions on every
+/// Raft voter.
+pub struct DeviceSignerRefineHostV2 {
+    signer: Option<cipher_clerk::crypto::SecretKey>,
+    nonce_key: Option<[u8; 32]>,
+    public_key: Option<[u8; 32]>,
+}
+
+impl DeviceSignerRefineHostV2 {
+    pub fn new(secret: Option<DeviceSecretV2>) -> Self {
+        let Some(secret) = secret else {
+            return Self::default();
+        };
+        let nonce_key = Hash::digest(b"vos/device-signer-nonce-key/v2", &[secret.seed()]).0;
+        let signer = derive_device_signer(&secret);
+        let public_key = signer.public_key().0;
+        Self {
+            signer: Some(signer),
+            nonce_key: Some(nonce_key),
+            public_key: Some(public_key),
+        }
+    }
+
+    pub const fn public_key(&self) -> Option<[u8; 32]> {
+        self.public_key
+    }
+}
+
+fn derive_device_signer(secret: &DeviceSecretV2) -> cipher_clerk::crypto::SecretKey {
+    (0u32..)
+        .find_map(|counter| {
+            let candidate = Hash::digest(
+                b"vos/device-signer-key/v2",
+                &[secret.seed(), &counter.to_le_bytes()],
+            );
+            cipher_clerk::crypto::SecretKey::from_bytes(candidate.0)
+                .and_then(|key| (key.public_key().0 != [0; 32]).then_some(key))
+        })
+        .expect("a 32-byte seed must derive a canonical device signing scalar")
+}
+
+impl Default for DeviceSignerRefineHostV2 {
+    fn default() -> Self {
+        Self {
+            signer: None,
+            nonce_key: None,
+            public_key: None,
+        }
+    }
+}
+
+impl Drop for DeviceSignerRefineHostV2 {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(nonce_key) = self.nonce_key.as_mut() {
+            nonce_key.zeroize();
+        }
+    }
+}
+
+impl core::fmt::Debug for DeviceSignerRefineHostV2 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DeviceSignerRefineHostV2")
+            .field("configured", &self.signer.is_some())
+            .field("public_key", &self.public_key)
+            .finish()
+    }
+}
+
+impl RefineProtocolHostV2 for DeviceSignerRefineHostV2 {
+    fn handle(
+        &self,
+        slot: u8,
+        registers: &[u64; 13],
+        kernel: &mut InvocationKernel,
+    ) -> Result<[u64; 2], ServicePvmErrorV2> {
+        if slot as u32 != crate::abi::hostcall::DEVICE_SIGN || kernel.active_vm == 0 {
+            return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+        }
+        let Some(signer) = self.signer.as_ref() else {
+            return Ok([crate::abi::error::HOST_NONE, 0]);
+        };
+        let input_address =
+            u32::try_from(registers[7]).map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
+        let input_len =
+            u32::try_from(registers[8]).map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
+        if input_len as usize > ACTOR_PRIVATE_INPUT_MAX_BYTES {
+            return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+        }
+        let payload = kernel
+            .read_data_cap_window(input_address, input_len)
+            .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+        use rand_chacha::rand_core::SeedableRng;
+        let nonce_seed = Hash::digest(
+            b"vos/device-signer-nonce/v2",
+            &[
+                &self
+                    .nonce_key
+                    .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?,
+                &payload,
+            ],
+        );
+        let mut nonce_rng = rand_chacha::ChaCha20Rng::from_seed(nonce_seed.0);
+        let signature = signer.sign(&payload, &mut nonce_rng);
+        let mut output = [0u8; 96];
+        output[..32].copy_from_slice(
+            &self
+                .public_key
+                .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?,
+        );
+        output[32..64].copy_from_slice(&signature.r);
+        output[64..].copy_from_slice(&signature.s);
+        let output_address =
+            u32::try_from(registers[9]).map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
+        let output_capacity = usize::try_from(registers[10])
+            .map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
+        let copy_len = output.len().min(output_capacity);
+        if !kernel.write_data_cap_window(output_address, &output[..copy_len]) {
+            return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+        }
+        Ok([output.len() as u64, 0])
+    }
+}
+
 /// Canonical generic-service program plus its verified identity.
 pub struct ServicePvmV2 {
     program: Vec<u8>,
@@ -2423,6 +2590,15 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                     }
                     continue;
                 }
+                if slot == crate::abi::hostcall::DEVICE_SIGN as u8
+                    && suspension_work.is_some_and(|work| work.proof_requested)
+                {
+                    // The signer key is deliberately absent from proof
+                    // imports. Until DEVICE_SIGN has its own authenticated
+                    // proof oracle, an attested method must not claim that a
+                    // trace independently reproduced this host-side result.
+                    return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                }
                 let mut registers = [0; 13];
                 for (index, register) in registers.iter_mut().enumerate() {
                     *register = kernel.active_reg(index);
@@ -2467,6 +2643,7 @@ fn install_actor_scheduler_caps(kernel: &mut InvocationKernel, actor_count: usiz
             crate::abi::hostcall::STORAGE_R as u8,
             crate::abi::hostcall::INVOKE as u8,
             crate::abi::hostcall::PROVABLE_RECORD_INTENT as u8,
+            crate::abi::hostcall::DEVICE_SIGN as u8,
             crate::crypto::ECALL_BLAKE2B_COMPRESS as u8,
             crate::abi::hostcall::GROW_HEAP as u8,
             crate::abi::hostcall::DEBUG_WRITE as u8,
@@ -2586,6 +2763,7 @@ pub fn validate_actor_program_layout(program: &[u8]) -> Result<(), ServicePvmErr
             || cap.cap_index == crate::abi::hostcall::STORAGE_R as u8
             || cap.cap_index == crate::abi::hostcall::INVOKE as u8
             || cap.cap_index == crate::abi::hostcall::PROVABLE_RECORD_INTENT as u8
+            || cap.cap_index == crate::abi::hostcall::DEVICE_SIGN as u8
     }) {
         return Err(ServicePvmErrorV2::InvalidActorCapabilityLayout);
     }
@@ -2613,6 +2791,7 @@ fn refine_protocol_call_is_pure(slot: u8) -> bool {
             | crate::abi::hostcall::REFINE_WORK_FETCH
             | crate::abi::hostcall::ACTOR_PRIVATE_FETCH
             | crate::abi::hostcall::ACTOR_EFFECT_EXPORT
+            | crate::abi::hostcall::DEVICE_SIGN
             | crate::crypto::ECALL_BLAKE2B_COMPRESS
             | crate::abi::hostcall::FETCH
             | crate::abi::hostcall::COMPILE
@@ -2629,6 +2808,27 @@ mod tests {
 
     const SYNTHETIC_SERVICE_GAS: u64 = 10_000_000;
     use grey_transpiler::assembler::Reg;
+
+    #[test]
+    fn device_signer_seed_derivation_is_stable_and_redacted() {
+        let seed = [0x5a; 32];
+        let left = DeviceSignerRefineHostV2::new(Some(DeviceSecretV2::new(seed)));
+        let right = DeviceSignerRefineHostV2::new(Some(DeviceSecretV2::new(seed)));
+        let other = DeviceSignerRefineHostV2::new(Some(DeviceSecretV2::new([0xa5; 32])));
+
+        assert_eq!(left.public_key(), right.public_key());
+        assert_eq!(
+            left.public_key(),
+            Some(DeviceSecretV2::new(seed).public_key())
+        );
+        assert_ne!(left.public_key(), other.public_key());
+        assert_ne!(left.public_key(), Some([0; 32]));
+        assert_eq!(
+            format!("{:?}", DeviceSecretV2::new(seed)),
+            "DeviceSecretV2(<redacted>)"
+        );
+        assert!(format!("{left:?}").starts_with("DeviceSignerRefineHostV2 { configured: true"));
+    }
 
     #[test]
     fn continued_vm_indices_ignore_later_directory_insertions() {

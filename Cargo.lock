@@ -7710,6 +7710,7 @@ dependencies = [
  "object",
  "pollster",
  "prover-extension",
+ "rand_chacha 0.3.1",
  "rcgen",
  "redb",
  "rkyv",
@@ -7730,6 +7731,7 @@ dependencies = [
  "vos-raft",
  "vrf",
  "x25519-dalek",
+ "zeroize",
  "zkpvm",
  "zkpvm-precompiles",
 ]

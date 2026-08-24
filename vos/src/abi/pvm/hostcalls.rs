@@ -82,6 +82,23 @@ pub fn provable_record_intent() -> u64 {
     ecall0(hostcall::PROVABLE_RECORD_INTENT)
 }
 
+/// Ask the host-private device signer to sign `payload`.
+///
+/// On success the host writes `public_key(32) || signature_r(32) ||
+/// signature_s(32)` and returns the full 96-byte length. `HOST_NONE` means
+/// this root has no device key. The seed itself never crosses the capability
+/// boundary or enters actor memory.
+#[inline]
+pub fn device_sign(payload: &[u8], output: &mut [u8; 96]) -> u64 {
+    ecall4(
+        hostcall::DEVICE_SIGN,
+        payload.as_ptr() as u64,
+        payload.len() as u64,
+        output.as_mut_ptr() as u64,
+        output.len() as u64,
+    )
+}
+
 /// Write debug output. vosx prints to stderr.
 #[inline]
 pub fn debug_write(data: &[u8]) -> u64 {

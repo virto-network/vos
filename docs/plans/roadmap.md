@@ -55,6 +55,11 @@ bank federation, without regressing it.
   authenticated witnesses, and producer-private ingress/record storage. Local
   and all-voter Raft private Task inputs are fail-closed and recoverable;
   CRDT private Task availability remains deliberately unsupported.
+- **Host-private Clerk signer foundation**: Local and Raft roots can expose a
+  Refine-only deterministic Schnorr signer to actors without mapping the seed
+  into guest memory, snapshots, or replication logs. The daemon provisions a
+  `0600` per-root sidecar; actor code must bind the returned public key to its
+  guest-owned bank identity. CRDT signing remains fail-closed.
 
 The former `worktree-provable` line was audited against this state. Its useful
 W1–W4 storage, proof-record, registry-pagination, and example-layout work has
@@ -86,8 +91,8 @@ signatures — signing is the mirror of what it does today):
   `window_net` accumulator it already keeps.
 - **`sign_claim`** handler — composes `issuer ⊕ receiver` net-flow and
   signs the `SettlementClaim`.
-- **Key custody:** device-secret provisioning (node-local, *not*
-  Raft-replicated), so the clerk secret stays off the log while ledger
+- **Key custody (landed platform seam):** device-secret provisioning
+  (node-local, *not* Raft-replicated), so the clerk secret stays off the log while ledger
   state replicates. Each bank's actor signs with its own key — preserves
   the "two independent banks, one key each" honesty (a single signer would
   make the venue's zero-sum check verify a script against itself).
@@ -154,7 +159,7 @@ stands in for the on-chain settlement venue Wave 2 makes real.
 
 **Near-term / demo-adjacent**
 - **The demo** (§2): the in-actor signing handlers (`issue_voucher`,
-  issuer accumulation, `sign_claim`, device-secret key) + bloque scripts +
+  issuer accumulation, `sign_claim`) on the landed device-signer seam + bloque scripts +
   runbook.
 - **vosx decoupling** → [vosx-decoupling.md](vosx-decoupling.md): retire the
   hardcoded `ai`/`dev`/`console` commands in favor of the metadata-driven

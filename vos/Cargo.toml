@@ -13,7 +13,7 @@ readme.workspace = true
 
 [features]
 default = ["std", "http", "storage", "network"]
-std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading", "dep:object", "dep:async-io", "dep:async-executor", "dep:futures-lite", "dep:futures-channel", "dep:futures-rustls", "dep:rustls-pemfile", "dep:getrandom", "dep:zkpvm-precompiles"]
+std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading", "dep:object", "dep:async-io", "dep:async-executor", "dep:futures-lite", "dep:futures-channel", "dep:futures-rustls", "dep:rustls-pemfile", "dep:getrandom", "dep:zkpvm-precompiles", "dep:cipher-clerk", "dep:rand_chacha", "dep:zeroize"]
 macros = ["dep:vos-macros"]
 pvm = []
 service = ["pvm"]
@@ -76,6 +76,13 @@ object = { version = "0.36", default-features = false, features = ["std", "read_
 # `boot_token` + the host-local `device_id`. `std`-gated — the no_std riscv
 # guest reaches the host via the BOOT_CONTEXT ecall and never links this.
 getrandom = { version = "0.2", optional = true }
+# Host-only device signer used by v2 Refine. Application VMs receive only the
+# public key and Schnorr signature; the seed never enters guest memory. The
+# no_std actor/service builds do not enable `std`, so this dependency cannot
+# leak into a canonical guest artifact.
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false, features = ["signing"], optional = true }
+rand_chacha = { version = "0.3", default-features = false, optional = true }
+zeroize = { version = "1", default-features = false, optional = true }
 ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
 dlmalloc = { version = "0.2", optional = true, features = ["global"] }
 redb = { version = "2", optional = true }

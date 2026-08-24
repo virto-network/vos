@@ -104,6 +104,18 @@ pub struct Context<A: Actor> {
 
 pub use crate::abi::service::ServiceId;
 
+/// Public result of one host-private device-signing operation.
+///
+/// The matching secret remains in the root host. Keeping this value limited
+/// to the public key and signature makes it safe to retain in actor state,
+/// replies, or a durable continuation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceSignature {
+    pub public_key: [u8; 32],
+    pub signature_r: [u8; 32],
+    pub signature_s: [u8; 32],
+}
+
 /// A queued transfer to another service (fire-and-forget).
 #[allow(dead_code)] // Fields read in cfg(pvm) path
 struct PendingTell {
@@ -150,6 +162,41 @@ impl<A: Actor> Context<A> {
             host_io_request: None,
             host_io_result: None,
             _phantom: core::marker::PhantomData,
+        }
+    }
+
+    /// Sign an application-domain-separated payload with this root's
+    /// host-private device key.
+    ///
+    /// The raw seed is never mapped into the actor VM. `None` means the root
+    /// was opened without a device key or the host rejected the request. V2
+    /// production actors should compare `public_key` with their guest-owned
+    /// configured identity before accepting the signature, so a misconfigured
+    /// failover voter fails closed instead of changing signer identity.
+    pub fn device_sign(&mut self, payload: &[u8]) -> Option<DeviceSignature> {
+        #[cfg(target_arch = "riscv64")]
+        {
+            let mut wire = [0u8; 96];
+            let len = crate::abi::pvm::hostcalls::device_sign(payload, &mut wire);
+            if len != wire.len() as u64 {
+                return None;
+            }
+            let mut public_key = [0u8; 32];
+            let mut signature_r = [0u8; 32];
+            let mut signature_s = [0u8; 32];
+            public_key.copy_from_slice(&wire[..32]);
+            signature_r.copy_from_slice(&wire[32..64]);
+            signature_s.copy_from_slice(&wire[64..]);
+            Some(DeviceSignature {
+                public_key,
+                signature_r,
+                signature_s,
+            })
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            let _ = payload;
+            None
         }
     }
 

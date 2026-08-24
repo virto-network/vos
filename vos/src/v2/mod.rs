@@ -85,10 +85,10 @@ pub use package::{
 };
 #[cfg(feature = "std")]
 pub use pvm::{
-    AccumulateProtocolHostV2, AccumulateTransactionV2, NoRefineProtocolHostV2,
-    ProducedProvableRecordV2, ReceiptVerificationHostV2, RefineProtocolHostV2, RefineTraceV2,
-    SERVICE_ARGUMENT_PAGES_V2, ServicePvmErrorV2, ServicePvmOutputV2, ServicePvmV2,
-    transpile_service_elf, validate_actor_program_layout,
+    AccumulateProtocolHostV2, AccumulateTransactionV2, DeviceSecretV2, DeviceSignerRefineHostV2,
+    NoRefineProtocolHostV2, ProducedProvableRecordV2, ReceiptVerificationHostV2,
+    RefineProtocolHostV2, RefineTraceV2, SERVICE_ARGUMENT_PAGES_V2, ServicePvmErrorV2,
+    ServicePvmOutputV2, ServicePvmV2, transpile_service_elf, validate_actor_program_layout,
 };
 #[cfg(feature = "std")]
 pub use root_service::{
@@ -129,7 +129,7 @@ pub use transport::{
 pub use wire::{DecodeError, V2Wire};
 
 /// Platform wire/ABI version carried by v2 work, transitions, and receipts.
-pub const ABI_VERSION: u16 = 15;
+pub const ABI_VERSION: u16 = 16;
 /// Portable continuation format version.
 pub const SNAPSHOT_VERSION: u16 = 6;
 /// Attestation statement version required by runtime v2.
@@ -140,8 +140,8 @@ pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
 /// This is protocol infrastructure, not a locally derived cache key. A fresh
 /// service build must match both the committed bytes and this identity.
 pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
-    0x72, 0x1f, 0x70, 0xf1, 0x7b, 0x12, 0x95, 0x26, 0x3a, 0x4a, 0xf9, 0x76, 0xf1, 0x86, 0xd2, 0x7c,
-    0x50, 0xe1, 0x5a, 0x28, 0xa4, 0x84, 0x27, 0xe7, 0xc4, 0xdf, 0x17, 0x9d, 0xb8, 0x3a, 0xd4, 0xcb,
+    0x72, 0xc1, 0x4f, 0x77, 0x3a, 0x02, 0xce, 0x00, 0xc7, 0x50, 0xdb, 0xb8, 0x8c, 0x12, 0xe7, 0xb5,
+    0x3e, 0x8b, 0x29, 0x6a, 0xaa, 0x80, 0xb3, 0x40, 0xd3, 0xb7, 0x89, 0x71, 0x97, 0x40, 0x76, 0x39,
 ]);
 
 /// Gray Paper instruction counter for the service Refine entry.
@@ -253,4 +253,4 @@ pub const JAR_REVISION: &str = "41d31e64b0f5d6c57a43769d7b8785556a311684";
 /// Consensus-visible execution semantics. Changing interpreter/recompiler or
 /// trace behavior requires a new identifier even if the public Rust API did
 /// not change.
-pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v20");
+pub const EXECUTION_SEMANTICS_ID: Hash = Hash(*b"vos-jar-v2-41d31e6-semantics-v21");

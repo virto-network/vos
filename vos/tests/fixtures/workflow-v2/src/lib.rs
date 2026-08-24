@@ -31,6 +31,36 @@ impl WorkflowV2 {
         next
     }
 
+    /// Exercise the host-private signer without ever mapping its seed into
+    /// this actor's address space. The public result is safe to commit.
+    #[msg]
+    fn device_signature(&mut self, ctx: &mut Context<Self>, payload: Vec<u8>) -> Vec<u8> {
+        let Some(signature) = ctx.device_sign(&payload) else {
+            return Vec::new();
+        };
+        let mut wire = Vec::with_capacity(96);
+        wire.extend_from_slice(&signature.public_key);
+        wire.extend_from_slice(&signature.signature_r);
+        wire.extend_from_slice(&signature.signature_s);
+        wire
+    }
+
+    #[msg(attested)]
+    fn attested_device_signature(
+        &mut self,
+        ctx: &mut Context<Self>,
+        payload: Vec<u8>,
+    ) -> Vec<u8> {
+        let Some(signature) = ctx.device_sign(&payload) else {
+            return Vec::new();
+        };
+        let mut wire = Vec::with_capacity(96);
+        wire.extend_from_slice(&signature.public_key);
+        wire.extend_from_slice(&signature.signature_r);
+        wire.extend_from_slice(&signature.signature_s);
+        wire
+    }
+
     /// Two calls to the same actor in one Refine slice pin storage
     /// read-after-write behavior in the invocation-local linear overlay.
     #[msg]

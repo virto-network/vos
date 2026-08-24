@@ -21,17 +21,18 @@ use super::{
     ActorDirectoryV2, ActorGenesisV2, ActorId, ActorUpgradeRecordV2, ActorUpgradeV2,
     AttestedServiceErrorV2, AuthorizationEvidenceV2, BlobRefV2, CausalCallContextV2,
     CommittedImageStoreV2, ConsistencyBaseV2, ConsistencyModeV2, ContinuationSnapshotV2,
-    CrdtChangeV2, CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryRecordV2, DirectIngressV2,
-    DurableJamStoreV2, DurableStoreOpenErrorV2, ExternalActorBindingV2, ExternalActorDirectoryV2,
-    ImportedBlobV2, ImportedProgramV2, JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2,
-    LocalStoreReadErrorV2, LocalWorkRequestV2, LocalWorkSchedulerV2, MessageRecordV2,
-    MethodPolicyV2, NoRefineProtocolHostV2, Origin, PackageError, PackageRolePoliciesV2,
-    PreparedWorkV2, ProductionTrustErrorV2, ProductionTrustV2, ProgramId, ProofArtifactStoreV2,
-    PublicationAckV2, PublicationRecordV2, PublishedEffectsV2, RefinedServiceOutputV2,
-    RoleAssertionEligibilityV2, RoleAuthorityBindingV2, RoleAuthorizationClaimV2, RoleCredentialV2,
-    ScheduleErrorV2, ServiceDispatchError, ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2,
-    StateKeyV2, V2Wire, VosPackageV2, WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key,
-    dedup_storage_key, delivery_storage_key,
+    CrdtChangeV2, CrdtSyncEnvelopeV2, DedupRecordV2, DeliveryRecordV2, DeviceSecretV2,
+    DeviceSignerRefineHostV2, DirectIngressV2, DurableJamStoreV2, DurableStoreOpenErrorV2,
+    ExternalActorBindingV2, ExternalActorDirectoryV2, ImportedBlobV2, ImportedProgramV2,
+    JamServiceV2, LocalJamStoreHostV2, LocalJamStoreV2, LocalStoreReadErrorV2, LocalWorkRequestV2,
+    LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, Origin, PackageError,
+    PackageRolePoliciesV2, PreparedWorkV2, ProductionTrustErrorV2, ProductionTrustV2, ProgramId,
+    ProofArtifactStoreV2, PublicationAckV2, PublicationRecordV2, PublishedEffectsV2,
+    RefinedServiceOutputV2, RoleAssertionEligibilityV2, RoleAuthorityBindingV2,
+    RoleAuthorizationClaimV2, RoleCredentialV2, ScheduleErrorV2, ServiceDispatchError,
+    ServiceGenesisV2, ServiceIdentityV2, ServicePvmErrorV2, StateKeyV2, V2Wire, VosPackageV2,
+    WorkInputIdV2, WorkflowCheckpointV2, crdt_node_storage_key, dedup_storage_key,
+    delivery_storage_key,
 };
 
 #[cfg(feature = "storage")]
@@ -566,6 +567,9 @@ pub struct LocalRootTreeConfigV2 {
     pub external_actors: Vec<ExternalActorBindingV2>,
     pub role_authority: Option<RoleAuthorityBindingV2>,
     pub install_authorization: AuthorizationEvidenceV2,
+    /// Optional host-private device-signing seed. It has no wire encoding and
+    /// is never inserted into the service image or replication log.
+    pub device_secret: Option<DeviceSecretV2>,
     pub refine_gas: u64,
     pub accumulate_gas: u64,
 }
@@ -583,6 +587,7 @@ pub enum LocalRootTreeConfigErrorV2 {
     WrongGasSchedule,
     InvalidConsistency,
     ReplicatedPrivateTaskUnsupported,
+    CrdtDeviceSignerUnsupported,
     InvalidRoleAuthority,
     ReplicationDriverRequired,
     RaftInstallEntryTooLarge,
@@ -773,9 +778,11 @@ pub enum RootTreeIngressRecoveryV2 {
 }
 
 enum RootTreeServiceDriverV2<B> {
-    Direct(JamServiceV2<NoRefineProtocolHostV2, DurableJamStoreV2<B>>),
+    Direct(JamServiceV2<DeviceSignerRefineHostV2, DurableJamStoreV2<B>>),
     #[cfg(feature = "storage")]
-    Raft(ReplicatedJamServiceV2<NoRefineProtocolHostV2, DurableJamStoreV2<B>, RaftAccumulateLogV2>),
+    Raft(
+        ReplicatedJamServiceV2<DeviceSignerRefineHostV2, DurableJamStoreV2<B>, RaftAccumulateLogV2>,
+    ),
 }
 
 enum RootTreeDriverConfigV2 {
@@ -1304,6 +1311,13 @@ impl LocalRootTreeConfigV2 {
             // producer-availability rule for the private preimage.
             return Err(LocalRootTreeConfigErrorV2::ReplicatedPrivateTaskUnsupported);
         }
+        if self.consistency == ConsistencyModeV2::Crdt && self.device_secret.is_some() {
+            // CRDT permits equivalent work to execute independently at more
+            // than one replica, but this host-private key is not authenticated
+            // by the causal work input. Missing or mismatched operator files
+            // could therefore create divergent physical transitions.
+            return Err(LocalRootTreeConfigErrorV2::CrdtDeviceSignerUnsupported);
+        }
         if self.role_authority.as_ref().is_some_and(|authority| {
             authority.service.space != self.service.space
                 || authority.service == self.service
@@ -1816,10 +1830,11 @@ where
                 .map_err(|_| LocalRootTreeOpenErrorV2::ProofHistoryUnavailable)?;
         }
         let expected_program = config.service.service_program;
+        let refine_host = DeviceSignerRefineHostV2::new(config.device_secret.clone());
         let mut service = JamServiceV2::new(
             config.service_pvm,
             expected_program,
-            NoRefineProtocolHostV2,
+            refine_host,
             store,
             config.refine_gas,
             config.accumulate_gas,

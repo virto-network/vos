@@ -140,6 +140,12 @@ pub const SUSPEND: u32 = 122;
 /// Refine never receive this capability.
 pub const PROOF_VERIFY: u32 = 123;
 
+/// Sign one application-selected, domain-separated payload with the root's
+/// host-private device key. Refine-only and installed only in application
+/// actor VMs. The phase-local slot is shared with [`PROOF_VERIFY`], which is
+/// Accumulate-only, so the two capabilities can never coexist.
+pub const DEVICE_SIGN: u32 = PROOF_VERIFY;
+
 /// Verify a disclosed role credential against the platform authority and its
 /// invocation-specific scope. Accumulate-only.
 pub const ROLE_CREDENTIAL_VERIFY: u32 = 124;

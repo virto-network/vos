@@ -36,7 +36,7 @@ pub use auth::{
 pub use client::{ActorHandle, ActorReference, CallError, ClientError};
 pub use codec::{Decode, Encode};
 pub mod context;
-pub use context::{Context, Extension, ExtensionCtx};
+pub use context::{Context, DeviceSignature, Extension, ExtensionCtx};
 #[cfg(feature = "extension")]
 pub use exec::{ExecIo, TaskFut, TaskState, TaskTable, task_waker};
 #[cfg(feature = "pvm")]

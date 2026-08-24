@@ -26,11 +26,11 @@ use vos::v2::{
     AuthorizationEvidenceV2, BlobRefV2, CallId, CausalCallContextV2, CommittedAccumulateBatchV2,
     CommittedAccumulateEntryV2, CommittedAccumulateLogV2, CommittedImageStoreV2,
     CommittedServiceImageHostV2, CommittedServiceSnapshotV2, ConsistencyBaseV2, ConsistencyModeV2,
-    ContinuationChangeV2, ContinuationSnapshotV2, CrdtChangeV2, DeploymentId, DirectIngressV2,
-    DurableJamStoreV2, ExternalActorBindingV2, FileCommittedImageStoreV2, GasAccountingV2,
-    GasScheduleV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2, InboxDrainOutcomeV2,
-    InvocationId, JamServiceV2, LocalJamStoreHostV2, LocalJamStoreSnapshotV2, LocalJamStoreV2,
-    LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2,
+    ContinuationChangeV2, ContinuationSnapshotV2, CrdtChangeV2, DeploymentId, DeviceSecretV2,
+    DirectIngressV2, DurableJamStoreV2, ExternalActorBindingV2, FileCommittedImageStoreV2,
+    GasAccountingV2, GasScheduleV2, Hash, ImportedActorV2, ImportedBlobV2, ImportedProgramV2,
+    InboxDrainOutcomeV2, InvocationId, JamServiceV2, LocalJamStoreHostV2, LocalJamStoreSnapshotV2,
+    LocalJamStoreV2, LocalRootTreeConfigErrorV2, LocalRootTreeConfigV2, LocalRootTreeInvokeErrorV2,
     LocalRootTreeOpenErrorV2, LocalRootTreeServiceV2, LocalTransportV2, LocalWorkRequestV2,
     LocalWorkSchedulerV2, MessageRecordV2, MethodPolicyV2, NoRefineProtocolHostV2, Origin,
     PackageManifestV2, PackageRolePoliciesV2, PackageTaskDependencyV2, PrivateIngressStagingV2,
@@ -1385,6 +1385,7 @@ fn attested_root_fixture(
             capability: SystemCapabilityId([salt.wrapping_add(3); 32]),
             authenticator: vec![salt.wrapping_add(4)],
         },
+        device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
@@ -1408,6 +1409,178 @@ fn attested_root_fixture(
         proof_requested: true,
     };
     (config, request)
+}
+
+fn decode_device_signature(committed: &vos::v2::CommittedRootTreeSliceV2) -> Vec<u8> {
+    let reply = committed
+        .published
+        .reply
+        .as_ref()
+        .expect("device signer publishes one direct reply");
+    let Value::Bytes(bytes) = Value::try_decode(&reply.result).expect("reply is a Value") else {
+        panic!("device signature is encoded as Value::Bytes")
+    };
+    bytes
+}
+
+#[test]
+fn host_private_device_signer_survives_reopen_without_entering_the_service_image() {
+    let (mut config, mut request) = attested_root_fixture(ConsistencyModeV2::Local, 0x6a);
+    let seed = [0xd3; 32];
+    let payload = b"vos/test/device-signature/v2".to_vec();
+    config.device_secret = Some(DeviceSecretV2::new(seed));
+    request.method = "device_signature".into();
+    request.arguments = {
+        let mut arguments = vec![vos::value::TAG_DYNAMIC];
+        arguments.extend_from_slice(
+            &Msg::new("device_signature")
+                .with("payload", payload.clone())
+                .encode(),
+        );
+        arguments
+    };
+    request.proof_requested = false;
+
+    let backend = SharedCommittedImages::default();
+    let mut service = LocalRootTreeServiceV2::open(config.clone(), backend.clone())
+        .expect("device signer config opens a Local root");
+    let first = decode_device_signature(
+        &service
+            .invoke(request.clone())
+            .expect("physical actor reaches DEVICE_SIGN"),
+    );
+    assert_eq!(first.len(), 96);
+    cipher_clerk::proof::signature::verify(
+        &payload,
+        &cipher_clerk::crypto::AuthKey(first[..32].try_into().unwrap()),
+        &cipher_clerk::proof::Proof {
+            mode: cipher_clerk::proof::Mode::Signature,
+            bytes: first[32..].to_vec(),
+        },
+    )
+    .expect("the public actor result is a valid cipher-clerk signature");
+    let image = backend.0.lock().unwrap().clone().expect("committed image");
+    assert!(
+        !image.windows(seed.len()).any(|window| window == seed),
+        "the raw device seed must not enter the recoverable service image",
+    );
+    drop(service);
+
+    request.invocation = InvocationId([0x6b; 32]);
+    request.logical_timeslot += 1;
+    let mut reopened = LocalRootTreeServiceV2::open(config, backend)
+        .expect("the root reopens with its host-private seed");
+    let second = decode_device_signature(
+        &reopened
+            .invoke(request)
+            .expect("reopened root still reaches DEVICE_SIGN"),
+    );
+    assert_eq!(
+        second, first,
+        "the domain-separated deterministic nonce makes exact re-execution stable",
+    );
+    cipher_clerk::proof::signature::verify(
+        &payload,
+        &cipher_clerk::crypto::AuthKey(second[..32].try_into().unwrap()),
+        &cipher_clerk::proof::Proof {
+            mode: cipher_clerk::proof::Mode::Signature,
+            bytes: second[32..].to_vec(),
+        },
+    )
+    .expect("reopened signer retains the same public identity");
+}
+
+#[test]
+fn raft_device_signing_replays_only_the_public_result() {
+    let (mut config, mut request) = attested_root_fixture(ConsistencyModeV2::Raft, 0x6c);
+    let seed = [0xe7; 32];
+    let payload = b"vos/test/raft-device-signature/v2".to_vec();
+    config.device_secret = Some(DeviceSecretV2::new(seed));
+    request.method = "device_signature".into();
+    request.arguments = {
+        let mut arguments = vec![vos::value::TAG_DYNAMIC];
+        arguments.extend_from_slice(
+            &Msg::new("device_signature")
+                .with("payload", payload.clone())
+                .encode(),
+        );
+        arguments
+    };
+    request.proof_requested = false;
+
+    let directory = std::env::temp_dir().join(format!(
+        "vos-v2-device-signer-raft-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let log_path = directory.join("raft.redb");
+    let backend = SharedCommittedImages::default();
+    let log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    let mut service = LocalRootTreeServiceV2::open_raft(config.clone(), backend, log)
+        .expect("single-voter Raft root installs with the host signer");
+    let signature = decode_device_signature(
+        &service
+            .invoke(request)
+            .expect("Raft Refine commits the public signature"),
+    );
+    cipher_clerk::proof::signature::verify(
+        &payload,
+        &cipher_clerk::crypto::AuthKey(signature[..32].try_into().unwrap()),
+        &cipher_clerk::proof::Proof {
+            mode: cipher_clerk::proof::Mode::Signature,
+            bytes: signature[32..].to_vec(),
+        },
+    )
+    .unwrap();
+    let backend = service.into_backend();
+    let log_bytes = std::fs::read(&log_path).unwrap();
+    assert!(
+        !log_bytes.windows(seed.len()).any(|window| window == seed),
+        "the device seed must not enter ordered Raft entries",
+    );
+
+    let log = RaftAccumulateLogV2::open(&log_path, RaftConfig::default()).unwrap();
+    LocalRootTreeServiceV2::open_raft(config, backend, log)
+        .expect("Raft recovery reconstructs the signer only from host config");
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn device_signing_is_rejected_from_unreproducible_attested_traces() {
+    let (mut config, mut request) = attested_root_fixture(ConsistencyModeV2::Local, 0x6d);
+    config.device_secret = Some(DeviceSecretV2::new([0xb4; 32]));
+    request.method = "attested_device_signature".into();
+    request.arguments = {
+        let mut arguments = vec![vos::value::TAG_DYNAMIC];
+        arguments.extend_from_slice(
+            &Msg::new("attested_device_signature")
+                .with("payload", b"not-a-proof-oracle".to_vec())
+                .encode(),
+        );
+        arguments
+    };
+    let mut service = LocalRootTreeServiceV2::open(config, SharedCommittedImages::default())
+        .expect("attested policy installs independently of invocation");
+    let mut producer = CanonicalTestProofProducer {
+        proof: canonical_test_proof_manifest(0x6e),
+        calls: 0,
+    };
+    assert!(matches!(
+        service.invoke_attested(request, &mut producer),
+        Err(AttestedRootTreeInvokeErrorV2::Root(
+            LocalRootTreeInvokeErrorV2::Service(ServiceDispatchError::Pvm(
+                ServicePvmErrorV2::RefineHostRejected(slot),
+            )),
+        )) if slot == vos::abi::hostcall::DEVICE_SIGN as u8,
+    ));
+    assert_eq!(
+        producer.calls, 0,
+        "the runtime refuses the trace before invoking a proof producer",
+    );
 }
 
 struct TestProductionTrust {
@@ -3242,6 +3415,7 @@ fn canonical_clerk_package_executes_a_private_provable_transfer_through_raft() {
             capability: SystemCapabilityId([124; 32]),
             authenticator: vec![125],
         },
+        device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
@@ -3449,6 +3623,7 @@ fn signed_task_dependency_actor_config(
             capability: SystemCapabilityId([124; 32]),
             authenticator: vec![125],
         },
+        device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
@@ -3529,6 +3704,7 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
             capability: SystemCapabilityId([94; 32]),
             authenticator: vec![95],
         },
+        device_secret: None,
         refine_gas: 1_000_000_000,
         accumulate_gas: 5_000_000_000,
     };
@@ -3783,6 +3959,7 @@ fn canonical_space_authority_authorizes_a_physical_target_and_exact_retry() {
             capability: SystemCapabilityId([186; 32]),
             authenticator: vec![187],
         },
+        device_secret: None,
         refine_gas: 1_000_000_000,
         accumulate_gas: 5_000_000_000,
     };
@@ -4084,6 +4261,7 @@ fn canonical_space_authority_authorizes_a_physical_target_and_exact_retry() {
             capability: SystemCapabilityId([208; 32]),
             authenticator: vec![209],
         },
+        device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
@@ -4249,6 +4427,7 @@ fn crdt_role_authorization_survives_causal_sync_restart_and_exact_retry() {
             capability: SystemCapabilityId([0xD7; 32]),
             authenticator: vec![0xD8],
         },
+        device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
@@ -4476,6 +4655,7 @@ fn node_ingress_uses_canonical_authority_for_raft_and_crdt_targets() {
             capability: SystemCapabilityId([215; 32]),
             authenticator: vec![216],
         },
+        device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
@@ -4579,6 +4759,7 @@ fn node_ingress_uses_canonical_authority_for_raft_and_crdt_targets() {
                 capability: SystemCapabilityId([220; 32]),
                 authenticator: vec![221],
             },
+            device_secret: None,
             refine_gas: TEST_GAS_SCHEDULE.refine,
             accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
         },
@@ -4613,9 +4794,17 @@ fn node_ingress_uses_canonical_authority_for_raft_and_crdt_targets() {
             capability: SystemCapabilityId([0xE3; 32]),
             authenticator: vec![0xE4],
         },
+        device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
+    let mut signed_crdt_config = crdt_config.clone();
+    signed_crdt_config.device_secret = Some(DeviceSecretV2::new([0xc7; 32]));
+    assert_eq!(
+        signed_crdt_config.validate(),
+        Err(LocalRootTreeConfigErrorV2::CrdtDeviceSignerUnsupported),
+        "CRDT cannot depend on a signer that is absent from its causal inputs",
+    );
     let crdt_backend = SharedCommittedImages::default();
     let crdt_target = LocalRootTreeServiceV2::open(crdt_config.clone(), crdt_backend.clone())
         .expect("the CRDT target pins the same authority identity in guest-owned state");
@@ -4878,6 +5067,7 @@ fn raft_root_tree_orders_genesis_apply_and_ack_through_physical_accumulate() {
             capability: SystemCapabilityId([116; 32]),
             authenticator: vec![117],
         },
+        device_secret: None,
         refine_gas: 1_000_000_000,
         accumulate_gas: 5_000_000_000,
     };
@@ -4987,6 +5177,7 @@ fn node_registers_a_raft_root_through_the_canonical_request_log() {
             capability: SystemCapabilityId([0xA4; 32]),
             authenticator: vec![0xA5],
         },
+        device_secret: None,
         refine_gas: 1_000_000_000,
         accumulate_gas: 5_000_000_000,
     };
@@ -5711,6 +5902,7 @@ fn raft_follower_registers_before_genesis_and_restores_caught_up_admission_time(
             capability: SystemCapabilityId([122; 32]),
             authenticator: vec![123],
         },
+        device_secret: None,
         refine_gas: 1_000_000_000,
         accumulate_gas: 5_000_000_000,
     };
@@ -5886,6 +6078,7 @@ fn node_routes_canonical_actor_ids_through_the_guest_owned_root_service() {
             capability: SystemCapabilityId([106; 32]),
             authenticator: vec![107],
         },
+        device_secret: None,
         refine_gas: 1_000_000_000,
         accumulate_gas: 5_000_000_000,
     };
@@ -6027,6 +6220,7 @@ fn root_upgrade_is_exactly_once_and_reopens_across_the_catalog_cutover() {
             capability: SystemCapabilityId([0x64; 32]),
             authenticator: vec![0x65],
         },
+        device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
@@ -6177,6 +6371,7 @@ fn conformance_raft_and_role_authority_shape_changes_are_refused_before_upgrade(
             capability: SystemCapabilityId([0xB4; 32]),
             authenticator: vec![0xB5],
         },
+        device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
@@ -6283,6 +6478,7 @@ fn production_raft_authority_upgrade_is_ordered_once_and_preserves_service_ident
             capability: SystemCapabilityId([0x69; 32]),
             authenticator: vec![0x6A],
         },
+        device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
@@ -6749,6 +6945,7 @@ fn attested_node_transport_fixture(
             program,
         )],
         install_authorization: install_authorization.clone(),
+        device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
@@ -6763,6 +6960,7 @@ fn attested_node_transport_fixture(
         initial_state: vec![],
         external_actors: vec![],
         install_authorization,
+        device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
@@ -7174,6 +7372,7 @@ fn node_routes_an_ordinary_cross_root_await_through_guest_accumulate() {
             program,
         )],
         install_authorization: install_authorization.clone(),
+        device_secret: None,
         refine_gas: 1_000_000_000,
         accumulate_gas: 5_000_000_000,
     };
@@ -7188,6 +7387,7 @@ fn node_routes_an_ordinary_cross_root_await_through_guest_accumulate() {
         initial_state: vec![],
         external_actors: vec![],
         install_authorization,
+        device_secret: None,
         refine_gas: 1_000_000_000,
         accumulate_gas: 5_000_000_000,
     };
@@ -7324,6 +7524,7 @@ fn node_routes_a_crdt_cross_root_await_and_acknowledges_both_publications() {
             program,
         )],
         install_authorization: install_authorization.clone(),
+        device_secret: None,
         refine_gas: 1_000_000_000,
         accumulate_gas: 5_000_000_000,
     };
@@ -7338,6 +7539,7 @@ fn node_routes_a_crdt_cross_root_await_and_acknowledges_both_publications() {
         initial_state: vec![],
         external_actors: vec![],
         install_authorization,
+        device_secret: None,
         refine_gas: 1_000_000_000,
         accumulate_gas: 5_000_000_000,
     };
@@ -7449,6 +7651,7 @@ fn node_routes_networkless_single_voter_raft_roots() {
             program,
         )],
         install_authorization: install_authorization.clone(),
+        device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
@@ -7463,6 +7666,7 @@ fn node_routes_networkless_single_voter_raft_roots() {
         initial_state: vec![],
         external_actors: vec![],
         install_authorization,
+        device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
@@ -7588,6 +7792,7 @@ fn node_routes_raft_cross_root_reply_between_different_leaders() {
             program,
         )],
         install_authorization: install_authorization.clone(),
+        device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
@@ -7602,6 +7807,7 @@ fn node_routes_raft_cross_root_reply_between_different_leaders() {
         initial_state: vec![],
         external_actors: vec![],
         install_authorization,
+        device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
@@ -7817,6 +8023,7 @@ fn node_retries_a_direct_reply_publication_ack_after_the_caller_is_gone() {
             capability: SystemCapabilityId([0xD4; 32]),
             authenticator: vec![0xD5],
         },
+        device_secret: None,
         refine_gas: 1_000_000_000,
         accumulate_gas: 5_000_000_000,
     };
@@ -7898,6 +8105,7 @@ fn node_expires_and_resumes_an_unreachable_durable_call() {
             capability: SystemCapabilityId([0xC5; 32]),
             authenticator: vec![0xC6],
         },
+        device_secret: None,
         refine_gas: 1_000_000_000,
         accumulate_gas: 5_000_000_000,
     };
@@ -7990,6 +8198,7 @@ fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
             capability: SystemCapabilityId([100; 32]),
             authenticator: vec![101],
         },
+        device_secret: None,
         refine_gas: 1_000_000_000,
         accumulate_gas: 5_000_000_000,
     };
@@ -8251,6 +8460,7 @@ fn node_anti_entropy_converges_authenticated_crdt_roots_across_restart() {
             capability: SystemCapabilityId([0x54; 32]),
             authenticator: vec![0x55],
         },
+        device_secret: None,
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };

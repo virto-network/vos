@@ -555,7 +555,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // Spawn every installed agent recorded in the registry.
     // Each gets a deterministic per-node ServiceId so its redb
     // path is stable across restarts.
-    spawn_installed_agents(
+    let legacy_agents = spawn_installed_agents(
         &mut node,
         &data_dir,
         space_id,
@@ -571,7 +571,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // `device_secret = true` (the messenger's MLS CSPRNG root). Runs after
     // spawn so the targets are live; the seed never touches the replicated
     // registry — it lives only in a node-local sidecar. Idempotent.
-    provision_device_seeds(&node, &device_secret_agents, &data_dir, local_prefix);
+    let legacy_device_secret_agents = device_secret_agents
+        .into_iter()
+        .filter(|name| legacy_agents.contains(name))
+        .collect::<Vec<_>>();
+    provision_device_seeds(&node, &legacy_device_secret_agents, &data_dir, local_prefix);
 
     // The space creator's operator key is granted ADMIN at genesis
     // (a signed `grant_role` baked into the DAG by `space new`),
@@ -1454,7 +1458,7 @@ fn spawn_installed_agents(
     pinned_v2_service: Option<&PinnedV2Service>,
     production_trust: Option<std::sync::Arc<dyn vos::v2::ProductionTrustV2>>,
     v2_registration_backoff: &mut V2RegistrationBackoff,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<std::collections::HashSet<String>> {
     use std::collections::HashSet;
     use vos::registry::{RegistryRef, Status};
 
@@ -1478,6 +1482,7 @@ fn spawn_installed_agents(
     // blob, …) so we don't accidentally trash their state.
     let mut live_svc_ids: HashSet<u32> = HashSet::new();
     let mut live_v2_services: HashSet<[u8; 32]> = HashSet::new();
+    let mut legacy_agents = HashSet::new();
     live_svc_ids.insert(ServiceId::REGISTRY.0);
     if has_hyperspace {
         // The hyperspace registry replica owns its own redb at
@@ -1551,6 +1556,9 @@ fn spawn_installed_agents(
         };
         let supports_raft = matches!(&prepared, RowConfig::Ready(_) | RowConfig::V2 { .. });
         let is_v2 = matches!(&prepared, RowConfig::V2 { .. });
+        if matches!(&prepared, RowConfig::Ready(_)) {
+            legacy_agents.insert(a.instance_name.clone());
+        }
         let svc_id = instance_service_id(&a.instance_name, local_prefix);
         let raft_seed = if supports_raft
             && consistency_from_u8(a.consistency) == Some(Consistency::Raft)
@@ -1735,7 +1743,7 @@ fn spawn_installed_agents(
     sweep_orphan_redbs(data_dir, &live_svc_ids);
     sweep_orphan_v2_services(data_dir, &live_v2_services);
 
-    Ok(())
+    Ok(legacy_agents)
 }
 
 /// How often the idle hook re-runs the spawn-reconcile pass. The
@@ -2283,12 +2291,11 @@ fn v2_config_from_row(
             "legacy install args/on_start payloads are unsupported; initialize v2 actors through explicit invocations"
         );
     }
-    if policies.get(&row.instance_name).is_some_and(|policy| {
-        policy.tick_ms.is_some() || !policy.intra_caps.is_empty() || policy.device_secret
-    }) {
-        anyhow::bail!(
-            "legacy tick/intra_caps/device_secret policy is unsupported for v2 root services"
-        );
+    if policies
+        .get(&row.instance_name)
+        .is_some_and(|policy| policy.tick_ms.is_some() || !policy.intra_caps.is_empty())
+    {
+        anyhow::bail!("legacy tick/intra_caps policy is unsupported for v2 root services");
     }
 
     let space = vos::v2::SpaceId(space_id);
@@ -2325,6 +2332,23 @@ fn v2_config_from_row(
     let state_path = data_dir
         .join("v2-services")
         .join(format!("{}.image", hex::encode(root_service.0)));
+    let device_secret_requested = policies
+        .get(&row.instance_name)
+        .is_some_and(|policy| policy.device_secret);
+    if consistency == Consistency::Crdt && device_secret_requested {
+        anyhow::bail!("v2 CRDT roots do not support host-private device signing");
+    }
+    let device_secret = device_secret_requested
+        .then(|| load_or_mint_v2_device_seed(data_dir, root_service))
+        .transpose()?
+        .map(vos::v2::DeviceSecretV2::new);
+    if let Some(secret) = device_secret.as_ref() {
+        tracing::info!(
+            actor = %row.instance_name,
+            public_key = %hex::encode(secret.public_key()),
+            "configured host-private v2 device signer",
+        );
+    }
     let install_authenticator = package.deployment_signature.signature.clone();
     let config = vos::v2::LocalRootTreeConfigV2 {
         role_authority,
@@ -2359,6 +2383,7 @@ fn v2_config_from_row(
             ),
             authenticator: install_authenticator,
         },
+        device_secret,
         refine_gas: 1_000_000_000,
         accumulate_gas: 5_000_000_000,
     };
@@ -2371,6 +2396,39 @@ fn v2_config_from_row(
         state_path,
         network_reachable: row.network_reachable,
     })
+}
+
+/// Load the host-private signer seed for one v2 root. Unlike the legacy
+/// messenger seed this is never sent as an actor message: Refine exposes only
+/// signatures through `DEVICE_SIGN`. Raft operators must provision the same
+/// 32-byte file on every voter before allowing leadership transfer.
+fn load_or_mint_v2_device_seed(
+    data_dir: &Path,
+    root_service: vos::v2::RootServiceId,
+) -> anyhow::Result<[u8; 32]> {
+    let dir = data_dir.join("v2-services");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.device-seed", hex::encode(root_service.0)));
+    match std::fs::read(&path) {
+        Ok(bytes) => bytes.try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "v2 device seed {} must contain exactly 32 bytes",
+                path.display()
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut seed = [0u8; 32];
+            getrandom::getrandom(&mut seed)
+                .map_err(|e| anyhow::anyhow!("OS entropy for v2 device seed: {e}"))?;
+            write_secret_file(&path, &seed)?;
+            tracing::warn!(
+                ?path,
+                "minted a v2 device seed; copy this exact 0600 file to every Raft voter before failover"
+            );
+            Ok(seed)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[derive(Debug)]
@@ -3923,6 +3981,39 @@ fn sweep_orphan_v2_services(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_device_seed_sidecar_is_stable_private_and_strictly_sized() {
+        let directory = std::env::temp_dir().join(format!(
+            "vosx-v2-device-seed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let root = vos::v2::RootServiceId([0x91; 32]);
+        let first = load_or_mint_v2_device_seed(&directory, root).unwrap();
+        assert_eq!(
+            load_or_mint_v2_device_seed(&directory, root).unwrap(),
+            first
+        );
+        let path = directory
+            .join("v2-services")
+            .join(format!("{}.device-seed", hex::encode(root.0)));
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::write(&path, [0u8; 31]).unwrap();
+        assert!(load_or_mint_v2_device_seed(&directory, root).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn v2_service_requires_an_explicit_trust_profile() {

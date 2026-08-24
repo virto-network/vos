@@ -170,9 +170,10 @@ pub use actors::run_refine;
 pub use actors::storage;
 pub use actors::value;
 pub use actors::{
-    Actor, ActorHandle, ActorReference, Ask, CallError, Caller, ClientError, Context, Extension,
-    ExtensionCtx, Forbidden, IntraCap, IntraCapParseError, Message, NO_ROLES_MAP, NoRoles,
-    RoleByte, RunResult, SpaceRole, SpaceRoleMap, Yield, metadata, run_blocking, try_poll,
+    Actor, ActorHandle, ActorReference, Ask, CallError, Caller, ClientError, Context,
+    DeviceSignature, Extension, ExtensionCtx, Forbidden, IntraCap, IntraCapParseError, Message,
+    NO_ROLES_MAP, NoRoles, RoleByte, RunResult, SpaceRole, SpaceRoleMap, Yield, metadata,
+    run_blocking, try_poll,
 };
 pub use actors::{Decode, Encode};
 pub use actors::{
