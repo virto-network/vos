@@ -639,6 +639,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cipher-clerk"
+version = "0.1.0"
+source = "git+https://codeberg.org/Virto/CipherClerk.git?rev=e9a7b0851f183c14dbd1635dbf0437c86682ad6f#e9a7b0851f183c14dbd1635dbf0437c86682ad6f"
+dependencies = [
+ "blake2",
+ "curve25519-dalek",
+ "rand_core 0.6.4",
+ "rkyv",
+ "zeroize",
+]
+
+[[package]]
 name = "clap"
 version = "4.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3892,6 +3904,7 @@ dependencies = [
  "async-io",
  "async-trait",
  "blake2b_simd",
+ "cipher-clerk",
  "clap",
  "futures-channel",
  "futures-executor",
@@ -3906,6 +3919,7 @@ dependencies = [
  "merkle-crdt",
  "object",
  "pollster",
+ "rand_chacha 0.3.1",
  "redb",
  "rkyv",
  "rustls-pemfile",
@@ -3917,6 +3931,7 @@ dependencies = [
  "vos-macros",
  "vos-raft",
  "vrf",
+ "zeroize",
  "zkpvm-precompiles",
 ]
 
