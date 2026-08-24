@@ -87,14 +87,15 @@ replication. Setup lives in `/home/daniel/src/bloque/bank-federation`.
 
 **Architecture: pure VOS actors + `vosx` + scripts. No new tool, no crypto
 CLI.** The actor side is landed: `clerk-bridge.issue_voucher` authenticates
-the destination peer and an immutable `clerk-ledger.voucher_anchor`, signs
-through the host-private device capability, and accumulates the issuer term
-exactly once. `clerk-bridge.sign_claim` composes issuer ⊕ receiver state and
-signs the closed window. The node-local secret never enters actor state or
-Raft; each bank retains its independent key. Recipient-envelope construction
-remains caller-side because it needs the recipient viewing key and encryption
-randomness, while every financial field is re-bound by the actor before it
-signs.
+the destination peer and an immutable `clerk-ledger.voucher_anchor`, requires
+that anchor to certify an ordinary settled transfer in the package's configured
+currency, signs through the host-private device capability, and accumulates the
+issuer term exactly once. `clerk-bridge.sign_claim` composes issuer ⊕ receiver
+state and signs the closed window. The node-local secret never enters actor
+state or Raft; each bank retains its independent key. Recipient-envelope
+construction remains caller-side because it needs the recipient viewing key
+and encryption randomness, while every financial field is re-bound by the
+actor before it signs.
 
 Then the whole driver is `vosx space call` + nushell/just scripts.
 
@@ -103,8 +104,10 @@ Then the whole driver is `vosx space call` + nushell/just scripts.
 2. build the recipient-encrypted zero-signature template, then
    `vosx space call clerk-bridge issue_voucher <transfer_id> peer=bank-b …`
    → signed voucher anchored to the *actor's* real roots
-3. `vosx space call clerk-bridge submit_voucher voucher=@voucher.bin
-   peer_name=bank-a` (B verifies + accumulates the receiver term)
+3. build a two-entry settled inflow in the configured currency, then
+   `vosx space call clerk-bridge redeem_voucher voucher=@voucher.bin
+   peer_name=bank-a …` (B verifies, credits its ledger, and accumulates the
+   receiver term atomically)
 4. window close: `vosx space call clerk-bridge sign_claim peer=… window=…`
    on each bank (composes issuer⊕receiver, signs) →
    `vosx space call clerk-settle submit_claim …` **at the venue leader**

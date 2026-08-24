@@ -82,7 +82,7 @@
 
 use cipher_clerk::crypto::{Amount, AuthKey, Signature, verify_signature};
 use cipher_clerk::settlement::SettlementClaim;
-use cipher_clerk::types::Transfer as CcTransfer;
+use cipher_clerk::types::{Layer, Transfer as CcTransfer, TransferFlags};
 use cipher_clerk::viewing_keys::IncomingViewingKey;
 use cipher_clerk::voucher::Voucher;
 use clerk_ledger::ClerkLedgerRef;
@@ -95,13 +95,15 @@ mod window;
 pub mod roles;
 pub use roles::{CLERK_BRIDGE_SPACE_ROLE_MAP, ClerkBridgeRole};
 
-/// The fixed demo settlement currency (ISO-4217 USD). Vouchers carry no
-/// currency (`cipher-clerk/src/voucher/mod.rs`), so the bridge stamps this
-/// into the receiver-term accumulator key. Multi-currency federation would
-/// instead carry a per-peer currency on `register_peer`; the accumulator is
-/// keyed by currency from the start so commitments never silently mix under
-/// one claim.
-pub const DEMO_CURRENCY: u32 = 840;
+/// This bridge package's configured settlement currency (ISO-4217 USD).
+/// Vouchers carry no currency (`cipher-clerk/src/voucher/mod.rs`), so issuer
+/// anchors and receiver inflows must prove this ledger identifier before a
+/// commitment enters a settlement accumulator. Multi-currency federation can
+/// later make this package configuration per-peer; the accumulator is already
+/// keyed by currency so commitments cannot silently mix under one claim.
+pub const SETTLEMENT_CURRENCY: u32 = 840;
+/// Compatibility name retained for existing callers and fixtures.
+pub const DEMO_CURRENCY: u32 = SETTLEMENT_CURRENCY;
 
 // ── Handler status ──────────────────────────────────────────────
 
@@ -149,12 +151,11 @@ pub enum Status {
     /// double-credited.
     VoucherReplayed = 7,
     /// `redeem_voucher`: caller-supplied inflow transfer doesn't
-    /// match the voucher. Either the credit-side amount commitment
-    /// disagrees with `voucher.amount_commit`, or the
-    /// `external_id` doesn't equal the voucher-triple dedup key
-    /// the bridge would have computed. The bridge enforces this
-    /// link so the operator can't accidentally credit the wrong
-    /// amount or skip the per-journal idempotency check.
+    /// match the voucher or settlement policy. The exact debit/credit
+    /// commitments and external-id must match, every row must use the
+    /// configured currency on `Layer::Settled`, and pending/void semantics
+    /// are forbidden. The bridge enforces this link so an operator cannot
+    /// credit or settle the wrong accounting partition.
     InflowInconsistent = 8,
     /// `redeem_voucher`: clerk-ledger.apply_transfer rejected the
     /// inflow. The reason is in `RedeemReply.ledger_status`. The
@@ -187,7 +188,8 @@ pub enum Status {
     /// the requested window.
     WindowOpen = 14,
     /// The authenticated clerk-ledger binding was missing, unreachable, or
-    /// did not confirm the voucher's transfer/commitment/root tuple.
+    /// did not confirm a final settled transfer with the voucher's exact
+    /// commitment, roots, and configured currency.
     LedgerUnavailable = 15,
     /// A peer-key rotation conflicts with the key already pinned by activity
     /// in the current settlement window.
@@ -348,6 +350,27 @@ pub struct IssuedVoucherEntry {
 /// (caller folds to `Status::BadInput`) on length mismatch.
 fn try_array<const N: usize>(bytes: Vec<u8>) -> Option<[u8; N]> {
     bytes.try_into().ok()
+}
+
+/// The receiver-side counterpart to clerk-ledger's voucher anchor policy.
+/// Only ordinary, settled rows in this bridge package's configured currency
+/// may turn an incoming voucher into local ledger state and a settlement
+/// receiver term.
+fn settlement_inflow_is_eligible(transfer: &CcTransfer) -> bool {
+    transfer.void_of.is_none()
+        && transfer.pending_id.is_none()
+        && !transfer.flags.contains(TransferFlags::PENDING)
+        && !transfer
+            .flags
+            .contains(TransferFlags::POST_PENDING_TRANSFER)
+        && !transfer
+            .flags
+            .contains(TransferFlags::VOID_PENDING_TRANSFER)
+        && !transfer.entries.is_empty()
+        && transfer
+            .entries
+            .iter()
+            .all(|entry| entry.layer == Layer::Settled && entry.ledger == SETTLEMENT_CURRENCY)
 }
 
 /// Decode an rkyv archive or short-circuit with the given
@@ -747,7 +770,7 @@ impl ClerkBridge {
                 if self.peers[i].clerk_pubkey != entry.clerk_pubkey
                     && !self.peer_key_compatible(
                         &entry.name,
-                        DEMO_CURRENCY,
+                        SETTLEMENT_CURRENCY,
                         self.peers[i].window,
                         entry.clerk_pubkey,
                     )
@@ -854,6 +877,7 @@ impl ClerkBridge {
         if voucher.state_root_before != anchor.root_before
             || voucher.state_root_after != anchor.root_after
             || voucher.amount_commit.0 != anchor.amount_commit
+            || anchor.currency != SETTLEMENT_CURRENCY
         {
             return issue_reply(Status::LedgerUnavailable);
         }
@@ -865,7 +889,7 @@ impl ClerkBridge {
             Ok(i) => (self.peers[i].clerk_pubkey, self.peers[i].window),
             Err(_) => return issue_reply(Status::UnknownPeer),
         };
-        if !self.peer_key_compatible(&peer_name, DEMO_CURRENCY, window, peer_key) {
+        if !self.peer_key_compatible(&peer_name, SETTLEMENT_CURRENCY, window, peer_key) {
             return issue_reply(Status::PeerKeyConflict);
         }
 
@@ -883,11 +907,11 @@ impl ClerkBridge {
 
         let voucher_bytes = voucher.to_bytes();
         let redemption_key = voucher.redemption_key();
-        self.pin_peer_key(&peer_name, DEMO_CURRENCY, window, peer_key);
+        self.pin_peer_key(&peer_name, SETTLEMENT_CURRENCY, window, peer_key);
         window::accumulate_pos(
             &mut self.issuer_nets,
             &peer_name,
-            DEMO_CURRENCY,
+            SETTLEMENT_CURRENCY,
             window,
             &voucher.amount_commit,
         );
@@ -925,6 +949,9 @@ impl ClerkBridge {
     ) -> SignClaimReply {
         if !Self::authorize_signer_operator(ctx) {
             return claim_reply(Status::Unauthorized);
+        }
+        if currency != SETTLEMENT_CURRENCY {
+            return claim_reply(Status::BadInput);
         }
         let current_window = match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
             Ok(i) => self.peers[i].window,
@@ -1103,7 +1130,7 @@ impl ClerkBridge {
                 if self.peers[i].clerk_pubkey == peer_clerk_pubkey
                     && self.peer_key_compatible(
                         &peer_name,
-                        DEMO_CURRENCY,
+                        SETTLEMENT_CURRENCY,
                         self.peers[i].window,
                         peer_clerk_pubkey,
                     ) =>
@@ -1120,7 +1147,7 @@ impl ClerkBridge {
         // Idempotent: the replay check above already returned, so this is
         // a fresh triple; `insert` returns whether it was new.
         self.received.insert(&dedup_key);
-        self.pin_peer_key(&peer_name, DEMO_CURRENCY, window, peer_clerk_pubkey);
+        self.pin_peer_key(&peer_name, SETTLEMENT_CURRENCY, window, peer_clerk_pubkey);
         // Advance the per-peer anchor to this voucher's post-state, and
         // fold the accepted commit into the current window's receiver term
         // — the two move together so the settlement sum and the anchor
@@ -1132,7 +1159,7 @@ impl ClerkBridge {
         window::accumulate_neg(
             &mut self.window_nets,
             &peer_name,
-            DEMO_CURRENCY,
+            SETTLEMENT_CURRENCY,
             window,
             &voucher.amount_commit,
         );
@@ -1167,9 +1194,10 @@ impl ClerkBridge {
     ///     voucher-triple dedup key. The caller can't bypass
     ///     clerk-ledger's external_id dedup; the bridge requires
     ///     the link to be set correctly.
-    ///   - The inflow's first entry's `amount` MUST equal the
-    ///     voucher's `amount_commit`. Caller can't credit a
-    ///     different value than the voucher attests to.
+    ///   - Both inflow entries' `amount` MUST equal the voucher's
+    ///     `amount_commit`, and both must use `Layer::Settled` in this
+    ///     bridge package's configured currency. Caller can't credit or
+    ///     settle a different value, ledger, or accounting partition.
     ///   - The ledger must accept the inflow. Otherwise the
     ///     bridge returns Status::LedgerRejected with the
     ///     clerk-ledger status in `ledger_status`, AND keeps the
@@ -1262,6 +1290,9 @@ impl ClerkBridge {
         if voucher.validate_inflow(&inflow).is_err() {
             return early_redeem(Status::InflowInconsistent);
         }
+        if !settlement_inflow_is_eligible(&inflow) {
+            return early_redeem(Status::InflowInconsistent);
+        }
 
         // Envelope open. We don't strictly need the recovered
         // opening here (the caller provided it in
@@ -1285,7 +1316,7 @@ impl ClerkBridge {
         }
         if !self.peer_key_compatible(
             &peer_name,
-            DEMO_CURRENCY,
+            SETTLEMENT_CURRENCY,
             redemption_window,
             peer_clerk_pubkey,
         ) {
@@ -1323,7 +1354,7 @@ impl ClerkBridge {
             self.received.insert(&dedup_key);
             self.pin_peer_key(
                 &peer_name,
-                DEMO_CURRENCY,
+                SETTLEMENT_CURRENCY,
                 redemption_window,
                 peer_clerk_pubkey,
             );
@@ -1336,7 +1367,7 @@ impl ClerkBridge {
                 window::accumulate_neg(
                     &mut self.window_nets,
                     &peer_name,
-                    DEMO_CURRENCY,
+                    SETTLEMENT_CURRENCY,
                     redemption_window,
                     &voucher.amount_commit,
                 );
@@ -1434,8 +1465,72 @@ impl ClerkBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cipher_clerk::crypto::Amount;
+    use cipher_clerk::ids::{AccountId, EntryId, JournalId, TransferId};
+    use cipher_clerk::types::Entry;
     use vos::Caller;
     use vos::actors::context::ServiceId;
+
+    fn settlement_inflow(layer: Layer, currency: u32) -> CcTransfer {
+        let mut transfer = CcTransfer::default();
+        transfer.id = TransferId([0x61; 16]);
+        transfer.journal_id = JournalId([0x62; 16]);
+        transfer.entries = vec![
+            Entry::debit(
+                EntryId([0x63; 16]),
+                transfer.id,
+                transfer.journal_id,
+                AccountId([0x64; 16]),
+                layer,
+                Amount::ZERO,
+                currency,
+                1,
+            ),
+            Entry::credit(
+                EntryId([0x65; 16]),
+                transfer.id,
+                transfer.journal_id,
+                AccountId([0x66; 16]),
+                layer,
+                Amount::ZERO,
+                currency,
+                1,
+            ),
+        ];
+        transfer
+    }
+
+    #[test]
+    fn inflows_must_match_the_configured_settled_currency() {
+        let settled = settlement_inflow(Layer::Settled, SETTLEMENT_CURRENCY);
+        assert!(settlement_inflow_is_eligible(&settled));
+        assert!(!settlement_inflow_is_eligible(&settlement_inflow(
+            Layer::Settled,
+            978,
+        )));
+        assert!(!settlement_inflow_is_eligible(&settlement_inflow(
+            Layer::Pending,
+            SETTLEMENT_CURRENCY,
+        )));
+
+        for flag in [
+            TransferFlags::PENDING,
+            TransferFlags::POST_PENDING_TRANSFER,
+            TransferFlags::VOID_PENDING_TRANSFER,
+        ] {
+            let mut flagged = settled.clone();
+            flagged.flags = flag;
+            assert!(!settlement_inflow_is_eligible(&flagged));
+        }
+
+        let mut pending_finalizer = settled.clone();
+        pending_finalizer.pending_id = Some(TransferId([0x67; 16]));
+        assert!(!settlement_inflow_is_eligible(&pending_finalizer));
+
+        let mut void = settled;
+        void.void_of = Some(TransferId([0x68; 16]));
+        assert!(!settlement_inflow_is_eligible(&void));
+    }
 
     #[test]
     fn signing_controls_reject_the_legacy_actor_bypass() {

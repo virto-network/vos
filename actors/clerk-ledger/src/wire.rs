@@ -55,16 +55,19 @@ pub struct TransferRootEntry {
     pub root_after: [u8; 32],
 }
 
-/// Public, opaque evidence that one accepted transfer carried exactly one
-/// amount commitment across all of its double-entry rows. This is the narrow
-/// cross-root surface used by `clerk-bridge` when it turns a caller-built,
-/// recipient-encrypted voucher template into a bank-signed voucher.
+/// Public, opaque evidence that one accepted transfer moved exactly one
+/// amount commitment on one settled currency across all of its double-entry
+/// rows. This is the narrow cross-root surface used by `clerk-bridge` when it
+/// turns a caller-built, recipient-encrypted voucher template into a
+/// bank-signed voucher.
 #[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
 )]
 #[rkyv(crate = vos::rkyv)]
 pub struct LedgerVoucherAnchor {
     pub amount_commit: [u8; 32],
+    /// ISO-4217 / ledger identifier shared by every eligible transfer row.
+    pub currency: u32,
     pub root_before: [u8; 32],
     pub root_after: [u8; 32],
 }

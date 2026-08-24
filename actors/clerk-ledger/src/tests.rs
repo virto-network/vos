@@ -11,22 +11,23 @@
 //! regression in the storage shape surfaces here without a PVM
 //! rebuild.
 
-use cipher_clerk::crypto::AuthKey;
+use cipher_clerk::crypto::{Amount, AuthKey, Blinding};
 use cipher_clerk::ids::{
-    AccountId as CcAccountId, ExternalId as CcExternalId, JournalId as CcJournalId,
-    TransferId as CcTransferId,
+    AccountId as CcAccountId, EntryId as CcEntryId, ExternalId as CcExternalId,
+    JournalId as CcJournalId, TransferId as CcTransferId,
 };
 use cipher_clerk::state::{LedgerState, PendingStatus};
 use cipher_clerk::state_root::journal_leaf_content;
 use cipher_clerk::types::{
-    Account as CcAccount, Direction, Journal as CcJournal, Transfer as CcTransfer,
+    Account as CcAccount, Direction, Entry as CcEntry, Journal as CcJournal, Layer,
+    Transfer as CcTransfer, TransferFlags,
 };
 use vos::storage::CommittedMap;
 
 use crate::oracle::NoopOracle;
 use crate::smt::compute_state_root;
 use crate::view::LedgerView;
-use crate::{ClerkLedger, ClerkLedgerRole};
+use crate::{ClerkLedger, ClerkLedgerRole, voucher_transfer_currency};
 
 const LEAF_DOMAIN: &[u8] = b"cipher-clerk/smt/leaf/v1";
 const NODE_DOMAIN: &[u8] = b"cipher-clerk/smt/node/v1";
@@ -47,6 +48,78 @@ fn mk_transfer(id_byte: u8) -> CcTransfer {
     t.id = CcTransferId([id_byte; 16]);
     t.journal_id = CcJournalId([0; 16]);
     t
+}
+
+fn voucher_candidate(layer: Layer, currency: u32) -> (CcTransfer, [u8; 32]) {
+    let mut transfer = mk_transfer(0x71);
+    let amount = Amount::commit(7, &Blinding([1; 32]));
+    transfer.entries = vec![
+        CcEntry::debit(
+            CcEntryId([0x72; 16]),
+            transfer.id,
+            transfer.journal_id,
+            CcAccountId([0x73; 16]),
+            layer,
+            amount,
+            currency,
+            1,
+        ),
+        CcEntry::credit(
+            CcEntryId([0x74; 16]),
+            transfer.id,
+            transfer.journal_id,
+            CcAccountId([0x75; 16]),
+            layer,
+            amount,
+            currency,
+            1,
+        ),
+    ];
+    (transfer, amount.0)
+}
+
+#[test]
+fn voucher_anchor_accepts_only_final_single_currency_settlement() {
+    let (settled, amount) = voucher_candidate(Layer::Settled, 840);
+    assert_eq!(
+        voucher_transfer_currency(&settled, &amount, false),
+        Some(840)
+    );
+
+    let (pending_layer, _) = voucher_candidate(Layer::Pending, 840);
+    assert_eq!(
+        voucher_transfer_currency(&pending_layer, &amount, false),
+        None
+    );
+
+    for flag in [
+        TransferFlags::PENDING,
+        TransferFlags::POST_PENDING_TRANSFER,
+        TransferFlags::VOID_PENDING_TRANSFER,
+    ] {
+        let mut flagged = settled.clone();
+        flagged.flags = flag;
+        assert_eq!(voucher_transfer_currency(&flagged, &amount, false), None);
+    }
+
+    let mut void = settled.clone();
+    void.void_of = Some(CcTransferId([0x76; 16]));
+    assert_eq!(voucher_transfer_currency(&void, &amount, false), None);
+
+    let mut pending_finalizer = settled.clone();
+    pending_finalizer.pending_id = Some(CcTransferId([0x77; 16]));
+    assert_eq!(
+        voucher_transfer_currency(&pending_finalizer, &amount, false),
+        None
+    );
+    assert_eq!(voucher_transfer_currency(&settled, &amount, true), None);
+
+    let mut mixed_currency = settled;
+    mixed_currency.entries[1].ledger = 978;
+    assert_eq!(
+        voucher_transfer_currency(&mixed_currency, &amount, false),
+        None
+    );
 }
 
 /// The actor's committed maps, freshly initialized over a clean mock

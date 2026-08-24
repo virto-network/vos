@@ -81,7 +81,8 @@ use cipher_clerk::kernel::{
 };
 use cipher_clerk::snapshot::OpeningsOracle as CcOpeningsOracle;
 use cipher_clerk::types::{
-    Account as CcAccount, Direction, Journal as CcJournal, Transfer as CcTransfer, TransferFlags,
+    Account as CcAccount, Direction, Journal as CcJournal, Layer, Transfer as CcTransfer,
+    TransferFlags,
 };
 use clerk_witness::{
     ClerkTransitionClaim, ClerkTransitionWitness, TouchedKeys, batch_digest, discover_touched,
@@ -112,6 +113,49 @@ use view::LedgerView;
 /// to spell `: Option<[u8; N]>` on the destructuring pattern.
 fn try_array<const N: usize>(bytes: Vec<u8>) -> Option<[u8; N]> {
     bytes.try_into().ok()
+}
+
+/// Return the one settled currency certified by a voucher-eligible transfer.
+///
+/// Voucher issuance is a final-settlement boundary. Reservations, pending
+/// finalizers, voids, already-voided originals, mixed layers, and
+/// cross-currency rows are all ineligible even when the kernel accepted them
+/// for their own distinct accounting purpose.
+fn voucher_transfer_currency(
+    transfer: &CcTransfer,
+    amount_commit: &[u8; 32],
+    already_voided: bool,
+) -> Option<u32> {
+    if already_voided
+        || transfer.void_of.is_some()
+        || transfer.pending_id.is_some()
+        || transfer.flags.contains(TransferFlags::PENDING)
+        || transfer
+            .flags
+            .contains(TransferFlags::POST_PENDING_TRANSFER)
+        || transfer
+            .flags
+            .contains(TransferFlags::VOID_PENDING_TRANSFER)
+    {
+        return None;
+    }
+
+    let currency = transfer.entries.first()?.ledger;
+    let mut has_debit = false;
+    let mut has_credit = false;
+    for entry in &transfer.entries {
+        if entry.layer != Layer::Settled
+            || entry.ledger != currency
+            || entry.amount.0 != *amount_commit
+        {
+            return None;
+        }
+        match entry.direction {
+            Direction::Debit => has_debit = true,
+            Direction::Credit => has_credit = true,
+        }
+    }
+    (has_debit && has_credit).then_some(currency)
 }
 
 /// Extract one touched-only witness directly from a committed map. The map
@@ -912,12 +956,12 @@ impl ClerkLedger {
 
     /// Return the exact accepted-transfer anchor needed for voucher issuance.
     ///
-    /// A voucher represents one confidential amount. Multi-amount and pending
-    /// finalization transfers are therefore deliberately ineligible: the
-    /// accepted transfer must contain both a debit and credit row and every
-    /// row must carry the caller-selected commitment. The bridge supplies the
-    /// commitment from its zero-signature voucher template; this method binds
-    /// it to immutable ledger state before any bank signature is produced.
+    /// A voucher represents one confidential, finalized amount in one
+    /// currency. Pending reservations/finalizers, voids, already-voided
+    /// transfers, mixed layers, mixed currencies, and multi-amount transfers
+    /// are deliberately ineligible. The bridge supplies the commitment from
+    /// its zero-signature voucher template; this method binds it to immutable
+    /// settled ledger state before any bank signature is produced.
     #[msg]
     async fn voucher_anchor(
         &self,
@@ -930,25 +974,14 @@ impl ClerkLedger {
         }
         let transfer = self.transfers.get(&id)?;
         let roots = self.transfer_roots.get(&id)?;
-        let has_debit = transfer
-            .entries
-            .iter()
-            .any(|entry| entry.direction == Direction::Debit);
-        let has_credit = transfer
-            .entries
-            .iter()
-            .any(|entry| entry.direction == Direction::Credit);
-        if !has_debit
-            || !has_credit
-            || !transfer
-                .entries
-                .iter()
-                .all(|entry| entry.amount.0 == amount_commit)
-        {
-            return None;
-        }
+        let currency = voucher_transfer_currency(
+            &transfer,
+            &amount_commit,
+            self.voided_transfers.contains(&id),
+        )?;
         Some(LedgerVoucherAnchor {
             amount_commit,
+            currency,
             root_before: roots.root_before,
             root_after: roots.root_after,
         })

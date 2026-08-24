@@ -1338,9 +1338,13 @@ a causally authenticated CRDT input. CRDT private-input availability remains
 deliberately staged. The production Clerk bridge binds that public identity
 with `bind_device_signer`; its operator-only signing surface rejects the
 legacy same-node actor bypass. `issue_voucher` first awaits an exact
-`voucher_anchor` from the package-authenticated clerk-ledger binding, then
-signs and accumulates the issuer commitment in one accepted slice. Exact
-retries return the stored voucher without signing or accumulating twice.
+`voucher_anchor` from the package-authenticated clerk-ledger binding. That
+anchor certifies one ordinary, non-voided transfer whose rows all use
+`Layer::Settled`, one amount commitment, and the bridge package's configured
+currency; the bridge compares the currency before it signs and accumulates the
+issuer commitment in one accepted slice. Receiver-side `redeem_voucher`
+enforces the same currency/layer and no-pending/no-void policy on its inflow.
+Exact retries return the stored voucher without signing or accumulating twice.
 `sign_claim` is limited to closed windows and derives every field from
 guest-owned issuer/receiver terms plus the peer key pinned for that window.
 On durable open, the
