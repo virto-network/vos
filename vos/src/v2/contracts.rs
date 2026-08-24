@@ -465,6 +465,14 @@ pub struct ActorPrivateInputV2 {
     /// stack, including `actor`. Actor IPC cannot rewrite this value.
     pub active_actor_mask: u64,
     pub origin: Origin,
+    /// Exact root service which authenticated an [`Origin::Actor`].
+    ///
+    /// Cross-root work derives this from the committed causal call context;
+    /// inline calls derive it from the currently executing root. Actor IDs are
+    /// intentionally reusable across roots, so the actor identity alone is
+    /// never sufficient to authorize an irreversible destination operation.
+    /// Non-actor origins must carry `None`.
+    pub origin_service: Option<ServiceIdentityV2>,
     /// Authenticated role recovered from the disclosed credential or private
     /// witness before entering the canonical actor PVM.
     pub space_role: Option<u8>,
@@ -2938,7 +2946,7 @@ impl V2Wire for ActorSliceInputV2 {
 }
 
 impl V2Wire for ActorPrivateInputV2 {
-    const MAGIC: [u8; 4] = *b"VPI2";
+    const MAGIC: [u8; 4] = *b"VPI3";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -2955,6 +2963,7 @@ impl V2Wire for ActorPrivateInputV2 {
         e.list(&self.causal_states, |e, state| e.bytes(state));
         e.u64(self.active_actor_mask);
         encode_origin(&mut e, self.origin);
+        e.option(&self.origin_service, encode_service);
         e.option(&self.space_role, |e, role| e.u8(*role));
         e.option(&self.actor_role, |e, role| e.u8(*role));
     }
@@ -2978,6 +2987,7 @@ impl V2Wire for ActorPrivateInputV2 {
             causal_states: d.list(Decoder::bytes)?,
             active_actor_mask: d.u64()?,
             origin: decode_origin(d)?,
+            origin_service: d.option(decode_service)?,
             space_role: d.option(|d| {
                 let role = d.u8()?;
                 crate::SpaceRole::from_u8(role)
@@ -3000,6 +3010,7 @@ impl V2Wire for ActorPrivateInputV2 {
         if value.active_actor_mask & (1u64 << self_index) == 0
             || value.active_actor_mask & !valid_actor_mask != 0
             || (value.change.is_none() && !value.causal_states.is_empty())
+            || matches!(value.origin, Origin::Actor(_)) != value.origin_service.is_some()
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -6544,6 +6555,7 @@ mod tests {
             causal_states: vec![b"concurrent".to_vec()],
             active_actor_mask: 1,
             origin: Origin::Actor(ActorId([22; 32])),
+            origin_service: Some(service()),
             space_role: Some(crate::SpaceRole::Developer.as_u8()),
             actor_role: Some(7),
         };
@@ -6557,6 +6569,18 @@ mod tests {
         assert_eq!(
             ActorPrivateInputV2::decode(&private.encode()).unwrap(),
             private
+        );
+        let mut missing_origin_service = private.clone();
+        missing_origin_service.origin_service = None;
+        assert_eq!(
+            ActorPrivateInputV2::decode(&missing_origin_service.encode()),
+            Err(DecodeError::NonCanonical)
+        );
+        let mut unexpected_origin_service = private.clone();
+        unexpected_origin_service.origin = Origin::Anonymous;
+        assert_eq!(
+            ActorPrivateInputV2::decode(&unexpected_origin_service.encode()),
+            Err(DecodeError::NonCanonical)
         );
         assert!(
             !input

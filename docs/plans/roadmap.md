@@ -89,8 +89,10 @@ replication. Setup lives in `/home/daniel/src/bloque/bank-federation`.
 CLI.** The actor side is landed: `clerk-bridge.issue_voucher` authenticates
 the destination peer and calls an immutable `clerk-ledger.voucher_anchor`.
 The ledger's reciprocal installation binding must name that exact issuer
-bridge, and the anchor must certify an ordinary settled transfer in the
-package's configured currency. Creating it atomically makes that transfer
+bridge service and ActorId; actor IDs may be reused by another root, so both
+halves of the authenticated causal source must match. The anchor must certify
+an ordinary settled transfer in the package's configured currency. Creating
+it atomically makes that transfer
 non-voidable before the anchor returns. The bridge then signs through the
 host-private device capability and
 accumulates the issuer term exactly once. `clerk-bridge.sign_claim` composes

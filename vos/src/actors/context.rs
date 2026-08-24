@@ -40,6 +40,10 @@ pub struct Context<A: Actor> {
     /// dispatch boundary; new service code sets it directly from the work
     /// envelope.
     origin: crate::v2::Origin,
+    /// Exact root service which authenticated an actor origin. `None` for
+    /// every non-actor origin and for legacy callers which cannot supply a
+    /// complete causal source identity.
+    origin_service: Option<crate::v2::ServiceIdentityV2>,
 
     /// Caller's space-wide role byte — a
     /// [`SpaceRole`](super::auth::SpaceRole) discriminant. `None`
@@ -132,6 +136,7 @@ impl<A: Actor> Context<A> {
             invocation_id: crate::v2::InvocationId::ZERO,
             caller: Caller::Unauthenticated,
             origin: crate::v2::Origin::Anonymous,
+            origin_service: None,
             space_role: None,
             actor_local_role: None,
             forbidden: false,
@@ -225,26 +230,35 @@ impl<A: Actor> Context<A> {
             .map(|actor| actor.actor)
     }
 
-    fn resolve_external_actor_v2(&self, name: &str) -> Option<crate::v2::ActorId> {
+    fn resolve_external_actor_v2(&self, name: &str) -> Option<&crate::v2::ExternalActorBindingV2> {
         self.external_actors
             .binary_search_by(|actor| actor.name.as_str().cmp(name))
             .ok()
-            .map(|index| self.external_actors[index].actor)
+            .map(|index| &self.external_actors[index])
     }
 
-    /// Return the exact actor identity pinned under `name` by this root's
+    /// Return whether the current actor origin exactly matches the complete
+    /// service-and-actor identity pinned under `name` by this root's
     /// authenticated external-actor directory.
     ///
     /// This is intentionally narrower than general actor resolution: owned
     /// tree members and legacy registry routes are never considered. Actors
     /// can use it to authenticate an incoming [`crate::v2::Origin::Actor`]
     /// against an immutable reciprocal binding before performing an
-    /// irreversible operation.
-    pub fn external_actor_id(&self, name: &str) -> Option<crate::v2::ActorId> {
-        self.actor_id
-            .is_some()
-            .then(|| self.resolve_external_actor_v2(name))
-            .flatten()
+    /// irreversible operation. Actor IDs are reusable across roots, so a
+    /// missing or different causal source service always fails closed.
+    pub fn external_actor_origin_matches(&self, name: &str) -> bool {
+        let crate::v2::Origin::Actor(caller) = self.origin else {
+            return false;
+        };
+        let Some(source_service) = self.origin_service.as_ref() else {
+            return false;
+        };
+        self.actor_id.is_some_and(|_| {
+            self.resolve_external_actor_v2(name).is_some_and(|binding| {
+                binding.actor == caller && binding.service == *source_service
+            })
+        })
     }
 
     #[doc(hidden)]
@@ -309,6 +323,7 @@ impl<A: Actor> Context<A> {
     /// each invocation sees the right caller — Context outlives
     /// individual invocations, so this is a per-call slot.
     pub fn set_caller(&mut self, caller: Caller) {
+        self.origin_service = None;
         self.origin = match &caller {
             Caller::Unauthenticated => crate::v2::Origin::Anonymous,
             Caller::System => crate::v2::Origin::System,
@@ -329,8 +344,13 @@ impl<A: Actor> Context<A> {
     }
 
     #[doc(hidden)]
-    pub fn __set_origin(&mut self, origin: crate::v2::Origin) {
+    pub fn __set_origin(
+        &mut self,
+        origin: crate::v2::Origin,
+        origin_service: Option<crate::v2::ServiceIdentityV2>,
+    ) {
         self.origin = origin;
+        self.origin_service = origin_service;
     }
 
     /// Overwrite the per-invocation role bytes. Mirrors
@@ -1144,7 +1164,10 @@ impl<A: Actor> Context<A> {
         if self.actor_id.is_some() {
             let actor = self
                 .resolve_owned_actor_v2(None, &name)
-                .or_else(|| self.resolve_external_actor_v2(&name))
+                .or_else(|| {
+                    self.resolve_external_actor_v2(&name)
+                        .map(|binding| binding.actor)
+                })
                 .ok_or(super::client::ClientError::NotFound)?;
             return Ok(R::bind(actor, self));
         }
@@ -2194,14 +2217,38 @@ mod tests {
             program: crate::v2::ProgramId([7; 32]),
         }];
 
-        assert_eq!(ctx.resolve_external_actor_v2("private-age"), Some(actor));
-        assert_eq!(ctx.external_actor_id("private-age"), Some(actor));
+        assert_eq!(
+            ctx.resolve_external_actor_v2("private-age")
+                .map(|binding| binding.actor),
+            Some(actor)
+        );
         assert_eq!(ctx.resolve_external_actor_v2("package-label"), None);
-        assert_eq!(ctx.external_actor_id("package-label"), None);
+        ctx.__set_origin(
+            crate::v2::Origin::Actor(actor),
+            Some(ctx.external_actors[0].service.clone()),
+        );
+        assert!(ctx.external_actor_origin_matches("private-age"));
+
+        let mut colliding_service = ctx.external_actors[0].service.clone();
+        colliding_service.root_service = crate::v2::RootServiceId([9; 32]);
+        ctx.__set_origin(crate::v2::Origin::Actor(actor), Some(colliding_service));
+        assert!(
+            !ctx.external_actor_origin_matches("private-age"),
+            "the same actor id under another root is not the installed peer"
+        );
+        ctx.__set_origin(crate::v2::Origin::Actor(actor), None);
+        assert!(
+            !ctx.external_actor_origin_matches("private-age"),
+            "an actor origin without causal service identity fails closed"
+        );
 
         let mut legacy: Context<TestActor> = Context::new(ServiceId(0));
         legacy.external_actors = ctx.external_actors;
-        assert_eq!(legacy.external_actor_id("private-age"), None);
+        legacy.__set_origin(
+            crate::v2::Origin::Actor(actor),
+            Some(legacy.external_actors[0].service.clone()),
+        );
+        assert!(!legacy.external_actor_origin_matches("private-age"));
     }
 
     // Richer fixture actor with a 3-tier Role enum — exercises

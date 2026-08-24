@@ -811,6 +811,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
         causal_states,
         active_actor_mask,
         origin,
+        origin_service,
         space_role,
         actor_role,
     } = ActorPrivateInputV2::decode(&private_buffer[..private_len])
@@ -844,7 +845,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
         first_await_ordinal,
         active_actor_mask,
     );
-    ctx.__set_origin(origin);
+    ctx.__set_origin(origin, origin_service);
     ctx.set_caller_roles(space_role, actor_role);
 
     assert_eq!(

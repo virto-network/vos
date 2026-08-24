@@ -314,10 +314,6 @@ pub struct ClerkLedger {
 }
 
 impl ClerkLedger {
-    fn voucher_issuer_matches(origin: Origin, expected: Option<ActorId>) -> bool {
-        matches!((origin, expected), (Origin::Actor(caller), Some(bound)) if caller == bound)
-    }
-
     /// Proof-record administration exposes producer-only material, so it may
     /// not inherit the legacy `Caller::Actor` role bypass. Host-controlled
     /// System calls remain available for local operator tooling; members must
@@ -336,12 +332,14 @@ impl ClerkLedger {
 
     /// Voucher anchoring is irreversible, so ordinary role authorization is
     /// insufficient: legacy actor callers bypass actor-role thresholds. The
-    /// only authority is the exact `clerk-bridge` ActorId pinned in this
-    /// ledger root's authenticated installation directory. The reciprocal
-    /// binding means an actor that merely names this ledger in *its* outgoing
+    /// only authority is the exact `(service, actor)` identity pinned under
+    /// `clerk-bridge` in this ledger root's authenticated installation
+    /// directory. Actor IDs may be reused by different roots; the reciprocal
+    /// binding therefore authenticates the causal source service as well as
+    /// the actor. An actor that merely names this ledger in *its* outgoing
     /// directory cannot create or read a voucher lock.
     fn authorize_voucher_anchor(ctx: &Context<Self>) -> bool {
-        Self::voucher_issuer_matches(ctx.origin(), ctx.external_actor_id("clerk-bridge"))
+        ctx.external_actor_origin_matches("clerk-bridge")
     }
 
     fn staged_record(tag: &[u8; 32]) -> Option<vos::provable::ProvableRecord> {

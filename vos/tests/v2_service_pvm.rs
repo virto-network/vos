@@ -3964,7 +3964,10 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
     ));
 
     let (rogue_package, rogue_name) = signed_test_package(&probe_elf(), &package_signer);
-    let rogue_actor = ActorId([0x3a; 32]);
+    // Actor IDs are root-local application identities. Deliberately reuse the
+    // legitimate bridge's ID under another service to prove the ledger binds
+    // both halves of MessageRecordV2's authenticated source.
+    let rogue_actor = bridge_actor;
     let rogue_identity = ServiceIdentityV2 {
         root_service: RootServiceId([0x3b; 32]),
         deployment: rogue_package.deployment_id(),
@@ -4205,7 +4208,7 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
             8,
             2,
         ),
-        "an actor whose own directory names the ledger cannot create the lock",
+        "the bridge actor id under another root cannot create the lock",
     );
 
     let issue = physical_operator_request(
@@ -4315,7 +4318,7 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
             14,
             4,
         ),
-        "the committed lock remains readable only by the installed issuer bridge",
+        "the bridge actor id under another root cannot reuse the committed lock",
     );
 
     // Signing and caching do not weaken the lock. A later independent void

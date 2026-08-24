@@ -640,6 +640,7 @@ pub struct ServicePvmV2 {
 /// transition itself.
 struct ActorRefineRuntimeV2 {
     target: super::ActorId,
+    service: super::ServiceIdentityV2,
     /// Exact current service work, available only to infrastructure VM 0
     /// when it must rebind a restored pre-suspension frame.
     resume_work: Vec<u8>,
@@ -730,6 +731,13 @@ impl ActorRefineRuntimeV2 {
                 causal_states,
                 active_actor_mask: 0,
                 origin: work.origin,
+                origin_service: match work.origin {
+                    Origin::Actor(_) => work
+                        .causal_context
+                        .as_ref()
+                        .map(|context| context.from_service.clone()),
+                    Origin::Anonymous | Origin::Member(_) | Origin::System => None,
+                },
                 space_role,
                 actor_role,
             };
@@ -774,6 +782,7 @@ impl ActorRefineRuntimeV2 {
         }
         Ok(Self {
             target: work.target,
+            service: work.service.clone(),
             resume_work: work.encode(),
             program_layout,
             actor_by_vm,
@@ -1218,6 +1227,7 @@ impl ActorRefineRuntimeV2 {
                             .actor_for_vm(caller_vm)
                             .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
                         private.origin = Origin::Actor(caller);
+                        private.origin_service = Some(self.service.clone());
                         private.space_role = None;
                         private.actor_role = None;
                     }
