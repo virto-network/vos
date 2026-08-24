@@ -45,6 +45,21 @@ impl WorkflowV2 {
         wire
     }
 
+    /// Exercise the invocation-wide host-work quota. A call beyond the
+    /// platform bound rejects the complete Refine slice before this handler
+    /// can return a partial count.
+    #[msg]
+    fn device_sign_repeatedly(&mut self, ctx: &mut Context<Self>, calls: u32) -> u32 {
+        let mut completed = 0;
+        for ordinal in 0..calls {
+            if ctx.device_sign(&ordinal.to_le_bytes()).is_none() {
+                break;
+            }
+            completed += 1;
+        }
+        completed
+    }
+
     #[msg(attested)]
     fn attested_device_signature(
         &mut self,

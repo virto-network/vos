@@ -1330,10 +1330,12 @@ production gate. ABI 16, schema 38, and execution semantics v21 add the
 Refine-only `DEVICE_SIGN` capability. A root host keeps the seed outside the
 service image and returns only `public_key || Schnorr(r,s)` to the active actor;
 domain-separated deterministic nonces make exact retries and Raft failover
-replay-stable. Actor code must compare that public key with its guest-owned
-configured identity. Device signing remains unavailable to CRDT roots because
-the host-private key is not a causally authenticated CRDT input. CRDT
-private-input availability remains deliberately staged.
+replay-stable. Host work is bounded to eight signatures per Refine slice and
+4 KiB per signed payload; exceeding either bound rejects the slice. Actor code
+must compare that public key with its guest-owned configured identity. Device
+signing remains unavailable to CRDT roots because the host-private key is not
+a causally authenticated CRDT input. CRDT private-input availability remains
+deliberately staged.
 On durable open, the
 producer side-CAS retains content-addressed inputs belonging to guest-owned
 unconsumed ingress records and explicitly Raft-staged inputs awaiting ordered

@@ -75,8 +75,12 @@ host-private CipherClerk signer through the Refine-only `DEVICE_SIGN`
 capability. The daemon stores the 32-byte seed at
 `v2-services/<root-service-id>.device-seed` with mode `0600`; actor memory,
 service snapshots, and Raft entries contain only the public key and signature.
-The actor must pin and compare the returned public key before accepting a
-signature.
+Existing seed paths must be regular, non-symlink files with exactly that mode
+and length or startup fails closed. First creation writes and syncs a private
+temporary file, atomically activates it, and syncs the containing directory
+before exposing the root. The actor must pin and compare the returned public
+key before accepting a signature. One Refine slice may request at most eight
+signatures, each over at most 4 KiB.
 
 For a Raft root, provision the exact same seed file on every voter before that
 voter can become leader. A missing file is minted locally, which intentionally
@@ -85,6 +89,9 @@ it is not a distributed key-generation protocol. Offline space backup includes
 this sidecar. Treat it like the node key and private-ingress store: encrypt the
 archive, never run two restored copies of one voter, and verify the signer
 public key before restoring traffic. CRDT roots reject this option.
+Uninstall/reinstallation moves a retired root's seed into recoverable trash
+with its image, Raft database, proofs, and private records; it is no longer
+included in active-root backups.
 
 ## Move an existing voter to another machine
 

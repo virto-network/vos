@@ -87,7 +87,8 @@ pub fn provable_record_intent() -> u64 {
 /// On success the host writes `public_key(32) || signature_r(32) ||
 /// signature_s(32)` and returns the full 96-byte length. `HOST_NONE` means
 /// this root has no device key. The seed itself never crosses the capability
-/// boundary or enters actor memory.
+/// boundary or enters actor memory. V2 rejects payloads and per-slice call
+/// counts above its public `DEVICE_SIGN_MAX_*` bounds.
 #[inline]
 pub fn device_sign(payload: &[u8], output: &mut [u8; 96]) -> u64 {
     ecall4(

@@ -206,6 +206,13 @@ pub const ACTOR_SLICE_INPUT_MAX_BYTES: usize = 64 * 1024;
 /// service may receive multi-megabyte work envelopes. State is bounded
 /// separately from shared IPC so one actor never receives a sibling's bytes.
 pub const ACTOR_PRIVATE_INPUT_MAX_BYTES: usize = 64 * 1024;
+/// Maximum message accepted by one host-private device-sign operation.
+///
+/// Signing is host work rather than JAR instructions, so payload size and
+/// call count are bounded independently of the actor's ordinary gas budget.
+pub const DEVICE_SIGN_MAX_PAYLOAD_BYTES: usize = 4 * 1024;
+/// Maximum host-private signatures produced during one Refine slice.
+pub const DEVICE_SIGN_MAX_CALLS_PER_REFINE: u32 = 8;
 /// Maximum opaque actor-effect batch returned to the generic service guest.
 pub const ACTOR_EFFECT_BATCH_MAX_BYTES: usize =
     MAX_ROOT_TREE_ACTORS * ACTOR_PRIVATE_INPUT_MAX_BYTES;

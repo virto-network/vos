@@ -21,7 +21,8 @@ use super::{
     ACTOR_PRIVATE_INPUT_MAX_BYTES, AccumulatedRoleAssertionV2, AccumulationResultV2,
     ActorEffectBatchV2, ActorPrivateInputV2, ActorSliceInputV2, ActorSliceOutputV2,
     ActorStorageKeyV2, ActorTreeImportV2, AuthorizationEvidenceV2, AwaitResumeV2, BlobRefV2,
-    CheckpointTokenV2, ContinuationSnapshotV2, CrdtChangeV2, CrdtDispatchV2, Hash, ImportedBlobV2,
+    CheckpointTokenV2, ContinuationSnapshotV2, CrdtChangeV2, CrdtDispatchV2,
+    DEVICE_SIGN_MAX_CALLS_PER_REFINE, DEVICE_SIGN_MAX_PAYLOAD_BYTES, Hash, ImportedBlobV2,
     MAX_ROOT_TREE_ACTORS, Origin, ProgramId, REFINE_ENTRY_IC, RefineImportsV2, RoleCredentialV2,
     TARGET_ACTOR_HANDLE_SLOT, V2Wire, WorkEnvelopeV2,
 };
@@ -585,7 +586,7 @@ impl RefineProtocolHostV2 for DeviceSignerRefineHostV2 {
             u32::try_from(registers[7]).map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
         let input_len =
             u32::try_from(registers[8]).map_err(|_| ServicePvmErrorV2::RefineHostRejected(slot))?;
-        if input_len as usize > ACTOR_PRIVATE_INPUT_MAX_BYTES {
+        if input_len as usize > DEVICE_SIGN_MAX_PAYLOAD_BYTES {
             return Err(ServicePvmErrorV2::RefineHostRejected(slot));
         }
         let payload = kernel
@@ -2390,6 +2391,7 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
         kernel.set_entry_ic(REFINE_ENTRY_IC);
     }
     let starting_gas = kernel.active_gas();
+    let mut device_sign_calls = 0u32;
 
     loop {
         let result = if let Some(recorder) = trace.as_mut() {
@@ -2598,6 +2600,14 @@ fn run_refine_kernel<H: RefineProtocolHostV2>(
                     // proof oracle, an attested method must not claim that a
                     // trace independently reproduced this host-side result.
                     return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                }
+                if slot == crate::abi::hostcall::DEVICE_SIGN as u8 {
+                    device_sign_calls = device_sign_calls
+                        .checked_add(1)
+                        .ok_or(ServicePvmErrorV2::RefineHostRejected(slot))?;
+                    if device_sign_calls > DEVICE_SIGN_MAX_CALLS_PER_REFINE {
+                        return Err(ServicePvmErrorV2::RefineHostRejected(slot));
+                    }
                 }
                 let mut registers = [0; 13];
                 for (index, register) in registers.iter_mut().enumerate() {

@@ -172,7 +172,9 @@ impl<A: Actor> Context<A> {
     /// was opened without a device key or the host rejected the request. V2
     /// production actors should compare `public_key` with their guest-owned
     /// configured identity before accepting the signature, so a misconfigured
-    /// failover voter fails closed instead of changing signer identity.
+    /// failover voter fails closed instead of changing signer identity. The
+    /// host rejects payloads above `DEVICE_SIGN_MAX_PAYLOAD_BYTES` and more
+    /// than `DEVICE_SIGN_MAX_CALLS_PER_REFINE` calls in one Refine slice.
     pub fn device_sign(&mut self, payload: &[u8]) -> Option<DeviceSignature> {
         #[cfg(target_arch = "riscv64")]
         {

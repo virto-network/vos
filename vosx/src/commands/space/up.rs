@@ -2407,28 +2407,175 @@ fn load_or_mint_v2_device_seed(
     root_service: vos::v2::RootServiceId,
 ) -> anyhow::Result<[u8; 32]> {
     let dir = data_dir.join("v2-services");
+    let dir_existed = dir.is_dir();
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.device-seed", hex::encode(root_service.0)));
-    match std::fs::read(&path) {
-        Ok(bytes) => bytes.try_into().map_err(|_| {
-            anyhow::anyhow!(
-                "v2 device seed {} must contain exactly 32 bytes",
-                path.display()
-            )
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut seed = [0u8; 32];
-            getrandom::getrandom(&mut seed)
-                .map_err(|e| anyhow::anyhow!("OS entropy for v2 device seed: {e}"))?;
-            write_secret_file(&path, &seed)?;
-            tracing::warn!(
-                ?path,
-                "minted a v2 device seed; copy this exact 0600 file to every Raft voter before failover"
-            );
-            Ok(seed)
-        }
-        Err(error) => Err(error.into()),
+    if !dir_existed {
+        sync_directory(data_dir)?;
     }
+    let path = dir.join(format!("{}.device-seed", hex::encode(root_service.0)));
+    remove_stale_secret_temp(&path)?;
+    if let Some(seed) = read_v2_device_seed(&path)? {
+        return Ok(seed);
+    }
+
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed)
+        .map_err(|e| anyhow::anyhow!("OS entropy for v2 device seed: {e}"))?;
+    create_secret_file_atomically(&path, &seed)?;
+    let persisted = read_v2_device_seed(&path)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "atomically created v2 device seed {} is not readable",
+            path.display()
+        )
+    })?;
+    if persisted != seed {
+        anyhow::bail!(
+            "atomically created v2 device seed {} changed before activation",
+            path.display()
+        );
+    }
+    tracing::warn!(
+        ?path,
+        "minted a v2 device seed; copy this exact 0600 file to every Raft voter before failover"
+    );
+    Ok(seed)
+}
+
+fn secret_temp_path(path: &Path) -> anyhow::Result<std::path::PathBuf> {
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("secret path {} has no file name", path.display()))?
+        .to_os_string();
+    name.push(".v2-next");
+    Ok(path.with_file_name(name))
+}
+
+/// Delete only an incomplete, not-yet-activated seed left by a crash. A
+/// directory at the reserved path is never recursively removed.
+fn remove_stale_secret_temp(path: &Path) -> anyhow::Result<()> {
+    let temp = secret_temp_path(path)?;
+    match std::fs::symlink_metadata(&temp) {
+        Ok(metadata) if metadata.file_type().is_dir() => anyhow::bail!(
+            "v2 device seed temporary path {} is a directory",
+            temp.display()
+        ),
+        Ok(_) => {
+            std::fs::remove_file(&temp)?;
+            if let Some(parent) = temp.parent() {
+                sync_directory(parent)?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+/// Open one existing signer seed without following links or blocking on a
+/// special file, then validate the metadata of the opened object itself.
+fn read_v2_device_seed(path: &Path) -> anyhow::Result<Option<[u8; 32]>> {
+    use std::io::Read;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "cannot securely open v2 device seed {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("v2 device seed {} must be a regular file", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            anyhow::bail!(
+                "v2 device seed {} must have mode 0600, found {mode:04o}",
+                path.display()
+            );
+        }
+    }
+    if metadata.len() != 32 {
+        anyhow::bail!(
+            "v2 device seed {} must contain exactly 32 bytes",
+            path.display()
+        );
+    }
+    let mut seed = [0u8; 32];
+    file.read_exact(&mut seed)?;
+    Ok(Some(seed))
+}
+
+/// Persist a new seed before making its final name visible. On Unix the
+/// hard-link activation is atomic and refuses to replace an existing seed;
+/// syncing the directory makes that name durable before the root is exposed.
+fn create_secret_file_atomically(path: &Path, bytes: &[u8; 32]) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("secret path {} has no parent", path.display()))?;
+    let temp = secret_temp_path(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+
+    #[cfg(unix)]
+    let activated = std::fs::hard_link(&temp, path);
+    #[cfg(not(unix))]
+    let activated = if path.exists() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "device seed already exists",
+        ))
+    } else {
+        std::fs::rename(&temp, path)
+    };
+    if let Err(error) = activated {
+        let _ = std::fs::remove_file(&temp);
+        return Err(anyhow::anyhow!(
+            "cannot atomically activate v2 device seed {}: {error}",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    std::fs::remove_file(&temp)?;
+    sync_directory(parent)?;
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -3924,9 +4071,9 @@ fn sweep_orphan_redbs(data_dir: &std::path::Path, live: &std::collections::HashS
 /// A v2 installation is keyed by `(space, name, replication_id)`. The
 /// registry forbids reusing a tombstoned replication id, so keeping an orphan
 /// in the active directory can only resurrect deleted state or collide with a
-/// later install. The image and its sibling `.image.proofs` and
-/// `.image.records` directories use the root-service hash prefix and are swept
-/// together on the next daemon boot.
+/// later install. The image, Raft state, signer seed, incomplete seed staging,
+/// and the `.image.proofs` / `.image.records` side directories use the
+/// root-service hash prefix and are swept together on the next daemon boot.
 fn sweep_orphan_v2_services(
     data_dir: &std::path::Path,
     live: &std::collections::HashSet<[u8; 32]>,
@@ -3948,7 +4095,13 @@ fn sweep_orphan_v2_services(
         let suffix = &name_str[64..];
         if !matches!(
             suffix,
-            ".image" | ".image.proofs" | ".image.records" | ".image.v2-next" | ".raft.redb"
+            ".image"
+                | ".image.proofs"
+                | ".image.records"
+                | ".image.v2-next"
+                | ".raft.redb"
+                | ".device-seed"
+                | ".device-seed.v2-next"
         ) {
             continue;
         }
@@ -3994,14 +4147,20 @@ mod tests {
         ));
         let root = vos::v2::RootServiceId([0x91; 32]);
         let first = load_or_mint_v2_device_seed(&directory, root).unwrap();
+        let path = directory
+            .join("v2-services")
+            .join(format!("{}.device-seed", hex::encode(root.0)));
+        let stale_temp = secret_temp_path(&path).unwrap();
+        std::fs::write(&stale_temp, [0x92; 7]).unwrap();
         assert_eq!(
             load_or_mint_v2_device_seed(&directory, root).unwrap(),
             first
         );
-        let path = directory
-            .join("v2-services")
-            .join(format!("{}.device-seed", hex::encode(root.0)));
         assert_eq!(std::fs::read(&path).unwrap(), first);
+        assert!(
+            !stale_temp.exists(),
+            "durable reopen removes an incomplete staging artifact"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -4009,8 +4168,37 @@ mod tests {
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(
+                load_or_mint_v2_device_seed(&directory, root)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("mode 0600"),
+                "an existing world-readable key must fail closed"
+            );
+            std::fs::remove_file(&path).unwrap();
+            let target = directory.join("copied-device-seed");
+            std::fs::write(&target, first).unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            assert!(
+                load_or_mint_v2_device_seed(&directory, root).is_err(),
+                "a symlink must never be followed as signer configuration"
+            );
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            assert!(
+                load_or_mint_v2_device_seed(&directory, root).is_err(),
+                "a non-regular seed path must fail without blocking"
+            );
+            std::fs::remove_dir(&path).unwrap();
         }
         std::fs::write(&path, [0u8; 31]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         assert!(load_or_mint_v2_device_seed(&directory, root).is_err());
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -4339,7 +4527,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_role_authority_preserves_the_batch_70_incarnation() {
+    fn canonical_role_authority_pins_the_abi_16_incarnation() {
         let root = Keypair::ed25519_from_bytes([7; 32]).unwrap();
         let package = root_signed_role_authority_package(&root).unwrap();
         let package_hash = BlobHash::of(&package.encode()).0;
@@ -4355,11 +4543,11 @@ mod tests {
         );
         assert_eq!(
             hex::encode(package_hash),
-            "8a4913b7bc2a881ad42894ca900992eebca0c704bfe94e5da41e0adf0ff1939a",
+            "4e41e7e56b7c9f5e772467f07d5b96c806cfb552ccc20c00fc909d6ba875c1e9",
         );
         assert_eq!(
             hex::encode(replication_id),
-            "c57bf093bdb6cf27f4755938a106845f4590e8e052536e4ac808d80bc46831c6",
+            "bc6d61dbb282bbe0dcdbe2fd72cb65074c441d7c759af531951216b52bd35d42",
         );
     }
 
@@ -5178,10 +5366,17 @@ mod tests {
         let orphan_records = services.join(format!("{}.image.records", hex::encode(orphan)));
         let active_raft = services.join(format!("{}.raft.redb", hex::encode(active)));
         let orphan_raft = services.join(format!("{}.raft.redb", hex::encode(orphan)));
+        let active_seed = services.join(format!("{}.device-seed", hex::encode(active)));
+        let orphan_seed = services.join(format!("{}.device-seed", hex::encode(orphan)));
+        let orphan_seed_temp =
+            services.join(format!("{}.device-seed.v2-next", hex::encode(orphan)));
         std::fs::write(&active_image, b"active").unwrap();
         std::fs::write(&orphan_image, b"orphan").unwrap();
         std::fs::write(&active_raft, b"active raft").unwrap();
         std::fs::write(&orphan_raft, b"orphan raft").unwrap();
+        std::fs::write(&active_seed, [0x51; 32]).unwrap();
+        std::fs::write(&orphan_seed, [0x52; 32]).unwrap();
+        std::fs::write(&orphan_seed_temp, [0x53; 32]).unwrap();
         std::fs::create_dir_all(&orphan_proofs).unwrap();
         std::fs::write(orphan_proofs.join("proof"), b"proof").unwrap();
         std::fs::create_dir_all(&orphan_records).unwrap();
@@ -5191,10 +5386,13 @@ mod tests {
 
         assert!(active_image.is_file());
         assert!(active_raft.is_file());
+        assert!(active_seed.is_file());
         assert!(!orphan_image.exists());
         assert!(!orphan_proofs.exists());
         assert!(!orphan_records.exists());
         assert!(!orphan_raft.exists());
+        assert!(!orphan_seed.exists());
+        assert!(!orphan_seed_temp.exists());
         assert!(
             dir.join("trash")
                 .join("v2-services")
@@ -5217,6 +5415,18 @@ mod tests {
             dir.join("trash")
                 .join("v2-services")
                 .join(orphan_raft.file_name().unwrap())
+                .is_file(),
+        );
+        assert!(
+            dir.join("trash")
+                .join("v2-services")
+                .join(orphan_seed.file_name().unwrap())
+                .is_file(),
+        );
+        assert!(
+            dir.join("trash")
+                .join("v2-services")
+                .join(orphan_seed_temp.file_name().unwrap())
                 .is_file(),
         );
         let _ = std::fs::remove_dir_all(dir);

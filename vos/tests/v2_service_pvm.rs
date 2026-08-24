@@ -1586,6 +1586,56 @@ fn device_signing_is_rejected_from_unreproducible_attested_traces() {
     );
 }
 
+#[test]
+fn device_signing_bounds_payload_and_host_work_per_refine_slice() {
+    fn assert_signer_rejected(
+        result: Result<vos::v2::CommittedRootTreeSliceV2, LocalRootTreeInvokeErrorV2>,
+    ) {
+        assert!(matches!(
+            result,
+            Err(LocalRootTreeInvokeErrorV2::Service(
+                ServiceDispatchError::Pvm(ServicePvmErrorV2::RefineHostRejected(slot)),
+            )) if slot == vos::abi::hostcall::DEVICE_SIGN as u8,
+        ));
+    }
+
+    let (mut config, mut request) = attested_root_fixture(ConsistencyModeV2::Local, 0x6f);
+    config.device_secret = Some(DeviceSecretV2::new([0xc5; 32]));
+    request.method = "device_signature".into();
+    request.arguments = {
+        let mut arguments = vec![vos::value::TAG_DYNAMIC];
+        arguments.extend_from_slice(
+            &Msg::new("device_signature")
+                .with(
+                    "payload",
+                    vec![0x41u8; vos::v2::DEVICE_SIGN_MAX_PAYLOAD_BYTES + 1],
+                )
+                .encode(),
+        );
+        arguments
+    };
+    request.proof_requested = false;
+    let mut oversized =
+        LocalRootTreeServiceV2::open(config.clone(), SharedCommittedImages::default())
+            .expect("device signer root opens");
+    assert_signer_rejected(oversized.invoke(request.clone()));
+
+    request.invocation = InvocationId([0x70; 32]);
+    request.method = "device_sign_repeatedly".into();
+    request.arguments = {
+        let mut arguments = vec![vos::value::TAG_DYNAMIC];
+        arguments.extend_from_slice(
+            &Msg::new("device_sign_repeatedly")
+                .with("calls", vos::v2::DEVICE_SIGN_MAX_CALLS_PER_REFINE + 1)
+                .encode(),
+        );
+        arguments
+    };
+    let mut overquota =
+        LocalRootTreeServiceV2::open(config, SharedCommittedImages::default()).unwrap();
+    assert_signer_rejected(overquota.invoke(request));
+}
+
 struct TestProductionTrust {
     policy: Hash,
     slot: AtomicU64,
