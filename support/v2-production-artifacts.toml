@@ -4,7 +4,7 @@ format = 1
 # pinned together after the compact Refine-work capability landed. The Clerk
 # `.vos` signature wrapper is operator-specific and is intentionally not a
 # repository-global artifact identity; releases select its signer explicitly.
-source_revision = "2a7ecb81ee144a0f88c6c169276235d4de78eaaa"
+source_revision = "3d9392d127b9e91198d23fa77f814d12af022729"
 guest_toolchain = "nightly-2026-03-20"
 host_toolchain = "nightly-2025-05-09"
 
@@ -12,6 +12,6 @@ service_program_id = "72c14f773a02ce00c750dbb88c12e7b53e8b296aaa80b340d3b7897197
 service_elf_blake2b_256 = "f21cce6478feb4311df3250bc0dcf093e12ee7251811b8618cf7fca037a3fea8"
 service_pvm_blake2b_256 = "8c79e21323ddb2611cb7ebac1bd6afa490845b2311599178b40faa9a4dccf0dd"
 
-clerk_actor_program_id = "6e2d7414343cd40d3c89f291e1fd7bd6b7919b3d05643e0c27b0fb41ee39e831"
-clerk_deployment_id = "664e351e2da9bbde84fd2ce01edf79d9327814d2d6000ed2f00c5ee109704dcd"
+clerk_actor_program_id = "ad32b877e296fb520b3f29ab2eba1a3e1d83c2e92a4d4eb2754339cae1da10c3"
+clerk_deployment_id = "fc9f0962d36923f8ad53ad3a6260b58b50ce02d869a64aa40d4fb26e561bae95"
 clerk_task_hash = "6267478da5b252954a3494ac9e0454ab792e513f7c79e98515cb3e5a1f060a4b"
