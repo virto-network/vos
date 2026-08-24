@@ -3767,7 +3767,7 @@ fn canonical_clerk_package_executes_a_private_provable_transfer_through_raft() {
 fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim() {
     use cipher_clerk::conventions::{BankCode, Iso4217};
     use cipher_clerk::crypto::{Amount, Blinding, Keypair, Signature};
-    use cipher_clerk::ids::JournalId;
+    use cipher_clerk::ids::{JournalId, TransferId};
     use cipher_clerk::kernel::CreateAccount as CcCreateAccount;
     use cipher_clerk::proof::Proof;
     use cipher_clerk::settlement::SettlementClaim;
@@ -3921,12 +3921,8 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
     );
     let alice_key = Keypair::generate();
     let alice = Account::asset(journal, alice_key.public, Iso4217::USD, BankCode::Checking);
-    let pool = Account::asset(
-        journal,
-        Keypair::generate().public,
-        Iso4217::USD,
-        BankCode::Vault,
-    );
+    let pool_key = Keypair::generate();
+    let pool = Account::asset(journal, pool_key.public, Iso4217::USD, BankCode::Vault);
     for (ordinal, account) in [alice.clone(), pool.clone()].into_iter().enumerate() {
         let create = CcCreateAccount::signed(account, &registrar.secret);
         let create = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&create)
@@ -3978,6 +3974,7 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
     let openings = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&openings)
         .unwrap()
         .to_vec();
+    let void_openings = openings.clone();
     let apply = physical_operator_request(
         &mut ledger,
         ledger_actor,
@@ -4094,6 +4091,40 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
         drained.as_slice(),
         [InboxDrainOutcomeV2::Committed(_)]
     ));
+
+    let build_void = || {
+        let void = Transfer::builder(journal)
+            .voiding(TransferId(transfer_id))
+            .credit(&alice, Layer::Settled, amount)
+            .debit(&pool, Layer::Settled, amount)
+            .signed_with(&[(&pool, &pool_key.secret)]);
+        vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&void)
+            .unwrap()
+            .to_vec()
+    };
+
+    // The ledger has committed the anchor reply, but the bridge has not
+    // resumed or signed yet. The anchor itself is the durable linearization
+    // point: a reversal in this window must already be rejected.
+    let void_while_bridge_suspended = physical_operator_request(
+        &mut ledger,
+        ledger_actor,
+        InvocationId([0x59; 32]),
+        12,
+        Msg::new("apply_transfer")
+            .with("transfer_bytes", build_void())
+            .with("openings_bytes", void_openings.clone())
+            .with("batch_seed_timestamp", 21u64),
+        Some(clerk_ledger::ClerkLedgerRole::Operator as u8),
+    );
+    assert_eq!(
+        ledger_status(&invoke_physical_actor(
+            &mut ledger,
+            void_while_bridge_suspended,
+        )),
+        clerk_ledger::Status::VoucherLocked,
+    );
+
     let ledger_publication = LocalTransportV2::pending_publications(&ledger)
         .unwrap()
         .into_iter()
@@ -4122,6 +4153,25 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
         .verify_signature(&cipher_clerk::crypto::AuthKey(bank_public))
         .unwrap();
     assert_eq!(issued.redemption_key, voucher.redemption_key());
+
+    // Signing and caching do not weaken the lock. A later independent void
+    // remains rejected, so the redeemable voucher cannot outlive its settled
+    // backing transfer.
+    let void_after_issue = physical_operator_request(
+        &mut ledger,
+        ledger_actor,
+        InvocationId([0x5a; 32]),
+        13,
+        Msg::new("apply_transfer")
+            .with("transfer_bytes", build_void())
+            .with("openings_bytes", void_openings)
+            .with("batch_seed_timestamp", 22u64),
+        Some(clerk_ledger::ClerkLedgerRole::Operator as u8),
+    );
+    assert_eq!(
+        ledger_status(&invoke_physical_actor(&mut ledger, void_after_issue)),
+        clerk_ledger::Status::VoucherLocked,
+    );
 
     // A fresh invocation after response loss reuses the actor-owned issuance
     // record. It must not query the ledger or add the amount twice.

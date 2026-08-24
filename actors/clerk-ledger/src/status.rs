@@ -99,6 +99,10 @@ pub enum Status {
     /// fails or does not complete traps the dispatch so no staged child
     /// effect, ledger mutation, or proof record can commit.
     ProofUnavailable = 16,
+    /// An ordinary `void_of` attempted to reverse a transfer whose voucher
+    /// anchor has already committed. Voucher anchoring is irreversible so a
+    /// redeemable signed obligation can never outlive its settled backing.
+    VoucherLocked = 17,
     /// The kernel returned an `EventStatus` variant the handler's
     /// taxonomy doesn't map — should be unreachable; widen
     /// `map_event_status` if it fires.

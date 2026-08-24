@@ -97,7 +97,7 @@ use cipher_clerk::state_root::{
     journal_leaf_content, pending_leaf_content, transfer_leaf_content, voided_leaf_content,
 };
 use vos::agent::{TaskStatus, Tasks};
-use vos::storage::{CommittedMap, FixedKey, StorageMap, StorageVec};
+use vos::storage::{CommittedMap, FixedKey, StorageMap, StorageSet, StorageVec};
 use vos::value::{Msg, Value};
 use vos::zk::state::LedgerWitness;
 
@@ -300,6 +300,17 @@ pub struct ClerkLedger {
     /// publish nullifiers — the spent-set is a follow-up slice.
     #[storage]
     note_commitments: StorageVec<[u8; 32]>,
+    /// Transfers whose voucher anchor has been durably disclosed. Locking is
+    /// the issuance linearization point: once present, an ordinary `void_of`
+    /// transfer may never reverse the backing settlement. This application
+    /// lifecycle set deliberately sits outside cipher-clerk's six-subtree
+    /// accounting root, so creating the lock cannot invalidate the exact
+    /// `(root_before, root_after)` pair that the voucher signs.
+    ///
+    /// Append this storage field after every pre-existing field so its stable
+    /// storage prefix does not renumber older Clerk rows.
+    #[storage]
+    voucher_locked_transfers: StorageSet<[u8; 16]>,
 }
 
 impl ClerkLedger {
@@ -419,6 +430,15 @@ impl ClerkLedger {
                     .is_some_and(|account| verify_signature(&account.auth_key, &msg, signature))
             })
     }
+
+    /// An ordinary reversal may not target a transfer whose voucher anchor
+    /// has already committed. This check runs after signature preflight so
+    /// unauthenticated junk cannot use the status as a lock-membership oracle.
+    fn voids_voucher_locked_transfer(&self, transfer: &CcTransfer) -> bool {
+        transfer
+            .void_of
+            .is_some_and(|original| self.voucher_locked_transfers.contains(&original.0))
+    }
 }
 
 #[messages]
@@ -434,6 +454,7 @@ impl ClerkLedger {
             pending_statuses: Default::default(),
             transfer_roots: Default::default(),
             note_commitments: Default::default(),
+            voucher_locked_transfers: Default::default(),
         }
     }
 
@@ -657,6 +678,9 @@ impl ClerkLedger {
         if !self.transfer_signatures_valid(&transfer) {
             return Status::SignatureInvalid;
         }
+        if self.voids_voucher_locked_transfer(&transfer) {
+            return Status::VoucherLocked;
+        }
 
         // Snapshot the composite SMT root BEFORE the kernel runs.
         // If the kernel accepts (`Status::Ok`), we'll snapshot again
@@ -728,6 +752,9 @@ impl ClerkLedger {
         let openings: Vec<Opening> = decode_or_bad_input!(&openings_bytes, Vec<Opening>);
         if !self.transfer_signatures_valid(&transfer) {
             return Status::SignatureInvalid;
+        }
+        if self.voids_voucher_locked_transfer(&transfer) {
+            return Status::VoucherLocked;
         }
 
         let oracle = CcOpeningsOracle::new(openings.clone());
@@ -964,7 +991,7 @@ impl ClerkLedger {
     /// settled ledger state before any bank signature is produced.
     #[msg]
     async fn voucher_anchor(
-        &self,
+        &mut self,
         ctx: &mut Context<Self>,
         id: [u8; 16],
         amount_commit: [u8; 32],
@@ -979,6 +1006,11 @@ impl ClerkLedger {
             &amount_commit,
             self.voided_transfers.contains(&id),
         )?;
+        // This insertion and the eligibility reads above commit in one actor
+        // slice. A concurrent void therefore has exactly two outcomes: it
+        // commits first and this call returns None, or this lock commits first
+        // and both transfer-apply paths reject the later reversal.
+        self.voucher_locked_transfers.insert(&id);
         Some(LedgerVoucherAnchor {
             amount_commit,
             currency,
