@@ -93,6 +93,31 @@ impl Probe {
         self.seen
     }
 
+    /// Adversarial cross-root caller used to prove that knowing a Clerk
+    /// transfer id and amount commitment is insufficient to obtain its
+    /// voucher anchor. The destination must authenticate this actor against
+    /// its own reciprocal installation binding.
+    #[msg]
+    async fn attempt_voucher_anchor(
+        &mut self,
+        ctx: &mut Context<Self>,
+        target: [u8; 32],
+        transfer_id: [u8; 16],
+        amount_commit: [u8; 32],
+    ) -> bool {
+        matches!(
+            ctx.ask_actor(
+            ActorId(target),
+            &Msg::new("voucher_anchor")
+                .with("id", transfer_id.to_vec())
+                .with("amount_commit", amount_commit.to_vec()),
+            None,
+        )
+            .await,
+            Ok(Value::Bytes(bytes)) if bytes.first() == Some(&1)
+        )
+    }
+
     /// Deterministic cross-root peer used by the v2 durable transport gate.
     #[msg]
     async fn peer_value(&self) -> u32 {
@@ -235,9 +260,7 @@ impl Probe {
         let record = vos::provable::read_staged_record(&tag)
             .unwrap_or_else(|| panic!("completed Task omitted its staged record"));
         assert!(
-            record.task_hash == task_hash
-                && record.reply == reply
-                && record.io_consistent(),
+            record.task_hash == task_hash && record.reply == reply && record.io_consistent(),
             "public producer record does not bind the exact Task execution"
         );
         match <Value as vos::Decode>::try_decode(&reply) {
@@ -263,11 +286,7 @@ impl Probe {
             .try_into()
             .unwrap_or_else(|_| panic!("record tag must contain 32 bytes"));
         let mut tasks = Tasks::new();
-        let task = tasks.spawn_provable(
-            task_hash,
-            &Msg::new("add_rooted").with("n", 1u64),
-            tag,
-        );
+        let task = tasks.spawn_provable(task_hash, &Msg::new("add_rooted").with("n", 1u64), tag);
         tasks.drive();
         assert!(tasks.status(task) == Some(TaskStatus::Done));
         ctx.yield_now().await;

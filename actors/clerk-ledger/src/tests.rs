@@ -122,6 +122,56 @@ fn voucher_anchor_accepts_only_final_single_currency_settlement() {
     );
 }
 
+#[test]
+fn only_the_reciprocally_bound_bridge_can_create_or_reuse_a_voucher_lock() {
+    use vos::Actor;
+    use vos::v2::{ActorId, Origin};
+
+    vos::storage::mock::reset();
+    let mut ledger = ClerkLedger::create();
+    ledger.__init_storage();
+    let (transfer, amount_commit) = voucher_candidate(Layer::Settled, 840);
+    let transfer_id = transfer.id.0;
+    ledger.transfers.insert_with_leaf(
+        &transfer_id,
+        &transfer,
+        &crate::transfer_leaf_content(&transfer),
+    );
+    ledger.transfer_roots.insert(
+        &transfer_id,
+        &crate::TransferRootEntry {
+            id: transfer_id,
+            root_before: [0x31; 32],
+            root_after: [0x32; 32],
+        },
+    );
+
+    let bridge = ActorId([0x41; 32]);
+    let unrelated = ActorId([0x42; 32]);
+
+    let attempt = |ledger: &mut ClerkLedger, caller| {
+        ClerkLedger::voucher_issuer_matches(Origin::Actor(caller), Some(bridge))
+            .then(|| ledger.lock_voucher_anchor(transfer_id, amount_commit))
+            .flatten()
+    };
+
+    assert_eq!(attempt(&mut ledger, unrelated), None);
+    assert!(
+        !ledger.voucher_locked_transfers.contains(&transfer_id),
+        "an unrelated actor must not create the irreversible lock",
+    );
+
+    assert!(attempt(&mut ledger, bridge).is_some());
+    assert!(ledger.voucher_locked_transfers.contains(&transfer_id));
+
+    assert_eq!(
+        attempt(&mut ledger, unrelated),
+        None,
+        "the lock does not turn the anchor into a bearer capability",
+    );
+    assert!(ledger.voucher_locked_transfers.contains(&transfer_id));
+}
+
 /// The actor's committed maps, freshly initialized over a clean mock
 /// keyspace — what `__init_storage` produces after a create/decode.
 struct Maps {

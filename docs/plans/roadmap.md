@@ -87,10 +87,12 @@ replication. Setup lives in `/home/daniel/src/bloque/bank-federation`.
 
 **Architecture: pure VOS actors + `vosx` + scripts. No new tool, no crypto
 CLI.** The actor side is landed: `clerk-bridge.issue_voucher` authenticates
-the destination peer and an immutable `clerk-ledger.voucher_anchor`, requires
-that anchor to certify an ordinary settled transfer in the package's configured
-currency, and atomically makes that transfer non-voidable before returning the
-anchor. It then signs through the host-private device capability and
+the destination peer and calls an immutable `clerk-ledger.voucher_anchor`.
+The ledger's reciprocal installation binding must name that exact issuer
+bridge, and the anchor must certify an ordinary settled transfer in the
+package's configured currency. Creating it atomically makes that transfer
+non-voidable before the anchor returns. The bridge then signs through the
+host-private device capability and
 accumulates the issuer term exactly once. `clerk-bridge.sign_claim` composes
 issuer ⊕ receiver state and signs the closed window. The node-local secret never
 enters actor state or Raft; each bank retains its independent key.

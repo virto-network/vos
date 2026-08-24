@@ -314,6 +314,10 @@ pub struct ClerkLedger {
 }
 
 impl ClerkLedger {
+    fn voucher_issuer_matches(origin: Origin, expected: Option<ActorId>) -> bool {
+        matches!((origin, expected), (Origin::Actor(caller), Some(bound)) if caller == bound)
+    }
+
     /// Proof-record administration exposes producer-only material, so it may
     /// not inherit the legacy `Caller::Actor` role bypass. Host-controlled
     /// System calls remain available for local operator tooling; members must
@@ -330,21 +334,14 @@ impl ClerkLedger {
         allowed
     }
 
-    /// Voucher anchors are opaque commitments, but they still prove whether a
-    /// caller-chosen transfer id exists. Expose them only to another
-    /// authenticated actor selected by installation authority, the local
-    /// System boundary, or an authenticated ledger operator. Anonymous/public
-    /// ingress cannot use this as a transfer-id oracle.
-    fn authorize_voucher_anchor(ctx: &mut Context<Self>) -> bool {
-        let allowed = match ctx.origin() {
-            Origin::Actor(_) | Origin::System => true,
-            Origin::Member(_) => ctx.has_role(ClerkLedgerRole::Operator),
-            Origin::Anonymous => false,
-        };
-        if !allowed {
-            ctx.__mark_forbidden();
-        }
-        allowed
+    /// Voucher anchoring is irreversible, so ordinary role authorization is
+    /// insufficient: legacy actor callers bypass actor-role thresholds. The
+    /// only authority is the exact `clerk-bridge` ActorId pinned in this
+    /// ledger root's authenticated installation directory. The reciprocal
+    /// binding means an actor that merely names this ledger in *its* outgoing
+    /// directory cannot create or read a voucher lock.
+    fn authorize_voucher_anchor(ctx: &Context<Self>) -> bool {
+        Self::voucher_issuer_matches(ctx.origin(), ctx.external_actor_id("clerk-bridge"))
     }
 
     fn staged_record(tag: &[u8; 32]) -> Option<vos::provable::ProvableRecord> {
@@ -438,6 +435,27 @@ impl ClerkLedger {
         transfer
             .void_of
             .is_some_and(|original| self.voucher_locked_transfers.contains(&original.0))
+    }
+
+    fn lock_voucher_anchor(
+        &mut self,
+        id: [u8; 16],
+        amount_commit: [u8; 32],
+    ) -> Option<LedgerVoucherAnchor> {
+        let transfer = self.transfers.get(&id)?;
+        let roots = self.transfer_roots.get(&id)?;
+        let currency = voucher_transfer_currency(
+            &transfer,
+            &amount_commit,
+            self.voided_transfers.contains(&id),
+        )?;
+        self.voucher_locked_transfers.insert(&id);
+        Some(LedgerVoucherAnchor {
+            amount_commit,
+            currency,
+            root_before: roots.root_before,
+            root_after: roots.root_after,
+        })
     }
 }
 
@@ -988,7 +1006,9 @@ impl ClerkLedger {
     /// transfers, mixed layers, mixed currencies, and multi-amount transfers
     /// are deliberately ineligible. The bridge supplies the commitment from
     /// its zero-signature voucher template; this method binds it to immutable
-    /// settled ledger state before any bank signature is produced.
+    /// settled ledger state before any bank signature is produced. The ledger
+    /// installation must reciprocally bind that bridge under `clerk-bridge`;
+    /// no member, System caller, or other actor can create or reuse the lock.
     #[msg]
     async fn voucher_anchor(
         &mut self,
@@ -999,24 +1019,11 @@ impl ClerkLedger {
         if !Self::authorize_voucher_anchor(ctx) {
             return None;
         }
-        let transfer = self.transfers.get(&id)?;
-        let roots = self.transfer_roots.get(&id)?;
-        let currency = voucher_transfer_currency(
-            &transfer,
-            &amount_commit,
-            self.voided_transfers.contains(&id),
-        )?;
-        // This insertion and the eligibility reads above commit in one actor
-        // slice. A concurrent void therefore has exactly two outcomes: it
-        // commits first and this call returns None, or this lock commits first
-        // and both transfer-apply paths reject the later reversal.
-        self.voucher_locked_transfers.insert(&id);
-        Some(LedgerVoucherAnchor {
-            amount_commit,
-            currency,
-            root_before: roots.root_before,
-            root_after: roots.root_after,
-        })
+        // The eligibility reads and insertion in this helper commit in one
+        // actor slice. A concurrent void therefore has exactly two outcomes:
+        // it commits first and this call returns None, or this lock commits
+        // first and both transfer-apply paths reject the later reversal.
+        self.lock_voucher_anchor(id, amount_commit)
     }
 
     #[msg(role = ClerkLedgerRole::Member)]

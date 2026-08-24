@@ -232,6 +232,21 @@ impl<A: Actor> Context<A> {
             .map(|index| self.external_actors[index].actor)
     }
 
+    /// Return the exact actor identity pinned under `name` by this root's
+    /// authenticated external-actor directory.
+    ///
+    /// This is intentionally narrower than general actor resolution: owned
+    /// tree members and legacy registry routes are never considered. Actors
+    /// can use it to authenticate an incoming [`crate::v2::Origin::Actor`]
+    /// against an immutable reciprocal binding before performing an
+    /// irreversible operation.
+    pub fn external_actor_id(&self, name: &str) -> Option<crate::v2::ActorId> {
+        self.actor_id
+            .is_some()
+            .then(|| self.resolve_external_actor_v2(name))
+            .flatten()
+    }
+
     #[doc(hidden)]
     pub fn __set_actor_id(&mut self, actor: crate::v2::ActorId) {
         self.actor_id = Some(actor);
@@ -2180,7 +2195,13 @@ mod tests {
         }];
 
         assert_eq!(ctx.resolve_external_actor_v2("private-age"), Some(actor));
+        assert_eq!(ctx.external_actor_id("private-age"), Some(actor));
         assert_eq!(ctx.resolve_external_actor_v2("package-label"), None);
+        assert_eq!(ctx.external_actor_id("package-label"), None);
+
+        let mut legacy: Context<TestActor> = Context::new(ServiceId(0));
+        legacy.external_actors = ctx.external_actors;
+        assert_eq!(legacy.external_actor_id("private-age"), None);
     }
 
     // Richer fixture actor with a 3-tier Role enum — exercises

@@ -1338,7 +1338,11 @@ a causally authenticated CRDT input. CRDT private-input availability remains
 deliberately staged. The production Clerk bridge binds that public identity
 with `bind_device_signer`; its operator-only signing surface rejects the
 legacy same-node actor bypass. `issue_voucher` first awaits an exact
-`voucher_anchor` from the package-authenticated clerk-ledger binding. That
+`voucher_anchor` from the package-authenticated clerk-ledger binding. The
+ledger installation reciprocally pins that one bridge under `clerk-bridge`
+and accepts the irreversible call only when its authenticated
+`Origin::Actor` equals the pinned ActorId; another actor cannot create or
+reuse the lock merely by naming the ledger in its own directory. That
 anchor certifies one ordinary, non-voided transfer whose rows all use
 `Layer::Settled`, one amount commitment, and the bridge package's configured
 currency. Returning that anchor atomically records an append-only voucher lock

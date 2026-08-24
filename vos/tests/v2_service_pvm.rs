@@ -3578,6 +3578,74 @@ fn physical_reply_bytes(published: &PublishedEffectsV2) -> Vec<u8> {
     bytes
 }
 
+fn attempt_voucher_anchor_from_unbound_actor(
+    source: &mut JamServiceV2<NoRefineProtocolHostV2, LocalJamStoreV2>,
+    ledger: &mut JamServiceV2<NoRefineProtocolHostV2, LocalJamStoreV2>,
+    source_actor: ActorId,
+    ledger_actor: ActorId,
+    transfer_id: [u8; 16],
+    amount_commit: [u8; 32],
+    invocation: InvocationId,
+    source_slot: u64,
+    delivery_slot: u64,
+    drain_slot: u64,
+    resume_slot: u64,
+) -> bool {
+    let request = physical_operator_request(
+        source,
+        source_actor,
+        invocation,
+        source_slot,
+        Msg::new("attempt_voucher_anchor")
+            .with("target", ledger_actor.0.to_vec())
+            .with("transfer_id", transfer_id.to_vec())
+            .with("amount_commit", amount_commit.to_vec()),
+        None,
+    );
+    let suspended = invoke_physical_actor(source, request);
+    let [message] = suspended.outbox.as_slice() else {
+        panic!("unbound actor must suspend on one ledger anchor attempt")
+    };
+    let call = message.call_id;
+    let publication = LocalTransportV2::pending_publications(source)
+        .unwrap()
+        .into_iter()
+        .find(|publication| {
+            publication
+                .published
+                .outbox
+                .iter()
+                .any(|row| row.call_id == call)
+        })
+        .unwrap();
+    LocalTransportV2::deliver(source, ledger, &publication, call, delivery_slot).unwrap();
+    assert!(matches!(
+        LocalTransportV2::drain_pending(ledger, drain_slot)
+            .unwrap()
+            .as_slice(),
+        [InboxDrainOutcomeV2::Committed(_)]
+    ));
+    let reply = LocalTransportV2::pending_publications(ledger)
+        .unwrap()
+        .into_iter()
+        .find(|publication| {
+            publication
+                .published
+                .reply
+                .as_ref()
+                .is_some_and(|reply| reply.call_id == call)
+        })
+        .unwrap();
+    let resumed = LocalTransportV2::resume_reply(ledger, source, &reply, resume_slot).unwrap();
+    let result = &resumed
+        .published
+        .reply
+        .as_ref()
+        .expect("probe publishes its boolean result")
+        .result;
+    matches!(Value::try_decode(result), Some(Value::Bool(true)))
+}
+
 #[test]
 fn canonical_clerk_package_executes_a_private_provable_transfer_through_raft() {
     use cipher_clerk::conventions::{BankCode, Iso4217};
@@ -3814,7 +3882,13 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
     .unwrap();
     let ledger_install = AccumulateRequestV2::Install(ServiceGenesisV2 {
         role_authority: None,
-        external_actors: vec![],
+        external_actors: vec![external_binding(
+            "clerk-bridge",
+            bridge_identity.clone(),
+            bridge_actor,
+            bridge_package.deployment_signature.producer,
+            bridge_package.manifest.actor_program,
+        )],
         service: ledger_identity.clone(),
         consistency: ConsistencyModeV2::Local,
         actors: vec![ActorGenesisV2 {
@@ -3874,7 +3948,7 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
             producer: bridge_package.deployment_signature.producer,
             deployment: bridge_package.deployment_id(),
             program: bridge_package.manifest.actor_program,
-            initial_state: initial_ref,
+            initial_state: initial_ref.clone(),
             crdt: false,
             role_policies: bridge_package.role_policies.clone(),
         }],
@@ -3886,6 +3960,61 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
     authorize_install(&mut bridge, &bridge_install);
     assert!(matches!(
         bridge.accumulate(&bridge_install).unwrap().result,
+        AccumulationResultV2::Installed(_)
+    ));
+
+    let (rogue_package, rogue_name) = signed_test_package(&probe_elf(), &package_signer);
+    let rogue_actor = ActorId([0x3a; 32]);
+    let rogue_identity = ServiceIdentityV2 {
+        root_service: RootServiceId([0x3b; 32]),
+        deployment: rogue_package.deployment_id(),
+        ..ledger_identity.clone()
+    };
+    let mut rogue_store = LocalJamStoreV2::default();
+    assert_eq!(rogue_store.import_blob(Vec::new()), initial_ref);
+    assert_eq!(
+        rogue_store.import_program(rogue_package.actor_pvm.clone()),
+        rogue_package.manifest.actor_program,
+    );
+    let mut rogue = JamServiceV2::new(
+        CANONICAL_SERVICE_PVM.to_vec(),
+        vos::v2::VOS_SERVICE_PROGRAM_ID,
+        NoRefineProtocolHostV2,
+        rogue_store,
+        TEST_GAS_SCHEDULE.refine,
+        TEST_GAS_SCHEDULE.accumulate,
+    )
+    .unwrap();
+    let rogue_install = AccumulateRequestV2::Install(ServiceGenesisV2 {
+        role_authority: None,
+        external_actors: vec![external_binding(
+            "clerk-ledger",
+            ledger_identity.clone(),
+            ledger_actor,
+            ledger_package.deployment_signature.producer,
+            ledger_package.manifest.actor_program,
+        )],
+        service: rogue_identity,
+        consistency: ConsistencyModeV2::Local,
+        actors: vec![ActorGenesisV2 {
+            actor: rogue_actor,
+            name: rogue_name,
+            parent: None,
+            producer: rogue_package.deployment_signature.producer,
+            deployment: rogue_package.deployment_id(),
+            program: rogue_package.manifest.actor_program,
+            initial_state: initial_ref,
+            crdt: false,
+            role_policies: rogue_package.role_policies.clone(),
+        }],
+        authorization: AuthorizationEvidenceV2::SystemCapability {
+            capability: SystemCapabilityId([0x3c; 32]),
+            authenticator: vec![0x3d],
+        },
+    });
+    authorize_install(&mut rogue, &rogue_install);
+    assert!(matches!(
+        rogue.accumulate(&rogue_install).unwrap().result,
         AccumulationResultV2::Installed(_)
     ));
 
@@ -4061,6 +4190,24 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
         .with("transfer_id", transfer_id.to_vec())
         .with("peer_name", b"bank-b".to_vec())
         .with("voucher_template", voucher_template.clone());
+
+    assert!(
+        !attempt_voucher_anchor_from_unbound_actor(
+            &mut rogue,
+            &mut ledger,
+            rogue_actor,
+            ledger_actor,
+            transfer_id,
+            amount.0,
+            InvocationId([0x3e; 32]),
+            1,
+            7,
+            8,
+            2,
+        ),
+        "an actor whose own directory names the ledger cannot create the lock",
+    );
+
     let issue = physical_operator_request(
         &mut bridge,
         bridge_actor,
@@ -4154,6 +4301,23 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
         .unwrap();
     assert_eq!(issued.redemption_key, voucher.redemption_key());
 
+    assert!(
+        !attempt_voucher_anchor_from_unbound_actor(
+            &mut rogue,
+            &mut ledger,
+            rogue_actor,
+            ledger_actor,
+            transfer_id,
+            amount.0,
+            InvocationId([0x3f; 32]),
+            3,
+            13,
+            14,
+            4,
+        ),
+        "the committed lock remains readable only by the installed issuer bridge",
+    );
+
     // Signing and caching do not weaken the lock. A later independent void
     // remains rejected, so the redeemable voucher cannot outlive its settled
     // backing transfer.
@@ -4161,7 +4325,7 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
         &mut ledger,
         ledger_actor,
         InvocationId([0x5a; 32]),
-        13,
+        15,
         Msg::new("apply_transfer")
             .with("transfer_bytes", build_void())
             .with("openings_bytes", void_openings)
@@ -4201,7 +4365,7 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
         &mut bridge,
         bridge_actor,
         InvocationId([0x56; 32]),
-        14,
+        16,
         Msg::new("issue_voucher")
             .with("transfer_id", transfer_id.to_vec())
             .with("peer_name", b"bank-b".to_vec())
@@ -4221,7 +4385,7 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
         &mut bridge,
         bridge_actor,
         InvocationId([0x57; 32]),
-        15,
+        17,
         Msg::new("window_rotate").with("peer_name", b"bank-b".to_vec()),
         Some(clerk_bridge::ClerkBridgeRole::Operator as u8),
     );
@@ -4233,7 +4397,7 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
         &mut bridge,
         bridge_actor,
         InvocationId([0x58; 32]),
-        16,
+        18,
         Msg::new("sign_claim")
             .with("peer_name", b"bank-b".to_vec())
             .with("currency", clerk_bridge::DEMO_CURRENCY)
