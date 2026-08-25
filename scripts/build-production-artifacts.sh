@@ -3,9 +3,9 @@ set -euo pipefail
 
 mode=${1:-all}
 case "$mode" in
-    all | service | clerk | clerk-test) ;;
+    all | service | authority | registry | clerk | clerk-test) ;;
     *)
-        echo "usage: $0 [all|service|clerk|clerk-test] [clerk-signer-key]" >&2
+        echo "usage: $0 [all|service|authority|registry|clerk|clerk-test] [clerk-signer-key]" >&2
         exit 2
         ;;
 esac
@@ -35,12 +35,17 @@ host_toolchain=$(manifest_value host_toolchain)
 service_elf_digest=$(manifest_value service_elf_blake2b_256)
 service_pvm_digest=$(manifest_value service_pvm_blake2b_256)
 service_program=$(manifest_value service_program_id)
+authority_pvm_digest=$(manifest_value authority_pvm_blake2b_256)
+authority_program=$(manifest_value authority_program_id)
+registry_elf_digest=$(manifest_value registry_elf_blake2b_256)
 clerk_program=$(manifest_value clerk_actor_program_id)
 clerk_deployment=$(manifest_value clerk_deployment_id)
 clerk_task=$(manifest_value clerk_task_hash)
 for value in \
     "$source_revision" "$guest_toolchain" "$host_toolchain" \
     "$service_elf_digest" "$service_pvm_digest" "$service_program" \
+    "$authority_pvm_digest" "$authority_program" \
+    "$registry_elf_digest" \
     "$clerk_program" "$clerk_deployment" "$clerk_task"
 do
     if [[ -z $value ]]; then
@@ -57,6 +62,8 @@ then
 fi
 for digest in \
     "$service_elf_digest" "$service_pvm_digest" "$service_program" \
+    "$authority_pvm_digest" "$authority_program" \
+    "$registry_elf_digest" \
     "$clerk_program" "$clerk_deployment" "$clerk_task"
 do
     if [[ ! $digest =~ ^[0-9a-f]{64}$ ]]; then
@@ -128,8 +135,14 @@ if [[ $mode == all || $mode == service ]]; then
         exit 1
     fi
     if ! cmp -s "$fresh_service_pvm" "$repository_root/services/vos-service/vos-service.pvm"; then
-        echo "fresh pinned service PVM differs from the committed artifact" >&2
-        exit 1
+        if [[ ${VOS_REPIN_ARTIFACTS:-0} != 1 ]]; then
+            echo "fresh pinned service PVM differs from the committed artifact" >&2
+            echo "set VOS_REPIN_ARTIFACTS=1 only for an intentional reviewed repin" >&2
+            exit 1
+        fi
+        install -m 0644 \
+            "$fresh_service_pvm" \
+            "$repository_root/services/vos-service/vos-service.pvm"
     fi
     install -m 0644 \
         "$service_elf" \
@@ -137,6 +150,79 @@ if [[ $mode == all || $mode == service ]]; then
     install -m 0644 \
         "$fresh_service_pvm" \
         "$artifact_root/vos-service.pvm"
+fi
+
+if [[ $mode == all || $mode == registry ]]; then
+    registry_out="$build_root/target/registry"
+    registry_config="$build_root/registry-signer-config"
+    mkdir -p "$registry_config"
+    (
+        cd "$build_root"
+        XDG_CONFIG_HOME="$registry_config" \
+            "$pinned_vosx" build \
+            "$build_root/actors/space-registry" \
+            --name space-registry \
+            --out-dir "$registry_out"
+    )
+    registry_elf="$build_root/actors/space-registry/target/vosx-canonical/riscv64em-vos/release/space_registry.elf"
+    actual_registry_digest=$(b2sum -l 256 "$registry_elf")
+    actual_registry_digest=${actual_registry_digest%% *}
+    if [[ $actual_registry_digest != "$registry_elf_digest" ]]; then
+        echo "fresh registry ELF digest mismatch: expected $registry_elf_digest, got $actual_registry_digest" >&2
+        exit 1
+    fi
+    if ! cmp -s "$registry_elf" "$repository_root/vosx/blobs/space_registry.elf"; then
+        if [[ ${VOS_REPIN_ARTIFACTS:-0} != 1 ]]; then
+            echo "fresh pinned registry ELF differs from the committed artifact" >&2
+            echo "set VOS_REPIN_ARTIFACTS=1 only for an intentional reviewed repin" >&2
+            exit 1
+        fi
+        install -m 0644 \
+            "$registry_elf" \
+            "$repository_root/vosx/blobs/space_registry.elf"
+    fi
+    install -m 0644 \
+        "$registry_elf" \
+        "$artifact_root/space-registry.elf"
+fi
+
+if [[ $mode == all || $mode == authority ]]; then
+    authority_out="$build_root/target/authority"
+    authority_config="$build_root/authority-signer-config"
+    authority_log="$build_root/authority-build.log"
+    mkdir -p "$authority_config"
+    (
+        cd "$build_root"
+        XDG_CONFIG_HOME="$authority_config" \
+            "$pinned_vosx" build \
+            "$build_root/actors/space-authority" \
+            --name space-authority \
+            --out-dir "$authority_out"
+    ) | tee "$authority_log"
+    if ! grep -Fq "program_id   = $authority_program" "$authority_log"; then
+        echo "pinned authority ProgramId missing from build output: $authority_program" >&2
+        exit 1
+    fi
+    fresh_authority_pvm="$authority_out/space-authority.pvm"
+    actual_authority_digest=$(b2sum -l 256 "$fresh_authority_pvm")
+    actual_authority_digest=${actual_authority_digest%% *}
+    if [[ $actual_authority_digest != "$authority_pvm_digest" ]]; then
+        echo "fresh authority PVM digest mismatch: expected $authority_pvm_digest, got $actual_authority_digest" >&2
+        exit 1
+    fi
+    if ! cmp -s "$fresh_authority_pvm" "$repository_root/vosx/blobs/space_authority.pvm"; then
+        if [[ ${VOS_REPIN_ARTIFACTS:-0} != 1 ]]; then
+            echo "fresh pinned authority PVM differs from the committed artifact" >&2
+            echo "set VOS_REPIN_ARTIFACTS=1 only for an intentional reviewed repin" >&2
+            exit 1
+        fi
+        install -m 0644 \
+            "$fresh_authority_pvm" \
+            "$repository_root/vosx/blobs/space_authority.pvm"
+    fi
+    install -m 0644 \
+        "$fresh_authority_pvm" \
+        "$artifact_root/space-authority.pvm"
 fi
 
 if [[ $mode == all || $mode == clerk || $mode == clerk-test ]]; then
@@ -160,7 +246,6 @@ if [[ $mode == all || $mode == clerk || $mode == clerk-test ]]; then
             "$pinned_vosx" build \
             "$build_root/actors/clerk-ledger" \
             --name clerk-ledger \
-            --version production \
             --task "$build_root/tests/fixtures/provable/clerk-apply" \
             --out-dir "$build_root/target/clerk"
     ) | tee "$clerk_log"

@@ -1,27 +1,9 @@
 //! Bundles pre-built platform actors into the vosx binary.
 //!
-//! Two registry source paths, tried in order:
-//!
-//! 1. **Dev path**: `actors/space-registry/target/riscv64em-vos/release/space_registry.elf`,
-//!    produced by `cargo actor` in that crate's directory. Inside
-//!    this workspace it's the fresh build; consumed by working-tree
-//!    builds and tests so changes show up immediately.
-//! 2. **Shipped path**: `vosx/blobs/space_registry.elf`. This file
-//!    is checked into the crate so `cargo package` includes it,
-//!    which is what `cargo install vosx` from crates.io uses.
-//!
-//! In a working tree both paths typically exist; the dev path wins
-//! because it's where local rebuilds land. In a packaged crate only
-//! the shipped path exists. If neither file is present, build.rs
-//! writes an empty placeholder so the runtime `include_bytes!`
-//! always resolves; `space new` falls back to requiring `--registry`
-//! and prints a helpful message pointing at the build step.
-//!
-//! The canonical space authority is deliberately different: its bytes
-//! are a durable protocol identity sealed into existing spaces. It is
-//! always loaded from the committed release blob and checked against its
-//! frozen digest. A source rebuild is an upgrade candidate, never an
-//! implicit replacement for that identity.
+//! Registry and authority bytes are durable protocol identities. Both are
+//! loaded only from committed release blobs and checked against pinned
+//! digests. A source build is an explicit repin candidate, never an implicit
+//! replacement selected from a developer target directory.
 
 use std::env;
 use std::fs;
@@ -31,117 +13,66 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    bundle_actor(
+    bundle_frozen_artifact(
         &manifest_dir,
         &out_dir,
-        "space-registry",
         "space_registry.elf",
         "bundled_registry.elf",
         "VOSX_BUNDLED_REGISTRY_ELF",
-        "`space new`/`space up <token>` will require --registry",
-        "cd actors/space-registry && cargo actor",
+        &SPACE_REGISTRY_BLAKE2B_256,
+        "space-registry",
     );
-
-    bundle_frozen_space_authority(&manifest_dir, &out_dir);
+    bundle_frozen_artifact(
+        &manifest_dir,
+        &out_dir,
+        "space_authority.pvm",
+        "bundled_space_authority.pvm",
+        "VOSX_BUNDLED_SPACE_AUTHORITY_PVM",
+        &SPACE_AUTHORITY_BLAKE2B_256,
+        "space-authority",
+    );
 }
 
+const SPACE_REGISTRY_BLAKE2B_256: [u8; 32] = [
+    0x01, 0x1f, 0xbc, 0xc1, 0x88, 0x88, 0x0d, 0x9e, 0xf8, 0xcb, 0xce, 0xad, 0xd5, 0x22, 0x51, 0x9d,
+    0xa6, 0xae, 0xd4, 0x10, 0xcf, 0x60, 0xdd, 0xa2, 0x44, 0x86, 0xba, 0x00, 0xe4, 0x2f, 0xc5, 0x0e,
+];
 const SPACE_AUTHORITY_BLAKE2B_256: [u8; 32] = [
-    0x45, 0xc1, 0xe7, 0x5b, 0xeb, 0x82, 0x1b, 0x45, 0xa2, 0x24, 0x2f, 0xd7, 0x30, 0xc7, 0x29, 0xa1,
-    0x9f, 0xab, 0x01, 0x4b, 0xe1, 0x43, 0x8a, 0xe2, 0x93, 0xdf, 0x19, 0x37, 0x49, 0x2e, 0xfe, 0xbc,
+    0xb4, 0x2e, 0x12, 0xa7, 0xa6, 0xbb, 0xaa, 0x06, 0x29, 0x14, 0xad, 0xf3, 0xaa, 0x23, 0xab, 0x83,
+    0x1e, 0x8e, 0xf8, 0x53, 0x4f, 0x75, 0x7d, 0x2c, 0xa0, 0x5a, 0xf3, 0x5a, 0x34, 0x4e, 0x4f, 0x45,
 ];
 
-/// Bundle the release authority identity without consulting developer output.
-/// Same-ABI sealed spaces derive their canonical authority incarnation partly
-/// from these exact bytes; the surrounding package identity additionally
-/// binds that release's service ABI, program, and semantics. Silently
-/// preferring a newer local actor build would therefore break even a same-ABI
-/// reopen.
-fn bundle_frozen_space_authority(manifest_dir: &Path, out_dir: &Path) {
-    let source = manifest_dir.join("blobs/space_authority.pvm");
+fn bundle_frozen_artifact(
+    manifest_dir: &Path,
+    out_dir: &Path,
+    file: &str,
+    bundled_file: &str,
+    env_var: &str,
+    expected_digest: &[u8; 32],
+    label: &str,
+) {
+    let source = manifest_dir.join("blobs").join(file);
     let bytes = fs::read(&source).unwrap_or_else(|e| {
         panic!(
-            "read canonical ABI-17 authority {}: {e}; restore the committed release blob",
+            "read canonical {label} {}: {e}; restore the committed release blob",
             source.display()
         )
     });
     let digest = blake2b_simd::Params::new().hash_length(32).hash(&bytes);
     assert_eq!(
         digest.as_bytes(),
-        SPACE_AUTHORITY_BLAKE2B_256,
-        "canonical ABI-17 authority {} does not match its release digest; source rebuilds must use the explicit UpgradeActor path",
+        expected_digest,
+        "canonical {label} {} does not match its release digest; use the explicit repin workflow",
         source.display(),
     );
 
-    let dest = out_dir.join("bundled_space_authority.pvm");
-    fs::write(&dest, &bytes).unwrap_or_else(|e| panic!("write bundled_space_authority.pvm: {e}"));
+    let dest = out_dir.join(bundled_file);
+    fs::write(&dest, &bytes).unwrap_or_else(|e| panic!("write {bundled_file}: {e}"));
     println!(
-        "cargo:warning=vosx: bundled canonical ABI-17 space-authority ({} bytes) from {}",
+        "cargo:warning=vosx: bundled canonical {label} ({} bytes) from {}",
         bytes.len(),
         source.display(),
     );
     println!("cargo:rerun-if-changed={}", source.display());
-    println!(
-        "cargo:rustc-env=VOSX_BUNDLED_SPACE_AUTHORITY_PVM={}",
-        dest.display()
-    );
-}
-
-/// Wire up one bundled actor artifact. Tries the working-tree dev path
-/// first (live rebuilds win) and falls back to the shipped
-/// `blobs/<file>` (what `cargo package` ships from crates.io). If
-/// neither exists, writes an empty placeholder and prints a hint
-/// at how to populate the bundle.
-#[allow(clippy::too_many_arguments)]
-fn bundle_actor(
-    manifest_dir: &Path,
-    out_dir: &Path,
-    actor_dir: &str,
-    elf_filename: &str,
-    bundled_dest: &str,
-    env_var: &str,
-    missing_hint: &str,
-    build_cmd: &str,
-) {
-    let dev_path = manifest_dir
-        .join("..")
-        .join("actors")
-        .join(actor_dir)
-        .join("target")
-        .join("riscv64em-vos")
-        .join("release")
-        .join(elf_filename);
-    let shipped_path = manifest_dir.join("blobs").join(elf_filename);
-    let dest = out_dir.join(bundled_dest);
-
-    let bundled = read_first_present(&[dev_path.as_path(), shipped_path.as_path()]);
-    match bundled {
-        Some((source, bytes)) => {
-            fs::write(&dest, &bytes).unwrap_or_else(|e| panic!("write {bundled_dest}: {e}"));
-            println!(
-                "cargo:warning=vosx: bundled {actor_dir} ({} bytes) from {}",
-                bytes.len(),
-                source.display(),
-            );
-        }
-        None => {
-            fs::write(&dest, []).unwrap_or_else(|e| panic!("write empty {bundled_dest}: {e}"));
-            println!(
-                "cargo:warning=vosx: {actor_dir} not built — {missing_hint}. \
-                 To enable bundling: {build_cmd}"
-            );
-        }
-    }
-
-    println!("cargo:rerun-if-changed={}", dev_path.display());
-    println!("cargo:rerun-if-changed={}", shipped_path.display());
     println!("cargo:rustc-env={env_var}={}", dest.display());
-}
-
-fn read_first_present(candidates: &[&Path]) -> Option<(PathBuf, Vec<u8>)> {
-    for p in candidates {
-        if let Ok(bytes) = fs::read(p) {
-            return Some((p.to_path_buf(), bytes));
-        }
-    }
-    None
 }

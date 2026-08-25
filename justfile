@@ -94,10 +94,9 @@ build-vos-service-candidate:
     cd services/vos-service; cargo actor
     @echo "candidate ELF: services/vos-service/target/riscv64em-vos/release/vos_service.elf"
 
-# Refresh the bundled space-registry ELF shipped with vosx.
-refresh-bundled-registry: (build-actor "space-registry")
-    cp actors/space-registry/target/riscv64em-vos/release/space_registry.elf \
-       vosx/blobs/space_registry.elf
+# Refresh the bundled registry from the pinned source and toolchain.
+refresh-bundled-registry:
+    VOS_REPIN_ARTIFACTS=1 scripts/build-production-artifacts.sh registry
 
 # Build a deliberately distinct, contract-compatible authority PVM for the
 # physical UpgradeActor rehearsal. Canonical release builds never enable
@@ -107,17 +106,14 @@ build-authority-upgrade-candidate:
     cargo run -p vosx -- build \
       actors/space-authority/target/riscv64em-vos/release/space_authority.elf \
       --name space-authority \
-      --version artifact-only --out-dir target/bundled-space-authority
+      --out-dir target/bundled-space-authority
     @echo "candidate: target/bundled-space-authority/space-authority.pvm"
     @echo "install only through a reviewed UpgradeActor migration"
 
 # Reproduce the canonical authority through vosx's checkout-independent actor
 # build and require exact identity with the committed release artifact.
 build-authority-release:
-    cargo run -p vosx -- build actors/space-authority --name space-authority \
-      --version artifact-only --out-dir target/canonical-space-authority
-    cmp target/canonical-space-authority/space-authority.pvm \
-      vosx/blobs/space_authority.pvm
+    scripts/build-production-artifacts.sh authority
 
 # Assemble the two protocol-pinned production PVMs with a strict manifest.
 # The command refuses to replace an existing directory so a release operator

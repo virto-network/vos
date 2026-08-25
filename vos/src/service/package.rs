@@ -82,7 +82,6 @@ pub enum PackageError {
     WrongExecutionSemantics,
     EmptyName,
     EmptyProgram,
-    ServiceProgramMismatch,
     ProgramIdMismatch,
     InterfaceHashMismatch,
     PolicyHashMismatch,
@@ -119,9 +118,6 @@ impl VosPackage {
         }
         if self.actor_pvm.is_empty() {
             return Err(PackageError::EmptyProgram);
-        }
-        if self.manifest.service_program != super::VOS_SERVICE_PROGRAM_ID {
-            return Err(PackageError::ServiceProgramMismatch);
         }
         if ProgramId::of_pvm(&self.actor_pvm) != self.manifest.actor_program {
             return Err(PackageError::ProgramIdMismatch);
@@ -760,15 +756,5 @@ mod tests {
         package.actor_pvm.push(5);
         assert_eq!(package.validate(), Err(PackageError::ProgramIdMismatch));
         assert_ne!(id, package.deployment_id());
-    }
-
-    #[test]
-    fn package_requires_the_protocol_service_program() {
-        let mut package = package();
-        package.manifest.service_program = ProgramId([9; 32]);
-        assert_eq!(
-            package.validate(),
-            Err(PackageError::ServiceProgramMismatch)
-        );
     }
 }
