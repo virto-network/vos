@@ -28,7 +28,7 @@ fn load_fibonacci_blob() -> Option<Vec<u8>> {
         Err(_) => {
             eprintln!(
                 "SKIP: fibonacci actor fixture absent; build with \
-                 `cd tests/fixtures/legacy-v1/actors/fibonacci && cargo actor` (or `just build-pvm`)"
+                 `cd pvm/proof/fixtures/fibonacci && cargo actor` (or `just build-pvm`)"
             );
             return None;
         }
@@ -71,7 +71,7 @@ fn trace_fibonacci_actor() {
     assert!(
         steps.len() > 1000 && !format!("{exit:?}").contains("Panic"),
         "fibonacci actor only traced {} steps (exit={exit:?}) — stale/mis-built \
-         ELF? rebuild with `cd tests/fixtures/legacy-v1/actors/fibonacci && cargo actor`",
+         ELF? rebuild with `cd pvm/proof/fixtures/fibonacci && cargo actor`",
         steps.len()
     );
     eprintln!("First: pc={} {:?}", steps[0].pc, steps[0].opcode);
@@ -163,9 +163,9 @@ fn analyze_register_dedup(name: &str, gas: u64) {
 
     let mut tracing = TracingPvm::new(interp);
     let _exit = tracing.run_with_vos_stubs();
-    let blake2b_calls: Vec<_> = tracing.blake2b_calls().iter().cloned().collect();
+    let blake2b_calls: Vec<_> = tracing.blake2b_calls().to_vec();
     let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
-    let ristretto_calls: Vec<_> = tracing.ristretto_calls().iter().cloned().collect();
+    let ristretto_calls: Vec<_> = tracing.ristretto_calls().to_vec();
     let ristretto_mem_ops = tracing.ristretto_mem_ops.clone();
     let ristretto_add_records = tracing.ristretto_add_records.clone();
     let ristretto_add_mem_ops = tracing.ristretto_add_mem_ops.clone();
@@ -239,7 +239,7 @@ fn analyze_register_dedup(name: &str, gas: u64) {
     eprintln!("  M  rows-after-dedup  log_size");
     for (m, rows, log) in &report.cap_after_dedup {
         let fits = if *log <= 15 { " (fits log=15)" } else { "" };
-        eprintln!("  {:>2}  {:>16}  {:>8}{}", m, rows, log, fits);
+        eprintln!("  {m:>2}  {rows:>16}  {log:>8}{fits}");
     }
 }
 
@@ -268,9 +268,9 @@ fn analyze_memory_dedup(name: &str, gas: u64) {
 
     let mut tracing = TracingPvm::new(interp);
     let _exit = tracing.run_with_vos_stubs();
-    let blake2b_calls: Vec<_> = tracing.blake2b_calls().iter().cloned().collect();
+    let blake2b_calls: Vec<_> = tracing.blake2b_calls().to_vec();
     let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
-    let ristretto_calls: Vec<_> = tracing.ristretto_calls().iter().cloned().collect();
+    let ristretto_calls: Vec<_> = tracing.ristretto_calls().to_vec();
     let ristretto_mem_ops = tracing.ristretto_mem_ops.clone();
     let ristretto_add_records = tracing.ristretto_add_records.clone();
     let ristretto_add_mem_ops = tracing.ristretto_add_mem_ops.clone();
@@ -337,7 +337,7 @@ fn analyze_memory_dedup(name: &str, gas: u64) {
     eprintln!("  M  rows-after-dedup  log_size");
     for (m, rows, log) in &report.cap_after_dedup {
         let fits = if *log <= 15 { " (fits log=15)" } else { "" };
-        eprintln!("  {:>2}  {:>16}  {:>8}{}", m, rows, log, fits);
+        eprintln!("  {m:>2}  {rows:>16}  {log:>8}{fits}");
     }
 }
 
@@ -1466,7 +1466,7 @@ fn prove_blake2b_via_ecall() {
     let bitmask = vec![1, 0, 0, 0, 0, 1];
 
     let mut regs = [0u64; vos_pvm::PVM_REGISTER_COUNT];
-    // PVM A0/A1/A2/A3 map to φ[7/8/9/10].  The zkpvm-precompiles
+    // PVM A0/A1/A2/A3 map to φ[7/8/9/10].  The vos-pvm-precompiles
     // shim's `in("a0") h_ptr, in("a1") m_ptr, in("a2") t_low,
     // in("a3") f_flag` lands the actor's blake2b arguments in
     // φ[7/8/9/10], where the host handler reads them.

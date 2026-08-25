@@ -28,7 +28,9 @@ The repository contains one application model:
 cargo run -p vosx -- new hello
 cargo run -p vosx -- build hello --name hello
 cargo run -p vosx -- space new demo
-cargo run -p vosx -- space up demo --service-pvm services/vos-service/vos-service.pvm
+cargo run -p vosx -- space up demo \
+  --service-pvm services/vos-service/vos-service.pvm \
+  --allow-conformance
 ```
 
 In another terminal:
@@ -64,4 +66,3 @@ cargo test --workspace
 
 Artifacts committed under `services/` and `vosx/blobs/` are protocol
 identities. Rebuild them only through the checked release recipes.
-

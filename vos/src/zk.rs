@@ -1,6 +1,6 @@
 //! VOS ZK actor-IO ABI — TAGLESS binding.
 //!
-//! A framework-level convention for binding a zkpvm proof of an actor
+//! A framework-level convention for binding a PVM execution proof of an actor
 //! handler to the specific `(public_inputs, return_value)` tuple a
 //! caller asserts it ran on — placing that tuple's hash in
 //! `final_state.registers` (φ[9..12]) so the caller can assert this

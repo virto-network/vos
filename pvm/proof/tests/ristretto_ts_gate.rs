@@ -20,7 +20,7 @@
 //! match, ts=0 / closing_ts collision) is exercised by the full-system
 //! `voucher_check_smoke` + capstone, not here.
 //!
-//! Run with: `cargo test -p zkpvm --features debug-internals --test
+//! Run with: `cargo test -p vos-pvm-proof --features debug-internals --test
 //! ristretto_ts_gate`.
 
 use vos_pvm_proof::AirColumn;

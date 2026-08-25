@@ -120,7 +120,7 @@ discovered the hard way:
     pair structure should pass `prove_fibonacci_actor` (a few hundred
     steps) before claiming the change is safe at scale.
 
-Minimum sweep: `cargo test -p zkpvm --test add64_e2e --test memory --test
+Minimum sweep: `cargo test -p vos-pvm-proof --test add64_e2e --test memory --test
 control_flow --test bitmanip --test alu_negative --test
 control_flow_negative --test memory_negative --test program_identity
 --test prove_vos_actor`.  ~6 minutes; catches all known regression

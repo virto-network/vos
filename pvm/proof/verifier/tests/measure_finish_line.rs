@@ -16,9 +16,9 @@
 //! path (Track A's real stack). The harness prints which path it ran.
 //!
 //! Run (one measurement per process so `VmHWM` is clean):
-//!   STEPS=7    cargo test -p zkpvm-verifier --release --test measure_finish_line \
+//!   STEPS=7    cargo test -p vos-pvm-proof-verifier --release --test measure_finish_line \
 //!                measure -- --exact --nocapture
-//!   STEPS=7    cargo test -p zkpvm-verifier --release --features poseidon2-channel \
+//!   STEPS=7    cargo test -p vos-pvm-proof-verifier --release --features poseidon2-channel \
 //!                --test measure_finish_line measure -- --exact --nocapture
 
 use std::time::Instant;

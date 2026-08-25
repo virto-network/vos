@@ -6,7 +6,7 @@
 
 //! Program-identity public API.
 //!
-//! In zkpvm, a proof's preprocessed-trace Merkle root IS the program
+//! In vos-pvm-proof, a proof's preprocessed-trace Merkle root IS the program
 //! commitment.  These tests demonstrate the publish-once / verify-many
 //! workflow: run the prover once on representative input, extract the
 //! commitment via `program_commitment_of_proof`, then check that

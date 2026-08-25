@@ -1404,7 +1404,7 @@ fn spawn_installed_agents(
                 let Some(db_path) = raft_db_path_for_row(data_dir, &prepared) else {
                     continue;
                 };
-                match raft_members_for_row(node, &db_path, &a, local_prefix, &mut boot_grace) {
+                match raft_members_for_row(node, &db_path, a, local_prefix, &mut boot_grace) {
                     Ok(seed @ (RaftSeed::Members { .. } | RaftSeed::Join { .. })) => Some(seed),
                     Ok(RaftSeed::Defer(reason)) => {
                         tracing::info!(
@@ -1679,6 +1679,7 @@ fn catalog_artifact_support(artifact: &[u8]) -> RowCatalogSupport {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum RoleAuthorityResolution {
     Ready(vos::service::RoleAuthorityBinding),
     MissingBlob,
@@ -2885,7 +2886,7 @@ fn raft_members_for_row(
     }
 
     let anchored = db_path.exists()
-        && vos::raft::persisted_membership(&db_path)
+        && vos::raft::persisted_membership(db_path)
             .unwrap_or_default()
             .is_some();
 
@@ -3048,9 +3049,8 @@ fn request_raft_join(
                 return Ok(Err(RejectedRaftJoin {
                     reason: format!(
                         "this node ({local_prefix:#06x}) is not enrolled as a voter for \
-                         agent '{}'; an admin must run `vosx space members add <peer> \
+                         agent '{instance_name}'; an admin must run `vosx space members add <peer> \
                          --role voter`",
-                        instance_name,
                     ),
                     membership_may_have_changed: false,
                 }));
@@ -3058,8 +3058,7 @@ fn request_raft_join(
             Ok(RaftJoinResult::PolicyMismatch) => {
                 return Ok(Err(RejectedRaftJoin {
                     reason: format!(
-                        "agent '{}' uses a different production trust policy than its Raft group",
-                        instance_name,
+                        "agent '{instance_name}' uses a different production trust policy than its Raft group",
                     ),
                     membership_may_have_changed: false,
                 }));
@@ -3494,7 +3493,7 @@ fn reconcile_installed_agents(
             let Some(db_path) = raft_db_path_for_row(data_dir, &prepared) else {
                 continue;
             };
-            match raft_members_for_row(node, &db_path, &a, local_prefix, boot_grace) {
+            match raft_members_for_row(node, &db_path, a, local_prefix, boot_grace) {
                 Ok(seed @ (RaftSeed::Members { .. } | RaftSeed::Join { .. })) => {
                     damped.remove(&key(RowNote::RaftWaiting));
                     Some(seed)

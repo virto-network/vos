@@ -59,18 +59,10 @@ pub fn path() -> PathBuf {
     config_root().join("cli_cache.toml")
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct CliCache {
     #[serde(default, rename = "space")]
     pub spaces: BTreeMap<String, SpaceCache>,
-}
-
-impl Default for CliCache {
-    fn default() -> Self {
-        Self {
-            spaces: BTreeMap::new(),
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]

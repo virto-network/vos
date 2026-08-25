@@ -83,8 +83,7 @@ fn test_three_reg_op(opcode: Opcode, r0: u64, r1: u64, expected: u64) {
     let steps = run_three_reg(opcode, 0, 1, 2, regs);
     assert_eq!(
         steps[0].regs_after[2], expected,
-        "opcode {:?}: {} op {} != {}",
-        opcode, r0, r1, expected
+        "opcode {opcode:?}: {r0} op {r1} != {expected}"
     );
     let code = vec![opcode as u8, 0x10, 2, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 0, 1];

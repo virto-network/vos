@@ -121,10 +121,10 @@ enum Command {
     },
     /// Provable-program pinning: `vosx zk pin` measures a provable actor's
     /// canonical commitment allowlist + entering-image root + witness address
-    /// and writes them to a catalog artifact verifiers trust. The heavy zkpvm
+    /// and writes them to a catalog artifact verifiers trust. The heavy proof
     /// work runs in the prover extension (`measure_catalog`), so this needs a
     /// space that's `up` with the prover extension loaded; `vosx` itself pulls
-    /// no zkpvm.
+    /// no prover dependency.
     Zk {
         #[command(subcommand)]
         command: commands::zk::ZkCommand,

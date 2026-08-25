@@ -1,6 +1,6 @@
 //! Public access to framework types for the standalone verifier.
 //!
-//! This module re-exports the types and functions needed by `zkpvm-verifier`
+//! This module re-exports the types and functions needed by `vos-pvm-proof-verifier`
 //! without requiring the full `SideNote` / trace generation infrastructure.
 
 #[allow(unused_imports)]

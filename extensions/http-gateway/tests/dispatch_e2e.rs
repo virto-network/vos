@@ -624,8 +624,7 @@ fn concurrent_keepalive_connections_interleave() {
                 assert_eq!(
                     body,
                     &(a + 7).to_string(),
-                    "conn {m} req {k}: reply cross-talk? want {}+7",
-                    a,
+                    "conn {m} req {k}: reply cross-talk? want {a}+7",
                 );
             }
         }));

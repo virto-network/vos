@@ -1032,7 +1032,7 @@ mod crdt {
             // our clock, so the sets differ and we reload to converge. This is
             // conservative: it never skips a real merge (any divergence reloads),
             // it only drops the redundant self-commit restart.
-            let persisted = load_clock(&self.db).unwrap_or_else(MerkleClock::new);
+            let persisted = load_clock(&self.db).unwrap_or_default();
             self.clock.roots() != persisted.roots()
         }
 

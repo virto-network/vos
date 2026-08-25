@@ -200,6 +200,7 @@ impl ServiceWire for RootTreeInvocation {
 /// barrier. The destination guest still authenticates the source receipt,
 /// full outbox membership, service identity, deadline and deduplication.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum RootTreeTransport {
     OutboxDelivery {
         publication: PublicationRecord,
@@ -756,6 +757,7 @@ pub struct CommittedCrdtSync {
 
 /// Durable disposition of a retried direct root invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum RootTreeIngressRecovery {
     Fresh,
     Queued {
@@ -771,6 +773,7 @@ pub enum RootTreeIngressRecovery {
     Completed,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum RootTreeServiceDriver<B> {
     Direct(ServiceRuntime<DeviceSignerRefineHost, DurableServiceStore<B>>),
     #[cfg(feature = "storage")]
@@ -779,6 +782,7 @@ enum RootTreeServiceDriver<B> {
     ),
 }
 
+#[allow(clippy::large_enum_variant)]
 enum RootTreeDriverConfig {
     Direct,
     #[cfg(feature = "storage")]
@@ -2895,8 +2899,8 @@ where
         else {
             return Ok(None);
         };
-        let record = DeliveryRecord::decode(&bytes)
-            .map_err(|_| LocalRootTreeInvokeError::CorruptWorkflow)?;
+        let record =
+            DeliveryRecord::decode(bytes).map_err(|_| LocalRootTreeInvokeError::CorruptWorkflow)?;
         if record.call_id != message.call_id {
             return Err(LocalRootTreeInvokeError::CorruptWorkflow);
         }

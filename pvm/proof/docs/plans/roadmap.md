@@ -1,10 +1,10 @@
-# zkpvm — prover perf & mobile-proving roadmap
+# vos-pvm-proof — prover perf & mobile-proving roadmap
 
 The single forward-looking doc for prover performance. Implementation
 history lives in `git log`; this is the "state + decisions + open
 questions + measured dead-ends" survivor.
 
-**Question.** What does it take to generate zkpvm proofs on phone-class
+**Question.** What does it take to generate vos-pvm-proof proofs on phone-class
 hardware (aarch64, ~3 GB usable app RAM, NEON)? Two workloads with very
 different gaps:
 
@@ -207,7 +207,7 @@ to 1-in-96 rows (a gate multiplies the numerator; the column still spans
 No source-level blocker: stwo's SimdBackend is portable `std::simd`
 (u32×16) with a hand-written NEON kernel for the hot M31 multiply
 (`vqdmull_s32`); Blake2s Merkle + PoW grind are portable SIMD that
-lowers to NEON; zkpvm itself has no intrinsics. Setup-level items:
+lowers to NEON; vos-pvm-proof itself has no intrinsics. Setup-level items:
 
 - Nightly toolchain per `rust-toolchain.toml` (portable_simd) for the
   aarch64 target; NDK/iOS clang for `blst` (unavoidable via javm →
@@ -225,9 +225,9 @@ lowers to NEON; zkpvm itself has no intrinsics. Setup-level items:
 
 ### Cross-compile recipe (x86_64 Linux host → aarch64-unknown-linux-gnu)
 
-The no-device half is landed and verified: `zkpvm --features prover`
+The no-device half is landed and verified: `vos-pvm-proof --features prover`
 and `prover-extension` cross-`check` clean, and `mobile_bench` (the
-on-device artifact, `zkpvm/src/bin/mobile_bench.rs`) links and runs
+on-device artifact, `pvm/proof/src/bin/mobile_bench.rs`) links and runs
 under qemu-user with the proof *verifying* — an end-to-end correctness
 gate for the portable-SIMD/NEON prover path on ARM.
 
@@ -245,9 +245,9 @@ From a clean checkout (rust-toolchain.toml pins the nightly; rustup
 installs the target into it):
 
     rustup target add aarch64-unknown-linux-gnu
-    cargo check -p zkpvm --features prover --target aarch64-unknown-linux-gnu
+    cargo check -p vos-pvm-proof --features prover --target aarch64-unknown-linux-gnu
     cargo check -p prover-extension --target aarch64-unknown-linux-gnu
-    cargo build --release -p zkpvm --bin mobile_bench \
+    cargo build --release -p vos-pvm-proof --bin mobile_bench \
         --target aarch64-unknown-linux-gnu
 
 Emulated smoke (correctness only — qemu timings are meaningless):
@@ -416,7 +416,7 @@ succinct-witness step reduction.
 Single-proof + per-stage benchmark methodology (7-trial median protocol,
 STANDARD vs MOBILE stage breakdowns, opcode-mix profiles) is in git
 history — regenerate the current numbers with the `prove` / `actors`
-benches (`cargo test -p zkpvm --release --test prove_vos_actor
+benches (`cargo test -p vos-pvm-proof --release --test prove_vos_actor
 profile_clerk_private_pay_bench{,_mobile} -- --exact --nocapture`, 7
 trials, discard the cold trial, take the median). The current chain
 numbers live in Status above.

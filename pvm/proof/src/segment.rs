@@ -336,6 +336,8 @@ mod prover {
         next: usize,
     }
 
+    type ClosedWindows = (Option<(usize, usize)>, Option<(usize, usize)>);
+
     impl BudgetedCutter {
         /// Panics if either budget is zero (the historical
         /// `segment_bounds_budgeted` contract).
@@ -357,10 +359,7 @@ mod prover {
         /// least one step, so a lone oversize step still segments) and the
         /// window closed AFTER it (the step budget filled), either or both
         /// `None`.
-        fn feed(
-            &mut self,
-            ranges: &[(u32, u32)],
-        ) -> (Option<(usize, usize)>, Option<(usize, usize)>) {
+        fn feed(&mut self, ranges: &[(u32, u32)]) -> ClosedWindows {
             let i = self.next;
             for &(addr, len) in ranges {
                 crate::page_merkle::add_range(&mut self.pages, addr, len);

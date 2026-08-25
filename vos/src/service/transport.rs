@@ -49,6 +49,7 @@ pub struct CommittedReplyResume {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum InboxDrainOutcome {
     Committed(CommittedInboxSlice),
     Retired {

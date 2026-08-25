@@ -191,14 +191,14 @@ fn read_row(key: &[u8]) -> Option<Vec<u8>> {
     enum Witnessed {
         Hit(Option<Vec<u8>>),
         Unproven,
-        NotWitnessed,
+        Disabled,
     }
     let witnessed = with_state(|s| match &s.witness {
         Some(rows) => match rows.get(key) {
             Some(value) => Witnessed::Hit(value.clone()),
             None => Witnessed::Unproven,
         },
-        None => Witnessed::NotWitnessed,
+        None => Witnessed::Disabled,
     });
     match witnessed {
         Witnessed::Hit(value) => value,
@@ -206,7 +206,7 @@ fn read_row(key: &[u8]) -> Option<Vec<u8>> {
             "unproven storage read of key {key:x?} — the task witness does not \
              carry this key; the invoker must name every row the handler touches",
         ),
-        Witnessed::NotWitnessed => backend_read(key),
+        Witnessed::Disabled => backend_read(key),
     }
 }
 
@@ -1314,17 +1314,17 @@ mod tests {
     #[test]
     fn fill_page_respects_row_and_byte_budgets() {
         fresh();
-        let mut it = (0..100u64).map(|i| i);
+        let mut it = (0..100u64);
         let (page, more) = fill_page(&mut it, 10, usize::MAX);
         assert_eq!(page.len(), 10);
         assert!(more);
         // Byte budget bites first: u64 encodes to 8 bytes.
-        let mut it = (0..100u64).map(|i| i);
+        let mut it = (0..100u64);
         let (page, more) = fill_page(&mut it, 1000, 40);
         assert!(page.len() <= 6, "byte budget must bound the page");
         assert!(more);
         // Exhaustion reports no more.
-        let mut it = (0..3u64).map(|i| i);
+        let mut it = (0..3u64);
         let (page, more) = fill_page(&mut it, 10, usize::MAX);
         assert_eq!(page.len(), 3);
         assert!(!more);

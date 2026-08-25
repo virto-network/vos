@@ -650,7 +650,7 @@ pub fn reconstruct_oods_for_recursion(proof: &Proof, side_note: &SideNote) -> Oo
 }
 
 /// The verifier-side state the native-recursion data extraction builds by
-/// replaying the zkpvm-specific FS-mix prefix of `verify` (the single source of
+/// replaying the vos-pvm-proof-specific FS-mix prefix of `verify` (the single source of
 /// truth for that load-bearing mix order — see [`recursion_verify_prefix`]).
 #[cfg(feature = "poseidon2-channel")]
 struct RecursionVerifyContext {
@@ -661,7 +661,7 @@ struct RecursionVerifyContext {
     verifier_components: alloc::vec::Vec<alloc::boxed::Box<dyn Component>>,
 }
 
-/// Replay the zkpvm-specific Fiat-Shamir prefix `verify` drives on `channel` and
+/// Replay the vos-pvm-proof-specific Fiat-Shamir prefix `verify` drives on `channel` and
 /// `commitment_scheme`, up to and including the interaction-tree commit: mix the
 /// per-component log sizes, commit the preprocessed + main trees, mix the boundary
 /// state (gated on `closing_chip_active`), draw the lookup elements, then mix the
@@ -783,7 +783,7 @@ pub struct RecursionTranscript {
     /// The number of permutations performed BEFORE stwo's verifier head — i.e.
     /// through the interaction-tree commit. The composition `random_coeff` is the
     /// first `Squeeze` record at-or-after this index (the head's first draw); the
-    /// records before it are the zkpvm prefix (log-size mix, preprocessed+main
+    /// records before it are the vos-pvm-proof prefix (log-size mix, preprocessed+main
     /// commit, boundary-state mix, per-relation lookup-element draws, claimed-sum
     /// mix, interaction commit).
     pub prefix_len: usize,
@@ -791,7 +791,7 @@ pub struct RecursionTranscript {
 
 /// Record a real canonical segment proof's full verifier transcript by handing a
 /// recording [`Poseidon2M31Channel`](crate::poseidon2::Poseidon2M31Channel)
-/// through the SAME Fiat-Shamir sequence [`verify`] drives — the zkpvm prefix
+/// through the SAME Fiat-Shamir sequence [`verify`] drives — the vos-pvm-proof prefix
 /// ([`recursion_verify_prefix`]) followed by stwo's `verify` head + FRI commit +
 /// PoW + query sampling + Merkle decommit. Every absorb/squeeze/pow permutation
 /// lands in [`RecursionTranscript::records`] in caller order. This calls the REAL
@@ -814,7 +814,7 @@ pub fn record_canonical_transcript(proof: &Proof, side_note: &SideNote) -> Recur
     let components_ref: alloc::vec::Vec<&dyn Component> =
         ctx.verifier_components.iter().map(|c| &**c).collect();
 
-    // Everything so far is the zkpvm prefix; stwo's `verify` drives the head
+    // Everything so far is the vos-pvm-proof prefix; stwo's `verify` drives the head
     // (random_coeff, composition commit, oods, sampled mix, DEEP coeff), the FRI
     // commit (per-layer roots + fold alphas), PoW, and query sampling next.
     let prefix_len = recorder.borrow().len();

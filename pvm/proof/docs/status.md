@@ -1,4 +1,4 @@
-# zkpvm — implementation status
+# vos-pvm-proof — implementation status
 
 A snapshot of which constraints / chips bind which PVM semantics
 in-circuit, and which gaps remain prover-trusted.  Phase numbers

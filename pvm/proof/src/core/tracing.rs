@@ -472,7 +472,7 @@ impl TracingPvm {
     fn handle_blake2b_ecall(&mut self) {
         // Read h (64 bytes) from memory at address in φ[7] (a0).
         //
-        // Register convention: zkpvm-precompiles shim emits a0/a1/a2/a3
+        // Register convention: vos-pvm-precompiles shim emits a0/a1/a2/a3
         // → h_ptr/m_ptr/t_low/f_flag, which grey-transpiler maps to PVM
         // φ[7/8/9/10].  Same off-by-three alignment as the other
         // precompile handlers (commit 02922c4 + this session's
@@ -549,7 +549,7 @@ impl TracingPvm {
         // PVM register convention (matches grey-transpiler's RISC-V → PVM
         // mapping in `riscv.rs::map_register`):
         //   φ[7] = A0 (RISC-V x10), φ[8] = A1, φ[9] = A2.
-        // The zkpvm-precompiles shim's inline asm uses `in("a0") scalar_ptr`
+        // The vos-pvm-precompiles shim's inline asm uses `in("a0") scalar_ptr`
         // etc., which the transpiler routes to φ[7/8/9].  Earlier code read
         // φ[10/11/12] (= A3/A4/A5) and silently saw zeros for transpiled
         // actor traces — the bug that kept the comb-method path dormant in
@@ -657,7 +657,7 @@ impl TracingPvm {
     /// output (canonical zero scalar).
     fn handle_scalar_reduce_wide_ecall(&mut self) {
         // PVM A0/A1 = φ[7/8] per grey-transpiler's RISC-V → PVM
-        // mapping (x10/x11 → φ[7/8]).  The zkpvm-precompiles shim
+        // mapping (x10/x11 → φ[7/8]).  The vos-pvm-precompiles shim
         // uses `in("a0") wide_ptr, in("a1") output_ptr` so the
         // pointers land in φ[7/8].  The previous handler read
         // φ[10/11] (= a3/a4), part of the same off-by-three bug

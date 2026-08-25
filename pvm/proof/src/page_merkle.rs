@@ -65,9 +65,9 @@ const IV: [u64; 8] = [
 const PARAM_XOR_256: u64 = 0x0101_0020;
 
 /// Domain tag prepended as the full first 128-byte block of a leaf hash.
-const TAG_LEAF: &[u8] = b"zkpvm/page-merkle/leaf/v1";
+const TAG_LEAF: &[u8] = b"vos-pvm-proof/page-merkle/leaf/v1";
 /// Domain tag prepended as the full first 128-byte block of a node hash.
-const TAG_NODE: &[u8] = b"zkpvm/page-merkle/node/v1";
+const TAG_NODE: &[u8] = b"vos-pvm-proof/page-merkle/node/v1";
 
 const BLOCK: usize = 128;
 

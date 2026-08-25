@@ -1,7 +1,7 @@
 //! Crypto precompiles — single-entry-point hashes/curves available to
 //! every actor and worker.
 //!
-//! The shape mirrors `zkpvm-precompiles`: each algorithm exposes a
+//! The shape mirrors `vos-pvm-precompiles`: each algorithm exposes a
 //! high-level helper that on `target_arch = "riscv64"` dispatches to
 //! a host ECALL (so PVM actors get the host's accelerated impl), and
 //! on every other target falls through to a self-contained software

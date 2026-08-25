@@ -4,7 +4,9 @@
 
 ```bash
 vosx space new team
-vosx space up team --service-pvm services/vos-service/vos-service.pvm
+vosx space up team \
+  --service-pvm services/vos-service/vos-service.pvm \
+  --production-trust-socket /run/vos/trust.sock
 vosx space info team
 ```
 
@@ -54,4 +56,3 @@ cargo run -p vosx -- release verify target/production-release
 
 Release verification rejects symlinks, special files, extra files, digest
 mismatches, and non-reproducible PVM output.
-

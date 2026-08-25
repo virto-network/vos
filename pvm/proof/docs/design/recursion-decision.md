@@ -2,7 +2,7 @@
 
 **Question.** Can the N per-segment proofs of a `verify_chain` be folded into ONE
 recursive proof — verifying each segment plus boundary (incl. memory) continuity
-inside a recursive STARK — on this M31/Blake2s zkpvm?
+inside a recursive STARK — on this M31/Blake2s vos-pvm-proof?
 
 **Verdict: native FRI-STARK recursion is not viable here (measured), and Track A
 does not need it.** Two products share one verifier:

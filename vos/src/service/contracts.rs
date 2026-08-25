@@ -1773,7 +1773,7 @@ impl Transition {
             outbox: self.outbox.clone(),
             reply: self.reply.clone(),
             exported_blobs: self.exported_blobs.clone(),
-            gas: self.gas.clone(),
+            gas: self.gas,
             proof: None,
         }
     }
@@ -4085,7 +4085,7 @@ impl ServiceWire for AttestationProofManifest {
         {
             return Err(DecodeError::NonCanonical);
         }
-        let mut hashes = value.segments.iter().copied().collect::<Vec<_>>();
+        let mut hashes = value.segments.to_vec();
         hashes.sort_unstable();
         if hashes.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(DecodeError::NonCanonical);
@@ -5742,8 +5742,8 @@ fn decode_checkpoint_token(d: &mut Decoder<'_>) -> Result<CheckpointToken, Decod
     if value.change.is_some() != is_crdt
         || value.base_causal_height.is_some() != is_crdt
         || value.change.is_some_and(|dispatch| dispatch.ordinal != 0)
-        || value.expected.is_some() != !value.previously_suspended.is_empty()
-        || value.replacement.is_some() != !value.suspended.is_empty()
+        || value.expected.is_some() == value.previously_suspended.is_empty()
+        || value.replacement.is_some() == value.suspended.is_empty()
         || value.pending_call.is_some() != value.pending_actor.is_some()
         || value.pending_actor.is_some_and(|actor| {
             value.suspended.binary_search(&actor).is_err()
@@ -7971,7 +7971,7 @@ mod tests {
         let manifest = AttestationProofManifest {
             proof_system: AttestationProofManifest::proof_system(),
             initial_root: Hash([91; 32]),
-            segments: vec![first.clone(), second.clone()],
+            segments: vec![first, second],
         };
         assert_eq!(
             AttestationProofManifest::decode(&manifest.encode()).unwrap(),

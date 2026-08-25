@@ -81,7 +81,7 @@ pub mod crypto;
 /// Service packages and persisted stores use this contract exclusively.
 pub mod service;
 
-/// ZK actor-IO ABI: bind a zkpvm proof to a `(public, return)` tuple
+/// ZK actor-I/O ABI: bind a PVM execution proof to a `(public, return)` tuple
 /// (TAGLESS — program identity lives in the proof's program commitment,
 /// not the hash).  `compute_io_hash` is always available (guest + host);
 /// the guest-side `bind_io` is `pvm`-gated.  Proof verification (STARK

@@ -644,7 +644,7 @@ mod tests {
     fn forbidden_displays_user_facing_text() {
         // Display text is what bubbles up through anyhow chains
         // and into vosx stderr. Lock the wording.
-        let s = alloc::format!("{}", Forbidden);
+        let s = alloc::format!("{Forbidden}");
         assert!(
             s.contains("permission denied"),
             "Forbidden display must contain 'permission denied'; got: {s}",

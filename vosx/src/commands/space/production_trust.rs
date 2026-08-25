@@ -218,7 +218,7 @@ fn exchange_with_timeout(
     let mut len = [0u8; 4];
     read_exact_until(&mut stream, &mut len, deadline).map_err(ProductionTrustSocketError::Io)?;
     let len = u32::from_le_bytes(len) as usize;
-    if len < 69 || len > 77 {
+    if !(69..=77).contains(&len) {
         return Err(ProductionTrustSocketError::InvalidResponse);
     }
     let mut response = vec![0; len];

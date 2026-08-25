@@ -1704,7 +1704,8 @@ fn extract_storage_fields(input: &mut ItemStruct) -> Vec<StorageField> {
         return out;
     };
     for field in named.named.iter_mut() {
-        let mut storage: Option<(Option<String>, bool, Option<String>, Option<String>)> = None;
+        type StorageAttribute = (Option<String>, bool, Option<String>, Option<String>);
+        let mut storage: Option<StorageAttribute> = None;
         field.attrs.retain(|attr| {
             if !attr.path().is_ident("storage") {
                 return true;

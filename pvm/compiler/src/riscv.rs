@@ -218,7 +218,7 @@ impl TranslationContext {
                     _ => {
                         return Err(TranspileError::UnsupportedInstruction {
                             offset: _addr as usize,
-                            detail: format!("JALR funct3={}", funct3),
+                            detail: format!("JALR funct3={funct3}"),
                         });
                     }
                 }
@@ -276,12 +276,7 @@ impl TranslationContext {
                                         self.emit_ecalli(id);
                                         self.last_t0_imm = None;
                                     }
-                                    _ => {
-                                        // No marker (legacy) — treat as ecalli for backward compat
-                                        let id = self.last_t0_imm.unwrap_or(0) as u32;
-                                        self.emit_ecalli(id);
-                                        self.last_t0_imm = None;
-                                    }
+                                    _ => self.emit_inst(0), // unmarked ECALL → trap
                                 }
                             }
                             1 => self.emit_inst(0), // EBREAK → trap
@@ -365,7 +360,7 @@ impl TranslationContext {
                     _ => {
                         return Err(TranspileError::UnsupportedInstruction {
                             offset: _addr as usize,
-                            detail: format!("custom-0 funct7={:#x} funct3={}", funct7, funct3),
+                            detail: format!("custom-0 funct7={funct7:#x} funct3={funct3}"),
                         });
                     }
                 }
@@ -373,7 +368,7 @@ impl TranslationContext {
             _ => {
                 return Err(TranspileError::UnsupportedInstruction {
                     offset: _addr as usize,
-                    detail: format!("unknown opcode {:#x}", opcode),
+                    detail: format!("unknown opcode {opcode:#x}"),
                 });
             }
         }
@@ -506,7 +501,7 @@ impl TranslationContext {
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
-                        detail: format!("branch funct3={}", funct3),
+                        detail: format!("branch funct3={funct3}"),
                     });
                 }
             };
@@ -527,7 +522,7 @@ impl TranslationContext {
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
-                        detail: format!("branch funct3={}", funct3),
+                        detail: format!("branch funct3={funct3}"),
                     });
                 }
             };
@@ -548,7 +543,7 @@ impl TranslationContext {
             _ => {
                 return Err(TranspileError::UnsupportedInstruction {
                     offset: 0,
-                    detail: format!("branch funct3={}", funct3),
+                    detail: format!("branch funct3={funct3}"),
                 });
             }
         };
@@ -638,7 +633,7 @@ impl TranslationContext {
             _ => {
                 return Err(TranspileError::UnsupportedInstruction {
                     offset: 0,
-                    detail: format!("load funct3={}", funct3),
+                    detail: format!("load funct3={funct3}"),
                 });
             }
         };
@@ -675,7 +670,7 @@ impl TranslationContext {
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
-                        detail: format!("store funct3={}", funct3),
+                        detail: format!("store funct3={funct3}"),
                     });
                 }
             };
@@ -702,7 +697,7 @@ impl TranslationContext {
             _ => {
                 return Err(TranspileError::UnsupportedInstruction {
                     offset: 0,
-                    detail: format!("store funct3={}", funct3),
+                    detail: format!("store funct3={funct3}"),
                 });
             }
         };
@@ -852,7 +847,7 @@ impl TranslationContext {
                         _ => {
                             return Err(TranspileError::UnsupportedInstruction {
                                 offset: 0,
-                                detail: format!("Zbb rs2={}", rs2),
+                                detail: format!("Zbb rs2={rs2}"),
                             });
                         }
                     };
@@ -1273,7 +1268,7 @@ impl TranslationContext {
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
-                        detail: format!("OP funct7=0x20 funct3={}", funct3),
+                        detail: format!("OP funct7=0x20 funct3={funct3}"),
                     });
                 }
             }
@@ -1287,7 +1282,7 @@ impl TranslationContext {
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
-                        detail: format!("Zbb f7=5 f3={}", funct3),
+                        detail: format!("Zbb f7=5 f3={funct3}"),
                     });
                 }
             }
@@ -1311,7 +1306,7 @@ impl TranslationContext {
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
-                        detail: format!("Zbb f7=30 f3={}", funct3),
+                        detail: format!("Zbb f7=30 f3={funct3}"),
                     });
                 }
             };
@@ -1352,7 +1347,7 @@ impl TranslationContext {
         } else {
             return Err(TranspileError::UnsupportedInstruction {
                 offset: 0,
-                detail: format!("OP funct7={:#x} funct3={}", funct7, funct3),
+                detail: format!("OP funct7={funct7:#x} funct3={funct3}"),
             });
         };
 
@@ -1409,7 +1404,7 @@ impl TranslationContext {
                         _ => {
                             return Err(TranspileError::UnsupportedInstruction {
                                 offset: 0,
-                                detail: format!("Zbb-W rs2={}", rs2),
+                                detail: format!("Zbb-W rs2={rs2}"),
                             });
                         }
                     };
@@ -1447,7 +1442,7 @@ impl TranslationContext {
             _ => {
                 return Err(TranspileError::UnsupportedInstruction {
                     offset: 0,
-                    detail: format!("OP-IMM-32 funct3={}", funct3),
+                    detail: format!("OP-IMM-32 funct3={funct3}"),
                 });
             }
         }
@@ -1554,7 +1549,7 @@ impl TranslationContext {
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
-                        detail: format!("OP-32 x0-as-rs1: funct7={:#x} funct3={}", funct7, funct3),
+                        detail: format!("OP-32 x0-as-rs1: funct7={funct7:#x} funct3={funct3}"),
                     });
                 }
             }
@@ -1588,7 +1583,7 @@ impl TranslationContext {
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
-                        detail: format!("OP-32 x0-as-rs2: funct7={:#x} funct3={}", funct7, funct3),
+                        detail: format!("OP-32 x0-as-rs2: funct7={funct7:#x} funct3={funct3}"),
                     });
                 }
             }
@@ -1608,7 +1603,7 @@ impl TranslationContext {
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
-                        detail: format!("OP-32 M funct3={}", funct3),
+                        detail: format!("OP-32 M funct3={funct3}"),
                     });
                 }
             }
@@ -1619,7 +1614,7 @@ impl TranslationContext {
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
-                        detail: format!("OP-32 funct7=0x20 funct3={}", funct3),
+                        detail: format!("OP-32 funct7=0x20 funct3={funct3}"),
                     });
                 }
             }
@@ -1631,7 +1626,7 @@ impl TranslationContext {
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
-                        detail: format!("OP-32 f7=30 f3={}", funct3),
+                        detail: format!("OP-32 f7=30 f3={funct3}"),
                     });
                 }
             };
@@ -1652,14 +1647,14 @@ impl TranslationContext {
                 _ => {
                     return Err(TranspileError::UnsupportedInstruction {
                         offset: 0,
-                        detail: format!("OP-32 funct3={}", funct3),
+                        detail: format!("OP-32 funct3={funct3}"),
                     });
                 }
             }
         } else {
             return Err(TranspileError::UnsupportedInstruction {
                 offset: 0,
-                detail: format!("OP-32 funct7={:#x} funct3={}", funct7, funct3),
+                detail: format!("OP-32 funct7={funct7:#x} funct3={funct3}"),
             });
         };
 
@@ -1912,10 +1907,7 @@ impl TranslationContext {
                 self.jump_table[jt_idx] = pvm_target;
             } else {
                 unresolved += 1;
-                eprintln!(
-                    "grey: unresolved return_fixup jt_idx={jt_idx} rv_addr={:#x}",
-                    rv_addr
-                );
+                eprintln!("grey: unresolved return_fixup jt_idx={jt_idx} rv_addr={rv_addr:#x}");
             }
         }
         if unresolved > 0 {
@@ -2214,5 +2206,13 @@ mod tests {
             "a store must not remove a base address that later instructions can reuse",
         );
         assert!(ctx.code.len() > address_load.len());
+    }
+
+    #[test]
+    fn unmarked_ecall_traps_instead_of_calling_a_capability() {
+        let mut ctx = TranslationContext::new(true);
+        ctx.translate_instruction(&0x0000_0073_u32.to_le_bytes(), 0, 0)
+            .unwrap();
+        assert_eq!(ctx.code, [0], "unmarked ECALL must compile to trap");
     }
 }

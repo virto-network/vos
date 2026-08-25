@@ -7,7 +7,7 @@ constraint re-evaluation at the OODS point. It carries only the VERIFY side (no
 `wasm32-unknown-unknown` and the JAM PVM (`riscv64em-vos`), and it executes and
 **ACCEPTS real proofs on the PVM**. This is the on-chain verify for a single
 light segment proof — the Track-A path in
-`zkpvm/docs/design/recursion-decision.md`.
+`vos-pvm-proof/docs/design/recursion-decision.md`.
 
 ## Why a separate workspace
 
@@ -31,12 +31,12 @@ full verify; it is the on-chain finish-line gate.
 just build-settle      # from the vos repo root
 ```
 
-This produces `target/riscv64em-vos/release/settle.elf`, which gates two zkpvm
+This produces `target/riscv64em-vos/release/settle.elf`, which gates two vos-pvm-proof
 tests (both SKIP, not fail, if the ELF is absent):
 
-- `cargo test -p zkpvm --test settle_transpile` — the ELF transpiles to JAM PVM
+- `cargo test -p vos-pvm-proof --test settle_transpile` — the ELF transpiles to JAM PVM
   bytecode (`grey_transpiler::link_elf`).
-- `cargo test -p zkpvm --test settle_run` — the transpiled blob executes on the
+- `cargo test -p vos-pvm-proof --test settle_run` — the transpiled blob executes on the
   tracing PVM and ACCEPTS the honest fixture (`a0 = 0xACCE`), reporting the
   on-chain cycle count.
 
@@ -47,7 +47,7 @@ The embedded fixture (`fixtures/bool_proof.postcard`) IS committed. Regenerate i
 ONLY if the proof wire format changes, then rebuild the ELF:
 
 ```sh
-cargo test -p zkpvm --test settle_fixture   # regenerates the postcard fixture
+cargo test -p vos-pvm-proof --test settle_fixture   # regenerates the postcard fixture
 just build-settle
 ```
 

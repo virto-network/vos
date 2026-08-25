@@ -258,12 +258,12 @@ mod tests {
             imm_y: 9,
             branch_target: 0x40,
             branch_taken: ts % 2 == 0,
-            mem_read: (ts % 3 == 0).then(|| MemAccess {
+            mem_read: (ts % 3 == 0).then_some(MemAccess {
                 address: 0x100,
                 value: 5,
                 size: 4,
             }),
-            mem_write: (ts % 3 == 1).then(|| MemAccess {
+            mem_write: (ts % 3 == 1).then_some(MemAccess {
                 address: 0x200,
                 value: 6,
                 size: 8,

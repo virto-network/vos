@@ -1,4 +1,4 @@
-//! F2 spike measurement artifact: full-AIR `zkpvm-verifier` verification
+//! F2 spike measurement artifact: full-AIR `vos-pvm-proof-verifier` verification
 //! compiled to wasm32-unknown-unknown, one export per embedded proof fixture.
 //!
 //! Return codes: 1 = proof verified, 0 = verification rejected, 2 = postcard
@@ -8,7 +8,7 @@
 //!
 //! The crate itself is `#![no_std]` (alloc only). wasm32-unknown-unknown has no
 //! default allocator or panic handler, so we supply a small `dlmalloc` global
-//! allocator and a minimal panic handler below. The `zkpvm-verifier` library
+//! allocator and a minimal panic handler below. The `vos-pvm-proof-verifier` library
 //! stays `no_std`; only this measurement embedding needs the runtime support.
 
 #![no_std]

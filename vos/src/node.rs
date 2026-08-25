@@ -7572,7 +7572,7 @@ fn decode_service_origin(wire: &[u8], cursor: &mut usize) -> Option<crate::servi
                 .then_some(crate::service::Origin::Member(crate::service::SubjectId(
                     bytes,
                 )))
-                .or_else(|| {
+                .or({
                     Some(crate::service::Origin::Actor(crate::service::ActorId(
                         bytes,
                     )))
@@ -8501,9 +8501,9 @@ fn resolve_service_raft_leader_route_before(
         .connected_peers()
         .into_iter()
         .filter(|peer| {
-            !exact_bootstrap
+            exact_bootstrap
                 .as_ref()
-                .is_some_and(|(_, exact)| exact == peer)
+                .is_none_or(|(_, exact)| exact != peer)
         })
         .collect::<Vec<_>>();
     let (connected_window, next_candidate_cursor) = service_raft_connected_candidate_window(
@@ -9626,7 +9626,7 @@ fn handle_service_root_transport<B>(
                 )
             })
             .filter(|peer| {
-                crate::network::derive_node_prefix(&peer) == envelope.from.node_prefix()
+                crate::network::derive_node_prefix(peer) == envelope.from.node_prefix()
                     && envelope.from.local_id() == id.local_id()
                     && service_crdt_sync_peer_allowed(
                         invoke_routes,

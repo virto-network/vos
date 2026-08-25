@@ -2,7 +2,7 @@
 
 //! Mode::External voucher-proof pipeline smoke test.
 //!
-//! Loads `tests/fixtures/legacy-v1/actors/voucher-check`'s PVM ELF, traces a bare run
+//! Loads `pvm/proof/fixtures/voucher-check`'s PVM ELF, traces a bare run
 //! (no injected witness — the guest early-exits without proving),
 //! proves it, then verifies via `vos_pvm_proof_verifier::verify_standalone`
 //! against the program-commitment hash extracted from the proof.
@@ -28,7 +28,7 @@
 //! Build the actor first:
 //!     just build-voucher-check
 //! Or directly:
-//!     cd tests/fixtures/legacy-v1/actors/voucher-check && cargo +nightly build --release
+//!     cd pvm/proof/fixtures/voucher-check && cargo +nightly build --release
 
 use vos_pvm_proof::{
     SideNote, program_commitment_hex, program_commitment_of_proof, prove, prove_mobile,
@@ -130,7 +130,7 @@ fn prove_verify_voucher_check_bare_run() {
 
 /// Constraint-debug helper (feature `debug-internals`).  Pinpoints
 /// which chip's row + constraint fails for the voucher-check trace.
-/// Run with `cargo test -p zkpvm --features debug-internals --test
+/// Run with `cargo test -p vos-pvm-proof --features debug-internals --test
 /// voucher_check_smoke debug_voucher_check_constraints -- --nocapture`
 /// to get a `row #X, constraint #Y` panic from the first chip whose
 /// assertions don't hold.
@@ -274,7 +274,7 @@ fn final_state_registers_are_stark_bound() {
 /// `chips/register_memory_closing.rs`. These honest-prover tests are
 /// unaffected.)
 ///
-/// This pins the mechanism end-to-end at the zkpvm level: the binding is
+/// This pins the mechanism end-to-end at the vos-pvm-proof level: the binding is
 /// non-zero (the actor really bound a hash), deterministic across
 /// proves, and STARK-bound on every word of the φ[9..12] window
 /// (tampering any of registers 9,10,11,12 makes verify reject).  The

@@ -24,7 +24,7 @@ fn main() {
     #[cfg(feature = "prover")]
     imp::run(std::env::args().skip(1).collect());
     #[cfg(not(feature = "prover"))]
-    eprintln!("zkpvm actor benchmarks require the `prover` feature (default-on)");
+    eprintln!("vos-pvm-proof actor benchmarks require the `prover` feature (default-on)");
 }
 
 #[cfg(feature = "prover")]
@@ -147,7 +147,7 @@ mod imp {
             Err(_) => {
                 eprintln!(
                     "SKIP: fibonacci actor fixture absent; build with \
-                     `cd tests/fixtures/legacy-v1/actors/fibonacci && cargo actor` (or `just build-pvm`)"
+                     `cd pvm/proof/fixtures/fibonacci && cargo actor` (or `just build-pvm`)"
                 );
                 return None;
             }
@@ -211,9 +211,9 @@ mod imp {
         // actors with no hostcalls behave the same as `run()`.
         let exit = tracing.run_with_vos_stubs();
         // Precompile ECALL records — capture before consuming `tracing`.
-        let blake2b_calls: Vec<_> = tracing.blake2b_calls().iter().cloned().collect();
+        let blake2b_calls: Vec<_> = tracing.blake2b_calls().to_vec();
         let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
-        let ristretto_calls: Vec<_> = tracing.ristretto_calls().iter().cloned().collect();
+        let ristretto_calls: Vec<_> = tracing.ristretto_calls().to_vec();
         let ristretto_mem_ops = tracing.ristretto_mem_ops.clone();
         let ristretto_add_records = tracing.ristretto_add_records.clone();
         let ristretto_add_mem_ops = tracing.ristretto_add_mem_ops.clone();
@@ -318,9 +318,9 @@ mod imp {
         let t0 = std::time::Instant::now();
         let mut tracing = TracingPvm::new(interp);
         let exit = tracing.run_with_vos_stubs();
-        let blake2b_calls: Vec<_> = tracing.blake2b_calls().iter().cloned().collect();
+        let blake2b_calls: Vec<_> = tracing.blake2b_calls().to_vec();
         let blake2b_mem_ops = tracing.blake2b_mem_ops.clone();
-        let ristretto_calls: Vec<_> = tracing.ristretto_calls().iter().cloned().collect();
+        let ristretto_calls: Vec<_> = tracing.ristretto_calls().to_vec();
         let ristretto_mem_ops = tracing.ristretto_mem_ops.clone();
         let ristretto_add_records = tracing.ristretto_add_records.clone();
         let ristretto_add_mem_ops = tracing.ristretto_add_mem_ops.clone();
@@ -456,7 +456,7 @@ mod imp {
     }
 
     /// Real-workload prove: clerk-refine-bench (vos macro style, see
-    /// tests/fixtures/legacy-v1/actors/clerk-refine-bench).  vos-macros special-case a
+    /// pvm/proof/fixtures/clerk-refine-bench). `vos-macros` special-cases a
     /// method named `start` as the on_start lifecycle hook, so the
     /// bare interpreter_from_blob path drives the workload via cold
     /// start without needing a FETCH-delivered invocation.
@@ -737,7 +737,7 @@ mod imp {
             1 + n_ops * 2 + 1
         );
         eprintln!("Prove:  {:>6.2} s", prove_time.as_secs_f64());
-        eprintln!("Verify: {:?}", verify_time);
+        eprintln!("Verify: {verify_time:?}");
         eprintln!();
         eprintln!(
             "Per-op cost: {:.2} ms",
@@ -823,7 +823,7 @@ mod imp {
         let t = Instant::now();
         let (proof, _) = prove_profiled(&mut side_note).expect("prove");
         let prove_time = t.elapsed();
-        eprintln!("Prove: {:?}", prove_time);
+        eprintln!("Prove: {prove_time:?}");
 
         let proof_bytes = bincode::serialize(&proof).expect("serialize");
         eprintln!("Proof: {:.1} KB", proof_bytes.len() as f64 / 1024.0);
@@ -902,7 +902,7 @@ mod imp {
         let proof =
             vos_pvm_proof::prove_with_config(&mut side_note, config).expect("proving failed");
         let prove_time = t2.elapsed();
-        eprintln!("Prove time: {:?}", prove_time);
+        eprintln!("Prove time: {prove_time:?}");
 
         let policy = vos_pvm_proof::PcsPolicy {
             min_pow_bits: 5,
@@ -962,8 +962,8 @@ mod imp {
         eprintln!("Pedersen +:      {} rows", rows_add.len());
         eprintln!("Schnorr k·G:     {} rows", rows_kg.len());
         eprintln!("Schnorr sk·G:    {} rows", rows_skg.len());
-        eprintln!("Total per pay:   {} rows", total_rows);
-        eprintln!("Chip log_size:   {}", log_n);
+        eprintln!("Total per pay:   {total_rows} rows");
+        eprintln!("Chip log_size:   {log_n}");
         let _ = ED25519_TWO_D;
 
         // Realistic prove-time projection.
@@ -987,7 +987,7 @@ mod imp {
             total_cells / 1_000_000
         );
         eprintln!("Throughput: {:.1} M cells/s", throughput / 1e6);
-        eprintln!("Projected total prove: ~{:.1}s on CPU", projected_secs);
+        eprintln!("Projected total prove: ~{projected_secs:.1}s on CPU");
         eprintln!("With GPU (3×):  ~{:.1}s", projected_secs / 3.0);
         eprintln!(
             "With NAF-w4 (-30% rows) + GPU: ~{:.1}s",
@@ -1012,12 +1012,7 @@ mod imp {
         let steps = tracing.into_trace();
         eprintln!("Phase-2 trace: {} PVM steps", steps.len());
         eprintln!(
-            "ECALLs: blake2b={}, ristretto_scalar_mult={}, ristretto_point_add={}, scalar_reduce_wide={}, scalar_binop={}",
-            blake2b_count,
-            ristretto_count,
-            ristretto_add_count,
-            scalar_reduce_count,
-            scalar_binop_count,
+            "ECALLs: blake2b={blake2b_count}, ristretto_scalar_mult={ristretto_count}, ristretto_point_add={ristretto_add_count}, scalar_reduce_wide={scalar_reduce_count}, scalar_binop={scalar_binop_count}",
         );
 
         let mut pc_count = std::collections::HashMap::<u32, u32>::new();

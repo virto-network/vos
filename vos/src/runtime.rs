@@ -256,7 +256,7 @@ fn install_vos_runtime_caps(kernel: &mut InvocationKernel) {
     }
 }
 
-/// Execute a zkpvm Ristretto/scalar precompile ECALL host-side — so a
+/// Execute a constrained Ristretto/scalar precompile ECALL host-side, so a
 /// `pvm-precompile` actor (cipher-clerk's curve crypto) runs LIVE in the
 /// runtime, not only when the prover traces it. Returns `true` when
 /// `call_id` was one of these precompiles (and it was serviced), `false`
@@ -1474,6 +1474,7 @@ impl Default for VosRuntime<MemoryDataLayer> {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum RefineKernelExit {
     Halted {
         output: Vec<u8>,
@@ -1778,7 +1779,7 @@ fn handle_refine_hostcall(
             }
         }
         crate::crypto::ECALL_BLAKE2B_COMPRESS => {
-            // Wire ABI matches `zkpvm-precompiles`: a0=h_ptr (64B
+            // Wire ABI matches `vos-pvm-precompiles`: a0=h_ptr (64B
             // in/out), a1=m_ptr (128B in), a2=t_low (counter low
             // 64 bits), a3=f flag. The compress primitive itself
             // lives inside vos::crypto as `host_compress_block`
@@ -2005,7 +2006,7 @@ pub(crate) fn build_task_kernel_with_backend(
 }
 
 /// Serve one hostcall of a Task child with EXACTLY the observable
-/// semantics `zkpvm`'s `TracingPvm::run_with_vos_stubs` gives the
+/// semantics the proof tracer's `TracingPvm::run_with_vos_stubs` gives the
 /// traced re-execution — this table is the live half of live≡proved:
 ///
 /// - the blake2b precompile executes natively (the tracer runs it too,
@@ -3193,8 +3194,8 @@ mod tests {
 
         assert!(split_invoke_input(&[]).is_none());
         assert!(split_invoke_input(&[8, 0, 0, 0]).is_none());
-        assert!(split_invoke_input(&(INVOKE_INPUT_HAS_ROWS | 0).to_le_bytes()).is_none());
-        assert!(split_invoke_input(&(INVOKE_INPUT_RECORD | 0).to_le_bytes()).is_none());
+        assert!(split_invoke_input(&INVOKE_INPUT_HAS_ROWS.to_le_bytes()).is_none());
+        assert!(split_invoke_input(&INVOKE_INPUT_RECORD.to_le_bytes()).is_none());
     }
 
     #[test]

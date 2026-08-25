@@ -249,7 +249,7 @@ fn resolve_task_input(input: &Path) -> anyhow::Result<PathBuf> {
     // does. Cargo's output path is part of rustc's invocation; inheriting an
     // arbitrary CARGO_TARGET_DIR would otherwise perturb crate metadata and
     // the linked Task identity even though JSON discovery found the right ELF.
-    let target_dir = build_root.join("target/vosx-canonical");
+    let target_dir = canonical_target_dir(&build_root)?;
     let mut command = Command::new("cargo");
     command
         .args([
@@ -354,7 +354,7 @@ fn resolve_program_input(input: &Path) -> anyhow::Result<PathBuf> {
     // actor target can make Cargo accept an ELF compiled without this rustc
     // wrapper, so the supposedly canonical ProgramId then depends on the
     // checkout path of the preceding `cargo actor` invocation.
-    let target_dir = build_root.join("target/vosx-canonical");
+    let target_dir = canonical_target_dir(&build_root)?;
     let mut command = Command::new("cargo");
     command.args(["+nightly", "actor"]);
     if build_root != project {
@@ -363,7 +363,7 @@ fn resolve_program_input(input: &Path) -> anyhow::Result<PathBuf> {
     command
         .env("RUSTC_WRAPPER", std::env::current_exe()?)
         .env(RUSTC_WRAPPER_MODE, "1")
-        .env(RUSTC_WRAPPER_SOURCE_ROOT, &source_root)
+        .env(RUSTC_WRAPPER_SOURCE_ROOT, source_root)
         .env("CARGO_TARGET_DIR", &target_dir);
     let status = command
         .current_dir(&build_root)
@@ -392,6 +392,43 @@ fn canonical_source_root(build_root: &Path) -> &Path {
         .ancestors()
         .find(|candidate| candidate.join(".git").exists())
         .unwrap_or(build_root)
+}
+
+/// Isolate canonical Cargo output by every input Cargo does not fingerprint
+/// for a rustc wrapper. Cargo keys a wrapper by its path, so rebuilding `vosx`
+/// in place would otherwise allow artifacts produced by an older wrapper to
+/// survive indefinitely. Source files remain ordinary Cargo inputs; this
+/// namespace covers the wrapper, toolchain, and platform contract.
+fn canonical_target_dir(build_root: &Path) -> anyhow::Result<PathBuf> {
+    let wrapper = std::env::current_exe().context("locate the canonical rustc wrapper")?;
+    let wrapper_bytes = std::fs::read(&wrapper)
+        .with_context(|| format!("read canonical rustc wrapper {}", wrapper.display()))?;
+    let toolchain = Command::new("rustc")
+        .args(["+nightly", "--version", "--verbose"])
+        .output()
+        .context("query the canonical nightly rustc identity")?;
+    if !toolchain.status.success() {
+        bail!(
+            "query canonical nightly rustc identity: {}",
+            String::from_utf8_lossy(&toolchain.stderr)
+        );
+    }
+    let source_root = canonical_source_root(build_root)
+        .as_os_str()
+        .as_encoded_bytes();
+    let identity = vos::service::Hash::digest(
+        b"vos/canonical-cargo-cache",
+        &[
+            &wrapper_bytes,
+            &toolchain.stdout,
+            &vos::service::PLATFORM_ID.0,
+            &vos::service::EXECUTION_SEMANTICS_ID.0,
+            source_root,
+        ],
+    );
+    Ok(build_root
+        .join("target/vosx-canonical")
+        .join(hex::encode(identity.0)))
 }
 
 /// Cargo invokes the current `vosx` executable as a rustc wrapper while

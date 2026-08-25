@@ -1238,7 +1238,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         // Detect Ecalli with imm == ECALL_BLAKE2B_COMPRESS and snapshot the
         // regs_before values that the precompile reads.
         //
-        // Register convention: the zkpvm-precompiles shim puts
+        // Register convention: the vos-pvm-precompiles shim puts
         // a0/a1/a2/a3 → h_ptr/m_ptr/t_low/f_flag, which grey-transpiler
         // maps to PVM φ[7/8/9/10].  The `Column::Phi*` names below are
         // semantic slot labels for the Blake2bCall lookup tuple — Phi10

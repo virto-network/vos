@@ -16,7 +16,7 @@
 //!
 //! Run from the workspace root:
 //!     cargo install cargo-fuzz   # one-time
-//!     cd crates/zkpvm
+//!     cd pvm/proof
 //!     cargo fuzz run prove_verify_roundtrip -- -max_total_time=300
 //!
 //! Corpus seeds in `corpus/prove_verify_roundtrip/` accumulate

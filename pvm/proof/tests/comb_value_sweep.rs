@@ -29,7 +29,7 @@
 //! not a comb-chip bug.)
 //!
 //! Run:
-//!   cargo test -p zkpvm --features prover \
+//!   cargo test -p vos-pvm-proof --features prover \
 //!     --test comb_value_sweep sweep -- --nocapture --test-threads=1
 
 use vos_pvm_proof::{

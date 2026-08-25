@@ -22,7 +22,7 @@
 //! so they exercise the *filler*, not the *constraint* — these tamper the
 //! finalized trace directly, which is exactly what a from-scratch prover does.
 //!
-//! Run with: `cargo test -p zkpvm --features debug-internals --test
+//! Run with: `cargo test -p vos-pvm-proof --features debug-internals --test
 //! ledger_readconsistency_gate`.
 
 use vos_pvm::PVM_REGISTER_COUNT;

@@ -14,7 +14,7 @@
 //!      multi-segment workflow.
 //!
 //! Run with:
-//!     cargo run --example prove_and_verify -p zkpvm --release
+//!     cargo run --example prove_and_verify -p vos-pvm-proof --release
 //!
 //! Reads ~5 seconds on a modern x86 desktop.
 
@@ -31,7 +31,7 @@ use vos_pvm_proof::{
 use vos_pvm_proof_verifier::verify_standalone;
 
 fn main() {
-    println!("zkpvm prove_and_verify example");
+    println!("vos-pvm-proof prove_and_verify example");
     println!("PROOF_FORMAT_VERSION = {PROOF_FORMAT_VERSION}");
     println!();
 

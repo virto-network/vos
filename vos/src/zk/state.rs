@@ -147,8 +147,7 @@ pub fn spine_hash(
     to: usize,
 ) -> [u8; 32] {
     debug_assert!(from <= to && to <= p.depth());
-    for depth in from..to {
-        let sibling = &chain[depth];
+    for (depth, sibling) in chain.iter().enumerate().take(to).skip(from) {
         h = if bit_at(p, key, depth) {
             node_hash(p, sibling, &h)
         } else {
@@ -460,10 +459,8 @@ impl WitnessedLedger {
         let recomputed = me.root();
         assert!(
             recomputed == root_before,
-            "witnessed-ledger: reconstructed root {:x?} != root_before {:x?} \
+            "witnessed-ledger: reconstructed root {recomputed:x?} != root_before {root_before:x?} \
              — inconsistent witness (swapped value, lying-absent, or wrong root)",
-            recomputed,
-            root_before,
         );
         me
     }
@@ -476,9 +473,8 @@ impl WitnessedLedger {
         match self.leaves.get(key) {
             Some(slot) => slot.as_deref(),
             None => panic!(
-                "witnessed-ledger: unproven read of key {:x?} — not in the witness \
+                "witnessed-ledger: unproven read of key {key:x?} — not in the witness \
                  (incomplete witness, not proven absence)",
-                key,
             ),
         }
     }
@@ -494,10 +490,9 @@ impl WitnessedLedger {
     pub fn insert(&mut self, key: &[u8], content: Vec<u8>) {
         match self.leaves.get_mut(key) {
             Some(slot) => *slot = Some(content),
-            None => panic!(
-                "witnessed-ledger: unproven write to key {:x?} — not in the witness",
-                key,
-            ),
+            None => {
+                panic!("witnessed-ledger: unproven write to key {key:x?} — not in the witness",)
+            }
         }
     }
 
@@ -506,10 +501,9 @@ impl WitnessedLedger {
     pub fn remove(&mut self, key: &[u8]) {
         match self.leaves.get_mut(key) {
             Some(slot) => *slot = None,
-            None => panic!(
-                "witnessed-ledger: unproven remove of key {:x?} — not in the witness",
-                key,
-            ),
+            None => {
+                panic!("witnessed-ledger: unproven remove of key {key:x?} — not in the witness",)
+            }
         }
     }
 

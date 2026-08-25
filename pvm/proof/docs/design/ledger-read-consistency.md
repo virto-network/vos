@@ -1,8 +1,8 @@
 # Ledger read-consistency soundness fix (register + RAM)
 
 **Status:** LANDED (format v6). Both ledgers fixed — register
-(`fix(zkpvm): bind register-ledger read-consistency`) and RAM
-(`fix(zkpvm): bind RAM-ledger read-consistency`). The gate tests
+(`fix(vos-pvm-proof): bind register-ledger read-consistency`) and RAM
+(`fix(vos-pvm-proof): bind RAM-ledger read-consistency`). The gate tests
 (`tests/ledger_readconsistency_gate.rs`) are GREEN; the segment-chain
 capstone re-prove validates the full ~7.5M-step workload against the new AIR.
 This was the **#1 money-path soundness task** on branch
@@ -55,7 +55,7 @@ what a from-scratch prover does), and assert `debug_assert_constraints` REJECTS:
 - `memory_forged_read_value_is_rejected`: StoreIndU8 0x42→[0x1000] then
   LoadIndU8; tamper the load row Value+PrevValue → 0x99. ACCEPTED today.
 
-Run: `cargo test -p zkpvm --features debug-internals --test
+Run: `cargo test -p vos-pvm-proof --features debug-internals --test
 ledger_readconsistency_gate -- --ignored`. **Add two STRONGER gates with the
 fix** (the current two only tamper prev_value with honest `key_same`/`is_write`,
 so they would pass under a *partial* fix): (a) **reorder** — place a stale write
@@ -208,7 +208,7 @@ The 4-slot emission machinery stays dormant (slots 1..3 emit 0-mult) so
 ## Validation
 
 1. Gate tests flip GREEN (un-ignore); add the reorder + is_write-flip gates.
-2. Fast regressions: `zkpvm --lib`, `chip_isolated`, `alu_negative`,
+2. Fast regressions: `vos-pvm-proof --lib`, `chip_isolated`, `alu_negative`,
    `register_ledger_negative`, `memory`, `memory_negative`, `phase2_alu`,
    `voucher_check_smoke`.
 3. A small full prove/verify (`register_ledger_negative::*_positive_smoke`,

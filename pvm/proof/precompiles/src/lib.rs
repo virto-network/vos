@@ -1,4 +1,4 @@
-//! Guest-side shims for zkpvm precompile ECALLs.
+//! Guest-side shims for vos-pvm-proof precompile ECALLs.
 //!
 //! The shim re-exports `Scalar`, `RistrettoPoint`, and basepoint
 //! constants from `curve25519-dalek` (under the `ristretto` feature)
@@ -13,7 +13,7 @@
 //! let p = &v * g + b * &h;
 //! ```
 //!
-//! On `target_arch = "riscv64"` (the zkpvm guest target), the
+//! On `target_arch = "riscv64"` (the vos-pvm-proof guest target), the
 //! `Mul` / `Add` impls dispatch to inline-asm `ecall` that the
 //! prover's chips intercept and accelerate.  On non-riscv64 targets
 //! they fall through to dalek's / a bundled software reference.

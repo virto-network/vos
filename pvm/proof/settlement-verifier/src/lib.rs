@@ -5,10 +5,10 @@
 //! custom Poseidon2-M31 Merkle channel, plus the in-AIR constraint evaluation
 //! the verifier re-runs at the OODS point — built for `wasm32-unknown-unknown`
 //! AND the JAM PVM (`riscv64em-vos`) target with NO blst and NO rayon. It
-//! executes and ACCEPTS real proofs on the PVM (see `zkpvm/tests/settle_run.rs`).
+//! executes and ACCEPTS real proofs on the PVM (see `pvm/proof/tests/settle_run.rs`).
 //!
 //! It carries only the VERIFY side of the recursion stack (promoted from the
-//! prover-side `zkpvm/tests/recursion_common/mod.rs`):
+//! prover-side `pvm/proof/tests/recursion_common/mod.rs`):
 //!   * the width-16 Poseidon2-M31 permutation + the `MerkleHasherLifted`
 //!     (`P2MerkleHasher`) the inner proofs are committed under,
 //!   * the Poseidon2-M31 Fiat-Shamir `Channel` (`Poseidon2M31Channel`) + its
@@ -23,12 +23,12 @@
 //! via `vos_pvm`, which this crate does not depend on).
 //!
 //! Round constants are SYNCED from the prover's canonical Grain-LFSR arrays
-//! (`zkpvm/src/poseidon2/mod.rs`), so this verifier accepts REAL proofs — they
+//! (`pvm/proof/src/poseidon2/mod.rs`), so this verifier accepts REAL proofs — they
 //! must stay byte-identical to the prover's or every honest proof is rejected.
 #![no_std]
 // AIR fill + the permutation are byte-position-indexed throughout (state[i],
 // round-const tables); the index loops are the natural shape (same rationale as
-// the parent `zkpvm` crate's lint config).  The `% RATE` sponge-padding form
+// the parent `vos-pvm-proof` crate's lint config).  The `% RATE` sponge-padding form
 // mirrors the prover-side source of truth.
 #![allow(clippy::needless_range_loop, clippy::manual_is_multiple_of)]
 
@@ -64,8 +64,8 @@ pub const RATE: usize = 8;
 pub const N_PERM_COLS: usize = N_STATE + FULL_ROUNDS * (N_STATE * 3) + N_PARTIAL_ROUNDS * 3;
 
 // Width-16 M31 Poseidon2 round constants — SYNCED from the prover's source of
-// truth, `zkpvm/src/poseidon2/mod.rs` (the canonical Grain-LFSR arrays pinned by
-// `zkpvm/tests/poseidon2_round_constants.rs`). They MUST stay byte-identical to
+// truth, `pvm/proof/src/poseidon2/mod.rs` (the canonical Grain-LFSR arrays pinned by
+// `pvm/proof/tests/poseidon2_round_constants.rs`). They MUST stay byte-identical to
 // the prover's, or this verifier rejects every honest proof.
 pub const EXTERNAL_ROUND_CONSTS: [[BaseField; N_STATE]; FULL_ROUNDS] = [
     [
@@ -611,7 +611,7 @@ pub fn verify_segment(
 // decommit + OODS dominate, independent of the AIR), so it is a representative
 // stand-in for measuring on-chain settlement-verify cycles without carrying the
 // full 31-chip segment AIR. MUST stay identical to the prover-side `BoolEval`
-// in `zkpvm/tests/settle_fixture.rs` (same `FIXTURE_LOG`, same constraint), or
+// in `pvm/proof/tests/settle_fixture.rs` (same `FIXTURE_LOG`, same constraint), or
 // the verifier replays a different AIR and rejects the honest proof.
 
 /// Trace log-size of the embedded settlement-proof fixture.

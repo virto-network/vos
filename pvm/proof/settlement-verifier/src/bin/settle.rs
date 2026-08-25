@@ -6,7 +6,7 @@
 //! FRI verify, Merkle decommit, OODS composition re-eval), halting with the
 //! result. This is the end-to-end proof that the M31-algebraic settlement verify
 //! is PVM-runnable AND value-correct: it ACCEPTS the honest fixture on the JAM
-//! PVM (see `zkpvm/tests/settle_run.rs`).
+//! PVM (see `pvm/proof/tests/settle_run.rs`).
 //!
 //! Built only with `--features pvm-settle` (so host / wasm32 `cargo build`
 //! skips the bare-metal bin).
@@ -57,7 +57,7 @@ static ALLOC: Bump = Bump {
 };
 
 /// The settlement proof, produced + format-pinned host-side by
-/// `zkpvm/tests/settle_fixture.rs` (postcard-encoded `StarkProof<P2MerkleHasher>`
+/// `pvm/proof/tests/settle_fixture.rs` (postcard-encoded `StarkProof<P2MerkleHasher>`
 /// of the trivial boolean AIR).
 const FIXTURE: &[u8] = include_bytes!("../../fixtures/bool_proof.postcard");
 

@@ -24,7 +24,7 @@
 //! line up in pc/ts/regs/memory will fail (2).
 //!
 //! Run from the workspace root:
-//!     cargo run -p zkpvm --example multi_segment --release
+//!     cargo run -p vos-pvm-proof --example multi_segment --release
 
 use vos_pvm::ExitReason;
 use vos_pvm::PVM_REGISTER_COUNT;
@@ -35,7 +35,7 @@ use vos_pvm_proof::core::tracing::TracingPvm;
 use vos_pvm_proof::{SideNote, prove, verify_chain};
 
 fn main() {
-    println!("zkpvm multi_segment example");
+    println!("vos-pvm-proof multi_segment example");
     println!();
 
     // ── Step 1: build a long-ish program ───────────────────────────

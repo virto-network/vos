@@ -4,7 +4,7 @@
 //! to a phone for the ARM bring-up numbers (reference x86 point:
 //! log14 MOBILE ≈ 1.5 s with target-cpu=native).
 //!
-//!     cargo build --release -p zkpvm --bin mobile_bench \
+//!     cargo build --release -p vos-pvm-proof --bin mobile_bench \
 //!         --target aarch64-unknown-linux-gnu
 //!     ./mobile_bench [log2-steps]     # default 14
 //!

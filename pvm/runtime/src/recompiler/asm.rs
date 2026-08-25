@@ -283,7 +283,7 @@ impl Assembler {
                     )
                 };
                 if new_ptr == libc::MAP_FAILED {
-                    panic!("mremap failed: need {} bytes", new_cap);
+                    panic!("mremap failed: need {new_cap} bytes");
                 }
                 *ptr = new_ptr as *mut u8;
                 *capacity = new_cap;

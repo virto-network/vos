@@ -625,12 +625,12 @@ impl Invoker for MockInvoker {
 }
 
 impl Invoker for MockAttestationInvoker {
-    fn invoke_actor(
+    async fn invoke_actor(
         &mut self,
         _target: ActorId,
         _payload: Vec<u8>,
-    ) -> impl core::future::Future<Output = core::result::Result<Value, ClientError>> + '_ {
-        async { Err(ClientError::Unreachable) }
+    ) -> core::result::Result<Value, ClientError> {
+        Err(ClientError::Unreachable)
     }
 }
 

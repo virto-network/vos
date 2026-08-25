@@ -130,7 +130,7 @@ fn tamper(dir: &std::path::Path) {
 /// Settlement-binding fixture: a proof whose bound io-hash window holds a
 /// caller-supplied hash.
 ///
-/// Produces a REAL, STANDARD-policy zkpvm proof whose bound io-hash window
+/// Produces a REAL, STANDARD-policy vos-pvm-proof proof whose bound io-hash window
 /// (`final_state.registers[9..13]`, read back by `Proof::public_io_hash`) holds a
 /// caller-supplied 32-byte hash `H` — typically `H = vos::zk::compute_io_hash(
 /// public_bytes, [])` computed with `cargo run -p vos --example

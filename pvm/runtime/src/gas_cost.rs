@@ -582,7 +582,7 @@ fn gas_sim_traced(code: &[u8], bitmask: &[u8], start_pc: usize, trace: bool) -> 
             #[cfg(feature = "std")]
             if trace {
                 let op = crate::instruction::Opcode::from_byte(code[pc])
-                    .map(|o| alloc::format!("{:?}", o))
+                    .map(|o| alloc::format!("{o:?}"))
                     .unwrap_or("?".into());
                 eprintln!(
                     "  [{}] DECODE pc={} {} cy={} dec={} rob_idx={} deps={:?} move={} term={} slots_left={}",
@@ -3050,7 +3050,7 @@ mod tests {
     #[test]
     fn test_load_imm_then_trap() {
         let cost = block_cost(&[51, 0, 42, 0], &[1, 0, 0, 1]);
-        assert!(cost >= 1, "cost should be >= 1, got {}", cost);
+        assert!(cost >= 1, "cost should be >= 1, got {cost}");
     }
 }
 

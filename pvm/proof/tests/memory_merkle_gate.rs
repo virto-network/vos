@@ -23,7 +23,7 @@
 //! chain `expected_initial_root`, `component_mask`) live in
 //! `voucher_check_smoke.rs` / `chain_standalone.rs`.
 //!
-//! Run with: `cargo test -p zkpvm --features debug-internals --test
+//! Run with: `cargo test -p vos-pvm-proof --features debug-internals --test
 //! memory_merkle_gate`.
 
 use vos_pvm::PVM_REGISTER_COUNT;

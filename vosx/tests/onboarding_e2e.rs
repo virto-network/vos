@@ -580,7 +580,7 @@ impl Drop for TestProductionTrustSidecar {
 
 fn counter_package_fixture(output_dir: &Path) -> PathBuf {
     let actor_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../examples/actors/target/riscv64em-vos/release/service_counter.elf");
+        .join("../examples/actors/target/riscv64em-vos/release/counter.elf");
     assert!(
         actor_elf.is_file(),
         "build the public counter first: `just build-examples` ({})",
@@ -607,7 +607,7 @@ fn counter_package_fixture(output_dir: &Path) -> PathBuf {
     package
 }
 
-fn crdt_counter_package_fixture(output_dir: &Path) -> PathBuf {
+fn named_crdt_counter_package_fixture(output_dir: &Path, name: &str) -> PathBuf {
     let actor_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
         "../tests/fixtures/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
     );
@@ -623,18 +623,15 @@ fn crdt_counter_package_fixture(output_dir: &Path) -> PathBuf {
     vosx_ok(
         &build_data,
         &build_config,
-        &[
-            "build",
-            &actor,
-            "--name",
-            "production-crdt-counter",
-            "--out-dir",
-            &out,
-        ],
+        &["build", &actor, "--name", name, "--out-dir", &out],
     );
-    let package = output_dir.join("production-crdt-counter.vos");
+    let package = output_dir.join(format!("{name}.vos"));
     assert!(package.is_file(), "vosx build must emit the signed package");
     package
+}
+
+fn crdt_counter_package_fixture(output_dir: &Path) -> PathBuf {
+    named_crdt_counter_package_fixture(output_dir, "production-crdt-counter")
 }
 
 fn authority_upgrade_package_fixture(
@@ -689,12 +686,12 @@ fn assert_bundled_space_authority_matches_canonical_program() {
         .expect("vosx ships the canonical authority PVM");
     assert_eq!(
         hex::encode(vos::service::ProgramId::of_pvm(&bundled).0),
-        "79099ccbec4e4dac7af893e153ba379a1d33aa75734daf1d93cbba3e684d65eb",
+        "63828f5cbe1b3796e05201c4b803984640506b1faa45e9bdcddb84630c9f2787",
         "the built-in authority program must implement the canonical private-input contract",
     );
     assert_eq!(
         hex::encode(vos::crypto::blake2b_hash::<32>(&[], &[&bundled])),
-        "45c1e75beb821b45a2242fd730c729a19fab014be1438ae293df1937492efebc",
+        "c7b7e27b3e5f775de06591a51e7cbcf1bd20a0c9a4074938b72755892aad0f3f",
         "the authority bytes must remain exact so sealed spaces can reopen",
     );
 }
@@ -967,8 +964,7 @@ fn signed_service_package_runs_and_reopens_through_the_space_daemon() {
     let dist = TempDir::new("root-dist");
     let upgrade_dist = TempDir::new("root-upgrade-dist");
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    let actor_elf =
-        workspace.join("examples/actors/target/riscv64em-vos/release/service_counter.elf");
+    let actor_elf = workspace.join("examples/actors/target/riscv64em-vos/release/counter.elf");
     let committed_service_pvm = workspace.join("services/vos-service/vos-service.pvm");
     assert!(
         actor_elf.is_file(),
@@ -2922,14 +2918,9 @@ fn boot_admin_with_service(
         service_pvm,
     ));
     wait_for_endpoint(data_a.path(), &log_a, "A");
-    let counter_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-        "../tests/fixtures/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
-    );
-    assert!(
-        counter_elf.is_file(),
-        "build the onboarding CRDT fixture first: `just build-registry-fixtures`",
-    );
-    let counter_source = counter_elf.to_string_lossy().into_owned();
+    let artifacts = data_a.path().join("onboarding-artifacts");
+    let package = named_crdt_counter_package_fixture(&artifacts, "crdt-counter");
+    let counter_source = package.to_string_lossy().into_owned();
     vosx_ok(
         data_a.path(),
         cfg_a.path(),

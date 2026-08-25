@@ -6,7 +6,7 @@
 //! `verify_with_explicit_components`: prove each chip's AIR in isolation
 //! and check the expected accept (self-balancing lookups) or open-chain
 //! reject (producer with no consumer in scope).  See
-//! `crates/zkpvm/STWO_PHASE_I_BLAKE2B.md` for background.
+//! `pvm/proof/STWO_PHASE_I_BLAKE2B.md` for background.
 //!
 //! The smoke test below uses only bound-1 chips (already at degree ≤ 2)
 //! on the lifted protocol.  If it fails, the harness wiring itself is
@@ -166,10 +166,7 @@ fn harness_blake2b_isolated() {
     use stwo::core::verifier::VerificationError;
     match verify_result {
         Err(VerificationError::InvalidStructure(msg))
-            if msg.contains("claimed logup sum is not zero") =>
-        {
-            ()
-        }
+            if msg.contains("claimed logup sum is not zero") => {}
         Err(e) => panic!("Blake2bChip harness: verify rejected for the wrong reason: {e:?}"),
         Ok(()) => panic!(
             "Blake2bChip harness: verify accepted unexpectedly — \
@@ -1260,7 +1257,7 @@ fn harness_ristretto_identity_output_forgery_rejected() {
 /// Pinpoints the failing constraint by row + constraint-#.  Requires the
 /// `debug-internals` feature; run with:
 ///
-///   cargo test -p zkpvm --features debug-internals --test chip_isolated \
+///   cargo test -p vos-pvm-proof --features debug-internals --test chip_isolated \
 ///       harness_cpuchip_debug_add64 -- --ignored --nocapture
 #[cfg(feature = "debug-internals")]
 #[test]

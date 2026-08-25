@@ -5935,17 +5935,14 @@ mod tests {
         w_a.shutdown();
         w_b.shutdown();
         w_c.shutdown();
-        match Arc::try_unwrap(net_a) {
-            Ok(n) => n.join(),
-            Err(_) => {}
+        if let Ok(n) = Arc::try_unwrap(net_a) {
+            n.join()
         }
-        match Arc::try_unwrap(net_b) {
-            Ok(n) => n.join(),
-            Err(_) => {}
+        if let Ok(n) = Arc::try_unwrap(net_b) {
+            n.join()
         }
-        match Arc::try_unwrap(net_c) {
-            Ok(n) => n.join(),
-            Err(_) => {}
+        if let Ok(n) = Arc::try_unwrap(net_c) {
+            n.join()
         }
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -6414,17 +6411,14 @@ mod tests {
         // `tests/elf_integration.rs` covers the host-level
         // last_applied advance end-to-end.
 
-        match Arc::try_unwrap(net_a) {
-            Ok(n) => n.join(),
-            Err(_) => {}
+        if let Ok(n) = Arc::try_unwrap(net_a) {
+            n.join()
         }
-        match Arc::try_unwrap(net_b) {
-            Ok(n) => n.join(),
-            Err(_) => {}
+        if let Ok(n) = Arc::try_unwrap(net_b) {
+            n.join()
         }
-        match Arc::try_unwrap(net_c) {
-            Ok(n) => n.join(),
-            Err(_) => {}
+        if let Ok(n) = Arc::try_unwrap(net_c) {
+            n.join()
         }
 
         let _ = std::fs::remove_dir_all(&dir);

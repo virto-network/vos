@@ -269,7 +269,7 @@ mod tests {
         for name in ["", "a", "counter", "very-long-instance-name"] {
             let id = instance_service_id(name, 0);
             let local = (id.0 & 0xFFFF) as u16;
-            assert!(local >= 0x100 && local < 0x8000, "got 0x{local:04x}");
+            assert!((0x100..0x8000).contains(&local), "got 0x{local:04x}");
         }
     }
 

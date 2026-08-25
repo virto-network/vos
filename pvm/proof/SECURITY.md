@@ -1,6 +1,6 @@
-# zkpvm — security considerations
+# vos-pvm-proof — security considerations
 
-A guide for deployers who want to use zkpvm in the wild.  Read this
+A guide for deployers who want to use vos-pvm-proof in the wild.  Read this
 alongside [`docs/status.md`](./docs/status.md) (which proves *what* is
 bound) and [`README.md`](./README.md) (which says *how* to call the API).
 
@@ -120,7 +120,7 @@ A proof verified against `hash = H(P)` for program `P` proves that:
   is a liveness concern, not a soundness concern — but deployers
   should plan for it (timeouts, alternative provers).
 
-- **Side-channel resistance**: zkpvm is not constant-time and
+- **Side-channel resistance**: vos-pvm-proof is not constant-time and
   leaks timing information about the trace shape via prover
   resource use.  Don't run the prover on inputs you can't tolerate
   leaking timing information about.  The verifier itself is
@@ -147,7 +147,7 @@ A proof verified against `hash = H(P)` for program `P` proves that:
 - 20-bit proof-of-work
 
 This corresponds to ≈96-bit conjectured security against the
-soundness error of FRI for the trace sizes zkpvm produces.  A
+soundness error of FRI for the trace sizes vos-pvm-proof produces.  A
 deployer who needs more or less can use `prove_with_config` with a
 custom `PcsConfig` — but the verifier accepts whatever `pcs_config`
 the proof carries (it's used as-is).  This means **a malicious
@@ -195,9 +195,9 @@ Before pointing real users at a deployed verifier:
 - [ ] **Plan for liveness failures** — a missing proof is not a
   rejected proof.  Deploy a fallback or alternative-prover path.
 - [ ] **Consider the `javm` interpreter your trusted reference** —
-  zkpvm proves that a trace matches javm's PVM semantics.  Bugs
-  in javm are bugs in zkpvm by construction; track its release
-  notes alongside zkpvm's.
+  vos-pvm-proof proves that a trace matches javm's PVM semantics.  Bugs
+  in javm are bugs in vos-pvm-proof by construction; track its release
+  notes alongside vos-pvm-proof's.
 
 ## Reporting issues
 
@@ -212,7 +212,7 @@ divergence, off-by-one in javm) belong in the javm tracker.
   sub-modules are internal.
 - Stwo and javm are pinned to git revs in this crate's
   `Cargo.toml` (no crates.io release yet for either).  A deployer
-  who vendors zkpvm should also pin those.
+  who vendors vos-pvm-proof should also pin those.
 - The proof format itself is *not* spec'd outside the source.  A
   bytewise-compatible Rust struct on the same `PROOF_FORMAT_VERSION`
   is the only guarantee.  For long-term archival, store proofs

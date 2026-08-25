@@ -1001,8 +1001,8 @@ impl ProofArtifactStore for FileCommittedImageStore {
     ) -> Result<bool, Self::Error> {
         use std::io::Write;
 
-        if !crate::provable::ProofRecordEntry::decode(record)
-            .is_some_and(|entry| entry.encode() == record)
+        if crate::provable::ProofRecordEntry::decode(record)
+            .is_none_or(|entry| entry.encode() != record)
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

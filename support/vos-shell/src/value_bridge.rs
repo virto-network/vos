@@ -220,10 +220,7 @@ mod tests {
             vos_to_nu(VosValue::Unit, span()),
             NuValue::Nothing { .. }
         ));
-        assert_eq!(
-            vos_to_nu(VosValue::Bool(true), span()).as_bool().unwrap(),
-            true
-        );
+        assert!(vos_to_nu(VosValue::Bool(true), span()).as_bool().unwrap());
         assert_eq!(vos_to_nu(VosValue::U32(42), span()).as_int().unwrap(), 42);
         assert_eq!(vos_to_nu(VosValue::I64(-7), span()).as_int().unwrap(), -7);
         assert_eq!(

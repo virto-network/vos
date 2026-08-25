@@ -1,16 +1,16 @@
-// zkpvm-verifier: standalone verification for PVM zkVM proofs.
+// vos-pvm-proof-verifier: standalone verification for PVM zkVM proofs.
 //
 // This crate provides a verify function that does NOT require the full
 // execution trace (SideNote). It only needs the proof and the expected
 // preprocessed trace commitment (which is deterministic per program).
 //
-// no_std-ready: the verifier path of zkpvm pulls only verifier-side stwo,
+// no_std-ready: the verifier path of vos-pvm-proof pulls only verifier-side stwo,
 // alloc::*, and core::*.  Builds for wasm32-unknown-unknown (`just
-// wasm-verifier`): `vos_pvm` is prover-only in zkpvm (it doesn't build on
+// wasm-verifier`): `vos_pvm` is prover-only in vos-pvm-proof (it doesn't build on
 // 32-bit targets — CODE_WINDOW_SIZE = 1 << 32 overflows usize), and the
 // workspace stwo pin is feature-less, with `std,prover,parallel` added
-// back only by zkpvm's `prover` feature — so this crate's normal-dep graph
-// carries no vos_pvm / rayon / curve25519-dalek / zkpvm-blake3.
+// back only by vos-pvm-proof's `prover` feature — so this crate's normal-dep graph
+// carries no vos_pvm / rayon / curve25519-dalek / vos-pvm-proof-blake3.
 
 #![no_std]
 
@@ -28,7 +28,7 @@ use stwo::core::{
 use stwo_constraint_framework::TraceLocationAllocator;
 
 // Per-build PCS selection (Blake2s by default; Poseidon2-M31 under
-// `poseidon2-channel`) — must match the zkpvm prover the proof came from.
+// `poseidon2-channel`) — must match the vos-pvm-proof prover the proof came from.
 use vos_pvm_proof::recursion_pcs::{ProverChannel, ProverMerkleChannel};
 
 // Re-export the Proof type + the format-version constant the verifier
@@ -333,7 +333,7 @@ fn verify_standalone_shaped(
     // `#[mask_next_row]` `prev_value` binding, a range-checked
     // `(reg, ts)` sortedness gadget, and an `is_write` tuple limb),
     // which is sound against a from-scratch prover (gate:
-    // `zkpvm/tests/ledger_readconsistency_gate.rs`) — see
+    // `pvm/proof/tests/ledger_readconsistency_gate.rs`) — see
     // `vos_pvm_proof::boundary_binding` and `chips/register_memory_closing.rs`.
     // So registers/pc/timestamp are all genuine bound public inputs. A
     // mask missing any binding

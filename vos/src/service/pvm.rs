@@ -501,6 +501,7 @@ impl Drop for DeviceSecret {
 /// domain-separately derived from the seed and payload, so the same seed
 /// identifies the same bank and produces replay-stable transitions on every
 /// Raft voter.
+#[derive(Default)]
 pub struct DeviceSignerRefineHost {
     signer: Option<cipher_clerk::crypto::SecretKey>,
     nonce_key: Option<[u8; 32]>,
@@ -538,16 +539,6 @@ fn derive_device_signer(secret: &DeviceSecret) -> cipher_clerk::crypto::SecretKe
                 .and_then(|key| (key.public_key().0 != [0; 32]).then_some(key))
         })
         .expect("a 32-byte seed must derive a canonical device signing scalar")
-}
-
-impl Default for DeviceSignerRefineHost {
-    fn default() -> Self {
-        Self {
-            signer: None,
-            nonce_key: None,
-            public_key: None,
-        }
-    }
 }
 
 impl Drop for DeviceSignerRefineHost {
@@ -2279,7 +2270,7 @@ fn write_suspension_payload(
         .map_err(|_| ServicePvmError::CheckpointTokenWriteFailed)?;
     if cap as u64 != ACTOR_STACK_OBJECT_CAP
         || encoded.len() > capacity
-        || !kernel.write_data_cap_window(address, &encoded)
+        || !kernel.write_data_cap_window(address, encoded)
     {
         return Err(ServicePvmError::CheckpointTokenWriteFailed);
     }
@@ -3003,7 +2994,7 @@ mod tests {
 
     fn emit_halt(code: &mut Vec<u8>, bitmask: &mut Vec<u8>) {
         let mut load = vec![20, Reg::T0 as u8];
-        load.extend_from_slice(&(vos_pvm::PVM_HALT_ADDR as u64).to_le_bytes());
+        load.extend_from_slice(&vos_pvm::PVM_HALT_ADDR.to_le_bytes());
         emit_instruction(code, bitmask, &load);
         let mut jump = vec![50, Reg::T0 as u8];
         jump.extend_from_slice(&0u32.to_le_bytes());

@@ -734,8 +734,7 @@ impl LocalWorkScheduler {
         let Some(bytes) = store.row(&delivery_storage_key(call)) else {
             return Err(ScheduleError::InvalidDelivery);
         };
-        let delivery =
-            DeliveryRecord::decode(&bytes).map_err(|_| ScheduleError::InvalidDelivery)?;
+        let delivery = DeliveryRecord::decode(bytes).map_err(|_| ScheduleError::InvalidDelivery)?;
         if delivery.call_id != call {
             return Err(ScheduleError::InvalidDelivery);
         }

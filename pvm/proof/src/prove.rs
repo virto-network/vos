@@ -114,7 +114,7 @@ pub fn production_pcs_config() -> PcsConfig {
         pow_bits: 20,
         fri_config: FriConfig::new(0, 4, 19, 1),
         // Stwo v2.x lifted protocol; `None` lets `try_get_lifting_log_size`
-        // default it to `log_trace_size`.  See crates/zkpvm/STWO_2.2.0_MIGRATION.md.
+        // default it to `log_trace_size`.  See pvm/proof/STWO_2.2.0_MIGRATION.md.
         lifting_log_size: None,
     }
 }

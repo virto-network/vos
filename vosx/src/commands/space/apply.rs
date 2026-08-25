@@ -394,7 +394,7 @@ fn execute_one(
                 replication_id.to_vec(),
                 *consistency,
                 *network_reachable,
-                sync_role.clone(),
+                *sync_role,
             )?;
             match status {
                 Status::Ok => Ok(()),

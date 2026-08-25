@@ -1,4 +1,4 @@
-//! ProverExtension — general-purpose, program-agnostic host-side zkpvm
+//! ProverExtension — general-purpose, program-agnostic PVM proving
 //! prover + verifier over transpiled PVM blobs.
 //!
 //! ## What it does
@@ -57,7 +57,7 @@
 //!   analogue of the allowlist — closes the doctored-initial-image splice).
 //!
 //! - `measure_catalog(pvm_blob, witness_bytes, witness_addr, seg_steps, page_budget,
-//!   profile, gas) -> Vec<u8>` — the heavy zkpvm measurement behind
+//!   profile, gas) -> Vec<u8>` — the heavy proof measurement behind
 //!   `vosx zk pin`: the entering-image root over the UNPATCHED image and, when
 //!   a representative `witness_bytes` is supplied, the canonical commitment
 //!   allowlist (`image_root(32) ++ commitment(32)…`). Blob-in like the rest —
@@ -115,7 +115,7 @@ const MAX_CHAIN_SEGMENTS: usize = 65_536;
 
 /// Spawn `f` on a dedicated 512 MiB-stack thread WITHOUT joining it. A
 /// canonical prove/verify overflows the default ~2 MiB stack, so every heavy
-/// zkpvm entry point runs on such a thread. The streaming chain paths use
+/// proving entry point runs on such a thread. The streaming chain paths use
 /// this directly (the spawner drains segments while the thread proves);
 /// everything else goes through the join-immediately [`run_on_large_stack`].
 /// `None` when the thread can't spawn.
@@ -625,7 +625,7 @@ impl Prover {
     }
 
     /// Measure the pinnable CATALOG fields for a provable PVM program — the
-    /// heavy zkpvm work behind `vosx zk pin`. The CLI transpiles the ELF and
+    /// heavy proving work behind `vosx zk pin`. The CLI transpiles the ELF and
     /// reads `__VOS_WITNESS` itself (this extension stays a pure PVM prover,
     /// blob-in), then invokes this to measure:
     ///   * the ENTERING-IMAGE page-Merkle root over the UNPATCHED image
@@ -799,7 +799,7 @@ pub fn record_checks(pvm_blob: &[u8], entry: &ProofRecordEntry) -> bool {
 /// io-hash in φ[9..12] — the producer-side proof that `prove_record` is
 /// about to prove exactly the recorded transition. The re-trace holds
 /// the full step trace resident (~the invocation's steps), so it runs
-/// on a large-stack thread like every heavy zkpvm entry here.
+/// on a large-stack thread like every heavy proving entry here.
 pub fn record_preflight(pvm_blob: &[u8], entry: &ProofRecordEntry, witness_addr: usize) -> bool {
     record_checks(pvm_blob, entry)
         && retrace_io_hash(pvm_blob, &entry.input.witness_bytes, witness_addr)
@@ -827,7 +827,7 @@ fn retrace_io_hash(pvm_blob: &[u8], witness_bytes: &[u8], witness_addr: usize) -
             interp.write_u8(address, byte).ok()?;
         }
         let mut tracing = vos_pvm_proof::core::tracing::TracingPvm::new(interp);
-        // zkpvm pins its own vos_pvm revision, so its ExitReason is a
+        // The proof crate pins its own `vos_pvm` revision, so its ExitReason is a
         // different type than vos's — compare the Debug form. The
         // Recorded Tasks terminate only through the dedicated HALT address.
         let exit = format!("{:?}", tracing.run_with_vos_stubs());
@@ -1511,8 +1511,10 @@ pub fn prove_chain_segments(
 /// the producer's initial image, which for an honest chain equals
 /// `proofs[0].initial_state.memory_root`). [`verify_chain`] checks segment 0's
 /// `initial_state.memory_root` against it — the memory analogue of the
-/// allowlist's program-identity anchor. Without ANY anchor, allowlist membership
-/// + boundary continuity + the final io-binding say nothing about the RAM the
+/// allowlist's program-identity anchor.
+///
+/// Without an anchor, allowlist membership, boundary continuity, and the final
+/// I/O binding say nothing about the RAM the
 /// entering segment starts from, so a chain running from a doctored initial image
 /// slips through; binding segment 0 to the manifest's declared root closes that
 /// (and brings the streaming path to parity with the library's
@@ -1607,18 +1609,13 @@ pub fn decode_chain_manifest(bytes: &[u8]) -> Option<ChainManifest> {
 /// Verify a chain delivered as per-segment proof bytes against the
 /// caller-supplied `allowlist` (the concatenation of accepted 32-byte canonical
 /// commitments, `32·N` bytes) and the asserted `(public_bytes, return_bytes)`.
-/// Composes, per segment, these checks so none is meaningful without the
-/// others:
-///   1. allowlist membership — every segment's commitment must be in
-///      `allowlist` (a foreign program matches no entry);
-///   2. chain validity — per-segment STARK validity (`verify_standalone`,
-///      MOBILE) + boundary continuity (each segment's `initial_state` equals
-///      the previous segment's `final_state`);
-///   2a. entering-image anchor — segment 0's `initial_state.memory_root` equals
-///      the caller's `expected_initial_root`;
-///   3. tagless io-binding on the FINAL segment — `public_io_hash() ==
-///      compute_io_hash(public, return)` (the guest binds it at halt, i.e. the
-///      last segment).
+/// Composes these checks for every segment:
+///
+/// 1. allowlist membership — every segment's commitment must be in
+///    `allowlist`;
+/// 2. chain validity — per-segment STARK validity plus boundary continuity;
+/// 3. entering-image anchor — segment zero starts at `expected_initial_root`;
+/// 4. final I/O binding — the final segment binds the public and return bytes.
 ///
 /// STREAMING: proofs are verified + DROPPED one at a time (each on a large
 /// stack — a canonical proof's verify overflows the default ~2 MiB), so peak

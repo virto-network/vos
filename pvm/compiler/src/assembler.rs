@@ -883,7 +883,7 @@ mod tests {
         // The refine path halts via djump to the halt address.
         match result {
             vos_pvm::kernel::KernelResult::Halt => {}
-            other => panic!("Expected Halt, got {:?}", other),
+            other => panic!("Expected Halt, got {other:?}"),
         }
     }
 }

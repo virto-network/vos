@@ -13,11 +13,11 @@
 //!
 //! The CLI owns the ELF/transpile half (which `vosx` already does everywhere):
 //! read the ELF → transpile to a PVM blob (`vos_pvm_compiler`) → locate
-//! `__VOS_WITNESS` → write the catalog TOML. The heavy zkpvm half — trace the
+//! `__VOS_WITNESS` → write the catalog TOML. The heavy proving half — trace the
 //! unpatched image for its page-Merkle root, and prove one representative
 //! canonical segment per distinct shape to measure the commitment allowlist —
 //! lives in the **prover extension**'s `measure_catalog` handler, so `vosx`
-//! carries no zkpvm dependency. `pin` therefore needs a space whose daemon has
+//! carries no prover dependency. `pin` therefore needs a space whose daemon has
 //! the prover extension loaded (`vosx space up`).
 //!
 //! The proving step is heavy (canonical prove of a handful of segments, minutes,
@@ -223,7 +223,7 @@ pub fn run(cmd: ZkCommand) -> Result<()> {
 }
 
 fn pin(args: PinArgs) -> Result<()> {
-    // ── ELF/transpile half (host-owned; no zkpvm) ────────────────────
+    // ── ELF/transpile half (host-owned; no prover) ───────────────────
     let elf = std::fs::read(&args.elf)
         .with_context(|| format!("read provable ELF {}", args.elf.display()))?;
     let blob = vos_pvm_compiler::link_elf(&elf)
@@ -275,7 +275,7 @@ fn pin(args: PinArgs) -> Result<()> {
         bail!("--witness <FILE> is required to derive the profile (or pass --profile)");
     }
 
-    // ── zkpvm half (prover extension over the daemon) ────────────────
+    // ── proof half (prover extension over the daemon) ────────────────
     let space = resolve_space(args.space.as_deref())?;
     let reply = DaemonClient::with_connect(&space, |client| {
         let ext = client.resolve_target(&args.extension).map_err(|_| {
@@ -539,10 +539,7 @@ fn prove(args: ProveArgs) -> Result<()> {
         std::fs::write(path, manifest)
             .with_context(|| format!("write manifest {}", path.display()))?;
     }
-    eprintln!(
-        "proved {} segment(s); proofs + manifest are in the host proof CAS",
-        segments
-    );
+    eprintln!("proved {segments} segment(s); proofs + manifest are in the host proof CAS");
     eprintln!("  manifest_hash = {}", bytes_to_hex(manifest_hash));
     if let Some(path) = &args.record_out {
         let mut record = entry.record.clone();

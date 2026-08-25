@@ -1349,7 +1349,7 @@ impl Counter {
             positive.saturating_sub(negative).min(i64::MAX as u128) as i64
         } else {
             let magnitude = negative.saturating_sub(positive);
-            if magnitude >= (i64::MAX as u128) + 1 {
+            if magnitude > (i64::MAX as u128) {
                 i64::MIN
             } else {
                 -(magnitude as i64)

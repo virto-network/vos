@@ -18,7 +18,7 @@
 //! it.  RED before the `NextTimestamp = Timestamp + 1` carry-chain constraint
 //! landed; GREEN after.
 //!
-//! Run with: `cargo test -p zkpvm --features debug-internals --test
+//! Run with: `cargo test -p vos-pvm-proof --features debug-internals --test
 //! cpu_ts_chain_gate`.
 
 use vos_pvm::PVM_REGISTER_COUNT;

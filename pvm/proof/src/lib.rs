@@ -1,4 +1,4 @@
-//! # zkpvm — zero-knowledge prover and verifier for PVM bytecode
+//! # vos-pvm-proof — zero-knowledge prover and verifier for PVM bytecode
 //!
 //! A STARK proving system for the **PVM** instruction set used by
 //! the Polkadot Virtual Machine and the Kunekt actor runtime.
@@ -26,7 +26,7 @@
 //!
 //! A *deployed* verifier sees only the proof + the program commitment
 //! (not the trace) and uses the side-note-free `verify_standalone` from
-//! the separate `no_std` `zkpvm-verifier` crate. Executions too large
+//! the separate `no_std` `vos-pvm-proof-verifier` crate. Executions too large
 //! for one proof are proved as a chain — see [`verify_chain`], the
 //! [`segment`] cut helpers, and the `prover-extension` crate for the
 //! streaming / CAS deployment.
@@ -75,7 +75,7 @@
 //! - **Verify** — [`verify`] / [`verify_with_pcs_policy`] (prover-side,
 //!   with the SideNote); [`verify_chain`] for a segment chain. The
 //!   side-note-free deployer verifier is `verify_standalone` in the
-//!   `zkpvm-verifier` crate.
+//!   `vos-pvm-proof-verifier` crate.
 //! - **Identity** — [`program_commitment_of_proof`] /
 //!   [`program_commitment_hex`] extract the program commitment a
 //!   verifier pins.
@@ -593,7 +593,7 @@ pub use side_note::{CompactTrace, SideNote};
 pub use stwo::core::fri::FriConfig;
 pub use stwo::core::pcs::PcsConfig;
 // ── Verify (prover-side, with the SideNote): the stable surface ───────
-// The side-note-FREE deployer verifier lives in the `zkpvm-verifier` crate
+// The side-note-FREE deployer verifier lives in the `vos-pvm-proof-verifier` crate
 // (`verify_standalone`) — no_std, no prover deps.
 #[cfg(feature = "prover")]
 pub use verify::{DEFAULT_MAX_LOG_SIZE, verify, verify_chain, verify_with_pcs_policy};

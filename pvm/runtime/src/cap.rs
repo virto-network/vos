@@ -547,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn test_data_cap_legacy_map_unmap() {
+    fn test_data_cap_map_unmap() {
         let mut data = DataCap::new(0, 10);
         assert!(!data.has_any_mapped());
 

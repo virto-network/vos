@@ -222,7 +222,7 @@ fn retire_inbox<S: GuestAccumulateStore>(
     let observed_timeslot = store
         .logical_timeslot()
         .map_err(GuestAccumulateError::Storage)?;
-    if !observed_timeslot.is_some_and(|slot| slot >= retirement.deadline_timeslot) {
+    if observed_timeslot.is_none_or(|slot| slot < retirement.deadline_timeslot) {
         return Ok(rejected(AccumulationRejection::InvalidWorkflowTransition));
     }
 
@@ -466,7 +466,6 @@ fn upgrade_actor<S: GuestAccumulateStore>(
         Some(&descriptor.encode()),
     )?;
     header.service_root = tree.root();
-    drop(tree);
     header.revision = header
         .revision
         .checked_add(1)
@@ -663,7 +662,6 @@ fn admit_ingress<S: GuestAccumulateStore>(
     )? {
         return Ok(rejected(rejection));
     }
-    drop(tree);
 
     for reference in &ingress.imported_blobs {
         if !blob_available(store, reference)? {
@@ -932,7 +930,7 @@ fn expire_call<S: GuestAccumulateStore>(
     let observed_timeslot = store
         .logical_timeslot()
         .map_err(GuestAccumulateError::Storage)?;
-    if !observed_timeslot.is_some_and(|slot| slot >= envelope.timeout.deadline_timeslot) {
+    if observed_timeslot.is_none_or(|slot| slot < envelope.timeout.deadline_timeslot) {
         return Ok(rejected(AccumulationRejection::InvalidWorkflowTransition));
     }
 
@@ -1269,7 +1267,6 @@ fn deliver<S: GuestAccumulateStore>(
     {
         return Ok(rejected(AccumulationRejection::InvalidWorkflowTransition));
     }
-    drop(tree);
     let admitted_message = envelope.admitted_message();
 
     let (delivery_commitment, resulting_state_root, resulting_crdt_heads, sequence, delivery_cid) =
@@ -1695,7 +1692,6 @@ fn sync_crdt<S: GuestAccumulateStore>(
     let mut tree = ServiceStateTree::new(store, header.service_root);
     apply_workflow_materialization(&mut tree, &mut materialized)?;
     header.service_root = tree.root();
-    drop(tree);
     apply_dedup_materialization(store, &header.service, &frontier, &materialized)?;
     header.crdt_heads = resulting_heads;
     // The rematerializers above consume the validated in-memory DAG. Persist
@@ -2675,7 +2671,7 @@ fn apply_delivery_materialization<S: GuestAccumulateStore>(
         if !matches!(
             change.workflow.as_slice(),
             [WorkflowOperation::Delivery(delivery)] if delivery == &event.value
-        ) || !crdt_receipt_matches_change(service, &change, &receipt)
+        ) || !crdt_receipt_matches_change(service, change, &receipt)
             || event.value.message.call_id != *call
         {
             return Err(GuestAccumulateError::CorruptStore);
@@ -2732,7 +2728,7 @@ fn apply_dedup_materialization<S: StateTreeStore>(
             .ok_or(GuestAccumulateError::CorruptStore)?;
         let receipt = AccumulationReceipt::decode(&receipt_bytes)
             .map_err(|_| GuestAccumulateError::CorruptStore)?;
-        if change.cid() != event.cid || !crdt_receipt_matches_change(service, &change, &receipt) {
+        if change.cid() != event.cid || !crdt_receipt_matches_change(service, change, &receipt) {
             return Err(GuestAccumulateError::CorruptStore);
         }
         let dedup = DedupRecord {
@@ -2771,7 +2767,7 @@ fn apply_dedup_materialization<S: StateTreeStore>(
         }
 
         let eligibility_key = role_assertion_eligibility_storage_key(input);
-        let eligibility = crdt_role_assertion_eligibility(&change, &receipt);
+        let eligibility = crdt_role_assertion_eligibility(change, &receipt);
         write(
             store,
             &eligibility_key,
@@ -2794,7 +2790,7 @@ fn apply_dedup_materialization<S: StateTreeStore>(
             write(store, &publication_key, None)?;
             continue;
         }
-        let Some(expected_published) = crdt_published_effects(&change)? else {
+        let Some(expected_published) = crdt_published_effects(change)? else {
             // Proof and attestation packages are intentionally absent from the
             // causal change. Preserve a local publication if this replica
             // produced it, but never synthesize or validate a stripped form.
@@ -2915,8 +2911,7 @@ fn materialized_actors_exist<S: StateTreeStore>(
     let mut actors = materialized
         .ingresses
         .iter()
-        .map(|(_, values)| values)
-        .flatten()
+        .flat_map(|(_, values)| values)
         .filter_map(|event| {
             let change = frontier.node(event.cid)?;
             let [WorkflowOperation::Ingress(ingress)] = change.workflow.as_slice() else {
@@ -2928,8 +2923,7 @@ fn materialized_actors_exist<S: StateTreeStore>(
             materialized
                 .workflows
                 .iter()
-                .map(|(_, values)| values)
-                .flatten()
+                .flat_map(|(_, values)| values)
                 .map(|event| event.value.target),
         )
         .chain(materialized.continuations.keys().copied())
@@ -2954,8 +2948,7 @@ fn materialized_actors_exist<S: StateTreeStore>(
             materialized
                 .replies
                 .iter()
-                .map(|(_, values)| values)
-                .flatten()
+                .flat_map(|(_, values)| values)
                 .map(|event| event.value.producer),
         )
         .collect::<Vec<_>>();
@@ -3194,15 +3187,11 @@ fn apply<S: GuestAccumulateStore>(
             }
         }
         ApplyMode::Commit => {
-            if proof_required {
-                if attached_proof.is_none() {
-                    return Ok(rejected(AccumulationRejection::MissingProof));
-                }
+            if proof_required && attached_proof.is_none() {
+                return Ok(rejected(AccumulationRejection::MissingProof));
             }
-            if attached_proof.is_some() {
-                if !proof_required {
-                    return Ok(rejected(AccumulationRejection::InvalidProof));
-                }
+            if attached_proof.is_some() && !proof_required {
+                return Ok(rejected(AccumulationRejection::InvalidProof));
             }
         }
     }
@@ -3708,7 +3697,6 @@ fn apply<S: GuestAccumulateStore>(
         Some(&workflow),
     )?;
     header.service_root = tree.root();
-    drop(tree);
 
     if work.workflow_step == 0
         && let Some(call) = work.parent_call
@@ -4130,7 +4118,7 @@ fn rematerialize_crdt_service<S: GuestAccumulateStore>(
     apply_ingress_materialization(store, frontier, &materialized)?;
     apply_delivery_materialization(store, &header.service, frontier, &materialized)?;
     let mut tree = ServiceStateTree::new(store, header.service_root);
-    if !materialized_actors_exist(&tree, &frontier, &materialized)? {
+    if !materialized_actors_exist(&tree, frontier, &materialized)? {
         return Err(GuestAccumulateError::CorruptStore);
     }
     apply_workflow_materialization(&mut tree, &mut materialized)?;
@@ -4349,8 +4337,7 @@ fn authorization_rejection<S: GuestAccumulateStore>(
             // Private witness bytes are intentionally unavailable here, so
             // authority-backed private grants remain fail-closed until the
             // proof public inputs expose that assertion separately.
-            !(authority.is_some() && policy.space_role.is_some())
-                && !policy.public
+            !(policy.public || authority.is_some() && policy.space_role.is_some())
                 && (policy.attested || work.proof_requested)
                 && (policy.space_role.is_some() || policy.actor_role.is_some())
                 && matches!(
@@ -9744,7 +9731,7 @@ mod tests {
             gas: GasAccounting::default(),
             proof: None,
         };
-        let workflow = transition.workflow_operations(&work);
+        let workflow = transition.workflow_operations(work);
         transition.crdt_change.as_mut().unwrap().workflow = workflow;
         transition
     }

@@ -16,7 +16,7 @@
 //! constant quality. The vetted width-16 M31 constants are pinned separately in
 //! `poseidon2_round_constants.rs`.
 //!
-//! Run: `cargo test -p zkpvm --test poseidon2_m31_channel -- --nocapture`
+//! Run: `cargo test -p vos-pvm-proof --test poseidon2_m31_channel -- --nocapture`
 
 use std::ops::{Add, AddAssign, Mul, Sub};
 

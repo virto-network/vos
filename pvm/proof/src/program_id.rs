@@ -1,6 +1,6 @@
 //! Program-identity commitment.
 //!
-//! In zkpvm, a proof's preprocessed-trace Merkle root IS the program
+//! In vos-pvm-proof, a proof's preprocessed-trace Merkle root IS the program
 //! commitment.  No separate computation is needed — the prover commits to
 //! it as part of `prove`, and the verifier checks it via
 //! `verify_standalone(proof, expected_commitment)`.

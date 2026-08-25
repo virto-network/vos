@@ -17,7 +17,7 @@
 //! the `ProverBackend` alias). No framework genericization (A1) and no
 //! SimdBackend Poseidon2 commit op (A3) were needed — the transplant suffices.
 //!
-//! Run: `cargo test -p zkpvm-verifier --features poseidon2-channel \
+//! Run: `cargo test -p vos-pvm-proof-verifier --features poseidon2-channel \
 //!         --test poseidon2_canonical_segment -- --nocapture`
 
 use vos_pvm::PVM_REGISTER_COUNT;

@@ -20,6 +20,7 @@ mod root_service;
 #[cfg(feature = "std")]
 mod scheduler;
 #[cfg(feature = "std")]
+#[allow(clippy::module_inception)]
 mod service;
 mod state_tree;
 mod storage;

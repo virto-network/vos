@@ -10,7 +10,7 @@ edition = "2024"
 # `#[actor]` macro emits under `cfg(all(target_arch = "riscv64",
 # feature = "bin"))` — replaces the removed `vos::pvm_main!` macro.
 # Default-on so `cargo build --release` for the riscv64em-vos target
-# produces a non-empty bin ELF (mirrors tests/fixtures/legacy-v1/actors/voucher-check).
+# produces a non-empty bin ELF (as in pvm/proof/fixtures/voucher-check).
 default = ["bin"]
 bin = []
 

@@ -11,19 +11,19 @@
 //!
 //! The PVM protocol ABI uses ID 100 with `φ[7]=h_ptr (64B)`,
 //! `φ[8]=m_ptr (128B)`, `φ[9]=t_low`, and `φ[10]=f`. When the
-//! zkpvm chip lands on master, the same actor binary lights up
+//! proof chip is enabled, the same actor binary uses
 //! the chip path with no source changes.
 //!
 //! **ABI limit**: only the low 64 bits of the blake2b byte
 //! counter are passed (`t_low`). Inputs ≥ 2^64 bytes per hash
 //! would silently lose the high half and produce a divergent
-//! digest. Not a practical concern — matches zkpvm-precompiles.
+//! digest. Not a practical concern — matches `vos-pvm-precompiles`.
 
 #[cfg(target_arch = "riscv64")]
 use crate::abi::pvm::ecall::VOS_OBJECT_CAP;
 
-/// blake2b compression precompile. ID matches `zkpvm-precompiles`
-/// so the same actor binary lights up the chip path under zkpvm.
+/// Blake2b compression precompile. Its ID matches `vos-pvm-precompiles`,
+/// so the same actor binary uses the constrained path during proving.
 pub const ECALL_BLAKE2B_COMPRESS: u32 = 100;
 
 /// High-level streaming hash. Produces an `OUT_LEN`-byte digest
@@ -339,7 +339,7 @@ mod tests {
         let ours: [u8; 2] = blake2b_hash(b"vos-instance-svc-id", &[&[0u8], b"bridge-b"]);
         let mut h = Blake2b16::new();
         h.update(b"vos-instance-svc-id");
-        h.update(&[0u8]);
+        h.update([0u8]);
         h.update(b"bridge-b");
         let theirs = h.finalize();
         assert_eq!(

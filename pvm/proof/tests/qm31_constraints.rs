@@ -1,6 +1,6 @@
 //! Constrain explicit **QM31 (SecureField) arithmetic** in-AIR as 4×M31 (mul +
 //! inverse) — the idiom any in-AIR extension-field arithmetic builds on (e.g.
-//! FRI-fold / OODS-composition constraints). No other zkpvm chip constrains
+//! FRI-fold / OODS-composition constraints). No other vos-pvm-proof chip constrains
 //! explicit extension-field ops: SecureField otherwise appears only in
 //! prover-side interaction-trace return types.
 //!
@@ -19,7 +19,7 @@
 //! protocol, and a corrupted product is rejected. Establishes the QM31-in-
 //! constraints convention the FRI-fold / OODS chips build on.
 //!
-//! Run: `cargo test -p zkpvm --test qm31_constraints -- --nocapture`
+//! Run: `cargo test -p vos-pvm-proof --test qm31_constraints -- --nocapture`
 
 use num_traits::{One, Zero};
 use stwo::core::air::Component;

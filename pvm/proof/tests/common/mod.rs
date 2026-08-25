@@ -78,10 +78,10 @@ pub fn prove_and_verify(steps: Vec<PvmStep>, code: &[u8], bitmask: &[u8]) {
 /// constraint addition produces a `ConstraintsNotSatisfied` and you need to
 /// distinguish "logup imbalance" (per-component sums non-zero, total
 /// non-zero) from "structural pair-shape blow-up" (sums zero, prover still
-/// rejects).  See `crates/zkpvm/src/chips/cpu/CONSTRAINTS.md`.
+/// rejects).  See `pvm/proof/src/chips/cpu/CONSTRAINTS.md`.
 ///
 /// This helper requires the `debug-internals` feature
-/// (`cargo test --features zkpvm/debug-internals`).
+/// (`cargo test -p vos-pvm-proof --features debug-internals`).
 #[cfg(feature = "debug-internals")]
 pub fn prove_and_verify_with_debug(steps: Vec<PvmStep>, code: &[u8], bitmask: &[u8]) {
     let mut side_note = vos_pvm_proof::SideNote::new(steps, code.to_vec(), bitmask.to_vec());

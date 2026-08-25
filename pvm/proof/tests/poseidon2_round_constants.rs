@@ -18,7 +18,7 @@
 //! `round_constants_match_baked` test then asserts the module's baked arrays
 //! equal the freshly-generated ones (the constants-vector test).
 //!
-//! Run: `cargo test -p zkpvm --test poseidon2_round_constants -- --nocapture`
+//! Run: `cargo test -p vos-pvm-proof --test poseidon2_round_constants -- --nocapture`
 
 use stwo::core::fields::m31::BaseField;
 use vos_pvm_proof::poseidon2::{FULL_ROUNDS, N_HALF_FULL_ROUNDS, N_PARTIAL_ROUNDS, N_STATE};

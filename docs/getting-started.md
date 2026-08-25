@@ -17,7 +17,7 @@ cargo run -p vosx -- new counter
 The generated actor has ordinary Rust state and typed handlers:
 
 ```rust
-use vos::actors::prelude::*;
+use vos::prelude::*;
 
 #[actor]
 pub struct Counter {
@@ -26,6 +26,10 @@ pub struct Counter {
 
 #[messages]
 impl Counter {
+    fn new() -> Self {
+        Self { value: 0 }
+    }
+
     #[msg]
     pub fn add(&mut self, amount: u64) {
         self.value += amount;
@@ -53,7 +57,9 @@ Start a local space:
 
 ```bash
 cargo run -p vosx -- space new demo
-cargo run -p vosx -- space up demo --service-pvm services/vos-service/vos-service.pvm
+cargo run -p vosx -- space up demo \
+  --service-pvm services/vos-service/vos-service.pvm \
+  --allow-conformance
 ```
 
 Publish, install, and call the actor:
@@ -67,4 +73,3 @@ cargo run -p vosx -- counter value --space demo
 
 Use `--consistency raft` for one ordered replicated state machine, or
 `--consistency crdt` for convergent operation history.
-

@@ -152,12 +152,7 @@ fn first_diff_level(a: &[u8], b: &[u8]) -> usize {
 
 /// First bit `< limit` where `key` disagrees with `prefix`, if any.
 fn diverge_before(key: &[u8], prefix: &[u8], limit: usize) -> Option<usize> {
-    for l in 0..limit {
-        if state::level_bit(key, l) != state::level_bit(prefix, l) {
-            return Some(l);
-        }
-    }
-    None
+    (0..limit).find(|&l| state::level_bit(key, l) != state::level_bit(prefix, l))
 }
 
 /// `key`'s first `level` bits, zero-padded to full width — the
@@ -908,8 +903,7 @@ mod tests {
             proof,
             BatchProof::build::<[u8; 16]>(&p, &[], &[&key(1), &key(2)])
         );
-        let touched: Vec<(Vec<u8>, Option<Vec<u8>>)> =
-            values.into_iter().map(|(k, v)| (k, v)).collect();
+        let touched: Vec<(Vec<u8>, Option<Vec<u8>>)> = values.into_iter().collect();
         let ledger = WitnessedLedger::new(p, proof, touched, m.root());
         assert_eq!(ledger.get(&key(1)), None);
 

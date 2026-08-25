@@ -17,7 +17,7 @@ fn main() {
     #[cfg(feature = "prover")]
     imp::run(std::env::args().skip(1).collect());
     #[cfg(not(feature = "prover"))]
-    eprintln!("zkpvm proving benchmarks require the `prover` feature (default-on)");
+    eprintln!("vos-pvm-proof proving benchmarks require the `prover` feature (default-on)");
 }
 
 #[cfg(feature = "prover")]

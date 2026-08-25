@@ -17,7 +17,7 @@
 //! directly (exactly what a from-scratch prover does), and assert the chip's
 //! AIR constraints REJECT it.
 //!
-//! Run with: `cargo test -p zkpvm --features debug-internals --test
+//! Run with: `cargo test -p vos-pvm-proof --features debug-internals --test
 //! blake2b_boundary_gate`.
 
 use vos_pvm_proof::AirColumn;
