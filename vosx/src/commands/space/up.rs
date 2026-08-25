@@ -4544,19 +4544,19 @@ mod tests {
         assert_eq!(package.manifest.service_abi, 17);
         assert_eq!(
             hex::encode(package.manifest.actor_program.0),
-            "16d0488cd51bfb70f5697cb909c7eb2a76772673936f3db69ff396868f7713e3",
+            "79099ccbec4e4dac7af893e153ba379a1d33aa75734daf1d93cbba3e684d65eb",
         );
         assert_eq!(
             hex::encode(package.deployment_id().0),
-            "c3a7a5cc5a6950a2d8be2cab8f8245d020057fd0b76a5496fa95ca9029862104",
+            "a811b21bb2d29e8e906b14c83f726ff20f8898e0d424b51f4e28213e304267e1",
         );
         assert_eq!(
             hex::encode(package_hash),
-            "a7bf5956660ff9a903490e611727484d19608655ff6af4ff6fd81d8fe02159c4",
+            "5f92e0bf821042268ef7c66b3ad0e6ee6ce435d989d20970ca2e01e7492be07d",
         );
         assert_eq!(
             hex::encode(replication_id),
-            "63c41545d501c54ec172ce44f4b662eba84405b13c7a48ee44e1f0e17f9b3089",
+            "e8d2b68a1310b2872ab8d5bb2d42fc6555714d70ab9dff26063499f4f176d060",
         );
         // ABI 17 is a clean service/storage break. It must not accidentally
         // reuse the deterministic ABI-16 package or replication identities

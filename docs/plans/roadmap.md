@@ -181,7 +181,7 @@ stands in for the on-chain settlement venue Wave 2 makes real.
 - **Release and operations**: verified offline backup/restore covers root
   images, node identity, local policy, every private side store, and immutable
   program artifacts under the same daemon-held data lock. The pinned service
-  and frozen Batch 70 authority now ship as one strictly verified release
+  and canonical ABI-17 authority now ship as one strictly verified release
   directory, and the physical Raft gate moves a stopped voter through an
   offline archive into fresh machine roots before catch-up. New-identity voter
   replacement now uses full PeerIds, private-ingress quiescence, committed

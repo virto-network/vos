@@ -681,7 +681,7 @@ fn authority_upgrade_package_fixture(
     .expect("decode authority candidate");
     let frozen =
         fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("blobs/space_authority.pvm"))
-            .expect("read frozen authority PVM");
+            .expect("read canonical ABI-17 authority PVM");
     assert_ne!(
         candidate.manifest.actor_program,
         vos::v2::ProgramId::of_pvm(&frozen),
@@ -690,19 +690,19 @@ fn authority_upgrade_package_fixture(
     package
 }
 
-fn assert_bundled_space_authority_preserves_batch_70_program() {
+fn assert_bundled_space_authority_matches_abi_17_program() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let bundled = fs::read(workspace.join("vosx/blobs/space_authority.pvm"))
         .expect("vosx ships the canonical authority PVM");
     assert_eq!(
         hex::encode(vos::v2::ProgramId::of_pvm(&bundled).0),
-        "16d0488cd51bfb70f5697cb909c7eb2a76772673936f3db69ff396868f7713e3",
-        "the built-in authority program is a durable protocol identity; source rebuilds require an explicit UpgradeActor migration",
+        "79099ccbec4e4dac7af893e153ba379a1d33aa75734daf1d93cbba3e684d65eb",
+        "the built-in authority program must implement the current ABI-17 private-input contract",
     );
     assert_eq!(
         hex::encode(vos::crypto::blake2b_hash::<32>(&[], &[&bundled])),
-        "86872e83d3bb445cbf2b477e81d51aaaa5c21e0a7555e90226000d09aeca0842",
-        "the Batch 70 authority bytes must remain exact so same-ABI sealed spaces can reopen",
+        "45c1e75beb821b45a2242fd730c729a19fab014be1438ae293df1937492efebc",
+        "the ABI-17 authority bytes must remain exact so same-ABI sealed spaces can reopen",
     );
 }
 
@@ -1026,7 +1026,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
     );
     assert!(
         !rejected.status.success()
-            && String::from_utf8_lossy(&rejected.stderr).contains("frozen Batch-70"),
+            && String::from_utf8_lossy(&rejected.stderr).contains("canonical ABI-17"),
         "release verification must reject changed authority bytes: {}",
         String::from_utf8_lossy(&rejected.stderr),
     );
@@ -1510,7 +1510,7 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
     let crdt_package = crdt_counter_package_fixture(crdt_dist.path());
 
     vosx_ok(data.path(), config.path(), &["space", "new", space]);
-    assert_bundled_space_authority_preserves_batch_70_program();
+    assert_bundled_space_authority_matches_abi_17_program();
     let authority_candidate =
         authority_upgrade_package_fixture(data.path(), config.path(), authority_dist.path());
 
@@ -1905,7 +1905,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
     let config_b = TempDir::new("production-crdt-b-config");
     let dist = TempDir::new("production-crdt-network-dist");
     let sidecar_dir = TempDir::new("production-crdt-sidecars");
-    assert_bundled_space_authority_preserves_batch_70_program();
+    assert_bundled_space_authority_matches_abi_17_program();
     let package = crdt_counter_package_fixture(dist.path());
     let policy = vos::v2::Hash([0x69; 32]);
     let trust_a_path = sidecar_dir.path().join("authority-a.sock");

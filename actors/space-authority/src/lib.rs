@@ -31,6 +31,9 @@ struct GrantRow {
     grantor_peer_id: Vec<u8>,
 }
 
+#[cfg(feature = "migration-fixture")]
+static MIGRATION_FIXTURE_MARKER: u8 = 0x79;
+
 /// A package host can use this to construct the immutable initial actor state
 /// committed by service genesis. Empty or malformed root identities produce
 /// no state rather than an authority which could be claimed after install.
@@ -78,6 +81,13 @@ impl SpaceAuthority {
     /// The empty constructor is fail-closed. Production installation supplies
     /// the encoded genesis state from [`initial_state`].
     fn new() -> Self {
+        // Keep the physical authority-upgrade rehearsal on a genuinely
+        // different executable without changing its signed contract or state
+        // semantics. Production release builds never enable this feature.
+        #[cfg(feature = "migration-fixture")]
+        // SAFETY: this is a read-only byte with static lifetime. Volatility is
+        // intentional so the migration fixture remains in the emitted PVM.
+        let _ = unsafe { core::ptr::read_volatile(&MIGRATION_FIXTURE_MARKER) };
         Self {
             space: [0; 32],
             authority_replication_id: [0; 32],

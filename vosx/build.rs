@@ -57,8 +57,8 @@ fn main() {
 }
 
 const SPACE_AUTHORITY_BLAKE2B_256: [u8; 32] = [
-    0x86, 0x87, 0x2e, 0x83, 0xd3, 0xbb, 0x44, 0x5c, 0xbf, 0x2b, 0x47, 0x7e, 0x81, 0xd5, 0x1a, 0xaa,
-    0xa5, 0xc2, 0x1e, 0x0a, 0x75, 0x55, 0xe9, 0x02, 0x26, 0x00, 0x0d, 0x09, 0xae, 0xca, 0x08, 0x42,
+    0x45, 0xc1, 0xe7, 0x5b, 0xeb, 0x82, 0x1b, 0x45, 0xa2, 0x24, 0x2f, 0xd7, 0x30, 0xc7, 0x29, 0xa1,
+    0x9f, 0xab, 0x01, 0x4b, 0xe1, 0x43, 0x8a, 0xe2, 0x93, 0xdf, 0x19, 0x37, 0x49, 0x2e, 0xfe, 0xbc,
 ];
 
 /// Bundle the release authority identity without consulting developer output.
@@ -71,7 +71,7 @@ fn bundle_frozen_space_authority(manifest_dir: &Path, out_dir: &Path) {
     let source = manifest_dir.join("blobs/space_authority.pvm");
     let bytes = fs::read(&source).unwrap_or_else(|e| {
         panic!(
-            "read frozen canonical authority {}: {e}; restore the committed release blob",
+            "read canonical ABI-17 authority {}: {e}; restore the committed release blob",
             source.display()
         )
     });
@@ -79,14 +79,14 @@ fn bundle_frozen_space_authority(manifest_dir: &Path, out_dir: &Path) {
     assert_eq!(
         digest.as_bytes(),
         SPACE_AUTHORITY_BLAKE2B_256,
-        "frozen canonical authority {} does not match its release digest; source rebuilds must use the explicit UpgradeActor path",
+        "canonical ABI-17 authority {} does not match its release digest; source rebuilds must use the explicit UpgradeActor path",
         source.display(),
     );
 
     let dest = out_dir.join("bundled_space_authority.pvm");
     fs::write(&dest, &bytes).unwrap_or_else(|e| panic!("write bundled_space_authority.pvm: {e}"));
     println!(
-        "cargo:warning=vosx: bundled frozen space-authority ({} bytes) from {}",
+        "cargo:warning=vosx: bundled canonical ABI-17 space-authority ({} bytes) from {}",
         bytes.len(),
         source.display(),
     );

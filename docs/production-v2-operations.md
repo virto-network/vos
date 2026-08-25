@@ -38,19 +38,25 @@ the catalog thereafter retains those exact signed bytes. Test recipes instead
 use a clearly labeled ephemeral signer and never treat their `.vos` as a
 release artifact.
 
-Package the committed canonical service with the frozen space authority:
+Reproduce the canonical ABI-17 authority, then package it with the committed
+service:
 
 ```sh
+just build-authority-release
 just package-v2-production-release target/production-v2-release
 cargo run -p vosx -- release verify target/production-v2-release
 ```
+
+`build-authority-release` performs the checkout-independent canonical actor
+build and requires the fresh PVM to equal the committed authority byte-for-byte.
+The package command repeats that prerequisite before assembling the release.
 
 The output directory contains exactly:
 
 - `vos-service.pvm`, whose `ProgramId` must equal
   `VOS_SERVICE_PROGRAM_ID`;
-- `space-authority.pvm`, whose bytes and `ProgramId` must equal the frozen
-  Batch 70 authority identity; and
+- `space-authority.pvm`, whose bytes and `ProgramId` must equal the canonical
+  ABI-17 authority identity; and
 - `manifest.json`, which binds both file sizes, raw BLAKE2b-256 digests,
   program identities, the v2 ABI, store schema, and execution-semantics ID.
 
@@ -61,7 +67,7 @@ select a service PVM from an unverified build cache.
 
 The authority PVM is included for disaster recovery and identity inspection.
 Normal startup uses the copy embedded in the release `vosx` binary and verifies
-the same frozen digest during the binary build.
+the same ABI-17 digest during the binary build.
 
 Before publishing the directory, run `just test-v2-release-operations`. The
 gate consumes the packaged service in a real Local root backup/reopen and moves
@@ -181,7 +187,7 @@ row is what authenticates the retiring slot during the transition.
 
 ## Canonical authority upgrades
 
-The bundled Batch 70 `space-authority` PVM is a durable actor-program artifact.
+The bundled ABI-17 `space-authority` PVM is a durable actor-program artifact.
 Its package, deployment, and derived replication identity are pinned per
 platform ABI because the package manifest also binds the service PVM, ABI, and
 execution semantics. Rebuilding its source within one ABI produces an upgrade
@@ -254,6 +260,6 @@ the process-local conformance allowlist is deliberately refused because it
 cannot replay on followers. CRDT roots, roots exposing attested methods, and
 changes which add or remove the root's role-authority requirement remain
 unsupported. Those shapes need guest-owned binding migrations before an
-in-place upgrade can be safe. Keep the bundled Batch 70 PVM unchanged: it is
-the recovery/genesis artifact for existing spaces, not an implicit upgrade
-channel.
+in-place upgrade can be safe. Keep the bundled ABI-17 PVM unchanged within that
+release line: it is the recovery/genesis artifact for ABI-17 spaces, not an
+implicit upgrade channel.

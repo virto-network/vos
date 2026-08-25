@@ -1,8 +1,8 @@
 //! Build and verify one self-describing production-v2 artifact directory.
 //!
-//! `vos-service.pvm` is the consensus program all hosts execute. The frozen
-//! `space-authority.pvm` is the durable Batch-70 authority identity already
-//! sealed into production spaces. A release must carry these exact pins
+//! `vos-service.pvm` is the consensus program all hosts execute. The canonical
+//! `space-authority.pvm` is the ABI-17 authority identity sealed into new
+//! production spaces. A release must carry these exact pins
 //! together; selecting either artifact from a developer build directory would
 //! make a deployment unreproducible or an existing space impossible to open.
 
@@ -101,7 +101,8 @@ fn bundle(service_path: &Path, output: &Path) -> anyhow::Result<()> {
     fs::create_dir(output).with_context(|| format!("reserve {}", output.display()))?;
     let mut guard = PartialDirectory(Some(output.to_path_buf()));
     fs::write(output.join(SERVICE_FILE), &service).context("write pinned service PVM")?;
-    fs::write(output.join(AUTHORITY_FILE), authority).context("write frozen authority PVM")?;
+    fs::write(output.join(AUTHORITY_FILE), authority)
+        .context("write canonical ABI-17 authority PVM")?;
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).context("encode release manifest")?;
     fs::write(output.join(MANIFEST_FILE), manifest_bytes).context("write release manifest")?;
     verify(output).context("verify staged production release")?;
@@ -156,11 +157,11 @@ fn validate_service(bytes: &[u8]) -> anyhow::Result<()> {
 fn validate_authority(bytes: &[u8]) -> anyhow::Result<()> {
     let digest = vos::crypto::blake2b_hash::<32>(&[], &[bytes]);
     if digest != bundled::SPACE_AUTHORITY_BLAKE2B_256 {
-        bail!("authority PVM does not match the frozen Batch-70 release bytes");
+        bail!("authority PVM does not match the canonical ABI-17 release bytes");
     }
     let program = ProgramId::of_pvm(bytes);
     if program.0 != bundled::SPACE_AUTHORITY_PROGRAM_ID {
-        bail!("authority PVM does not match the frozen Batch-70 program identity");
+        bail!("authority PVM does not match the canonical ABI-17 program identity");
     }
     Ok(())
 }
@@ -349,7 +350,7 @@ mod tests {
 
     #[test]
     fn authority_pin_rejects_changed_bytes() {
-        assert!(validate_authority(b"not the frozen authority").is_err());
+        assert!(validate_authority(b"not the canonical ABI-17 authority").is_err());
     }
 
     #[cfg(unix)]

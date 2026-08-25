@@ -785,10 +785,11 @@ claiming that automatic topology discovery has landed. Snapshot joiners verify
 the sealed production provenance and exact policy; log replay independently
 re-runs historical checks. Every voter must observe historical JAM-slot
 verification before the gate completes. The bundled `space-authority` PVM is a
-durable protocol identity: its Batch 70 program ID and exact bytes remain
-frozen. The root-signed authority package, deployment, and derived replication
-incarnation are separately pinned for each platform ABI because their manifest
-binds the service PVM, ABI, and execution semantics. Spaces sealed by the same
+durable protocol identity: its ABI-17 program ID and exact bytes are pinned to
+the VPI3-capable build. The root-signed authority package, deployment, and
+derived replication incarnation are separately pinned for each platform ABI
+because their manifest binds the service PVM, ABI, and execution semantics.
+Spaces sealed by the same
 ABI therefore reopen unchanged; an ABI clean break deliberately produces a
 different authority incarnation and is rejected rather than silently
 reinterpreted. Such a space must be reopened with the release that sealed it
@@ -804,8 +805,9 @@ check also covers raw privileged ingress and voter-authenticated redirects;
 dependent roots continue resolving the frozen genesis service deployment after
 the catalog moves to the upgraded actor package.
 
-`just package-v2-production-release` writes the canonical service PVM and
-frozen authority PVM beside a `VOSR1` manifest. `vosx release verify` binds the
+`just package-v2-production-release` reproduces the ABI-17 authority PVM, then
+writes it with the canonical service PVM beside a `VOSR1` manifest. `vosx
+release verify` binds the
 file sizes, raw BLAKE2b-256 digests, program identities, ABI, store schema, and
 execution semantics and rejects symlinks or surplus files. The complete
 identity-preserving machine-replacement and authority-upgrade runbook is
@@ -1257,8 +1259,9 @@ continue on the old host during this staged cutover.
 Registry-level pointer mutation alone remains invalid for signed v2 packages.
 The `space upgrade` command recognizes a v2-to-v2 change and first runs the
 guest-owned `UpgradeActor` protocol described above, then performs the catalog
-compare-and-swap. Crossing the legacy/v2 boundary, CRDT upgrades, and upgrades
-of the frozen canonical authority fail closed.
+compare-and-swap. Crossing the legacy/v2 boundary and CRDT upgrades fail
+closed. Canonical-authority upgrades require the specialized immutable-root
+validation and migration path; raw catalog substitution remains forbidden.
 
 The service identity retains the root package `DeploymentId` selected when
 the root tree is installed; it is the stable service/routing identity. Every
@@ -1353,12 +1356,13 @@ root cannot create or reuse the lock merely by choosing the bridge's ActorId
 and naming the ledger in its own directory. ABI 17, schema 39, and execution
 semantics v22 add that source service to the host-private actor input and
 require it exactly for actor origins. This is a clean service/store boundary
-from ABI 16: although the frozen authority PVM bytes do not change, the
-authority package manifest binds the new service ProgramId, ABI, and semantics,
-so its deployment, signed package hash, and auto-derived replication
-incarnation change as well. ABI-16 authority roots must remain on their sealing
-release or be cleanly reinstalled; startup never aliases the ABI-16 incarnation
-to ABI 17. That
+from ABI 16. The authority was rebuilt against VPI3 and repinned together with
+the new service ProgramId, ABI, and semantics, so its actor program, deployment,
+signed package hash, and auto-derived replication incarnation all change.
+Wrapping the pre-ABI-17 authority PVM in new metadata is forbidden because that
+guest decodes the older private-input wire. ABI-16 authority roots must remain
+on their sealing release or be cleanly reinstalled; startup never aliases the
+ABI-16 incarnation to ABI 17. That
 anchor certifies one ordinary, non-voided transfer whose rows all use
 `Layer::Settled`, one amount commitment, and the bridge package's configured
 currency. Returning that anchor atomically records an append-only voucher lock

@@ -107,20 +107,30 @@ refresh-bundled-registry: (build-actor "space-registry")
     cp actors/space-registry/target/riscv64em-javm/release/space_registry.elf \
        vosx/blobs/space_registry.elf
 
-# Build a candidate authority PVM for an explicit UpgradeActor migration. The
-# bundled Batch 70 PVM is a durable identity and must not be replaced in-place:
-# doing so changes the root-signed package and replication incarnation of every
-# already-sealed space.
-build-authority-upgrade-candidate: (build-actor "space-authority")
-    cargo run -p vosx -- build actors/space-authority --name space-authority \
+# Build a deliberately distinct, contract-compatible authority PVM for the
+# physical UpgradeActor rehearsal. Canonical ABI release builds never enable
+# `migration-fixture` and must not be replaced through this recipe.
+build-authority-upgrade-candidate:
+    cd actors/space-authority; cargo +nightly actor --features migration-fixture
+    cargo run -p vosx -- build \
+      actors/space-authority/target/riscv64em-javm/release/space_authority.elf \
+      --name space-authority \
       --version artifact-only --out-dir target/bundled-space-authority
     @echo "candidate: target/bundled-space-authority/space-authority.pvm"
     @echo "install only through a reviewed UpgradeActor migration"
 
+# Reproduce the canonical authority through vosx's checkout-independent actor
+# build and require exact identity with the ABI-17 release artifact.
+build-authority-release:
+    cargo run -p vosx -- build actors/space-authority --name space-authority \
+      --version artifact-only --out-dir target/canonical-space-authority
+    cmp target/canonical-space-authority/space-authority.pvm \
+      vosx/blobs/space_authority.pvm
+
 # Assemble the two protocol-pinned production PVMs with a strict manifest.
 # The command refuses to replace an existing directory so a release operator
 # cannot silently mutate an artifact set that has already been distributed.
-package-v2-production-release out="target/production-v2-release":
+package-v2-production-release out="target/production-v2-release": build-authority-release
     cargo run -p vosx -- release bundle \
       --service-pvm services/vos-service/vos-service.pvm --out "{{out}}"
     cargo run -p vosx -- release verify "{{out}}"
@@ -178,7 +188,7 @@ test-v2-release-operations: test-v2-daemon-root test-v2-production-raft-relocati
 # Run the production-profile daemon gates against independent VTA1/VTR1
 # authority sidecars, including fail-closed recovery, two-node CRDT sync, and
 # three-voter Raft failover/catch-up through follower-facing calls.
-test-v2-production-daemon: build-v2-daemon-root-artifacts build-v2-registry-fixtures (build-actor "space-authority")
+test-v2-production-daemon: build-v2-daemon-root-artifacts build-v2-registry-fixtures build-authority-upgrade-candidate
     cargo test -p vosx --test onboarding_e2e signed_v2_roots_run_under_production_trust_and_recover -- --nocapture --test-threads=1
     cargo test -p vosx --test onboarding_e2e production_crdt_root_converges_across_enrolled_daemons_and_restart -- --nocapture --test-threads=1
     cargo test -p vosx --test onboarding_e2e production_raft_root_survives_voter_join_leader_loss_and_backup_relocation -- --nocapture --test-threads=1
