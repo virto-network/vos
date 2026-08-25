@@ -702,8 +702,8 @@ mod tests {
         assert!(!c.is_full_wildcard());
 
         // Synonyms + case-folding of the actor name.
-        let c = IntraCap::parse("Dev-Project:dev").unwrap();
-        assert_eq!(c.actor_name.as_deref(), Some("dev-project"));
+        let c = IntraCap::parse("Workspace:dev").unwrap();
+        assert_eq!(c.actor_name.as_deref(), Some("workspace"));
         assert_eq!(c.role, Some(SpaceRole::Developer));
     }
 
@@ -755,7 +755,7 @@ mod tests {
         let caps = [IntraCap::parse("space-registry:admin").unwrap()];
         // Unrelated target, and an unresolved target: neither matches
         // a name-pinned cap.
-        assert_eq!(cap_for(&caps, Some("dev-project")), None);
+        assert_eq!(cap_for(&caps, Some("workspace")), None);
         assert_eq!(cap_for(&caps, None), None);
         // Empty caps deny everything.
         assert_eq!(cap_for(&[], Some("space-registry")), None);
@@ -833,7 +833,7 @@ mod tests {
             ("*:guest", "*:guest"),
             ("*", "*:*"),
             ("*:*", "*:*"),
-            ("Dev-Project:dev", "dev-project:developer"),
+            ("Workspace:dev", "workspace:developer"),
         ];
         for (input, canonical) in cases {
             let c = IntraCap::parse(input).unwrap();

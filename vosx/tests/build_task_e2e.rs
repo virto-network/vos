@@ -39,7 +39,7 @@ fn build_accepts_the_canonical_binary_task_project() {
     let vosx = PathBuf::from(env!("CARGO_BIN_EXE_vosx"));
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repository = crate_root.parent().expect("vosx lives in the workspace");
-    let actor = crate_root.join("blobs/dev_project.elf");
+    let actor = crate_root.join("blobs/space_registry.elf");
     let task = repository.join("tests/fixtures/provable/clerk-apply");
     let output = TempDir::new("task-project-output");
     let config = TempDir::new("task-project-config");

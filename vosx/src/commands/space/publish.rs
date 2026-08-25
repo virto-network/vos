@@ -5,7 +5,6 @@ use vos::registry::Status;
 use vos::service::{ServiceWire, VosPackage};
 
 use crate::blob_store::{self, BlobHash, BlobSource};
-use crate::bundled;
 use crate::commands::space::client::DaemonClient;
 use crate::commands::space::common::parse_program_name;
 use crate::output;
@@ -21,33 +20,16 @@ struct PublishedView {
 
 pub struct Args {
     pub space: String,
-    /// Catalog name. `None` only when `--bundled` supplies it.
-    pub program_ref: Option<String>,
-    /// Blob source: file path, hash, ipfs:<cid>, or URL. `None` only
-    /// when `--bundled` supplies the bytes.
-    pub source: Option<String>,
-    /// Publish a blob baked into this `vosx` binary instead of a
-    /// `<source>`. The name selects the bundled program and its fixed
-    /// catalog identity; the publish is idempotent (re-running with the
-    /// same bytes is a no-op) so provisioning flows can call it freely.
-    pub bundled: Option<String>,
+    pub program_ref: String,
+    /// Blob source: file path, hash, content identifier, or URL.
+    pub source: String,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    if let Some(name) = args.bundled.as_deref() {
-        return run_bundled(&args.space, name);
-    }
-
-    let program_ref = args.program_ref.ok_or_else(|| {
-        anyhow::anyhow!("`space publish` needs a program ref (or `--bundled <name>`)")
-    })?;
-    let source = args.source.ok_or_else(|| {
-        anyhow::anyhow!("`space publish` needs a blob source (or `--bundled <name>`)")
-    })?;
-    let name = parse_program_name(&program_ref)?;
+    let name = parse_program_name(&args.program_ref)?;
 
     // Resolve and cache the blob bytes locally.
-    let source = BlobSource::parse(&source);
+    let source = BlobSource::parse(&args.source);
     let (source_hash, bytes) =
         blob_store::resolve(&source).map_err(|e| anyhow::anyhow!("blob: {e}"))?;
     let (hash, catalog_bytes, package_meta, crdt) = canonical_program(&name, source_hash, bytes)?;
@@ -110,50 +92,6 @@ fn canonical_program(
         Some(package.schemas),
         package.manifest.crdt,
     ))
-}
-
-/// Catalog name + ELF resolver for each bundled program.
-fn bundled_program(name: &str) -> anyhow::Result<(&'static str, Option<&'static [u8]>)> {
-    match name {
-        "dev-project" => Ok(("dev-project", bundled::dev_project_elf())),
-        other => anyhow::bail!("unknown bundled program '{other}' (known: dev-project)"),
-    }
-}
-
-/// Publish a baked-in program under its canonical name.
-fn run_bundled(space: &str, bundled_name: &str) -> anyhow::Result<()> {
-    let (prog_name, elf) = bundled_program(bundled_name)?;
-    let elf = elf.ok_or_else(|| {
-        anyhow::anyhow!(
-            "no bundled {bundled_name} ELF — rebuild vosx with the actor present \
-             (cd actors/{bundled_name} && cargo actor)"
-        )
-    })?;
-    let cached_hash =
-        blob_store::cache_put(elf).map_err(|e| anyhow::anyhow!("cache {bundled_name}: {e}"))?;
-    let crdt = vos::metadata::from_elf(elf).is_some_and(|meta| meta.crdt);
-
-    DaemonClient::with_connect(space, |client| {
-        let already_present = match client.program(prog_name)? {
-            Some(existing) => {
-                let on_disk = BlobHash(existing.hash);
-                on_disk == cached_hash && existing.crdt == crdt
-            }
-            None => false,
-        };
-        if !already_present {
-            let status = client.publish(prog_name.to_string(), cached_hash.0.to_vec(), crdt)?;
-            if status != Status::Ok {
-                anyhow::bail!("registry.publish returned status {status}");
-            }
-        }
-        // Forward the schema (idempotent) so dynamic dispatch resolves
-        // types for the installed instance — even if a prior run
-        // published this program without it.
-        forward_meta(client, &cached_hash, elf);
-        emit(prog_name, &cached_hash, already_present);
-        Ok(())
-    })
 }
 
 /// Best-effort: forward a program's `.vos_meta` schema blob to the

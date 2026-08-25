@@ -1,6 +1,6 @@
 //! Bundles pre-built platform actors into the vosx binary.
 //!
-//! Two source paths, tried in order:
+//! Two registry source paths, tried in order:
 //!
 //! 1. **Dev path**: `actors/space-registry/target/riscv64em-vos/release/space_registry.elf`,
 //!    produced by `cargo actor` in that crate's directory. Inside
@@ -40,17 +40,6 @@ fn main() {
         "VOSX_BUNDLED_REGISTRY_ELF",
         "`space new`/`space up <token>` will require --registry",
         "cd actors/space-registry && cargo actor",
-    );
-
-    bundle_actor(
-        &manifest_dir,
-        &out_dir,
-        "dev-project",
-        "dev_project.elf",
-        "bundled_dev_project.elf",
-        "VOSX_BUNDLED_DEV_PROJECT_ELF",
-        "`dev new` will require --program-source",
-        "cd actors/dev-project && cargo actor",
     );
 
     bundle_frozen_space_authority(&manifest_dir, &out_dir);

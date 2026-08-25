@@ -1,14 +1,10 @@
 //! Build-time-bundled PVM actor ELFs.
 //!
-//! Three actors get bundled today:
+//! Two platform actors are bundled:
 //!
 //! - **space-registry**: per-space program/agent/member catalog.
 //!   Required for every `vosx space new` / `space up <token>`; without it
 //!   those commands have to take a `--registry` source explicitly.
-//! - **dev-project**: per-project content-addressed object store +
-//!   commit DAG. Backing actor for the dev extension's compile /
-//!   publish flow; bundled so `vosx dev new` can publish + install
-//!   the program in one shot without out-of-band scaffolding.
 //! - **space-authority**: canonical actor PVM used to construct the root-signed
 //!   authority package at first service startup. Package signing remains local to
 //!   the immutable space root.
@@ -17,11 +13,9 @@
 //! `actors/<name>/target/riscv64em-vos/release/` and falls back to
 //! `vosx/blobs/<name>.elf` (checked into the crate). When neither
 //! is present the bundle is empty and the runtime falls back to
-//! requiring an explicit `--registry` / `--program-source` arg
-//! depending on which one is missing.
+//! requiring an explicit `--registry` argument.
 
 const BUNDLED_REGISTRY_ELF: &[u8] = include_bytes!(env!("VOSX_BUNDLED_REGISTRY_ELF"));
-const BUNDLED_DEV_PROJECT_ELF: &[u8] = include_bytes!(env!("VOSX_BUNDLED_DEV_PROJECT_ELF"));
 const BUNDLED_SPACE_AUTHORITY_PVM: &[u8] = include_bytes!(env!("VOSX_BUNDLED_SPACE_AUTHORITY_PVM"));
 
 /// Canonical ABI-17 authority identity. These runtime pins are shared by the
@@ -48,19 +42,6 @@ pub fn registry_elf() -> Option<&'static [u8]> {
         None
     } else {
         Some(BUNDLED_REGISTRY_ELF)
-    }
-}
-
-/// Returns the bundled dev-project ELF bytes, or `None` if vosx
-/// was built without the actor pre-built. Used by `vosx dev new`
-/// to provision a project actor instance without requiring the
-/// operator to publish the dev-project program manually first.
-pub fn dev_project_elf() -> Option<&'static [u8]> {
-    #[allow(clippy::const_is_empty)]
-    if BUNDLED_DEV_PROJECT_ELF.is_empty() {
-        None
-    } else {
-        Some(BUNDLED_DEV_PROJECT_ELF)
     }
 }
 

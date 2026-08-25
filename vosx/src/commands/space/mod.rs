@@ -230,24 +230,13 @@ pub enum SpaceCommand {
         upgrade: bool,
     },
     /// Point a catalog name at a content-addressed program package.
-    ///
-    /// Pass `--bundled <name>` to publish a program baked into this
-    /// `vosx` binary (currently `dev-project`) under its fixed catalog
-    /// identity, idempotently — no `program_ref`/`source` needed. This
-    /// is the works-out-of-the-box provisioning step `space install`
-    /// builds on.
     Publish {
         /// Space id or name.
         space: String,
-        /// Catalog name. Omit when using `--bundled`.
-        program_ref: Option<String>,
+        /// Catalog name.
+        program_ref: String,
         /// Blob source: file path, hash, ipfs:<cid>, or URL.
-        /// Omit when using `--bundled`.
-        source: Option<String>,
-        /// Publish a program bundled into `vosx` (e.g. `dev-project`)
-        /// instead of a `<source>`.
-        #[arg(long, value_name = "NAME")]
-        bundled: Option<String>,
+        source: String,
     },
     /// Remove a program from the catalog. Errors if any
     /// installed agent still references its package.
@@ -459,12 +448,10 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             space,
             program_ref,
             source,
-            bundled,
         } => publish::run(publish::Args {
             space,
             program_ref,
             source,
-            bundled,
         }),
         SpaceCommand::Unpublish { space, program_ref } => {
             unpublish::run(unpublish::Args { space, program_ref })

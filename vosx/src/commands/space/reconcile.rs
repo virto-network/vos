@@ -1331,15 +1331,15 @@ mod tests {
     fn unresolvable_named_cap_warns() {
         // A named cap for an actor the space doesn't install is almost
         // certainly a typo — warn so it doesn't silently fail to bind.
-        // `dev-project` and the registry are installed; `auth-service`
+        // `workspace` and the registry are installed; `auth-service`
         // is not.
-        let known: std::collections::HashSet<String> = ["space-registry", "dev-project"]
+        let known: std::collections::HashSet<String> = ["space-registry", "workspace"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         let caps = vec![
             vos::IntraCap::parse("space-registry:admin").unwrap(),
-            vos::IntraCap::parse("dev-project:developer").unwrap(),
+            vos::IntraCap::parse("workspace:developer").unwrap(),
             vos::IntraCap::parse("auth-service:member").unwrap(),
         ];
         let w = unresolvable_cap_warning("dev", &caps, &known).expect("unresolvable cap warns");
@@ -1347,7 +1347,7 @@ mod tests {
         assert!(w.contains("won't bind"), "{w}");
         // Installed actors must NOT be listed.
         assert!(!w.contains("space-registry:"), "{w}");
-        assert!(!w.contains("dev-project"), "{w}");
+        assert!(!w.contains("workspace"), "{w}");
     }
 
     #[test]
@@ -1355,21 +1355,21 @@ mod tests {
         // IntraCap matching is case-insensitive, so the typo check must
         // be too — a correctly-named-but-differently-cased cap is fine.
         let known: std::collections::HashSet<String> =
-            std::iter::once("Dev-Project".to_string()).collect();
-        let caps = vec![vos::IntraCap::parse("dev-project:admin").unwrap()];
+            std::iter::once("Workspace".to_string()).collect();
+        let caps = vec![vos::IntraCap::parse("workspace:admin").unwrap()];
         assert!(unresolvable_cap_warning("dev", &caps, &known).is_none());
     }
 
     #[test]
     fn no_unresolvable_warning_for_known_or_wildcards() {
         // Installed-actor caps + wildcard-actor caps are all matchable.
-        let known: std::collections::HashSet<String> = ["space-registry", "dev-project"]
+        let known: std::collections::HashSet<String> = ["space-registry", "workspace"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         let caps = vec![
             vos::IntraCap::parse("space-registry:admin").unwrap(),
-            vos::IntraCap::parse("dev-project:admin").unwrap(),
+            vos::IntraCap::parse("workspace:admin").unwrap(),
             vos::IntraCap::parse("*:developer").unwrap(),
             vos::IntraCap::parse("*").unwrap(),
         ];

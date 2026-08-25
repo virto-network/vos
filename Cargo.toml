@@ -15,8 +15,6 @@ members = [
     "pvm/proof/precompiles",
     "pvm/proof/derive",
     "pvm/proof/verifier",
-    "extensions/ai",
-    "extensions/dev",
     "extensions/http-gateway",
     "extensions/prover",
     "clerk-witness",

@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Daniel Olano <daniel@olanod.com>"]
 # Ship the platform actors inside the crate so `cargo install vosx` has the
-# exact registry, authority, and development programs available out of the
+# exact registry and authority programs available out of the
 # box. The checked artifacts are refreshed by their corresponding just tasks.
 include = [
     "src/**/*",
@@ -16,7 +16,6 @@ include = [
     "Cargo.toml",
     "blobs/space_registry.elf",
     "blobs/space_authority.pvm",
-    "blobs/dev_project.elf",
 ]
 
 [dependencies]

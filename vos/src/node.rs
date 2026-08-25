@@ -15210,7 +15210,7 @@ mod tests {
         // itself…
         let node = VosNode::new();
         node.record_agent_name(ServiceId::REGISTRY, None);
-        node.record_agent_name(ServiceId::new(0, 0x0444), Some("dev-project".into()));
+        node.record_agent_name(ServiceId::new(0, 0x0444), Some("workspace".into()));
 
         // Registry resolves (and still does under a node prefix — low
         // 16 bits zero).
@@ -15224,7 +15224,7 @@ mod tests {
         );
         // …and so does a non-registry installed agent — the cap for it
         // now binds instead of silently vanishing.
-        assert_eq!(node.agent_name_for(0x0444).as_deref(), Some("dev-project"));
+        assert_eq!(node.agent_name_for(0x0444).as_deref(), Some("workspace"));
         // An unregistered id stays unresolved → matches only `*` caps.
         assert_eq!(node.agent_name_for(0x0007), None);
     }
@@ -15253,7 +15253,7 @@ mod tests {
         );
         // A cap for a *different* actor doesn't apply to this target.
         assert_eq!(
-            resolve_relay_caller(Some(&p_admin), &admin_cap, Some("dev-project")),
+            resolve_relay_caller(Some(&p_admin), &admin_cap, Some("workspace")),
             (Caller::Unauthenticated, None),
         );
 
@@ -18280,19 +18280,19 @@ mod tests {
     #[test]
     fn record_agent_name_populates_and_resolves_prefix_independently() {
         let node = VosNode::with_prefix(0x0042);
-        node.record_agent_name(ServiceId::new(0x0042, 0x0321), Some("dev-project".into()));
+        node.record_agent_name(ServiceId::new(0x0042, 0x0321), Some("workspace".into()));
         // Resolvable by the full prefix-scoped id…
         assert_eq!(
             node.agent_name_for(ServiceId::new(0x0042, 0x0321).0)
                 .as_deref(),
-            Some("dev-project")
+            Some("workspace")
         );
         // …and by any value sharing the low 16 bits (a replica of the
         // same instance on another node reuses the entry).
-        assert_eq!(node.agent_name_for(0x0321).as_deref(), Some("dev-project"));
+        assert_eq!(node.agent_name_for(0x0321).as_deref(), Some("workspace"));
         assert_eq!(
             node.agent_name_for(0xBEEF_0321).as_deref(),
-            Some("dev-project")
+            Some("workspace")
         );
         // An id this node never registered → None (deny-by-omission).
         assert_eq!(node.agent_name_for(0x0999), None);
@@ -18355,7 +18355,7 @@ mod tests {
         use crate::value::{Msg, TAG_DYNAMIC, Value};
 
         let target = ServiceId::new(0, 0x0444);
-        const TARGET_NAME: &str = "dev-project";
+        const TARGET_NAME: &str = "workspace";
         const ACTOR_LOCAL_ROLE: u8 = 3; // Admin grant on that actor.
 
         // Mock registry on route 0: answers the peer_role + actor_role
@@ -20498,17 +20498,17 @@ mod tests {
     fn relay_actor_local_propagates_peer_grant_uncapped_when_cap_permits() {
         use crate::actors::{Caller, IntraCap, SpaceRole};
         let (routes, seen, h) = mock_registry_actor_role(3);
-        let caps = vec![IntraCap::parse("dev-project:member").unwrap()];
+        let caps = vec![IntraCap::parse("workspace:member").unwrap()];
         let pc = PropagatedCaller {
             caller: Caller::Peer(vec![1, 2, 3]),
             space_role: Some(SpaceRole::Guest.as_u8()),
         };
-        let got = relay_actor_local_role(&routes, Some(&pc), &caps, Some("dev-project"));
+        let got = relay_actor_local_role(&routes, Some(&pc), &caps, Some("workspace"));
         assert_eq!(got, Some((vec![1, 2, 3], 3)));
         // The probe was keyed on the propagated peer + the target name.
         assert_eq!(
             seen.lock().unwrap().as_slice(),
-            &[("dev-project".to_string(), vec![1, 2, 3])]
+            &[("workspace".to_string(), vec![1, 2, 3])]
         );
         drop(routes);
         h.join().unwrap();
@@ -20526,7 +20526,7 @@ mod tests {
             space_role: Some(SpaceRole::Admin.as_u8()),
         };
         assert_eq!(
-            relay_actor_local_role(&routes, Some(&pc), &[], Some("dev-project")),
+            relay_actor_local_role(&routes, Some(&pc), &[], Some("workspace")),
             None
         );
         assert!(seen.lock().unwrap().is_empty(), "no cap → no probe");
@@ -20548,7 +20548,7 @@ mod tests {
             space_role: None,
         };
         assert_eq!(
-            relay_actor_local_role(&routes, Some(&pc), &caps, Some("dev-project")),
+            relay_actor_local_role(&routes, Some(&pc), &caps, Some("workspace")),
             None
         );
         assert!(seen.lock().unwrap().is_empty());
@@ -20571,7 +20571,7 @@ mod tests {
         // Registry has no row for the peer (replies AUTH_ROLE_NONE).
         let (routes, _seen, h) = mock_registry_actor_role(AUTH_ROLE_NONE);
         assert_eq!(
-            relay_actor_local_role(&routes, Some(&peer()), &caps, Some("dev-project")),
+            relay_actor_local_role(&routes, Some(&peer()), &caps, Some("workspace")),
             None
         );
         drop(routes);

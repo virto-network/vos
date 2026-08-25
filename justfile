@@ -127,11 +127,6 @@ package-production-release out="target/production-release": build-authority-rele
       --service-pvm services/vos-service/vos-service.pvm --out "{{out}}"
     cargo run -p vosx -- release verify "{{out}}"
 
-# Refresh the bundled dev-project ELF shipped with vosx.
-refresh-bundled-dev-project: (build-actor "dev-project")
-    cp actors/dev-project/target/riscv64em-vos/release/dev_project.elf \
-       vosx/blobs/dev_project.elf
-
 # Build the settlement-verifier ELF for the VOS PVM target.
 build-settle:
     cd pvm/proof/settlement-verifier; cargo build --release --target riscv64em-vos.json \
