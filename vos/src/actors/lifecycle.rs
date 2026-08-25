@@ -492,40 +492,20 @@ fn invoke_hash_full(
 
 // ── Message dispatch ──────────────────────────────────────────────
 
-/// Wire-marker the host prepends to dispatch messages so the
-/// PVM agent can populate `Context::caller` + the role bytes
-/// before each handler runs. Layout:
-///
-///   raw[0] = TAG_CALLER_PREFIX (0xFE)
-///   raw[1] = internal_origin (0 = external, 1 = system)
-///   raw[2] = has_space_role (0 / 1)
-///   raw[3] = space_role byte (only meaningful if has_space_role)
-///   raw[4] = has_actor_local_role (0 / 1)
-///   raw[5] = actor_local_role byte
-///   raw[6..] = the original message (TAG_DYNAMIC / typed bytes)
-///
-/// Hosts that don't know about this prefix (and the legacy
-/// dispatch path that doesn't need role info) send `raw` without
-/// the header — `dispatch_one` then leaves Context::caller at
-/// its previous value.
-pub const TAG_CALLER_PREFIX: u8 = 0xFE;
-
-/// Versioned dispatch prefix carrying both authorization data and the stable
+/// Dispatch prefix carrying authorization data and the stable
 /// invocation identity visible through [`Context::invocation_id`].
 ///
 /// Layout:
 ///
 ///   raw[0] = TAG_DISPATCH_PREFIX (0xFD)
-///   raw[1..6] = the legacy five-byte caller prefix
+///   raw[1..6] = caller and role bytes
 ///   raw[6..38] = InvocationId
 ///   raw[38..] = the original message
 ///
-/// [`TAG_CALLER_PREFIX`] remains accepted for stored legacy inputs, but all
-/// current host dispatch and replay paths emit this prefix.
 pub const TAG_DISPATCH_PREFIX: u8 = 0xFD;
 
 #[cfg(any(feature = "pvm", test))]
-fn should_decode_legacy_dispatch_prefix(raw: &[u8], actor_slice: bool) -> bool {
+fn should_decode_dispatch_prefix(raw: &[u8], actor_slice: bool) -> bool {
     !actor_slice && raw.len() >= 38 && raw[0] == TAG_DISPATCH_PREFIX
 }
 
@@ -568,14 +548,14 @@ fn dispatch_one_inner<A: Actor>(
 
     // A service actor slice already received its invocation, origin, and roles from
     // the authenticated service envelope. Its message bytes are application
-    // data and must never be reinterpreted as a legacy host prefix: doing so
+    // data and must never be reinterpreted as a host prefix: doing so
     // would let an argument beginning with 0xFD replace that authenticated
-    // context. Prefix decoding remains solely on the v1 entry where
+    // context. Prefix decoding remains solely on the host entry where
     // `invocation` is absent.
     let actor_slice = invocation.is_some();
     let raw = if actor_slice {
         raw
-    } else if should_decode_legacy_dispatch_prefix(raw, actor_slice) {
+    } else if should_decode_dispatch_prefix(raw, actor_slice) {
         use super::auth::Caller;
         let trust_flag = raw[1];
         let has_space = raw[2] != 0;
@@ -599,29 +579,6 @@ fn dispatch_one_inner<A: Actor>(
         invocation_id.copy_from_slice(&raw[6..38]);
         ctx.__set_invocation_id(crate::service::InvocationId::new(invocation_id));
         &raw[38..]
-    // Stored v1 logs and older embedders may still carry only caller data.
-    } else if raw.len() >= 6 && raw[0] == TAG_CALLER_PREFIX {
-        use super::auth::Caller;
-        let trust_flag = raw[1];
-        let has_space = raw[2] != 0;
-        let space_byte = raw[3];
-        let has_actor_local = raw[4] != 0;
-        let actor_local_byte = raw[5];
-        ctx.set_caller(if trust_flag == 1 {
-            Caller::System
-        } else {
-            Caller::Unauthenticated
-        });
-        ctx.set_caller_roles(
-            if has_space { Some(space_byte) } else { None },
-            if has_actor_local {
-                Some(actor_local_byte)
-            } else {
-                None
-            },
-        );
-        ctx.__set_invocation_id(crate::service::InvocationId::ZERO);
-        &raw[6..]
     } else {
         raw
     };
@@ -768,12 +725,12 @@ mod tests {
 
 #[cfg(test)]
 mod dispatch_prefix_tests {
-    use super::{TAG_DISPATCH_PREFIX, should_decode_legacy_dispatch_prefix};
+    use super::{TAG_DISPATCH_PREFIX, should_decode_dispatch_prefix};
 
     #[test]
-    fn actor_slice_arguments_can_never_select_the_legacy_identity_prefix() {
+    fn actor_slice_arguments_can_never_select_the_host_identity_prefix() {
         let forged = [TAG_DISPATCH_PREFIX; 38];
-        assert!(!should_decode_legacy_dispatch_prefix(&forged, true));
-        assert!(should_decode_legacy_dispatch_prefix(&forged, false));
+        assert!(!should_decode_dispatch_prefix(&forged, true));
+        assert!(should_decode_dispatch_prefix(&forged, false));
     }
 }

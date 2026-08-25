@@ -59,25 +59,22 @@ fn decode_value(bytes: &[u8]) -> Option<Value> {
     <Value as vos::Decode>::try_decode(bytes)
 }
 
-/// Extract the rkyv payload from a typed-handler reply
-/// (`Value::Bytes`); `Value::Unit` maps to empty.
+/// Extract the rkyv payload from a typed-handler reply.
 fn value_to_bytes(v: Value) -> Option<Vec<u8>> {
     match v {
         Value::Bytes(b) => Some(b),
-        Value::Unit => Some(Vec::new()),
         _ => None,
     }
 }
 
 /// Decode the canonical `Option<T>` handler reply: `[0]` for `None`,
-/// `[1] || rkyv(T)` for `Some`. The empty/unit and untagged cases retain
-/// read-only compatibility with older registry guests.
+/// `[1] || rkyv(T)` for `Some`.
 fn decode_option_value<T: vos::Decode>(value: Value) -> Result<Option<T>, ()> {
     let bytes = value_to_bytes(value).ok_or(())?;
-    if bytes.is_empty() || bytes.as_slice() == [0] {
+    if bytes.as_slice() == [0] {
         return Ok(None);
     }
-    let payload = bytes.strip_prefix(&[1]).unwrap_or(bytes.as_slice());
+    let payload = bytes.strip_prefix(&[1]).ok_or(())?;
     T::try_decode(payload).map(Some).ok_or(())
 }
 

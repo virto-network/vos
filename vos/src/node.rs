@@ -2872,8 +2872,7 @@ fn lookup_node_member_from_routes_with_timeout(
 }
 
 /// Decode a registry handler's `Option<T>` reply after the outer invoke
-/// envelope has been removed. Current guests emit `[0]` / `[1] || rkyv(T)`;
-/// the unit/empty and untagged forms remain accepted for legacy registries.
+/// envelope has been removed. Guests emit `[0]` / `[1] || rkyv(T)`.
 #[cfg(feature = "network")]
 fn decode_registry_option_reply<T: crate::actors::codec::Decode>(
     reply: &[u8],
@@ -2881,15 +2880,13 @@ fn decode_registry_option_reply<T: crate::actors::codec::Decode>(
     use crate::value::Value;
 
     let value = <Value as crate::actors::codec::Decode>::try_decode(reply)?;
-    let bytes = match value {
-        Value::Unit => return Some(None),
-        Value::Bytes(bytes) => bytes,
-        _ => return None,
+    let Value::Bytes(bytes) = value else {
+        return None;
     };
-    if bytes.is_empty() || bytes.as_slice() == [0] {
+    if bytes.as_slice() == [0] {
         return Some(None);
     }
-    let payload = bytes.strip_prefix(&[1]).unwrap_or(bytes.as_slice());
+    let payload = bytes.strip_prefix(&[1])?;
     T::try_decode(payload).map(Some)
 }
 
@@ -15531,9 +15528,8 @@ mod tests {
     #[test]
     fn replay_payload_carries_recorded_caller() {
         // Replay re-runs a committed log entry under the RECORDED
-        // caller prefix, so the original gate decision reproduces —
-        // refused stays refused, granted stays granted. Legacy logs
-        // decode as CALLER_SYSTEM, their historical replay identity.
+        // caller prefix, so the original gate decision reproduces:
+        // refused stays refused and granted stays granted.
         let inner = b"logged-msg";
         let recorded: crate::effect_log::CallerPrefix = [0, 1, 3, 0, 0];
         let invocation = crate::service::InvocationId::derive(b"test", b"replay");
@@ -15542,19 +15538,12 @@ mod tests {
         assert_eq!(&wrapped[1..6], &recorded[..]);
         assert_eq!(&wrapped[6..38], invocation.as_bytes());
         assert_eq!(&wrapped[38..], &inner[..]);
-
-        let legacy = encode_replay_payload(
-            &crate::effect_log::CALLER_SYSTEM,
-            crate::service::InvocationId::ZERO,
-            inner,
-        );
-        assert_eq!(legacy[1], 1, "legacy logs replay as trusted-System");
     }
 
     #[test]
     fn inbox_wrap_neutralises_forged_caller_prefix() {
         // Attacker crafts a Tell payload that *itself* starts
-        // with TAG_CALLER_PREFIX and a forged trust_flag=1
+        // with TAG_DISPATCH_PREFIX and a forged trust_flag=1
         // (System). After the host wraps it with the safe
         // default, the attacker's bytes start at offset 38 — the
         // PVM's dispatch_one only strips one prefix, so the
@@ -15563,8 +15552,9 @@ mod tests {
         // confirming the wrap puts the attacker's prefix at
         // offset 38 is sufficient to prove the forgery is
         // neutralised.
-        let forged: Vec<u8> = std::iter::once(crate::actors::lifecycle::TAG_CALLER_PREFIX)
+        let forged: Vec<u8> = std::iter::once(crate::actors::lifecycle::TAG_DISPATCH_PREFIX)
             .chain([1, 0, 0, 0, 0])
+            .chain([0; 32])
             .chain(b"would-be-admin-call".iter().copied())
             .collect();
         let wrapped = wrap_with_unauthenticated_prefix(&forged, crate::service::InvocationId::ZERO);
@@ -15572,7 +15562,7 @@ mod tests {
         assert_eq!(wrapped[1], 0, "outer trust_flag must be 0");
         assert_eq!(
             wrapped[38],
-            crate::actors::lifecycle::TAG_CALLER_PREFIX,
+            crate::actors::lifecycle::TAG_DISPATCH_PREFIX,
             "attacker's prefix byte is preserved inside as msg \
              content — dispatch_one is single-pass so this byte \
              gets treated as the first byte of the inner Msg, not \

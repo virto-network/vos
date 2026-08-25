@@ -554,8 +554,8 @@ mod tests {
         assert!(!parsed.provable);
 
         assert!(
-            decode(&buf[..len - 1]).is_some(),
-            "metadata predating the trailing provable flag remains readable"
+            decode(&buf[..len - 1]).is_none(),
+            "a truncated metadata record must be rejected"
         );
         let mut wrong_count = buf[..len].to_vec();
         let policy_count_offset =
@@ -569,8 +569,8 @@ mod tests {
         let mut trailing = buf[..len].to_vec();
         trailing.push(0);
         assert!(
-            decode(&trailing).is_some(),
-            "older decoders ignore a future append-only metadata section"
+            decode(&trailing).is_none(),
+            "trailing metadata bytes must be rejected"
         );
         let partial_actor_roles = &buf[..len - 2];
         assert!(
@@ -627,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn crdt_opt_in_roundtrips_and_legacy_defaults_off() {
+    fn crdt_opt_in_roundtrips() {
         const META: ActorMeta = ActorMeta {
             actor_name: "Board",
             messages: &[],
@@ -641,27 +641,6 @@ mod tests {
         };
         let (buf, len) = encode::<128>(&META);
         assert!(decode(&buf[..len]).unwrap().crdt);
-        // Drop the provable flag, both appended policy-section counts, and
-        // the CRDT byte itself.
-        assert!(!decode(&buf[..len - 6]).unwrap().crdt);
-    }
-
-    #[test]
-    fn kind_byte_defaults_to_actor_when_missing() {
-        // Manually craft a meta blob without the trailing kind byte
-        // (simulates an older ELF). actor_name "X", 0 messages,
-        // 0 constructor fields. No kind byte.
-        let blob: &[u8] = &[
-            1, 0,    // actor_name_len = 1
-            b'X', // actor_name
-            0, 0, // msg_count = 0
-            0, 0, // ctor_count = 0
-               // no kind byte
-        ];
-        let parsed = decode(blob).expect("decode");
-        assert_eq!(parsed.actor_name, "X");
-        assert_eq!(parsed.kind, 0);
-        assert!(parsed.caps.is_empty());
     }
 
     #[test]
@@ -688,24 +667,6 @@ mod tests {
                 "tokio-runtime".to_string(),
             ],
         );
-    }
-
-    #[test]
-    fn caps_empty_when_older_blob_missing_section() {
-        // Older blob: name + msg_count=0 + ctor_count=0 +
-        // kind=1, no trailing caps section.
-        let blob: &[u8] = &[
-            1, 0,    // name_len = 1
-            b'Y', // name
-            0, 0, // msg_count = 0
-            0, 0, // ctor_count = 0
-            1, // kind = Service
-               // no caps section
-        ];
-        let parsed = decode(blob).expect("decode");
-        assert_eq!(parsed.actor_name, "Y");
-        assert_eq!(parsed.kind, 1);
-        assert!(parsed.caps.is_empty());
     }
 
     #[test]
@@ -773,72 +734,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_methods_absent_in_older_blob_defaults_false() {
-        // Older blob: walks through messages, ctor,
-        // kind, caps — stops cleanly without the cli_methods
-        // section. Decoder must default `exposed_to_cli=false`
-        // on every parsed message rather than panicking.
-        let blob: &[u8] = &[
-            1, 0,    // name_len = 1
-            b'Z', // name
-            1, 0, // msg_count = 1
-            3, 0, b'r', b'u', b'n', // msg name "run"
-            0,    // is_query = false
-            0, 0, // field_count = 0
-            0, 0, // ctor_count = 0
-            0, // kind = Actor
-            0, 0, // caps_count = 0
-               // no cli_methods section
-        ];
-        let parsed = decode(blob).expect("decode");
-        assert_eq!(parsed.messages.len(), 1);
-        assert!(!parsed.messages[0].exposed_to_cli);
-    }
-
-    #[test]
-    fn service_main_layout_with_cli_decodes() {
-        // Hand-craft the exact byte layout the `service_main!` macro
-        // emits for `service_main!(Gateway, caps = ["x"], cli = [stop, status])`.
-        // Each CLI handler shows up as a 0-arg / !is_query message AND
-        // as a `cli_methods` entry — the decoder cross-references the
-        // two so `ParsedMessage.exposed_to_cli` flips on for both.
-        let blob: &[u8] = &[
-            // actor name "Gateway"
-            7, 0, b'G', b'a', b't', b'e', b'w', b'a', b'y', // msg_count = 2
-            2, 0, // msg 0: "stop", !is_query, 0 fields
-            4, 0, b's', b't', b'o', b'p', 0, // is_query = false
-            0, 0, // field_count = 0
-            // msg 1: "status", !is_query, 0 fields
-            6, 0, b's', b't', b'a', b't', b'u', b's', 0, // is_query = false
-            0, 0, // field_count = 0
-            // ctor_count = 0
-            0, 0, // kind = 1 (Service)
-            1, // caps_count = 1, "x"
-            1, 0, 1, 0, b'x', // cli_methods_count = 2, "stop", "status"
-            2, 0, 4, 0, b's', b't', b'o', b'p', 6, 0, b's', b't', b'a', b't', b'u', b's',
-        ];
-        let parsed = decode(blob).expect("decode");
-        assert_eq!(parsed.actor_name, "Gateway");
-        assert_eq!(parsed.kind, 1);
-        assert_eq!(parsed.caps, vec!["x".to_string()]);
-        assert_eq!(parsed.messages.len(), 2);
-        let stop = parsed
-            .messages
-            .iter()
-            .find(|m| m.name == "stop")
-            .expect("stop");
-        let status = parsed
-            .messages
-            .iter()
-            .find(|m| m.name == "status")
-            .expect("status");
-        assert!(stop.exposed_to_cli);
-        assert!(status.exposed_to_cli);
-        assert!(stop.fields.is_empty());
-        assert!(status.fields.is_empty());
-    }
-
-    #[test]
     fn docs_and_timeout_roundtrip() {
         // Metadata service: per-message docs, actor doc, and per-message
         // timeout_ms survive a full encode→decode round-trip.
@@ -888,41 +783,9 @@ mod tests {
         assert_eq!(parsed.messages[1].doc, "");
         assert_eq!(parsed.messages[1].timeout_ms, 0);
         assert_eq!(parsed.messages[1].mode, 0, "sync handler stays mode 0");
-        // Earlier sections still decode alongside the new ones.
+        // All sections decode together.
         assert_eq!(parsed.messages[0].returns, "u64");
         assert!(parsed.messages[0].exposed_to_cli);
-    }
-
-    #[test]
-    fn metadata_service_sections_absent_default_empty_and_zero() {
-        // A blob that stops after the `returns` section (pre-metadata)
-        // must still decode, with docs empty and timeouts 0. Layout:
-        // name "W", 1 msg "run" (!query, 0 fields), 0 ctor, kind 0,
-        // 0 caps, 0 cli, then a returns section [count=1]["u64"].
-        let blob: &[u8] = &[
-            1, 0, b'W', // actor name "W"
-            1, 0, // msg_count = 1
-            3, 0, b'r', b'u', b'n', // msg name "run"
-            0,    // is_query = false
-            0, 0, // field_count = 0
-            0, 0, // ctor_count = 0
-            0, // kind = Actor
-            0, 0, // caps_count = 0
-            0, 0, // cli_methods_count = 0
-            1, 0, // returns_count = 1
-            3, 0, b'u', b'6',
-            b'4', // returns[0] = "u64"
-                  // no doc / actor-doc / timeout sections
-        ];
-        let parsed = decode(blob).expect("decode");
-        assert_eq!(parsed.doc, "");
-        assert_eq!(parsed.messages.len(), 1);
-        assert_eq!(parsed.messages[0].returns, "u64");
-        assert_eq!(parsed.messages[0].doc, "");
-        assert_eq!(parsed.messages[0].timeout_ms, 0);
-        assert_eq!(parsed.messages[0].mode, 0);
-        assert!(!parsed.messages[0].attested);
-        assert_eq!(parsed.messages[0].space_role, None);
     }
 }
 
@@ -1043,182 +906,110 @@ mod decode {
             });
         }
 
-        // Constructor fields (optional — backward compat with old ELFs)
-        let mut constructor = Vec::new();
-        if pos < data.len()
-            && let Some(ctor_count) = read_u16(data, &mut pos)
-        {
-            for _ in 0..ctor_count as usize {
-                let fname = read_str(data, &mut pos)?;
-                let fty = read_str(data, &mut pos)?;
-                constructor.push(ParsedField {
-                    name: fname,
-                    ty: fty,
-                });
-            }
+        let ctor_count = read_u16(data, &mut pos)? as usize;
+        let mut constructor = Vec::with_capacity(ctor_count);
+        for _ in 0..ctor_count {
+            constructor.push(ParsedField {
+                name: read_str(data, &mut pos)?,
+                ty: read_str(data, &mut pos)?,
+            });
         }
 
-        // Extension kind byte (optional — older ELFs lack it, default
-        // to Actor). Trailing position so older decoders simply stop
-        // before reaching it.
-        let kind = data.get(pos).copied().unwrap_or(0);
-        if pos < data.len() {
+        let kind = *data.get(pos)?;
+        pos += 1;
+        if kind > 2 {
+            return None;
+        }
+
+        let cap_count = read_u16(data, &mut pos)? as usize;
+        let mut caps = Vec::with_capacity(cap_count);
+        for _ in 0..cap_count {
+            caps.push(read_str(data, &mut pos)?);
+        }
+
+        let cli_count = read_u16(data, &mut pos)? as usize;
+        for _ in 0..cli_count {
+            let name = read_str(data, &mut pos)?;
+            let msg = messages.iter_mut().find(|message| message.name == name)?;
+            msg.exposed_to_cli = true;
+        }
+
+        let ret_count = read_u16(data, &mut pos)? as usize;
+        if ret_count != messages.len() {
+            return None;
+        }
+        for message in &mut messages {
+            message.returns = read_str(data, &mut pos)?;
+        }
+
+        let doc_count = read_u16(data, &mut pos)? as usize;
+        if doc_count != messages.len() {
+            return None;
+        }
+        for message in &mut messages {
+            message.doc = read_str(data, &mut pos)?;
+        }
+
+        let doc = read_str(data, &mut pos)?;
+
+        let timeout_count = read_u16(data, &mut pos)? as usize;
+        if timeout_count != messages.len() {
+            return None;
+        }
+        for message in &mut messages {
+            message.timeout_ms = read_u32(data, &mut pos)?;
+        }
+
+        let mode_count = read_u16(data, &mut pos)? as usize;
+        if mode_count != messages.len() {
+            return None;
+        }
+        for message in &mut messages {
+            message.mode = *data.get(pos)?;
             pos += 1;
         }
 
-        // Capability list. Empty if absent.
-        let mut caps: Vec<String> = Vec::new();
-        if pos < data.len()
-            && let Some(cap_count) = read_u16(data, &mut pos)
-        {
-            for _ in 0..cap_count as usize {
-                if let Some(s) = read_str(data, &mut pos) {
-                    caps.push(s);
-                } else {
-                    break;
-                }
-            }
-        }
+        let crdt = match *data.get(pos)? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        pos += 1;
 
-        // CLI-exposed method names. Trailing-append: older blobs
-        // stop after caps and every `ParsedMessage.exposed_to_cli` stays
-        // `false`. Cross-reference by name rather than by index so the
-        // per-message wire format stays unchanged — adding a flag
-        // inline would break older decoders.
-        if pos < data.len()
-            && let Some(cli_count) = read_u16(data, &mut pos)
-        {
-            for _ in 0..cli_count as usize {
-                let Some(name) = read_str(data, &mut pos) else {
-                    break;
-                };
-                if let Some(msg) = messages.iter_mut().find(|m| m.name == name) {
-                    msg.exposed_to_cli = true;
-                }
-            }
+        let policy_count = read_u16(data, &mut pos)? as usize;
+        if policy_count != messages.len() {
+            return None;
         }
-
-        // Per-message return-type names. Cross-referenced by
-        // index — the encoder writes one entry per message in order.
-        // Trailing-append: an absent section leaves every `returns` empty.
-        if pos < data.len()
-            && let Some(ret_count) = read_u16(data, &mut pos)
-        {
-            for i in 0..ret_count as usize {
-                let Some(ty) = read_str(data, &mut pos) else {
-                    break;
-                };
-                if let Some(msg) = messages.get_mut(i) {
-                    msg.returns = ty;
-                }
-            }
-        }
-
-        // Per-message doc strings. Index-crossref like
-        // `returns`. Absent → every `doc` empty.
-        if pos < data.len()
-            && let Some(doc_count) = read_u16(data, &mut pos)
-        {
-            for i in 0..doc_count as usize {
-                let Some(doc) = read_str(data, &mut pos) else {
-                    break;
-                };
-                if let Some(msg) = messages.get_mut(i) {
-                    msg.doc = doc;
-                }
-            }
-        }
-
-        // Actor-level doc string. A single string; absent → empty.
-        let mut doc = String::new();
-        if pos < data.len()
-            && let Some(s) = read_str(data, &mut pos)
-        {
-            doc = s;
-        }
-
-        // Per-message invoke timeouts, u32 LE each,
-        // index-crossref. Absent → every `timeout_ms` stays 0.
-        if pos < data.len()
-            && let Some(to_count) = read_u16(data, &mut pos)
-        {
-            for i in 0..to_count as usize {
-                let Some(ms) = read_u32(data, &mut pos) else {
-                    break;
-                };
-                if let Some(msg) = messages.get_mut(i) {
-                    msg.timeout_ms = ms;
-                }
-            }
-        }
-
-        // Per-message dispatch mode, one u8 each,
-        // index-crossref. Absent → every `mode` stays 0 (sync).
-        if pos < data.len()
-            && let Some(mode_count) = read_u16(data, &mut pos)
-        {
-            for i in 0..mode_count as usize {
-                let Some(&m) = data.get(pos) else {
-                    break;
-                };
-                pos += 1;
-                if let Some(msg) = messages.get_mut(i) {
-                    msg.mode = m;
-                }
-            }
-        }
-
-        let crdt = data.get(pos).copied().unwrap_or(0) == 1;
-        if pos < data.len() {
-            pos += 1;
-        }
-
-        // Per-message attestation policy. Old blobs end after `crdt`, leaving
-        // both fields at their legacy regular/public defaults.
-        if pos < data.len() {
-            let policy_count = read_u16(data, &mut pos)?;
-            if policy_count as usize != messages.len() {
+        for message in &mut messages {
+            let &attested = data.get(pos)?;
+            let &space_role = data.get(pos + 1)?;
+            pos += 2;
+            if attested > 1 || (space_role != u8::MAX && space_role > 3) {
                 return None;
             }
-            for message in &mut messages {
-                let &attested = data.get(pos)?;
-                let &space_role = data.get(pos + 1)?;
-                pos += 2;
-                if attested > 1 || (space_role != u8::MAX && space_role > 3) {
-                    return None;
-                }
-                message.attested = attested == 1;
-                message.space_role = (space_role != u8::MAX).then_some(space_role);
-            }
-
-            // Actor-local roles were added as a separate append-only section
-            // so the established two-byte policy entries remain aligned.
-            if pos < data.len() {
-                let actor_role_count =
-                    u16::from_le_bytes([*data.get(pos)?, *data.get(pos + 1)?]) as usize;
-                pos += 2;
-                if actor_role_count != messages.len() {
-                    return None;
-                }
-                for message in &mut messages {
-                    let &actor_role = data.get(pos)?;
-                    pos += 1;
-                    message.actor_role = (actor_role != u8::MAX).then_some(actor_role);
-                }
-            }
-            // Future metadata sections are appended after this complete
-            // fixed-width policy section. Older decoders deliberately ignore
-            // that unknown tail; a present policy section itself remains
-            // all-or-nothing and count-checked above.
+            message.attested = attested == 1;
+            message.space_role = (space_role != u8::MAX).then_some(space_role);
         }
 
-        // Actor-level provable flag, one trailing byte. Absent → false.
-        let mut provable = false;
-        if let Some(&p) = data.get(pos) {
-            provable = p != 0;
+        let actor_role_count = read_u16(data, &mut pos)? as usize;
+        if actor_role_count != messages.len() {
+            return None;
+        }
+        for message in &mut messages {
+            let &actor_role = data.get(pos)?;
             pos += 1;
+            message.actor_role = (actor_role != u8::MAX).then_some(actor_role);
         }
-        let _ = pos;
+
+        let provable = match *data.get(pos)? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        pos += 1;
+        if pos != data.len() {
+            return None;
+        }
 
         Some(ParsedMeta {
             actor_name,

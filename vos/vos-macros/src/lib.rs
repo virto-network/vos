@@ -2217,18 +2217,9 @@ fn client_decode_body(
     if let Some(inner) = option_inner_type(ty) {
         return quote! {
             match #value_ident {
-                // Read-only compatibility for legacy v1 actors. Current
-                // encoders never emit these ambiguous shapes.
-                vos::value::Value::Unit => Ok(None),
-                vos::value::Value::Bytes(b) if b.is_empty() => Ok(None),
                 vos::value::Value::Bytes(b) if b.as_slice() == [0] => Ok(None),
-                vos::value::Value::Bytes(b) => {
-                    let payload = if b.first() == Some(&1) {
-                        &b[1..]
-                    } else {
-                        // Legacy v1 `Some(T)` omitted the discriminant.
-                        b.as_slice()
-                    };
+                vos::value::Value::Bytes(b) if b.first() == Some(&1) => {
+                    let payload = &b[1..];
                     let mut av =
                         vos::rkyv::util::AlignedVec::<16>::with_capacity(payload.len());
                     av.extend_from_slice(payload);
