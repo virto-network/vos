@@ -13,6 +13,7 @@ use vos::service::{
 
 const RUSTC_WRAPPER_MODE: &str = "VOSX_CANONICAL_RUSTC_WRAPPER";
 const RUSTC_WRAPPER_SOURCE_ROOT: &str = "VOSX_CANONICAL_SOURCE_ROOT";
+const RUSTC_WRAPPER_TARGET_ROOT: &str = "VOSX_CANONICAL_TARGET_ROOT";
 const RUSTC_UNIT_METADATA_DOMAIN: &[u8] = b"vos/rustc-unit-metadata/service";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -264,6 +265,7 @@ fn resolve_task_input(input: &Path) -> anyhow::Result<PathBuf> {
         .env("RUSTC_WRAPPER", std::env::current_exe()?)
         .env(RUSTC_WRAPPER_MODE, "1")
         .env(RUSTC_WRAPPER_SOURCE_ROOT, source_root)
+        .env(RUSTC_WRAPPER_TARGET_ROOT, &target_dir)
         .env("CARGO_TARGET_DIR", target_dir);
     let output = command
         .output()
@@ -364,6 +366,7 @@ fn resolve_program_input(input: &Path) -> anyhow::Result<PathBuf> {
         .env("RUSTC_WRAPPER", std::env::current_exe()?)
         .env(RUSTC_WRAPPER_MODE, "1")
         .env(RUSTC_WRAPPER_SOURCE_ROOT, source_root)
+        .env(RUSTC_WRAPPER_TARGET_ROOT, &target_dir)
         .env("CARGO_TARGET_DIR", &target_dir);
     let status = command
         .current_dir(&build_root)
@@ -450,10 +453,19 @@ pub fn maybe_run_canonical_rustc_wrapper() {
         eprintln!("vosx canonical rustc wrapper: missing source root");
         std::process::exit(1);
     };
+    let Some(target_root) = std::env::var_os(RUSTC_WRAPPER_TARGET_ROOT) else {
+        eprintln!("vosx canonical rustc wrapper: missing target root");
+        std::process::exit(1);
+    };
     let arguments = arguments.collect::<Vec<_>>();
     let unit = RustcUnitIdentity::from_environment();
     let status = Command::new(rustc)
-        .args(canonical_rustc_arguments(arguments, &source_root, &unit))
+        .args(canonical_rustc_arguments(
+            arguments,
+            &source_root,
+            &target_root,
+            &unit,
+        ))
         .status();
     match status {
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
@@ -467,10 +479,11 @@ pub fn maybe_run_canonical_rustc_wrapper() {
 fn canonical_rustc_arguments(
     arguments: impl IntoIterator<Item = OsString>,
     source_root: &OsStr,
+    target_root: &OsStr,
     unit: &RustcUnitIdentity,
 ) -> Vec<OsString> {
     let arguments = arguments.into_iter().collect::<Vec<_>>();
-    let metadata = canonical_rustc_unit_metadata(&arguments, source_root, unit);
+    let metadata = canonical_rustc_unit_metadata(&arguments, source_root, target_root, unit);
     let mut arguments = arguments.into_iter().peekable();
     let mut canonical = Vec::new();
     while let Some(argument) = arguments.next() {
@@ -496,6 +509,10 @@ fn canonical_rustc_arguments(
     remap.push(source_root);
     remap.push("=vos-source");
     canonical.push(remap);
+    let mut remap = OsString::from("--remap-path-prefix=");
+    remap.push(target_root);
+    remap.push("=vos-target");
+    canonical.push(remap);
     canonical
 }
 
@@ -509,6 +526,7 @@ fn canonical_rustc_arguments(
 fn canonical_rustc_unit_metadata(
     arguments: &[OsString],
     source_root: &OsStr,
+    target_root: &OsStr,
     unit: &RustcUnitIdentity,
 ) -> String {
     let source_root = Path::new(source_root);
@@ -573,8 +591,12 @@ fn canonical_rustc_unit_metadata(
             push_metadata_part(&mut identity, b"rustc-extern", OsStr::new(name));
             continue;
         }
-        let normalized =
-            normalize_rustc_argument(argument, source_root, unit.manifest_dir.as_deref());
+        let normalized = normalize_rustc_argument(
+            argument,
+            source_root,
+            target_root,
+            unit.manifest_dir.as_deref(),
+        );
         push_metadata_part(&mut identity, b"rustc-argument", &normalized);
     }
 
@@ -595,9 +617,14 @@ fn push_metadata_bytes(output: &mut Vec<u8>, value: &[u8]) {
 fn normalize_rustc_argument(
     argument: &OsStr,
     source_root: &Path,
+    target_root: &OsStr,
     manifest_dir: Option<&Path>,
 ) -> OsString {
     let mut value = argument.to_string_lossy().replace('\\', "/");
+    let target_root = target_root.to_string_lossy().replace('\\', "/");
+    if !target_root.is_empty() {
+        value = value.replace(&target_root, "vos-target");
+    }
     let source_root = source_root.to_string_lossy().replace('\\', "/");
     if !source_root.is_empty() {
         value = value.replace(&source_root, "vos-source");
@@ -727,7 +754,12 @@ mod tests {
             "--emit=link",
         ]
         .map(OsString::from);
-        let canonical = canonical_rustc_arguments(arguments, OsStr::new("/checkout"), &unit);
+        let canonical = canonical_rustc_arguments(
+            arguments,
+            OsStr::new("/checkout"),
+            OsStr::new("/checkout/target/vosx-canonical/cache-a"),
+            &unit,
+        );
         assert_eq!(&canonical[..3], ["--crate-name", "counter", "--emit=link"]);
         assert!(
             canonical[3]
@@ -735,17 +767,22 @@ mod tests {
                 .starts_with("-Cmetadata=vos-actor-")
         );
         assert_eq!(canonical[4], "--remap-path-prefix=/checkout=vos-source");
+        assert_eq!(
+            canonical[5],
+            "--remap-path-prefix=/checkout/target/vosx-canonical/cache-a=vos-target"
+        );
     }
 
     #[test]
     fn canonical_metadata_is_checkout_independent() {
         let arguments = |checkout: &str| {
+            let cache = checkout.trim_start_matches("/checkout-");
             [
                 "--crate-name".into(),
                 "counter".into(),
                 format!("{checkout}/actors/counter/src/lib.rs").into(),
                 "--out-dir".into(),
-                format!("{checkout}/target/release/deps").into(),
+                format!("{checkout}/target/vosx-canonical/cache-{cache}/release/deps").into(),
                 "-Cmetadata=checkout-specific".into(),
                 format!("-Cextra-filename=-{}", checkout.trim_start_matches('/')).into(),
                 "--extern".into(),
@@ -764,11 +801,13 @@ mod tests {
             canonical_rustc_unit_metadata(
                 &arguments("/checkout-a"),
                 OsStr::new("/checkout-a"),
+                OsStr::new("/checkout-a/target/vosx-canonical/cache-a"),
                 &unit("/checkout-a"),
             ),
             canonical_rustc_unit_metadata(
                 &arguments("/checkout-b"),
                 OsStr::new("/checkout-b"),
+                OsStr::new("/checkout-b/target/vosx-canonical/cache-b"),
                 &unit("/checkout-b"),
             ),
         );
@@ -787,6 +826,7 @@ mod tests {
             canonical_rustc_unit_metadata(
                 &arguments,
                 OsStr::new("/workspace"),
+                OsStr::new("/workspace/target/vosx-canonical/cache"),
                 &unit(version, source),
             )
         };
