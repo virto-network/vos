@@ -4,7 +4,7 @@
 //! program catalog. Given a build commit hash (typically returned
 //! from a prior `compile()` call), the extension fetches the
 //! recorded artifact, hands the bytes to the registry's blob
-//! store, registers a `(name, version) -> hash` mapping with
+//! store, points a catalog name at that content hash through
 //! `registry.publish`, and finally records an `INTENT_PUBLISH`
 //! commit on the dev-project's `publishes` branch so the chain
 //! "what got published, from which build, at what time" is
@@ -46,17 +46,12 @@ const REGISTRY_ID: u32 = 0;
 pub const PUBLISH_STATUS_BUILD_NOT_FOUND: u8 = 30;
 pub const PUBLISH_STATUS_BUILD_FAILED: u8 = 31;
 pub const PUBLISH_STATUS_BLOB_NOT_FOUND: u8 = 32;
-/// Registry rejected the (name, version, hash) row for some
-/// reason it didn't specialise. Distinct from the more specific
-/// codes below (tag conflict, bad hash) — see [`map_registry_status`].
+/// Registry rejected the (name, hash) row for some reason it did not
+/// specialise.
 pub const PUBLISH_STATUS_REGISTRY_REJECTED: u8 = 33;
 pub const PUBLISH_STATUS_RECORD_FAILED: u8 = 34;
 pub const PUBLISH_STATUS_BAD_INTENT: u8 = 35;
 pub const PUBLISH_STATUS_BAD_BUILD_TAG: u8 = 36;
-/// Registry already has this (name, version) under a different
-/// hash. Surfaced separately so the CLI can hint at `--allow-retag`
-/// or version-bump workflows when that lands.
-pub const PUBLISH_STATUS_TAG_CONFLICT: u8 = 37;
 /// Registry rejected the hash as not 32 bytes — should never
 /// fire because publish already validates length, but routed
 /// through to keep the status pipeline honest.
@@ -69,18 +64,14 @@ pub const PUBLISH_STATUS_BAD_HASH: u8 = 38;
 /// REGISTRY_REJECTED bucket and the operator picks the detail
 /// out of the daemon log.
 fn map_registry_status(s: u8) -> u8 {
-    // Mapped against space_registry::STATUS_* circa Phase 5.
-    // Numeric values cross the FFI; mapping (not re-export)
-    // keeps the dev extension free of a build-time dep on
-    // space_registry's status constants.
+    // Numeric values cross the actor boundary.
     match s {
-        1 => PUBLISH_STATUS_TAG_CONFLICT, // STATUS_TAG_CONFLICT
-        6 => PUBLISH_STATUS_BAD_HASH,     // STATUS_BAD_HASH
+        6 => PUBLISH_STATUS_BAD_HASH, // STATUS_BAD_HASH
         _ => PUBLISH_STATUS_REGISTRY_REJECTED,
     }
 }
 
-/// Publish a build's PVM blob under `(name, version)` in the space
+/// Publish a build's PVM blob under a catalog name in the space
 /// registry. Returns the dev-project commit hash for the
 /// `INTENT_PUBLISH` record on success.
 pub async fn publish(
@@ -88,7 +79,6 @@ pub async fn publish(
     project_id: u32,
     build_commit: Vec<u8>,
     name: String,
-    version: String,
 ) -> HashResult {
     // ── 1. Resolve the build commit
     let commit = match fetch_commit(ctx, project_id, &build_commit).await {
@@ -162,7 +152,7 @@ pub async fn publish(
     let crdt = vos::metadata::from_elf(&artifact).is_some_and(|meta| meta.crdt);
 
     // ── 4. Register the program in the catalog. The catalog only
-    //    needs the (name, version, hash) row — the actual bytes
+    //    needs the (name, hash) row — the actual bytes
     //    are already in the local blob cache from the compile
     //    step, which is where `space install` reads them.
     //
@@ -171,7 +161,7 @@ pub async fn publish(
     //    The CLI surfaces specific codes (tag conflict, bad
     //    hash) so the operator gets actionable diagnostics
     //    rather than a flat "rejected".
-    match registry_publish(ctx, &name, &version, &registry_hash, crdt).await {
+    match registry_publish(ctx, &name, &registry_hash, crdt).await {
         Ok(s) if s == STATUS_OK => {}
         Ok(s) => {
             log::warn!("dev: registry.publish returned status {s}");
@@ -192,7 +182,6 @@ pub async fn publish(
     //    branch.
     let publish_intent = PublishIntent {
         program_name: name,
-        program_version: version,
         program_hash: bytes_to_32_or_zero(&registry_hash),
     };
     let intent_data = <PublishIntent as Encode>::encode(&publish_intent);
@@ -260,16 +249,9 @@ pub fn publish_args(r: HashResult) -> Args {
     }
 }
 
-async fn registry_publish(
-    ctx: &mut DevCtx,
-    name: &str,
-    version: &str,
-    hash: &[u8],
-    crdt: bool,
-) -> Result<u8, u8> {
+async fn registry_publish(ctx: &mut DevCtx, name: &str, hash: &[u8], crdt: bool) -> Result<u8, u8> {
     let msg = Msg::new("publish")
         .with("name", name.to_string())
-        .with("version", version.to_string())
         .with("hash", hash.to_vec())
         .with("crdt", crdt);
     let raw = ctx

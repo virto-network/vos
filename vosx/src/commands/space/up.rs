@@ -87,20 +87,11 @@ fn validate_service_trust_mode(
     Ok(())
 }
 
-fn role_authority_package_version(actor_program: vos::service::ProgramId) -> String {
-    format!(
-        "service-{}-actor-{}",
-        hex::encode(vos::service::VOS_SERVICE_PROGRAM_ID.0),
-        hex::encode(actor_program.0),
-    )
-}
-
 /// Construct the frozen authority package contents for the current service
-/// ABI. The signature wrapper is intentionally supplied separately: it is not
+/// platform. The signature wrapper is intentionally supplied separately: it is not
 /// part of [`vos::service::DeploymentId`]. The actor PVM is stable across releases,
 /// while the package, deployment, and derived replication identities are
-/// deliberately ABI-scoped because the manifest binds the service program,
-/// ABI, and execution semantics.
+/// scoped because the manifest binds the platform and execution semantics.
 fn frozen_role_authority_package(public_key: Vec<u8>) -> anyhow::Result<vos::service::VosPackage> {
     use vos::service::{ServiceWire, artifact_hash};
 
@@ -119,7 +110,6 @@ fn frozen_role_authority_package(public_key: Vec<u8>) -> anyhow::Result<vos::ser
     Ok(vos::service::VosPackage {
         manifest: vos::service::PackageManifest {
             name: vos::service::ROLE_AUTHORITY_INSTANCE_.into(),
-            version: role_authority_package_version(actor_program),
             platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
@@ -215,9 +205,7 @@ fn ensure_service_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::
             other => anyhow::bail!("sealing canonical role-authority cutover returned {other}"),
         }
     } else if cutover.as_slice() != replication_id {
-        anyhow::bail!(
-            "registry is sealed to a different canonical role-authority incarnation; authority package identities are ABI-scoped, so reopen with the release that sealed this space or perform the documented clean reinstall"
-        );
+        anyhow::bail!("registry is sealed to a different canonical role-authority incarnation");
     }
 
     if vos::block_on(reg.agent(&mut &*node, vos::service::ROLE_AUTHORITY_INSTANCE_.into()))
@@ -227,20 +215,14 @@ fn ensure_service_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::
         return Ok(());
     }
     let program_name = package.manifest.name.clone();
-    let program_version = package.manifest.version.clone();
-    let existing =
-        vos::block_on(reg.program(&mut &*node, program_name.clone(), program_version.clone()))
-            .map_err(|error| anyhow::anyhow!("query canonical space-authority package: {error}"))?;
+    let existing = vos::block_on(reg.program(&mut &*node, program_name.clone()))
+        .map_err(|error| anyhow::anyhow!("query canonical space-authority package: {error}"))?;
     match existing {
         Some(row) if row.hash == package_hash.0 => {}
-        Some(_) => anyhow::bail!(
-            "canonical authority tag {program_name}:{program_version} is pinned to different bytes"
-        ),
-        None => {
+        Some(_) | None => {
             let status = vos::block_on(reg.publish(
                 &mut &*node,
                 program_name.clone(),
-                program_version.clone(),
                 package_hash.0.to_vec(),
                 false,
                 Vec::new(),
@@ -255,7 +237,6 @@ fn ensure_service_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::
         &mut &*node,
         vos::service::ROLE_AUTHORITY_INSTANCE_.into(),
         program_name,
-        program_version,
         package_hash.0.to_vec(),
         replication_id.to_vec(),
         Consistency::Raft as u8,
@@ -1975,7 +1956,7 @@ pub(super) fn validate_role_authority_deployment(
     if package.manifest.name != vos::service::ROLE_AUTHORITY_INSTANCE_ {
         anyhow::bail!("installed space-authority has the wrong package name");
     }
-    // Authority upgrades may replace code, version, and the resulting actor
+    // Authority upgrades may replace code and the resulting actor
     // deployment. They may not silently change the wire/API surface trusted
     // by the registry, daemon, or already-installed dependent roots.
     if package.generated_interfaces != frozen.generated_interfaces
@@ -2061,8 +2042,7 @@ fn resolve_service_role_authority_with(
     }
     let package =
         validate_exact_service_package(&exact_package, vos::service::ROLE_AUTHORITY_INSTANCE_)?;
-    if package.manifest.name != row.program_name || package.manifest.version != row.program_version
-    {
+    if package.manifest.name != row.program_name {
         anyhow::bail!("space-authority catalog row does not name its exact signed package");
     }
     validate_role_authority_deployment(&package, root_peer_id, consistency)?;
@@ -4416,7 +4396,6 @@ mod tests {
         let mut package = VosPackage {
             manifest: PackageManifest {
                 name: "counter".into(),
-                version: "2.0.0".into(),
                 platform: vos::service::PLATFORM_ID,
                 execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
                 service_program,
@@ -4469,7 +4448,6 @@ mod tests {
             instance_name: vos::service::ROLE_AUTHORITY_INSTANCE_.into(),
             program_hash,
             program_name: package.manifest.name.clone(),
-            program_version: package.manifest.version.clone(),
             replication_id: [91; 32],
             consistency: Consistency::Raft as u8,
             network_reachable: false,
@@ -4507,7 +4485,6 @@ mod tests {
         // roots continue binding the frozen service deployment rather than
         // following the catalog's new actor deployment.
         let mut candidate = package.clone();
-        candidate.manifest.version = "authority-candidate".into();
         candidate.deployment_signature.signature = root
             .sign(&candidate.signing_message())
             .expect("sign authority candidate");
@@ -4518,7 +4495,6 @@ mod tests {
         let candidate_hash = BlobHash::of(&candidate_wire).0;
         let mut upgraded_row = row.clone();
         upgraded_row.program_hash = candidate_hash;
-        upgraded_row.program_version = candidate.manifest.version.clone();
         let upgraded = resolve_service_role_authority_with(
             space_id,
             std::slice::from_ref(&upgraded_row),
@@ -4721,7 +4697,6 @@ mod tests {
             instance_name: "counter".into(),
             program_hash: [1; 32],
             program_name: "counter".into(),
-            program_version: "2.0.0".into(),
             replication_id: [2; 32],
             consistency: Consistency::Raft as u8,
             network_reachable: true,
@@ -4775,7 +4750,6 @@ mod tests {
             instance_name: "counter".into(),
             program_hash: BlobHash::of(&original.encode()).0,
             program_name: original.manifest.name.clone(),
-            program_version: original.manifest.version.clone(),
             replication_id: [0xD1; 32],
             consistency: Consistency::Raft as u8,
             network_reachable: false,
@@ -4827,7 +4801,6 @@ mod tests {
         let original_service_image = std::fs::read(&state_path).unwrap();
 
         let mut replacement = original.clone();
-        replacement.manifest.version = "2.1.0".into();
         let replacement_signer = Keypair::generate_ed25519();
         replacement.deployment_signature.public_key = replacement_signer.public().encode_protobuf();
         replacement.deployment_signature.producer =
@@ -4946,7 +4919,6 @@ mod tests {
 
         row.program_hash = BlobHash::of(&package_wire).0;
         row.program_name = replacement.manifest.name.clone();
-        row.program_version = replacement.manifest.version.clone();
         let cache_path = blob_store::cache_path_for(&BlobHash(row.program_hash));
         let _ = std::fs::remove_file(&cache_path);
         let RowConfig::Service { config, .. } = agent_config_from_row(
@@ -5029,7 +5001,6 @@ mod tests {
             instance_name: "production-counter".into(),
             program_hash: [31; 32],
             program_name: "counter".into(),
-            program_version: "2.0.0".into(),
             replication_id: [32; 32],
             consistency: Consistency::Local as u8,
             network_reachable: false,
@@ -5188,7 +5159,6 @@ mod tests {
             instance_name: "production-raft-counter".into(),
             program_hash: [41; 32],
             program_name: "counter".into(),
-            program_version: "2.0.0".into(),
             replication_id,
             consistency: Consistency::Raft as u8,
             network_reachable: false,
@@ -5287,7 +5257,6 @@ mod tests {
             instance_name: "shared-counter".into(),
             program_hash: [11; 32],
             program_name: "shared-counter".into(),
-            program_version: "2.0.0".into(),
             replication_id: [12; 32],
             consistency: Consistency::Crdt as u8,
             network_reachable: true,

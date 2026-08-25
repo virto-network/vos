@@ -1334,7 +1334,6 @@ fn signed_test_package(
     let mut package = VosPackage {
         manifest: PackageManifest {
             name: metadata.actor_name.clone(),
-            version: "2.0.0".into(),
             platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
@@ -6575,7 +6574,6 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
     // the immutable space-root package signature enforced by the root driver.
     let attacker = libp2p::identity::Keypair::generate_ed25519();
     let mut attacker_signed = authority_package.clone();
-    attacker_signed.manifest.version = "voter-forged-authority".into();
     attacker_signed.deployment_signature.public_key = attacker.public().encode_protobuf();
     attacker_signed.deployment_signature.producer =
         ProducerId::of_public_key(&attacker_signed.deployment_signature.public_key);
@@ -7053,7 +7051,6 @@ fn root_upgrade_is_exactly_once_and_reopens_across_the_catalog_cutover() {
         .unwrap();
 
     let mut replacement = package.clone();
-    replacement.manifest.version = "2.1.0".into();
     replacement.deployment_signature.signature = signer
         .sign(&replacement.signing_message())
         .expect("sign replacement package");
@@ -7190,7 +7187,6 @@ fn conformance_raft_and_role_authority_shape_changes_are_refused_before_upgrade(
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
     let mut replacement = package.clone();
-    replacement.manifest.version = "2.1.0".into();
     replacement.deployment_signature.signature = signer
         .sign(&replacement.signing_message())
         .expect("sign replacement package");
@@ -7318,7 +7314,6 @@ fn production_raft_authority_upgrade_is_ordered_once_and_preserves_service_ident
     .expect("single-voter production Raft root installs");
 
     let mut replacement = package.clone();
-    replacement.manifest.version = "2.1.0".into();
     replacement.deployment_signature.signature = signer
         .sign(&replacement.signing_message())
         .expect("sign replacement package");
@@ -7334,7 +7329,6 @@ fn production_raft_authority_upgrade_is_ordered_once_and_preserves_service_ident
     // immutable space-root signer check at the service proposal boundary.
     let attacker = libp2p::identity::Keypair::generate_ed25519();
     let mut attacker_signed = replacement.clone();
-    attacker_signed.manifest.version = "attacker-signed".into();
     attacker_signed.deployment_signature.public_key = attacker.public().encode_protobuf();
     attacker_signed.deployment_signature.producer =
         ProducerId::of_public_key(&attacker_signed.deployment_signature.public_key);

@@ -67,10 +67,9 @@ impl DevExtension {
         project_id: u32,
         build_commit: Vec<u8>,
         name: String,
-        version: String,
         ctx: &mut Context<Self>,
     ) -> Args {
-        let result = publish::publish(ctx, project_id, build_commit, name, version).await;
+        let result = publish::publish(ctx, project_id, build_commit, name).await;
         publish::publish_args(result)
     }
 }

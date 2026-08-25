@@ -7,26 +7,21 @@ use vos::service::{ServiceWire, VosPackage};
 use crate::blob_store::{self, BlobHash, BlobSource};
 use crate::bundled;
 use crate::commands::space::client::DaemonClient;
-use crate::commands::space::common::parse_program_ref;
+use crate::commands::space::common::parse_program_name;
 use crate::output;
 
 #[derive(Serialize)]
 struct PublishedView {
     name: String,
-    version: String,
     hash: String,
-    /// `true` when the (name, version) was already in the catalog with
-    /// this exact hash — a no-op re-publish (only reachable via
-    /// `--bundled`, whose idempotency makes the provisioning flow safe
-    /// to re-run).
+    /// `true` when the name already pointed at this package.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     already_present: bool,
 }
 
 pub struct Args {
     pub space: String,
-    /// `name` or `name:version`. `None` only when `--bundled` supplies
-    /// its own catalog identity.
+    /// Catalog name. `None` only when `--bundled` supplies it.
     pub program_ref: Option<String>,
     /// Blob source: file path, hash, ipfs:<cid>, or URL. `None` only
     /// when `--bundled` supplies the bytes.
@@ -49,21 +44,20 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let source = args.source.ok_or_else(|| {
         anyhow::anyhow!("`space publish` needs a blob source (or `--bundled <name>`)")
     })?;
-    let (name, version) = parse_program_ref(&program_ref)?;
+    let name = parse_program_name(&program_ref)?;
 
     // Resolve and cache the blob bytes locally.
     let source = BlobSource::parse(&source);
     let (source_hash, bytes) =
         blob_store::resolve(&source).map_err(|e| anyhow::anyhow!("blob: {e}"))?;
-    let (hash, catalog_bytes, package_meta, crdt) =
-        canonical_program(&name, &version, source_hash, bytes)?;
+    let (hash, catalog_bytes, package_meta, crdt) = canonical_program(&name, source_hash, bytes)?;
     if hash != source_hash {
         blob_store::cache_put(&catalog_bytes)
             .map_err(|e| anyhow::anyhow!("cache canonical program artifact: {e}"))?;
     }
 
     DaemonClient::with_connect(&args.space, |client| {
-        let status = client.publish(name.clone(), version.clone(), hash.0.to_vec(), crdt)?;
+        let status = client.publish(name.clone(), hash.0.to_vec(), crdt)?;
         match status {
             Status::Ok => {
                 if let Some(meta) = package_meta.as_deref() {
@@ -71,13 +65,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 } else {
                     forward_meta(client, &hash, &catalog_bytes);
                 }
-                emit(&name, &version, &hash, false);
+                emit(&name, &hash, false);
                 Ok(())
             }
-            Status::TagConflict => anyhow::bail!(
-                "{name}:{version} already exists in the catalog with a different hash; \
-                 tags are immutable",
-            ),
             other => anyhow::bail!("publish returned status {other}"),
         }
     })
@@ -85,7 +75,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
 fn canonical_program(
     name: &str,
-    version: &str,
     source_hash: BlobHash,
     bytes: Vec<u8>,
 ) -> anyhow::Result<(BlobHash, Vec<u8>, Option<Vec<u8>>, bool)> {
@@ -99,12 +88,8 @@ fn canonical_program(
     vos::service::validate_actor_program_layout(&package.actor_pvm).map_err(|error| {
         anyhow::anyhow!("package actor PVM capability layout is invalid: {error}")
     })?;
-    if package.manifest.name != name || package.manifest.version != version {
-        anyhow::bail!(
-            "package identity is {}:{}, but publish requested {name}:{version}",
-            package.manifest.name,
-            package.manifest.version,
-        );
+    if package.manifest.name != name {
+        anyhow::bail!("package is named {}, not {name}", package.manifest.name);
     }
     let public_key =
         libp2p::identity::PublicKey::try_decode_protobuf(&package.deployment_signature.public_key)
@@ -127,25 +112,17 @@ fn canonical_program(
     ))
 }
 
-/// Catalog identity + ELF resolver for each bundled program. The tuple
-/// is `(program_name, version, elf-getter)`; keep it in sync with the
-/// blobs `vosx/build.rs` bakes.
-fn bundled_program(
-    name: &str,
-) -> anyhow::Result<(&'static str, &'static str, Option<&'static [u8]>)> {
+/// Catalog name + ELF resolver for each bundled program.
+fn bundled_program(name: &str) -> anyhow::Result<(&'static str, Option<&'static [u8]>)> {
     match name {
-        "dev-project" => Ok(("dev-project", "0.1.0", bundled::dev_project_elf())),
+        "dev-project" => Ok(("dev-project", bundled::dev_project_elf())),
         other => anyhow::bail!("unknown bundled program '{other}' (known: dev-project)"),
     }
 }
 
-/// `--bundled` path: publish a baked-in program under its fixed
-/// `(name, version)`, idempotently. Re-running with the same bytes is a
-/// no-op; a stale catalog entry (same tag, different hash) is a hard
-/// error since tags are immutable. This is the provisioning step
-/// `space install <name>` builds on.
+/// Publish a baked-in program under its canonical name.
 fn run_bundled(space: &str, bundled_name: &str) -> anyhow::Result<()> {
-    let (prog_name, version, elf) = bundled_program(bundled_name)?;
+    let (prog_name, elf) = bundled_program(bundled_name)?;
     let elf = elf.ok_or_else(|| {
         anyhow::anyhow!(
             "no bundled {bundled_name} ELF — rebuild vosx with the actor present \
@@ -157,47 +134,24 @@ fn run_bundled(space: &str, bundled_name: &str) -> anyhow::Result<()> {
     let crdt = vos::metadata::from_elf(elf).is_some_and(|meta| meta.crdt);
 
     DaemonClient::with_connect(space, |client| {
-        let already_present = match client.program(prog_name, version)? {
+        let already_present = match client.program(prog_name)? {
             Some(existing) => {
                 let on_disk = BlobHash(existing.hash);
-                if on_disk != cached_hash {
-                    anyhow::bail!(
-                        "{prog_name}:{version} already exists with a different hash ({on_disk}); \
-                         bundled blob has hash {cached_hash}. Tags are immutable — bump the \
-                        version, or unpublish first."
-                    );
-                }
-                if existing.crdt != crdt {
-                    anyhow::bail!(
-                        "{prog_name}:{version} already exists with a different signed CRDT \
-                         capability. Tags are immutable — bump the version, or unpublish first."
-                    );
-                }
-                true
+                on_disk == cached_hash && existing.crdt == crdt
             }
-            None => {
-                let status = client.publish(
-                    prog_name.to_string(),
-                    version.to_string(),
-                    cached_hash.0.to_vec(),
-                    crdt,
-                )?;
-                match status {
-                    Status::Ok => {}
-                    Status::TagConflict => anyhow::bail!(
-                        "{prog_name}:{version} TAG_CONFLICT mid-publish — race with another \
-                         vosx? Retry.",
-                    ),
-                    other => anyhow::bail!("registry.publish returned status {other}"),
-                }
-                false
-            }
+            None => false,
         };
+        if !already_present {
+            let status = client.publish(prog_name.to_string(), cached_hash.0.to_vec(), crdt)?;
+            if status != Status::Ok {
+                anyhow::bail!("registry.publish returned status {status}");
+            }
+        }
         // Forward the schema (idempotent) so dynamic dispatch resolves
         // types for the installed instance — even if a prior run
         // published this program without it.
         forward_meta(client, &cached_hash, elf);
-        emit(prog_name, version, &cached_hash, already_present);
+        emit(prog_name, &cached_hash, already_present);
         Ok(())
     })
 }
@@ -226,19 +180,18 @@ fn forward_meta_blob(client: &DaemonClient, hash: &BlobHash, meta_blob: &[u8]) {
     }
 }
 
-fn emit(name: &str, version: &str, hash: &BlobHash, already_present: bool) {
+fn emit(name: &str, hash: &BlobHash, already_present: bool) {
     if output::is_json() {
         output::print_json(&PublishedView {
             name: name.to_string(),
-            version: version.to_string(),
             hash: hash.to_hex(),
             already_present,
         });
     } else if already_present {
-        println!("{name}:{version} already published");
+        println!("{name} already points to this package");
         println!("  hash = {hash}");
     } else {
-        println!("published {name}:{version}");
+        println!("published {name}");
         println!("  hash = {hash}");
     }
 }
@@ -295,7 +248,6 @@ mod tests {
         let mut package = VosPackage {
             manifest: PackageManifest {
                 name: "counter".into(),
-                version: "2.0.0".into(),
                 platform: vos::service::PLATFORM_ID,
                 execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
                 service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
@@ -328,7 +280,7 @@ mod tests {
         let bytes = package.encode();
         let source_hash = BlobHash::of(&bytes);
         let (catalog_hash, catalog_bytes, metadata, crdt) =
-            canonical_program("counter", "2.0.0", source_hash, bytes.clone()).unwrap();
+            canonical_program("counter", source_hash, bytes.clone()).unwrap();
 
         assert_eq!(catalog_hash, source_hash);
         assert_eq!(catalog_bytes, bytes);
@@ -343,7 +295,7 @@ mod tests {
         package.deployment_signature.signature[0] ^= 0xff;
         let bytes = package.encode();
         let source_hash = BlobHash::of(&bytes);
-        let error = canonical_program("counter", "2.0.0", source_hash, bytes).unwrap_err();
+        let error = canonical_program("counter", source_hash, bytes).unwrap_err();
         assert!(
             error
                 .to_string()

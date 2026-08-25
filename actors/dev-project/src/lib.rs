@@ -95,7 +95,6 @@ pub const INTENT_REVERT: u8 = 6;
 #[rkyv(crate = vos::rkyv)]
 pub struct PublishIntent {
     pub program_name: String,
-    pub program_version: String,
     pub program_hash: [u8; HASH_BYTES],
 }
 

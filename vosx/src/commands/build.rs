@@ -37,7 +37,6 @@ impl RustcUnitIdentity {
 pub struct Args {
     pub program: PathBuf,
     pub name: Option<String>,
-    pub version: String,
     pub out_dir: PathBuf,
     pub interfaces: Option<PathBuf>,
     pub role_policies: Option<PathBuf>,
@@ -133,7 +132,6 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
     let mut package = VosPackage {
         manifest: PackageManifest {
             name: name.clone(),
-            version: args.version,
             platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             service_program,
@@ -849,7 +847,6 @@ mod tests {
         let build_args = |out_dir| Args {
             program: temp.0.join("actor.pvm"),
             name: None,
-            version: "2.0.0".into(),
             out_dir,
             interfaces: None,
             role_policies: None,

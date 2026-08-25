@@ -161,7 +161,7 @@ pub(crate) async fn reg_is_member(ctx: &mut MsgrCtx, peer_id: &[u8]) -> Result<b
 }
 
 /// `space-registry.install` — instantiate a new agent row, cloning
-/// the program identity (name/version/hash) and consistency from
+/// the program identity (name/hash) and consistency from
 /// `template` under a fresh instance name + replication id.
 ///
 /// The verb is Admin-gated and the host relays the real caller's
@@ -177,7 +177,6 @@ pub(crate) async fn reg_install(
     let msg = Msg::new("install")
         .with("instance_name", instance_name.to_string())
         .with("program_name", template.program_name.clone())
-        .with("program_version", template.program_version.clone())
         .with("program_hash", template.program_hash.to_vec())
         .with("replication_id", replication_id.to_vec())
         .with("consistency", template.consistency as u64)

@@ -9,7 +9,6 @@ use crate::output;
 #[derive(Serialize)]
 struct ProgramView<'a> {
     name: &'a str,
-    version: &'a str,
     hash: String,
     crdt: bool,
 }
@@ -22,7 +21,6 @@ pub fn run(space: &str) -> anyhow::Result<()> {
                 .iter()
                 .map(|p| ProgramView {
                     name: &p.name,
-                    version: &p.version,
                     hash: hex::encode(p.hash),
                     crdt: p.crdt,
                 })
@@ -34,13 +32,12 @@ pub fn run(space: &str) -> anyhow::Result<()> {
             println!("no programs in catalog. publish one with `vosx space publish`.");
             return Ok(());
         }
-        println!("{:<20}  {:<12}  {:<5}  HASH", "NAME", "VERSION", "CRDT");
+        println!("{:<20}  {:<5}  HASH", "NAME", "CRDT");
         for p in &programs {
             let short_hash: String = hex::encode(p.hash).chars().take(12).collect();
             println!(
-                "{:<20}  {:<12}  {:<5}  {short_hash}…",
+                "{:<20}  {:<5}  {short_hash}…",
                 truncate(&p.name, 20),
-                truncate(&p.version, 12),
                 if p.crdt { "yes" } else { "no" },
             );
         }

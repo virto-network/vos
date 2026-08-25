@@ -20070,7 +20070,6 @@ mod tests {
                                     instance_name: "private-board".into(),
                                     program_hash: [1; 32],
                                     program_name: "board".into(),
-                                    program_version: "1".into(),
                                     replication_id: [2; 32],
                                     consistency: Consistency::Crdt as u8,
                                     network_reachable: true,
@@ -20120,7 +20119,6 @@ mod tests {
                             tagged.extend_from_slice(
                                 &crate::registry::ProgramRow {
                                     name: "program".into(),
-                                    version: "1".into(),
                                     hash,
                                     crdt: false,
                                 }

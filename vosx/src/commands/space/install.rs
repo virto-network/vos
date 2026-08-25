@@ -6,14 +6,13 @@ use vos::init::{InitArgs, InitValue};
 use vos::registry::Status;
 
 use crate::commands::space::client::DaemonClient;
-use crate::commands::space::common::{auto_replication_id, parse_consistency, parse_program_ref};
+use crate::commands::space::common::{auto_replication_id, parse_consistency, parse_program_name};
 use crate::output;
 
 #[derive(Serialize)]
 struct InstalledView<'a> {
     instance_name: &'a str,
     program_name: &'a str,
-    program_version: &'a str,
     program_hash: String,
     replication_id: String,
     consistency: &'a str,
@@ -21,8 +20,7 @@ struct InstalledView<'a> {
 
 pub struct Args {
     pub space: String,
-    /// Program ref: `name`, `name:version`, or `name:version@hash`.
-    /// Bare `name` resolves to `name:latest`.
+    /// Published program name.
     pub program_ref: String,
     /// Override the install/instance name. Defaults to the
     /// program's name.
@@ -43,7 +41,7 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let (program_name, program_version) = parse_program_ref(&args.program_ref)?;
+    let program_name = parse_program_name(&args.program_ref)?;
     let instance_name = args.name.unwrap_or_else(|| program_name.clone());
 
     let consistency = parse_consistency(&args.consistency).ok_or_else(|| {
@@ -64,12 +62,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     DaemonClient::with_connect(&args.space, |client| {
         let program = client
-            .program(&program_name, &program_version)?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "program {program_name}:{program_version} not in catalog. publish it first.",
-                )
-            })?;
+            .program(&program_name)?
+            .ok_or_else(|| anyhow::anyhow!("program {program_name} is not published"))?;
 
         let replication_id = match &args.replication_id {
             Some(hex) => {
@@ -89,7 +83,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         let status = client.install(
             instance_name.clone(),
             program_name.clone(),
-            program_version.clone(),
             program.hash.to_vec(),
             replication_id.to_vec(),
             consistency,
@@ -105,14 +98,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                     output::print_json(&InstalledView {
                         instance_name: &instance_name,
                         program_name: &program_name,
-                        program_version: &program_version,
                         program_hash: hex::encode(program.hash),
                         replication_id: hex::encode(replication_id),
                         consistency: &args.consistency,
                     });
                 } else {
                     println!("installed {instance_name}");
-                    println!("  program        = {program_name}:{program_version}");
+                    println!("  program        = {program_name}");
                     println!("  program_hash   = {}", hex::encode(program.hash));
                     println!("  replication_id = {}", hex::encode(replication_id));
                     println!("  consistency    = {}", args.consistency);
@@ -123,7 +115,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 "an agent named '{instance_name}' is already installed; pass --name to disambiguate",
             ),
             Status::ProgramNotFound => {
-                anyhow::bail!("program {program_name}:{program_version} not in catalog (race?)",)
+                anyhow::bail!("program {program_name} is no longer published")
             }
             Status::ConsistencyWidenDenied => anyhow::bail!(
                 "'{instance_name}' was previously installed at a more confined consistency tier; \

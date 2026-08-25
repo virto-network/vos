@@ -16,7 +16,6 @@ use super::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageManifest {
     pub name: String,
-    pub version: String,
     pub platform: Hash,
     pub execution_semantics: Hash,
     pub service_program: ProgramId,
@@ -115,7 +114,7 @@ impl VosPackage {
         if self.manifest.execution_semantics != super::EXECUTION_SEMANTICS_ID {
             return Err(PackageError::WrongExecutionSemantics);
         }
-        if self.manifest.name.is_empty() || self.manifest.version.is_empty() {
+        if self.manifest.name.is_empty() {
             return Err(PackageError::EmptyName);
         }
         if self.actor_pvm.is_empty() {
@@ -449,7 +448,6 @@ fn decode_package_task_dependencies(
 
 fn encode_manifest(encoder: &mut Encoder<'_>, manifest: &PackageManifest) {
     encoder.string(&manifest.name);
-    encoder.string(&manifest.version);
     encoder.fixed(&manifest.platform.0);
     encoder.fixed(&manifest.execution_semantics.0);
     encoder.fixed(&manifest.service_program.0);
@@ -464,7 +462,6 @@ fn encode_manifest(encoder: &mut Encoder<'_>, manifest: &PackageManifest) {
 fn decode_manifest(decoder: &mut Decoder<'_>) -> Result<PackageManifest, DecodeError> {
     Ok(PackageManifest {
         name: decoder.string()?,
-        version: decoder.string()?,
         platform: Hash(decoder.fixed()?),
         execution_semantics: Hash(decoder.fixed()?),
         service_program: ProgramId(decoder.fixed()?),
@@ -565,7 +562,6 @@ mod tests {
         VosPackage {
             manifest: PackageManifest {
                 name: "counter".into(),
-                version: "2.0.0".into(),
                 platform: super::super::PLATFORM_ID,
                 execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
                 service_program: super::super::VOS_SERVICE_PROGRAM_ID,

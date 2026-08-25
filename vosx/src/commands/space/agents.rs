@@ -9,7 +9,6 @@ use serde::Serialize;
 struct AgentView<'a> {
     instance_name: &'a str,
     program_name: &'a str,
-    program_version: &'a str,
     program_hash: String,
     replication_id: String,
     consistency: &'static str,
@@ -24,7 +23,6 @@ pub fn run(space: &str) -> anyhow::Result<()> {
                 .map(|a| AgentView {
                     instance_name: &a.instance_name,
                     program_name: &a.program_name,
-                    program_version: &a.program_version,
                     program_hash: hex::encode(a.program_hash),
                     replication_id: hex::encode(a.replication_id),
                     consistency: consistency_name(a.consistency),
@@ -42,12 +40,11 @@ pub fn run(space: &str) -> anyhow::Result<()> {
             "NAME", "PROGRAM", "MODE",
         );
         for a in &agents {
-            let prog = format!("{}:{}", a.program_name, a.program_version);
             let short_rep: String = hex::encode(a.replication_id).chars().take(12).collect();
             println!(
                 "{:<20}  {:<20}  {:<10}  {short_rep}…",
                 truncate(&a.instance_name, 20),
-                truncate(&prog, 20),
+                truncate(&a.program_name, 20),
                 consistency_name(a.consistency),
             );
         }

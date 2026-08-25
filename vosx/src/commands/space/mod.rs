@@ -229,8 +229,7 @@ pub enum SpaceCommand {
         #[arg(long)]
         upgrade: bool,
     },
-    /// Add a program (PVM blob) to the catalog with an
-    /// immutable `(name, version)` tag.
+    /// Point a catalog name at a content-addressed program package.
     ///
     /// Pass `--bundled <name>` to publish a program baked into this
     /// `vosx` binary (currently `dev-project`) under its fixed catalog
@@ -240,8 +239,7 @@ pub enum SpaceCommand {
     Publish {
         /// Space id or name.
         space: String,
-        /// `name` or `name:version`. Bare `name` ⇒ `name:latest`.
-        /// Omit when using `--bundled`.
+        /// Catalog name. Omit when using `--bundled`.
         program_ref: Option<String>,
         /// Blob source: file path, hash, ipfs:<cid>, or URL.
         /// Omit when using `--bundled`.
@@ -252,10 +250,10 @@ pub enum SpaceCommand {
         bundled: Option<String>,
     },
     /// Remove a program from the catalog. Errors if any
-    /// installed agent still references the version.
+    /// installed agent still references its package.
     Unpublish {
         space: String,
-        /// `name:version` (both required).
+        /// Catalog name.
         program_ref: String,
     },
     /// List programs in the catalog.
@@ -264,8 +262,7 @@ pub enum SpaceCommand {
     Install {
         /// Space id or name.
         space: String,
-        /// Program ref: `name`, `name:version`. Bare `name`
-        /// resolves to `name:latest`.
+        /// Published program name.
         program_ref: String,
         /// Override the install/instance name. Defaults to
         /// the program's `name`.
@@ -289,13 +286,12 @@ pub enum SpaceCommand {
     },
     /// Tombstone an installed agent.
     Uninstall { space: String, instance: String },
-    /// Repoint an installed agent at a different program
-    /// version. State is preserved (same replication_id, same
-    /// redb); replicas restart on next sync.
+    /// Upgrade an installed actor to the package currently under a name.
+    /// State and replication identity are preserved.
     Upgrade {
         space: String,
         instance: String,
-        /// New program ref: `name:version`.
+        /// Published program name.
         program_ref: String,
     },
     /// List installed agents.

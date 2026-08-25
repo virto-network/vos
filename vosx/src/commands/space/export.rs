@@ -40,7 +40,6 @@ fn print_recipe(
     for p in programs {
         println!("[[program]]");
         println!("name    = {:?}", p.name);
-        println!("version = {:?}", p.version);
         println!("hash    = {:?}", hex::encode(p.hash));
         println!("crdt    = {}", p.crdt);
         println!();
@@ -49,10 +48,7 @@ fn print_recipe(
     for a in agents {
         println!("[[agent]]");
         println!("name           = {:?}", a.instance_name);
-        println!(
-            "program        = {:?}",
-            format!("{}:{}", a.program_name, a.program_version)
-        );
+        println!("program        = {:?}", a.program_name);
         println!("program_hash   = {:?}", hex::encode(a.program_hash));
         println!("replication_id = {:?}", hex::encode(a.replication_id));
         println!("consistency    = {:?}", consistency_name(a.consistency));

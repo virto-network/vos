@@ -126,9 +126,8 @@ pub struct AgentDef {
     /// `apply` resolves the blob by hash. Empty when absent.
     #[serde(default)]
     pub path: String,
-    /// `name:version` of the already-published program (emitted by
-    /// `space export`). When absent, the program name is the agent name
-    /// and the version is the recipe tag.
+    /// Published program name (emitted by `space export`). When absent,
+    /// the instance name is also used as the catalog name.
     #[serde(default)]
     pub program: Option<String>,
     /// Hex blob hash of an already-published program (emitted by `space
@@ -683,37 +682,18 @@ fn reconcile_one(
         .map_err(|e| anyhow::anyhow!("cache blob for '{}': {e}", agent.name))?;
     let crdt = vos::metadata::from_elf(&elf_bytes).is_some_and(|meta| meta.crdt);
 
-    // 2. Ensure published. Treat the agent's `name` as the
-    //    program name; recipes don't carry per-program
-    //    versions yet, so we use the literal "recipe" tag.
-    let program_name = agent.name.clone();
-    let program_version = "recipe".to_string();
+    // 2. Ensure the requested catalog name points at these bytes.
+    let program_name =
+        super::common::parse_program_name(agent.program.as_deref().unwrap_or(&agent.name))?;
     let existing: Option<ProgramRow> =
-        vos::block_on(reg.program(&mut &*node, program_name.clone(), program_version.clone()))
+        vos::block_on(reg.program(&mut &*node, program_name.clone()))
             .map_err(|e| anyhow::anyhow!("registry.program('{program_name}'): {e}"))?;
     let program_hash = match existing {
         Some(p) if p.hash == hash.0 && p.crdt == crdt => {
-            tracing::debug!("{program_name}:{program_version} already published");
+            tracing::debug!("{program_name} already published");
             p.hash
         }
-        Some(p) if p.hash == hash.0 => {
-            anyhow::bail!(
-                "recipe's '{program_name}:{program_version}' has the same bytes but a different \
-                 signed CRDT capability than the catalog. Publish it under a new version."
-            );
-        }
-        Some(_) => {
-            // Tag pinned to a different blob — recipe's blob
-            // and registry's disagree. Don't silently overwrite;
-            // this is what `space upgrade` is for.
-            anyhow::bail!(
-                "recipe's '{program_name}:{program_version}' has a different hash than \
-                 the catalog. Run `vosx space upgrade {} {program_name}:<new-version>` \
-                 explicitly, or remove the agent from the recipe.",
-                agent.name,
-            );
-        }
-        None => {
+        Some(_) | None => {
             // Empty `auth`: the daemon signs catalog mutations on relay
             // with its operator key. On the admin (operator) node that
             // signature authorizes the op; on a joined non-admin node it
@@ -722,7 +702,6 @@ fn reconcile_one(
             let status = vos::block_on(reg.publish(
                 &mut &*node,
                 program_name.clone(),
-                program_version.clone(),
                 hash.0.to_vec(),
                 crdt,
                 Vec::new(),
@@ -730,7 +709,7 @@ fn reconcile_one(
             .map_err(|e| anyhow::anyhow!("registry.publish('{program_name}'): {e}"))?;
             match status {
                 Status::Ok => {
-                    tracing::info!("published {program_name}:{program_version}");
+                    tracing::info!("published {program_name}");
                 }
                 Status::Forbidden if node_is_admin => {
                     // This node IS the space admin, yet the daemon's
@@ -739,7 +718,7 @@ fn reconcile_one(
                     // silently install nothing (no peer will supply the
                     // rows for the authoring node).
                     anyhow::bail!(
-                        "publish '{program_name}:{program_version}' refused (Status::Forbidden) on \
+                        "publish '{program_name}' refused (Status::Forbidden) on \
                          the space-admin node — the operator key cannot author registry ops. \
                          Check that the correct identity.key is loaded and matches the space root."
                     );
@@ -751,12 +730,9 @@ fn reconcile_one(
                     // install (likewise tolerant) so the agent spawns
                     // once the synced rows land.
                     tracing::debug!(
-                        "publish {program_name}:{program_version} not authored locally; awaiting \
+                        "publish {program_name} not authored locally; awaiting \
                          registry sync (if this should be the admin node, check identity.key)",
                     );
-                }
-                Status::TagConflict => {
-                    anyhow::bail!("publish conflict on {program_name}:{program_version}");
                 }
                 other => anyhow::bail!("publish status {other}"),
             }
@@ -787,7 +763,7 @@ fn reconcile_one(
             Vec::new(),
         )) {
             Ok(Status::Ok) => {
-                tracing::debug!("registered meta for {program_name}:{program_version}");
+                tracing::debug!("registered meta for {program_name}");
             }
             Ok(status) => tracing::warn!(
                 "register_meta('{program_name}') returned status {status}; \
@@ -799,7 +775,7 @@ fn reconcile_one(
             ),
         }
     } else {
-        tracing::debug!("{program_name}:{program_version} has no .vos_meta section; skipping",);
+        tracing::debug!("{program_name} has no .vos_meta section; skipping");
     }
 
     // 3. Ensure installed.
@@ -856,7 +832,6 @@ fn reconcile_one(
         &mut &*node,
         agent.name.clone(),
         program_name.clone(),
-        program_version.clone(),
         program_hash.to_vec(),
         replication_id.to_vec(),
         consistency,
@@ -1178,13 +1153,12 @@ mod tests {
 
             [[program]]
             name    = "counter"
-            version = "recipe"
             hash    = "deadbeef"
             crdt    = true
 
             [[agent]]
             name           = "counter"
-            program        = "counter:recipe"
+            program        = "counter"
             program_hash   = "deadbeef"
             replication_id = "0011"
             consistency    = "crdt"

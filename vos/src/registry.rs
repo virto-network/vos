@@ -26,7 +26,6 @@ use alloc::vec::Vec;
 #[rkyv(crate = rkyv)]
 pub struct ProgramRow {
     pub name: String,
-    pub version: String,
     pub hash: [u8; 32],
     /// Whether the immutable program was explicitly built as
     /// `#[actor(crdt)]`. This is part of the signed catalog publication,
@@ -35,10 +34,10 @@ pub struct ProgramRow {
 }
 
 /// One page of [`RegistryRef::programs`]. The catalog is returned in
-/// `(name, version)` order and every scanned row is emitted (no
+/// name order and every scanned row is emitted (no
 /// filtering), so — unlike [`AuthGrantPage`] — the cursor is just the
-/// last row's `(name, version)`; `more` is the terminator. Start with an
-/// empty `(after_name, after_version)` and continue while `more` is set.
+/// last row's name; `more` is the terminator. Start with an empty name and
+/// continue while `more` is set.
 /// Use [`RegistryRef::programs_all`] to drain the whole catalog.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
 #[rkyv(crate = rkyv)]
@@ -59,7 +58,6 @@ pub struct AgentRow {
     /// resolve code via `program_hash`; these are for
     /// `space agents` listings and manifest export.
     pub program_name: String,
-    pub program_version: String,
     pub replication_id: [u8; 32],
     /// 0 = Ephemeral, 1 = Local, 2 = Crdt, 3 = Raft. Mirrors
     /// `vos::node::Consistency` discriminants.
@@ -731,23 +729,17 @@ fn catalog_op_canonical(msg: &Msg) -> Option<Vec<u8>> {
     let canon = match msg.name.as_str() {
         "publish" => {
             let name = a.get_str("name")?;
-            let version = a.get_str("version")?;
             let hash = a.get_bytes("hash")?;
             let crdt = a.get_bool("crdt")?;
-            canonical_op_bytes(
-                "publish",
-                &[name.as_bytes(), version.as_bytes(), &hash, &[crdt as u8]],
-            )
+            canonical_op_bytes("publish", &[name.as_bytes(), &hash, &[crdt as u8]])
         }
         "unpublish" => {
             let name = a.get_str("name")?;
-            let version = a.get_str("version")?;
-            canonical_op_bytes("unpublish", &[name.as_bytes(), version.as_bytes()])
+            canonical_op_bytes("unpublish", &[name.as_bytes()])
         }
         "install" => {
             let instance_name = a.get_str("instance_name")?;
             let program_name = a.get_str("program_name")?;
-            let program_version = a.get_str("program_version")?;
             let program_hash = a.get_bytes("program_hash")?;
             let replication_id = a.get_bytes("replication_id")?;
             let consistency = a.get_u8("consistency")?;
@@ -764,7 +756,6 @@ fn catalog_op_canonical(msg: &Msg) -> Option<Vec<u8>> {
                 &[
                     instance_name.as_bytes(),
                     program_name.as_bytes(),
-                    program_version.as_bytes(),
                     &program_hash,
                     &replication_id,
                     &[consistency],
@@ -782,7 +773,6 @@ fn catalog_op_canonical(msg: &Msg) -> Option<Vec<u8>> {
         "upgrade" => {
             let instance_name = a.get_str("instance_name")?;
             let new_program_name = a.get_str("new_program_name")?;
-            let new_program_version = a.get_str("new_program_version")?;
             let new_program_hash = a.get_bytes("new_program_hash")?;
             let from_hash = a.get_bytes("from_hash")?;
             canonical_op_bytes(
@@ -790,7 +780,6 @@ fn catalog_op_canonical(msg: &Msg) -> Option<Vec<u8>> {
                 &[
                     instance_name.as_bytes(),
                     new_program_name.as_bytes(),
-                    new_program_version.as_bytes(),
                     &new_program_hash,
                     &from_hash,
                 ],
@@ -928,15 +917,14 @@ impl RegistryRef {
     // ── Catalog reads ─────────────────────────────────────────────
 
     /// One page of the program catalog, in `(name, version)` order. Pass
-    /// an empty `(after_name, after_version)` to start; continue from the
-    /// last returned row's `(name, version)` while the page's `more` flag
+    /// an empty name to start; continue from the
+    /// last returned row's name while the page's `more` flag
     /// is set. `budget` caps the page (0 = the registry's max). Prefer
     /// [`programs_all`](Self::programs_all) unless paging by hand.
     pub async fn programs<I: Invoker>(
         &self,
         inv: &mut I,
         after_name: String,
-        after_version: String,
         budget: u32,
     ) -> Result<ProgramPage, ClientError> {
         decode_rkyv(
@@ -944,14 +932,13 @@ impl RegistryRef {
                 inv,
                 Msg::new("programs")
                     .with("after_name", after_name)
-                    .with("after_version", after_version)
                     .with("budget", budget),
             )
             .await?,
         )
     }
 
-    /// Drain the whole program catalog into one `Vec` (name/version order).
+    /// Drain the whole program catalog into one `Vec` (name order).
     /// Callers that need the full set — `space programs`, `space info`,
     /// manifest export — use this.
     pub async fn programs_all<I: Invoker>(
@@ -960,11 +947,8 @@ impl RegistryRef {
     ) -> Result<Vec<ProgramRow>, ClientError> {
         let mut out: Vec<ProgramRow> = Vec::new();
         loop {
-            let (after_name, after_version) = out
-                .last()
-                .map(|p| (p.name.clone(), p.version.clone()))
-                .unwrap_or_default();
-            let page = self.programs(inv, after_name, after_version, 0).await?;
+            let after_name = out.last().map(|p| p.name.clone()).unwrap_or_default();
+            let page = self.programs(inv, after_name, 0).await?;
             let more = page.more;
             out.extend(page.rows);
             if !more {
@@ -978,16 +962,10 @@ impl RegistryRef {
         &self,
         inv: &mut I,
         name: String,
-        version: String,
     ) -> Result<Option<ProgramRow>, ClientError> {
         decode_opt(
-            self.call(
-                inv,
-                Msg::new("program")
-                    .with("name", name)
-                    .with("version", version),
-            )
-            .await?,
+            self.call(inv, Msg::new("program").with("name", name))
+                .await?,
         )
     }
 
@@ -1353,7 +1331,6 @@ impl RegistryRef {
         &self,
         inv: &mut I,
         name: String,
-        version: String,
         hash: Vec<u8>,
         crdt: bool,
         auth: Vec<u8>,
@@ -1363,7 +1340,6 @@ impl RegistryRef {
                 inv,
                 Msg::new("publish")
                     .with("name", name)
-                    .with("version", version)
                     .with("hash", hash)
                     .with("crdt", crdt)
                     .with("auth", auth),
@@ -1414,16 +1390,12 @@ impl RegistryRef {
         &self,
         inv: &mut I,
         name: String,
-        version: String,
         auth: Vec<u8>,
     ) -> Result<Status, ClientError> {
         decode_rkyv(
             self.call(
                 inv,
-                Msg::new("unpublish")
-                    .with("name", name)
-                    .with("version", version)
-                    .with("auth", auth),
+                Msg::new("unpublish").with("name", name).with("auth", auth),
             )
             .await?,
         )
@@ -1435,7 +1407,6 @@ impl RegistryRef {
         inv: &mut I,
         instance_name: String,
         program_name: String,
-        program_version: String,
         program_hash: Vec<u8>,
         replication_id: Vec<u8>,
         consistency: u8,
@@ -1451,7 +1422,6 @@ impl RegistryRef {
                 Msg::new("install")
                     .with("instance_name", instance_name)
                     .with("program_name", program_name)
-                    .with("program_version", program_version)
                     .with("program_hash", program_hash)
                     .with("replication_id", replication_id)
                     .with("consistency", consistency)
@@ -1471,7 +1441,6 @@ impl RegistryRef {
         inv: &mut I,
         instance_name: String,
         new_program_name: String,
-        new_program_version: String,
         new_program_hash: Vec<u8>,
         from_hash: Vec<u8>,
         auth: Vec<u8>,
@@ -1482,7 +1451,6 @@ impl RegistryRef {
                 Msg::new("upgrade")
                     .with("instance_name", instance_name)
                     .with("new_program_name", new_program_name)
-                    .with("new_program_version", new_program_version)
                     .with("new_program_hash", new_program_hash)
                     .with("from_hash", from_hash)
                     .with("auth", auth),
@@ -1791,7 +1759,6 @@ mod tests {
         let m = Msg::new("install")
             .with("instance_name", "msg-x-log")
             .with("program_name", "p")
-            .with("program_version", "1")
             .with("program_hash", alloc::vec![7u8; 32])
             .with("replication_id", alloc::vec![9u8; 32])
             .with("consistency", 2u64)
@@ -1859,7 +1826,6 @@ mod tests {
         let m = Msg::new("upgrade")
             .with("instance_name", "msg-x-log")
             .with("new_program_name", "p")
-            .with("new_program_version", "2")
             .with("new_program_hash", alloc::vec![5u8; 32])
             .with("from_hash", alloc::vec![7u8; 32]);
         assert_eq!(

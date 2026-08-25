@@ -92,8 +92,6 @@ enum Command {
         program: PathBuf,
         #[arg(long)]
         name: Option<String>,
-        #[arg(long, default_value = "0.1.0")]
-        version: String,
         #[arg(long, default_value = "dist")]
         out_dir: PathBuf,
         #[arg(long)]
@@ -272,7 +270,6 @@ fn main() {
         Some(Command::Build {
             program,
             name,
-            version,
             out_dir,
             interfaces,
             role_policies,
@@ -285,7 +282,6 @@ fn main() {
             if let Err(error) = commands::build::run(commands::build::Args {
                 program,
                 name,
-                version,
                 out_dir,
                 interfaces,
                 role_policies,

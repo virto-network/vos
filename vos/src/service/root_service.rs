@@ -4196,7 +4196,6 @@ mod tests {
         let package = VosPackage {
             manifest: super::super::PackageManifest {
                 name: "replacement".into(),
-                version: "2.1.0".into(),
                 platform: super::super::PLATFORM_ID,
                 execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
                 service_program: super::super::VOS_SERVICE_PROGRAM_ID,

@@ -570,13 +570,9 @@ impl DaemonClient {
             .map_err(|e| anyhow::anyhow!("registry.programs(): {e}"))
     }
 
-    pub fn program(&self, name: &str, version: &str) -> anyhow::Result<Option<ProgramRow>> {
-        vos::block_on(self.registry().program(
-            &mut &self.node,
-            name.to_string(),
-            version.to_string(),
-        ))
-        .map_err(|e| anyhow::anyhow!("registry.program('{name}:{version}'): {e}"))
+    pub fn program(&self, name: &str) -> anyhow::Result<Option<ProgramRow>> {
+        vos::block_on(self.registry().program(&mut &self.node, name.to_string()))
+            .map_err(|e| anyhow::anyhow!("registry.program('{name}'): {e}"))
     }
 
     pub fn agents(&self) -> anyhow::Result<Vec<AgentRow>> {
@@ -683,21 +679,11 @@ impl DaemonClient {
     // operator key it loaded at boot, so the signature is the operator's
     // regardless of whether the CLI or a keyless PVM agent drove the op.
     // See `space_registry`'s signed-registry-ops note.
-    pub fn publish(
-        &self,
-        name: String,
-        version: String,
-        hash: Vec<u8>,
-        crdt: bool,
-    ) -> anyhow::Result<Status> {
-        vos::block_on(self.registry().publish(
-            &mut &self.node,
-            name,
-            version,
-            hash,
-            crdt,
-            Vec::new(),
-        ))
+    pub fn publish(&self, name: String, hash: Vec<u8>, crdt: bool) -> anyhow::Result<Status> {
+        vos::block_on(
+            self.registry()
+                .publish(&mut &self.node, name, hash, crdt, Vec::new()),
+        )
         .map_err(|e| anyhow::anyhow!("registry.publish(): {e}"))
     }
 
@@ -720,12 +706,9 @@ impl DaemonClient {
         .map_err(|e| anyhow::anyhow!("registry.register_meta(): {e}"))
     }
 
-    pub fn unpublish(&self, name: String, version: String) -> anyhow::Result<Status> {
-        vos::block_on(
-            self.registry()
-                .unpublish(&mut &self.node, name, version, Vec::new()),
-        )
-        .map_err(|e| anyhow::anyhow!("registry.unpublish(): {e}"))
+    pub fn unpublish(&self, name: String) -> anyhow::Result<Status> {
+        vos::block_on(self.registry().unpublish(&mut &self.node, name, Vec::new()))
+            .map_err(|e| anyhow::anyhow!("registry.unpublish(): {e}"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -733,7 +716,6 @@ impl DaemonClient {
         &self,
         instance_name: String,
         program_name: String,
-        program_version: String,
         program_hash: Vec<u8>,
         replication_id: Vec<u8>,
         consistency: u8,
@@ -746,7 +728,6 @@ impl DaemonClient {
             &mut &self.node,
             instance_name,
             program_name,
-            program_version,
             program_hash,
             replication_id,
             consistency,
@@ -763,14 +744,13 @@ impl DaemonClient {
         &self,
         instance_name: String,
         program_name: String,
-        program_version: String,
         program_hash: Vec<u8>,
     ) -> anyhow::Result<Status> {
         use vos::service::ServiceWire as _;
 
         // Compare-and-swap base: read the instance's live program hash so
         // the registry rejects this upgrade if the instance has moved on
-        // (a replayed/superseded upgrade can't roll the version back).
+        // (a replayed or superseded upgrade cannot roll the package back).
         let installed = vos::block_on(
             self.registry()
                 .agent(&mut &self.node, instance_name.clone()),
@@ -800,7 +780,7 @@ impl DaemonClient {
         let to = to_artifact.get(..4) == Some(b"VOSP");
         let terminal_catalog_retry = from_hash == to_hash;
         if from != to {
-            anyhow::bail!("upgrade cannot cross the legacy/service runtime boundary");
+            anyhow::bail!("upgrade cannot change the package format");
         }
         if from {
             let from_package = decode_exact_service_package(&from_artifact, "installed")?;
@@ -890,7 +870,6 @@ impl DaemonClient {
             &mut &self.node,
             instance_name,
             program_name,
-            program_version,
             program_hash,
             from_hash.to_vec(),
             Vec::new(),

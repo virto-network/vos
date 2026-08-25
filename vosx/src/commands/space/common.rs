@@ -9,17 +9,13 @@
 use vos::abi::service::ServiceId;
 use vos::node::Consistency;
 
-/// Parse `name` or `name:version`. Bare `name` ⇒ `name:latest`.
-/// Empty halves (`":1.0"`, `"foo:"`) are rejected.
-pub fn parse_program_ref(s: &str) -> anyhow::Result<(String, String)> {
-    if let Some((n, v)) = s.split_once(':') {
-        if n.is_empty() || v.is_empty() {
-            anyhow::bail!("program ref '{s}' must be 'name' or 'name:version'");
-        }
-        Ok((n.to_string(), v.to_string()))
-    } else {
-        Ok((s.to_string(), "latest".to_string()))
+/// Validate a catalog name. Package hashes, not user-chosen tags, identify
+/// immutable artifacts; a name is only the movable catalog pointer.
+pub fn parse_program_name(s: &str) -> anyhow::Result<String> {
+    if s.is_empty() || s.contains([':', '@']) {
+        anyhow::bail!("program name must be non-empty and contain neither ':' nor '@'");
     }
+    Ok(s.to_string())
 }
 
 /// Truncate `s` to at most `max` chars (byte-indexed — only
@@ -240,25 +236,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_versioned_ref() {
-        assert_eq!(
-            parse_program_ref("counter:1.0").unwrap(),
-            ("counter".into(), "1.0".into()),
-        );
-    }
-
-    #[test]
-    fn parses_bare_name_to_latest() {
-        assert_eq!(
-            parse_program_ref("counter").unwrap(),
-            ("counter".into(), "latest".into()),
-        );
-    }
-
-    #[test]
-    fn rejects_empty_halves() {
-        assert!(parse_program_ref(":1.0").is_err());
-        assert!(parse_program_ref("counter:").is_err());
+    fn validates_plain_program_names() {
+        assert_eq!(parse_program_name("counter").unwrap(), "counter");
+        assert!(parse_program_name("").is_err());
+        assert!(parse_program_name("counter:tag").is_err());
+        assert!(parse_program_name("counter@hash").is_err());
     }
 
     #[test]
