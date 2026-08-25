@@ -53,8 +53,8 @@ pub use vos::registry::{
 
 /// One row in the metadata table — opaque schema bytes attached to a
 /// program hash. The wire payload is the raw `.vos_meta` ELF section
-/// (binary format defined by `vos::actors::metadata`); the registry
-/// itself doesn't decode it, so no schema lock-in across versions.
+/// (binary format defined by `vos::actors::metadata`). The registry validates
+/// that format before storing the bytes.
 /// All agents installed from the same program share one entry; the
 /// `meta_for_instance` lookup composes the agent → program_hash join
 /// internally.
@@ -196,7 +196,7 @@ pub struct HostMappingPage {
 use vos::prelude::*;
 use vos::storage::{StorageMap, StorageSet, StorageValue, fill_page};
 
-/// Per-actor SpaceRole map (M7) — declared as a `pub const` so
+/// Per-actor SpaceRole map, declared as a `pub const` so
 /// it survives the `#[actor(space_role_map = ...)]` expansion.
 /// Maps the four space-level tiers onto this registry's local
 /// roles:
@@ -206,7 +206,7 @@ use vos::storage::{StorageMap, StorageSet, StorageValue, fill_page};
 ///                                         handlers gate on
 ///                                         Developer today, but
 ///                                         the tier is wired so
-///                                         M8/M9 operators can
+///                                         operators can
 ///                                         delegate via local
 ///                                         grants)
 ///   space Member    → registry Reader    (read-only handlers)
@@ -236,8 +236,8 @@ pub struct SpaceRegistry {
     /// Identity members, one `#[storage]` row per identity keyed by
     /// `identity_key(public_key)` (variable-length key folded to fixed
     /// width; the row keeps the plain key). The nodes/identities split
-    /// keeps each a single-key-type map — the old flat `Vec<MemberRow>`
-    /// mixed `u16` prefixes and variable pubkeys.
+    /// keeps each a single-key-type map instead of mixing `u16` prefixes and
+    /// variable public keys.
     #[storage]
     identities: StorageMap<[u8; 32], MemberRow>,
     /// Opaque metadata blobs keyed by program hash. Stored as raw
@@ -256,7 +256,7 @@ pub struct SpaceRegistry {
     #[storage]
     authority_grant_witnesses: StorageMap<[u8; 32], [u8; 32]>,
     /// Opaque metadata blobs for native `.so` extensions, keyed by
-    /// the manifest `instance_name`. Service-mode extensions have
+    /// the manifest `instance_name`. Native extensions have
     /// no program-hash identity in this catalog (the host loads
     /// them off a filesystem path), so we key by the operator-
     /// visible name. `meta_for_instance` falls through here when
@@ -265,12 +265,9 @@ pub struct SpaceRegistry {
     /// fixed-width key); the row keeps the plain name.
     #[storage]
     extension_metas: StorageMap<[u8; 32], ExtensionMetaRow>,
-    /// Sprint 2 — per-PeerId auth grants, one row per peer. A `#[storage]`
+    /// Per-PeerId auth grants, one row per peer. A `#[storage]`
     /// map keyed by `peer_key(peer_id)`: `effective_role`/`peer_epoch`
-    /// point-get, `auth_grants()` pages. Pre-Sprint-2 state archives don't
-    /// have this field; the actor's fall-back-to-fresh behaviour on archive
-    /// decode failure (see "Schema evolution" in this file's module doc)
-    /// lets upgrades resync from the DAG.
+    /// point-get, `auth_grants()` pages.
     #[storage]
     auth_grants: StorageMap<[u8; 32], AuthGrantRow>,
     /// Grow-only revoke high-waters for space-level grants, one row per
@@ -569,10 +566,8 @@ impl SpaceRegistry {
     // ── Metadata blobs ──────────────────────────────────────────
 
     /// Record (or replace) the metadata blob for a program hash.
-    /// Idempotent: re-registering the same hash overwrites the
-    /// existing blob (lets a manifest re-deploy refresh schema).
-    /// Returns `Status::BadHash` if the hash isn't 32 bytes;
-    /// otherwise `Status::Ok`. The hash doesn't need to match an
+    /// Idempotent: re-registering the same hash overwrites the existing blob.
+    /// The hash doesn't need to match an
     /// existing `ProgramRow` — schema can be registered before
     /// the program is published if the orchestrator prefers
     /// that order.
@@ -592,6 +587,9 @@ impl SpaceRegistry {
         let Some(program_hash) = bytes_to_32(&program_hash) else {
             return Status::BadHash;
         };
+        if vos::metadata::decode(&blob).is_none() {
+            return Status::BadMetadata;
+        }
         // Upsert: one point write, keyed by the program hash.
         self.metas
             .insert(&program_hash, &MetaRow { program_hash, blob });
@@ -599,9 +597,7 @@ impl SpaceRegistry {
     }
 
     /// Look up the metadata blob for a program hash. Returns an
-    /// empty vector when no entry exists — callers treat that as
-    /// "schema unknown" and fall back to whatever heuristic they
-    /// were using before.
+    /// empty vector when no entry exists.
     #[msg]
     async fn meta_for_program(&self, program_hash: Vec<u8>) -> Vec<u8> {
         let Some(program_hash) = bytes_to_32(&program_hash) else {
@@ -625,8 +621,7 @@ impl SpaceRegistry {
     /// a single lookup that doesn't care whether the target is a
     /// PVM agent or a native `.so`. Agents win on collision; an
     /// extension with the same name as an installed agent is
-    /// shadowed. The manifest reconciler is the right place to
-    /// reject the collision up-front, but doesn't today.
+    /// shadowed.
     #[msg]
     async fn meta_for_instance(&self, name: String) -> Vec<u8> {
         let mut ai = 0usize;
@@ -648,13 +643,8 @@ impl SpaceRegistry {
     /// extension instance. Keyed by `instance_name` (not a
     /// program hash — see `ExtensionMetaRow` comment).
     ///
-    /// An empty `blob` removes the row outright rather than
-    /// storing an empty entry. That keeps "no schema registered"
-    /// distinguishable from "schema registered but trivially
-    /// empty" if the producer ever has reason to publish a
-    /// zero-method surface — and lets a re-deploy genuinely roll
-    /// back a previously-published surface rather than leaving
-    /// behind a stale row.
+    /// An empty `blob` removes the row. Non-empty metadata is decoded before
+    /// it becomes visible.
     #[msg]
     async fn register_extension_meta(
         &mut self,
@@ -677,6 +667,9 @@ impl SpaceRegistry {
         if blob.is_empty() {
             self.extension_metas.remove(&key);
         } else {
+            if vos::metadata::decode(&blob).is_none() {
+                return Status::BadMetadata;
+            }
             self.extension_metas.insert(
                 &key,
                 &ExtensionMetaRow {
@@ -1180,8 +1173,7 @@ impl SpaceRegistry {
     }
 
     /// One page of the member roster, nodes (by prefix) before identities
-    /// (by key) — the single ordered stream the old flat `Vec<MemberRow>`
-    /// presented, now stitched across the two `#[storage]` maps. Pass
+    /// (by key), stitched across the two `#[storage]` maps. Pass
     /// `(0, [])` to start; continue from the returned page's
     /// `(next_kind, next_key)` while `more` is true. `budget` caps the page.
     #[msg]
@@ -1283,7 +1275,7 @@ impl SpaceRegistry {
             .unwrap_or(0)
     }
 
-    // ── Auth grants (Sprint 2) ─────────────────────────────────
+    // ── Auth grants ────────────────────────────────────────────
 
     /// Canonical-authority counterpart of `grant_role`. It is a distinct
     /// message so captured pre-cutover calls cannot be reinterpreted as
@@ -1543,7 +1535,7 @@ impl SpaceRegistry {
             role,
             expires_at,
             &token_pub_key,
-            Some(&authority_replication_id),
+            &authority_replication_id,
         );
         if !verify_op_sig(&admin_peer_id, &invite_canon, &admin_sig)
             || !self.is_effective_admin(&admin_peer_id)

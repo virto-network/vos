@@ -1,10 +1,6 @@
 //! Operator identity for `vosx` client invocations.
 //!
-//! Sprint 2 prerequisite: the daemon needs a stable caller
-//! identity to consult its `members` ACL table against. Without
-//! persistence every `vosx` invocation generated a fresh
-//! ephemeral keypair (see `commands/space/client.rs`), so the
-//! daemon couldn't tell two calls from the same operator apart.
+//! The daemon needs a stable caller identity to consult its membership policy.
 //!
 //! Layout:
 //!
@@ -17,11 +13,8 @@
 //! the config home. Containers / per-persona setups override
 //! `XDG_CONFIG_HOME` for separation.
 //!
-//! Per-space identities (a.k.a. "multi-persona") are sketched in
-//! `project_identity_devices.md` and stay out of Sprint 2's
-//! scope; the auth check trusts the PeerId, and the registry's
-//! `members` table is the source of truth for what that PeerId
-//! is allowed to do.
+//! The authorization check trusts the PeerId, and the registry is the source
+//! of truth for what that PeerId may do.
 
 use std::path::Path;
 
@@ -93,7 +86,7 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 /// Convenience: format the PeerId for the operator's persistent
 /// identity. Surfaced in error messages and `vosx space members`
 /// listings.
-#[allow(dead_code)] // wired in the Sprint 2 `space members` CLI commit.
+#[allow(dead_code)]
 pub fn peer_id_string() -> anyhow::Result<String> {
     Ok(libp2p::PeerId::from(load_or_create()?.public()).to_string())
 }
@@ -122,9 +115,8 @@ mod tests {
     }
     impl Drop for TempPath {
         fn drop(&mut self) {
-            // Best-effort cleanup of the per-test scratch dir. The
-            // earlier version removed `.parent()` which is /tmp —
-            // collateral damage across tests in the same suite.
+            // Best-effort cleanup is intentionally scoped to this test's
+            // scratch directory, never its shared parent.
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }

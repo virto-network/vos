@@ -1,7 +1,4 @@
-//! Explicit CRDT installation fixture.
-//!
-//! This retains the former public CRDT counter for registry and package gates.
-//! It is deliberately isolated so CRDT behavior is tested explicitly.
+//! Explicit CRDT installation fixture for registry and package gates.
 
 use vos::prelude::*;
 

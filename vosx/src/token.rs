@@ -1,4 +1,4 @@
-//! Invite tokens — the `vos1…` bearer credential that carries a node
+//! Invite tokens — the `vos-…` bearer credential that carries a node
 //! into a space with one command (`vosx space up <token>`).
 //!
 //! A token is a *pointer + credential, never policy*: it names the space
@@ -10,13 +10,11 @@
 //! ## Wire shape
 //!
 //! ```text
-//! "vos1" + bs58( [version] ‖ rkyv(InvitePayload) ‖ blake2b(body)[..4] )
+//! "vos-" + bs58( rkyv(InvitePayload) ‖ blake2b(payload)[..4] )
 //! ```
 //!
-//! The leading raw `version` byte lets a reader reject a wrong-version
-//! token before touching rkyv; the trailing 4-byte blake2b checksum
-//! catches transcription errors (a truncated or fat-fingered token fails
-//! `parse` instead of half-decoding).
+//! The trailing 4-byte blake2b checksum catches transcription errors (a
+//! truncated or mistyped token fails `parse` instead of half-decoding).
 //!
 //! ## Delegated-grant chain (admin → token → node)
 //!
@@ -42,13 +40,9 @@ use vos::registry::{
     ed25519_pubkey_from_peer_id,
 };
 
-/// Human-readable prefix. A space name may not start with `vos1`, which
+/// Human-readable prefix. A space name may not start with `vos-`, which
 /// keeps `space up <arg>` disambiguation unambiguous.
-pub const TOKEN_HRP: &str = "vos1";
-
-/// Current token format version — the first raw byte inside the bs58
-/// blob. Bump on any breaking `InvitePayload` layout change.
-pub const TOKEN_VERSION: u8 = 3;
+pub const TOKEN_HRP: &str = "vos-";
 
 /// Domain tag for the token's integrity checksum.
 const CHECKSUM_DOMAIN: &[u8] = b"vos-invite";
@@ -56,7 +50,7 @@ const CHECKSUM_DOMAIN: &[u8] = b"vos-invite";
 /// Trailing checksum length (bytes of a domain-separated blake2b).
 const CHECKSUM_LEN: usize = 4;
 
-/// The decoded contents of a `vos1…` token. `token_secret` is the whole
+/// The decoded contents of a `vos-…` token. `token_secret` is the whole
 /// point — it is the bearer credential; treat the token string as
 /// sensitive (it is single-use and short-lived, but anyone holding it
 /// can redeem the role).
@@ -94,7 +88,7 @@ pub struct InvitePayload {
     pub token_secret: [u8; 32],
 }
 
-/// Mint a `vos1…` invite token: generate a fresh token keypair, have
+/// Mint a `vos-…` invite token: generate a fresh token keypair, have
 /// `operator` sign the invite canonical, and encode the payload. Returns
 /// the token string. `expires_at` is an absolute unix-seconds deadline
 /// (the caller resolves `--expires` against its wall clock).
@@ -133,7 +127,7 @@ pub fn mint(
         role,
         expires_at,
         &token_pub,
-        Some(&authority_replication_id),
+        &authority_replication_id,
     );
     let admin_sig = sig64(
         &operator
@@ -157,9 +151,8 @@ pub fn mint(
     encode(&payload)
 }
 
-/// Parse a `vos1…` token: verify the checksum and version, then decode
-/// the payload. Fails (rather than half-decoding) on a truncated,
-/// mistyped, or wrong-version string.
+/// Parse a `vos-…` token: verify the checksum, then decode the payload.
+/// Fails rather than half-decoding a truncated or mistyped string.
 pub fn parse(token: &str) -> anyhow::Result<InvitePayload> {
     let body58 = token
         .strip_prefix(TOKEN_HRP)
@@ -167,7 +160,7 @@ pub fn parse(token: &str) -> anyhow::Result<InvitePayload> {
     let blob = bs58::decode(body58)
         .into_vec()
         .map_err(|e| anyhow!("invite token is not valid base58: {e}"))?;
-    if blob.len() <= 1 + CHECKSUM_LEN {
+    if blob.len() <= CHECKSUM_LEN {
         return Err(anyhow!("invite token is truncated"));
     }
     let (signed, checksum) = blob.split_at(blob.len() - CHECKSUM_LEN);
@@ -177,17 +170,10 @@ pub fn parse(token: &str) -> anyhow::Result<InvitePayload> {
             "invite token checksum mismatch (corrupted or truncated)"
         ));
     }
-    if signed[0] != TOKEN_VERSION {
-        return Err(anyhow!(
-            "unsupported invite token version {} (this build speaks v{TOKEN_VERSION})",
-            signed[0],
-        ));
-    }
-    // The version byte offsets the rkyv payload off the archive's
-    // alignment, and a bs58-decoded `Vec<u8>` is only byte-aligned
-    // anyway — copy the payload into an `AlignedVec` before decoding.
+    // A bs58-decoded `Vec<u8>` is only byte-aligned. Copy the payload into an
+    // `AlignedVec` before decoding.
     let mut aligned = vos::rkyv::util::AlignedVec::<16>::new();
-    aligned.extend_from_slice(&signed[1..]);
+    aligned.extend_from_slice(signed);
     let payload = vos::rkyv::from_bytes::<InvitePayload, vos::rkyv::rancor::Error>(&aligned)
         .map_err(|e| anyhow!("decode invite token payload: {e}"))?;
     validate_role(payload.role)?;
@@ -248,12 +234,11 @@ pub fn parse_duration(s: &str) -> anyhow::Result<u64> {
         .ok_or_else(|| anyhow!("duration '{s}' overflows"))
 }
 
-/// `bs58("vos1"-less blob)` where blob = `[version] ‖ rkyv ‖ checksum`.
+/// `bs58("vos-"-less blob)` where blob = `rkyv ‖ checksum`.
 fn encode(payload: &InvitePayload) -> anyhow::Result<String> {
     let body = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(payload)
         .map_err(|e| anyhow!("encode invite token payload: {e}"))?;
-    let mut blob = Vec::with_capacity(1 + body.len() + CHECKSUM_LEN);
-    blob.push(TOKEN_VERSION);
+    let mut blob = Vec::with_capacity(body.len() + CHECKSUM_LEN);
     blob.extend_from_slice(&body);
     let checksum = vos::crypto::blake2b_hash::<32>(CHECKSUM_DOMAIN, &[&blob]);
     blob.extend_from_slice(&checksum[..CHECKSUM_LEN]);
@@ -300,7 +285,7 @@ mod tests {
             [0xa7; 32],
         )
         .unwrap();
-        assert!(token.starts_with("vos1"));
+        assert!(token.starts_with(TOKEN_HRP));
         let p = parse(&token).unwrap();
         assert_eq!(p.space_id, sample_space_id());
         assert_eq!(p.name, "demo");
@@ -410,38 +395,9 @@ mod tests {
     }
 
     #[test]
-    fn wrong_version_byte_is_rejected() {
-        let op = Keypair::generate_ed25519();
-        let token = mint(
-            &op,
-            sample_space_id(),
-            "x".into(),
-            vec![],
-            AUTH_ROLE_READONLY,
-            1,
-            [0xa7; 32],
-        )
-        .unwrap();
-        // Decode, bump the version byte, re-checksum, re-encode.
-        let body58 = token.strip_prefix(TOKEN_HRP).unwrap();
-        let blob = bs58::decode(body58).into_vec().unwrap();
-        let (signed, _) = blob.split_at(blob.len() - CHECKSUM_LEN);
-        let mut tampered = signed.to_vec();
-        tampered[0] = 0xFE; // unsupported version
-        let checksum = vos::crypto::blake2b_hash::<32>(CHECKSUM_DOMAIN, &[&tampered]);
-        tampered.extend_from_slice(&checksum[..CHECKSUM_LEN]);
-        let token2 = format!("{TOKEN_HRP}{}", bs58::encode(tampered).into_string());
-        let err = parse(&token2).unwrap_err().to_string();
-        assert!(
-            err.contains("version"),
-            "expected a version error, got: {err}"
-        );
-    }
-
-    #[test]
     fn non_token_string_is_rejected() {
         assert!(parse("my-space").is_err());
-        assert!(parse("vos1!!!not-base58!!!").is_err());
+        assert!(parse("vos-!!!not-base58!!!").is_err());
     }
 
     #[test]
@@ -476,7 +432,7 @@ mod tests {
             role,
             expires_at,
             &p.token_pub,
-            Some(&p.authority_replication_id),
+            &p.authority_replication_id,
         );
         assert!(
             verify_op_sig(&p.admin_peer_id, &invite_canon, &p.admin_sig),
@@ -490,16 +446,9 @@ mod tests {
             role,
             expires_at,
             &p.token_pub,
-            Some(&p.authority_replication_id),
+            &p.authority_replication_id,
         );
         assert!(!verify_op_sig(&p.admin_peer_id, &wrong_canon, &p.admin_sig));
-        let downgraded =
-            vos::registry::invite_signed_bytes(&space_id, role, expires_at, &p.token_pub, None);
-        assert!(
-            !verify_op_sig(&p.admin_peer_id, &downgraded, &p.admin_sig),
-            "the signed authority marker cannot be stripped"
-        );
-
         // The joining node signs the redeem canonical with BOTH the token
         // secret (redeem_sig, under token_pub) and its own node key
         // (node_sig, under the node peer-id).

@@ -255,11 +255,6 @@ impl Future for HostIo {
     }
 }
 
-// `Resolve` future removed in favour of `Context::resolve` being an
-// `async fn` directly — see context.rs for the local-then-hyperspace
-// fallthrough chain. `super::value::Value` matching now lives next
-// to the call site.
-
 // ── Refine-mode flag (service framework) ──────────────────────────────
 
 /// Global flag: are we currently inside `run_refine_service`?
@@ -328,7 +323,7 @@ fn halt_with_output(data: &[u8]) -> ! {
 /// PVM specification halt jump, so the compiler materialises them into a2-a5 via
 /// real instructions immediately before the jump. The dynamic jump consumes
 /// only its target register, so a0-a5 persist unchanged into
-/// `final_state.registers`, where Phase Z0's closing chip pins the
+/// `final_state.registers`, where the closing chip pins the
 /// columns and the verifier's boundary-binding check equates the
 /// metadata to them (`vos_pvm_proof::Proof::public_io_hash`). No new hostcall, no
 /// tracer/prover cooperation, no register-ledger surgery: it is ordinary
@@ -339,7 +334,7 @@ fn halt_with_output(data: &[u8]) -> ! {
 /// `pvm/proof/tests/ledger_readconsistency_gate.rs`) — see `crate::zk` and
 /// `vos_pvm_proof::chips::register_memory_closing`.
 ///
-/// a2→φ[9], a3→φ[10], a4→φ[11], a5→φ[12] per grey-transpiler's RISC-V→PVM
+/// a2→φ[9], a3→φ[10], a4→φ[11], a5→φ[12] per the VOS RISC-V→PVM
 /// mapping — the exact window `public_io_hash` reconstructs.
 #[cfg(target_arch = "riscv64")]
 fn halt_with_output_bound(data: &[u8], io_hash: &[u8; 32]) -> ! {
@@ -763,8 +758,8 @@ pub fn run_nested_actor_service<A: super::Actor>(
     crate::crdt::reset_actor_slice();
 
     let expected_address =
-        crate::service::ACTOR_IPC_BASE_PAGE as u64 * javm_page_size_for_guest() as u64;
-    let page_size = javm_page_size_for_guest() as u64;
+        crate::service::ACTOR_IPC_BASE_PAGE as u64 * pvm_page_size_for_guest() as u64;
+    let page_size = pvm_page_size_for_guest() as u64;
     let input_len = usize::try_from(input_len).expect("actor IPC input length exceeds usize");
     let capacity = usize::try_from(capacity).expect("actor IPC capacity exceeds usize");
     assert_eq!(
@@ -982,7 +977,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
 }
 
 #[cfg(feature = "service")]
-const fn javm_page_size_for_guest() -> usize {
+const fn pvm_page_size_for_guest() -> usize {
     // This is the GP/PVM page size. Keep the guest free of a vos_pvm dependency;
     // the workspace-side host checks the same value through vos_pvm::PVM_PAGE_SIZE.
     1 << 12

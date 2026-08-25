@@ -1,13 +1,13 @@
 //! Typed hostcall wrappers for PVM actors.
 //!
-//! Hostcall IDs are spec-canonical PVM/service platform protocol cap slots. Phase
-//! discipline (which calls are legal in refine vs accumulate) is enforced
+//! Hostcall IDs are canonical PVM/service platform capability slots. Call
+//! discipline (which calls are legal in refine versus accumulate) is enforced
 //! by the host runtime, not the ID namespace.
 
 use super::ecall::*;
 use crate::abi::hostcall;
 
-// --- Shared across phases ---
+// --- Shared hostcalls ---
 
 /// Get remaining gas.
 #[inline]

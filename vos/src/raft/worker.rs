@@ -1,22 +1,12 @@
-//! Per-replication-group Raft worker — vos-side facade over
-//! [`vos_raft::Worker`].
-//!
-//! Pre-extraction this file owned a 1900-line state machine that
-//! mixed the consensus core (election timing, replication, snapshot
-//! install) with vos's specific storage backend (redb) and transport
-//! (libp2p `request_response`). Post-extraction the consensus core
-//! lives in the `vos-raft` crate as a transport-and-storage-agnostic
-//! generic worker; this file is a thin adapter that:
+//! Per-replication-group adapter between [`vos_raft::Worker`] and VOS storage
+//! and network transports. It:
 //!
 //! 1. Builds a [`RedbStorage`](super::redb_storage::RedbStorage) from
 //!    the host's `Arc<Database>` and a [`VosTransport`](super::vos_transport::VosTransport)
 //!    from its `Arc<Network>`.
 //! 2. Spawns a [`vos_raft::Worker<u16>`] with that storage + transport
 //!    + the host's [`WorkerConfig`].
-//! 3. Re-exports [`RaftWorker`] / [`WorkerHandle`] / [`ProposeError`]
-//!    / [`WorkerSnapshot`] with the same shape vos used to expose,
-//!    so existing call sites (`RaftCommit`, `Network::set_raft_handler`,
-//!    tests) keep compiling unchanged.
+//! 3. Exposes VOS-specific worker and error types.
 //!
 //! The vos-raft crate ships its own unit tests for the state machine
 //! itself; the tests here verify the integration between vos's
@@ -54,10 +44,7 @@ const _: () = assert!(INSTALL_SNAPSHOT_CHUNK_BYTES < crate::network::MAX_FRAME_B
 // `Role` is the same enum, defined once in vos-raft.
 pub use vos_raft::Role;
 
-/// Configuration for a worker. Same shape vos has had since the
-/// first phase, retained as a vos-specific type so existing call
-/// sites (`RaftCommit`, integration tests) don't have to learn the
-/// wider `vos_raft::Config<N>` API surface.
+/// Configuration for a VOS Raft worker.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
     /// Local node's `node_prefix`.
@@ -174,61 +161,8 @@ impl core::fmt::Display for ChangeMembershipError {
 }
 impl std::error::Error for ChangeMembershipError {}
 
-/// Diagnostic snapshot of a worker's state. Returned by
-/// [`WorkerHandle::snapshot`].
-///
-/// Specialized over `u16` (vos's `node_prefix`) for stability of
-/// the historical API; the generic `vos_raft::WorkerSnapshot<N>`
-/// stays internal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct WorkerSnapshot {
-    pub role: Role,
-    pub current_term: u64,
-    pub voted_for: Option<u16>,
-    pub last_log_index: u64,
-    pub commit_index: u64,
-    pub snap_last_index: u64,
-    /// Active member set this replica is operating against. New
-    /// in the multi-group / dynamic-join refactor — surfaced so
-    /// `vosx join` and the leader-side `RaftJoin` handler can
-    /// compute `new_members = current ∪ {joiner}` without
-    /// re-scanning the log.
-    pub members: Vec<u16>,
-    /// Joint-consensus indicator. `Some(prev_members)` while a
-    /// configuration change is in flight; `None` in steady state.
-    pub joint_old: Option<Vec<u16>>,
-    /// Log/snapshot index that established the active membership view.
-    /// `None` means exclusion from the view is not durable evidence of a
-    /// committed removal.
-    pub active_config_index: Option<u64>,
-    /// Initial final-configuration index still awaiting the replicated
-    /// retiring-voter confirmation barrier.
-    pub retirement_final_index: Option<u64>,
-    /// Best-effort leader hint. `Some(prefix)` once we've seen a
-    /// current-term `AppendEntries` (or self if we are leader).
-    /// `None` between elections. Followers use it to redirect
-    /// misaddressed client / join requests.
-    pub leader_hint: Option<u16>,
-}
-
-impl From<vos_raft::WorkerSnapshot<u16>> for WorkerSnapshot {
-    fn from(s: vos_raft::WorkerSnapshot<u16>) -> Self {
-        Self {
-            role: s.role,
-            current_term: s.current_term,
-            voted_for: s.voted_for,
-            last_log_index: s.last_log_index,
-            commit_index: s.commit_index,
-            snap_last_index: s.snap_last_index,
-            members: s.members,
-            joint_old: s.joint_old,
-            active_config_index: s.active_config_index,
-            retirement_final_index: s.retirement_final_index,
-            leader_hint: s.leader_hint,
-        }
-    }
-}
+/// Diagnostic snapshot returned by [`WorkerHandle::snapshot`].
+pub type WorkerSnapshot = vos_raft::WorkerSnapshot<u16>;
 
 /// Owning handle to a running worker. Drop or [`shutdown`] cleans
 /// up the underlying thread.
@@ -318,7 +252,7 @@ impl WorkerHandle {
     /// the worker's current state. `None` if the worker is shut
     /// down or busy beyond the deadline.
     pub fn snapshot(&self) -> Option<WorkerSnapshot> {
-        block_on(self.inner.snapshot()).map(WorkerSnapshot::from)
+        block_on(self.inner.snapshot())
     }
 
     fn status_from_snapshot(

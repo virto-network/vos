@@ -512,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_jar_snapshot_envelope_roundtrips() {
+    fn canonical_kernel_snapshot_envelope_roundtrips() {
         let value = snapshot();
         assert_eq!(
             ContinuationSnapshot::decode(&value.encode()).unwrap(),

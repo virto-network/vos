@@ -5,13 +5,13 @@
 //! generated Ref. The PVM-side handlers decode them via
 //! `vos::rkyv::from_bytes`. Keep the field shapes stable; reordering
 //! fields or changing types breaks anything persisted or sent over
-//! the wire by an older build.
+//! the canonical wire.
 
 /// One commitment opening — what value + blinding produce a given
 /// `Amount`. The transfer handler decodes a `Vec<Opening>` from
 /// rkyv-archived bytes and feeds each to the kernel's `Oracle`.
 ///
-/// D7: the library owns this wire type now
+/// The library owns this wire type.
 /// ([`cipher_clerk::state::Opening`]) so consumers don't re-spell it.
 /// Re-export rather than redeclare — the rkyv layout is byte-identical
 /// (unified rkyv 0.8: `vos::rkyv` IS cipher-clerk's `rkyv`), so the

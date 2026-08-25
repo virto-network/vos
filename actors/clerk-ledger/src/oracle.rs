@@ -12,7 +12,7 @@ use crate::wire::Opening;
 /// have no value commitments at creation. `reveal_amount` is
 /// `unimplemented!()` to fail loud if a future kernel path
 /// accidentally reveals; `merkle_path` / `next_blinding` use the
-/// `Oracle` trait defaults (no kernel path calls them — D5).
+/// `Oracle` trait defaults; the kernel path does not call them.
 pub(crate) struct NoopOracle;
 
 impl Oracle for NoopOracle {
@@ -30,7 +30,7 @@ impl Oracle for NoopOracle {
 /// `merkle_path` / `next_blinding` are unused by `apply_batch` against
 /// in-memory state (no SMT proofs; the Pedersen homomorphism handles
 /// balance updates without fresh blindings), so they fall through to the
-/// `Oracle` trait defaults rather than carrying local stubs (D5).
+/// `Oracle` trait defaults rather than carrying local stubs.
 pub(crate) struct StatefulOracle<'a> {
     pub(crate) openings: &'a [Opening],
 }

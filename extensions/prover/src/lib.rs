@@ -164,9 +164,7 @@ fn run_on_large_stack<T: Send + 'static>(
 // full proof bytes is gone.
 
 /// Terminal outcome codes carried in the completion callback's `status` field
-/// (`1` = proved, `2` = failed). Wire-preserved from the retired `JobStatus`
-/// enum so the federation callback's shape is unchanged; job STATE otherwise
-/// lives in the [`JobQueue`] (`job_poll` reports `done` / `error`).
+/// (`1` = proved, `2` = failed). Job state otherwise lives in the [`JobQueue`].
 const JOB_DONE: u64 = 1;
 const JOB_FAILED: u64 = 2;
 
@@ -360,7 +358,7 @@ impl Prover {
     }
 
     /// Prove a captured [`ProofRecordEntry`] (`docs/actors.md`
-    /// D4) — the SYNCHRONOUS record analog of `prove_chain`, gated by
+    /// — the synchronous record analog of `prove_chain`, gated by
     /// the record PRE-FLIGHT: the entry's internal io-hash consistency,
     /// the blob's content-address against the record's `task_hash`, and
     /// a full witness RE-TRACE to the record's bound io-hash (φ[9..12])
@@ -416,7 +414,7 @@ impl Prover {
 
     /// The witness-free third-party check of a shipped
     /// [`ProvableRecord`] against its proved chain
-    /// (`docs/actors.md` D4) — four checks composed so none is
+    /// — four checks composed so none is
     /// meaningful without the others:
     ///   1. the chain verifies against the caller-supplied `allowlist`
     ///      (the record's content-addressed catalog pin — WHICH PROGRAM);
@@ -831,8 +829,7 @@ fn retrace_io_hash(pvm_blob: &[u8], witness_bytes: &[u8], witness_addr: usize) -
         let mut tracing = vos_pvm_proof::core::tracing::TracingPvm::new(interp);
         // zkpvm pins its own vos_pvm revision, so its ExitReason is a
         // different type than vos's — compare the Debug form. The
-        // current Task ABI terminates only through the dedicated HALT
-        // address; retired root-reply hostcall termination is rejected.
+        // Recorded Tasks terminate only through the dedicated HALT address.
         let exit = format!("{:?}", tracing.run_with_vos_stubs());
         if exit != "Halt" {
             return None;
@@ -849,7 +846,7 @@ fn retrace_io_hash(pvm_blob: &[u8], witness_bytes: &[u8], witness_addr: usize) -
 /// chain, delivered as per-segment proof bytes — the offline/test
 /// mirror of the `verify_record` handler (which streams the same
 /// segments from the CAS). The four checks of
-/// `docs/actors.md` D4, composed exactly as the handler
+/// Composed exactly as the handler
 /// documents them: record io-consistency and the `expected_root_before`
 /// comparison run here; allowlist membership, chain validity, and the
 /// final-segment io-binding over the record-reconstructed `public'`
@@ -2175,42 +2172,6 @@ mod chain_stream_tests {
                 Some(root),
                 segment_initial_root(&segments),
                 "the returned entering root is segment 0's initial_state.memory_root"
-            );
-            Some(())
-        })
-        .expect("large-stack test body");
-    }
-
-    /// The W2(a) migration bar at this level: the single-pass streaming
-    /// prove (trace interleaved with proving, no resident chain trace)
-    /// must produce byte-identical segments to the retired
-    /// compact-holder pipeline (full `CompactTrace` + cursor + offline
-    /// cut) it replaced — canonical proving is deterministic, so any
-    /// divergence is a cut or threading bug, not noise.
-    #[test]
-    fn streaming_pass_matches_the_compact_holder_pipeline() {
-        run_on_large_stack(move || {
-            let blob = straight_line_blob(6);
-            let floors = tiny_floors(&blob);
-
-            // The retired pipeline, inlined: hold the whole compact
-            // trace, cut offline, prove via the forward cursor.
-            let full = vos_pvm_proof::actor::trace_blob_compact(&blob, super::TRACE_GAS)
-                .expect("compact-holder trace");
-            let bounds = vos_pvm_proof::segment::segment_bounds(full.num_steps(), SEG_STEPS);
-            let mut cursor = vos_pvm_proof::segment::CompactSegmentCursor::new(&full);
-            let mut via_holder: Vec<Vec<u8>> = Vec::new();
-            for &(a, b) in &bounds {
-                let mut sn = cursor.side_note(a, b);
-                let proof = prove_canonical(&mut sn, &floors).expect("prove via holder");
-                via_holder.push(bincode::serialize(&proof).expect("encode"));
-            }
-
-            let via_stream = prove_chain_segments(&blob, &[], 0, SEG_STEPS, 0, &floors)
-                .expect("streaming chain prove");
-            assert_eq!(
-                via_stream, via_holder,
-                "streaming pass must reproduce the compact-holder pipeline byte for byte"
             );
             Some(())
         })

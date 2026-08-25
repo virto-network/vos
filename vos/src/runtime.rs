@@ -77,7 +77,7 @@
 //! address-based window helpers — [`InvocationKernel::read_data_cap_window`]
 //! and [`InvocationKernel::write_data_cap_window`] — which resolve the
 //! covering DATA cap internally. The declared object cap in φ[12]
-//! (grey-transpiler emits the stack cap, slot 65, by default) is
+//! (the VOS PVM compiler emits stack slot 65 by default) is
 //! therefore ceremonial for VOS: cap dispatch is done by the kernel
 //! over the flat window, not the φ[12] value.
 
@@ -271,7 +271,7 @@ fn install_vos_runtime_caps(kernel: &mut InvocationKernel) {
 /// scalar relation. Recorded Tasks therefore reject these calls, and the
 /// Clerk proof guest uses software arithmetic until the AIR is complete.
 ///
-/// ECALL ABI (grey-transpiler maps RISC-V `a0/a1/a2` → φ[7/8/9]): the
+/// ECALL ABI (the VOS PVM compiler maps RISC-V `a0/a1/a2` → φ[7/8/9]): the
 /// argument registers hold flat-memory pointers to the 32-byte operands
 /// and the 32-byte output (a 64-byte input for the wide reduction). On a
 /// non-canonical scalar / invalid point the host functions return the
@@ -582,18 +582,6 @@ fn expected_anchor(
     crate::refine_payload::anchor_for(effective)
 }
 
-/// Whether halt-output bytes claim to be a work result. Used to distinguish
-/// malformed payloads (which fail loud)
-/// from "old-style `[status][state_len][state][reply]` envelope" when
-/// [`RefinePayload::decode`] returns `None`. Old-style envelopes lead
-/// with a status byte, and no reachable status collides: traps never
-/// halt, so `STATUS_PANICKED` (0x02) is never emitted as an envelope
-/// head, and 0x03+ statuses only appear in sub-5-byte error envelopes
-/// the invoke path packs host-side.
-fn claims_refine_payload(bytes: &[u8]) -> bool {
-    bytes.starts_with(&crate::refine_payload::REFINE_PAYLOAD_MAGIC)
-}
-
 // --- Per-service storage ---
 
 /// Each service's keyspace is an ordered map so key-adjacent rows can
@@ -740,7 +728,7 @@ pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     last_reply: HashMap<u32, Vec<u8>>,
     /// Per-service exit status byte from the most recent
     /// dispatch's invoke envelope. Today only `STATUS_FORBIDDEN`
-    /// (from the M6 macro-emitted role check) flows through here
+    /// (from the macro-emitted role check) flows through here
     /// — `STATUS_DONE` / `STATUS_YIELDED` are still inferred by
     /// the host from `is_suspended`. Cleared by
     /// [`take_last_status`](VosRuntime::take_last_status).
@@ -815,7 +803,7 @@ impl<D: DataLayer> VosRuntime<D> {
     /// Take the `(kind, anchor)` of the first work-result applied for
     /// `svc_id` since the previous take — the anchor of the state the
     /// dispatch ran against. `None` when no anchored work-result was
-    /// applied (service blobs, old-style actors, pure-trap dispatches). The
+    /// applied (service blobs or pure-trap dispatches). The
     /// host stamps this into the dispatch's EffectLog before commit and
     /// compares it during replay.
     pub fn take_dispatch_anchor(&mut self, svc_id: ServiceId) -> Option<(u8, [u8; 32])> {
@@ -848,7 +836,7 @@ impl<D: DataLayer> VosRuntime<D> {
 
     /// Take and return the most recent dispatch's exit status
     /// byte for `svc_id`, if any. Today only `STATUS_FORBIDDEN`
-    /// shows up here (from the M6 role check); other statuses
+    /// shows up here (from the role check); other statuses
     /// stay implicit. Used by the host (`handle_invoke_request`)
     /// to override the default `STATUS_DONE` when the actor
     /// refused the call at the dispatch boundary.
@@ -1250,20 +1238,13 @@ impl<D: DataLayer> VosRuntime<D> {
                 // as a final Write{STATE_KEY} effect — into the refine
                 // output. There is no host state special-case.
                 if let Some(payload_bytes) = halted {
-                    // Two output formats: RefinePayload (service actors) or
-                    // old-style [status:u8][state_len:u32][state...][reply...]
-                    // (invoked actors). Both can signal yield/continue.
-                    let applied = match RefinePayload::decode(&payload_bytes) {
-                        Some(payload) => {
-                            absorb_work_result(&mut journal, storage, svc_id, payload).map(Some)
-                        }
-                        None if claims_refine_payload(&payload_bytes) => {
-                            Err(WorkResultError::Malformed)
-                        }
-                        None => Ok(None),
-                    };
+                    let applied = RefinePayload::decode(&payload_bytes)
+                        .ok_or(WorkResultError::Malformed)
+                        .and_then(|payload| {
+                            absorb_work_result(&mut journal, storage, svc_id, payload)
+                        });
                     let continue_next = match applied {
-                        Ok(Some(absorbed)) => {
+                        Ok(absorbed) => {
                             // First applied work-result of this dispatch:
                             // its anchor is the state the dispatch ran
                             // against (later chain iterations anchor
@@ -1285,7 +1266,7 @@ impl<D: DataLayer> VosRuntime<D> {
                             // panics surface to the host as silent
                             // success.
                             self.last_reply.insert(svc_id, absorbed.reply);
-                            // M6 — propagate the forbidden flag from
+                            // Propagate the forbidden flag from
                             // the work-result so the host can
                             // surface the actor-emitted refusal as a
                             // STATUS_FORBIDDEN envelope. Other
@@ -1296,11 +1277,6 @@ impl<D: DataLayer> VosRuntime<D> {
                                     .insert(svc_id, crate::actors::run::STATUS_FORBIDDEN);
                             }
                             absorbed.continue_next
-                        }
-                        // Old-style format: status byte 0x01 = yielded.
-                        Ok(None) => {
-                            !payload_bytes.is_empty()
-                                && payload_bytes[0] == crate::actors::run::STATUS_YIELDED
                         }
                         Err(err) => {
                             // Reject the work-result whole: nothing it
@@ -2851,13 +2827,10 @@ fn handle_invoke(
         out.extend_from_slice(&child_state);
         out.extend_from_slice(&payload.reply);
         out
-    } else if claims_refine_payload(&raw_output) {
-        // Claims the work-result format but does not decode — fail loud.
+    } else {
         error!(?target_svc_id, "child invoke: malformed work-result");
         journal.rollback_to(invoke_mark);
         alloc::vec![STATUS_PANICKED]
-    } else {
-        raw_output
     };
 
     record_and_write_invoke(caller, output_ptr, output_buf_len, &output, depth, mode)
@@ -3257,7 +3230,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_anchor_checks_against_journal_overlay() {
+    fn anchor_checks_against_journal_overlay() {
         use crate::refine_payload::{Effect, RefinePayload, anchor_for};
 
         // Iteration N's anchor is the hash of iteration N−1's final
@@ -3300,7 +3273,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_smt_anchor_follows_the_committed_root_row() {
+    fn smt_anchor_follows_the_committed_root_row() {
         use crate::refine_payload::{ANCHOR_SMT_ROOT, Effect, RefinePayload, anchor_for};
 
         // A committed-storage actor's expected anchor is its recorded
@@ -3466,7 +3439,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_genesis_anchor_requires_absent_or_empty_state() {
+    fn genesis_anchor_requires_absent_or_empty_state() {
         use crate::refine_payload::RefinePayload;
 
         let svc = 4u32;

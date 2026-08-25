@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 default = ["bin"]
 bin = []
 # Test-only code-identity delta used by the physical UpgradeActor gate. The
-# canonical ABI release is always built without this feature.
+# The canonical authority artifact is always built without this feature.
 migration-fixture = []
 
 [lib]

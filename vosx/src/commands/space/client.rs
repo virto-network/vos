@@ -1,11 +1,8 @@
 //! Tiny libp2p client peer that dials a running `space up`
 //! daemon and remote-invokes its registry.
 //!
-//! Replaces the old `TransientRegistry::boot` pattern: rather
-//! than two processes opening the same redb (which redb forbids
-//! and which racing made unsafe), the daemon owns the redb and
-//! every other `space *` command is a one-shot client that
-//! sends a single libp2p invoke and exits.
+//! The daemon owns the registry database. Every other `space *` command is a
+//! one-shot client that sends one libp2p request and exits.
 //!
 //! Use `DaemonClient::with_connect(query, |c| …)` for the common
 //! "connect, do one thing, shut down" shape — shutdown runs
@@ -623,9 +620,7 @@ impl DaemonClient {
     }
 
     /// Fetch the raw `.vos_meta` blob the registry has on file
-    /// for the agent's program. Empty when no meta is
-    /// registered (older binaries) — callers treat that as
-    /// "schema unknown".
+    /// for the agent's program. Empty means no schema is registered.
     pub fn meta_for_instance(&self, instance_name: &str) -> anyhow::Result<Vec<u8>> {
         vos::block_on(
             self.registry()

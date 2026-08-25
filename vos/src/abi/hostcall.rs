@@ -159,14 +159,14 @@ pub const RECEIPT_VERIFY: u32 = 125;
 pub const INSTALL_AUTH_VERIFY: u32 = 126;
 
 /// Query one canonical actor PVM by `ProgramId` inside the current Accumulate
-/// transaction. This is a VOS service capability, not a service platform protocol slot.
+/// transaction. This is a VOS service capability, not a reserved PVM slot.
 pub const PROGRAM_LOOKUP: u32 = 127;
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn vos_capabilities_never_use_jam_protocol_slots() {
+    fn vos_capabilities_never_use_reserved_pvm_slots() {
         let supplied = [
             REFINE_WORK_FETCH,
             PROVABLE_RECORD_INTENT,

@@ -281,7 +281,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
 
     // Trivalent positional (decision 1): an existing `.toml` recipe
-    // (create-if-missing + genesis apply), a `vos1…` invite token
+    // (create-if-missing + genesis apply), a `vos-…` invite token
     // (join-if-needed + auto-redeem), or a known space name / id. Any of
     // these may scaffold/join the space and persist a pending token or
     // recipe; all that flows forward is the lookup key.
@@ -701,12 +701,12 @@ fn resolve_up_target(args: &Args) -> anyhow::Result<String> {
         args.query.clone()
     };
     // (a) recipe: an existing `.toml` path. File existence + extension is
-    //     unambiguous — a space name may not start with `vos1` and a
+    //     unambiguous — a space name may not start with `vos-` and a
     //     token is never a path.
     if is_recipe_path(&raw) {
         return resolve_recipe(&raw);
     }
-    // (b) token: a `vos1…` string.
+    // (b) token: a `vos-…` string.
     if raw.starts_with(crate::token::TOKEN_HRP) {
         return resolve_token(&raw);
     }
@@ -718,7 +718,7 @@ fn is_recipe_path(arg: &str) -> bool {
     arg.ends_with(".toml") && Path::new(arg).is_file()
 }
 
-/// Read a `vos1…` token from stdin (`space up -`), keeping a bearer
+/// Read a `vos-…` token from stdin (`space up -`), keeping a bearer
 /// string out of argv / shell history.
 fn read_token_stdin() -> anyhow::Result<String> {
     use std::io::Read;
@@ -728,7 +728,7 @@ fn read_token_stdin() -> anyhow::Result<String> {
         .map_err(|e| anyhow::anyhow!("read token from stdin: {e}"))?;
     let tok = buf.trim().to_string();
     if tok.is_empty() {
-        anyhow::bail!("no token on stdin (`space up -` expects a vos1… token piped in)");
+        anyhow::bail!("no token on stdin (`space up -` expects a vos-… token piped in)");
     }
     Ok(tok)
 }
@@ -4883,8 +4883,8 @@ mod tests {
         let recipe = dir.join("r.toml");
         std::fs::write(&recipe, "space = \"x\"\n").unwrap();
         assert!(is_recipe_path(recipe.to_str().unwrap()));
-        // A `vos1…` token is never mistaken for a recipe.
-        assert!(!is_recipe_path("vos1abc"));
+        // A `vos-…` token is never mistaken for a recipe.
+        assert!(!is_recipe_path("vos-abc"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

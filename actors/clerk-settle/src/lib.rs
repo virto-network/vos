@@ -21,13 +21,13 @@
 //!
 //! ## Trust posture
 //!
-//! Wave-1: mutually-known operators. The venue checks mutual **consistency**
-//! of the two banks' books (the commitments cancel), not solvency — that is
-//! the Wave-2 proof slot. `submit_claim` is authenticated by the claim
+//! The venue checks mutual **consistency**
+//! of the two banks' books (the commitments cancel), not solvency. `submit_claim`
+//! is authenticated by the claim
 //! signature against a *registered* bank key, NOT by venue-space
 //! membership: submitting banks are not members of the venue space, exactly
-//! like `clerk-bridge::submit_voucher`. `register_bank` / `settle_window`
-//! are the venue operator's, and are role-gated (see [`roles`]).
+//! like `clerk-bridge::submit_voucher`. `register_bank` and `settle_window`
+//! belong to the venue operator and are role-gated (see [`roles`]).
 //!
 //! ## State
 //!
@@ -38,14 +38,8 @@
 //! - `settled`: the log of settled `(pair, currency, window)` outcomes; a
 //!   present entry freezes that window against further `submit_claim`.
 //!
-//! ## Wave-2 seam
-//!
-//! The stored claim body carries a `version` byte and the diagnostics
-//! (`voucher_count`, `rk_set_hash`) travel *alongside* the signed claim,
-//! not inside it — so the cipher-clerk claim schema is untouched and can
-//! grow state-root/proof fields without a store migration.
-//! `reconcile` is the seam Wave-2 upgrades to STARK verification of a
-//! settlement statement.
+//! Diagnostics (`voucher_count`, `rk_set_hash`) travel alongside the signed
+//! claim rather than changing cipher-clerk's canonical claim bytes.
 
 use vos::prelude::*;
 
@@ -57,7 +51,7 @@ pub use roles::{CLERK_SETTLE_SPACE_ROLE_MAP, ClerkSettleRole};
 // ── Handler status ──────────────────────────────────────────────
 
 /// Return type for the venue handlers. `#[repr(u8)]` keeps the wire bytes
-/// stable — reordering variants breaks any peer running an older build.
+/// stable — reordering variants changes the canonical wire.
 #[derive(
     vos::rkyv::Archive,
     vos::rkyv::Serialize,
@@ -99,12 +93,6 @@ pub enum Status {
     WindowMismatch = 9,
 }
 
-/// Stored-claim body layout version. The signed claim is stored as
-/// `cipher_clerk::settlement::SettlementClaim::to_bytes` bytes; this byte
-/// tags which layout produced them so a Wave-2 claim schema can be
-/// distinguished without a store migration.
-pub const CLAIM_FORMAT: u8 = 1;
-
 // ── Wire types ──────────────────────────────────────────────────
 
 /// A registered bank: a federation-visible `name` bound to the bank's
@@ -120,9 +108,8 @@ pub struct BankEntry {
 
 /// A submitted, signature-verified settlement claim, keyed by its
 /// *directional* `(claimant, peer, currency, window)`. `claim_bytes` is the
-/// canonical `SettlementClaim` wire form; `version` tags its layout; the
-/// diagnostics (`voucher_count`, `rk_set_hash`) travel alongside the signed
-/// body to localize a reconcile mismatch without opening any commitment.
+/// canonical `SettlementClaim` wire form. The diagnostics (`voucher_count`,
+/// `rk_set_hash`) localize a reconcile mismatch without opening a commitment.
 #[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,
 )]
@@ -133,7 +120,6 @@ pub struct StoredClaim {
     pub currency: u32,
     pub window_start: u64,
     pub window_end: u64,
-    pub version: u8,
     pub claim_bytes: Vec<u8>,
     pub voucher_count: u32,
     pub rk_set_hash: [u8; 32],

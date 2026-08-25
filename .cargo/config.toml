@@ -7,7 +7,7 @@
 # leaves cross-builds clean; cargo uses the matching target section
 # INSTEAD of `[build] rustflags`, not in addition to it.
 
-# Phase 61: target-cpu=native is a 20% prove-time win on the zkpvm
+# Native code generation materially improves local proving throughput.
 # bench (log14 MOBILE: 1.90 s → 1.52 s on the reference Intel Core
 # Ultra 7 155H).  Stwo's SimdBackend benefits massively from AVX2 +
 # AES-NI + SHA-NI codegen vs the generic baseline.
@@ -28,7 +28,7 @@ rustflags = ["-C", "target-cpu=native"]
 # Only consulted when building `--target aarch64-unknown-linux-gnu`;
 # harmless otherwise.  The linker must be a cross-gcc (or clang with
 # `--target=`) because rust-lld is not the default for this triple.
-# blst (via javm → grey-crypto) compiles C: the `cc` crate finds the
+# blst (through the PVM crypto stack) compiles C: the `cc` crate finds the
 # conventional `aarch64-linux-gnu-gcc` on PATH automatically; to use
 # clang instead set
 #   CC_aarch64_unknown_linux_gnu=clang

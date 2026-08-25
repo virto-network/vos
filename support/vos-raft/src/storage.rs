@@ -168,10 +168,8 @@ pub trait Storage<N: NodeId>: Send + 'static {
     ///
     /// A worker must not compact beyond this cursor: doing so would advertise
     /// snapshot metadata newer than the state-machine bytes sent to a lagging
-    /// follower. `None` preserves the historical behavior for storage engines
-    /// whose state machine is applied synchronously inside the consensus
-    /// transaction. Hosts with an out-of-band apply loop should persist and
-    /// return an explicit cursor.
+    /// follower. Synchronous state machines may return `None`; hosts with an
+    /// out-of-band apply loop must persist and return an explicit cursor.
     fn applied_index(
         &self,
     ) -> impl core::future::Future<Output = Result<Option<u64>, Self::Error>> + Send {

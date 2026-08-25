@@ -109,7 +109,7 @@ pub const SETTLEMENT_CURRENCY: u32 = 840;
 /// `match` instead of comparing raw byte codes.
 ///
 /// `#[repr(u8)]` keeps the wire bytes stable — reordering
-/// variants breaks any peer running an older build.
+/// variants changes the canonical wire.
 #[derive(
     vos::rkyv::Archive,
     vos::rkyv::Serialize,

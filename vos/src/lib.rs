@@ -1,27 +1,15 @@
 //! # vos
 //!
-//! VOS runtime — PVM-aligned PVM executor for VOS actors.
+//! Actor SDK and host runtime for signed VOS applications.
 //!
-//! The runtime manages service lifecycles using the PVM execution model:
-//! fresh PVM per invocation, state via storage hostcalls, transfer-based messaging.
+//! Each installed package runs behind the generic service guest. The service
+//! authenticates work, invokes the actor, and commits its state and effects
+//! through Local, Raft, or CRDT ordering.
 //!
 //! ## Architecture
 //!
 //! ```text
-//! ┌──────────────────────────────────┐
-//! │  vosx (native host)              │
-//! ├──────────────────────────────────┤
-//! │  VosRuntime                      │
-//! │  ┌───────────────────────────┐   │
-//! │  │ Hostcall handler          │   │
-//! │  │  - per-service KV storage │   │
-//! │  │  - preimage store         │   │
-//! │  │  - transfer routing       │   │
-//! │  ├───────────────────────────┤   │
-//! │  │ Service registry          │   │
-//! │  │  [Svc 1] [Svc 2] ...     │   │
-//! │  └───────────────────────────┘   │
-//! └──────────────────────────────────┘
+//! Client → node → root service → actor tree → durable state
 //! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -469,13 +457,11 @@ macro_rules! __vos_emit_worker_glue {
                 Box::into_raw(state) as *mut ()
             }
 
-            // Per-task ABI: `task_new` builds a handler future and slots
+            // `task_new` builds a handler future and slots
             // it (returning a non-zero handle), `task_poll` injects the host's
             // fulfilment of the previous PENDING and polls the future once,
             // `task_drop` frees the slot, `take_spawned` drains spawned children
-            // (reserved). This supersedes an earlier
-            // `submit`/`poll_event`/`provide` set whose scheduler lived in the
-            // `.so`; the scheduler now runs host-side.
+            // (reserved). The scheduler runs host-side.
 
             #[unsafe(no_mangle)]
             pub extern "C" fn vos_extension_task_new(
@@ -525,13 +511,7 @@ macro_rules! __vos_emit_worker_glue {
             // per accept; many such tasks run concurrently on the host
             // executor, all sharing `&actor`.
             #[unsafe(no_mangle)]
-            // `2` suffix: this signature carries `svc_id`, which an earlier
-            // 2-arg `conn_new` lacked. This ABI renames a symbol on any
-            // incompatible change so a stale `.so` fails to LOAD (clear
-            // missing-symbol error) rather than be called through a mismatched
-            // pointer — a 2-arg callee would otherwise silently get
-            // `ServiceId(0)` and mis-scope `ctx.resolve`.
-            pub extern "C" fn vos_extension_conn_new2(
+            pub extern "C" fn vos_extension_conn_new(
                 state: *mut (),
                 conn_id: u64,
                 svc_id: u32,

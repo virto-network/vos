@@ -156,7 +156,7 @@ impl RaftRole {
 
     /// Decode from the on-wire byte. Unknown values become
     /// `RaftRole::Unknown(b)` rather than failing — forward-
-    /// compatible with newer peers reporting future roles.
+    /// safe when peers report unsupported roles.
     pub fn from_wire(b: u8) -> Self {
         match b {
             0 => Self::Follower,

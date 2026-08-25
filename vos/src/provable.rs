@@ -51,7 +51,7 @@
 //! ## Catalog identity
 //!
 //! `catalog_name`/`catalog_pin` route a verifier to the allowlist
-//! entry the chain must verify against (`docs/actors.md` D5).
+//! entry the chain must verify against.
 //! They are EMPTY at capture — the runtime holds no catalog — and are
 //! resolved at prove time by matching the catalog pin whose `blob_hash`
 //! equals the record's `task_hash` (unambiguous and stable across

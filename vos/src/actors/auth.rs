@@ -70,7 +70,7 @@ impl SpaceRole {
     /// Decode from the raw byte stored in the registry's grant
     /// table. Returns `None` for an unknown discriminant — the
     /// caller treats that as `Guest` (deny mutations) rather
-    /// than panicking on a forward-incompatible byte.
+    /// than panicking on an unknown byte.
     pub const fn from_u8(byte: u8) -> Option<Self> {
         match byte {
             0 => Some(Self::Guest),
@@ -254,11 +254,11 @@ impl Caller {
 ///
 /// Manually implementing the trait is straightforward — the
 /// `#[actor]` macro emits one automatically for the user's
-/// `Role` enum (M6).
+/// `Role` enum.
 pub trait RoleByte: Sized + Copy {
     /// Decode the byte form. Returns `None` on an unrecognised byte
     /// — the caller treats that as "no effective role" rather than
-    /// panicking on a forward-incompatible discriminant.
+    /// panicking on an unknown discriminant.
     fn from_byte(b: u8) -> Option<Self>;
     /// Encode to byte form for storage / wire.
     fn as_byte(self) -> u8;
@@ -268,7 +268,7 @@ pub trait RoleByte: Sized + Copy {
 /// `Role`. Acts as a single-variant Top — `NoRoles::Any` satisfies
 /// every check. The `#[actor]` macro emits this as the default
 /// `type Role` so existing actors keep compiling without source
-/// edits when the trait is extended in M1.
+/// edits when the trait is extended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum NoRoles {
@@ -527,7 +527,7 @@ mod tests {
 
     #[test]
     fn space_role_from_u8_unknown_is_none() {
-        // Forward-incompatible byte (e.g. a future tier) decodes
+        // Unknown byte (e.g. an unsupported tier) decodes
         // as None so callers can downgrade gracefully — not
         // panic — when a newer registry granted a role the old
         // code doesn't know about.

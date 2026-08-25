@@ -72,19 +72,14 @@ pub trait SpaceClient: Send + Sync {
     /// `vosx` (instance name / `0xHEX` / `registry`).
     fn resolve_target(&self, name: &str) -> Result<ServiceId, BackendError>;
 
-    /// The raw `.vos_meta` blob for an instance. Empty `Vec` = schema unknown
-    /// (old binary / hash mismatch); the engine then falls back to permissive
-    /// argument handling.
+    /// The raw `.vos_meta` blob for an instance.
     fn raw_meta(&self, name: &str) -> Result<Vec<u8>, BackendError>;
 
     /// Decoded schema for an instance. Default impl decodes [`Self::raw_meta`].
-    fn schema(&self, name: &str) -> Result<Option<ParsedMeta>, BackendError> {
+    fn schema(&self, name: &str) -> Result<ParsedMeta, BackendError> {
         let blob = self.raw_meta(name)?;
-        Ok(if blob.is_empty() {
-            None
-        } else {
-            vos::metadata::decode(&blob)
-        })
+        vos::metadata::decode(&blob)
+            .ok_or_else(|| BackendError::Decode(format!("invalid schema for `{name}`")))
     }
 
     /// Invoke a dynamic message and return the decoded reply. Implementors

@@ -220,7 +220,7 @@ pub fn fetch_raw(buf: &mut [u8]) -> usize {
 #[cfg(feature = "pvm")]
 pub fn exit_status<A: Actor>(ctx: &Context<A>) -> Vec<u8> {
     use super::run::{STATUS_DONE, STATUS_FORBIDDEN, STATUS_YIELDED};
-    // M6 — the macro-emitted role check flagged this dispatch
+    // The macro-emitted role check flagged this dispatch.
     // as refused. `STATUS_FORBIDDEN` propagates through the wire
     // envelope so vosx surfaces "permission denied" without any
     // handler-body side effects.
@@ -581,9 +581,6 @@ fn dispatch_one_inner<A: Actor>(
     };
 
     // VOS service has one application message wire: TAG_DYNAMIC followed by Msg.
-    // The old typed-enum rkyv fallback made generated message fields part of
-    // the public ABI and prevented portable proof packages from being passed
-    // as arguments.
     if raw.first() != Some(&TAG_DYNAMIC) {
         return DispatchResult::Skipped;
     }

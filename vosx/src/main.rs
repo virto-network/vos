@@ -4,12 +4,6 @@
 //! operation lives under `vosx space *`. Top-level commands build canonical
 //! packages and manage platform artifacts.
 //!
-//! The earlier manifest-driven commands (`new`, `up`, `join`,
-//! `ls`, `ps`, `call`) folded into `vosx space *`; they had
-//! different semantics (`up` started a node from a TOML
-//! template; `space up` boots the registry-driven daemon)
-//! and the registry-as-truth model supersedes the
-//! manifest-as-truth model that originally drove them.
 //! A recipe is applied into a space's registry either at
 //! genesis — `space new <name> --recipe <file>` or the one-shot
 //! `space up <recipe.toml>` on a space's first boot — or via

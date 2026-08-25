@@ -285,7 +285,7 @@ fn append_entries_returns_no_reply_on_storage_failure() {
         "follower must not report success when its meta write failed",
     );
 
-    // C3/H3 fix verification: the in-memory term is rolled back
+    // The in-memory term is rolled back
     // to its pre-mutation value (0) when the storage write fails,
     // so the worker's view stays consistent with disk. Without
     // the rollback, snapshot would show term=5 while the on-disk

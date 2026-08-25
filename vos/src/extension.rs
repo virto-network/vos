@@ -47,7 +47,7 @@ pub enum ExtensionKind {
     /// task per accept — all sharing `&actor` on a single-threaded
     /// executor. Exports `vos_extension_conn_new` in addition to the
     /// actor-mode task ABI.
-    Transport = 2,
+    Transport = 1,
 }
 
 impl ExtensionKind {
@@ -55,7 +55,7 @@ impl ExtensionKind {
     pub const fn from_byte(b: u8) -> Option<Self> {
         match b {
             0 => Some(Self::Actor),
-            2 => Some(Self::Transport),
+            1 => Some(Self::Transport),
             _ => None,
         }
     }
@@ -142,11 +142,7 @@ impl ExtensionPollResult {
 //   vos_extension_take_spawned(state) -> u64
 //       Drain the next spawned-child handle (reserved; currently always 0).
 //
-// This is the current per-task ABI set; it supersedes an earlier
-// `submit`/`poll_event`/`provide` trio and a still-earlier single-future
-// `dispatch`/`poll`/`…`. Each incompatible change renames the symbols so a
-// stale `.so` fails to load with a clear "missing symbol" error instead of
-// being driven through an incompatible ABI. `TaskPoll.ptr` points
+// `TaskPoll.ptr` points
 // into the extension-owned `TaskState` and is valid only until the next call on
 // this `state`, so the host copies the bytes immediately (the safe
 // `ExtensionInstance::poll_task` wrapper does this and returns owned `Vec`s).
@@ -308,11 +304,11 @@ mod host {
                 let kind = ExtensionKind::from_byte(meta.kind)
                     .ok_or_else(|| format!("unknown extension kind {}", meta.kind))?;
 
-                // Only Actor + Transport remain; both use the per-task executor
-                // ABI, Transport additionally requiring conn_new2.
+                // Both modes use the task executor. Transport additionally
+                // requires the connection entry point.
                 let actor = match kind {
                     // Transport-mode reuses the actor-mode task
-                    // ABI and ADDITIONALLY exports `vos_extension_conn_new`
+                    // and additionally exports `vos_extension_conn_new`
                     // (resolved below); the host branches on `plugin.kind()` to
                     // pick the transport accept-loop driver.
                     ExtensionKind::Actor | ExtensionKind::Transport => {
@@ -340,22 +336,13 @@ mod host {
                         let state_fn = *lib
                             .get::<StateFn>(b"vos_extension_state")
                             .map_err(|e| format!("missing vos_extension_state: {e}"))?;
-                        // Transport additionally requires conn_new;
-                        // for plain Actor it's optional (always emitted by
-                        // current builds, but never called).
-                        // `conn_new2`'s `2` suffix marks the 3-arg signature
-                        // (with svc_id). A stale transport .so exports the
-                        // 2-arg `conn_new` instead, so this lookup misses and
-                        // the load fails loudly below rather than calling a
-                        // mismatched pointer.
+                        // Plain actors export this too, but never call it.
                         let conn_new_fn = lib
-                            .get::<ConnNewFn>(b"vos_extension_conn_new2")
+                            .get::<ConnNewFn>(b"vos_extension_conn_new")
                             .ok()
                             .map(|s| *s);
                         if kind == ExtensionKind::Transport && conn_new_fn.is_none() {
-                            return Err("transport extension missing vos_extension_conn_new2 \
-                                 (stale .so built before the conn_new2 ABI?)"
-                                .to_string());
+                            return Err("transport extension missing vos_extension_conn_new".into());
                         }
                         Some(ActorSymbols {
                             task_new_fn,
@@ -845,8 +832,8 @@ mod tests {
     #[test]
     fn extension_kind_from_byte_round_trip() {
         assert_eq!(ExtensionKind::from_byte(0), Some(ExtensionKind::Actor));
-        assert_eq!(ExtensionKind::from_byte(2), Some(ExtensionKind::Transport));
-        assert_eq!(ExtensionKind::from_byte(1), None);
+        assert_eq!(ExtensionKind::from_byte(1), Some(ExtensionKind::Transport));
+        assert_eq!(ExtensionKind::from_byte(2), None);
         assert_eq!(ExtensionKind::from_byte(7), None);
         assert_eq!(ExtensionKind::from_byte(255), None);
     }

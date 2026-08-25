@@ -153,7 +153,7 @@ impl ServiceWire for RootTreeAttestedResult {
             attestation: super::AttestationDelivery {
                 producer_name: decoder.string()?,
                 producer: super::ProducerId(decoder.fixed()?),
-                statement: crate::AttestationStatement::decode(&decoder.bytes()?)?,
+                statement: crate::attestation::AttestationStatement::decode(&decoder.bytes()?)?,
                 proof: super::contracts::decode_proof(decoder)?,
             },
             proof: decoder.bytes()?,

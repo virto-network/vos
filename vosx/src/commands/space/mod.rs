@@ -88,7 +88,7 @@ pub enum SpaceCommand {
         /// Space id (full hex) or name.
         space: String,
     },
-    /// Mint a `vos1…` invite token for a running space. Requires the
+    /// Mint a `vos-…` invite token for a running space. Requires the
     /// operator to hold ADMIN. The joiner redeems it with `space up
     /// <token>`. Tokens grant `member` or `developer`; promote admins
     /// explicitly with `space role grant` after admission. Subcommands:
@@ -116,13 +116,13 @@ pub enum SpaceCommand {
     },
     /// Boot a space — THE onboarding command. The positional is
     /// trivalent: an existing `.toml` recipe path (create-if-missing +
-    /// one-shot genesis apply + boot), a `vos1…` invite token
+    /// one-shot genesis apply + boot), a `vos-…` invite token
     /// (join-if-needed + boot + auto-redeem), or a space name / id
     /// (boot a known space). `-` reads a token from stdin. Loads the
     /// registry from cache, registers it as `ServiceId::REGISTRY`, and
     /// runs forever.
     Up {
-        /// Recipe path, `vos1…` token, `-` (token via stdin), or a
+        /// Recipe path, `vos-…` token, `-` (token via stdin), or a
         /// known space id (full hex) / name.
         space: String,
         /// Exit when the registry goes idle (smoke-test mode).

@@ -280,9 +280,9 @@ fn spawn_up_with_service_trust_and_connects(
         .expect("spawn vosx space up")
 }
 
-/// Minimal independent implementation of the documented VTA1/VTR1 authority
-/// protocol. Keeping this outside the daemon crate makes the acceptance test
-/// exercise the public wire rather than its private codec helpers.
+/// Minimal independent implementation of the production authority protocol.
+/// Keeping this outside the daemon crate makes the acceptance test exercise
+/// the public wire rather than its private codec helpers.
 struct TestProductionTrustSidecar {
     path: PathBuf,
     stop: Arc<AtomicBool>,
@@ -300,7 +300,6 @@ struct TestProductionTrustObservations {
 impl TestProductionTrustSidecar {
     const REQUEST_MAGIC: [u8; 4] = *b"VTAW";
     const RESPONSE_MAGIC: [u8; 4] = *b"VTRW";
-    const VERSION: u16 = 1;
     const QUERY_POLICY: u8 = 0;
     const CURRENT_TIMESLOT: u8 = 1;
     const VERIFY_TIMESLOT: u8 = 2;
@@ -353,23 +352,18 @@ impl TestProductionTrustSidecar {
                 if stream.read_exact(&mut request).is_err() {
                     continue;
                 }
-                assert!(request.len() >= 11, "authority request header");
+                assert!(request.len() >= 9, "authority request header");
                 assert_eq!(request[..4], Self::REQUEST_MAGIC);
-                assert_eq!(u16::from_le_bytes([request[4], request[5]]), Self::VERSION);
-                let tag = request[6];
-                let payload_len = u32::from_le_bytes(request[7..11].try_into().unwrap()) as usize;
-                assert_eq!(payload_len, request.len() - 11);
+                let tag = request[4];
+                let payload_len = u32::from_le_bytes(request[5..9].try_into().unwrap()) as usize;
+                assert_eq!(payload_len, request.len() - 9);
 
                 let request_hash =
                     vos::service::Hash::digest(b"vos/production-trust-socket/request", &[&request]);
-                let result = Self::classify(
-                    tag,
-                    &request[11..],
-                    &mut thread_observations.lock().unwrap(),
-                );
-                let mut response = Vec::with_capacity(79);
+                let result =
+                    Self::classify(tag, &request[9..], &mut thread_observations.lock().unwrap());
+                let mut response = Vec::with_capacity(77);
                 response.extend_from_slice(&Self::RESPONSE_MAGIC);
-                response.extend_from_slice(&Self::VERSION.to_le_bytes());
                 response.extend_from_slice(&request_hash.0);
                 response.extend_from_slice(&policy.0);
                 response.push(result);
@@ -604,8 +598,6 @@ fn counter_package_fixture(output_dir: &Path) -> PathBuf {
             &actor,
             "--name",
             "onboarding-counter",
-            "--version",
-            "0.1.0",
             "--out-dir",
             &out,
         ],
@@ -636,8 +628,6 @@ fn crdt_counter_package_fixture(output_dir: &Path) -> PathBuf {
             &actor,
             "--name",
             "production-crdt-counter",
-            "--version",
-            "0.1.0",
             "--out-dir",
             &out,
         ],
@@ -669,8 +659,6 @@ fn authority_upgrade_package_fixture(
             &actor,
             "--name",
             vos::service::ROLE_AUTHORITY_INSTANCE_,
-            "--version",
-            "migration",
             "--out-dir",
             &out,
         ],
@@ -686,7 +674,7 @@ fn authority_upgrade_package_fixture(
     .expect("decode authority candidate");
     let frozen =
         fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("blobs/space_authority.pvm"))
-            .expect("read canonical ABI-17 authority PVM");
+            .expect("read canonical authority PVM");
     assert_ne!(
         candidate.manifest.actor_program,
         vos::service::ProgramId::of_pvm(&frozen),
@@ -695,19 +683,19 @@ fn authority_upgrade_package_fixture(
     package
 }
 
-fn assert_bundled_space_authority_matches_abi_17_program() {
+fn assert_bundled_space_authority_matches_canonical_program() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let bundled = fs::read(workspace.join("vosx/blobs/space_authority.pvm"))
         .expect("vosx ships the canonical authority PVM");
     assert_eq!(
         hex::encode(vos::service::ProgramId::of_pvm(&bundled).0),
         "79099ccbec4e4dac7af893e153ba379a1d33aa75734daf1d93cbba3e684d65eb",
-        "the built-in authority program must implement the current ABI-17 private-input contract",
+        "the built-in authority program must implement the canonical private-input contract",
     );
     assert_eq!(
         hex::encode(vos::crypto::blake2b_hash::<32>(&[], &[&bundled])),
         "45c1e75beb821b45a2242fd730c729a19fab014be1438ae293df1937492efebc",
-        "the ABI-17 authority bytes must remain exact so same-ABI sealed spaces can reopen",
+        "the authority bytes must remain exact so sealed spaces can reopen",
     );
 }
 
@@ -823,8 +811,8 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
         .trim()
         .to_string();
     assert!(
-        token.starts_with("vos1"),
-        "expected a vos1… token, got: {token}"
+        token.starts_with("vos-"),
+        "expected a vos-… token, got: {token}"
     );
 
     // ── host B: literally `space up <token>` — join + redeem + sync ─
@@ -1034,7 +1022,7 @@ fn signed_service_package_runs_and_reopens_through_the_space_daemon() {
     );
     assert!(
         !rejected.status.success()
-            && String::from_utf8_lossy(&rejected.stderr).contains("canonical ABI-17"),
+            && String::from_utf8_lossy(&rejected.stderr).contains("canonical authority"),
         "release verification must reject changed authority bytes: {}",
         String::from_utf8_lossy(&rejected.stderr),
     );
@@ -1049,11 +1037,7 @@ fn signed_service_package_runs_and_reopens_through_the_space_daemon() {
     let invalid_data = TempDir::new("root-invalid-profile-data");
     let invalid_config = TempDir::new("root-invalid-profile-config");
     let invalid_recipe = dist.path().join("invalid-profile.toml");
-    fs::write(
-        &invalid_recipe,
-        "space = \"invalid-profile\"\nversion = \"0.1.0\"\n",
-    )
-    .unwrap();
+    fs::write(&invalid_recipe, "space = \"invalid-profile\"\n").unwrap();
     let recipe = invalid_recipe.to_string_lossy().into_owned();
     let service = service_pvm.to_string_lossy().into_owned();
     let implicit_trust = vosx(
@@ -1082,30 +1066,27 @@ fn signed_service_package_runs_and_reopens_through_the_space_daemon() {
     vosx_ok(
         data.path(),
         config.path(),
-        &[
-            "build",
-            &actor,
-            "--name",
-            "counter",
-            "--version",
-            "0.1.0",
-            "--out-dir",
-            &out,
-        ],
+        &["build", &actor, "--name", "counter", "--out-dir", &out],
     );
     let package = dist.path().join("counter.vos");
     assert!(package.is_file(), "vosx build must emit the signed package");
+    let upgrade_actor_elf = workspace.join(
+        "vos/tests/fixtures/counter-upgrade/target/riscv64em-vos/release/counter_upgrade_fixture.elf",
+    );
+    assert!(
+        upgrade_actor_elf.is_file(),
+        "build the upgrade fixture first: `just build-daemon-root-artifacts`",
+    );
+    let upgrade_actor = upgrade_actor_elf.to_string_lossy().into_owned();
     let upgrade_out = upgrade_dist.path().to_string_lossy().into_owned();
     vosx_ok(
         data.path(),
         config.path(),
         &[
             "build",
-            &actor,
+            &upgrade_actor,
             "--name",
             "counter",
-            "--version",
-            "0.2.0",
             "--out-dir",
             &upgrade_out,
         ],
@@ -1171,19 +1152,6 @@ fn signed_service_package_runs_and_reopens_through_the_space_daemon() {
 
     let endpoint_path = find_endpoint(data.path()).unwrap();
     let service_data_dir = endpoint_path.parent().unwrap().to_path_buf();
-    let endpoint_body = fs::read_to_string(&endpoint_path).unwrap();
-    let endpoint: toml::Value = toml::from_str(&endpoint_body).unwrap();
-    let prefix = endpoint["prefix"].as_integer().unwrap() as u16;
-    let raw_route = format!(
-        "0x{:08x}",
-        vos::registry::instance_service_id("counter", prefix),
-    );
-    let raw_value = vosx_ok(
-        data.path(),
-        config.path(),
-        &["space", "call", space, &raw_route, "value"],
-    );
-    assert_eq!(raw_value.trim(), "U64(3)");
 
     let described = vosx_ok(
         data.path(),
@@ -1199,12 +1167,18 @@ fn signed_service_package_runs_and_reopens_through_the_space_daemon() {
     vosx_ok(
         data.path(),
         config.path(),
-        &["space", "publish", space, "counter:0.2.0", &upgrade_source],
+        &[
+            "space",
+            "publish",
+            space,
+            "counter-upgrade",
+            &upgrade_source,
+        ],
     );
     let upgraded = vosx_ok(
         data.path(),
         config.path(),
-        &["space", "upgrade", space, "counter", "counter:0.2.0"],
+        &["space", "upgrade", space, "counter", "counter-upgrade"],
     );
     assert!(
         upgraded.contains("upgraded counter"),
@@ -1213,7 +1187,7 @@ fn signed_service_package_runs_and_reopens_through_the_space_daemon() {
     let repeated_upgrade = vosx_ok(
         data.path(),
         config.path(),
-        &["space", "upgrade", space, "counter", "counter:0.2.0"],
+        &["space", "upgrade", space, "counter", "counter-upgrade"],
     );
     assert!(
         repeated_upgrade.contains("upgraded counter"),
@@ -1518,7 +1492,7 @@ fn signed_service_roots_run_under_production_trust_and_recover() {
     let crdt_package = crdt_counter_package_fixture(crdt_dist.path());
 
     vosx_ok(data.path(), config.path(), &["space", "new", space]);
-    assert_bundled_space_authority_matches_abi_17_program();
+    assert_bundled_space_authority_matches_canonical_program();
     let authority_candidate =
         authority_upgrade_package_fixture(data.path(), config.path(), authority_dist.path());
 
@@ -1919,7 +1893,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
     let config_b = TempDir::new("production-crdt-b-config");
     let dist = TempDir::new("production-crdt-network-dist");
     let sidecar_dir = TempDir::new("production-crdt-sidecars");
-    assert_bundled_space_authority_matches_abi_17_program();
+    assert_bundled_space_authority_matches_canonical_program();
     let package = crdt_counter_package_fixture(dist.path());
     let policy = vos::service::Hash([0x69; 32]);
     let trust_a_path = sidecar_dir.path().join("authority-a.sock");
@@ -2976,17 +2950,17 @@ fn boot_admin_with_service(
     (data_a, cfg_a, daemon_a, log_a)
 }
 
-/// A tampered `vos1…` token fails the checksum at parse time, so `space
+/// A tampered `vos-…` token fails the checksum at parse time, so `space
 /// up` errors immediately (no daemon, no partial join).
 #[test]
 fn tampered_token_fails_parse() {
     let data = TempDir::new("tamper-data");
     let cfg = TempDir::new("tamper-config");
-    // A syntactically-`vos1` string with a corrupt body.
+    // A syntactically-`vos-` string with a corrupt body.
     let o = vosx(
         data.path(),
         cfg.path(),
-        &["space", "up", "vos1zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"],
+        &["space", "up", "vos-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"],
     );
     assert!(!o.status.success(), "a tampered token must be rejected");
     let err = String::from_utf8_lossy(&o.stderr).to_lowercase();

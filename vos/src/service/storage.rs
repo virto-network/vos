@@ -1,4 +1,4 @@
-//! Clean-break guest-owned service storage schema.
+//! Guest-owned service storage schema.
 //!
 //! The header is the mutable root anchor and is deliberately not a leaf in
 //! the application state tree. Deduplication and receipt rows are likewise
@@ -1033,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_store_gets_actionable_clean_break_error() {
+    fn foreign_store_gets_an_actionable_error() {
         let error = StoreHeader::open(b"foreign-state").unwrap_err();
         assert_eq!(error, StoreOpenError::UnknownStore);
         let message = error.to_string();

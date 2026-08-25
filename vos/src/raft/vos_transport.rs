@@ -248,7 +248,7 @@ impl Transport<u16> for VosTransport {
 /// oneshot channel.
 ///
 /// **Why polling, not one big `recv_timeout(2s)`.** The earlier
-/// version blocked the helper thread for the full `RPC_TIMEOUT`
+/// synchronous implementation blocked the helper thread for the full `RPC_TIMEOUT`
 /// even when the future had already been dropped (worker
 /// shutdown, `FuturesUnordered` discard, election-storm churn).
 /// Up to 2s of orphaned threads accumulated under cancellation

@@ -3242,7 +3242,7 @@ mod tests {
     }
 
     #[test]
-    fn root_tree_actor_limit_matches_the_pinned_jar_kernel() {
+    fn root_tree_actor_limit_matches_the_pvm_runtime() {
         assert_eq!(
             MAX_ROOT_TREE_ACTORS + 1,
             vos_pvm::vm_pool::MAX_CODE_CAPS,

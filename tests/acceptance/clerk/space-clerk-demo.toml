@@ -18,7 +18,6 @@
 # Vec<u8> handler args are hex strings (bootstrap wants a 16-byte
 # journal_id + 32-byte registrar_pubkey); byte replies render as hex too.
 space = "clerk-demo"
-version = "0.1.0"
 
 [[agent]]
 name = "clerk-ledger"

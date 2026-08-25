@@ -50,13 +50,8 @@
 //! [provable:u8]                 (actor-level: #[actor(task, provable)])
 //! ```
 //!
-//! Each trailing section is append-only: older decoders that don't
-//! know about `kind` / `caps` / `cli_methods` / `returns` / the metadata
-//! doc + timeout sections stop reading at the previous section and the
-//! corresponding `ParsedMeta` field defaults to empty/false/0. This is how
-//! the format has evolved without breaking older actor binaries. New
-//! sections MUST be appended at the end, never inserted — decoding is
-//! strictly positional.
+//! Decoding is strict and positional: every section above must be present and
+//! no trailing bytes are accepted.
 
 /// Field descriptor — name and type as strings.
 pub struct FieldMeta {
@@ -81,22 +76,19 @@ pub struct MessageMeta {
     /// `[u8;32]`, `Vec<u8>`, a custom struct name, …), with any
     /// `Result<T, E>` unwrapped to `T` — the error surfaces separately
     /// as `ClientError`. `()` for a unit / no-return handler. Emitted
-    /// in a trailing `.vos_meta` section (see [`encode`]), so blobs
-    /// that predate it decode to an empty string.
+    /// in `.vos_meta` (see [`encode`]).
     pub returns: &'static str,
     /// One-line handler description — the first paragraph of the
     /// handler's `///` doc, captured by the `#[msg]` macro. Empty when
-    /// undocumented. Trailing `.vos_meta` section; old blobs decode empty.
+    /// undocumented.
     pub doc: &'static str,
     /// Per-handler invoke timeout in milliseconds; `0` = the client's
     /// default. Set with `#[msg(timeout_ms = N)]` for handlers that
     /// legitimately run past the default (a minutes-long prove/measure).
-    /// Trailing section; old blobs decode `0`.
     pub timeout_ms: u32,
     /// Dispatch mode: `0` = sync (the reply is the result), `1` = job (the
     /// handler is a `#[msg(job)]` *begin* returning a `u64` job id; the
-    /// dispatcher then drives poll → stream → release). Trailing section;
-    /// old blobs decode `0`.
+    /// dispatcher then drives poll → stream → release).
     pub mode: u8,
     /// Whether the handler requires proof production before its transition may
     /// be accumulated. Declared with `#[msg(attested)]`.
@@ -118,10 +110,8 @@ pub struct ActorMeta {
     pub messages: &'static [MessageMeta],
     pub constructor: &'static [FieldMeta],
     /// Extension kind discriminant, encoded as a `u8`. Mirrors
-    /// [`crate::extension::ExtensionKind`]: `0 = Actor`, `1 =
-    /// Service`. PVM actors emit `0` — services are a host-side
-    /// concept; a PVM actor running inside the deterministic
-    /// universe is always `Actor`.
+    /// [`crate::extension::ExtensionKind`]: `0 = Actor`, `1 = Transport`.
+    /// PVM actors emit `0`; transports are native extensions.
     pub kind: u8,
     /// Capability tokens the extension wants to use — declarative
     /// only, not enforced. Logged at load time so manifest reviewers
@@ -139,17 +129,17 @@ pub struct ActorMeta {
     pub cli_methods: &'static [&'static str],
     /// One-line actor description — the first paragraph of the actor
     /// struct's `///` doc, threaded through `Actor::DOC` by the macro.
-    /// Empty when undocumented. Trailing section; old blobs decode empty.
+    /// Empty when undocumented.
     pub doc: &'static str,
     /// Whether this program was declared with `#[actor(crdt)]` and may
     /// therefore be installed with CRDT consistency.  Ordinary actors must
     /// use Ephemeral, Local, or Raft storage.
     pub crdt: bool,
     /// `#[actor(task, provable)]` — this Task is published as a
-    /// provable program (`docs/actors.md` D6): a discovery/
+    /// provable program: a discovery/
     /// publication mark for the pin/verify tooling, not a semantic
     /// fork (record capture is the caller's `spawn_provable` opt-in
-    /// either way). Trailing section; old blobs decode `false`.
+    /// either way).
     pub provable: bool,
 }
 
@@ -274,14 +264,11 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         c += 1;
     }
 
-    // Extension kind discriminant. Trailing byte so older decoders
-    // that don't read it parse cleanly — they fall off the end of the
-    // buffer and ParsedMeta defaults to Actor.
+    // Extension kind discriminant.
     buf[pos] = meta.kind;
     pos += 1;
 
-    // Capability list. Same trailing-append discipline: older
-    // decoders stop here and read an empty caps list.
+    // Capability list.
     let [lo, hi] = (meta.caps.len() as u16).to_le_bytes();
     buf[pos] = lo;
     buf[pos + 1] = hi;
@@ -302,13 +289,7 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         k += 1;
     }
 
-    // CLI-exposed method names. Same trailing-append discipline:
-    // older decoders stop after caps and every
-    // `ParsedMessage.exposed_to_cli` stays `false`. Cross-reference
-    // by name (rather than a per-message flag inline with the
-    // existing record) keeps the existing per-message wire format
-    // untouched — adding a byte mid-record would break every
-    // older decoder.
+    // CLI-exposed method names, cross-referenced by message name.
     let [lo, hi] = (meta.cli_methods.len() as u16).to_le_bytes();
     buf[pos] = lo;
     buf[pos + 1] = hi;
@@ -329,11 +310,7 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         c += 1;
     }
 
-    // Per-message return-type names. Same trailing-append discipline:
-    // one entry per message in message order, so a decoder
-    // cross-references by index. Blobs produced before this section
-    // simply stop after cli_methods and every `ParsedMessage.returns`
-    // defaults to the empty string.
+    // Per-message return-type names in message order.
     let [lo, hi] = (meta.messages.len() as u16).to_le_bytes();
     buf[pos] = lo;
     buf[pos + 1] = hi;
@@ -354,9 +331,7 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         r += 1;
     }
 
-    // Per-message doc strings. One entry per message in order,
-    // index-crossref like `returns`. Older blobs stop after `returns`
-    // and every `ParsedMessage.doc` is empty.
+    // Per-message doc strings in message order.
     let [lo, hi] = (meta.messages.len() as u16).to_le_bytes();
     buf[pos] = lo;
     buf[pos + 1] = hi;
@@ -377,8 +352,7 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         d += 1;
     }
 
-    // Actor-level doc string. A single length-prefixed string.
-    // Absent → `ParsedMeta.doc` empty.
+    // Actor-level doc string.
     let actor_doc = meta.doc.as_bytes();
     let [lo, hi] = (actor_doc.len() as u16).to_le_bytes();
     buf[pos] = lo;
@@ -391,8 +365,7 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
     }
     pos += actor_doc.len();
 
-    // Per-message invoke timeouts, u32 LE each, one per message in
-    // order. Absent → every `ParsedMessage.timeout_ms` stays 0.
+    // Per-message invoke timeouts, u32 LE each, in message order.
     let [lo, hi] = (meta.messages.len() as u16).to_le_bytes();
     buf[pos] = lo;
     buf[pos + 1] = hi;
@@ -408,8 +381,7 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         t += 1;
     }
 
-    // Per-message dispatch mode, one u8 per message in order.
-    // `0` = sync, `1` = job. Absent → every `ParsedMessage.mode` is 0 (sync).
+    // Per-message dispatch mode: `0` = sync, `1` = job.
     let [lo, hi] = (meta.messages.len() as u16).to_le_bytes();
     buf[pos] = lo;
     buf[pos + 1] = hi;
@@ -421,8 +393,7 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         md += 1;
     }
 
-    // Actor replication model. Appended so pre metadata remains readable,
-    // but it defaults to `false` and therefore can never opt into CRDT mode.
+    // Actor replication model.
     buf[pos] = meta.crdt as u8;
     pos += 1;
 
@@ -443,9 +414,7 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         ap += 1;
     }
 
-    // Actor-local policy is its own append-only section. A decoder that knows
-    // only the original policy section can ignore this complete tail without
-    // losing alignment between messages.
+    // Actor-local policy in message order.
     let [lo, hi] = (meta.messages.len() as u16).to_le_bytes();
     buf[pos] = lo;
     buf[pos + 1] = hi;
@@ -466,8 +435,7 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         ar += 1;
     }
 
-    // Actor-level provable flag, one trailing byte. Absent →
-    // `ParsedMeta.provable` is false.
+    // Actor-level provable flag.
     buf[pos] = meta.provable as u8;
     pos += 1;
 
@@ -609,12 +577,12 @@ mod tests {
     }
 
     #[test]
-    fn kind_byte_roundtrips_for_service() {
+    fn kind_byte_roundtrips_for_transport() {
         const META: ActorMeta = ActorMeta {
             actor_name: "Gateway",
             messages: &[],
             constructor: &[],
-            kind: 1, // Service
+            kind: 1,
             caps: &[],
             cli_methods: &[],
             doc: "",
@@ -812,25 +780,19 @@ mod decode {
         pub name: String,
         pub is_query: bool,
         pub fields: Vec<ParsedField>,
-        /// `true` if the binary's trailing `cli_methods` section
-        /// names this handler. Empty / absent section → `false`
-        /// across the board (binary predates the CLI dispatch
-        /// surface). Used by `vosx <ext> <cmd>` to filter the
-        /// handler list to those exposed to the CLI.
+        /// `true` if `cli_methods` names this handler. Used by
+        /// `vosx <ext> <cmd>` to filter the handler list.
         pub exposed_to_cli: bool,
         /// Declared return type (whitespace-free, `Result` unwrapped).
-        /// Empty when the blob predates the `returns` section. The CLI
-        /// and gateway use it to label an otherwise-opaque reply.
+        /// The CLI and gateway use it to label an otherwise-opaque reply.
         pub returns: String,
-        /// One-line handler description. Empty when the blob predates
-        /// the doc section or the handler is undocumented.
+        /// One-line handler description. Empty when undocumented.
         pub doc: String,
         /// Per-handler invoke timeout in milliseconds; `0` = the
-        /// client's default. Empty/old blobs decode `0`.
+        /// client's default.
         pub timeout_ms: u32,
         /// Dispatch mode: `0` = sync (the reply is the result), `1` =
-        /// job (the handler is a `#[msg(job)]` begin). Empty/old blobs
-        /// decode `0`.
+        /// job (the handler is a `#[msg(job)]` begin).
         pub mode: u8,
         /// True only for handlers explicitly declared `#[msg(attested)]`.
         pub attested: bool,
@@ -846,21 +808,16 @@ mod decode {
         pub actor_name: String,
         pub messages: Vec<ParsedMessage>,
         pub constructor: Vec<ParsedField>,
-        /// Extension kind byte (0 = Actor, 1 = Service). Decoded
-        /// from the trailing byte of the meta blob; absent / unknown
-        /// values default to `Actor`.
+        /// Extension kind byte (`0 = Actor`, `1 = Transport`).
         pub kind: u8,
-        /// Declared capability tokens. Empty when the blob predates
-        /// the field.
+        /// Declared capability tokens.
         pub caps: Vec<String>,
-        /// One-line actor description. Empty when the blob predates
-        /// the doc section or the actor is undocumented.
+        /// One-line actor description. Empty when undocumented.
         pub doc: String,
         /// True only for programs explicitly compiled with `#[actor(crdt)]`.
         pub crdt: bool,
         /// `#[actor(task, provable)]` publication mark — this Task is
-        /// meant to be pinned/proved (`docs/actors.md` D6).
-        /// `false` when the blob predates the section.
+        /// meant to be pinned and proved.
         pub provable: bool,
     }
 
@@ -917,7 +874,7 @@ mod decode {
 
         let kind = *data.get(pos)?;
         pos += 1;
-        if kind > 2 {
+        if kind > 1 {
             return None;
         }
 
@@ -1061,11 +1018,8 @@ mod decode {
     /// Raw bytes of the `.vos_meta` ELF section, without decoding.
     /// Used by `vosx` to forward the schema verbatim to the
     /// space-registry's `register_meta` handler, which stores it
-    /// opaquely keyed by program hash. The registry then serves
-    /// the same bytes back to consumers (the gateway, CLIs) which
-    /// run `decode` to get a `ParsedMeta`. Skipping decode here
-    /// keeps the registry schema-agnostic across vos versions —
-    /// only the encoder and the consumer need to agree.
+    /// opaquely keyed by program hash. The registry validates and serves the
+    /// same bytes back to consumers, which decode them into [`ParsedMeta`].
     pub fn raw_section_from_elf(elf_data: &[u8]) -> Option<Vec<u8>> {
         find_elf_section(elf_data, b".vos_meta").map(|s| s.to_vec())
     }

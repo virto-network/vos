@@ -1,7 +1,7 @@
 //! Raw ecall interface.
 //!
 //! On RISC-V, loads the hostcall ID into `t0` and executes `ecall`.
-//! The grey-transpiler converts this to a PVM `ecalli` instruction.
+//! The VOS PVM compiler converts this to a PVM `ecalli` instruction.
 //!
 //! Per PVM spec `Capability.lean:169-182`, the ecalli calling convention is:
 //!
@@ -9,15 +9,12 @@
 //! - `phi[7..=11]`    = 5 data arguments
 //! - `phi[12]`        = **object cap** (u32, byte-packed indirection encoding)
 //!
-//! The grey-transpiler maps RISC-V `a0..=a4` (`x10..=x14`) → PVM `phi[7..=11]`
-//! and RISC-V `a5` (`x15`) → PVM `phi[12]` (see
-//! `grey-transpiler/src/riscv.rs`).
+//! The compiler maps RISC-V `a0..=a4` (`x10..=x14`) → PVM `phi[7..=11]`
+//! and RISC-V `a5` (`x15`) → PVM `phi[12]`.
 //!
-//! For a direct reference to a local cap slot (no indirection), the object
-//! cap is just `(slot as u32)` — per spec `Capability.lean:109`:
-//! "`(u8 as u32)` zero-extended = local slot, backward compatible".
+//! A direct object-cap reference is the zero-extended local slot number.
 //!
-//! VOS uses the **stack cap** (slot 65, emitted by `grey-transpiler`) as the
+//! VOS uses the compiler-emitted **stack cap** (slot 65) as the
 //! default object cap for every hostcall. The rationale: hostcall argument
 //! buffers typically live in stack frames, and the kernel's Linux backend
 //! reads guest memory via a flat 4GB window so the declared cap is mostly
@@ -27,7 +24,7 @@
 
 /// VOS convention: the PVM cap slot used as the default object cap for
 /// every hostcall. Matches the stack DATA cap emitted by
-/// `grey-transpiler/src/emitter.rs`. Direct reference, no indirection.
+/// the VOS PVM compiler. Direct reference, no indirection.
 pub const VOS_OBJECT_CAP: u64 = 65;
 const RESULT_WHAT: u64 = u64::MAX - 1;
 

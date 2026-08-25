@@ -34,9 +34,6 @@ pub struct Endpoint {
     /// scraping the boot log. These are *per-daemon* host policy
     /// (not replicated registry state), which is why they ride the
     /// local endpoint descriptor rather than the registry.
-    /// `#[serde(default)]` keeps older `.endpoint` files (and
-    /// recipe-less daemons) readable.
-    #[serde(default)]
     pub extensions: Vec<ExtensionCaps>,
 }
 

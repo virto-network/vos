@@ -4361,7 +4361,7 @@ fn authorization_rejection<S: GuestAccumulateStore>(
                 && *credential_commitment != Hash::ZERO
                 && witness.len != 0
         }
-        // A future statement version will bind platform authority keys. Until
+        // A future statement shape will bind platform authority keys. Until
         // then System is an identity class, never an authorization bypass.
         AuthorizationEvidence::SystemCapability { .. } => false,
     };
@@ -6451,7 +6451,7 @@ mod tests {
     }
 
     #[test]
-    fn child_spawn_rejects_the_pinned_jar_tree_ceiling_atomically() {
+    fn child_spawn_rejects_the_pvm_tree_ceiling_atomically() {
         let mut store = MemStore::default();
         let initial = store.provide_blob(b"state").unwrap();
         store.programs.insert(program(), FIXTURE_ACTOR_PVM.to_vec());
@@ -9193,7 +9193,7 @@ mod tests {
         // The admitted credential is scoped to the current actor deployment
         // and program. Until its inbox slice consumes that decision, a
         // package-only or program upgrade must fail atomically instead of
-        // stranding an invocation which can authorize neither version.
+        // stranding an invocation which can authorize neither descriptor.
         let admitted_header =
             StoreHeader::open(store.rows.get(header_storage_key()).unwrap()).unwrap();
         let mut upgrade = upgrade_fixture(admitted_header.service_root);

@@ -98,12 +98,7 @@ impl ConsoleEngine {
         let delta = {
             let mut ws = StateWorkingSet::new(&self.engine_state);
             for agent in &agents {
-                // A missing/undecodable schema just means no commands for that
-                // agent yet — skip rather than fail the whole refresh.
-                let meta = match self.client.schema(&agent.instance_name) {
-                    Ok(Some(m)) => m,
-                    Ok(None) | Err(_) => continue,
-                };
+                let meta = self.client.schema(&agent.instance_name)?;
                 for msg in &meta.messages {
                     ws.add_decl(Box::new(ActorCommand::new(
                         agent.instance_name.clone(),

@@ -1,7 +1,6 @@
 //! `space info` — show metadata + daemon liveness for a single
 //! space. When the daemon is up, also round-trips a registry
-//! call to confirm reachability and report RTT (the diagnostic
-//! the old `space ping` exposed).
+//! call to confirm reachability and report RTT.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

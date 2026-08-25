@@ -651,7 +651,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    // ── Sprint 5 — crash-recovery tests ──────────────────────
+    // ── Crash-recovery tests ─────────────────────────────────
     //
     // The existing tests above drop the `RedbStorage` and re-open
     // a new one from the *same* `Arc<Database>` handle. That misses

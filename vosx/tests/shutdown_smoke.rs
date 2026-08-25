@@ -1,6 +1,6 @@
 //! `vosx space up` exits cleanly on SIGTERM.
 //!
-//! Regression for Sprint 1 / C8 — without a signal handler the
+//! Without a signal handler the
 //! daemon ignored SIGTERM and the supervisor had to escalate to
 //! SIGKILL, losing in-flight commits + leaking the endpoint file.
 //! The handler installed in `vosx::shutdown::install` flips the
@@ -207,7 +207,7 @@ fn wait_for_endpoint(data_home: &Path, log_path: &Path) -> PathBuf {
     }
 }
 
-/// Sprint 5: SIGKILL bypasses the graceful shutdown handler and
+/// SIGKILL bypasses the graceful shutdown handler and
 /// any in-process cleanup the daemon would otherwise run. The
 /// auth_grants the operator wrote BEFORE the kill must still be
 /// in redb when the daemon restarts — that's the durability

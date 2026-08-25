@@ -155,7 +155,7 @@ impl SpaceAuthority {
             redemption.role.as_u8(),
             redemption.expires_at,
             &redemption.token_pub,
-            Some(&redemption.authority_replication_id),
+            &redemption.authority_replication_id,
         );
         if !Self::verify_peer_signature(
             &redemption.admin_peer_id,
@@ -503,7 +503,7 @@ mod tests {
             role.as_u8(),
             expires_at,
             &token_pub,
-            Some(&authority_replication_id),
+            &authority_replication_id,
         );
         let redeem =
             vos::registry::canonical_op_bytes("redeem_invite", &[&token_pub, &holder_peer_id]);

@@ -7,7 +7,7 @@
 //! one explicit, domain-separated encoding owned by cipher-clerk, the two
 //! sides agree *by construction* — there is no rkyv-layout / cross-crate
 //! equivalence left to guard (the prior dual-encoding `canonical_bytes`
-//! wart is gone, the D1 cleanup).
+//! wart is gone).
 //!
 //! So this is now a fast host-side canary that vos's io-hash primitive
 //! composes with cipher-clerk's `public_bytes` the way the bridge expects

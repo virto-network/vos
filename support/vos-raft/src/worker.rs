@@ -307,9 +307,7 @@ impl<N: NodeId> Worker<N> {
     /// [`StdRng`](crate::StdRng). The thread runs a single-task
     /// `futures_executor::block_on` over the worker future.
     ///
-    /// `apply_notifier` is the historical std-only convenience: a
-    /// `None` suppresses commit notifications (sink = `()`) and
-    /// `Some(sender)` plugs the channel directly into the worker.
+    /// `apply_notifier` optionally receives committed indices.
     /// For embedded use or custom sinks, call
     /// [`spawn_with`](Self::spawn_with) and pass any
     /// [`ApplySink`].
@@ -323,9 +321,7 @@ impl<N: NodeId> Worker<N> {
         S: Storage<N>,
         T: Transport<N>,
     {
-        // Translate the historical Option<Sender> into the
-        // generic ApplySink at the call site so the inner
-        // `spawn_with` signature stays uniform.
+        // Select the concrete ApplySink while keeping `spawn_with` generic.
         match apply_notifier {
             Some(tx) => Self::spawn_with(
                 storage,

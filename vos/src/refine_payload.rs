@@ -81,7 +81,7 @@ pub const REFINE_PAYLOAD_MAGIC: [u8; 4] = *b"VRFN";
 /// Flag bit: guest yielded; host should re-queue this service next tick.
 pub const FLAG_CONTINUE_NEXT: u8 = 0x01;
 
-/// Flag bit: the M6 macro-emitted role check refused the call.
+/// Flag bit: the macro-emitted role check refused the call.
 /// Host produces a `STATUS_FORBIDDEN` invoke envelope so vosx
 /// surfaces "permission denied" instead of treating the empty
 /// reply as `Value::Unit`. Wire-additive — older hosts that
@@ -176,7 +176,7 @@ pub struct RefinePayload {
     pub app_public: Vec<u8>,
     /// Guest requested to be re-scheduled next tick (yield_now / sleep).
     pub continue_next: bool,
-    /// M6 — the macro-emitted pre-dispatch role check refused the call.
+    /// The macro-emitted pre-dispatch role check refused the call.
     pub forbidden: bool,
 }
 

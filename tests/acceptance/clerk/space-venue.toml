@@ -11,7 +11,6 @@
 # must be granted Admin (the grant script in the bloque repo does this).
 # submit_claim is an OPEN handler — submitting banks are not venue members.
 space = "venue"
-version = "0.1.0"
 
 # Same hyperspace name as the banks so the venue's clerk-settle is advertised
 # into the shared registry and the banks' drivers can resolve it cross-space.

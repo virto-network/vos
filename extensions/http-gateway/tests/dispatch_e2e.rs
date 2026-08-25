@@ -86,8 +86,7 @@ fn keepalive_gets(port: u16, paths: &[String]) -> Vec<(u16, String)> {
 
 // ── Fixture sanity ──────────────────────────────────────────────
 //
-// Pre-Phase-6 admin-namespace tests are gone; `vosx gateway *`
-// covers the lifecycle surface in `gateway_pvm_e2e`. Boot-time
+// `vosx gateway *` covers the lifecycle surface in `gateway_pvm_e2e`. Boot-time
 // sanity is implicitly covered by every test below — a failed
 // `TestNode::start` aborts the run.
 
@@ -128,8 +127,8 @@ fn gateway_is_a_transport_extension_with_no_msg_handlers() {
         unsafe { vos::extension::ExtensionPlugin::load(&paths.gateway) }.expect("load gateway");
     let meta = plugin.meta().expect("meta");
     assert_eq!(
-        meta.kind, 2,
-        "gateway should be ExtensionKind::Transport (2); saw kind {}",
+        meta.kind, 1,
+        "gateway should be ExtensionKind::Transport (1); saw kind {}",
         meta.kind,
     );
     assert!(
@@ -525,7 +524,7 @@ fn mutating_state_persists_across_calls() {
 
 #[test]
 fn metrics_reflect_request_count() {
-    // Replaces the pre-Phase-6 `admin_status_reflects_request_count`
+    // Covers the public metrics surface.
     // that scraped `GET /__admin/status`. The same dispatched-
     // request counter now rides `GET /__metrics` as
     // `vos_gateway_requests_total` — public, scrape-friendly,

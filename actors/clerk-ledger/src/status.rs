@@ -13,7 +13,7 @@ use cipher_clerk::error::EventStatus;
 /// comparing raw byte codes. The `#[repr(u8)]` discriminants are
 /// wire-stable — bumping the type or reordering variants WILL
 /// shift the rkyv archive bytes and break peer banks running
-/// older builds.
+/// the canonical wire.
 ///
 /// Many of these collapse multiple kernel `EventStatus` variants
 /// (see `map_event_status`). The kernel's taxonomy is

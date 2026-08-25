@@ -1,4 +1,4 @@
-//! `space invite` — mint a `vos1…` invite token.
+//! `space invite` — mint a `vos-…` invite token.
 //!
 //! An invite is a pointer + credential, never policy (decision 3): it
 //! carries the space id, name, bootnodes, a role, an expiry, and an
@@ -30,11 +30,11 @@ pub enum InviteCommand {
     /// credential the registry hasn't seen yet. Same rows as `space
     /// members`.
     List,
-    /// Revoke an invite by its exact `vos1…` bearer or a recorded
+    /// Revoke an invite by its exact `vos-…` bearer or a recorded
     /// `token_pub` prefix. Grow-only + idempotent; does NOT claw back a
     /// role already granted by a redemption — use `space role revoke`.
     Revoke {
-        /// Exact `vos1…` token, or a hex `token_pub` prefix from `invite list`.
+        /// Exact `vos-…` token, or a hex `token_pub` prefix from `invite list`.
         prefix: String,
     },
 }
@@ -141,7 +141,7 @@ fn revoke(space: &str, selector: &str) -> anyhow::Result<()> {
             match matches.as_slice() {
                 [] => anyhow::bail!(
                     "no invite token matches prefix '{prefix}' in space '{}' \
-                     (pass the exact vos1… token to revoke it before first redemption)",
+                     (pass the exact vos-… token to revoke it before first redemption)",
                     client.entry.name,
                 ),
                 [one] => one.token_pub.to_vec(),

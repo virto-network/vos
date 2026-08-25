@@ -5,8 +5,8 @@
 set -e
 
 echo "→ pre-commit: fmt"
-# `--all` follows path-deps into the sibling jar/grey tree and the
-# excluded actor crates, so we stick with the workspace-only run.
+# `--all` follows path dependencies into excluded actor crates, so we stick
+# with the workspace-only run.
 cargo fmt -- --check
 
 echo "→ pre-commit: clippy"

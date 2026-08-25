@@ -838,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn replicated_timeout_payload_pins_the_ambient_jam_slot() {
+    fn replicated_timeout_payload_pins_the_ambient_timeslot() {
         let bytes = expiration_request().encode();
         assert!(RaftAccumulatePayload::from_request(&bytes, None, None, &[], &[], &[]).is_err());
         assert!(
@@ -869,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn replicated_receipt_sidecar_uses_a_clean_break_wire() {
+    fn replicated_receipt_sidecar_rejects_an_invalid_envelope() {
         let payload = RaftAccumulatePayload::from_request(
             &request(1).encode(),
             None,
@@ -882,9 +882,9 @@ mod tests {
         let encoded = payload.encode();
         assert_eq!(RaftAccumulatePayload::decode(&encoded).unwrap(), payload);
 
-        let mut retired = encoded;
-        retired[..4].copy_from_slice(b"VRQW");
-        assert!(RaftAccumulatePayload::decode(&retired).is_err());
+        let mut invalid = encoded;
+        invalid[..4].copy_from_slice(b"NOPE");
+        assert!(RaftAccumulatePayload::decode(&invalid).is_err());
         assert!(
             RaftAccumulatePayload::from_request(
                 &request(1).encode(),

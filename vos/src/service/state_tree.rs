@@ -692,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn logical_values_may_be_empty_even_though_jam_zero_length_deletes() {
+    fn logical_values_may_be_empty_even_when_physical_empty_values_delete() {
         let mut store = MemStore::default();
         let key = row(2);
         let root = ServiceStateTree::new(&mut store, empty_state_root())

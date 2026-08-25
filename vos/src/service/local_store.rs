@@ -3804,7 +3804,7 @@ mod tests {
         assert_eq!(
             restarted.private_ingress(private_invocation, &private_reference),
             Some(private_arguments.clone()),
-            "startup migrates Batch 60 raw input owned by an unconsumed guest ingress",
+            "startup retains input owned by an unconsumed guest ingress",
         );
         assert_eq!(
             restarted.private_ingress(orphan_invocation, &orphan_reference),

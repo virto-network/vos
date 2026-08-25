@@ -13,7 +13,6 @@
 # SINGLE bank share it — that is the bank's Raft cluster — and the two banks
 # differ.
 space = "bank-a"
-version = "0.1.0"
 
 # Federate over the shared hyperspace: every bank AND the venue declare the
 # same name, so each node additionally spawns a registry replica into the

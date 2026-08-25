@@ -135,9 +135,8 @@ fn handle_metrics(req: &Request, inner: &Inner) -> Option<Response> {
         return Some(text(405, "/__metrics is GET-only"));
     }
     let body = crate::state::render_prometheus(inner).into_bytes();
-    // Prometheus exposition convention. Some scrapers tolerate
-    // bare `text/plain` too, but the versioned content-type is
-    // the canonical form.
+    // Prometheus exposition convention. Some scrapers also tolerate bare
+    // `text/plain`, but this is the canonical content type.
     Some(with_content_type(200, "text/plain; version=0.0.4", body))
 }
 
@@ -304,9 +303,8 @@ fn label_return(mut resp: Response, ret_ty: Option<&str>) -> Response {
 /// - `GET /__schema`           → JSON `["name", ...]` of installed agents
 /// - `GET /__schema/<agent>`   → JSON `ActorMeta` of that agent
 ///
-/// Non-GET methods 405; unknown agents 404; agents without
-/// registered meta (older binaries, hash mismatch) 404 with
-/// "no schema for".
+/// Non-GET methods return 405. Unknown agents and agents without registered
+/// metadata return 404.
 async fn handle_schema(
     req: &Request,
     inner: &Inner,
@@ -387,8 +385,7 @@ async fn schema_for_agent(name: &str, inner: &Inner, ctx: &mut Context<HttpGatew
 
 /// Render a `ParsedMeta` as JSON. Mirrors the field names of the
 /// in-tree `ActorMeta`/`MessageMeta`/`FieldMeta` structs so a
-/// client that's parsed a vos meta binary in a previous life sees
-/// the same names — `actor_name`, `messages[i].name`,
+/// The field names mirror the in-tree schema: `actor_name`, `messages[i].name`,
 /// `messages[i].is_query`, `messages[i].fields[j].name/type`,
 /// `constructor[i].name/type`, `kind`, `caps`.
 fn meta_to_json(meta: &vos::metadata::ParsedMeta) -> String {
@@ -480,7 +477,7 @@ async fn render_openapi(inner: &Inner, ctx: &mut Context<HttpGateway>) -> Respon
         "openapi": "3.0.3",
         "info": {
             "title": "VOS gateway",
-            "version": "1.0",
+            "version": "unreleased",
             "description": "Auto-generated from installed-agent schemas (see GET /__schema)."
         },
         "paths": paths_obj,
@@ -836,9 +833,8 @@ async fn fetch_meta_from_registry(
         return None;
     }
     // The reply is a `Value::Bytes(...)` carrying the raw
-    // `.vos_meta` section. Empty bytes means the registry didn't
-    // find a meta entry (old binary, hash mismatch). `decode`
-    // returns None on a malformed/empty section too.
+    // `.vos_meta` section. Empty bytes mean no entry exists. `decode`
+    // returns None for malformed data too.
     let value = <vos::value::Value as vos::Decode>::try_decode(&bytes)?;
     let raw = value.as_bytes()?;
     if raw.is_empty() {

@@ -17,7 +17,7 @@ use crate::config::NodeId;
 /// replicated them.
 ///
 /// Most entries are `EntryKind::Data` carrying an application
-/// payload; future versions will add `EntryKind::ConfigChange`
+/// payload; membership APIs add `EntryKind::ConfigChange`
 /// entries produced by membership-change APIs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogEntry<N: NodeId> {

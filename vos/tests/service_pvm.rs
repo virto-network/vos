@@ -4899,7 +4899,7 @@ fn canonical_space_authority_authorizes_a_physical_target_and_exact_retry() {
         vos::SpaceRole::Member.as_u8(),
         expires_at,
         &token_pub,
-        Some(&authority_replication_id),
+        &authority_replication_id,
     );
     let redeem =
         vos::registry::canonical_op_bytes("redeem_invite", &[&token_pub, &invited_peer_id]);

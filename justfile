@@ -45,6 +45,7 @@ build-vos-service:
 # Build the package/service pair consumed by the physical daemon-root test.
 build-daemon-root-artifacts: build-vos-service
     cd examples/actors; cargo +nightly actor -p counter
+    cd vos/tests/fixtures/counter-upgrade; cargo +nightly actor
 
 # Build every guest consumed by the physical service gate.
 build-pvm-test-artifacts: build-daemon-root-artifacts (build-actor "space-authority") (build-actor "clerk-ledger") (build-actor "clerk-bridge") build-clerk-apply

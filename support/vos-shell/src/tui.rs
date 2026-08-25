@@ -715,8 +715,8 @@ mod tests {
         fn raw_meta(&self, _name: &str) -> Result<Vec<u8>, BackendError> {
             Ok(vec![])
         }
-        fn schema(&self, _name: &str) -> Result<Option<ParsedMeta>, BackendError> {
-            Ok(Some(self.schema.clone()))
+        fn schema(&self, _name: &str) -> Result<ParsedMeta, BackendError> {
+            Ok(self.schema.clone())
         }
         fn invoke(&self, _t: ServiceId, msg: &Msg) -> Result<Value, BackendError> {
             if msg.name == "add" {

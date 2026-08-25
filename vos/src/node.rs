@@ -421,9 +421,7 @@ impl Consistency {
 /// Pinned back to `sealed`: a shareability *widening* (e.g. `Local`→`Crdt`),
 /// AND a `Crdt`↔`Raft` *lateral* — same shareability, but it swaps the
 /// replication trust model (consensus-sequenced Raft ↔ merge-anyone CRDT), so
-/// a forged catalog byte must not be able to downgrade a Raft replica to CRDT
-/// The earlier seal collapsed `Crdt`/`Raft` to one shareability rank and
-/// let the lateral through; this pins the exact tier instead.
+/// a forged catalog byte must not be able to downgrade a Raft replica to CRDT.
 #[cfg(feature = "storage")]
 pub(crate) fn effective_after_seal(
     sealed: Option<Consistency>,
@@ -764,7 +762,7 @@ pub struct ExtensionConfig {
     /// When set, the extension's redb file is created at
     /// `{data_dir}/extensions/{name}.redb`.
     pub data_dir: Option<std::path::PathBuf>,
-    /// Sprint 2: cap-overage policy applied at the host ABI
+    /// Cap-overage policy applied at the host ABI
     /// boundary for this extension. Default `Block` — refuse
     /// syscalls outside the declared caps. Override via the space
     /// manifest's `cap_policy = "log"`/`"block"`/`"kill"`.
@@ -960,21 +958,21 @@ struct InvokeRequest {
     /// the noise-verified PeerId); `Caller::Actor` for intra-system
     /// invokes (the calling actor's ServiceId); `Caller::Unauthenticated`
     /// for host-initiated calls and future HTTP gateway routes.
-    #[allow(dead_code)] // Consumer wired via macro emission in M6.
+    #[allow(dead_code)] // Consumed by macro-emitted dispatch.
     caller: crate::actors::Caller,
     /// Space-wide role byte for `caller`, decoded as a
     /// [`SpaceRole`](crate::actors::SpaceRole) discriminant.
     /// `None` for callers without a space-level grant (Unauthenticated
     /// or unknown peers). Populated by [`NodeService::dispatch_invoke`]
-    /// in M5; until then, all sites leave it at `None`.
-    #[allow(dead_code)] // Consumer wired in M3/M5.
+    /// when the host resolves an actor-local grant.
+    #[allow(dead_code)] // Consumed by authenticated dispatch.
     space_role: Option<u8>,
     /// Actor-local role byte for `caller`, decoded against the
     /// target actor's [`Role`](crate::Actor::Role) discriminant.
     /// `None` when no actor-local grant exists; falls back to the
     /// space-level grant mapped via `SPACE_ROLE_MAP`. Populated
-    /// in M5; until then, all sites leave it at `None`.
-    #[allow(dead_code)] // Consumer wired in M3/M5.
+    /// when the host resolves a space grant.
+    #[allow(dead_code)] // Consumed by authenticated dispatch.
     actor_local_role: Option<u8>,
     /// Consensus-significant origin observed by another replica before it
     /// redirected this Raft invocation. Only the network ingress may populate
@@ -1975,7 +1973,7 @@ impl InvokeHandle {
             // bypasses role checks via the trust shortcut so
             // host-side bootstrap (admin grant before any peer
             // is enrolled) and test harness calls don't hit the
-            // M6 macro-emitted gate.
+            // Macro-emitted role gate.
             caller: crate::actors::Caller::System,
             space_role: None,
             actor_local_role: None,
@@ -2298,7 +2296,7 @@ impl NodeService {
         unwrap_invoke_envelope(&envelope)
     }
 
-    /// Sprint 2 auth lookup. Send a synchronous `peer_role` invoke
+    /// Send a synchronous `peer_role` invoke
     /// to the local space-registry and surface the result as the
     /// `AUTH_ROLE_*` byte the gate compares against. Returns
     /// `AUTH_ROLE_NONE` (= "deny") for any of:
@@ -2956,7 +2954,7 @@ fn send_service_raft_invoke_exact(
 
 /// Pull a `u8` out of the actor-framework reply bytes. Handles
 /// both the `Value::U8` wire shape and the `Value::Bytes(rkyv(u8))`
-/// fallback. Sprint 2's auth lookup needs this; other host
+/// fallback. The authorization lookup needs this; other host
 /// callers stay with the dynamic Value decoder.
 #[cfg(feature = "network")]
 fn decode_u8_reply(bytes: &[u8]) -> Option<u8> {
@@ -3315,7 +3313,7 @@ impl crate::network::NetworkService for NodeService {
         // here. A future protocol bump can carry the envelope so
         // remote yielded children become drivable cross-node.
         //
-        // M7 — STATUS_FORBIDDEN envelopes are preserved verbatim
+        // STATUS_FORBIDDEN envelopes are preserved verbatim
         // so the client-side `is_forbidden_envelope` peek
         // surfaces ClientError::Forbidden ("permission denied").
         // Without this passthrough, the unwrap collapses the
@@ -7535,7 +7533,7 @@ struct RaftRedirect {
 struct RaftDelegatedIngress {
     origin: crate::service::Origin,
     /// Return the complete status/state/reply envelope to typed host callers.
-    /// Actor/extension forwarding keeps the historical raw-reply contract.
+    /// Actor and extension forwarding returns only the actor reply.
     preserve_envelope: bool,
     /// Host-private protocol marker forwarded only after the source peer has
     /// been authenticated as a voter of this exact root's Raft group.
@@ -11703,8 +11701,7 @@ fn handle_invoke_request(
 }
 
 /// Wire-byte for "no grant exists" in the registry's
-/// `peer_role` / `actor_role` probe replies. Mirrors
-/// `space_registry::AUTH_ROLE_NONE`; kept here so the host
+/// `peer_role` probe replies. Mirrors `space_registry::AUTH_ROLE_NONE`; kept here so the host
 /// doesn't need a cross-crate dep on the actor just to read a
 /// single byte.
 #[cfg(feature = "network")]
@@ -11752,7 +11749,7 @@ fn is_private_read_method(method: &str) -> bool {
 /// vosx surfaces "permission denied" rather than colliding with
 /// a generic actor panic.
 ///
-/// Retained post-M7 as a host-side fallback (e.g. for a future
+/// Host-side fallback (e.g. for a future
 /// quota / rate-limit gate); the actor-level role check now
 /// produces STATUS_FORBIDDEN through the agent's own dispatch.
 ///
@@ -12068,7 +12065,7 @@ fn dispatch_once(
         };
     if let Some(payload) = msg {
         // SECURITY: wrap with Caller::Unauthenticated *before*
-        // dispatching so the actor's M7 dispatch_one always sees
+        // dispatching so the actor's dispatch_one always sees
         // a host-controlled caller prefix. Without this wrap, an
         // attacker could send a libp2p Tell whose payload begins
         // with TAG_CALLER_PREFIX (0xFE) and have dispatch_one
@@ -13310,7 +13307,7 @@ impl ConnFulfiller {
 
     /// Transport conn tasks have no inbound caller — they serve raw external
     /// (HTTP/TCP) traffic with no authenticated VOS principal — so they relay
-    /// [`Caller::Unauthenticated`] (reaches only `*`/public targets via the M5
+    /// [`Caller::Unauthenticated`] (reaches only `*`/public targets via the
     /// gate), matching the gateway's relay posture. See [`route_invoke`].
     ///
     /// NOTE: a transport extension's declared `intra_caps` are therefore NOT a
@@ -14637,8 +14634,7 @@ mod tests {
         // positive controls) interleaved with forged ops signed by a
         // non-admin — inject it via the same `insert_node` path, then
         // cold-start the registry so the real replay runs. The
-        // root-signed grant + install must land; the forged grant +
-        // install (the forged AgentRow vector) must not. This is the
+        // root-signed install must land; the forged install must not. This is the
         // end-to-end counterpart to the registry's
         // `forged_*_rejected_on_system_replay_path` unit tests, which
         // exercise only the actor struct.
@@ -14661,7 +14657,6 @@ mod tests {
         let blob = vos_pvm_compiler::link_elf(&elf).expect("registry transpiles");
 
         // ── Identities ──────────────────────────────────────────────
-        const ADMIN: u8 = 3; // space_registry::AUTH_ROLE_ADMIN
         let root_key = SigningKey::from_bytes(&[7u8; 32]);
         let attacker_key = SigningKey::from_bytes(&[42u8; 32]);
         let peer_id_for = |pk: [u8; 32]| -> Vec<u8> {
@@ -14671,7 +14666,6 @@ mod tests {
         };
         let root_peer = peer_id_for(root_key.verifying_key().to_bytes());
         let attacker_peer = peer_id_for(attacker_key.verifying_key().to_bytes());
-        let victim = vec![0xBBu8; 38];
 
         // auth blob = signer_peer_id || ed25519_sig(canonical_op_bytes).
         let auth_as =
@@ -14683,7 +14677,6 @@ mod tests {
 
         // A shared program the installs pin to.
         let prog = "p";
-        let ver = "1";
         let hash = vec![7u8; 32];
         let rep = vec![9u8; 32];
         let consistency = Consistency::Crdt.as_u8();
@@ -14695,32 +14688,11 @@ mod tests {
             p.extend_from_slice(&m.encode());
             p
         };
-        let grant_msg = |key: &SigningKey, signer: &[u8], who: &[u8]| {
-            // First grant for each peer → epoch 1 (the canonical now binds
-            // a per-peer freshness epoch; see space_registry::grant_role).
-            let epoch: u64 = 1;
-            dyn_payload(
-                Msg::new("grant_role")
-                    .with("peer_id", who.to_vec())
-                    .with("role", ADMIN as u64)
-                    .with("epoch", epoch)
-                    .with(
-                        "auth",
-                        auth_as(
-                            key,
-                            signer,
-                            "grant_role",
-                            &[who, &[ADMIN], &epoch.to_le_bytes()],
-                        ),
-                    ),
-            )
-        };
         let install_msg = |key: &SigningKey, signer: &[u8], inst: &str| {
             dyn_payload(
                 Msg::new("install")
                     .with("instance_name", inst.to_string())
                     .with("program_name", prog.to_string())
-                    .with("program_version", ver.to_string())
                     .with("program_hash", hash.clone())
                     .with("replication_id", rep.clone())
                     .with("consistency", consistency as u64)
@@ -14735,12 +14707,9 @@ mod tests {
                             &[
                                 inst.as_bytes(),
                                 prog.as_bytes(),
-                                ver.as_bytes(),
                                 &hash,
                                 &rep,
                                 &[consistency],
-                                &[],
-                                &[],
                                 &[0u8], // network_reachable = false
                                 &[crate::registry::SyncFloor::Member as u8], // sync_role
                             ],
@@ -14753,7 +14722,6 @@ mod tests {
         let publish = dyn_payload(
             Msg::new("publish")
                 .with("name", prog.to_string())
-                .with("version", ver.to_string())
                 .with("hash", hash.clone())
                 .with("crdt", true)
                 .with(
@@ -14762,14 +14730,12 @@ mod tests {
                         &root_key,
                         &root_peer,
                         "publish",
-                        &[prog.as_bytes(), ver.as_bytes(), &hash, &[1u8]],
+                        &[prog.as_bytes(), &hash, &[1u8]],
                     ),
                 ),
         );
         let ops = [
             set_root,
-            grant_msg(&root_key, &root_peer, &victim), // valid grant
-            grant_msg(&attacker_key, &attacker_peer, &attacker_peer), // forged grant
             publish,
             install_msg(&root_key, &root_peer, "good"), // valid install
             install_msg(&attacker_key, &attacker_peer, "evil"), // forged install
@@ -14828,22 +14794,12 @@ mod tests {
             p.extend_from_slice(&m.encode());
             node.invoke(ServiceId::REGISTRY, p).expect("registry reply")
         };
-        let role_of = |peer: &[u8]| -> u64 {
-            let bytes = invoke(Msg::new("peer_role").with("peer_id", peer.to_vec()));
-            let v: crate::value::Value = crate::Decode::decode(&bytes);
-            v.as_u64().expect("peer_role returns an integer")
-        };
         let agent_reply =
             |inst: &str| invoke(Msg::new("agent").with("instance_name", inst.to_string()));
         let none_reply = agent_reply("does-not-exist"); // canonical `None` for this type
 
         // Positive controls: the root-signed ops survived replay —
         // proves the inject + replay pipeline is genuinely live.
-        assert_eq!(
-            role_of(&victim),
-            ADMIN as u64,
-            "root-signed grant must apply on replay"
-        );
         assert_ne!(
             agent_reply("good"),
             none_reply,
@@ -14853,14 +14809,9 @@ mod tests {
         // The headline: forged ops were refused by authorize_op on the
         // System replay path, so neither row ever materializes.
         assert_eq!(
-            role_of(&attacker_peer),
-            0,
-            "forged admin grant must be rejected at replay (AUTH_ROLE_NONE)",
-        );
-        assert_eq!(
             agent_reply("evil"),
             none_reply,
-            "forged install (M5 AgentRow vector) must be rejected at replay",
+            "forged install must be rejected at replay",
         );
 
         node.shutdown();
@@ -15208,7 +15159,7 @@ mod tests {
         assert_eq!(unwrap_invoke_envelope(&env), None);
     }
 
-    // ── Tell-path forgery defense (C1 regression test) ───────
+    // ── Tell-path forgery defense ─────────────────────────────
     //
     // The dispatch-prefix protocol is the host's mechanism for asserting
     // "this dispatch is from <Caller> under <InvocationId>"; the PVM strips
@@ -15586,12 +15537,12 @@ mod tests {
 
     #[test]
     #[cfg(all(feature = "network", feature = "storage"))]
-    fn service_crdt_private_floor_requires_a_space_or_actor_grant() {
+    fn service_crdt_private_floor_requires_a_space_grant() {
         use crate::registry::SyncFloor;
 
         let peer = libp2p::PeerId::random();
-        let check = |floor, space_role, actor_role| {
-            let (routes, registry) = spawn_stub_sync_floor_registry(floor, space_role, actor_role);
+        let check = |floor, space_role| {
+            let (routes, registry) = spawn_stub_sync_floor_registry(floor, space_role);
             let allowed = service_crdt_sync_peer_allowed(
                 &routes,
                 &peer,
@@ -15602,28 +15553,11 @@ mod tests {
             registry.join().unwrap();
             allowed
         };
-        assert!(!check(
-            Some(SyncFloor::Private),
-            AUTH_ROLE_NONE,
-            AUTH_ROLE_NONE
-        ));
-        assert!(check(
-            Some(SyncFloor::Private),
-            AUTH_ROLE_READONLY,
-            AUTH_ROLE_NONE
-        ));
-        assert!(check(
-            Some(SyncFloor::Private),
-            AUTH_ROLE_NONE,
-            AUTH_ROLE_READONLY
-        ));
-        assert!(check(
-            Some(SyncFloor::Member),
-            AUTH_ROLE_NONE,
-            AUTH_ROLE_NONE
-        ));
+        assert!(!check(Some(SyncFloor::Private), AUTH_ROLE_NONE));
+        assert!(check(Some(SyncFloor::Private), AUTH_ROLE_READONLY));
+        assert!(check(Some(SyncFloor::Member), AUTH_ROLE_NONE));
         assert!(
-            !check(None, AUTH_ROLE_READONLY, AUTH_ROLE_READONLY),
+            !check(None, AUTH_ROLE_READONLY),
             "an unknown floor must deny even an otherwise granted enrolled peer"
         );
     }
@@ -16550,7 +16484,7 @@ mod tests {
         node.route(Envelope {
             from: ServiceId::new(colliding_prefix, 8),
             to: route,
-            payload: b"VRT2 collision regression".to_vec(),
+            payload: b"VRTW collision regression".to_vec(),
             authenticated_source_peer: None,
             destination_peer: Some(peer_bytes.clone()),
         });
@@ -16563,7 +16497,7 @@ mod tests {
         node.route(Envelope {
             from: route,
             to: route,
-            payload: b"VRT2 inbound collision regression".to_vec(),
+            payload: b"VRTW inbound collision regression".to_vec(),
             authenticated_source_peer: Some(peer_bytes.clone()),
             destination_peer: None,
         });
@@ -16662,14 +16596,25 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(decode_service_raft_delegation(b"VRD4\x02\x00\x00bad").is_err());
-        assert!(decode_service_raft_delegation(b"VRD4\x00\x02\x00bad").is_err());
-        assert!(decode_service_raft_delegation(b"VRD4\x00\x00\x02bad").is_err());
+        let mut invalid = encode_service_raft_delegation(
+            crate::service::Origin::System,
+            true,
+            false,
+            false,
+            b"root ingress",
+        );
+        invalid[4] = 2;
+        assert!(decode_service_raft_delegation(&invalid).is_err());
+        invalid[4] = 0;
+        invalid[5] = 2;
+        assert!(decode_service_raft_delegation(&invalid).is_err());
+        invalid[5] = 0;
+        invalid[6] = 2;
+        assert!(decode_service_raft_delegation(&invalid).is_err());
         assert!(
-            decode_service_raft_delegation(b"VRD2\x00\x03old")
+            decode_service_raft_delegation(b"NOPE\x00\x03bad")
                 .unwrap()
-                .is_none(),
-            "the pre-marker delegation layout cannot be ambiguously decoded",
+                .is_none()
         );
     }
 
@@ -16749,7 +16694,7 @@ mod tests {
     }
 
     #[test]
-    fn backwards_compat_local_ids() {
+    fn zero_prefix_ids_address_local_services() {
         let id = ServiceId(3);
         assert_eq!(id.node_prefix(), 0);
         assert_eq!(id.local_id(), 3);
@@ -19663,7 +19608,6 @@ mod tests {
     fn spawn_stub_sync_floor_registry(
         floor: Option<crate::registry::SyncFloor>,
         space_role: u8,
-        actor_role: u8,
     ) -> (InvokeRoutes, thread::JoinHandle<()>) {
         use crate::actors::codec::Encode;
         use crate::registry::AgentRow;
@@ -19693,7 +19637,6 @@ mod tests {
                         }
                         Value::Bytes(tagged)
                     }
-                    Some("actor_role") => Value::U8(actor_role),
                     _ => Value::U8(space_role),
                 };
                 let reply =
@@ -19990,7 +19933,7 @@ mod tests {
         };
         assert!(
             json.contains("\"name\":\"gateway\"")
-                && json.contains("\"kind\":2")
+                && json.contains("\"kind\":1")
                 && json.contains("\"running\":true")
                 && json.contains("127.0.0.1:8080"),
             "describe json: {json}",
@@ -20033,7 +19976,7 @@ mod tests {
             target.0,
             AgentInfo {
                 name: Some("gateway".into()),
-                kind: 2,
+                kind: crate::extension::ExtensionKind::Transport as u8,
                 serves_addr: Some("127.0.0.1:8080".into()),
                 consistency: None,
                 network_reachable: true,

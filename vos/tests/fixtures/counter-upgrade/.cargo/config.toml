@@ -1,0 +1,5 @@
+[target.riscv64em-vos]
+rustflags = ["-C", "link-arg=--entry=__vos_entry", "-C", "link-arg=-Ttext=0x10000"]
+
+[alias]
+actor = "rustc --lib --crate-type bin -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --release --target riscv64em-vos.json"

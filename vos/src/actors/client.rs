@@ -57,7 +57,7 @@ pub enum ClientError {
     UnexpectedReply(String),
     /// Reply payload was the right `Value` shape but couldn't
     /// be rkyv-decoded into the user-defined return type. Most
-    /// often a version skew between the actor and the consumer.
+    /// often an interface mismatch between the actor and the consumer.
     Decode,
     /// The remote daemon's dispatch-layer auth gate refused the
     /// call (`STATUS_FORBIDDEN` envelope). The local peer lacks
@@ -144,7 +144,7 @@ pub struct AttestedInvocationResult {
     pub value: Value,
     pub producer_name: String,
     pub producer: crate::service::ProducerId,
-    pub statement: crate::AttestationStatement,
+    pub statement: crate::attestation::AttestationStatement,
     pub trace: crate::service::Hash,
     pub proof: Vec<u8>,
 }

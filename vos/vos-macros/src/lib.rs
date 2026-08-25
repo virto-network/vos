@@ -115,7 +115,7 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     //   #[actor(caps = ["net.tcp.bind", ...])] — declarative capability list
     // A proof exists only for the witness-delivered, refine-pure Task
     // shape — `provable` on anything else is a category error, not a
-    // flag to ignore (docs/actors.md D1/D6).
+    // flag to ignore.
     if parsed.provable && parsed.task_buf.is_none() {
         return syn::Error::new(
             proc_macro2::Span::call_site(),
@@ -347,7 +347,7 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             // Per-agent ACL framework — sentinel defaults so
             // actors that haven't declared their own `Role` enum
             // keep compiling. `NoRoles::Any` admits every check;
-            // M7-and-later actors opt in via
+            // Actors opt in via
             // `#[actor(role = MyRole, default_role = ...,
             // space_role_map = ...)]`.
             type Role = #role_ty;
@@ -459,7 +459,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // section in the binary meta blob) cross-referenced by the
     // decoder to set `ParsedMessage.exposed_to_cli`.
     let mut cli_method_names: Vec<proc_macro2::TokenStream> = Vec::new();
-    // M6 — one arm per `#[msg(role = X)]` variant for the
+    // One arm per `#[msg(role = X)]` variant for the
     // emitted `required_role(&self) -> Option<u8>` method. Other
     // variants emit a `None` arm so the dispatch boundary skips
     // the role check.
@@ -496,7 +496,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         //
         //   #[msg(cli)]          — bare ident; exposes handler to
         //                          the vosx CLI dispatcher.
-        //   #[msg(role = EXPR)]  — M6; requires caller's effective
+        //   #[msg(role = EXPR)]  — requires the caller's effective
         //                          role to be `>=` EXPR before the
         //                          handler runs. EXPR is parsed as
         //                          a syn::Expr so paths like
@@ -846,7 +846,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             });
         }
 
-        // M6 — pre-dispatch role check. Emitted at the very top
+        // Pre-dispatch role check. Emitted at the very top
         // of the arm so it runs *before* the user's handler can
         // observe `msg`. On refusal the actor flags the dispatch
         // as forbidden via Context::__mark_forbidden; lifecycle's
@@ -1149,7 +1149,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
 
-            /// M6 — role byte required to invoke this variant.
+            /// Role byte required to invoke this variant.
             /// `Some(b)` for handlers annotated with
             /// `#[msg(role = X)]` (the byte decodes against
             /// the actor's `Role` enum); `None` for handlers
@@ -1260,12 +1260,9 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // builds receive args via __vos_create_with_args; bare create()
         // is an error there.
         //
-        // The cfg gate is target-based, not feature-based: every PVM
-        // actor crate is built for `riscv64`, the service feature is
-        // enabled on `vos` (not on the user crate). A previous version
-        // checked `cfg(feature = "service")` against the *user* crate
-        // — which never has that feature — and `__vos_create` always
-        // hit the panic branch.
+        // The cfg gate is target-based: every PVM actor crate is built for
+        // `riscv64`, while the service feature belongs to `vos`, not the user
+        // crate.
         quote! {
             fn __vos_create() -> Self {
                 #[cfg(target_arch = "riscv64")]
@@ -1650,20 +1647,20 @@ struct ActorAttrs {
     /// when not specified.
     error_ty: proc_macro2::TokenStream,
     /// Encoded kind byte that lands in the `.vos_meta` blob — 0 for
-    /// `Actor` (the default), 1 for `Service`.
+    /// `Actor` (the default), 1 for `Transport`.
     kind_byte: u8,
     /// Declared capability tokens. Each element is a
     /// string literal that goes into the `Actor::CAPS` slice.
     caps: Vec<String>,
-    /// M7 — token stream for the actor's `Role` associated type
+    /// Token stream for the actor's `Role` associated type
     /// (e.g. `MyRole`). `vos::NoRoles` when not specified, which
     /// makes the actor opt out of RBAC.
     role_ty: proc_macro2::TokenStream,
-    /// M7 — token stream for `Actor::DEFAULT_ROLE` (the value
+    /// Token stream for `Actor::DEFAULT_ROLE` (the value
     /// applied when no grant resolves). `vos::NoRoles::Any` when
     /// not specified.
     default_role: proc_macro2::TokenStream,
-    /// M7 — token stream for `Actor::SPACE_ROLE_MAP` (a const
+    /// Token stream for `Actor::SPACE_ROLE_MAP` (a const
     /// SpaceRoleMap<Self::Role>). Defaults to vos::NO_ROLES_MAP.
     space_role_map: proc_macro2::TokenStream,
     /// `Some(buffer_size)` when the actor is a **Task** blob
@@ -1676,7 +1673,7 @@ struct ActorAttrs {
     crdt: bool,
     /// `#[actor(task, provable)]` — publish this Task as a provable
     /// program: sets `Actor::PROVABLE`, which lands as the `.vos_meta`
-    /// trailing provable flag (`docs/actors.md` D6). Valid
+    /// provable flag. Valid
     /// only with `task`; the macro rejects it otherwise.
     provable: bool,
 }
@@ -1853,7 +1850,7 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
                 }
             }
             syn::Meta::NameValue(nv) if nv.path.is_ident("role") => {
-                // M7 — `role = MyRole` overrides `type Role`.
+                // `role = MyRole` overrides `type Role`.
                 let val = &nv.value;
                 out.role_ty = quote! { #val };
             }
@@ -2004,11 +2001,9 @@ const DEFAULT_TASK_BUF: usize = 16 * 1024;
 fn parse_kind_str(s: &str) -> u8 {
     match s {
         "actor" => 0,
-        "transport" => 2,
-        // Only `actor` and `transport` are supported: discriminant 1
-        // (service-mode) is rejected, and like any unknown kind it falls
-        // back to actor. The macro doesn't fail at compile time so older
-        // toolchains still build crates naming future kinds.
+        "transport" => 1,
+        // Only `actor` and `transport` are supported. Unknown kinds fall
+        // back to actor so metadata never advertises an unsupported mode.
         _ => 0,
     }
 }

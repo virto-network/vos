@@ -46,9 +46,8 @@ pub(crate) struct MetaEntry {
 /// The cache distinguishes three states for a given ServiceId:
 /// - absent key: "not yet asked"
 /// - present, `meta = Some(_)`: schema known
-/// - present, `meta = None`: registry asked, no schema available
-///   (old binary, hash mismatch). Caching `None` avoids
-///   re-asking on every request for the same name.
+/// - present, `meta = None`: registry asked, no schema available. Caching
+///   `None` avoids re-asking on every request for the same name.
 ///
 /// `RefCell` (not `Mutex`): single-threaded executor. The borrow is
 /// always dropped before the registry `ask` — never held across an await.

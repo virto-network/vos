@@ -100,14 +100,8 @@ impl<'a> From<&'a ParsedMeta> for MetaView<'a> {
 
 pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
     DaemonClient::with_connect(space, |client| {
-        // Try the meta lookup first; the registry joins agents +
-        // extension instances internally, so a non-empty blob
-        // proves *some* installed thing owns the name (PVM agent
-        // or native extension). When the lookup comes back empty,
-        // fall back to the agent table to distinguish "name
-        // unknown" from "name installed but no schema" — the
-        // latter happens for older actor binaries that predate
-        // schema forwarding.
+        // The registry joins agents and extension instances internally, so a
+        // non-empty blob proves that an installed target owns the name.
         let blob = client.meta_for_instance(instance)?;
         if blob.is_empty() {
             if client.agent(instance)?.is_none() {
@@ -117,10 +111,8 @@ pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
                 ));
             }
             return Err(anyhow!(
-                "no schema registered for '{instance}'. The agent's \
-                 program was likely installed before vosx started \
-                 forwarding `.vos_meta` to the registry — \
-                 `vosx space apply <space> <recipe>` will refresh it."
+                "no schema registered for '{instance}'; reinstall or repair \
+                 the target package"
             ));
         }
         let meta = decode(&blob).ok_or_else(|| {

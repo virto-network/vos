@@ -13,7 +13,7 @@
 //!
 //! The encoding is deliberately hand-rolled (no serde / rkyv): the
 //! schema is small, framing the wire format ourselves makes
-//! versioning explicit, and we sidestep pulling another serializer
+//! field boundaries explicit, and we sidestep pulling another serializer
 //! into the network feature's dep tree.
 
 const TAG_HELLO: u8 = 0x10;

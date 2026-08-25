@@ -853,7 +853,7 @@ fn print_target_surface(target: &str, meta: Option<&ParsedMeta>) -> anyhow::Resu
     let Some(m) = meta else {
         bail!(
             "no schema registered for '{target}'. \
-             Either the name is unknown or its program predates schema forwarding — \
+             Either the name is unknown or its package has no valid schema — \
              run `vosx space agents <space>` to see installed agents."
         );
     };

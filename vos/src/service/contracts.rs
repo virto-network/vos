@@ -1903,7 +1903,7 @@ pub struct ActorDirectory {
     pub actors: Vec<ActorId>,
 }
 
-/// Clean-break initialization accepted only by an empty service service store.
+/// Initialization accepted only by an empty service store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceGenesis {
     pub service: ServiceIdentity,
@@ -7231,14 +7231,6 @@ mod tests {
         };
         ingress.crdt_change = Some(change);
         assert_eq!(DirectIngress::decode(&ingress.encode()).unwrap(), ingress);
-
-        let mut previous_abi = ingress.encode();
-        previous_abi[4..6].copy_from_slice(&6u16.to_le_bytes());
-        assert_eq!(
-            DirectIngress::decode(&previous_abi),
-            Err(DecodeError::InvalidPlatform),
-            "ABI 6 cannot be interpreted as the authorization-reference wire",
-        );
 
         let admitted = DirectIngress::decode(&ingress.encode_admitted()).unwrap();
         let materialized = DirectIngress::decode(&DirectIngress::encode_materialized(

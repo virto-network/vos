@@ -323,7 +323,7 @@ pub trait CommitStrategy: Send {
     ///
     /// The sync notifier fires for *every* committed index, including the echo
     /// of the agent's OWN proposal — the raft relay can't tell the two apart.
-    /// Default `true` preserves the historical always-reload behaviour; a
+    /// Default `true` always reloads; a
     /// strategy that can recognise a self-commit echo (its committed state
     /// already matches what's on disk) overrides this to return `false` for it,
     /// skipping a soft-restart that would otherwise replay the entire DAG on
@@ -612,12 +612,8 @@ mod crdt {
     pub const NEXT_SEQ_KEY: &str = "crdt_next_seq";
 
     /// Durable marker for the replay-log wire accepted by this runtime.
-    ///
-    /// Pre-marker stores may contain the retired, pre-anchor EffectLog wire.
-    /// Treating those nodes like hostile peer input would quarantine the whole
-    /// legitimate history and make an actor appear fresh after restart. The
-    /// marker lets open fail with the service clean-break instruction while current
-    /// stores can continue quarantining individual malformed peer nodes.
+    /// A non-empty database without this marker is incompatible and rejected;
+    /// malformed peer nodes in a marked database are quarantined individually.
     pub(super) const REPLAY_FORMAT_KEY: &str = "crdt_replay_format";
     const REPLAY_FORMAT: &[u8] = b"VCRW";
 
@@ -1257,7 +1253,7 @@ mod crdt {
             if marker == REPLAY_FORMAT {
                 return Ok(());
             }
-            return Err(retired_replay_format());
+            return Err(incompatible_replay_format());
         }
 
         let dag_has_rows = match txn.open_table(DAG_TABLE) {
@@ -1273,7 +1269,7 @@ mod crdt {
         drop(txn);
 
         if state_has_rows || dag_has_rows || kv_has_rows {
-            return Err(retired_replay_format());
+            return Err(incompatible_replay_format());
         }
 
         let txn = db.begin_write()?;
@@ -1285,10 +1281,9 @@ mod crdt {
         Ok(())
     }
 
-    fn retired_replay_format() -> CommitError {
+    fn incompatible_replay_format() -> CommitError {
         CommitError::Config(
-            "CRDT store uses a retired replay format; reset/reinstall this actor before opening it"
-                .into(),
+            "CRDT store is incompatible; reset or reinstall this actor before opening it".into(),
         )
     }
 
@@ -1491,16 +1486,15 @@ mod tests {
     fn crdt_store_without_replay_format_requires_reset() {
         use crate::effect_log::EffectLog;
 
-        let path = temp_db_path("crdt_retired_replay_format");
+        let path = temp_db_path("crdt_incompatible_replay_format");
         {
             let mut cc = CrdtCommit::open(&path, [0u8; 32]).unwrap();
             cc.commit_with_log(b"persisted", &EffectLog::for_msg(b"old".to_vec()))
                 .unwrap();
         }
 
-        // A pre-Batch-37 database has state, roots, and DAG nodes but no
-        // replay-format marker. Removing it models that durable image while
-        // retaining a complete history that must not be mistaken for empty.
+        // A database with state, roots, and DAG nodes but no replay marker is
+        // incomplete. It must not be mistaken for an empty store.
         {
             let db = redb::Database::open(&path).unwrap();
             let txn = db.begin_write().unwrap();
@@ -1512,12 +1506,12 @@ mod tests {
         }
 
         let error = match CrdtCommit::open(&path, [0u8; 32]) {
-            Ok(_) => panic!("retired CRDT history must not open as fresh state"),
+            Ok(_) => panic!("incompatible CRDT history must not open as fresh state"),
             Err(error) => error,
         };
         assert!(
-            error.to_string().contains("reset/reinstall"),
-            "error must give the clean-break recovery action: {error}"
+            error.to_string().contains("reset or reinstall"),
+            "error must give the recovery action: {error}"
         );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

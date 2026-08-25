@@ -52,7 +52,7 @@ pub trait Actor: Sized + Encode + Decode {
     /// against. Auto-derived to [`NoRoles`](super::auth::NoRoles)
     /// by the `#[actor]` macro for actors that opted out of RBAC;
     /// override by declaring your own enum with `#[derive(...)]`
-    /// (or, in M6+, `#[actor(role = MyRole)]`).
+    /// (or `#[actor(role = MyRole)]`).
     ///
     /// The bounds are minimal: `Copy + Ord` for the `>=` comparison
     /// inside `ensure_role`, plus `RoleByte` so the host can plumb
@@ -76,16 +76,15 @@ pub trait Actor: Sized + Encode + Decode {
     const SPACE_ROLE_MAP: super::auth::SpaceRoleMap<Self::Role>;
 
     /// Extension kind discriminant — `0 = Actor` (request-driven,
-    /// the default) or `2 = Transport` (a `handle_connection(&self, …)`
+    /// the default) or `1 = Transport` (a `handle_connection(&self, …)`
     /// server). Overridden by `#[actor(kind = "transport")]`. Mirrors
     /// [`crate::extension::ExtensionKind`] and lands in the
     /// `.vos_meta` blob for the loader to read at boot. PVM actors
-    /// always leave this at `0`. (`1 = Service` is not a valid kind —
-    /// only `Actor` and `Transport` exist.)
+    /// always leave this at `0`.
     const KIND_BYTE: u8 = 0;
 
     /// `#[actor(task, provable)]` — this Task is published as a
-    /// provable program (`docs/actors.md` D6): a discovery /
+    /// provable program: a discovery /
     /// publication mark landing in `.vos_meta` for the pin/verify
     /// tooling. Not a semantic fork — record capture stays the
     /// caller's `spawn_provable` opt-in either way. Only valid

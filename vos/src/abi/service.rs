@@ -7,18 +7,17 @@
 //! ```
 //!
 //! - **node_prefix** (bits 31..16): identifies the node in the network.
-//!   0 = local/unscoped (backwards compatible with existing actors).
+//!   0 identifies the local control plane.
 //! - **local_id** (bits 15..0): per-node service counter.
 //!   0 = reserved for the registry service.
 //!
-//! service platform sees the full u32 — no protocol changes needed. Routing checks
-//! the prefix: matching prefix → local delivery, different → forward
-//! to the network layer.
+//! Routing checks the prefix: matching prefix means local delivery; a different
+//! prefix is forwarded to the network layer.
 
 /// Unique identifier for a service within the VOS network.
 ///
 /// Encodes `[node_prefix:16][local_id:16]` in a single u32.
-/// Backwards compatible: IDs with prefix 0 behave like plain counters.
+/// Prefix 0 is reserved for the local control plane.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ServiceId(pub u32);
@@ -41,7 +40,7 @@ impl ServiceId {
         Self(((node_prefix as u32) << 16) | (local_id as u32))
     }
 
-    /// The node prefix (upper 16 bits). 0 = local/unscoped.
+    /// The node prefix (upper 16 bits). 0 is the local control plane.
     pub const fn node_prefix(self) -> u16 {
         (self.0 >> 16) as u16
     }

@@ -21,7 +21,6 @@ use vos::service::{
 
 const REQUEST_MAGIC: [u8; 4] = *b"VTAW";
 const RESPONSE_MAGIC: [u8; 4] = *b"VTRW";
-const PROTOCOL_VERSION: u16 = 1;
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -166,14 +165,13 @@ impl ProductionTrust for SocketProductionTrust {
 }
 
 fn encode_request(tag: u8, payload: &[u8]) -> Result<Vec<u8>, ProductionTrustSocketError> {
-    if payload.len() > MAX_FRAME_BYTES.saturating_sub(11) {
+    if payload.len() > MAX_FRAME_BYTES.saturating_sub(9) {
         return Err(ProductionTrustSocketError::InvalidResponse);
     }
     let payload_len =
         u32::try_from(payload.len()).map_err(|_| ProductionTrustSocketError::InvalidResponse)?;
-    let mut request = Vec::with_capacity(11 + payload.len());
+    let mut request = Vec::with_capacity(9 + payload.len());
     request.extend_from_slice(&REQUEST_MAGIC);
-    request.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
     request.push(tag);
     request.extend_from_slice(&payload_len.to_le_bytes());
     request.extend_from_slice(payload);
@@ -184,7 +182,7 @@ fn encode_pair(left: &[u8], right: &[u8]) -> Option<Vec<u8>> {
     let left_len = u32::try_from(left.len()).ok()?;
     let right_len = u32::try_from(right.len()).ok()?;
     let total = 8usize.checked_add(left.len())?.checked_add(right.len())?;
-    if total > MAX_FRAME_BYTES.saturating_sub(11) {
+    if total > MAX_FRAME_BYTES.saturating_sub(9) {
         return None;
     }
     let mut payload = Vec::with_capacity(total);
@@ -220,7 +218,7 @@ fn exchange_with_timeout(
     let mut len = [0u8; 4];
     read_exact_until(&mut stream, &mut len, deadline).map_err(ProductionTrustSocketError::Io)?;
     let len = u32::from_le_bytes(len) as usize;
-    if len < 71 || len > 79 {
+    if len < 69 || len > 77 {
         return Err(ProductionTrustSocketError::InvalidResponse);
     }
     let mut response = vec![0; len];
@@ -312,24 +310,23 @@ fn decode_response(
     expected_request: Hash,
 ) -> Result<TrustResponse, ProductionTrustSocketError> {
     if bytes.get(..4) != Some(&RESPONSE_MAGIC)
-        || bytes.get(4..6) != Some(PROTOCOL_VERSION.to_le_bytes().as_slice())
-        || bytes.get(6..38) != Some(expected_request.0.as_slice())
+        || bytes.get(4..36) != Some(expected_request.0.as_slice())
     {
         return Err(ProductionTrustSocketError::InvalidResponse);
     }
     let policy = Hash(
         bytes
-            .get(38..70)
+            .get(36..68)
             .and_then(|bytes| bytes.try_into().ok())
             .ok_or(ProductionTrustSocketError::InvalidResponse)?,
     );
     let result = *bytes
-        .get(70)
+        .get(68)
         .ok_or(ProductionTrustSocketError::InvalidResponse)?;
     let timeslot = match result {
-        AUTHORIZED | DENIED | UNAVAILABLE | NO_TIMESLOT | POLICY if bytes.len() == 71 => None,
-        TIMESLOT if bytes.len() == 79 => Some(u64::from_le_bytes(
-            bytes[71..79]
+        AUTHORIZED | DENIED | UNAVAILABLE | NO_TIMESLOT | POLICY if bytes.len() == 69 => None,
+        TIMESLOT if bytes.len() == 77 => Some(u64::from_le_bytes(
+            bytes[69..77]
                 .try_into()
                 .map_err(|_| ProductionTrustSocketError::InvalidResponse)?,
         )),
@@ -380,7 +377,6 @@ mod tests {
             }
             let mut response = Vec::new();
             response.extend_from_slice(&RESPONSE_MAGIC);
-            response.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
             response.extend_from_slice(&request_hash.0);
             response.extend_from_slice(&policy.0);
             response.push(result);
@@ -407,10 +403,10 @@ mod tests {
     #[test]
     fn policy_query_has_a_stable_hash_vector() {
         let request = encode_request(QUERY_POLICY, &[]).unwrap();
-        assert_eq!(hex::encode(&request), "5654415701000000000000");
+        assert_eq!(hex::encode(&request), "565441570000000000");
         assert_eq!(
             hex::encode(Hash::digest(b"vos/production-trust-socket/request", &[&request]).0),
-            "582b7691278ba20233d0799f3a46928c781abaf2fd9dce4bd56af3cd9f49f477",
+            "8f6d4dc3ce77abba6cf5ff82d1bc557f9e9bc460f8acf7e1813e22261b016149",
         );
     }
 
@@ -467,7 +463,6 @@ mod tests {
             let request_hash = Hash::digest(b"vos/production-trust-socket/request", &[&request]);
             let mut response = Vec::new();
             response.extend_from_slice(&RESPONSE_MAGIC);
-            response.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
             response.extend_from_slice(&request_hash.0);
             response.extend_from_slice(&Hash([11; 32]).0);
             response.push(AUTHORIZED);

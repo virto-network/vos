@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 
 use cipher_clerk::settlement::{SettlementClaim, SettlementError, reconcile};
 
-use crate::{BankEntry, CLAIM_FORMAT, ClaimReport, SettledEntry, Status, StoredClaim};
+use crate::{BankEntry, ClaimReport, SettledEntry, Status, StoredClaim};
 
 /// Order a pair's two clerk pubkeys ascending so a `(pair, …)` key is
 /// direction-independent.
@@ -118,7 +118,6 @@ pub(crate) fn submit_claim(
         currency: parsed.currency,
         window_start: parsed.window_start,
         window_end: parsed.window_end,
-        version: CLAIM_FORMAT,
         claim_bytes: claim,
         voucher_count,
         rk_set_hash,
@@ -388,7 +387,6 @@ mod tests {
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].voucher_count, 4);
         assert_eq!(claims[0].rk_set_hash, [0xBBu8; 32]);
-        assert_eq!(claims[0].version, CLAIM_FORMAT);
     }
 
     #[test]

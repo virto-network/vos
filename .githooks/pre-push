@@ -24,6 +24,6 @@ if grep -q 'found to be present in multiple build targets' "$LOG"; then
     exit 1
 fi
 
-echo "→ pre-push: physical v2 service-PVM gate"
-just build-v2-pvm-test-artifacts
-cargo test -p vos --test v2_service_pvm --quiet -- --test-threads=1
+echo "→ pre-push: physical service-PVM gate"
+just build-pvm-test-artifacts
+cargo test -p vos --test service_pvm --quiet -- --test-threads=1

@@ -47,8 +47,8 @@ pub struct Context<A: Actor> {
     /// Caller's space-wide role byte — a
     /// [`SpaceRole`](super::auth::SpaceRole) discriminant. `None`
     /// when the registry holds no space-level grant for this
-    /// caller. M3 ships the field; M5 populates it from
-    /// `lookup_caller_role` and `set_caller_roles` plumbs it in.
+    /// caller. The host populates it from `lookup_caller_role` and
+    /// `set_caller_roles` plumbs it in.
     space_role: Option<u8>,
 
     /// Caller's actor-local role byte — a discriminant of this
@@ -58,13 +58,12 @@ pub struct Context<A: Actor> {
     /// [`Self::caller_role`].
     actor_local_role: Option<u8>,
 
-    /// Set by the M6 macro-emitted pre-dispatch check when the
+    /// Set by the macro-emitted pre-dispatch check when the
     /// caller's role doesn't satisfy the handler's
     /// `#[msg(role = X)]`. Surfaces upstream via
     /// [`lifecycle::exit_status`](super::lifecycle::exit_status)
     /// as `STATUS_FORBIDDEN` so the wire envelope carries the
-    /// refusal and vosx prints "permission denied" — same
-    /// surface the Sprint-2 dispatch-layer gate produced.
+    /// refusal and vosx prints "permission denied".
     forbidden: bool,
 
     // Effect queues (drained into the refine output payload)
@@ -304,7 +303,7 @@ impl<A: Actor> Context<A> {
 
     /// Who invoked the currently-running handler. The host writes
     /// this from the [`InvokeRequest`] before each dispatch; PVM
-    /// guests receive it via a hostcall (wired in M3).
+    /// guests receive it via a hostcall.
     ///
     /// Variants:
     /// - [`Caller::Unauthenticated`]: no credentials presented
@@ -429,7 +428,7 @@ impl<A: Actor> Context<A> {
     /// }
     /// ```
     ///
-    /// The M6 macro-emitted check at the dispatch boundary
+    /// The macro-emitted check at the dispatch boundary
     /// halts the actor with `STATUS_FORBIDDEN` *before* the
     /// handler runs, so this method is for the *manual*
     /// composability case (e.g.
@@ -442,7 +441,7 @@ impl<A: Actor> Context<A> {
         }
     }
 
-    /// Byte-form of [`Self::has_role`] used by the M6 macro-emitted
+    /// Byte-form of [`Self::has_role`] used by the macro-emitted
     /// pre-dispatch check, which only has the raw discriminant
     /// from the message enum's `required_role()` and doesn't want
     /// to round-trip through `A::Role::from_byte`.
@@ -453,7 +452,7 @@ impl<A: Actor> Context<A> {
         }
     }
 
-    /// Flag the current dispatch as refused. Called by the M6
+    /// Flag the current dispatch as refused. Called by the
     /// macro-emitted pre-handler check when
     /// [`Self::has_role_byte`] returns false — surfaces upstream
     /// via [`lifecycle::exit_status`](super::lifecycle::exit_status)
@@ -1828,7 +1827,7 @@ mod tests {
 
     // Minimal fixture Actor — just enough to satisfy the trait
     // bounds for Context<A> construction. Roles default to
-    // NoRoles via the M1 sentinels.
+    // NoRoles via the sentinel values.
     #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
     struct TestActor;
 
@@ -2040,7 +2039,7 @@ mod tests {
     }
 
     #[test]
-    fn service_spawn_never_falls_back_to_the_legacy_registry_route() {
+    fn service_spawn_requires_the_service_runtime() {
         let mut ctx: Context<TestActor> = Context::new(ServiceId(0));
         ctx.__set_actor_id(crate::service::ActorId([1; 32]));
 
@@ -2141,7 +2140,7 @@ mod tests {
 
     // Richer fixture actor with a 3-tier Role enum — exercises
     // the precedence matrix in `caller_role` / `has_role` /
-    // `ensure_role` that the M6 macro will emit checks against.
+    // `ensure_role` that the macro emits checks against.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     #[repr(u8)]
     enum FixtureRole {
@@ -2396,11 +2395,11 @@ mod tests {
 
     #[test]
     fn has_role_byte_round_trips_known_discriminants() {
-        // The macro-emitted dispatch check (M6) only has the raw
+        // The macro-emitted dispatch check only has the raw
         // byte from `required_role()`. has_role_byte must handle
         // the round-trip — valid discriminants succeed when the
         // caller has the role; unknown discriminants always fail
-        // (forward-incompatible).
+        // (unsupported).
         let ctx = fixture_ctx_with(
             Caller::Peer(alloc::vec![1]),
             Some(SpaceRole::Developer.as_u8()),

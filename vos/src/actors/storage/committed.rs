@@ -381,7 +381,7 @@ impl<K: FixedKey, V: Encode + Decode> CommittedMap<K, V> {
     /// [`state::BatchProof::build`] over the full sorted leaves.
     ///
     /// This is the provable-Task parent's witness half
-    /// (`docs/actors.md` D2): together with [`Self::root`] as
+    /// together with [`Self::root`] as
     /// `root_before`, the returned pair feeds a
     /// [`LedgerWitness`](state::LedgerWitness) — the caller maps each
     /// value to its LEAF CONTENT first (identity for [`Self::insert`]

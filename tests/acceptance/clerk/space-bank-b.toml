@@ -2,7 +2,6 @@
 # tests/acceptance/clerk/space-bank-a.toml except for the space name and the pinned ledger
 # replication_id (see that file's header for why the id must differ per bank).
 space = "bank-b"
-version = "0.1.0"
 
 hyperspace = "bank-federation"
 

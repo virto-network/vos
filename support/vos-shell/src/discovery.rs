@@ -11,20 +11,17 @@ use crate::backend::{AgentInfo, BackendError, SpaceClient};
 #[derive(Debug, Clone, Default)]
 pub struct SchemaCache {
     pub agents: Vec<AgentInfo>,
-    /// instance name → decoded schema (absent if the binary has no/old meta).
+    /// instance name → decoded schema.
     pub schemas: HashMap<String, ParsedMeta>,
 }
 
 impl SchemaCache {
-    /// Load every installed agent and its schema. Agents whose schema can't be
-    /// fetched/decoded are still listed (with no entry in `schemas`).
+    /// Load every installed agent and its schema.
     pub fn load(client: &dyn SpaceClient) -> Result<Self, BackendError> {
         let agents = client.list_agents()?;
         let mut schemas = HashMap::new();
         for a in &agents {
-            if let Ok(Some(meta)) = client.schema(&a.instance_name) {
-                schemas.insert(a.instance_name.clone(), meta);
-            }
+            schemas.insert(a.instance_name.clone(), client.schema(&a.instance_name)?);
         }
         Ok(Self { agents, schemas })
     }

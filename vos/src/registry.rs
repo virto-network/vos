@@ -3,12 +3,8 @@
 //! (verifier), the `vosx` CLI (signer/reader), and the daemon's
 //! sign-on-relay path.
 //!
-//! These used to live in the `space-registry` actor crate, which forced
-//! a mirror here (`registry_canon`) because `vos` can't depend on an
-//! actor crate that already depends on `vos`. Hoisting the protocol into
-//! `vos` ends that cycle: the actor now `pub use`s these back, so there
-//! is one source of truth for the consensus-critical byte layouts and
-//! the drift-pin cross-check test is no longer needed.
+//! The actor re-exports these definitions, keeping one source of truth for
+//! consensus-critical byte layouts without creating a crate dependency cycle.
 //!
 //! Everything here is `no_std` + `alloc` only — the row types must
 //! compile for the actor's `service`/`wasm` builds. The verifier-side
@@ -72,9 +68,8 @@ pub struct AgentRow {
     /// Serving-side sync floor: who this replica's state (`FetchHeads`/
     /// `FetchNode`) is served to, and the default spawn set a node
     /// derives from its own role. `Public` serves any connected peer,
-    /// `Member` requires a space read grant, `Private` requires a
-    /// per-actor grant (the generalized `msg-*` private semantics). See
-    /// [`SyncFloor`].
+    /// `Member` and `Private` require a space read grant. `Private` also
+    /// excludes enrolled nodes that do not hold that grant. See [`SyncFloor`].
     pub sync_role: SyncFloor,
 }
 
@@ -128,8 +123,8 @@ pub enum SyncFloor {
     /// Served to a caller holding a space read grant
     /// (`>= AUTH_ROLE_READONLY`); the default for new installs.
     Member = 1,
-    /// Served only to a caller holding a per-actor grant on this replica
-    /// (`>= AUTH_ROLE_READONLY`) — the generalized `msg-*` semantics.
+    /// Served only to a caller holding a space read grant
+    /// (`>= AUTH_ROLE_READONLY`). Node enrollment alone is insufficient.
     Private = 2,
 }
 
@@ -234,26 +229,27 @@ pub const AUTH_ROLE_ADMIN: u8 = 3;
 
 /// Canonical invite evidence signed by the granting administrator.
 ///
-/// The optional input exists only to reconstruct and reject historical
-/// four-field evidence. Current invite tokens always carry the fifth field,
-/// equal to the registry guest's sealed authority incarnation. The signed
-/// marker prevents either a joining client or a lagging peer from silently
-/// downgrading an authority-bound bearer to registry-only redemption.
+/// The authority identity is part of every invite. It prevents either a
+/// joining client or a lagging peer from turning an authority-bound bearer
+/// into registry-only evidence.
 pub fn invite_signed_bytes(
     space_id: &[u8; 32],
     role: u8,
     expires_at: u64,
     token_pub: &[u8; 32],
-    authority_replication_id: Option<&[u8; 32]>,
+    authority_replication_id: &[u8; 32],
 ) -> Vec<u8> {
     let expires_at = expires_at.to_le_bytes();
-    match authority_replication_id {
-        Some(authority) => canonical_op_bytes(
-            "invite",
-            &[space_id, &[role], &expires_at, token_pub, authority],
-        ),
-        None => canonical_op_bytes("invite", &[space_id, &[role], &expires_at, token_pub]),
-    }
+    canonical_op_bytes(
+        "invite",
+        &[
+            space_id,
+            &[role],
+            &expires_at,
+            token_pub,
+            authority_replication_id,
+        ],
+    )
 }
 
 /// Total ordering shared by the registry and canonical service authority for the
@@ -395,8 +391,8 @@ pub struct InvitePage {
 pub enum Status {
     /// Handler succeeded.
     Ok = 0,
-    /// A `(name, version)` tag already exists bound to a different hash.
-    TagConflict = 1,
+    /// A catalog name is already bound to different content.
+    CatalogConflict = 1,
     /// The referenced row doesn't exist.
     NotFound = 2,
     /// A program can't be unpublished while an agent still references it.
@@ -428,6 +424,8 @@ pub enum Status {
     /// CRDT consistency was requested for a catalog entry whose signed
     /// publication does not declare `#[actor(crdt)]`.
     CrdtOptInRequired = 12,
+    /// Actor metadata is missing or malformed.
+    BadMetadata = 13,
 }
 
 impl Status {
@@ -436,7 +434,7 @@ impl Status {
     pub fn from_u8(b: u8) -> Option<Self> {
         match b {
             0 => Some(Self::Ok),
-            1 => Some(Self::TagConflict),
+            1 => Some(Self::CatalogConflict),
             2 => Some(Self::NotFound),
             3 => Some(Self::InUse),
             4 => Some(Self::ProgramNotFound),
@@ -448,6 +446,7 @@ impl Status {
             10 => Some(Self::ReplicationIdReused),
             11 => Some(Self::StaleUpgrade),
             12 => Some(Self::CrdtOptInRequired),
+            13 => Some(Self::BadMetadata),
             _ => None,
         }
     }
@@ -457,7 +456,7 @@ impl core::fmt::Display for Status {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Status::Ok => "ok",
-            Status::TagConflict => "tag conflict",
+            Status::CatalogConflict => "catalog conflict",
             Status::NotFound => "not found",
             Status::InUse => "in use",
             Status::ProgramNotFound => "program not found",
@@ -469,6 +468,7 @@ impl core::fmt::Display for Status {
             Status::ReplicationIdReused => "replication id reused",
             Status::StaleUpgrade => "stale upgrade",
             Status::CrdtOptInRequired => "CRDT consistency requires #[actor(crdt)]",
+            Status::BadMetadata => "bad metadata",
         })
     }
 }
@@ -871,7 +871,7 @@ impl RegistryRef {
 
     // ── Catalog reads ─────────────────────────────────────────────
 
-    /// One page of the program catalog, in `(name, version)` order. Pass
+    /// One page of the program catalog in name order. Pass
     /// an empty name to start; continue from the
     /// last returned row's name while the page's `more` flag
     /// is set. `budget` caps the page (0 = the registry's max). Prefer

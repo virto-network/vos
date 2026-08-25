@@ -34,7 +34,7 @@ vos-pvm = { workspace = true }
 # and `Hash` sources, only `Cid` and `Url` resolution touch
 # external services.
 hex = "0.4"
-# base58 (Bitcoin alphabet) for the `vos1…` invite token string —
+# base58 (Bitcoin alphabet) for the `vos-…` invite token string —
 # compact, unambiguous, double-click-selectable. Only used by
 # `token.rs`.
 bs58 = "0.5"

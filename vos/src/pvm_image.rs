@@ -6,27 +6,23 @@
 //! memory blocks. The runtime never reconstructs a continuation from a flat
 //! memory image or starts it at PC 0.
 //!
-//! ## Header wire format (version 3)
+//! ## Header wire format
 //!
 //! ```text
 //! offset  size  field
 //! 0       4     magic = b"VKSW"
-//! 4       1     version = 3
-//! 5       3     reserved
-//! 8       4     snapshot_len: u32 LE
-//! 12      32    commitment: blake2b-256(snapshot wire)
-//! 44      32    VOS execution-semantics ID
-//! 76      -     end (HEADER_SIZE)
+//! 4       4     snapshot_len: u32 LE
+//! 8       32    commitment: blake2b-256(snapshot wire)
+//! 40      32    VOS execution-semantics ID
+//! 72      -     end (HEADER_SIZE)
 //! ```
 
 use alloc::vec::Vec;
 
 /// Byte layout magic: b"VKSW".
 const MAGIC: [u8; 4] = *b"VKSW";
-/// Current header format version.
-pub const VERSION: u8 = 3;
 /// Size of the encoded continuation header.
-pub const HEADER_SIZE: usize = 76;
+pub const HEADER_SIZE: usize = 72;
 
 /// Small persistable header for an exact suspended kernel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,8 +37,6 @@ impl ContinuationHeader {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_SIZE);
         out.extend_from_slice(&MAGIC);
-        out.push(VERSION);
-        out.extend_from_slice(&[0u8; 3]);
         out.extend_from_slice(&self.snapshot_len.to_le_bytes());
         out.extend_from_slice(&self.commitment);
         out.extend_from_slice(&self.execution_semantics);
@@ -55,14 +49,14 @@ impl ContinuationHeader {
         if bytes.len() != HEADER_SIZE {
             return None;
         }
-        if bytes[0..4] != MAGIC || bytes[4] != VERSION || bytes[5..8] != [0; 3] {
+        if bytes[0..4] != MAGIC {
             return None;
         }
-        let snapshot_len = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+        let snapshot_len = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
         let mut commitment = [0u8; 32];
-        commitment.copy_from_slice(&bytes[12..44]);
+        commitment.copy_from_slice(&bytes[8..40]);
         let mut execution_semantics = [0u8; 32];
-        execution_semantics.copy_from_slice(&bytes[44..76]);
+        execution_semantics.copy_from_slice(&bytes[40..72]);
         Some(Self {
             snapshot_len,
             commitment,
@@ -85,8 +79,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn header_size_is_76() {
-        assert_eq!(HEADER_SIZE, 76);
+    fn header_size_is_72() {
+        assert_eq!(HEADER_SIZE, 72);
     }
 
     #[test]
@@ -112,15 +106,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_version() {
-        let mut bytes = vec![0u8; HEADER_SIZE];
-        bytes[0..4].copy_from_slice(&MAGIC);
-        bytes[4] = 0xFF;
-        assert!(ContinuationHeader::decode(&bytes).is_none());
-    }
-
-    #[test]
-    fn rejects_trailing_bytes_and_nonzero_reserved_bytes() {
+    fn rejects_trailing_bytes() {
         let mut bytes = ContinuationHeader {
             snapshot_len: 0,
             commitment: [0; 32],
@@ -128,9 +114,6 @@ mod tests {
         }
         .encode();
         bytes.push(0);
-        assert!(ContinuationHeader::decode(&bytes).is_none());
-        bytes.pop();
-        bytes[5] = 1;
         assert!(ContinuationHeader::decode(&bytes).is_none());
     }
 

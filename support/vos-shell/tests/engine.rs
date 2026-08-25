@@ -81,8 +81,11 @@ impl SpaceClient for Mock {
     fn raw_meta(&self, _name: &str) -> Result<Vec<u8>, BackendError> {
         Ok(vec![]) // schema() is overridden, so this is unused
     }
-    fn schema(&self, name: &str) -> Result<Option<ParsedMeta>, BackendError> {
-        Ok(self.schemas.get(name).cloned())
+    fn schema(&self, name: &str) -> Result<ParsedMeta, BackendError> {
+        self.schemas
+            .get(name)
+            .cloned()
+            .ok_or_else(|| BackendError::NotFound(name.into()))
     }
     fn invoke(&self, _target: ServiceId, msg: &Msg) -> Result<Value, BackendError> {
         self.calls.lock().unwrap().push(msg.clone());
@@ -221,7 +224,7 @@ fn refresh_picks_up_late_agents() {
         fn raw_meta(&self, name: &str) -> Result<Vec<u8>, BackendError> {
             self.0.lock().unwrap().raw_meta(name)
         }
-        fn schema(&self, name: &str) -> Result<Option<ParsedMeta>, BackendError> {
+        fn schema(&self, name: &str) -> Result<ParsedMeta, BackendError> {
             self.0.lock().unwrap().schema(name)
         }
         fn invoke(&self, target: ServiceId, msg: &Msg) -> Result<Value, BackendError> {
