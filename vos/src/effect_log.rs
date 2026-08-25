@@ -37,7 +37,8 @@ pub type CallerPrefix = [u8; 5];
 /// Default caller prefix for a recording session before the authenticated
 /// dispatch identity is stamped.
 pub const CALLER_SYSTEM: CallerPrefix = [1, 0, 0, 0, 0];
-const INVOCATION_ID_EXTENSION: u8 = 0x01;
+const EFFECT_LOG_MAGIC: [u8; 4] = *b"EFCT";
+const CRDT_EVENT_MAGIC: [u8; 4] = *b"CRDT";
 
 /// Default size cap for a single `ctx.ask` reply, in bytes.
 ///
@@ -98,10 +99,7 @@ pub struct EffectLog {
     /// to the reply they rode with. Empty for dispatches whose invokes
     /// produced no effects (and for every ask reply).
     pub invoke_effects: Vec<InvokeEffects>,
-    /// Invocation identity supplied to the handler. New logs carry it in a
-    /// trailing extension so every replay strategy restores it exactly.
-    /// Legacy CRDT logs reconstruct it from the enclosing
-    /// [`CrdtEvent`]'s `(origin, seq)`.
+    /// Invocation identity supplied to the handler.
     invocation_id: crate::service::InvocationId,
 }
 
@@ -171,25 +169,22 @@ impl EffectLog {
     ///
     /// Format:
     /// ```text
-    /// [msg_len:u64 LE][msg][n_replies:u64 LE]
+    /// ["EFCT"][msg_len:u64 LE][msg][n_replies:u64 LE]
     /// ( [reply_len:u64 LE][reply] )*
     /// [anchor_kind:u8][anchor:32B][caller_prefix:5B]
     /// [n_invoke_effects:u64 LE]
     /// ( [reply_idx:u64 LE][svc_id:u32 LE][len:u64 LE][effects] )*
-    /// [INVOCATION_ID_EXTENSION:u8][invocation_id:32B]
+    /// [invocation_id:32B]
     /// ```
-    ///
-    /// The invoke-effect count is mandatory. The invocation extension is
-    /// omitted only for the zero identity used by non-durable recording
-    /// sessions; its absence is not a legacy-format fallback.
     ///
     /// The encoding is deterministic and unambiguous, so two
     /// replicas observing the same dispatch produce the same bytes
     /// (and thus the same CID) without coordination.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            16 + 33 + self.msg.len() + self.replies.iter().map(|r| 8 + r.len()).sum::<usize>(),
+            4 + 16 + 32 + self.msg.len() + self.replies.iter().map(|r| 8 + r.len()).sum::<usize>(),
         );
+        buf.extend_from_slice(&EFFECT_LOG_MAGIC);
         buf.extend_from_slice(&(self.msg.len() as u64).to_le_bytes());
         buf.extend_from_slice(&self.msg);
         buf.extend_from_slice(&(self.replies.len() as u64).to_le_bytes());
@@ -207,18 +202,18 @@ impl EffectLog {
             buf.extend_from_slice(&(rec.effects.len() as u64).to_le_bytes());
             buf.extend_from_slice(&rec.effects);
         }
-        if self.invocation_id != crate::service::InvocationId::ZERO {
-            buf.push(INVOCATION_ID_EXTENSION);
-            buf.extend_from_slice(self.invocation_id.as_bytes());
-        }
+        buf.extend_from_slice(self.invocation_id.as_bytes());
         buf
     }
 
     /// Deserialize from bytes produced by [`to_bytes`]. Returns
     /// `None` if the buffer is malformed, truncated, has trailing garbage,
-    /// or uses a retired pre-anchor/pre-invoke-effects encoding.
+    /// or has the wrong record identity.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut pos = 0;
+        if take(bytes, &mut pos, EFFECT_LOG_MAGIC.len())? != EFFECT_LOG_MAGIC {
+            return None;
+        }
         let msg_len = usize::try_from(read_u64(bytes, &mut pos)?).ok()?;
         let msg = take(bytes, &mut pos, msg_len)?.to_vec();
 
@@ -255,17 +250,9 @@ impl EffectLog {
                 effects,
             });
         }
-        let invocation_id = if pos == bytes.len() {
-            crate::service::InvocationId::ZERO
-        } else {
-            if *bytes.get(pos)? != INVOCATION_ID_EXTENSION {
-                return None;
-            }
-            pos += 1;
-            let mut invocation_id = [0u8; 32];
-            invocation_id.copy_from_slice(take(bytes, &mut pos, 32)?);
-            crate::service::InvocationId::new(invocation_id)
-        };
+        let mut invocation_id = [0u8; 32];
+        invocation_id.copy_from_slice(take(bytes, &mut pos, 32)?);
+        let invocation_id = crate::service::InvocationId::new(invocation_id);
         if pos != bytes.len() {
             return None;
         }
@@ -314,12 +301,6 @@ pub struct CrdtEvent {
     pub log: EffectLog,
 }
 
-/// Wire format version byte at the head of [`CrdtEvent::to_bytes`].
-/// Reserved for future additions (e.g. embedding a parent-vector
-/// or a deletion tombstone). Bumping invalidates existing CIDs;
-/// downstream stores must be drained on upgrade.
-pub const CRDT_EVENT_VERSION: u8 = 1;
-
 impl CrdtEvent {
     /// Handler-visible identity corresponding to one durable CRDT event.
     pub fn invocation_id_for(origin: [u8; 32], seq: u64) -> crate::service::InvocationId {
@@ -345,7 +326,7 @@ impl CrdtEvent {
     ///
     /// Format:
     /// ```text
-    /// [version:u8][origin:32B][seq:u64 LE][effect_log_bytes…]
+    /// ["CRDT"][origin:32B][seq:u64 LE][effect_log_bytes…]
     /// ```
     ///
     /// The encoding is deterministic — replicas with identical
@@ -354,8 +335,8 @@ impl CrdtEvent {
     /// CIDs), which is the whole point.
     pub fn to_bytes(&self) -> Vec<u8> {
         let log_bytes = self.log.to_bytes();
-        let mut buf = Vec::with_capacity(1 + 32 + 8 + log_bytes.len());
-        buf.push(CRDT_EVENT_VERSION);
+        let mut buf = Vec::with_capacity(4 + 32 + 8 + log_bytes.len());
+        buf.extend_from_slice(&CRDT_EVENT_MAGIC);
         buf.extend_from_slice(&self.origin);
         buf.extend_from_slice(&self.seq.to_le_bytes());
         buf.extend_from_slice(&log_bytes);
@@ -363,19 +344,19 @@ impl CrdtEvent {
     }
 
     /// Deserialize from bytes produced by [`to_bytes`]. Returns
-    /// `None` on a version mismatch, malformed prefix, or any
+    /// `None` on a record-identity mismatch, malformed prefix, or any
     /// EffectLog decode failure.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 1 + 32 + 8 {
+        if bytes.len() < 4 + 32 + 8 {
             return None;
         }
-        if bytes[0] != CRDT_EVENT_VERSION {
+        if bytes[..4] != CRDT_EVENT_MAGIC {
             return None;
         }
         let mut origin = [0u8; 32];
-        origin.copy_from_slice(&bytes[1..33]);
-        let seq = u64::from_le_bytes(bytes[33..41].try_into().ok()?);
-        let log = EffectLog::from_bytes(&bytes[41..])?;
+        origin.copy_from_slice(&bytes[4..36]);
+        let seq = u64::from_le_bytes(bytes[36..44].try_into().ok()?);
+        let log = EffectLog::from_bytes(&bytes[44..])?;
         let expected = Self::invocation_id_for(origin, seq);
         if log.invocation_id() != crate::service::InvocationId::ZERO
             && log.invocation_id() != expected
@@ -715,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn invocation_extension_roundtrips_and_zero_stays_omitted() {
+    fn invocation_identity_is_always_part_of_the_record() {
         let zero = EffectLog::for_msg(b"zero".to_vec());
         let zero_bytes = zero.to_bytes();
 
@@ -724,7 +705,7 @@ mod tests {
         current.set_invocation_id(invocation);
         let current_bytes = current.to_bytes();
 
-        assert!(current_bytes.len() > zero_bytes.len());
+        assert_eq!(current_bytes.len(), zero_bytes.len());
         assert_eq!(
             EffectLog::from_bytes(&zero_bytes)
                 .expect("zero-identity decode")
@@ -779,11 +760,10 @@ mod tests {
     }
 
     #[test]
-    fn invoke_effects_count_is_always_present() {
+    fn invoke_effects_are_part_of_the_record() {
         let mut log = EffectLog::for_msg(b"m".to_vec());
         log.record_reply(b"r".to_vec());
         let plain = log.to_bytes();
-        assert_eq!(&plain[plain.len() - 8..], &0u64.to_le_bytes());
         log.invoke_effects.push(InvokeEffects {
             reply_idx: 0,
             svc_id: 3,
@@ -817,8 +797,8 @@ mod tests {
         assert!(EffectLog::from_bytes(&replies).is_none());
 
         let mut effects = EffectLog::for_msg(Vec::new()).to_bytes();
-        let count = effects.len() - 8;
-        effects[count..].copy_from_slice(&u64::MAX.to_le_bytes());
+        let count = effects.len() - 32 - 8;
+        effects[count..count + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(EffectLog::from_bytes(&effects).is_none());
     }
 
@@ -847,16 +827,6 @@ mod tests {
         assert_eq!(decoded, log);
         assert_eq!(decoded.anchor_kind, 0x01);
         assert_eq!(decoded.anchor, [7u8; 32]);
-    }
-
-    #[test]
-    fn pre_anchor_encoding_requires_reset_and_reinstall() {
-        let mut log = EffectLog::for_msg(b"legacy".to_vec());
-        log.record_reply(b"r".to_vec());
-        let with_suffix = log.to_bytes();
-        let pre_anchor_len = 8 + log.msg.len() + 8 + 8 + log.replies[0].len();
-        assert!(EffectLog::from_bytes(&with_suffix[..pre_anchor_len]).is_none());
-        assert!(EffectLog::from_bytes(&with_suffix[..with_suffix.len() - 8]).is_none());
     }
 
     #[test]

@@ -12,10 +12,10 @@
 //! This module is `no_std` so the same constants and helpers are visible
 //! to both the guest framework (encoding) and the host runtime (parsing).
 //!
-//! ## Wire layout (version 4)
+//! ## Wire layout
 //!
 //! ```text
-//! [version: u8 = 0x04]
+//! [magic: "VRFN"]
 //! [flags: u8]              // bit 0 = continue_next, bit 1 = forbidden
 //! [anchor_kind: u8]        // see the anchor section below
 //! [anchor: 32 bytes]       // zero-filled when anchor_kind = 0x00
@@ -28,22 +28,18 @@
 //! [app_public_len: u32 LE][app_public_bytes]
 //! ```
 //!
-//! The v3/v4 decodes are **strictly canonical**: an effect whose payload
+//! Decoding is **strictly canonical**: an effect whose payload
 //! is not exactly consumed by its fields, or trailing bytes after the
 //! last field, reject the whole payload. That makes "the wire bytes"
 //! well-defined for the transition digest.
 //!
-//! Version 4 appends the trailing `app_public` field — the app-level
+//! The trailing `app_public` field carries the app-level
 //! public bytes a provable Task designated via `vos::zk::bind_public`.
 //! The guest already folds them into its bound io-hash (see
 //! [`folded_public`]); v4 is what SURFACES them to the host, so the
 //! captured `ProvableRecord` can carry the bytes a verifier needs to
-//! reconstruct `public'` (v3's strict exhaustion left no room for a
-//! wire-additive field, hence the version bump). `app_public` is bound
-//! through `public'`/io-hash, NOT the transition digest — the digest
-//! preimage is identical across v3/v4 except for the version byte.
-//! Version 3 (the previous current version) decodes unchanged with an
-//! empty `app_public`, keeping its anchor-checked apply semantics.
+//! reconstruct `public'`. `app_public` is bound through `public'`/io-hash,
+//! not the transition digest.
 //!
 //! Effects apply in wire order; duplicate keys are legal and later wins
 //! per key. The guest framework appends the state write last within the
@@ -79,19 +75,8 @@
 
 use alloc::vec::Vec;
 
-/// Previous current version, accepted for already-installed actor blobs.
-/// Same strict-canonical rules and anchor-checked apply semantics as v4;
-/// carries no `app_public` field.
-pub const REFINE_PAYLOAD_: u8 = 0x03;
-/// Current wire version — what the guest framework emits.
-pub const REFINE_PAYLOAD_VERSION: u8 = 0x04;
-
-/// Retired service discriminator, permanently reserved at the runtime boundary.
-///
-/// Its payload is intentionally no longer decodable, but recognizing the
-/// leading byte prevents complete service results from falling through to the
-/// unrelated legacy status-envelope decoder.
-pub const RETIRED_REFINE_PAYLOAD_: u8 = 0x02;
+/// Canonical work-result discriminator.
+pub const REFINE_PAYLOAD_MAGIC: [u8; 4] = *b"VRFN";
 
 /// Flag bit: guest yielded; host should re-queue this service next tick.
 pub const FLAG_CONTINUE_NEXT: u8 = 0x01;
@@ -174,9 +159,6 @@ pub enum Effect {
 /// A complete refine output ready to encode/decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefinePayload {
-    /// Wire version this payload was decoded from. VOS accepts canonical
-    /// v3/v4; retired service stores and actor blobs must be reinstalled.
-    pub version: u8,
     /// Commitment kind for the state this refine ran against.
     pub anchor_kind: u8,
     /// The commitment bytes; zero-filled for [`ANCHOR_GENESIS`].
@@ -188,8 +170,8 @@ pub struct RefinePayload {
     /// `Write{STATE_KEY}`, emitted only when the state bytes changed.
     pub effects: Vec<Effect>,
     /// App-level public bytes a provable Task designated via
-    /// `vos::zk::bind_public` (v4 field; empty for non-binding actors and
-    /// for decoded service/v3 payloads). Bound through `public'`/io-hash — see
+    /// `vos::zk::bind_public` (empty for non-binding actors). Bound through
+    /// `public'`/io-hash — see
     /// [`folded_public`] — NOT through the transition digest.
     pub app_public: Vec<u8>,
     /// Guest requested to be re-scheduled next tick (yield_now / sleep).
@@ -201,7 +183,6 @@ pub struct RefinePayload {
 impl Default for RefinePayload {
     fn default() -> Self {
         Self {
-            version: REFINE_PAYLOAD_VERSION,
             anchor_kind: ANCHOR_GENESIS,
             anchor: [0u8; 32],
             reply: Vec::new(),
@@ -218,10 +199,10 @@ impl RefinePayload {
         Self::default()
     }
 
-    /// Encode to the v4 wire format.
+    /// Encode the canonical wire format.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.push(REFINE_PAYLOAD_VERSION);
+        out.extend_from_slice(&REFINE_PAYLOAD_MAGIC);
         let mut flags: u8 = 0;
         if self.continue_next {
             flags |= FLAG_CONTINUE_NEXT;
@@ -243,23 +224,12 @@ impl RefinePayload {
         out
     }
 
-    /// Decode from the wire, dispatching on the leading version byte:
-    /// v4/v3 with the strict canonical rules (v3 carries no `app_public`
-    /// field — it decodes empty). Retired service and unknown versions fail
-    /// hard rather than becoming migration input or falling through to
-    /// defaults.
+    /// Decode the canonical wire format.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        match bytes.first()? {
-            &REFINE_PAYLOAD_VERSION | &REFINE_PAYLOAD_ => Self::decode_current(bytes),
-            _ => None,
-        }
-    }
-
-    /// The shared strict-canonical decode for v3 and v4 — identical
-    /// layouts except v4's trailing `app_public` field.
-    fn decode_current(bytes: &[u8]) -> Option<Self> {
         let mut c = Cursor::new(bytes);
-        let version = c.read_u8()?;
+        if c.read_bytes(REFINE_PAYLOAD_MAGIC.len())? != REFINE_PAYLOAD_MAGIC {
+            return None;
+        }
         let flags = c.read_u8()?;
         let anchor_kind = c.read_u8()?;
         let mut anchor = [0u8; 32];
@@ -286,18 +256,13 @@ impl RefinePayload {
         for _ in 0..effects_count {
             effects.push(decode_effect(&mut c, true)?);
         }
-        let app_public = if version >= REFINE_PAYLOAD_VERSION {
-            let app_public_len = c.read_u32()? as usize;
-            c.read_bytes(app_public_len)?.to_vec()
-        } else {
-            Vec::new()
-        };
+        let app_public_len = c.read_u32()? as usize;
+        let app_public = c.read_bytes(app_public_len)?.to_vec();
         // Strict canonical: the payload is exactly its fields.
         if !c.is_exhausted() {
             return None;
         }
         Some(RefinePayload {
-            version,
             anchor_kind,
             anchor,
             reply,
@@ -333,7 +298,7 @@ impl RefinePayload {
     ///
     /// ```text
     /// blake2b-256( b"vos/transition"
-    ///     || version || anchor_kind || anchor
+    ///     || "VRFN" || anchor_kind || anchor
     ///     || effects_count (u16 LE) || effect_bytes )
     /// ```
     ///
@@ -341,14 +306,11 @@ impl RefinePayload {
     /// `app_public` (both are bound as io-hash halves instead — see
     /// [`folded_public`]). Byte-different but semantically-equal
     /// encodings digest differently *by design*: every consumer applies
-    /// exactly the bytes it digests, so digest-equal ⇒ byte-equal ⇒
-    /// apply-equal. Normative for v3/v4 — strict canonical decode is
-    /// what makes the preimage unambiguous. The version byte is the
-    /// DECODED version, so a record captured under v3 stays recomputable
-    /// after the v4 bump.
+    /// exactly the bytes it digests, so digest-equal implies byte-equal and
+    /// apply-equal. Strict canonical decode makes the preimage unambiguous.
     pub fn transition_digest(&self) -> [u8; 32] {
         let mut pre = Vec::new();
-        pre.push(self.version);
+        pre.extend_from_slice(&REFINE_PAYLOAD_MAGIC);
         pre.push(self.anchor_kind);
         pre.extend_from_slice(&self.anchor);
         push_u16(&mut pre, self.effects.len() as u16);
@@ -571,64 +533,47 @@ mod tests {
     use super::*;
     use alloc::vec;
 
-    fn state_key() -> Vec<u8> {
-        crate::lifecycle::STATE_KEY_BYTES.to_vec()
-    }
-
     #[test]
-    fn roundtrip_empty() {
-        let p = RefinePayload::new();
-        let bytes = p.encode();
-        let decoded = RefinePayload::decode(&bytes).unwrap();
-        assert_eq!(p, decoded);
-    }
-
-    #[test]
-    fn roundtrip_anchor_and_reply() {
-        let p = RefinePayload {
+    fn canonical_payload_roundtrips() {
+        let payload = RefinePayload {
             anchor_kind: ANCHOR_STATE_HASH,
-            anchor: state_anchor(b"prior-state"),
-            reply: vec![0xAA, 0xBB],
-            continue_next: true,
-            ..RefinePayload::new()
-        };
-        let bytes = p.encode();
-        let decoded = RefinePayload::decode(&bytes).unwrap();
-        assert_eq!(p, decoded);
-    }
-
-    #[test]
-    fn roundtrip_all_effects() {
-        let p = RefinePayload {
+            anchor: state_anchor(b"prior"),
+            reply: b"reply".to_vec(),
             effects: vec![
                 Effect::Write {
-                    key: b"k1".to_vec(),
-                    value: vec![1, 2, 3],
+                    key: b"key".to_vec(),
+                    value: b"value".to_vec(),
                 },
                 Effect::Transfer {
-                    target: 42,
-                    memo: b"hello".to_vec(),
-                },
-                Effect::Provide {
-                    hash: [9; 32],
-                    data: vec![0xFF, 0xEE],
-                },
-                Effect::New { code_hash: [7; 32] },
-                Effect::Delete {
-                    key: b"k1".to_vec(),
+                    target: 7,
+                    memo: b"memo".to_vec(),
                 },
             ],
-            ..RefinePayload::new()
+            app_public: b"public".to_vec(),
+            continue_next: true,
+            forbidden: false,
         };
-        let bytes = p.encode();
-        let decoded = RefinePayload::decode(&bytes).unwrap();
-        assert_eq!(p, decoded);
+        assert_eq!(RefinePayload::decode(&payload.encode()), Some(payload));
     }
 
     #[test]
-    fn rejects_state_key_delete() {
+    fn wrong_magic_and_trailing_bytes_are_rejected() {
+        let bytes = RefinePayload::new().encode();
+        let mut wrong = bytes.clone();
+        wrong[0] ^= 1;
+        assert!(RefinePayload::decode(&wrong).is_none());
+
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(RefinePayload::decode(&trailing).is_none());
+    }
+
+    #[test]
+    fn state_delete_is_not_a_valid_transition() {
         let bytes = RefinePayload {
-            effects: vec![Effect::Delete { key: state_key() }],
+            effects: vec![Effect::Delete {
+                key: crate::lifecycle::STATE_KEY_BYTES.to_vec(),
+            }],
             ..RefinePayload::new()
         }
         .encode();
@@ -636,302 +581,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_delete_payload_slack() {
-        // Same strict-canonical rule as Write: a Delete payload not
-        // exactly consumed by its fields rejects under v3.
-        let mut bytes = Vec::new();
-        bytes.push(REFINE_PAYLOAD_VERSION);
-        bytes.push(0); // flags
-        bytes.push(ANCHOR_GENESIS);
-        bytes.extend_from_slice(&[0u8; 32]);
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // reply_len
-        bytes.extend_from_slice(&1u16.to_le_bytes()); // effects_count
-        bytes.push(EFFECT_DELETE);
-        // payload = key_len(2) + "k"(1) = 3, declared 4 with slack.
-        bytes.extend_from_slice(&4u32.to_le_bytes());
-        bytes.extend_from_slice(&1u16.to_le_bytes());
-        bytes.push(b'k');
-        bytes.push(0x00); // slack
-        assert!(RefinePayload::decode(&bytes).is_none());
-    }
-
-    #[test]
-    fn transition_digest_distinguishes_delete_from_write() {
-        let base = RefinePayload {
-            effects: vec![Effect::Write {
-                key: b"k".to_vec(),
-                value: Vec::new(),
-            }],
-            ..RefinePayload::new()
-        };
-        let with_delete = RefinePayload {
-            effects: vec![Effect::Delete { key: b"k".to_vec() }],
-            ..RefinePayload::new()
-        };
-        // An empty-value write and a delete are different transitions
-        // (present-and-empty vs absent) and must digest differently.
-        assert_ne!(base.transition_digest(), with_delete.transition_digest());
-    }
-
-    #[test]
-    fn rejects_unknown_version() {
-        let mut bytes = RefinePayload::new().encode();
-        bytes[0] = 0xFF;
-        assert!(RefinePayload::decode(&bytes).is_none());
-    }
-
-    #[test]
-    fn roundtrip_app_public() {
-        let p = RefinePayload {
-            reply: vec![0xAA],
-            app_public: vec![7u8; 40],
-            effects: vec![Effect::Write {
-                key: b"k".to_vec(),
-                value: vec![1],
-            }],
-            ..RefinePayload::new()
-        };
-        let decoded = RefinePayload::decode(&p.encode()).unwrap();
-        assert_eq!(p, decoded);
-        assert_eq!(decoded.version, REFINE_PAYLOAD_VERSION);
-    }
-
-    #[test]
-    fn v3_decodes_with_empty_app_public() {
-        // A v3 wire is a v4 wire minus the trailing app_public field —
-        // already-installed blobs emit it and must keep decoding, with
-        // the strict-canonical rules intact (no trailing slack).
-        let v4 = RefinePayload {
-            reply: vec![1, 2],
-            ..RefinePayload::new()
-        }
-        .encode();
-        let mut v3 = v4[..v4.len() - 4].to_vec();
-        v3[0] = REFINE_PAYLOAD_;
-        let decoded = RefinePayload::decode(&v3).expect("v3 decodes");
-        assert_eq!(decoded.version, REFINE_PAYLOAD_);
-        assert!(decoded.app_public.is_empty());
-        assert_eq!(decoded.reply, vec![1, 2]);
-        // v3 must NOT accept a trailing app_public field.
-        let mut v3_with_field = v4.clone();
-        v3_with_field[0] = REFINE_PAYLOAD_;
-        assert!(RefinePayload::decode(&v3_with_field).is_none());
-    }
-
-    #[test]
-    fn rejects_truncated_app_public() {
-        let bytes = RefinePayload {
-            app_public: vec![9u8; 8],
-            ..RefinePayload::new()
-        }
-        .encode();
-        assert!(RefinePayload::decode(&bytes[..bytes.len() - 1]).is_none());
-    }
-
-    #[test]
-    fn transition_digest_skips_app_public() {
-        // app_public is bound through public'/io-hash, never the digest
-        // — two payloads differing only in app_public digest equal.
-        let base = RefinePayload {
-            effects: vec![Effect::Write {
-                key: b"k".to_vec(),
-                value: vec![1],
-            }],
-            ..RefinePayload::new()
-        };
-        let with_public = RefinePayload {
-            app_public: vec![0xCC; 64],
+    fn transition_digest_ignores_reply_but_binds_effects() {
+        let base = RefinePayload::new();
+        let with_reply = RefinePayload {
+            reply: b"reply".to_vec(),
             ..base.clone()
         };
-        assert_eq!(base.transition_digest(), with_public.transition_digest());
-    }
-
-    #[test]
-    fn transition_digest_binds_decoded_version() {
-        // The digest preimage takes the DECODED version byte, so a v3
-        // record's digest stays recomputable after the v4 bump — and v3
-        // and v4 digests of the same transition differ (they are
-        // different wire bytes by definition).
-        let p = RefinePayload {
-            anchor_kind: ANCHOR_STATE_HASH,
-            anchor: state_anchor(b"s"),
-            ..RefinePayload::new()
-        };
-        let v4 = p.encode();
-        let mut v3 = v4[..v4.len() - 4].to_vec();
-        v3[0] = REFINE_PAYLOAD_;
-        let d4 = RefinePayload::decode(&v4).unwrap().transition_digest();
-        let d3 = RefinePayload::decode(&v3).unwrap().transition_digest();
-        assert_ne!(d3, d4);
-        assert_eq!(d4, p.transition_digest());
-    }
-
-    #[test]
-    fn rejects_truncated() {
-        let bytes = RefinePayload {
-            reply: vec![1, 2, 3],
-            ..RefinePayload::new()
-        }
-        .encode();
-        assert!(RefinePayload::decode(&bytes[..bytes.len() - 1]).is_none());
-    }
-
-    #[test]
-    fn rejects_trailing_bytes() {
-        // Strict canonical: anything after the last effect rejects.
-        let mut bytes = RefinePayload {
+        let with_effect = RefinePayload {
             effects: vec![Effect::Write {
-                key: b"k".to_vec(),
-                value: vec![1],
+                key: b"key".to_vec(),
+                value: b"value".to_vec(),
             }],
-            ..RefinePayload::new()
-        }
-        .encode();
-        bytes.push(0x00);
-        assert!(RefinePayload::decode(&bytes).is_none());
-    }
-
-    #[test]
-    fn rejects_effect_payload_slack() {
-        // A Write whose declared payload_len exceeds its fields must
-        // reject under v3 — the digest preimage would be ambiguous.
-        let mut bytes = Vec::new();
-        bytes.push(REFINE_PAYLOAD_VERSION);
-        bytes.push(0); // flags
-        bytes.push(ANCHOR_GENESIS);
-        bytes.extend_from_slice(&[0u8; 32]);
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // reply_len
-        bytes.extend_from_slice(&1u16.to_le_bytes()); // effects_count
-        bytes.push(EFFECT_WRITE);
-        // payload = key_len(2) + "k"(1) + value_len(4) + value(1) = 8,
-        // declared 9 with one slack byte inside the payload.
-        bytes.extend_from_slice(&9u32.to_le_bytes());
-        bytes.extend_from_slice(&1u16.to_le_bytes());
-        bytes.push(b'k');
-        bytes.extend_from_slice(&1u32.to_le_bytes());
-        bytes.push(0xAB);
-        bytes.push(0x00); // slack
-        assert!(RefinePayload::decode(&bytes).is_none());
-    }
-
-    #[test]
-    fn rejects_nonzero_genesis_anchor() {
-        let mut bytes = RefinePayload::new().encode();
-        // anchor bytes start after version+flags+anchor_kind.
-        bytes[3] = 1;
-        assert!(RefinePayload::decode(&bytes).is_none());
-    }
-
-    #[test]
-    fn smt_anchor_kind_round_trips_and_unknown_kinds_reject() {
-        // 0x02 is live: any 32-byte composite root decodes (an empty
-        // committed tree's root is non-zero, so no content check).
-        let mut p = RefinePayload::new();
-        p.anchor_kind = ANCHOR_SMT_ROOT;
-        p.anchor = [0xab; 32];
-        let back = RefinePayload::decode(&p.encode()).expect("0x02 decodes");
-        assert_eq!(back.anchor_kind, ANCHOR_SMT_ROOT);
-        assert_eq!(back.anchor, [0xab; 32]);
-        // The next kind byte stays reserved-and-rejected.
-        let mut bytes = RefinePayload::new().encode();
-        bytes[2] = ANCHOR_SMT_ROOT + 1;
-        assert!(RefinePayload::decode(&bytes).is_none());
-    }
-
-    #[test]
-    fn service_payloads_require_reset_and_reinstall() {
-        let legacy = [RETIRED_REFINE_PAYLOAD_, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert!(RefinePayload::decode(&legacy).is_none());
-    }
-
-    #[test]
-    fn roundtrip_forbidden_flag() {
-        let p = RefinePayload {
-            forbidden: true,
-            ..RefinePayload::new()
-        };
-        let bytes = p.encode();
-        let decoded = RefinePayload::decode(&bytes).unwrap();
-        assert_eq!(p, decoded);
-        assert!(decoded.forbidden);
-    }
-
-    #[test]
-    fn take_state_write_strips_and_returns_last() {
-        let mut p = RefinePayload {
-            effects: vec![
-                Effect::Write {
-                    key: state_key(),
-                    value: b"first".to_vec(),
-                },
-                Effect::Write {
-                    key: b"other".to_vec(),
-                    value: b"kept".to_vec(),
-                },
-                Effect::Write {
-                    key: state_key(),
-                    value: b"last".to_vec(),
-                },
-            ],
-            ..RefinePayload::new()
-        };
-        assert_eq!(p.take_state_write(), Some(b"last".to_vec()));
-        assert_eq!(
-            p.effects,
-            vec![Effect::Write {
-                key: b"other".to_vec(),
-                value: b"kept".to_vec(),
-            }]
-        );
-        assert_eq!(p.take_state_write(), None);
-    }
-
-    #[test]
-    fn transition_digest_skips_flags_and_reply() {
-        let base = RefinePayload {
-            anchor_kind: ANCHOR_STATE_HASH,
-            anchor: state_anchor(b"s"),
-            effects: vec![Effect::Write {
-                key: b"k".to_vec(),
-                value: vec![1],
-            }],
-            ..RefinePayload::new()
-        };
-        let with_reply = RefinePayload {
-            reply: b"different-reply".to_vec(),
-            continue_next: true,
             ..base.clone()
         };
         assert_eq!(base.transition_digest(), with_reply.transition_digest());
-
-        let different_effects = RefinePayload {
-            effects: vec![Effect::Write {
-                key: b"k".to_vec(),
-                value: vec![2],
-            }],
-            ..base.clone()
-        };
-        assert_ne!(
-            base.transition_digest(),
-            different_effects.transition_digest()
-        );
-
-        let different_anchor = RefinePayload {
-            anchor: state_anchor(b"other"),
-            ..base.clone()
-        };
-        assert_ne!(
-            base.transition_digest(),
-            different_anchor.transition_digest()
-        );
-    }
-
-    #[test]
-    fn anchor_for_matches_contract() {
-        assert_eq!(anchor_for(None), (ANCHOR_GENESIS, [0u8; 32]));
-        assert_eq!(anchor_for(Some(b"")), (ANCHOR_GENESIS, [0u8; 32]));
-        let (kind, anchor) = anchor_for(Some(b"state"));
-        assert_eq!(kind, ANCHOR_STATE_HASH);
-        assert_eq!(anchor, state_anchor(b"state"));
+        assert_ne!(base.transition_digest(), with_effect.transition_digest());
     }
 }

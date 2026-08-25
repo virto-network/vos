@@ -991,10 +991,7 @@ impl ActorRefineRuntime {
                 crate::abi::hostcall::INVOKE as u8,
             ))?;
         let mut payload = crate::refine_payload::RefinePayload::decode(&raw_output)
-            .filter(|payload| {
-                payload.version == crate::refine_payload::REFINE_PAYLOAD_VERSION
-                    && !payload.forbidden
-            })
+            .filter(|payload| !payload.forbidden)
             .ok_or(ServicePvmError::RefineHostRejected(
                 crate::abi::hostcall::INVOKE as u8,
             ))?;

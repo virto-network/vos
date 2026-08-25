@@ -527,7 +527,7 @@ struct AbsorbedWorkResult {
 
 /// Verify and absorb one decoded work-result into the journal — the
 /// single applier the native drain, the intra-tick anchor chain, and the
-/// strict v3 tests all go through.
+/// strict work-result tests all go through.
 ///
 /// The anchor is checked against the **effective** state: the last
 /// `Write{STATE_KEY}` absorbed from previously accepted work-results in
@@ -540,11 +540,6 @@ fn absorb_work_result(
     svc_id: u32,
     payload: RefinePayload,
 ) -> Result<AbsorbedWorkResult, WorkResultError> {
-    if payload.version != crate::refine_payload::REFINE_PAYLOAD_
-        && payload.version != crate::refine_payload::REFINE_PAYLOAD_VERSION
-    {
-        return Err(WorkResultError::Malformed);
-    }
     let expected = expected_anchor(journal, storage, svc_id);
     if (payload.anchor_kind, payload.anchor) != expected {
         return Err(WorkResultError::AnchorMismatch);
@@ -561,7 +556,7 @@ fn absorb_work_result(
     })
 }
 
-/// The `(anchor_kind, anchor)` a v3 work-result must carry for this
+/// The `(anchor_kind, anchor)` a work-result must carry for this
 /// service's *effective* prior state. Committed-storage actors write
 /// their composite root as an ordinary framework row
 /// ([`COMMITTED_ROOT_KEY`](crate::lifecycle::COMMITTED_ROOT_KEY)), so
@@ -589,9 +584,8 @@ fn expected_anchor(
     crate::refine_payload::anchor_for(effective)
 }
 
-/// Whether halt-output bytes claim to be a current or retired
-/// RefinePayload wire version. Used to distinguish "malformed or retired
-/// payload — fail loud"
+/// Whether halt-output bytes claim to be a work result. Used to distinguish
+/// malformed payloads (which fail loud)
 /// from "old-style `[status][state_len][state][reply]` envelope" when
 /// [`RefinePayload::decode`] returns `None`. Old-style envelopes lead
 /// with a status byte, and no reachable status collides: traps never
@@ -599,12 +593,7 @@ fn expected_anchor(
 /// head, and 0x03+ statuses only appear in sub-5-byte error envelopes
 /// the invoke path packs host-side.
 fn claims_refine_payload(bytes: &[u8]) -> bool {
-    matches!(
-        bytes.first(),
-        Some(&crate::refine_payload::RETIRED_REFINE_PAYLOAD_)
-            | Some(&crate::refine_payload::REFINE_PAYLOAD_)
-            | Some(&crate::refine_payload::REFINE_PAYLOAD_VERSION)
-    )
+    bytes.starts_with(&crate::refine_payload::REFINE_PAYLOAD_MAGIC)
 }
 
 // --- Per-service storage ---
@@ -2237,18 +2226,11 @@ fn run_task_invoke(
     let out_len = (child.active_reg(8) as usize).min(1 << 20);
     let raw_output = kread(&child, out_ptr, out_len);
 
-    // Tasks are current-version-native — run_task_service is the only
-    // entry that can produce this halt shape, and it always emits the
-    // current wire (v4, which surfaces app_public for record capture);
-    // anything else is a mis-built or stale blob. No deployed task blob
-    // predates v4, so no compat arm exists here.
+    // run_task_service is the only entry that can produce this halt shape.
     let payload = match RefinePayload::decode(&raw_output) {
-        Some(p) if p.version == crate::refine_payload::REFINE_PAYLOAD_VERSION => p,
+        Some(p) => p,
         _ => {
-            error!(
-                parent_svc_id,
-                "task child: halt output is not a v4 work-result (stale blob?)"
-            );
+            error!(parent_svc_id, "task child returned a malformed work-result");
             journal.rollback_to(invoke_mark);
             return record_and_write_invoke(
                 caller,
@@ -2814,37 +2796,35 @@ fn handle_invoke(
     let raw_output = kread(&child, out_ptr, out_len);
 
     let output = if let Some(mut payload) = RefinePayload::decode(&raw_output) {
-        // Parity check: a v3/v4 child's anchor must commit to exactly
+        // The child's anchor must commit to exactly
         // the state the host staged for it — or, for a committed-storage
         // child, the composite root its own keyspace recorded (read
         // through the same journal overlay; see `expected_anchor`).
         // A mismatch means a buggy guest or a doctored blob — apply
         // nothing, surface a crash.
-        if payload.version >= crate::refine_payload::REFINE_PAYLOAD_ {
-            let expected = if let Some(root) = journal.effective_read(
-                storage,
-                target_svc_id.0,
-                crate::lifecycle::COMMITTED_ROOT_KEY,
-            ) && root.len() == 32
-            {
-                let mut anchor = [0u8; 32];
-                anchor.copy_from_slice(root);
-                (crate::refine_payload::ANCHOR_SMT_ROOT, anchor)
-            } else {
-                crate::refine_payload::anchor_for(Some(&child_prior_state))
-            };
-            if (payload.anchor_kind, payload.anchor) != expected {
-                error!(?target_svc_id, "child invoke: work-result anchor mismatch");
-                journal.rollback_to(invoke_mark);
-                return record_and_write_invoke(
-                    caller,
-                    output_ptr,
-                    output_buf_len,
-                    &[STATUS_PANICKED],
-                    depth,
-                    mode,
-                );
-            }
+        let expected = if let Some(root) = journal.effective_read(
+            storage,
+            target_svc_id.0,
+            crate::lifecycle::COMMITTED_ROOT_KEY,
+        ) && root.len() == 32
+        {
+            let mut anchor = [0u8; 32];
+            anchor.copy_from_slice(root);
+            (crate::refine_payload::ANCHOR_SMT_ROOT, anchor)
+        } else {
+            crate::refine_payload::anchor_for(Some(&child_prior_state))
+        };
+        if (payload.anchor_kind, payload.anchor) != expected {
+            error!(?target_svc_id, "child invoke: work-result anchor mismatch");
+            journal.rollback_to(invoke_mark);
+            return record_and_write_invoke(
+                caller,
+                output_ptr,
+                output_buf_len,
+                &[STATUS_PANICKED],
+                depth,
+                mode,
+            );
         }
 
         // When the child emitted no state write (state unchanged), echo
@@ -2879,7 +2859,7 @@ fn handle_invoke(
         out.extend_from_slice(&payload.reply);
         out
     } else if claims_refine_payload(&raw_output) {
-        // Claims a payload version but doesn't decode — fail loud.
+        // Claims the work-result format but does not decode — fail loud.
         error!(?target_svc_id, "child invoke: malformed work-result");
         journal.rollback_to(invoke_mark);
         alloc::vec![STATUS_PANICKED]
@@ -3046,13 +3026,6 @@ mod tests {
         let a0 = 0x1122_3344_5566_7788;
         let a1 = 0x8877_6655_4433_2211;
         assert_eq!(precompile_resume_registers(a0, a1), (a0, a1));
-    }
-
-    #[test]
-    fn retired_service_work_result_remains_reserved_and_fail_loud() {
-        let retired = [crate::refine_payload::RETIRED_REFINE_PAYLOAD_, 0, 0, 0, 0];
-        assert!(claims_refine_payload(&retired));
-        assert!(RefinePayload::decode(&retired).is_none());
     }
 
     fn exact_resume_blob() -> Vec<u8> {

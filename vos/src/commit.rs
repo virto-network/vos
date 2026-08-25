@@ -1637,55 +1637,6 @@ mod tests {
 
     #[cfg(feature = "storage")]
     #[test]
-    fn retired_peer_root_cannot_hide_a_later_current_event() {
-        use crate::effect_log::{CRDT_EVENT_VERSION, EffectLog};
-        use merkle_crdt::Hasher;
-
-        let path = temp_db_path("retired_peer_root");
-        let mut cc = CrdtCommit::open(&path, [0u8; 32]).unwrap();
-
-        // Build a content-addressed DagNode carrying the retired pre-anchor
-        // EffectLog wire: [msg_len][msg][reply_count], wrapped in the still-
-        // current CrdtEvent prefix. Its CID is valid, but its typed payload is
-        // intentionally undecodable by the current runtime.
-        let msg = b"retired";
-        let mut retired_log = Vec::new();
-        retired_log.extend_from_slice(&(msg.len() as u64).to_le_bytes());
-        retired_log.extend_from_slice(msg);
-        retired_log.extend_from_slice(&0u64.to_le_bytes());
-
-        let mut retired_event = Vec::new();
-        retired_event.push(CRDT_EVENT_VERSION);
-        retired_event.extend_from_slice(&[0x44; 32]);
-        retired_event.extend_from_slice(&0u64.to_le_bytes());
-        retired_event.extend_from_slice(&retired_log);
-
-        let mut retired_node = Vec::new();
-        retired_node.extend_from_slice(&(retired_event.len() as u64).to_le_bytes());
-        retired_node.extend_from_slice(&retired_event);
-        retired_node.extend_from_slice(&0u64.to_le_bytes());
-        let retired_cid = Blake2b::hash(&retired_node);
-
-        assert!(
-            !cc.insert_node(&retired_cid, &retired_node).unwrap(),
-            "retired peer wire must be dropped at ingestion",
-        );
-        assert!(cc.get_node_bytes(&retired_cid).unwrap().is_none());
-        assert!(cc.root_bytes().is_empty());
-
-        // The subsequent current event must remain an independent root and
-        // replay normally; it must never descend from the rejected history.
-        let current = EffectLog::for_msg(b"current".to_vec());
-        cc.commit_with_log(b"current-state", &current).unwrap();
-        let replay = cc.replay_logs().unwrap();
-        assert_eq!(replay.len(), 1);
-        assert_eq!(replay[0].msg, b"current");
-
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-    }
-
-    #[cfg(feature = "storage")]
-    #[test]
     fn replay_logs_quarantines_dangling_parent() {
         // A peer (or a forging member) can inject a DAG node that cites a
         // parent which was never produced: `insert_node` accepts it on the
