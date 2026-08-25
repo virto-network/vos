@@ -1361,6 +1361,27 @@ fn signed_test_package(
     (package, metadata.actor_name)
 }
 
+fn replacement_test_package(
+    original: &VosPackage,
+    signer: &libp2p::identity::Keypair,
+) -> VosPackage {
+    let mut assembler = vos_pvm_compiler::assembler::Assembler::new();
+    assembler
+        .load_imm_64(vos_pvm_compiler::assembler::Reg::A0, 0)
+        .ecalli(0);
+    let mut replacement = original.clone();
+    replacement.actor_pvm = assembler.build();
+    replacement.manifest.actor_program = ProgramId::of_pvm(&replacement.actor_pvm);
+    replacement.deployment_signature.signature = signer
+        .sign(&replacement.signing_message())
+        .expect("sign replacement package");
+    replacement
+        .validate()
+        .expect("replacement package is canonical");
+    assert_ne!(replacement.deployment_id(), original.deployment_id());
+    replacement
+}
+
 fn attested_root_fixture(
     consistency: ConsistencyMode,
     salt: u8,
@@ -4483,7 +4504,7 @@ fn snapshot_without_program(snapshot: &[u8], removed: ProgramId) -> Vec<u8> {
         *position += len;
     }
 
-    let mut position = 4 + 2 + 8;
+    let mut position = 4 + 32 + 8;
     let rows = u32_at(snapshot, &mut position);
     for _ in 0..rows {
         skip_bytes(snapshot, &mut position);
@@ -7060,11 +7081,7 @@ fn root_upgrade_is_exactly_once_and_reopens_across_the_catalog_cutover() {
         )
         .unwrap();
 
-    let mut replacement = package.clone();
-    replacement.deployment_signature.signature = signer
-        .sign(&replacement.signing_message())
-        .expect("sign replacement package");
-    replacement.validate().unwrap();
+    let replacement = replacement_test_package(&package, &signer);
     let request = RootTreeUpgradeRequest {
         expected_deployment: package.deployment_id(),
         expected_program: package.manifest.actor_program,
@@ -7196,10 +7213,7 @@ fn conformance_raft_and_role_authority_shape_changes_are_refused_before_upgrade(
         refine_gas: TEST_GAS_SCHEDULE.refine,
         accumulate_gas: TEST_GAS_SCHEDULE.accumulate,
     };
-    let mut replacement = package.clone();
-    replacement.deployment_signature.signature = signer
-        .sign(&replacement.signing_message())
-        .expect("sign replacement package");
+    let replacement = replacement_test_package(&package, &signer);
     let request = RootTreeUpgradeRequest {
         expected_deployment: package.deployment_id(),
         expected_program: package.manifest.actor_program,
@@ -7323,11 +7337,7 @@ fn production_raft_authority_upgrade_is_ordered_once_and_preserves_service_ident
     )
     .expect("single-voter production Raft root installs");
 
-    let mut replacement = package.clone();
-    replacement.deployment_signature.signature = signer
-        .sign(&replacement.signing_message())
-        .expect("sign replacement package");
-    replacement.validate().unwrap();
+    let replacement = replacement_test_package(&package, &signer);
     let request = RootTreeUpgradeRequest {
         expected_deployment: package.deployment_id(),
         expected_program: package.manifest.actor_program,
