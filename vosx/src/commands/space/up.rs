@@ -4096,19 +4096,19 @@ mod tests {
         assert_eq!(package.manifest.platform, vos::service::PLATFORM_ID);
         assert_eq!(
             hex::encode(package.manifest.actor_program.0),
-            "48792b3fb57772ec76ddcb5dd985cc7d14f87a820814e4040a6012eef924c672",
+            "2cf46bcc484a9af8a715b1ec4d628ff1644dcd3404b4591acbfdcbe135f79060",
         );
         assert_eq!(
             hex::encode(package.deployment_id().0),
-            "5fb01a266b1ab1f406d306ff43a0b6d9c540e7475e01496fa22b583b5f54ca33",
+            "0248228744e3dccc0e24658989734e923a97fbf6d1749a8c864994ee4da2d467",
         );
         assert_eq!(
             hex::encode(package_hash),
-            "bbd0d3f20cbe67b13732bbb027bf0adc9f868c91ab14b545175c56991077f6ac",
+            "b04fb5d5f98bc5e3c85caae18460a7cd59f21852fd93431115ad79c388c9d76e",
         );
         assert_eq!(
             hex::encode(replication_id),
-            "142dd67d916830aacaeab4cbe8fd39c0ea4aa2b4c8c00144ea8bfb93eafca316",
+            "a9beb1d665fb7231e58d2d07b06f69b926b3498298b16c161c81e582d3ae625f",
         );
     }
 
@@ -4339,6 +4339,12 @@ mod tests {
         let original_service_image = std::fs::read(&state_path).unwrap();
 
         let mut replacement = original.clone();
+        let mut replacement_assembler = vos_pvm_compiler::assembler::Assembler::new();
+        replacement_assembler
+            .load_imm_64(vos_pvm_compiler::assembler::Reg::A0, 1)
+            .ecalli(0);
+        replacement.actor_pvm = replacement_assembler.build();
+        replacement.manifest.actor_program = ProgramId::of_pvm(&replacement.actor_pvm);
         let replacement_signer = Keypair::generate_ed25519();
         replacement.deployment_signature.public_key = replacement_signer.public().encode_protobuf();
         replacement.deployment_signature.producer =
@@ -4383,6 +4389,12 @@ mod tests {
                 .to_vec(),
             },
         };
+        assert_ne!(upgrade.expected_deployment, upgrade.replacement_deployment);
+        assert_eq!(
+            vos::service::ActorUpgrade::decode(&upgrade.encode()),
+            Ok(upgrade.clone()),
+            "the recovery fixture itself must be a canonical actor upgrade",
+        );
         let mut log = vos::raft::service::RaftAccumulateLog::open(
             &raft_path,
             vos::raft::RaftConfig::default(),

@@ -49,7 +49,7 @@ for value in \
     "$clerk_program" "$clerk_deployment" "$clerk_task"
 do
     if [[ -z $value ]]; then
-        echo "incomplete service artifact provenance: $provenance" >&2
+        echo "incomplete production artifact provenance: $provenance" >&2
         exit 1
     fi
 done
@@ -67,7 +67,7 @@ for digest in \
     "$clerk_program" "$clerk_deployment" "$clerk_task"
 do
     if [[ ! $digest =~ ^[0-9a-f]{64}$ ]]; then
-        echo "invalid service artifact identity in $provenance: $digest" >&2
+        echo "invalid production artifact identity in $provenance: $digest" >&2
         exit 1
     fi
 done
