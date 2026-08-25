@@ -1,126 +1,63 @@
 # Architecture
 
-This chapter is the map of the **platform**. It shows the layers VOS itself
-provides and how they fit together; each has its own chapter in the rest of
-Part I. How a full private *application* stacks on top of these layers is a
-separate concern, covered in [Messaging](messaging.md).
+A space is an operator-controlled network. Its registry names packages,
+actors, nodes, and grants. Each installed package creates a root service that
+owns one actor tree and one durable state image.
 
-## The platform, bottom to top
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  APPLICATIONS            actors you install into a space      │
-│                          (messaging, ledger, …)              │
-├─────────────────────────────────────────────────────────────┤
-│  zkPVM                   succinct proofs of PVM execution    │
-├─────────────────────────────────────────────────────────────┤
-│  EXTENSIONS              native host plugins (e.g. gateway)   │
-├─────────────────────────────────────────────────────────────┤
-│  SPACES & REGISTRY       membership, installed agents, IDs   │
-├─────────────────────────────────────────────────────────────┤
-│  REPLICATION             ephemeral · local · crdt · raft     │
-├─────────────────────────────────────────────────────────────┤
-│  PVM RUNTIME             deterministic RISC-V actors + sched │
-├─────────────────────────────────────────────────────────────┤
-│  PERSISTENCE             redb-backed local state             │
-├─────────────────────────────────────────────────────────────┤
-│  NETWORK                 libp2p: mDNS · gossipsub · req-resp │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Space
+        Registry[Registry]
+        Authority[Role authority]
+        subgraph Root
+            Service[Generic service]
+            Actor[Application actor]
+            Children[Child actors]
+            Store[(State image)]
+        end
+        Registry --> Service
+        Authority --> Service
+        Service --> Actor
+        Actor --> Children
+        Service --> Store
+    end
 ```
 
-Each layer has a clear contract; upper layers don't care how lower layers
-satisfy it.
+## Request path
 
-| Layer | Responsibility | Chapter |
-|---|---|---|
-| PVM Runtime | Run actors deterministically so replicas converge bit-for-bit | [Runtime](runtime.md) |
-| Replication | Pick the consistency mode per agent | [Replication](replication.md) |
-| Persistence | Durable local state | [Persistence](persistence.md) |
-| Network | Move bytes between peers | [Transport](transport.md) |
-| Spaces & Registry | Group actors, track members and agents | [Documents](documents.md) |
-| Extensions | Native host plugins outside the sandbox | [Extensions](extensions.md) |
-| Identity | Per-space keys, devices, recovery | [Identity](identity.md) |
-| Authorization | Who may call what (roles, ACLs, anon credentials) | [Authorization](authorization.md) |
-| PVM proofs | Succinct proofs of PVM execution | [PVM proofs](pvm-proofs.md) |
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Node
+    participant Service
+    participant Actor
+    participant Store
+    Client->>Node: typed invocation
+    Node->>Service: authenticated work
+    Service->>Actor: private state + origin
+    Actor-->>Service: reply + effects
+    Service->>Store: validate and commit
+    Service-->>Client: committed result
+```
 
-## Actors
+The host proposes work, but the generic service guest validates package
+identity, method policy, credentials, causal state, effects, and transition
+shape before state changes become durable.
 
-The unit of code is an **actor**: ordinary Rust compiled to a small RISC-V
-PVM and run inside a host sandbox. Actors are deterministic — two replicas
-of the same actor, fed the same messages, reach the same state. That
-determinism is what makes replication safe: the network only has to agree
-on the *inputs*, never on the *result*. See [Runtime](runtime.md).
+## Consistency
 
-## Spaces
+| Mode | Use when | Commit rule |
+| --- | --- | --- |
+| Local | one operator owns the state | local durable commit |
+| Raft | nodes need one total order | voter quorum |
+| CRDT | nodes accept concurrent work | causal merge |
 
-A **space** is the top-level unit of collaboration — a per-collaboration
-root identified by a content-addressed `space_id`. A space owns:
+All modes execute the same package and actor API. Consistency changes how
+accepted transitions are ordered and exchanged, not what an actor is.
 
-- a **registry** tracking members and installed agents,
-- the **agents** (actor instances) running inside it,
-- a **daemon** that owns local persistence and the libp2p endpoint.
+## Content identity
 
-Everything inside a space is data, and data is replicated by the mode each
-agent chooses. There is no leader and no global ordering across spaces —
-only in-space ordering, and only when the chosen mode requires it.
+Packages, programs, proofs, and state artifacts are content-addressed. Human
+names are catalog labels. Durable work binds the exact hashes and deployment
+identities it used, so a label change cannot silently change execution.
 
-Members onboard by redeeming an invite token: an admin mints a role-scoped
-`vos1…` token, and the joiner's daemon redeems it against the space's
-bootnode, which grants the joiner's node key a role. Agents are installed
-once by an admin — from a genesis recipe applied on the space's first boot,
-or a later reconcile against the running space — and replicate from the
-registry; a joiner syncs the catalog rather than booting its own manifest,
-and each agent reaches a member only if that member's role clears the
-agent's sync floor.
-
-The daemon retains an invite bearer until both authorization layers accept
-the same evidence: the serving root first commits the holder grant through
-physical Accumulate in canonical `space-authority`, then signs that exact
-accepted redemption and records the attestation with the registry operation.
-A rejected authority redemption therefore leaves no effective registry role.
-Restricted service calls use an invocation-scoped authority reply and
-its finalized accumulation receipt; a daemon-local role lookup is not a service
-credential. Authority-aware tokens sign the authority's replication
-incarnation, and markerless tokens are no longer minted or accepted. Authority
-activation uses a read-only registry-guest preflight requiring exactly one
-enrolled node and no live or revivable legacy space/actor grant. The separate
-root-signed seal is unconditional and replay-monotone; it closes legacy role
-admission even if a concurrent row later reorders before it. The single-node
-condition is a conservative cutover prerequisite; any legacy row discovered
-later remains ineffective because post-cutover roles also require an exact
-point-addressed authority witness in a guest-private storage namespace. Catalog
-presence or replica-local absence never selects a protocol mode. Operators
-revoke legacy grants and remove other nodes before cutover, then re-grant
-through both canonical layers. Before first redemption, an operator may
-cancel the bearer by
-passing the exact `vos1…` token to `space invite <space> revoke`; the same
-grow-only cancellation is committed to both authorization layers.
-
-Role-scoped sync is access control, not secrecy: every replica that holds
-state can leak it, and revocation never claws back already-synced data.
-Agents needing real confidentiality use the messenger's answer — an
-encrypted payload with gated keys.
-
-## Replication modes
-
-State is replicated per agent, not globally. An agent picks the weakest
-mode that is still correct for its data:
-
-| Mode | Guarantee | Use when |
-|---|---|---|
-| `ephemeral` | none (in-memory) | state needn't outlive the process |
-| `local` | durable, single-node | no replication needed |
-| `crdt` | eventual, leaderless | edits commute (logs, sets, counters) |
-| `raft` | strict, ordered | a single authoritative sequence is required |
-
-The `crdt` mode is backed by the [`merkle-crdt`](sync.md) crate — the same
-DAG that underpins [Messaging](messaging.md). See
-[Replication](replication.md) for how to choose.
-
-## Where applications fit
-
-An application is just a set of actors installed into a space
-([Applications](applications.md)). It composes the platform layers with the
-cross-cutting protocol layers it needs — group encryption, anonymous
-moderation, metadata-protecting transport. [Messaging](messaging.md) is the
-worked example and the place those application-level layers are described.

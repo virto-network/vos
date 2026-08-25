@@ -1,34 +1,23 @@
-# VOS examples
+# Examples
 
-The public actor examples use only the service source and package model. Application
-authors build one canonical actor PVM; the pinned generic VOS service owns service platform
-Refine and Accumulate.
+The examples use the same signed package and root-service path as production.
 
-The [`actors`](actors/) workspace contains four focused examples:
+| Example | Demonstrates |
+| --- | --- |
+| `counter` | minimal state and query handlers |
+| `shared-board` | convergent shared state |
+| `workflow` | durable actor calls and suspension |
+| `private-age` + `age-gate` | private input and attested claims |
 
-- `counter`: ordinary Rust state for Local or Raft consistency;
-- `workflow`: an owned child suspends on a durable cross-root call and resumes
-  from its exact machine checkpoint;
-- `private-age` + `age-gate`: an ordinary and an attested method on one
-  producer, with proof verification in a separate actor;
-- `shared-board`: explicit `Map`, `List`, `Text`, and `Counter` fields merged
-  across two CRDT replicas.
+Build all examples:
 
-Build them without source-level `no_std` or `no_main` attributes:
-
-```sh
-cd examples/actors
-cargo +nightly actor -p counter
-cargo +nightly actor -p workflow
-cargo +nightly actor -p private-age
-cargo +nightly actor -p age-gate
-cargo +nightly actor -p shared-board
+```bash
+just build-examples
 ```
 
-The old single-actor replay samples are retained only as internal regression
-fixtures under [`tests/fixtures/legacy-v1`](../tests/fixtures/legacy-v1/); they
-are not an application API. Native-extension, WASM, and proof-program fixtures
-also live under [`tests/fixtures`](../tests/fixtures/), keeping this directory
-limited to the canonical actor source surface. Clerk is the larger acceptance
-application under [`tests/acceptance/clerk`](../tests/acceptance/clerk/), not a
-beginner sample.
+Package one example:
+
+```bash
+cargo run -p vosx -- build examples/actors/counter --name counter
+```
+

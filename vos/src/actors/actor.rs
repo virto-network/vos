@@ -85,7 +85,7 @@ pub trait Actor: Sized + Encode + Decode {
     const KIND_BYTE: u8 = 0;
 
     /// `#[actor(task, provable)]` — this Task is published as a
-    /// provable program (`docs/plans/provable.md` D6): a discovery /
+    /// provable program (`docs/actors.md` D6): a discovery /
     /// publication mark landing in `.vos_meta` for the pin/verify
     /// tooling. Not a semantic fork — record capture stays the
     /// caller's `spawn_provable` opt-in either way. Only valid

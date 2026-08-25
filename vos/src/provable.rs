@@ -1,4 +1,4 @@
-//! Durable provable-transition records (`docs/plans/provable.md` W2/W3).
+//! Durable provable-transition records (`docs/actors.md` W2/W3).
 //!
 //! When a parent invokes a provable Task with a record tag (see
 //! `lifecycle::INVOKE_INPUT_RECORD` / `agent::Tasks::spawn_provable`), the
@@ -51,7 +51,7 @@
 //! ## Catalog identity
 //!
 //! `catalog_name`/`catalog_pin` route a verifier to the allowlist
-//! entry the chain must verify against (`docs/plans/provable.md` D5).
+//! entry the chain must verify against (`docs/actors.md` D5).
 //! They are EMPTY at capture — the runtime holds no catalog — and are
 //! resolved at prove time by matching the catalog pin whose `blob_hash`
 //! equals the record's `task_hash` (unambiguous and stable across

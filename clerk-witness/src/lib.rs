@@ -1,6 +1,6 @@
 //! cipher-clerk `LedgerState` over vos [`WitnessedLedger`]s — the
 //! witness bridge the `#[provable]` clerk arc runs on
-//! (`docs/plans/provable.md` W4).
+//! (`docs/actors.md` W4).
 //!
 //! A provable clerk transition is a PURE VERIFIER: it receives, in its
 //! witness, the touched leaves of the six committed clerk sub-trees
@@ -189,7 +189,7 @@ pub fn batch_digest(events: &[Transfer]) -> [u8; 32] {
 }
 
 /// Verify-and-apply one witnessed transition — the whole pure-verifier
-/// body (`docs/plans/provable.md`, the load-bearing insight):
+/// body (`docs/actors.md`, the load-bearing insight):
 ///
 /// 1. each sub-tree's [`WitnessedLedger`] construction asserts
 ///    `proof.root(touched) == sub_root_before` (inclusion AND

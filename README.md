@@ -1,310 +1,67 @@
 # VOS
 
-A peer-to-peer operating system for collaborative, replicated applications.
+VOS runs signed actors across a group of operator-owned nodes. Actors are
+small Rust programs with durable state, typed messages, explicit authority,
+and a chosen consistency model.
 
-VOS runs deterministic actors on a service platform-aligned PVM (RISC-V) and replicates
-them across nodes using either CRDTs (eventual) or Raft (strict). Spaces
-group actors into per-collaboration roots that converge automatically when
-peers come online, with no central server and no coordination protocol on
-the user's critical path.
+```mermaid
+flowchart LR
+    C[Client] --> N[Node]
+    N --> R[Root service]
+    R --> A[Actor tree]
+    R --> S[(Durable state)]
+    N <--> P[Peer nodes]
+    R --> Q[Proof producer]
+```
 
-## What's in this repo
+The repository contains one application model:
 
-| Path | What |
-|---|---|
-| [`vos/`](vos/) | Core runtime: PVM host, scheduler, persistence, networking |
-| [`vos/vos-macros/`](vos/vos-macros/) | `#[actor]` / `#[messages]` / `#[msg]` proc-macros |
-| [`support/vos-raft/`](support/vos-raft/) | Async Raft implementation used by the `raft` consistency mode |
-| [`support/merkle-crdt/`](support/merkle-crdt/) | Merkle-DAG CRDT used by the `crdt` consistency mode |
-| [`support/vos-shell/`](support/vos-shell/) | Sandboxed nushell-backed console engine |
-| [`vosx/`](vosx/) | Operator-facing CLI (`vosx run …`, `vosx space …`) — see its [README](vosx/README.md) |
-| [`actors/`](actors/) | Built-in PVM actors bundled into `vosx` (e.g. `space-registry`) |
-| [`extensions/`](extensions/) | Native extension plugins loaded by the runtime (e.g. `http-gateway`) |
-| [`pvm/`](pvm/) | Virtual machine, compiler, and proof toolchain |
-| [`examples/`](examples/) | Four canonical service actor examples |
-| [`tests/fixtures/`](tests/fixtures/) | Test-only legacy, extension, WASM, and proving workloads |
-| [`tests/acceptance/clerk/`](tests/acceptance/clerk/) | Complex replicated-payment acceptance application |
-| [`docs/`](docs/) | The VOS Book (architecture, protocols, applications) |
+- `#[actor]` defines an actor.
+- `vosx build` creates a signed `.vos` package.
+- `vosx space publish` records that exact package by content hash.
+- `vosx space install` creates a root service from it.
+- Local, Raft, and CRDT roots share the same actor and package APIs.
 
-The clean-break service, continuation, wire, package and CRDT contracts—and
-their current implementation status—are documented in
-[`docs/runtime.md`](docs/runtime.md).
-
-## Quick start
+## Start here
 
 ```bash
-# Reproduce the protocol-pinned generic service from its recorded source and
-# toolchains. The recipe requires the pinned revision in local git history.
-just build-vos-service
-cp target/pinned-production-artifacts/vos-service.pvm dist/vos-service.pvm
-
-# Build one canonical application PVM and its signed .vos package. The package
-# pins the service program above; developers do not implement Refine/Accumulate.
-cargo run -p vosx -- build examples/actors/counter \
-  --out-dir dist
-
-# Exercise all four public scenarios, including their canonical actor builds.
-just test-examples
+cargo run -p vosx -- new hello
+cargo run -p vosx -- build hello --name hello
+cargo run -p vosx -- space new demo
+cargo run -p vosx -- space up demo --service-pvm services/vos-service/vos-service.pvm
 ```
 
-The immutable artifact provenance is recorded in
-[`support/production-artifacts.toml`](support/production-artifacts.toml).
-Building current service sources is deliberately separate (`just
-build-vos-service-candidate`): that output is an upgrade candidate with a new
-identity, never an in-place replacement for the production pin.
-
-Clerk's executable/package content is pinned by its ProgramId, DeploymentId,
-and Task hash, while its final `.vos` signature is operator-specific. Build a
-release wrapper by naming the signing key explicitly—ambient XDG identity is
-never consulted by this recipe:
+In another terminal:
 
 ```bash
-just build-clerk-package /secure/operator/identity.key
+cargo run -p vosx -- space publish demo hello dist/hello.vos
+cargo run -p vosx -- space install demo hello --consistency local
+cargo run -p vosx -- hello value --space demo
 ```
 
-The space daemon installs signed service packages through the generic service PVM
-for Local, Raft, and CRDT roots, while legacy catalog rows continue on the old
-host. Supplying `--service-pvm` requires an explicit trust profile:
-`--production-trust-socket <path>` opens every service root through a fail-closed
-local service platform/consensus authority sidecar. The development-only
-`--allow-conformance` flag selects the protocol conformance seam instead;
-it is never selected implicitly and is not production-safe. The production
-wire and policy contract are described in
-[`docs/runtime.md`](docs/runtime.md). `vosx run`
-remains a legacy one-shot ELF/PVM runner and does not install `.vos` packages.
-The physical production-profile acceptance gate is `just
-test-production-daemon`; it covers signed Local, single-voter Raft, and
-CRDT roots across durable restart, authenticated two-daemon CRDT convergence
-and receipt verification, plus three-voter Raft onboarding, follower ingress,
-leader failover, and restarted-voter catch-up under independently connected
-implementations of the trust protocol.
+See [Getting started](docs/getting-started.md),
+[Architecture](docs/architecture.md), and
+[Operations](docs/operations.md).
 
-## Offline backup and restore
+## Repository map
 
-Stop the space daemon, then archive the complete space—not just its redb
-files. The `VOSB1` directory includes the node identity, Local/Raft/CRDT
-state, service root images, proof/private-input/prover-record side stores, local
-policy, and the content-addressed program cache under a per-file BLAKE2b-256
-manifest:
-
-```bash
-vosx space backup a /backups/a-2026-08-21.vos-backup
-vosx space restore /backups/a-2026-08-21.vos-backup --name a-restored
-vosx space up a-restored --service-pvm ./dist/vos-service.pvm \
-  --production-trust-socket /run/vos/production-trust.sock
-```
-
-`space up`, backup, restore, and `space forget` share a space-ID lock, so a
-live daemon cannot be copied, replaced, or unlinked. Restore verifies every
-archive byte and its mandatory node identity, registry database, and declared
-registry blob before activating it. It never overwrites an existing data
-directory unless `--replace` is given, and never overwrites a directory owned
-by another indexed space or any ancestor/descendant of its data directory;
-replacement renames the old directory aside and reports its recovery path.
-Indexed data paths are canonical absolute UTF-8 paths—legacy relative,
-overlapping, and non-representable entries are rejected on load—and cannot
-overlap the vosx configuration or shared blob-cache control trees. Every
-spaces-index mutation shares one cross-process lock.
-Cache objects are public, immutable artifacts and use independent
-copy-on-write clones when the filesystem supports them, avoiding an immediate
-second physical copy without tying archive integrity to the live cache inode.
-Private side stores and `node.key` are sensitive: keep the backup on encrypted,
-access-controlled storage. The manifest detects corruption; preserve the
-printed manifest digest separately if it must also be authenticated against a
-hostile archive provider. `just test-release-operations` exercises a
-committed signed root through backup, fresh-directory restore, and reopen.
-The operator signing identity, canonical service PVM, and production-trust
-authority are deployment-level inputs rather than space data; back them up and
-restore them through their own key/artifact procedures.
-
-## Consistency modes
-
-Each `[[agent]]` in a recipe picks a `consistency` mode:
-
-| Mode | Replication | Read-from-any-replica | Writes block on |
-|---|---|---|---|
-| `ephemeral` | none, in-memory | n/a | nothing |
-| `local` | redb on local disk | n/a | local fsync |
-| `crdt` | merkle-CRDT, eventual | yes | local commit |
-| `raft` | Raft consensus, strict | leader only (today) | quorum ack |
-
-CRDT is available only to `#[actor(crdt)]` programs whose fields use explicit
-convergent types such as `Counter`, `Value`, `Map`, `Set`, `List`, and `Text`.
-Raft fits
-strictly sequenced state where divergence corrupts (ledgers,
-unique-name registries). Modes mix freely per-agent.
-
-Raft requires a cluster membership list (every replica's `node_prefix`). The
-daemon driver and package flow are documented in
-[`docs/runtime.md`](docs/runtime.md).
-
-```bash
-just test                              # rebuild artifacts + full integration suite
-```
-
-## Multi-node
-
-The admin node installs agents once; a joiner never boots its own
-manifest — it redeems an invite token and syncs the catalog from the
-registry.
-
-```bash
-# host A — create with a genesis recipe, boot, then invite a member
-vosx space new a --recipe ./my-space.toml
-vosx space up a --service-pvm ./dist/vos-service.pvm \
-  --production-trust-socket /run/vos/production-trust.sock \
-  --listen /ip4/0.0.0.0/tcp/4811 &   # first boot seals canonical authority
-vosx space info a            # prints the node's bootnode hint:
-                             #   /ip4/.../tcp/4811/p2p/<peer-id>
-vosx space invite a --role member --bootnode <bootnode-hint>
-                             # prints a vos1… token on its first stdout line
-
-# host B — redeem the token: join-if-needed + boot + auto-redeem
-vosx space up "<paste-the-vos1-token>" \
-  --service-pvm ./dist/vos-service.pvm \
-  --production-trust-socket /run/vos/production-trust.sock &
-                             # or  vosx space up -  to read the token from stdin
-```
-
-For local protocol development only, replace `--production-trust-socket` with
-`--allow-conformance`. Production deployments must provide an authority.
-
-The TOML recipe is a devhelper, not the runtime source of truth —
-the registry is. A recipe is consumed once at genesis (the space's
-first boot) to seed the registry; thereafter the registry is
-authoritative and joiners sync agents from it. `space export`
-re-derives a recipe from the live registry; `space apply`
-reconciles a recipe against a running space.
-
-To cancel an offline bearer before its first redemption, run
-`vosx space invite a revoke "<paste-the-vos1-token>"`. Once a token appears
-in `space invite a list`, `revoke` also accepts its displayed `token_pub`
-prefix. Invite revocation blocks later redemptions in both the registry and
-canonical service authority, but does not remove a role already granted; use
-`space role a revoke <peer-id>` for that.
-
-## Writing an actor
-
-```rust
-use vos::prelude::*;
-
-#[actor]
-pub struct Counter { count: u64 }
-
-#[messages]
-impl Counter {
-    fn new() -> Self { Counter { count: 0 } }
-
-    #[msg]
-    async fn inc(&mut self) { self.count += 1; }
-
-    #[msg]
-    async fn get(&self) -> u64 { self.count }
-}
-```
-
-`#[actor]` emits the canonical actor PVM entrypoint. The generic VOS service,
-not application code, owns Refine and Accumulate. `#[messages]` generates the
-per-handler message types, route-only `CounterRef`, and a bound handle whose
-methods need no extra context argument:
-
-```rust
-use counter::CounterRef;
-
-let mut counter = ctx.actor::<CounterRef>("counter").await?;
-counter.inc().await?;
-let n = counter.get().await?;
-```
-
-`vosx new counter` creates the target configuration that injects `no_std` and
-`no_main` plus the required `core,alloc,compiler_builtins` build-std flags.
-Use `vosx new shared-board --crdt` for an explicit CRDT template.
-
-## Writing an extension
-
-An **extension** is a native `.so` plugin that runs alongside PVM
-agents and gives them OS access — sockets, filesystem, threads,
-async runtimes. PVM agents reach the outside world by `ctx.ask`-ing
-extensions. Two kinds:
-
-- **Actor** — request-driven, same `#[actor]` / `#[messages]` DSL
-  as PVM agents, just compiled as a cdylib. Add an `async fn tick`
-  handler (driven by a manifest `tick_ms`) to originate periodic work.
-- **Transport** — serves a network protocol on a socket the host
-  binds for it. You write `handle_connection(&self, ctx, conn_id)`;
-  the host owns the listener + accept loop and spawns one concurrent
-  connection task per accept, all sharing `&self`.
-
-```rust
-use vos::prelude::*;
-
-#[actor(kind = "transport", caps = ["net.tcp.bind"])]
-pub struct MyServer { /* state */ }
-
-#[messages]
-impl MyServer {
-    fn new(args: &[u8]) -> Self { /* parse init args */ }
-
-    // The host binds the listener (from the manifest's bind_addr/port),
-    // accepts + terminates TLS, and drives one task per connection.
-    async fn handle_connection(&self, ctx: &mut Context<Self>, conn_id: u64) {
-        while let Some(bytes) = ctx.read(conn_id, 4096).await {
-            if bytes.is_empty() || ctx.write(conn_id, &bytes).await.is_none() {
-                break;
-            }
-        }
-        ctx.close(conn_id).await;
-    }
-}
-```
-
-Install via the manifest:
-
-```toml
-[[extension]]
-name = "gateway"
-path = "../target/debug/libmy_gateway.so"
-init = { bind_addr = "127.0.0.1", port = 8080 }
-```
-
-See [`extensions/AUTHORING.md`](extensions/AUTHORING.md) for the
-full cookbook and [`docs/extensions.md`](docs/extensions.md) for the
-book chapter. The canonical transport example is
-[`extensions/http-gateway/`](extensions/http-gateway/).
-
-## Applications
-
-VOS is a substrate. Concrete applications are built on top of it as
-groups of actors and services.
-
-### Kunekt — private-by-default collaboration
-
-**Kunekt** is the headline application that the design of VOS was originally
-shaped around: a protocol for private, decentralized real-time collaboration.
-It combines the VOS runtime with three protocol layers:
-
-1. **Sync** — Merkle-CRDT documents propagated via the standard `crdt`
-   consistency mode.
-2. **Encryption** — group ratchet keys (MLS-style) so peers and storage
-   backends only ever see opaque blobs.
-3. **Persistence** — encrypted DAG nodes can ride on any content-addressed
-   backend (relay, DHT, DA layer) since storage doesn't need to be trusted.
-
-Kunekt itself is exposed as a built-in actor/service group inside VOS, with
-its own slice of the documentation covering the protocol layers, threat
-model, and integrations (Nostr, anonymous credentials, zk-promises). See
-[`docs/kunekt.md`](docs/kunekt.md).
+| Path | Purpose |
+| --- | --- |
+| `vos/` | Actor SDK, service runtime, replication, networking |
+| `vosx/` | Build, space, and operator CLI |
+| `pvm/` | Bytecode runtime, compiler, codec, and proof system |
+| `services/` | Generic service guest |
+| `actors/` | Platform actors |
+| `examples/` | Small supported applications |
+| `extensions/` | Native host integrations |
 
 ## Development
 
-Install the in-repo git hooks once after cloning:
-
 ```bash
-just install-hooks
+just build-test-artifacts
+cargo test --workspace
 ```
 
-This points `core.hooksPath` at `.githooks/`. Pre-commit gates on
-`cargo fmt --check`, `cargo clippy -D warnings`, and `vosx`'s unit
-tests; pre-push runs the full workspace test suite and `just build-pvm`
-(which also re-asserts the multi-target Cargo warning stays silenced).
-Run everything by hand with `just check-all`.
+Artifacts committed under `services/` and `vosx/blobs/` are protocol
+identities. Rebuild them only through the checked release recipes.
+

@@ -15,7 +15,7 @@ bin = []
 [lints.rust]
 unexpected_cfgs = { level = "allow" }
 
-# The flagship #[provable] Task (docs/plans/provable.md W4): a PURE
+# The flagship #[provable] Task (docs/actors.md W4): a PURE
 # VERIFIER of a cipher-clerk batch transition. A clerk-ledger parent
 # gathers the touched committed leaves + a BatchProof per sub-tree
 # (CommittedMap::batch_proof), ships them as a ClerkTransitionWitness,

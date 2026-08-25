@@ -1,34 +1,9 @@
-# The VOS Book
+# Summary
 
-[Introduction](vos.md)
-
-## Part I — Platform
-
-- [Runtime service contract](runtime.md)
-- [Architecture Overview](architecture.md)
-- [Spaces, Actors & Documents](documents.md)
-- [PVM Runtime](runtime.md)
+- [Getting started](getting-started.md)
+- [Architecture](architecture.md)
+- [Actors and packages](actors.md)
+- [Authority and privacy](security.md)
+- [Operations](operations.md)
 - [Extensions](extensions.md)
-- [Replication: CRDT vs Raft](replication.md)
-- [Persistence](persistence.md)
-- [Networking & Transport](transport.md)
-- [Identity](identity.md)
-- [Authorization](authorization.md)
-- [PVM proofs](pvm-proofs.md)
-- [SDK & Developer Experience](sdk.md)
-- [Performance & Scalability](performance.md)
 
-## Part II — Applications
-
-- [Overview](applications.md)
-- [Messaging — Private Group Messaging](messaging.md)
-    - [Sync Layer: Merkle-CRDTs](sync.md)
-    - [Anonymous Moderation: zk-promises](zk-promises.md)
-- [Private Economy: Payments, Voting, Governance](private-economy.md)
-- [Kunekt — Real-Time Collaboration (reserved)](kunekt.md)
-
-## Appendices
-
-- [The Privacy Gap](privacy-gap.md)
-- [Original Kunekt Introduction](introduction.md)
-- [Glossary](glossary.md)

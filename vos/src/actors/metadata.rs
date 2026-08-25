@@ -146,7 +146,7 @@ pub struct ActorMeta {
     /// use Ephemeral, Local, or Raft storage.
     pub crdt: bool,
     /// `#[actor(task, provable)]` — this Task is published as a
-    /// provable program (`docs/plans/provable.md` D6): a discovery/
+    /// provable program (`docs/actors.md` D6): a discovery/
     /// publication mark for the pin/verify tooling, not a semantic
     /// fork (record capture is the caller's `spawn_provable` opt-in
     /// either way). Trailing section; old blobs decode `false`.
@@ -996,7 +996,7 @@ mod decode {
         /// True only for programs explicitly compiled with `#[actor(crdt)]`.
         pub crdt: bool,
         /// `#[actor(task, provable)]` publication mark — this Task is
-        /// meant to be pinned/proved (`docs/plans/provable.md` D6).
+        /// meant to be pinned/proved (`docs/actors.md` D6).
         /// `false` when the blob predates the section.
         pub provable: bool,
     }

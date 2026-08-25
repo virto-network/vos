@@ -1,5 +1,5 @@
 //! The soundness gate for the cipher-clerk ↔ vos witness bridge
-//! (`docs/plans/provable.md` W4): a `ClerkTransitionWitness` built from
+//! (`docs/actors.md` W4): a `ClerkTransitionWitness` built from
 //! a real ledger must verify-and-apply to the SAME `(root_before,
 //! root_after)` cipher-clerk's own `SuccinctTransitionWitness` and a
 //! live `VecLedger` apply produce — and a doctored witness must panic

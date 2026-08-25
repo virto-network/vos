@@ -67,7 +67,7 @@
 //! - `prove_record(pvm_blob, entry_bytes, witness_addr, seg_steps,
 //!   page_budget, profile) -> Vec<u8>` / `verify_record(allowlist,
 //!   record_bytes, proof_hash, expected_root, peer_prefix) -> u8` — the
-//!   `#[provable]` record surface (`docs/plans/provable.md` W3) over the
+//!   `#[provable]` record surface (`docs/actors.md` W3) over the
 //!   chain machinery above: `prove_record` gates the chain prove on the
 //!   record PRE-FLIGHT (record io-consistency, blob content-address, and
 //!   a witness re-trace to the record's bound io-hash), CASes the
@@ -360,7 +360,7 @@ impl Prover {
         .await
     }
 
-    /// Prove a captured [`ProofRecordEntry`] (`docs/plans/provable.md`
+    /// Prove a captured [`ProofRecordEntry`] (`docs/actors.md`
     /// D4) — the SYNCHRONOUS record analog of `prove_chain`, gated by
     /// the record PRE-FLIGHT: the entry's internal io-hash consistency,
     /// the blob's content-address against the record's `task_hash`, and
@@ -417,7 +417,7 @@ impl Prover {
 
     /// The witness-free third-party check of a shipped
     /// [`ProvableRecord`] against its proved chain
-    /// (`docs/plans/provable.md` D4) — four checks composed so none is
+    /// (`docs/actors.md` D4) — four checks composed so none is
     /// meaningful without the others:
     ///   1. the chain verifies against the caller-supplied `allowlist`
     ///      (the record's content-addressed catalog pin — WHICH PROGRAM);
@@ -441,7 +441,7 @@ impl Prover {
     /// host CAS, streamed segment-by-segment like `verify_chain`.
     /// Returns 1/0.
     ///
-    /// Known platform gap, inherited (docs/plans/provable.md trust
+    /// Known platform gap, inherited (docs/actors.md trust
     /// model): a witness-injecting program's entering-image root cannot
     /// be pinned against its published build yet (the catalog's
     /// `unpatched_image_root` is diagnostic-only; the masked root is
@@ -854,7 +854,7 @@ fn retrace_io_hash(pvm_blob: &[u8], witness_bytes: &[u8], witness_addr: usize) -
 /// chain, delivered as per-segment proof bytes — the offline/test
 /// mirror of the `verify_record` handler (which streams the same
 /// segments from the CAS). The four checks of
-/// `docs/plans/provable.md` D4, composed exactly as the handler
+/// `docs/actors.md` D4, composed exactly as the handler
 /// documents them: record io-consistency and the `expected_root_before`
 /// comparison run here; allowlist membership, chain validity, and the
 /// final-segment io-binding over the record-reconstructed `public'`

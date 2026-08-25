@@ -7,7 +7,7 @@ edition = "2024"
 # on vos and vos must not depend on cipher-clerk, so the LedgerState
 # adapter over vos::zk::state::WitnessedLedger lives here — consumed by
 # the clerk-apply provable Task, the voucher-check guest, and the
-# clerk-ledger parent (docs/plans/provable.md W4).
+# clerk-ledger parent (docs/actors.md W4).
 
 [dependencies]
 vos = { path = "../vos", default-features = false }

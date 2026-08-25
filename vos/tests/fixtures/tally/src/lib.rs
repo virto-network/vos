@@ -57,7 +57,7 @@ impl Tally {
     }
 
     /// Like `add`, but binds the transition's app-public roots — the
-    /// provable-record fixture (`docs/plans/provable.md` W3). The bound
+    /// provable-record fixture (`docs/actors.md` W3). The bound
     /// bytes are `root_before(32) ‖ root_after(32)` over the running
     /// total, LEADING with `root_before` per the `vos::provable` root
     /// convention (that leading word is what a verifier's

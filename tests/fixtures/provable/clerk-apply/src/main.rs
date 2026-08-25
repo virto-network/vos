@@ -1,4 +1,4 @@
-//! clerk-apply — the flagship `#[provable]` Task (`docs/plans/provable.md`
+//! clerk-apply — the flagship `#[provable]` Task (`docs/actors.md`
 //! W4): a PURE VERIFIER of a cipher-clerk batch transition.
 //!
 //! ## What it proves

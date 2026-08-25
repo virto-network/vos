@@ -115,7 +115,7 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     //   #[actor(caps = ["net.tcp.bind", ...])] — declarative capability list
     // A proof exists only for the witness-delivered, refine-pure Task
     // shape — `provable` on anything else is a category error, not a
-    // flag to ignore (docs/plans/provable.md D1/D6).
+    // flag to ignore (docs/actors.md D1/D6).
     if parsed.provable && parsed.task_buf.is_none() {
         return syn::Error::new(
             proc_macro2::Span::call_site(),
@@ -1809,7 +1809,7 @@ struct ActorAttrs {
     crdt: bool,
     /// `#[actor(task, provable)]` — publish this Task as a provable
     /// program: sets `Actor::PROVABLE`, which lands as the `.vos_meta`
-    /// trailing provable flag (`docs/plans/provable.md` D6). Valid
+    /// trailing provable flag (`docs/actors.md` D6). Valid
     /// only with `task`; the macro rejects it otherwise.
     provable: bool,
 }
