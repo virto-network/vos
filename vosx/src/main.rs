@@ -1,9 +1,8 @@
 //! `vosx` — service platform-aligned PVM executor + space orchestrator.
 //!
 //! Top-level surface is intentionally tiny: every space-related
-//! operation lives under `vosx space *`. The remaining
-//! top-level commands are for things that don't fit the space
-//! model — currently just `run` for raw ELF/PVM execution.
+//! operation lives under `vosx space *`. Top-level commands build canonical
+//! packages and manage platform artifacts.
 //!
 //! The earlier manifest-driven commands (`new`, `up`, `join`,
 //! `ls`, `ps`, `call`) folded into `vosx space *`; they had
@@ -53,16 +52,11 @@ const EXIT_NOT_FOUND: i32 = 3;
 #[command(
     name = "vosx",
     version,
-    about = "VOS host CLI — run actors, manage spaces, talk to peers"
+    about = "VOS host CLI — build actors, manage spaces, talk to peers"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
-
-    /// Raw ELF/PVM blob to run as a one-shot. Equivalent to
-    /// `vosx run <file>`. Anything space-related needs an
-    /// explicit `vosx space *` subcommand.
-    file: Option<PathBuf>,
 
     /// Output format. `text` (default) is human-readable;
     /// `json` emits a single JSON value per command for scripts
@@ -125,21 +119,6 @@ enum Command {
     Release {
         #[command(subcommand)]
         command: commands::production_release::ReleaseCommand,
-    },
-    /// Run a single PVM/ELF program with no recipe (one-shot).
-    /// No registry, no networking — just boot the kernel,
-    /// deliver the supplied work items, halt.
-    Run {
-        program: PathBuf,
-        /// Deliver file contents as a FETCH work item (repeatable).
-        #[arg(long, value_name = "FILE")]
-        payload: Vec<PathBuf>,
-        /// Deliver hex-encoded bytes as a FETCH work item (repeatable).
-        #[arg(long, value_name = "HEX")]
-        hex: Vec<String>,
-        /// Set gas limit.
-        #[arg(long, default_value_t = 100_000_000)]
-        gas: u64,
     },
     /// Per-space lifecycle and operations.
     Space {
@@ -207,19 +186,14 @@ fn main() {
 
     // Pre-parser: peek argv and decide whether to enter the
     // dynamic-dispatch path before handing off to clap. clap's
-    // Subcommand derive only knows the built-in verbs (`run`,
-    // `space`, `help-schema`); a `vosx gateway stop` invocation
-    // would otherwise slip through as the `file` positional and
-    // fail with a confusing "no such ELF" error.
+    // Subcommand derive only knows the built-in verbs; a
+    // `vosx gateway stop` invocation is routed to the dynamic actor client.
     //
     // The verb is the first non-flag argv token. We route to the
     // dynamic dispatcher when:
     //
     //   * the verb exists,
-    //   * it's not a built-in (`run`, `space`, `help-schema`,
-    //     `help`),
-    //   * and it's not a path-like token (one-shot ELF run still
-    //     takes precedence so `vosx ./foo.elf` keeps working).
+    //   * it's not a built-in (`space`, `help-schema`, `help`).
     //
     // Anything else falls through to `Cli::parse()` so clap's
     // own --help / --version / parse-error machinery stays intact.
@@ -304,14 +278,6 @@ fn main() {
                 report_error(error);
             }
         }
-        Some(Command::Run {
-            program,
-            payload,
-            hex,
-            gas,
-        }) => {
-            commands::run::run(&program, &payload, &hex, gas);
-        }
         Some(Command::Space { command }) => {
             if let Err(e) = commands::space::run(command) {
                 report_error(e);
@@ -356,16 +322,10 @@ fn main() {
                 println!("path    = {}", path.display());
             }
         }
-        None => match cli.file {
-            Some(p) => commands::run::run(&p, &[], &[], 100_000_000),
-            None => {
-                eprintln!(
-                    "vosx: no command. Try `vosx space new foo`, \
-                     `vosx run path/to.elf`, or `vosx --help`."
-                );
-                std::process::exit(EXIT_USAGE_ERROR);
-            }
-        },
+        None => {
+            eprintln!("vosx: no command. Try `vosx space new foo` or `vosx --help`.");
+            std::process::exit(EXIT_USAGE_ERROR);
+        }
     }
 }
 
@@ -403,16 +363,13 @@ fn is_top_level_help(argv: &[String]) -> bool {
 /// Decide whether argv should bypass clap into the dynamic
 /// dispatcher. The first non-flag token is the candidate verb;
 /// any of the built-in subcommand names — including clap's
-/// auto-generated `help` — falls back to clap. A path-like token
-/// (one with `/` or `\`, or starting with `.`) is preserved for
-/// the existing one-shot ELF run path.
+/// auto-generated `help` — falls back to clap.
 fn should_dynamic_dispatch(argv: &[String]) -> bool {
     const BUILTIN_VERBS: &[&str] = &[
         "new",
         "build",
         "service-pvm",
         "release",
-        "run",
         "space",
         "zk",
         "help-schema",
@@ -445,9 +402,6 @@ fn should_dynamic_dispatch(argv: &[String]) -> bool {
                     return false;
                 }
                 if BUILTIN_VERBS.contains(&a.as_str()) {
-                    return false;
-                }
-                if a.contains('/') || a.contains('\\') || a.starts_with('.') {
                     return false;
                 }
                 return true;
@@ -532,26 +486,12 @@ mod routing_tests {
             "build",
             "service-pvm",
             "release",
-            "run",
             "space",
             "zk",
             "help-schema",
             "help",
             "whoami",
         ] {
-            assert!(!should_dynamic_dispatch(&s(&[v])), "verb={v}");
-        }
-        // `ai` and `dev` are no longer builtins — `vosx ai generate …`
-        // and `vosx dev compile …` dispatch dynamically to their
-        // extension instances.
-        assert!(should_dynamic_dispatch(&s(&["ai", "generate"])));
-        assert!(should_dynamic_dispatch(&s(&["dev", "compile"])));
-    }
-
-    #[test]
-    fn path_like_first_positional_runs_one_shot() {
-        // The existing `vosx ./foo.elf` shape must keep working.
-        for v in ["./foo.elf", "/abs/path.elf", "rel\\path"] {
             assert!(!should_dynamic_dispatch(&s(&[v])), "verb={v}");
         }
     }
@@ -640,7 +580,6 @@ mod routing_tests {
         // `vosx space --help` is subcommand help — clap should
         // handle that path, not our extended renderer.
         assert!(!is_top_level_help(&s(&["space", "--help"])));
-        assert!(!is_top_level_help(&s(&["run", "--help"])));
     }
 
     #[test]

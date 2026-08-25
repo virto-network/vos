@@ -26,9 +26,7 @@
 //!
 //! `main` decides whether to enter this module by peeking argv
 //! before clap. The verb must be neither a built-in subcommand
-//! (`run`, `space`, `help-schema`, `help`) nor a path-like token
-//! (contains `/` or `\`, or starts with `.`). Path-likes still
-//! flow into `commands::run` as one-shot ELF execution.
+//! (`space`, `help-schema`, `help`).
 
 use anyhow::{Context, anyhow, bail};
 use vos::metadata::{ParsedMessage, ParsedMeta};
@@ -841,9 +839,8 @@ fn apply_arg(msg: Msg, k: &str, v: &str, field_ty: Option<&str>) -> anyhow::Resu
         return Ok(msg.with(k, bytes));
     }
 
-    // Types are recorded whitespace-free by the macro, but older
-    // binaries may carry a pretty-printed `Vec < u8 >`; normalize so
-    // the arms match either.
+    // Normalize whitespace so hand-written schema declarations and generated
+    // declarations use the same coercion rules.
     let ty = field_ty.map(normalize_ty);
     let parse_err = |ty: &str| anyhow!("arg '{k}': expected {ty}, got {v:?}");
     let hex_err = |ty: &str| anyhow!("arg '{k}': expected hex bytes for {ty}, got {v:?}");
@@ -885,9 +882,7 @@ fn apply_arg(msg: Msg, k: &str, v: &str, field_ty: Option<&str>) -> anyhow::Resu
             let bytes = hex_decode(v).ok_or_else(|| hex_err(t))?;
             msg.with(k, bytes)
         }
-        // No schema or unrecognised type — fall back to the
-        // legacy heuristic so `space call`-equivalent commands
-        // keep working on agents that haven't registered meta.
+        // No schema or unrecognised type — use a small text heuristic.
         _ => {
             if let Ok(n) = v.parse::<u64>() {
                 msg.with(k, n)
