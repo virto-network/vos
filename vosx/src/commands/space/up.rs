@@ -20,7 +20,7 @@ use crate::commands::space::common::{
     consistency_from_u8, derive_hyperspace_id, instance_service_id, registry_replication_id,
     service_root_actor_id, service_root_service_id,
 };
-use crate::commands::space::{payload_codec, reconcile, subscriptions};
+use crate::commands::space::{reconcile, subscriptions};
 use crate::spaces_index;
 
 const PENDING_INVITE_FILE: &str = ".pending-invite.token";
@@ -233,8 +233,6 @@ fn ensure_service_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::
         package_hash.0.to_vec(),
         replication_id.to_vec(),
         Consistency::Raft as u8,
-        Vec::new(),
-        Vec::new(),
         false,
         vos::registry::SyncFloor::Member,
         Vec::new(),
@@ -508,14 +506,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         clear_pending_recipe(&entry.id)?;
     }
 
-    // Node-local policy is now the single source of truth alongside the
-    // registry: `local.toml`. A bare `space up` restart re-applies every
-    // agent's `tick_ms` / `intra_caps` / device-seed provisioning and the
-    // `[[extension]]` registrations from here — the standing bug where a
-    // restart silently dropped them is gone.
+    // `local.toml` retains host-private service signing configuration and
+    // native extension registrations across restarts.
     let local_cfg = subscriptions::load(&data_dir).unwrap_or_default();
     let agent_policies = agent_policies_from_local(&local_cfg)?;
-    let device_secret_agents = device_secret_agents_from_local(&local_cfg);
     // Shared across bootstrap and runtime reconciliation. Bootstrap opens at
     // most one service root synchronously; remaining rows inherit the same global
     // window/backoff and are opened only after the endpoint is published.
@@ -534,7 +528,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // Spawn every installed agent recorded in the registry.
     // Each gets a deterministic per-node ServiceId so its redb
     // path is stable across restarts.
-    let legacy_agents = spawn_installed_agents(
+    spawn_installed_agents(
         &mut node,
         &data_dir,
         space_id,
@@ -545,16 +539,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         production_trust.clone(),
         &mut service_registration_backoff,
     )?;
-
-    // Provision device-local secret seeds for agents that declared
-    // `device_secret = true` (the messenger's MLS CSPRNG root). Runs after
-    // spawn so the targets are live; the seed never touches the replicated
-    // registry — it lives only in a node-local sidecar. Idempotent.
-    let legacy_device_secret_agents = device_secret_agents
-        .into_iter()
-        .filter(|name| legacy_agents.contains(name))
-        .collect::<Vec<_>>();
-    provision_device_seeds(&node, &legacy_device_secret_agents, &data_dir, local_prefix);
 
     // The space creator's operator key is granted ADMIN at genesis
     // (a signed `grant_role` baked into the DAG by `space new`),
@@ -599,7 +583,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         // waiting for the next daemon restart. `local_cfg` (loaded
         // above) is captured once; editing local.toml still needs a
         // restart to take effect.
-        let has_hyperspace = hyperspace.is_some();
         // A pending invite is redeemed from the same tick: each pass,
         // until the bootnode grants this node's key, re-parse the token
         // and invoke the bootnode's `redeem_invite`; clear the marker on
@@ -614,27 +597,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let mut query_warned = false;
         let mut last_pass = std::time::Instant::now();
-        // chronos clock/randomness feed (`vos::chronos_feed::ChronosFeeder`): a
-        // separate, faster keepalive gate than the spawn-reconcile pass. The
-        // per-space domain is the space id; the feeder holds its own cross-pass
-        // state and the node's static VRF keypair. A node.key read failure
-        // disables the feed rather than the whole daemon.
-        let mut chronos_feeder =
-            match vos::chronos_feed::ChronosFeeder::new(&data_dir, entry.id.as_bytes().to_vec()) {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    tracing::warn!("chronos feed disabled: {e}");
-                    None
-                }
-            };
-        let mut last_feed = std::time::Instant::now();
         node.run_forever_with(|n| {
-            if last_feed.elapsed() >= CHRONOS_FEED_EVERY {
-                last_feed = std::time::Instant::now();
-                if let Some(feeder) = chronos_feeder.as_mut() {
-                    feeder.feed(n, local_prefix);
-                }
-            }
             if last_pass.elapsed() < SPAWN_RECONCILE_EVERY {
                 return;
             }
@@ -675,7 +638,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 &data_dir,
                 space_id,
                 local_prefix,
-                has_hyperspace,
                 &local_cfg,
                 &mut damped,
                 &mut service_registration_backoff,
@@ -1253,132 +1215,28 @@ fn build_network_for_daemon(
     }))
 }
 
-/// Node-local per-agent policy from the recipe (never replicated): the
-/// periodic `tick_ms` and the parsed `intra_caps` relay bound.
+/// Node-local service policy from the recipe (never replicated).
 #[derive(Default, Clone)]
 struct AgentLocalPolicy {
-    tick_ms: Option<u64>,
-    intra_caps: Vec<vos::IntraCap>,
     device_secret: bool,
 }
 
 type AgentPolicies = std::collections::BTreeMap<String, AgentLocalPolicy>;
 
-/// Collect the `tick_ms` / `intra_caps` policy for each agent from
-/// `local.toml`. Parses the `intra_caps` strings eagerly so a malformed
-/// cap fails the boot (like the extension path).
+/// Collect host-private service policy from `local.toml`.
 fn agent_policies_from_local(cfg: &subscriptions::LocalConfig) -> anyhow::Result<AgentPolicies> {
     let mut map = AgentPolicies::new();
     for (name, a) in &cfg.agents {
-        let mut intra_caps = Vec::with_capacity(a.intra_caps.len());
-        for tok in &a.intra_caps {
-            intra_caps.push(
-                vos::IntraCap::parse(tok)
-                    .map_err(|e| anyhow::anyhow!("agent '{name}': intra_cap '{tok}': {e}"))?,
-            );
-        }
-        let tick_ms = a.tick_ms.filter(|ms| *ms > 0);
-        if tick_ms.is_some() || !intra_caps.is_empty() || a.device_secret {
+        if a.device_secret {
             map.insert(
                 name.clone(),
                 AgentLocalPolicy {
-                    tick_ms,
-                    intra_caps,
                     device_secret: a.device_secret,
                 },
             );
         }
     }
     Ok(map)
-}
-
-/// The instance names flagged `device_secret = true` in `local.toml` —
-/// each gets a node-local CSPRNG seed provisioned post-spawn.
-fn device_secret_agents_from_local(cfg: &subscriptions::LocalConfig) -> Vec<String> {
-    cfg.agents
-        .iter()
-        .filter(|(_, a)| a.device_secret)
-        .map(|(n, _)| n.clone())
-        .collect()
-}
-
-/// Provision each `device_secret = true` agent with a node-local CSPRNG seed
-/// (the messenger's MLS confidentiality root). The seed is 32 bytes of OS
-/// entropy held in a `{data_dir}/agents/{svc_id:08x}.seed` sidecar — node-local
-/// like the P0 `.seal`, never replicated — and delivered by a `seed` message
-/// over a local `Caller::System` invoke (a node-local, host-initiated path
-/// that bypasses the auth gate). Idempotent: the agent persists the seed in
-/// its Local redb, so a re-send on a later boot is a no-op. Best-effort — a
-/// failure to seed is logged, not fatal.
-fn provision_device_seeds(
-    node: &VosNode,
-    agents: &[String],
-    data_dir: &std::path::Path,
-    daemon_prefix: u16,
-) {
-    for name in agents {
-        let svc_id = crate::commands::space::common::instance_service_id(name, daemon_prefix);
-        let seed = match load_or_mint_device_seed(data_dir, svc_id) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(agent = %name, "device seed: {e}");
-                continue;
-            }
-        };
-        let msg = vos::value::Msg::new("seed").with("seed_bytes", seed);
-        let encoded = vos::Encode::encode(&msg);
-        let mut payload = Vec::with_capacity(1 + encoded.len());
-        payload.push(vos::value::TAG_DYNAMIC);
-        payload.extend_from_slice(&encoded);
-        match node.invoke_with_timeout(svc_id, payload, std::time::Duration::from_secs(5)) {
-            Some(_) => tracing::info!(agent = %name, "device seed provisioned"),
-            None => tracing::warn!(
-                agent = %name,
-                "device seed: provisioning invoke returned no reply (agent not spawned?)"
-            ),
-        }
-    }
-}
-
-/// Load an agent's 32-byte device seed from its node-local sidecar, minting
-/// fresh OS entropy (persisted `0600`) on first boot.
-fn load_or_mint_device_seed(
-    data_dir: &std::path::Path,
-    svc_id: ServiceId,
-) -> anyhow::Result<Vec<u8>> {
-    let dir = data_dir.join("agents");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{:08x}.seed", svc_id.0));
-    if let Ok(bytes) = std::fs::read(&path) {
-        if bytes.len() == 32 {
-            return Ok(bytes);
-        }
-        tracing::warn!(?path, "device seed sidecar has wrong length; re-minting");
-    }
-    let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed)
-        .map_err(|e| anyhow::anyhow!("OS entropy for device seed: {e}"))?;
-    write_secret_file(&path, &seed)?;
-    Ok(seed.to_vec())
-}
-
-/// Write a secret file, `0600` on Unix.
-fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(bytes)?;
-    }
-    #[cfg(not(unix))]
-    std::fs::write(path, bytes)?;
-    Ok(())
 }
 
 fn publish_endpoint(
@@ -1436,7 +1294,7 @@ fn spawn_installed_agents(
     pinned_service_service: Option<&PinnedService>,
     production_trust: Option<std::sync::Arc<dyn vos::service::ProductionTrust>>,
     service_registration_backoff: &mut RegistrationBackoff,
-) -> anyhow::Result<std::collections::HashSet<String>> {
+) -> anyhow::Result<()> {
     use std::collections::HashSet;
     use vos::registry::{RegistryRef, Status};
 
@@ -1460,7 +1318,6 @@ fn spawn_installed_agents(
     // blob, …) so we don't accidentally trash their state.
     let mut live_svc_ids: HashSet<u32> = HashSet::new();
     let mut live_service_services: HashSet<[u8; 32]> = HashSet::new();
-    let mut legacy_agents = HashSet::new();
     live_svc_ids.insert(ServiceId::REGISTRY.0);
     if has_hyperspace {
         // The hyperspace registry replica owns its own redb at
@@ -1532,82 +1389,38 @@ fn spawn_installed_agents(
                 continue;
             }
         };
-        let supports_raft = matches!(&prepared, RowConfig::Ready(_) | RowConfig::Service { .. });
-        let is = matches!(&prepared, RowConfig::Service { .. });
-        if matches!(&prepared, RowConfig::Ready(_)) {
-            legacy_agents.insert(a.instance_name.clone());
-        }
-        let svc_id = instance_service_id(&a.instance_name, local_prefix);
-        let raft_seed = if supports_raft
-            && consistency_from_u8(a.consistency) == Some(Consistency::Raft)
-        {
-            if !blob_store::cache_path_for(&BlobHash(a.program_hash)).exists() {
-                tracing::warn!(
-                    "skipping agent '{}' — program blob {} not in local cache",
-                    a.instance_name,
-                    BlobHash(a.program_hash),
-                );
-                continue;
-            }
-            let db_path = raft_db_path_for_row(data_dir, svc_id, &prepared);
-            match raft_members_for_row(node, &db_path, &a, local_prefix, &mut boot_grace) {
-                Ok(RaftSeed::Join {
-                    leader,
-                    known,
-                    voter_peer_ids,
-                }) if !is => {
-                    let Some(network) = node.network() else {
-                        tracing::info!(
-                            "agent '{}' (raft) deferred: no network attached",
-                            a.instance_name
-                        );
-                        continue;
-                    };
-                    match join_raft_group(
-                        &network,
-                        &a,
-                        local_prefix,
-                        leader,
-                        known,
-                        voter_peer_ids,
-                    )? {
-                        seed @ RaftSeed::Members { .. } => Some(seed),
-                        RaftSeed::Defer(reason) => {
-                            tracing::info!("agent '{}' (raft) deferred: {reason}", a.instance_name);
-                            continue;
-                        }
-                        RaftSeed::Join { .. } => unreachable!(),
-                    }
-                }
-                Ok(seed @ (RaftSeed::Members { .. } | RaftSeed::Join { .. })) => Some(seed),
-                Ok(RaftSeed::Defer(reason)) => {
-                    tracing::info!(
-                        "agent '{}' (raft) deferred to the runtime reconciler: {reason}",
+        let supports_raft = matches!(&prepared, RowConfig::Service { .. });
+        let raft_seed =
+            if supports_raft && consistency_from_u8(a.consistency) == Some(Consistency::Raft) {
+                if !blob_store::cache_path_for(&BlobHash(a.program_hash)).exists() {
+                    tracing::warn!(
+                        "skipping agent '{}' — program blob {} not in local cache",
                         a.instance_name,
+                        BlobHash(a.program_hash),
                     );
                     continue;
                 }
-                Err(e) => {
-                    tracing::warn!("agent '{}' (raft) deferred: {e}", a.instance_name);
+                let Some(db_path) = raft_db_path_for_row(data_dir, &prepared) else {
                     continue;
+                };
+                match raft_members_for_row(node, &db_path, &a, local_prefix, &mut boot_grace) {
+                    Ok(seed @ (RaftSeed::Members { .. } | RaftSeed::Join { .. })) => Some(seed),
+                    Ok(RaftSeed::Defer(reason)) => {
+                        tracing::info!(
+                            "agent '{}' (raft) deferred to the runtime reconciler: {reason}",
+                            a.instance_name,
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("agent '{}' (raft) deferred: {e}", a.instance_name);
+                        continue;
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         match prepared {
-            RowConfig::Ready(cfg) => {
-                let mut cfg = *cfg;
-                if let Some(RaftSeed::Members { members, .. }) = raft_seed {
-                    cfg.members = members;
-                }
-                let id = node.register_at_id(cfg, svc_id);
-                tracing::info!(
-                    "agent '{}' as {id} ({})",
-                    a.instance_name,
-                    crate::commands::space::common::consistency_name(a.consistency),
-                );
-            }
             RowConfig::Service {
                 config,
                 state_path,
@@ -1721,7 +1534,7 @@ fn spawn_installed_agents(
     sweep_orphan_redbs(data_dir, &live_svc_ids);
     sweep_orphan_service_services(data_dir, &live_service_services);
 
-    Ok(legacy_agents)
+    Ok(())
 }
 
 /// How often the idle hook re-runs the spawn-reconcile pass. The
@@ -1828,20 +1641,8 @@ fn spawn_program_blob_fetch(node: &VosNode, hash: [u8; 32], in_flight: &InFlight
     });
 }
 
-/// How often the leader commits a chronos `advance`. This is a keepalive
-/// cadence, deliberately NOT the 250 ms slot rate: every state-changing advance
-/// is a raft commit, so feeding the clock at 4 Hz would be 4 commits/s/space —
-/// too heavy for a chat workload. One commit/second bounds clock freshness to
-/// ~1 s while folding roughly one entropy epoch per commit. Piggybacking the
-/// slot stamp on the msg-ctl commits a space already makes (sub-second freshness
-/// with no extra commits) is the future optimisation; this is the idle-keepalive
-/// half of that design.
-const CHRONOS_FEED_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// Outcome of resolving one registry `AgentRow` into a spawnable
-/// [`AgentConfig`].
+/// Outcome of resolving one registry row into a canonical service.
 enum RowConfig {
-    Ready(Box<AgentConfig>),
     Service {
         config: Box<vos::service::LocalRootTreeConfig>,
         state_path: PathBuf,
@@ -1864,21 +1665,16 @@ enum RowConfig {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RowCatalogSupport {
-    LegacyHost,
+    Unsupported,
     ServicePackage,
 }
 
-/// Inspect the content-addressed artifact before any Raft membership action.
-///
-/// This deliberately does not parse/transpile legacy artifacts: that remains
-/// after Raft admission so deferred rows do not pay the expensive work every
-/// reconciliation pass. Recognizing the package magic is sufficient to keep
-/// unsupported service rows out of the legacy membership protocol.
+/// Inspect the content-addressed artifact before any membership action.
 fn catalog_artifact_support(artifact: &[u8]) -> RowCatalogSupport {
     if artifact.get(..4) == Some(b"VOSP") {
         RowCatalogSupport::ServicePackage
     } else {
-        RowCatalogSupport::LegacyHost
+        RowCatalogSupport::Unsupported
     }
 }
 
@@ -2088,81 +1884,27 @@ fn agent_config_from_row(
             None => return Ok(RowConfig::MissingBlob),
         },
     };
-    if catalog_artifact_support(&artifact) == RowCatalogSupport::ServicePackage {
-        return Ok(
-            match service_config_from_row(
-                data_dir,
-                space_id,
-                a,
-                installed_agents,
-                policies,
-                consistency,
-                artifact,
-                pinned_service_service,
-                root_peer_id,
-            ) {
-                Ok(config) => config,
-                Err(error) => RowConfig::UnsupportedPackage(error.to_string()),
-            },
-        );
+    if catalog_artifact_support(&artifact) != RowCatalogSupport::ServicePackage {
+        return Ok(RowConfig::UnsupportedPackage(
+            "catalog applications must be signed service packages".into(),
+        ));
     }
-    let CatalogActorArtifact::LegacyExecutable(blob) =
-        actor_blob_from_catalog(artifact, &a.instance_name)?;
-
-    let needs_persistence = matches!(
-        consistency,
-        Consistency::Local | Consistency::Crdt | Consistency::Raft
-    );
-    let needs_replication = matches!(consistency, Consistency::Crdt | Consistency::Raft);
-    let mut cfg = AgentConfig::new(blob)
-        .with_name(a.instance_name.clone())
-        .with_consistency(consistency);
-    if needs_persistence {
-        cfg = cfg.persist(data_dir);
-    }
-    if needs_replication {
-        cfg = cfg.with_replication_id(a.replication_id);
-    }
-    // A node-confined (Local/Ephemeral) agent opts out of the device gate so
-    // remote peers can reach it — the network-served bridges. No-op for
-    // Crdt/Raft (never confined).
-    if a.network_reachable {
-        cfg = cfg.network_reachable();
-    }
-    if !a.install_args.is_empty() {
-        cfg = cfg.with_storage(vec![(
-            vos::lifecycle::INIT_KEY.to_vec(),
-            a.install_args.clone(),
-        )]);
-    }
-
-    // on_start payloads (from recipe reconciliation) get
-    // dispatched on cold start. Stored as rkyv-encoded
-    // `Vec<Vec<u8>>` on the agent row.
-    match payload_codec::decode(&a.install_payloads) {
-        Ok(payloads) if !payloads.is_empty() => {
-            cfg = cfg.with_init_payloads(payloads);
-        }
-        Ok(_) => {}
-        Err(e) => {
-            tracing::warn!(
-                "agent '{}' has unparseable install_payloads, ignoring: {e}",
-                a.instance_name,
-            );
-        }
-    }
-
-    // Node-local recipe policy (never replicated): periodic `tick` cadence
-    // and the bounded outbound-relay caps.
-    if let Some(policy) = policies.get(&a.instance_name) {
-        if let Some(ms) = policy.tick_ms {
-            cfg = cfg.with_tick_ms(ms);
-        }
-        if !policy.intra_caps.is_empty() {
-            cfg = cfg.with_intra_caps(policy.intra_caps.clone());
-        }
-    }
-    Ok(RowConfig::Ready(Box::new(cfg)))
+    Ok(
+        match service_config_from_row(
+            data_dir,
+            space_id,
+            a,
+            installed_agents,
+            policies,
+            consistency,
+            artifact,
+            pinned_service_service,
+            root_peer_id,
+        ) {
+            Ok(config) => config,
+            Err(error) => RowConfig::UnsupportedPackage(error.to_string()),
+        },
+    )
 }
 
 /// Recover an upgraded root's exact signed package when the node-local catalog
@@ -2269,18 +2011,6 @@ fn service_config_from_row(
             "#[actor(crdt)] package must use CRDT consistency, whose daemon driver is not attached yet"
         ),
     }
-    if !row.install_args.is_empty() || !row.install_payloads.is_empty() {
-        anyhow::bail!(
-            "legacy install args/on_start payloads are unsupported; initialize service actors through explicit invocations"
-        );
-    }
-    if policies
-        .get(&row.instance_name)
-        .is_some_and(|policy| policy.tick_ms.is_some() || !policy.intra_caps.is_empty())
-    {
-        anyhow::bail!("legacy tick/intra_caps policy is unsupported for service root services");
-    }
-
     let space = vos::service::SpaceId(space_id);
     let root_service = service_root_service_id(space, &row.instance_name, row.replication_id);
     let root_actor = service_root_actor_id(root_service, &row.instance_name);
@@ -2838,59 +2568,19 @@ fn register_service_root_from_row(
         })
 }
 
-fn legacy_raft_db_path(data_dir: &Path, svc_id: ServiceId) -> PathBuf {
-    data_dir
-        .join("agents")
-        .join(format!("{:08x}.redb", svc_id.0))
-}
-
 fn service_raft_db_path(data_dir: &Path, root_service: vos::service::RootServiceId) -> PathBuf {
     data_dir
         .join("services")
         .join(format!("{}.raft.redb", hex::encode(root_service.0)))
 }
 
-fn raft_db_path_for_row(data_dir: &Path, svc_id: ServiceId, prepared: &RowConfig) -> PathBuf {
+fn raft_db_path_for_row(data_dir: &Path, prepared: &RowConfig) -> Option<PathBuf> {
     match prepared {
         RowConfig::Service { config, .. } => {
-            service_raft_db_path(data_dir, config.service.root_service)
+            Some(service_raft_db_path(data_dir, config.service.root_service))
         }
-        _ => legacy_raft_db_path(data_dir, svc_id),
+        _ => None,
     }
-}
-
-/// Recover executable bytes from one content-addressed catalog artifact.
-///
-/// Resolve only artifacts that the legacy one-service-per-actor host may run.
-///
-/// A signed service package is a root-tree deployment input, not an actor blob for
-/// [`VosNode`]. Extracting its canonical actor PVM here would execute it in the
-/// native `RefinePayload`/`EffectLog` runtime and silently discard its pinned
-/// generic-service, deployment, policy, and guest-Accumulate semantics. Fail
-/// closed until this daemon path installs the complete package through
-/// `vos-service.pvm`.
-#[derive(Debug, Eq, PartialEq)]
-enum CatalogActorArtifact {
-    LegacyExecutable(Vec<u8>),
-}
-
-fn actor_blob_from_catalog(
-    artifact: Vec<u8>,
-    instance_name: &str,
-) -> anyhow::Result<CatalogActorArtifact> {
-    if catalog_artifact_support(&artifact) == RowCatalogSupport::ServicePackage {
-        anyhow::bail!(
-            "{instance_name} is a signed service package and cannot execute in the legacy actor host"
-        );
-    }
-    if artifact.get(..3) == Some(b"PVM") {
-        vos_pvm::program::parse_blob(&artifact)
-            .ok_or_else(|| anyhow::anyhow!("{instance_name} canonical PVM is invalid"))?;
-        return Ok(CatalogActorArtifact::LegacyExecutable(artifact));
-    }
-    vos_pvm_compiler::link_elf(&artifact)
-        .map(CatalogActorArtifact::LegacyExecutable)
-        .map_err(|error| anyhow::anyhow!("transpile legacy {instance_name}: {error:?}"))
 }
 
 /// Per-voter wait for a `RaftStatusReq` answer. Probes run on the router
@@ -3274,9 +2964,7 @@ fn raft_members_for_row(
 /// our probe and our join must be in our seed, or we'd reject its
 /// votes until the log catches up) and fall back to the probed
 /// `known` view when the re-probe fails.
-struct AcceptedRaftJoin {
-    members: Vec<u16>,
-}
+struct AcceptedRaftJoin;
 
 struct RejectedRaftJoin {
     reason: String,
@@ -3328,7 +3016,7 @@ fn request_raft_join(
                     instance_name,
                     members.len(),
                 );
-                return Ok(Ok(AcceptedRaftJoin { members }));
+                return Ok(Ok(AcceptedRaftJoin));
             }
             Ok(RaftJoinResult::NotLeader {
                 leader_hint: Some(h),
@@ -3387,34 +3075,6 @@ fn request_raft_join(
         reason: "leader redirects did not converge".into(),
         membership_may_have_changed: false,
     }))
-}
-
-fn join_raft_group(
-    net: &std::sync::Arc<vos::network::Network>,
-    a: &vos::registry::AgentRow,
-    local_prefix: u16,
-    leader: u16,
-    known: Vec<u16>,
-    voter_peer_ids: Vec<(u16, Vec<u8>)>,
-) -> anyhow::Result<RaftSeed> {
-    Ok(
-        match request_raft_join(
-            net,
-            &a.instance_name,
-            a.replication_id,
-            local_prefix,
-            leader,
-            known,
-            &voter_peer_ids,
-            None,
-        )? {
-            Ok(joined) => RaftSeed::Members {
-                members: joined.members,
-                voter_peer_ids,
-            },
-            Err(rejection) => RaftSeed::Defer(rejection.reason),
-        },
-    )
 }
 
 fn promote_prepared_service_raft_root(
@@ -3720,7 +3380,6 @@ fn reconcile_installed_agents(
     data_dir: &std::path::Path,
     space_id: [u8; 32],
     local_prefix: u16,
-    has_hyperspace: bool,
     local_cfg: &crate::commands::space::subscriptions::LocalConfig,
     damped: &mut RowDamping,
     service_registration_backoff: &mut RegistrationBackoff,
@@ -3730,7 +3389,7 @@ fn reconcile_installed_agents(
     pinned_service_service: Option<&PinnedService>,
     production_trust: Option<std::sync::Arc<dyn vos::service::ProductionTrust>>,
 ) -> anyhow::Result<()> {
-    use vos::registry::{RegistryRef, Status};
+    use vos::registry::RegistryRef;
 
     let reg = RegistryRef::at(ServiceId::REGISTRY);
     let agents = vos::block_on(reg.agents_all(&mut &*node))
@@ -3815,8 +3474,7 @@ fn reconcile_installed_agents(
                 continue;
             }
         };
-        let supports_raft = matches!(&prepared, RowConfig::Ready(_) | RowConfig::Service { .. });
-        let is = matches!(&prepared, RowConfig::Service { .. });
+        let supports_raft = matches!(&prepared, RowConfig::Service { .. });
         let raft_seed = if supports_raft
             && consistency_from_u8(a.consistency) == Some(Consistency::Raft)
         {
@@ -3832,40 +3490,10 @@ fn reconcile_installed_agents(
                 }
                 continue;
             }
-            let db_path = raft_db_path_for_row(data_dir, svc_id, &prepared);
+            let Some(db_path) = raft_db_path_for_row(data_dir, &prepared) else {
+                continue;
+            };
             match raft_members_for_row(node, &db_path, &a, local_prefix, boot_grace) {
-                Ok(RaftSeed::Join {
-                    leader,
-                    known,
-                    voter_peer_ids,
-                }) if !is => {
-                    let Some(network) = node.network() else {
-                        continue;
-                    };
-                    match join_raft_group(
-                        &network,
-                        &a,
-                        local_prefix,
-                        leader,
-                        known,
-                        voter_peer_ids,
-                    )? {
-                        seed @ RaftSeed::Members { .. } => {
-                            damped.remove(&key(RowNote::RaftWaiting));
-                            Some(seed)
-                        }
-                        RaftSeed::Defer(reason) => {
-                            if damped.insert(key(RowNote::RaftWaiting)) {
-                                tracing::warn!(
-                                    "agent '{}' (raft) deferred: {reason}",
-                                    a.instance_name
-                                );
-                            }
-                            continue;
-                        }
-                        RaftSeed::Join { .. } => unreachable!(),
-                    }
-                }
                 Ok(seed @ (RaftSeed::Members { .. } | RaftSeed::Join { .. })) => {
                     damped.remove(&key(RowNote::RaftWaiting));
                     Some(seed)
@@ -3889,37 +3517,6 @@ fn reconcile_installed_agents(
             None
         };
         match prepared {
-            RowConfig::Ready(cfg) => {
-                let mut cfg = *cfg;
-                if let Some(RaftSeed::Members { members, .. }) = raft_seed {
-                    cfg.members = members;
-                }
-                let id = node.register_at_id(cfg, svc_id);
-                spawned_this_pass += 1;
-                tracing::info!(
-                    "agent '{}' spawned at runtime as {id} ({})",
-                    a.instance_name,
-                    crate::commands::space::common::consistency_name(a.consistency),
-                );
-                if has_hyperspace {
-                    let hs_reg = RegistryRef::at(ServiceId::HYPERSPACE_REGISTRY);
-                    match vos::block_on(hs_reg.register_remote(
-                        &mut &*node,
-                        a.instance_name.clone(),
-                        local_prefix as u32,
-                    )) {
-                        Ok(Status::Ok) => {}
-                        Ok(other) => tracing::warn!(
-                            "hyperspace: register_remote('{}') returned status {other}",
-                            a.instance_name,
-                        ),
-                        Err(e) => tracing::warn!(
-                            "hyperspace: register_remote('{}') failed: {e}",
-                            a.instance_name,
-                        ),
-                    }
-                }
-            }
             RowConfig::Service {
                 config,
                 state_path,
@@ -4444,8 +4041,6 @@ mod tests {
             consistency: Consistency::Raft as u8,
             network_reachable: false,
             sync_role: vos::registry::SyncFloor::Member,
-            install_args: Vec::new(),
-            install_payloads: Vec::new(),
         };
         let space_id = [92; 32];
         let resolved = resolve_service_role_authority_with(
@@ -4621,18 +4216,14 @@ mod tests {
     }
 
     #[test]
-    fn signed_service_packages_are_skippable_without_becoming_legacy_executables() {
+    fn catalog_accepts_only_signed_service_packages() {
         assert_eq!(
             catalog_artifact_support(b"VOSP\x02\0package"),
             RowCatalogSupport::ServicePackage,
         );
         assert_eq!(
             catalog_artifact_support(b"PVM\0canonical"),
-            RowCatalogSupport::LegacyHost,
-        );
-        assert!(
-            actor_blob_from_catalog(b"VOSP\x02\0package".to_vec(), "counter").is_err(),
-            "the legacy host must never extract an actor from a service package",
+            RowCatalogSupport::Unsupported,
         );
     }
 
@@ -4651,8 +4242,6 @@ mod tests {
             consistency: Consistency::Raft as u8,
             network_reachable: true,
             sync_role: vos::registry::SyncFloor::Public,
-            install_args: vec![],
-            install_payloads: vec![],
         };
         let pinned = PinnedService {
             pvm: std::sync::Arc::new(service_pvm),
@@ -4704,8 +4293,6 @@ mod tests {
             consistency: Consistency::Raft as u8,
             network_reachable: false,
             sync_role: vos::registry::SyncFloor::Public,
-            install_args: vec![],
-            install_payloads: vec![],
         };
         let space_id = [0xD2; 32];
         let RowConfig::Service {
@@ -4955,8 +4542,6 @@ mod tests {
             consistency: Consistency::Local as u8,
             network_reachable: false,
             sync_role: vos::registry::SyncFloor::Public,
-            install_args: vec![],
-            install_payloads: vec![],
         };
         let pinned = PinnedService {
             pvm: std::sync::Arc::new(service_pvm),
@@ -5113,8 +4698,6 @@ mod tests {
             consistency: Consistency::Raft as u8,
             network_reachable: false,
             sync_role: vos::registry::SyncFloor::Public,
-            install_args: vec![],
-            install_payloads: vec![],
         };
         let pinned = PinnedService {
             pvm: std::sync::Arc::new(service_pvm),
@@ -5211,8 +4794,6 @@ mod tests {
             consistency: Consistency::Crdt as u8,
             network_reachable: true,
             sync_role: vos::registry::SyncFloor::Member,
-            install_args: vec![],
-            install_payloads: vec![],
         };
         let pinned = PinnedService {
             pvm: std::sync::Arc::new(service_pvm),
@@ -5251,48 +4832,23 @@ mod tests {
 
     #[test]
     fn agent_policies_come_from_local_toml() {
-        // Node-local policy is now sourced from local.toml, not the
-        // recipe — the fix for the bare-restart drop. A bare agent
-        // (no tick_ms / caps) gets no policy entry; the malformed-cap
-        // case fails the boot.
+        // Host-private signing configuration is sourced from local.toml.
         let mut cfg = subscriptions::LocalConfig::default();
         cfg.agents.insert(
-            "ticker".into(),
+            "authority".into(),
             subscriptions::AgentLocal {
-                tick_ms: Some(250),
-                intra_caps: vec!["space-registry:member".into()],
                 device_secret: true,
             },
         );
         cfg.agents.insert(
             "plain".into(),
             subscriptions::AgentLocal {
-                tick_ms: Some(0), // 0 = off → no policy
-                intra_caps: vec![],
                 device_secret: false,
             },
         );
         let policies = agent_policies_from_local(&cfg).unwrap();
-        assert!(policies.contains_key("ticker"));
-        assert_eq!(policies["ticker"].tick_ms, Some(250));
-        assert_eq!(policies["ticker"].intra_caps.len(), 1);
-        assert!(policies["ticker"].device_secret);
-        assert!(!policies.contains_key("plain"), "tick_ms=0 → no policy");
-
-        let seeds = device_secret_agents_from_local(&cfg);
-        assert_eq!(seeds, vec!["ticker".to_string()]);
-
-        // A malformed intra_cap fails the boot rather than silently
-        // dropping an authority bound.
-        cfg.agents.insert(
-            "bad".into(),
-            subscriptions::AgentLocal {
-                tick_ms: None,
-                intra_caps: vec!["not a valid cap token !!".into()],
-                device_secret: false,
-            },
-        );
-        assert!(agent_policies_from_local(&cfg).is_err());
+        assert!(policies["authority"].device_secret);
+        assert!(!policies.contains_key("plain"));
     }
 
     #[test]

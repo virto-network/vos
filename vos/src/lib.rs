@@ -111,14 +111,9 @@ pub mod jobs;
 // (no_std) so the space-registry actor's service/wasm builds can
 // `pub use` them back; the daemon's sign-on-relay path is std-gated
 // inside the module.
-pub mod registry;
-// Chronos protocol — the feeder-facing clock/committee/reveal wire types +
-// a dynamic `ChronosRef` client. Always available (no_std, no VRF) so the
-// chronos actor `pub use`s them back; the VRF-driven host feeder lives in the
-// network-gated `chronos_feed` module below.
-pub mod chronos;
 pub mod provable;
 pub mod refine_payload;
+pub mod registry;
 pub mod task_abi;
 
 pub mod effect_log;
@@ -401,13 +396,6 @@ pub mod raft;
 
 #[cfg(feature = "network")]
 pub mod network;
-
-// Host-side chronos feeder — drives the per-space clock + committee/reveal
-// protocol from a daemon's periodic hook. Needs the node, the libp2p
-// transport, the raft-role probe, VRF proving, and OS entropy, so it rides the
-// `network` feature (which implies `std`).
-#[cfg(feature = "network")]
-pub mod chronos_feed;
 
 /// Re-export for use by generated worker entry points.
 #[doc(hidden)]

@@ -39,7 +39,6 @@ pub mod list;
 pub mod members;
 pub mod new;
 pub mod op_sign;
-pub mod payload_codec;
 mod production_trust;
 pub mod programs;
 pub mod publish;
@@ -212,8 +211,7 @@ pub enum SpaceCommand {
     },
     /// Apply a recipe TOML to a running space: publish + install any
     /// missing agents (the replicated half → the registry) and project
-    /// the recipe's node-local half (`tick_ms` / `intra_caps` /
-    /// `device_secret`, `cap_policy`, `[[extension]]`) into `local.toml`.
+    /// the recipe's node-local policy into `local.toml`.
     /// Idempotent — a re-apply of the same recipe is all-skips.
     Apply {
         /// Space id (full hex) or name.
@@ -257,11 +255,7 @@ pub enum SpaceCommand {
         /// the program's `name`.
         #[arg(long)]
         name: Option<String>,
-        /// Init args as `key=value` pairs (repeatable). Values
-        /// are typed as u64 / bool / String in that order.
-        #[arg(long, value_name = "KEY=VALUE")]
-        init: Vec<String>,
-        /// Consistency mode: ephemeral, local, crdt, or raft.
+        /// Consistency mode: local, crdt, or raft.
         #[arg(long, default_value = "local")]
         consistency: String,
         /// Optional explicit replication id (64 hex). Default:
@@ -461,7 +455,6 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             space,
             program_ref,
             name,
-            init,
             consistency,
             replication_id,
             sync,
@@ -469,7 +462,6 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             space,
             program_ref,
             name,
-            init,
             consistency,
             replication_id,
             sync,

@@ -29,11 +29,6 @@ space-authority = { path = "../actors/space-authority", version = "0.1.0", defau
 # `version` is what crates.io resolves at publish time.
 vos-pvm-compiler = { workspace = true }
 vos-pvm = { workspace = true }
-# The per-space clock + verifiable-randomness feed now lives in
-# `vos::chronos_feed` (behind vos's `network` feature); its protocol types +
-# the `ChronosRef` client are in `vos::chronos`, and the VRF primitive it uses
-# rides along inside vos — so vosx no longer depends on the chronos actor or
-# vrf directly.
 # Content-addressed cache + IPFS resolver dependency for the
 # blob store. Stays a thin dep — no daemon required for `Path`
 # and `Hash` sources, only `Cid` and `Url` resolution touch
@@ -58,9 +53,7 @@ libc = "0.2"
 # Bounded Unix-domain connect for the production trust sidecar. Reads and
 # writes use shrinking std socket timeouts against the same absolute deadline.
 socket2 = "0.6"
-# OS entropy for the chronos beacon feed (the leader samples 32
-# fresh bytes per advance; a draw failure skips the pass rather
-# than ever feeding zero entropy).
+# OS entropy for keys, tokens, and atomic file updates.
 getrandom = "0.2"
 # Cross-process advisory lock shared by daemon startup and offline
 # backup/restore. This prevents raw redb/image copies racing a live commit.

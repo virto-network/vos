@@ -75,10 +75,7 @@ pub struct LocalConfig {
     /// projects it here, boot reads it. `None` → host default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap_policy: Option<String>,
-    /// Per-agent node-local policy, keyed by instance name. Only agents
-    /// that declare at least one node-local field get an entry — a bare
-    /// agent isn't listed. Written by `apply`, applied at every boot so
-    /// a plain `space up` restart no longer drops `tick_ms`/`intra_caps`.
+    /// Per-service host-private signing configuration, keyed by instance.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, AgentLocal>,
     /// Native `.so` extensions to register at boot. Host-local — never
@@ -89,21 +86,11 @@ pub struct LocalConfig {
     pub extensions: Vec<ExtensionLocal>,
 }
 
-/// The node-local half of an `[[agent]]` recipe entry. Everything else
-/// on the entry (program, consistency, sync floor, init, on_start) is
-/// replicated through the registry `install`; these three fields never
-/// touch the `AgentRow`.
+/// The node-local half of an `[[agent]]` recipe entry.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AgentLocal {
-    /// Periodic `tick` cadence in ms (0 / omitted → no ticking).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tick_ms: Option<u64>,
-    /// `"actor:role"` intra-system caps bounding this agent's outbound
-    /// relays. Empty → legacy trusted relay.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub intra_caps: Vec<String>,
-    /// Mint + deliver a node-local device secret seed to this agent on
-    /// every spawn (the messenger's MLS root). Never leaves the node.
+    /// Configure the service with a host-private device signer.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub device_secret: bool,
 }
@@ -327,17 +314,15 @@ mod tests {
 
         let mut agents = BTreeMap::new();
         agents.insert(
-            "messenger".to_string(),
+            "ledger".to_string(),
             AgentLocal {
-                tick_ms: Some(500),
-                intra_caps: vec!["space-registry:member".into()],
                 device_secret: true,
             },
         );
         let mut init = BTreeMap::new();
         init.insert("port".to_string(), toml::Value::Integer(8080));
         let cfg = LocalConfig {
-            subscriptions: vec!["messenger".into()],
+            subscriptions: vec!["ledger".into()],
             listen: vec![],
             cap_policy: Some("block".into()),
             agents,

@@ -40,12 +40,12 @@ pub const SERVICE_ID_RAW: u32 = 0;
 // the moved `ed25519_pubkey_from_peer_id`.
 pub use vos::registry::{
     AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, AgentNamePage,
-    AgentPage, AgentRow, AuthGrantPage, AuthGrantRow, BINDING_DOMAIN, InvitePage, InviteRow,
-    MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, MemberPage, MemberRow, NODE_ROLE_OBSERVER,
-    NODE_ROLE_VOTER, OP_SIG_LEN, PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, ProgramPage,
-    ProgramRow, REGISTRY_OP_DOMAIN, SPACE_ID_DOMAIN_TAG, Status, SyncFloor, binding_signed_bytes,
-    canonical_op_bytes, ed25519_pubkey_from_peer_id, instance_service_id, invite_signed_bytes,
-    pack_auth, role_authority_invite_attestation_signed_bytes, role_authority_signed_bytes,
+    AgentPage, AgentRow, AuthGrantPage, AuthGrantRow, InvitePage, InviteRow, MEMBER_KIND_IDENTITY,
+    MEMBER_KIND_NODE, MemberPage, MemberRow, NODE_ROLE_OBSERVER, NODE_ROLE_VOTER, OP_SIG_LEN,
+    PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, ProgramPage, ProgramRow, REGISTRY_OP_DOMAIN,
+    SPACE_ID_DOMAIN_TAG, Status, SyncFloor, canonical_op_bytes, ed25519_pubkey_from_peer_id,
+    instance_service_id, invite_signed_bytes, pack_auth,
+    role_authority_invite_attestation_signed_bytes, role_authority_signed_bytes,
     role_grant_supersedes,
 };
 
@@ -694,9 +694,6 @@ impl SpaceRegistry {
     /// Instantiate a program as an agent. The caller resolves
     /// `program_name` to a hash and passes
     /// the hash so the install pins to a specific blob.
-    /// Init args are NOT stored here — they're applied host-side
-    /// when the agent is spawned and recorded in the registry's
-    /// DAG node for this `install` call.
     #[msg(role = SpaceRegistryRole::Admin)]
     async fn install(
         &mut self,
@@ -705,8 +702,6 @@ impl SpaceRegistry {
         program_hash: Vec<u8>,
         replication_id: Vec<u8>,
         consistency: u8,
-        install_args: Vec<u8>,
-        install_payloads: Vec<u8>,
         network_reachable: bool,
         sync_role: u8,
         auth: Vec<u8>,
@@ -720,8 +715,6 @@ impl SpaceRegistry {
                     &program_hash,
                     &replication_id,
                     &[consistency],
-                    &install_args,
-                    &install_payloads,
                     &[network_reachable as u8],
                     &[sync_role],
                 ],
@@ -821,8 +814,6 @@ impl SpaceRegistry {
                 consistency,
                 network_reachable,
                 sync_role: SyncFloor::from_u8(sync_role).unwrap_or_default(),
-                install_args,
-                install_payloads,
             },
         );
         // Burn the replication_id so it can never seed a second install.

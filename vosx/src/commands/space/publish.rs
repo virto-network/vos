@@ -44,8 +44,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             Status::Ok => {
                 if let Some(meta) = package_meta.as_deref() {
                     forward_meta_blob(client, &hash, meta);
-                } else {
-                    forward_meta(client, &hash, &catalog_bytes);
                 }
                 emit(&name, &hash, false);
                 Ok(())
@@ -55,16 +53,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     })
 }
 
-fn canonical_program(
-    name: &str,
-    source_hash: BlobHash,
-    bytes: Vec<u8>,
-) -> anyhow::Result<(BlobHash, Vec<u8>, Option<Vec<u8>>, bool)> {
+pub(crate) fn validate_package(name: &str, bytes: &[u8]) -> anyhow::Result<VosPackage> {
     if bytes.get(..4) != Some(b"VOSP") {
-        let crdt = vos::metadata::from_elf(&bytes).is_some_and(|meta| meta.crdt);
-        return Ok((source_hash, bytes, None, crdt));
+        anyhow::bail!("expected a signed .vos service package");
     }
-    let package = VosPackage::decode(&bytes)
+    let package = VosPackage::decode(bytes)
         .map_err(|error| anyhow::anyhow!("decode .vos service package: {error}"))?;
     package.validate()?;
     vos::service::validate_actor_program_layout(&package.actor_pvm).map_err(|error| {
@@ -82,6 +75,15 @@ fn canonical_program(
     ) {
         anyhow::bail!("deployment signature is invalid");
     }
+    Ok(package)
+}
+
+fn canonical_program(
+    name: &str,
+    source_hash: BlobHash,
+    bytes: Vec<u8>,
+) -> anyhow::Result<(BlobHash, Vec<u8>, Option<Vec<u8>>, bool)> {
+    let package = validate_package(name, &bytes)?;
     // The catalog and CAS retain the exact signed deployment bytes. Root-tree
     // installation must consume this package through the pinned generic
     // service; publishing must not replace package identity with an extracted
@@ -92,21 +94,6 @@ fn canonical_program(
         Some(package.schemas),
         package.manifest.crdt,
     ))
-}
-
-/// Best-effort: forward a program's `.vos_meta` schema blob to the
-/// registry (keyed by program hash) so `meta_for_instance` resolves for
-/// agents installed off it — the precondition for schema-aware dynamic
-/// dispatch. A blob with no meta section, or a non-admin node, is a
-/// no-op (the row arrives via sync / coercion falls back to the
-/// heuristic), so failure never blocks the publish.
-fn forward_meta(client: &DaemonClient, hash: &BlobHash, elf_bytes: &[u8]) {
-    let Some(meta_blob) = vos::metadata::raw_section_from_elf(elf_bytes) else {
-        return;
-    };
-    if let Err(e) = client.register_meta(hash.0.to_vec(), meta_blob) {
-        tracing::debug!("register_meta for bundled/published program skipped: {e}");
-    }
 }
 
 fn forward_meta_blob(client: &DaemonClient, hash: &BlobHash, meta_blob: &[u8]) {

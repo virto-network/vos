@@ -7,8 +7,8 @@
 //! space) and by the genesis apply that runs on a space's first
 //! `space up`:
 //!
-//! - Each `path = "…"` ELF gets blob-cached and published as
-//!   `<name>:recipe` if not already in the catalog.
+//! - Each `path = "…"` signed service package gets blob-cached and
+//!   published if not already in the catalog.
 //! - Each agent gets `install()`'d if no instance with that
 //!   `name` is already registered.
 //! - Agents already in the registry are left alone (their
@@ -27,14 +27,12 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use vos::abi::service::ServiceId;
-use vos::init::{InitArgs, InitValue};
 use vos::node::{ExtensionConfig, VosNode};
 use vos::registry::{ProgramRow, RegistryRef, Status};
 use vos::value::Args;
 
 use crate::blob_store;
 use crate::commands::space::common::{auto_replication_id, instance_service_id, parse_consistency};
-use crate::commands::space::payload_codec;
 
 /// Slim view of the recipe TOML — only the fields the
 /// reconciler cares about. Extra fields are silently ignored
@@ -73,6 +71,7 @@ pub struct Recipe {
 }
 
 #[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ExtensionDef {
     /// Display name. Logged at boot; not used for routing today
     /// (extensions get auto-allocated ServiceIds).
@@ -107,13 +106,12 @@ pub struct ExtensionDef {
 }
 
 #[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AgentDef {
     pub name: String,
-    /// Path to the actor ELF — relative to the recipe file's
-    /// directory. A hand-written recipe carries this; a `space export`
-    /// output does NOT (blobs are content-addressed, with no source
-    /// path on a running node) and instead carries `program_hash`, so
-    /// `apply` resolves the blob by hash. Empty when absent.
+    /// Path to the signed `.vos` package, relative to the recipe file.
+    /// Exported recipes use `program_hash` instead because a running
+    /// node does not retain the package's original source path.
     #[serde(default)]
     pub path: String,
     /// Published program name (emitted by `space export`). When absent,
@@ -125,12 +123,10 @@ pub struct AgentDef {
     /// the precondition for `export | apply --diff` being all-skips.
     #[serde(default)]
     pub program_hash: Option<String>,
-    /// `ephemeral` / `local` / `crdt` / `raft`. Defaults to
-    /// `local`; CRDT replication is an explicit source and
-    /// deployment opt-in.
+    /// `local` / `crdt` / `raft`. Defaults to `local`.
     #[serde(default = "default_consistency")]
     pub consistency: String,
-    /// Opt a network-served but node-confined (`local`/`ephemeral`) agent OUT
+    /// Opt a network-served but node-confined (`local`) agent OUT
     /// of the device-confinement gate so remote peers can reach it — for the
     /// cross-bank `clerk-bridge` and cross-space `space-bridge`. `false`
     /// (confined, device-private) by default; `crdt`/`raft` agents are never
@@ -142,61 +138,14 @@ pub struct AgentDef {
     /// replica's state is served to and the default spawn set.
     #[serde(default)]
     pub sync: Option<String>,
-    /// Constructor args. Values are resolved against the
-    /// actor's `.vos_meta` so e.g. `Vec<u32>` typed args
-    /// automatically map a list of agent names to their
-    /// derived ServiceIds.
-    #[serde(default)]
-    pub init: BTreeMap<String, toml::Value>,
-    /// Inline child actors. Each becomes its own installed
-    /// agent (separate replication group). Nested children
-    /// are not currently supported.
-    #[serde(default)]
-    pub actors: Vec<AgentDef>,
     /// Override replication id (`auto` / `off` / 64-hex).
     /// `auto` (default) hashes `(name, blob_hash)`.
     #[serde(default)]
     pub replication_id: Option<String>,
-    /// One-shot messages dispatched when the agent first
-    /// cold-starts. Each entry is `{ msg = "name", … }`
-    /// where extra keys become `Msg::with` arguments.
-    #[serde(default)]
-    pub on_start: Vec<OnStartMsg>,
-    /// Provision a device-local secret seed into this agent (the
-    /// messenger's MLS CSPRNG root). The daemon mints 32 bytes of OS
-    /// entropy into a node-local `{svc_id}.seed` sidecar on first spawn and
-    /// sends it via a `seed` message (`Caller::System`), re-sent idempotently
-    /// on every restart. Node-LOCAL by design: unlike `on_start`/`init` (which
-    /// ride the replicated `AgentRow`), this never touches the registry, so the
-    /// secret never leaves the node. Only meaningful for `consistency = "local"`
-    /// agents that expose a `seed(Vec<u8>)` handler.
+    /// Configure this service with a host-private device signer. The secret is
+    /// stored beside the service image and never enters replicated state.
     #[serde(default)]
     pub device_secret: bool,
-    /// Periodic `tick` interval in milliseconds — the host dispatches a
-    /// synthetic `tick` to this agent's `tick` handler about this often,
-    /// between inbound work (the agent analogue of an extension's
-    /// `tick_ms`). Node-local policy; only set it on agents with a `tick`
-    /// handler. Omitted / 0 → no ticking.
-    pub tick_ms: Option<u64>,
-    /// Declared intra-system capabilities — `"actor:role"` strings bounding
-    /// what this agent may relay to other actors on its OUTBOUND invokes.
-    /// Node-local policy (never the replicated `AgentRow`). Empty (the
-    /// default) keeps the legacy trusted relay (outbound calls are
-    /// `Caller::Actor`, bypassing role gates); a non-empty list opts the
-    /// agent into bounded relay (the real caller's role capped per cap),
-    /// mirroring an extension's `intra_caps`.
-    #[serde(default)]
-    pub intra_caps: Vec<String>,
-}
-
-#[derive(Deserialize, Debug, Default)]
-pub struct OnStartMsg {
-    /// Message handler name to invoke.
-    pub msg: String,
-    /// Remaining keys are typed args. `flatten` so the recipe
-    /// can write `{ msg = "set", val = 42 }` without nesting.
-    #[serde(flatten, default)]
-    pub args: BTreeMap<String, toml::Value>,
 }
 
 fn default_consistency() -> String {
@@ -485,7 +434,7 @@ fn intra_caps_wildcard_warning(name: &str, caps: &[vos::IntraCap]) -> Option<Str
         return None;
     }
     let detail = if full {
-        "'*' / '*:*' grants ANY role on ANY actor — the extension becomes a fully-trusted relay"
+        "'*' / '*:*' grants ANY role on ANY actor"
     } else if actor_wild {
         "a '*:<role>' cap grants that role on EVERY actor in the space"
     } else {
@@ -570,22 +519,7 @@ pub(crate) fn install_agents(
     if recipe.agents.is_empty() {
         return Ok(());
     }
-    tracing::info!(
-        "genesis apply ({} agent definition(s))",
-        flat_count(&recipe.agents),
-    );
-
-    // Pre-compute every agent's name → derived svc_id so
-    // init-arg resolution (e.g. `children = ["greeter"]` →
-    // Vec<u32>) can hand back the right ids without round-
-    // tripping through the registry.
-    let mut name_ids: BTreeMap<String, u32> = BTreeMap::new();
-    for a in flatten(&recipe.agents) {
-        name_ids.insert(
-            a.name.clone(),
-            instance_service_id(&a.name, daemon_prefix).0,
-        );
-    }
+    tracing::info!("genesis apply ({} service package(s))", recipe.agents.len());
 
     // Is this daemon the space's admin authoring node? True when its
     // operator is the genesis root or holds an ADMIN grant. The daemon
@@ -606,17 +540,8 @@ pub(crate) fn install_agents(
         None => false,
     };
 
-    for agent in flatten(&recipe.agents) {
-        reconcile_one(
-            node,
-            &reg,
-            agent,
-            recipe_dir,
-            daemon_prefix,
-            &name_ids,
-            node_is_admin,
-            space_id,
-        )?;
+    for agent in &recipe.agents {
+        reconcile_one(node, &reg, agent, recipe_dir, node_is_admin, space_id)?;
     }
 
     Ok(())
@@ -627,36 +552,35 @@ fn reconcile_one(
     reg: &RegistryRef,
     agent: &AgentDef,
     recipe_dir: &Path,
-    _daemon_prefix: u16,
-    name_ids: &BTreeMap<String, u32>,
     node_is_admin: bool,
     space_id: &[u8; 32],
 ) -> anyhow::Result<()> {
-    // 1. Resolve and cache the agent's blob. Genesis recipes carry a
-    //    `path`; the path-less `program_hash` form is `apply`-only.
+    // Genesis recipes must carry the exact signed package bytes. A path-less
+    // exported recipe can only reconcile an already-running space.
     if agent.path.is_empty() {
         anyhow::bail!(
             "recipe agent '{}' has no `path` — a genesis-applied recipe installs from source \
-             ELFs. (The path-less `program_hash` form is only for `space apply` against an \
+             packages. (The path-less `program_hash` form is only for `space apply` against an \
              already-published catalog.)",
             agent.name,
         );
     }
-    let elf_path = recipe_dir.join(&agent.path);
-    let elf_bytes = std::fs::read(&elf_path).map_err(|e| {
+    let package_path = recipe_dir.join(&agent.path);
+    let package_bytes = std::fs::read(&package_path).map_err(|e| {
         anyhow::anyhow!(
             "read {} for agent '{}': {e}",
-            elf_path.display(),
+            package_path.display(),
             agent.name
         )
     })?;
-    let hash = blob_store::cache_put(&elf_bytes)
-        .map_err(|e| anyhow::anyhow!("cache blob for '{}': {e}", agent.name))?;
-    let crdt = vos::metadata::from_elf(&elf_bytes).is_some_and(|meta| meta.crdt);
-
-    // 2. Ensure the requested catalog name points at these bytes.
     let program_name =
         super::common::parse_program_name(agent.program.as_deref().unwrap_or(&agent.name))?;
+    let package = super::publish::validate_package(&program_name, &package_bytes)?;
+    let hash = blob_store::cache_put(&package_bytes)
+        .map_err(|e| anyhow::anyhow!("cache blob for '{}': {e}", agent.name))?;
+    let crdt = package.manifest.crdt;
+
+    // Ensure the requested catalog name points at this exact package.
     let existing: Option<ProgramRow> =
         vos::block_on(reg.program(&mut &*node, program_name.clone()))
             .map_err(|e| anyhow::anyhow!("registry.program('{program_name}'): {e}"))?;
@@ -712,15 +636,10 @@ fn reconcile_one(
         }
     };
 
-    // 2b. Forward the program's metadata blob to the registry so
-    //     downstream consumers (gateway, schema CLIs) can fetch a
-    //     per-method type signature. Idempotent — re-registering
-    //     the same hash overwrites. Older binaries built before
-    //     `.vos_meta` lands as a section just skip this step;
-    //     the registry's `meta_for_*` queries will return empty
-    //     and consumers fall back to whatever heuristic they
-    //     have today.
-    if let Some(meta_blob) = vos::metadata::raw_section_from_elf(&elf_bytes) {
+    // Forward the signed package schema so dynamic clients can resolve
+    // method arguments. The package is still installable if the best-effort
+    // registry side channel is temporarily unavailable.
+    if !package.schemas.is_empty() {
         // Meta registration is a nice-to-have (it enables schema-aware
         // coercion for the gateway / dynamic CLIs); it must never abort the
         // install. Both a non-Ok status (e.g. FORBIDDEN on a non-admin node —
@@ -731,7 +650,7 @@ fn reconcile_one(
         match vos::block_on(reg.register_meta(
             &mut &*node,
             program_hash.to_vec(),
-            meta_blob,
+            package.schemas,
             Vec::new(),
         )) {
             Ok(Status::Ok) => {
@@ -746,8 +665,6 @@ fn reconcile_one(
                  schema-aware coercion disabled for this agent",
             ),
         }
-    } else {
-        tracing::debug!("{program_name} has no .vos_meta section; skipping");
     }
 
     // 3. Ensure installed.
@@ -760,11 +677,17 @@ fn reconcile_one(
 
     let consistency = parse_consistency(&agent.consistency).ok_or_else(|| {
         anyhow::anyhow!(
-            "agent '{}': unknown consistency '{}', expected ephemeral|local|crdt|raft",
+            "agent '{}': unknown consistency '{}', expected local|crdt|raft",
             agent.name,
             agent.consistency,
         )
     })?;
+    if consistency == vos::node::Consistency::Ephemeral as u8 {
+        anyhow::bail!(
+            "agent '{}': service packages cannot be ephemeral",
+            agent.name
+        );
+    }
 
     let replication_id = match agent.replication_id.as_deref() {
         Some("auto") | None => auto_replication_id(space_id, &agent.name, &program_hash),
@@ -793,9 +716,6 @@ fn reconcile_one(
         None => vos::registry::SyncFloor::Member,
     };
 
-    let install_args = encode_init_args(&agent.name, &elf_bytes, &agent.init, name_ids)?;
-    let install_payloads = encode_on_start_payloads(&agent.on_start)?;
-
     // Empty `auth`: the daemon signs on relay (see the publish call
     // above). Status::Forbidden here means this isn't the admin node, so
     // the agent row is authored on the operator's node and arrives via
@@ -807,8 +727,6 @@ fn reconcile_one(
         program_hash.to_vec(),
         replication_id.to_vec(),
         consistency,
-        install_args,
-        install_payloads,
         agent.network_reachable,
         sync_role,
         Vec::new(),
@@ -878,82 +796,11 @@ fn reconcile_one(
     Ok(())
 }
 
-/// Encode init args into rkyv bytes, using the actor's
-/// `.vos_meta` to type each entry. List-of-string init values
-/// whose target type is `Vec<u32>` get translated through
-/// `name_ids` so recipe-style `children = ["greeter", …]`
-/// resolves to actual ServiceIds.
-pub(crate) fn encode_init_args(
-    agent_name: &str,
-    elf_bytes: &[u8],
-    init: &BTreeMap<String, toml::Value>,
-    name_ids: &BTreeMap<String, u32>,
-) -> anyhow::Result<Vec<u8>> {
-    if init.is_empty() {
-        return Ok(Vec::new());
-    }
-    let meta = vos::metadata::from_elf(elf_bytes);
-    let mut args = InitArgs::new();
-    for (key, val) in init {
-        let resolved = resolve_env_indirection(agent_name, key, val)?;
-        let ty = meta
-            .as_ref()
-            .and_then(|m| m.constructor.iter().find(|f| f.name == *key))
-            .map(|f| f.ty.as_str())
-            .unwrap_or("String");
-        args = args.with(key, toml_to_init_value(&resolved, ty, name_ids));
-    }
-    Ok(vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&args)
-        .map_err(|e| anyhow::anyhow!("encode init args: {e}"))?
-        .to_vec())
-}
-
-/// Encode each `on_start` entry as a `[TAG_DYNAMIC] + rkyv(Msg)`
-/// payload, then hand the resulting `Vec<Vec<u8>>` to
-/// `payload_codec::encode` so the registry can store it as a
-/// single `Vec<u8>` field on `AgentRow`. `spawn_installed_agents`
-/// reverses both layers on cold start.
-pub(crate) fn encode_on_start_payloads(on_start: &[OnStartMsg]) -> anyhow::Result<Vec<u8>> {
-    use vos::Encode;
-    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(on_start.len());
-    for entry in on_start {
-        let mut msg = vos::value::Msg::new(&entry.msg);
-        for (k, v) in &entry.args {
-            // Same heuristic as `space install --init`: numeric
-            // → u64, true/false → bool, else string. Recipe
-            // authors who want explicit typing can upgrade to
-            // typed init args once we have schemas.
-            //
-            // `$env:VAR` strings are resolved here too so on_start
-            // payloads can pull secrets out of the container's env
-            // without baking them into the recipe.
-            let resolved = resolve_env_indirection(&entry.msg, k, v)?;
-            match &resolved {
-                toml::Value::Integer(n) => msg = msg.with(k, *n as u64),
-                toml::Value::Boolean(b) => msg = msg.with(k, *b),
-                toml::Value::String(s) => msg = msg.with(k, s.clone()),
-                other => {
-                    anyhow::bail!(
-                        "on_start arg '{k}' has unsupported type {other:?}; \
-                         use string, integer, or boolean",
-                    );
-                }
-            }
-        }
-        let encoded = msg.encode();
-        let mut payload = Vec::with_capacity(1 + encoded.len());
-        payload.push(vos::value::TAG_DYNAMIC);
-        payload.extend_from_slice(&encoded);
-        payloads.push(payload);
-    }
-    payload_codec::encode(&payloads)
-}
-
 /// Resolve `$env:VAR` indirection in recipe init values. String values
 /// matching `$env:NAME` are looked up in the process environment;
 /// everything else passes through unchanged. Used by extension
-/// `[[extension]] init = {...}` and agent `[[agent]] init = {...}`
-/// paths so container deployments can keep secrets (HF tokens,
+/// `[[extension]] init = {...}` paths so container deployments can keep
+/// secrets (HF tokens,
 /// API keys, …) out of the recipe file itself.
 ///
 /// Error semantics:
@@ -993,73 +840,6 @@ fn resolve_env_indirection(
     }
 }
 
-fn toml_to_init_value(val: &toml::Value, ty: &str, name_ids: &BTreeMap<String, u32>) -> InitValue {
-    match val {
-        toml::Value::String(s) => match ty {
-            "u64" | "u32" | "u16" | "u8" => s
-                .parse::<u64>()
-                .map(InitValue::U64)
-                .unwrap_or(InitValue::Str(s.clone())),
-            _ => InitValue::Str(s.clone()),
-        },
-        toml::Value::Integer(n) => match ty {
-            "bool" => InitValue::Bool(*n != 0),
-            _ => InitValue::U64(*n as u64),
-        },
-        toml::Value::Boolean(b) => InitValue::Bool(*b),
-        toml::Value::Array(items) => {
-            // Heuristic: if every entry is a string AND the
-            // declared type is `Vec<u32>`, resolve names →
-            // ServiceIds via `name_ids`. Otherwise emit a
-            // plain ListStr (or empty if mixed types).
-            if ty == "Vec<u32>" && items.iter().all(|v| matches!(v, toml::Value::String(_))) {
-                let ids: Vec<u32> = items
-                    .iter()
-                    .filter_map(|v| {
-                        let s = v.as_str()?;
-                        name_ids.get(s).copied()
-                    })
-                    .collect();
-                InitValue::ListU32(ids)
-            } else if items.iter().all(|v| matches!(v, toml::Value::String(_))) {
-                let strs: Vec<String> = items
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-                InitValue::ListStr(strs)
-            } else if items.iter().all(|v| matches!(v, toml::Value::Integer(_))) {
-                let ns: Vec<u32> = items
-                    .iter()
-                    .filter_map(|v| v.as_integer().map(|n| n as u32))
-                    .collect();
-                InitValue::ListU32(ns)
-            } else {
-                InitValue::Unit
-            }
-        }
-        _ => InitValue::Unit,
-    }
-}
-
-/// Walk every agent in the recipe, including nested children.
-/// Returned in tree-iteration order (parents before children) so
-/// `reconcile` can process them sequentially while `name_ids` is
-/// still being built up.
-pub(crate) fn flatten(agents: &[AgentDef]) -> Vec<&AgentDef> {
-    let mut out = Vec::new();
-    for a in agents {
-        out.push(a);
-        for c in &a.actors {
-            out.push(c);
-        }
-    }
-    out
-}
-
-fn flat_count(agents: &[AgentDef]) -> usize {
-    flatten(agents).len()
-}
-
 /// Reject recipes where the same `instance_name` appears in
 /// more than one slot — agent + agent, agent + extension, or
 /// extension + extension.
@@ -1083,7 +863,7 @@ pub(crate) fn validate_recipe_names(recipe: &Recipe) -> anyhow::Result<()> {
     // for an error message; an IndexMap would preserve source
     // order but isn't worth the dep for one-shot validation.
     let mut seen: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
-    for agent in flatten(&recipe.agents) {
+    for agent in &recipe.agents {
         seen.entry(agent.name.clone()).or_default().push("agent");
     }
     for ext in &recipe.extensions {
@@ -1155,7 +935,7 @@ mod tests {
         let a = &m.agents[0];
         assert_eq!(a.name, "counter");
         assert!(a.path.is_empty(), "exported agents carry no source path");
-        assert_eq!(a.program.as_deref(), Some("counter:recipe"));
+        assert_eq!(a.program.as_deref(), Some("counter"));
         assert_eq!(a.program_hash.as_deref(), Some("deadbeef"));
         assert_eq!(a.sync.as_deref(), Some("member"));
         assert!(a.network_reachable);
@@ -1167,7 +947,7 @@ mod tests {
             space = "demo"
             [[agent]]
             name = "counter"
-            path = "actors/counter/foo.elf"
+            path = "packages/counter.vos"
             consistency = "crdt"
         "#;
         let m: Recipe = toml::from_str(s).unwrap();
@@ -1188,7 +968,7 @@ mod tests {
             r#"
                 [[agent]]
                 name = "counter"
-                path = "counter.elf"
+                path = "counter.vos"
             "#,
         )
         .unwrap();
@@ -1202,13 +982,13 @@ mod tests {
             space = "bank-a"
             [[agent]]
             name = "clerk-bridge"
-            path = "actors/clerk-bridge.elf"
-            consistency = "ephemeral"
+            path = "packages/clerk-bridge.vos"
+            consistency = "local"
             network_reachable = true
         "#;
         let m: Recipe = toml::from_str(s).unwrap();
         assert!(m.agents[0].network_reachable);
-        assert_eq!(m.agents[0].consistency, "ephemeral");
+        assert_eq!(m.agents[0].consistency, "local");
     }
 
     #[test]
@@ -1218,7 +998,7 @@ mod tests {
             hyperspace = "bank-federation"
             [[agent]]
             name = "noop"
-            path = "actors/noop.elf"
+            path = "packages/noop.vos"
         "#;
         let m: Recipe = toml::from_str(s).unwrap();
         assert_eq!(m.space.as_deref(), Some("bank-a"));
@@ -1365,32 +1145,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_nested_actors() {
-        let s = r#"
-            [[agent]]
-            name = "scheduler"
-            path = "agents/scheduler.elf"
-            consistency = "ephemeral"
-            actors = [
-                { name = "greeter", path = "actors/greeter.elf" },
-            ]
-        "#;
-        let m: Recipe = toml::from_str(s).unwrap();
-        assert_eq!(m.agents.len(), 1);
-        assert_eq!(m.agents[0].actors.len(), 1);
-        assert_eq!(m.agents[0].actors[0].name, "greeter");
-    }
-
-    #[test]
     fn validate_names_accepts_distinct() {
         let m: Recipe = toml::from_str(
             r#"
                 [[agent]]
                 name = "counter"
-                path = "a.elf"
+                path = "a.vos"
                 [[agent]]
                 name = "greeter"
-                path = "b.elf"
+                path = "b.vos"
                 [[extension]]
                 name = "gateway"
                 path = "c.so"
@@ -1410,7 +1173,7 @@ mod tests {
             r#"
                 [[agent]]
                 name = "gateway"
-                path = "a.elf"
+                path = "a.vos"
                 [[extension]]
                 name = "gateway"
                 path = "b.so"
@@ -1445,89 +1208,21 @@ mod tests {
         // The registry's `install` handler returns
         // Status::InstanceExists for this case at runtime, but
         // the recipe-side check fails earlier — before any
-        // .elf gets blob-cached or any partial registration
+        // package gets blob-cached or any partial registration
         // lands.
         let m: Recipe = toml::from_str(
             r#"
                 [[agent]]
                 name = "counter"
-                path = "a.elf"
+                path = "a.vos"
                 [[agent]]
                 name = "counter"
-                path = "b.elf"
+                path = "b.vos"
             "#,
         )
         .unwrap();
         let err = validate_recipe_names(&m).unwrap_err();
         assert!(err.to_string().contains("'counter' appears 2×"), "{}", err);
-    }
-
-    #[test]
-    fn validate_names_catches_nested_child_collision() {
-        // `flatten` walks parent + child agents; a child named
-        // the same as a top-level agent is a collision too.
-        let m: Recipe = toml::from_str(
-            r#"
-                [[agent]]
-                name = "scheduler"
-                path = "s.elf"
-                actors = [
-                    { name = "scheduler", path = "dup.elf" },
-                ]
-            "#,
-        )
-        .unwrap();
-        let err = validate_recipe_names(&m).unwrap_err();
-        assert!(err.to_string().contains("'scheduler'"), "{}", err);
-    }
-
-    #[test]
-    fn flatten_yields_parents_then_children() {
-        let m: Recipe = toml::from_str(
-            r#"
-                [[agent]]
-                name = "scheduler"
-                path = "x.elf"
-                actors = [
-                    { name = "a", path = "a.elf" },
-                    { name = "b", path = "b.elf" },
-                ]
-                [[agent]]
-                name = "outer"
-                path = "y.elf"
-            "#,
-        )
-        .unwrap();
-        let flat: Vec<&str> = flatten(&m.agents).iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(flat, vec!["scheduler", "a", "b", "outer"]);
-    }
-
-    #[test]
-    fn vec_u32_init_resolves_names_to_ids() {
-        let mut name_ids = BTreeMap::new();
-        name_ids.insert("alpha".to_string(), 0xC0DE_0001);
-        name_ids.insert("beta".to_string(), 0xC0DE_0002);
-        let val = toml::Value::Array(vec![
-            toml::Value::String("alpha".into()),
-            toml::Value::String("beta".into()),
-        ]);
-        match toml_to_init_value(&val, "Vec<u32>", &name_ids) {
-            InitValue::ListU32(ids) => assert_eq!(ids, vec![0xC0DE_0001, 0xC0DE_0002]),
-            other => panic!("expected ListU32, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn unknown_names_are_dropped_when_resolving_to_u32() {
-        let name_ids = BTreeMap::new();
-        let val = toml::Value::Array(vec![toml::Value::String("ghost".into())]);
-        // No name_ids entry for "ghost" → empty ListU32 rather
-        // than panicking. The actor will see an empty list and
-        // can decide what to do.
-        match toml_to_init_value(&val, "Vec<u32>", &name_ids) {
-            InitValue::ListU32(ids) => assert!(ids.is_empty()),
-            other => panic!("expected ListU32, got {other:?}"),
-        }
     }
 
     // ── $env:VAR indirection ──────────────────────

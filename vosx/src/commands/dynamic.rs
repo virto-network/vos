@@ -99,16 +99,6 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
             return print_target_surface(target, meta.as_ref());
         };
 
-        // Identity-bound registration is a two-step process the CLI orchestrates
-        // for any messenger instance: call `register` to get the messenger's MLS
-        // public key, have the operator's identity key sign a binding cert over
-        // it, then `bind_identity`. `register` is messenger-unique, so the verb
-        // alone identifies the flow. `bind_identity` stays directly reachable for
-        // manual re-binding.
-        if method == "register" {
-            return messenger_register(client, target, &method_args);
-        }
-
         if parsed.wants_help {
             return print_method_surface(target, method, meta.as_ref());
         }
@@ -173,61 +163,6 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
         let ret_ty = method_meta.map(|m| m.returns.as_str());
         render_reply(reply, ret_ty, parsed.out.as_deref())
     })
-}
-
-/// Orchestrate `vosx messenger register`: register to learn the
-/// messenger's seed-derived MLS public key, have the operator's identity key
-/// sign a binding cert over `(mls_pubkey ‖ peer_id ‖ space_id)`, then
-/// `bind_identity`. This is the two-step process the messenger can't do itself — it
-/// holds no operator key.
-fn messenger_register(client: &DaemonClient, target: &str, args: &[&str]) -> anyhow::Result<()> {
-    let nickname = args
-        .iter()
-        .find_map(|a| a.strip_prefix("nickname="))
-        .or_else(|| args.iter().copied().find(|a| !a.contains('=')))
-        .ok_or_else(|| anyhow!("usage: vosx {target} register nickname=<name>"))?
-        .to_string();
-
-    let target_id = client.resolve_target(target)?;
-
-    // 1. register → `mls_pubkey=<hex>`
-    let reply = client.invoke_dyn(target_id, &Msg::new("register").with("nickname", nickname))?;
-    let reply_str = reply
-        .as_str()
-        .ok_or_else(|| anyhow!("messenger register: unexpected reply"))?;
-    let mls_pubkey_hex = reply_str
-        .strip_prefix("mls_pubkey=")
-        .ok_or_else(|| anyhow!("messenger register failed: {reply_str}"))?;
-    let mls_pubkey = hex::decode(mls_pubkey_hex).map_err(|e| anyhow!("bad mls pubkey hex: {e}"))?;
-
-    // 2. operator identity + the space id
-    let keypair = crate::identity::load_or_create()?;
-    let operator_peer = libp2p::PeerId::from(keypair.public()).to_bytes();
-    let space_id: [u8; 32] = hex::decode(&client.entry.id)
-        .map_err(|e| anyhow!("bad space id hex: {e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("space id is not 32 bytes"))?;
-
-    // 3. sign the binding cert (shared canonical so it byte-matches the
-    //    messenger verifier — see `vos::registry::binding_signed_bytes`)
-    let cert = keypair
-        .sign(&vos::registry::binding_signed_bytes(
-            &mls_pubkey,
-            &operator_peer,
-            &space_id,
-        ))
-        .map_err(|e| anyhow!("sign binding cert: {e}"))?;
-
-    // 4. bind_identity
-    let reply2 = client.invoke_dyn(
-        target_id,
-        &Msg::new("bind_identity")
-            .with("peer_id", operator_peer)
-            .with("space_id", space_id.to_vec())
-            .with("cert", cert),
-    )?;
-    render_reply(reply2, None, None)
 }
 
 /// Render an invoke reply. Without `--out` it goes to stdout, JSON or text

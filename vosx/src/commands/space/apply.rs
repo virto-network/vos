@@ -11,8 +11,8 @@
 //!   installed (if no instance exists).
 //!   The bytes reach the daemon through the shared content-addressed
 //!   blob cache — `publish` only ships `(name, hash)`.
-//! - **Node-local half** → `local.toml`: per-agent `tick_ms` /
-//!   `intra_caps` / `device_secret`, the space `cap_policy`, and
+//! - **Node-local half** → `local.toml`: per-service device signing,
+//!   the space `cap_policy`, and
 //!   `[[extension]]` entries. These never touch the `AgentRow`; boot
 //!   reads them back so a bare `space up` restart re-applies them.
 //!   Extensions are host-local (`dlopen` in-process) — a running daemon
@@ -32,10 +32,8 @@ use vos::registry::{Status, SyncFloor};
 
 use crate::blob_store;
 use crate::commands::space::client::DaemonClient;
-use crate::commands::space::common::{auto_replication_id, instance_service_id, parse_consistency};
-use crate::commands::space::reconcile::{
-    self, AgentDef, Recipe, encode_init_args, encode_on_start_payloads, flatten,
-};
+use crate::commands::space::common::{auto_replication_id, parse_consistency};
+use crate::commands::space::reconcile::{self, AgentDef, Recipe};
 use crate::commands::space::subscriptions::{self, AgentLocal, ExtensionLocal, LocalConfig};
 use crate::output;
 
@@ -110,15 +108,6 @@ pub(crate) fn apply_recipe(
         .id_bytes()
         .ok_or_else(|| anyhow::anyhow!("space id in index is not 32 bytes of hex"))?;
 
-    // name → derived svc id, for `Vec<u32>` init-arg resolution (e.g.
-    // `children = ["greeter"]`). Same derivation the daemon uses to
-    // register the agents, so the ids match.
-    let prefix = client.daemon_prefix();
-    let mut name_ids: BTreeMap<String, u32> = BTreeMap::new();
-    for a in flatten(&recipe.agents) {
-        name_ids.insert(a.name.clone(), instance_service_id(&a.name, prefix).0);
-    }
-
     // Node-local half → local.toml. Recipe fields overwrite the recipe-
     // owned sections (cap_policy, per-agent policy, extensions) while
     // node-owned fields (subscriptions, listen) are preserved.
@@ -130,8 +119,8 @@ pub(crate) fn apply_recipe(
     // or local-config write.
     let mut plans = Vec::new();
     let mut planned_names: BTreeMap<String, [u8; 32]> = BTreeMap::new();
-    for agent in flatten(&recipe.agents) {
-        let mut plan = preflight_one(client, agent, recipe_dir, &space_id, &name_ids, upgrade)?;
+    for agent in &recipe.agents {
+        let mut plan = preflight_one(client, agent, recipe_dir, &space_id, upgrade)?;
         if plan.needs_publish {
             let name = plan.program_name.clone();
             match planned_names.get(&name) {
@@ -169,7 +158,7 @@ pub(crate) fn apply_recipe(
     // A real apply heals the content-addressed cache even for skipped
     // instances. Dry runs never reach this write.
     for plan in &plans {
-        if let Some(bytes) = &plan.elf_bytes {
+        if let Some(bytes) = &plan.package_bytes {
             let cached = blob_store::cache_put(bytes)
                 .map_err(|e| anyhow::anyhow!("cache blob for '{}': {e}", plan.instance_name))?;
             debug_assert_eq!(cached.0, plan.hash);
@@ -191,8 +180,6 @@ enum ApplyAction {
     Install {
         consistency: u8,
         replication_id: [u8; 32],
-        install_args: Vec<u8>,
-        install_payloads: Vec<u8>,
         network_reachable: bool,
         sync_role: SyncFloor,
     },
@@ -204,9 +191,10 @@ struct PreparedAgent {
     instance_name: String,
     program_name: String,
     hash: [u8; 32],
-    /// Signed catalog capability copied from the compiled actor metadata.
+    /// Signed catalog capability copied from the service package.
     crdt: bool,
-    elf_bytes: Option<Vec<u8>>,
+    package_bytes: Option<Vec<u8>>,
+    schemas: Option<Vec<u8>>,
     needs_publish: bool,
     action: ApplyAction,
 }
@@ -217,31 +205,33 @@ fn preflight_one(
     agent: &AgentDef,
     recipe_dir: &Path,
     space_id: &[u8; 32],
-    name_ids: &BTreeMap<String, u32>,
     upgrade: bool,
 ) -> anyhow::Result<PreparedAgent> {
-    // 1. Resolve the blob hash + program identity from either a source
-    //    `path` (a hand-written recipe) or `program_hash` (a `space
-    //    export` output, which carries no path). Path-based also yields
-    //    the ELF bytes — needed to publish and to encode init args; the
-    //    hash-based form resolves against the already-published catalog,
-    //    which is what makes `export | apply --diff` all-skips.
+    // Resolve the exact package from either a source `path` or the hash in
+    // exported recipes. Path-less recipes can reconcile existing rows but
+    // cannot publish or install bytes they do not contain.
     let program_name = program_name(agent)?;
-    let (hash, elf_bytes) = if !agent.path.is_empty() {
-        let elf_path = recipe_dir.join(&agent.path);
-        let bytes = std::fs::read(&elf_path).map_err(|e| {
+    let (hash, package_bytes, package_crdt, schemas) = if !agent.path.is_empty() {
+        let package_path = recipe_dir.join(&agent.path);
+        let bytes = std::fs::read(&package_path).map_err(|e| {
             anyhow::anyhow!(
                 "read {} for agent '{}': {e}",
-                elf_path.display(),
+                package_path.display(),
                 agent.name
             )
         })?;
+        let package = super::publish::validate_package(&program_name, &bytes)?;
         let h = blob_store::BlobHash::of(&bytes);
-        (h.0, Some(bytes))
+        (
+            h.0,
+            Some(bytes),
+            Some(package.manifest.crdt),
+            Some(package.schemas),
+        )
     } else if let Some(ph) = &agent.program_hash {
         let h = blob_store::BlobHash::from_hex(ph)
             .map_err(|_| anyhow::anyhow!("agent '{}': program_hash must be 64 hex", agent.name))?;
-        (h.0, None)
+        (h.0, None, None, None)
     } else {
         anyhow::bail!(
             "agent '{}' has neither `path` (a source recipe) nor `program_hash` (an exported \
@@ -249,11 +239,6 @@ fn preflight_one(
             agent.name,
         );
     };
-    let crdt = elf_bytes
-        .as_deref()
-        .and_then(vos::metadata::from_elf)
-        .is_some_and(|meta| meta.crdt);
-
     // Resolve the instance first. An unchanged instance is already at the
     // requested content and does not need a synthetic catalog rewrite.
     let existing = client.agent(&agent.name)?;
@@ -265,23 +250,24 @@ fn preflight_one(
             instance_name: agent.name.clone(),
             program_name,
             hash,
-            crdt,
-            elf_bytes,
+            crdt: package_crdt.unwrap_or(false),
+            package_bytes,
+            schemas,
             needs_publish: false,
             action: ApplyAction::Skip,
         });
     }
 
     let needs_publish = match client.program(&program_name)? {
-        Some(p) if p.hash == hash && p.crdt == crdt => false,
-        Some(_) if elf_bytes.is_some() => true,
+        Some(p) if p.hash == hash && package_crdt.is_none_or(|crdt| p.crdt == crdt) => false,
+        Some(_) if package_bytes.is_some() => true,
         Some(_) => anyhow::bail!(
             "agent '{}': catalog name {program_name} points at another package and this recipe \
              has no `path` with replacement bytes",
             agent.name,
         ),
         None => {
-            if elf_bytes.is_none() {
+            if package_bytes.is_none() {
                 anyhow::bail!(
                     "agent '{}': program {program_name} (hash {}) is not in the \
                      catalog and this recipe carries no `path` to publish it from",
@@ -298,8 +284,9 @@ fn preflight_one(
             instance_name: agent.name.clone(),
             program_name,
             hash,
-            crdt,
-            elf_bytes,
+            crdt: package_crdt.unwrap_or(false),
+            package_bytes,
+            schemas,
             needs_publish,
             action: if upgrade {
                 ApplyAction::Upgrade
@@ -312,11 +299,17 @@ fn preflight_one(
     // Not installed — install it (replicated half only).
     let consistency = parse_consistency(&agent.consistency).ok_or_else(|| {
         anyhow::anyhow!(
-            "agent '{}': unknown consistency '{}', expected ephemeral|local|crdt|raft",
+            "agent '{}': unknown consistency '{}', expected local|crdt|raft",
             agent.name,
             agent.consistency,
         )
     })?;
+    if consistency == vos::node::Consistency::Ephemeral as u8 {
+        anyhow::bail!(
+            "agent '{}': service packages cannot be ephemeral",
+            agent.name
+        );
+    }
     let replication_id = resolve_replication_id(agent, space_id, &hash)?;
     let sync_role = match agent.sync.as_deref() {
         Some(s) => SyncFloor::parse(s).ok_or_else(|| {
@@ -328,31 +321,24 @@ fn preflight_one(
         })?,
         None => SyncFloor::Member,
     };
-    // Installing a new instance needs the ELF (to encode init args). The
-    // path-less `program_hash` form only supports the already-installed
-    // (skip) path — the round-trip case.
-    let Some(install_elf_bytes) = &elf_bytes else {
+    let Some(_) = &package_bytes else {
         anyhow::bail!(
             "agent '{}' is not installed and this recipe carries no `path` — the path-less \
              (exported) form can only reconcile already-installed instances",
             agent.name,
         );
     };
-    let install_args = encode_init_args(&agent.name, install_elf_bytes, &agent.init, name_ids)?;
-    let install_payloads = encode_on_start_payloads(&agent.on_start)?;
-
     Ok(PreparedAgent {
         instance_name: agent.name.clone(),
         program_name,
         hash,
-        crdt,
-        elf_bytes,
+        crdt: package_crdt.expect("package bytes have package metadata"),
+        package_bytes,
+        schemas,
         needs_publish,
         action: ApplyAction::Install {
             consistency,
             replication_id,
-            install_args,
-            install_payloads,
             network_reachable: agent.network_reachable,
             sync_role,
         },
@@ -367,8 +353,8 @@ fn execute_one(
     if plan.needs_publish {
         match client.publish(plan.program_name.clone(), plan.hash.to_vec(), plan.crdt)? {
             Status::Ok => {
-                if let Some(bytes) = &plan.elf_bytes {
-                    forward_meta(client, &blob_store::BlobHash(plan.hash), bytes);
+                if let Some(schemas) = &plan.schemas {
+                    forward_meta(client, &blob_store::BlobHash(plan.hash), schemas);
                 }
             }
             Status::Forbidden => anyhow::bail!(
@@ -398,8 +384,6 @@ fn execute_one(
         ApplyAction::Install {
             consistency,
             replication_id,
-            install_args,
-            install_payloads,
             network_reachable,
             sync_role,
         } => {
@@ -409,8 +393,6 @@ fn execute_one(
                 plan.hash.to_vec(),
                 replication_id.to_vec(),
                 *consistency,
-                install_args.clone(),
-                install_payloads.clone(),
                 *network_reachable,
                 sync_role.clone(),
             )?;
@@ -480,7 +462,7 @@ fn resolve_replication_id(
 /// is what keeps `export | apply` non-destructive — `space export`
 /// emits none of the node-local fields (they aren't in the registry),
 /// so merging an exported recipe changes nothing (all-skips), whereas a
-/// replace would delete the operator's cap_policy / intra_caps /
+/// replace would delete the operator's cap_policy /
 /// extensions. Node-owned fields (subscriptions, listen) always survive.
 /// Deterministic → idempotent (re-applying the same recipe re-produces
 /// the same config). Extension `.so` paths are resolved absolute against
@@ -496,15 +478,13 @@ pub(crate) fn project_node_local(
         out.cap_policy = recipe.cap_policy.clone();
     }
     // agents: upsert each recipe agent that carries node-local policy.
-    for a in flatten(&recipe.agents) {
-        if a.tick_ms.is_none() && a.intra_caps.is_empty() && !a.device_secret {
+    for a in &recipe.agents {
+        if !a.device_secret {
             continue; // no node-local policy — leave any base entry intact
         }
         out.agents.insert(
             a.name.clone(),
             AgentLocal {
-                tick_ms: a.tick_ms,
-                intra_caps: a.intra_caps.clone(),
                 device_secret: a.device_secret,
             },
         );
@@ -540,14 +520,14 @@ fn absolutize(recipe_dir: &Path, path: &str) -> String {
     }
 }
 
-/// Best-effort: forward a program's `.vos_meta` schema so dynamic
+/// Best-effort: forward a package schema so dynamic
 /// dispatch resolves types. A blob without meta, or a transport hiccup,
 /// is a no-op — it never blocks the apply.
-fn forward_meta(client: &DaemonClient, hash: &blob_store::BlobHash, elf_bytes: &[u8]) {
-    let Some(meta_blob) = vos::metadata::raw_section_from_elf(elf_bytes) else {
+fn forward_meta(client: &DaemonClient, hash: &blob_store::BlobHash, schemas: &[u8]) {
+    if schemas.is_empty() {
         return;
-    };
-    if let Err(e) = client.register_meta(hash.0.to_vec(), meta_blob) {
+    }
+    if let Err(e) = client.register_meta(hash.0.to_vec(), schemas.to_vec()) {
         tracing::debug!("register_meta during apply skipped: {e}");
     }
 }
@@ -604,19 +584,16 @@ mod tests {
 
     #[test]
     fn project_node_local_only_emits_agents_with_policy() {
-        // A bare agent gets no [agents.<name>] table; one with node-local
-        // fields does. cap_policy + extensions ride from the recipe.
+        // A bare service gets no local table; one with a device signer does.
         let m = recipe_from(
             r#"
             cap_policy = "block"
             [[agent]]
             name = "plain"
-            path = "plain.elf"
+            path = "plain.vos"
             [[agent]]
-            name = "ticker"
-            path = "ticker.elf"
-            tick_ms = 250
-            intra_caps = ["space-registry:member"]
+            name = "authority"
+            path = "authority.vos"
             device_secret = true
             [[extension]]
             name = "gateway"
@@ -635,10 +612,7 @@ mod tests {
         // recipe-owned fields projected
         assert_eq!(out.cap_policy.as_deref(), Some("block"));
         assert!(!out.agents.contains_key("plain"), "bare agent has no table");
-        let ticker = out.agents.get("ticker").expect("ticker has policy");
-        assert_eq!(ticker.tick_ms, Some(250));
-        assert_eq!(ticker.intra_caps, vec!["space-registry:member".to_string()]);
-        assert!(ticker.device_secret);
+        assert!(out.agents["authority"].device_secret);
         assert_eq!(out.extensions.len(), 1);
         assert_eq!(out.extensions[0].name, "gateway");
         // extension .so path resolved absolute against the recipe dir.
@@ -660,12 +634,12 @@ mod tests {
         };
         assert_eq!(program_name(&exported).unwrap(), "counter-package");
 
-        let tagged = AgentDef {
+        let invalid = AgentDef {
             name: "x".into(),
-            program: Some("libcounter:old-tag".into()),
+            program: Some("counter:tag".into()),
             ..Default::default()
         };
-        assert!(program_name(&tagged).is_err());
+        assert!(program_name(&invalid).is_err());
     }
 
     #[test]
@@ -676,15 +650,13 @@ mod tests {
         // cap_policy / per-agent policy / extensions untouched.
         let mut existing_agents = BTreeMap::new();
         existing_agents.insert(
-            "messenger".to_string(),
+            "ledger".to_string(),
             AgentLocal {
-                tick_ms: Some(500),
-                intra_caps: vec!["space-registry:member".into()],
                 device_secret: true,
             },
         );
         let base = LocalConfig {
-            subscriptions: vec!["messenger".into()],
+            subscriptions: vec!["ledger".into()],
             listen: vec![],
             cap_policy: Some("block".into()),
             agents: existing_agents,
@@ -700,8 +672,8 @@ mod tests {
             r#"
             space = "x"
             [[agent]]
-            name = "messenger"
-            program = "messenger"
+            name = "ledger"
+            program = "ledger"
             program_hash = "aa"
         "#,
         );
@@ -720,9 +692,9 @@ mod tests {
             r#"
             cap_policy = "log"
             [[agent]]
-            name = "ticker"
-            path = "ticker.elf"
-            tick_ms = 100
+            name = "authority"
+            path = "authority.vos"
+            device_secret = true
         "#,
         );
         let once = project_node_local(&LocalConfig::default(), &m, Path::new("/recipes"));

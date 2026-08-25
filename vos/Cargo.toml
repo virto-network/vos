@@ -37,7 +37,7 @@ storage = ["dep:redb", "dep:merkle-crdt", "dep:futures-executor", "dep:futures-c
 # discovery). Pulls a substantial dep tree (libp2p + tokio runtime),
 # so it's opt-in. Hosts that want cross-node spaces enable it; bare
 # single-node runs (extensions, no_std actors) don't need it.
-network = ["std", "dep:libp2p", "dep:tokio", "dep:async-trait", "dep:vrf"]
+network = ["std", "dep:libp2p", "dep:tokio", "dep:async-trait"]
 
 [dependencies]
 vos-macros = { path = "vos-macros", version = "0.1.0", optional = true }
@@ -87,11 +87,6 @@ merkle-crdt = { path = "../support/merkle-crdt", version = "0.1.0", features = [
 libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "mdns", "macros", "ping", "identify", "request-response", "gossipsub"], optional = true }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "fs"], optional = true }
 async-trait = { version = "0.1", optional = true }
-# ECVRF primitive for the host-side `chronos_feed` feeder: the
-# leader's feeder derives a static VRF keypair from `node.key`, enrols pubkeys,
-# and posts per-round reveals. no_std pure software; rides the `network`
-# feature (the feeder is network-gated). The chronos actor pulls it directly.
-vrf = { path = "../support/vrf", optional = true }
 # Host-side extension executor: the cooperative scheduler runs host-side,
 # driven by `async-io::block_on(LocalExecutor::run(..))`. `LocalExecutor`
 # keeps the extension's `!Send` per-task futures on the one thread that owns
@@ -142,11 +137,6 @@ space-registry = { path = "../actors/space-registry", default-features = false }
 # Canonical service authority state encoder used by the physical generic-service
 # integration gate. The runtime itself remains application-agnostic.
 space-authority = { path = "../actors/space-authority", default-features = false }
-# The channel sequencer's reply types (`CommitOutcome` / `Status`), so the
-# in-PVM commit-retry gate can mint byte-identical msg-ctl replies through the
-# external-invoke seam and drive `commit_chain_op`'s catch-up loop without a
-# live sequencer. `default-features = false` keeps the PVM bin glue out.
-msg-ctl = { path = "../actors/msg-ctl", default-features = false }
 # Per-bank stateful clerk agent — host tests use ClerkLedgerRef to
 # drive bootstrap / create_account / account against the wire ABI.
 clerk-ledger = { path = "../actors/clerk-ledger", default-features = false }
