@@ -16,7 +16,7 @@ pub struct ServiceIdentity {
     pub root_service: RootServiceId,
     pub deployment: DeploymentId,
     pub service_program: ProgramId,
-    pub service_abi: u16,
+    pub platform: Hash,
     pub execution_semantics: Hash,
     /// Consensus-visible execution budget. Replicas must reject work whose
     /// declared schedule differs from the host schedule used to run it.
@@ -210,10 +210,9 @@ impl RoleAuthorityInviteRedemption {
     }
 }
 
-/// Admin-signed cancellation of one offline invite bearer. Unlike the
-/// legacy registry operation, this canonical wire binds the space as well as
-/// the token, so an administrator of two spaces cannot replay one signature
-/// across their independent authorities.
+/// Admin-signed cancellation of one offline invite bearer. The wire binds the
+/// space as well as the token, so an administrator of two spaces cannot replay
+/// one signature across their independent authorities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleAuthorityInviteRevocation {
     pub space: SpaceId,
@@ -437,7 +436,7 @@ pub struct ActorSliceInput {
 
 /// Invocation-private input returned only to the currently active actor VM.
 ///
-/// The generic service host derives `actor` and `origin` from JAR's live CALL
+/// The generic service host derives `actor` and `origin` from PVM's live CALL
 /// stack. A parent actor therefore receives no sibling materialization and
 /// cannot impersonate another same-tree caller by rewriting the shared IPC
 /// bytes.
@@ -561,7 +560,7 @@ impl ActorPrivateInput {
     }
 
     /// Actor-local directory slot for a same-tree peer. Availability is
-    /// enforced by the live JAR CNode: the scheduler omits or revokes the
+    /// enforced by the live PVM CNode: the scheduler omits or revokes the
     /// CALLABLE for suspended actors, including after snapshot restore.
     pub fn callable_slot(&self, actor: ActorId) -> Option<u8> {
         let index = self
@@ -605,7 +604,7 @@ pub struct ActorSliceOutput {
     pub checkpoint: Option<CheckpointToken>,
 }
 
-/// Pure host-to-guest handoff written only after JAR captured the exact
+/// Pure host-to-guest handoff written only after PVM captured the exact
 /// pre-result machine snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointToken {
@@ -628,7 +627,7 @@ pub struct CheckpointToken {
     pub expected: Option<Hash>,
     pub replacement: Option<BlobRef>,
     pub pending_call: Option<CallId>,
-    /// Exact actor VM which issued `pending_call`, derived from the live JAR
+    /// Exact actor VM which issued `pending_call`, derived from the live PVM
     /// stack by the scheduler. `None` for an explicit yield.
     pub pending_actor: Option<ActorId>,
     /// Actors locked by the continuation being replaced or deleted.
@@ -665,7 +664,7 @@ pub struct WorkEnvelope {
     /// advances this value, so retries deduplicate without conflating later
     /// checkpoints with the first transition.
     pub workflow_step: u64,
-    /// Consensus-supplied JAM logical timeslot at which this work item is
+    /// Consensus-supplied service platform logical timeslot at which this work item is
     /// scheduled. Durable deadlines are compared only to this input, never to
     /// a wall clock.
     pub logical_timeslot: u64,
@@ -726,7 +725,7 @@ impl WorkEnvelope {
     pub fn hash(&self) -> Hash {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&Self::MAGIC);
-        bytes.extend_from_slice(&super::ABI_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&super::PLATFORM_ID.0);
         self.encode_body_with_arguments(
             &mut bytes,
             if self.private_arguments.is_some() {
@@ -1095,7 +1094,7 @@ pub struct AccumulatedReply {
 }
 
 /// Deterministic result of expiring one durable cross-root call. Deadlines
-/// and observation times are JAM logical timeslots, never wall-clock values.
+/// and observation times are service platform logical timeslots, never wall-clock values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallTimeout {
     pub call_id: CallId,
@@ -1217,7 +1216,7 @@ pub struct AttestationResume {
     pub statement: AttestationStatement,
     pub proof: ProofCommitment,
     /// Byte window in the invocation-owned actor IPC capability. The generic
-    /// service writes the imported proof there before resuming JAR; only this
+    /// service writes the imported proof there before resuming PVM; only this
     /// small descriptor crosses the bounded protocol-call stack buffer.
     pub proof_offset: u32,
     pub proof_len: u32,
@@ -1242,9 +1241,8 @@ fn validate_attestation_delivery(
     if proof.proof_blob.len == 0
         || statement.actor != reply.producer
         || statement.accumulation_receipt != *receipt
-        || statement.claim_commitment != Hash::digest(b"vos/attestation-claim/v3", &[&reply.result])
+        || statement.claim_commitment != Hash::digest(b"vos/attestation-claim", &[&reply.result])
         || proof.statement != statement.commitment()
-        || proof.statement_version != super::ATTESTATION_STATEMENT_VERSION
     {
         return Err(crate::AttestationError::InvalidStatement);
     }
@@ -1620,10 +1618,9 @@ pub struct ProofCommitment {
     pub statement: Hash,
     pub trace: Hash,
     pub proof_blob: BlobRef,
-    pub statement_version: u16,
 }
 
-/// Versioned, bounded root artifact for a streamed production proof.
+/// Bounded root artifact for a streamed production proof.
 ///
 /// [`ProofCommitment::proof_blob`] addresses the encoding of this manifest;
 /// each listed segment lives independently in the verifier's durable CAS.
@@ -1950,7 +1947,7 @@ impl ActorUpgrade {
 pub struct AccumulationEnvelope {
     pub work: WorkEnvelope,
     pub transition: Transition,
-    /// Candidate content-addressed bytes produced by Refine or its exact JAR
+    /// Candidate content-addressed bytes produced by Refine or its exact PVM
     /// snapshot boundary. They remain unobservable unless this Accumulate
     /// transaction commits.
     pub provided_blobs: Vec<ImportedBlob>,
@@ -2018,7 +2015,7 @@ impl DirectIngress {
     pub(crate) fn encode_admitted(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&Self::MAGIC);
-        out.extend_from_slice(&super::ABI_VERSION.to_le_bytes());
+        out.extend_from_slice(&super::PLATFORM_ID.0);
         let authorization = if self.crdt_change.is_some() {
             &AuthorizationEvidence::Public
         } else {
@@ -2035,7 +2032,7 @@ impl DirectIngress {
     pub(crate) fn encode_materialized(ingress: &CrdtIngress, change: &CrdtChange) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&Self::MAGIC);
-        out.extend_from_slice(&super::ABI_VERSION.to_le_bytes());
+        out.extend_from_slice(&super::PLATFORM_ID.0);
         let mut e = Encoder(&mut out);
         encode_service(&mut e, &ingress.service);
         e.fixed(&ingress.invocation.0);
@@ -2378,7 +2375,7 @@ pub enum AccumulationRejection {
     StoreAlreadyInitialized,
     StoreUninitialized,
     WrongService,
-    WrongAbi,
+    WrongPlatform,
     WrongExecutionSemantics,
     WrongProgram,
     InvalidConsistency,
@@ -2469,7 +2466,7 @@ pub enum AccumulationResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefineError {
-    WrongAbi,
+    WrongPlatform,
     WrongExecutionSemantics,
     MissingImport(Hash),
     InvalidImport(Hash),
@@ -2490,8 +2487,8 @@ impl RefineImports {
     /// Verify that Refine has every byte named by the work envelope and that
     /// no imported code/blob can masquerade under a different content ID.
     pub fn validate_for(&self, work: &WorkEnvelope) -> Result<(), RefineError> {
-        if work.service.service_abi != super::ABI_VERSION {
-            return Err(RefineError::WrongAbi);
+        if work.service.platform != super::PLATFORM_ID {
+            return Err(RefineError::WrongPlatform);
         }
         if work.service.execution_semantics != super::EXECUTION_SEMANTICS_ID {
             return Err(RefineError::WrongExecutionSemantics);
@@ -2644,7 +2641,7 @@ impl RefineImports {
 }
 
 impl ServiceWire for WorkEnvelope {
-    const MAGIC: [u8; 4] = *b"VWK2";
+    const MAGIC: [u8; 4] = *b"VWKW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         self.encode_body_with_arguments(out, &self.arguments);
@@ -2864,7 +2861,7 @@ impl WorkEnvelope {
 }
 
 impl ServiceWire for RefineImports {
-    const MAGIC: [u8; 4] = *b"VRI2";
+    const MAGIC: [u8; 4] = *b"VRIW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -2930,7 +2927,7 @@ impl ServiceWire for RefineImports {
 }
 
 impl ServiceWire for ActorSliceInput {
-    const MAGIC: [u8; 4] = *b"VSI2";
+    const MAGIC: [u8; 4] = *b"VSIW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -2950,7 +2947,7 @@ impl ServiceWire for ActorSliceInput {
 }
 
 impl ServiceWire for ActorPrivateInput {
-    const MAGIC: [u8; 4] = *b"VPI3";
+    const MAGIC: [u8; 4] = *b"VPIW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -3023,7 +3020,7 @@ impl ServiceWire for ActorPrivateInput {
 }
 
 impl ServiceWire for ActorCallResult {
-    const MAGIC: [u8; 4] = *b"VAC2";
+    const MAGIC: [u8; 4] = *b"VACW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -3063,7 +3060,7 @@ impl ServiceWire for ActorCallResult {
 }
 
 impl ServiceWire for ActorEffectBatch {
-    const MAGIC: [u8; 4] = *b"VEB2";
+    const MAGIC: [u8; 4] = *b"VEBW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -3080,7 +3077,7 @@ impl ServiceWire for ActorEffectBatch {
 }
 
 impl ServiceWire for ActorSliceOutput {
-    const MAGIC: [u8; 4] = *b"VSO2";
+    const MAGIC: [u8; 4] = *b"VSOW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -3202,7 +3199,7 @@ impl ServiceWire for ActorSliceOutput {
 }
 
 impl ServiceWire for CheckpointToken {
-    const MAGIC: [u8; 4] = *b"VCP2";
+    const MAGIC: [u8; 4] = *b"VCPW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         encode_checkpoint_token(&mut Encoder(out), self);
@@ -3214,7 +3211,7 @@ impl ServiceWire for CheckpointToken {
 }
 
 impl ServiceWire for AwaitResume {
-    const MAGIC: [u8; 4] = *b"VRS2";
+    const MAGIC: [u8; 4] = *b"VRSW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -3270,7 +3267,7 @@ impl ServiceWire for AwaitResume {
 }
 
 impl ServiceWire for Transition {
-    const MAGIC: [u8; 4] = *b"VTR2";
+    const MAGIC: [u8; 4] = *b"VTRW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -3326,7 +3323,7 @@ impl ServiceWire for Transition {
 }
 
 impl ServiceWire for RefineOutput {
-    const MAGIC: [u8; 4] = *b"VRO2";
+    const MAGIC: [u8; 4] = *b"VROW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -3353,7 +3350,7 @@ impl ServiceWire for RefineOutput {
 }
 
 impl ServiceWire for CrdtChange {
-    const MAGIC: [u8; 4] = *b"VCG2";
+    const MAGIC: [u8; 4] = *b"VCGW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -3465,7 +3462,7 @@ impl ServiceWire for CrdtChange {
 }
 
 impl ServiceWire for BlobRef {
-    const MAGIC: [u8; 4] = *b"VBR2";
+    const MAGIC: [u8; 4] = *b"VBRW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         encode_blob_ref(&mut Encoder(out), self);
@@ -3477,7 +3474,7 @@ impl ServiceWire for BlobRef {
 }
 
 impl ServiceWire for RoleAuthorityBinding {
-    const MAGIC: [u8; 4] = *b"VAB2";
+    const MAGIC: [u8; 4] = *b"VABW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
@@ -3498,7 +3495,7 @@ impl ServiceWire for RoleAuthorityBinding {
 }
 
 impl ServiceWire for RoleAuthorityMutation {
-    const MAGIC: [u8; 4] = *b"VRM2";
+    const MAGIC: [u8; 4] = *b"VRMW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
@@ -3551,7 +3548,7 @@ impl ServiceWire for RoleAuthorityMutation {
 }
 
 impl ServiceWire for RoleAuthorityInviteRedemption {
-    const MAGIC: [u8; 4] = *b"VIG2";
+    const MAGIC: [u8; 4] = *b"VIGW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
@@ -3607,7 +3604,7 @@ impl ServiceWire for RoleAuthorityInviteRedemption {
 }
 
 impl ServiceWire for RoleAuthorityInviteRevocation {
-    const MAGIC: [u8; 4] = *b"VIR2";
+    const MAGIC: [u8; 4] = *b"VIRW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
@@ -3630,7 +3627,7 @@ impl ServiceWire for RoleAuthorityInviteRevocation {
 }
 
 impl ServiceWire for RoleAuthorizationClaim {
-    const MAGIC: [u8; 4] = *b"VCL2";
+    const MAGIC: [u8; 4] = *b"VCLW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
@@ -3672,7 +3669,7 @@ impl ServiceWire for RoleAuthorizationClaim {
 }
 
 impl ServiceWire for AccumulatedRoleAssertion {
-    const MAGIC: [u8; 4] = *b"VRA2";
+    const MAGIC: [u8; 4] = *b"VRAW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
@@ -3726,7 +3723,7 @@ impl RoleCredential {
 }
 
 impl ServiceWire for RoleCredential {
-    const MAGIC: [u8; 4] = *b"VRC2";
+    const MAGIC: [u8; 4] = *b"VRCW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
@@ -3760,7 +3757,7 @@ impl ServiceWire for RoleCredential {
 }
 
 impl ServiceWire for MethodPolicy {
-    const MAGIC: [u8; 4] = *b"VMP2";
+    const MAGIC: [u8; 4] = *b"VMPW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -3800,7 +3797,7 @@ impl ServiceWire for MethodPolicy {
 }
 
 impl ServiceWire for ActorGenesis {
-    const MAGIC: [u8; 4] = *b"VAG2";
+    const MAGIC: [u8; 4] = *b"VAGW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         encode_actor_genesis(&mut Encoder(out), self);
@@ -3812,7 +3809,7 @@ impl ServiceWire for ActorGenesis {
 }
 
 impl ServiceWire for ActorDirectory {
-    const MAGIC: [u8; 4] = *b"VAD2";
+    const MAGIC: [u8; 4] = *b"VADW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         Encoder(out).list(&self.actors, |e, actor| e.fixed(&actor.0));
@@ -3831,7 +3828,7 @@ impl ServiceWire for ActorDirectory {
 }
 
 impl ServiceWire for ExternalActorDirectory {
-    const MAGIC: [u8; 4] = *b"VEX2";
+    const MAGIC: [u8; 4] = *b"VEXW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         Encoder(out).list(&self.actors, encode_external_actor);
@@ -3847,7 +3844,7 @@ impl ServiceWire for ExternalActorDirectory {
 }
 
 impl ServiceWire for MessageRecord {
-    const MAGIC: [u8; 4] = *b"VMR2";
+    const MAGIC: [u8; 4] = *b"VMRW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         encode_message(&mut Encoder(out), self);
@@ -3859,7 +3856,7 @@ impl ServiceWire for MessageRecord {
 }
 
 impl ServiceWire for AccumulatedReply {
-    const MAGIC: [u8; 4] = *b"VRP2";
+    const MAGIC: [u8; 4] = *b"VRPW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -3892,7 +3889,7 @@ impl ServiceWire for AccumulatedReply {
 }
 
 impl ServiceWire for CallTimeout {
-    const MAGIC: [u8; 4] = *b"VTO2";
+    const MAGIC: [u8; 4] = *b"VTOW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -3926,7 +3923,7 @@ impl ServiceWire for CallTimeout {
 }
 
 impl ServiceWire for CallExpirationEnvelope {
-    const MAGIC: [u8; 4] = *b"VCE2";
+    const MAGIC: [u8; 4] = *b"VCEW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -3964,7 +3961,7 @@ impl ServiceWire for CallExpirationEnvelope {
 }
 
 impl ServiceWire for AccumulatedTimeout {
-    const MAGIC: [u8; 4] = *b"VAT2";
+    const MAGIC: [u8; 4] = *b"VATW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -3983,7 +3980,7 @@ impl ServiceWire for AccumulatedTimeout {
 }
 
 impl ServiceWire for AccumulationReceipt {
-    const MAGIC: [u8; 4] = *b"VAR2";
+    const MAGIC: [u8; 4] = *b"VARW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -4065,7 +4062,7 @@ impl ServiceWire for ProofVerificationRequest {
 }
 
 impl ServiceWire for AttestationProofManifest {
-    const MAGIC: [u8; 4] = *b"VPM2";
+    const MAGIC: [u8; 4] = *b"VPMW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -4133,7 +4130,7 @@ impl ServiceWire for RoleCredentialVerificationRequest {
 }
 
 impl ServiceWire for ServiceGenesis {
-    const MAGIC: [u8; 4] = *b"VGN2";
+    const MAGIC: [u8; 4] = *b"VGNW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -4170,7 +4167,7 @@ impl ServiceGenesis {
 }
 
 impl ServiceWire for ActorUpgrade {
-    const MAGIC: [u8; 4] = *b"VAU2";
+    const MAGIC: [u8; 4] = *b"VAUW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -4215,7 +4212,7 @@ impl ServiceWire for ActorUpgrade {
 }
 
 impl ServiceWire for AccumulationEnvelope {
-    const MAGIC: [u8; 4] = *b"VAE2";
+    const MAGIC: [u8; 4] = *b"VAEW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -4244,7 +4241,7 @@ impl ServiceWire for AccumulationEnvelope {
 }
 
 impl ServiceWire for DeliveryEnvelope {
-    const MAGIC: [u8; 4] = *b"VDL2";
+    const MAGIC: [u8; 4] = *b"VDLW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -4316,7 +4313,7 @@ impl ServiceWire for InboxRetirement {
 }
 
 impl ServiceWire for PublicationAck {
-    const MAGIC: [u8; 4] = *b"VPA2";
+    const MAGIC: [u8; 4] = *b"VPAW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -4349,7 +4346,7 @@ impl PublicationAck {
 }
 
 impl ServiceWire for DirectIngress {
-    const MAGIC: [u8; 4] = *b"VDI2";
+    const MAGIC: [u8; 4] = *b"VDIW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         self.encode_body_with_authorization(out, &self.authorization);
@@ -4407,7 +4404,7 @@ impl ServiceWire for DirectIngress {
 }
 
 impl ServiceWire for CrdtSyncEnvelope {
-    const MAGIC: [u8; 4] = *b"VCS2";
+    const MAGIC: [u8; 4] = *b"VCSW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -4481,7 +4478,7 @@ impl ServiceWire for CrdtSyncEnvelope {
 }
 
 impl ServiceWire for AccumulateRequest {
-    const MAGIC: [u8; 4] = *b"VAC2";
+    const MAGIC: [u8; 4] = *b"VACW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -4553,7 +4550,7 @@ impl ServiceWire for AccumulateRequest {
 }
 
 impl ServiceWire for PublishedEffects {
-    const MAGIC: [u8; 4] = *b"VEF2";
+    const MAGIC: [u8; 4] = *b"VEFW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -4606,7 +4603,7 @@ impl ServiceWire for PublishedEffects {
 }
 
 impl ServiceWire for AccumulationResult {
-    const MAGIC: [u8; 4] = *b"VAO2";
+    const MAGIC: [u8; 4] = *b"VAOW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -4861,7 +4858,7 @@ fn validate_genesis(value: &ServiceGenesis) -> Result<(), DecodeError> {
     for external in &value.external_actors {
         if external.name.is_empty()
             || external.service == value.service
-            || external.service.service_abi != super::ABI_VERSION
+            || external.service.platform != super::PLATFORM_ID
             || external.service.execution_semantics != super::EXECUTION_SEMANTICS_ID
             || known.contains(&external.actor)
             || root_names.contains(external.name.as_str())
@@ -4872,7 +4869,7 @@ fn validate_genesis(value: &ServiceGenesis) -> Result<(), DecodeError> {
     if value.role_authority.as_ref().is_some_and(|authority| {
         authority.service.space != value.service.space
             || authority.service == value.service
-            || authority.service.service_abi != super::ABI_VERSION
+            || authority.service.platform != super::PLATFORM_ID
             || authority.service.execution_semantics != super::EXECUTION_SEMANTICS_ID
             || authority.actor == ActorId::ZERO
     }) {
@@ -5143,7 +5140,7 @@ fn encode_rejection(e: &mut Encoder<'_>, value: &AccumulationRejection) {
         R::StoreAlreadyInitialized => e.u8(0),
         R::StoreUninitialized => e.u8(1),
         R::WrongService => e.u8(2),
-        R::WrongAbi => e.u8(3),
+        R::WrongPlatform => e.u8(3),
         R::WrongExecutionSemantics => e.u8(4),
         R::WrongProgram => e.u8(5),
         R::InvalidConsistency => e.u8(6),
@@ -5195,7 +5192,7 @@ fn decode_rejection(d: &mut Decoder<'_>) -> Result<AccumulationRejection, Decode
         0 => Ok(R::StoreAlreadyInitialized),
         1 => Ok(R::StoreUninitialized),
         2 => Ok(R::WrongService),
-        3 => Ok(R::WrongAbi),
+        3 => Ok(R::WrongPlatform),
         4 => Ok(R::WrongExecutionSemantics),
         5 => Ok(R::WrongProgram),
         6 => Ok(R::InvalidConsistency),
@@ -5231,7 +5228,7 @@ pub(super) fn encode_service(e: &mut Encoder<'_>, value: &ServiceIdentity) {
     e.fixed(&value.root_service.0);
     e.fixed(&value.deployment.0);
     e.fixed(&value.service_program.0);
-    e.u16(value.service_abi);
+    e.fixed(&value.platform.0);
     e.fixed(&value.execution_semantics.0);
     e.u64(value.gas_schedule.refine);
     e.u64(value.gas_schedule.accumulate);
@@ -5243,12 +5240,12 @@ pub(super) fn decode_service(d: &mut Decoder<'_>) -> Result<ServiceIdentity, Dec
         root_service: RootServiceId(d.fixed()?),
         deployment: DeploymentId(d.fixed()?),
         service_program: ProgramId(d.fixed()?),
-        service_abi: d.u16()?,
+        platform: Hash(d.fixed()?),
         execution_semantics: Hash(d.fixed()?),
         gas_schedule: GasSchedule::new(d.u64()?, d.u64()?),
     };
-    if value.service_abi != super::ABI_VERSION || !value.gas_schedule.is_valid() {
-        return Err(DecodeError::InvalidVersion);
+    if value.platform != super::PLATFORM_ID || !value.gas_schedule.is_valid() {
+        return Err(DecodeError::InvalidPlatform);
     }
     Ok(value)
 }
@@ -5373,7 +5370,7 @@ fn encode_blob_ref(e: &mut Encoder<'_>, value: &BlobRef) {
 fn decode_blob_ref(d: &mut Decoder<'_>) -> Result<BlobRef, DecodeError> {
     let hash = Hash(d.fixed()?);
     let len = d.u64()?;
-    // JAM uses u64::MAX as the missing-preimage sentinel. Keeping that value
+    // service platform uses u64::MAX as the missing-preimage sentinel. Keeping that value
     // out of canonical references prevents absence from comparing equal to a
     // claimed blob length at any host boundary.
     if len == u64::MAX {
@@ -5874,7 +5871,6 @@ pub(crate) fn encode_proof(e: &mut Encoder<'_>, value: &ProofCommitment) {
     e.fixed(&value.statement.0);
     e.fixed(&value.trace.0);
     encode_blob_ref(e, &value.proof_blob);
-    e.u16(value.statement_version);
 }
 
 pub(crate) fn decode_proof(d: &mut Decoder<'_>) -> Result<ProofCommitment, DecodeError> {
@@ -5882,13 +5878,9 @@ pub(crate) fn decode_proof(d: &mut Decoder<'_>) -> Result<ProofCommitment, Decod
         statement: Hash(d.fixed()?),
         trace: Hash(d.fixed()?),
         proof_blob: decode_blob_ref(d)?,
-        statement_version: d.u16()?,
     };
-    if value.statement_version != super::ATTESTATION_STATEMENT_VERSION
-        || value.statement == Hash::ZERO
-        || value.trace == Hash::ZERO
-    {
-        return Err(DecodeError::InvalidVersion);
+    if value.statement == Hash::ZERO || value.trace == Hash::ZERO {
+        return Err(DecodeError::InvalidPlatform);
     }
     Ok(value)
 }
@@ -5933,7 +5925,7 @@ mod tests {
             root_service: RootServiceId([1; 32]),
             deployment: DeploymentId([2; 32]),
             service_program: ProgramId([3; 32]),
-            service_abi: super::super::ABI_VERSION,
+            platform: super::super::PLATFORM_ID,
             execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
             gas_schedule: GasSchedule::new(1_000_000_000, 5_000_000_000),
         }
@@ -6183,7 +6175,7 @@ mod tests {
                 root_service: RootServiceId([40; 32]),
                 deployment: DeploymentId([41; 32]),
                 service_program: ProgramId([42; 32]),
-                service_abi: super::super::ABI_VERSION,
+                platform: super::super::PLATFORM_ID,
                 execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
                 gas_schedule: GasSchedule::new(1_000_000_000, 5_000_000_000),
             },
@@ -6302,7 +6294,7 @@ mod tests {
         invalid_schedule.service.gas_schedule.refine = 0;
         assert_eq!(
             WorkEnvelope::decode(&invalid_schedule.encode()),
-            Err(DecodeError::InvalidVersion)
+            Err(DecodeError::InvalidPlatform)
         );
 
         let mut trailing = bytes.clone();
@@ -6313,7 +6305,10 @@ mod tests {
         );
         let mut old = bytes;
         old[4..6].copy_from_slice(&1u16.to_le_bytes());
-        assert_eq!(WorkEnvelope::decode(&old), Err(DecodeError::InvalidVersion));
+        assert_eq!(
+            WorkEnvelope::decode(&old),
+            Err(DecodeError::InvalidPlatform)
+        );
 
         let mut causal = value.clone();
         let parent_invocation = InvocationId([40; 32]);
@@ -6812,7 +6807,6 @@ mod tests {
             consistency: ConsistencyMode::Local,
         };
         let statement = AttestationStatement {
-            statement_version: super::super::ATTESTATION_STATEMENT_VERSION,
             space: receipt.service.space,
             actor,
             producer_name: "private-age".into(),
@@ -6825,7 +6819,7 @@ mod tests {
             reply_call: call,
             before: crate::attestation::StateCommitment::Linear(Hash([47; 32])),
             after: crate::attestation::StateCommitment::Linear(Hash([44; 32])),
-            claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&reply.result]),
+            claim_commitment: Hash::digest(b"vos/attestation-claim", &[&reply.result]),
             input_commitment: Hash([48; 32]),
             authorization_policy: Hash([49; 32]),
             accumulation_receipt: receipt.clone(),
@@ -6835,7 +6829,6 @@ mod tests {
             statement: statement.commitment(),
             trace: Hash([50; 32]),
             proof_blob: BlobRef::of_bytes(&proof_bytes),
-            statement_version: super::super::ATTESTATION_STATEMENT_VERSION,
         };
         let accumulated = AccumulatedReply {
             reply: reply.clone(),
@@ -6941,7 +6934,6 @@ mod tests {
             statement: Hash([14; 32]),
             trace: Hash([13; 32]),
             proof_blob: BlobRef::of_bytes(b"proof"),
-            statement_version: super::super::ATTESTATION_STATEMENT_VERSION,
         });
         assert_ne!(proved.hash(), changed.hash());
         assert_eq!(proved.commitment(), changed.commitment());
@@ -7104,7 +7096,6 @@ mod tests {
             statement: Hash([14; 32]),
             trace: Hash([15; 32]),
             proof_blob: proof_blob.clone(),
-            statement_version: super::super::ATTESTATION_STATEMENT_VERSION,
         });
         mismatched_proof.provided_blobs = vec![ImportedBlob {
             reference: proof_blob,
@@ -7245,7 +7236,7 @@ mod tests {
         previous_abi[4..6].copy_from_slice(&6u16.to_le_bytes());
         assert_eq!(
             DirectIngress::decode(&previous_abi),
-            Err(DecodeError::InvalidVersion),
+            Err(DecodeError::InvalidPlatform),
             "ABI 6 cannot be interpreted as the authorization-reference wire",
         );
 

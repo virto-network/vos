@@ -29,7 +29,7 @@
 //! index pages (~[`PAGE_BYTES`] each) and fetches values lazily, so a
 //! paged query touches a handful of rows however large the map is. No
 //! iteration hostcall exists or is needed — the index is ordinary rows,
-//! which also keeps actors portable to a conformant JAM host (where
+//! which also keeps actors portable to a conformant service platform host (where
 //! `STORAGE_R` is accumulate-only and refine data arrives as witness).
 //!
 //! ## Dispatch semantics

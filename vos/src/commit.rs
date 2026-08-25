@@ -619,7 +619,7 @@ mod crdt {
     /// marker lets open fail with the service clean-break instruction while current
     /// stores can continue quarantining individual malformed peer nodes.
     pub(super) const REPLAY_FORMAT_KEY: &str = "crdt_replay_format";
-    const REPLAY_FORMAT: &[u8] = b"VCR2";
+    const REPLAY_FORMAT: &[u8] = b"VCRW";
 
     /// Merkle-CRDT commit strategy.
     ///

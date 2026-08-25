@@ -1,14 +1,9 @@
-//! VOS runtime service: JAM-aligned service contracts.
+//! Canonical service contracts.
 //!
-//! A root actor tree is owned by one logical JAM service. One generic service
-//! program exposes the two Gray Paper entry instruction counters: Refine at IC
-//! 0 and Accumulate at IC 5. Registers `phi[7]`/`phi[8]` retain their standard
-//! argument-window meaning. Refine receives every input explicitly and returns
-//! a deterministic [`Transition`]. Only Accumulate may mutate service state
-//! or publish effects.
-//!
-//! This is a clean boundary. None of the types in this module accept legacy
-//! `RefinePayload`, `EffectLog`, or continuation encodings.
+//! A root actor tree is owned by one service program. Refine receives every
+//! input explicitly and returns a deterministic [`Transition`]. Only
+//! Accumulate may mutate service state or publish effects. Persisted objects
+//! bind [`PLATFORM_ID`]; bytes from any other platform are rejected.
 
 mod causal;
 mod continuation;
@@ -69,9 +64,9 @@ pub use identity::{
 };
 #[cfg(feature = "std")]
 pub use local_store::{
-    CommittedImageStore, CommittedServiceImageHost, DurableJamStore, DurableStoreOpenError,
-    FileCommittedImageStore, LocalJamStore, LocalJamStoreHost, LocalJamStoreSnapshot,
-    LocalStoreReadError, PrivateIngressStaging, ProductionTrust, ProductionTrustDecision,
+    CommittedImageStore, CommittedServiceImageHost, DurableServiceStore, DurableStoreOpenError,
+    FileCommittedImageStore, LocalStoreReadError, MemoryServiceHost, MemoryServiceSnapshot,
+    MemoryServiceStore, PrivateIngressStaging, ProductionTrust, ProductionTrustDecision,
     ProductionTrustError, ProofArtifactStore, ServiceImageInstallError,
 };
 pub use package::{
@@ -99,8 +94,8 @@ pub use scheduler::{LocalWorkRequest, LocalWorkScheduler, PreparedWork, Schedule
 pub use service::{
     AccumulatedServiceOutput, AttestedServiceError, CommittedAccumulateBatch,
     CommittedAccumulateEntry, CommittedAccumulateLog, CommittedAttestationOutput,
-    CommittedProofArtifact, CommittedServiceSnapshot, JamService, RefinedServiceOutput,
-    ReplicatedJamService, ReplicatedServiceError, ServiceDispatchError,
+    CommittedProofArtifact, CommittedServiceSnapshot, RefinedServiceOutput, ReplicatedServiceError,
+    ReplicatedServiceRuntime, ServiceDispatchError, ServiceRuntime,
 };
 pub use state_tree::{
     SERVICE_STATE_KEY_DOMAIN, SERVICE_STATE_LEAF_DOMAIN, SERVICE_STATE_NODE_DOMAIN,
@@ -109,12 +104,12 @@ pub use state_tree::{
 pub use storage::{
     ActorUpgradeRecord, DedupRecord, DeliveryRecord, IngressRecord, PendingCallDeadline,
     PublicationAckRecord, PublicationRecord, ReplyAdmissionRecord, RoleAssertionEligibility,
-    SERVICE_STORE_SCHEMA_VERSION, StateKey, StoreHeader, StoreOpenError, WorkflowCheckpoint,
-    actor_upgrade_storage_key, call_expiration_storage_key, crdt_change_storage_key,
-    crdt_node_receipt_storage_key, crdt_node_storage_key, dedup_storage_key, delivery_storage_key,
-    header_storage_key, ingress_storage_key, pending_call_deadline_storage_key,
-    publication_ack_storage_key, publication_storage_key, receipt_storage_key,
-    reply_admission_storage_key, role_assertion_eligibility_storage_key,
+    StateKey, StoreHeader, StoreOpenError, WorkflowCheckpoint, actor_upgrade_storage_key,
+    call_expiration_storage_key, crdt_change_storage_key, crdt_node_receipt_storage_key,
+    crdt_node_storage_key, dedup_storage_key, delivery_storage_key, header_storage_key,
+    ingress_storage_key, pending_call_deadline_storage_key, publication_ack_storage_key,
+    publication_storage_key, receipt_storage_key, reply_admission_storage_key,
+    role_assertion_eligibility_storage_key,
 };
 #[cfg(feature = "std")]
 pub use transport::{
@@ -123,12 +118,10 @@ pub use transport::{
 };
 pub use wire::{DecodeError, ServiceWire};
 
-/// Platform wire/ABI version carried by service work, transitions, and receipts.
-pub const ABI_VERSION: u16 = 17;
-/// Portable continuation format version.
-pub const SNAPSHOT_VERSION: u16 = 6;
-/// Attestation statement version required by runtime service.
-pub const ATTESTATION_STATEMENT_VERSION: u16 = 3;
+/// Identity of the canonical wire, package, store, continuation, and
+/// attestation contract. A contract change creates a new clean platform
+/// identity; no compatibility decoder is retained.
+pub const PLATFORM_ID: Hash = Hash(*b"vos-platform-canonical-20260825!");
 
 /// Program identity of the canonical [`vos-service.pvm`](../../../services/vos-service/vos-service.pvm).
 ///
@@ -139,25 +132,24 @@ pub const VOS_SERVICE_PROGRAM_ID: ProgramId = ProgramId([
     0xbf, 0xbf, 0x57, 0x24, 0x9b, 0xf0, 0x04, 0xaf, 0xc5, 0xe6, 0x0b, 0x2c, 0x42, 0x05, 0xe6, 0x8a,
 ]);
 
-/// Gray Paper instruction counter for the service Refine entry.
+/// Instruction counter for the service Refine entry.
 pub const REFINE_ENTRY_IC: u32 = 0;
-/// Gray Paper instruction counter for the service Accumulate entry.
+/// Instruction counter for the service Accumulate entry.
 pub const ACCUMULATE_ENTRY_IC: u32 = 5;
 
 /// Owning HANDLE through which the generic service enters the target actor VM.
-/// This is a JAR capability-table slot supplied at invocation setup, not a JAM
-/// protocol capability or hostcall number.
+/// This is a PVM capability-table slot supplied at invocation setup.
 pub const TARGET_ACTOR_HANDLE_SLOT: u8 = 144;
 /// Maximum actor programs in one root tree.
 ///
-/// The pinned JAR kernel owns one shared code-capability table with five
+/// The PVM kernel owns one shared code-capability table with five
 /// entries. The generic VOS service consumes the first entry, leaving four
 /// application actors. This is a kernel limit, not a VOS wire-size limit.
 pub const MAX_ROOT_TREE_ACTORS: usize = 4;
 
 /// Maximum signed pure-Task dependencies carried by one actor package.
 /// Dependency programs are not installed as dormant root-tree VMs and
-/// therefore do not consume the root tree's scarce JAR code-capability slots,
+/// therefore do not consume the root tree's scarce code-capability slots,
 /// but the package/work wires still need a deterministic bound.
 pub const MAX_PACKAGE_TASK_DEPENDENCIES: usize = 16;
 
@@ -203,7 +195,7 @@ pub const ACTOR_SLICE_INPUT_MAX_BYTES: usize = 64 * 1024;
 pub const ACTOR_PRIVATE_INPUT_MAX_BYTES: usize = 64 * 1024;
 /// Maximum message accepted by one host-private device-sign operation.
 ///
-/// Signing is host work rather than JAR instructions, so payload size and
+/// Signing is host work rather than PVM instructions, so payload size and
 /// call count are bounded independently of the actor's ordinary gas budget.
 pub const DEVICE_SIGN_MAX_PAYLOAD_BYTES: usize = 4 * 1024;
 /// Maximum host-private signatures produced during one Refine slice.
@@ -229,8 +221,7 @@ pub const AWAIT_SUSPEND_MAGIC: u64 = 0x564f_532d_4157_5432;
 /// Marker passed in phi[10] so the canonical actor entry selects CALL/REPLY.
 pub const NESTED_ACTOR_CALL_MAGIC: u64 = 0x564f_532d_4143_5432;
 
-/// The two functions exposed by the generic service program through the Gray
-/// Paper two-slot entry prologue.
+/// The two functions exposed by the generic service program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ServiceFunction {

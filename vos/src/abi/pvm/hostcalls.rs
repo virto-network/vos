@@ -1,6 +1,6 @@
 //! Typed hostcall wrappers for PVM actors.
 //!
-//! Hostcall IDs are spec-canonical JAR/JAM protocol cap slots. Phase
+//! Hostcall IDs are spec-canonical PVM/service platform protocol cap slots. Phase
 //! discipline (which calls are legal in refine vs accumulate) is enforced
 //! by the host runtime, not the ID namespace.
 
@@ -43,7 +43,7 @@ pub fn suspend() -> u64 {
 
 /// Stop at an exact durable boundary and receive the post-snapshot VOS
 /// checkpoint token. The token buffer is deliberately guest-owned stack
-/// memory: JAR snapshots it before the host writes the token, so restoration
+/// memory: PVM snapshots it before the host writes the token, so restoration
 /// cannot accidentally reuse the finalization fork's bytes.
 #[inline]
 pub fn suspend_checkpoint(token: &mut [u8]) -> [u64; 2] {

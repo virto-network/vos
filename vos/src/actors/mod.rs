@@ -1,4 +1,4 @@
-//! Minimal actor framework for VOS. JAR-aligned lifecycle:
+//! Minimal actor framework for VOS. PVM-aligned lifecycle:
 //! fresh PVM per invocation, state via storage, transfer-based messaging.
 //!
 //! Actors appear as long-running structs with methods. The framework
@@ -50,7 +50,7 @@ pub use run::{
 pub use run::{run_refine_service, run_task_service};
 pub use value::InvokeError;
 
-/// JAM refine entry (PC=0). Always uses the service lifecycle so
+/// service platform refine entry (PC=0). Always uses the service lifecycle so
 /// actors can run both standalone (`vosx run actor.elf -s`) and as
 /// invoked children. State is read from storage on cold start; FETCH
 /// items are treated as messages.
@@ -58,7 +58,7 @@ pub use value::InvokeError;
 pub fn run_refine_entry<A: Actor>() {
     run::run_refine_service::<A>()
 }
-/// Nested JAR actor entry selected by the service CALL marker.
+/// Nested PVM actor entry selected by the service CALL marker.
 #[cfg(feature = "service")]
 pub fn run_nested_actor_entry<A: Actor>(input_address: u64, input_len: u64, capacity: u64) -> ! {
     run::run_nested_actor_service::<A>(input_address, input_len, capacity)
@@ -68,7 +68,7 @@ pub fn run_refine_entry<A: Actor>() {
     run::run_refine::<A>()
 }
 
-/// JAM refine entry (PC=0) for **Task** blobs: input is the
+/// service platform refine entry (PC=0) for **Task** blobs: input is the
 /// witness-delivered `(state, msg)` at `witness_ptr` instead of
 /// READ/FETCH — see [`run::run_task_service`]. Emitted as `_start` by
 /// `#[actor(task)]`.

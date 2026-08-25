@@ -1,6 +1,6 @@
-//! Generic VOS service JAM service guest.
+//! Generic VOS service service guest.
 //!
-//! The ELF exports the Gray Paper's two physical entries. `_start` is Refine
+//! The ELF exports the PVM specification's two physical entries. `_start` is Refine
 //! (IC 0 after transpilation) and `accumulate` is Accumulate (IC 5). Registers
 //! `a0`/`a1` remain the standard argument pointer/length window; no register is
 //! used as a VOS phase selector.
@@ -60,8 +60,8 @@ mod guest {
         "ret",
     );
 
-    /// Run one pure actor-tree slice through the target actor's owning JAR
-    /// HANDLE. Slot 144 is supplied at invocation setup; it is not a JAM
+    /// Run one pure actor-tree slice through the target actor's owning PVM
+    /// HANDLE. Slot 144 is supplied at invocation setup; it is not a service platform
     /// protocol capability and no host callback performs the actor execution.
     #[unsafe(no_mangle)]
     extern "C" fn vos_service_refine(
@@ -70,10 +70,10 @@ mod guest {
         actor_input_len: usize,
         actor_ipc_capacity: usize,
     ) -> OutputWindow {
-        // SAFETY: JAM initializes a readable argument window at (a0, a1).
+        // SAFETY: service platform initializes a readable argument window at (a0, a1).
         let input = unsafe { core::slice::from_raw_parts(arguments, arguments_len) };
         let mut work = WorkEnvelope::decode(input).unwrap_or_else(|_| fail_closed());
-        if work.service.service_abi != vos::service::ABI_VERSION
+        if work.service.platform != vos::service::PLATFORM_ID
             || work.service.execution_semantics != vos::service::EXECUTION_SEMANTICS_ID
             || !work.base.mode_compatible(work.consistency)
         {
@@ -106,7 +106,7 @@ mod guest {
             fail_closed();
         }
         let actor_output_address = vos::service::ACTOR_IPC_BASE_PAGE as usize * 4096usize;
-        // SAFETY: JAR returned and remapped the same invocation-owned DATA cap
+        // SAFETY: PVM returned and remapped the same invocation-owned DATA cap
         // after REPLY; the returned length is bounded by its capacity.
         let actor_output_bytes = unsafe {
             core::slice::from_raw_parts(actor_output_address as *const u8, actor_output_len)
@@ -598,14 +598,14 @@ mod guest {
 
     /// Give every actor a directory-indexed CALLABLE for each other idle actor
     /// in its owned tree. The generic service retains the HANDLEs; DOWNGRADE
-    /// is the ordinary JAM/JAR authority-narrowing operation and does not add
+    /// is the ordinary service platform/PVM authority-narrowing operation and does not add
     /// a VOS-specific kernel call surface.
     fn prepare_actor_cnodes(work: &WorkEnvelope) {
         if work.imported_actors.len() > vos::service::MAX_ROOT_TREE_ACTORS {
             fail_closed();
         }
         // Every canonical actor manifest owns slot 0 for standalone args, but
-        // JAR CALL reserves it for the move-only IPC cap. Preserve all actor
+        // PVM CALL reserves it for the move-only IPC cap. Preserve all actor
         // arg caps up front so arbitrary main→child→peer nesting sees an empty
         // IPC slot in every dormant callee.
         for actor in &work.imported_actors {
@@ -668,8 +668,8 @@ mod guest {
             .unwrap_or_else(|| fail_closed())
     }
 
-    /// Validate and stage one service install/transition using only standard JAM
-    /// service storage and preimage capabilities. The outer JAR driver owns the
+    /// Validate and stage one service install/transition using only standard service platform
+    /// service storage and preimage capabilities. The outer PVM driver owns the
     /// transaction: returning successfully commits all calls atomically, while
     /// `fail_closed` makes it discard the entire staging area.
     #[unsafe(no_mangle)]
@@ -677,7 +677,7 @@ mod guest {
         arguments: *const u8,
         arguments_len: usize,
     ) -> OutputWindow {
-        // SAFETY: JAM initializes a readable argument window at (a0, a1).
+        // SAFETY: service platform initializes a readable argument window at (a0, a1).
         let input = unsafe { core::slice::from_raw_parts(arguments, arguments_len) };
         let result = match AccumulateRequest::decode(input) {
             Ok(request) => {
@@ -689,7 +689,7 @@ mod guest {
                 let upgrade_authorized = matches!(&request, AccumulateRequest::UpgradeActor(_))
                     && hostcalls::verify_upgrade_authorization(input) == error::HOST_OK;
                 execute_owned_canonical_guest_accumulate(
-                    &mut JamAccumulateStore {
+                    &mut GuestServiceStore {
                         install_authorized,
                         upgrade_authorized,
                     },
@@ -705,21 +705,21 @@ mod guest {
     const STORAGE_PROBE_CAPACITY: usize = 4096;
     const MAX_STORAGE_VALUE: usize = 64 * 1024 * 1024;
 
-    struct JamAccumulateStore {
+    struct GuestServiceStore {
         install_authorized: bool,
         upgrade_authorized: bool,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum JamStoreError {
+    enum GuestStoreError {
         ValueTooLarge,
         ReadFailed,
         WriteFailed,
         ProvideFailed,
     }
 
-    impl StateTreeStore for JamAccumulateStore {
-        type Error = JamStoreError;
+    impl StateTreeStore for GuestServiceStore {
+        type Error = GuestStoreError;
 
         fn read(&self, key: &[u8]) -> Result<Option<alloc::vec::Vec<u8>>, Self::Error> {
             let mut probe = [0u8; STORAGE_PROBE_CAPACITY];
@@ -727,33 +727,33 @@ mod guest {
             if len == error::HOST_NONE {
                 return Ok(None);
             }
-            let len = usize::try_from(len).map_err(|_| JamStoreError::ValueTooLarge)?;
+            let len = usize::try_from(len).map_err(|_| GuestStoreError::ValueTooLarge)?;
             if len <= probe.len() {
                 return Ok(Some(probe[..len].to_vec()));
             }
             if len > MAX_STORAGE_VALUE {
-                return Err(JamStoreError::ValueTooLarge);
+                return Err(GuestStoreError::ValueTooLarge);
             }
             let mut value = alloc::vec![0u8; len];
             if hostcalls::read(key, &mut value) != len as u64 {
-                return Err(JamStoreError::ReadFailed);
+                return Err(GuestStoreError::ReadFailed);
             }
             Ok(Some(value))
         }
 
         fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Result<(), Self::Error> {
-            // JAM's zero-length STORAGE_W deletes the key. Logical empty
+            // service platform's zero-length STORAGE_W deletes the key. Logical empty
             // values are wrapped in non-empty service-tree leaves.
             let value = value.unwrap_or_default();
             if hostcalls::write(key, value) == error::HOST_OK {
                 Ok(())
             } else {
-                Err(JamStoreError::WriteFailed)
+                Err(GuestStoreError::WriteFailed)
             }
         }
     }
 
-    impl GuestAccumulateStore for JamAccumulateStore {
+    impl GuestAccumulateStore for GuestServiceStore {
         fn logical_timeslot(&self) -> Result<Option<u64>, Self::Error> {
             let timeslot = hostcalls::accumulation_timeslot();
             Ok((timeslot != error::HOST_NONE).then_some(timeslot))
@@ -789,23 +789,23 @@ mod guest {
                 return Ok(None);
             }
             if len != reference.len {
-                return Err(JamStoreError::ReadFailed);
+                return Err(GuestStoreError::ReadFailed);
             }
-            let len = usize::try_from(len).map_err(|_| JamStoreError::ValueTooLarge)?;
+            let len = usize::try_from(len).map_err(|_| GuestStoreError::ValueTooLarge)?;
             let bytes = if len <= probe.len() {
                 probe[..len].to_vec()
             } else {
                 if len > MAX_STORAGE_VALUE {
-                    return Err(JamStoreError::ValueTooLarge);
+                    return Err(GuestStoreError::ValueTooLarge);
                 }
                 let mut bytes = alloc::vec![0u8; len];
                 if hostcalls::preimage_lookup(&reference.hash.0, &mut bytes) != len as u64 {
-                    return Err(JamStoreError::ReadFailed);
+                    return Err(GuestStoreError::ReadFailed);
                 }
                 bytes
             };
             if BlobRef::of_bytes(&bytes) != *reference {
-                return Err(JamStoreError::ReadFailed);
+                return Err(GuestStoreError::ReadFailed);
             }
             Ok(Some(bytes))
         }
@@ -815,7 +815,7 @@ mod guest {
             if hostcalls::provide(&reference.hash.0, bytes) == error::HOST_OK {
                 Ok(reference)
             } else {
-                Err(JamStoreError::ProvideFailed)
+                Err(GuestStoreError::ProvideFailed)
             }
         }
 

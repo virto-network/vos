@@ -21,7 +21,7 @@ use super::{
     CausalCallContext, ConsistencyBase, ConsistencyMode, ContinuationSnapshot, CrdtChange,
     CrdtSyncEnvelope, CrdtSyncNode, DecodeError, DeliveryEnvelope, DeliveryRecord, DirectIngress,
     ExternalActorDirectory, ImportedActor, ImportedBlob, ImportedProgram, InboxRetirement,
-    InvocationId, LocalJamStore, LocalStoreReadError, MessageRecord, Origin, RefineImports,
+    InvocationId, LocalStoreReadError, MemoryServiceStore, MessageRecord, Origin, RefineImports,
     ServiceIdentity, ServiceWire, StateKey, WorkEnvelope, WorkflowCheckpoint, WorkflowOperation,
     crdt_node_receipt_storage_key, crdt_node_storage_key, delivery_storage_key,
 };
@@ -111,7 +111,7 @@ impl LocalWorkScheduler {
     /// original machine state, so actors never observe the provisional
     /// HOST_NONE results.
     pub fn hydrate_actor_storage_rows(
-        store: &LocalJamStore,
+        store: &MemoryServiceStore,
         prepared: &mut PreparedWork,
         requests: &[ActorStorageKey],
     ) -> Result<(), ScheduleError> {
@@ -217,7 +217,7 @@ impl LocalWorkScheduler {
     /// or causal frontier. CRDT admission becomes a workflow DAG node before
     /// Refine runs; constructing this input is read-only.
     pub fn prepare_direct_ingress(
-        store: &LocalJamStore,
+        store: &MemoryServiceStore,
         service: &ServiceIdentity,
         request: &LocalWorkRequest,
     ) -> Result<DirectIngress, ScheduleError> {
@@ -308,7 +308,9 @@ impl LocalWorkScheduler {
     /// is a read-only transport helper: the destination still submits the
     /// envelope to physical IC-5, where guest Accumulate verifies every node
     /// receipt, dependency, blob, and workflow operation before committing.
-    pub fn prepare_crdt_sync(store: &LocalJamStore) -> Result<CrdtSyncEnvelope, ScheduleError> {
+    pub fn prepare_crdt_sync(
+        store: &MemoryServiceStore,
+    ) -> Result<CrdtSyncEnvelope, ScheduleError> {
         let header = store.header()?.ok_or(ScheduleError::StoreUninitialized)?;
         if header.consistency != ConsistencyMode::Crdt {
             return Err(ScheduleError::UnsupportedConsistency(header.consistency));
@@ -364,7 +366,7 @@ impl LocalWorkScheduler {
     /// cross-root outbox record. This is read-only scheduling: the physical
     /// service PVM independently verifies and commits the inbox.
     pub fn prepare_delivery(
-        store: &LocalJamStore,
+        store: &MemoryServiceStore,
         logical_timeslot: u64,
         message: MessageRecord,
         source_outbox: Vec<MessageRecord>,
@@ -383,7 +385,7 @@ impl LocalWorkScheduler {
     /// Build a delivery whose source bytes remain public while the
     /// destination commits separately authenticated authorization evidence.
     pub fn prepare_authorized_delivery(
-        store: &LocalJamStore,
+        store: &MemoryServiceStore,
         logical_timeslot: u64,
         authorization: AuthorizationEvidence,
         message: MessageRecord,
@@ -419,7 +421,7 @@ impl LocalWorkScheduler {
     /// call. `logical_timeslot` is consensus scheduler input; the committed
     /// outcome itself uses the deadline as its deterministic effective time.
     pub fn prepare_call_expiration(
-        store: &LocalJamStore,
+        store: &MemoryServiceStore,
         invocation: InvocationId,
         logical_timeslot: u64,
     ) -> Result<Option<CallExpirationEnvelope>, ScheduleError> {
@@ -525,9 +527,9 @@ impl LocalWorkScheduler {
 
     /// Rediscover every due timeout solely from guest-owned durable rows.
     /// The returned envelopes remain read-only proposals until physical IC-5
-    /// Accumulate validates them against its trusted ambient JAM slot.
+    /// Accumulate validates them against its trusted ambient service platform slot.
     pub fn prepare_due_call_expirations(
-        store: &LocalJamStore,
+        store: &MemoryServiceStore,
         logical_timeslot: u64,
     ) -> Result<Vec<CallExpirationEnvelope>, ScheduleError> {
         let mut due = Vec::new();
@@ -557,7 +559,7 @@ impl LocalWorkScheduler {
     /// an awaited call, the accumulated remote reply it received for
     /// admission. No process-local copy of the original request is required.
     pub fn prepare_resume(
-        store: &LocalJamStore,
+        store: &MemoryServiceStore,
         invocation: InvocationId,
         logical_timeslot: u64,
         awaited_reply: Option<AccumulatedReply>,
@@ -568,7 +570,7 @@ impl LocalWorkScheduler {
     /// Reconstruct a timed-out continuation solely from guest-owned workflow
     /// and expiration rows. No host-created error payload is accepted.
     pub fn prepare_timeout_resume(
-        store: &LocalJamStore,
+        store: &MemoryServiceStore,
         invocation: InvocationId,
         logical_timeslot: u64,
     ) -> Result<Option<PreparedWork>, ScheduleError> {
@@ -612,7 +614,7 @@ impl LocalWorkScheduler {
     /// walks expiration rows rather than deadline rows: expiration removes
     /// the deadline atomically before host orchestration can resume the VM.
     pub fn pending_timeout_resumes(
-        store: &LocalJamStore,
+        store: &MemoryServiceStore,
     ) -> Result<Vec<InvocationId>, ScheduleError> {
         let mut pending = BTreeSet::new();
         for timeout in store.call_expirations()? {
@@ -627,7 +629,7 @@ impl LocalWorkScheduler {
     }
 
     fn prepare_resume_outcome(
-        store: &LocalJamStore,
+        store: &MemoryServiceStore,
         invocation: InvocationId,
         logical_timeslot: u64,
         awaited_reply: Option<AccumulatedReply>,
@@ -674,7 +676,7 @@ impl LocalWorkScheduler {
     /// from the guest-committed message. The scheduler supplies only the
     /// consensus-supplied logical timeslot used to enforce its deadline.
     pub fn prepare_inbox(
-        store: &LocalJamStore,
+        store: &MemoryServiceStore,
         call: CallId,
         logical_timeslot: u64,
     ) -> Result<PreparedWork, ScheduleError> {
@@ -721,7 +723,7 @@ impl LocalWorkScheduler {
     /// observation slot; this read-only step binds the exact current base and
     /// admitted deadline.
     pub fn prepare_inbox_retirement(
-        store: &LocalJamStore,
+        store: &MemoryServiceStore,
         call: CallId,
         logical_timeslot: u64,
     ) -> Result<Option<InboxRetirement>, ScheduleError> {
@@ -768,7 +770,7 @@ impl LocalWorkScheduler {
     /// Prepare one slice from the current committed linear revision or CRDT
     /// frontier. Both paths use the same guest-owned header and actor rows.
     pub fn prepare(
-        store: &LocalJamStore,
+        store: &MemoryServiceStore,
         request: LocalWorkRequest,
     ) -> Result<PreparedWork, ScheduleError> {
         if request.method.is_empty() {
@@ -1243,7 +1245,7 @@ fn validate_await_boundary(
 }
 
 fn actor_states(
-    store: &LocalJamStore,
+    store: &MemoryServiceStore,
     header: &super::StoreHeader,
     descriptor: &ActorGenesis,
     causal_frontier: Option<&CausalFrontier>,
@@ -1274,7 +1276,7 @@ fn dynamic_method(payload: &[u8]) -> Option<String> {
 }
 
 fn decode_row<T: ServiceWire>(
-    store: &LocalJamStore,
+    store: &MemoryServiceStore,
     root: super::Hash,
     key: &StateKey,
 ) -> Result<Option<T>, ScheduleError> {
@@ -1287,7 +1289,7 @@ fn decode_row<T: ServiceWire>(
 }
 
 fn import_blob(
-    store: &LocalJamStore,
+    store: &MemoryServiceStore,
     imports: &mut BTreeMap<super::Hash, ImportedBlob>,
     reference: &BlobRef,
 ) -> Result<(), ScheduleError> {

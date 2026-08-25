@@ -1,4 +1,4 @@
-//! JAR error/result codes returned by hostcalls.
+//! PVM error/result codes returned by hostcalls.
 
 pub const HOST_OK: u64 = 0;
 pub const HOST_NONE: u64 = u64::MAX;

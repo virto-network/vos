@@ -14,7 +14,7 @@ use vos::storage::StorageMap;
 /// pure), so gates and verifiers derive the same `expected_root_before`
 /// from the state they know.
 fn total_root(total: u64) -> [u8; 32] {
-    vos::crypto::blake2b_hash::<32>(b"tally/root/v1", &[&total.to_le_bytes()])
+    vos::crypto::blake2b_hash::<32>(b"tally/root", &[&total.to_le_bytes()])
 }
 
 #[actor(task)]

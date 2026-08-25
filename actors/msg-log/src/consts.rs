@@ -1,10 +1,10 @@
 //! Tunable constants: the envelope-id domain tag, MLS framing prefix, and
 //! sizing/paging bounds.
 
-/// Domain tag for envelope ids: `blake2b("vos-msg-envelope/v1" ‖
+/// Domain tag for envelope ids: `blake2b("vos-msg-envelope" ‖
 /// fields)`. Content-derived, so equal envelopes deduplicate and
 /// every replica computes the same id without coordination.
-pub const ENVELOPE_ID_DOMAIN_TAG: &[u8] = b"vos-msg-envelope/v1";
+pub const ENVELOPE_ID_DOMAIN_TAG: &[u8] = b"vos-msg-envelope";
 
 /// Upper bound on one envelope's ciphertext body. Keeps a single
 /// envelope well under the dispatch reply cap and the 8 MiB

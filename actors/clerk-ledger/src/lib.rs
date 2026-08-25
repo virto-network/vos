@@ -193,7 +193,7 @@ where
 /// Canonical 32-byte proof-record tag for a Clerk transfer id. Pass this to
 /// `vosx zk prove --tag` or the `proof_record`/`prune_proof_record` handlers.
 pub fn transfer_record_tag(id: &[u8; 16]) -> [u8; 32] {
-    vos::crypto::blake2b_hash::<32>(b"clerk-ledger/provable-transfer/v1", &[id])
+    vos::crypto::blake2b_hash::<32>(b"clerk-ledger/provable-transfer", &[id])
 }
 
 /// Canonical content address of the pure `clerk-apply` Task this actor is
@@ -242,20 +242,20 @@ pub struct ClerkLedger {
     /// insert (`state_root::*_leaf_content`) for the same reason.
     #[storage(
         committed,
-        leaf_domain = "cipher-clerk/smt/leaf/v1",
-        node_domain = "cipher-clerk/smt/node/v1"
+        leaf_domain = "cipher-clerk/smt/leaf",
+        node_domain = "cipher-clerk/smt/node"
     )]
     accounts: CommittedMap<[u8; 16], CcAccount>,
     #[storage(
         committed,
-        leaf_domain = "cipher-clerk/smt/leaf/v1",
-        node_domain = "cipher-clerk/smt/node/v1"
+        leaf_domain = "cipher-clerk/smt/leaf",
+        node_domain = "cipher-clerk/smt/node"
     )]
     transfers: CommittedMap<[u8; 16], CcTransfer>,
     #[storage(
         committed,
-        leaf_domain = "cipher-clerk/smt/leaf/v1",
-        node_domain = "cipher-clerk/smt/node/v1"
+        leaf_domain = "cipher-clerk/smt/leaf",
+        node_domain = "cipher-clerk/smt/node"
     )]
     journal: CommittedMap<[u8; 16], CcJournal>,
     /// Keyed by `external_id_key(eid)` (16-byte hash of the 32-byte
@@ -263,20 +263,20 @@ pub struct ClerkLedger {
     /// reports "seen" and the kernel rejects instead of aliasing.
     #[storage(
         committed,
-        leaf_domain = "cipher-clerk/smt/leaf/v1",
-        node_domain = "cipher-clerk/smt/node/v1"
+        leaf_domain = "cipher-clerk/smt/leaf",
+        node_domain = "cipher-clerk/smt/node"
     )]
     external_ids: CommittedMap<[u8; 16], [u8; 32]>,
     #[storage(
         committed,
-        leaf_domain = "cipher-clerk/smt/leaf/v1",
-        node_domain = "cipher-clerk/smt/node/v1"
+        leaf_domain = "cipher-clerk/smt/leaf",
+        node_domain = "cipher-clerk/smt/node"
     )]
     voided_transfers: CommittedMap<[u8; 16], u8>,
     #[storage(
         committed,
-        leaf_domain = "cipher-clerk/smt/leaf/v1",
-        node_domain = "cipher-clerk/smt/node/v1"
+        leaf_domain = "cipher-clerk/smt/leaf",
+        node_domain = "cipher-clerk/smt/node"
     )]
     pending_statuses: CommittedMap<[u8; 16], u8>,
     /// Per-accepted-transfer `(root_before, root_after)` pair,

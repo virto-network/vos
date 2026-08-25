@@ -2343,7 +2343,7 @@ fn handle_req_resp(
                         // derived source through even when its 16-bit lookup
                         // prefix collides; ordinary legacy Tell still relies
                         // on the unambiguous prefix map.
-                        let authenticated_source = if payload.starts_with(b"VRT2") {
+                        let authenticated_source = if payload.starts_with(b"VRTW") {
                             claimed_prefix == derive_node_prefix(&peer)
                         } else {
                             authenticated_tell_source(prefix_map, peer, from)

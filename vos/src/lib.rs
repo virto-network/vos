@@ -1,8 +1,8 @@
 //! # vos
 //!
-//! VOS runtime — JAR-aligned PVM executor for VOS actors.
+//! VOS runtime — PVM-aligned PVM executor for VOS actors.
 //!
-//! The runtime manages service lifecycles using the JAR execution model:
+//! The runtime manages service lifecycles using the PVM execution model:
 //! fresh PVM per invocation, state via storage hostcalls, transfer-based messaging.
 //!
 //! ## Architecture
@@ -88,11 +88,9 @@ pub mod __io {
 pub mod abi;
 pub mod attestation;
 pub mod crypto;
-/// Version-2 JAM service contracts and the local conformance harness.
+/// Canonical service contracts and the local conformance harness.
 ///
-/// This module is intentionally independent of the legacy `RefinePayload`
-/// journal. Service packages and persisted stores never decode through the v1
-/// runtime.
+/// Service packages and persisted stores use this contract exclusively.
 pub mod service;
 
 /// ZK actor-IO ABI: bind a zkpvm proof to a `(public, return)` tuple

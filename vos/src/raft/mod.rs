@@ -1,7 +1,7 @@
 //! Raft consensus storage and strategy for VOS actors.
 //!
 //! The durable layer lives in [`log::RaftLog`] / [`log::RaftMeta`] on redb.
-//! [`service::RaftAccumulateLog`] orders canonical JAM service requests and leaves
+//! [`service::RaftAccumulateLog`] orders canonical service requests and leaves
 //! their application to the guest Accumulate entry. The native actor state
 //! machine uses the separate [`CommitStrategy`] implementation in
 //! [`strategy::RaftCommit`].

@@ -46,8 +46,8 @@ pub const EMPTY_LEAF: [u8; 32] = [0u8; 32];
 /// composite). Application trees that must reproduce pre-existing
 /// roots (clerk-ledger ↔ cipher-clerk) instantiate [`SmtParams`] with
 /// their own domains instead.
-pub const VOS_LEAF_DOMAIN: &[u8] = b"vos/smt/leaf/v1";
-pub const VOS_NODE_DOMAIN: &[u8] = b"vos/smt/node/v1";
+pub const VOS_LEAF_DOMAIN: &[u8] = b"vos/smt/leaf";
+pub const VOS_NODE_DOMAIN: &[u8] = b"vos/smt/node";
 
 /// One tree's shape: hash domains + key width in bytes. Depth is
 /// always `8 × width` — every key bit is a tree level, so the leaf
@@ -562,8 +562,8 @@ mod tests {
 
     /// cipher-clerk's exact domains — the parity instantiation.
     const CC: SmtParams = SmtParams {
-        leaf_domain: b"cipher-clerk/smt/leaf/v1",
-        node_domain: b"cipher-clerk/smt/node/v1",
+        leaf_domain: b"cipher-clerk/smt/leaf",
+        node_domain: b"cipher-clerk/smt/node",
         width: 16,
     };
 

@@ -134,8 +134,7 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
         manifest: PackageManifest {
             name: name.clone(),
             version: args.version,
-            service_abi: vos::service::ABI_VERSION,
-            snapshot_version: vos::service::SNAPSHOT_VERSION,
+            platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             service_program,
             actor_program,

@@ -47,7 +47,7 @@ fn load_pinned_service_service(path: Option<&Path>) -> anyhow::Result<Option<Pin
     let pvm = std::fs::read(path)
         .map_err(|error| anyhow::anyhow!("read pinned service PVM {}: {error}", path.display()))?;
     vos_pvm::program::parse_blob(&pvm)
-        .ok_or_else(|| anyhow::anyhow!("{} is not a canonical JAR PVM", path.display()))?;
+        .ok_or_else(|| anyhow::anyhow!("{} is not a canonical PVM PVM", path.display()))?;
     let actual = vos::service::ProgramId::of_pvm(&pvm);
     if actual != vos::service::VOS_SERVICE_PROGRAM_ID {
         anyhow::bail!(
@@ -120,8 +120,7 @@ fn frozen_role_authority_package(public_key: Vec<u8>) -> anyhow::Result<vos::ser
         manifest: vos::service::PackageManifest {
             name: vos::service::ROLE_AUTHORITY_INSTANCE_.into(),
             version: role_authority_package_version(actor_program),
-            service_abi: vos::service::ABI_VERSION,
-            snapshot_version: vos::service::SNAPSHOT_VERSION,
+            platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
             actor_program,
@@ -334,7 +333,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         ),
     };
     // Cache stores raw ELF bytes (hash addresses the source); the
-    // PVM kernel needs the transpiled JAR blob.
+    // PVM kernel needs the transpiled PVM blob.
     let blob = vos_pvm_compiler::link_elf(&elf)
         .map_err(|e| anyhow::anyhow!("transpile registry elf: {e:?}"))?;
 
@@ -2083,7 +2082,7 @@ fn resolve_service_role_authority_with(
                 // identity, not the catalog's current actor deployment.
                 deployment: frozen_role_authority_deployment()?,
                 service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-                service_abi: vos::service::ABI_VERSION,
+                platform: vos::service::PLATFORM_ID,
                 execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
                 gas_schedule: vos::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
             },
@@ -2227,7 +2226,7 @@ fn recover_service_catalog_artifact(
         }
     };
     let mut artifact = if let Some(image) = image {
-        let snapshot = vos::service::LocalJamStoreSnapshot::decode(&image).map_err(|error| {
+        let snapshot = vos::service::MemoryServiceSnapshot::decode(&image).map_err(|error| {
             anyhow::anyhow!(
                 "decode service service image {} while recovering catalog artifact: {error}",
                 image_path.display(),
@@ -2371,7 +2370,7 @@ fn service_config_from_row(
             root_service,
             deployment,
             service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: vos::service::ABI_VERSION,
+            platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: vos::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
         },
@@ -2912,7 +2911,7 @@ fn actor_blob_from_catalog(
             "{instance_name} is a signed service package and cannot execute in the legacy actor host"
         );
     }
-    if artifact.get(..3) == Some(b"JAR") {
+    if artifact.get(..3) == Some(b"PVM") {
         vos_pvm::program::parse_blob(&artifact)
             .ok_or_else(|| anyhow::anyhow!("{instance_name} canonical PVM is invalid"))?;
         return Ok(CatalogActorArtifact::LegacyExecutable(artifact));
@@ -4418,8 +4417,7 @@ mod tests {
             manifest: PackageManifest {
                 name: "counter".into(),
                 version: "2.0.0".into(),
-                service_abi: vos::service::ABI_VERSION,
-                snapshot_version: vos::service::SNAPSHOT_VERSION,
+                platform: vos::service::PLATFORM_ID,
                 execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
                 service_program,
                 actor_program: ProgramId::of_pvm(&actor_pvm),
@@ -4558,7 +4556,7 @@ mod tests {
             &package_hash,
         );
 
-        assert_eq!(package.manifest.service_abi, 17);
+        assert_eq!(package.manifest.platform, vos::service::PLATFORM_ID);
         assert_eq!(
             hex::encode(package.manifest.actor_program.0),
             "79099ccbec4e4dac7af893e153ba379a1d33aa75734daf1d93cbba3e684d65eb",
@@ -4703,7 +4701,7 @@ mod tests {
             RowCatalogSupport::ServicePackage,
         );
         assert_eq!(
-            catalog_artifact_support(b"JAR\0canonical"),
+            catalog_artifact_support(b"PVM\0canonical"),
             RowCatalogSupport::LegacyHost,
         );
         assert!(

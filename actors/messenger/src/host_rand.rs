@@ -34,7 +34,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 /// Global domain tag. Any change to the construction MUST bump the version
 /// suffix — it re-forks every derived stream.
-const DOMAIN: &[u8] = b"vos-msg/csprng/v1";
+const DOMAIN: &[u8] = b"vos-msg/csprng";
 /// Boot-state derivation branch (folds in device + boot-epoch).
 const INIT_LABEL: &[u8] = b"init";
 /// Per-draw output branch (the only branch the beacon may touch).

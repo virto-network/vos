@@ -6,7 +6,7 @@
 //! emitted only when the state bytes changed** — encodes them into a single
 //! byte blob, and halts with that blob as its output. Every consumer
 //! applies the identical byte-defined semantic: the VOS host drain, the
-//! child-invoke conversion, a guest APPLY on a JAM host, and any
+//! child-invoke conversion, a guest APPLY on a service platform host, and any
 //! prover/verifier (see `docs/design/work-result-contract.md`).
 //!
 //! This module is `no_std` so the same constants and helpers are visible
@@ -126,7 +126,7 @@ pub const EFFECT_NEW: u8 = 0x04;
 pub const EFFECT_DELETE: u8 = 0x05;
 
 /// Domain separator for [`RefinePayload::transition_digest`].
-pub const TRANSITION_DOMAIN: &[u8] = b"vos/transition/v1";
+pub const TRANSITION_DOMAIN: &[u8] = b"vos/transition";
 
 /// The state anchor: plain blake2b-256 over the exact serialized state
 /// blob bytes. Shared guest/host definition — the guest computes it via
@@ -332,7 +332,7 @@ impl RefinePayload {
     /// the bytes every consumer applies:
     ///
     /// ```text
-    /// blake2b-256( b"vos/transition/v1"
+    /// blake2b-256( b"vos/transition"
     ///     || version || anchor_kind || anchor
     ///     || effects_count (u16 LE) || effect_bytes )
     /// ```

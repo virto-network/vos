@@ -27,7 +27,7 @@ The local conformance scheduler can admit one guest-committed durable inbox
 row, derive the callee invocation, origin, authorization and causal parent from
 that row, enforce its deadline, and consume it atomically with the callee's
 first accepted slice. Its logical timeslot is an explicit harness input;
-production integration must bind that value to the consensus JAM timeslot
+production integration must bind that value to the consensus service platform timeslot
 rather than accept a caller-selected value. Actor-side cross-root CALL now
 emits a durable outbox row and captures the exact pending protocol boundary.
 Fresh Local/Raft root invocations likewise enter physical Accumulate as a
@@ -130,9 +130,9 @@ reply routing carries those exact fields and the content-addressed proof bytes
 into the restored caller.
 
 The local host serializes the complete committed service image as canonical
-`LocalJamStoreSnapshot` bytes. Restore checks the current store header and
+`MemoryServiceSnapshot` bytes. Restore checks the current store header and
 recomputes every blob and program identity before exposing the image; in-flight
-transactions and process-local receipt policy are excluded. `DurableJamStore`
+transactions and process-local receipt policy are excluded. `DurableServiceStore`
 persists each candidate image through a `CommittedImageStore` backend before
 swapping it into live state or returning published effects. A backend failure
 leaves the prior in-process image visible and permits an exact retry. The
@@ -158,7 +158,7 @@ rejected. Replies and outbox effects remain in the durable publication table
 until their exact commitment is acknowledged through physical Accumulate.
 The direct constructor rejects `Raft` consistency rather than claiming
 replication without a driver. `open_raft` composes the same owner with
-`ReplicatedJamService`: genesis, actor Apply, and publication
+`ReplicatedServiceRuntime`: genesis, actor Apply, and publication
 acknowledgement enter the canonical Raft request log before IC-5 mutates the
 local service image. Followers catch up those exact requests and installed
 service snapshots; they never apply native actor commands. The owner exposes
@@ -235,7 +235,7 @@ receipt cache. Proof and attestation publications stay durable but are not
 admitted by this ordinary node route. Roots opened through the default
 conformance profile still use a host-generated local admission ordinal. A
 production-profile root instead accepts only the exact slot returned by its
-installed JAM trust capability; it never substitutes wall time or increments
+installed service platform trust capability; it never substitutes wall time or increments
 that observation to manufacture a later slot.
 
 `RootTreeTransport` is the canonical node wire for an ordinary publication,
@@ -438,14 +438,14 @@ Installation commits the canonical actor directory and each actor's
 parent-scoped name in guest-owned service state. Every Refine invocation imports
 the exact code, state frontier and continuation status of all directory members;
 guest Accumulate rejects a partial or differently named tree. The infrastructure
-PVM instantiates at most four application actors: the pinned JAR kernel has one
+PVM instantiates at most four application actors: the pinned PVM kernel has one
 shared five-entry code-capability table and the generic service consumes one
-entry. It grants only idle peers a directory-indexed JAR `CALLABLE`.
+entry. It grants only idle peers a directory-indexed PVM `CALLABLE`.
 
 The shared CALL IPC contains only the generated target identity, await ordinal
 and message. The canonical actor directory, actor state and authenticated
 caller fields arrive through a scheduler-supplied private capability bound to
-the currently active JAR VM; nested `Origin::Actor` is derived from the live
+the currently active PVM VM; nested `Origin::Actor` is derived from the live
 call stack. The complete move-only IPC page is zeroed before and after every
 hop, so a shorter call cannot observe a prior sibling's tail bytes. Each actor
 exports its own canonical effects through a second scheduler capability; a
@@ -453,9 +453,9 @@ parent sees only the child reply and checkpoint control flow, while the generic
 service guest canonicalizes the opaque effect batch into `Transition`.
 These buffers are invocation-local Refine state, never native persistent
 service state. This preserves role-gated sibling-state isolation without
-changing JAR CALL/REPLY semantics or making the host the transition authority.
+changing PVM CALL/REPLY semantics or making the host the transition authority.
 
-An ordinary same-tree call executes through JAR `CALLABLE` and returns inline.
+An ordinary same-tree call executes through PVM `CALLABLE` and returns inline.
 For CRDT trees, the private scheduler channel also carries a host-owned
 per-actor dispatch ordinal and refreshes only that actor's private
 materialization after it returns. The service guest independently requires
@@ -467,7 +467,7 @@ caller-visible IPC page. A nested CRDT call must currently finish inline;
 suspending a nested CRDT stack remains fail-closed until causal-branch
 continuation rebinding lands.
 
-The scheduler derives the active actor set from JAR's live call stack through
+The scheduler derives the active actor set from PVM's live call stack through
 the private channel, so application IPC cannot clear it; attempting to re-enter
 any active caller returns `InvokeError::Cycle`. Await ordinals are allocated
 across the complete inline actor tree and flow back through the minimal call
@@ -660,7 +660,7 @@ namespace.
 ## Production trust profile
 
 `ProductionTrust` is the fail-closed host boundary for the trust inputs which
-cannot be invented by the service guest: the observed JAM slot and proof,
+cannot be invented by the service guest: the observed service platform slot and proof,
 Install, Upgrade, role-credential, and accumulation-receipt verification. Its
 nonzero `policy_id` is a stable commitment to the complete authority set and
 verification rules. The host seals that ID to every exact durable service
@@ -677,7 +677,7 @@ before making the request visible to IC-5. The leader performs that same
 verification before proposal, so a production-denied sidecar cannot become a
 committed poison entry. A missing time observation or one
 behind the committed admission high-water stops admission and timeout driving.
-Repeated transitions may share one genuine JAM slot.
+Repeated transitions may share one genuine service platform slot.
 New direct ingress and delivery require the exact current observation and may
 not fall below the durable admission high-water. Actor work derived from an
 already admitted durable input uses historical verification. Follower replay
@@ -702,7 +702,7 @@ also carries that exact ID (or `None` for conformance), so an empty voter must
 match the group policy before it can replay genesis or advance its applied
 cursor.
 
-This repository does not contain a JAM/consensus authority implementation.
+This repository does not contain a service platform/consensus authority implementation.
 `LocalRootTreeService::open_production` and `open_raft_production` require an
 embedding node to supply that capability before Install, recovery, or replay.
 `vosx space up --production-trust-socket <path>` supplies the same capability
@@ -713,7 +713,7 @@ through an operator-selected local Unix-domain sidecar. Supplying
 conformance seam is not production-safe. In particular, a production provider
 must bind
 Install authorization to consensus-authoritative deployment state and the
-executing JAM service account, verify Upgrade against the same package
+executing service account, verify Upgrade against the same package
 authority, resolve roles from the canonical issuer, validate receipt finality
 from an independent consensus certificate/state view, and verify the exact
 proof public input under the policy's pinned proof system. Authenticated
@@ -783,7 +783,7 @@ disabled in that test and voter addresses are
 explicit, so it exercises authenticated full-PeerId forwarding without
 claiming that automatic topology discovery has landed. Snapshot joiners verify
 the sealed production provenance and exact policy; log replay independently
-re-runs historical checks. Every voter must observe historical JAM-slot
+re-runs historical checks. Every voter must observe historical service platform-slot
 verification before the gate completes. The bundled `space-authority` PVM is a
 durable protocol identity: its ABI-17 program ID and exact bytes are pinned to
 the VPI3-capable build. The root-signed authority package, deployment, and
@@ -846,7 +846,7 @@ which do not trust every authorized replica must carry an independently
 verifiable finality certificate instead. Direct role-authorized Raft ingress
 already quorum-orders its exact authority verifier input beside admission and
 persists the accepted ingress in guest state. Every delivery, deadline, and
-expiration observation in the production profile comes from its JAM slot
+expiration observation in the production profile comes from its service platform slot
 provider. Its proof backend must consume or reproduce the canonical Refine
 trace committed by the proof request.
 Replicated service identity binds the exact Refine and Accumulate gas schedule.
@@ -881,9 +881,9 @@ Until that lands, CRDT activation deliberately revalidates complete ancestry.
 This is sound but O(history), so the current CRDT engine remains a conformance
 path rather than a production-state path.
 
-VOS service assigns one logical JAM service to a root actor and its owned child
+VOS service assigns one logical service to a root actor and its owned child
 tree. The protocol-pinned `vos-service.pvm` is one generic program with the
-Gray Paper two-slot entry prologue: Refine begins at instruction counter 0 and
+PVM specification two-slot entry prologue: Refine begins at instruction counter 0 and
 Accumulate at instruction counter 5. Registers `φ[7]`/`φ[8]` remain the
 standard argument pointer/length window; they are never VOS phase selectors.
 Actor packages contain application PVMs, not application-written Refine or
@@ -917,7 +917,7 @@ Refine buffers the request and content-addresses the initial state. Accumulate
 then installs the child descriptor, method-policy rows, state row and sorted
 actor-directory membership in the same atomic transaction as the enclosing
 linear slice. Missing state, a duplicate parent-scoped name, an identity
-collision or the four-actor JAR ceiling rejects the complete transition. An
+collision or the four-actor PVM ceiling rejects the complete transition. An
 exact retry resolves through the original input-deduplication receipt even
 though the accepted transition changed the directory.
 
@@ -938,14 +938,14 @@ actor/`DeploymentId`/`ProgramId` layout used to create every dormant handle.
 Resume consumes the checkpoint, reconstructs that exact layout, injects one
 result into its declared registers and continues at `resume_pc`. Actors spawned
 after the checkpoint remain in the complete current work import but do not
-rewrite the older JAR invocation-layout commitment. Resume never restarts the
+rewrite the older PVM invocation-layout commitment. Resume never restarts the
 handler at PC 0. One continuation reference locks every actor in the captured
 nested stack; guest Accumulate rejects a partial lock or unlock. Suspended
 actors are non-reentrant, including children whose caller remains suspended,
 and later messages remain queued.
 
 Raft orders canonical `AccumulateRequest` bytes together with a canonical
-availability sidecar and the consensus-observed JAM slot for a time-dependent
+availability sidecar and the consensus-observed service platform slot for a time-dependent
 `ExpireCall`. The slot is part of the committed entry, so leader execution,
 follower catch-up, restart, and failover inject the identical IC-5 ambient
 input; a slotless replicated expiration is rejected before proposal. An
@@ -967,7 +967,7 @@ availability artifacts, and receipt-verification sidecars; retired
 payloads fail loud rather than being interpreted without their availability or
 receipt-verification sidecars. Raft
 does not replicate an `EffectLog` or a leader-produced post-state image.
-`ReplicatedJamService` waits for the
+`ReplicatedServiceRuntime` waits for the
 request's log position to commit, then applies it through the physical
 service-PVM Accumulate entry before advancing the replica's applied cursor.
 For a proved Apply, durable proof-CAS hydration is a retryable local
@@ -982,7 +982,7 @@ In multi-replica mode it accepts writes only from the elected leader, waits for
 the worker's quorum-commit notification, then re-reads and verifies the exact
 committed request and time-provenance bytes. Its `last_applied` cursor advances separately and only
 after the local service image commits. Each cursor advance records the canonical
-`LocalJamStoreSnapshot` image for that exact log index while retaining a
+`MemoryServiceSnapshot` image for that exact log index while retaining a
 bounded recent window. Automatic compaction cannot cross this durable
 application cursor and freezes the matching image—not a newer mutable state
 row—into a `CommittedServiceSnapshot`. A lagging follower receives that
@@ -1033,7 +1033,7 @@ replacement PVM bytes matching the requested `ProgramId`.
 For Ephemeral, Local, and Raft services, guest Accumulate requires the exact
 current revision and state root. It rejects an actor as `ActorBusy` while any
 durable continuation in the root tree still binds that actor's package/program
-in its dormant JAR layout. It replaces only that actor's
+in its dormant PVM layout. It replaces only that actor's
 package/program/producer/policy rows, and preserves instance identity,
 ownership, consistency kind, and application state. A
 physical upgrade record makes an exact retry read-only. The old program remains

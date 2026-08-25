@@ -3,7 +3,7 @@
 //! ## Lifecycle entry point
 //!
 //! Services built with the actor framework expose a single entry at
-//! PC=0 — the JAR refine body:
+//! PC=0 — the PVM refine body:
 //!
 //! - [`run_refine_service`] (`_start`, PC=0): the **pure** refine body.
 //!   Reads persisted state via the read-only `READ` hostcall, dispatches
@@ -264,7 +264,7 @@ impl Future for HostIo {
 
 /// Global flag: are we currently inside `run_refine_service`?
 ///
-/// In refine the JAM-pure hostcall table forbids state-mutating calls
+/// In refine the service platform-pure hostcall table forbids state-mutating calls
 /// (`WRITE`, `TRANSFER`, `PROVIDE`, `NEW`). The framework's
 /// `Context::flush_effects` checks this flag and, when set, *buffers*
 /// effects in the context's pending vectors instead of issuing hostcalls
@@ -298,7 +298,7 @@ pub fn is_refine_mode() -> bool {
 
 // ── Halt ──────────────────────────────────────────────────────────────
 
-/// Gray Paper dynamic-jump halt address (2^32 - 2^16).
+/// PVM specification dynamic-jump halt address (2^32 - 2^16).
 #[cfg(target_arch = "riscv64")]
 const PVM_HALT_ADDR: u64 = 0xFFFF_0000;
 
@@ -307,7 +307,7 @@ const PVM_HALT_ADDR: u64 = 0xFFFF_0000;
 fn halt_with_output(data: &[u8]) -> ! {
     // SAFETY: terminal PVM dynamic jump. The host reads `len` bytes from
     // `data.as_ptr()` after observing the GP halt address; the slice is owned
-    // by the caller until then. Root REPLY (ecalli 0) is not a halt in JAR:
+    // by the caller until then. Root REPLY (ecalli 0) is not a halt in PVM:
     // it is reserved for returning from a nested CALL and panics at the root.
     unsafe {
         core::arch::asm!(
@@ -325,7 +325,7 @@ fn halt_with_output(data: &[u8]) -> ! {
 ///
 /// This is the ZK actor-IO ABI binding mechanism (see [`crate::zk`]).
 /// The four little-endian hash words are passed as `in` operands on the
-/// Gray Paper halt jump, so the compiler materialises them into a2-a5 via
+/// PVM specification halt jump, so the compiler materialises them into a2-a5 via
 /// real instructions immediately before the jump. The dynamic jump consumes
 /// only its target register, so a0-a5 persist unchanged into
 /// `final_state.registers`, where Phase Z0's closing chip pins the
@@ -438,9 +438,9 @@ pub const STATUS_OOG: u8 = InvokeStatus::OutOfGas as u8;
 pub const STATUS_FORBIDDEN: u8 = InvokeStatus::Forbidden as u8;
 pub const STATUS_TOO_BIG: u8 = InvokeStatus::TooBig as u8;
 
-// ── Service refine phase (PC=0, JAM-pure) ─────────────────────────────
+// ── Service refine phase (PC=0, service platform-pure) ─────────────────────────────
 
-/// JAM-pure refine entry for service actors.
+/// service platform-pure refine entry for service actors.
 ///
 /// Runs at PC=0. Cannot mutate state — issues only read-only hostcalls.
 /// Side effects produced by handlers are buffered in the `Context` and
@@ -495,7 +495,7 @@ pub fn run_refine_service<A: super::Actor>() {
         if *holder_ptr == 0 {
             cold_start = true;
             // Cold start: try to restore from persisted state in storage.
-            // This is the JAM-compatible path — the guest reads its own
+            // This is the service platform-compatible path — the guest reads its own
             // serialized state via READ (legal in refine) without any
             // host cooperation. Exact continuation restore skips it because
             // it resumes the existing call stack after the await boundary.
@@ -735,7 +735,7 @@ pub fn run_task_service<A: super::Actor>(witness_ptr: *const u8, witness_cap: us
     halt_with_output_bound(&encoded, &io_hash);
 }
 
-/// Execute one canonical actor message as a nested JAR VM and return its service
+/// Execute one canonical actor message as a nested PVM VM and return its service
 /// slice result through the move-only IPC DATA capability in slot 0.
 ///
 /// The generic service owns scheduling and transition construction. This
@@ -972,7 +972,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
     }
     let encoded_len = encoded.len() as u64;
     core::mem::forget(encoded);
-    // JAR REPLY never unwinds this Rust frame. Reset the actor-local arena
+    // PVM REPLY never unwinds this Rust frame. Reset the actor-local arena
     // only after every output byte is copied so a later legal CALL starts
     // from the full deterministic heap instead of inheriting leaked frames.
     unsafe {
@@ -983,14 +983,14 @@ pub fn run_nested_actor_service<A: super::Actor>(
 
 #[cfg(feature = "service")]
 const fn javm_page_size_for_guest() -> usize {
-    // This is the GP/JAR page size. Keep the guest free of a vos_pvm dependency;
+    // This is the GP/PVM page size. Keep the guest free of a vos_pvm dependency;
     // the workspace-side host checks the same value through vos_pvm::PVM_PAGE_SIZE.
     1 << 12
 }
 
 // ── Refine phase (all actors) ─────────────────────────────────────────
 
-/// Refine-only actor lifecycle — JAR refine phase (PC=0).
+/// Refine-only actor lifecycle — PVM refine phase (PC=0).
 ///
 /// The runtime splits invoke input into separate FETCH items:
 ///   FETCH 1: `[state_bytes]` (empty on first invocation)

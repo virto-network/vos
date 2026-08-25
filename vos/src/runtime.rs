@@ -4,9 +4,9 @@
 //! handles protocol-cap hostcalls, and routes cross-service transfers
 //! across ticks.
 //!
-//! ## Execution model (JAM-aligned, refine-only top level)
+//! ## Execution model (service platform-aligned, refine-only top level)
 //!
-//! The JAVM kernel runs a single entry at PC=0 — the JAR refine body.
+//! The JAVM kernel runs a single entry at PC=0 — the PVM refine body.
 //! VOS drives top-level services exclusively in refine:
 //!
 //!   * **Refine is the hot loop.** State-mutating hostcalls issued
@@ -35,10 +35,10 @@
 //!     transfers join `pending_transfers` for the next tick. There is no
 //!     second PVM invocation — the native drain is an *optimization of*
 //!     the byte-defined apply semantic in `crate::refine_payload`, which
-//!     a guest APPLY on a JAM host executes identically.
+//!     a guest APPLY on a service platform host executes identically.
 //!
 //! This keeps refine bounded and deterministic while still honoring the
-//! JAM invariant that all state mutation is structurally one commit.
+//! service platform invariant that all state mutation is structurally one commit.
 //! When on-chain bridging lands, journaled cross-service transfers will
 //! be routed to a pallet submission instead of `pending_transfers`.
 //!
@@ -206,8 +206,8 @@ fn mint_boot_context(svc_id: u32) -> [u8; BOOT_CONTEXT_LEN] {
 }
 
 /// Supply VOS runtime and crypto capabilities in the active VM's cap table.
-/// JAVM owns the JAM-reserved protocol range 1..=28; VOS capabilities live in
-/// explicitly supplied high slots and are never mistaken for JAM host ABI.
+/// JAVM owns the service platform-reserved protocol range 1..=28; VOS capabilities live in
+/// explicitly supplied high slots and are never mistaken for service platform host ABI.
 ///
 /// Slot layout (`pvm/proof/src/core/ecall.rs` is the source of truth):
 ///
@@ -371,7 +371,7 @@ fn kwrite(k: &mut InvocationKernel, addr: u32, data: &[u8]) {
 // --- Per-service refine journal ---
 //
 // One journal spans a top-level service's tick. It accumulates effects
-// from the service itself **and** from any children it INVOKEs — JAM
+// from the service itself **and** from any children it INVOKEs — service platform
 // semantics make every effect produced under one refine a structural
 // part of that refine's commit. The journal still tracks *which*
 // service each entry belongs to so they land on the right storage row
@@ -1365,7 +1365,7 @@ impl<D: DataLayer> VosRuntime<D> {
                         // this round's items unconsumed; dropping them would
                         // silently lose messages. Both redeliver next tick —
                         // un-fetched mail first — and the saved continuation
-                        // resumes the guest exactly after its await. On a JAM
+                        // resumes the guest exactly after its await. On a service platform
                         // host, accumulate would replay the self-transfers
                         // via hostcalls; VOS must match.
                         for msg in round_items.drain(..) {
@@ -1755,7 +1755,7 @@ fn handle_refine_hostcall(
             (error::HOST_OK, 0)
         }
         hostcall::SERVICE_NEW => {
-            // JAM NEW: guest provides code_hash in a0 (ptr to 32 bytes).
+            // service platform NEW: guest provides code_hash in a0 (ptr to 32 bytes).
             // Look up the code blob from journaled preimages, assign a
             // new service ID, and record it for commit.
             let code_hash = kread_hash(kernel, a0 as u32);

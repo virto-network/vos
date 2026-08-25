@@ -29,8 +29,8 @@ use crate::smt::compute_state_root;
 use crate::view::LedgerView;
 use crate::{ClerkLedger, ClerkLedgerRole, voucher_transfer_currency};
 
-const LEAF_DOMAIN: &[u8] = b"cipher-clerk/smt/leaf/v1";
-const NODE_DOMAIN: &[u8] = b"cipher-clerk/smt/node/v1";
+const LEAF_DOMAIN: &[u8] = b"cipher-clerk/smt/leaf";
+const NODE_DOMAIN: &[u8] = b"cipher-clerk/smt/node";
 
 fn mk_account(id_byte: u8) -> CcAccount {
     CcAccount::new(

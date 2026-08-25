@@ -24,7 +24,7 @@ If you want **how it's built**, read on: the rest of this introduction and
 VOS is a peer-to-peer operating system for collaborative, replicated
 applications.
 
-It runs deterministic actors on a JAM-aligned PVM (RISC-V) and replicates
+It runs deterministic actors on a service platform-aligned PVM (RISC-V) and replicates
 their state across nodes using either CRDTs (eventual consistency) or
 Raft (strict consistency). **Spaces** group actors into per-collaboration
 roots that converge automatically when peers come online — with no central

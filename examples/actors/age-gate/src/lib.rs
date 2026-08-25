@@ -73,7 +73,7 @@ mod tests {
                 root_service: RootServiceId([1; 32]),
                 deployment,
                 service_program: ProgramId([2; 32]),
-                service_abi: vos::service::ABI_VERSION,
+                platform: vos::service::PLATFORM_ID,
                 execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
                 gas_schedule: vos::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
             },
@@ -94,7 +94,6 @@ mod tests {
             consistency: ConsistencyMode::Local,
         };
         let statement = AttestationStatement {
-            statement_version: vos::service::ATTESTATION_STATEMENT_VERSION,
             space: SpaceId([6; 32]),
             actor,
             producer_name: "private-age".into(),
@@ -107,7 +106,7 @@ mod tests {
             reply_call,
             before: StateCommitment::Linear(Hash([11; 32])),
             after: StateCommitment::Linear(Hash([5; 32])),
-            claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&claim_wire]),
+            claim_commitment: Hash::digest(b"vos/attestation-claim", &[&claim_wire]),
             input_commitment: Hash([13; 32]),
             authorization_policy: Hash([14; 32]),
             accumulation_receipt: receipt,

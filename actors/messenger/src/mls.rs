@@ -42,12 +42,12 @@ pub(crate) const CIPHERSUITE: CipherSuite = CipherSuite::CURVE25519_AES128;
 
 /// Domain tag for deriving a channel's MLS GroupId from its name, so every
 /// member computes the same id without coordination.
-pub(crate) const GROUP_ID_DOMAIN_TAG: &[u8] = b"vos-msg-group/v1";
+pub(crate) const GROUP_ID_DOMAIN_TAG: &[u8] = b"vos-msg-group";
 
 /// HKDF label deriving the Ed25519 signer seed from the CSPRNG root — domain
 /// separated from the rest of the stream so the signer is reproducible without
 /// exposing or being entangled with other draws.
-const SIGNER_LABEL: &[u8] = b"vos-msg/mls-signer/v1";
+const SIGNER_LABEL: &[u8] = b"vos-msg/mls-signer";
 
 /// Retain decryption keys for this many epochs behind the group's current one.
 /// In mls-rs this is enforced by the storage layer's trim-on-write (there is no
@@ -96,7 +96,7 @@ fn random_32() -> Result<[u8; 32], String> {
     let _ = vos::hostcalls::boot_context(&mut ctx_buf);
     let n = next_token_counter();
     Ok(vos::crypto::blake2b_hash::<32>(
-        b"vos-msg/token/v1",
+        b"vos-msg/token",
         &[&ctx_buf[..32], &n.to_le_bytes()],
     ))
 }

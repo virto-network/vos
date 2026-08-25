@@ -11,7 +11,7 @@
 //! - **local_id** (bits 15..0): per-node service counter.
 //!   0 = reserved for the registry service.
 //!
-//! JAM sees the full u32 — no protocol changes needed. Routing checks
+//! service platform sees the full u32 — no protocol changes needed. Routing checks
 //! the prefix: matching prefix → local delivery, different → forward
 //! to the network layer.
 

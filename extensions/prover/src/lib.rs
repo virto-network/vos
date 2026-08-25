@@ -1993,7 +1993,7 @@ mod anchor_tests {
 #[cfg(test)]
 mod test_trace {
     //! Shared tiny-trace fixture: a straight-line `Add64` program traced
-    //! into a [`SideNote`] (or packaged as a JAR blob), small enough to
+    //! into a [`SideNote`] (or packaged as a PVM blob), small enough to
     //! prove in-test.
     use vos_pvm::PVM_REGISTER_COUNT;
     use vos_pvm::instruction::Opcode;
@@ -2037,7 +2037,7 @@ mod test_trace {
         SideNote::new(tracing.into_trace(), code, bitmask).with_memory(mem)
     }
 
-    /// The same straight-line program packaged as a JAR blob, so the
+    /// The same straight-line program packaged as a PVM blob, so the
     /// deployed blob→trace→cut→prove chain pipeline
     /// (`prove_chain_segments_with` and the job path over it) runs
     /// end-to-end on a REAL, cheap program.

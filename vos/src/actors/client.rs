@@ -165,7 +165,7 @@ pub struct AttestedInvocationResult {
 }
 
 /// One exact attested-await result. The pending form exists only in the
-/// transition-finalization fork; JAR restores the machine before this future
+/// transition-finalization fork; PVM restores the machine before this future
 /// is reconstructed with the committed package.
 #[doc(hidden)]
 pub struct AttestedAsk {

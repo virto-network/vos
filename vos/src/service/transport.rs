@@ -12,13 +12,13 @@ use crate::attestation::{AttestationProofHost, AttestationProofProducer};
 use super::{
     AccumulateProtocolHost, AccumulateRequest, AccumulatedReply, AccumulationEnvelope,
     AccumulationReceipt, AccumulationRejection, AccumulationResult, AttestedServiceError, CallId,
-    InvocationId, JamService, LocalJamStoreHost, LocalStoreReadError, LocalWorkScheduler,
+    InvocationId, LocalStoreReadError, LocalWorkScheduler, MemoryServiceHost,
     ProofVerificationRequest, PublicationAck, PublicationRecord, PublishedEffects,
     ReceiptVerificationRequest, RefineProtocolHost, RefinedServiceOutput, ScheduleError,
-    ServiceDispatchError, ServicePvmError, ServiceWire,
+    ServiceDispatchError, ServicePvmError, ServiceRuntime, ServiceWire,
 };
 
-type LocalService<R, A> = JamService<R, A>;
+type LocalService<R, A> = ServiceRuntime<R, A>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommittedDelivery {
@@ -131,7 +131,7 @@ impl LocalTransport {
     ) -> Result<(super::PreparedWork, RefinedServiceOutput), LocalTransportError>
     where
         R: RefineProtocolHost,
-        A: LocalJamStoreHost + AccumulateProtocolHost,
+        A: MemoryServiceHost + AccumulateProtocolHost,
     {
         let mut discovery_rounds = 0usize;
         loop {
@@ -162,7 +162,7 @@ impl LocalTransport {
     ) -> Result<InboxDrainOutcome, LocalTransportError>
     where
         R: RefineProtocolHost,
-        A: LocalJamStoreHost + AccumulateProtocolHost,
+        A: MemoryServiceHost + AccumulateProtocolHost,
     {
         let retirement = LocalWorkScheduler::prepare_inbox_retirement(
             destination.accumulate_host().local_store(),
@@ -190,7 +190,7 @@ impl LocalTransport {
     }
 
     /// Recover source effects in canonical guest row order.
-    pub fn pending_publications<R, A: LocalJamStoreHost>(
+    pub fn pending_publications<R, A: MemoryServiceHost>(
         source: &LocalService<R, A>,
     ) -> Result<Vec<PublicationRecord>, LocalTransportError> {
         Ok(source
@@ -214,9 +214,9 @@ impl LocalTransport {
         logical_timeslot: u64,
     ) -> Result<CommittedDelivery, LocalTransportError>
     where
-        S: LocalJamStoreHost,
+        S: MemoryServiceHost,
         DR: RefineProtocolHost,
-        D: LocalJamStoreHost + AccumulateProtocolHost,
+        D: MemoryServiceHost + AccumulateProtocolHost,
     {
         let canonical = committed_publication(source, publication)?;
         let message = canonical
@@ -274,8 +274,8 @@ impl LocalTransport {
     ) -> Result<CommittedReplyResume, LocalTransportError>
     where
         CR: RefineProtocolHost,
-        P: LocalJamStoreHost + AttestationProofHost,
-        C: LocalJamStoreHost + AccumulateProtocolHost + AttestationProofHost,
+        P: MemoryServiceHost + AttestationProofHost,
+        C: MemoryServiceHost + AccumulateProtocolHost + AttestationProofHost,
     {
         let canonical = committed_publication(producer, publication)?;
         let reply = canonical
@@ -426,7 +426,7 @@ impl LocalTransport {
     ) -> Result<Vec<InboxDrainOutcome>, LocalTransportError>
     where
         R: RefineProtocolHost,
-        A: LocalJamStoreHost + AccumulateProtocolHost,
+        A: MemoryServiceHost + AccumulateProtocolHost,
     {
         let pending = destination
             .accumulate_host()
@@ -501,7 +501,7 @@ impl LocalTransport {
     ) -> Result<Vec<InboxDrainOutcome>, AttestedTransportError<P::Error>>
     where
         R: RefineProtocolHost,
-        A: LocalJamStoreHost + AccumulateProtocolHost + AttestationProofHost,
+        A: MemoryServiceHost + AccumulateProtocolHost + AttestationProofHost,
         P: AttestationProofProducer,
     {
         let pending = destination
@@ -603,7 +603,7 @@ impl LocalTransport {
     }
 }
 
-fn committed_publication<R, A: LocalJamStoreHost>(
+fn committed_publication<R, A: MemoryServiceHost>(
     source: &LocalService<R, A>,
     publication: &PublicationRecord,
 ) -> Result<PublicationRecord, LocalTransportError> {

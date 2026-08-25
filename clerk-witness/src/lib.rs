@@ -185,7 +185,7 @@ pub fn batch_digest(events: &[Transfer]) -> [u8; 32] {
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&events.to_vec())
         .expect("events rkyv-encode")
         .to_vec();
-    vos::crypto::blake2b_hash::<32>(b"clerk-witness/batch/v1", &[&bytes])
+    vos::crypto::blake2b_hash::<32>(b"clerk-witness/batch", &[&bytes])
 }
 
 /// Verify-and-apply one witnessed transition — the whole pure-verifier

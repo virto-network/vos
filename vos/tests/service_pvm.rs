@@ -27,22 +27,23 @@ use vos::service::{
     CommittedAccumulateEntry, CommittedAccumulateLog, CommittedImageStore,
     CommittedServiceImageHost, CommittedServiceSnapshot, ConsistencyBase, ConsistencyMode,
     ContinuationChange, ContinuationSnapshot, CrdtChange, DeploymentId, DeviceSecret,
-    DeviceSignerRefineHost, DirectIngress, DurableJamStore, ExternalActorBinding,
+    DeviceSignerRefineHost, DirectIngress, DurableServiceStore, ExternalActorBinding,
     FileCommittedImageStore, GasAccounting, GasSchedule, Hash, ImportedActor, ImportedBlob,
-    ImportedProgram, InboxDrainOutcome, InvocationId, JamService, LocalJamStore, LocalJamStoreHost,
-    LocalJamStoreSnapshot, LocalRootTreeConfig, LocalRootTreeConfigError, LocalRootTreeInvokeError,
-    LocalRootTreeOpenError, LocalRootTreeService, LocalTransport, LocalWorkRequest,
-    LocalWorkScheduler, MessageRecord, MethodPolicy, NoRefineProtocolHost, Origin, PackageManifest,
-    PackageRolePolicies, PackageTaskDependency, PrivateIngressStaging, ProducerId, ProductionTrust,
-    ProductionTrustDecision, ProductionTrustError, ProgramId, ProofArtifactStore,
-    ProofVerificationRequest, PublishedEffects, ReceiptVerificationRequest, RefineImports,
-    RefineOutput, RefineProtocolHost, ReplicatedJamService, ReplicatedServiceError, ReplyRecord,
-    RoleAuthorityBinding, RoleAuthorityInviteRedemption, RoleAuthorityMutation,
-    RoleAuthorizationClaim, RoleCredential, RoleCredentialVerificationRequest, RootServiceId,
-    RootTreeAttestedResult, RootTreeInvocation, RootTreeUpgradeRequest, ScheduleError,
-    ServiceDispatchError, ServiceGenesis, ServiceIdentity, ServicePvm, ServicePvmError,
-    ServiceWire, StateKey, SubjectId, SystemCapabilityId, TaskDependency, Transition, VosPackage,
-    WorkEnvelope, WorkflowOperation, artifact_hash, public_policy_hash, space_role_policy_hash,
+    ImportedProgram, InboxDrainOutcome, InvocationId, LocalRootTreeConfig,
+    LocalRootTreeConfigError, LocalRootTreeInvokeError, LocalRootTreeOpenError,
+    LocalRootTreeService, LocalTransport, LocalWorkRequest, LocalWorkScheduler, MemoryServiceHost,
+    MemoryServiceSnapshot, MemoryServiceStore, MessageRecord, MethodPolicy, NoRefineProtocolHost,
+    Origin, PackageManifest, PackageRolePolicies, PackageTaskDependency, PrivateIngressStaging,
+    ProducerId, ProductionTrust, ProductionTrustDecision, ProductionTrustError, ProgramId,
+    ProofArtifactStore, ProofVerificationRequest, PublishedEffects, ReceiptVerificationRequest,
+    RefineImports, RefineOutput, RefineProtocolHost, ReplicatedServiceError,
+    ReplicatedServiceRuntime, ReplyRecord, RoleAuthorityBinding, RoleAuthorityInviteRedemption,
+    RoleAuthorityMutation, RoleAuthorizationClaim, RoleCredential,
+    RoleCredentialVerificationRequest, RootServiceId, RootTreeAttestedResult, RootTreeInvocation,
+    RootTreeUpgradeRequest, ScheduleError, ServiceDispatchError, ServiceGenesis, ServiceIdentity,
+    ServicePvm, ServicePvmError, ServiceRuntime, ServiceWire, StateKey, SubjectId,
+    SystemCapabilityId, TaskDependency, Transition, VosPackage, WorkEnvelope, WorkflowOperation,
+    artifact_hash, public_policy_hash, space_role_policy_hash,
 };
 use vos::{
     Decode, Encode,
@@ -103,7 +104,7 @@ fn direct_linear_ingress(work: &WorkEnvelope) -> AccumulateRequest {
     })
 }
 
-fn admit_linear_work<R, A>(service: &mut JamService<R, A>, work: &WorkEnvelope)
+fn admit_linear_work<R, A>(service: &mut ServiceRuntime<R, A>, work: &WorkEnvelope)
 where
     R: RefineProtocolHost,
     A: AccumulateProtocolHost,
@@ -145,10 +146,10 @@ fn request_from_work(work: &WorkEnvelope) -> LocalWorkRequest {
 }
 
 fn admit_direct_request<A>(
-    service: &mut JamService<NoRefineProtocolHost, A>,
+    service: &mut ServiceRuntime<NoRefineProtocolHost, A>,
     request: &LocalWorkRequest,
 ) where
-    A: AccumulateProtocolHost + LocalJamStoreHost,
+    A: AccumulateProtocolHost + MemoryServiceHost,
 {
     let service_identity = service
         .accumulate_host()
@@ -176,11 +177,11 @@ fn admit_direct_request<A>(
 }
 
 fn admit_and_prepare<A>(
-    service: &mut JamService<NoRefineProtocolHost, A>,
+    service: &mut ServiceRuntime<NoRefineProtocolHost, A>,
     request: LocalWorkRequest,
 ) -> vos::service::PreparedWork
 where
-    A: AccumulateProtocolHost + LocalJamStoreHost,
+    A: AccumulateProtocolHost + MemoryServiceHost,
 {
     admit_direct_request(service, &request);
     LocalWorkScheduler::prepare(service.accumulate_host().local_store(), request).unwrap()
@@ -660,7 +661,7 @@ impl ProofArtifactStore for FailableCommittedImages {
 }
 
 type DurableTestService =
-    JamService<NoRefineProtocolHost, DurableJamStore<FailableCommittedImages>>;
+    ServiceRuntime<NoRefineProtocolHost, DurableServiceStore<FailableCommittedImages>>;
 
 fn restart_durable_service(
     service: DurableTestService,
@@ -669,11 +670,11 @@ fn restart_durable_service(
 ) -> DurableTestService {
     let (_, host) = service.into_hosts();
     let (_, backend) = host.into_parts();
-    JamService::new(
+    ServiceRuntime::new(
         service_pvm.to_vec(),
         service_program,
         NoRefineProtocolHost,
-        DurableJamStore::open(backend).expect("committed service image reopens"),
+        DurableServiceStore::open(backend).expect("committed service image reopens"),
         TEST_GAS_SCHEDULE.refine,
         TEST_GAS_SCHEDULE.accumulate,
     )
@@ -860,8 +861,8 @@ impl CommittedAccumulateLog for TestCommittedLog {
     }
 }
 
-fn authorize_install<R, A: LocalJamStoreHost>(
-    service: &mut JamService<R, A>,
+fn authorize_install<R, A: MemoryServiceHost>(
+    service: &mut ServiceRuntime<R, A>,
     request: &AccumulateRequest,
 ) {
     let AccumulateRequest::Install(genesis) = request else {
@@ -1151,7 +1152,7 @@ fn work(actor_program: ProgramId, state: BlobRef) -> WorkEnvelope {
             root_service: RootServiceId([1; 32]),
             deployment: DeploymentId([2; 32]),
             service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: vos::service::ABI_VERSION,
+            platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: TEST_GAS_SCHEDULE,
         },
@@ -1334,8 +1335,7 @@ fn signed_test_package(
         manifest: PackageManifest {
             name: metadata.actor_name.clone(),
             version: "2.0.0".into(),
-            service_abi: vos::service::ABI_VERSION,
-            snapshot_version: vos::service::SNAPSHOT_VERSION,
+            platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
             actor_program: ProgramId::of_pvm(&actor_pvm),
@@ -1377,7 +1377,7 @@ fn attested_root_fixture(
         root_service: RootServiceId([salt.wrapping_add(2); 32]),
         deployment: package.deployment_id(),
         service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -1820,7 +1820,7 @@ fn raft_replay_rejects_a_different_production_trust_policy_before_genesis() {
         root_service: RootServiceId([0x86; 32]),
         deployment: DeploymentId([0x87; 32]),
         service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -1863,11 +1863,11 @@ fn raft_replay_rejects_a_different_production_trust_policy_before_genesis() {
     }];
     let shared = Arc::new(Mutex::new(SharedCommittedLog::default()));
     let make_replica = |policy: u8, leader: bool| {
-        let mut host = LocalJamStore::default();
+        let mut host = MemoryServiceStore::default();
         host.install_production_trust(Arc::new(TestProductionTrust::new(policy, 20, true)))
             .unwrap();
-        ReplicatedJamService::new(
-            JamService::new(
+        ReplicatedServiceRuntime::new(
+            ServiceRuntime::new(
                 CANONICAL_SERVICE_PVM.to_vec(),
                 vos::service::VOS_SERVICE_PROGRAM_ID,
                 NoRefineProtocolHost,
@@ -2871,7 +2871,7 @@ fn signed_task_dependencies_install_and_survive_durable_reopen() {
     let mut backend = reopened.into_backend();
     let image = backend.image.take().expect("committed service image");
     let missing_dependency = snapshot_without_program(&image, binding.program);
-    LocalJamStoreSnapshot::decode(&missing_dependency)
+    MemoryServiceSnapshot::decode(&missing_dependency)
         .expect("the dependency-free snapshot remains canonically encoded");
     backend.image = Some(missing_dependency);
     assert!(matches!(
@@ -3435,7 +3435,7 @@ fn clerk_status(committed: &vos::service::CommittedRootTreeSlice) -> clerk_ledge
 }
 
 fn physical_operator_request<R, A>(
-    service: &mut JamService<R, A>,
+    service: &mut ServiceRuntime<R, A>,
     actor: ActorId,
     invocation: InvocationId,
     logical_timeslot: u64,
@@ -3444,7 +3444,7 @@ fn physical_operator_request<R, A>(
 ) -> LocalWorkRequest
 where
     R: RefineProtocolHost,
-    A: LocalJamStoreHost + AccumulateProtocolHost,
+    A: MemoryServiceHost + AccumulateProtocolHost,
 {
     let method = message.name.clone();
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
@@ -3511,12 +3511,12 @@ where
 }
 
 fn invoke_physical_actor<R, A>(
-    service: &mut JamService<R, A>,
+    service: &mut ServiceRuntime<R, A>,
     request: LocalWorkRequest,
 ) -> PublishedEffects
 where
     R: RefineProtocolHost,
-    A: LocalJamStoreHost + AccumulateProtocolHost,
+    A: MemoryServiceHost + AccumulateProtocolHost,
 {
     let mut prepared =
         LocalWorkScheduler::prepare(service.accumulate_host().local_store(), request)
@@ -3567,8 +3567,8 @@ fn physical_reply_bytes(published: &PublishedEffects) -> Vec<u8> {
 }
 
 fn attempt_voucher_anchor_from_unbound_actor(
-    source: &mut JamService<NoRefineProtocolHost, LocalJamStore>,
-    ledger: &mut JamService<NoRefineProtocolHost, LocalJamStore>,
+    source: &mut ServiceRuntime<NoRefineProtocolHost, MemoryServiceStore>,
+    ledger: &mut ServiceRuntime<NoRefineProtocolHost, MemoryServiceStore>,
     source_actor: ActorId,
     ledger_actor: ActorId,
     transfer_id: [u8; 16],
@@ -3656,7 +3656,7 @@ fn canonical_clerk_package_executes_a_private_provable_transfer_through_raft() {
             root_service: RootServiceId([122; 32]),
             deployment: package.deployment_id(),
             service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: vos::service::ABI_VERSION,
+            platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: TEST_GAS_SCHEDULE,
         },
@@ -3841,7 +3841,7 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
         root_service: RootServiceId([0x44; 32]),
         deployment: ledger_package.deployment_id(),
         service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -3853,13 +3853,13 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
     let initial = Vec::new();
     let initial_ref = BlobRef::of_bytes(&initial);
 
-    let mut ledger_store = LocalJamStore::default();
+    let mut ledger_store = MemoryServiceStore::default();
     assert_eq!(ledger_store.import_blob(initial.clone()), initial_ref);
     assert_eq!(
         ledger_store.import_program(ledger_package.actor_pvm.clone()),
         ledger_package.manifest.actor_program,
     );
-    let mut ledger = JamService::new(
+    let mut ledger = ServiceRuntime::new(
         CANONICAL_SERVICE_PVM.to_vec(),
         vos::service::VOS_SERVICE_PROGRAM_ID,
         NoRefineProtocolHost,
@@ -3903,13 +3903,13 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
 
     let device_secret = DeviceSecret::new([0x48; 32]);
     let bank_public = device_secret.public_key();
-    let mut bridge_store = LocalJamStore::default();
+    let mut bridge_store = MemoryServiceStore::default();
     assert_eq!(bridge_store.import_blob(initial), initial_ref);
     assert_eq!(
         bridge_store.import_program(bridge_package.actor_pvm.clone()),
         bridge_package.manifest.actor_program,
     );
-    let mut bridge = JamService::new(
+    let mut bridge = ServiceRuntime::new(
         CANONICAL_SERVICE_PVM.to_vec(),
         vos::service::VOS_SERVICE_PROGRAM_ID,
         DeviceSignerRefineHost::new(Some(device_secret)),
@@ -3961,13 +3961,13 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
         deployment: rogue_package.deployment_id(),
         ..ledger_identity.clone()
     };
-    let mut rogue_store = LocalJamStore::default();
+    let mut rogue_store = MemoryServiceStore::default();
     assert_eq!(rogue_store.import_blob(Vec::new()), initial_ref);
     assert_eq!(
         rogue_store.import_program(rogue_package.actor_pvm.clone()),
         rogue_package.manifest.actor_program,
     );
-    let mut rogue = JamService::new(
+    let mut rogue = ServiceRuntime::new(
         CANONICAL_SERVICE_PVM.to_vec(),
         vos::service::VOS_SERVICE_PROGRAM_ID,
         NoRefineProtocolHost,
@@ -4455,7 +4455,7 @@ fn signed_task_dependency_actor_config(
             root_service: RootServiceId([122; 32]),
             deployment: package.deployment_id(),
             service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: vos::service::ABI_VERSION,
+            platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: TEST_GAS_SCHEDULE,
         },
@@ -4531,7 +4531,7 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         root_service: RootServiceId([92; 32]),
         deployment,
         service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -4777,7 +4777,7 @@ fn canonical_space_authority_authorizes_a_physical_target_and_exact_retry() {
         root_service: RootServiceId([185; 32]),
         deployment: package.deployment_id(),
         service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -5089,7 +5089,7 @@ fn canonical_space_authority_authorizes_a_physical_target_and_exact_retry() {
         root_service: RootServiceId([207; 32]),
         deployment: target_package.deployment_id(),
         service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -5247,7 +5247,7 @@ fn crdt_role_authorization_survives_causal_sync_restart_and_exact_retry() {
         root_service: RootServiceId([0xD4; 32]),
         deployment: package.deployment_id(),
         service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -5472,7 +5472,7 @@ fn node_ingress_uses_canonical_authority_for_raft_and_crdt_targets() {
         root_service: RootServiceId([214; 32]),
         deployment: authority_package.deployment_id(),
         service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -5573,7 +5573,7 @@ fn node_ingress_uses_canonical_authority_for_raft_and_crdt_targets() {
         root_service: RootServiceId([219; 32]),
         deployment: target_package.deployment_id(),
         service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -5620,7 +5620,7 @@ fn node_ingress_uses_canonical_authority_for_raft_and_crdt_targets() {
         root_service: RootServiceId([0xE2; 32]),
         deployment: crdt_package.deployment_id(),
         service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -5869,7 +5869,7 @@ fn raft_root_tree_orders_genesis_apply_and_ack_through_physical_accumulate() {
             root_service: RootServiceId([115; 32]),
             deployment: package.deployment_id(),
             service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: vos::service::ABI_VERSION,
+            platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: TEST_GAS_SCHEDULE,
         },
@@ -5979,7 +5979,7 @@ fn node_registers_a_raft_root_through_the_canonical_request_log() {
             root_service: RootServiceId([0xA3; 32]),
             deployment: package.deployment_id(),
             service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: vos::service::ABI_VERSION,
+            platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: TEST_GAS_SCHEDULE,
         },
@@ -6553,7 +6553,7 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
         arguments: forged_arguments,
         proof_requested: false,
     };
-    let mut forged_delegation = b"VRD4".to_vec();
+    let mut forged_delegation = b"VRDW".to_vec();
     // preserve envelope + no authority/upgrade marker + Origin::System
     forged_delegation.extend_from_slice(&[1, 0, 0, 3]);
     forged_delegation.extend_from_slice(&forged_ingress.encode());
@@ -6595,7 +6595,7 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
         .encode(),
         proof_requested: false,
     };
-    let mut delegated_upgrade = b"VRD4".to_vec();
+    let mut delegated_upgrade = b"VRDW".to_vec();
     // preserve envelope + no authority marker + upgrade marker + System origin
     delegated_upgrade.extend_from_slice(&[1, 0, 1, 3]);
     delegated_upgrade.extend_from_slice(&upgrade_ingress.encode());
@@ -6704,7 +6704,7 @@ fn raft_follower_registers_before_genesis_and_restores_caught_up_admission_time(
             root_service: RootServiceId([121; 32]),
             deployment: package.deployment_id(),
             service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: vos::service::ABI_VERSION,
+            platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: TEST_GAS_SCHEDULE,
         },
@@ -6851,7 +6851,8 @@ fn raft_follower_registers_before_genesis_and_restores_caught_up_admission_time(
     drop(worker_handle);
 
     let image = backend.0.lock().unwrap().clone().unwrap();
-    let restored = LocalJamStore::from_snapshot(LocalJamStoreSnapshot::decode(&image).unwrap());
+    let restored =
+        MemoryServiceStore::from_snapshot(MemoryServiceSnapshot::decode(&image).unwrap());
     assert_eq!(
         restored
             .header()
@@ -6878,7 +6879,7 @@ fn node_routes_canonical_actor_ids_through_the_guest_owned_root_service() {
             root_service: RootServiceId([105; 32]),
             deployment: package.deployment_id(),
             service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: vos::service::ABI_VERSION,
+            platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: TEST_GAS_SCHEDULE,
         },
@@ -7015,7 +7016,7 @@ fn root_upgrade_is_exactly_once_and_reopens_across_the_catalog_cutover() {
         root_service: RootServiceId([0x63; 32]),
         deployment: package.deployment_id(),
         service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -7171,7 +7172,7 @@ fn conformance_raft_and_role_authority_shape_changes_are_refused_before_upgrade(
             root_service: RootServiceId([0xB3; 32]),
             deployment: package.deployment_id(),
             service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: vos::service::ABI_VERSION,
+            platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: TEST_GAS_SCHEDULE,
         },
@@ -7230,7 +7231,7 @@ fn conformance_raft_and_role_authority_shape_changes_are_refused_before_upgrade(
             root_service: RootServiceId([0xB7; 32]),
             deployment: vos::service::DeploymentId([0xB8; 32]),
             service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: vos::service::ABI_VERSION,
+            platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: TEST_GAS_SCHEDULE,
         },
@@ -7278,7 +7279,7 @@ fn production_raft_authority_upgrade_is_ordered_once_and_preserves_service_ident
             root_service: RootServiceId([0x68; 32]),
             deployment: package.deployment_id(),
             service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: vos::service::ABI_VERSION,
+            platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: TEST_GAS_SCHEDULE,
         },
@@ -7724,7 +7725,7 @@ fn attested_node_transport_fixture(
         root_service: RootServiceId([salt.wrapping_add(2); 32]),
         deployment,
         service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -8149,7 +8150,7 @@ fn node_routes_an_ordinary_cross_root_await_through_guest_accumulate() {
         root_service: RootServiceId([0xB4; 32]),
         deployment,
         service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -8301,7 +8302,7 @@ fn node_routes_a_crdt_cross_root_await_and_acknowledges_both_publications() {
         root_service: RootServiceId([0xE3; 32]),
         deployment,
         service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -8428,7 +8429,7 @@ fn node_routes_networkless_single_voter_raft_roots() {
         root_service: RootServiceId([0xBC; 32]),
         deployment,
         service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -8569,7 +8570,7 @@ fn node_routes_raft_cross_root_reply_between_different_leaders() {
         root_service: RootServiceId([0xC3; 32]),
         deployment,
         service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -8815,7 +8816,7 @@ fn node_retries_a_direct_reply_publication_ack_after_the_caller_is_gone() {
             root_service: RootServiceId([0xD3; 32]),
             deployment: package.deployment_id(),
             service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: vos::service::ABI_VERSION,
+            platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: TEST_GAS_SCHEDULE,
         },
@@ -8883,7 +8884,7 @@ fn node_expires_and_resumes_an_unreachable_durable_call() {
         root_service: RootServiceId([0xC3; 32]),
         deployment,
         service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -8990,7 +8991,7 @@ fn durable_crdt_root_tree_reattaches_an_exact_invocation_after_restart() {
             root_service: RootServiceId([99; 32]),
             deployment: package.deployment_id(),
             service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: vos::service::ABI_VERSION,
+            platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: TEST_GAS_SCHEDULE,
         },
@@ -9252,7 +9253,7 @@ fn node_anti_entropy_converges_authenticated_crdt_roots_across_restart() {
             root_service: RootServiceId([0x53; 32]),
             deployment: package.deployment_id(),
             service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: vos::service::ABI_VERSION,
+            platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: TEST_GAS_SCHEDULE,
         },
@@ -9433,8 +9434,8 @@ fn same_package_child_spawn_commits_before_the_child_becomes_callable() {
         reference: initial.clone(),
         bytes: initial_bytes,
     }];
-    let host = LocalJamStore::default();
-    let mut service = JamService::new(
+    let host = MemoryServiceStore::default();
+    let mut service = ServiceRuntime::new(
         CANONICAL_SERVICE_PVM.to_vec(),
         vos::service::VOS_SERVICE_PROGRAM_ID,
         NoRefineProtocolHost,
@@ -9638,10 +9639,10 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
     let seed = work(actor_program, initial.clone());
     let child = ActorId([36; 32]);
     let sibling = ActorId([37; 32]);
-    let mut host = LocalJamStore::default();
+    let mut host = MemoryServiceStore::default();
     assert_eq!(host.import_blob(initial_bytes), initial);
     assert_eq!(host.import_program(actor_pvm), actor_program);
-    let mut service = JamService::new(
+    let mut service = ServiceRuntime::new(
         CANONICAL_SERVICE_PVM.to_vec(),
         vos::service::VOS_SERVICE_PROGRAM_ID,
         NoRefineProtocolHost,
@@ -9848,7 +9849,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
     admit_linear_work(&mut service, &scheduled.work);
     let refined = service
         .refine_actor_tree(&scheduled.work, &scheduled.imports)
-        .expect("root calls its child through an ordinary JAR CALLABLE");
+        .expect("root calls its child through an ordinary PVM CALLABLE");
     assert_eq!(
         refined
             .transition
@@ -10007,7 +10008,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
     assert_eq!(recompiled.gas_used, first_bytes.gas_used);
     assert_eq!(
         recompiled.exported_blobs, first_bytes.exported_blobs,
-        "nested JAR checkpoints must be backend-independent"
+        "nested PVM checkpoints must be backend-independent"
     );
     assert!(recompiled.trace.is_none());
     let first_output = RefineOutput::decode(&first_bytes.bytes).unwrap();
@@ -10074,7 +10075,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
         AccumulationResult::Rejected(
             vos::service::AccumulationRejection::InvalidWorkflowTransition
         ),
-        "guest Accumulate binds the outbox sender to JAR's exact pending actor"
+        "guest Accumulate binds the outbox sender to PVM's exact pending actor"
     );
 
     let mut incomplete_checkpoint = first.clone();
@@ -10138,9 +10139,9 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
     );
 
     let persisted = service.accumulate_host().snapshot_bytes();
-    let restarted_store = LocalJamStore::from_snapshot_bytes(&persisted)
+    let restarted_store = MemoryServiceStore::from_snapshot_bytes(&persisted)
         .expect("the complete tree checkpoint survives a process restart");
-    let mut restarted = JamService::new(
+    let mut restarted = ServiceRuntime::new(
         CANONICAL_SERVICE_PVM.to_vec(),
         vos::service::VOS_SERVICE_PROGRAM_ID,
         NoRefineProtocolHost,
@@ -10307,11 +10308,11 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
     ));
 
     let persisted = restarted.accumulate_host().snapshot_bytes();
-    restarted = JamService::new(
+    restarted = ServiceRuntime::new(
         CANONICAL_SERVICE_PVM.to_vec(),
         vos::service::VOS_SERVICE_PROGRAM_ID,
         NoRefineProtocolHost,
-        LocalJamStore::from_snapshot_bytes(&persisted).unwrap(),
+        MemoryServiceStore::from_snapshot_bytes(&persisted).unwrap(),
         TEST_GAS_SCHEDULE.refine,
         TEST_GAS_SCHEDULE.accumulate,
     )
@@ -10376,11 +10377,11 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
     ));
 
     let persisted = restarted.accumulate_host().snapshot_bytes();
-    restarted = JamService::new(
+    restarted = ServiceRuntime::new(
         CANONICAL_SERVICE_PVM.to_vec(),
         vos::service::VOS_SERVICE_PROGRAM_ID,
         NoRefineProtocolHost,
-        LocalJamStore::from_snapshot_bytes(&persisted).unwrap(),
+        MemoryServiceStore::from_snapshot_bytes(&persisted).unwrap(),
         TEST_GAS_SCHEDULE.refine,
         TEST_GAS_SCHEDULE.accumulate,
     )
@@ -10783,10 +10784,10 @@ fn same_tree_causal_cycles_return_an_explicit_guest_error() {
     let seed = work(actor_program, initial.clone());
     let child = ActorId([36; 32]);
 
-    let mut host = LocalJamStore::default();
+    let mut host = MemoryServiceStore::default();
     assert_eq!(host.import_blob(initial_bytes), initial);
     assert_eq!(host.import_program(actor_pvm), actor_program);
-    let mut service = JamService::new(
+    let mut service = ServiceRuntime::new(
         CANONICAL_SERVICE_PVM.to_vec(),
         vos::service::VOS_SERVICE_PROGRAM_ID,
         NoRefineProtocolHost,
@@ -10994,10 +10995,10 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     work.base = ConsistencyBase::Crdt { heads: vec![] };
     work.base_causal_height = Some(0);
 
-    let mut host = LocalJamStore::default();
+    let mut host = MemoryServiceStore::default();
     assert_eq!(host.import_blob(initial_bytes.clone()), initial);
     assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
-    let mut service = JamService::new(
+    let mut service = ServiceRuntime::new(
         service_pvm.clone(),
         ProgramId::of_pvm(&service_pvm),
         NoRefineProtocolHost,
@@ -11118,10 +11119,10 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     // A second replica imports the authenticated DAG node through physical
     // IC-5. The host only supplies receipt verification and atomic storage;
     // the service guest validates and materializes the synced workflow.
-    let mut replica_host = LocalJamStore::default();
+    let mut replica_host = MemoryServiceStore::default();
     assert_eq!(replica_host.import_blob(initial_bytes), initial);
     assert_eq!(replica_host.import_program(actor_pvm), actor_program);
-    let mut replica = JamService::new(
+    let mut replica = ServiceRuntime::new(
         service_pvm.clone(),
         ProgramId::of_pvm(&service_pvm),
         NoRefineProtocolHost,
@@ -11354,10 +11355,10 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
     let seed = work(actor_program, initial.clone());
     let child = ActorId([36; 32]);
 
-    let mut host = LocalJamStore::default();
+    let mut host = MemoryServiceStore::default();
     assert_eq!(host.import_blob(initial_bytes), initial);
     assert_eq!(host.import_program(actor_pvm), actor_program);
-    let mut service = JamService::new(
+    let mut service = ServiceRuntime::new(
         CANONICAL_SERVICE_PVM.to_vec(),
         vos::service::VOS_SERVICE_PROGRAM_ID,
         NoRefineProtocolHost,
@@ -12029,10 +12030,10 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
     first_work.base = ConsistencyBase::Crdt { heads: vec![] };
     first_work.base_causal_height = Some(0);
 
-    let mut host = LocalJamStore::default();
+    let mut host = MemoryServiceStore::default();
     assert_eq!(host.import_blob(initial_bytes), initial);
     assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
-    let mut service = JamService::new(
+    let mut service = ServiceRuntime::new(
         service_pvm.clone(),
         ProgramId::of_pvm(&service_pvm),
         NoRefineProtocolHost,
@@ -12263,10 +12264,10 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
     ping.extend_from_slice(&Msg::new("ping").encode());
     first_work.method = "ping".into();
     first_work.arguments = ping;
-    let mut host = LocalJamStore::default();
+    let mut host = MemoryServiceStore::default();
     assert_eq!(host.import_blob(initial_state.clone()), initial_state_ref);
     assert_eq!(host.import_program(actor.clone()), actor_program);
-    let mut committed = JamService::new(
+    let mut committed = ServiceRuntime::new(
         service_pvm.clone(),
         service_program,
         NoRefineProtocolHost,
@@ -12445,7 +12446,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
     // Reconstruct the runtime from an in-memory committed snapshot after
     // Accumulate commits slice 0. The scheduler must recover the exact program,
     // actor state, and continuation rather than use this test's local values.
-    let reopened = LocalJamStore::from_snapshot(committed.accumulate_host().snapshot());
+    let reopened = MemoryServiceStore::from_snapshot(committed.accumulate_host().snapshot());
     let mut resume_request = request;
     resume_request.workflow_step = 1;
     let mut changed_identity = resume_request.clone();
@@ -12480,7 +12481,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
         resumed_work.imported_actors[0].continuation,
         Some(first_continuation.clone())
     );
-    let mut committed = JamService::new(
+    let mut committed = ServiceRuntime::new(
         service_pvm,
         service_program,
         NoRefineProtocolHost,
@@ -12590,10 +12591,10 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
     seed_work.method = "await_peer".into();
     seed_work.arguments = arguments;
 
-    let mut host = LocalJamStore::default();
+    let mut host = MemoryServiceStore::default();
     assert_eq!(host.import_blob(initial_state), initial_state_ref);
     assert_eq!(host.import_program(actor), actor_program);
-    let mut committed = JamService::new(
+    let mut committed = ServiceRuntime::new(
         service_pvm.clone(),
         service_program,
         NoRefineProtocolHost,
@@ -12677,7 +12678,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             )
             .unwrap(),
         first_output,
-        "both JAR backends must capture the same awaited-call boundary"
+        "both PVM backends must capture the same awaited-call boundary"
     );
     let first = RefineOutput::decode(&first_output.bytes)
         .unwrap()
@@ -12726,9 +12727,9 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
     // durable guest transition before the exact machine is restored. A crash
     // at either boundary must not replay code before `.await`.
     let persisted_checkpoint = committed.accumulate_host().snapshot_bytes();
-    let timeout_store = LocalJamStore::from_snapshot_bytes(&persisted_checkpoint)
+    let timeout_store = MemoryServiceStore::from_snapshot_bytes(&persisted_checkpoint)
         .expect("the checkpoint image starts an independent timeout branch");
-    let timeout_jam = JamService::new(
+    let timeout_runtime = ServiceRuntime::new(
         service_pvm.clone(),
         service_program,
         NoRefineProtocolHost,
@@ -12737,9 +12738,9 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
         TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
-    let timeout_follower_store = LocalJamStore::from_snapshot_bytes(&persisted_checkpoint)
+    let timeout_follower_store = MemoryServiceStore::from_snapshot_bytes(&persisted_checkpoint)
         .expect("the follower starts from the identical checkpoint image");
-    let timeout_follower_jam = JamService::new(
+    let timeout_follower_runtime = ServiceRuntime::new(
         service_pvm.clone(),
         service_program,
         NoRefineProtocolHost,
@@ -12749,12 +12750,12 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
     )
     .unwrap();
     let timeout_log = Arc::new(Mutex::new(SharedCommittedLog::default()));
-    let mut timeout_service = ReplicatedJamService::new(
-        timeout_jam,
+    let mut timeout_service = ReplicatedServiceRuntime::new(
+        timeout_runtime,
         TestCommittedLog::new(timeout_log.clone(), true),
     );
-    let mut timeout_follower = ReplicatedJamService::new(
-        timeout_follower_jam,
+    let mut timeout_follower = ReplicatedServiceRuntime::new(
+        timeout_follower_runtime,
         TestCommittedLog::new(timeout_log, false),
     );
     assert!(
@@ -12796,7 +12797,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             .accumulate_host()
             .snapshot()
             .same_service_state(&timeout_follower.service().accumulate_host().snapshot()),
-        "the follower replays the committed ambient JAM slot through IC-5"
+        "the follower replays the committed ambient service platform slot through IC-5"
     );
     let AccumulationResult::CallExpired {
         timeout,
@@ -12835,9 +12836,9 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
     );
 
     let timeout_persisted = timeout_service.service().accumulate_host().snapshot_bytes();
-    let timeout_restarted_store = LocalJamStore::from_snapshot_bytes(&timeout_persisted)
+    let timeout_restarted_store = MemoryServiceStore::from_snapshot_bytes(&timeout_persisted)
         .expect("the expiration outcome survives a second process restart");
-    let mut timeout_restarted_service = JamService::new(
+    let mut timeout_restarted_service = ServiceRuntime::new(
         service_pvm.clone(),
         service_program,
         NoRefineProtocolHost,
@@ -12882,7 +12883,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
 
     // A different runnable actor may have spawned a child while this kernel
     // was suspended. The current work import must include the complete newer
-    // directory, while JAR restoration still uses only the exact dormant
+    // directory, while PVM restoration still uses only the exact dormant
     // program layout captured by the continuation.
     let mut expanded = timed_out.clone();
     // Sort before the existing target to prove current directory order does
@@ -12925,7 +12926,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             &NoRefineProtocolHost,
             vos_pvm::PvmBackend::ForceInterpreter,
         )
-        .expect("a newer tree directory does not rewrite the suspended JAR layout");
+        .expect("a newer tree directory does not rewrite the suspended PVM layout");
     assert_eq!(expanded_timeout.bytes, timed_out_output.bytes);
     assert_eq!(
         expanded_timeout.exported_blobs,
@@ -12986,7 +12987,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
 
     // Reconstruct the service from committed state before the peer reply
     // arrives. No live handler future or warm actor VM survives this boundary.
-    let reopened = LocalJamStore::from_snapshot(committed.accumulate_host().snapshot());
+    let reopened = MemoryServiceStore::from_snapshot(committed.accumulate_host().snapshot());
 
     let reply = ReplyRecord {
         call_id,
@@ -13061,9 +13062,9 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             )
             .unwrap(),
         resumed_output,
-        "both JAR backends must inject the same reply into the same snapshot"
+        "both PVM backends must inject the same reply into the same snapshot"
     );
-    let mut committed = JamService::new(
+    let mut committed = ServiceRuntime::new(
         service_pvm,
         service_program,
         NoRefineProtocolHost,
@@ -13153,10 +13154,10 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
     second_remote_service.root_service = RootServiceId([74; 32]);
     second_remote_service.deployment = DeploymentId([75; 32]);
 
-    let mut host = LocalJamStore::default();
+    let mut host = MemoryServiceStore::default();
     assert_eq!(host.import_blob(initial_state), initial_state_ref);
     assert_eq!(host.import_program(actor), actor_program);
-    let mut committed = JamService::new(
+    let mut committed = ServiceRuntime::new(
         service_pvm.clone(),
         service_program,
         NoRefineProtocolHost,
@@ -13394,8 +13395,9 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
     // must consume call 0 and publish call 1 in the same guest transaction;
     // tying consumption to handler completion would wedge this saga.
     let timeout_branch =
-        LocalJamStore::from_snapshot_bytes(&committed.accumulate_host().snapshot_bytes()).unwrap();
-    let mut timeout_service = JamService::new(
+        MemoryServiceStore::from_snapshot_bytes(&committed.accumulate_host().snapshot_bytes())
+            .unwrap();
+    let mut timeout_service = ServiceRuntime::new(
         service_pvm.clone(),
         service_program,
         NoRefineProtocolHost,
@@ -13538,7 +13540,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
         attestation: None,
     };
 
-    let reopened = LocalJamStore::from_snapshot(committed.accumulate_host().snapshot());
+    let reopened = MemoryServiceStore::from_snapshot(committed.accumulate_host().snapshot());
     assert_eq!(
         LocalWorkScheduler::prepare_resume(&reopened, initial.work.invocation, 3, None),
         Err(ScheduleError::MissingAwaitedReply(first_call))
@@ -13705,7 +13707,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
     first_resume_blobs.extend(first_resumed_output.exported_blobs);
     first_resume_blobs.sort_by_key(|blob| blob.reference.hash);
     first_resume_blobs.dedup();
-    let mut committed = JamService::new(
+    let mut committed = ServiceRuntime::new(
         service_pvm.clone(),
         service_program,
         NoRefineProtocolHost,
@@ -13771,7 +13773,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
         attestation: None,
     };
 
-    let reopened = LocalJamStore::from_snapshot(committed.accumulate_host().snapshot());
+    let reopened = MemoryServiceStore::from_snapshot(committed.accumulate_host().snapshot());
     let second_resume = LocalWorkScheduler::prepare_resume(
         &reopened,
         initial.work.invocation,
@@ -13828,7 +13830,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
         Some(vos::value::Value::U32(23))
     );
 
-    let mut committed = JamService::new(
+    let mut committed = ServiceRuntime::new(
         service_pvm,
         service_program,
         NoRefineProtocolHost,
@@ -13883,10 +13885,10 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     let initial_bytes = b"initial actor state".to_vec();
     let initial = BlobRef::of_bytes(&initial_bytes);
     let seed_work = work(actor_program, initial.clone());
-    let mut host = DurableJamStore::open(FailableCommittedImages::default()).unwrap();
+    let mut host = DurableServiceStore::open(FailableCommittedImages::default()).unwrap();
     assert_eq!(host.import_blob(initial_bytes.clone()), initial);
     assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
-    let mut service = JamService::new(
+    let mut service = ServiceRuntime::new(
         pvm.clone(),
         ProgramId::of_pvm(&pvm),
         NoRefineProtocolHost,
@@ -14092,9 +14094,6 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     assert_eq!(prepared.imports.programs[0].pvm, actor_pvm);
     let work = prepared.work;
     let continuation = ContinuationSnapshot {
-        snapshot_version: vos::service::SNAPSHOT_VERSION,
-        jar_semantics: vos::service::EXECUTION_SEMANTICS_ID,
-        vos_abi: vos::service::ABI_VERSION,
         service: work.service.clone(),
         invocation: work.invocation,
         checkpoint_step: 0,
@@ -14175,8 +14174,8 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         producer: proof_work.target,
         result: b"attested result".to_vec(),
     });
-    let proof_host = LocalJamStore::from_snapshot(service.accumulate_host().snapshot());
-    let mut proof_service = JamService::new(
+    let proof_host = MemoryServiceStore::from_snapshot(service.accumulate_host().snapshot());
+    let mut proof_service = ServiceRuntime::new(
         pvm.clone(),
         ProgramId::of_pvm(&pvm),
         NoRefineProtocolHost,
@@ -14313,7 +14312,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         .image
         .clone()
         .expect("the accepted guest transition is durable before it returns");
-    let reopened = LocalJamStore::from_snapshot_bytes(&persisted)
+    let reopened = MemoryServiceStore::from_snapshot_bytes(&persisted)
         .expect("canonical guest state survives a process-style restart");
     assert_eq!(
         LocalWorkScheduler::prepare_inbox(&reopened, call_id, 50),
@@ -14436,9 +14435,6 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     assert_eq!(service.accumulate_host().snapshot(), before_expired);
 
     let delivery_continuation = ContinuationSnapshot {
-        snapshot_version: vos::service::SNAPSHOT_VERSION,
-        jar_semantics: vos::service::EXECUTION_SEMANTICS_ID,
-        vos_abi: vos::service::ABI_VERSION,
         service: delivered.work.service.clone(),
         invocation: delivered.work.invocation,
         checkpoint_step: 0,
@@ -14615,9 +14611,6 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
     admit_linear_work(&mut service, &caller.work);
     let awaited_call = caller.work.invocation.call_id(0);
     let continuation_bytes = ContinuationSnapshot {
-        snapshot_version: vos::service::SNAPSHOT_VERSION,
-        jar_semantics: vos::service::EXECUTION_SEMANTICS_ID,
-        vos_abi: vos::service::ABI_VERSION,
         service: caller.work.service.clone(),
         invocation: caller.work.invocation,
         checkpoint_step: 0,
@@ -14762,10 +14755,7 @@ fn canonical_guest_accumulate_installs_applies_and_deduplicates_at_ic5() {
         awaited.receipt.reply_commitment,
         Some(awaited.reply.commitment())
     );
-    assert_eq!(
-        awaited.receipt.service.service_abi,
-        vos::service::ABI_VERSION
-    );
+    assert_eq!(awaited.receipt.service.platform, vos::service::PLATFORM_ID);
     assert_eq!(
         awaited.receipt.service.execution_semantics,
         vos::service::EXECUTION_SEMANTICS_ID
@@ -14871,10 +14861,10 @@ fn physical_guest_accumulate_upgrades_only_an_idle_authorized_actor() {
     let mut seed = work(actor_program, initial.clone());
     seed.service.service_program = service_program;
 
-    let mut store = DurableJamStore::open(FailableCommittedImages::default()).unwrap();
+    let mut store = DurableServiceStore::open(FailableCommittedImages::default()).unwrap();
     assert_eq!(store.import_blob(initial_bytes), initial);
     assert_eq!(store.import_program(initial_pvm.clone()), actor_program);
-    let mut service = JamService::new(
+    let mut service = ServiceRuntime::new(
         service_pvm,
         service_program,
         NoRefineProtocolHost,
@@ -15112,10 +15102,10 @@ fn disclosed_role_credentials_require_authority_verification_in_physical_accumul
         },
     };
     let install = AccumulateRequest::Install(genesis);
-    let mut host = LocalJamStore::default();
+    let mut host = MemoryServiceStore::default();
     assert_eq!(host.import_blob(initial_bytes), initial);
     assert_eq!(host.import_program(actor_pvm), actor_program);
-    let mut service = JamService::new(
+    let mut service = ServiceRuntime::new(
         service_pvm,
         service_program,
         NoRefineProtocolHost,
@@ -15302,14 +15292,14 @@ fn attested_driver_rejects_a_transition_not_produced_by_exact_refine() {
         },
     };
     let install = AccumulateRequest::Install(genesis);
-    let mut host = LocalJamStore::default();
+    let mut host = MemoryServiceStore::default();
     assert_eq!(host.import_blob(initial_bytes), initial);
     assert_eq!(
         host.import_private_witness(private_witness.bytes.clone()),
         private_witness.reference
     );
     assert_eq!(host.import_program(actor_pvm), actor_program);
-    let mut service = JamService::new(
+    let mut service = ServiceRuntime::new(
         service_pvm,
         service_program,
         NoRefineProtocolHost,
@@ -15428,9 +15418,9 @@ fn physical_guest_install_rejects_an_unavailable_actor_program() {
     let initial_bytes = b"initial actor state".to_vec();
     let initial = BlobRef::of_bytes(&initial_bytes);
     let seed_work = work(actor_program, initial.clone());
-    let mut host = LocalJamStore::default();
+    let mut host = MemoryServiceStore::default();
     assert_eq!(host.import_blob(initial_bytes), initial);
-    let mut service = JamService::new(
+    let mut service = ServiceRuntime::new(
         pvm.clone(),
         ProgramId::of_pvm(&pvm),
         NoRefineProtocolHost,
@@ -15492,9 +15482,9 @@ fn physical_guest_rejects_the_missing_preimage_length_sentinel() {
             len: u64::MAX,
         },
     );
-    let mut host = LocalJamStore::default();
+    let mut host = MemoryServiceStore::default();
     assert_eq!(host.import_program(actor_pvm), actor_program);
-    let mut service = JamService::new(
+    let mut service = ServiceRuntime::new(
         pvm.clone(),
         ProgramId::of_pvm(&pvm),
         NoRefineProtocolHost,
@@ -15548,7 +15538,7 @@ fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
         root_service: RootServiceId([202; 32]),
         deployment: DeploymentId([203; 32]),
         service_program,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -15568,10 +15558,10 @@ fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
                            attested: bool,
                            producer: ProducerId,
                            external_actors: Vec<ExternalActorBinding>| {
-        let mut host = DurableJamStore::open(FailableCommittedImages::default()).unwrap();
+        let mut host = DurableServiceStore::open(FailableCommittedImages::default()).unwrap();
         assert_eq!(host.import_blob(initial_bytes.clone()), initial);
         assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
-        let mut service = JamService::new(
+        let mut service = ServiceRuntime::new(
             CANONICAL_SERVICE_PVM.to_vec(),
             service_program,
             NoRefineProtocolHost,
@@ -15781,7 +15771,7 @@ fn crdt_delivery_is_causal_physical_and_restart_drainable_after_sync() {
         root_service: RootServiceId([0xD2; 32]),
         deployment: DeploymentId([0xD3; 32]),
         service_program,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -15816,10 +15806,10 @@ fn crdt_delivery_is_causal_physical_and_restart_drainable_after_sync() {
         },
     });
     let open = || {
-        let mut host = DurableJamStore::open(FailableCommittedImages::default()).unwrap();
+        let mut host = DurableServiceStore::open(FailableCommittedImages::default()).unwrap();
         assert_eq!(host.import_blob(initial_state.clone()), initial_state_ref);
         assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
-        let mut service = JamService::new(
+        let mut service = ServiceRuntime::new(
             service_pvm.clone(),
             service_program,
             NoRefineProtocolHost,
@@ -15944,10 +15934,10 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
                            actor: ActorId,
                            method: &str,
                            external_actors: Vec<ExternalActorBinding>| {
-        let mut host = DurableJamStore::open(FailableCommittedImages::default()).unwrap();
+        let mut host = DurableServiceStore::open(FailableCommittedImages::default()).unwrap();
         assert_eq!(host.import_blob(initial_state.clone()), initial_state_ref);
         assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
-        let mut service = JamService::new(
+        let mut service = ServiceRuntime::new(
             service_pvm.clone(),
             service_program,
             NoRefineProtocolHost,
@@ -15996,7 +15986,7 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
         root_service: RootServiceId([80; 32]),
         deployment: DeploymentId([81; 32]),
         service_program,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -16005,7 +15995,7 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
         root_service: RootServiceId([82; 32]),
         deployment: DeploymentId([83; 32]),
         service_program,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -16418,10 +16408,10 @@ fn raft_delivery_and_reply_verifiers_replay_before_physical_accumulate() {
                            actor: ActorId,
                            method: &str,
                            external_actors: Vec<ExternalActorBinding>| {
-        let mut host = LocalJamStore::default();
+        let mut host = MemoryServiceStore::default();
         assert_eq!(host.import_blob(initial_state.clone()), initial_state_ref);
         assert_eq!(host.import_program(actor_pvm.clone()), actor_program);
-        let mut service = JamService::new(
+        let mut service = ServiceRuntime::new(
             service_pvm.clone(),
             service_program,
             NoRefineProtocolHost,
@@ -16472,7 +16462,7 @@ fn raft_delivery_and_reply_verifiers_replay_before_physical_accumulate() {
         root_service: RootServiceId([0x82; 32]),
         deployment: DeploymentId([0x83; 32]),
         service_program,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -16552,13 +16542,13 @@ fn raft_delivery_and_reply_verifiers_replay_before_physical_accumulate() {
     let source_snapshot = source.accumulate_host().snapshot();
     let source_log = Arc::new(Mutex::new(SharedCommittedLog::default()));
     let mut source_leader =
-        ReplicatedJamService::new(source, TestCommittedLog::new(source_log.clone(), true));
-    let mut source_follower = ReplicatedJamService::new(
-        JamService::new(
+        ReplicatedServiceRuntime::new(source, TestCommittedLog::new(source_log.clone(), true));
+    let mut source_follower = ReplicatedServiceRuntime::new(
+        ServiceRuntime::new(
             service_pvm.clone(),
             service_program,
             NoRefineProtocolHost,
-            LocalJamStore::from_snapshot(source_snapshot),
+            MemoryServiceStore::from_snapshot(source_snapshot),
             TEST_GAS_SCHEDULE.refine,
             TEST_GAS_SCHEDULE.accumulate,
         )
@@ -16567,16 +16557,16 @@ fn raft_delivery_and_reply_verifiers_replay_before_physical_accumulate() {
     );
     let destination_snapshot = destination.accumulate_host().snapshot();
     let destination_log = Arc::new(Mutex::new(SharedCommittedLog::default()));
-    let mut destination_leader = ReplicatedJamService::new(
+    let mut destination_leader = ReplicatedServiceRuntime::new(
         destination,
         TestCommittedLog::new(destination_log.clone(), true),
     );
-    let mut destination_follower = ReplicatedJamService::new(
-        JamService::new(
+    let mut destination_follower = ReplicatedServiceRuntime::new(
+        ServiceRuntime::new(
             service_pvm,
             service_program,
             NoRefineProtocolHost,
-            LocalJamStore::from_snapshot(destination_snapshot),
+            MemoryServiceStore::from_snapshot(destination_snapshot),
             TEST_GAS_SCHEDULE.refine,
             TEST_GAS_SCHEDULE.accumulate,
         )
@@ -16749,7 +16739,7 @@ fn raft_authority_receipts_replay_on_a_fresh_follower_before_actor_apply() {
         root_service: RootServiceId([0x64; 32]),
         deployment: DeploymentId([0x65; 32]),
         service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
-        service_abi: vos::service::ABI_VERSION,
+        platform: vos::service::PLATFORM_ID,
         execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
         gas_schedule: TEST_GAS_SCHEDULE,
     };
@@ -16799,13 +16789,13 @@ fn raft_authority_receipts_replay_on_a_fresh_follower_before_actor_apply() {
         reference: initial,
         bytes: initial_bytes,
     }];
-    let mut leader_host = LocalJamStore::default();
+    let mut leader_host = MemoryServiceStore::default();
     leader_host.allow_install(&genesis);
-    let mut follower_host = LocalJamStore::default();
+    let mut follower_host = MemoryServiceStore::default();
     follower_host.allow_install(&genesis);
     let shared = Arc::new(Mutex::new(SharedCommittedLog::default()));
-    let mut leader = ReplicatedJamService::new(
-        JamService::new(
+    let mut leader = ReplicatedServiceRuntime::new(
+        ServiceRuntime::new(
             service_pvm.clone(),
             ProgramId::of_pvm(&service_pvm),
             NoRefineProtocolHost,
@@ -16816,8 +16806,8 @@ fn raft_authority_receipts_replay_on_a_fresh_follower_before_actor_apply() {
         .unwrap(),
         TestCommittedLog::new(shared.clone(), true),
     );
-    let mut follower = ReplicatedJamService::new(
-        JamService::new(
+    let mut follower = ReplicatedServiceRuntime::new(
+        ServiceRuntime::new(
             service_pvm.clone(),
             ProgramId::of_pvm(&service_pvm),
             NoRefineProtocolHost,
@@ -16839,12 +16829,12 @@ fn raft_authority_receipts_replay_on_a_fresh_follower_before_actor_apply() {
     let fresh_follower_snapshot = follower.service().accumulate_host().snapshot();
     let fresh_follower_applied = follower.log_mut().applied_index().unwrap();
     drop(follower);
-    let mut follower = ReplicatedJamService::new(
-        JamService::new(
+    let mut follower = ReplicatedServiceRuntime::new(
+        ServiceRuntime::new(
             service_pvm.clone(),
             ProgramId::of_pvm(&service_pvm),
             NoRefineProtocolHost,
-            LocalJamStore::from_snapshot(fresh_follower_snapshot),
+            MemoryServiceStore::from_snapshot(fresh_follower_snapshot),
             TEST_GAS_SCHEDULE.refine,
             TEST_GAS_SCHEDULE.accumulate,
         )
@@ -17016,9 +17006,9 @@ fn raft_authority_receipts_replay_on_a_fresh_follower_before_actor_apply() {
     let follower_snapshot = follower.service().accumulate_host().snapshot();
     let follower_applied = follower.log_mut().applied_index().unwrap();
     drop(follower);
-    let follower_host = LocalJamStore::from_snapshot(follower_snapshot);
-    let mut follower = ReplicatedJamService::new(
-        JamService::new(
+    let follower_host = MemoryServiceStore::from_snapshot(follower_snapshot);
+    let mut follower = ReplicatedServiceRuntime::new(
+        ServiceRuntime::new(
             service_pvm.clone(),
             ProgramId::of_pvm(&service_pvm),
             NoRefineProtocolHost,
@@ -17237,12 +17227,12 @@ fn raft_authority_receipts_replay_on_a_fresh_follower_before_actor_apply() {
     let follower_snapshot = follower.service().accumulate_host().snapshot();
     let follower_applied = follower.log_mut().applied_index().unwrap();
     drop(follower);
-    let mut follower = ReplicatedJamService::new(
-        JamService::new(
+    let mut follower = ReplicatedServiceRuntime::new(
+        ServiceRuntime::new(
             service_pvm.clone(),
             ProgramId::of_pvm(&service_pvm),
             NoRefineProtocolHost,
-            LocalJamStore::from_snapshot(follower_snapshot),
+            MemoryServiceStore::from_snapshot(follower_snapshot),
             TEST_GAS_SCHEDULE.refine,
             TEST_GAS_SCHEDULE.accumulate,
         )
@@ -17353,13 +17343,13 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
         reference: initial.clone(),
         bytes: initial_bytes,
     }];
-    let mut leader_host = LocalJamStore::default();
+    let mut leader_host = MemoryServiceStore::default();
     leader_host.allow_install(&genesis);
-    let mut follower_host = LocalJamStore::default();
+    let mut follower_host = MemoryServiceStore::default();
     follower_host.allow_install(&genesis);
 
     let shared_log = Arc::new(Mutex::new(SharedCommittedLog::default()));
-    let leader_service = JamService::new(
+    let leader_service = ServiceRuntime::new(
         service_pvm.clone(),
         ProgramId::of_pvm(&service_pvm),
         NoRefineProtocolHost,
@@ -17368,7 +17358,7 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
         TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
-    let follower_service = JamService::new(
+    let follower_service = ServiceRuntime::new(
         service_pvm.clone(),
         ProgramId::of_pvm(&service_pvm),
         NoRefineProtocolHost,
@@ -17377,12 +17367,12 @@ fn raft_failover_applies_committed_requests_through_the_physical_guest() {
         TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
-    let mut leader = ReplicatedJamService::new(
+    let mut leader = ReplicatedServiceRuntime::new(
         leader_service,
         TestCommittedLog::new(shared_log.clone(), true),
     );
     let mut follower =
-        ReplicatedJamService::new(follower_service, TestCommittedLog::new(shared_log, false));
+        ReplicatedServiceRuntime::new(follower_service, TestCommittedLog::new(shared_log, false));
 
     let mut wrong_program = genesis.clone();
     wrong_program.service.service_program = ProgramId([0xFF; 32]);
@@ -17816,13 +17806,13 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
         reference: initial.clone(),
         bytes: initial_bytes,
     }];
-    let mut poison_host = LocalJamStore::default();
+    let mut poison_host = MemoryServiceStore::default();
     poison_host.allow_install(&genesis);
     let poison_shared = Arc::new(Mutex::new(SharedCommittedLog::default()));
     let poison_log = TestCommittedLog::new(poison_shared.clone(), true);
-    let mut poison_follower_host = LocalJamStore::default();
+    let mut poison_follower_host = MemoryServiceStore::default();
     poison_follower_host.allow_install(&genesis);
-    let poison_service = JamService::new(
+    let poison_service = ServiceRuntime::new(
         service_pvm.clone(),
         service_program,
         NoRefineProtocolHost,
@@ -17831,8 +17821,8 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
         poison_gas_schedule.accumulate,
     )
     .unwrap();
-    let mut poisoned = ReplicatedJamService::new(poison_service, poison_log);
-    let poison_follower_service = JamService::new(
+    let mut poisoned = ReplicatedServiceRuntime::new(poison_service, poison_log);
+    let poison_follower_service = ServiceRuntime::new(
         service_pvm.clone(),
         service_program,
         NoRefineProtocolHost,
@@ -17841,7 +17831,7 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
         poison_gas_schedule.accumulate,
     )
     .unwrap();
-    let mut poison_follower = ReplicatedJamService::new(
+    let mut poison_follower = ReplicatedServiceRuntime::new(
         poison_follower_service,
         TestCommittedLog::new(poison_shared.clone(), false),
     );
@@ -17892,9 +17882,9 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
             .is_none()
     );
 
-    let mut mismatched_host = LocalJamStore::default();
+    let mut mismatched_host = MemoryServiceStore::default();
     mismatched_host.allow_install(&genesis);
-    let mismatched_service = JamService::new(
+    let mismatched_service = ServiceRuntime::new(
         service_pvm.clone(),
         service_program,
         NoRefineProtocolHost,
@@ -17903,7 +17893,7 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
         TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
-    let mut mismatched_follower = ReplicatedJamService::new(
+    let mut mismatched_follower = ReplicatedServiceRuntime::new(
         mismatched_service,
         TestCommittedLog::new(poison_shared, false),
     );
@@ -17925,7 +17915,7 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
 
     let mut retry_genesis = genesis.clone();
     retry_genesis.service.gas_schedule = TEST_GAS_SCHEDULE;
-    let mut retry_host = DurableJamStore::open(FailableCommittedImages {
+    let mut retry_host = DurableServiceStore::open(FailableCommittedImages {
         fail_next_commit: true,
         ..FailableCommittedImages::default()
     })
@@ -17933,7 +17923,7 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
     retry_host.allow_install(&retry_genesis);
     let retry_log =
         TestCommittedLog::new(Arc::new(Mutex::new(SharedCommittedLog::default())), true);
-    let retry_service = JamService::new(
+    let retry_service = ServiceRuntime::new(
         service_pvm,
         service_program,
         NoRefineProtocolHost,
@@ -17942,7 +17932,7 @@ fn deterministic_raft_dispatch_failure_advances_but_commit_failure_retries() {
         TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
-    let mut retryable = ReplicatedJamService::new(retry_service, retry_log);
+    let mut retryable = ReplicatedServiceRuntime::new(retry_service, retry_log);
     assert!(matches!(
         retryable.accumulate_with_availability(
             &AccumulateRequest::Install(retry_genesis),
@@ -18035,11 +18025,11 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         bytes: initial_bytes,
     }];
     let proof_bytes = canonical_test_proof_manifest(0x87);
-    let mut leader_host = LocalJamStore::default();
+    let mut leader_host = MemoryServiceStore::default();
     leader_host.allow_install(&genesis);
     let leader_proof = proof_bytes.clone();
     leader_host.install_proof_verifier(move |_, candidate| candidate == leader_proof);
-    let mut follower_host = DurableJamStore::open(FailableCommittedImages {
+    let mut follower_host = DurableServiceStore::open(FailableCommittedImages {
         fail_next_proof_commit: true,
         ..FailableCommittedImages::default()
     })
@@ -18054,7 +18044,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
     });
 
     let shared_log = Arc::new(Mutex::new(SharedCommittedLog::default()));
-    let leader_service = JamService::new(
+    let leader_service = ServiceRuntime::new(
         service_pvm.clone(),
         service_program,
         NoRefineProtocolHost,
@@ -18063,7 +18053,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
-    let follower_service = JamService::new(
+    let follower_service = ServiceRuntime::new(
         service_pvm.clone(),
         service_program,
         NoRefineProtocolHost,
@@ -18072,11 +18062,11 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
-    let mut leader = ReplicatedJamService::new(
+    let mut leader = ReplicatedServiceRuntime::new(
         leader_service,
         TestCommittedLog::new(shared_log.clone(), true),
     );
-    let mut follower = ReplicatedJamService::new(
+    let mut follower = ReplicatedServiceRuntime::new(
         follower_service,
         TestCommittedLog::new(shared_log.clone(), false),
     );
@@ -18259,8 +18249,8 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
     let mismatched_schedule =
         GasSchedule::new(TEST_GAS_SCHEDULE.refine, TEST_GAS_SCHEDULE.accumulate - 1);
     let mismatched_snapshot_host =
-        DurableJamStore::open(FailableCommittedImages::default()).unwrap();
-    let mismatched_snapshot_service = JamService::new(
+        DurableServiceStore::open(FailableCommittedImages::default()).unwrap();
+    let mismatched_snapshot_service = ServiceRuntime::new(
         service_pvm.clone(),
         service_program,
         NoRefineProtocolHost,
@@ -18269,7 +18259,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         mismatched_schedule.accumulate,
     )
     .unwrap();
-    let mut mismatched_snapshot_follower = ReplicatedJamService::new(
+    let mut mismatched_snapshot_follower = ReplicatedServiceRuntime::new(
         mismatched_snapshot_service,
         TestCommittedLog::new(shared_log.clone(), false).with_installed_snapshot(snapshot.clone()),
     );
@@ -18312,9 +18302,9 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
     );
 
     let mut rejecting_snapshot_host =
-        DurableJamStore::open(FailableCommittedImages::default()).unwrap();
+        DurableServiceStore::open(FailableCommittedImages::default()).unwrap();
     rejecting_snapshot_host.install_proof_verifier(|_, _| false);
-    let rejecting_snapshot_service = JamService::new(
+    let rejecting_snapshot_service = ServiceRuntime::new(
         service_pvm.clone(),
         service_program,
         NoRefineProtocolHost,
@@ -18323,7 +18313,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
-    let mut rejecting_snapshot_follower = ReplicatedJamService::new(
+    let mut rejecting_snapshot_follower = ReplicatedServiceRuntime::new(
         rejecting_snapshot_service,
         TestCommittedLog::new(shared_log.clone(), false).with_installed_snapshot(snapshot.clone()),
     );
@@ -18356,9 +18346,9 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         "a verifier denial leaves the proof side-CAS untouched"
     );
 
-    let mark_only_host = LocalJamStore::from_snapshot_bytes(&snapshot.service_image).unwrap();
+    let mark_only_host = MemoryServiceStore::from_snapshot_bytes(&snapshot.service_image).unwrap();
     let mark_only_image = mark_only_host.committed_service_image();
-    let mark_only_service = JamService::new(
+    let mark_only_service = ServiceRuntime::new(
         service_pvm.clone(),
         service_program,
         NoRefineProtocolHost,
@@ -18367,7 +18357,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         mismatched_schedule.accumulate,
     )
     .unwrap();
-    let mut mark_only_follower = ReplicatedJamService::new(
+    let mut mark_only_follower = ReplicatedServiceRuntime::new(
         mark_only_service,
         TestCommittedLog::new(Arc::new(Mutex::new(SharedCommittedLog::default())), false)
             .with_committed_index_floor(1),
@@ -18391,7 +18381,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         "cursor-only advancement cannot bless a mismatched existing image"
     );
 
-    let mut snapshot_host = DurableJamStore::open(FailableCommittedImages {
+    let mut snapshot_host = DurableServiceStore::open(FailableCommittedImages {
         fail_next_proof_commit: true,
         ..FailableCommittedImages::default()
     })
@@ -18403,7 +18393,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         snapshot_verification_count.fetch_add(1, Ordering::Relaxed);
         candidate == expected_snapshot_proof
     });
-    let snapshot_service = JamService::new(
+    let snapshot_service = ServiceRuntime::new(
         service_pvm,
         service_program,
         NoRefineProtocolHost,
@@ -18412,7 +18402,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
         TEST_GAS_SCHEDULE.accumulate,
     )
     .unwrap();
-    let mut snapshot_follower = ReplicatedJamService::new(
+    let mut snapshot_follower = ReplicatedServiceRuntime::new(
         snapshot_service,
         TestCommittedLog::new(shared_log, false).with_installed_snapshot(snapshot),
     );
@@ -18503,9 +18493,9 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
         reference: initial.clone(),
         bytes: initial_bytes,
     }];
-    let mut host = LocalJamStore::default();
+    let mut host = MemoryServiceStore::default();
     host.allow_install(&genesis);
-    let service = JamService::new(
+    let service = ServiceRuntime::new(
         service_pvm.clone(),
         ProgramId::of_pvm(&service_pvm),
         NoRefineProtocolHost,
@@ -18525,7 +18515,7 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join("raft.redb");
     let log = RaftAccumulateLog::open(&path, RaftConfig::default()).unwrap();
-    let mut replicated = ReplicatedJamService::new(service, log);
+    let mut replicated = ReplicatedServiceRuntime::new(service, log);
 
     assert!(matches!(
         replicated
@@ -18603,11 +18593,11 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
     );
     assert_eq!(installed.term, 1);
 
-    let follower_service = JamService::new(
+    let follower_service = ServiceRuntime::new(
         service_pvm.clone(),
         ProgramId::of_pvm(&service_pvm),
         NoRefineProtocolHost,
-        DurableJamStore::open(FailableCommittedImages {
+        DurableServiceStore::open(FailableCommittedImages {
             fail_next_commit: true,
             ..FailableCommittedImages::default()
         })
@@ -18618,7 +18608,7 @@ fn redb_raft_log_drives_physical_guest_accumulate() {
     .unwrap();
     let follower_log =
         RaftAccumulateLog::from_worker(follower_db, raft_config, worker, apply_rx).unwrap();
-    let mut follower = ReplicatedJamService::new(follower_service, follower_log);
+    let mut follower = ReplicatedServiceRuntime::new(follower_service, follower_log);
     assert!(matches!(
         follower.catch_up(),
         Err(vos::service::ReplicatedServiceError::ServiceImage(
@@ -18657,7 +18647,7 @@ fn malformed_guest_accumulate_returns_a_rejection_without_storage_effects() {
     let elf = service_elf();
     let pvm = vos::service::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let service = ServicePvm::new(pvm.clone(), ProgramId::of_pvm(&pvm)).unwrap();
-    let mut host = LocalJamStore::default();
+    let mut host = MemoryServiceStore::default();
 
     let output = service
         .accumulate(b"not a service request", 10_000_000, &mut host)

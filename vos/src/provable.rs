@@ -85,7 +85,7 @@ pub fn proofrec_key(tag: &[u8; 32]) -> Vec<u8> {
 /// record's pin. ONE definition, shared by the runtime, `vosx zk pin`,
 /// and the verify surface, so the join key cannot drift.
 pub fn task_blob_hash(blob: &[u8]) -> [u8; 32] {
-    crate::crypto::blake2b::blake2b_hash::<32>(b"vos/blob-addr/v1", &[blob])
+    crate::crypto::blake2b::blake2b_hash::<32>(b"vos/blob-addr", &[blob])
 }
 
 /// Prover-only material: the complete secret that re-traces the proved
@@ -319,7 +319,7 @@ mod tests {
         let blob = b"example-blob-bytes";
         assert_eq!(
             task_blob_hash(blob),
-            crate::crypto::blake2b::blake2b_hash::<32>(b"vos/blob-addr/v1", &[blob]),
+            crate::crypto::blake2b::blake2b_hash::<32>(b"vos/blob-addr", &[blob]),
         );
     }
 }

@@ -1,6 +1,6 @@
 //! Consensus Accumulate implementation executed by the generic service guest.
 //!
-//! The store passed here is one invocation-scoped JAM transaction: writes are
+//! The store passed here is one invocation-scoped service platform transaction: writes are
 //! visible to later reads, but the host publishes none of them unless the
 //! physical IC-5 entry halts successfully. Storage errors are therefore fatal
 //! rather than encoded rejections; trapping makes the host discard staging.
@@ -17,16 +17,16 @@ use super::causal::{
 };
 use super::contracts::crdt_change_blob_references;
 use super::{
-    ABI_VERSION, AccumulateRequest, AccumulatedRoleAssertion, AccumulatedTimeout,
-    AccumulationEnvelope, AccumulationReceipt, AccumulationRejection, AccumulationResult,
-    ActorGenesis, ActorId, ActorUpgrade, ActorUpgradeRecord, AuthorizationEvidence, AwaitResume,
-    BlobRef, CHECKPOINT_TOKEN_CAPACITY, CallExpirationEnvelope, CallTimeout, CheckpointToken,
+    AccumulateRequest, AccumulatedRoleAssertion, AccumulatedTimeout, AccumulationEnvelope,
+    AccumulationReceipt, AccumulationRejection, AccumulationResult, ActorGenesis, ActorId,
+    ActorUpgrade, ActorUpgradeRecord, AuthorizationEvidence, AwaitResume, BlobRef,
+    CHECKPOINT_TOKEN_CAPACITY, CallExpirationEnvelope, CallTimeout, CheckpointToken,
     ConsistencyBase, ConsistencyMode, ContinuationSnapshot, CrdtChange, CrdtDispatch,
     CrdtSyncEnvelope, DedupRecord, DeliveryEnvelope, DeliveryRecord, DirectIngress,
     EXECUTION_SEMANTICS_ID, ExternalActorDirectory, Hash, InboxRetirement, IngressRecord,
-    MessageRecord, MethodPolicy, PendingCallDeadline, ProgramId, ProofVerificationRequest,
-    PublicationAck, PublicationAckRecord, PublicationRecord, PublishedEffects,
-    ReceiptVerificationRequest, ReplyAdmissionRecord, RoleAssertionEligibility,
+    MessageRecord, MethodPolicy, PLATFORM_ID, PendingCallDeadline, ProgramId,
+    ProofVerificationRequest, PublicationAck, PublicationAckRecord, PublicationRecord,
+    PublishedEffects, ReceiptVerificationRequest, ReplyAdmissionRecord, RoleAssertionEligibility,
     RoleAuthorityBinding, RoleCredential, RoleCredentialVerificationRequest, ServiceGenesis,
     ServiceIdentity, ServiceInstallReceipt, ServiceStateTree, ServiceWire, StateKey,
     StateTreeError, StateTreeStore, StoreHeader, StoreOpenError, WorkInputId, WorkflowCheckpoint,
@@ -39,9 +39,9 @@ use super::{
 };
 
 /// Extra content-addressed operations needed by guest Accumulate in addition
-/// to ordinary JAM service storage.
+/// to ordinary service storage.
 pub trait GuestAccumulateStore: StateTreeStore {
-    /// Consensus-authenticated ambient JAM slot for this Accumulate
+    /// Consensus-authenticated ambient service platform slot for this Accumulate
     /// invocation. `None` means time-dependent transitions are unavailable.
     fn logical_timeslot(&self) -> Result<Option<u64>, Self::Error>;
 
@@ -201,15 +201,15 @@ fn retire_inbox<S: GuestAccumulateStore>(
         Err(StoreOpenError::IncompatibleSemantics) => {
             return Ok(rejected(AccumulationRejection::WrongExecutionSemantics));
         }
-        Err(StoreOpenError::LegacyStore | StoreOpenError::InvalidHeader(_)) => {
+        Err(StoreOpenError::UnknownStore | StoreOpenError::InvalidHeader(_)) => {
             return Ok(rejected(AccumulationRejection::NonCanonical));
         }
     };
     if retirement.service != header.service {
         return Ok(rejected(AccumulationRejection::WrongService));
     }
-    if header.service.service_abi != ABI_VERSION {
-        return Ok(rejected(AccumulationRejection::WrongAbi));
+    if header.service.platform != PLATFORM_ID {
+        return Ok(rejected(AccumulationRejection::WrongPlatform));
     }
     if header.service.execution_semantics != EXECUTION_SEMANTICS_ID {
         return Ok(rejected(AccumulationRejection::WrongExecutionSemantics));
@@ -310,15 +310,15 @@ fn upgrade_actor<S: GuestAccumulateStore>(
         Err(StoreOpenError::IncompatibleSemantics) => {
             return Ok(rejected(AccumulationRejection::WrongExecutionSemantics));
         }
-        Err(StoreOpenError::LegacyStore | StoreOpenError::InvalidHeader(_)) => {
+        Err(StoreOpenError::UnknownStore | StoreOpenError::InvalidHeader(_)) => {
             return Ok(rejected(AccumulationRejection::NonCanonical));
         }
     };
     if upgrade.service != header.service {
         return Ok(rejected(AccumulationRejection::WrongService));
     }
-    if header.service.service_abi != ABI_VERSION {
-        return Ok(rejected(AccumulationRejection::WrongAbi));
+    if header.service.platform != PLATFORM_ID {
+        return Ok(rejected(AccumulationRejection::WrongPlatform));
     }
     if header.service.execution_semantics != EXECUTION_SEMANTICS_ID {
         return Ok(rejected(AccumulationRejection::WrongExecutionSemantics));
@@ -388,7 +388,7 @@ fn upgrade_actor<S: GuestAccumulateStore>(
     if pending_authorized_inbox_count(&tree, upgrade.actor)? != 0 {
         return Ok(rejected(AccumulationRejection::ActorBusy(upgrade.actor)));
     }
-    // A JAR continuation binds every dormant actor program in its invocation
+    // A PVM continuation binds every dormant actor program in its invocation
     // layout, not only the actor whose message produced the checkpoint. Do
     // not activate replacement code while any durable kernel can still call
     // the old package through one of those handles.
@@ -520,15 +520,15 @@ fn admit_ingress<S: GuestAccumulateStore>(
         Err(StoreOpenError::WrongService) => {
             return Ok(rejected(AccumulationRejection::WrongService));
         }
-        Err(StoreOpenError::LegacyStore | StoreOpenError::InvalidHeader(_)) => {
+        Err(StoreOpenError::UnknownStore | StoreOpenError::InvalidHeader(_)) => {
             return Ok(rejected(AccumulationRejection::NonCanonical));
         }
     };
     if ingress.service != header.service {
         return Ok(rejected(AccumulationRejection::WrongService));
     }
-    if header.service.service_abi != ABI_VERSION {
-        return Ok(rejected(AccumulationRejection::WrongAbi));
+    if header.service.platform != PLATFORM_ID {
+        return Ok(rejected(AccumulationRejection::WrongPlatform));
     }
     if header.service.execution_semantics != EXECUTION_SEMANTICS_ID {
         return Ok(rejected(AccumulationRejection::WrongExecutionSemantics));
@@ -729,8 +729,8 @@ fn install<S: GuestAccumulateStore>(
     if read(store, header_storage_key())?.is_some() {
         return Ok(rejected(AccumulationRejection::StoreAlreadyInitialized));
     }
-    if genesis.service.service_abi != ABI_VERSION {
-        return Ok(rejected(AccumulationRejection::WrongAbi));
+    if genesis.service.platform != PLATFORM_ID {
+        return Ok(rejected(AccumulationRejection::WrongPlatform));
     }
     if genesis.service.execution_semantics != EXECUTION_SEMANTICS_ID {
         return Ok(rejected(AccumulationRejection::WrongExecutionSemantics));
@@ -855,7 +855,7 @@ fn acknowledge_publication<S: GuestAccumulateStore>(
         Err(StoreOpenError::IncompatibleSemantics) => {
             return Ok(rejected(AccumulationRejection::WrongExecutionSemantics));
         }
-        Err(StoreOpenError::LegacyStore | StoreOpenError::InvalidHeader(_)) => {
+        Err(StoreOpenError::UnknownStore | StoreOpenError::InvalidHeader(_)) => {
             return Ok(rejected(AccumulationRejection::NonCanonical));
         }
     };
@@ -910,15 +910,15 @@ fn expire_call<S: GuestAccumulateStore>(
         Err(StoreOpenError::IncompatibleSemantics) => {
             return Ok(rejected(AccumulationRejection::WrongExecutionSemantics));
         }
-        Err(StoreOpenError::LegacyStore | StoreOpenError::InvalidHeader(_)) => {
+        Err(StoreOpenError::UnknownStore | StoreOpenError::InvalidHeader(_)) => {
             return Ok(rejected(AccumulationRejection::NonCanonical));
         }
     };
     if envelope.service != header.service {
         return Ok(rejected(AccumulationRejection::WrongService));
     }
-    if header.service.service_abi != ABI_VERSION {
-        return Ok(rejected(AccumulationRejection::WrongAbi));
+    if header.service.platform != PLATFORM_ID {
+        return Ok(rejected(AccumulationRejection::WrongPlatform));
     }
     if header.service.execution_semantics != EXECUTION_SEMANTICS_ID {
         return Ok(rejected(AccumulationRejection::WrongExecutionSemantics));
@@ -1132,7 +1132,7 @@ fn deliver<S: GuestAccumulateStore>(
         Err(StoreOpenError::IncompatibleSemantics) => {
             return Ok(rejected(AccumulationRejection::WrongExecutionSemantics));
         }
-        Err(StoreOpenError::LegacyStore | StoreOpenError::InvalidHeader(_)) => {
+        Err(StoreOpenError::UnknownStore | StoreOpenError::InvalidHeader(_)) => {
             return Ok(rejected(AccumulationRejection::NonCanonical));
         }
     };
@@ -1142,8 +1142,8 @@ fn deliver<S: GuestAccumulateStore>(
     if envelope.message.to_service != header.service {
         return Ok(rejected(AccumulationRejection::WrongService));
     }
-    if header.service.service_abi != ABI_VERSION {
-        return Ok(rejected(AccumulationRejection::WrongAbi));
+    if header.service.platform != PLATFORM_ID {
+        return Ok(rejected(AccumulationRejection::WrongPlatform));
     }
     if header.service.execution_semantics != EXECUTION_SEMANTICS_ID {
         return Ok(rejected(AccumulationRejection::WrongExecutionSemantics));
@@ -1157,7 +1157,7 @@ fn deliver<S: GuestAccumulateStore>(
     let source = &envelope.source_receipt.service;
     if envelope.message.from_service != *source
         || source.root_service == header.service.root_service
-        || source.service_abi != ABI_VERSION
+        || source.platform != PLATFORM_ID
         || source.execution_semantics != EXECUTION_SEMANTICS_ID
     {
         return Ok(rejected(AccumulationRejection::InvalidReceipt));
@@ -1504,7 +1504,7 @@ fn sync_crdt<S: GuestAccumulateStore>(
         Err(StoreOpenError::IncompatibleSemantics) => {
             return Ok(rejected(AccumulationRejection::WrongExecutionSemantics));
         }
-        Err(StoreOpenError::LegacyStore | StoreOpenError::InvalidHeader(_)) => {
+        Err(StoreOpenError::UnknownStore | StoreOpenError::InvalidHeader(_)) => {
             return Ok(rejected(AccumulationRejection::NonCanonical));
         }
     };
@@ -3003,7 +3003,7 @@ fn apply<S: GuestAccumulateStore>(
         Err(StoreOpenError::IncompatibleSemantics) => {
             return Ok(rejected(AccumulationRejection::WrongExecutionSemantics));
         }
-        Err(StoreOpenError::LegacyStore | StoreOpenError::InvalidHeader(_)) => {
+        Err(StoreOpenError::UnknownStore | StoreOpenError::InvalidHeader(_)) => {
             return Ok(rejected(AccumulationRejection::NonCanonical));
         }
     };
@@ -3019,8 +3019,8 @@ fn apply<S: GuestAccumulateStore>(
     if work.service != header.service || transition.service != header.service {
         return Ok(rejected(AccumulationRejection::WrongService));
     }
-    if header.service.service_abi != ABI_VERSION {
-        return Ok(rejected(AccumulationRejection::WrongAbi));
+    if header.service.platform != PLATFORM_ID {
+        return Ok(rejected(AccumulationRejection::WrongPlatform));
     }
     if header.service.execution_semantics != EXECUTION_SEMANTICS_ID {
         return Ok(rejected(AccumulationRejection::WrongExecutionSemantics));
@@ -4677,7 +4677,7 @@ fn validate_continuation_change<S: GuestAccumulateStore>(
         };
         if previous.programs != next.programs {
             // Restoring and checkpointing again cannot add, drop, reorder, or
-            // replace a VM in the invocation layout frozen by the old JAR
+            // replace a VM in the invocation layout frozen by the old PVM
             // snapshot, even if the complete current directory has changed.
             return Ok(Some(AccumulationRejection::InvalidWorkflowTransition));
         }
@@ -4867,7 +4867,7 @@ fn validate_awaited_outcome<S: GuestAccumulateStore>(
             .deadline_timeslot
             .is_some_and(|deadline| work.logical_timeslot >= deadline)
         || awaited.receipt.reply_commitment != Some(awaited.reply.commitment())
-        || awaited.receipt.service.service_abi != ABI_VERSION
+        || awaited.receipt.service.platform != PLATFORM_ID
         || awaited.receipt.service.execution_semantics != EXECUTION_SEMANTICS_ID
         || awaited.receipt.service.root_service == work.service.root_service
         || awaited.receipt.service != external.service
@@ -5010,7 +5010,7 @@ fn contains_cycle(messages: &[MessageRecord]) -> bool {
 /// Validate stable call IDs against both new and committed workflow rows, then
 /// walk each new outbound call through its causal parents. A locally staged
 /// inbox row identifies the root slice as its sender; an outbound awaited call
-/// is separately bound to the exact active actor recorded by the JAR
+/// is separately bound to the exact active actor recorded by the PVM
 /// checkpoint. A nested sender may extend the root's exact authenticated
 /// parent call, but older child edges must originate at their parent recipient.
 /// No call may extend a parent deadline or target an actor already present in
@@ -5362,7 +5362,7 @@ mod tests {
             root_service: RootServiceId([1; 32]),
             deployment: DeploymentId([2; 32]),
             service_program: ProgramId([3; 32]),
-            service_abi: ABI_VERSION,
+            platform: PLATFORM_ID,
             execution_semantics: EXECUTION_SEMANTICS_ID,
             gas_schedule: super::super::GasSchedule::new(1_000_000_000, 5_000_000_000),
         }
@@ -5901,9 +5901,6 @@ mod tests {
         let mut header = store_header(&store);
         let work = linear_work(initial, install.resulting_state_root.unwrap());
         let continuation_bytes = ContinuationSnapshot {
-            snapshot_version: super::super::SNAPSHOT_VERSION,
-            jar_semantics: super::super::EXECUTION_SEMANTICS_ID,
-            vos_abi: super::super::ABI_VERSION,
             service: work.service.clone(),
             invocation: work.invocation,
             checkpoint_step: work.workflow_step,
@@ -6003,9 +6000,6 @@ mod tests {
         ));
 
         let continuation_bytes = ContinuationSnapshot {
-            snapshot_version: super::super::SNAPSHOT_VERSION,
-            jar_semantics: super::super::EXECUTION_SEMANTICS_ID,
-            vos_abi: super::super::ABI_VERSION,
             service: identity(),
             invocation: InvocationId([22; 32]),
             checkpoint_step: 0,
@@ -6203,7 +6197,7 @@ mod tests {
         );
     }
 
-    /// Legacy unit fixtures construct complete work envelopes directly so
+    /// Focused unit fixtures construct complete work envelopes directly so
     /// they can focus on a particular Apply rejection. Seed the exact
     /// guest-owned admission prerequisite without advancing the causal base;
     /// dedicated admission and physical-PVM tests exercise AdmitIngress.
@@ -6564,9 +6558,6 @@ mod tests {
         assert_eq!(outgoing.caller_invocation, work.invocation);
         assert_eq!(outgoing.await_ordinal, 0);
         let continuation_bytes = ContinuationSnapshot {
-            snapshot_version: super::super::SNAPSHOT_VERSION,
-            jar_semantics: super::super::EXECUTION_SEMANTICS_ID,
-            vos_abi: super::super::ABI_VERSION,
             service: work.service.clone(),
             invocation: work.invocation,
             checkpoint_step: work.workflow_step,
@@ -7073,7 +7064,6 @@ mod tests {
             statement: preparation.statement.commitment(),
             trace: Hash([12; 32]),
             proof_blob: proof_blob.clone(),
-            statement_version: super::super::ATTESTATION_STATEMENT_VERSION,
         };
         let verification = ProofVerificationRequest {
             actor_program: work.target_program,
@@ -7826,9 +7816,6 @@ mod tests {
         let first_work = linear_work(initial, install.resulting_state_root.unwrap());
         seed_direct_ingress(&mut store, &first_work);
         let continuation_bytes = ContinuationSnapshot {
-            snapshot_version: super::super::SNAPSHOT_VERSION,
-            jar_semantics: super::super::EXECUTION_SEMANTICS_ID,
-            vos_abi: super::super::ABI_VERSION,
             service: first_work.service.clone(),
             invocation: first_work.invocation,
             checkpoint_step: first_work.workflow_step,
@@ -8037,9 +8024,6 @@ mod tests {
             deadline_timeslot: Some(10),
         };
         let continuation_bytes = ContinuationSnapshot {
-            snapshot_version: super::super::SNAPSHOT_VERSION,
-            jar_semantics: super::super::EXECUTION_SEMANTICS_ID,
-            vos_abi: super::super::ABI_VERSION,
             service: first_work.service.clone(),
             invocation: first_work.invocation,
             checkpoint_step: 0,
@@ -8387,9 +8371,6 @@ mod tests {
             deadline_timeslot: Some(10),
         };
         let continuation_bytes = ContinuationSnapshot {
-            snapshot_version: super::super::SNAPSHOT_VERSION,
-            jar_semantics: super::super::EXECUTION_SEMANTICS_ID,
-            vos_abi: super::super::ABI_VERSION,
             service: work.service.clone(),
             invocation: work.invocation,
             checkpoint_step: 0,
@@ -8576,9 +8557,6 @@ mod tests {
         let call = work.invocation.call_id(0);
         let message = awaited_message(&work, peer, None, Some(20));
         let continuation_bytes = ContinuationSnapshot {
-            snapshot_version: super::super::SNAPSHOT_VERSION,
-            jar_semantics: super::super::EXECUTION_SEMANTICS_ID,
-            vos_abi: super::super::ABI_VERSION,
             service: work.service.clone(),
             invocation: work.invocation,
             checkpoint_step: 0,
@@ -10392,7 +10370,6 @@ mod tests {
         .unwrap();
         let materialized = materialize_workflow_crdt(&frontier, &identity()).unwrap();
         let statement = crate::AttestationStatement {
-            statement_version: super::super::ATTESTATION_STATEMENT_VERSION,
             space: receipt.service.space,
             actor: work.target,
             producer_name: "fixture".into(),
@@ -10415,7 +10392,6 @@ mod tests {
             statement: statement.commitment(),
             trace: Hash([51; 32]),
             proof_blob: BlobRef::of_bytes(b"proof bytes"),
-            statement_version: super::super::ATTESTATION_STATEMENT_VERSION,
         };
         let publication = PublicationRecord {
             input: work.input_id(),

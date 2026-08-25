@@ -375,7 +375,7 @@ impl TestClient {
     /// and the registry do — mirrors `instance_service_id`.
     fn resolve_instance(&self, name: &str) -> ServiceId {
         let raw: [u8; 2] =
-            vos::crypto::blake2b_hash(b"vos-instance-svc-id/v1", &[&[0u8], name.as_bytes()]);
+            vos::crypto::blake2b_hash(b"vos-instance-svc-id", &[&[0u8], name.as_bytes()]);
         let local = (u16::from_le_bytes(raw) & 0x7FFF).max(0x100);
         ServiceId(((self.daemon_prefix as u32) << 16) | (local as u32))
     }

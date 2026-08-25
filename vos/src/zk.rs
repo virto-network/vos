@@ -14,7 +14,7 @@
 //! I/O bytes:
 //!
 //! ```text
-//! H = blake2b_256( b"vos/zk/io/v1" || H_field(public) || H_field(return) )
+//! H = blake2b_256( b"vos/zk/io" || H_field(public) || H_field(return) )
 //! ```
 //!
 //! It is **tagless**: no actor/message identity enters the hash.  That
@@ -49,7 +49,7 @@
 //!    (or computes the hash directly with [`compute_io_hash_typed`]).
 //! 2. The actor's halt sequence places that hash into the final-state
 //!    register window φ[9..12] (RISC-V `a2..a5`) via inline-asm `in`
-//!    operands on the Gray Paper halt jump (see `actors::run`'s
+//!    operands on the PVM specification halt jump (see `actors::run`'s
 //!    `halt_with_output_bound`). The closing chip pins the final-register
 //!    columns and the verifier's boundary-binding check
 //!    (`vos_pvm_proof::boundary_binding`) equates `final_state.registers` to
@@ -67,7 +67,7 @@
 //!    recomputed [`compute_io_hash`] — alongside the STARK validity
 //!    check against the trusted program commitment.
 //!
-//! The ABI version lives in the hash domain separator (`b"vos/zk/io/v1"`),
+//! The ABI version lives in the hash domain separator (`b"vos/zk/io"`),
 //! not in `PROOF_FORMAT_VERSION` (which is constraint-shape only): old
 //! proofs leave φ[9..13] at their cold-start zero, so their
 //! `public_io_hash` is `[0u8; 32]` and naturally fails the equality
@@ -82,12 +82,12 @@ pub mod state;
 /// the trailing version rotates the binding so old proofs and old
 /// verifiers cleanly fail the equality check rather than silently
 /// cross-validating.
-const IO_DOMAIN: &[u8] = b"vos/zk/io/v1";
+const IO_DOMAIN: &[u8] = b"vos/zk/io";
 
 /// Domain separator for the per-field inner hash.  Distinct from
 /// [`IO_DOMAIN`] so a field digest can never be confused with a full
 /// io-hash.
-const IO_FIELD_DOMAIN: &[u8] = b"vos/zk/io-field/v1";
+const IO_FIELD_DOMAIN: &[u8] = b"vos/zk/io-field";
 
 /// Inner reduction of one I/O field to a fixed-width 32-byte digest.
 ///
@@ -105,7 +105,7 @@ fn field_hash(bytes: &[u8]) -> [u8; 32] {
 ///
 /// ```text
 /// H = blake2b_256(
-///       b"vos/zk/io/v1"            // domain + ABI version
+///       b"vos/zk/io"            // domain + ABI version
 ///    || field_hash(public_bytes)   // 32 bytes, injective reduction
 ///    || field_hash(return_bytes)   // 32 bytes
 /// )

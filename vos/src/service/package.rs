@@ -17,8 +17,7 @@ use super::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 pub struct PackageManifest {
     pub name: String,
     pub version: String,
-    pub service_abi: u16,
-    pub snapshot_version: u16,
+    pub platform: Hash,
     pub execution_semantics: Hash,
     pub service_program: ProgramId,
     pub actor_program: ProgramId,
@@ -80,8 +79,7 @@ pub struct PackageRolePolicies {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageError {
-    WrongAbi,
-    WrongSnapshotVersion,
+    WrongPlatform,
     WrongExecutionSemantics,
     EmptyName,
     EmptyProgram,
@@ -111,11 +109,8 @@ impl core::error::Error for PackageError {}
 
 impl VosPackage {
     pub fn validate(&self) -> Result<(), PackageError> {
-        if self.manifest.service_abi != super::ABI_VERSION {
-            return Err(PackageError::WrongAbi);
-        }
-        if self.manifest.snapshot_version != super::SNAPSHOT_VERSION {
-            return Err(PackageError::WrongSnapshotVersion);
+        if self.manifest.platform != super::PLATFORM_ID {
+            return Err(PackageError::WrongPlatform);
         }
         if self.manifest.execution_semantics != super::EXECUTION_SEMANTICS_ID {
             return Err(PackageError::WrongExecutionSemantics);
@@ -202,7 +197,7 @@ impl VosPackage {
         bytes.extend_from_slice(&self.actor_pvm);
         DeploymentId(crate::crypto::blake2b_hash::<32>(
             b"vos/deployment/service",
-            &[&bytes, &self.manifest.service_abi.to_le_bytes()],
+            &[&bytes, &self.manifest.platform.0],
         ))
     }
 
@@ -389,7 +384,7 @@ impl ServiceWire for VosPackage {
 }
 
 impl ServiceWire for PackageRolePolicies {
-    const MAGIC: [u8; 4] = *b"VRP2";
+    const MAGIC: [u8; 4] = *b"VRPW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
@@ -455,8 +450,7 @@ fn decode_package_task_dependencies(
 fn encode_manifest(encoder: &mut Encoder<'_>, manifest: &PackageManifest) {
     encoder.string(&manifest.name);
     encoder.string(&manifest.version);
-    encoder.u16(manifest.service_abi);
-    encoder.u16(manifest.snapshot_version);
+    encoder.fixed(&manifest.platform.0);
     encoder.fixed(&manifest.execution_semantics.0);
     encoder.fixed(&manifest.service_program.0);
     encoder.fixed(&manifest.actor_program.0);
@@ -471,8 +465,7 @@ fn decode_manifest(decoder: &mut Decoder<'_>) -> Result<PackageManifest, DecodeE
     Ok(PackageManifest {
         name: decoder.string()?,
         version: decoder.string()?,
-        service_abi: decoder.u16()?,
-        snapshot_version: decoder.u16()?,
+        platform: Hash(decoder.fixed()?),
         execution_semantics: Hash(decoder.fixed()?),
         service_program: ProgramId(decoder.fixed()?),
         actor_program: ProgramId(decoder.fixed()?),
@@ -573,8 +566,7 @@ mod tests {
             manifest: PackageManifest {
                 name: "counter".into(),
                 version: "2.0.0".into(),
-                service_abi: super::super::ABI_VERSION,
-                snapshot_version: super::super::SNAPSHOT_VERSION,
+                platform: super::super::PLATFORM_ID,
                 execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
                 service_program: super::super::VOS_SERVICE_PROGRAM_ID,
                 actor_program: ProgramId::of_pvm(&pvm),

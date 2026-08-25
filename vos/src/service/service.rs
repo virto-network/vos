@@ -2,7 +2,7 @@
 //!
 //! There is deliberately no native Refine implementation and no native
 //! transition-apply shortcut here. Both paths execute the same canonical PVM
-//! that deployment installs; the host supplies only imports and an atomic JAM
+//! that deployment installs; the host supplies only imports and an atomic service platform
 //! storage transaction boundary.
 
 use alloc::boxed::Box;
@@ -18,14 +18,14 @@ use super::{
     AccumulateProtocolHost, AccumulateRequest, AccumulatedReply, AccumulatedRoleAssertion,
     AccumulationEnvelope, AccumulationReceipt, AccumulationRejection, AccumulationResult,
     AttestationDelivery, AuthorizationEvidence, CommittedServiceImageHost, GasSchedule,
-    ImportedBlob, ImportedProgram, LocalJamStoreSnapshot, ProgramId, ProofCommitment,
+    ImportedBlob, ImportedProgram, MemoryServiceSnapshot, ProgramId, ProofCommitment,
     ProofVerificationRequest, PublishedEffects, ReceiptVerificationHost,
     ReceiptVerificationRequest, RefineImports, RefineOutput, RefineProtocolHost, RefineTrace,
     RoleCredential, ServiceIdentity, ServiceImageInstallError, ServicePvm, ServicePvmError,
     ServicePvmOutput, ServiceWire, SystemCapabilityId, Transition, VosPackage, WorkEnvelope,
 };
 
-pub(crate) const ROOT_UPGRADE_REQUEST_MAGIC: [u8; 4] = *b"VRU2";
+pub(crate) const ROOT_UPGRADE_REQUEST_MAGIC: [u8; 4] = *b"VRUW";
 
 pub(crate) fn root_upgrade_capability(
     service: &ServiceIdentity,
@@ -47,7 +47,7 @@ pub(crate) fn root_upgrade_authenticator(
 ) -> super::Hash {
     let mut request = Vec::new();
     request.extend_from_slice(&ROOT_UPGRADE_REQUEST_MAGIC);
-    request.extend_from_slice(&super::ABI_VERSION.to_le_bytes());
+    request.extend_from_slice(&super::PLATFORM_ID.0);
     let mut encoder = Encoder(&mut request);
     encoder.fixed(&expected_deployment.0);
     encoder.fixed(&expected_program.0);
@@ -510,7 +510,7 @@ impl<E: core::fmt::Debug, P: core::fmt::Debug> core::fmt::Display for AttestedSe
 impl<E: core::fmt::Debug, P: core::fmt::Debug> core::error::Error for AttestedServiceError<E, P> {}
 
 /// One canonical Accumulate request whose Raft log position is committed.
-/// Time-dependent entries carry the consensus JAM slot observed by the
+/// Time-dependent entries carry the consensus service platform slot observed by the
 /// proposer so every follower replays the identical IC-5 ambient input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommittedAccumulateEntry {
@@ -568,7 +568,7 @@ pub struct CommittedAccumulateBatch {
 }
 
 /// Exact physical service image represented by one compacted Raft prefix.
-/// The image remains the canonical `LocalJamStoreSnapshot` wire; this
+/// The image remains the canonical `MemoryServiceSnapshot` wire; this
 /// envelope binds it to the log position advertised by InstallSnapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommittedProofArtifact {
@@ -590,7 +590,7 @@ pub struct CommittedServiceSnapshot {
 }
 
 impl ServiceWire for CommittedServiceSnapshot {
-    const MAGIC: [u8; 4] = *b"VRS4";
+    const MAGIC: [u8; 4] = *b"VRSW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
@@ -611,7 +611,7 @@ impl ServiceWire for CommittedServiceSnapshot {
                 bytes: decoder.bytes()?,
             })
         })?;
-        let service_snapshot = LocalJamStoreSnapshot::decode(&service_image)?;
+        let service_snapshot = MemoryServiceSnapshot::decode(&service_image)?;
         if applied_index == 0 {
             return Err(DecodeError::NonCanonical);
         }
@@ -644,7 +644,7 @@ impl ServiceWire for CommittedServiceSnapshot {
 /// Raft boundary for the service service state machine.
 ///
 /// Implementations order the exact canonical request and its optional trusted
-/// JAM-slot provenance, and return from `propose_at` only after the named entry
+/// service platform-slot provenance, and return from `propose_at` only after the named entry
 /// is quorum committed. They never apply actor state themselves: leaders and
 /// followers pass every returned entry to the same physical service PVM before
 /// advancing `applied_index`.
@@ -729,7 +729,7 @@ pub enum ServiceDispatchError {
 impl ServiceDispatchError {
     /// Whether replaying the same committed request against the same service
     /// program and gas schedule must reproduce this failure. This is an
-    /// explicit allowlist: new host/JAR failure variants remain retryable until
+    /// explicit allowlist: new host/PVM failure variants remain retryable until
     /// their determinism is proved. A deterministic guest failure is an
     /// ordered no-op; local allocation, JIT, host, and durable-commit failures
     /// leave the apply cursor untouched.
@@ -820,7 +820,7 @@ impl core::error::Error for ServiceDispatchError {}
 /// Drives the canonical service PVM in a local node or conformance test.
 /// `R` is immutable Refine import plumbing; `A` owns the atomic Accumulate
 /// transaction. Neither is allowed to implement actor semantics.
-pub struct JamService<R, A> {
+pub struct ServiceRuntime<R, A> {
     pvm: ServicePvm,
     refine_host: R,
     accumulate_host: A,
@@ -830,16 +830,16 @@ pub struct JamService<R, A> {
 /// Raft orchestration around the canonical generic service PVM.
 ///
 /// The log owns ordering only. It contains `AccumulateRequest` bytes plus the
-/// trusted JAM slot required by time-dependent requests, rather than
+/// trusted service platform slot required by time-dependent requests, rather than
 /// `EffectLog` commands or leader-produced state snapshots. Consequently
 /// failover and follower catch-up execute guest validation, deduplication, and
 /// storage mutation through the identical IC-5 entry used by the leader.
-pub struct ReplicatedJamService<R, A, L> {
-    service: JamService<R, A>,
+pub struct ReplicatedServiceRuntime<R, A, L> {
+    service: ServiceRuntime<R, A>,
     log: L,
 }
 
-impl<R, A> JamService<R, A> {
+impl<R, A> ServiceRuntime<R, A> {
     pub fn new(
         canonical_service_pvm: Vec<u8>,
         expected_program: ProgramId,
@@ -883,16 +883,16 @@ impl<R, A> JamService<R, A> {
     }
 }
 
-impl<R, A, L> ReplicatedJamService<R, A, L> {
-    pub const fn new(service: JamService<R, A>, log: L) -> Self {
+impl<R, A, L> ReplicatedServiceRuntime<R, A, L> {
+    pub const fn new(service: ServiceRuntime<R, A>, log: L) -> Self {
         Self { service, log }
     }
 
-    pub fn service(&self) -> &JamService<R, A> {
+    pub fn service(&self) -> &ServiceRuntime<R, A> {
         &self.service
     }
 
-    pub fn service_mut(&mut self) -> &mut JamService<R, A> {
+    pub fn service_mut(&mut self) -> &mut ServiceRuntime<R, A> {
         &mut self.service
     }
 
@@ -904,12 +904,12 @@ impl<R, A, L> ReplicatedJamService<R, A, L> {
         &mut self.log
     }
 
-    pub fn into_parts(self) -> (JamService<R, A>, L) {
+    pub fn into_parts(self) -> (ServiceRuntime<R, A>, L) {
         (self.service, self.log)
     }
 }
 
-impl<R: RefineProtocolHost, A: AccumulateProtocolHost> JamService<R, A> {
+impl<R: RefineProtocolHost, A: AccumulateProtocolHost> ServiceRuntime<R, A> {
     pub fn refine_actor_tree(
         &self,
         work: &WorkEnvelope,
@@ -999,7 +999,7 @@ impl<R: RefineProtocolHost, A: AccumulateProtocolHost> JamService<R, A> {
     }
 
     /// Accumulate a time-dependent request against a consensus-authenticated
-    /// JAM logical timeslot. Ordinary requests should use [`Self::accumulate`].
+    /// service platform logical timeslot. Ordinary requests should use [`Self::accumulate`].
     pub fn accumulate_at(
         &mut self,
         request: &AccumulateRequest,
@@ -1124,7 +1124,7 @@ fn decode_refined_service_output(
     })
 }
 
-impl<R, A> JamService<R, A>
+impl<R, A> ServiceRuntime<R, A>
 where
     R: RefineProtocolHost,
     A: AccumulateProtocolHost + AttestationProofHost,
@@ -1216,7 +1216,6 @@ where
             statement: preparation.statement.commitment(),
             trace: produced.trace,
             proof_blob: proof_blob.clone(),
-            statement_version: super::ATTESTATION_STATEMENT_VERSION,
         };
         let verification = ProofVerificationRequest {
             actor_program: envelope.work.target_program,
@@ -1366,14 +1365,14 @@ fn validate_committed_attestation<E, P>(
         })
         || committed_receipt.reply_commitment != Some(reply.commitment())
         || preparation.statement.claim_commitment
-            != super::Hash::digest(b"vos/attestation-claim/v3", &[&reply.result])
+            != super::Hash::digest(b"vos/attestation-claim", &[&reply.result])
     {
         return Err(AttestedServiceError::CommitMismatch);
     }
     Ok(())
 }
 
-impl<R, A, L> ReplicatedJamService<R, A, L>
+impl<R, A, L> ReplicatedServiceRuntime<R, A, L>
 where
     R: RefineProtocolHost,
     A: AccumulateProtocolHost
@@ -1409,7 +1408,7 @@ where
         &self,
         service_image: &[u8],
     ) -> Result<(), ReplicatedServiceError<L::Error>> {
-        let snapshot = LocalJamStoreSnapshot::decode(service_image).map_err(|_| {
+        let snapshot = MemoryServiceSnapshot::decode(service_image).map_err(|_| {
             ReplicatedServiceError::ServiceImage(ServiceImageInstallError::InvalidSnapshot)
         })?;
         if let Some(identity) = snapshot.service_identity().map_err(|_| {
@@ -1565,7 +1564,7 @@ where
             // image, or advancing the applied cursor. A fresh host has no
             // existing header against which install can detect a mismatch.
             self.validate_service_image_identity(&snapshot.service_image)?;
-            let service_snapshot = LocalJamStoreSnapshot::decode(&snapshot.service_image)
+            let service_snapshot = MemoryServiceSnapshot::decode(&snapshot.service_image)
                 .map_err(|_| ReplicatedServiceError::InvalidCommittedLog)?;
             if self
                 .service
@@ -1667,7 +1666,7 @@ where
     }
 
     /// Quorum-order a time-dependent request together with the
-    /// consensus-authenticated JAM slot observed by the leader. The slot is
+    /// consensus-authenticated service platform slot observed by the leader. The slot is
     /// part of the replicated entry and is replayed identically by followers.
     pub fn accumulate_at(
         &mut self,
@@ -1910,7 +1909,7 @@ fn snapshot_proof_artifacts<A: AttestationProofHost>(
     host: &A,
     service_image: &[u8],
 ) -> Result<Vec<CommittedProofArtifact>, ()> {
-    let snapshot = LocalJamStoreSnapshot::decode(service_image).map_err(|_| ())?;
+    let snapshot = MemoryServiceSnapshot::decode(service_image).map_err(|_| ())?;
     snapshot
         .referenced_proof_verifications()
         .map_err(|_| ())?

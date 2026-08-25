@@ -1,7 +1,7 @@
 # VOS examples
 
 The public actor examples use only the service source and package model. Application
-authors build one canonical actor PVM; the pinned generic VOS service owns JAM
+authors build one canonical actor PVM; the pinned generic VOS service owns service platform
 Refine and Accumulate.
 
 The [`actors`](actors/) workspace contains four focused examples:

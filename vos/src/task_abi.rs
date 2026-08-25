@@ -4,14 +4,14 @@
 //! initial memory image at its witness-buffer address — the same
 //! `__VOS_WITNESS` channel the prover's tracer patches
 //! (`vos_pvm_proof::actor::trace_blob_with_patches`), and the same shape as a
-//! JAM work-package payload. The live invocation and a traced
+//! service platform work-package payload. The live invocation and a traced
 //! re-execution therefore start from byte-identical images: proving a
 //! recorded Task invocation is a literal replay of bytes the parent
 //! already held.
 //!
 //! The child is FETCH-free and READ-free — refine-pure by construction
 //! (`run_task_service` reads this buffer instead of issuing input
-//! hostcalls), which is exactly what JAR refine permits for `machine`-
+//! hostcalls), which is exactly what PVM refine permits for `machine`-
 //! nested blobs.
 //!
 //! ## Layout (little-endian)

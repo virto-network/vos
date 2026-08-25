@@ -68,8 +68,8 @@ is already proven at the application layer in cipher-clerk
 - cipher-clerk `merkle.rs` (`SparseMerkleTree`, depth 128, 16-byte
   keys, `BatchProof`), `view.rs` (`SparseLedger`: panics on unproven
   reads) — the W4 generalization source.
-- JAM phase discipline (jar `spec/JarBook/Capability.lean:205-208`):
-  `STORAGE_R`/`STORAGE_W` are **accumulate-only** in JAM; vos's
+- service platform phase discipline (jar `spec/JarBook/Capability.lean:205-208`):
+  `STORAGE_R`/`STORAGE_W` are **accumulate-only** in service platform; vos's
   refine-legal `STORAGE_R` is a deliberate deviation for `local`
   consistency. Nothing in this plan may add a hostcall.
 - Recurring trap: PVM e2e tests run prebuilt actor ELFs — **rebuild the
@@ -82,12 +82,12 @@ is already proven at the application layer in cipher-clerk
 ## Non-goals (explicitly out of scope)
 
 - **No new hostcalls.** A `SCAN`/`NEXT_KEY` primitive would break actors
-  on a conformant JAM host and buys ~1 ecall per index page over the
+  on a conformant service platform host and buys ~1 ecall per index page over the
   self-indexed layout. Rejected permanently, not deferred.
 - **No change to phase legality.** `STORAGE_R`-in-refine stays for
   `local`-consistency actors, documented as a vos-local deviation;
   provable/replicated paths get the witnessed backend (W4) which is the
-  JAM-portable one.
+  service platform-portable one.
 - **Lazy host-side hydration.** `read_kv_rows` stays eager (full row
   load at agent boot). Fine at tens of MB; read-through to redb is a
   follow-up when an actual space hurts.
@@ -125,12 +125,12 @@ is already proven at the application layer in cipher-clerk
    ~200 index pages ≈ 50k keys — enough headroom for every current
    actor; deeper directories are a follow-up.
 4. **Iteration without hostcalls, three mechanisms.** (a) Self-indexed
-   structures over point reads — legal in JAM accumulate. (b) In W4 the
+   structures over point reads — legal in service platform accumulate. (b) In W4 the
    unhashed-key SMT doubles as the ordered index; the node rows a
    traversal reads *are* the authentication-path material. (c) For
    refine-phase/provable access, the host prefetches touched
    leaves + multiproof into the witness (`SparseLedger` pattern) — on
-   JAM, refine has no storage reads at all, so this is the only
+   service platform, refine has no storage reads at all, so this is the only
    conformant refine path anyway.
 5. **Deletes are a first-class effect.** New wire tag
    `EFFECT_DELETE = 0x05`, `Effect::Delete { key }`. Same journal,

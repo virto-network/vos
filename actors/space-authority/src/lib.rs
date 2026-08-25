@@ -433,7 +433,7 @@ mod tests {
                 root_service: RootServiceId([3; 32]),
                 deployment: DeploymentId([4; 32]),
                 service_program: ProgramId([5; 32]),
-                service_abi: vos::service::ABI_VERSION,
+                platform: vos::service::PLATFORM_ID,
                 execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
                 gas_schedule: vos::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
             },

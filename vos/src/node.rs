@@ -1336,7 +1336,7 @@ pub(crate) type ProofBlobStore = Arc<RwLock<HashMap<[u8; 32], Vec<u8>>>>;
 /// the namespace can't collide with other hash uses on the node
 /// (replication IDs, CRDT CIDs, etc.).
 pub fn proof_blob_hash(bytes: &[u8]) -> [u8; 32] {
-    crate::crypto::blake2b::blake2b_hash::<32>(b"vos/proof-blob/v1", &[bytes])
+    crate::crypto::blake2b::blake2b_hash::<32>(b"vos/proof-blob", &[bytes])
 }
 
 /// Lower-case hex encoding of a proof-blob hash. Used as the
@@ -4406,7 +4406,7 @@ impl VosNode {
 
     /// Insert `bytes` into the proof-blob store. Returns the
     /// content address (32-byte blake2b-256 of the bytes under the
-    /// `"vos/proof-blob/v1"` domain tag).
+    /// `"vos/proof-blob"` domain tag).
     ///
     /// Idempotent on equal bytes; the hash is collision-resistant.
     /// Used by producers to stash a STARK proof before sending a
@@ -4578,7 +4578,7 @@ impl VosNode {
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                if tell.payload.starts_with(b"VRT2") {
+                if tell.payload.starts_with(b"VRTW") {
                     use crate::service::ServiceWire;
 
                     let peer = tell.peer.to_bytes();
@@ -7194,7 +7194,7 @@ impl VosNode {
         // and their acknowledgements. Inbound frames retain their exact Noise
         // peer and are authenticated by the bridge + root handler instead.
         #[cfg(all(feature = "network", feature = "storage"))]
-        if envelope.payload.starts_with(b"VRT2")
+        if envelope.payload.starts_with(b"VRTW")
             && envelope.authenticated_source_peer.is_none()
             && let Some(binding) =
                 service_transport_destination_route(&self.service_actor_routes, &envelope.payload)
@@ -7237,7 +7237,7 @@ impl VosNode {
         // trusted destination therefore wins over the lossy local-prefix
         // classification. Inbound frames carry only `authenticated_source_peer`
         // and continue through ordinary local delivery below.
-        if envelope.payload.starts_with(b"VRT2")
+        if envelope.payload.starts_with(b"VRTW")
             && let Some(_peer_bytes) = envelope.destination_peer.as_deref()
         {
             #[cfg(feature = "network")]
@@ -7313,7 +7313,7 @@ impl VosNode {
         {
             let net = self.shared_network.lock().ok().and_then(|g| g.clone());
             if let Some(net) = net {
-                if envelope.payload.starts_with(b"VRT2") {
+                if envelope.payload.starts_with(b"VRTW") {
                     warn!(%target, "node: remote service envelope omitted its exact destination peer");
                     return;
                 }
@@ -7627,7 +7627,7 @@ fn send_service_status(reply: ReplyChannel, status: u8, id: ServiceId) {
 const SERVICE_RAFT_REDIRECT_STATUS: u8 = 0xFE;
 
 #[cfg(all(feature = "storage", feature = "network"))]
-const SERVICE_RAFT_DELEGATION_MAGIC: [u8; 4] = *b"VRD4";
+const SERVICE_RAFT_DELEGATION_MAGIC: [u8; 4] = *b"VRDW";
 
 #[cfg(all(feature = "storage", feature = "network"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10949,7 +10949,7 @@ fn retry_service_root_transport<B>(
                 .max(service_wall_timeslot()),
         ),
         Err(failure) => {
-            warn!(%id, ?failure, "production JAM timeslot is unavailable");
+            warn!(%id, ?failure, "production service platform timeslot is unavailable");
             None
         }
     };
@@ -11977,7 +11977,7 @@ fn wrap_with_unauthenticated_prefix(
 /// effective message ceiling is `BUF_SIZE` minus that header.
 ///
 /// This guard lives in the VOS dispatch layer, not `VosRuntime::send_to`, so
-/// the JAR/JAM-aligned runtime and the `FETCH` hostcall stay buffer-size-
+/// the PVM/service platform-aligned runtime and the `FETCH` hostcall stay buffer-size-
 /// agnostic (a guest with a larger buffer would accept a larger item). Returns
 /// `true` when the item fit and was enqueued.
 fn send_if_deliverable(runtime: &mut VosRuntime, svc_id: ServiceId, payload: Vec<u8>) -> bool {
@@ -12327,7 +12327,7 @@ fn dispatch_once(
 /// Derive the per-replica `CrdtEvent.origin` from the group's
 /// replication_id and the host node's 16-bit prefix.
 ///
-/// `blake2b("vos-replica-origin/v1" || replication_id || prefix)`
+/// `blake2b("vos-replica-origin" || replication_id || prefix)`
 /// — the prefix domain-separates replicas of the same group
 /// running on different nodes, while the replication_id
 /// domain-separates groups that happen to share a node. The
@@ -12336,7 +12336,7 @@ fn dispatch_once(
 #[cfg(feature = "storage")]
 fn derive_replica_origin(replication_id: &[u8; 32], node_prefix: u16) -> [u8; 32] {
     let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
-    h.update(b"vos-replica-origin/v1");
+    h.update(b"vos-replica-origin");
     h.update(&[0u8]);
     h.update(replication_id);
     h.update(&node_prefix.to_le_bytes());
@@ -15678,7 +15678,7 @@ mod tests {
         assert_eq!(
             allocate_service_observed_slot_after_barrier(&clock, 121, Some(121)),
             Ok(121),
-            "several transitions may share one consensus JAM slot",
+            "several transitions may share one consensus service platform slot",
         );
         assert_eq!(
             allocate_service_observed_slot_after_barrier(&clock, 121, Some(120)),
@@ -15710,7 +15710,7 @@ mod tests {
             root_service: crate::service::RootServiceId([2; 32]),
             deployment: crate::service::DeploymentId([3; 32]),
             service_program: crate::service::ProgramId([4; 32]),
-            service_abi: crate::service::ABI_VERSION,
+            platform: crate::service::PLATFORM_ID,
             execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: crate::service::GasSchedule::new(1_000_000, 1_000_000),
         };
@@ -16007,7 +16007,7 @@ mod tests {
             root_service: crate::service::RootServiceId([2; 32]),
             deployment: crate::service::DeploymentId([3; 32]),
             service_program: crate::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: crate::service::ABI_VERSION,
+            platform: crate::service::PLATFORM_ID,
             execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
         };
@@ -16083,7 +16083,7 @@ mod tests {
             root_service: crate::service::RootServiceId([2; 32]),
             deployment: crate::service::DeploymentId([3; 32]),
             service_program: crate::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: crate::service::ABI_VERSION,
+            platform: crate::service::PLATFORM_ID,
             execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
         };
@@ -16411,7 +16411,7 @@ mod tests {
             root_service: crate::service::RootServiceId([6; 32]),
             deployment: crate::service::DeploymentId([7; 32]),
             service_program: crate::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: crate::service::ABI_VERSION,
+            platform: crate::service::PLATFORM_ID,
             execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
         };
@@ -16723,7 +16723,7 @@ mod tests {
             root_service: crate::service::RootServiceId([2; 32]),
             deployment: crate::service::DeploymentId([3; 32]),
             service_program: crate::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: crate::service::ABI_VERSION,
+            platform: crate::service::PLATFORM_ID,
             execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
         };
@@ -16805,7 +16805,7 @@ mod tests {
             root_service: crate::service::RootServiceId([5; 32]),
             deployment: crate::service::DeploymentId([6; 32]),
             service_program: crate::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: crate::service::ABI_VERSION,
+            platform: crate::service::PLATFORM_ID,
             execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
         };
@@ -18928,7 +18928,7 @@ mod tests {
             root_service: crate::service::RootServiceId([2; 32]),
             deployment: crate::service::DeploymentId([3; 32]),
             service_program: crate::service::VOS_SERVICE_PROGRAM_ID,
-            service_abi: crate::service::ABI_VERSION,
+            platform: crate::service::PLATFORM_ID,
             execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
         };
@@ -19942,7 +19942,7 @@ mod tests {
                     root_service: crate::service::RootServiceId([0xA7; 32]),
                     deployment: crate::service::DeploymentId([0xA8; 32]),
                     service_program: crate::service::VOS_SERVICE_PROGRAM_ID,
-                    service_abi: crate::service::ABI_VERSION,
+                    platform: crate::service::PLATFORM_ID,
                     execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
                     gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
                 },

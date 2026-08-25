@@ -8,12 +8,12 @@ pub const BEACON_DOMAIN_TAG: &[u8] = b"vos-beacon/service";
 
 /// Domain tag for a round's VRF input `α` ([`crate::derive_alpha`]) — kept
 /// distinct from the beacon hash so the two derivations can never collide.
-pub const ALPHA_DOMAIN_TAG: &[u8] = b"vos-chronos-alpha/v1";
+pub const ALPHA_DOMAIN_TAG: &[u8] = b"vos-chronos-alpha";
 
 /// Domain tag for the committee combine ([`crate::combine_betas`]) — the hash
 /// that folds the XOR of the voters' VRF outputs down to the 32-byte round
 /// entropy.
-pub const COMBINE_DOMAIN_TAG: &[u8] = b"vos-chronos-combine/v1";
+pub const COMBINE_DOMAIN_TAG: &[u8] = b"vos-chronos-combine";
 
 /// Bound on the operator-chosen per-space domain label. Replicated to every
 /// node, so cap it.
@@ -29,9 +29,9 @@ pub const ENTROPY_LEN: usize = 32;
 pub const SLOTS_PER_EPOCH: u64 = 4;
 
 /// How many folded epochs behind the live head a value must be before it is
-/// considered **finalized** (the JAM η₂ lesson: the live head η₀ is biasable by
+/// considered **finalized** (the service platform η₂ lesson: the live head η₀ is biasable by
 /// a last-revealer, so grinding-sensitive consumers read a lagged buffer). A lag
-/// of 2 matches JAM's η₂. [`crate::Chronos::latest_final`] /
+/// of 2 matches service platform's η₂. [`crate::Chronos::latest_final`] /
 /// [`crate::Chronos::randomness_at`] never return a round newer than this;
 /// [`crate::Chronos::current`] is the un-lagged head, documented low-stakes-only.
 pub const FINALIZED_LAG: usize = 2;

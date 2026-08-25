@@ -298,8 +298,8 @@ struct TestProductionTrustObservations {
 }
 
 impl TestProductionTrustSidecar {
-    const REQUEST_MAGIC: [u8; 4] = *b"VTA1";
-    const RESPONSE_MAGIC: [u8; 4] = *b"VTR1";
+    const REQUEST_MAGIC: [u8; 4] = *b"VTAW";
+    const RESPONSE_MAGIC: [u8; 4] = *b"VTRW";
     const VERSION: u16 = 1;
     const QUERY_POLICY: u8 = 0;
     const CURRENT_TIMESLOT: u8 = 1;
@@ -360,10 +360,8 @@ impl TestProductionTrustSidecar {
                 let payload_len = u32::from_le_bytes(request[7..11].try_into().unwrap()) as usize;
                 assert_eq!(payload_len, request.len() - 11);
 
-                let request_hash = vos::service::Hash::digest(
-                    b"vos/production-trust-socket/request/v1",
-                    &[&request],
-                );
+                let request_hash =
+                    vos::service::Hash::digest(b"vos/production-trust-socket/request", &[&request]);
                 let result = Self::classify(
                     tag,
                     &request[11..],
@@ -376,7 +374,7 @@ impl TestProductionTrustSidecar {
                 response.extend_from_slice(&policy.0);
                 response.push(result);
                 if result == Self::TIMESLOT {
-                    // One JAM slot admits multiple service transitions. Keep
+                    // One service platform slot admits multiple service transitions. Keep
                     // the observation stable across the node's allocation and
                     // IC-5 verification calls; changing it between those two
                     // reads must fail closed.
@@ -1018,11 +1016,10 @@ fn signed_service_package_runs_and_reopens_through_the_space_daemon() {
         &["release", "verify", &release_arg],
     );
     assert!(
-        verified.contains(&format!("ABI {}", vos::service::ABI_VERSION))
-            && verified.contains(&format!(
-                "schema {}",
-                vos::service::SERVICE_STORE_SCHEMA_VERSION,
-            )),
+        verified.contains(&format!(
+            "platform {}",
+            hex::encode(vos::service::PLATFORM_ID.0)
+        )),
         "release verification must report the pinned protocol: {verified}",
     );
     let authority_path = release_dir.join("space-authority.pvm");

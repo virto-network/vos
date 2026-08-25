@@ -1,7 +1,7 @@
 //! Build and verify one self-describing production artifact directory.
 //!
 //! `vos-service.pvm` is the consensus program all hosts execute. The canonical
-//! `space-authority.pvm` is the ABI-17 authority identity sealed into new
+//! `space-authority.pvm` is the authority identity sealed into new
 //! production spaces. A release must carry these exact pins
 //! together; selecting either artifact from a developer build directory would
 //! make a deployment unreproducible or an existing space impossible to open.
@@ -17,8 +17,7 @@ use vos::service::{ProgramId, ServicePvm};
 
 use crate::bundled;
 
-const RELEASE_FORMAT: &str = "VOSR1";
-const RELEASE_VERSION: u32 = 1;
+const RELEASE_FORMAT: &str = "VOS-RELEASE";
 const MANIFEST_FILE: &str = "manifest.json";
 const SERVICE_FILE: &str = "vos-service.pvm";
 const AUTHORITY_FILE: &str = "space-authority.pvm";
@@ -47,9 +46,7 @@ pub enum ReleaseCommand {
 #[serde(deny_unknown_fields)]
 struct ReleaseManifest {
     format: String,
-    version: u32,
-    platform_abi: u16,
-    store_schema: u16,
+    platform: String,
     execution_semantics: String,
     service: ReleaseArtifact,
     authority: ReleaseArtifact,
@@ -69,10 +66,9 @@ pub fn run(command: ReleaseCommand) -> anyhow::Result<()> {
         ReleaseCommand::Bundle { service_pvm, out } => bundle(&service_pvm, &out),
         ReleaseCommand::Verify { directory } => verify(&directory).map(|manifest| {
             println!(
-                "verified {} (ABI {}, schema {}, semantics {})",
+                "verified {} (platform {}, semantics {})",
                 directory.display(),
-                manifest.platform_abi,
-                manifest.store_schema,
+                manifest.platform,
                 manifest.execution_semantics,
             );
         }),
@@ -101,8 +97,7 @@ fn bundle(service_path: &Path, output: &Path) -> anyhow::Result<()> {
     fs::create_dir(output).with_context(|| format!("reserve {}", output.display()))?;
     let mut guard = PartialDirectory(Some(output.to_path_buf()));
     fs::write(output.join(SERVICE_FILE), &service).context("write pinned service PVM")?;
-    fs::write(output.join(AUTHORITY_FILE), authority)
-        .context("write canonical ABI-17 authority PVM")?;
+    fs::write(output.join(AUTHORITY_FILE), authority).context("write canonical authority PVM")?;
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).context("encode release manifest")?;
     fs::write(output.join(MANIFEST_FILE), manifest_bytes).context("write release manifest")?;
     verify(output).context("verify staged production release")?;
@@ -160,11 +155,11 @@ fn validate_service(bytes: &[u8]) -> anyhow::Result<()> {
 fn validate_authority(bytes: &[u8]) -> anyhow::Result<()> {
     let digest = vos::crypto::blake2b_hash::<32>(&[], &[bytes]);
     if digest != bundled::SPACE_AUTHORITY_BLAKE2B_256 {
-        bail!("authority PVM does not match the canonical ABI-17 release bytes");
+        bail!("authority PVM does not match the canonical release bytes");
     }
     let program = ProgramId::of_pvm(bytes);
     if program.0 != bundled::SPACE_AUTHORITY_PROGRAM_ID {
-        bail!("authority PVM does not match the canonical ABI-17 program identity");
+        bail!("authority PVM does not match the canonical program identity");
     }
     Ok(())
 }
@@ -172,9 +167,7 @@ fn validate_authority(bytes: &[u8]) -> anyhow::Result<()> {
 fn manifest_for(service: &[u8], authority: &[u8]) -> ReleaseManifest {
     ReleaseManifest {
         format: RELEASE_FORMAT.into(),
-        version: RELEASE_VERSION,
-        platform_abi: vos::service::ABI_VERSION,
-        store_schema: vos::service::SERVICE_STORE_SCHEMA_VERSION,
+        platform: hex::encode(vos::service::PLATFORM_ID.0),
         execution_semantics: hex::encode(vos::service::EXECUTION_SEMANTICS_ID.0),
         service: artifact(SERVICE_FILE, service),
         authority: artifact(AUTHORITY_FILE, authority),
@@ -341,14 +334,10 @@ mod tests {
     }
 
     #[test]
-    fn manifest_binds_protocol_versions_and_both_artifacts() {
+    fn manifest_binds_platform_and_both_artifacts() {
         let manifest = manifest_for(b"service", b"authority");
-        assert_eq!(manifest.format, "VOSR1");
-        assert_eq!(manifest.platform_abi, vos::service::ABI_VERSION);
-        assert_eq!(
-            manifest.store_schema,
-            vos::service::SERVICE_STORE_SCHEMA_VERSION
-        );
+        assert_eq!(manifest.format, RELEASE_FORMAT);
+        assert_eq!(manifest.platform, hex::encode(vos::service::PLATFORM_ID.0));
         assert_eq!(manifest.service.file, SERVICE_FILE);
         assert_eq!(manifest.authority.file, AUTHORITY_FILE);
         assert_ne!(manifest.service.blake2b_256, manifest.authority.blake2b_256);
@@ -356,7 +345,7 @@ mod tests {
 
     #[test]
     fn authority_pin_rejects_changed_bytes() {
-        assert!(validate_authority(b"not the canonical ABI-17 authority").is_err());
+        assert!(validate_authority(b"not the canonical authority").is_err());
     }
 
     #[cfg(unix)]

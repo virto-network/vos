@@ -5,7 +5,7 @@
 /// KeyPackage it minted, the directory dedupes by it, and the
 /// Welcome routing hint on the msg-ctl chain carries the same
 /// value so a joiner recognises which record admits it.
-pub const KP_HASH_DOMAIN_TAG: &[u8] = b"vos-msg-kp/v1";
+pub const KP_HASH_DOMAIN_TAG: &[u8] = b"vos-msg-kp";
 
 /// Bound on one serialized KeyPackage (typically a few hundred
 /// bytes for the pinned ciphersuite).

@@ -21,20 +21,20 @@ use super::{
     ActorId, ActorUpgrade, ActorUpgradeRecord, AttestedServiceError, AuthorizationEvidence,
     BlobRef, CausalCallContext, CommittedImageStore, ConsistencyBase, ConsistencyMode,
     ContinuationSnapshot, CrdtChange, CrdtSyncEnvelope, DedupRecord, DeliveryRecord, DeviceSecret,
-    DeviceSignerRefineHost, DirectIngress, DurableJamStore, DurableStoreOpenError,
-    ExternalActorBinding, ExternalActorDirectory, ImportedBlob, ImportedProgram, JamService,
-    LocalJamStore, LocalJamStoreHost, LocalStoreReadError, LocalWorkRequest, LocalWorkScheduler,
-    MessageRecord, MethodPolicy, Origin, PackageError, PackageRolePolicies, PreparedWork,
-    ProductionTrust, ProductionTrustError, ProgramId, ProofArtifactStore, PublicationAck,
-    PublicationRecord, PublishedEffects, RefinedServiceOutput, RoleAssertionEligibility,
-    RoleAuthorityBinding, RoleAuthorizationClaim, RoleCredential, ScheduleError,
-    ServiceDispatchError, ServiceGenesis, ServiceIdentity, ServicePvmError, ServiceWire, StateKey,
-    VosPackage, WorkInputId, WorkflowCheckpoint, crdt_node_storage_key, dedup_storage_key,
-    delivery_storage_key,
+    DeviceSignerRefineHost, DirectIngress, DurableServiceStore, DurableStoreOpenError,
+    ExternalActorBinding, ExternalActorDirectory, ImportedBlob, ImportedProgram,
+    LocalStoreReadError, LocalWorkRequest, LocalWorkScheduler, MemoryServiceHost,
+    MemoryServiceStore, MessageRecord, MethodPolicy, Origin, PackageError, PackageRolePolicies,
+    PreparedWork, ProductionTrust, ProductionTrustError, ProgramId, ProofArtifactStore,
+    PublicationAck, PublicationRecord, PublishedEffects, RefinedServiceOutput,
+    RoleAssertionEligibility, RoleAuthorityBinding, RoleAuthorizationClaim, RoleCredential,
+    ScheduleError, ServiceDispatchError, ServiceGenesis, ServiceIdentity, ServicePvmError,
+    ServiceRuntime, ServiceWire, StateKey, VosPackage, WorkInputId, WorkflowCheckpoint,
+    crdt_node_storage_key, dedup_storage_key, delivery_storage_key,
 };
 
 #[cfg(feature = "storage")]
-use super::{ReplicatedJamService, ReplicatedServiceError};
+use super::{ReplicatedServiceError, ReplicatedServiceRuntime};
 #[cfg(feature = "storage")]
 use crate::commit::CommitError;
 #[cfg(feature = "storage")]
@@ -135,7 +135,7 @@ impl RootTreeAttestedResult {
 }
 
 impl ServiceWire for RootTreeAttestedResult {
-    const MAGIC: [u8; 4] = *b"VAR2";
+    const MAGIC: [u8; 4] = *b"VARW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
@@ -164,7 +164,7 @@ impl ServiceWire for RootTreeAttestedResult {
 }
 
 impl ServiceWire for RootTreeInvocation {
-    const MAGIC: [u8; 4] = *b"VRI2";
+    const MAGIC: [u8; 4] = *b"VRIW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
@@ -246,7 +246,7 @@ pub enum RootTreeTransport {
 }
 
 impl ServiceWire for RootTreeTransport {
-    const MAGIC: [u8; 4] = *b"VRT2";
+    const MAGIC: [u8; 4] = *b"VRTW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
@@ -452,7 +452,7 @@ impl RootTreeTransport {
 }
 
 fn direct_ingress_from_request(
-    store: &LocalJamStore,
+    store: &MemoryServiceStore,
     service: &ServiceIdentity,
     request: &LocalWorkRequest,
     private_arguments: bool,
@@ -479,7 +479,7 @@ fn direct_ingress_from_request(
 }
 
 fn direct_ingress_authorization(
-    store: &LocalJamStore,
+    store: &MemoryServiceStore,
     ingress: &DirectIngress,
 ) -> Result<AuthorizationEvidence, LocalRootTreeInvokeError> {
     let Some(causal) = ingress.crdt_ingress() else {
@@ -772,9 +772,11 @@ pub enum RootTreeIngressRecovery {
 }
 
 enum RootTreeServiceDriver<B> {
-    Direct(JamService<DeviceSignerRefineHost, DurableJamStore<B>>),
+    Direct(ServiceRuntime<DeviceSignerRefineHost, DurableServiceStore<B>>),
     #[cfg(feature = "storage")]
-    Raft(ReplicatedJamService<DeviceSignerRefineHost, DurableJamStore<B>, RaftAccumulateLog>),
+    Raft(
+        ReplicatedServiceRuntime<DeviceSignerRefineHost, DurableServiceStore<B>, RaftAccumulateLog>,
+    ),
 }
 
 enum RootTreeDriverConfig {
@@ -845,7 +847,7 @@ where
         }
     }
 
-    fn accumulate_host(&self) -> &DurableJamStore<B> {
+    fn accumulate_host(&self) -> &DurableServiceStore<B> {
         match self {
             Self::Direct(service) => service.accumulate_host(),
             #[cfg(feature = "storage")]
@@ -853,7 +855,7 @@ where
         }
     }
 
-    fn accumulate_host_mut(&mut self) -> &mut DurableJamStore<B> {
+    fn accumulate_host_mut(&mut self) -> &mut DurableServiceStore<B> {
         match self {
             Self::Direct(service) => service.accumulate_host_mut(),
             #[cfg(feature = "storage")]
@@ -1058,7 +1060,7 @@ where
         }
     }
 
-    fn into_store(self) -> DurableJamStore<B> {
+    fn into_store(self) -> DurableServiceStore<B> {
         match self {
             Self::Direct(service) => service.into_hosts().1,
             #[cfg(feature = "storage")]
@@ -1067,7 +1069,7 @@ where
     }
 }
 
-/// A durable local host for exactly one logical JAM service/root actor tree.
+/// A durable local host for exactly one logical service/root actor tree.
 pub struct LocalRootTreeService<B> {
     service: RootTreeServiceDriver<B>,
     identity: ServiceIdentity,
@@ -1211,7 +1213,7 @@ fn same_service_incarnation_except_deployment(
     left.space == right.space
         && left.root_service == right.root_service
         && left.service_program == right.service_program
-        && left.service_abi == right.service_abi
+        && left.platform == right.platform
         && left.execution_semantics == right.execution_semantics
         && left.gas_schedule == right.gas_schedule
 }
@@ -1277,8 +1279,8 @@ impl LocalRootTreeConfig {
         {
             return Err(LocalRootTreeConfigError::WrongServiceProgram);
         }
-        if self.service.service_abi != super::ABI_VERSION
-            || self.package.manifest.service_abi != super::ABI_VERSION
+        if self.service.platform != super::PLATFORM_ID
+            || self.package.manifest.platform != super::PLATFORM_ID
         {
             return Err(LocalRootTreeConfigError::WrongServiceAbi);
         }
@@ -1306,7 +1308,7 @@ impl LocalRootTreeConfig {
         if self.role_authority.as_ref().is_some_and(|authority| {
             authority.service.space != self.service.space
                 || authority.service == self.service
-                || authority.service.service_abi != super::ABI_VERSION
+                || authority.service.platform != super::PLATFORM_ID
                 || authority.service.execution_semantics != super::EXECUTION_SEMANTICS_ID
                 || !authority.service.gas_schedule.is_valid()
                 || authority.actor == ActorId::ZERO
@@ -1785,7 +1787,8 @@ where
             LocalRootTreeOpenError::InvalidConfig(LocalRootTreeConfigError::InvalidGenesis)
         })?;
         let production_proof_verifier = proof_verifier.is_some() || production_trust.is_some();
-        let mut store = DurableJamStore::open(backend).map_err(LocalRootTreeOpenError::Store)?;
+        let mut store =
+            DurableServiceStore::open(backend).map_err(LocalRootTreeOpenError::Store)?;
         if let Some(trust) = production_trust {
             store
                 .install_production_trust(trust)
@@ -1805,7 +1808,7 @@ where
         }
         let expected_program = config.service.service_program;
         let refine_host = DeviceSignerRefineHost::new(config.device_secret.clone());
-        let mut service = JamService::new(
+        let mut service = ServiceRuntime::new(
             config.service_pvm,
             expected_program,
             refine_host,
@@ -1820,7 +1823,7 @@ where
             RootTreeDriverConfig::Direct => RootTreeServiceDriver::Direct(service),
             #[cfg(feature = "storage")]
             RootTreeDriverConfig::Raft(log) => {
-                RootTreeServiceDriver::Raft(ReplicatedJamService::new(service, log))
+                RootTreeServiceDriver::Raft(ReplicatedServiceRuntime::new(service, log))
             }
         };
 
@@ -2055,11 +2058,11 @@ where
         self.service.raft_propose_timeout_ms()
     }
 
-    pub fn store(&self) -> &DurableJamStore<B> {
+    pub fn store(&self) -> &DurableServiceStore<B> {
         self.service.accumulate_host()
     }
 
-    pub fn store_mut(&mut self) -> &mut DurableJamStore<B> {
+    pub fn store_mut(&mut self) -> &mut DurableServiceStore<B> {
         self.service.accumulate_host_mut()
     }
 
@@ -4194,8 +4197,7 @@ mod tests {
             manifest: super::super::PackageManifest {
                 name: "replacement".into(),
                 version: "2.1.0".into(),
-                service_abi: super::super::ABI_VERSION,
-                snapshot_version: super::super::SNAPSHOT_VERSION,
+                platform: super::super::PLATFORM_ID,
                 execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
                 service_program: super::super::VOS_SERVICE_PROGRAM_ID,
                 actor_program: ProgramId::of_pvm(&actor_pvm),
@@ -4255,7 +4257,7 @@ mod tests {
                 root_service: super::super::RootServiceId([31; 32]),
                 deployment: super::super::DeploymentId([32; 32]),
                 service_program: ProgramId([33; 32]),
-                service_abi: super::super::ABI_VERSION,
+                platform: super::super::PLATFORM_ID,
                 execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
                 gas_schedule: super::super::GasSchedule::new(1_000_000_000, 5_000_000_000),
             },
@@ -4368,7 +4370,7 @@ mod tests {
             root_service: super::super::RootServiceId([2; 32]),
             deployment: super::super::DeploymentId([3; 32]),
             service_program: ProgramId([4; 32]),
-            service_abi: super::super::ABI_VERSION,
+            platform: super::super::PLATFORM_ID,
             execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
             gas_schedule: super::super::GasSchedule::new(1_000_000_000, 5_000_000_000),
         };

@@ -247,7 +247,7 @@ unsafe impl GlobalAlloc for FreeListHeap {
 #[global_allocator]
 static HEAP: FreeListHeap = FreeListHeap::new();
 
-/// Reset the current actor VM's arena immediately before a non-returning JAR
+/// Reset the current actor VM's arena immediately before a non-returning PVM
 /// REPLY. No allocation may be read or dropped after this call.
 ///
 /// # Safety

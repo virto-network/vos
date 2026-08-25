@@ -1,4 +1,4 @@
-//! `vosx` — JAM-aligned PVM executor + space orchestrator.
+//! `vosx` — service platform-aligned PVM executor + space orchestrator.
 //!
 //! Top-level surface is intentionally tiny: every space-related
 //! operation lives under `vosx space *`. The remaining
@@ -117,7 +117,7 @@ enum Command {
     },
     /// Transpile and validate the protocol-pinned generic service PVM.
     ServicePvm {
-        /// `vos-service.elf` built with the pinned VOS/JAR revisions.
+        /// `vos-service.elf` built with the pinned VOS/PVM revisions.
         elf: PathBuf,
         /// Output path; defaults to the input path with a `.pvm` extension.
         #[arg(long)]

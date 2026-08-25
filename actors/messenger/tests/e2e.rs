@@ -529,7 +529,7 @@ impl RawClient {
     /// against the group's leader.
     fn publish_kp_raw(&self, owner: &str, kp: Vec<u8>) -> Option<u8> {
         let raw: [u8; 2] =
-            vos::crypto::blake2b_hash(b"vos-instance-svc-id/v1", &[&[0u8], b"msg-directory"]);
+            vos::crypto::blake2b_hash(b"vos-instance-svc-id", &[&[0u8], b"msg-directory"]);
         let local = (u16::from_le_bytes(raw) & 0x7FFF).max(0x100);
         let target = ServiceId(((self.daemon_prefix as u32) << 16) | (local as u32));
         let msg = Msg::new("publish_kp")
@@ -555,7 +555,7 @@ impl RawClient {
     /// msg-<chan>-log replicas.
     fn raw_envelopes(&self, log_instance: &str) -> Vec<msg_log::EnvelopeRow> {
         let raw: [u8; 2] = vos::crypto::blake2b_hash(
-            b"vos-instance-svc-id/v1",
+            b"vos-instance-svc-id",
             &[&[0u8], log_instance.as_bytes()],
         );
         let local = (u16::from_le_bytes(raw) & 0x7FFF).max(0x100);

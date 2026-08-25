@@ -9,12 +9,12 @@
 //! and **serves** them over a stable pull API; it never *originates* time or
 //! randomness. The single feeder — the raft leader at the sequencing boundary —
 //! samples the wall-clock and OS entropy once, commits them via `advance`, and
-//! every replica replays the committed values identically. This is JAM's model
+//! every replica replays the committed values identically. This is service platform's model
 //! (sample once at the proposer, commit, replay; the wall-clock only *gates*
 //! acceptance) and drand's architecture (a known committee produces, everyone
 //! pulls), without drand's crypto.
 //!
-//! Derived from the JAM Gray Paper: time is an integer timeslot the block
+//! Derived from the service platform PVM specification: time is an integer timeslot the block
 //! author writes into the signed header (`H_t`), and state advances by a pure
 //! *copy* (`τ' ≡ H_t`) — the local wall-clock only bounds acceptance
 //! (`parent_t < H_t ≤ w/6`), never feeds execution. Entropy is a rotating
@@ -73,11 +73,11 @@
 //! favourable beacon) before committing; grinding-sensitive consumers must
 //! therefore read the **lagged/finalized** value ([`Chronos::latest_final`] /
 //! [`Chronos::randomness_at`]), never the live head ([`Chronos::current`]) — the
-//! head is biasable by a last-revealer, exactly as JAM reads the lagged buffer
+//! head is biasable by a last-revealer, exactly as service platform reads the lagged buffer
 //! η₂ rather than the live η₀. Bias resistance comes from the committee layer:
 //! ECVRF over Ristretto255 with a committee XOR-combine ([`combine_betas`]),
 //! folded behind this same API so a consumer reads the same rows whether or not
-//! a committee is active. (A Bandersnatch RingVRF for JAM interop fits the same
+//! a committee is active. (A Bandersnatch RingVRF for service platform interop fits the same
 //! shape.)
 //!
 //! State is rkyv-serialized as a whole struct with no on-disk version tag, so a
@@ -333,7 +333,7 @@ impl Chronos {
     }
 
     /// The latest **finalized** round — the head lagged by [`FINALIZED_LAG`]
-    /// folds (the JAM η₂ analog). This is the read grinding-sensitive consumers
+    /// folds (the service platform η₂ analog). This is the read grinding-sensitive consumers
     /// and the messenger hedge use. `None` until at least `FINALIZED_LAG + 1`
     /// rounds exist (so right after `init`, a consumer gets `None` ⇒ no hedge ⇒
     /// no behavior change). Note round 0 (genesis) carries no entropy and is

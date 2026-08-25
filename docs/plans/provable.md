@@ -104,7 +104,7 @@ refine IC 0 and accumulate IC 5):
 - **Refine-purity.** A proof exists only for a refine-pure execution
   (no FETCH loop, no warm state, deterministic from the witness). A
   `#[actor(task)]` is exactly that unit; a service/refine actor is not.
-  This is JAM's own split — refine is the provable phase.
+  This is service platform's own split — refine is the provable phase.
 - **Image economy.** A small Task image keeps canonical-shape floors
   and per-segment proving cost down; a provable twin of a large
   service actor would prove the whole service image.

@@ -247,7 +247,7 @@ pub fn with_change<R>(change: ChangeId, f: impl FnOnce() -> Result<R, Error>) ->
 
 /// Replace the allocator namespace restored inside a suspended actor VM.
 ///
-/// A JAR snapshot intentionally preserves the active Rust stack, including
+/// A PVM snapshot intentionally preserves the active Rust stack, including
 /// this scope. The resume token names the new execution slice, so resumption
 /// must reset both its change identity and operation ordinal before the guest
 /// executes any post-await mutation.

@@ -1,9 +1,9 @@
-//! Raft log adapter for the JAM-aligned service service state machine.
+//! Raft log adapter for the service platform-aligned service service state machine.
 //!
 //! Unlike [`super::strategy::RaftCommit`], this adapter never serializes an
 //! `EffectLog` and never materializes actor state itself. The replicated data
 //! entry carries one canonical `AccumulateRequest` plus the authenticated
-//! JAM slot for time-dependent requests; `ReplicatedJamService` executes
+//! service platform slot for time-dependent requests; `ReplicatedServiceRuntime` executes
 //! committed entries through the physical service PVM and advances
 //! `last_applied` only after that local service-image commit succeeds.
 
@@ -21,7 +21,7 @@ use crate::service::wire::{DecodeError, Decoder, Encoder};
 use crate::service::{
     AccumulateRequest, CommittedAccumulateBatch, CommittedAccumulateEntry, CommittedAccumulateLog,
     CommittedProofArtifact, CommittedServiceSnapshot, Hash, ImportedBlob, ImportedProgram,
-    LocalJamStoreSnapshot, ProgramId, ReceiptVerificationRequest, ServiceWire, VosPackage,
+    MemoryServiceSnapshot, ProgramId, ReceiptVerificationRequest, ServiceWire, VosPackage,
 };
 
 use super::log::{LogEntry, RaftLog, RaftMeta};
@@ -65,7 +65,8 @@ impl RaftAccumulatePayload {
         })?;
         if matches!(&decoded, AccumulateRequest::ExpireCall(_)) != logical_timeslot.is_some() {
             return Err(CommitError::Config(
-                "raft service time-dependent entry has invalid JAM-slot provenance".into(),
+                "raft service time-dependent entry has invalid service platform-slot provenance"
+                    .into(),
             ));
         }
         if production_trust_policy.is_some_and(|policy| policy == Hash::ZERO) {
@@ -150,7 +151,7 @@ fn package_from_service_image(
     service_image: &[u8],
     expected_catalog_hash: [u8; 32],
 ) -> Result<Option<Vec<u8>>, CommitError> {
-    let snapshot = LocalJamStoreSnapshot::decode(service_image).map_err(|_| {
+    let snapshot = MemoryServiceSnapshot::decode(service_image).map_err(|_| {
         CommitError::Config("committed Raft service snapshot is not canonical".into())
     })?;
     for bytes in snapshot.content_blobs() {
@@ -225,7 +226,7 @@ pub fn recover_catalog_package_artifact(
 }
 
 impl ServiceWire for RaftAccumulatePayload {
-    const MAGIC: [u8; 4] = *b"VRQ5";
+    const MAGIC: [u8; 4] = *b"VRQW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
@@ -301,7 +302,7 @@ enum Role {
     },
 }
 
-/// Concrete committed-request log used by [`crate::service::ReplicatedJamService`].
+/// Concrete committed-request log used by [`crate::service::ReplicatedServiceRuntime`].
 pub struct RaftAccumulateLog {
     db: Arc<Database>,
     log: RaftLog,
@@ -707,7 +708,7 @@ impl CommittedAccumulateLog for RaftAccumulateLog {
                 self.meta.commit_index,
             )));
         }
-        LocalJamStoreSnapshot::decode(service_image).map_err(|_| {
+        MemoryServiceSnapshot::decode(service_image).map_err(|_| {
             CommitError::Config("raft service applied service image is not canonical".into())
         })?;
         let snapshot = CommittedServiceSnapshot {
@@ -736,9 +737,9 @@ mod tests {
     use super::super::redb_storage::RedbStorage;
     use super::*;
     use crate::service::{
-        ABI_VERSION, ActorId, CallExpirationEnvelope, CallTimeout, ConsistencyBase, DeploymentId,
-        EXECUTION_SEMANTICS_ID, Hash, InvocationId, ProgramId, PublicationAck, RootServiceId,
-        ServiceIdentity, SpaceId, WorkInputId,
+        ActorId, CallExpirationEnvelope, CallTimeout, ConsistencyBase, DeploymentId,
+        EXECUTION_SEMANTICS_ID, Hash, InvocationId, PLATFORM_ID, ProgramId, PublicationAck,
+        RootServiceId, ServiceIdentity, SpaceId, WorkInputId,
     };
     use vos_raft::{Meta, Storage, WriteBatch};
 
@@ -749,7 +750,7 @@ mod tests {
                 root_service: RootServiceId([byte; 32]),
                 deployment: DeploymentId([3; 32]),
                 service_program: ProgramId([4; 32]),
-                service_abi: ABI_VERSION,
+                platform: PLATFORM_ID,
                 execution_semantics: EXECUTION_SEMANTICS_ID,
                 gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
             },
@@ -799,7 +800,7 @@ mod tests {
     }
 
     fn service_image(byte: u8) -> Vec<u8> {
-        let mut store = crate::service::LocalJamStore::default();
+        let mut store = crate::service::MemoryServiceStore::default();
         store.import_blob(vec![byte]);
         store.snapshot_bytes()
     }
@@ -819,7 +820,7 @@ mod tests {
                 committed_index: 1,
             }
         );
-        let service_image = LocalJamStoreSnapshot::default().encode();
+        let service_image = MemoryServiceSnapshot::default().encode();
         log.mark_applied(1, &service_image, &[]).unwrap();
         drop(log);
 
@@ -882,7 +883,7 @@ mod tests {
         assert_eq!(RaftAccumulatePayload::decode(&encoded).unwrap(), payload);
 
         let mut retired = encoded;
-        retired[..4].copy_from_slice(b"VRQ4");
+        retired[..4].copy_from_slice(b"VRQW");
         assert!(RaftAccumulatePayload::decode(&retired).is_err());
         assert!(
             RaftAccumulatePayload::from_request(
@@ -1112,7 +1113,7 @@ mod tests {
                 committed_index: 2,
             }
         );
-        let service_image = LocalJamStoreSnapshot::default().encode();
+        let service_image = MemoryServiceSnapshot::default().encode();
         log.mark_applied(2, &service_image, &[]).unwrap();
         assert_eq!(log.applied_index().unwrap(), 2);
 

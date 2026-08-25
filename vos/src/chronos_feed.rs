@@ -121,7 +121,7 @@ impl ChronosFeeder {
         // so the VRF key is independent of every other use of the node key and
         // never derivable from public material. `keypair_from_seed` reduces it
         // into the scalar field, so any 32-byte seed yields a valid key.
-        let seed = crate::crypto::blake2b_hash(b"vos-chronos-vrf/v1", &[&key_bytes]);
+        let seed = crate::crypto::blake2b_hash(b"vos-chronos-vrf", &[&key_bytes]);
         let (vrf_sk, vrf_pk) = vrf::keypair_from_seed(&seed);
         let vrf_pk_bytes = vrf_pk.to_bytes().to_vec();
         Ok(Self {

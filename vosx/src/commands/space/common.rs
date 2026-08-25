@@ -92,14 +92,14 @@ pub fn consistency_from_u8(c: u8) -> Option<Consistency> {
     }
 }
 
-/// Per-space registry replication-id: blake2b("vos-space-registry/v1"
+/// Per-space registry replication-id: blake2b("vos-space-registry"
 /// || space_id). Deterministic from `space_id` so any two replicas
 /// of the same space subscribe to the same gossipsub topic.
 pub fn registry_replication_id(space_id: &[u8; 32]) -> [u8; 32] {
-    vos::crypto::blake2b_hash(b"vos-space-registry/v1", &[&[0u8], space_id])
+    vos::crypto::blake2b_hash(b"vos-space-registry", &[&[0u8], space_id])
 }
 
-/// Per-hyperspace registry replication-id: blake2b("vos-hyperspace/v1"
+/// Per-hyperspace registry replication-id: blake2b("vos-hyperspace"
 /// || hyperspace_name). All member spaces of the same hyperspace
 /// derive the same id from the shared name and so subscribe to the
 /// same gossipsub topic for the hyperspace registry. Distinct from
@@ -111,7 +111,7 @@ pub fn registry_replication_id(space_id: &[u8; 32]) -> [u8; 32] {
 /// replication group.
 #[allow(dead_code)]
 pub fn derive_hyperspace_id(hyperspace_name: &str) -> [u8; 32] {
-    vos::crypto::blake2b_hash(b"vos-hyperspace/v1", &[&[0u8], hyperspace_name.as_bytes()])
+    vos::crypto::blake2b_hash(b"vos-hyperspace", &[&[0u8], hyperspace_name.as_bytes()])
 }
 
 /// Compute a space's id from the registry's genesis DAG root.
@@ -184,7 +184,7 @@ pub fn genesis_node_validator(space_id: [u8; 32]) -> vos::commit::NodeValidator 
 }
 
 /// Auto-derive a `replication_id` for an installed agent.
-/// `blake2b("vos-replication-id/v1" || space_id || 0 || instance_name || 0
+/// `blake2b("vos-replication-id" || space_id || 0 || instance_name || 0
 /// || program_hash)`. Two replicas that install the same program under the
 /// same `instance_name` IN THE SAME SPACE auto-discover each other on the
 /// gossipsub topic this id maps to. Scoping by `space_id` is load-bearing:
@@ -199,7 +199,7 @@ pub fn auto_replication_id(
     program_hash: &[u8; 32],
 ) -> [u8; 32] {
     vos::crypto::blake2b_hash(
-        b"vos-replication-id/v1",
+        b"vos-replication-id",
         &[
             space_id,
             &[0u8],

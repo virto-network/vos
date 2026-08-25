@@ -2,7 +2,7 @@
 
 A peer-to-peer operating system for collaborative, replicated applications.
 
-VOS runs deterministic actors on a JAM-aligned PVM (RISC-V) and replicates
+VOS runs deterministic actors on a service platform-aligned PVM (RISC-V) and replicates
 them across nodes using either CRDTs (eventual) or Raft (strict). Spaces
 group actors into per-collaboration roots that converge automatically when
 peers come online, with no central server and no coordination protocol on
@@ -66,7 +66,7 @@ The space daemon installs signed service packages through the generic service PV
 for Local, Raft, and CRDT roots, while legacy catalog rows continue on the old
 host. Supplying `--service-pvm` requires an explicit trust profile:
 `--production-trust-socket <path>` opens every service root through a fail-closed
-local JAM/consensus authority sidecar. The development-only
+local service platform/consensus authority sidecar. The development-only
 `--allow-conformance` flag selects the protocol conformance seam instead;
 it is never selected implicitly and is not production-safe. The production
 wire and policy contract are described in

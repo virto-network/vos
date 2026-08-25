@@ -9,7 +9,7 @@
 //! either path, no in-tree reference for actor consumers to
 //! depend on.
 //!
-//! The JAR protocol ABI uses ID 100 with `φ[7]=h_ptr (64B)`,
+//! The PVM protocol ABI uses ID 100 with `φ[7]=h_ptr (64B)`,
 //! `φ[8]=m_ptr (128B)`, `φ[9]=t_low`, and `φ[10]=f`. When the
 //! zkpvm chip lands on master, the same actor binary lights up
 //! the chip path with no source changes.
@@ -131,7 +131,7 @@ fn ecall_compress(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
     // Keep this at the point where the borrowed buffers are live. Routing it
     // through the generic Rust wrapper lets LLVM treat the wrapper's `a0`
     // argument as the still-live allocation pointer after the protocol
-    // boundary when the result is unused. JAR resumes by overwriting a0/a1,
+    // boundary when the result is unused. PVM resumes by overwriting a0/a1,
     // so that optimization turns the following drop into a load through
     // HOST_OK. Declaring both late outputs here makes the suspension boundary
     // explicit to the code that owns the buffers. The outputs are deliberately
@@ -336,9 +336,9 @@ mod tests {
         // identical 2-byte outputs for the same input.
         use blake2::digest::consts::U2;
         type Blake2b16 = blake2::Blake2b<U2>;
-        let ours: [u8; 2] = blake2b_hash(b"vos-instance-svc-id/v1", &[&[0u8], b"bridge-b"]);
+        let ours: [u8; 2] = blake2b_hash(b"vos-instance-svc-id", &[&[0u8], b"bridge-b"]);
         let mut h = Blake2b16::new();
-        h.update(b"vos-instance-svc-id/v1");
+        h.update(b"vos-instance-svc-id");
         h.update(&[0u8]);
         h.update(b"bridge-b");
         let theirs = h.finalize();
@@ -366,7 +366,7 @@ mod tests {
             h[i * 8..i * 8 + 8].copy_from_slice(&h_words[i].to_le_bytes());
         }
         // Single block of 22+1+8 = 31 bytes, zero-padded to 128.
-        let domain = b"vos-instance-svc-id/v1";
+        let domain = b"vos-instance-svc-id";
         let sep = b"\0";
         let payload = b"bridge-b";
         let mut buf = [0u8; 128];
@@ -377,7 +377,7 @@ mod tests {
         host_compress_block(&mut h, &buf, total as u128, true);
         let emulated: [u8; 2] = [h[0], h[1]];
 
-        let direct: [u8; 2] = blake2b_hash(b"vos-instance-svc-id/v1", &[&[0u8], b"bridge-b"]);
+        let direct: [u8; 2] = blake2b_hash(b"vos-instance-svc-id", &[&[0u8], b"bridge-b"]);
 
         assert_eq!(
             emulated, direct,

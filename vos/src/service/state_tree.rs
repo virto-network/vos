@@ -63,7 +63,7 @@ enum StateNode {
 }
 
 impl ServiceWire for StateNode {
-    const MAGIC: [u8; 4] = *b"VSN2";
+    const MAGIC: [u8; 4] = *b"VSNW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -403,7 +403,7 @@ fn hash_node(node: &StateNode) -> Hash {
 /// during causal rematerialization, where retaining a complete DAG leaves
 /// deliberately little transient heap for redundant key buffers.
 fn hash_state_key(domain: &[u8], prefix: &[&[u8]], key: &StateKey, suffix: &[&[u8]]) -> Hash {
-    let version = super::ABI_VERSION.to_le_bytes();
+    let platform = super::PLATFORM_ID.0;
     let tag = [match key {
         StateKey::ActorDescriptor(_) => 0,
         StateKey::MethodPolicy { .. } => 1,
@@ -429,7 +429,7 @@ fn hash_state_key(domain: &[u8], prefix: &[&[u8]], key: &StateKey, suffix: &[&[u
         parts[used] = part;
         used += 1;
     }
-    for part in [&StateKey::MAGIC[..], &version, &tag] {
+    for part in [&StateKey::MAGIC[..], &platform, &tag] {
         parts[used] = part;
         used += 1;
     }

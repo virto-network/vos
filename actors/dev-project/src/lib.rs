@@ -519,8 +519,8 @@ pub mod store {
         kind: BlobKind,
     ) -> [u8; HASH_BYTES] {
         let domain = match kind {
-            BlobKind::Raw => b"vos-dev-project/blob/v1".as_slice(),
-            BlobKind::RustAst => b"vos-dev-project/ast/v1".as_slice(),
+            BlobKind::Raw => b"vos-dev-project/blob".as_slice(),
+            BlobKind::RustAst => b"vos-dev-project/ast".as_slice(),
         };
         let hash: [u8; HASH_BYTES] = vos::crypto::blake2b_hash(domain, &[&bytes]);
         if find_blob(state, &hash).is_none() {
@@ -1099,7 +1099,7 @@ pub mod store {
         };
         let count = state.working.len() as u64;
         let change_id: [u8; HASH_BYTES] = vos::crypto::blake2b_hash(
-            b"vos-dev-project/change-id/v1",
+            b"vos-dev-project/change-id",
             &[&base_arr, &count.to_le_bytes()],
         );
         let change = WorkingChange {
@@ -1446,7 +1446,7 @@ fn commit_hash(row: &CommitNode, change_id_used: [u8; HASH_BYTES]) -> [u8; HASH_
         buf.extend_from_slice(&c.ours);
         buf.extend_from_slice(&c.theirs);
     }
-    vos::crypto::blake2b_hash(b"vos-dev-project/commit/v1", &[&buf])
+    vos::crypto::blake2b_hash(b"vos-dev-project/commit", &[&buf])
 }
 
 /// Re-hash a stored commit row, using its on-disk `change_id`.

@@ -39,7 +39,7 @@ bank federation, without regressing it.
 - **Ergonomics**: typed `#[msg]` args (custom rkyv structs, `[u8;N]`,
   checked reply decode), `vosx space raft-status`, hyperspace persistence,
   space-scoped `auto_replication_id`.
-- **jar (github.com/olanod/jar)**: JAM-alignment Phase 0 (hard-fork policy)
+- **jar (github.com/olanod/jar)**: service platform-alignment Phase 0 (hard-fork policy)
   + Phase 1 (host-owned SP, args ω7/ω8, refine IC 0 / accumulate IC 5,
   two-slot jump prologue; jar1 conformance gate holds, gp072 untouched).
 - **Service production root stack**: request-byte Raft replay and snapshot catch-up,
@@ -48,7 +48,7 @@ bank federation, without regressing it.
   signed canonical packages, portable attestations, attested retries, idle
   upgrades, and child spawn. The daemon runs signed Local, Raft, and CRDT roots
   under one pinned service PVM and gates production registration on an external
-  JAM/consensus trust policy.
+  service platform/consensus trust policy.
 - **Provable actor path**: durable bounded `ProvableRecord` capture, exact
   live-versus-traced transition checks, portable proof verification, canonical
   Task dependencies, software-arithmetic Clerk programs, point storage with
@@ -174,7 +174,7 @@ stands in for the on-chain settlement venue Wave 2 makes real.
   protocol (registry/chronos) into `vos`, end with zero actor/extension
   crate deps in `vosx`.
 - **Production authority deployment**: connect the documented trust protocol
-  to the real JAM/consensus slot, package, role, receipt, and proof authorities;
+  to the real service platform/consensus slot, package, role, receipt, and proof authorities;
   operate it as a supervised local service; and rehearse policy rotation and
   unavailable-authority recovery. The daemon now refuses an implicit
   conformance fallback whenever a service PVM is supplied.
@@ -224,13 +224,13 @@ stands in for the on-chain settlement venue Wave 2 makes real.
   entry-table — mostly done); A17 stale-anchor reconciliation spike (prereq
   for parallel refine).
 
-**jar JAM-alignment (platform track — the demo does NOT depend on it)**
+**jar service platform-alignment (platform track — the demo does NOT depend on it)**
 - Phase-1 remainder: GP halt-address / REPLY-retirement, ISA strictness
   (reject opcode 3, branch-target validation), interp/JIT page-permission
   parity.
 - Phases 2–7 (jar `ROADMAP.md`): turn the gp072 vector ratchet on; SPI
   loader + PVM vectors; hostcall convergence; the economics decision
-  (coinless vs BalanceEcon — gates any "JAM conformant" claim); the in-core
+  (coinless vs BalanceEcon — gates any "service platform conformant" claim); the in-core
   pipeline; advance the GP pin.
 
 **Wave 2 (federation, future)**
@@ -281,7 +281,7 @@ Wire v3: `version(0x03) | flags | anchor_kind | anchor[32] | reply | effects`.
   root do different jobs; neither subsumes the other. Provable Tasks are
   always cold; `return` = the payload's exact reply bytes.
 
-### 4.2 JAM entry-point convergence (was `jam-entry-points.md`)
+### 4.2 service platform entry-point convergence (was `jam-entry-points.md`)
 
 Converge the jar fork on the graypaper entry prologue. **Landed (jar Phase
 1)**: host-owned SP (`φ[1]=stack_top` at kernel init; in-blob preamble

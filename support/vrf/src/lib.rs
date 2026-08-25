@@ -51,7 +51,7 @@ use zeroize::Zeroize;
 
 /// Domain-separation tag for this ciphersuite. Any change re-forks every
 /// derived value, so it carries a version suffix.
-const SUITE: &[u8] = b"vos-chronos-ecvrf/ristretto255-sha512/v0";
+const SUITE: &[u8] = b"vos-chronos-ecvrf/ristretto255-sha512";
 
 const H2C_DOMAIN: u8 = 0x01;
 const CHALLENGE_DOMAIN: u8 = 0x02;

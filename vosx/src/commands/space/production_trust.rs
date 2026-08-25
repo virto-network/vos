@@ -1,6 +1,6 @@
 //! Fail-closed bridge from the space daemon to a local production authority.
 //!
-//! The authority process owns the JAM/consensus view. `vosx` owns only a
+//! The authority process owns the service platform/consensus view. `vosx` owns only a
 //! Unix-domain client capability selected explicitly by the operator. Every
 //! response repeats both the exact request commitment and the authority's
 //! stable policy ID, so reconnecting to a different process cannot silently
@@ -19,8 +19,8 @@ use vos::service::{
     ReceiptVerificationRequest, RoleCredentialVerificationRequest, ServiceGenesis, ServiceWire,
 };
 
-const REQUEST_MAGIC: [u8; 4] = *b"VTA1";
-const RESPONSE_MAGIC: [u8; 4] = *b"VTR1";
+const REQUEST_MAGIC: [u8; 4] = *b"VTAW";
+const RESPONSE_MAGIC: [u8; 4] = *b"VTRW";
 const PROTOCOL_VERSION: u16 = 1;
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -209,7 +209,7 @@ fn exchange_with_timeout(
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or(ProductionTrustSocketError::InvalidResponse)?;
-    let request_hash = Hash::digest(b"vos/production-trust-socket/request/v1", &[request]);
+    let request_hash = Hash::digest(b"vos/production-trust-socket/request", &[request]);
     let mut stream = connect_until(path, deadline).map_err(ProductionTrustSocketError::Connect)?;
     let request_len =
         u32::try_from(request.len()).map_err(|_| ProductionTrustSocketError::InvalidResponse)?;
@@ -374,7 +374,7 @@ mod tests {
             let mut request = vec![0; u32::from_le_bytes(len) as usize];
             stream.read_exact(&mut request).unwrap();
             let mut request_hash =
-                Hash::digest(b"vos/production-trust-socket/request/v1", &[&request]);
+                Hash::digest(b"vos/production-trust-socket/request", &[&request]);
             if corrupt_request {
                 request_hash.0[0] ^= 1;
             }
@@ -409,7 +409,7 @@ mod tests {
         let request = encode_request(QUERY_POLICY, &[]).unwrap();
         assert_eq!(hex::encode(&request), "5654413101000000000000");
         assert_eq!(
-            hex::encode(Hash::digest(b"vos/production-trust-socket/request/v1", &[&request]).0),
+            hex::encode(Hash::digest(b"vos/production-trust-socket/request", &[&request]).0),
             "a5ee8be4abb996fd3735970cd7b5a53632afef7cb7a548e1314d9c6ef39ece35",
         );
     }
@@ -464,7 +464,7 @@ mod tests {
             stream.read_exact(&mut len).unwrap();
             let mut request = vec![0; u32::from_le_bytes(len) as usize];
             stream.read_exact(&mut request).unwrap();
-            let request_hash = Hash::digest(b"vos/production-trust-socket/request/v1", &[&request]);
+            let request_hash = Hash::digest(b"vos/production-trust-socket/request", &[&request]);
             let mut response = Vec::new();
             response.extend_from_slice(&RESPONSE_MAGIC);
             response.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());

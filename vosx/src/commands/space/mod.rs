@@ -143,7 +143,7 @@ pub enum SpaceCommand {
         /// service packages. Without it, service rows remain installed but are skipped.
         #[arg(long, value_name = "FILE")]
         service_pvm: Option<PathBuf>,
-        /// Unix socket for the fail-closed JAM/consensus trust authority.
+        /// Unix socket for the fail-closed service platform/consensus trust authority.
         /// When set, all service roots use the production profile.
         #[arg(
             long,
@@ -279,7 +279,7 @@ pub enum SpaceCommand {
         #[arg(long, default_value = "local")]
         consistency: String,
         /// Optional explicit replication id (64 hex). Default:
-        /// blake2b("vos-replication-id/v1" || instance_name ||
+        /// blake2b("vos-replication-id" || instance_name ||
         /// 0 || program_hash).
         #[arg(long, value_name = "HEX")]
         replication_id: Option<String>,

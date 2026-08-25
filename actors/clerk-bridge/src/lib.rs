@@ -413,7 +413,7 @@ pub struct ClerkBridge {
     /// Sorted-by-`name` ascending. Lookups via `partition_point`.
     peers: Vec<PeerEntry>,
     /// Sorted dedup set of voucher transfer-triples. Each entry
-    /// is `blake2b_256("clerk-bridge/voucher-redemption/v1",
+    /// is `blake2b_256("clerk-bridge/voucher-redemption",
     /// amount_commit || root_before || root_after)`. Anchoring
     /// on the underlying kernel-transfer triple (rather than on
     /// voucher bytes or signing_payload) is robust to issuer
@@ -473,7 +473,7 @@ pub struct ClerkBridge {
 }
 
 impl ClerkBridge {
-    const DEVICE_BINDING_PROBE: &'static [u8] = b"clerk-bridge/device-binding/v1";
+    const DEVICE_BINDING_PROBE: &'static [u8] = b"clerk-bridge/device-binding";
 
     /// Signer configuration controls the bank identity used on external
     /// vouchers and settlement claims. Do not inherit the legacy same-node
@@ -521,7 +521,7 @@ impl ClerkBridge {
         voucher_template: &[u8],
     ) -> [u8; 32] {
         vos::crypto::blake2b_hash::<32>(
-            b"clerk-bridge/issue-voucher/v1",
+            b"clerk-bridge/issue-voucher",
             &[
                 &(peer_name.len() as u64).to_le_bytes(),
                 peer_name,

@@ -14,7 +14,7 @@
 //!
 //! Concurrency = parent-level task interleaving via [`Tasks::drive`],
 //! not intra-handler concurrent asks: each drive pass re-invokes every
-//! runnable child once, synchronously (JAM refine is single-threaded
+//! runnable child once, synchronously (service platform refine is single-threaded
 //! per work item, so intra-handler concurrency buys nothing on the
 //! target platform).
 //!
@@ -30,7 +30,7 @@ use alloc::vec::Vec;
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Child {
     /// An anonymous pure blob invoked by its 32-byte code hash — the
-    /// primary, JAM-aligned shape. No ServiceId, no storage row, no
+    /// primary, service platform-aligned shape. No ServiceId, no storage row, no
     /// address: state lives in the parent's [`TaskRecord`], input is
     /// witness-delivered, and effects fold into the parent's keyspace.
     Task([u8; 32]),

@@ -1,4 +1,4 @@
-//! Portable v3 attestations and the verifier-only path.
+//! Portable attestations and the verifier-only path.
 
 use alloc::collections::BTreeSet;
 use alloc::string::String;
@@ -22,7 +22,6 @@ pub enum StateCommitment {
 /// Consensus-visible statement proved by an attested actor method.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttestationStatement {
-    pub statement_version: u16,
     pub space: SpaceId,
     pub actor: ActorId,
     pub producer_name: String,
@@ -89,8 +88,7 @@ impl AttestationPreparation {
             return Err(AttestationError::ReceiptMismatch);
         }
         if let Some(proof) = &self.committed_proof
-            && (proof.statement != self.statement.commitment()
-                || proof.statement_version != crate::service::ATTESTATION_STATEMENT_VERSION)
+            && proof.statement != self.statement.commitment()
         {
             return Err(AttestationError::InvalidProof);
         }
@@ -129,10 +127,10 @@ impl AttestationPreparation {
             || statement.invocation != work.invocation
             || statement.reply_call != reply.call_id
             || statement.claim_commitment
-                != Hash::digest(b"vos/attestation-claim/v3", &[&reply.result])
+                != Hash::digest(b"vos/attestation-claim", &[&reply.result])
             || statement.input_commitment
                 != Hash::digest(
-                    b"vos/attestation-input/v3",
+                    b"vos/attestation-input",
                     &[
                         &work.arguments,
                         &authorization_input.0,
@@ -147,7 +145,7 @@ impl AttestationPreparation {
 }
 
 impl ServiceWire for AttestationPreparation {
-    const MAGIC: [u8; 4] = *b"VAP2";
+    const MAGIC: [u8; 4] = *b"VAPW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
@@ -158,7 +156,6 @@ impl ServiceWire for AttestationPreparation {
             encoder.fixed(&proof.trace.0);
             encoder.fixed(&proof.proof_blob.hash.0);
             encoder.u64(proof.proof_blob.len);
-            encoder.u16(proof.statement_version);
         });
     }
 
@@ -173,12 +170,10 @@ impl ServiceWire for AttestationPreparation {
                     hash: Hash(decoder.fixed()?),
                     len: decoder.u64()?,
                 },
-                statement_version: decoder.u16()?,
             };
             if proof.statement == Hash::ZERO
                 || proof.trace == Hash::ZERO
                 || proof.proof_blob.len == u64::MAX
-                || proof.statement_version != crate::service::ATTESTATION_STATEMENT_VERSION
             {
                 return Err(DecodeError::NonCanonical);
             }
@@ -250,7 +245,6 @@ impl AttestationStatement {
         };
         let authorization_input = authorization_input(&work.authorization);
         let value = Self {
-            statement_version: crate::service::ATTESTATION_STATEMENT_VERSION,
             space: work.service.space,
             actor: work.target,
             producer_name: producer_name.into(),
@@ -263,9 +257,9 @@ impl AttestationStatement {
             reply_call: reply.call_id,
             before,
             after,
-            claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&reply.result]),
+            claim_commitment: Hash::digest(b"vos/attestation-claim", &[&reply.result]),
             input_commitment: Hash::digest(
-                b"vos/attestation-input/v3",
+                b"vos/attestation-input",
                 &[
                     &work.arguments,
                     &authorization_input.0,
@@ -280,18 +274,15 @@ impl AttestationStatement {
     }
 
     pub fn commitment(&self) -> Hash {
-        Hash::digest(b"vos/attestation-statement/v3", &[&self.encode()])
+        Hash::digest(b"vos/attestation-statement", &[&self.encode()])
     }
 
     pub fn validate(&self) -> Result<(), AttestationError> {
-        if self.statement_version != crate::service::ATTESTATION_STATEMENT_VERSION {
-            return Err(AttestationError::WrongStatementVersion);
-        }
         if self.method.is_empty()
             || self.producer_name.is_empty()
             || self.producer == ProducerId::ZERO
             || self.reply_call == CallId::ZERO
-            || self.accumulation_receipt.service.service_abi != crate::service::ABI_VERSION
+            || self.accumulation_receipt.service.platform != crate::service::PLATFORM_ID
             || self.accumulation_receipt.service.execution_semantics
                 != crate::service::EXECUTION_SEMANTICS_ID
         {
@@ -468,7 +459,6 @@ impl ServiceWire for AttestationStatement {
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut encoder = Encoder(out);
-        encoder.u16(self.statement_version);
         encoder.fixed(&self.space.0);
         encoder.fixed(&self.actor.0);
         encoder.string(&self.producer_name);
@@ -489,7 +479,6 @@ impl ServiceWire for AttestationStatement {
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let value = Self {
-            statement_version: decoder.u16()?,
             space: SpaceId(decoder.fixed()?),
             actor: ActorId(decoder.fixed()?),
             producer_name: decoder.string()?,
@@ -628,7 +617,7 @@ impl<T, M> Attestation<T, M> {
         if package.statement.method != M::METHOD {
             return Err(AttestationError::WrongMethod);
         }
-        if Hash::digest(b"vos/attestation-claim/v3", &[&package.claim_wire])
+        if Hash::digest(b"vos/attestation-claim", &[&package.claim_wire])
             != package.statement.claim_commitment
             || M::claim_wire(&package.preview) != package.claim_wire
         {
@@ -674,8 +663,8 @@ impl<T, M> Attestation<T, M> {
             validate_portable_field_len(field.len())?;
         }
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"VAT3");
-        bytes.extend_from_slice(&crate::service::ABI_VERSION.to_le_bytes());
+        bytes.extend_from_slice(b"VATT");
+        bytes.extend_from_slice(&crate::service::PLATFORM_ID.0);
         let mut encoder = Encoder(&mut bytes);
         encoder.string(&self.producer_name);
         encoder.fixed(&self.producer.0);
@@ -691,12 +680,12 @@ impl<T, M> Attestation<T, M> {
         M: AttestedMethod<T>,
     {
         let mut decoder = Decoder::new(bytes);
-        if decoder.take(4).map_err(invalid_package)? != b"VAT3" {
+        if decoder.take(4).map_err(invalid_package)? != b"VATT" {
             return Err(AttestationError::InvalidPackage(DecodeError::InvalidTag));
         }
-        if decoder.u16().map_err(invalid_package)? != crate::service::ABI_VERSION {
+        if Hash(decoder.fixed().map_err(invalid_package)?) != crate::service::PLATFORM_ID {
             return Err(AttestationError::InvalidPackage(
-                DecodeError::InvalidVersion,
+                DecodeError::InvalidPlatform,
             ));
         }
         let producer_name = decoder.string().map_err(invalid_package)?;
@@ -705,7 +694,7 @@ impl<T, M> Attestation<T, M> {
             .map_err(invalid_package)?;
         let trace = Hash(decoder.fixed().map_err(invalid_package)?);
         let claim_wire = decoder.bytes().map_err(invalid_package)?;
-        if Hash::digest(b"vos/attestation-claim/v3", &[&claim_wire]) != statement.claim_commitment {
+        if Hash::digest(b"vos/attestation-claim", &[&claim_wire]) != statement.claim_commitment {
             return Err(AttestationError::ClaimCommitmentMismatch);
         }
         let preview =
@@ -923,7 +912,7 @@ pub fn verify_once<T, M: AttestedMethod<T>>(
     if package.statement.method != M::METHOD {
         return Err(AttestationError::WrongMethod);
     }
-    if Hash::digest(b"vos/attestation-claim/v3", &[&package.claim_wire])
+    if Hash::digest(b"vos/attestation-claim", &[&package.claim_wire])
         != package.statement.claim_commitment
         || M::claim_wire(&package.preview) != package.claim_wire
     {
@@ -1145,7 +1134,7 @@ mod tests {
                 root_service: RootServiceId([1; 32]),
                 deployment: service_deployment,
                 service_program: ProgramId([2; 32]),
-                service_abi: crate::service::ABI_VERSION,
+                platform: crate::service::PLATFORM_ID,
                 execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
                 gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
             },
@@ -1159,7 +1148,6 @@ mod tests {
             consistency: ConsistencyMode::Local,
         };
         let statement = AttestationStatement {
-            statement_version: crate::service::ATTESTATION_STATEMENT_VERSION,
             space: SpaceId([6; 32]),
             actor,
             producer_name: "private-age".to_string(),
@@ -1173,7 +1161,7 @@ mod tests {
             before: StateCommitment::Linear(Hash([11; 32])),
             after: StateCommitment::Linear(Hash([5; 32])),
             claim_commitment: Hash::digest(
-                b"vos/attestation-claim/v3",
+                b"vos/attestation-claim",
                 &[&Method::claim_wire(&claim)],
             ),
             input_commitment: Hash([13; 32]),
@@ -1512,8 +1500,8 @@ mod tests {
         );
 
         let mut oversized = Vec::new();
-        oversized.extend_from_slice(b"VAT3");
-        oversized.extend_from_slice(&crate::service::ABI_VERSION.to_le_bytes());
+        oversized.extend_from_slice(b"VATT");
+        oversized.extend_from_slice(&crate::service::PLATFORM_ID.0);
         Encoder(&mut oversized).u32((crate::service::wire::MAX_BYTES + 1) as u32);
         assert!(matches!(
             Attestation::<u64, Method>::from_portable_bytes(&oversized),
@@ -1534,7 +1522,7 @@ mod tests {
         let mut statement = base.statement;
         statement.method = AmbiguousOption::METHOD.to_string();
         let canonical = AmbiguousOption::claim_wire(&None);
-        statement.claim_commitment = Hash::digest(b"vos/attestation-claim/v3", &[&canonical]);
+        statement.claim_commitment = Hash::digest(b"vos/attestation-claim", &[&canonical]);
         statement.accumulation_receipt.reply_commitment = Some(
             crate::service::ReplyRecord {
                 call_id: statement.reply_call,
@@ -1560,8 +1548,8 @@ mod tests {
             "the adversarial decoder demonstrates why hashing a re-encoded preview is unsafe"
         );
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"VAT3");
-        bytes.extend_from_slice(&crate::service::ABI_VERSION.to_le_bytes());
+        bytes.extend_from_slice(b"VATT");
+        bytes.extend_from_slice(&crate::service::PLATFORM_ID.0);
         let mut encoder = Encoder(&mut bytes);
         encoder.string(&package.producer_name);
         encoder.fixed(&package.producer.0);
@@ -1593,7 +1581,6 @@ mod tests {
             statement: committed.statement.commitment(),
             trace: Hash([17; 32]),
             proof_blob: BlobRef::of_bytes(b"committed proof"),
-            statement_version: crate::service::ATTESTATION_STATEMENT_VERSION,
         });
         assert_eq!(
             AttestationPreparation::decode(&committed.encode()).unwrap(),

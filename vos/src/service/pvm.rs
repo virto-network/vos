@@ -2,7 +2,7 @@
 //!
 //! This is a conformance boundary, not a native implementation of Refine.
 //! The transition bytes are produced by the service program itself. During
-//! Refine the host surface is read-only and persistent JAM protocol calls are
+//! Refine the host surface is read-only and persistent service platform protocol calls are
 //! rejected before a handler can observe them.
 
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -76,7 +76,7 @@ pub struct ProducedProvableRecord {
 
 /// Compact commitment to one complete nested Refine execution slice.
 ///
-/// The commitment follows every service and actor instruction across JAR
+/// The commitment follows every service and actor instruction across PVM
 /// CALL/REPLY VM switches and binds host protocol-call requests and injected
 /// results. A prover can reproduce the full witness by replaying the canonical
 /// work/import bytes under the pinned execution-semantics identifier.
@@ -86,7 +86,7 @@ pub struct RefineTrace {
     pub instruction_count: u64,
     pub protocol_call_count: u64,
     pub vm_switch_count: u64,
-    /// Canonical JAR CODE-sub-blob hashes observed during this slice.
+    /// Canonical PVM CODE-sub-blob hashes observed during this slice.
     pub code_hashes: Vec<Hash>,
 }
 
@@ -394,7 +394,7 @@ pub trait AccumulateProtocolHost {
 
     fn begin(&mut self) -> Result<Self::Transaction, ServicePvmError>;
 
-    /// Begin one transaction with an authenticated ambient JAM timeslot.
+    /// Begin one transaction with an authenticated ambient service platform timeslot.
     /// Hosts which do not implement the consensus-time seam reject attempts
     /// to use it instead of silently dropping the observation.
     fn begin_at(
@@ -633,7 +633,7 @@ pub struct ServicePvm {
 /// service guest.
 ///
 /// Actor materializations never enter the shared CALL IPC window. The bridge
-/// selects private input from the active JAR VM and authenticates nested
+/// selects private input from the active PVM VM and authenticates nested
 /// `Origin::Actor` from the live call stack. Actor outputs are retained as
 /// opaque canonical wires until VM 0 fetches the batch and constructs the
 /// transition itself.
@@ -908,7 +908,7 @@ impl ActorRefineRuntime {
             0 => DEFAULT_TASK_GAS,
             requested => requested.min(DEFAULT_TASK_GAS),
         };
-        // JAR does not expose a backend-neutral setter for the live parent's
+        // PVM does not expose a backend-neutral setter for the live parent's
         // gas while a recompiled VM is suspended at a protocol boundary.
         // Maintain the nested charge separately and never let Tasks spend
         // more than the parent slice's currently unclaimed budget. The two
@@ -1441,13 +1441,13 @@ impl ServicePvm {
         )
     }
 
-    /// Execute Refine with every declared actor instantiated as a dormant JAR
+    /// Execute Refine with every declared actor instantiated as a dormant PVM
     /// VM owned by this service invocation.
     ///
     /// The target actor is always installed at
     /// [`super::TARGET_ACTOR_HANDLE_SLOT`]. Other imported actors follow in
     /// canonical actor-ID order. No `INVOKE` protocol capability is installed:
-    /// nested execution must use the ordinary JAR HANDLE/CALL/REPLY path.
+    /// nested execution must use the ordinary PVM HANDLE/CALL/REPLY path.
     pub fn refine_actor_tree<H: RefineProtocolHost>(
         &self,
         arguments: &[u8],
@@ -1464,7 +1464,7 @@ impl ServicePvm {
         )
     }
 
-    /// Conformance variant of [`Self::refine_actor_tree`] selecting a JAR
+    /// Conformance variant of [`Self::refine_actor_tree`] selecting a PVM
     /// backend explicitly. Consensus outputs must be identical across the
     /// interpreter and recompiler.
     pub fn refine_actor_tree_with_backend<H: RefineProtocolHost>(
@@ -1572,7 +1572,7 @@ impl ServicePvm {
             // Restore the exact dormant-program layout captured by this
             // continuation. The current service directory may contain actors
             // spawned after the checkpoint, but adding their handles would
-            // change JAR's invocation-layout commitment.
+            // change PVM's invocation-layout commitment.
             let mut pinned = Vec::with_capacity(continuation.programs.len());
             let target_binding = continuation
                 .programs
@@ -1764,7 +1764,7 @@ impl ServicePvm {
         )
     }
 
-    /// Execute Accumulate with the consensus-authenticated JAM timeslot for
+    /// Execute Accumulate with the consensus-authenticated service platform timeslot for
     /// time-dependent requests such as durable call expiration.
     pub fn accumulate_at<H: AccumulateProtocolHost>(
         &self,
@@ -1804,7 +1804,7 @@ impl ServicePvm {
         )
     }
 
-    /// Conformance variant of [`Self::accumulate`] selecting a JAR backend.
+    /// Conformance variant of [`Self::accumulate`] selecting a PVM backend.
     /// Guest-owned state transitions must be identical under both engines.
     pub fn accumulate_with_backend<H: AccumulateProtocolHost>(
         &self,
@@ -1991,7 +1991,7 @@ fn reconcile_actor_callables(
         .and_then(|actor| actor.continuation.as_ref());
     // Only actors captured in the restored kernel have VMs and HANDLEs.
     // Newly spawned directory members remain part of the authoritative work
-    // import, but cannot be retrofitted into an older JAR invocation layout.
+    // import, but cannot be retrofitted into an older PVM invocation layout.
     for destination in programs {
         let destination_vm = continued_actor_vm_index(programs, work.target, destination.actor)
             .ok_or(ServicePvmError::InvalidContinuation)?;
@@ -2099,7 +2099,7 @@ fn install_actor_ipc(
         Cap::Data(DataCap::new(backing_offset, page_count)),
     );
 
-    // Exercise the ordinary JAR MAP operation instead of reaching around the
+    // Exercise the ordinary PVM MAP operation instead of reaching around the
     // capability model to synthesize a mapped address. Preserve the guest's
     // invocation registers around this host-owned setup call.
     let saved = core::array::from_fn::<_, 6, _>(|offset| kernel.active_reg(7 + offset));
@@ -2322,9 +2322,6 @@ fn capture_checkpoint(
         })
         .transpose()?;
     let continuation = ContinuationSnapshot {
-        snapshot_version: super::SNAPSHOT_VERSION,
-        jar_semantics: super::EXECUTION_SEMANTICS_ID,
-        vos_abi: super::ABI_VERSION,
         service: work.service.clone(),
         invocation: work.invocation,
         checkpoint_step: work.workflow_step,
@@ -2628,7 +2625,7 @@ fn run_refine_kernel<H: RefineProtocolHost>(
 }
 
 fn install_refine_scheduler_caps(kernel: &mut InvocationKernel) {
-    // These are VOS scheduler capabilities, not JAM protocol slots. The
+    // These are VOS scheduler capabilities, not service platform protocol slots. The
     // nondeterministic BOOT_CONTEXT/NOW_MS seams are intentionally absent from
     // service Refine.
     for slot in [
@@ -2792,7 +2789,7 @@ fn read_output(kernel: &InvocationKernel) -> Result<Vec<u8>, ServicePvmError> {
 }
 
 /// Protocol capabilities that can be implemented without access to mutable
-/// service state. Every state-changing JAM capability (including storage
+/// service state. Every state-changing service platform capability (including storage
 /// writes, transfers, service management, output publication, and preimage
 /// provision) is absent from this list.
 fn refine_protocol_call_is_pure(slot: u8) -> bool {
@@ -2877,7 +2874,7 @@ mod tests {
                 root_service: super::super::RootServiceId([2; 32]),
                 deployment: super::super::DeploymentId([3; 32]),
                 service_program: ProgramId([4; 32]),
-                service_abi: super::super::ABI_VERSION,
+                platform: super::super::PLATFORM_ID,
                 execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
                 gas_schedule: super::super::GasSchedule::new(1_000_000_000, 5_000_000_000),
             },
@@ -3140,7 +3137,7 @@ mod tests {
                 root_service: RootServiceId([1; 32]),
                 deployment: DeploymentId([2; 32]),
                 service_program: ProgramId([3; 32]),
-                service_abi: crate::service::ABI_VERSION,
+                platform: crate::service::PLATFORM_ID,
                 execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
                 gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
             },
@@ -3169,7 +3166,6 @@ mod tests {
             };
             receipt.reply_commitment = Some(reply.commitment());
             let statement = crate::attestation::AttestationStatement {
-                statement_version: crate::service::ATTESTATION_STATEMENT_VERSION,
                 space: receipt.service.space,
                 actor,
                 producer_name: "attested".into(),
@@ -3182,7 +3178,7 @@ mod tests {
                 reply_call: reply.call_id,
                 before: crate::attestation::StateCommitment::Linear(Hash([10; 32])),
                 after: crate::attestation::StateCommitment::Linear(Hash([5; 32])),
-                claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&reply.result]),
+                claim_commitment: Hash::digest(b"vos/attestation-claim", &[&reply.result]),
                 input_commitment: Hash([12; 32]),
                 authorization_policy: Hash([13; 32]),
                 accumulation_receipt: receipt.clone(),
@@ -3250,7 +3246,7 @@ mod tests {
         assert_eq!(
             MAX_ROOT_TREE_ACTORS + 1,
             vos_pvm::vm_pool::MAX_CODE_CAPS,
-            "one shared JAR code-capability entry is consumed by the service",
+            "one shared PVM code-capability entry is consumed by the service",
         );
 
         let service = two_entry_program(None);

@@ -296,8 +296,7 @@ mod tests {
             manifest: PackageManifest {
                 name: "counter".into(),
                 version: "2.0.0".into(),
-                service_abi: vos::service::ABI_VERSION,
-                snapshot_version: vos::service::SNAPSHOT_VERSION,
+                platform: vos::service::PLATFORM_ID,
                 execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
                 service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
                 actor_program: ProgramId::of_pvm(&actor_pvm),

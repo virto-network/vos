@@ -51,7 +51,7 @@ pub const TOKEN_HRP: &str = "vos1";
 pub const TOKEN_VERSION: u8 = 3;
 
 /// Domain tag for the token's integrity checksum.
-const CHECKSUM_DOMAIN: &[u8] = b"vos-invite/v3";
+const CHECKSUM_DOMAIN: &[u8] = b"vos-invite";
 
 /// Trailing checksum length (bytes of a domain-separated blake2b).
 const CHECKSUM_LEN: usize = 4;

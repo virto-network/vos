@@ -39,7 +39,7 @@ const META_SNAP_TERM: &str = "snap_last_term";
 /// bootstraps so a restart never falls back to a stale static
 /// member seed.
 const META_ACTIVE_CONFIG: &str = "active_config";
-const ACTIVE_CONFIG_MAGIC: &[u8; 4] = b"VAC2";
+const ACTIVE_CONFIG_MAGIC: &[u8; 4] = b"VACW";
 
 /// One Raft log entry. Index is 1-based and contiguous.
 #[derive(Debug, Clone, PartialEq, Eq)]

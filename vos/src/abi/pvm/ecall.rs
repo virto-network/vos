@@ -3,7 +3,7 @@
 //! On RISC-V, loads the hostcall ID into `t0` and executes `ecall`.
 //! The grey-transpiler converts this to a PVM `ecalli` instruction.
 //!
-//! Per JAR spec `Capability.lean:169-182`, the ecalli calling convention is:
+//! Per PVM spec `Capability.lean:169-182`, the ecalli calling convention is:
 //!
 //! - `imm`            = subject cap (the hostcall identity, spec slot 1..=28)
 //! - `phi[7..=11]`    = 5 data arguments
@@ -88,7 +88,7 @@ pub fn ecall4_pair(id: u32, a0: u64, a1: u64, a2: u64, a3: u64) -> [u64; 2] {
     _ecall_pair(id as u64, a0, a1, a2, a3, 0, VOS_OBJECT_CAP)
 }
 
-/// Reference a slot in the current CNode for a dynamic JAR management call.
+/// Reference a slot in the current CNode for a dynamic PVM management call.
 pub const fn local_cap_ref(slot: u8) -> u32 {
     slot as u32
 }
@@ -111,13 +111,13 @@ pub fn map_cap_rw(cap_slot: u8, base_page: u32, page_count: u32) -> bool {
     ) != RESULT_WHAT
 }
 
-/// Move a capability between CNodes using ordinary JAR cap references.
+/// Move a capability between CNodes using ordinary PVM cap references.
 #[inline(always)]
 pub fn move_cap(subject: u32, object: u32) -> bool {
     _management_ecall(0, 0, 0, 0, 0x06, ((subject as u64) << 32) | object as u64) != RESULT_WHAT
 }
 
-/// Copy a copyable capability between CNodes using ordinary JAR cap
+/// Copy a copyable capability between CNodes using ordinary PVM cap
 /// references. HANDLE and DATA capabilities remain move-only and fail closed.
 #[inline(always)]
 pub fn copy_cap(subject: u32, object: u32) -> bool {
@@ -141,7 +141,7 @@ pub fn call_cap(subject: u32, ipc_cap_slot: u8, a0: u64, a1: u64, a2: u64, a3: u
 }
 
 /// CALL a dynamically selected HANDLE/CALLABLE and preserve both the reply
-/// value and the JAR call status.
+/// value and the PVM call status.
 #[inline(always)]
 pub fn call_cap_pair(
     subject: u32,
@@ -161,11 +161,11 @@ pub fn call_cap_pair(
     )
 }
 
-/// Return from a nested JAR CALL through the reserved IPC capability slot.
+/// Return from a nested PVM CALL through the reserved IPC capability slot.
 #[cfg(target_arch = "riscv64")]
 #[inline(always)]
 pub fn reply(value: u64) -> ! {
-    // SAFETY: ecalli(0) is JAR REPLY for a nested VM. The kernel transfers
+    // SAFETY: ecalli(0) is PVM REPLY for a nested VM. The kernel transfers
     // control to the waiting caller, so this actor invocation never resumes.
     unsafe {
         core::arch::asm!(
@@ -186,7 +186,7 @@ pub fn reply(value: u64) -> ! {
 #[cfg(not(target_arch = "riscv64"))]
 #[inline(always)]
 pub fn reply(_value: u64) -> ! {
-    panic!("vos-abi JAR reply requires RISC-V target")
+    panic!("vos-abi PVM reply requires RISC-V target")
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -194,7 +194,7 @@ pub fn reply(_value: u64) -> ! {
 fn _call_ecall_pair(a0: u64, a1: u64, a2: u64, a3: u64, op: u64, refs: u64) -> [u64; 2] {
     let ret: u64;
     let discarded_result1: u64;
-    // SAFETY: dynamic CALL suspends until the callee replies. The JAR kernel
+    // SAFETY: dynamic CALL suspends until the callee replies. The PVM kernel
     // resumes the caller by injecting its result into phi[7] and a success
     // status into phi[8], so both a0 and a1 are late outputs.
     unsafe {
@@ -216,7 +216,7 @@ fn _call_ecall_pair(a0: u64, a1: u64, a2: u64, a3: u64, op: u64, refs: u64) -> [
 #[cfg(not(target_arch = "riscv64"))]
 #[inline(always)]
 fn _call_ecall_pair(_a0: u64, _a1: u64, _a2: u64, _a3: u64, op: u64, _refs: u64) -> [u64; 2] {
-    panic!("vos-abi JAR CALL requires RISC-V target (op={op})")
+    panic!("vos-abi PVM CALL requires RISC-V target (op={op})")
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -247,7 +247,7 @@ fn _management_ecall(a0: u64, a1: u64, a2: u64, a3: u64, op: u64, refs: u64) -> 
 #[cfg(not(target_arch = "riscv64"))]
 #[inline(always)]
 fn _management_ecall(_a0: u64, _a1: u64, _a2: u64, _a3: u64, op: u64, _refs: u64) -> u64 {
-    panic!("vos-abi JAR management ecalls require RISC-V target (op={op})")
+    panic!("vos-abi PVM management ecalls require RISC-V target (op={op})")
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -265,7 +265,7 @@ fn _ecall(id: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 
             "ecall",
             in("t0") id,
             inlateout("a0") a0 => ret,
-            // JAR protocol calls inject their two-word result into phi[7]/
+            // PVM protocol calls inject their two-word result into phi[7]/
             // phi[8] (a0/a1). Even hostcalls whose public wrapper returns one
             // word therefore clobber a1 at the suspension boundary.
             inlateout("a1") a1 => discarded_result1,
@@ -291,7 +291,7 @@ fn _ecall(id: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -
 fn _ecall_pair(id: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> [u64; 2] {
     let ret0: u64;
     let ret1: u64;
-    // SAFETY: same hostcall boundary as `_ecall`; JAR injects the one
+    // SAFETY: same hostcall boundary as `_ecall`; PVM injects the one
     // suspension result into phi[7]/phi[8] before execution resumes.
     unsafe {
         core::arch::asm!(

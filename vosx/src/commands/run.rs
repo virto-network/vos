@@ -55,7 +55,7 @@ fn load_file(path: &Path) -> Vec<u8> {
 
 /// Load a PVM blob from disk. `.pvm` files are passed through
 /// untouched; anything else is treated as an ELF and run
-/// through the JAM transpiler. `die` on any failure.
+/// through the service platform transpiler. `die` on any failure.
 fn load_blob(path: &Path) -> Vec<u8> {
     let data = load_file(path);
     match path.extension().and_then(|e| e.to_str()) {

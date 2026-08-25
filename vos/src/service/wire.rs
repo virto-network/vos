@@ -10,7 +10,7 @@ const MAX_ITEMS: usize = 1_000_000;
 pub enum DecodeError {
     Truncated,
     InvalidTag,
-    InvalidVersion,
+    InvalidPlatform,
     InvalidUtf8,
     LimitExceeded,
     TrailingBytes,
@@ -34,7 +34,7 @@ pub trait ServiceWire: Sized {
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&Self::MAGIC);
-        out.extend_from_slice(&super::ABI_VERSION.to_le_bytes());
+        out.extend_from_slice(&super::PLATFORM_ID.0);
         self.encode_body(&mut out);
         out
     }
@@ -44,8 +44,8 @@ pub trait ServiceWire: Sized {
         if decoder.take(4)? != Self::MAGIC {
             return Err(DecodeError::InvalidTag);
         }
-        if decoder.u16()? != super::ABI_VERSION {
-            return Err(DecodeError::InvalidVersion);
+        if decoder.fixed().map(super::Hash)? != super::PLATFORM_ID {
+            return Err(DecodeError::InvalidPlatform);
         }
         let value = Self::decode_body(&mut decoder)?;
         if !decoder.exhausted() {

@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! offset  size  field
-//! 0       4     magic = b"VKS2"
+//! 0       4     magic = b"VKSW"
 //! 4       1     version = 3
 //! 5       3     reserved
 //! 8       4     snapshot_len: u32 LE
@@ -21,8 +21,8 @@
 
 use alloc::vec::Vec;
 
-/// Byte layout magic: b"VKS2".
-const MAGIC: [u8; 4] = *b"VKS2";
+/// Byte layout magic: b"VKSW".
+const MAGIC: [u8; 4] = *b"VKSW";
 /// Current header format version.
 pub const VERSION: u8 = 3;
 /// Size of the encoded continuation header.

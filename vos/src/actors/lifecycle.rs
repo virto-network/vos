@@ -1,6 +1,6 @@
 //! Lifecycle building blocks for VOS actors.
 //!
-//! Composable functions that implement the JAM actor lifecycle.
+//! Composable functions that implement the service platform actor lifecycle.
 //! Used by the default `run_refine_service` and `run_refine` implementations,
 //! and exported for custom lifecycle composition.
 //!

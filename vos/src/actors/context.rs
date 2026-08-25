@@ -951,7 +951,7 @@ impl<A: Actor> Context<A> {
         }
         let address = crate::service::ACTOR_IPC_BASE_PAGE as usize * 4096usize;
         // SAFETY: this actor owns the mapped invocation IPC DATA capability.
-        // It remains mapped until JAR CALL moves it to the child.
+        // It remains mapped until PVM CALL moves it to the child.
         unsafe {
             core::ptr::write_bytes(address as *mut u8, 0, capacity);
             core::ptr::copy_nonoverlapping(encoded.as_ptr(), address as *mut u8, encoded.len());
@@ -974,9 +974,9 @@ impl<A: Actor> Context<A> {
                 super::value::InvokeError::NotFound,
             ));
         }
-        // SAFETY: JAR returned and remapped the exclusive IPC cap to this VM.
+        // SAFETY: PVM returned and remapped the exclusive IPC cap to this VM.
         let decoded = {
-            // SAFETY: JAR returned and remapped the exclusive IPC cap to this
+            // SAFETY: PVM returned and remapped the exclusive IPC cap to this
             // VM. Decode owns every field before the shared page is scrubbed.
             let bytes =
                 unsafe { core::slice::from_raw_parts(address as *const u8, output_len as usize) };
@@ -1013,7 +1013,7 @@ impl<A: Actor> Context<A> {
         }) {
             // A nested child is the active VM which directly receives the
             // scheduler's resume token. Its suspended caller crosses the same
-            // durable boundary when JAR returns the child output, before any
+            // durable boundary when PVM returns the child output, before any
             // new-slice effects are aggregated into this restored Context.
             let checkpoint = output
                 .checkpoint
@@ -2214,7 +2214,7 @@ mod tests {
                 root_service: crate::service::RootServiceId([3; 32]),
                 deployment: crate::service::DeploymentId([4; 32]),
                 service_program: crate::service::ProgramId([5; 32]),
-                service_abi: crate::service::ABI_VERSION,
+                platform: crate::service::PLATFORM_ID,
                 execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
                 gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000,),
             },

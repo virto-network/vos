@@ -30,7 +30,7 @@ use vos::storage::StorageMap;
 /// iterated, so hashing forfeits nothing here.
 pub(crate) fn window_key(peer_name: &[u8], currency: u32, window: u64) -> [u8; 32] {
     vos::crypto::blake2b_hash::<32>(
-        b"clerk-bridge/window-net/v1",
+        b"clerk-bridge/window-net",
         &[peer_name, &currency.to_be_bytes(), &window.to_be_bytes()],
     )
 }
@@ -41,7 +41,7 @@ pub(crate) fn window_key(peer_name: &[u8], currency: u32, window: u64) -> [u8; 3
 /// this actor when auditing a claim.
 pub(crate) fn peer_key_key(peer_name: &[u8], currency: u32, window: u64) -> [u8; 32] {
     vos::crypto::blake2b_hash::<32>(
-        b"clerk-bridge/window-peer-key/v1",
+        b"clerk-bridge/window-peer-key",
         &[peer_name, &currency.to_be_bytes(), &window.to_be_bytes()],
     )
 }

@@ -1,4 +1,4 @@
-//! JAR/JAM protocol capability numbering.
+//! PVM/service platform protocol capability numbering.
 //!
 //! IDs match the canonical slot numbers in `spec/Jar/JAVM/Capability.lean`
 //! (`protocolGas = 1`, `protocolFetch = 2`, ... `protocolQuota = 28`).
@@ -85,7 +85,7 @@ pub const ACTOR_PRIVATE_FETCH: u32 = 115;
 
 /// Export one actor's buffered effects to the generic service scheduler.
 ///
-/// The host binds the bytes to the currently active JAR VM; the service guest
+/// The host binds the bytes to the currently active PVM VM; the service guest
 /// later validates and canonicalizes them into `Transition`. Refine-only.
 pub const ACTOR_EFFECT_EXPORT: u32 = 116;
 
@@ -123,7 +123,7 @@ pub const NOW_MS: u32 = 121;
 ///
 /// Capability slots are phase-local: actor Refine uses slot 121 for the
 /// explicitly non-consensus [`NOW_MS`] seam, while the generic service's
-/// Accumulate entry receives this deterministic JAM-slot observation. The two
+/// Accumulate entry receives this deterministic service platform-slot observation. The two
 /// capabilities are never installed in the same invocation.
 pub const ACCUMULATION_TIMESLOT: u32 = NOW_MS;
 
@@ -159,7 +159,7 @@ pub const RECEIPT_VERIFY: u32 = 125;
 pub const INSTALL_AUTH_VERIFY: u32 = 126;
 
 /// Query one canonical actor PVM by `ProgramId` inside the current Accumulate
-/// transaction. This is a VOS service capability, not a JAM protocol slot.
+/// transaction. This is a VOS service capability, not a service platform protocol slot.
 pub const PROGRAM_LOOKUP: u32 = 127;
 #[cfg(test)]
 mod tests {

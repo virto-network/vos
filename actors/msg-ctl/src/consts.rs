@@ -1,7 +1,7 @@
 //! Tunable constants: the commit-id domain tag and sizing/paging bounds.
 
 /// Domain tag for commit-record ids.
-pub const COMMIT_ID_DOMAIN_TAG: &[u8] = b"vos-msg-commit/v1";
+pub const COMMIT_ID_DOMAIN_TAG: &[u8] = b"vos-msg-commit";
 
 /// Per-field ciphertext bound. Keeps a `CommitRow` small and a
 /// `commits` page predictable; the host's hard reply ceiling is far

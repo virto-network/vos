@@ -1,6 +1,6 @@
 //! Pluggable data layer for exact VOS kernel snapshots.
 //!
-//! In the CoreVM-on-JAM split, a service's persisted continuation has
+//! In the CoreVM-on-service platform split, a service's persisted continuation has
 //! two parts:
 //!
 //! - A small **header** (snapshot length, execution semantics, commitment)
@@ -11,13 +11,13 @@
 //!
 //! [`DataLayer`] abstracts the body store. The default in-process
 //! [`MemoryDataLayer`] is a `HashMap<[u8; 32], Vec<u8>>`. A real
-//! backend (LevelDB, JAM DA, …) drops in by implementing the trait.
+//! backend (LevelDB, service platform DA, …) drops in by implementing the trait.
 //!
 //! The trait is `async` so disk- and network-backed implementations
 //! can plug in without restructuring the runtime; the in-memory
 //! default returns immediately.
 //!
-//! Despite the name, this is not (yet) a JAM data-availability lane —
+//! Despite the name, this is not (yet) a service platform data-availability lane —
 //! VOS runs it locally today. The name is chosen so that on-chain
 //! wiring will replace `MemoryDataLayer` with a backend that pushes
 //! bodies into the real DA bus, and validators reassemble the

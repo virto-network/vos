@@ -525,7 +525,7 @@ impl core::fmt::Display for Status {
 // ── Signing-byte builders (consensus-critical: byte-exact) ─────────
 
 /// Domain tag for registry-op author signatures.
-pub const REGISTRY_OP_DOMAIN: &[u8] = b"vos-registry-op/v1";
+pub const REGISTRY_OP_DOMAIN: &[u8] = b"vos-registry-op";
 
 /// ed25519 signature length.
 pub const OP_SIG_LEN: usize = 64;
@@ -647,7 +647,7 @@ pub fn ed25519_pubkey_from_peer_id(peer_id: &[u8]) -> Option<[u8; 32]> {
 /// Domain tag for the MLS identity-binding signature (the messenger's
 /// `vos-msg/identity-binding/v1`). Separate from [`REGISTRY_OP_DOMAIN`]
 /// so a registry-op signature can never be replayed as a binding cert.
-pub const BINDING_DOMAIN: &[u8] = b"vos-msg/identity-binding/v1";
+pub const BINDING_DOMAIN: &[u8] = b"vos-msg/identity-binding";
 
 /// Canonical bytes the operator's identity key signs to bind an MLS
 /// signature key to a space PeerId: `domain || u16(mls_pubkey.len) ||
@@ -669,8 +669,8 @@ pub fn binding_signed_bytes(mls_pubkey: &[u8], peer_id: &[u8], space_id: &[u8; 3
 // ── Service-id derivation ─────────────────────────────────────────
 
 /// Domain tag for `space_id` derivation. The host computes
-/// `space_id = blake2b("vos-space-id/v1" || genesis_dag_root)`.
-pub const SPACE_ID_DOMAIN_TAG: &[u8] = b"vos-space-id/v1";
+/// `space_id = blake2b("vos-space-id" || genesis_dag_root)`.
+pub const SPACE_ID_DOMAIN_TAG: &[u8] = b"vos-space-id";
 
 /// Deterministic per-node `ServiceId` (raw u32) for an installed
 /// instance. The low 16 bits are `blake2b(instance_name)` folded into
@@ -685,10 +685,8 @@ pub const SPACE_ID_DOMAIN_TAG: &[u8] = b"vos-space-id/v1";
 /// host ECALL precompile; on every other target it runs through
 /// [`crate::crypto::blake2b_hash`] → `blake2b_simd`.
 pub fn instance_service_id(instance_name: &str, prefix: u16) -> u32 {
-    let raw_bytes: [u8; 2] = crate::crypto::blake2b_hash(
-        b"vos-instance-svc-id/v1",
-        &[&[0u8], instance_name.as_bytes()],
-    );
+    let raw_bytes: [u8; 2] =
+        crate::crypto::blake2b_hash(b"vos-instance-svc-id", &[&[0u8], instance_name.as_bytes()]);
     let raw = u16::from_le_bytes(raw_bytes);
     let local = (raw & 0x7FFF).max(0x100);
     ((prefix as u32) << 16) | (local as u32)

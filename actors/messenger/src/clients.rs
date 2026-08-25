@@ -363,7 +363,7 @@ pub(crate) async fn chronos_beacon(ctx: &mut MsgrCtx) -> Option<[u8; 32]> {
     )
     .ok()??;
     Some(vos::crypto::blake2b_hash::<32>(
-        b"vos-msg/beacon-hedge/v1",
+        b"vos-msg/beacon-hedge",
         &[&round.round.to_le_bytes(), &round.beacon],
     ))
 }

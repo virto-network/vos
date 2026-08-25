@@ -2257,7 +2257,7 @@ fn page_rows(budget: u32) -> usize {
 /// only the ordered-by-name iteration is forfeit, and no consumer depends
 /// on it (`resolve`/`meta_for_instance` are exact-name point lookups).
 fn name_key(name: &str) -> [u8; 32] {
-    vos::crypto::blake2b_hash::<32>(b"space-registry/name-key/v1", &[name.as_bytes()])
+    vos::crypto::blake2b_hash::<32>(b"space-registry/name-key", &[name.as_bytes()])
 }
 
 /// Fixed-width `StorageMap` key for a variable-length peer id. One grant
@@ -2265,7 +2265,7 @@ fn name_key(name: &str) -> [u8; 32] {
 /// key, not peer id — no consumer depends on peer order (grants are point
 /// looked-up in `effective_role`; the list handler pages).
 fn peer_key(peer_id: &[u8]) -> [u8; 32] {
-    vos::crypto::blake2b_hash::<32>(b"space-registry/peer-key/v1", &[peer_id])
+    vos::crypto::blake2b_hash::<32>(b"space-registry/peer-key", &[peer_id])
 }
 
 /// Reserved rows in the existing metadata keyspace avoid changing the
@@ -2291,7 +2291,7 @@ fn role_authority_grant_binding(authority: [u8; 32], row: &AuthGrantRow) -> [u8;
 
 fn role_authority_grant_witness_key(authority: [u8; 32], peer: [u8; 32]) -> [u8; 32] {
     vos::crypto::blake2b_hash::<32>(
-        b"space-registry/role-authority-grant-witness/v3",
+        b"space-registry/role-authority-grant-witness",
         &[&authority, &peer],
     )
 }
@@ -2301,7 +2301,7 @@ fn role_authority_grant_witness_key(authority: [u8; 32], peer: [u8; 32]) -> [u8;
 /// can't collide into the same key.
 fn acl_key(peer_id: &[u8], agent_name: &str) -> [u8; 32] {
     vos::crypto::blake2b_hash::<32>(
-        b"space-registry/acl-key/v1",
+        b"space-registry/acl-key",
         &[
             &(peer_id.len() as u32).to_be_bytes(),
             peer_id,
@@ -2314,7 +2314,7 @@ fn acl_key(peer_id: &[u8], agent_name: &str) -> [u8; 32] {
 /// public key. Nodes key directly by their `u16` prefix (order-preserving);
 /// only identities need folding.
 fn identity_key(public_key: &[u8]) -> [u8; 32] {
-    vos::crypto::blake2b_hash::<32>(b"space-registry/identity-key/v1", &[public_key])
+    vos::crypto::blake2b_hash::<32>(b"space-registry/identity-key", &[public_key])
 }
 
 /// Position of an `AgentRow.consistency` byte on the monotone

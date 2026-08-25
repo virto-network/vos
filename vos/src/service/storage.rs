@@ -15,9 +15,7 @@ use super::{
     ServiceIdentity, WorkEnvelope, WorkInputId,
 };
 
-pub const SERVICE_STORE_SCHEMA_VERSION: u16 = 39;
-
-/// Physical keys used directly in the JAM service account. They are outside
+/// Physical keys used directly in the service account. They are outside
 /// every actor's logical keyspace and never exposed through application APIs.
 const HEADER_STORAGE_KEY: &[u8] = b"\0vos/service/header";
 const DEDUP_STORAGE_PREFIX: &[u8] = b"\0vos/service/dedup/";
@@ -37,7 +35,6 @@ const CRDT_CHANGE_STORAGE_PREFIX: &[u8] = b"\0vos/service/crdt-change/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreHeader {
-    pub schema_version: u16,
     pub service: ServiceIdentity,
     pub consistency: ConsistencyMode,
     /// Root of the guest-owned service metadata/workflow tree. It exists for
@@ -53,13 +50,11 @@ pub struct StoreHeader {
     /// floor before admitting new work, so process restart and wall-clock
     /// rollback cannot backdate a later invocation.
     pub admission_timeslot_high_water: u64,
-    pub snapshot_version: u16,
 }
 
 impl StoreHeader {
     pub fn current(service: ServiceIdentity, consistency: ConsistencyMode) -> Self {
         Self {
-            schema_version: SERVICE_STORE_SCHEMA_VERSION,
             service,
             consistency,
             service_root: super::state_tree::empty_state_root(),
@@ -68,20 +63,17 @@ impl StoreHeader {
                 .then(super::state_tree::empty_state_root),
             crdt_heads: Vec::new(),
             admission_timeslot_high_water: 0,
-            snapshot_version: super::SNAPSHOT_VERSION,
         }
     }
 
     pub fn open(bytes: &[u8]) -> Result<Self, StoreOpenError> {
         if bytes.get(..4) != Some(&Self::MAGIC) {
-            return Err(StoreOpenError::LegacyStore);
+            return Err(StoreOpenError::UnknownStore);
         }
         let header = Self::decode(bytes).map_err(StoreOpenError::InvalidHeader)?;
-        if header.schema_version != SERVICE_STORE_SCHEMA_VERSION
-            || header.service.service_abi != super::ABI_VERSION
+        if header.service.platform != super::PLATFORM_ID
             || header.service.execution_semantics != super::EXECUTION_SEMANTICS_ID
             || !header.service.gas_schedule.is_valid()
-            || header.snapshot_version != super::SNAPSHOT_VERSION
         {
             return Err(StoreOpenError::IncompatibleSemantics);
         }
@@ -98,11 +90,10 @@ impl StoreHeader {
 }
 
 impl ServiceWire for StoreHeader {
-    const MAGIC: [u8; 4] = *b"VST2";
+    const MAGIC: [u8; 4] = *b"VSTR";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
-        e.u16(self.schema_version);
         encode_service(&mut e, &self.service);
         e.u8(self.consistency as u8);
         e.fixed(&self.service_root.0);
@@ -110,12 +101,10 @@ impl ServiceWire for StoreHeader {
         e.option(&self.state_root, |e, root| e.fixed(&root.0));
         e.list(&self.crdt_heads, |e, head| e.fixed(&head.0));
         e.u64(self.admission_timeslot_high_water);
-        e.u16(self.snapshot_version);
     }
 
     fn decode_body(d: &mut Decoder<'_>) -> Result<Self, DecodeError> {
         let value = Self {
-            schema_version: d.u16()?,
             service: decode_service(d)?,
             consistency: decode_consistency(d)?,
             service_root: Hash(d.fixed()?),
@@ -123,7 +112,6 @@ impl ServiceWire for StoreHeader {
             state_root: d.option(|d| d.fixed().map(Hash))?,
             crdt_heads: d.list(|d| d.fixed().map(Hash))?,
             admission_timeslot_high_water: d.u64()?,
-            snapshot_version: d.u16()?,
         };
         ensure_hashes_sorted(&value.crdt_heads)?;
         let valid_commitment = match value.consistency {
@@ -172,7 +160,7 @@ pub enum StateKey {
 }
 
 impl ServiceWire for StateKey {
-    const MAGIC: [u8; 4] = *b"VSK2";
+    const MAGIC: [u8; 4] = *b"VSKW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -301,7 +289,7 @@ impl IngressRecord {
     ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&Self::MAGIC);
-        out.extend_from_slice(&super::ABI_VERSION.to_le_bytes());
+        out.extend_from_slice(&super::PLATFORM_ID.0);
         let mut e = Encoder(&mut out);
         e.bytes(&ingress.encode_admitted());
         e.bool(consumed);
@@ -317,7 +305,7 @@ impl IngressRecord {
     ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&Self::MAGIC);
-        out.extend_from_slice(&super::ABI_VERSION.to_le_bytes());
+        out.extend_from_slice(&super::PLATFORM_ID.0);
         let mut e = Encoder(&mut out);
         e.bytes(&DirectIngress::encode_materialized(ingress, change));
         e.bool(consumed);
@@ -330,19 +318,17 @@ impl IngressRecord {
     /// [`ServiceWire::decode`] over the same bytes; this helper only preserves that
     /// authenticated wire while changing the one atomic lifecycle bit.
     pub(crate) fn mark_consumed_in_place(bytes: &mut [u8]) -> Result<(), DecodeError> {
-        if bytes.get(..4) != Some(&Self::MAGIC)
-            || bytes.get(4..6) != Some(&super::ABI_VERSION.to_le_bytes())
-        {
+        if bytes.get(..4) != Some(&Self::MAGIC) || bytes.get(4..36) != Some(&super::PLATFORM_ID.0) {
             return Err(DecodeError::NonCanonical);
         }
         let ingress_len = u32::from_le_bytes(
             bytes
-                .get(6..10)
+                .get(36..40)
                 .ok_or(DecodeError::Truncated)?
                 .try_into()
                 .map_err(|_| DecodeError::Truncated)?,
         ) as usize;
-        let consumed = 10usize
+        let consumed = 40usize
             .checked_add(ingress_len)
             .ok_or(DecodeError::LimitExceeded)?;
         let flag = bytes.get_mut(consumed).ok_or(DecodeError::Truncated)?;
@@ -392,7 +378,7 @@ impl PublicationRecord {
 }
 
 impl ServiceWire for PublicationAckRecord {
-    const MAGIC: [u8; 4] = *b"VPA2";
+    const MAGIC: [u8; 4] = *b"VPAW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -473,7 +459,7 @@ pub struct WorkflowCheckpoint {
 }
 
 impl ServiceWire for WorkflowCheckpoint {
-    const MAGIC: [u8; 4] = *b"VWF2";
+    const MAGIC: [u8; 4] = *b"VWFW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         Self::encode_materialized_body(
@@ -524,7 +510,7 @@ impl WorkflowCheckpoint {
         e.u32(0);
         let resume_offset = e.0.len();
         e.0.extend_from_slice(&WorkEnvelope::MAGIC);
-        e.0.extend_from_slice(&super::ABI_VERSION.to_le_bytes());
+        e.0.extend_from_slice(&super::PLATFORM_ID.0);
         resume_work.encode_body(e.0);
         let resume_len = e.0.len() - resume_offset;
         let resume_len =
@@ -545,7 +531,7 @@ impl WorkflowCheckpoint {
     ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&Self::MAGIC);
-        out.extend_from_slice(&super::ABI_VERSION.to_le_bytes());
+        out.extend_from_slice(&super::PLATFORM_ID.0);
         Self::encode_materialized_body(
             &mut out,
             input,
@@ -567,7 +553,7 @@ impl WorkflowCheckpoint {
 }
 
 impl ServiceWire for DedupRecord {
-    const MAGIC: [u8; 4] = *b"VDD2";
+    const MAGIC: [u8; 4] = *b"VDDW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -594,7 +580,7 @@ impl ServiceWire for DedupRecord {
 }
 
 impl ServiceWire for PublicationRecord {
-    const MAGIC: [u8; 4] = *b"VPB2";
+    const MAGIC: [u8; 4] = *b"VPBW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -628,7 +614,7 @@ impl ServiceWire for PublicationRecord {
 }
 
 impl ServiceWire for RoleAssertionEligibility {
-    const MAGIC: [u8; 4] = *b"VRE2";
+    const MAGIC: [u8; 4] = *b"VREW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -651,7 +637,7 @@ impl ServiceWire for RoleAssertionEligibility {
 }
 
 impl ServiceWire for ActorUpgradeRecord {
-    const MAGIC: [u8; 4] = *b"VUR2";
+    const MAGIC: [u8; 4] = *b"VURW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -690,7 +676,7 @@ impl ServiceWire for ActorUpgradeRecord {
 }
 
 impl ServiceWire for DeliveryRecord {
-    const MAGIC: [u8; 4] = *b"VDR2";
+    const MAGIC: [u8; 4] = *b"VDRW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -731,7 +717,7 @@ impl ServiceWire for DeliveryRecord {
 }
 
 impl ServiceWire for IngressRecord {
-    const MAGIC: [u8; 4] = *b"VIR2";
+    const MAGIC: [u8; 4] = *b"VIRW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -761,7 +747,7 @@ impl ServiceWire for IngressRecord {
 }
 
 impl ServiceWire for ReplyAdmissionRecord {
-    const MAGIC: [u8; 4] = *b"VRD2";
+    const MAGIC: [u8; 4] = *b"VRDW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -791,7 +777,7 @@ impl ServiceWire for ReplyAdmissionRecord {
 }
 
 impl ServiceWire for PendingCallDeadline {
-    const MAGIC: [u8; 4] = *b"VPD2";
+    const MAGIC: [u8; 4] = *b"VPDW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         let mut e = Encoder(out);
@@ -962,7 +948,7 @@ fn encode_service(e: &mut Encoder<'_>, service: &ServiceIdentity) {
     e.fixed(&service.root_service.0);
     e.fixed(&service.deployment.0);
     e.fixed(&service.service_program.0);
-    e.u16(service.service_abi);
+    e.fixed(&service.platform.0);
     e.fixed(&service.execution_semantics.0);
     e.u64(service.gas_schedule.refine);
     e.u64(service.gas_schedule.accumulate);
@@ -974,7 +960,7 @@ fn decode_service(d: &mut Decoder<'_>) -> Result<ServiceIdentity, DecodeError> {
         root_service: super::RootServiceId(d.fixed()?),
         deployment: super::DeploymentId(d.fixed()?),
         service_program: super::ProgramId(d.fixed()?),
-        service_abi: d.u16()?,
+        platform: Hash(d.fixed()?),
         execution_semantics: Hash(d.fixed()?),
         gas_schedule: super::GasSchedule::new(d.u64()?, d.u64()?),
     })
@@ -999,7 +985,7 @@ fn ensure_hashes_sorted(values: &[Hash]) -> Result<(), DecodeError> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreOpenError {
-    LegacyStore,
+    UnknownStore,
     InvalidHeader(DecodeError),
     IncompatibleSemantics,
     WrongService,
@@ -1008,9 +994,8 @@ pub enum StoreOpenError {
 impl core::fmt::Display for StoreOpenError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::LegacyStore => f.write_str(
-                "this is a VOS v1 store; runtime service cannot migrate it—export any needed data, \
-                 reset the store, and reinstall the signed .vos package",
+            Self::UnknownStore => f.write_str(
+                "store does not belong to this platform; reset it and reinstall the signed package",
             ),
             Self::InvalidHeader(error) => write!(f, "invalid VOS service store header: {error}"),
             Self::IncompatibleSemantics => {
@@ -1031,7 +1016,7 @@ mod tests {
 
     use super::*;
     use crate::service::{
-        ABI_VERSION, ChangeId, DeploymentId, EXECUTION_SEMANTICS_ID, MessageRecord, ProgramId,
+        ChangeId, DeploymentId, EXECUTION_SEMANTICS_ID, MessageRecord, PLATFORM_ID, ProgramId,
         RootServiceId, empty_state_root,
     };
 
@@ -1041,16 +1026,16 @@ mod tests {
             root_service: RootServiceId([byte; 32]),
             deployment: DeploymentId([byte.wrapping_add(1); 32]),
             service_program: ProgramId([byte.wrapping_add(2); 32]),
-            service_abi: ABI_VERSION,
+            platform: PLATFORM_ID,
             execution_semantics: EXECUTION_SEMANTICS_ID,
             gas_schedule: super::super::GasSchedule::new(1_000_000_000, 5_000_000_000),
         }
     }
 
     #[test]
-    fn v1_store_gets_actionable_clean_break_error() {
-        let error = StoreHeader::open(b"legacy-state").unwrap_err();
-        assert_eq!(error, StoreOpenError::LegacyStore);
+    fn foreign_store_gets_actionable_clean_break_error() {
+        let error = StoreHeader::open(b"foreign-state").unwrap_err();
+        assert_eq!(error, StoreOpenError::UnknownStore);
         let message = error.to_string();
         assert!(message.contains("reset"));
         assert!(message.contains("reinstall"));
@@ -1070,16 +1055,6 @@ mod tests {
         assert_eq!(crdt.revision, 0);
         assert_eq!(crdt.admission_timeslot_high_water, 0);
         assert_eq!(crdt.service_root, empty_state_root());
-    }
-
-    #[test]
-    fn prior_crdt_ingress_schema_is_a_clean_break() {
-        let mut previous = StoreHeader::current(service(9), ConsistencyMode::Crdt);
-        previous.schema_version = 28;
-        assert_eq!(
-            StoreHeader::open(&previous.encode()),
-            Err(StoreOpenError::IncompatibleSemantics),
-        );
     }
 
     #[test]

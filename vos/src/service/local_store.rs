@@ -1,4 +1,4 @@
-//! Atomic local JAM storage host for the service conformance and production profiles.
+//! Atomic local service platform storage host for the service conformance and production profiles.
 //!
 //! This module implements only the physical storage and preimage protocol
 //! calls used by the canonical service PVM. It deliberately does not decode or
@@ -54,7 +54,7 @@ fn proof_verification_for_attestation(
 /// crash-recovery image persisted by a host. It contains no in-flight
 /// transaction or process-local verifier policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LocalJamStoreSnapshot {
+pub struct MemoryServiceSnapshot {
     rows: BTreeMap<Vec<u8>, Vec<u8>>,
     blobs: BTreeMap<[u8; 32], Vec<u8>>,
     programs: BTreeMap<[u8; 32], Vec<u8>>,
@@ -70,7 +70,7 @@ pub struct LocalJamStoreSnapshot {
     production_trust_provenance: Option<(super::Hash, super::Hash)>,
 }
 
-impl LocalJamStoreSnapshot {
+impl MemoryServiceSnapshot {
     /// Exact content-addressed application blobs retained in this committed
     /// image. Hosts use this read-only view to recover catalog artifacts that
     /// were ordered with an actor upgrade before the registry pointer moved.
@@ -214,8 +214,8 @@ impl LocalJamStoreSnapshot {
     }
 }
 
-impl ServiceWire for LocalJamStoreSnapshot {
-    const MAGIC: [u8; 4] = *b"VSS4";
+impl ServiceWire for MemoryServiceSnapshot {
+    const MAGIC: [u8; 4] = *b"VSSW";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         self.encode_provenance_input(out);
@@ -524,7 +524,7 @@ impl FileCommittedImageStore {
         self.path.with_file_name(name)
     }
 
-    fn legacy_private_ingress_path(&self, invocation: super::InvocationId) -> PathBuf {
+    fn private_ingress_base_path(&self, invocation: super::InvocationId) -> PathBuf {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut name = [0_u8; 64];
         for (index, byte) in invocation.0.iter().copied().enumerate() {
@@ -536,8 +536,8 @@ impl FileCommittedImageStore {
     }
 
     fn private_ingress_path(&self, invocation: super::InvocationId) -> PathBuf {
-        self.legacy_private_ingress_path(invocation)
-            .with_extension("vpi3")
+        self.private_ingress_base_path(invocation)
+            .with_extension("private")
     }
 
     fn write_private_ingress_artifact(
@@ -586,11 +586,8 @@ impl FileCommittedImageStore {
     }
 }
 
-fn decode_private_ingress_file_name(name: &str) -> Option<(super::InvocationId, bool)> {
-    let (name, current) = match name.strip_suffix(".vpi3") {
-        Some(name) => (name, true),
-        None => (name, false),
-    };
+fn decode_private_ingress_file_name(name: &str) -> Option<super::InvocationId> {
+    let name = name.strip_suffix(".private")?;
     if name.len() != 64 {
         return None;
     }
@@ -605,11 +602,10 @@ fn decode_private_ingress_file_name(name: &str) -> Option<(super::InvocationId, 
     for (index, pair) in name.as_bytes().chunks_exact(2).enumerate() {
         invocation[index] = nibble(pair[0])?.checked_shl(4)? | nibble(pair[1])?;
     }
-    Some((super::InvocationId(invocation), current))
+    Some(super::InvocationId(invocation))
 }
 
-const PRIVATE_INGRESS_ARTIFACT_MAGIC: &[u8; 4] = b"VPI3";
-const LEGACY_PRIVATE_INGRESS_ARTIFACT_MAGIC: &[u8; 4] = b"VPI2";
+const PRIVATE_INGRESS_ARTIFACT_MAGIC: &[u8; 4] = b"VPIN";
 
 fn encode_private_ingress_artifact(
     invocation: super::InvocationId,
@@ -638,7 +634,7 @@ fn private_ingress_artifact_binding(
     reference: &BlobRef,
 ) -> super::Hash {
     super::Hash::digest(
-        b"vos/private-ingress-artifact/v3",
+        b"vos/private-ingress-artifact",
         &[
             PRIVATE_INGRESS_ARTIFACT_MAGIC,
             &invocation.0,
@@ -671,20 +667,6 @@ fn decode_private_ingress_artifact(
         && payload.len() <= super::ACTOR_PRIVATE_INPUT_MAX_BYTES
         && reference.matches(payload))
     .then_some((staging, reference, payload))
-}
-
-fn decode_legacy_private_ingress_artifact(bytes: &[u8]) -> Option<(BlobRef, &[u8])> {
-    if bytes.get(..4)? != LEGACY_PRIVATE_INGRESS_ARTIFACT_MAGIC {
-        return None;
-    }
-    let hash = super::Hash(bytes.get(4..36)?.try_into().ok()?);
-    let len = u64::from_le_bytes(bytes.get(36..44)?.try_into().ok()?);
-    let payload = bytes.get(44..)?;
-    let reference = BlobRef { hash, len };
-    (!payload.is_empty()
-        && payload.len() <= super::ACTOR_PRIVATE_INPUT_MAX_BYTES
-        && reference.matches(payload))
-    .then_some((reference, payload))
 }
 
 impl CommittedImageStore for FileCommittedImageStore {
@@ -814,7 +796,7 @@ impl ProofArtifactStore for FileCommittedImageStore {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            let Some((invocation, true)) = decode_private_ingress_file_name(&name) else {
+            let Some(invocation) = decode_private_ingress_file_name(&name) else {
                 // Incomplete atomic-write files are not acknowledged durable
                 // artifacts and are removed by startup reconciliation.
                 continue;
@@ -922,8 +904,7 @@ impl ProofArtifactStore for FileCommittedImageStore {
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            let decoded_name = decode_private_ingress_file_name(&name);
-            let Some((invocation, current)) = decoded_name else {
+            let Some(invocation) = decode_private_ingress_file_name(&name) else {
                 if entry.file_type()?.is_dir() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -942,16 +923,9 @@ impl ProofArtifactStore for FileCommittedImageStore {
                 retained.binary_search_by_key(&invocation, |(candidate, _)| *candidate)
             {
                 let expected = &retained[index].1;
-                let decoded = if current {
+                let Some((staging, stored_reference, bytes)) =
                     decode_private_ingress_artifact(invocation, &artifact)
-                        .map(|(_, reference, bytes)| (reference, bytes))
-                } else {
-                    (artifact.len() <= super::ACTOR_PRIVATE_INPUT_MAX_BYTES
-                        && expected.matches(&artifact))
-                    .then_some((expected.clone(), artifact.as_slice()))
-                    .or_else(|| decode_legacy_private_ingress_artifact(&artifact))
-                };
-                let Some((stored_reference, bytes)) = decoded else {
+                else {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "private ingress artifact is not canonical",
@@ -963,36 +937,7 @@ impl ProofArtifactStore for FileCommittedImageStore {
                         "private ingress does not match its guest-owned content address",
                     ));
                 }
-                if !current {
-                    let current_path = self.private_ingress_path(invocation);
-                    match std::fs::read(&current_path) {
-                        Ok(existing)
-                            if decode_private_ingress_artifact(invocation, &existing)
-                                .is_some_and(|(_, reference, current_bytes)| {
-                                    reference == *expected && current_bytes == bytes
-                                }) => {}
-                        Ok(_) => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "legacy and current private ingress artifacts disagree",
-                            ));
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            self.write_private_ingress_artifact(
-                                invocation,
-                                PrivateIngressStaging::Local,
-                                expected,
-                                bytes,
-                            )?;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                    std::fs::remove_file(path)?;
-                } else if !decode_private_ingress_artifact(invocation, &artifact).is_some_and(
-                    |(staging, reference, _)| {
-                        staging == PrivateIngressStaging::Local && reference == *expected
-                    },
-                ) {
+                if staging != PrivateIngressStaging::Local {
                     self.write_private_ingress_artifact(
                         invocation,
                         PrivateIngressStaging::Local,
@@ -1001,14 +946,6 @@ impl ProofArtifactStore for FileCommittedImageStore {
                     )?;
                 }
                 present.insert(invocation);
-                continue;
-            }
-            if !current {
-                // Batch 60 stored raw Local bytes at the unversioned path;
-                // the short-lived VPI2 review format used the same name.
-                // Neither has independently authenticated replicated
-                // ownership, so an orphan is always retired.
-                std::fs::remove_file(path)?;
                 continue;
             }
             match decode_private_ingress_artifact(invocation, &artifact) {
@@ -1138,7 +1075,7 @@ pub enum LocalStoreReadError {
     CorruptUpgrade,
 }
 
-/// Consensus/JAM trust inputs required by a production service service host.
+/// Consensus/service platform trust inputs required by a production service service host.
 ///
 /// Implementations are host capabilities, not service state. Their stable
 /// `policy_id` is sealed into every durable image, while each decision is
@@ -1149,7 +1086,7 @@ pub trait ProductionTrust: Send + Sync + 'static {
     /// Stable commitment to the authority set and verification rules.
     fn policy_id(&self) -> super::Hash;
 
-    /// Current consensus-observed JAM slot. Repeated observations may return
+    /// Current consensus-observed service platform slot. Repeated observations may return
     /// the same slot, but must never move behind committed service state.
     fn logical_timeslot(&self) -> Option<u64>;
 
@@ -1220,7 +1157,7 @@ impl core::fmt::Display for LocalStoreReadError {
 
 impl core::error::Error for LocalStoreReadError {}
 
-/// In-memory implementation of the JAM storage boundary used by the local
+/// In-memory implementation of the service platform storage boundary used by the local
 /// runtime and conformance tests.
 ///
 /// [`AccumulateProtocolHost::begin`] clones the committed image. IC-5 reads
@@ -1228,8 +1165,8 @@ impl core::error::Error for LocalStoreReadError {}
 /// swaps it into visibility atomically. Dropping a transaction therefore
 /// discards every staged row and blob.
 #[derive(Clone, Default)]
-pub struct LocalJamStore {
-    committed: LocalJamStoreSnapshot,
+pub struct MemoryServiceStore {
+    committed: MemoryServiceSnapshot,
     /// Proof artifacts are verifier/CAS inputs, not consensus service state.
     /// They are deliberately excluded from snapshots and equality.
     proof_blobs: BTreeMap<[u8; 32], Vec<u8>>,
@@ -1238,7 +1175,7 @@ pub struct LocalJamStore {
     private_witnesses: BTreeMap<[u8; 32], Vec<u8>>,
     /// Installed proof verifier for node/production execution. `None` is
     /// retained only for the explicit conformance harness, whose tests seed
-    /// exact request hashes through the legacy local allowlist seam.
+    /// exact request hashes directly.
     proof_verifier: Option<Arc<ProofVerifierFn>>,
     /// Production verifier/time capability. Its identity is sealed into the
     /// durable image; `None` is the explicit conformance profile.
@@ -1257,9 +1194,9 @@ pub struct LocalJamStore {
 pub(crate) type ProofVerifierFn =
     dyn Fn(&ProofVerificationRequest, &[u8]) -> bool + Send + Sync + 'static;
 
-impl core::fmt::Debug for LocalJamStore {
+impl core::fmt::Debug for MemoryServiceStore {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("LocalJamStore")
+        f.debug_struct("MemoryServiceStore")
             .field("committed", &self.committed)
             .field("proof_blobs", &self.proof_blobs.len())
             .field("private_witnesses", &self.private_witnesses.len())
@@ -1269,14 +1206,14 @@ impl core::fmt::Debug for LocalJamStore {
     }
 }
 
-/// JAM storage host whose committed image is durable before IC-5 returns.
+/// service platform storage host whose committed image is durable before IC-5 returns.
 ///
 /// Private-witness inputs and credential, receipt, and install verifier
 /// configuration remain process-local. Proof bytes and producer-private Task
 /// records use the backend's separate [`ProofArtifactStore`] side stores and
 /// never enter the consensus service image.
-pub struct DurableJamStore<B> {
-    local: LocalJamStore,
+pub struct DurableServiceStore<B> {
+    local: MemoryServiceStore,
     backend: B,
     private_ingress_retirement_debt: BTreeSet<super::InvocationId>,
 }
@@ -1288,33 +1225,33 @@ pub struct DurableJamStore<B> {
 /// view and process-local receipt policy. Transport remains orchestration
 /// only: every service-state mutation still crosses physical IC-5 and the
 /// host's [`AccumulateProtocolHost::commit`] boundary.
-pub trait LocalJamStoreHost {
-    fn local_store(&self) -> &LocalJamStore;
+pub trait MemoryServiceHost {
+    fn local_store(&self) -> &MemoryServiceStore;
 
-    fn local_store_mut(&mut self) -> &mut LocalJamStore;
+    fn local_store_mut(&mut self) -> &mut MemoryServiceStore;
 }
 
-impl LocalJamStoreHost for LocalJamStore {
-    fn local_store(&self) -> &LocalJamStore {
+impl MemoryServiceHost for MemoryServiceStore {
+    fn local_store(&self) -> &MemoryServiceStore {
         self
     }
 
-    fn local_store_mut(&mut self) -> &mut LocalJamStore {
+    fn local_store_mut(&mut self) -> &mut MemoryServiceStore {
         self
     }
 }
 
-impl<B> LocalJamStoreHost for DurableJamStore<B> {
-    fn local_store(&self) -> &LocalJamStore {
+impl<B> MemoryServiceHost for DurableServiceStore<B> {
+    fn local_store(&self) -> &MemoryServiceStore {
         &self.local
     }
 
-    fn local_store_mut(&mut self) -> &mut LocalJamStore {
+    fn local_store_mut(&mut self) -> &mut MemoryServiceStore {
         &mut self.local
     }
 }
 
-impl<B> DurableJamStore<B>
+impl<B> DurableServiceStore<B>
 where
     B: CommittedImageStore + ProofArtifactStore<Error = <B as CommittedImageStore>::Error>,
 {
@@ -1322,9 +1259,9 @@ where
         mut backend: B,
     ) -> Result<Self, DurableStoreOpenError<<B as CommittedImageStore>::Error>> {
         let local = match backend.load().map_err(DurableStoreOpenError::Backend)? {
-            Some(bytes) => LocalJamStore::from_snapshot_bytes(&bytes)
+            Some(bytes) => MemoryServiceStore::from_snapshot_bytes(&bytes)
                 .map_err(DurableStoreOpenError::InvalidSnapshot)?,
-            None => LocalJamStore::new(),
+            None => MemoryServiceStore::new(),
         };
         let (retained, terminal) = local
             .private_ingress_recovery()
@@ -1347,7 +1284,7 @@ where
         &mut self.backend
     }
 
-    pub fn into_parts(self) -> (LocalJamStore, B) {
+    pub fn into_parts(self) -> (MemoryServiceStore, B) {
         (self.local, self.backend)
     }
 
@@ -1362,7 +1299,7 @@ where
     }
 }
 
-impl<B> DurableJamStore<B>
+impl<B> DurableServiceStore<B>
 where
     B: CommittedImageStore + ProofArtifactStore<Error = <B as CommittedImageStore>::Error>,
 {
@@ -1574,15 +1511,15 @@ where
     }
 }
 
-impl<B> Deref for DurableJamStore<B> {
-    type Target = LocalJamStore;
+impl<B> Deref for DurableServiceStore<B> {
+    type Target = MemoryServiceStore;
 
     fn deref(&self) -> &Self::Target {
         &self.local
     }
 }
 
-impl<B> DerefMut for DurableJamStore<B> {
+impl<B> DerefMut for DurableServiceStore<B> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.local
     }
@@ -1592,18 +1529,18 @@ impl<B> DerefMut for DurableJamStore<B> {
 /// proof/private-witness inputs and credential, receipt, and install
 /// allowlists are process-scoped host configuration and deliberately do not
 /// participate in snapshots or equality.
-impl PartialEq for LocalJamStore {
+impl PartialEq for MemoryServiceStore {
     fn eq(&self, other: &Self) -> bool {
         self.committed == other.committed
     }
 }
 
-impl Eq for LocalJamStore {}
+impl Eq for MemoryServiceStore {}
 
-impl LocalJamStore {
+impl MemoryServiceStore {
     pub const fn new() -> Self {
         Self {
-            committed: LocalJamStoreSnapshot {
+            committed: MemoryServiceSnapshot {
                 rows: BTreeMap::new(),
                 blobs: BTreeMap::new(),
                 programs: BTreeMap::new(),
@@ -1625,7 +1562,7 @@ impl LocalJamStore {
     }
 
     /// Reopen one already-decoded committed service-account image.
-    pub fn from_snapshot(snapshot: LocalJamStoreSnapshot) -> Self {
+    pub fn from_snapshot(snapshot: MemoryServiceSnapshot) -> Self {
         Self {
             committed: snapshot,
             proof_blobs: BTreeMap::new(),
@@ -1643,14 +1580,14 @@ impl LocalJamStore {
 
     /// Restore one canonical committed image read from durable storage.
     pub fn from_snapshot_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
-        LocalJamStoreSnapshot::decode(bytes).map(Self::from_snapshot)
+        MemoryServiceSnapshot::decode(bytes).map(Self::from_snapshot)
     }
 
     fn validate_replacement(
         &self,
         image: &[u8],
-    ) -> Result<LocalJamStoreSnapshot, ServiceImageInstallError> {
-        let replacement = LocalJamStoreSnapshot::decode(image)
+    ) -> Result<MemoryServiceSnapshot, ServiceImageInstallError> {
+        let replacement = MemoryServiceSnapshot::decode(image)
             .map_err(|_| ServiceImageInstallError::InvalidSnapshot)?;
         let replacement_header = replacement
             .rows
@@ -1682,7 +1619,7 @@ impl LocalJamStore {
     /// Clone only committed state for in-process reconstruction. An active
     /// Accumulate transaction is owned by the service invocation and cannot be
     /// observed through this object.
-    pub fn snapshot(&self) -> LocalJamStoreSnapshot {
+    pub fn snapshot(&self) -> MemoryServiceSnapshot {
         self.committed.clone()
     }
 
@@ -2307,7 +2244,7 @@ impl LocalJamStore {
     }
 }
 
-impl AttestationProofHost for LocalJamStore {
+impl AttestationProofHost for MemoryServiceStore {
     fn make_proof_available(&mut self, request: &ProofVerificationRequest, proof: &[u8]) -> bool {
         if !self.proof_is_accepted(request, proof) {
             return false;
@@ -2328,7 +2265,7 @@ impl AttestationProofHost for LocalJamStore {
     }
 }
 
-impl super::ReceiptVerificationHost for LocalJamStore {
+impl super::ReceiptVerificationHost for MemoryServiceStore {
     fn make_receipt_available(&mut self, request: &ReceiptVerificationRequest) -> bool {
         if let Some(trust) = self.production_trust.as_ref() {
             match trust.verify_receipt(request) {
@@ -2343,13 +2280,13 @@ impl super::ReceiptVerificationHost for LocalJamStore {
     }
 }
 
-impl<B> super::ReceiptVerificationHost for DurableJamStore<B> {
+impl<B> super::ReceiptVerificationHost for DurableServiceStore<B> {
     fn make_receipt_available(&mut self, request: &ReceiptVerificationRequest) -> bool {
         super::ReceiptVerificationHost::make_receipt_available(&mut self.local, request)
     }
 }
 
-impl<B: ProofArtifactStore> AttestationProofHost for DurableJamStore<B> {
+impl<B: ProofArtifactStore> AttestationProofHost for DurableServiceStore<B> {
     fn make_proof_available(&mut self, request: &ProofVerificationRequest, proof: &[u8]) -> bool {
         if !self.local.proof_is_accepted(request, proof)
             || self
@@ -2378,7 +2315,7 @@ impl<B: ProofArtifactStore> AttestationProofHost for DurableJamStore<B> {
     }
 }
 
-impl CommittedServiceImageHost for LocalJamStore {
+impl CommittedServiceImageHost for MemoryServiceStore {
     fn committed_service_image(&self) -> Vec<u8> {
         self.snapshot_bytes()
     }
@@ -2392,7 +2329,7 @@ impl CommittedServiceImageHost for LocalJamStore {
     }
 }
 
-impl<B> CommittedServiceImageHost for DurableJamStore<B>
+impl<B> CommittedServiceImageHost for DurableServiceStore<B>
 where
     B: CommittedImageStore + ProofArtifactStore<Error = <B as CommittedImageStore>::Error>,
 {
@@ -2405,7 +2342,7 @@ where
         image: &[u8],
     ) -> Result<(), ServiceImageInstallError> {
         let replacement = self.local.validate_replacement(image)?;
-        let (retained, terminal) = LocalJamStore::from_snapshot(replacement.clone())
+        let (retained, terminal) = MemoryServiceStore::from_snapshot(replacement.clone())
             .private_ingress_recovery()
             .map_err(|_| ServiceImageInstallError::InvalidSnapshot)?;
         // A snapshot never carries private bytes. Validate every live
@@ -2448,7 +2385,7 @@ impl StateTreeStore for CommittedRows<'_> {
 
 /// Private copy-on-write image for one physical IC-5 execution.
 pub struct LocalJamTransaction {
-    staged: LocalJamStoreSnapshot,
+    staged: MemoryServiceSnapshot,
     logical_timeslot: Option<u64>,
     proof_blobs: BTreeMap<[u8; 32], Vec<u8>>,
     proof_allowlist: BTreeSet<super::Hash>,
@@ -2689,7 +2626,7 @@ impl AccumulateTransaction for LocalJamTransaction {
     }
 }
 
-impl AccumulateProtocolHost for LocalJamStore {
+impl AccumulateProtocolHost for MemoryServiceStore {
     type Transaction = LocalJamTransaction;
 
     fn production_trust_policy_id(&self) -> Option<super::Hash> {
@@ -2838,7 +2775,7 @@ impl AccumulateProtocolHost for LocalJamStore {
     }
 }
 
-impl<B> AccumulateProtocolHost for DurableJamStore<B>
+impl<B> AccumulateProtocolHost for DurableServiceStore<B>
 where
     B: CommittedImageStore + ProofArtifactStore<Error = <B as CommittedImageStore>::Error>,
 {
@@ -3104,7 +3041,7 @@ mod tests {
                 root_service: super::super::RootServiceId([2; 32]),
                 deployment: super::super::DeploymentId([3; 32]),
                 service_program: ProgramId([4; 32]),
-                service_abi: super::super::ABI_VERSION,
+                platform: super::super::PLATFORM_ID,
                 execution_semantics: super::super::EXECUTION_SEMANTICS_ID,
                 gas_schedule: super::super::GasSchedule::new(1_000_000_000, 5_000_000_000),
             },
@@ -3133,7 +3070,7 @@ mod tests {
     #[test]
     fn production_trust_cannot_be_replaced_by_conformance_grants() {
         let trust = Arc::new(TestProductionTrust::new(0x71, 9, false));
-        let mut store = LocalJamStore::new();
+        let mut store = MemoryServiceStore::new();
         store.install_production_trust(trust.clone()).unwrap();
 
         let receipt = receipt_verification();
@@ -3169,7 +3106,7 @@ mod tests {
 
     #[test]
     fn unavailable_production_authority_is_a_retryable_host_failure() {
-        let mut store = LocalJamStore::new();
+        let mut store = MemoryServiceStore::new();
         store
             .install_production_trust(Arc::new(TestProductionTrust::unavailable(0x77, 13)))
             .unwrap();
@@ -3197,7 +3134,7 @@ mod tests {
     #[test]
     fn production_trust_provenance_is_bound_across_restart() {
         let trust = Arc::new(TestProductionTrust::new(0x72, 11, true));
-        let mut store = LocalJamStore::new();
+        let mut store = MemoryServiceStore::new();
         store.install_production_trust(trust.clone()).unwrap();
         let mut transaction = store.begin().unwrap();
         transaction.staged.rows.insert(
@@ -3208,7 +3145,8 @@ mod tests {
         let snapshot = store.snapshot();
         assert_eq!(snapshot.production_trust_policy(), Some(trust.policy));
 
-        let mut restarted = LocalJamStore::from_snapshot_bytes(&store.snapshot_bytes()).unwrap();
+        let mut restarted =
+            MemoryServiceStore::from_snapshot_bytes(&store.snapshot_bytes()).unwrap();
         assert!(restarted.requires_production_trust());
         assert!(
             restarted.begin().is_err(),
@@ -3225,7 +3163,7 @@ mod tests {
         let (_, seal) = forged_policy.production_trust_provenance.unwrap();
         forged_policy.production_trust_provenance = Some((super::super::Hash([0x74; 32]), seal));
         assert_eq!(
-            LocalJamStoreSnapshot::decode(&forged_policy.encode()),
+            MemoryServiceSnapshot::decode(&forged_policy.encode()),
             Err(DecodeError::NonCanonical),
         );
 
@@ -3233,7 +3171,7 @@ mod tests {
         let (policy, _) = forged_seal.production_trust_provenance.unwrap();
         forged_seal.production_trust_provenance = Some((policy, super::super::Hash([0x75; 32])));
         assert_eq!(
-            LocalJamStoreSnapshot::decode(&forged_seal.encode()),
+            MemoryServiceSnapshot::decode(&forged_seal.encode()),
             Err(DecodeError::NonCanonical),
         );
     }
@@ -3241,11 +3179,11 @@ mod tests {
     #[test]
     fn nonempty_conformance_images_cannot_be_promoted_in_place() {
         assert_eq!(
-            LocalJamStore::new()
+            MemoryServiceStore::new()
                 .install_production_trust(Arc::new(TestProductionTrust::new(0, 12, true),)),
             Err(ProductionTrustError::InvalidPolicy),
         );
-        let mut store = LocalJamStore::new();
+        let mut store = MemoryServiceStore::new();
         let mut transaction = store.begin().unwrap();
         transaction.staged.rows.insert(
             super::super::header_storage_key().to_vec(),
@@ -3344,7 +3282,7 @@ mod tests {
                 .as_nanos(),
         ));
         let path = directory.join("service.service");
-        let mut store = DurableJamStore::open(FileCommittedImageStore::new(&path)).unwrap();
+        let mut store = DurableServiceStore::open(FileCommittedImageStore::new(&path)).unwrap();
         let mut first = None;
         for ordinal in 0..MAX_REPLICATED_PRIVATE_INGRESS_ARTIFACTS {
             let mut invocation = [0_u8; 32];
@@ -3380,7 +3318,7 @@ mod tests {
         );
 
         let (_, backend) = store.into_parts();
-        let mut store = DurableJamStore::open(backend).unwrap();
+        let mut store = DurableServiceStore::open(backend).unwrap();
         assert!(
             store
                 .persist_replicated_private_ingress(
@@ -3406,7 +3344,7 @@ mod tests {
 
     #[test]
     fn snapshots_exclude_uncommitted_transactions() {
-        let mut store = LocalJamStore::new();
+        let mut store = MemoryServiceStore::new();
         let blob = store.import_blob(b"installation state".to_vec());
         let program = store.import_program(b"canonical actor pvm".to_vec());
         let before = store.snapshot();
@@ -3433,7 +3371,7 @@ mod tests {
 
     #[test]
     fn proof_artifacts_never_enter_the_recoverable_service_image() {
-        let mut store = LocalJamStore::new();
+        let mut store = MemoryServiceStore::new();
         let proof = vec![0xA5; 1024 * 1024];
         let proof_blob = BlobRef::of_bytes(&proof);
         let request = ProofVerificationRequest {
@@ -3461,7 +3399,7 @@ mod tests {
 
     #[test]
     fn installed_proof_verifier_cannot_be_bypassed_by_conformance_grants() {
-        let mut store = LocalJamStore::new();
+        let mut store = MemoryServiceStore::new();
         let proof = b"verified proof artifact".to_vec();
         let proof_blob = BlobRef::of_bytes(&proof);
         let request = ProofVerificationRequest {
@@ -3489,7 +3427,7 @@ mod tests {
 
     #[test]
     fn private_role_witnesses_never_enter_the_recoverable_service_image() {
-        let mut store = LocalJamStore::new();
+        let mut store = MemoryServiceStore::new();
         let witness = b"invocation-private credential witness".to_vec();
         let before = store.snapshot_bytes();
 
@@ -3498,14 +3436,14 @@ mod tests {
         assert_eq!(store.snapshot_bytes(), before);
         assert_eq!(store.blob_count(), 0);
 
-        let reopened = LocalJamStore::from_snapshot(store.snapshot());
+        let reopened = MemoryServiceStore::from_snapshot(store.snapshot());
         assert_eq!(reopened.private_witness(&reference), None);
         assert_eq!(reopened, store);
     }
 
     #[test]
     fn malformed_role_verification_requests_are_clean_denials() {
-        let mut store = LocalJamStore::new();
+        let mut store = MemoryServiceStore::new();
         let transaction = store.begin().unwrap();
 
         assert_eq!(
@@ -3519,7 +3457,7 @@ mod tests {
 
     #[test]
     fn commit_swaps_rows_and_blobs_as_one_image() {
-        let mut store = LocalJamStore::new();
+        let mut store = MemoryServiceStore::new();
         let mut transaction = store.begin().unwrap();
         let bytes = b"continuation page".to_vec();
         let reference = BlobRef::of_bytes(&bytes);
@@ -3547,7 +3485,7 @@ mod tests {
         store
             .receipt_allowlist
             .insert(crate::service::Hash([7; 32]));
-        let reopened = LocalJamStore::from_snapshot(store.snapshot());
+        let reopened = MemoryServiceStore::from_snapshot(store.snapshot());
         assert!(reopened.receipt_allowlist.is_empty());
         assert!(!store.receipt_allowlist.is_empty());
         assert_eq!(reopened, store);
@@ -3555,7 +3493,7 @@ mod tests {
 
     #[test]
     fn committed_snapshot_wire_restores_and_rejects_identity_drift() {
-        let mut store = LocalJamStore::new();
+        let mut store = MemoryServiceStore::new();
         let blob = store.import_blob(b"continuation page".to_vec());
         let program = store.import_program(b"canonical actor pvm".to_vec());
         let mut transaction = store.begin().unwrap();
@@ -3574,7 +3512,7 @@ mod tests {
             store.snapshot_bytes(),
             "snapshot wire is deterministic"
         );
-        let restarted = LocalJamStore::from_snapshot_bytes(&bytes).unwrap();
+        let restarted = MemoryServiceStore::from_snapshot_bytes(&bytes).unwrap();
         assert_eq!(restarted, store);
         assert!(restarted.receipt_allowlist.is_empty());
         assert_eq!(restarted.blob(&blob), Some(b"continuation page".as_slice()));
@@ -3586,7 +3524,7 @@ mod tests {
         let mut forged_provenance = store.snapshot();
         forged_provenance.proof_verifier_provenance = Some(super::super::Hash([0xFA; 32]));
         assert_eq!(
-            LocalJamStoreSnapshot::decode(&forged_provenance.encode()),
+            MemoryServiceSnapshot::decode(&forged_provenance.encode()),
             Err(DecodeError::NonCanonical),
             "verifier provenance is bound to the exact durable image"
         );
@@ -3596,7 +3534,7 @@ mod tests {
             .blobs
             .insert(blob.hash.0, b"different bytes".to_vec());
         assert_eq!(
-            LocalJamStoreSnapshot::decode(&corrupt_blob.encode()),
+            MemoryServiceSnapshot::decode(&corrupt_blob.encode()),
             Err(DecodeError::NonCanonical)
         );
 
@@ -3605,7 +3543,7 @@ mod tests {
             .programs
             .insert(program.0, b"different pvm".to_vec());
         assert_eq!(
-            LocalJamStoreSnapshot::decode(&corrupt_program.encode()),
+            MemoryServiceSnapshot::decode(&corrupt_program.encode()),
             Err(DecodeError::NonCanonical)
         );
 
@@ -3614,14 +3552,14 @@ mod tests {
             .rows
             .remove(super::super::header_storage_key());
         assert_eq!(
-            LocalJamStoreSnapshot::decode(&missing_header.encode()),
+            MemoryServiceSnapshot::decode(&missing_header.encode()),
             Err(DecodeError::NonCanonical)
         );
     }
 
     #[test]
     fn service_image_install_validates_identity_and_persists_before_visibility() {
-        let mut source = LocalJamStore::new();
+        let mut source = MemoryServiceStore::new();
         let mut source_transaction = source.begin().unwrap();
         source_transaction.staged.rows.insert(
             super::super::header_storage_key().to_vec(),
@@ -3630,13 +3568,13 @@ mod tests {
         source.commit(source_transaction).unwrap();
         let image = source.snapshot_bytes();
 
-        let mut fresh = LocalJamStore::new();
+        let mut fresh = MemoryServiceStore::new();
         fresh.install_committed_service_image(&image).unwrap();
         assert!(fresh.snapshot().same_service_state(&source.snapshot()));
 
         let mut different_header = valid_header();
         different_header.service.root_service = super::super::RootServiceId([99; 32]);
-        let mut different = LocalJamStore::new();
+        let mut different = MemoryServiceStore::new();
         let mut transaction = different.begin().unwrap();
         transaction.staged.rows.insert(
             super::super::header_storage_key().to_vec(),
@@ -3654,7 +3592,7 @@ mod tests {
             fail_next_commit: true,
             ..TestImageStore::default()
         };
-        let mut durable = DurableJamStore::open(backend).unwrap();
+        let mut durable = DurableServiceStore::open(backend).unwrap();
         let before = durable.snapshot();
         assert_eq!(
             durable.install_committed_service_image(&image),
@@ -3670,7 +3608,7 @@ mod tests {
             fail_next_commit: true,
             ..TestImageStore::default()
         };
-        let mut store = DurableJamStore::open(backend).unwrap();
+        let mut store = DurableServiceStore::open(backend).unwrap();
         let blob = store.import_blob(b"continuation page".to_vec());
         let program = store.import_program(b"canonical actor pvm".to_vec());
         let before = store.snapshot();
@@ -3697,7 +3635,7 @@ mod tests {
 
         let expected = store.snapshot();
         let (_, backend) = store.into_parts();
-        let restarted = DurableJamStore::open(backend).unwrap();
+        let restarted = DurableServiceStore::open(backend).unwrap();
         assert_eq!(restarted.snapshot(), expected);
         assert_eq!(restarted.blob(&blob), Some(b"continuation page".as_slice()));
         assert_eq!(
@@ -3717,7 +3655,7 @@ mod tests {
                 .as_nanos(),
         ));
         let path = directory.join("service.service");
-        let mut store = DurableJamStore::open(FileCommittedImageStore::new(&path)).unwrap();
+        let mut store = DurableServiceStore::open(FileCommittedImageStore::new(&path)).unwrap();
         let mut transaction = store.begin().unwrap();
         transaction.staged.rows.insert(
             super::super::header_storage_key().to_vec(),
@@ -3727,12 +3665,7 @@ mod tests {
         let proof = b"durable proof side-CAS".to_vec();
         let proof_blob = BlobRef::of_bytes(&proof);
         let private_invocation = super::super::InvocationId([40; 32]);
-        let legacy_payload = b"operator-private invocation arguments";
-        let legacy_payload_reference = BlobRef::of_bytes(legacy_payload);
-        let mut private_arguments = LEGACY_PRIVATE_INGRESS_ARTIFACT_MAGIC.to_vec();
-        private_arguments.extend_from_slice(&legacy_payload_reference.hash.0);
-        private_arguments.extend_from_slice(&legacy_payload_reference.len.to_le_bytes());
-        private_arguments.extend_from_slice(legacy_payload);
+        let private_arguments = b"operator-private invocation arguments".to_vec();
         let private_reference = store
             .persist_private_ingress(private_invocation, &private_arguments)
             .unwrap();
@@ -3850,17 +3783,9 @@ mod tests {
             .private_ingress_directory()
             .join("abandoned.next");
         std::fs::write(&abandoned_temporary, b"partial private input").unwrap();
-        std::fs::write(
-            store
-                .backend
-                .legacy_private_ingress_path(private_invocation),
-            &private_arguments,
-        )
-        .unwrap();
-        std::fs::remove_file(store.backend.private_ingress_path(private_invocation)).unwrap();
         drop(store);
 
-        let mut restarted = DurableJamStore::open(FileCommittedImageStore::new(&path)).unwrap();
+        let mut restarted = DurableServiceStore::open(FileCommittedImageStore::new(&path)).unwrap();
         assert_eq!(restarted.snapshot(), expected);
         assert!(
             !expected
@@ -3921,7 +3846,7 @@ mod tests {
         );
         restarted.commit(transaction).unwrap();
         let (_, backend) = restarted.into_parts();
-        let mut restarted = DurableJamStore::open(backend).unwrap();
+        let mut restarted = DurableServiceStore::open(backend).unwrap();
         assert_eq!(
             restarted.private_ingress(private_invocation, &private_reference),
             None,
@@ -3938,9 +3863,9 @@ mod tests {
         );
         drop(restarted);
 
-        std::fs::write(&path, b"legacy-or-corrupt-image").unwrap();
+        std::fs::write(&path, b"foreign-or-corrupt-image").unwrap();
         assert!(matches!(
-            DurableJamStore::open(FileCommittedImageStore::new(&path)),
+            DurableServiceStore::open(FileCommittedImageStore::new(&path)),
             Err(DurableStoreOpenError::InvalidSnapshot(
                 DecodeError::InvalidTag
             ))

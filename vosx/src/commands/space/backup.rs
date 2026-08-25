@@ -214,7 +214,7 @@ fn create_archive(entry: &SpaceEntry, output: &Path, cache_dir: &Path) -> anyhow
     sync_directory(parent)?;
     partial.disarm();
     Ok(hex::encode(vos::crypto::blake2b_hash::<32>(
-        b"vosx/space-backup-manifest/v1",
+        b"vosx/space-backup-manifest",
         &[&bytes],
     )))
 }

@@ -694,7 +694,7 @@ fn attested_receipt_result(claim: &Receipt) -> AttestedInvocationResult {
             root_service: RootServiceId([1; 32]),
             deployment,
             service_program: ProgramId([2; 32]),
-            service_abi: vos::service::ABI_VERSION,
+            platform: vos::service::PLATFORM_ID,
             execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             gas_schedule: vos::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
         },
@@ -711,7 +711,6 @@ fn attested_receipt_result(claim: &Receipt) -> AttestedInvocationResult {
         producer_name: "private-vault".into(),
         producer: ProducerId([15; 32]),
         statement: vos::AttestationStatement {
-            statement_version: vos::service::ATTESTATION_STATEMENT_VERSION,
             space: SpaceId([6; 32]),
             actor,
             producer_name: "private-vault".into(),
@@ -724,7 +723,7 @@ fn attested_receipt_result(claim: &Receipt) -> AttestedInvocationResult {
             reply_call: reply.call_id,
             before: vos::StateCommitment::Linear(Hash([11; 32])),
             after: vos::StateCommitment::Linear(Hash([5; 32])),
-            claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&value.encode()]),
+            claim_commitment: Hash::digest(b"vos/attestation-claim", &[&value.encode()]),
             input_commitment: Hash([13; 32]),
             authorization_policy: Hash([14; 32]),
             accumulation_receipt: receipt,
@@ -743,8 +742,7 @@ fn attested_value_result(method: &str, value: Value) -> AttestedInvocationResult
         tag: [0; 32],
     });
     result.statement.method = method.into();
-    result.statement.claim_commitment =
-        Hash::digest(b"vos/attestation-claim/v3", &[&value.encode()]);
+    result.statement.claim_commitment = Hash::digest(b"vos/attestation-claim", &[&value.encode()]);
     result.statement.accumulation_receipt.reply_commitment = Some(
         ReplyRecord {
             call_id: result.statement.reply_call,

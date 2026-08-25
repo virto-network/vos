@@ -30,7 +30,7 @@ fn canonical_service_pvm(elf: &[u8]) -> anyhow::Result<Vec<u8>> {
         .map_err(|error| anyhow!("transpile generic service ELF: {error:?}"))?;
     let program = ProgramId::of_pvm(&pvm);
     ServicePvm::new(pvm.clone(), program).map_err(|error| {
-        anyhow!("generic service has no valid JAM Refine/Accumulate entries: {error}")
+        anyhow!("generic service has no valid service platform Refine/Accumulate entries: {error}")
     })?;
     Ok(pvm)
 }
