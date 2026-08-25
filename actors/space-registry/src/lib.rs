@@ -1129,8 +1129,7 @@ impl SpaceRegistry {
     /// Add an Identity member. The registry stores the `proof`
     /// verbatim — verification happens on the consumer side
     /// when an identity-authored message arrives at an agent.
-    /// `proof_kind` is `PROOF_KIND_MERKLE_INCLUSION` (v1) or
-    /// `PROOF_KIND_ZK` (future).
+    /// `proof_kind` is `PROOF_KIND_MERKLE_INCLUSION` or `PROOF_KIND_ZK`.
     #[msg]
     async fn add_identity(
         &mut self,

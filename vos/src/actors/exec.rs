@@ -39,10 +39,10 @@
 //! the brief `&mut WorkerState` the glue uses to *find* the slot cannot alias
 //! those raw pointers under any borrow model.
 //!
-//! ## v1 simplification
+//! ## Scheduling constraint
 //!
 //! One outstanding host-I/O op per task (linear `await`-one-then-the-next).
-//! `join!`-ing two host-I/O futures in one task is unsupported in v1; concurrency
+//! `join!`-ing two host-I/O futures in one task is unsupported; concurrency
 //! comes from *separate* tasks the host runs on its executor.
 
 use alloc::boxed::Box;

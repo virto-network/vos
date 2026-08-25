@@ -33,6 +33,8 @@ const TAG_RAFT_APPEND_REQ: u8 = 0x30;
 const TAG_RAFT_APPEND_RESP: u8 = 0x31;
 const TAG_RAFT_VOTE_REQ: u8 = 0x32;
 const TAG_RAFT_VOTE_RESP: u8 = 0x33;
+const TAG_RAFT_PRE_VOTE_REQ: u8 = 0x34;
+const TAG_RAFT_PRE_VOTE_RESP: u8 = 0x35;
 const TAG_RAFT_INSTALL_REQ: u8 = 0x37;
 const TAG_RAFT_INSTALL_RESP: u8 = 0x38;
 // Dynamic membership and cluster discovery. `RAFT_JOIN_*` lets a
@@ -224,6 +226,20 @@ pub enum Frame {
         term: u64,
         vote_granted: bool,
     },
+    /// Raft pre-vote RPC. Unlike `RaftVoteReq`, this probes whether an
+    /// election would succeed without changing the receiver's term or vote.
+    RaftPreVoteReq {
+        replication_id: [u8; REPLICATION_ID_BYTES],
+        next_term: u64,
+        candidate_prefix: u16,
+        last_log_index: u64,
+        last_log_term: u64,
+    },
+    /// Reply to [`Frame::RaftPreVoteReq`].
+    RaftPreVoteResp {
+        term: u64,
+        vote_granted: bool,
+    },
     /// Raft `InstallSnapshot` RPC — the leader hands a far-behind
     /// follower the actor state at `last_included_index`/term so
     /// the follower doesn't need a log replay it can no longer
@@ -263,7 +279,7 @@ pub enum Frame {
         joiner_prefix: u16,
         /// Production trust policy the joining replica will use while
         /// replaying this group's application log. `None` identifies a
-        /// conformance/legacy group. Leaders reject a value that differs
+        /// conformance group. Leaders reject a value that differs
         /// from their locally installed root policy before changing
         /// membership.
         production_trust_policy: Option<[u8; 32]>,
@@ -698,6 +714,25 @@ impl Frame {
                 out.extend_from_slice(&term.to_le_bytes());
                 out.push(if *vote_granted { 1 } else { 0 });
             }
+            Frame::RaftPreVoteReq {
+                replication_id,
+                next_term,
+                candidate_prefix,
+                last_log_index,
+                last_log_term,
+            } => {
+                out.push(TAG_RAFT_PRE_VOTE_REQ);
+                out.extend_from_slice(replication_id);
+                out.extend_from_slice(&next_term.to_le_bytes());
+                out.extend_from_slice(&candidate_prefix.to_le_bytes());
+                out.extend_from_slice(&last_log_index.to_le_bytes());
+                out.extend_from_slice(&last_log_term.to_le_bytes());
+            }
+            Frame::RaftPreVoteResp { term, vote_granted } => {
+                out.push(TAG_RAFT_PRE_VOTE_RESP);
+                out.extend_from_slice(&term.to_le_bytes());
+                out.push(if *vote_granted { 1 } else { 0 });
+            }
             Frame::RaftInstallSnapshotReq {
                 replication_id,
                 term,
@@ -1126,6 +1161,22 @@ impl Frame {
                     other => return Err(FrameError::BadOption(other)),
                 };
                 Frame::RaftVoteResp { term, vote_granted }
+            }
+            TAG_RAFT_PRE_VOTE_REQ => Frame::RaftPreVoteReq {
+                replication_id: r.fixed::<REPLICATION_ID_BYTES>()?,
+                next_term: r.u64()?,
+                candidate_prefix: r.u16()?,
+                last_log_index: r.u64()?,
+                last_log_term: r.u64()?,
+            },
+            TAG_RAFT_PRE_VOTE_RESP => {
+                let term = r.u64()?;
+                let vote_granted = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    other => return Err(FrameError::BadOption(other)),
+                };
+                Frame::RaftPreVoteResp { term, vote_granted }
             }
             TAG_RAFT_INSTALL_REQ => {
                 let replication_id = r.fixed::<REPLICATION_ID_BYTES>()?;
@@ -1932,6 +1983,25 @@ mod tests {
             vote_granted: true,
         });
         roundtrip(Frame::RaftVoteResp {
+            term: 9,
+            vote_granted: false,
+        });
+    }
+
+    #[test]
+    fn raft_pre_vote_roundtrip() {
+        roundtrip(Frame::RaftPreVoteReq {
+            replication_id: [0x22; REPLICATION_ID_BYTES],
+            next_term: 10,
+            candidate_prefix: 0xCAFE,
+            last_log_index: 101,
+            last_log_term: 9,
+        });
+        roundtrip(Frame::RaftPreVoteResp {
+            term: 9,
+            vote_granted: true,
+        });
+        roundtrip(Frame::RaftPreVoteResp {
             term: 9,
             vote_granted: false,
         });

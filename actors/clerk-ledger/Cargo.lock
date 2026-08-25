@@ -3589,7 +3589,6 @@ dependencies = [
  "vos-pvm-compiler",
  "vos-pvm-precompiles",
  "vos-raft",
- "vrf",
  "zeroize",
 ]
 
@@ -3656,15 +3655,6 @@ dependencies = [
  "futures-channel",
  "futures-executor",
  "futures-util",
-]
-
-[[package]]
-name = "vrf"
-version = "0.1.0"
-dependencies = [
- "curve25519-dalek",
- "sha2",
- "zeroize",
 ]
 
 [[package]]

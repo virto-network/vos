@@ -37,7 +37,7 @@ pub fn instance_service_id(instance_name: &str, prefix: u16) -> ServiceId {
 
 /// Stable logical service identity for one installed service root-tree incarnation.
 ///
-/// The compatibility route used by the daemon remains node-local. The
+/// The daemon route remains node-local. The
 /// guest-owned identity is scoped to the space and registry installation, so
 /// it survives process restarts but a tombstoned name reinstalled with the
 /// required fresh replication id cannot inherit the deleted actor's state or

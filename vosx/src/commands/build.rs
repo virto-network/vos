@@ -806,7 +806,7 @@ mod tests {
             Some("actors")
         );
         assert_eq!(
-            root.join("target/riscv64em-vos/release/service_counter.elf"),
+            root.join("target/riscv64em-vos/release/counter.elf"),
             root.join("target/riscv64em-vos/release")
                 .join(format!("{}.elf", "counter".replace('-', "_")))
         );

@@ -38,8 +38,8 @@ use std::sync::{Arc, Mutex};
 use futures_executor::block_on;
 use proptest::prelude::*;
 use vos_raft::{
-    AppendEntriesReq, InstallSnapshotReq, LogEntry, Meta, RequestVoteReq, StdClock, Storage,
-    Worker, WriteBatch,
+    AppendEntriesReq, InstallSnapshotReq, LogEntry, Meta, PreVoteReq, PreVoteResp, RequestVoteReq,
+    StdClock, Storage, Worker, WriteBatch,
 };
 
 /// Operations the test can issue against a single worker.
@@ -277,6 +277,13 @@ impl vos_raft::Transport<u16> for NoopTransport {
         _peer: u16,
         _req: RequestVoteReq<u16>,
     ) -> Result<vos_raft::RequestVoteResp, NoopErr> {
+        Err(NoopErr)
+    }
+    async fn send_prevote(
+        &self,
+        _peer: u16,
+        _req: PreVoteReq<u16>,
+    ) -> Result<PreVoteResp, NoopErr> {
         Err(NoopErr)
     }
     async fn send_install(

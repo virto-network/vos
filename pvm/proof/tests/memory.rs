@@ -32,7 +32,7 @@ fn prove_store_only() {
     regs[0] = 42;
     regs[1] = 0x1000;
 
-    let mut memory = vec![0u8; 4 * 1024 * 1024];
+    let memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
         Opcode::StoreIndU8 as u8,
@@ -73,7 +73,7 @@ fn prove_store_and_load_u8() {
     regs[0] = 42; // value to store
     regs[1] = 0x1000; // base address
 
-    let mut memory = vec![0u8; 4 * 1024 * 1024];
+    let memory = vec![0u8; 4 * 1024 * 1024];
 
     // StoreIndU8 (opcode 120): TwoRegOneImm [opcode, ra|(rb<<4), imm...]
     //   ra=0 (value source), rb=1 (base addr), imm=0 (offset)
@@ -137,7 +137,7 @@ fn prove_store_and_load_u64() {
     regs[0] = 0xDEAD_BEEF_CAFE_BABE;
     regs[1] = 0x2000;
 
-    let mut memory = vec![0u8; 4 * 1024 * 1024];
+    let memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
         Opcode::StoreIndU64 as u8,
@@ -243,7 +243,7 @@ fn prove_multiple_stores_same_addr() {
     regs[1] = 0x1000; // address
     regs[3] = 20; // second value
 
-    let mut memory = vec![0u8; 4 * 1024 * 1024];
+    let memory = vec![0u8; 4 * 1024 * 1024];
 
     // Store 10, store 20, load (should get 20)
     let code = vec![
@@ -367,7 +367,7 @@ fn prove_store_load_with_alu() {
     regs[1] = 50;
     regs[4] = 0x1000; // address register
 
-    let mut memory = vec![0u8; 4 * 1024 * 1024];
+    let memory = vec![0u8; 4 * 1024 * 1024];
 
     let code = vec![
         Opcode::Add64 as u8,

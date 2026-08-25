@@ -5,6 +5,8 @@
 //! triggering a duplicate-binary warning.  Callers do `mod common;` then
 //! `use common::*;`.
 
+#![allow(dead_code)]
+
 use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;

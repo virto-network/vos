@@ -78,8 +78,8 @@ pub struct DaemonClient {
     pub endpoint: endpoint::Endpoint,
     daemon_prefix: u16,
     /// Service actor identities and signed method policies learned while resolving
-    /// an installed package name. Routes that are not service remain on the legacy
-    /// dynamic wire unchanged.
+    /// an installed package name. Registry and extension targets use their explicit
+    /// control-plane wire instead.
     service_targets: Mutex<std::collections::HashMap<u32, ServiceTarget>>,
 }
 
@@ -328,12 +328,9 @@ impl DaemonClient {
     }
 
     /// Resolve a user-supplied target string to a daemon-side
-    /// `ServiceId`. Four forms supported, in lookup order:
+    /// `ServiceId`. Three forms are supported, in lookup order:
     ///
     /// - `"registry"` — the well-known per-space registry.
-    /// - `"0xHEX"` / 8-hex-chars — bare 32-bit ServiceId. The
-    ///   prefix half is honored as-is, letting power users
-    ///   target a specific node in a multi-node setup.
     /// - `"<instance_name>"` of an installed PVM agent — looks
     ///   the agent up in the daemon's registry, then derives
     ///   its per-node ServiceId via `instance_service_id` (the
@@ -350,13 +347,6 @@ impl DaemonClient {
     pub fn resolve_target(&self, target: &str) -> anyhow::Result<ServiceId> {
         if target == "registry" {
             return Ok(self.registry_id());
-        }
-        if let Some(hex) = target.strip_prefix("0x") {
-            let raw = u32::from_str_radix(hex, 16)
-                .map_err(|e| anyhow::anyhow!("invalid 0x ServiceId '{target}': {e}"))?;
-            let route = ServiceId(raw);
-            self.remember_service_target_for_route(route)?;
-            return Ok(route);
         }
         if let Some(agent) = self.agent(target)? {
             debug_assert_eq!(agent.instance_name, target);
@@ -469,52 +459,29 @@ impl DaemonClient {
     }
 
     fn remember_service_target(&self, route: ServiceId, agent: &AgentRow) -> anyhow::Result<()> {
-        if let Some(service_target) = self.service_target_for_agent(agent)? {
-            self.service_targets
-                .lock()
-                .map_err(|_| anyhow::anyhow!("service target cache is unavailable"))?
-                .insert(route.0, service_target);
-        }
+        let service_target = self.service_target_for_agent(agent)?;
+        self.service_targets
+            .lock()
+            .map_err(|_| anyhow::anyhow!("service target cache is unavailable"))?
+            .insert(route.0, service_target);
         Ok(())
     }
 
-    /// Recover the typed identity behind a route-only advanced target.
-    ///
-    /// `ServiceId` is a node-local compatibility address, not the actor's
-    /// authenticated identity. Match its local slot against the replicated
-    /// catalog while retaining the caller-selected node prefix, then cache the
-    /// exact package identity just as name resolution does.
-    fn remember_service_target_for_route(&self, route: ServiceId) -> anyhow::Result<()> {
-        let prefix = (route.0 >> 16) as u16;
-        let mut matched: Option<AgentRow> = None;
-        for agent in self.agents()? {
-            if instance_service_id(&agent.instance_name, prefix) != route {
-                continue;
-            }
-            if let Some(previous) = &matched {
-                anyhow::bail!(
-                    "ServiceId {route} is ambiguous between installed agents '{}' and '{}'",
-                    previous.instance_name,
-                    agent.instance_name,
-                );
-            }
-            matched = Some(agent);
-        }
-        if let Some(agent) = matched {
-            self.remember_service_target(route, &agent)?;
-        }
-        Ok(())
-    }
-
-    fn service_target_for_agent(&self, agent: &AgentRow) -> anyhow::Result<Option<ServiceTarget>> {
+    fn service_target_for_agent(&self, agent: &AgentRow) -> anyhow::Result<ServiceTarget> {
         use vos::service::ServiceWire;
 
         let hash = crate::blob_store::BlobHash(agent.program_hash);
         let Some(exact_package) = crate::blob_store::cache_get(&hash)? else {
-            return Ok(None);
+            anyhow::bail!(
+                "installed package for '{}' is missing from the local content store",
+                agent.instance_name
+            );
         };
         if exact_package.get(..4) != Some(b"VOSP") {
-            return Ok(None);
+            anyhow::bail!(
+                "installed catalog entry '{}' does not contain a signed service package",
+                agent.instance_name
+            );
         }
         let package = vos::service::VosPackage::decode(&exact_package)
             .map_err(|error| anyhow::anyhow!("decode installed service package: {error}"))?;
@@ -536,7 +503,7 @@ impl DaemonClient {
             &agent.instance_name,
             agent.replication_id,
         );
-        Ok(Some(ServiceTarget {
+        Ok(ServiceTarget {
             actor: crate::commands::space::common::service_root_actor_id(
                 service,
                 &agent.instance_name,
@@ -546,7 +513,7 @@ impl DaemonClient {
                 .into_iter()
                 .map(|policy| (policy.method.clone(), policy))
                 .collect(),
-        }))
+        })
     }
 
     /// Tear down the libp2p peer. Always call before exiting

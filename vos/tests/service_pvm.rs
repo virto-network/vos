@@ -4128,9 +4128,7 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
         bridge_actor,
         InvocationId([0x51; 32]),
         1,
-        Msg::new("bootstrap")
-            .with("local_ledger_id", 0x3500u32)
-            .with("ivk_secret", receiver_ivk.to_bytes().to_vec()),
+        Msg::new("bootstrap").with("ivk_secret", receiver_ivk.to_bytes().to_vec()),
         Some(clerk_bridge::ClerkBridgeRole::Operator as u8),
     );
     assert_eq!(
@@ -4388,7 +4386,7 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
         18,
         Msg::new("sign_claim")
             .with("peer_name", b"bank-b".to_vec())
-            .with("currency", clerk_bridge::DEMO_CURRENCY)
+            .with("currency", clerk_bridge::SETTLEMENT_CURRENCY)
             .with("window", 0u64),
         Some(clerk_bridge::ClerkBridgeRole::Operator as u8),
     );
@@ -4401,7 +4399,7 @@ fn clerk_bridge_issues_once_from_bound_ledger_and_signs_the_closed_window_claim(
     let claim = SettlementClaim::from_bytes(&signed.claim).unwrap();
     assert_eq!(claim.claimant_clerk.0, bank_public);
     assert_eq!(claim.peer_clerk, peer.public);
-    assert_eq!(claim.currency, clerk_bridge::DEMO_CURRENCY);
+    assert_eq!(claim.currency, clerk_bridge::SETTLEMENT_CURRENCY);
     assert_eq!((claim.window_start, claim.window_end), (0, 1));
     assert_eq!(claim.net_flow, amount, "issuance contributes exactly once");
     claim.verify_signature().unwrap();
@@ -6082,6 +6080,20 @@ fn node_registers_a_raft_root_through_the_canonical_request_log() {
         ) -> vos::network::RaftVoteResult {
             vos::network::RaftVoteResult {
                 term,
+                vote_granted: false,
+            }
+        }
+
+        fn pre_vote(
+            &self,
+            _replication_id: &[u8; 32],
+            _from_prefix: u16,
+            next_term: u64,
+            _last_log_index: u64,
+            _last_log_term: u64,
+        ) -> vos::network::RaftPreVoteResult {
+            vos::network::RaftPreVoteResult {
+                term: next_term.saturating_sub(1),
                 vote_granted: false,
             }
         }

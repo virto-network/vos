@@ -43,7 +43,7 @@
 //! The stored claim body carries a `version` byte and the diagnostics
 //! (`voucher_count`, `rk_set_hash`) travel *alongside* the signed claim,
 //! not inside it — so the cipher-clerk claim schema is untouched and can
-//! grow state-root/proof fields (its v0.2 note) without a store migration.
+//! grow state-root/proof fields without a store migration.
 //! `reconcile` is the seam Wave-2 upgrades to STARK verification of a
 //! settlement statement.
 

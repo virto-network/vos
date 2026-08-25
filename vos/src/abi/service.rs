@@ -56,7 +56,7 @@ impl ServiceId {
         self.node_prefix() == prefix
     }
 
-    /// Check if this ID is unscoped (prefix 0, backwards compat).
+    /// Check if this ID addresses this node's unscoped control plane.
     pub const fn is_local(self) -> bool {
         self.node_prefix() == 0
     }

@@ -405,12 +405,12 @@ mod tests {
     }
 
     #[test]
-    fn policy_query_matches_the_documented_hash_vector() {
+    fn policy_query_has_a_stable_hash_vector() {
         let request = encode_request(QUERY_POLICY, &[]).unwrap();
-        assert_eq!(hex::encode(&request), "5654413101000000000000");
+        assert_eq!(hex::encode(&request), "5654415701000000000000");
         assert_eq!(
             hex::encode(Hash::digest(b"vos/production-trust-socket/request", &[&request]).0),
-            "a5ee8be4abb996fd3735970cd7b5a53632afef7cb7a548e1314d9c6ef39ece35",
+            "582b7691278ba20233d0799f3a46928c781abaf2fd9dce4bd56af3cd9f49f477",
         );
     }
 

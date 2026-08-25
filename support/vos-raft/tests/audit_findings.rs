@@ -13,7 +13,8 @@ use std::time::Duration;
 use futures_executor::block_on;
 use vos_raft::{
     ActiveConfigRecord, AppendEntriesReq, InstallSnapshotReq, LogEntry, MemStorage, Meta,
-    RequestVoteReq, Role, StdClock, StdRng, Storage, Transport, Worker, WriteBatch,
+    PreVoteReq, PreVoteResp, RequestVoteReq, Role, StdClock, StdRng, Storage, Transport, Worker,
+    WriteBatch,
 };
 
 // ── Shared storage harness ──────────────────────────────────────
@@ -166,6 +167,9 @@ impl Transport<u16> for NoopT {
         _: u16,
         _: RequestVoteReq<u16>,
     ) -> Result<vos_raft::RequestVoteResp, NoopE> {
+        Err(NoopE)
+    }
+    async fn send_prevote(&self, _: u16, _: PreVoteReq<u16>) -> Result<PreVoteResp, NoopE> {
         Err(NoopE)
     }
     async fn send_install(

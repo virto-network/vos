@@ -338,7 +338,7 @@ impl CommitStrategy for RaftCommit {
 
         // Durable-node rule, raft flavor: pure reads must not bloat the
         // log — even stronger here than for CRDT because every entry
-        // costs an RTT under multi-node mode. An effect-bearing v3
+        // costs an RTT under multi-node mode. An effect-bearing
         // dispatch appends even when state is unchanged; service deltas fall
         // back to value comparison.
         if !state_changed && !delta.effect_bearing && rest.is_empty() {

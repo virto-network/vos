@@ -66,13 +66,9 @@ pub struct Config<N: NodeId> {
     /// election. This prevents term inflation from a flapping
     /// partition.
     ///
-    /// Set `false` if your `Transport` impl doesn't support the
-    /// `send_prevote` method (e.g., the wire frame doesn't yet
-    /// carry `PreVoteReq` / `PreVoteResp`). With pre-vote
-    /// disabled, the worker skips the phase entirely and goes
-    /// straight to `start_election` from Follower — equivalent
-    /// to plain Raft. The cluster loses the term-stability
-    /// guarantee but remains correct.
+    /// Set `false` only when intentionally operating without the pre-vote
+    /// phase. Every transport implements the request so configuration cannot
+    /// silently weaken election behavior.
     pub pre_vote: bool,
     /// Maximum bytes per `InstallSnapshot` chunk the leader
     /// will send. Snapshots larger than this are streamed across
@@ -126,7 +122,7 @@ pub struct Config<N: NodeId> {
     /// external observer that reads the worker's role atomic.
     ///
     /// Setting this to `0` disables the fallback (PreCandidate
-    /// keeps retrying indefinitely — the legacy behavior).
+    /// keeps retrying indefinitely).
     /// Default: `3` — enough to absorb a transient network blip
     /// but quick enough to surface a stuck node.
     pub pre_candidate_misses_before_revert: u32,

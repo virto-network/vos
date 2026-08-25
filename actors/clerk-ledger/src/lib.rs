@@ -242,20 +242,20 @@ pub struct ClerkLedger {
     /// insert (`state_root::*_leaf_content`) for the same reason.
     #[storage(
         committed,
-        leaf_domain = "cipher-clerk/smt/leaf",
-        node_domain = "cipher-clerk/smt/node"
+        leaf_domain = "cipher-clerk/smt/leaf/v1",
+        node_domain = "cipher-clerk/smt/node/v1"
     )]
     accounts: CommittedMap<[u8; 16], CcAccount>,
     #[storage(
         committed,
-        leaf_domain = "cipher-clerk/smt/leaf",
-        node_domain = "cipher-clerk/smt/node"
+        leaf_domain = "cipher-clerk/smt/leaf/v1",
+        node_domain = "cipher-clerk/smt/node/v1"
     )]
     transfers: CommittedMap<[u8; 16], CcTransfer>,
     #[storage(
         committed,
-        leaf_domain = "cipher-clerk/smt/leaf",
-        node_domain = "cipher-clerk/smt/node"
+        leaf_domain = "cipher-clerk/smt/leaf/v1",
+        node_domain = "cipher-clerk/smt/node/v1"
     )]
     journal: CommittedMap<[u8; 16], CcJournal>,
     /// Keyed by `external_id_key(eid)` (16-byte hash of the 32-byte
@@ -263,20 +263,20 @@ pub struct ClerkLedger {
     /// reports "seen" and the kernel rejects instead of aliasing.
     #[storage(
         committed,
-        leaf_domain = "cipher-clerk/smt/leaf",
-        node_domain = "cipher-clerk/smt/node"
+        leaf_domain = "cipher-clerk/smt/leaf/v1",
+        node_domain = "cipher-clerk/smt/node/v1"
     )]
     external_ids: CommittedMap<[u8; 16], [u8; 32]>,
     #[storage(
         committed,
-        leaf_domain = "cipher-clerk/smt/leaf",
-        node_domain = "cipher-clerk/smt/node"
+        leaf_domain = "cipher-clerk/smt/leaf/v1",
+        node_domain = "cipher-clerk/smt/node/v1"
     )]
     voided_transfers: CommittedMap<[u8; 16], u8>,
     #[storage(
         committed,
-        leaf_domain = "cipher-clerk/smt/leaf",
-        node_domain = "cipher-clerk/smt/node"
+        leaf_domain = "cipher-clerk/smt/leaf/v1",
+        node_domain = "cipher-clerk/smt/node/v1"
     )]
     pending_statuses: CommittedMap<[u8; 16], u8>,
     /// Per-accepted-transfer `(root_before, root_after)` pair,
@@ -284,10 +284,8 @@ pub struct ClerkLedger {
     /// moment the kernel accepts the transfer — `root_before` is the
     /// composite state root just before the kernel runs, `root_after`
     /// just after its mutations land. Voucher emission anchors to
-    /// these two values; the host-side caller queries
-    /// `transfer_state_roots` immediately after `apply_transfer`
-    /// returns `Status::Ok`. Not part of the composite root (vouchers
-    /// sign the six-subtree shape), so a plain storage map.
+    /// these two values through `voucher_anchor`. Not part of the composite
+    /// root (vouchers sign the six-subtree shape), so a plain storage map.
     #[storage]
     transfer_roots: StorageMap<[u8; 16], TransferRootEntry>,
     /// L3 shielded-note commitments (Pedersen points,
@@ -314,9 +312,8 @@ pub struct ClerkLedger {
 }
 
 impl ClerkLedger {
-    /// Proof-record administration exposes producer-only material, so it may
-    /// not inherit the legacy `Caller::Actor` role bypass. Host-controlled
-    /// System calls remain available for local operator tooling; members must
+    /// Proof-record administration exposes producer-only material.
+    /// Host-controlled System calls remain available for local operator tooling; members must
     /// carry the authenticated role bytes supplied by their ingress boundary.
     fn authorize_proof_operator(ctx: &mut Context<Self>) -> bool {
         let allowed = match ctx.origin() {
@@ -331,8 +328,7 @@ impl ClerkLedger {
     }
 
     /// Voucher anchoring is irreversible, so ordinary role authorization is
-    /// insufficient: legacy actor callers bypass actor-role thresholds. The
-    /// only authority is the exact `(service, actor)` identity pinned under
+    /// insufficient. The only authority is the exact `(service, actor)` identity pinned under
     /// `clerk-bridge` in this ledger root's authenticated installation
     /// directory. Actor IDs may be reused by different roots; the reciprocal
     /// binding therefore authenticates the causal source service as well as
@@ -608,23 +604,6 @@ impl ClerkLedger {
             .collect()
     }
 
-    /// Compatibility probe for tooling which previously configured the Task
-    /// after installation. The selection is now immutable: only the
-    /// actor-compiled canonical hash is accepted and no ledger state changes.
-    #[msg(role = ClerkLedgerRole::Operator)]
-    async fn configure_provable_apply(
-        &mut self,
-        task_hash: [u8; 32],
-        ctx: &mut Context<Self>,
-    ) -> Status {
-        if !Self::authorize_proof_operator(ctx) {
-            return Status::BadInput;
-        }
-        (task_hash == CLERK_APPLY_TASK_HASH)
-            .then_some(Status::Ok)
-            .unwrap_or(Status::BadInput)
-    }
-
     /// Accept a signed `cipher_clerk::types::Transfer` plus the
     /// commitment openings (`Vec<Opening>`) needed by the kernel
     /// to verify each entry's `Amount`. Dispatches to
@@ -689,8 +668,8 @@ impl ClerkLedger {
         // constructs a finalize transfer (proper flags, empty
         // entries, pending_id set) can still probe whether that
         // pending_id is on file via the TransferNotFound code path.
-        // Acceptable for v1: a caller able to name a specific
-        // pending_id is already operator-adjacent.
+        // A caller able to name a specific pending_id is already
+        // operator-adjacent; all other signature failures were collapsed above.
         if !self.transfer_signatures_valid(&transfer) {
             return Status::SignatureInvalid;
         }
@@ -979,22 +958,6 @@ impl ClerkLedger {
     #[msg(role = ClerkLedgerRole::Member)]
     async fn transfer(&self, id: [u8; 16]) -> Option<CcTransfer> {
         self.transfers.get(&id)
-    }
-
-    /// Read the `(state_root_before, state_root_after)` anchor pair
-    /// captured at the moment `apply_transfer` accepted this
-    /// transfer. Returns `None` if the id was never accepted (or
-    /// failed mid-dispatch). Each Vec is exactly 32 bytes when
-    /// present.
-    ///
-    /// This remains a diagnostic/compatibility read. Production issuance uses
-    /// `voucher_anchor` through an authenticated external-actor binding so the
-    /// bridge binds both roots and the exact amount before DEVICE_SIGN.
-    #[msg(role = ClerkLedgerRole::Member)]
-    async fn transfer_state_roots(&self, id: [u8; 16]) -> Option<(Vec<u8>, Vec<u8>)> {
-        self.transfer_roots
-            .get(&id)
-            .map(|e| (e.root_before.to_vec(), e.root_after.to_vec()))
     }
 
     /// Return the exact accepted-transfer anchor needed for voucher issuance.

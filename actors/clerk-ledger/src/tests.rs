@@ -29,8 +29,8 @@ use crate::smt::compute_state_root;
 use crate::view::LedgerView;
 use crate::{ClerkLedger, ClerkLedgerRole, voucher_transfer_currency};
 
-const LEAF_DOMAIN: &[u8] = b"cipher-clerk/smt/leaf";
-const NODE_DOMAIN: &[u8] = b"cipher-clerk/smt/node";
+const LEAF_DOMAIN: &[u8] = cipher_clerk::merkle::SMT_LEAF;
+const NODE_DOMAIN: &[u8] = cipher_clerk::merkle::SMT_NODE;
 
 fn mk_account(id_byte: u8) -> CcAccount {
     CcAccount::new(
@@ -497,7 +497,7 @@ fn composite_root_is_insertion_order_invariant() {
 }
 
 #[test]
-fn proof_record_administration_rejects_the_legacy_actor_bypass() {
+fn proof_record_administration_rejects_actor_origins() {
     use vos::actors::context::ServiceId;
     use vos::{Caller, Context};
 

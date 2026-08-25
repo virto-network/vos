@@ -1807,6 +1807,17 @@ fn snapshot_sender_rewinds_after_follower_loses_partial_buffer() {
             })
         }
 
+        async fn send_prevote(
+            &self,
+            _peer: u16,
+            req: PreVoteReq<u16>,
+        ) -> Result<PreVoteResp, Self::Error> {
+            Ok(PreVoteResp {
+                term: req.next_term.saturating_sub(1),
+                vote_granted: true,
+            })
+        }
+
         async fn send_install(
             &self,
             _peer: u16,

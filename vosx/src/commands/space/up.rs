@@ -2112,7 +2112,7 @@ fn service_config_from_row(
     })
 }
 
-/// Load the host-private signer seed for one service root. Unlike the legacy
+/// Load the host-private signer seed for one service root. Unlike a generic
 /// messenger seed this is never sent as an actor message: Refine exposes only
 /// signatures through `DEVICE_SIGN`. Raft operators must provision the same
 /// 32-byte file on every voter before allowing leadership transfer.
@@ -2721,7 +2721,7 @@ enum RaftSeed {
     },
     /// A live group exists, but this replica is not a voter yet. The service path
     /// starts its worker and validates its route before sending the join;
-    /// legacy roots complete the old eager handshake immediately before spawn.
+    /// conformance roots complete the eager handshake immediately before spawn.
     Join {
         leader: u16,
         known: Vec<u16>,
@@ -3189,7 +3189,7 @@ fn wait_for_raft_promotion_retry(
 const MAX_SPAWNS_PER_PASS: usize = 4;
 /// Registration opens durable stores and may synchronously consult the
 /// production authority. Keep that blocking boundary to one root per router
-/// pass; ordinary legacy spawns retain their separate cap above.
+/// pass; ordinary service starts retain their separate cap above.
 const MAX_REGISTRATION_ATTEMPTS_PER_PASS: usize = 1;
 const SERVICE_REGISTRATION_GLOBAL_RETRY_GAP: std::time::Duration =
     std::time::Duration::from_secs(2);
@@ -4200,7 +4200,7 @@ mod tests {
         payload.authority_replication_id = [0; 32];
         assert!(
             authority_invite_redemption(&payload, vec![26; 38], [27; 64], vec![28; 64]).is_err(),
-            "a markerless legacy token never enters the service authority path"
+            "a markerless token never enters the service authority path"
         );
     }
 
@@ -4260,7 +4260,7 @@ mod tests {
         )
         .expect("a signed ordinary service package may select Raft");
         let RowConfig::Service { config, .. } = resolved else {
-            panic!("service package fell through to the legacy runtime")
+            panic!("service package did not select the service runtime")
         };
         assert_eq!(config.consistency, vos::service::ConsistencyMode::Raft);
     }
@@ -4812,7 +4812,7 @@ mod tests {
         )
         .expect("a signed #[actor(crdt)] package selects CRDT");
         let RowConfig::Service { config, .. } = resolved else {
-            panic!("service CRDT package fell through to the legacy runtime")
+            panic!("service CRDT package did not select the service runtime")
         };
         assert_eq!(config.consistency, vos::service::ConsistencyMode::Crdt);
     }

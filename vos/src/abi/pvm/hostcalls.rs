@@ -166,9 +166,7 @@ pub fn peek(key: &[u8], value_buf: &mut [u8]) -> u64 {
 /// its write into the caller's PVM memory: when the producer's
 /// reply exceeds the caller's buffer, the runtime substitutes a
 /// single-byte `STATUS_PANICKED` envelope rather than overrunning
-/// the stack. A length of 0 in the high bits is interpreted as
-/// "legacy / no cap" so older PVM blobs that predate this ABI
-/// extension keep their previous behaviour (unsafe but unchanged).
+/// the stack. A zero-length output buffer cannot receive a reply.
 #[inline]
 pub fn invoke(code_hash: &[u8; 32], input: &[u8], gas_limit: u64, output: &mut [u8]) -> u64 {
     let output_packed = (output.as_mut_ptr() as u64) | ((output.len() as u64) << 32);

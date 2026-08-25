@@ -246,7 +246,7 @@ fn validate_stored_data_directory(entry: &SpaceEntry) -> Result<(), IndexError> 
     let stored = Path::new(&entry.data_dir);
     if !stored.is_absolute() {
         return Err(IndexError::Conflict(format!(
-            "space '{}' ({}) uses legacy relative data directory '{}'; replace it in spaces.toml with the absolute canonical path before continuing",
+            "space '{}' ({}) uses unsupported relative data directory '{}'; replace it in spaces.toml with the absolute canonical path before continuing",
             entry.name, entry.id, entry.data_dir,
         )));
     }
@@ -718,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    fn relative_legacy_data_directory_is_rejected() {
+    fn relative_data_directory_is_rejected() {
         let path = tmp_path("relative-entry");
         let index = SpacesIndex {
             spaces: vec![SpaceEntry {
@@ -735,12 +735,15 @@ mod tests {
         save_to(&index, &path).unwrap();
 
         let error = load_from(&path).unwrap_err().to_string();
-        assert!(error.contains("legacy relative data directory"), "{error}");
+        assert!(
+            error.contains("unsupported relative data directory"),
+            "{error}"
+        );
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn overlapping_legacy_data_directories_are_rejected_on_load() {
+    fn overlapping_data_directories_are_rejected_on_load() {
         let path = tmp_path("overlapping-entries");
         let parent = tmp_path("overlapping-owner");
         let index = SpacesIndex {

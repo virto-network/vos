@@ -120,7 +120,7 @@ pub use wire::{DecodeError, ServiceWire};
 
 /// Identity of the canonical wire, package, store, continuation, and
 /// attestation contract. A contract change creates a new clean platform
-/// identity; no compatibility decoder is retained.
+/// identity; no alternate decoder is retained.
 pub const PLATFORM_ID: Hash = Hash(*b"vos-platform-canonical-20260825!");
 
 /// Program identity of the canonical [`vos-service.pvm`](../../../services/vos-service/vos-service.pvm).

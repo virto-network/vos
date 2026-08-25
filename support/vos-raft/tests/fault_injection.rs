@@ -30,9 +30,9 @@ use std::time::Duration;
 
 use futures_executor::block_on;
 use vos_raft::{
-    AppendEntriesReq, ApplySink, Clock, InstallSnapshotReq, LogEntry, MemStorage, Meta,
-    ProposeError, RequestVoteReq, Rng, Role, StdClock, StdRng, Storage, Transport, Worker,
-    WriteBatch,
+    AppendEntriesReq, ApplySink, Clock, InstallSnapshotReq, LogEntry, MemStorage, Meta, PreVoteReq,
+    PreVoteResp, ProposeError, RequestVoteReq, Rng, Role, StdClock, StdRng, Storage, Transport,
+    Worker, WriteBatch,
 };
 
 /// Storage wrapper that delegates to an inner backend but
@@ -201,6 +201,9 @@ impl Transport<u16> for NoopT {
         _: u16,
         _: RequestVoteReq<u16>,
     ) -> Result<vos_raft::RequestVoteResp, NoopE> {
+        Err(NoopE)
+    }
+    async fn send_prevote(&self, _: u16, _: PreVoteReq<u16>) -> Result<PreVoteResp, NoopE> {
         Err(NoopE)
     }
     async fn send_install(

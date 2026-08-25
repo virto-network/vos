@@ -832,7 +832,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
             .__merge_crdt(&other)
             .expect("invalid concurrent CRDT actor materialization");
     }
-    // The legacy route-only ServiceId is deliberately not derived by
+    // A route-only ServiceId is deliberately not derived by
     // truncating ActorId. Nested service actors retain their complete typed identity
     // in Context and all service scheduler effects use that value.
     let mut ctx = super::Context::new(ServiceId(0));

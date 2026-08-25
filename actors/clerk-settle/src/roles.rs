@@ -2,9 +2,8 @@
 //!
 //! The venue actor answers any peer that can route to its `ServiceId`, so
 //! the money-path mutators (`register_bank`, `settle_window`) are
-//! role-gated. `Caller::System` and `Caller::Actor` map to
-//! `SpaceRole::Admin` and bypass these checks, so the venue operator
-//! (driving via the daemon) is unaffected — the gate bites external peers.
+//! role-gated. The venue operator uses authenticated ingress with an explicit
+//! role; origin kind alone grants no authority.
 //!
 //! `submit_claim` is deliberately NOT gated: submitting banks are not
 //! members of the venue space, so a role gate could never carry them. Its

@@ -30,8 +30,7 @@
 //!
 //! ## State (persisted as actor rkyv archive)
 //!
-//! - `local_ledger_id`: compatibility/diagnostic ServiceId. Production issuer
-//!   dispatch uses the signed package's `clerk-ledger` external binding.
+//! - `bootstrapped`: records whether the incoming viewing key was installed.
 //! - `device_signer_pubkey`: guest-owned public identity for the host-private
 //!   DEVICE_SIGN capability. The secret never enters actor state.
 //! - `ivk_secret_bytes`: this bank's incoming-viewing-key secret,
@@ -102,9 +101,6 @@ pub use roles::{CLERK_BRIDGE_SPACE_ROLE_MAP, ClerkBridgeRole};
 /// later make this package configuration per-peer; the accumulator is already
 /// keyed by currency so commitments cannot silently mix under one claim.
 pub const SETTLEMENT_CURRENCY: u32 = 840;
-/// Compatibility name retained for existing callers and fixtures.
-pub const DEMO_CURRENCY: u32 = SETTLEMENT_CURRENCY;
-
 // ── Handler status ──────────────────────────────────────────────
 
 /// Return type for `bootstrap` / `register_peer` /
@@ -397,10 +393,8 @@ macro_rules! decode_or_else {
     space_role_map = CLERK_BRIDGE_SPACE_ROLE_MAP,
 )]
 pub struct ClerkBridge {
-    /// Local clerk-ledger ServiceId, packed as u32. `0` means
-    /// not-yet-bootstrapped. Retained for compatibility/diagnostics; issuer
-    /// dispatch resolves only the authenticated `clerk-ledger` binding.
-    local_ledger_id: u32,
+    /// Whether the incoming viewing key has been installed.
+    bootstrapped: bool,
     /// This bank's IVK secret, raw canonical-scalar bytes. The
     /// `IncomingViewingKey` type itself isn't rkyv-archivable
     /// (it wraps a curve scalar), so we keep the bytes and
@@ -476,8 +470,7 @@ impl ClerkBridge {
     const DEVICE_BINDING_PROBE: &'static [u8] = b"clerk-bridge/device-binding";
 
     /// Signer configuration controls the bank identity used on external
-    /// vouchers and settlement claims. Do not inherit the legacy same-node
-    /// Actor role bypass: only System or an authenticated operator member may
+    /// vouchers and settlement claims. Only System or an authenticated operator member may
     /// establish it.
     fn authorize_signer_operator(ctx: &mut Context<Self>) -> bool {
         let allowed = match ctx.origin() {
@@ -560,7 +553,7 @@ impl ClerkBridge {
 impl ClerkBridge {
     fn new() -> Self {
         Self {
-            local_ledger_id: 0,
+            bootstrapped: false,
             ivk_secret_bytes: [0u8; 32],
             device_signer_pubkey: None,
             peers: Vec::new(),
@@ -574,11 +567,9 @@ impl ClerkBridge {
         }
     }
 
-    /// One-time initialisation. `local_ledger_id` is the ServiceId
-    /// of this bank's clerk-ledger (carried for diagnostics + a
-    /// future cross-actor-dispatch slice). `ivk_secret` is the
-    /// canonical 32-byte Ristretto scalar this bank uses to open
-    /// envelopes sealed by peers.
+    /// One-time installation of the canonical 32-byte Ristretto scalar this
+    /// bank uses to open envelopes sealed by peers. The clerk-ledger itself is
+    /// selected by the signed package's authenticated external binding.
     ///
     /// Returns:
     ///   - `Status::Ok` on a fresh bootstrap or an idempotent
@@ -595,12 +586,7 @@ impl ClerkBridge {
     ///   - `Status::AlreadyBootstrapped` if conflicting arguments
     ///     are supplied to a re-call.
     #[msg(role = ClerkBridgeRole::Operator)]
-    async fn bootstrap(
-        &mut self,
-        ctx: &mut Context<Self>,
-        local_ledger_id: u32,
-        ivk_secret: Vec<u8>,
-    ) -> Status {
+    async fn bootstrap(&mut self, ctx: &mut Context<Self>, ivk_secret: Vec<u8>) -> Status {
         if !Self::authorize_signer_operator(ctx) {
             return Status::Unauthorized;
         }
@@ -613,11 +599,11 @@ impl ClerkBridge {
         if IncomingViewingKey::from_bytes(&secret_bytes).is_none() {
             return Status::BadInput;
         }
-        if self.local_ledger_id == 0 {
-            self.local_ledger_id = local_ledger_id;
+        if !self.bootstrapped {
+            self.bootstrapped = true;
             self.ivk_secret_bytes = secret_bytes;
             Status::Ok
-        } else if self.local_ledger_id == local_ledger_id && self.ivk_secret_bytes == secret_bytes {
+        } else if self.ivk_secret_bytes == secret_bytes {
             Status::Ok
         } else {
             Status::AlreadyBootstrapped
@@ -705,7 +691,7 @@ impl ClerkBridge {
         if !Self::authorize_signer_operator(ctx) {
             return Status::Unauthorized;
         }
-        if self.local_ledger_id == 0 {
+        if !self.bootstrapped {
             return Status::NotBootstrapped;
         }
         self.prover_id = prover_id;
@@ -744,7 +730,7 @@ impl ClerkBridge {
         if !Self::authorize_signer_operator(ctx) {
             return Status::Unauthorized;
         }
-        if self.local_ledger_id == 0 {
+        if !self.bootstrapped {
             return Status::NotBootstrapped;
         }
         let Some(pk_bytes) = try_array::<32>(clerk_pubkey) else {
@@ -831,7 +817,7 @@ impl ClerkBridge {
         if !Self::authorize_signer_operator(ctx) {
             return issue_reply(Status::Unauthorized);
         }
-        if self.local_ledger_id == 0 {
+        if !self.bootstrapped {
             return issue_reply(Status::NotBootstrapped);
         }
         if self.device_signer_pubkey.is_none() {
@@ -858,8 +844,8 @@ impl ClerkBridge {
             return issue_reply(Status::BadInput);
         }
 
-        // The package's authenticated external-actor directory, not the
-        // legacy route integer, selects the ledger root. A missing binding is
+        // The package's authenticated external-actor directory selects the
+        // ledger root. A missing binding is
         // a clean denial rather than a fallback to an arbitrary same-node
         // service.
         let anchor = {
@@ -1028,7 +1014,7 @@ impl ClerkBridge {
         voucher_bytes: Vec<u8>,
         peer_name: Vec<u8>,
     ) -> SubmitVoucherReply {
-        if self.local_ledger_id == 0 {
+        if !self.bootstrapped {
             return reply(Status::NotBootstrapped);
         }
 
@@ -1096,7 +1082,7 @@ impl ClerkBridge {
         }
 
         // SAFETY: bootstrap validates canonicality on entry, so
-        // from_bytes never returns None once `local_ledger_id != 0`
+        // from_bytes never returns None after bootstrap validation.
         // (which we already gated on above). The expect message
         // calls out the invariant for future readers.
         let ivk = IncomingViewingKey::from_bytes(&self.ivk_secret_bytes)
@@ -1218,7 +1204,7 @@ impl ClerkBridge {
         inflow_openings_bytes: Vec<u8>,
         batch_seed_timestamp: u64,
     ) -> RedeemReply {
-        if self.local_ledger_id == 0 {
+        if !self.bootstrapped {
             return early_redeem(Status::NotBootstrapped);
         }
         let (peer_clerk_pubkey, peer_prefix, expected_root, redemption_window) =
@@ -1390,7 +1376,7 @@ impl ClerkBridge {
         if !Self::authorize_signer_operator(ctx) {
             return Status::Unauthorized;
         }
-        if self.local_ledger_id == 0 {
+        if !self.bootstrapped {
             return Status::NotBootstrapped;
         }
         match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
@@ -1445,7 +1431,7 @@ impl ClerkBridge {
         if !Self::authorize_signer_operator(ctx) {
             return Status::Unauthorized;
         }
-        if self.local_ledger_id == 0 {
+        if !self.bootstrapped {
             return Status::NotBootstrapped;
         }
         match self.peers.binary_search_by(|e| e.name.cmp(&peer_name)) {
@@ -1529,7 +1515,7 @@ mod tests {
     }
 
     #[test]
-    fn signing_controls_reject_the_legacy_actor_bypass() {
+    fn signing_controls_reject_actor_origins() {
         let mut actor = Context::<ClerkBridge>::new(ServiceId(7));
         actor.set_caller(Caller::Actor(ServiceId(9)));
         actor.set_caller_roles(None, Some(ClerkBridgeRole::Operator as u8));

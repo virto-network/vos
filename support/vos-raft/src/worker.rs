@@ -670,7 +670,7 @@ impl<N: NodeId> WorkerHandle<N> {
     /// `commit_index >= that_index` to know when the joint phase
     /// has committed.
     ///
-    /// **Restrictions** (v0.1):
+    /// **Restrictions:**
     /// - One in-flight change at a time. The second concurrent
     ///   `change_membership` returns `InProgress`.
     /// - `new_members` must be non-empty and must include `me`
@@ -1559,7 +1559,7 @@ where
     // ConfigChange entries can't be recovered from the log —
     // hosts that need that level of persistence must encode the
     // active config into their snapshot bytes and re-prime via
-    // a follow-up call (not yet exposed). For v0.1 the storage
+    // a follow-up call (not yet exposed). The storage
     // window is large enough that this is rare in practice.
     // On boot, prefer the persisted active config (if the
     // backend supports it) so a leader that compacted past the

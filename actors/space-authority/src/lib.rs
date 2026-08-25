@@ -187,7 +187,7 @@ impl SpaceAuthority {
     }
 
     /// Permanently cancel an offline bearer. The authority authenticates the
-    /// admin independently of the legacy registry and stores a sorted,
+    /// admin independently of the catalog registry and stores a sorted,
     /// grow-only token set, so replay and merge order cannot resurrect it.
     #[msg]
     fn revoke_invite(&mut self, revocation: Vec<u8>, signature: Vec<u8>) -> bool {

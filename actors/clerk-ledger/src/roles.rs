@@ -2,11 +2,9 @@
 //!
 //! Confined-tier ledgers still answer any peer that can route to their
 //! `ServiceId` (the ACL is the only gate at that boundary), so the money-path
-//! mutators and the balance/transfer reads are role-gated. `Caller::System`
-//! and `Caller::Actor` normally bypass actor-local role checks, so ordinary
-//! money-path compatibility remains unchanged. Producer-record configuration,
-//! export, and pruning add a stricter origin check: only the host operator or
-//! an authenticated member carrying `Operator` may reach the proving secret.
+//! mutators and the balance/transfer reads are role-gated. Producer-record
+//! export and pruning add a stricter origin check: only the host operator or
+//! an authenticated member carrying `Operator` may reach proving material.
 
 /// Ordered: `Operator` >= `Member` >= `None`, so an `Operator` also satisfies a
 /// `Member` gate (can read), while a `Member` cannot satisfy an `Operator` gate

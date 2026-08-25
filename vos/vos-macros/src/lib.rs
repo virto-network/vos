@@ -480,7 +480,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // method (not `#[msg]`). Its presence flips the extension to
     // transport-mode: the host owns a listener + accept loop and spawns one
     // concurrent `&self` connection task per accept. A transport extension
-    // must have NO inbound `#[msg]` handlers (v1).
+    // must have no inbound `#[msg]` handlers.
     let mut has_handle_connection = false;
     let mut msg_handler_count: usize = 0;
 
@@ -1544,12 +1544,12 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // A transport extension (one with `handle_connection`) must have
-    // NO inbound `#[msg]` handlers in v1 — it serves connections only.
+    // no inbound `#[msg]` handlers — it serves connections only.
     if has_handle_connection && msg_handler_count > 0 {
         return syn::Error::new(
             proc_macro2::Span::call_site(),
             "a transport extension (one with `handle_connection`) must have NO `#[msg]` handlers \
-             in v1 — it serves connections only; concurrent request/reply handlers are not yet supported",
+             — it serves connections only; concurrent request/reply handlers are not supported",
         )
         .to_compile_error()
         .into();

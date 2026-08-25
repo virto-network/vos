@@ -359,6 +359,7 @@ pub fn folded_public(
 /// these so a replayed depth-1 invoke can re-absorb the side effects
 /// its child folded into the journal (replay short-circuits the child,
 /// but the effects are as much recorded history as the output bytes).
+#[cfg(feature = "std")]
 pub(crate) fn encode_effects(effects: &[Effect]) -> Vec<u8> {
     let mut out = Vec::new();
     push_u16(&mut out, effects.len() as u16);
@@ -370,6 +371,7 @@ pub(crate) fn encode_effects(effects: &[Effect]) -> Vec<u8> {
 
 /// Decode a list produced by [`encode_effects`]. Strict canonical:
 /// payload slack or trailing bytes reject the whole list.
+#[cfg(feature = "std")]
 pub(crate) fn decode_effects(bytes: &[u8]) -> Option<Vec<Effect>> {
     let mut c = Cursor::new(bytes);
     let count = c.read_u16()? as usize;

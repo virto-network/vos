@@ -321,7 +321,7 @@ pub enum SpaceCommand {
     /// Manage auth-role grants. Subcommands: list, grant, revoke.
     /// Bare `space role <space>` lists. When service is active, space-level
     /// mutations are also committed to the root-signed canonical authority;
-    /// actor-local raw-byte grants remain a legacy v1 surface.
+    /// actor-local grants are carried by signed service policy.
     Role {
         space: String,
         #[command(subcommand)]
@@ -354,7 +354,6 @@ pub enum SpaceCommand {
     /// - `registry` — the well-known per-space registry
     /// - `<instance_name>` — an installed agent (resolved via
     ///   the daemon's registry)
-    /// - `0xHEX` — bare 32-bit ServiceId
     Call {
         space: String,
         target: String,

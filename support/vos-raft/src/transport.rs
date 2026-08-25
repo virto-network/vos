@@ -50,41 +50,11 @@ pub trait Transport<N: NodeId>: Send + Sync + 'static {
     /// this to ask "would you grant me a real vote at
     /// `next_term`?" without bumping its own term.
     ///
-    /// Default impl returns `Err(Self::Error::default())` so
-    /// implementations that haven't been updated for pre-vote
-    /// gracefully degrade to plain Raft (the worker treats
-    /// every error reply as "no answer" and falls back to
-    /// starting a real election after the timeout). Wire-up is
-    /// strictly opt-in: you only need to override this when
-    /// you've taught the transport to deliver `PreVoteReq` /
-    /// `PreVoteResp` over your physical channel. Until then,
-    /// the worker's pre-vote phase functions as a brief delay,
-    /// not as a strict prevention — concrete transports should
-    /// implement it before depending on the term-inflation
-    /// guarantee in production.
-    ///
-    /// Default impl is provided for source-compat; embedded
-    /// transports without pre-vote wire support should keep
-    /// the default and document the limitation.
     fn send_prevote(
         &self,
         peer: N,
         req: PreVoteReq<N>,
-    ) -> impl core::future::Future<Output = Result<PreVoteResp, Self::Error>> + Send {
-        // Default: pretend the prevote was rejected so the
-        // candidate falls back to skipping pre-vote. The
-        // _peer/_req params are explicitly read here so the
-        // closure captures them and the default body is
-        // identical regardless of `Send` plumbing.
-        let _ = peer;
-        let _ = req;
-        async {
-            Ok(PreVoteResp {
-                term: 0,
-                vote_granted: false,
-            })
-        }
-    }
+    ) -> impl core::future::Future<Output = Result<PreVoteResp, Self::Error>> + Send;
 
     /// Send one `InstallSnapshot` chunk to `peer`. The response reports the
     /// follower's authoritative assembled-byte count; the worker sequences

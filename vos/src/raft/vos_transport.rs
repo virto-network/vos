@@ -25,8 +25,8 @@ use alloc::sync::Arc;
 use core::time::Duration;
 
 use vos_raft::{
-    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, RequestVoteReq,
-    RequestVoteResp, Transport,
+    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, PreVoteReq,
+    PreVoteResp, RequestVoteReq, RequestVoteResp, Transport,
 };
 
 use crate::network::{Network, RaftEntry, RaftEntryKind};
@@ -51,6 +51,9 @@ pub enum VosTransportError {
     /// A single Raft entry cannot fit the network frame even without any
     /// neighboring entries.
     EntryTooLarge,
+    /// The consensus core emitted an entry kind this canonical wire does not
+    /// define. Refuse it instead of changing its meaning in transit.
+    UnsupportedEntryKind,
 }
 
 impl core::fmt::Display for VosTransportError {
@@ -64,6 +67,9 @@ impl core::fmt::Display for VosTransportError {
             }
             Self::NoReply => write!(f, "vos transport: no reply within timeout"),
             Self::EntryTooLarge => write!(f, "vos transport: Raft entry exceeds frame cap"),
+            Self::UnsupportedEntryKind => {
+                write!(f, "vos transport: unsupported Raft entry kind")
+            }
         }
     }
 }
@@ -112,26 +118,17 @@ impl Transport<u16> for VosTransport {
             .entries
             .into_iter()
             .map(|e| match e.kind {
-                vos_raft::EntryKind::Data { payload } => RaftEntry {
+                vos_raft::EntryKind::Data { payload } => Ok(RaftEntry {
                     term: e.term,
                     kind: RaftEntryKind::Data { payload },
-                },
-                vos_raft::EntryKind::ConfigChange { joint_old, members } => RaftEntry {
+                }),
+                vos_raft::EntryKind::ConfigChange { joint_old, members } => Ok(RaftEntry {
                     term: e.term,
                     kind: RaftEntryKind::ConfigChange { joint_old, members },
-                },
-                // Future EntryKind variants — degrade to an empty
-                // `Data` blob on the wire so older peers don't
-                // choke on a tag they can't parse. The receiver's
-                // host apply-path skips empty payloads anyway.
-                _ => RaftEntry {
-                    term: e.term,
-                    kind: RaftEntryKind::Data {
-                        payload: alloc::vec![],
-                    },
-                },
+                }),
+                _ => Err(VosTransportError::UnsupportedEntryKind),
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let prefix = crate::network::raft_append_prefix_len(&entries)
             .ok_or(VosTransportError::EntryTooLarge)?;
         entries.truncate(prefix);
@@ -183,6 +180,32 @@ impl Transport<u16> for VosTransport {
         Ok(RequestVoteResp {
             term: r.term,
             vote_granted: r.vote_granted,
+        })
+    }
+
+    async fn send_prevote(
+        &self,
+        peer: u16,
+        req: PreVoteReq<u16>,
+    ) -> Result<PreVoteResp, Self::Error> {
+        let peer_id = self
+            .network
+            .raft_voter_peer(&self.replication_id, peer)
+            .ok_or(VosTransportError::UnknownPeer(peer))?;
+        let rx = self.network.send_raft_pre_vote(
+            peer_id,
+            self.replication_id,
+            req.next_term,
+            req.candidate,
+            req.last_log_index,
+            req.last_log_term,
+        );
+        let response = recv_timeout(rx, RPC_TIMEOUT)
+            .await
+            .ok_or(VosTransportError::NoReply)?;
+        Ok(PreVoteResp {
+            term: response.term,
+            vote_granted: response.vote_granted,
         })
     }
 

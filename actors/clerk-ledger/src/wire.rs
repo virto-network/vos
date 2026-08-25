@@ -41,9 +41,8 @@ pub(crate) const PENDING_STATUS_VOIDED: u8 = 2;
 /// 32-byte fields are the composite SMT roots just before and just
 /// after the kernel applied the transfer.
 ///
-/// These are the bytes a `cipher_clerk::voucher::Voucher` signs over. The
-/// public diagnostic remains available through `transfer_state_roots`; the
-/// production issuer path uses `voucher_anchor`, which additionally binds the
+/// These are the bytes a `cipher_clerk::voucher::Voucher` signs over.
+/// `voucher_anchor` additionally binds the
 /// single amount commitment before `clerk-bridge` signs through DEVICE_SIGN.
 #[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Clone, Debug, PartialEq, Eq,

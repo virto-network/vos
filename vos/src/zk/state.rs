@@ -562,8 +562,8 @@ mod tests {
 
     /// cipher-clerk's exact domains — the parity instantiation.
     const CC: SmtParams = SmtParams {
-        leaf_domain: b"cipher-clerk/smt/leaf",
-        node_domain: b"cipher-clerk/smt/node",
+        leaf_domain: b"cipher-clerk/smt/leaf/v1",
+        node_domain: b"cipher-clerk/smt/node/v1",
         width: 16,
     };
 

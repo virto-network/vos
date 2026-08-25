@@ -32,7 +32,8 @@ use redb::Database;
 use crate::commit::CommitError;
 use crate::network::{
     Network, RaftAppendResult, RaftEntry, RaftEntryKind, RaftInstallSnapshotResult, RaftJoinResult,
-    RaftReplaceVoterResult, RaftRole, RaftRpcHandler, RaftStatusReply, RaftVoteResult,
+    RaftPreVoteResult, RaftReplaceVoterResult, RaftRole, RaftRpcHandler, RaftStatusReply,
+    RaftVoteResult,
 };
 
 use super::RaftMeta;
@@ -40,7 +41,7 @@ use super::redb_storage::RedbStorage;
 use super::vos_transport::VosTransport;
 
 use vos_raft::{
-    AppendEntriesReq, Config as RaftCfg, InstallSnapshotReq, RequestVoteReq,
+    AppendEntriesReq, Config as RaftCfg, InstallSnapshotReq, PreVoteReq, RequestVoteReq,
     Transport as RaftTransport,
 };
 
@@ -83,14 +84,6 @@ impl WorkerConfig {
         let mut c = RaftCfg::new(self.me, self.members, self.replication_id);
         c.election_timeout_ms = self.election_timeout_ms;
         c.heartbeat_interval_ms = self.heartbeat_interval_ms;
-        // Pre-vote disabled until vos's libp2p frame layer
-        // routes `PreVoteReq` / `PreVoteResp`. Without that
-        // wire support, the worker would stay in PreCandidate
-        // forever (no peer can reply, no quorum, no
-        // promotion). Plain-Raft elections work fine — vos
-        // loses the term-inflation-prevention property until
-        // the network is upgraded.
-        c.pre_vote = false;
         c.install_snapshot_chunk_bytes = INSTALL_SNAPSHOT_CHUNK_BYTES;
         c
     }
@@ -512,6 +505,27 @@ impl RaftRpcHandler for WorkerHandle {
         }
     }
 
+    fn pre_vote(
+        &self,
+        _replication_id: &[u8; 32],
+        from_prefix: u16,
+        next_term: u64,
+        last_log_index: u64,
+        last_log_term: u64,
+    ) -> RaftPreVoteResult {
+        let req = PreVoteReq {
+            candidate: from_prefix,
+            next_term,
+            last_log_index,
+            last_log_term,
+        };
+        let resp = block_on(self.inner.handle_inbound_prevote(from_prefix, req));
+        RaftPreVoteResult {
+            term: resp.term,
+            vote_granted: resp.vote_granted,
+        }
+    }
+
     fn handle_status(&self, _replication_id: &[u8; 32]) -> RaftStatusReply {
         self.local_status().unwrap_or_else(RaftStatusReply::absent)
     }
@@ -695,6 +709,14 @@ impl RaftTransport<u16> for NoopTransport {
         _peer: u16,
         _req: RequestVoteReq<u16>,
     ) -> Result<vos_raft::RequestVoteResp, Self::Error> {
+        Err(NoopError)
+    }
+
+    async fn send_prevote(
+        &self,
+        _peer: u16,
+        _req: PreVoteReq<u16>,
+    ) -> Result<vos_raft::PreVoteResp, Self::Error> {
         Err(NoopError)
     }
 

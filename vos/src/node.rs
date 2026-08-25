@@ -1109,7 +1109,7 @@ pub struct VosNode {
     invoke_routes: InvokeRoutes,
     /// Canonical service actor identity to local host route. Unlike `ServiceId`,
     /// this identity is preserved end-to-end in WorkEnvelope and never
-    /// truncated into the legacy 32-bit namespace.
+    /// truncated into the 32-bit control-plane namespace.
     service_actor_routes: Arc<RwLock<HashMap<crate::service::ActorId, ActorRoute>>>,
     /// Per-process entropy and monotone ordinal for host-originated service work.
     /// The seed prevents fallback invocation identities repeating after a
@@ -1267,7 +1267,7 @@ pub struct VosNode {
     /// `Some`, blobs land at `{dir}/{hex_hash}` on `put`, and a
     /// hot-cache miss falls back to a read from that path before
     /// returning `None`. `None` keeps the store pure in-memory —
-    /// matches the legacy behaviour and is what tests use unless
+    /// matches the in-memory mode and is what tests use unless
     /// they explicitly opt in.
     pub(crate) proof_blobs_dir: Option<std::path::PathBuf>,
     /// Directory the node serves *program* blobs (actor ELFs) from over
@@ -2025,8 +2025,8 @@ type SharedNetwork = Arc<Mutex<Option<Arc<crate::network::Network>>>>;
 struct NodeService {
     invoke_routes: InvokeRoutes,
     /// Guest-owned root routes distinguish canonical service Raft delegation from
-    /// legacy Raft forwarding. Only the former consumes delegated origin and
-    /// can safely omit the legacy host-role probes.
+    /// control-plane Raft forwarding. Only the former consumes delegated origin and
+    /// can safely omit the host-role probes.
     service_actor_routes: Arc<RwLock<HashMap<crate::service::ActorId, ActorRoute>>>,
     /// Clone of the node's [`AgentNames`] reverse map, read by
     /// [`Self::dispatch_invoke`] to resolve the target's instance name
@@ -3571,7 +3571,7 @@ impl crate::network::NetworkService for NodeService {
             .ok()
             .and_then(|routes| routes.get(replication_id).cloned());
         let Some(route) = route else {
-            // Legacy/non groups retain their existing join contract.
+            // Conformance groups retain their existing join contract.
             return if production_trust_policy.is_none() {
                 handler.handle_join(replication_id, joiner_prefix)
             } else {
@@ -3752,7 +3752,7 @@ impl crate::network::NetworkService for NodeService {
             .and_then(|routes| routes.get(replication_id).cloned());
         let Some(route) = route else {
             // This production surface is intentionally limited to service roots;
-            // legacy groups have no durable private-input quiescence contract.
+            // other groups have no durable private-input quiescence contract.
             return RaftReplaceVoterResult::UnknownGroup;
         };
         let Some(barrier) = route.barrier.try_acquire() else {
@@ -3833,7 +3833,7 @@ fn replay_dag_into_runtime(
         // so every gate decision reproduces exactly: a role-refused
         // dispatch replays as refused (its durable node may still
         // carry framework effects like the genesis state write), a
-        // granted one as granted. Legacy logs without a recorded
+        // granted one as granted. Logs without a recorded
         // prefix decode as trusted-System, their historical replay
         // identity.
         if msg.is_empty() {
@@ -5859,7 +5859,7 @@ impl VosNode {
                 || record
                     .joint_old
                     .is_some_and(|members| members.contains(&raft_config.me))
-                // A legacy row or a configuration newer than commit_index
+                // A row without provenance or a configuration newer than commit_index
                 // cannot prove that removal committed. Retain the worker so
                 // it can still satisfy the last committed joint quorum.
                 || record
@@ -8083,7 +8083,7 @@ fn service_crdt_replica_roster_page(
     Some(CrdtRosterPage { peers, next })
 }
 
-/// Resolve the same per-agent sync floor used by the legacy pull service.
+/// Resolve the same per-agent sync floor used by the pull service.
 /// Unknown catalog state is distinct from `Member`: callers must deny it so a
 /// timeout, malformed response, or lagging registry cannot open a private
 /// replica.
@@ -9385,7 +9385,7 @@ where
             // Attested work and actor-local/mixed roles retain their separate
             // fail-closed paths. A space-role-only method is authorized by an
             // invocation-scoped receipt from the installed Raft authority;
-            // neither legacy role bytes nor synthetic System identity enter
+            // neither raw role bytes nor synthetic System identity enter
             // the guest work envelope. CRDT ingress carries that exact scoped
             // assertion in its causal admission node, whose finalized receipt
             // is independently verified by every syncing replica.
@@ -11327,7 +11327,7 @@ fn agent_thread(
                     // dispatch, so an outbound ask during it can relay the real
                     // caller bounded by `intra_caps` (read in `external_invoke`).
                     // Only when this agent opted into bounded relay — otherwise
-                    // the relay carrier is unread and the legacy `Caller::Actor`
+                    // the relay carrier is unread and the internal `Caller::Actor`
                     // path is byte-for-byte unchanged. Cleared on scope exit
                     // (even on panic), so a refused call can't poison the next.
                     let _relay = (!config.intra_caps.is_empty()).then(|| {
@@ -12615,7 +12615,7 @@ fn extension_thread(
 ///
 /// `actor_local_role` is intentionally dropped: the incoming byte was
 /// computed for the *extension* as target and is meaningless for a
-/// downstream actor; v1 doesn't re-look-up per-target actor-local
+/// downstream actor; this path does not re-look-up per-target actor-local
 /// grants on the extension path — the same limitation the libp2p
 /// dispatch path has (it only probes actor-local for the registry).
 #[derive(Clone, Debug)]
@@ -13164,7 +13164,7 @@ impl Fulfiller<'_> {
 /// ambiguity) and awaited on the executor (no blocking-pool thread), so other
 /// connection tasks keep serving. The relayed caller is
 /// [`Caller::Unauthenticated`] (a conn task has no inbound authenticated
-/// caller). The remaining effects are still rejected in v1:
+/// caller). The remaining effects are still rejected:
 ///   - `EFFECT_LISTEN`/`ACCEPT` — the host owns the accept loop; a connection
 ///     task cannot bind or accept.
 ///   - `EFFECT_FETCH`/`BLOB_GET`/`BLOB_PUT` — synchronous/blocking on the
@@ -13271,7 +13271,7 @@ impl ConnFulfiller {
             }
             other => {
                 // EFFECT_FETCH / BLOB_GET / BLOB_PUT (and anything else) stay
-                // rejected in v1: they take the synchronous `handle_effect` transport and
+                // rejected: they take the synchronous `handle_effect` transport and
                 // would block the single executor thread. (ASK is handled above
                 // via the async invoke route.) Returning empty bytes makes the
                 // handler's fetch/blob decode yield `None`/default, not hang.

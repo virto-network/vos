@@ -5,7 +5,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 /// One canonical application identity for a transport-authenticated peer.
-/// All legacy and service host ingress must use this helper so route choice cannot
+/// Every host ingress must use this helper so route choice cannot
 /// change the persistent [`crate::service::SubjectId`].
 #[inline(always)]
 pub(crate) fn authenticated_peer_subject(peer: &[u8]) -> crate::service::SubjectId {
@@ -36,12 +36,11 @@ pub struct Context<A: Actor> {
     /// `Unauthenticated` by default until per-invoke plumbing
     /// overwrites it from the [`InvokeRequest`].
     caller: Caller,
-    /// Typed service origin. Legacy callers are mapped into this field at the
-    /// dispatch boundary; new service code sets it directly from the work
-    /// envelope.
+    /// Typed service origin. Service code sets it from the authenticated work
+    /// envelope. Raw control-plane calls never synthesize an actor identity.
     origin: crate::service::Origin,
     /// Exact root service which authenticated an actor origin. `None` for
-    /// every non-actor origin and for legacy callers which cannot supply a
+    /// every non-actor origin and for control-plane callers which cannot supply a
     /// complete causal source identity.
     origin_service: Option<crate::service::ServiceIdentity>,
 
@@ -212,9 +211,8 @@ impl<A: Actor> Context<A> {
         self.id
     }
 
-    /// Typed service identity of this actor when running under the generic service.
-    /// Legacy standalone/service paths do not synthesize an `ActorId` and
-    /// therefore return `None`.
+    /// Typed service identity of this actor. Control-plane actors have no
+    /// application identity and return `None`.
     pub fn actor_id(&self) -> Option<crate::service::ActorId> {
         self.actor_id
     }
@@ -242,7 +240,7 @@ impl<A: Actor> Context<A> {
     /// authenticated external-actor directory.
     ///
     /// This is intentionally narrower than general actor resolution: owned
-    /// tree members and legacy registry routes are never considered. Actors
+    /// tree members and registry routes are never considered. Actors
     /// can use it to authenticate an incoming [`crate::service::Origin::Actor`]
     /// against an immutable reciprocal binding before performing an
     /// irreversible operation. Actor IDs are reusable across roots, so a
@@ -330,12 +328,7 @@ impl<A: Actor> Context<A> {
             Caller::Peer(bytes) => {
                 crate::service::Origin::Member(authenticated_peer_subject(bytes))
             }
-            Caller::Actor(id) => crate::service::Origin::Actor(crate::service::ActorId(
-                crate::crypto::blake2b_hash::<32>(
-                    b"vos/legacy-service-actor/service",
-                    &[&id.0.to_le_bytes()],
-                ),
-            )),
+            Caller::Actor(_) => crate::service::Origin::Anonymous,
         };
         self.caller = caller;
     }
@@ -604,7 +597,7 @@ impl<A: Actor> Context<A> {
 
     /// Issue a durable service call to an actor in another root tree.
     ///
-    /// Unlike the legacy route-oriented [`ask`](Self::ask), this call records
+    /// Unlike a control-plane [`ask`](Self::ask), this call records
     /// a stable await ordinal, checkpoints the exact guest machine before it
     /// observes a result, and resumes only after the owning service injects an
     /// accumulated reply at that same protocol-call boundary.
@@ -1368,8 +1361,7 @@ impl<A: Actor> Context<A> {
     /// Checkpoint state and yield. `sleep` is an alias for
     /// [`yield_now`](Self::yield_now): no host implements a multi-tick
     /// sleep, so `ticks` is ignored — the actor is simply re-scheduled
-    /// next tick. Kept for source compatibility and as the natural name
-    /// for a periodic-work loop.
+    /// next tick.
     pub fn sleep(&mut self, _ticks: u32) -> super::run::Yield {
         self.yield_now()
     }
@@ -1925,6 +1917,7 @@ mod tests {
 
         ctx.set_caller(Caller::Actor(ServiceId(42)));
         assert_eq!(ctx.caller(), &Caller::Actor(ServiceId(42)));
+        assert_eq!(ctx.origin(), crate::service::Origin::Anonymous);
     }
 
     #[test]
@@ -2137,13 +2130,13 @@ mod tests {
             "an actor origin without causal service identity fails closed"
         );
 
-        let mut legacy: Context<TestActor> = Context::new(ServiceId(0));
-        legacy.external_actors = ctx.external_actors;
-        legacy.__set_origin(
+        let mut control_plane: Context<TestActor> = Context::new(ServiceId(0));
+        control_plane.external_actors = ctx.external_actors;
+        control_plane.__set_origin(
             crate::service::Origin::Actor(actor),
-            Some(legacy.external_actors[0].service.clone()),
+            Some(control_plane.external_actors[0].service.clone()),
         );
-        assert!(!legacy.external_actor_origin_matches("private-age"));
+        assert!(!control_plane.external_actor_origin_matches("private-age"));
     }
 
     // Richer fixture actor with a 3-tier Role enum — exercises

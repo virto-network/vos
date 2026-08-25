@@ -115,7 +115,7 @@ fn list(space: &str) -> anyhow::Result<()> {
 
 /// Extract an unredeemed token's public key directly from the offline bearer,
 /// or resolve a recorded prefix, then commit the grow-only cancellation to
-/// both the canonical service authority and legacy registry.
+/// both the canonical service authority and catalog registry.
 fn revoke(space: &str, selector: &str) -> anyhow::Result<()> {
     DaemonClient::with_connect(space, |client| {
         let token_pub = if selector.starts_with(token::TOKEN_HRP) {

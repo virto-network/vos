@@ -1099,7 +1099,7 @@ mod tests {
     #[test]
     fn build_msg_uses_schema_type_when_present() {
         // Schema says `a: u64`, so a non-u64 input is rejected
-        // up front — the legacy heuristic would silently fall
+        // up front — a type-guessing heuristic would silently fall
         // back to a String and the actor would reject it later
         // with a less helpful message.
         let field = vos::metadata::ParsedField {

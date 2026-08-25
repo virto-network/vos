@@ -158,7 +158,6 @@ fn sign_extend_16_forged_byte_1_rejected() {
 // reg_d, imm) flows through ProgramMemoryChip.  Forging any field —
 // the prover lying about which instruction ran — breaks the lookup.
 
-use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm_proof::core::step::PvmStep;
 
 #[test]

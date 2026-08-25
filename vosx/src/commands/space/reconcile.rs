@@ -1062,7 +1062,7 @@ mod tests {
         let caps = vec![vos::IntraCap::parse("*").unwrap()];
         let w = intra_caps_wildcard_warning("dev", &caps).expect("full wildcard warns");
         assert!(w.contains("dev"), "{w}");
-        assert!(w.contains("fully-trusted relay"), "{w}");
+        assert!(w.contains("ANY role on ANY actor"), "{w}");
 
         // Actor wildcard with a concrete role → still fires (broad
         // authority on every actor).

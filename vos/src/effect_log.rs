@@ -377,6 +377,7 @@ impl CrdtEvent {
 ///
 /// The runtime holds one of these per tick and threads a
 /// mutable reference down through the refine/invoke call chain.
+#[cfg(feature = "std")]
 #[derive(Default)]
 pub enum EffectMode {
     /// No recording or replay — the default.
@@ -391,6 +392,7 @@ pub enum EffectMode {
     Replaying(EffectReplay),
 }
 
+#[cfg(feature = "std")]
 impl EffectMode {
     /// `true` when actively recording. Mainly for tests and host
     /// diagnostics; user code generally shouldn't need to peek.
@@ -443,12 +445,14 @@ impl EffectMode {
 ///
 /// Only used on the recording side; replay reads directly from a
 /// stored [`EffectLog`] via [`EffectCursor`].
+#[cfg(feature = "std")]
 pub struct EffectSession {
     log: EffectLog,
     cap: usize,
     private_record_rejected: bool,
 }
 
+#[cfg(feature = "std")]
 impl EffectSession {
     /// Start a session for the given incoming dispatch message.
     pub fn new(msg: Vec<u8>) -> Self {
@@ -512,6 +516,7 @@ impl EffectSession {
 /// returns `None` and marks the replay as exhausted — callers
 /// should treat this as a non-determinism failure and surface a
 /// PANICKED status back to the PVM.
+#[cfg(feature = "std")]
 pub struct EffectReplay {
     log: EffectLog,
     pos: usize,
@@ -519,6 +524,7 @@ pub struct EffectReplay {
     private_record_rejected: bool,
 }
 
+#[cfg(feature = "std")]
 impl EffectReplay {
     /// Wrap a stored [`EffectLog`] for replay.
     pub fn new(log: EffectLog) -> Self {

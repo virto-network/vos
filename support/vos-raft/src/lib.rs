@@ -39,6 +39,7 @@
 //! #     type Error = E;
 //! #     async fn send_append(&self, _: u16, _: vos_raft::AppendEntriesReq<u16>) -> Result<vos_raft::AppendEntriesResp, E> { Err(E) }
 //! #     async fn send_vote(&self, _: u16, _: vos_raft::RequestVoteReq<u16>) -> Result<vos_raft::RequestVoteResp, E> { Err(E) }
+//! #     async fn send_prevote(&self, _: u16, _: vos_raft::PreVoteReq<u16>) -> Result<vos_raft::PreVoteResp, E> { Err(E) }
 //! #     async fn send_install(&self, _: u16, _: vos_raft::InstallSnapshotReq<u16>) -> Result<vos_raft::InstallSnapshotResp, E> { Err(E) }
 //! # }
 //! // Solo-cluster smoke test — single member self-elects to

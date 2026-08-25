@@ -5,8 +5,7 @@
 //! issuer's signature, not by space membership. Setup, issuer signing, claim
 //! signing, and settlement-window controls are operator-gated.
 //!
-//! The signing-control handlers additionally reject the legacy same-node
-//! `Caller::Actor` bypass: only `System` or an authenticated member carrying
+//! Signing-control handlers accept only `System` or an authenticated member carrying
 //! `Operator` may bind keys, change peer trust, issue, or sign claims. Under
 //! Raft leader-forward the peer must hold the `Admin`/`Developer` grant.
 

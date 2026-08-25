@@ -82,6 +82,13 @@ pub struct RaftVoteResult {
     pub vote_granted: bool,
 }
 
+/// Inbound result from a Raft pre-vote probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftPreVoteResult {
+    pub term: u64,
+    pub vote_granted: bool,
+}
+
 /// Inbound result from an
 /// [`InstallSnapshot`](Frame::RaftInstallSnapshotReq) RPC.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -474,6 +481,22 @@ pub trait RaftRpcHandler: Send + Sync {
         last_log_term: u64,
     ) -> RaftVoteResult;
 
+    /// Inbound pre-vote from `from_prefix`. Implementations perform the same
+    /// log-freshness check as a real vote without persisting a term or vote.
+    fn pre_vote(
+        &self,
+        _replication_id: &[u8; 32],
+        _from_prefix: u16,
+        next_term: u64,
+        _last_log_index: u64,
+        _last_log_term: u64,
+    ) -> RaftPreVoteResult {
+        RaftPreVoteResult {
+            term: next_term.saturating_sub(1),
+            vote_granted: false,
+        }
+    }
+
     /// Inbound `InstallSnapshot` from `from_prefix` (the leader).
     /// Implementations replace the local actor state, advance
     /// the snap pointer, and drop any log entries the snapshot
@@ -748,6 +771,20 @@ impl RaftRpcHandler for ReservedRaftHandler {
             vote_granted: false,
         }
     }
+
+    fn pre_vote(
+        &self,
+        _replication_id: &[u8; 32],
+        _from_prefix: u16,
+        next_term: u64,
+        _last_log_index: u64,
+        _last_log_term: u64,
+    ) -> RaftPreVoteResult {
+        RaftPreVoteResult {
+            term: next_term.saturating_sub(1),
+            vote_granted: false,
+        }
+    }
 }
 
 /// Multiaddrs the local swarm has actually bound to. Populated
@@ -806,8 +843,7 @@ pub struct NetworkConfig {
     /// one-shot CLI client peers do **not** — they only need to
     /// reach a single known bootstrap address, and auto-dialling
     /// random LAN peers floods the log with `outgoing connection
-    /// failed` WARNs from unrelated libp2p apps. Defaults to
-    /// `true` for backwards compat.
+    /// failed` WARNs from unrelated libp2p apps.
     pub auto_dial_mdns: bool,
 }
 
@@ -934,6 +970,16 @@ pub(in crate::network) enum NetworkCmd {
         last_log_term: u64,
         reply: std_mpsc::Sender<RaftVoteResult>,
     },
+    /// Send a Raft pre-vote probe to a specific peer.
+    SendRaftPreVote {
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        next_term: u64,
+        candidate_prefix: u16,
+        last_log_index: u64,
+        last_log_term: u64,
+        reply: std_mpsc::Sender<RaftPreVoteResult>,
+    },
     /// Send a Raft `InstallSnapshot` RPC to a specific peer.
     SendRaftInstallSnapshot {
         target_peer: PeerId,
@@ -998,6 +1044,7 @@ enum OutboundReply {
     Node(std_mpsc::Sender<Option<Vec<u8>>>),
     RaftAppend(std_mpsc::Sender<RaftAppendResult>),
     RaftVote(std_mpsc::Sender<RaftVoteResult>),
+    RaftPreVote(std_mpsc::Sender<RaftPreVoteResult>),
     RaftInstallSnapshot(std_mpsc::Sender<RaftInstallSnapshotResult>),
     RaftJoin(std_mpsc::Sender<RaftJoinResult>),
     RaftReplaceVoter(std_mpsc::Sender<RaftReplaceVoterResult>),
@@ -1335,6 +1382,29 @@ impl Network {
             target_peer,
             replication_id,
             term,
+            candidate_prefix,
+            last_log_index,
+            last_log_term,
+            reply: tx,
+        });
+        rx
+    }
+
+    /// Send a Raft pre-vote probe to a specific peer.
+    pub fn send_raft_pre_vote(
+        &self,
+        target_peer: PeerId,
+        replication_id: [u8; 32],
+        next_term: u64,
+        candidate_prefix: u16,
+        last_log_index: u64,
+        last_log_term: u64,
+    ) -> std_mpsc::Receiver<RaftPreVoteResult> {
+        let (tx, rx) = std_mpsc::channel();
+        let _ = self.cmd_tx.send(NetworkCmd::SendRaftPreVote {
+            target_peer,
+            replication_id,
+            next_term,
             candidate_prefix,
             last_log_index,
             last_log_term,
@@ -1994,6 +2064,29 @@ async fn network_main(
                         outbound_replies.insert(req_id, OutboundReply::RaftVote(reply));
                         debug!(%target_peer, term, "network: sent RaftVote");
                     }
+                    Some(NetworkCmd::SendRaftPreVote {
+                        target_peer,
+                        replication_id,
+                        next_term,
+                        candidate_prefix,
+                        last_log_index,
+                        last_log_term,
+                        reply,
+                    }) => {
+                        let frame = Frame::RaftPreVoteReq {
+                            replication_id,
+                            next_term,
+                            candidate_prefix,
+                            last_log_index,
+                            last_log_term,
+                        };
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .req_resp
+                            .send_request(&target_peer, frame);
+                        outbound_replies.insert(req_id, OutboundReply::RaftPreVote(reply));
+                        debug!(%target_peer, next_term, "network: sent RaftPreVote");
+                    }
                     Some(NetworkCmd::SendRaftInstallSnapshot {
                         target_peer,
                         replication_id,
@@ -2341,7 +2434,7 @@ fn handle_req_resp(
                         // Canonical service root transport is bound again to the
                         // full PeerId at the node bridge. Let a correctly
                         // derived source through even when its 16-bit lookup
-                        // prefix collides; ordinary legacy Tell still relies
+                        // prefix collides; an ordinary control-plane Tell still relies
                         // on the unambiguous prefix map.
                         let authenticated_source = if payload.starts_with(b"VRTW") {
                             claimed_prefix == derive_node_prefix(&peer)
@@ -2652,6 +2745,62 @@ fn handle_req_resp(
                             let _ = response_tx.send((
                                 channel,
                                 Frame::RaftVoteResp {
+                                    term: resp.term,
+                                    vote_granted: resp.vote_granted,
+                                },
+                            ));
+                        });
+                    }
+                    Frame::RaftPreVoteReq {
+                        replication_id,
+                        next_term,
+                        candidate_prefix,
+                        last_log_index,
+                        last_log_term,
+                    } => {
+                        let registration = raft_handlers
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.get(&replication_id).cloned());
+                        let service = service.clone();
+                        let raft_handlers = raft_handlers.clone();
+                        let response_tx = response_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let resp = match authenticated_raft_rpc_handler(
+                                registration,
+                                &raft_handlers,
+                                &service,
+                                &replication_id,
+                                candidate_prefix,
+                                peer,
+                            ) {
+                                Ok(h) => h.pre_vote(
+                                    &replication_id,
+                                    candidate_prefix,
+                                    next_term,
+                                    last_log_index,
+                                    last_log_term,
+                                ),
+                                Err((local_term, reason)) => {
+                                    debug!(
+                                        %peer,
+                                        candidate_prefix,
+                                        reason,
+                                        rep_id = format!(
+                                            "{:02x}{:02x}..",
+                                            replication_id[0], replication_id[1]
+                                        ),
+                                        "network: refused unauthenticated RaftPreVoteReq",
+                                    );
+                                    RaftPreVoteResult {
+                                        term: local_term,
+                                        vote_granted: false,
+                                    }
+                                }
+                            };
+                            let _ = response_tx.send((
+                                channel,
+                                Frame::RaftPreVoteResp {
                                     term: resp.term,
                                     vote_granted: resp.vote_granted,
                                 },
@@ -3008,6 +3157,12 @@ fn handle_req_resp(
                         let _ = tx.send(RaftVoteResult { term, vote_granted });
                     }
                     (
+                        Frame::RaftPreVoteResp { term, vote_granted },
+                        Some(OutboundReply::RaftPreVote(tx)),
+                    ) => {
+                        let _ = tx.send(RaftPreVoteResult { term, vote_granted });
+                    }
+                    (
                         Frame::RaftInstallSnapshotResp {
                             term,
                             bytes_received,
@@ -3328,7 +3483,7 @@ fn authenticated_tell_source(map: &PrefixMap, peer: PeerId, from: u32) -> bool {
 /// in its top 16 bits; remote peers learn it via the [`Frame::Hello`]
 /// handshake on first contact.
 ///
-/// Zero is reserved for legacy/local routes and is deterministically remapped.
+/// Zero is reserved for local control-plane routes and is deterministically remapped.
 /// Collisions remain possible, so security-sensitive protocols additionally
 /// bind the full authenticated [`PeerId`] and a collision never overwrites an
 /// existing prefix owner.
@@ -4908,6 +5063,7 @@ mod tests {
         struct StubHandler {
             append_calls: StdMutex<Vec<(u16, u64, u64, u64, u64, usize)>>,
             vote_calls: StdMutex<Vec<(u16, u64, u64, u64)>>,
+            pre_vote_calls: StdMutex<Vec<(u16, u64, u64, u64)>>,
             install_calls: StdMutex<Vec<(u64, bool, usize, Vec<u16>)>>,
             term: AtomicU64,
             members: Vec<u16>,
@@ -4917,6 +5073,7 @@ mod tests {
                 Self {
                     append_calls: StdMutex::new(Vec::new()),
                     vote_calls: StdMutex::new(Vec::new()),
+                    pre_vote_calls: StdMutex::new(Vec::new()),
                     install_calls: StdMutex::new(Vec::new()),
                     term: AtomicU64::new(initial_term),
                     members,
@@ -4982,6 +5139,26 @@ mod tests {
                 RaftVoteResult {
                     term: local_term,
                     vote_granted: term >= local_term,
+                }
+            }
+
+            fn pre_vote(
+                &self,
+                _replication_id: &[u8; 32],
+                from_prefix: u16,
+                next_term: u64,
+                last_log_index: u64,
+                last_log_term: u64,
+            ) -> RaftPreVoteResult {
+                self.pre_vote_calls.lock().unwrap().push((
+                    from_prefix,
+                    next_term,
+                    last_log_index,
+                    last_log_term,
+                ));
+                RaftPreVoteResult {
+                    term: self.term.load(Ordering::Relaxed),
+                    vote_granted: next_term > self.term.load(Ordering::Relaxed),
                 }
             }
 
@@ -5105,6 +5282,19 @@ mod tests {
         assert_eq!(calls[0], (prefix_a, 9u64, 12u64, 8u64));
         drop(calls);
 
+        // ── PreVote: the same authenticated path without mutating term. ──
+        let rx = net_a.send_raft_pre_vote(target_b, rep_id, 10, prefix_a, 12, 8);
+        let resp = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("PreVote response");
+        assert_eq!(resp.term, 7);
+        assert!(resp.vote_granted);
+        assert_eq!(handler.term.load(Ordering::Relaxed), 7);
+        assert_eq!(
+            *handler.pre_vote_calls.lock().unwrap(),
+            vec![(prefix_a, 10, 12, 8)]
+        );
+
         // ── InstallSnapshot: bounded chunks preserve their cursor and
         // final membership metadata across the libp2p wire. ─────────
         let first = net_a.send_raft_install_snapshot(
@@ -5226,6 +5416,21 @@ mod tests {
                 }
             }
 
+            fn pre_vote(
+                &self,
+                _replication_id: &[u8; 32],
+                _from_prefix: u16,
+                next_term: u64,
+                _last_log_index: u64,
+                _last_log_term: u64,
+            ) -> RaftPreVoteResult {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                RaftPreVoteResult {
+                    term: next_term.saturating_sub(1),
+                    vote_granted: true,
+                }
+            }
+
             fn install_snapshot(
                 &self,
                 _replication_id: &[u8; 32],
@@ -5328,6 +5533,12 @@ mod tests {
             .expect("forged vote receives a refusal");
         assert_eq!(vote.term, 7);
         assert!(!vote.vote_granted);
+        let pre_vote = attacker
+            .send_raft_pre_vote(receiver_peer, replication_id, 100, voter_prefix, 0, 0)
+            .recv_timeout(Duration::from_secs(5))
+            .expect("forged pre-vote receives a refusal");
+        assert_eq!(pre_vote.term, 7);
+        assert!(!pre_vote.vote_granted);
         let snapshot = attacker
             .send_raft_install_snapshot(
                 receiver_peer,

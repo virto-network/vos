@@ -402,7 +402,7 @@ fn remove_node(space: &str, prefix: u32, replacement: Option<u32>) -> anyhow::Re
             })?;
 
             // A catalog should not name the same replication group twice, but
-            // deduplicate defensively so a malformed/legacy row cannot make
+            // deduplicate defensively so a malformed row cannot make
             // the operator race the same membership transition with itself.
             let mut seen = BTreeSet::new();
             for (name, replication_id, operation_epoch) in active_roots {

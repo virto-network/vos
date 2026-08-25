@@ -1051,6 +1051,7 @@ fn prove_set_lt_s_pos_vs_neg() {
     test_three_reg_op(Opcode::SetLtS, 100, neg100, 0);
 }
 
+#[test]
 fn prove_mul_upper_uu_large() {
     // Large but not max: schoolbook carries stay within u8
     test_three_reg_op(

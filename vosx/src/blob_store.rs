@@ -62,8 +62,7 @@ pub enum BlobSource {
     /// Local file. Always valid; bytes are read on resolve and
     /// the resulting hash is stored back to the cache.
     Path(PathBuf),
-    /// IPFS content-id. v1 implementation deferred — when wired
-    /// up, fetches via local IPFS gateway / kubo HTTP API.
+    /// IPFS content-id. Resolution is not implemented yet.
     Cid(String),
     /// Plain HTTP(S) URL. Bytes are streamed and verified
     /// against the URL's fragment if present.

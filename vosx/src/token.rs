@@ -78,7 +78,7 @@ pub struct InvitePayload {
     pub expires_at: u64,
     /// Durable protocol marker pinning redemption to the canonical service
     /// authority incarnation. Markerless invitations are intentionally no
-    /// longer representable: replica-local absence cannot prove legacy mode.
+    /// longer representable: replica-local absence cannot prove protocol mode.
     pub authority_replication_id: [u8; 32],
     /// The minting admin's libp2p peer-id bytes — the key `admin_sig`
     /// verifies under. Named so the registry verifies in O(1) instead of

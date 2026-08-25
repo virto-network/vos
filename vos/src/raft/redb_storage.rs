@@ -356,26 +356,9 @@ impl Storage<u16> for RedbStorage {
                         )));
                     }
                     (None, false) => {
-                        // The legacy Raft state machine stores only its latest
-                        // image. It remains safe to compact exactly at that
-                        // durable cursor, but never at an older boundary whose
-                        // state can no longer be reconstructed.
-                        let last_applied = RaftMeta::last_applied_in_txn(&txn)?;
-                        if index != last_applied {
-                            return Err(CommitError::Config(alloc::format!(
-                                "raft cannot compact index {index}: legacy service image is at {last_applied}"
-                            )));
-                        }
-                        let state = {
-                            let table = txn.open_table(STATE_TABLE)?;
-                            table.get(STATE_KEY)?.map(|value| value.value().to_vec())
-                        }
-                        .ok_or_else(|| {
-                            CommitError::Config(alloc::format!(
-                                "raft cannot compact index {index}: durable service image is missing"
-                            ))
-                        })?;
-                        (Some(state), false)
+                        return Err(CommitError::Config(alloc::format!(
+                            "raft cannot compact index {index}: applied-image history is not initialized"
+                        )));
                     }
                 }
             } else {

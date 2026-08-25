@@ -1782,7 +1782,7 @@ fn signed_service_roots_run_under_production_trust_and_recover() {
         .expect("the production Raft counter spawn log must expose its concrete service id");
 
     // A production-sealed image cannot be reopened by omitting the authority.
-    // The daemon itself remains available for legacy/control-plane traffic,
+    // The daemon itself remains available for control-plane traffic,
     // while the service route stays fail-closed.
     drop(first);
     let _ = fs::remove_file(&endpoint);
