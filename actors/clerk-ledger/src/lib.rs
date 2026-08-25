@@ -747,7 +747,7 @@ impl ClerkLedger {
     /// the live committed maps only when the Task's bound roots and batch
     /// digest match exactly.
     ///
-    /// This is the parent-side D6 contract. Service-v2 Local and Raft
+    /// This is the parent-side D6 contract. Service Local and Raft
     /// execution bind the invocation to a private-input commitment, hydrate
     /// the exact Refine trace from an operator sidecar, and persist the
     /// resulting witness to the producer-private record sidecar before

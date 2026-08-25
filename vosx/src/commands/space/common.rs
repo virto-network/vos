@@ -39,34 +39,37 @@ pub fn instance_service_id(instance_name: &str, prefix: u16) -> ServiceId {
     ServiceId(vos::registry::instance_service_id(instance_name, prefix))
 }
 
-/// Stable logical service identity for one installed v2 root-tree incarnation.
+/// Stable logical service identity for one installed service root-tree incarnation.
 ///
 /// The compatibility route used by the daemon remains node-local. The
 /// guest-owned identity is scoped to the space and registry installation, so
 /// it survives process restarts but a tombstoned name reinstalled with the
 /// required fresh replication id cannot inherit the deleted actor's state or
 /// deduplication history.
-pub fn v2_root_service_id(
-    space: vos::v2::SpaceId,
+pub fn service_root_service_id(
+    space: vos::service::SpaceId,
     instance: &str,
     replication_id: [u8; 32],
-) -> vos::v2::RootServiceId {
-    vos::v2::RootServiceId(
-        vos::v2::Hash::digest(
-            b"vos/installed-root-service/v2",
+) -> vos::service::RootServiceId {
+    vos::service::RootServiceId(
+        vos::service::Hash::digest(
+            b"vos/installed-root-service/service",
             &[&space.0, instance.as_bytes(), &replication_id],
         )
         .0,
     )
 }
 
-/// Stable application identity of the root actor owned by an installed v2
+/// Stable application identity of the root actor owned by an installed service
 /// service. Deployment and program identities may change through an upgrade;
 /// the actor identity does not.
-pub fn v2_root_actor_id(service: vos::v2::RootServiceId, instance: &str) -> vos::v2::ActorId {
-    vos::v2::ActorId(
-        vos::v2::Hash::digest(
-            b"vos/installed-root-actor/v2",
+pub fn service_root_actor_id(
+    service: vos::service::RootServiceId,
+    instance: &str,
+) -> vos::service::ActorId {
+    vos::service::ActorId(
+        vos::service::Hash::digest(
+            b"vos/installed-root-actor/service",
             &[&service.0, instance.as_bytes()],
         )
         .0,
@@ -289,28 +292,30 @@ mod tests {
     }
 
     #[test]
-    fn v2_root_tree_identity_is_stable_and_installation_scoped() {
-        let first = v2_root_service_id(vos::v2::SpaceId([1; 32]), "counter", [3; 32]);
-        let same = v2_root_service_id(vos::v2::SpaceId([1; 32]), "counter", [3; 32]);
-        let other_space = v2_root_service_id(vos::v2::SpaceId([2; 32]), "counter", [3; 32]);
-        let other_name = v2_root_service_id(vos::v2::SpaceId([1; 32]), "ledger", [3; 32]);
-        let reinstalled = v2_root_service_id(vos::v2::SpaceId([1; 32]), "counter", [4; 32]);
+    fn service_root_tree_identity_is_stable_and_installation_scoped() {
+        let first = service_root_service_id(vos::service::SpaceId([1; 32]), "counter", [3; 32]);
+        let same = service_root_service_id(vos::service::SpaceId([1; 32]), "counter", [3; 32]);
+        let other_space =
+            service_root_service_id(vos::service::SpaceId([2; 32]), "counter", [3; 32]);
+        let other_name = service_root_service_id(vos::service::SpaceId([1; 32]), "ledger", [3; 32]);
+        let reinstalled =
+            service_root_service_id(vos::service::SpaceId([1; 32]), "counter", [4; 32]);
 
         assert_eq!(first, same);
         assert_ne!(first, other_space);
         assert_ne!(first, other_name);
         assert_ne!(first, reinstalled);
-        assert_ne!(first, vos::v2::RootServiceId::ZERO);
+        assert_ne!(first, vos::service::RootServiceId::ZERO);
     }
 
     #[test]
-    fn v2_root_actor_identity_is_stable_across_deployments() {
-        let service = v2_root_service_id(vos::v2::SpaceId([3; 32]), "counter", [5; 32]);
-        let actor = v2_root_actor_id(service, "counter");
+    fn service_root_actor_identity_is_stable_across_deployments() {
+        let service = service_root_service_id(vos::service::SpaceId([3; 32]), "counter", [5; 32]);
+        let actor = service_root_actor_id(service, "counter");
 
-        assert_eq!(actor, v2_root_actor_id(service, "counter"));
-        assert_ne!(actor, v2_root_actor_id(service, "counter-child"));
-        assert_ne!(actor, vos::v2::ActorId::ZERO);
+        assert_eq!(actor, service_root_actor_id(service, "counter"));
+        assert_ne!(actor, service_root_actor_id(service, "counter-child"));
+        assert_ne!(actor, vos::service::ActorId::ZERO);
     }
 
     #[test]

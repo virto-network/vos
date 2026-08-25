@@ -17,7 +17,7 @@ struct ChangeScope {
 
 #[derive(Debug, Clone)]
 struct PendingOperation {
-    field: crate::v2::Hash,
+    field: crate::service::Hash,
     id: OpId,
     payload: Vec<u8>,
 }
@@ -91,9 +91,9 @@ pub fn reset_actor_slice() {
     }
 }
 
-fn field_tag(actor: &str, field: &str) -> crate::v2::Hash {
-    crate::v2::Hash::digest(
-        b"vos/crdt-field-tag/v2",
+fn field_tag(actor: &str, field: &str) -> crate::service::Hash {
+    crate::service::Hash::digest(
+        b"vos/crdt-field-tag/service",
         &[actor.as_bytes(), field.as_bytes()],
     )
 }
@@ -125,7 +125,7 @@ impl ChangeId {
         let namespace_len = (namespace.len() as u64).to_le_bytes();
         let nonce_len = (nonce.len() as u64).to_le_bytes();
         Self(crate::crypto::blake2b_hash::<32>(
-            b"vos/crdt-change/v2",
+            b"vos/crdt-change/service",
             &[&namespace_len, namespace, &nonce_len, nonce],
         ))
     }
@@ -138,23 +138,23 @@ impl ChangeId {
     }
 
     /// Derive the actor-local allocator namespace for one scheduler dispatch.
-    /// The outer v2 change remains the batch identity; this scoped identifier
+    /// The outer service change remains the batch identity; this scoped identifier
     /// prevents actor re-entry from reusing `(change, ordinal)` in field state.
     #[doc(hidden)]
     pub fn for_dispatch(
-        change: crate::v2::ChangeId,
-        actor: crate::v2::ActorId,
+        change: crate::service::ChangeId,
+        actor: crate::service::ActorId,
         dispatch_ordinal: u32,
     ) -> Self {
         Self(crate::crypto::blake2b_hash::<32>(
-            b"vos/crdt-actor-dispatch/v2",
+            b"vos/crdt-actor-dispatch/service",
             &[&change.0, &actor.0, &dispatch_ordinal.to_le_bytes()],
         ))
     }
 }
 
-impl From<crate::v2::InvocationId> for ChangeId {
-    fn from(value: crate::v2::InvocationId) -> Self {
+impl From<crate::service::InvocationId> for ChangeId {
+    fn from(value: crate::service::InvocationId) -> Self {
         Self(value.0)
     }
 }
@@ -376,7 +376,7 @@ fn next_operation_from(scope: Option<&mut ChangeScope>) -> Result<OpId, Error> {
     Ok(scope.change.operation(ordinal))
 }
 
-fn record_operation(field: crate::v2::Hash, id: OpId, payload: Vec<u8>) -> Result<(), Error> {
+fn record_operation(field: crate::service::Hash, id: OpId, payload: Vec<u8>) -> Result<(), Error> {
     debug_assert!(!payload.is_empty());
     #[cfg(feature = "std")]
     {
@@ -393,7 +393,7 @@ fn record_operation(field: crate::v2::Hash, id: OpId, payload: Vec<u8>) -> Resul
 
 fn record_operation_in(
     scope: Option<&mut ChangeScope>,
-    field: crate::v2::Hash,
+    field: crate::service::Hash,
     id: OpId,
     payload: Vec<u8>,
 ) -> Result<(), Error> {
@@ -411,9 +411,9 @@ fn record_operation_in(
 /// The returned order is the actor's mutation-emission order.
 #[doc(hidden)]
 pub fn take_operations(
-    actor: crate::v2::ActorId,
-    dispatch: crate::v2::CrdtDispatchV2,
-) -> Result<Vec<crate::v2::CrdtOperationV2>, Error> {
+    actor: crate::service::ActorId,
+    dispatch: crate::service::CrdtDispatch,
+) -> Result<Vec<crate::service::CrdtOperation>, Error> {
     #[cfg(feature = "std")]
     let completed = COMPLETED_CHANGE.with(|completed| completed.borrow_mut().take());
     #[cfg(not(feature = "std"))]
@@ -428,7 +428,7 @@ pub fn take_operations(
     let operations = completed
         .operations
         .into_iter()
-        .map(|operation| crate::v2::CrdtOperationV2 {
+        .map(|operation| crate::service::CrdtOperation {
             actor,
             dispatch_ordinal: dispatch.ordinal,
             field: operation.field,
@@ -501,7 +501,7 @@ pub struct Value<T> {
     values: BTreeMap<OpId, T>,
     removed: BTreeSet<OpId>,
     #[rkyv(with = rkyv::with::Skip)]
-    field: crate::v2::Hash,
+    field: crate::service::Hash,
 }
 
 impl<T> Default for Value<T> {
@@ -509,7 +509,7 @@ impl<T> Default for Value<T> {
         Self {
             values: BTreeMap::new(),
             removed: BTreeSet::new(),
-            field: crate::v2::Hash::ZERO,
+            field: crate::service::Hash::ZERO,
         }
     }
 }
@@ -637,7 +637,7 @@ pub struct Map<K, V> {
     entries: BTreeMap<K, Value<V>>,
     operation_keys: BTreeMap<OpId, K>,
     #[rkyv(with = rkyv::with::Skip)]
-    field: crate::v2::Hash,
+    field: crate::service::Hash,
 }
 
 impl<K, V> Default for Map<K, V> {
@@ -645,7 +645,7 @@ impl<K, V> Default for Map<K, V> {
         Self {
             entries: BTreeMap::new(),
             operation_keys: BTreeMap::new(),
-            field: crate::v2::Hash::ZERO,
+            field: crate::service::Hash::ZERO,
         }
     }
 }
@@ -786,7 +786,7 @@ pub struct Set<T> {
     operations: BTreeMap<OpId, T>,
     removed: BTreeSet<OpId>,
     #[rkyv(with = rkyv::with::Skip)]
-    field: crate::v2::Hash,
+    field: crate::service::Hash,
 }
 
 impl<T> Default for Set<T> {
@@ -794,7 +794,7 @@ impl<T> Default for Set<T> {
         Self {
             operations: BTreeMap::new(),
             removed: BTreeSet::new(),
-            field: crate::v2::Hash::ZERO,
+            field: crate::service::Hash::ZERO,
         }
     }
 }
@@ -932,7 +932,7 @@ pub struct List<T> {
     elements: BTreeMap<OpId, ListElement<T>>,
     removed: BTreeSet<OpId>,
     #[rkyv(with = rkyv::with::Skip)]
-    field: crate::v2::Hash,
+    field: crate::service::Hash,
 }
 
 impl<T> Default for List<T> {
@@ -940,7 +940,7 @@ impl<T> Default for List<T> {
         Self {
             elements: BTreeMap::new(),
             removed: BTreeSet::new(),
-            field: crate::v2::Hash::ZERO,
+            field: crate::service::Hash::ZERO,
         }
     }
 }
@@ -1161,13 +1161,13 @@ impl<T: Clone + PartialEq> List<T> {
 }
 
 /// Unicode scalar sequence editing. Rich-text marks are intentionally not part
-/// of the v2 ABI.
+/// of the service ABI.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Default)]
 #[rkyv(crate = rkyv)]
 pub struct Text {
     chars: List<char>,
     #[rkyv(with = rkyv::with::Skip)]
-    field: crate::v2::Hash,
+    field: crate::service::Hash,
 }
 
 impl Field for Text {
@@ -1280,7 +1280,7 @@ impl core::fmt::Display for Text {
 pub struct Counter {
     operations: BTreeMap<OpId, i128>,
     #[rkyv(with = rkyv::with::Skip)]
-    field: crate::v2::Hash,
+    field: crate::service::Hash,
 }
 
 impl Field for Counter {
@@ -1454,15 +1454,15 @@ mod tests {
 
     #[test]
     fn scheduler_dispatches_have_distinct_actor_local_namespaces() {
-        let batch = crate::v2::ChangeId([9; 32]);
-        let actor = crate::v2::ActorId([8; 32]);
+        let batch = crate::service::ChangeId([9; 32]);
+        let actor = crate::service::ActorId([8; 32]);
         assert_ne!(
             ChangeId::for_dispatch(batch, actor, 0),
             ChangeId::for_dispatch(batch, actor, 1)
         );
         assert_ne!(
             ChangeId::for_dispatch(batch, actor, 0),
-            ChangeId::for_dispatch(batch, crate::v2::ActorId([7; 32]), 0)
+            ChangeId::for_dispatch(batch, crate::service::ActorId([7; 32]), 0)
         );
     }
 
@@ -1470,10 +1470,10 @@ mod tests {
     fn restored_slice_rebinds_and_discards_checkpoint_operations() {
         let mut counter = Counter::default();
         Field::__vos_init(&mut counter, "Board", "edits");
-        let actor = crate::v2::ActorId([5; 32]);
-        let before = crate::v2::ChangeId([5; 32]);
-        let after = crate::v2::ChangeId([6; 32]);
-        let after_dispatch = crate::v2::CrdtDispatchV2 {
+        let actor = crate::service::ActorId([5; 32]);
+        let before = crate::service::ChangeId([5; 32]);
+        let after = crate::service::ChangeId([6; 32]);
+        let after_dispatch = crate::service::CrdtDispatch {
             change: after,
             ordinal: 0,
         };
@@ -1500,9 +1500,9 @@ mod tests {
     fn completed_slice_exposes_field_scoped_consensus_operations() {
         let mut counter = Counter::default();
         Field::__vos_init(&mut counter, "Board", "edits");
-        let actor = crate::v2::ActorId([4; 32]);
-        let change = crate::v2::ChangeId([7; 32]);
-        let dispatch = crate::v2::CrdtDispatchV2 { change, ordinal: 3 };
+        let actor = crate::service::ActorId([4; 32]);
+        let change = crate::service::ChangeId([7; 32]);
+        let dispatch = crate::service::CrdtDispatch { change, ordinal: 3 };
         let scoped = ChangeId::for_dispatch(change, actor, dispatch.ordinal);
 
         with_change(scoped, || {
@@ -1540,9 +1540,9 @@ mod tests {
 
     #[test]
     fn value_set_and_followup_mutation_emit_contiguous_operations() {
-        let actor = crate::v2::ActorId([4; 32]);
-        let change = crate::v2::ChangeId([7; 32]);
-        let dispatch = crate::v2::CrdtDispatchV2 { change, ordinal: 0 };
+        let actor = crate::service::ActorId([4; 32]);
+        let change = crate::service::ChangeId([7; 32]);
+        let dispatch = crate::service::CrdtDispatch { change, ordinal: 0 };
         let scoped = ChangeId::for_dispatch(change, actor, dispatch.ordinal);
         let mut title = Value::default();
         let mut edits = Counter::default();

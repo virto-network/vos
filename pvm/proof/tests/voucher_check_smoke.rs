@@ -44,7 +44,7 @@ fn load_voucher_check_blob() -> Option<Vec<u8>> {
     // `.wt_alt/` — two levels is the correct relative path either way.)
     let elf_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/fixtures/legacy-v1/actors/voucher-check/target/riscv64em-vos/release/voucher-check.elf",
+        "/fixtures/voucher-check/target/riscv64em-vos/release/voucher-check.elf",
     );
     let elf = match std::fs::read(elf_path) {
         Ok(b) => b,

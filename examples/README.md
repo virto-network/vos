@@ -1,6 +1,6 @@
 # VOS examples
 
-The public actor examples use only the v2 source and package model. Application
+The public actor examples use only the service source and package model. Application
 authors build one canonical actor PVM; the pinned generic VOS service owns JAM
 Refine and Accumulate.
 
@@ -18,11 +18,11 @@ Build them without source-level `no_std` or `no_main` attributes:
 
 ```sh
 cd examples/actors
-cargo +nightly actor -p v2-counter
-cargo +nightly actor -p v2-workflow
-cargo +nightly actor -p v2-private-age
-cargo +nightly actor -p v2-age-gate
-cargo +nightly actor -p v2-shared-board
+cargo +nightly actor -p counter
+cargo +nightly actor -p workflow
+cargo +nightly actor -p private-age
+cargo +nightly actor -p age-gate
+cargo +nightly actor -p shared-board
 ```
 
 The old single-actor replay samples are retained only as internal regression

@@ -1,10 +1,10 @@
 //! Tunable constants: domain tags, cadence, and retention bounds.
 
 /// Domain tag separating chronos beacon hashes from every other blake2b use in
-/// VOS. The `/v2` suffix pins the current derivation input layout
+/// VOS. The `/service` suffix pins the current derivation input layout
 /// ([`crate::derive_beacon`], which folds the per-round `slot`), so an external
 /// re-implementer of a different layout is not silently accepted.
-pub const BEACON_DOMAIN_TAG: &[u8] = b"vos-beacon/v2";
+pub const BEACON_DOMAIN_TAG: &[u8] = b"vos-beacon/service";
 
 /// Domain tag for a round's VRF input `α` ([`crate::derive_alpha`]) — kept
 /// distinct from the beacon hash so the two derivations can never collide.

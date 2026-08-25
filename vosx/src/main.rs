@@ -79,14 +79,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a minimal v2 actor project.
+    /// Create a minimal service actor project.
     New {
         path: PathBuf,
         /// Scaffold an explicitly convergent actor using VOS CRDT fields.
         #[arg(long)]
         crdt: bool,
     },
-    /// Build one canonical actor PVM and signed `.vos` v2 package.
+    /// Build one canonical actor PVM and signed `.vos` service package.
     Build {
         /// Actor project directory, ELF (transpiled once), or canonical `.pvm`.
         program: PathBuf,

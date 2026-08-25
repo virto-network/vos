@@ -21,5 +21,5 @@ while (($#)); do
 done
 
 exec "$rustc_bin" "${args[@]}" \
-    "-Cmetadata=vos-service-v2" \
+    "-Cmetadata=vos-service" \
     "--remap-path-prefix=$repository_root=vos-source"

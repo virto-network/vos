@@ -91,9 +91,9 @@ pub mod crypto;
 /// Version-2 JAM service contracts and the local conformance harness.
 ///
 /// This module is intentionally independent of the legacy `RefinePayload`
-/// journal. V2 packages and persisted stores never decode through the v1
+/// journal. Service packages and persisted stores never decode through the v1
 /// runtime.
-pub mod v2;
+pub mod service;
 
 /// ZK actor-IO ABI: bind a zkpvm proof to a `(public, return)` tuple
 /// (TAGLESS — program identity lives in the proof's program commitment,
@@ -181,14 +181,14 @@ pub use actors::{
     STATUS_TOO_BIG, STATUS_YIELDED, service_code_hash,
 };
 pub use attestation::{
-    Attestation, AttestationError, AttestationPreparationV2, AttestationProofBackendV2,
-    AttestationProofHostV2, AttestationProofProducerV2, AttestationProofRequestV2,
-    AttestationProofVerifierV2, AttestationReplayGuard, AttestationReplayKey,
-    AttestationReplayStore, AttestationSource, AttestationSourceResolver, AttestationStatementV3,
-    AttestedMethod, ProducedAttestationProofV2, ProofVerifier, ReceiptVerifier, StateCommitmentV3,
-    VerificationContext, Verified, VerifyAttestationBuilder, VerifyAttestationFrom, verify_once,
+    Attestation, AttestationError, AttestationPreparation, AttestationProofBackend,
+    AttestationProofHost, AttestationProofProducer, AttestationProofRequest,
+    AttestationProofVerifier, AttestationReplayGuard, AttestationReplayKey, AttestationReplayStore,
+    AttestationSource, AttestationSourceResolver, AttestationStatement, AttestedMethod,
+    ProducedAttestationProof, ProofVerifier, ReceiptVerifier, StateCommitment, VerificationContext,
+    Verified, VerifyAttestationBuilder, VerifyAttestationFrom, verify_once,
 };
-pub use v2::{ActorId, CallId, InvocationId, Origin, ProducerId, ProgramId, SubjectId};
+pub use service::{ActorId, CallId, InvocationId, Origin, ProducerId, ProgramId, SubjectId};
 // Per-task future machinery for native extensions: the scheduler lives
 // host-side (see node.rs). Re-exported at the crate root so the
 // `__vos_emit_worker_glue!` macro can name `$crate::TaskTable` / `$crate::TaskState`
@@ -283,7 +283,7 @@ mod host_invoker {
 
         fn invoke_actor(
             &mut self,
-            target: crate::v2::ActorId,
+            target: crate::service::ActorId,
             payload: Vec<u8>,
         ) -> impl Future<Output = Result<Value, ClientError>> + '_ {
             let outcome = VosNode::invoke_actor(self, target, payload);
@@ -310,7 +310,7 @@ mod host_invoker {
 
         fn invoke_actor_attested(
             &mut self,
-            target: crate::v2::ActorId,
+            target: crate::service::ActorId,
             payload: Vec<u8>,
         ) -> impl Future<
             Output = Result<crate::actors::client::AttestedInvocationResult, ClientError>,

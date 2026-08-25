@@ -189,7 +189,7 @@ both replicate a room as a content-addressed, hash-linked structure and sync by
 |---|---|---|
 | Message log | grow-only CRDT (merkle-CRDT) | event DAG |
 | Room state (membership, roles) | MLS group + role grants | mutable `(type, state_key)` map |
-| Conflict resolution | **none for content**; membership by raft quorum | **state-resolution v2** over `auth_events` |
+| Conflict resolution | **none for content**; membership by raft quorum | **state-resolution service** over `auth_events` |
 | Identity | verified PeerId | `@user:server` |
 
 Matrix carries a second `auth_events` graph and a notoriously subtle
@@ -251,7 +251,7 @@ actors, and `space-registry:admin` lets an admin's `create` install a new
 channel's agent pair. A caller below the required role is refused downstream — the
 messenger grants no authority of its own. The retired single-actor recipe is
 retained at `tests/fixtures/legacy-v1/space-msg-a.toml` until this scenario is
-rebuilt on the v2 package flow.
+rebuilt on the service package flow.
 
 ## Security
 

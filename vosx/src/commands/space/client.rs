@@ -28,7 +28,7 @@ use crate::spaces_index::{self, SpaceEntry};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const INVOKE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
-/// A role-authorized v2 call may wait for a Raft authority read barrier and
+/// A role-authorized service call may wait for a Raft authority read barrier and
 /// decision commit before the Local target executes. Match the libp2p
 /// request-response budget unless the operator supplied an explicit override.
 const ROLE_AUTHORIZED_INVOKE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(300);
@@ -47,7 +47,7 @@ fn invoke_timeout() -> Duration {
         .unwrap_or(INVOKE_TIMEOUT_DEFAULT)
 }
 
-fn invoke_timeout_for_policy(policy: Option<&vos::v2::MethodPolicyV2>) -> Duration {
+fn invoke_timeout_for_policy(policy: Option<&vos::service::MethodPolicy>) -> Duration {
     let configured = invoke_timeout();
     if std::env::var_os("VOSX_INVOKE_TIMEOUT_MS").is_some() {
         return configured;
@@ -77,30 +77,30 @@ pub struct DaemonClient {
     /// file.
     pub endpoint: endpoint::Endpoint,
     daemon_prefix: u16,
-    /// V2 actor identities and signed method policies learned while resolving
-    /// an installed package name. Routes that are not v2 remain on the legacy
+    /// Service actor identities and signed method policies learned while resolving
+    /// an installed package name. Routes that are not service remain on the legacy
     /// dynamic wire unchanged.
-    v2_targets: Mutex<std::collections::HashMap<u32, V2Target>>,
+    service_targets: Mutex<std::collections::HashMap<u32, ServiceTarget>>,
 }
 
 #[derive(Clone)]
-struct V2Target {
-    actor: vos::v2::ActorId,
-    methods: std::collections::HashMap<String, vos::v2::MethodPolicyV2>,
+struct ServiceTarget {
+    actor: vos::service::ActorId,
+    methods: std::collections::HashMap<String, vos::service::MethodPolicy>,
 }
 
-fn encode_v2_invocation(
-    target: &V2Target,
-    invocation: vos::v2::InvocationId,
+fn encode_service_invocation(
+    target: &ServiceTarget,
+    invocation: vos::service::InvocationId,
     msg: &vos::value::Msg,
     arguments: Vec<u8>,
 ) -> anyhow::Result<Vec<u8>> {
-    use vos::v2::V2Wire;
+    use vos::service::ServiceWire;
 
     let policy = target
         .methods
         .get(&msg.name)
-        .ok_or_else(|| anyhow::anyhow!("v2 package has no method named '{}'", msg.name))?;
+        .ok_or_else(|| anyhow::anyhow!("service package has no method named '{}'", msg.name))?;
     if policy.attested {
         anyhow::bail!(
             "attested method '{}' requires the proof-producing transport path, which space call does not attach yet",
@@ -113,7 +113,7 @@ fn encode_v2_invocation(
             msg.name,
         );
     }
-    Ok(vos::v2::RootTreeInvocationV2 {
+    Ok(vos::service::RootTreeInvocation {
         invocation,
         target: target.actor,
         method: msg.name.clone(),
@@ -127,44 +127,51 @@ fn is_reserved_host_operation(method: &str) -> bool {
     matches!(method, "__stop" | "__describe")
 }
 
-fn decode_exact_v2_package(bytes: &[u8], label: &str) -> anyhow::Result<vos::v2::VosPackageV2> {
-    use vos::v2::V2Wire;
+fn decode_exact_service_package(
+    bytes: &[u8],
+    label: &str,
+) -> anyhow::Result<vos::service::VosPackage> {
+    use vos::service::ServiceWire;
 
-    let package = vos::v2::VosPackageV2::decode(bytes)
-        .map_err(|error| anyhow::anyhow!("decode {label} signed v2 package: {error}"))?;
+    let package = vos::service::VosPackage::decode(bytes)
+        .map_err(|error| anyhow::anyhow!("decode {label} signed service package: {error}"))?;
     package
         .validate()
-        .map_err(|error| anyhow::anyhow!("validate {label} signed v2 package: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("validate {label} signed service package: {error}"))?;
     if package.encode() != bytes {
-        anyhow::bail!("{label} signed v2 package is not canonical");
+        anyhow::bail!("{label} signed service package is not canonical");
     }
     Ok(package)
 }
 
 fn role_grant_mutation(
-    space: vos::v2::SpaceId,
+    space: vos::service::SpaceId,
     peer_id: &[u8],
     role: u8,
     epoch: u64,
-) -> anyhow::Result<vos::v2::RoleAuthorityMutationV2> {
+) -> anyhow::Result<vos::service::RoleAuthorityMutation> {
     let role = vos::SpaceRole::from_u8(role)
-        .ok_or_else(|| anyhow::anyhow!("role {role} is not a canonical v2 space role"))?;
-    Ok(vos::v2::RoleAuthorityMutationV2::Grant {
+        .ok_or_else(|| anyhow::anyhow!("role {role} is not a canonical service space role"))?;
+    Ok(vos::service::RoleAuthorityMutation::Grant {
         space,
-        holder: vos::v2::Origin::Member(vos::v2::SubjectId::of_authenticated_peer(peer_id)),
+        holder: vos::service::Origin::Member(vos::service::SubjectId::of_authenticated_peer(
+            peer_id,
+        )),
         role,
         epoch,
     })
 }
 
 fn role_revoke_mutation(
-    space: vos::v2::SpaceId,
+    space: vos::service::SpaceId,
     peer_id: &[u8],
     epoch: u64,
-) -> vos::v2::RoleAuthorityMutationV2 {
-    vos::v2::RoleAuthorityMutationV2::Revoke {
+) -> vos::service::RoleAuthorityMutation {
+    vos::service::RoleAuthorityMutation::Revoke {
         space,
-        holder: vos::v2::Origin::Member(vos::v2::SubjectId::of_authenticated_peer(peer_id)),
+        holder: vos::service::Origin::Member(vos::service::SubjectId::of_authenticated_peer(
+            peer_id,
+        )),
         epoch,
     }
 }
@@ -268,7 +275,7 @@ impl DaemonClient {
             entry,
             daemon_prefix: ep.prefix,
             endpoint: ep,
-            v2_targets: Mutex::new(std::collections::HashMap::new()),
+            service_targets: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -348,13 +355,13 @@ impl DaemonClient {
             let raw = u32::from_str_radix(hex, 16)
                 .map_err(|e| anyhow::anyhow!("invalid 0x ServiceId '{target}': {e}"))?;
             let route = ServiceId(raw);
-            self.remember_v2_target_for_route(route)?;
+            self.remember_service_target_for_route(route)?;
             return Ok(route);
         }
         if let Some(agent) = self.agent(target)? {
             debug_assert_eq!(agent.instance_name, target);
             let route = instance_service_id(target, self.daemon_prefix);
-            self.remember_v2_target(route, &agent)?;
+            self.remember_service_target(route, &agent)?;
             return Ok(route);
         }
         // Not an installed agent — try the extension fallback.
@@ -380,7 +387,7 @@ impl DaemonClient {
         msg: &vos::value::Msg,
     ) -> anyhow::Result<vos::value::Value> {
         let timeout = self
-            .v2_targets
+            .service_targets
             .lock()
             .ok()
             .and_then(|targets| targets.get(&target.0).cloned())
@@ -423,27 +430,29 @@ impl DaemonClient {
         payload.push(vos::value::TAG_DYNAMIC);
         payload.extend_from_slice(&encoded);
 
-        let v2_target = self
-            .v2_targets
+        let service_target = self
+            .service_targets
             .lock()
-            .map_err(|_| anyhow::anyhow!("v2 target cache is unavailable"))?
+            .map_err(|_| anyhow::anyhow!("service target cache is unavailable"))?
             .get(&target.0)
             .cloned();
-        let is_v2_invocation = v2_target.is_some() && !is_reserved_host_operation(&msg.name);
-        let payload =
-            if let Some(v2_target) = v2_target.filter(|_| !is_reserved_host_operation(&msg.name)) {
-                let mut nonce = [0; 32];
-                getrandom::getrandom(&mut nonce)
-                    .map_err(|error| anyhow::anyhow!("mint v2 invocation ID: {error}"))?;
-                encode_v2_invocation(
-                    &v2_target,
-                    vos::v2::InvocationId::derive(b"vosx/daemon-invocation/v2", &nonce),
-                    msg,
-                    payload,
-                )?
-            } else {
-                payload
-            };
+        let is_service_invocation =
+            service_target.is_some() && !is_reserved_host_operation(&msg.name);
+        let payload = if let Some(service_target) =
+            service_target.filter(|_| !is_reserved_host_operation(&msg.name))
+        {
+            let mut nonce = [0; 32];
+            getrandom::getrandom(&mut nonce)
+                .map_err(|error| anyhow::anyhow!("mint service invocation ID: {error}"))?;
+            encode_service_invocation(
+                &service_target,
+                vos::service::InvocationId::derive(b"vosx/daemon-invocation/service", &nonce),
+                msg,
+                payload,
+            )?
+        } else {
+            payload
+        };
 
         let reply = self
             .node
@@ -453,18 +462,18 @@ impl DaemonClient {
                     "daemon at {target} didn't reply within {timeout:?} (target unreachable or timed out)",
                 )
             })?;
-        if is_v2_invocation && reply.is_empty() {
-            anyhow::bail!("v2 target at {target} refused the invocation or is not attached");
+        if is_service_invocation && reply.is_empty() {
+            anyhow::bail!("service target at {target} refused the invocation or is not attached");
         }
         Ok(reply)
     }
 
-    fn remember_v2_target(&self, route: ServiceId, agent: &AgentRow) -> anyhow::Result<()> {
-        if let Some(v2_target) = self.v2_target_for_agent(agent)? {
-            self.v2_targets
+    fn remember_service_target(&self, route: ServiceId, agent: &AgentRow) -> anyhow::Result<()> {
+        if let Some(service_target) = self.service_target_for_agent(agent)? {
+            self.service_targets
                 .lock()
-                .map_err(|_| anyhow::anyhow!("v2 target cache is unavailable"))?
-                .insert(route.0, v2_target);
+                .map_err(|_| anyhow::anyhow!("service target cache is unavailable"))?
+                .insert(route.0, service_target);
         }
         Ok(())
     }
@@ -475,7 +484,7 @@ impl DaemonClient {
     /// authenticated identity. Match its local slot against the replicated
     /// catalog while retaining the caller-selected node prefix, then cache the
     /// exact package identity just as name resolution does.
-    fn remember_v2_target_for_route(&self, route: ServiceId) -> anyhow::Result<()> {
+    fn remember_service_target_for_route(&self, route: ServiceId) -> anyhow::Result<()> {
         let prefix = (route.0 >> 16) as u16;
         let mut matched: Option<AgentRow> = None;
         for agent in self.agents()? {
@@ -492,13 +501,13 @@ impl DaemonClient {
             matched = Some(agent);
         }
         if let Some(agent) = matched {
-            self.remember_v2_target(route, &agent)?;
+            self.remember_service_target(route, &agent)?;
         }
         Ok(())
     }
 
-    fn v2_target_for_agent(&self, agent: &AgentRow) -> anyhow::Result<Option<V2Target>> {
-        use vos::v2::V2Wire;
+    fn service_target_for_agent(&self, agent: &AgentRow) -> anyhow::Result<Option<ServiceTarget>> {
+        use vos::service::ServiceWire;
 
         let hash = crate::blob_store::BlobHash(agent.program_hash);
         let Some(exact_package) = crate::blob_store::cache_get(&hash)? else {
@@ -507,28 +516,31 @@ impl DaemonClient {
         if exact_package.get(..4) != Some(b"VOSP") {
             return Ok(None);
         }
-        let package = vos::v2::VosPackageV2::decode(&exact_package)
-            .map_err(|error| anyhow::anyhow!("decode installed v2 package: {error}"))?;
+        let package = vos::service::VosPackage::decode(&exact_package)
+            .map_err(|error| anyhow::anyhow!("decode installed service package: {error}"))?;
         package
             .validate()
-            .map_err(|error| anyhow::anyhow!("validate installed v2 package: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("validate installed service package: {error}"))?;
         if package.encode() != exact_package {
-            anyhow::bail!("installed v2 package wire is not canonical");
+            anyhow::bail!("installed service package wire is not canonical");
         }
-        let policies = vos::v2::PackageRolePoliciesV2::decode(&package.role_policies)
-            .map_err(|error| anyhow::anyhow!("decode installed v2 policies: {error}"))?;
-        let space = vos::v2::SpaceId(
+        let policies = vos::service::PackageRolePolicies::decode(&package.role_policies)
+            .map_err(|error| anyhow::anyhow!("decode installed service policies: {error}"))?;
+        let space = vos::service::SpaceId(
             self.entry
                 .id_bytes()
                 .ok_or_else(|| anyhow::anyhow!("space ID is not canonical hex"))?,
         );
-        let service = crate::commands::space::common::v2_root_service_id(
+        let service = crate::commands::space::common::service_root_service_id(
             space,
             &agent.instance_name,
             agent.replication_id,
         );
-        Ok(Some(V2Target {
-            actor: crate::commands::space::common::v2_root_actor_id(service, &agent.instance_name),
+        Ok(Some(ServiceTarget {
+            actor: crate::commands::space::common::service_root_actor_id(
+                service,
+                &agent.instance_name,
+            ),
             methods: policies
                 .methods
                 .into_iter()
@@ -754,7 +766,7 @@ impl DaemonClient {
         program_version: String,
         program_hash: Vec<u8>,
     ) -> anyhow::Result<Status> {
-        use vos::v2::V2Wire as _;
+        use vos::service::ServiceWire as _;
 
         // Compare-and-swap base: read the instance's live program hash so
         // the registry rejects this upgrade if the instance has moved on
@@ -784,16 +796,16 @@ impl DaemonClient {
                     hex::encode(to_hash),
                 )
             })?;
-        let from_v2 = from_artifact.get(..4) == Some(b"VOSP");
-        let to_v2 = to_artifact.get(..4) == Some(b"VOSP");
+        let from = from_artifact.get(..4) == Some(b"VOSP");
+        let to = to_artifact.get(..4) == Some(b"VOSP");
         let terminal_catalog_retry = from_hash == to_hash;
-        if from_v2 != to_v2 {
-            anyhow::bail!("upgrade cannot cross the legacy/v2 runtime boundary");
+        if from != to {
+            anyhow::bail!("upgrade cannot cross the legacy/service runtime boundary");
         }
-        if from_v2 {
-            let from_package = decode_exact_v2_package(&from_artifact, "installed")?;
-            let to_package = decode_exact_v2_package(&to_artifact, "replacement")?;
-            if instance_name == vos::v2::ROLE_AUTHORITY_INSTANCE_V2 {
+        if from {
+            let from_package = decode_exact_service_package(&from_artifact, "installed")?;
+            let to_package = decode_exact_service_package(&to_artifact, "replacement")?;
+            if instance_name == vos::service::ROLE_AUTHORITY_INSTANCE_ {
                 let root_peer_id = vos::block_on(self.registry().root(&mut &self.node))
                     .map_err(|error| anyhow::anyhow!("registry.root(): {error}"))?;
                 let consistency = super::common::consistency_from_u8(installed.consistency)
@@ -811,43 +823,46 @@ impl DaemonClient {
             }
             let target = self.resolve_target(&instance_name)?;
             let actor = self
-                .v2_targets
+                .service_targets
                 .lock()
-                .map_err(|_| anyhow::anyhow!("v2 target cache is unavailable"))?
+                .map_err(|_| anyhow::anyhow!("service target cache is unavailable"))?
                 .get(&target.0)
                 .map(|target| target.actor)
-                .ok_or_else(|| anyhow::anyhow!("installed root is not a signed v2 target"))?;
-            let request = vos::v2::RootTreeUpgradeRequestV2 {
+                .ok_or_else(|| anyhow::anyhow!("installed root is not a signed service target"))?;
+            let request = vos::service::RootTreeUpgradeRequest {
                 expected_deployment: from_package.deployment_id(),
                 expected_program: from_package.manifest.actor_program,
                 replacement: to_package.clone(),
             };
             let mut nonce = [0; 32];
             getrandom::getrandom(&mut nonce)
-                .map_err(|error| anyhow::anyhow!("mint v2 upgrade invocation ID: {error}"))?;
-            let ingress = vos::v2::RootTreeInvocationV2 {
-                invocation: vos::v2::InvocationId::derive(b"vosx/root-upgrade/v2", &nonce),
+                .map_err(|error| anyhow::anyhow!("mint service upgrade invocation ID: {error}"))?;
+            let ingress = vos::service::RootTreeInvocation {
+                invocation: vos::service::InvocationId::derive(
+                    b"vosx/root-upgrade/service",
+                    &nonce,
+                ),
                 target: actor,
-                method: vos::v2::ROOT_UPGRADE_METHOD_V2.into(),
-                arguments: vos::v2::V2Wire::encode(&request),
+                method: vos::service::ROOT_UPGRADE_METHOD_.into(),
+                arguments: vos::service::ServiceWire::encode(&request),
                 proof_requested: false,
             };
             let reply = self
                 .node
                 .invoke_with_timeout(
                     target,
-                    vos::v2::V2Wire::encode(&ingress),
+                    vos::service::ServiceWire::encode(&ingress),
                     Duration::from_secs(120),
                 )
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "v2 root upgrade was refused or its durable disposition could not be recovered"
+                        "service root upgrade was refused or its durable disposition could not be recovered"
                     )
                 })?;
-            let result = vos::v2::AccumulationResultV2::decode(&reply)
-                .map_err(|error| anyhow::anyhow!("decode v2 root upgrade result: {error}"))?;
+            let result = vos::service::AccumulationResult::decode(&reply)
+                .map_err(|error| anyhow::anyhow!("decode service root upgrade result: {error}"))?;
             match result {
-                vos::v2::AccumulationResultV2::ActorUpgraded {
+                vos::service::AccumulationResult::ActorUpgraded {
                     actor: committed_actor,
                     previous_deployment,
                     previous_program,
@@ -862,10 +877,10 @@ impl DaemonClient {
                         && previous_deployment == from_package.deployment_id()
                         && previous_program == from_package.manifest.actor_program)
                         || (terminal_catalog_retry && duplicate)) => {}
-                vos::v2::AccumulationResultV2::Rejected(rejection) => {
-                    anyhow::bail!("guest rejected v2 root upgrade: {rejection:?}")
+                vos::service::AccumulationResult::Rejected(rejection) => {
+                    anyhow::bail!("guest rejected service root upgrade: {rejection:?}")
                 }
-                _ => anyhow::bail!("v2 root returned a mismatched upgrade result"),
+                _ => anyhow::bail!("service root returned a mismatched upgrade result"),
             }
         }
         if terminal_catalog_retry {
@@ -943,49 +958,33 @@ impl DaemonClient {
     // ── Auth grants ────────────────────────────────────
 
     pub fn grant_role(&self, peer_id: Vec<u8>, role: u8) -> anyhow::Result<Status> {
-        let authority = self.role_authority_cutover_id()?;
-        if authority.is_some() {
-            self.require_v2_role_authority_root()?;
-        }
+        let authority = self
+            .role_authority_cutover_id()?
+            .ok_or_else(|| anyhow::anyhow!("the space role authority is not installed"))?;
+        self.require_service_role_authority_root()?;
         // Read the peer's current freshness epoch and sign `epoch + 1`
         // so the grant strictly post-dates any prior revoke — a replayed
         // stale-epoch grant can never resurrect a revoked role.
         let epoch = self.peer_epoch(peer_id.clone())? + 1;
-        let status = if let Some(authority) = authority {
-            let auth = op_auth(
-                &self.signer,
-                "grant_role_v2",
-                &[&peer_id, &[role], &epoch.to_le_bytes(), &authority],
-            )?;
-            vos::block_on(self.registry().grant_role_v2(
-                &mut &self.node,
-                peer_id.clone(),
-                role,
-                epoch,
-                authority.to_vec(),
-                auth,
-            ))
-            .map_err(|e| anyhow::anyhow!("registry.grant_role_v2(): {e}"))?
-        } else {
-            let auth = op_auth(
-                &self.signer,
-                "grant_role",
-                &[&peer_id, &[role], &epoch.to_le_bytes()],
-            )?;
-            vos::block_on(self.registry().grant_role(
-                &mut &self.node,
-                peer_id.clone(),
-                role,
-                epoch,
-                auth,
-            ))
-            .map_err(|e| anyhow::anyhow!("registry.grant_role(): {e}"))?
-        };
-        if status == Status::Ok && authority.is_some() {
-            let mutation = role_grant_mutation(self.v2_space_id()?, &peer_id, role, epoch)?;
-            self.commit_v2_role_mutation(&mutation).map_err(|error| {
+        let auth = op_auth(
+            &self.signer,
+            "grant_role",
+            &[&peer_id, &[role], &epoch.to_le_bytes(), &authority],
+        )?;
+        let status = vos::block_on(self.registry().grant_role(
+            &mut &self.node,
+            peer_id.clone(),
+            role,
+            epoch,
+            authority.to_vec(),
+            auth,
+        ))
+        .map_err(|e| anyhow::anyhow!("registry.grant_role(): {e}"))?;
+        if status == Status::Ok {
+            let mutation = role_grant_mutation(self.service_space_id()?, &peer_id, role, epoch)?;
+            self.commit_service_role_mutation(&mutation).map_err(|error| {
                 anyhow::anyhow!(
-                    "registry grant committed at epoch {epoch}, but v2 authority did not: {error}; retry the same grant"
+                    "registry grant committed at epoch {epoch}, but service authority did not: {error}; retry the same grant"
                 )
             })?;
         }
@@ -993,44 +992,29 @@ impl DaemonClient {
     }
 
     pub fn revoke_role(&self, peer_id: Vec<u8>) -> anyhow::Result<Status> {
-        let authority = self.role_authority_cutover_id()?;
-        if authority.is_some() {
-            self.require_v2_role_authority_root()?;
-        }
+        let authority = self
+            .role_authority_cutover_id()?
+            .ok_or_else(|| anyhow::anyhow!("the space role authority is not installed"))?;
+        self.require_service_role_authority_root()?;
         let epoch = self.peer_epoch(peer_id.clone())? + 1;
-        let status = if let Some(authority) = authority {
-            let auth = op_auth(
-                &self.signer,
-                "revoke_role_v2",
-                &[&peer_id, &epoch.to_le_bytes(), &authority],
-            )?;
-            vos::block_on(self.registry().revoke_role_v2(
-                &mut &self.node,
-                peer_id.clone(),
-                epoch,
-                authority.to_vec(),
-                auth,
-            ))
-            .map_err(|e| anyhow::anyhow!("registry.revoke_role_v2(): {e}"))?
-        } else {
-            let auth = op_auth(
-                &self.signer,
-                "revoke_role",
-                &[&peer_id, &epoch.to_le_bytes()],
-            )?;
-            vos::block_on(self.registry().revoke_role(
-                &mut &self.node,
-                peer_id.clone(),
-                epoch,
-                auth,
-            ))
-            .map_err(|e| anyhow::anyhow!("registry.revoke_role(): {e}"))?
-        };
-        if status == Status::Ok && authority.is_some() {
-            let mutation = role_revoke_mutation(self.v2_space_id()?, &peer_id, epoch);
-            self.commit_v2_role_mutation(&mutation).map_err(|error| {
+        let auth = op_auth(
+            &self.signer,
+            "revoke_role",
+            &[&peer_id, &epoch.to_le_bytes(), &authority],
+        )?;
+        let status = vos::block_on(self.registry().revoke_role(
+            &mut &self.node,
+            peer_id.clone(),
+            epoch,
+            authority.to_vec(),
+            auth,
+        ))
+        .map_err(|e| anyhow::anyhow!("registry.revoke_role(): {e}"))?;
+        if status == Status::Ok {
+            let mutation = role_revoke_mutation(self.service_space_id()?, &peer_id, epoch);
+            self.commit_service_role_mutation(&mutation).map_err(|error| {
                 anyhow::anyhow!(
-                    "registry revoke committed at epoch {epoch}, but v2 authority did not: {error}; retry the same revoke"
+                    "registry revoke committed at epoch {epoch}, but service authority did not: {error}; retry the same revoke"
                 )
             })?;
         }
@@ -1052,46 +1036,46 @@ impl DaemonClient {
         Ok(Some(marker))
     }
 
-    fn require_v2_role_authority_root(&self) -> anyhow::Result<()> {
+    fn require_service_role_authority_root(&self) -> anyhow::Result<()> {
         let root = vos::block_on(self.registry().root(&mut &self.node))
             .map_err(|error| anyhow::anyhow!("registry.root(): {error}"))?;
         let signer = libp2p::PeerId::from(self.signer.public()).to_bytes();
         if root.is_empty() || signer != root {
             anyhow::bail!(
-                "v2 role mutations must be signed by this space's immutable root identity"
+                "service role mutations must be signed by this space's immutable root identity"
             );
         }
         Ok(())
     }
 
-    fn v2_space_id(&self) -> anyhow::Result<vos::v2::SpaceId> {
+    fn service_space_id(&self) -> anyhow::Result<vos::service::SpaceId> {
         self.entry
             .id_bytes()
-            .map(vos::v2::SpaceId)
+            .map(vos::service::SpaceId)
             .ok_or_else(|| anyhow::anyhow!("space ID is not canonical hex"))
     }
 
-    fn commit_v2_role_mutation(
+    fn commit_service_role_mutation(
         &self,
-        mutation: &vos::v2::RoleAuthorityMutationV2,
+        mutation: &vos::service::RoleAuthorityMutation,
     ) -> anyhow::Result<()> {
-        use vos::v2::V2Wire;
+        use vos::service::ServiceWire;
 
         let mutation_bytes = mutation.encode();
         let signature = self
             .signer
             .sign(&mutation_bytes)
-            .map_err(|error| anyhow::anyhow!("sign v2 role mutation: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("sign service role mutation: {error}"))?;
         if signature.len() != vos::registry::OP_SIG_LEN {
-            anyhow::bail!("v2 role authority requires an Ed25519 root identity");
+            anyhow::bail!("service role authority requires an Ed25519 root identity");
         }
-        let target = self.resolve_target(vos::v2::ROLE_AUTHORITY_INSTANCE_V2)?;
-        if !self.v2_targets.lock().unwrap().contains_key(&target.0) {
+        let target = self.resolve_target(vos::service::ROLE_AUTHORITY_INSTANCE_)?;
+        if !self.service_targets.lock().unwrap().contains_key(&target.0) {
             anyhow::bail!("canonical space-authority package is unavailable to the CLI");
         }
         let reply = self.invoke_dyn(
             target,
-            &vos::value::Msg::new(vos::v2::ROLE_AUTHORITY_MUTATION_METHOD_V2)
+            &vos::value::Msg::new(vos::service::ROLE_AUTHORITY_MUTATION_METHOD_)
                 .with("mutation", mutation_bytes)
                 .with("signature", signature),
         )?;
@@ -1171,7 +1155,7 @@ impl DaemonClient {
                 .as_slice()
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("invite token public key is not 32 bytes"))?;
-            self.commit_v2_invite_revocation(token)?;
+            self.commit_service_invite_revocation(token)?;
         }
         let auth = op_auth(&self.signer, "revoke_invite", &[&token_pub])?;
         vos::block_on(
@@ -1181,28 +1165,28 @@ impl DaemonClient {
         .map_err(|e| anyhow::anyhow!("registry.revoke_invite(): {e}"))
     }
 
-    fn commit_v2_invite_revocation(&self, token_pub: [u8; 32]) -> anyhow::Result<()> {
-        use vos::v2::V2Wire;
+    fn commit_service_invite_revocation(&self, token_pub: [u8; 32]) -> anyhow::Result<()> {
+        use vos::service::ServiceWire;
 
-        let revocation = vos::v2::RoleAuthorityInviteRevocationV2 {
-            space: self.v2_space_id()?,
+        let revocation = vos::service::RoleAuthorityInviteRevocation {
+            space: self.service_space_id()?,
             token_pub,
             admin_peer_id: libp2p::PeerId::from(self.signer.public()).to_bytes(),
         };
         let signature = self
             .signer
             .sign(&revocation.encode())
-            .map_err(|error| anyhow::anyhow!("sign v2 invite revocation: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("sign service invite revocation: {error}"))?;
         if signature.len() != vos::registry::OP_SIG_LEN {
-            anyhow::bail!("v2 role authority requires an Ed25519 admin identity");
+            anyhow::bail!("service role authority requires an Ed25519 admin identity");
         }
-        let target = self.resolve_target(vos::v2::ROLE_AUTHORITY_INSTANCE_V2)?;
-        if !self.v2_targets.lock().unwrap().contains_key(&target.0) {
+        let target = self.resolve_target(vos::service::ROLE_AUTHORITY_INSTANCE_)?;
+        if !self.service_targets.lock().unwrap().contains_key(&target.0) {
             anyhow::bail!("canonical space-authority package is unavailable to the CLI");
         }
         let reply = self.invoke_dyn(
             target,
-            &vos::value::Msg::new(vos::v2::ROLE_AUTHORITY_INVITE_REVOKE_METHOD_V2)
+            &vos::value::Msg::new(vos::service::ROLE_AUTHORITY_INVITE_REVOKE_METHOD_)
                 .with("revocation", revocation.encode())
                 .with("signature", signature),
         )?;
@@ -1301,34 +1285,35 @@ impl DaemonClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vos::v2::V2Wire;
+    use vos::service::ServiceWire;
 
-    fn target(method: &str, public: bool, attested: bool) -> V2Target {
-        let policy = vos::v2::MethodPolicyV2 {
+    fn target(method: &str, public: bool, attested: bool) -> ServiceTarget {
+        let policy = vos::service::MethodPolicy {
             method: method.to_string(),
-            schema: vos::v2::Hash([1; 32]),
-            policy: vos::v2::Hash([2; 32]),
+            schema: vos::service::Hash([1; 32]),
+            policy: vos::service::Hash([2; 32]),
             public,
             attested,
             space_role: None,
             actor_role: None,
         };
-        V2Target {
-            actor: vos::v2::ActorId([0x41; 32]),
+        ServiceTarget {
+            actor: vos::service::ActorId([0x41; 32]),
             methods: [(method.to_string(), policy)].into_iter().collect(),
         }
     }
 
     #[test]
-    fn v2_ingress_preserves_typed_identity_and_actor_message() {
+    fn service_ingress_preserves_typed_identity_and_actor_message() {
         let target = target("increment", true, false);
-        let invocation = vos::v2::InvocationId([0x17; 32]);
+        let invocation = vos::service::InvocationId([0x17; 32]);
         let msg = vos::value::Msg::new("increment").with("by", 3u64);
         let mut arguments = vec![vos::value::TAG_DYNAMIC];
         arguments.extend_from_slice(&vos::Encode::encode(&msg));
 
-        let encoded = encode_v2_invocation(&target, invocation, &msg, arguments.clone()).unwrap();
-        let decoded = vos::v2::RootTreeInvocationV2::decode(&encoded).unwrap();
+        let encoded =
+            encode_service_invocation(&target, invocation, &msg, arguments.clone()).unwrap();
+        let decoded = vos::service::RootTreeInvocation::decode(&encoded).unwrap();
 
         assert_eq!(decoded.invocation, invocation);
         assert_eq!(decoded.target, target.actor);
@@ -1339,11 +1324,11 @@ mod tests {
 
     #[test]
     fn daemon_ingress_admits_space_roles_but_refuses_unwired_authorization_paths() {
-        let invocation = vos::v2::InvocationId([0x18; 32]);
+        let invocation = vos::service::InvocationId([0x18; 32]);
         let msg = vos::value::Msg::new("claim");
         let arguments = vec![vos::value::TAG_DYNAMIC, 1];
 
-        let attested = encode_v2_invocation(
+        let attested = encode_service_invocation(
             &target("claim", true, true),
             invocation,
             &msg,
@@ -1357,7 +1342,7 @@ mod tests {
         space_role.methods.get_mut("claim").unwrap().space_role =
             Some(vos::SpaceRole::Member.as_u8());
         assert!(
-            encode_v2_invocation(&space_role, invocation, &msg, arguments.clone(),).is_ok(),
+            encode_service_invocation(&space_role, invocation, &msg, arguments.clone(),).is_ok(),
             "the daemon obtains an invocation-scoped assertion from the installed authority",
         );
         assert_eq!(
@@ -1367,7 +1352,7 @@ mod tests {
 
         let mut actor_role = target("claim", false, false);
         actor_role.methods.get_mut("claim").unwrap().actor_role = Some(1);
-        let protected = encode_v2_invocation(&actor_role, invocation, &msg, arguments)
+        let protected = encode_service_invocation(&actor_role, invocation, &msg, arguments)
             .unwrap_err()
             .to_string();
         assert!(protected.contains("bound-handle credential"));
@@ -1383,34 +1368,40 @@ mod tests {
 
     #[test]
     fn root_upgrade_control_method_is_outside_the_actor_namespace() {
-        assert!(vos::v2::ROOT_UPGRADE_METHOD_V2.starts_with('\0'));
-        assert!(!is_reserved_host_operation(vos::v2::ROOT_UPGRADE_METHOD_V2));
+        assert!(vos::service::ROOT_UPGRADE_METHOD_.starts_with('\0'));
+        assert!(!is_reserved_host_operation(
+            vos::service::ROOT_UPGRADE_METHOD_
+        ));
     }
 
     #[test]
     fn registry_peer_roles_map_to_exact_authority_mutations() {
-        let space = vos::v2::SpaceId([0x51; 32]);
+        let space = vos::service::SpaceId([0x51; 32]);
         let peer = b"authenticated peer";
         let grant =
             role_grant_mutation(space, peer, vos::registry::AUTH_ROLE_DEVELOPER, 7).unwrap();
         assert_eq!(
             grant,
-            vos::v2::RoleAuthorityMutationV2::Grant {
+            vos::service::RoleAuthorityMutation::Grant {
                 space,
-                holder: vos::v2::Origin::Member(vos::v2::SubjectId::of_authenticated_peer(peer)),
+                holder: vos::service::Origin::Member(
+                    vos::service::SubjectId::of_authenticated_peer(peer)
+                ),
                 role: vos::SpaceRole::Developer,
                 epoch: 7,
             }
         );
         assert_eq!(
-            vos::v2::RoleAuthorityMutationV2::decode(&grant.encode()).unwrap(),
+            vos::service::RoleAuthorityMutation::decode(&grant.encode()).unwrap(),
             grant
         );
         assert_eq!(
             role_revoke_mutation(space, peer, 8),
-            vos::v2::RoleAuthorityMutationV2::Revoke {
+            vos::service::RoleAuthorityMutation::Revoke {
                 space,
-                holder: vos::v2::Origin::Member(vos::v2::SubjectId::of_authenticated_peer(peer)),
+                holder: vos::service::Origin::Member(
+                    vos::service::SubjectId::of_authenticated_peer(peer)
+                ),
                 epoch: 8,
             }
         );

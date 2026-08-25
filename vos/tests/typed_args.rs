@@ -19,9 +19,9 @@
 
 use vos::abi::service::ServiceId;
 use vos::actors::client::{AttestationInvoker, AttestedInvocationResult, ClientError, Invoker};
-use vos::v2::{
-    AccumulationReceiptV2, ActorId, ConsistencyModeV2, DeploymentId, Hash, InvocationId,
-    ProducerId, ProgramId, ReplyRecordV2, RootServiceId, ServiceIdentityV2, SpaceId,
+use vos::service::{
+    AccumulationReceipt, ActorId, ConsistencyMode, DeploymentId, Hash, InvocationId, ProducerId,
+    ProgramId, ReplyRecord, RootServiceId, ServiceIdentity, SpaceId,
 };
 use vos::value::{Msg, Value};
 
@@ -683,20 +683,20 @@ fn attested_receipt_result(claim: &Receipt) -> AttestedInvocationResult {
     let deployment = DeploymentId([3; 32]);
     let invocation = InvocationId([10; 32]);
     let actor = ActorId([7; 32]);
-    let reply = ReplyRecordV2 {
+    let reply = ReplyRecord {
         call_id: invocation.root_reply_id(),
         producer: actor,
         result: value.encode(),
     };
-    let receipt = AccumulationReceiptV2 {
-        service: ServiceIdentityV2 {
+    let receipt = AccumulationReceipt {
+        service: ServiceIdentity {
             space: SpaceId([6; 32]),
             root_service: RootServiceId([1; 32]),
             deployment,
             service_program: ProgramId([2; 32]),
-            service_abi: vos::v2::ABI_VERSION,
-            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
-            gas_schedule: vos::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
+            service_abi: vos::service::ABI_VERSION,
+            execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
+            gas_schedule: vos::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
         },
         accepted_transition: Hash([4; 32]),
         reply_commitment: Some(reply.commitment()),
@@ -705,13 +705,13 @@ fn attested_receipt_result(claim: &Receipt) -> AttestedInvocationResult {
         resulting_crdt_heads: vec![],
         sequence: 1,
         checkpoint: 1,
-        consistency: ConsistencyModeV2::Local,
+        consistency: ConsistencyMode::Local,
     };
     AttestedInvocationResult {
         producer_name: "private-vault".into(),
         producer: ProducerId([15; 32]),
-        statement: vos::AttestationStatementV3 {
-            statement_version: vos::v2::ATTESTATION_STATEMENT_VERSION,
+        statement: vos::AttestationStatement {
+            statement_version: vos::service::ATTESTATION_STATEMENT_VERSION,
             space: SpaceId([6; 32]),
             actor,
             producer_name: "private-vault".into(),
@@ -722,8 +722,8 @@ fn attested_receipt_result(claim: &Receipt) -> AttestedInvocationResult {
             schema: Hash([9; 32]),
             invocation,
             reply_call: reply.call_id,
-            before: vos::StateCommitmentV3::Linear(Hash([11; 32])),
-            after: vos::StateCommitmentV3::Linear(Hash([5; 32])),
+            before: vos::StateCommitment::Linear(Hash([11; 32])),
+            after: vos::StateCommitment::Linear(Hash([5; 32])),
             claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&value.encode()]),
             input_commitment: Hash([13; 32]),
             authorization_policy: Hash([14; 32]),
@@ -746,7 +746,7 @@ fn attested_value_result(method: &str, value: Value) -> AttestedInvocationResult
     result.statement.claim_commitment =
         Hash::digest(b"vos/attestation-claim/v3", &[&value.encode()]);
     result.statement.accumulation_receipt.reply_commitment = Some(
-        ReplyRecordV2 {
+        ReplyRecord {
             call_id: result.statement.reply_call,
             producer: result.statement.actor,
             result: value.encode(),

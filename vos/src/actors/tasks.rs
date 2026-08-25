@@ -344,7 +344,7 @@ impl Tasks {
 /// the first drive pass by arbitrarily many committed dispatches. Ask the host
 /// to approve producer-local storage before constructing that record. Every
 /// replicated parent rejects packages with private Task dependencies until a
-/// commitment-only ingress carrier exists. A Local service-v2 parent accepts
+/// commitment-only ingress carrier exists. A Local service parent accepts
 /// only when the Task is driven successfully in this exact Refine slice and
 /// the producer-private sidecar is durable before the transition can commit.
 #[cfg(all(feature = "pvm", target_arch = "riscv64"))]

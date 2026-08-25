@@ -2,7 +2,7 @@
 
 [package]
 name = "space-authority"
-description = "Canonical VOS v2 role-authority actor"
+description = "Canonical VOS service role-authority actor"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"

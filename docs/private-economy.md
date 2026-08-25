@@ -81,7 +81,7 @@ Balance commitment: C = g^v * h^r
   - r: random blinding factor (hidden)
   - g, h: public generators (nothing-up-my-sleeve points)
 
-Homomorphic property: C1 + C2 = g^(v1+v2) * h^(r1+r2)
+Homomorphic property: C1 + C2 = g^(v1+service) * h^(r1+r2)
   → can verify sum relationships without opening commitments
 ```
 

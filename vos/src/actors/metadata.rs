@@ -51,7 +51,7 @@
 //! ```
 //!
 //! Each trailing section is append-only: older decoders that don't
-//! know about `kind` / `caps` / `cli_methods` / `returns` / the metadata-v2
+//! know about `kind` / `caps` / `cli_methods` / `returns` / the metadata
 //! doc + timeout sections stop reading at the previous section and the
 //! corresponding `ParsedMeta` field defaults to empty/false/0. This is how
 //! the format has evolved without breaking older actor binaries. New
@@ -421,7 +421,7 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         md += 1;
     }
 
-    // Actor replication model. Appended so pre-v2 metadata remains readable,
+    // Actor replication model. Appended so pre metadata remains readable,
     // but it defaults to `false` and therefore can never opt into CRDT mode.
     buf[pos] = meta.crdt as u8;
     pos += 1;
@@ -840,7 +840,7 @@ mod tests {
 
     #[test]
     fn docs_and_timeout_roundtrip() {
-        // Metadata v2: per-message docs, actor doc, and per-message
+        // Metadata service: per-message docs, actor doc, and per-message
         // timeout_ms survive a full encode→decode round-trip.
         const META: ActorMeta = ActorMeta {
             actor_name: "Prover",
@@ -894,8 +894,8 @@ mod tests {
     }
 
     #[test]
-    fn metadata_v2_sections_absent_default_empty_and_zero() {
-        // A blob that stops after the `returns` section (pre-metadata-v2)
+    fn metadata_service_sections_absent_default_empty_and_zero() {
+        // A blob that stops after the `returns` section (pre-metadata)
         // must still decode, with docs empty and timeouts 0. Layout:
         // name "W", 1 msg "run" (!query, 0 fields), 0 ctor, kind 0,
         // 0 caps, 0 cli, then a returns section [count=1]["u64"].
@@ -1033,7 +1033,7 @@ mod decode {
                 exposed_to_cli: false,
                 // Filled in from the trailing `returns` section.
                 returns: String::new(),
-                // Filled in from the metadata-v2 doc / timeout / mode sections.
+                // Filled in from the metadata doc / timeout / mode sections.
                 doc: String::new(),
                 timeout_ms: 0,
                 mode: 0,

@@ -14,9 +14,9 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
-use vos::v2::{
-    ActorUpgradeV2, Hash, ProductionTrustDecisionV2, ProductionTrustV2, ProofVerificationRequestV2,
-    ReceiptVerificationRequestV2, RoleCredentialVerificationRequestV2, ServiceGenesisV2, V2Wire,
+use vos::service::{
+    ActorUpgrade, Hash, ProductionTrust, ProductionTrustDecision, ProofVerificationRequest,
+    ReceiptVerificationRequest, RoleCredentialVerificationRequest, ServiceGenesis, ServiceWire,
 };
 
 const REQUEST_MAGIC: [u8; 4] = *b"VTA1";
@@ -75,7 +75,7 @@ impl std::error::Error for ProductionTrustSocketError {}
 /// authority restarts ordinary availability failures. The sampled policy ID
 /// is immutable for this value and is checked on every subsequent response.
 #[derive(Debug, Clone)]
-pub(super) struct SocketProductionTrustV2 {
+pub(super) struct SocketProductionTrust {
     path: PathBuf,
     policy: Hash,
 }
@@ -87,7 +87,7 @@ struct TrustResponse {
     timeslot: Option<u64>,
 }
 
-impl SocketProductionTrustV2 {
+impl SocketProductionTrust {
     pub(super) fn open(path: impl AsRef<Path>) -> Result<Self, ProductionTrustSocketError> {
         let path = path.as_ref().to_path_buf();
         let request = encode_request(QUERY_POLICY, &[])?;
@@ -107,17 +107,17 @@ impl SocketProductionTrustV2 {
         (response.policy == self.policy).then_some(response)
     }
 
-    fn decision(&self, tag: u8, payload: &[u8]) -> ProductionTrustDecisionV2 {
+    fn decision(&self, tag: u8, payload: &[u8]) -> ProductionTrustDecision {
         match self.request(tag, payload).map(|response| response.result) {
-            Some(AUTHORIZED) => ProductionTrustDecisionV2::Authorized,
-            Some(DENIED) => ProductionTrustDecisionV2::Denied,
-            Some(UNAVAILABLE) | None => ProductionTrustDecisionV2::Unavailable,
-            Some(_) => ProductionTrustDecisionV2::Unavailable,
+            Some(AUTHORIZED) => ProductionTrustDecision::Authorized,
+            Some(DENIED) => ProductionTrustDecision::Denied,
+            Some(UNAVAILABLE) | None => ProductionTrustDecision::Unavailable,
+            Some(_) => ProductionTrustDecision::Unavailable,
         }
     }
 }
 
-impl ProductionTrustV2 for SocketProductionTrustV2 {
+impl ProductionTrust for SocketProductionTrust {
     fn policy_id(&self) -> Hash {
         self.policy
     }
@@ -129,38 +129,38 @@ impl ProductionTrustV2 for SocketProductionTrustV2 {
             .flatten()
     }
 
-    fn verify_logical_timeslot(&self, logical_timeslot: u64) -> ProductionTrustDecisionV2 {
+    fn verify_logical_timeslot(&self, logical_timeslot: u64) -> ProductionTrustDecision {
         self.decision(VERIFY_TIMESLOT, &logical_timeslot.to_le_bytes())
     }
 
     fn verify_proof(
         &self,
-        request: &ProofVerificationRequestV2,
+        request: &ProofVerificationRequest,
         proof: &[u8],
-    ) -> ProductionTrustDecisionV2 {
+    ) -> ProductionTrustDecision {
         let request = request.encode();
         let Some(payload) = encode_pair(&request, proof) else {
-            return ProductionTrustDecisionV2::Unavailable;
+            return ProductionTrustDecision::Unavailable;
         };
         self.decision(VERIFY_PROOF, &payload)
     }
 
-    fn verify_install(&self, genesis: &ServiceGenesisV2) -> ProductionTrustDecisionV2 {
+    fn verify_install(&self, genesis: &ServiceGenesis) -> ProductionTrustDecision {
         self.decision(VERIFY_INSTALL, &genesis.encode())
     }
 
-    fn verify_upgrade(&self, upgrade: &ActorUpgradeV2) -> ProductionTrustDecisionV2 {
+    fn verify_upgrade(&self, upgrade: &ActorUpgrade) -> ProductionTrustDecision {
         self.decision(VERIFY_UPGRADE, &upgrade.encode())
     }
 
     fn verify_role_credential(
         &self,
-        request: &RoleCredentialVerificationRequestV2,
-    ) -> ProductionTrustDecisionV2 {
+        request: &RoleCredentialVerificationRequest,
+    ) -> ProductionTrustDecision {
         self.decision(VERIFY_ROLE, &request.encode())
     }
 
-    fn verify_receipt(&self, request: &ReceiptVerificationRequestV2) -> ProductionTrustDecisionV2 {
+    fn verify_receipt(&self, request: &ReceiptVerificationRequest) -> ProductionTrustDecision {
         self.decision(VERIFY_RECEIPT, &request.encode())
     }
 }
@@ -398,7 +398,7 @@ mod tests {
         let path = temp_socket("handshake");
         let policy = Hash([7; 32]);
         let server = respond_once(path.clone(), policy, POLICY, None, false);
-        let trust = SocketProductionTrustV2::open(&path).unwrap();
+        let trust = SocketProductionTrust::open(&path).unwrap();
         assert_eq!(trust.policy_id(), policy);
         server.join().unwrap();
         let _ = std::fs::remove_file(path);
@@ -418,14 +418,14 @@ mod tests {
     fn reconnect_policy_change_fails_closed() {
         let path = temp_socket("policy-change");
         let server = respond_once(path.clone(), Hash([8; 32]), POLICY, None, false);
-        let trust = SocketProductionTrustV2::open(&path).unwrap();
+        let trust = SocketProductionTrust::open(&path).unwrap();
         server.join().unwrap();
         std::fs::remove_file(&path).unwrap();
 
         let server = respond_once(path.clone(), Hash([9; 32]), AUTHORIZED, None, false);
         assert_eq!(
             trust.verify_logical_timeslot(4),
-            ProductionTrustDecisionV2::Unavailable,
+            ProductionTrustDecision::Unavailable,
         );
         server.join().unwrap();
         let _ = std::fs::remove_file(path);
@@ -436,7 +436,7 @@ mod tests {
         let path = temp_socket("slot");
         let policy = Hash([10; 32]);
         let server = respond_once(path.clone(), policy, POLICY, None, false);
-        let trust = SocketProductionTrustV2::open(&path).unwrap();
+        let trust = SocketProductionTrust::open(&path).unwrap();
         server.join().unwrap();
         std::fs::remove_file(&path).unwrap();
 
@@ -448,7 +448,7 @@ mod tests {
         let server = respond_once(path.clone(), policy, AUTHORIZED, None, true);
         assert_eq!(
             trust.verify_logical_timeslot(77),
-            ProductionTrustDecisionV2::Unavailable,
+            ProductionTrustDecision::Unavailable,
         );
         server.join().unwrap();
         let _ = std::fs::remove_file(path);

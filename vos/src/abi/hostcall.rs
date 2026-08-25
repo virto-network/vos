@@ -86,7 +86,7 @@ pub const ACTOR_PRIVATE_FETCH: u32 = 115;
 /// Export one actor's buffered effects to the generic service scheduler.
 ///
 /// The host binds the bytes to the currently active JAR VM; the service guest
-/// later validates and canonicalizes them into `TransitionV2`. Refine-only.
+/// later validates and canonicalizes them into `Transition`. Refine-only.
 pub const ACTOR_EFFECT_EXPORT: u32 = 116;
 
 /// Request additional guest heap pages.
@@ -200,9 +200,9 @@ mod tests {
     }
 
     #[test]
-    fn v2_actor_handles_do_not_shadow_supplied_capabilities() {
-        let actor_handles = crate::v2::TARGET_ACTOR_HANDLE_SLOT
-            ..crate::v2::TARGET_ACTOR_HANDLE_SLOT + crate::v2::MAX_ROOT_TREE_ACTORS as u8;
+    fn service_actor_handles_do_not_shadow_supplied_capabilities() {
+        let actor_handles = crate::service::TARGET_ACTOR_HANDLE_SLOT
+            ..crate::service::TARGET_ACTOR_HANDLE_SLOT + crate::service::MAX_ROOT_TREE_ACTORS as u8;
         let occupied = [
             crate::crypto::ECALL_BLAKE2B_COMPRESS as u8,
             REFINE_WORK_FETCH as u8,
@@ -218,7 +218,7 @@ mod tests {
             RECEIPT_VERIFY as u8,
             INSTALL_AUTH_VERIFY as u8,
             PROGRAM_LOOKUP as u8,
-            crate::v2::ACTOR_IPC_CAP_SLOT,
+            crate::service::ACTOR_IPC_CAP_SLOT,
         ];
         assert!(
             occupied
@@ -227,13 +227,13 @@ mod tests {
         );
         assert_eq!(
             actor_handles.end - actor_handles.start,
-            crate::v2::MAX_ROOT_TREE_ACTORS as u8
+            crate::service::MAX_ROOT_TREE_ACTORS as u8
         );
         assert!(
-            crate::v2::ACTOR_CALLABLE_BASE_SLOT
-                .checked_add(crate::v2::MAX_ROOT_TREE_ACTORS as u8 - 1)
-                .is_some_and(|last| last < crate::v2::ACTOR_IPC_CAP_SLOT)
+            crate::service::ACTOR_CALLABLE_BASE_SLOT
+                .checked_add(crate::service::MAX_ROOT_TREE_ACTORS as u8 - 1)
+                .is_some_and(|last| last < crate::service::ACTOR_IPC_CAP_SLOT)
         );
-        assert!(crate::v2::ACTOR_IPC_CAP_SLOT < crate::v2::ACTOR_SAVED_ARGS_CAP_SLOT);
+        assert!(crate::service::ACTOR_IPC_CAP_SLOT < crate::service::ACTOR_SAVED_ARGS_CAP_SLOT);
     }
 }

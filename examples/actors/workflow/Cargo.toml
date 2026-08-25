@@ -1,5 +1,5 @@
 [package]
-name = "v2-workflow"
+name = "workflow"
 version.workspace = true
 edition.workspace = true
 

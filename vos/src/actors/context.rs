@@ -5,11 +5,11 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 /// One canonical application identity for a transport-authenticated peer.
-/// All legacy and v2 host ingress must use this helper so route choice cannot
-/// change the persistent [`crate::v2::SubjectId`].
+/// All legacy and service host ingress must use this helper so route choice cannot
+/// change the persistent [`crate::service::SubjectId`].
 #[inline(always)]
-pub(crate) fn authenticated_peer_subject(peer: &[u8]) -> crate::v2::SubjectId {
-    crate::v2::SubjectId::of_authenticated_peer(peer)
+pub(crate) fn authenticated_peer_subject(peer: &[u8]) -> crate::service::SubjectId {
+    crate::service::SubjectId::of_authenticated_peer(peer)
 }
 
 /// Execution context passed to message handlers.
@@ -24,26 +24,26 @@ pub(crate) fn authenticated_peer_subject(peer: &[u8]) -> crate::v2::SubjectId {
 /// - `sleep(n)` — commit state and sleep for N ticks
 pub struct Context<A: Actor> {
     id: ServiceId,
-    actor_id: Option<crate::v2::ActorId>,
+    actor_id: Option<crate::service::ActorId>,
     stop_requested: bool,
 
     /// Stable identity of the handler invocation currently being
     /// dispatched. CRDT hosts derive this from the durable event identity
     /// before the guest runs and reconstruct the same value during replay.
-    invocation_id: crate::v2::InvocationId,
+    invocation_id: crate::service::InvocationId,
 
     /// Identity of whoever invoked the handler currently running.
     /// `Unauthenticated` by default until per-invoke plumbing
     /// overwrites it from the [`InvokeRequest`].
     caller: Caller,
-    /// Typed v2 origin. Legacy callers are mapped into this field at the
+    /// Typed service origin. Legacy callers are mapped into this field at the
     /// dispatch boundary; new service code sets it directly from the work
     /// envelope.
-    origin: crate::v2::Origin,
+    origin: crate::service::Origin,
     /// Exact root service which authenticated an actor origin. `None` for
     /// every non-actor origin and for legacy callers which cannot supply a
     /// complete causal source identity.
-    origin_service: Option<crate::v2::ServiceIdentityV2>,
+    origin_service: Option<crate::service::ServiceIdentity>,
 
     /// Caller's space-wide role byte — a
     /// [`SpaceRole`](super::auth::SpaceRole) discriminant. `None`
@@ -74,19 +74,19 @@ pub struct Context<A: Actor> {
     pending_spawns: Vec<[u8; 32]>,
     pending_provides: Vec<([u8; 32], Vec<u8>)>,
     #[cfg(feature = "pvm")]
-    pending_actor_calls: Vec<crate::v2::ActorCallRequestV2>,
+    pending_actor_calls: Vec<crate::service::ActorCallRequest>,
     #[cfg(feature = "pvm")]
-    pending_actor_spawns: Vec<crate::v2::ActorSpawnRequestV2>,
+    pending_actor_spawns: Vec<crate::service::ActorSpawnRequest>,
     #[cfg(feature = "pvm")]
     first_await_ordinal: u64,
     #[cfg(feature = "pvm")]
     next_await_ordinal: u64,
-    actor_tree: Vec<crate::v2::ActorTreeImportV2>,
-    external_actors: Vec<crate::v2::ExternalActorBindingV2>,
+    actor_tree: Vec<crate::service::ActorTreeImport>,
+    external_actors: Vec<crate::service::ExternalActorBinding>,
     #[cfg(feature = "pvm")]
     active_actor_mask: u64,
     #[cfg(feature = "pvm")]
-    actor_change: Option<crate::v2::ChangeId>,
+    actor_change: Option<crate::service::ChangeId>,
     #[cfg(feature = "pvm")]
     actor_ipc_capacity: usize,
 
@@ -96,7 +96,7 @@ pub struct Context<A: Actor> {
     // Cooperative scheduling
     self_schedule: bool,
     #[cfg(feature = "pvm")]
-    checkpoint: Option<crate::v2::CheckpointTokenV2>,
+    checkpoint: Option<crate::service::CheckpointToken>,
 
     // Worker host I/O: the handler yields with a request, the host
     // fulfills it and provides the result before re-polling.
@@ -133,9 +133,9 @@ impl<A: Actor> Context<A> {
             id,
             actor_id: None,
             stop_requested: false,
-            invocation_id: crate::v2::InvocationId::ZERO,
+            invocation_id: crate::service::InvocationId::ZERO,
             caller: Caller::Unauthenticated,
-            origin: crate::v2::Origin::Anonymous,
+            origin: crate::service::Origin::Anonymous,
             origin_service: None,
             space_role: None,
             actor_local_role: None,
@@ -174,7 +174,7 @@ impl<A: Actor> Context<A> {
     /// host-private device key.
     ///
     /// The raw seed is never mapped into the actor VM. `None` means the root
-    /// was opened without a device key or the host rejected the request. V2
+    /// was opened without a device key or the host rejected the request. Service
     /// production actors should compare `public_key` with their guest-owned
     /// configured identity before accepting the signature, so a misconfigured
     /// failover voter fails closed instead of changing signer identity. The
@@ -212,25 +212,25 @@ impl<A: Actor> Context<A> {
         self.id
     }
 
-    /// Typed v2 identity of this actor when running under the generic service.
+    /// Typed service identity of this actor when running under the generic service.
     /// Legacy standalone/service paths do not synthesize an `ActorId` and
     /// therefore return `None`.
-    pub fn actor_id(&self) -> Option<crate::v2::ActorId> {
+    pub fn actor_id(&self) -> Option<crate::service::ActorId> {
         self.actor_id
     }
 
-    fn resolve_owned_actor_v2(
+    fn resolve_owned_actor(
         &self,
-        parent: Option<crate::v2::ActorId>,
+        parent: Option<crate::service::ActorId>,
         name: &str,
-    ) -> Option<crate::v2::ActorId> {
+    ) -> Option<crate::service::ActorId> {
         self.actor_tree
             .iter()
             .find(|actor| actor.parent == parent && actor.name == name)
             .map(|actor| actor.actor)
     }
 
-    fn resolve_external_actor_v2(&self, name: &str) -> Option<&crate::v2::ExternalActorBindingV2> {
+    fn resolve_external_actor(&self, name: &str) -> Option<&crate::service::ExternalActorBinding> {
         self.external_actors
             .binary_search_by(|actor| actor.name.as_str().cmp(name))
             .ok()
@@ -243,26 +243,26 @@ impl<A: Actor> Context<A> {
     ///
     /// This is intentionally narrower than general actor resolution: owned
     /// tree members and legacy registry routes are never considered. Actors
-    /// can use it to authenticate an incoming [`crate::v2::Origin::Actor`]
+    /// can use it to authenticate an incoming [`crate::service::Origin::Actor`]
     /// against an immutable reciprocal binding before performing an
     /// irreversible operation. Actor IDs are reusable across roots, so a
     /// missing or different causal source service always fails closed.
     pub fn external_actor_origin_matches(&self, name: &str) -> bool {
-        let crate::v2::Origin::Actor(caller) = self.origin else {
+        let crate::service::Origin::Actor(caller) = self.origin else {
             return false;
         };
         let Some(source_service) = self.origin_service.as_ref() else {
             return false;
         };
         self.actor_id.is_some_and(|_| {
-            self.resolve_external_actor_v2(name).is_some_and(|binding| {
+            self.resolve_external_actor(name).is_some_and(|binding| {
                 binding.actor == caller && binding.service == *source_service
             })
         })
     }
 
     #[doc(hidden)]
-    pub fn __set_actor_id(&mut self, actor: crate::v2::ActorId) {
+    pub fn __set_actor_id(&mut self, actor: crate::service::ActorId) {
         self.actor_id = Some(actor);
     }
 
@@ -271,7 +271,7 @@ impl<A: Actor> Context<A> {
     /// Use this as the change identity for CRDT operations so concurrent
     /// invocations from the same causal state remain distinct while replaying
     /// the same durable invocation remains idempotent.
-    pub fn invocation_id(&self) -> crate::v2::InvocationId {
+    pub fn invocation_id(&self) -> crate::service::InvocationId {
         self.invocation_id
     }
 
@@ -280,17 +280,17 @@ impl<A: Actor> Context<A> {
     /// This is a host/macro integration hook; application handlers should
     /// only read [`Self::invocation_id`].
     #[doc(hidden)]
-    pub fn __set_invocation_id(&mut self, invocation_id: crate::v2::InvocationId) {
+    pub fn __set_invocation_id(&mut self, invocation_id: crate::service::InvocationId) {
         self.invocation_id = invocation_id;
     }
 
     #[cfg(feature = "pvm")]
     #[doc(hidden)]
-    pub fn __set_actor_tree_v2(
+    pub fn __set_actor_tree(
         &mut self,
-        actor_tree: Vec<crate::v2::ActorTreeImportV2>,
-        external_actors: Vec<crate::v2::ExternalActorBindingV2>,
-        change: Option<crate::v2::ChangeId>,
+        actor_tree: Vec<crate::service::ActorTreeImport>,
+        external_actors: Vec<crate::service::ExternalActorBinding>,
+        change: Option<crate::service::ChangeId>,
         ipc_capacity: usize,
         first_await_ordinal: u64,
         active_actor_mask: u64,
@@ -325,29 +325,31 @@ impl<A: Actor> Context<A> {
     pub fn set_caller(&mut self, caller: Caller) {
         self.origin_service = None;
         self.origin = match &caller {
-            Caller::Unauthenticated => crate::v2::Origin::Anonymous,
-            Caller::System => crate::v2::Origin::System,
-            Caller::Peer(bytes) => crate::v2::Origin::Member(authenticated_peer_subject(bytes)),
-            Caller::Actor(id) => {
-                crate::v2::Origin::Actor(crate::v2::ActorId(crate::crypto::blake2b_hash::<32>(
-                    b"vos/legacy-service-actor/v2",
-                    &[&id.0.to_le_bytes()],
-                )))
+            Caller::Unauthenticated => crate::service::Origin::Anonymous,
+            Caller::System => crate::service::Origin::System,
+            Caller::Peer(bytes) => {
+                crate::service::Origin::Member(authenticated_peer_subject(bytes))
             }
+            Caller::Actor(id) => crate::service::Origin::Actor(crate::service::ActorId(
+                crate::crypto::blake2b_hash::<32>(
+                    b"vos/legacy-service-actor/service",
+                    &[&id.0.to_le_bytes()],
+                ),
+            )),
         };
         self.caller = caller;
     }
 
-    /// Authenticated, typed origin supplied by `WorkEnvelopeV2`.
-    pub fn origin(&self) -> crate::v2::Origin {
+    /// Authenticated, typed origin supplied by `WorkEnvelope`.
+    pub fn origin(&self) -> crate::service::Origin {
         self.origin
     }
 
     #[doc(hidden)]
     pub fn __set_origin(
         &mut self,
-        origin: crate::v2::Origin,
-        origin_service: Option<crate::v2::ServiceIdentityV2>,
+        origin: crate::service::Origin,
+        origin_service: Option<crate::service::ServiceIdentity>,
     ) {
         self.origin = origin;
         self.origin_service = origin_service;
@@ -395,7 +397,7 @@ impl<A: Actor> Context<A> {
     /// True iff the caller's effective role satisfies `required`
     /// — i.e. `>=` in the actor's role hierarchy.
     /// System and actor origins temporarily bypass this check because the
-    /// legacy bootstrap and replay paths cannot carry role bytes. The v2
+    /// legacy bootstrap and replay paths cannot carry role bytes. The service
     /// authority cutover removes this compatibility boundary only after
     /// those callers carry explicit platform capabilities.
     pub fn has_role(&self, required: A::Role) -> bool {
@@ -607,7 +609,7 @@ impl<A: Actor> Context<A> {
         }
     }
 
-    /// Issue a durable v2 call to an actor in another root tree.
+    /// Issue a durable service call to an actor in another root tree.
     ///
     /// Unlike the legacy route-oriented [`ask`](Self::ask), this call records
     /// a stable await ordinal, checkpoints the exact guest machine before it
@@ -615,7 +617,7 @@ impl<A: Actor> Context<A> {
     /// accumulated reply at that same protocol-call boundary.
     pub fn ask_actor(
         &mut self,
-        target: crate::v2::ActorId,
+        target: crate::service::ActorId,
         msg: &super::value::Msg,
         deadline_timeslot: Option<u64>,
     ) -> super::run::Ask {
@@ -626,11 +628,11 @@ impl<A: Actor> Context<A> {
         self.ask_actor_raw(target, &payload, deadline_timeslot)
     }
 
-    /// Raw durable v2 actor call. This is an advanced runtime primitive;
+    /// Raw durable service actor call. This is an advanced runtime primitive;
     /// generated bound handles are the application-facing API.
     pub fn ask_actor_raw(
         &mut self,
-        target: crate::v2::ActorId,
+        target: crate::service::ActorId,
         payload: &[u8],
         deadline_timeslot: Option<u64>,
     ) -> super::run::Ask {
@@ -639,7 +641,7 @@ impl<A: Actor> Context<A> {
             if self.actor_id.is_none() || payload.is_empty() {
                 return super::run::Ask::ready_err(super::value::InvokeError::NotFound);
             }
-            if let Some(inline) = self.__try_inline_actor_v2(target, payload) {
+            if let Some(inline) = self.__try_inline_actor(target, payload) {
                 return inline;
             }
             if self.actor_tree.iter().any(|actor| actor.actor == target) {
@@ -657,24 +659,24 @@ impl<A: Actor> Context<A> {
             self.next_await_ordinal = self
                 .next_await_ordinal
                 .checked_add(1)
-                .expect("v2 actor await ordinal overflow");
+                .expect("service actor await ordinal overflow");
             self.pending_actor_calls
-                .push(crate::v2::ActorCallRequestV2 {
+                .push(crate::service::ActorCallRequest {
                     await_ordinal,
-                    from: self.actor_id.expect("v2 actor identity was checked"),
+                    from: self.actor_id.expect("service actor identity was checked"),
                     to_service: binding.service,
                     to: target,
                     payload: payload.to_vec(),
-                    authorization: crate::v2::AuthorizationEvidenceV2::Public,
+                    authorization: crate::service::AuthorizationEvidence::Public,
                     proof_requested: false,
                     deadline_timeslot,
                 });
 
-            let mut response = [0u8; crate::v2::CHECKPOINT_TOKEN_CAPACITY];
+            let mut response = [0u8; crate::service::CHECKPOINT_TOKEN_CAPACITY];
             let [resume_kind, response_len] = crate::abi::pvm::hostcalls::suspend_await(
                 &mut response,
                 await_ordinal,
-                crate::v2::AWAIT_SUSPEND_MAGIC,
+                crate::service::AWAIT_SUSPEND_MAGIC,
             );
             match resume_kind {
                 0 => {
@@ -684,10 +686,11 @@ impl<A: Actor> Context<A> {
                         response_len <= response.len(),
                         "await checkpoint payload exceeds buffer"
                     );
-                    let checkpoint = <crate::v2::CheckpointTokenV2 as crate::v2::V2Wire>::decode(
-                        &response[..response_len],
-                    )
-                    .expect("invalid v2 await checkpoint token");
+                    let checkpoint =
+                        <crate::service::CheckpointToken as crate::service::ServiceWire>::decode(
+                            &response[..response_len],
+                        )
+                        .expect("invalid service await checkpoint token");
                     assert!(
                         checkpoint.pending_call.is_some(),
                         "await checkpoint is missing its stable CallId"
@@ -703,12 +706,13 @@ impl<A: Actor> Context<A> {
                         response_len <= response.len(),
                         "await resume payload exceeds buffer"
                     );
-                    let resume = <crate::v2::AwaitResumeV2 as crate::v2::V2Wire>::decode(
-                        &response[..response_len],
-                    )
-                    .expect("invalid v2 accumulated reply");
-                    self.__rebind_checkpoint_change_v2(&resume.checkpoint);
-                    self.__clear_committed_checkpoint_effects_v2();
+                    let resume =
+                        <crate::service::AwaitResume as crate::service::ServiceWire>::decode(
+                            &response[..response_len],
+                        )
+                        .expect("invalid service accumulated reply");
+                    self.__rebind_checkpoint_change(&resume.checkpoint);
+                    self.__clear_committed_checkpoint_effects();
                     self.checkpoint = Some(resume.checkpoint);
                     self.self_schedule = false;
                     super::run::Ask::ready(resume.reply.result)
@@ -720,17 +724,18 @@ impl<A: Actor> Context<A> {
                         response_len <= response.len(),
                         "timeout resume payload exceeds buffer"
                     );
-                    let checkpoint = <crate::v2::CheckpointTokenV2 as crate::v2::V2Wire>::decode(
-                        &response[..response_len],
-                    )
-                    .expect("invalid v2 accumulated timeout");
-                    self.__rebind_checkpoint_change_v2(&checkpoint);
-                    self.__clear_committed_checkpoint_effects_v2();
+                    let checkpoint =
+                        <crate::service::CheckpointToken as crate::service::ServiceWire>::decode(
+                            &response[..response_len],
+                        )
+                        .expect("invalid service accumulated timeout");
+                    self.__rebind_checkpoint_change(&checkpoint);
+                    self.__clear_committed_checkpoint_effects();
                     self.checkpoint = Some(checkpoint);
                     self.self_schedule = false;
                     super::run::Ask::ready_err(super::value::InvokeError::Timeout)
                 }
-                _ => panic!("invalid v2 await resume kind"),
+                _ => panic!("invalid service await resume kind"),
             }
         }
         #[cfg(not(feature = "pvm"))]
@@ -747,7 +752,7 @@ impl<A: Actor> Context<A> {
     #[doc(hidden)]
     pub fn ask_actor_attested_raw(
         &mut self,
-        target: crate::v2::ActorId,
+        target: crate::service::ActorId,
         payload: &[u8],
         deadline_timeslot: Option<u64>,
     ) -> super::client::AttestedAsk {
@@ -775,24 +780,24 @@ impl<A: Actor> Context<A> {
             self.next_await_ordinal = self
                 .next_await_ordinal
                 .checked_add(1)
-                .expect("v2 actor await ordinal overflow");
+                .expect("service actor await ordinal overflow");
             self.pending_actor_calls
-                .push(crate::v2::ActorCallRequestV2 {
+                .push(crate::service::ActorCallRequest {
                     await_ordinal,
-                    from: self.actor_id.expect("v2 actor identity was checked"),
+                    from: self.actor_id.expect("service actor identity was checked"),
                     to_service: binding.service,
                     to: target,
                     payload: payload.to_vec(),
-                    authorization: crate::v2::AuthorizationEvidenceV2::Public,
+                    authorization: crate::service::AuthorizationEvidence::Public,
                     proof_requested: true,
                     deadline_timeslot,
                 });
 
-            let mut response = [0u8; crate::v2::CHECKPOINT_TOKEN_CAPACITY];
+            let mut response = [0u8; crate::service::CHECKPOINT_TOKEN_CAPACITY];
             let [resume_kind, response_len] = crate::abi::pvm::hostcalls::suspend_await(
                 &mut response,
                 await_ordinal,
-                crate::v2::AWAIT_SUSPEND_MAGIC,
+                crate::service::AWAIT_SUSPEND_MAGIC,
             );
             match resume_kind {
                 0 => {
@@ -802,10 +807,11 @@ impl<A: Actor> Context<A> {
                         response_len <= response.len(),
                         "await checkpoint payload exceeds buffer"
                     );
-                    let checkpoint = <crate::v2::CheckpointTokenV2 as crate::v2::V2Wire>::decode(
-                        &response[..response_len],
-                    )
-                    .expect("invalid v2 await checkpoint token");
+                    let checkpoint =
+                        <crate::service::CheckpointToken as crate::service::ServiceWire>::decode(
+                            &response[..response_len],
+                        )
+                        .expect("invalid service await checkpoint token");
                     assert!(
                         checkpoint.pending_call.is_some(),
                         "await checkpoint is missing its stable CallId"
@@ -821,12 +827,13 @@ impl<A: Actor> Context<A> {
                         response_len <= response.len(),
                         "await resume payload exceeds buffer"
                     );
-                    let resume = <crate::v2::AwaitResumeV2 as crate::v2::V2Wire>::decode(
-                        &response[..response_len],
-                    )
-                    .expect("invalid v2 accumulated attestation reply");
-                    self.__rebind_checkpoint_change_v2(&resume.checkpoint);
-                    self.__clear_committed_checkpoint_effects_v2();
+                    let resume =
+                        <crate::service::AwaitResume as crate::service::ServiceWire>::decode(
+                            &response[..response_len],
+                        )
+                        .expect("invalid service accumulated attestation reply");
+                    self.__rebind_checkpoint_change(&resume.checkpoint);
+                    self.__clear_committed_checkpoint_effects();
                     self.checkpoint = Some(resume.checkpoint);
                     self.self_schedule = false;
                     let Some(attestation) = resume.attestation else {
@@ -851,7 +858,7 @@ impl<A: Actor> Context<A> {
                         ));
                     }
                     let proof_address =
-                        crate::v2::ACTOR_IPC_BASE_PAGE as usize * 4096usize + proof_offset;
+                        crate::service::ACTOR_IPC_BASE_PAGE as usize * 4096usize + proof_offset;
                     // SAFETY: the invocation-owned IPC DATA capability is
                     // mapped over `actor_ipc_capacity`; the descriptor was
                     // bounds-checked above and the service writes it before
@@ -890,19 +897,20 @@ impl<A: Actor> Context<A> {
                         response_len <= response.len(),
                         "timeout resume payload exceeds buffer"
                     );
-                    let checkpoint = <crate::v2::CheckpointTokenV2 as crate::v2::V2Wire>::decode(
-                        &response[..response_len],
-                    )
-                    .expect("invalid v2 accumulated timeout");
-                    self.__rebind_checkpoint_change_v2(&checkpoint);
-                    self.__clear_committed_checkpoint_effects_v2();
+                    let checkpoint =
+                        <crate::service::CheckpointToken as crate::service::ServiceWire>::decode(
+                            &response[..response_len],
+                        )
+                        .expect("invalid service accumulated timeout");
+                    self.__rebind_checkpoint_change(&checkpoint);
+                    self.__clear_committed_checkpoint_effects();
                     self.checkpoint = Some(checkpoint);
                     self.self_schedule = false;
                     super::client::AttestedAsk::ready(Err(ClientError::Call(
                         super::client::CallError::Timeout,
                     )))
                 }
-                _ => panic!("invalid v2 attested await resume kind"),
+                _ => panic!("invalid service attested await resume kind"),
             }
         }
         #[cfg(not(feature = "pvm"))]
@@ -913,9 +921,9 @@ impl<A: Actor> Context<A> {
     }
 
     #[cfg(feature = "pvm")]
-    fn __try_inline_actor_v2(
+    fn __try_inline_actor(
         &mut self,
-        target: crate::v2::ActorId,
+        target: crate::service::ActorId,
         payload: &[u8],
     ) -> Option<super::run::Ask> {
         let caller = self.actor_id?;
@@ -923,24 +931,25 @@ impl<A: Actor> Context<A> {
             .actor_tree
             .binary_search_by_key(&target, |actor| actor.actor)
             .ok()?;
-        let callable_slot = crate::v2::ACTOR_CALLABLE_BASE_SLOT.checked_add(index as u8)?;
+        let callable_slot = crate::service::ACTOR_CALLABLE_BASE_SLOT.checked_add(index as u8)?;
         let target_mask = 1u64 << index;
         if self.active_actor_mask & target_mask != 0 {
             return Some(super::run::Ask::ready_err(super::value::InvokeError::Cycle));
         }
-        let child_input = crate::v2::ActorSliceInputV2 {
+        let child_input = crate::service::ActorSliceInput {
             actor: target,
             first_await_ordinal: self.next_await_ordinal,
             message: payload.to_vec(),
         };
-        let encoded = <crate::v2::ActorSliceInputV2 as crate::v2::V2Wire>::encode(&child_input);
+        let encoded =
+            <crate::service::ActorSliceInput as crate::service::ServiceWire>::encode(&child_input);
         let capacity = self.actor_ipc_capacity;
         if encoded.len() > capacity {
             return Some(super::run::Ask::ready_err(
                 super::value::InvokeError::TooBig,
             ));
         }
-        let address = crate::v2::ACTOR_IPC_BASE_PAGE as usize * 4096usize;
+        let address = crate::service::ACTOR_IPC_BASE_PAGE as usize * 4096usize;
         // SAFETY: this actor owns the mapped invocation IPC DATA capability.
         // It remains mapped until JAR CALL moves it to the child.
         unsafe {
@@ -949,15 +958,15 @@ impl<A: Actor> Context<A> {
         }
         let local_ipc = crate::abi::pvm::ecall::local_cap_ref(0);
         let nested_ipc =
-            crate::abi::pvm::ecall::local_cap_ref(crate::v2::ACTOR_NESTED_IPC_CAP_SLOT);
+            crate::abi::pvm::ecall::local_cap_ref(crate::service::ACTOR_NESTED_IPC_CAP_SLOT);
         assert!(crate::abi::pvm::ecall::move_cap(local_ipc, nested_ipc));
         let output_len = crate::abi::pvm::ecall::call_cap(
             crate::abi::pvm::ecall::local_cap_ref(callable_slot),
-            crate::v2::ACTOR_NESTED_IPC_CAP_SLOT,
+            crate::service::ACTOR_NESTED_IPC_CAP_SLOT,
             address as u64,
             encoded.len() as u64,
             capacity as u64,
-            crate::v2::NESTED_ACTOR_CALL_MAGIC,
+            crate::service::NESTED_ACTOR_CALL_MAGIC,
         );
         assert!(crate::abi::pvm::ecall::move_cap(nested_ipc, local_ipc));
         if output_len == u64::MAX - 1 || output_len == 0 || output_len as usize > capacity {
@@ -971,7 +980,7 @@ impl<A: Actor> Context<A> {
             // VM. Decode owns every field before the shared page is scrubbed.
             let bytes =
                 unsafe { core::slice::from_raw_parts(address as *const u8, output_len as usize) };
-            <crate::v2::ActorCallResultV2 as crate::v2::V2Wire>::decode(bytes)
+            <crate::service::ActorCallResult as crate::service::ServiceWire>::decode(bytes)
         };
         // SAFETY: this VM owns the returned RW IPC capability. No bytes from
         // this hop remain observable by a later sibling.
@@ -1010,8 +1019,8 @@ impl<A: Actor> Context<A> {
                 .checkpoint
                 .as_ref()
                 .expect("checked nested checkpoint presence");
-            self.__rebind_checkpoint_change_v2(checkpoint);
-            self.__clear_committed_checkpoint_effects_v2();
+            self.__rebind_checkpoint_change(checkpoint);
+            self.__clear_committed_checkpoint_effects();
         }
         self.next_await_ordinal = output.next_await_ordinal;
         if output.yielded {
@@ -1034,8 +1043,8 @@ impl<A: Actor> Context<A> {
                         super::value::InvokeError::Panicked,
                     ));
                 }
-                self.__rebind_checkpoint_change_v2(&checkpoint);
-                self.__clear_committed_checkpoint_effects_v2();
+                self.__rebind_checkpoint_change(&checkpoint);
+                self.__clear_committed_checkpoint_effects();
                 self.checkpoint = Some(checkpoint);
             }
             Some(super::run::Ask::ready(output.reply))
@@ -1163,9 +1172,9 @@ impl<A: Actor> Context<A> {
         let name = name.into();
         if self.actor_id.is_some() {
             let actor = self
-                .resolve_owned_actor_v2(None, &name)
+                .resolve_owned_actor(None, &name)
                 .or_else(|| {
-                    self.resolve_external_actor_v2(&name)
+                    self.resolve_external_actor(&name)
                         .map(|binding| binding.actor)
                 })
                 .ok_or(super::client::ClientError::NotFound)?;
@@ -1178,7 +1187,7 @@ impl<A: Actor> Context<A> {
         Ok(R::bind_service(ServiceId(id), self))
     }
 
-    /// Resolve an existing actor directly owned by the current actor. Under v2
+    /// Resolve an existing actor directly owned by the current actor. Under service
     /// this consults only the authenticated root-tree import; a same-node
     /// service route cannot masquerade as an owned child.
     pub async fn child<'a, R: super::client::ActorReference + 'a>(
@@ -1188,7 +1197,7 @@ impl<A: Actor> Context<A> {
         let name = name.into();
         if let Some(parent) = self.actor_id {
             let actor = self
-                .resolve_owned_actor_v2(Some(parent), &name)
+                .resolve_owned_actor(Some(parent), &name)
                 .ok_or(super::client::ClientError::NotOwnedChild)?;
             return Ok(R::bind(actor, self));
         }
@@ -1219,13 +1228,13 @@ impl<A: Actor> Context<A> {
             {
                 if A::CRDT
                     || name.is_empty()
-                    || name.len() > crate::v2::MAX_ACTOR_NAME_BYTES
+                    || name.len() > crate::service::MAX_ACTOR_NAME_BYTES
                     || self
                         .actor_tree
                         .binary_search_by_key(&parent, |actor| actor.actor)
                         .is_err()
                     || self.actor_tree.len() + self.pending_actor_spawns.len()
-                        >= crate::v2::MAX_ROOT_TREE_ACTORS
+                        >= crate::service::MAX_ROOT_TREE_ACTORS
                     || self
                         .actor_tree
                         .iter()
@@ -1237,7 +1246,7 @@ impl<A: Actor> Context<A> {
                 {
                     return Err(super::client::ClientError::SpawnUnavailable);
                 }
-                let actor = crate::v2::ActorId::owned_child(parent, &name);
+                let actor = crate::service::ActorId::owned_child(parent, &name);
                 if self
                     .actor_tree
                     .iter()
@@ -1250,7 +1259,7 @@ impl<A: Actor> Context<A> {
                     return Err(super::client::ClientError::SpawnUnavailable);
                 }
                 self.pending_actor_spawns
-                    .push(crate::v2::ActorSpawnRequestV2 {
+                    .push(crate::service::ActorSpawnRequest {
                         actor,
                         name,
                         parent,
@@ -1398,21 +1407,22 @@ impl<A: Actor> Context<A> {
         #[cfg(feature = "pvm")]
         {
             let restored = if self.actor_id.is_some() {
-                let mut token = [0u8; crate::v2::CHECKPOINT_TOKEN_CAPACITY];
+                let mut token = [0u8; crate::service::CHECKPOINT_TOKEN_CAPACITY];
                 let [resume_kind, token_len] =
                     crate::abi::pvm::hostcalls::suspend_checkpoint(&mut token);
                 let token_len = usize::try_from(token_len)
                     .expect("checkpoint token length exceeds guest usize");
                 assert!(token_len <= token.len(), "checkpoint token exceeds buffer");
-                let checkpoint = <crate::v2::CheckpointTokenV2 as crate::v2::V2Wire>::decode(
-                    &token[..token_len],
-                )
-                .expect("invalid v2 checkpoint token");
+                let checkpoint =
+                    <crate::service::CheckpointToken as crate::service::ServiceWire>::decode(
+                        &token[..token_len],
+                    )
+                    .expect("invalid service checkpoint token");
                 if resume_kind == 1 {
-                    self.__rebind_checkpoint_change_v2(&checkpoint);
+                    self.__rebind_checkpoint_change(&checkpoint);
                     // The exact snapshot still contains the queues emitted by
                     // the slice which installed this continuation.
-                    self.__clear_committed_checkpoint_effects_v2();
+                    self.__clear_committed_checkpoint_effects();
                 }
                 self.checkpoint = Some(checkpoint);
                 resume_kind == 1
@@ -1431,14 +1441,14 @@ impl<A: Actor> Context<A> {
 
     #[cfg(feature = "pvm")]
     #[doc(hidden)]
-    pub fn __take_checkpoint_v2(&mut self) -> Option<crate::v2::CheckpointTokenV2> {
+    pub fn __take_checkpoint(&mut self) -> Option<crate::service::CheckpointToken> {
         self.checkpoint.take()
     }
 
-    fn __rebind_checkpoint_change_v2(&self, checkpoint: &crate::v2::CheckpointTokenV2) {
+    fn __rebind_checkpoint_change(&self, checkpoint: &crate::service::CheckpointToken) {
         match (A::CRDT, checkpoint.change) {
             (true, Some(dispatch)) => {
-                let actor = self.actor_id.expect("v2 actor identity is installed");
+                let actor = self.actor_id.expect("service actor identity is installed");
                 crate::crdt::rebind_change(crate::crdt::ChangeId::for_dispatch(
                     dispatch.change,
                     actor,
@@ -1452,7 +1462,7 @@ impl<A: Actor> Context<A> {
     }
 
     #[cfg(feature = "pvm")]
-    fn __clear_committed_checkpoint_effects_v2(&mut self) {
+    fn __clear_committed_checkpoint_effects(&mut self) {
         self.pending_writes.clear();
         self.pending_tells.clear();
         self.pending_provides.clear();
@@ -1646,18 +1656,18 @@ impl<A: Actor> Context<A> {
         }
     }
 
-    /// Drain the state-row effects supported by the v2 nested actor slice.
+    /// Drain the state-row effects supported by the service nested actor slice.
     /// Messaging and service-management effects are deliberately rejected
     /// until the root-tree scheduler can translate them into typed
     /// inbox/outbox records without falling back to the v1 effect journal.
     #[cfg(feature = "pvm")]
     #[doc(hidden)]
-    pub fn __drain_actor_writes_v2(
+    pub fn __drain_actor_writes(
         &mut self,
-        actor: crate::v2::ActorId,
+        actor: crate::service::ActorId,
         row_effects: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         state_write: Option<Vec<u8>>,
-    ) -> Result<Vec<crate::v2::ActorWriteV2>, ()> {
+    ) -> Result<Vec<crate::service::ActorWrite>, ()> {
         if !self.pending_tells.is_empty()
             || !self.pending_spawns.is_empty()
             || !self.pending_provides.is_empty()
@@ -1682,7 +1692,7 @@ impl<A: Actor> Context<A> {
         }
         Ok(writes
             .into_iter()
-            .map(|(key, value)| crate::v2::ActorWriteV2 { actor, key, value })
+            .map(|(key, value)| crate::service::ActorWrite { actor, key, value })
             .collect())
     }
 
@@ -1690,7 +1700,7 @@ impl<A: Actor> Context<A> {
     /// the generic service can derive canonical `CallId`s from its invocation.
     #[cfg(feature = "pvm")]
     #[doc(hidden)]
-    pub fn __drain_actor_calls_v2(&mut self) -> Vec<crate::v2::ActorCallRequestV2> {
+    pub fn __drain_actor_calls(&mut self) -> Vec<crate::service::ActorCallRequest> {
         core::mem::take(&mut self.pending_actor_calls)
     }
 
@@ -1699,7 +1709,7 @@ impl<A: Actor> Context<A> {
     /// the child's package identity from its authenticated parent descriptor.
     #[cfg(feature = "pvm")]
     #[doc(hidden)]
-    pub fn __drain_actor_spawns_v2(&mut self) -> Vec<crate::v2::ActorSpawnRequestV2> {
+    pub fn __drain_actor_spawns(&mut self) -> Vec<crate::service::ActorSpawnRequest> {
         let mut spawns = core::mem::take(&mut self.pending_actor_spawns);
         spawns.sort_by_key(|spawn| spawn.actor);
         spawns
@@ -1707,7 +1717,7 @@ impl<A: Actor> Context<A> {
 
     #[cfg(feature = "pvm")]
     #[doc(hidden)]
-    pub fn __await_ordinal_range_v2(&self) -> (u64, u64) {
+    pub fn __await_ordinal_range(&self) -> (u64, u64) {
         (self.first_await_ordinal, self.next_await_ordinal)
     }
 }
@@ -1975,7 +1985,7 @@ mod tests {
         type Handle<'a, I: crate::actors::client::Invoker + 'a> = ();
 
         fn bind<'a, I: crate::actors::client::Invoker + 'a>(
-            _target: crate::v2::ActorId,
+            _target: crate::service::ActorId,
             _invoker: &'a mut I,
         ) -> Self::Handle<'a, I> {
         }
@@ -1998,13 +2008,13 @@ mod tests {
         // populate the slot safe.
         let ctx: Context<TestActor> = Context::new(ServiceId(7));
         assert_eq!(ctx.caller(), &Caller::Unauthenticated);
-        assert_eq!(ctx.invocation_id(), crate::v2::InvocationId::ZERO);
+        assert_eq!(ctx.invocation_id(), crate::service::InvocationId::ZERO);
     }
 
     #[test]
     fn context_invocation_id_round_trips_through_host_hook() {
         let mut ctx: Context<TestActor> = Context::new(ServiceId(7));
-        let invocation = crate::v2::InvocationId::derive(b"test", b"dispatch");
+        let invocation = crate::service::InvocationId::derive(b"test", b"dispatch");
         ctx.__set_invocation_id(invocation);
         assert_eq!(ctx.invocation_id(), invocation);
     }
@@ -2025,7 +2035,7 @@ mod tests {
         assert_eq!(ctx.caller(), &Caller::Peer(peer.clone()));
         assert_eq!(
             ctx.origin(),
-            crate::v2::Origin::Member(authenticated_peer_subject(&peer))
+            crate::service::Origin::Member(authenticated_peer_subject(&peer))
         );
 
         ctx.set_caller(Caller::Actor(ServiceId(42)));
@@ -2033,9 +2043,9 @@ mod tests {
     }
 
     #[test]
-    fn v2_actor_identity_is_not_truncated_into_a_route_id() {
+    fn service_actor_identity_is_not_truncated_into_a_route_id() {
         let mut ctx: Context<TestActor> = Context::new(ServiceId(0));
-        let actor = crate::v2::ActorId([0xab; 32]);
+        let actor = crate::service::ActorId([0xab; 32]);
         assert_eq!(ctx.actor_id(), None);
         ctx.__set_actor_id(actor);
         assert_eq!(ctx.actor_id(), Some(actor));
@@ -2070,31 +2080,31 @@ mod tests {
     fn await_resume_rebinds_crdt_change_and_resets_the_operation_ordinal() {
         use crate::crdt::{Counter, Field};
 
-        let actor = crate::v2::ActorId([0x41; 32]);
-        let old = crate::v2::CrdtDispatchV2 {
-            change: crate::v2::ChangeId([0x42; 32]),
+        let actor = crate::service::ActorId([0x41; 32]);
+        let old = crate::service::CrdtDispatch {
+            change: crate::service::ChangeId([0x42; 32]),
             ordinal: 0,
         };
-        let resumed = crate::v2::CrdtDispatchV2 {
-            change: crate::v2::ChangeId([0x43; 32]),
+        let resumed = crate::service::CrdtDispatch {
+            change: crate::service::ChangeId([0x43; 32]),
             ordinal: 0,
         };
         let mut ctx: Context<CrdtTestActor> = Context::new(ServiceId(0));
         ctx.__set_actor_id(actor);
         let mut counter = Counter::default();
         Field::__vos_init(&mut counter, "CrdtTestActor", "counter");
-        let token = crate::v2::CheckpointTokenV2 {
-            input: crate::v2::WorkInputIdV2 {
-                invocation: crate::v2::InvocationId([0x44; 32]),
+        let token = crate::service::CheckpointToken {
+            input: crate::service::WorkInputId {
+                invocation: crate::service::InvocationId([0x44; 32]),
                 workflow_step: 1,
             },
-            base: crate::v2::ConsistencyBaseV2::Crdt { heads: vec![] },
-            work_hash: crate::v2::Hash([0x45; 32]),
+            base: crate::service::ConsistencyBase::Crdt { heads: vec![] },
+            work_hash: crate::service::Hash([0x45; 32]),
             base_causal_height: Some(0),
             change: Some(resumed),
-            expected: Some(crate::v2::Hash([0x46; 32])),
+            expected: Some(crate::service::Hash([0x46; 32])),
             replacement: None,
-            pending_call: Some(crate::v2::CallId([0x47; 32])),
+            pending_call: Some(crate::service::CallId([0x47; 32])),
             pending_actor: Some(actor),
             previously_suspended: vec![actor],
             suspended: Vec::new(),
@@ -2104,7 +2114,7 @@ mod tests {
             crate::crdt::ChangeId::for_dispatch(old.change, actor, old.ordinal),
             || {
                 counter.increment(1)?;
-                ctx.__rebind_checkpoint_change_v2(&token);
+                ctx.__rebind_checkpoint_change(&token);
                 counter.increment(1)
             },
         )
@@ -2121,17 +2131,17 @@ mod tests {
     }
 
     #[test]
-    fn v2_child_resolution_requires_the_exact_parent_identity() {
-        let root = crate::v2::ActorId([1; 32]);
-        let child = crate::v2::ActorId([2; 32]);
-        let sibling_child = crate::v2::ActorId([3; 32]);
-        let other_root = crate::v2::ActorId([4; 32]);
-        let program = crate::v2::ProgramId([9; 32]);
-        let actor = |actor, name: &str, parent| crate::v2::ActorTreeImportV2 {
+    fn service_child_resolution_requires_the_exact_parent_identity() {
+        let root = crate::service::ActorId([1; 32]);
+        let child = crate::service::ActorId([2; 32]);
+        let sibling_child = crate::service::ActorId([3; 32]);
+        let other_root = crate::service::ActorId([4; 32]);
+        let program = crate::service::ProgramId([9; 32]);
+        let actor = |actor, name: &str, parent| crate::service::ActorTreeImport {
             actor,
             name: name.into(),
             parent,
-            deployment: crate::v2::DeploymentId([8; 32]),
+            deployment: crate::service::DeploymentId([8; 32]),
             program,
         };
         let mut ctx: Context<TestActor> = Context::new(ServiceId(0));
@@ -2143,21 +2153,18 @@ mod tests {
             actor(other_root, "other", None),
         ];
 
+        assert_eq!(ctx.resolve_owned_actor(Some(root), "worker"), Some(child));
         assert_eq!(
-            ctx.resolve_owned_actor_v2(Some(root), "worker"),
-            Some(child)
-        );
-        assert_eq!(
-            ctx.resolve_owned_actor_v2(Some(other_root), "worker"),
+            ctx.resolve_owned_actor(Some(other_root), "worker"),
             Some(sibling_child)
         );
-        assert_eq!(ctx.resolve_owned_actor_v2(Some(root), "other"), None);
+        assert_eq!(ctx.resolve_owned_actor(Some(root), "other"), None);
     }
 
     #[test]
-    fn v2_spawn_never_falls_back_to_the_legacy_registry_route() {
+    fn service_spawn_never_falls_back_to_the_legacy_registry_route() {
         let mut ctx: Context<TestActor> = Context::new(ServiceId(0));
-        ctx.__set_actor_id(crate::v2::ActorId([1; 32]));
+        ctx.__set_actor_id(crate::service::ActorId([1; 32]));
 
         assert!(matches!(
             crate::block_on(ctx.spawn::<TestRef>("child", &TestActor)),
@@ -2167,16 +2174,16 @@ mod tests {
 
     #[cfg(feature = "pvm")]
     #[test]
-    fn v2_spawn_buffers_one_deterministic_same_package_child() {
-        let root = crate::v2::ActorId([1; 32]);
+    fn service_spawn_buffers_one_deterministic_same_package_child() {
+        let root = crate::service::ActorId([1; 32]);
         let mut ctx: Context<TestActor> = Context::new(ServiceId(0));
         ctx.__set_actor_id(root);
-        ctx.actor_tree = alloc::vec![crate::v2::ActorTreeImportV2 {
+        ctx.actor_tree = alloc::vec![crate::service::ActorTreeImport {
             actor: root,
             name: "root".into(),
             parent: None,
-            deployment: crate::v2::DeploymentId([8; 32]),
-            program: crate::v2::ProgramId([9; 32]),
+            deployment: crate::service::DeploymentId([8; 32]),
+            program: crate::service::ProgramId([9; 32]),
         }];
 
         assert!(crate::block_on(ctx.spawn::<TestRef>("child", &TestActor)).is_ok());
@@ -2184,11 +2191,11 @@ mod tests {
             crate::block_on(ctx.spawn::<TestRef>("child", &TestActor)),
             Err(crate::ClientError::SpawnUnavailable)
         ));
-        let spawns = ctx.__drain_actor_spawns_v2();
+        let spawns = ctx.__drain_actor_spawns();
         assert_eq!(spawns.len(), 1);
         assert_eq!(
             spawns[0].actor,
-            crate::v2::ActorId::owned_child(root, "child")
+            crate::service::ActorId::owned_child(root, "child")
         );
         assert_eq!(spawns[0].parent, root);
         assert_eq!(spawns[0].name, "child");
@@ -2196,47 +2203,50 @@ mod tests {
     }
 
     #[test]
-    fn v2_external_resolution_uses_only_install_time_bindings() {
+    fn service_external_resolution_uses_only_install_time_bindings() {
         let mut ctx: Context<TestActor> = Context::new(ServiceId(0));
-        let actor = crate::v2::ActorId([41; 32]);
-        ctx.__set_actor_id(crate::v2::ActorId([1; 32]));
-        ctx.external_actors = alloc::vec![crate::v2::ExternalActorBindingV2 {
+        let actor = crate::service::ActorId([41; 32]);
+        ctx.__set_actor_id(crate::service::ActorId([1; 32]));
+        ctx.external_actors = alloc::vec![crate::service::ExternalActorBinding {
             name: "private-age".into(),
-            service: crate::v2::ServiceIdentityV2 {
-                space: crate::v2::SpaceId([2; 32]),
-                root_service: crate::v2::RootServiceId([3; 32]),
-                deployment: crate::v2::DeploymentId([4; 32]),
-                service_program: crate::v2::ProgramId([5; 32]),
-                service_abi: crate::v2::ABI_VERSION,
-                execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
-                gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000,),
+            service: crate::service::ServiceIdentity {
+                space: crate::service::SpaceId([2; 32]),
+                root_service: crate::service::RootServiceId([3; 32]),
+                deployment: crate::service::DeploymentId([4; 32]),
+                service_program: crate::service::ProgramId([5; 32]),
+                service_abi: crate::service::ABI_VERSION,
+                execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
+                gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000,),
             },
             actor,
-            producer: crate::v2::ProducerId([6; 32]),
-            actor_deployment: crate::v2::DeploymentId([8; 32]),
-            program: crate::v2::ProgramId([7; 32]),
+            producer: crate::service::ProducerId([6; 32]),
+            actor_deployment: crate::service::DeploymentId([8; 32]),
+            program: crate::service::ProgramId([7; 32]),
         }];
 
         assert_eq!(
-            ctx.resolve_external_actor_v2("private-age")
+            ctx.resolve_external_actor("private-age")
                 .map(|binding| binding.actor),
             Some(actor)
         );
-        assert_eq!(ctx.resolve_external_actor_v2("package-label"), None);
+        assert_eq!(ctx.resolve_external_actor("package-label"), None);
         ctx.__set_origin(
-            crate::v2::Origin::Actor(actor),
+            crate::service::Origin::Actor(actor),
             Some(ctx.external_actors[0].service.clone()),
         );
         assert!(ctx.external_actor_origin_matches("private-age"));
 
         let mut colliding_service = ctx.external_actors[0].service.clone();
-        colliding_service.root_service = crate::v2::RootServiceId([9; 32]);
-        ctx.__set_origin(crate::v2::Origin::Actor(actor), Some(colliding_service));
+        colliding_service.root_service = crate::service::RootServiceId([9; 32]);
+        ctx.__set_origin(
+            crate::service::Origin::Actor(actor),
+            Some(colliding_service),
+        );
         assert!(
             !ctx.external_actor_origin_matches("private-age"),
             "the same actor id under another root is not the installed peer"
         );
-        ctx.__set_origin(crate::v2::Origin::Actor(actor), None);
+        ctx.__set_origin(crate::service::Origin::Actor(actor), None);
         assert!(
             !ctx.external_actor_origin_matches("private-age"),
             "an actor origin without causal service identity fails closed"
@@ -2245,7 +2255,7 @@ mod tests {
         let mut legacy: Context<TestActor> = Context::new(ServiceId(0));
         legacy.external_actors = ctx.external_actors;
         legacy.__set_origin(
-            crate::v2::Origin::Actor(actor),
+            crate::service::Origin::Actor(actor),
             Some(legacy.external_actors[0].service.clone()),
         );
         assert!(!legacy.external_actor_origin_matches("private-age"));

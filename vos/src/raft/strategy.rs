@@ -339,7 +339,7 @@ impl CommitStrategy for RaftCommit {
         // Durable-node rule, raft flavor: pure reads must not bloat the
         // log — even stronger here than for CRDT because every entry
         // costs an RTT under multi-node mode. An effect-bearing v3
-        // dispatch appends even when state is unchanged; v2 deltas fall
+        // dispatch appends even when state is unchanged; service deltas fall
         // back to value comparison.
         if !state_changed && !delta.effect_bearing && rest.is_empty() {
             return Ok(CommitReceipt {
@@ -652,9 +652,9 @@ mod tests {
         assert_eq!(s.last_applied(), 1);
 
         // New state → new entry.
-        s.commit_with_log(b"state-v2", &log).unwrap();
+        s.commit_with_log(b"state", &log).unwrap();
         assert_eq!(s.last_applied(), 2);
-        assert_eq!(s.restore(), Some(b"state-v2".to_vec()));
+        assert_eq!(s.restore(), Some(b"state".to_vec()));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -733,10 +733,10 @@ mod tests {
         s.commit_with_log(b"state-v1", &log).unwrap();
         assert_eq!(s.last_applied(), 2);
 
-        // Second propose: state=v2.
-        s.commit_with_log(b"state-v2", &EffectLog::for_msg(b"second".to_vec()))
+        // Second propose: state=service.
+        s.commit_with_log(b"state", &EffectLog::for_msg(b"second".to_vec()))
             .unwrap();
-        assert_eq!(s.restore(), Some(b"state-v2".to_vec()));
+        assert_eq!(s.restore(), Some(b"state".to_vec()));
         assert_eq!(s.last_applied(), 3);
 
         let _ = std::fs::remove_dir_all(dir);

@@ -5,23 +5,23 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
-use crate::v2::wire::{Decoder, Encoder};
-use crate::v2::{
-    AccumulationReceiptV2, ActorId, BlobRefV2, CallId, DecodeError, DeploymentId, Hash,
-    InvocationId, MethodPolicyV2, ProducerId, ProgramId, ProofCommitmentV2,
-    ProofVerificationRequestV2, ReceiptVerificationRequestV2, ReceiptVerificationV2,
-    RefineImportsV2, ServiceIdentityV2, SpaceId, TransitionV2, V2Wire, WorkEnvelopeV2,
+use crate::service::wire::{Decoder, Encoder};
+use crate::service::{
+    AccumulationReceipt, ActorId, BlobRef, CallId, DecodeError, DeploymentId, Hash, InvocationId,
+    MethodPolicy, ProducerId, ProgramId, ProofCommitment, ProofVerificationRequest,
+    ReceiptVerification, ReceiptVerificationRequest, RefineImports, ServiceIdentity, ServiceWire,
+    SpaceId, Transition, WorkEnvelope,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StateCommitmentV3 {
+pub enum StateCommitment {
     Linear(Hash),
     Crdt(Vec<Hash>),
 }
 
 /// Consensus-visible statement proved by an attested actor method.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttestationStatementV3 {
+pub struct AttestationStatement {
     pub statement_version: u16,
     pub space: SpaceId,
     pub actor: ActorId,
@@ -37,12 +37,12 @@ pub struct AttestationStatementV3 {
     pub invocation: InvocationId,
     /// Exact reply route committed by the accumulation receipt.
     pub reply_call: CallId,
-    pub before: StateCommitmentV3,
-    pub after: StateCommitmentV3,
+    pub before: StateCommitment,
+    pub after: StateCommitment,
     pub claim_commitment: Hash,
     pub input_commitment: Hash,
     pub authorization_policy: Hash,
-    pub accumulation_receipt: AccumulationReceiptV2,
+    pub accumulation_receipt: AccumulationReceipt,
 }
 
 /// Canonical public inputs returned by guest-owned attestation preparation.
@@ -51,24 +51,24 @@ pub struct AttestationStatementV3 {
 /// it must not reconstruct the method policy or predicted receipt outside the
 /// service guest.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttestationPreparationV2 {
-    pub receipt: AccumulationReceiptV2,
-    pub statement: AttestationStatementV3,
+pub struct AttestationPreparation {
+    pub receipt: AccumulationReceipt,
+    pub statement: AttestationStatement,
     /// Existing proof publication for an exact already-committed input.
     /// `None` means the transition still requires proof production and Apply.
-    pub committed_proof: Option<ProofCommitmentV2>,
+    pub committed_proof: Option<ProofCommitment>,
 }
 
-impl AttestationPreparationV2 {
+impl AttestationPreparation {
     pub fn for_transition(
-        work: &WorkEnvelopeV2,
-        transition: &TransitionV2,
-        policy: &MethodPolicyV2,
+        work: &WorkEnvelope,
+        transition: &Transition,
+        policy: &MethodPolicy,
         producer_name: &str,
         producer: ProducerId,
-        receipt: AccumulationReceiptV2,
+        receipt: AccumulationReceipt,
     ) -> Result<Self, AttestationError> {
-        let statement = AttestationStatementV3::for_transition(
+        let statement = AttestationStatement::for_transition(
             work,
             transition,
             policy,
@@ -90,7 +90,7 @@ impl AttestationPreparationV2 {
         }
         if let Some(proof) = &self.committed_proof
             && (proof.statement != self.statement.commitment()
-                || proof.statement_version != crate::v2::ATTESTATION_STATEMENT_VERSION)
+                || proof.statement_version != crate::service::ATTESTATION_STATEMENT_VERSION)
         {
             return Err(AttestationError::InvalidProof);
         }
@@ -101,8 +101,8 @@ impl AttestationPreparationV2 {
     /// proof producer will deterministically replay.
     pub fn validate_for_execution(
         &self,
-        work: &WorkEnvelopeV2,
-        transition: &TransitionV2,
+        work: &WorkEnvelope,
+        transition: &Transition,
     ) -> Result<(), AttestationError> {
         self.validate()?;
         let statement = &self.statement;
@@ -146,7 +146,7 @@ impl AttestationPreparationV2 {
     }
 }
 
-impl V2Wire for AttestationPreparationV2 {
+impl ServiceWire for AttestationPreparation {
     const MAGIC: [u8; 4] = *b"VAP2";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
@@ -163,13 +163,13 @@ impl V2Wire for AttestationPreparationV2 {
     }
 
     fn decode_body(decoder: &mut Decoder<'_>) -> Result<Self, DecodeError> {
-        let receipt = AccumulationReceiptV2::decode(&decoder.bytes()?)?;
-        let statement = AttestationStatementV3::decode(&decoder.bytes()?)?;
+        let receipt = AccumulationReceipt::decode(&decoder.bytes()?)?;
+        let statement = AttestationStatement::decode(&decoder.bytes()?)?;
         let committed_proof = decoder.option(|decoder| {
-            let proof = ProofCommitmentV2 {
+            let proof = ProofCommitment {
                 statement: Hash(decoder.fixed()?),
                 trace: Hash(decoder.fixed()?),
-                proof_blob: BlobRefV2 {
+                proof_blob: BlobRef {
                     hash: Hash(decoder.fixed()?),
                     len: decoder.u64()?,
                 },
@@ -178,7 +178,7 @@ impl V2Wire for AttestationPreparationV2 {
             if proof.statement == Hash::ZERO
                 || proof.trace == Hash::ZERO
                 || proof.proof_blob.len == u64::MAX
-                || proof.statement_version != crate::v2::ATTESTATION_STATEMENT_VERSION
+                || proof.statement_version != crate::service::ATTESTATION_STATEMENT_VERSION
             {
                 return Err(DecodeError::NonCanonical);
             }
@@ -194,18 +194,18 @@ impl V2Wire for AttestationPreparationV2 {
     }
 }
 
-impl AttestationStatementV3 {
+impl AttestationStatement {
     /// Construct the canonical statement for one prepared actor execution.
     ///
     /// Both proof production and guest Accumulate use this projection, so the
     /// host cannot substitute a method policy, receipt, or public claim.
     pub fn for_transition(
-        work: &WorkEnvelopeV2,
-        transition: &TransitionV2,
-        policy: &MethodPolicyV2,
+        work: &WorkEnvelope,
+        transition: &Transition,
+        policy: &MethodPolicy,
         producer_name: &str,
         producer: ProducerId,
-        receipt: AccumulationReceiptV2,
+        receipt: AccumulationReceipt,
     ) -> Result<Self, AttestationError> {
         if work.service != transition.service
             || work.service != receipt.service
@@ -219,9 +219,9 @@ impl AttestationStatementV3 {
                 != transition
                     .reply
                     .as_ref()
-                    .map(crate::v2::ReplyRecordV2::commitment)
+                    .map(crate::service::ReplyRecord::commitment)
             || receipt.outbox_commitment
-                != crate::v2::MessageRecordV2::outbox_commitment(&transition.outbox)
+                != crate::service::MessageRecord::outbox_commitment(&transition.outbox)
             || receipt.checkpoint != work.workflow_step
             || receipt.consistency != work.consistency
         {
@@ -233,16 +233,16 @@ impl AttestationStatementV3 {
             .filter(|reply| reply.producer == work.target)
             .ok_or(AttestationError::InvalidStatement)?;
         let before = match &work.base {
-            crate::v2::ConsistencyBaseV2::Linear { state_root, .. } => {
-                StateCommitmentV3::Linear(*state_root)
+            crate::service::ConsistencyBase::Linear { state_root, .. } => {
+                StateCommitment::Linear(*state_root)
             }
-            crate::v2::ConsistencyBaseV2::Crdt { heads } => StateCommitmentV3::Crdt(heads.clone()),
+            crate::service::ConsistencyBase::Crdt { heads } => StateCommitment::Crdt(heads.clone()),
         };
         let after = match receipt.consistency {
-            crate::v2::ConsistencyModeV2::Crdt => {
-                StateCommitmentV3::Crdt(receipt.resulting_crdt_heads.clone())
+            crate::service::ConsistencyMode::Crdt => {
+                StateCommitment::Crdt(receipt.resulting_crdt_heads.clone())
             }
-            _ => StateCommitmentV3::Linear(
+            _ => StateCommitment::Linear(
                 receipt
                     .resulting_state_root
                     .ok_or(AttestationError::InvalidStatement)?,
@@ -250,7 +250,7 @@ impl AttestationStatementV3 {
         };
         let authorization_input = authorization_input(&work.authorization);
         let value = Self {
-            statement_version: crate::v2::ATTESTATION_STATEMENT_VERSION,
+            statement_version: crate::service::ATTESTATION_STATEMENT_VERSION,
             space: work.service.space,
             actor: work.target,
             producer_name: producer_name.into(),
@@ -284,16 +284,16 @@ impl AttestationStatementV3 {
     }
 
     pub fn validate(&self) -> Result<(), AttestationError> {
-        if self.statement_version != crate::v2::ATTESTATION_STATEMENT_VERSION {
+        if self.statement_version != crate::service::ATTESTATION_STATEMENT_VERSION {
             return Err(AttestationError::WrongStatementVersion);
         }
         if self.method.is_empty()
             || self.producer_name.is_empty()
             || self.producer == ProducerId::ZERO
             || self.reply_call == CallId::ZERO
-            || self.accumulation_receipt.service.service_abi != crate::v2::ABI_VERSION
+            || self.accumulation_receipt.service.service_abi != crate::service::ABI_VERSION
             || self.accumulation_receipt.service.execution_semantics
-                != crate::v2::EXECUTION_SEMANTICS_ID
+                != crate::service::EXECUTION_SEMANTICS_ID
         {
             return Err(AttestationError::InvalidStatement);
         }
@@ -304,15 +304,17 @@ impl AttestationStatementV3 {
             return Err(AttestationError::ReceiptMismatch);
         }
         match (&self.before, &self.after) {
-            (StateCommitmentV3::Linear(_), StateCommitmentV3::Linear(after))
-                if self.accumulation_receipt.consistency != crate::v2::ConsistencyModeV2::Crdt
+            (StateCommitment::Linear(_), StateCommitment::Linear(after))
+                if self.accumulation_receipt.consistency
+                    != crate::service::ConsistencyMode::Crdt
                     && self.accumulation_receipt.resulting_state_root == Some(*after)
                     && self.accumulation_receipt.resulting_crdt_heads.is_empty() =>
             {
                 Ok(())
             }
-            (StateCommitmentV3::Crdt(before), StateCommitmentV3::Crdt(after))
-                if self.accumulation_receipt.consistency == crate::v2::ConsistencyModeV2::Crdt
+            (StateCommitment::Crdt(before), StateCommitment::Crdt(after))
+                if self.accumulation_receipt.consistency
+                    == crate::service::ConsistencyMode::Crdt
                     && self.accumulation_receipt.resulting_state_root.is_none()
                     && self.accumulation_receipt.resulting_crdt_heads == *after
                     && hashes_are_canonical(before)
@@ -325,18 +327,18 @@ impl AttestationStatementV3 {
     }
 }
 
-fn authorization_input(authorization: &crate::v2::AuthorizationEvidenceV2) -> Hash {
+fn authorization_input(authorization: &crate::service::AuthorizationEvidence) -> Hash {
     match authorization {
-        crate::v2::AuthorizationEvidenceV2::Public => Hash::ZERO,
-        crate::v2::AuthorizationEvidenceV2::Credential {
+        crate::service::AuthorizationEvidence::Public => Hash::ZERO,
+        crate::service::AuthorizationEvidence::Credential {
             credential_commitment,
             ..
         }
-        | crate::v2::AuthorizationEvidenceV2::PrivateCredential {
+        | crate::service::AuthorizationEvidence::PrivateCredential {
             credential_commitment,
             ..
         } => *credential_commitment,
-        crate::v2::AuthorizationEvidenceV2::SystemCapability { capability, .. } => {
+        crate::service::AuthorizationEvidence::SystemCapability { capability, .. } => {
             Hash(capability.0)
         }
     }
@@ -345,18 +347,18 @@ fn authorization_input(authorization: &crate::v2::AuthorizationEvidenceV2) -> Ha
 /// Exact replay input handed to the configured proof producer. It includes
 /// the protocol-pinned service scheduler, all canonical actor PVMs and blobs,
 /// the live work input/output, and the guest-derived public statement.
-pub struct AttestationProofRequestV2<'a> {
+pub struct AttestationProofRequest<'a> {
     pub canonical_service_pvm: &'a [u8],
-    pub work: &'a WorkEnvelopeV2,
-    pub imports: &'a RefineImportsV2,
-    pub transition: &'a TransitionV2,
-    pub preparation: &'a AttestationPreparationV2,
+    pub work: &'a WorkEnvelope,
+    pub imports: &'a RefineImports,
+    pub transition: &'a Transition,
+    pub preparation: &'a AttestationPreparation,
     /// Commitment produced by observing the service's exact canonical
     /// interpreter replay of `work`, `imports`, and `transition`.
     pub refine_trace: Hash,
 }
 
-impl AttestationProofRequestV2<'_> {
+impl AttestationProofRequest<'_> {
     pub fn validate(&self) -> Result<(), AttestationError> {
         if ProgramId::of_pvm(self.canonical_service_pvm) != self.work.service.service_program
             || self.imports.validate_for(self.work).is_err()
@@ -371,16 +373,16 @@ impl AttestationProofRequestV2<'_> {
 
 /// Trace and proof bytes produced from one exact canonical replay.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProducedAttestationProofV2 {
+pub struct ProducedAttestationProof {
     pub trace: Hash,
     pub proof: Vec<u8>,
 }
 
-impl ProducedAttestationProofV2 {
+impl ProducedAttestationProof {
     pub fn validate(&self) -> Result<(), AttestationError> {
         if self.trace == Hash::ZERO
             || self.proof.is_empty()
-            || self.proof.len() > crate::v2::MAX_ATTESTATION_PROOF_BYTES
+            || self.proof.len() > crate::service::MAX_ATTESTATION_PROOF_BYTES
         {
             return Err(AttestationError::InvalidProof);
         }
@@ -399,34 +401,34 @@ impl ProducedAttestationProofV2 {
 /// Canonical actor-PVM proof engine. Implementations may trace the live run or
 /// deterministically replay the exact request; they may not substitute an
 /// attestation-only program.
-pub trait AttestationProofProducerV2 {
+pub trait AttestationProofProducer {
     type Error;
 
     fn prove(
         &mut self,
-        request: &AttestationProofRequestV2<'_>,
-    ) -> Result<ProducedAttestationProofV2, Self::Error>;
+        request: &AttestationProofRequest<'_>,
+    ) -> Result<ProducedAttestationProof, Self::Error>;
 }
 
 /// Consensus-side verifier paired with an attestation proof producer.
 ///
 /// Production root registration requires one value which implements both
-/// this trait and [`AttestationProofProducerV2`]. Leaders may produce a proof,
+/// this trait and [`AttestationProofProducer`]. Leaders may produce a proof,
 /// but every replica independently invokes this verifier over the exact
 /// guest-derived public input before making that proof available to IC-5.
 /// Implementations must therefore be deterministic for a fixed execution
 /// semantics identity and proof artifact.
-/// For a streamed [`crate::v2::AttestationProofManifestV2`], verification
+/// For a streamed [`crate::service::AttestationProofManifest`], verification
 /// includes fetching every referenced segment from the backend's proof CAS,
 /// rejecting a segment larger than
-/// [`crate::v2::MAX_ATTESTATION_PROOF_SEGMENT_BYTES`], and checking the
+/// [`crate::service::MAX_ATTESTATION_PROOF_SEGMENT_BYTES`], and checking the
 /// complete ordered chain rather than trusting manifest presence.
-pub trait AttestationProofVerifierV2 {
+pub trait AttestationProofVerifier {
     type Error;
 
     fn verify(
         &mut self,
-        request: &ProofVerificationRequestV2,
+        request: &ProofVerificationRequest,
         proof: &[u8],
     ) -> Result<bool, Self::Error>;
 }
@@ -435,21 +437,15 @@ pub trait AttestationProofVerifierV2 {
 ///
 /// The marker prevents a node from attaching a producer which can mint proof
 /// bytes but cannot independently validate them during follower replay.
-pub trait AttestationProofBackendV2:
-    AttestationProofProducerV2 + AttestationProofVerifierV2
-{
-}
+pub trait AttestationProofBackend: AttestationProofProducer + AttestationProofVerifier {}
 
-impl<T> AttestationProofBackendV2 for T where
-    T: AttestationProofProducerV2 + AttestationProofVerifierV2
-{
-}
+impl<T> AttestationProofBackend for T where T: AttestationProofProducer + AttestationProofVerifier {}
 
 /// Host cache/verifier seam used after proof generation and before Apply.
 /// Making proof bytes available is not a service-state commit and never
 /// publishes an application attestation package.
-pub trait AttestationProofHostV2 {
-    fn make_proof_available(&mut self, request: &ProofVerificationRequestV2, proof: &[u8]) -> bool;
+pub trait AttestationProofHost {
+    fn make_proof_available(&mut self, request: &ProofVerificationRequest, proof: &[u8]) -> bool;
 
     /// Whether recovered Raft snapshots must carry durable proof-verifier
     /// provenance. Conformance hosts return `false`; production hosts return
@@ -462,12 +458,12 @@ pub trait AttestationProofHostV2 {
     /// Production hosts back this with their durable proof CAS; conformance
     /// hosts may return `None` after a process restart and deterministically
     /// reproduce the proof instead.
-    fn proof_bytes(&self, _reference: &BlobRefV2) -> Option<Vec<u8>> {
+    fn proof_bytes(&self, _reference: &BlobRef) -> Option<Vec<u8>> {
         None
     }
 }
 
-impl V2Wire for AttestationStatementV3 {
+impl ServiceWire for AttestationStatement {
     const MAGIC: [u8; 4] = *b"VOSA";
 
     fn encode_body(&self, out: &mut Vec<u8>) {
@@ -509,7 +505,7 @@ impl V2Wire for AttestationStatementV3 {
             claim_commitment: Hash(decoder.fixed()?),
             input_commitment: Hash(decoder.fixed()?),
             authorization_policy: Hash(decoder.fixed()?),
-            accumulation_receipt: AccumulationReceiptV2::decode(&decoder.bytes()?)?,
+            accumulation_receipt: AccumulationReceipt::decode(&decoder.bytes()?)?,
         };
         value.validate().map_err(|_| DecodeError::NonCanonical)?;
         Ok(value)
@@ -520,23 +516,23 @@ fn hashes_are_canonical(values: &[Hash]) -> bool {
     values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
-fn encode_state(encoder: &mut Encoder<'_>, state: &StateCommitmentV3) {
+fn encode_state(encoder: &mut Encoder<'_>, state: &StateCommitment) {
     match state {
-        StateCommitmentV3::Linear(root) => {
+        StateCommitment::Linear(root) => {
             encoder.u8(0);
             encoder.fixed(&root.0);
         }
-        StateCommitmentV3::Crdt(heads) => {
+        StateCommitment::Crdt(heads) => {
             encoder.u8(1);
             encoder.list(heads, |encoder, head| encoder.fixed(&head.0));
         }
     }
 }
 
-fn decode_state(decoder: &mut Decoder<'_>) -> Result<StateCommitmentV3, DecodeError> {
+fn decode_state(decoder: &mut Decoder<'_>) -> Result<StateCommitment, DecodeError> {
     match decoder.u8()? {
-        0 => Ok(StateCommitmentV3::Linear(Hash(decoder.fixed()?))),
-        1 => Ok(StateCommitmentV3::Crdt(
+        0 => Ok(StateCommitment::Linear(Hash(decoder.fixed()?))),
+        1 => Ok(StateCommitment::Crdt(
             decoder.list(|decoder| decoder.fixed().map(Hash))?,
         )),
         _ => Err(DecodeError::InvalidTag),
@@ -549,7 +545,7 @@ fn decode_state(decoder: &mut Decoder<'_>) -> Result<StateCommitmentV3, DecodeEr
 pub struct Attestation<T, M> {
     producer_name: String,
     producer: ProducerId,
-    statement: AttestationStatementV3,
+    statement: AttestationStatement,
     trace: Hash,
     claim_wire: Vec<u8>,
     preview: T,
@@ -558,7 +554,7 @@ pub struct Attestation<T, M> {
 }
 
 /// Generated binding between an attested method marker, its return type, and
-/// the exact actor reply wire committed by `TransitionV2`.
+/// the exact actor reply wire committed by `Transition`.
 pub trait AttestedMethod<T> {
     const METHOD: &'static str;
 
@@ -572,7 +568,7 @@ impl<T, M> Attestation<T, M> {
     pub fn __from_runtime(
         producer_name: String,
         producer: ProducerId,
-        statement: AttestationStatementV3,
+        statement: AttestationStatement,
         trace: Hash,
         preview: T,
         proof: Vec<u8>,
@@ -596,7 +592,7 @@ impl<T, M> Attestation<T, M> {
     pub fn __from_runtime_wire(
         producer_name: String,
         producer: ProducerId,
-        statement: AttestationStatementV3,
+        statement: AttestationStatement,
         trace: Hash,
         claim_wire: Vec<u8>,
         preview: T,
@@ -625,7 +621,7 @@ impl<T, M> Attestation<T, M> {
         package.statement.validate()?;
         if package.trace == Hash::ZERO
             || package.proof.is_empty()
-            || package.proof.len() > crate::v2::MAX_ATTESTATION_PROOF_BYTES
+            || package.proof.len() > crate::service::MAX_ATTESTATION_PROOF_BYTES
         {
             return Err(AttestationError::InvalidProof);
         }
@@ -654,7 +650,7 @@ impl<T, M> Attestation<T, M> {
         &self.preview
     }
 
-    pub fn statement(&self) -> &AttestationStatementV3 {
+    pub fn statement(&self) -> &AttestationStatement {
         &self.statement
     }
 
@@ -679,7 +675,7 @@ impl<T, M> Attestation<T, M> {
         }
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"VAT3");
-        bytes.extend_from_slice(&crate::v2::ABI_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&crate::service::ABI_VERSION.to_le_bytes());
         let mut encoder = Encoder(&mut bytes);
         encoder.string(&self.producer_name);
         encoder.fixed(&self.producer.0);
@@ -698,14 +694,14 @@ impl<T, M> Attestation<T, M> {
         if decoder.take(4).map_err(invalid_package)? != b"VAT3" {
             return Err(AttestationError::InvalidPackage(DecodeError::InvalidTag));
         }
-        if decoder.u16().map_err(invalid_package)? != crate::v2::ABI_VERSION {
+        if decoder.u16().map_err(invalid_package)? != crate::service::ABI_VERSION {
             return Err(AttestationError::InvalidPackage(
                 DecodeError::InvalidVersion,
             ));
         }
         let producer_name = decoder.string().map_err(invalid_package)?;
         let producer = ProducerId(decoder.fixed().map_err(invalid_package)?);
-        let statement = AttestationStatementV3::decode(&decoder.bytes().map_err(invalid_package)?)
+        let statement = AttestationStatement::decode(&decoder.bytes().map_err(invalid_package)?)
             .map_err(invalid_package)?;
         let trace = Hash(decoder.fixed().map_err(invalid_package)?);
         let claim_wire = decoder.bytes().map_err(invalid_package)?;
@@ -735,15 +731,15 @@ fn invalid_package(error: DecodeError) -> AttestationError {
 }
 
 fn validate_portable_field_len(len: usize) -> Result<(), AttestationError> {
-    if len > crate::v2::wire::MAX_BYTES {
+    if len > crate::service::wire::MAX_BYTES {
         Err(AttestationError::InvalidPackage(DecodeError::LimitExceeded))
     } else {
         Ok(())
     }
 }
 
-fn claim_reply_commitment(statement: &AttestationStatementV3, claim_wire: &[u8]) -> Hash {
-    crate::v2::ReplyRecordV2 {
+fn claim_reply_commitment(statement: &AttestationStatement, claim_wire: &[u8]) -> Hash {
+    crate::service::ReplyRecord {
         call_id: statement.reply_call,
         producer: statement.actor,
         result: claim_wire.to_vec(),
@@ -815,14 +811,14 @@ pub trait ProofVerifier {
 /// portable package. Actor proof verification alone is insufficient because
 /// the proof is constructed before Accumulate commits the transition.
 pub trait ReceiptVerifier {
-    fn verify_receipt(&self, request: &ReceiptVerificationRequestV2) -> ReceiptVerificationV2;
+    fn verify_receipt(&self, request: &ReceiptVerificationRequest) -> ReceiptVerification;
 }
 
 impl<F> ReceiptVerifier for F
 where
-    F: Fn(&ReceiptVerificationRequestV2) -> ReceiptVerificationV2,
+    F: Fn(&ReceiptVerificationRequest) -> ReceiptVerification,
 {
-    fn verify_receipt(&self, request: &ReceiptVerificationRequestV2) -> ReceiptVerificationV2 {
+    fn verify_receipt(&self, request: &ReceiptVerificationRequest) -> ReceiptVerification {
         self(request)
     }
 }
@@ -873,7 +869,7 @@ impl AttestationReplayStore for AttestationReplayGuard {
 /// [`VerifyAttestationBuilder::from`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttestationSource {
-    pub service: ServiceIdentityV2,
+    pub service: ServiceIdentity,
     pub actor: ActorId,
     /// Deployment identity of the current signature-verified actor package.
     pub actor_deployment: DeploymentId,
@@ -941,13 +937,13 @@ pub fn verify_once<T, M: AttestedMethod<T>>(
     {
         return Err(AttestationError::ReceiptMismatch);
     }
-    match receipt_verifier.verify_receipt(&ReceiptVerificationRequestV2 {
+    match receipt_verifier.verify_receipt(&ReceiptVerificationRequest {
         expected_producer: package.statement.actor,
         receipt: package.statement.accumulation_receipt.clone(),
     }) {
-        ReceiptVerificationV2::Valid => {}
-        ReceiptVerificationV2::Invalid => return Err(AttestationError::InvalidReceipt),
-        ReceiptVerificationV2::Unavailable => {
+        ReceiptVerification::Valid => {}
+        ReceiptVerification::Invalid => return Err(AttestationError::InvalidReceipt),
+        ReceiptVerification::Unavailable => {
             return Err(AttestationError::ReceiptUnavailable);
         }
     }
@@ -1079,7 +1075,7 @@ mod tests {
     use alloc::vec;
 
     use crate::Encode;
-    use crate::v2::{ConsistencyModeV2, ReplyRecordV2, RootServiceId, ServiceIdentityV2};
+    use crate::service::{ConsistencyMode, ReplyRecord, RootServiceId, ServiceIdentity};
 
     use super::*;
 
@@ -1138,20 +1134,20 @@ mod tests {
         let actor_deployment = DeploymentId([30; 32]);
         let invocation = InvocationId([10; 32]);
         let actor = ActorId([7; 32]);
-        let reply = ReplyRecordV2 {
+        let reply = ReplyRecord {
             call_id: invocation.root_reply_id(),
             producer: actor,
             result: Method::claim_wire(&claim),
         };
-        let receipt = AccumulationReceiptV2 {
-            service: ServiceIdentityV2 {
+        let receipt = AccumulationReceipt {
+            service: ServiceIdentity {
                 space: SpaceId([6; 32]),
                 root_service: RootServiceId([1; 32]),
                 deployment: service_deployment,
                 service_program: ProgramId([2; 32]),
-                service_abi: crate::v2::ABI_VERSION,
-                execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
-                gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
+                service_abi: crate::service::ABI_VERSION,
+                execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
+                gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
             },
             accepted_transition: Hash([4; 32]),
             reply_commitment: Some(reply.commitment()),
@@ -1160,10 +1156,10 @@ mod tests {
             resulting_crdt_heads: vec![],
             sequence: 1,
             checkpoint: 1,
-            consistency: ConsistencyModeV2::Local,
+            consistency: ConsistencyMode::Local,
         };
-        let statement = AttestationStatementV3 {
-            statement_version: crate::v2::ATTESTATION_STATEMENT_VERSION,
+        let statement = AttestationStatement {
+            statement_version: crate::service::ATTESTATION_STATEMENT_VERSION,
             space: SpaceId([6; 32]),
             actor,
             producer_name: "private-age".to_string(),
@@ -1174,8 +1170,8 @@ mod tests {
             schema: Hash([9; 32]),
             invocation,
             reply_call: reply.call_id,
-            before: StateCommitmentV3::Linear(Hash([11; 32])),
-            after: StateCommitmentV3::Linear(Hash([5; 32])),
+            before: StateCommitment::Linear(Hash([11; 32])),
+            after: StateCommitment::Linear(Hash([5; 32])),
             claim_commitment: Hash::digest(
                 b"vos/attestation-claim/v3",
                 &[&Method::claim_wire(&claim)],
@@ -1208,8 +1204,8 @@ mod tests {
         }
     }
 
-    fn finalized(_: &ReceiptVerificationRequestV2) -> ReceiptVerificationV2 {
-        ReceiptVerificationV2::Valid
+    fn finalized(_: &ReceiptVerificationRequest) -> ReceiptVerification {
+        ReceiptVerification::Valid
     }
 
     #[test]
@@ -1290,7 +1286,7 @@ mod tests {
         );
 
         let mut wrong_state = package(23);
-        wrong_state.statement.after = StateCommitmentV3::Linear(Hash([99; 32]));
+        wrong_state.statement.after = StateCommitment::Linear(Hash([99; 32]));
         assert_eq!(
             verify_once(
                 wrong_state,
@@ -1359,7 +1355,7 @@ mod tests {
     #[test]
     fn verification_requires_finality_and_the_current_resolved_deployment() {
         let verifier = |_: ProgramId, _: Hash, _: Hash, _: Hash, proof: &[u8]| proof == [1];
-        let unavailable = |_: &ReceiptVerificationRequestV2| ReceiptVerificationV2::Unavailable;
+        let unavailable = |_: &ReceiptVerificationRequest| ReceiptVerification::Unavailable;
         assert_eq!(
             verify_once(
                 package(28),
@@ -1372,7 +1368,7 @@ mod tests {
             Err(AttestationError::ReceiptUnavailable)
         );
 
-        let invalid = |_: &ReceiptVerificationRequestV2| ReceiptVerificationV2::Invalid;
+        let invalid = |_: &ReceiptVerificationRequest| ReceiptVerification::Invalid;
         assert_eq!(
             verify_once(
                 package(28),
@@ -1511,14 +1507,14 @@ mod tests {
     #[test]
     fn portable_package_preserves_wire_errors_and_bounds_encoding() {
         assert_eq!(
-            validate_portable_field_len(crate::v2::wire::MAX_BYTES + 1),
+            validate_portable_field_len(crate::service::wire::MAX_BYTES + 1),
             Err(AttestationError::InvalidPackage(DecodeError::LimitExceeded))
         );
 
         let mut oversized = Vec::new();
         oversized.extend_from_slice(b"VAT3");
-        oversized.extend_from_slice(&crate::v2::ABI_VERSION.to_le_bytes());
-        Encoder(&mut oversized).u32((crate::v2::wire::MAX_BYTES + 1) as u32);
+        oversized.extend_from_slice(&crate::service::ABI_VERSION.to_le_bytes());
+        Encoder(&mut oversized).u32((crate::service::wire::MAX_BYTES + 1) as u32);
         assert!(matches!(
             Attestation::<u64, Method>::from_portable_bytes(&oversized),
             Err(AttestationError::InvalidPackage(DecodeError::LimitExceeded))
@@ -1540,7 +1536,7 @@ mod tests {
         let canonical = AmbiguousOption::claim_wire(&None);
         statement.claim_commitment = Hash::digest(b"vos/attestation-claim/v3", &[&canonical]);
         statement.accumulation_receipt.reply_commitment = Some(
-            crate::v2::ReplyRecordV2 {
+            crate::service::ReplyRecord {
                 call_id: statement.reply_call,
                 producer: statement.actor,
                 result: canonical,
@@ -1565,7 +1561,7 @@ mod tests {
         );
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"VAT3");
-        bytes.extend_from_slice(&crate::v2::ABI_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&crate::service::ABI_VERSION.to_le_bytes());
         let mut encoder = Encoder(&mut bytes);
         encoder.string(&package.producer_name);
         encoder.fixed(&package.producer.0);
@@ -1582,47 +1578,47 @@ mod tests {
     #[test]
     fn preparation_wire_binds_the_guest_receipt_to_the_statement() {
         let package = package(21);
-        let preparation = AttestationPreparationV2 {
+        let preparation = AttestationPreparation {
             receipt: package.statement.accumulation_receipt.clone(),
             statement: package.statement.clone(),
             committed_proof: None,
         };
         assert_eq!(
-            AttestationPreparationV2::decode(&preparation.encode()).unwrap(),
+            AttestationPreparation::decode(&preparation.encode()).unwrap(),
             preparation
         );
 
         let mut committed = preparation.clone();
-        committed.committed_proof = Some(ProofCommitmentV2 {
+        committed.committed_proof = Some(ProofCommitment {
             statement: committed.statement.commitment(),
             trace: Hash([17; 32]),
-            proof_blob: BlobRefV2::of_bytes(b"committed proof"),
-            statement_version: crate::v2::ATTESTATION_STATEMENT_VERSION,
+            proof_blob: BlobRef::of_bytes(b"committed proof"),
+            statement_version: crate::service::ATTESTATION_STATEMENT_VERSION,
         });
         assert_eq!(
-            AttestationPreparationV2::decode(&committed.encode()).unwrap(),
+            AttestationPreparation::decode(&committed.encode()).unwrap(),
             committed
         );
 
         let mut mismatched = preparation;
         mismatched.receipt.sequence += 1;
         assert_eq!(
-            AttestationPreparationV2::decode(&mismatched.encode()),
+            AttestationPreparation::decode(&mismatched.encode()),
             Err(DecodeError::NonCanonical)
         );
 
         committed.committed_proof.as_mut().unwrap().statement = Hash([18; 32]);
         assert_eq!(
-            AttestationPreparationV2::decode(&committed.encode()),
+            AttestationPreparation::decode(&committed.encode()),
             Err(DecodeError::NonCanonical)
         );
     }
 
     #[test]
     fn produced_proofs_must_fit_the_durable_actor_resume_window() {
-        let proof = ProducedAttestationProofV2 {
+        let proof = ProducedAttestationProof {
             trace: Hash([1; 32]),
-            proof: vec![0; crate::v2::MAX_ATTESTATION_PROOF_BYTES + 1],
+            proof: vec![0; crate::service::MAX_ATTESTATION_PROOF_BYTES + 1],
         };
         assert_eq!(proof.validate(), Err(AttestationError::InvalidProof));
 
@@ -1642,7 +1638,7 @@ mod tests {
 
     #[test]
     fn produced_proof_must_bind_the_live_refine_trace() {
-        let proof = ProducedAttestationProofV2 {
+        let proof = ProducedAttestationProof {
             trace: Hash([1; 32]),
             proof: vec![2],
         };

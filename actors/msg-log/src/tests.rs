@@ -40,14 +40,14 @@ fn run<F: core::future::Future>(fut: F) -> F::Output {
     }
 }
 
-fn test_change(domain: &[u8], identity: &[u8]) -> vos::v2::ChangeId {
-    vos::v2::ChangeId::new(vos::InvocationId::derive(domain, identity).0)
+fn test_change(domain: &[u8], identity: &[u8]) -> vos::service::ChangeId {
+    vos::service::ChangeId::new(vos::InvocationId::derive(domain, identity).0)
 }
 
 fn dispatch_with_change<M>(
     l: &mut MsgLog,
     msg: M,
-    change: vos::v2::ChangeId,
+    change: vos::service::ChangeId,
 ) -> <MsgLog as Message<M>>::Output
 where
     MsgLog: Message<M>,
@@ -56,7 +56,7 @@ where
     // guest-style allocator is process-global. Serialise direct dispatches as
     // the real single-threaded actor VM does.
     let _scope = TEST_CHANGE_SCOPE.lock().expect("test change scope lock");
-    let dispatch = vos::v2::CrdtDispatchV2 { change, ordinal: 0 };
+    let dispatch = vos::service::CrdtDispatch { change, ordinal: 0 };
     let scoped_change = crdt::ChangeId::for_dispatch(change, TEST_ACTOR, dispatch.ordinal);
     let mut ctx: vos::Context<MsgLog> = vos::Context::new(ServiceId(0));
     let output = crdt::with_change(scoped_change, || {

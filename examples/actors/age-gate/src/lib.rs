@@ -29,14 +29,14 @@ mod tests {
         task::{Context, Poll, Wake, Waker},
     };
 
-    use vos::v2::{
-        AccumulationReceiptV2, ActorId, ConsistencyModeV2, DeploymentId, Hash, InvocationId,
-        ProducerId, ProgramId, ReceiptVerificationV2, ReplyRecordV2, RootServiceId,
-        ServiceIdentityV2, SpaceId,
+    use vos::service::{
+        AccumulationReceipt, ActorId, ConsistencyMode, DeploymentId, Hash, InvocationId,
+        ProducerId, ProgramId, ReceiptVerification, ReplyRecord, RootServiceId,
+        ServiceIdentity, SpaceId,
     };
     use vos::{
-        AttestationReplayGuard, AttestationSource, AttestationStatementV3, AttestedMethod,
-        StateCommitmentV3,
+        AttestationReplayGuard, AttestationSource, AttestationStatement, AttestedMethod,
+        StateCommitment,
     };
 
     use super::*;
@@ -67,19 +67,19 @@ mod tests {
         let reply_call = invocation.root_reply_id();
         let claim_wire = <IsAdult as AttestedMethod<AgeClaim>>::claim_wire(&claim);
         let deployment = DeploymentId([3; 32]);
-        let receipt = AccumulationReceiptV2 {
-            service: ServiceIdentityV2 {
+        let receipt = AccumulationReceipt {
+            service: ServiceIdentity {
                 space: SpaceId([6; 32]),
                 root_service: RootServiceId([1; 32]),
                 deployment,
                 service_program: ProgramId([2; 32]),
-                service_abi: vos::v2::ABI_VERSION,
-                execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
-                gas_schedule: vos::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
+                service_abi: vos::service::ABI_VERSION,
+                execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
+                gas_schedule: vos::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
             },
             accepted_transition: Hash([4; 32]),
             reply_commitment: Some(
-                ReplyRecordV2 {
+                ReplyRecord {
                     call_id: reply_call,
                     producer: actor,
                     result: claim_wire.clone(),
@@ -91,10 +91,10 @@ mod tests {
             resulting_crdt_heads: vec![],
             sequence: 1,
             checkpoint: 1,
-            consistency: ConsistencyModeV2::Local,
+            consistency: ConsistencyMode::Local,
         };
-        let statement = AttestationStatementV3 {
-            statement_version: vos::v2::ATTESTATION_STATEMENT_VERSION,
+        let statement = AttestationStatement {
+            statement_version: vos::service::ATTESTATION_STATEMENT_VERSION,
             space: SpaceId([6; 32]),
             actor,
             producer_name: "private-age".into(),
@@ -105,8 +105,8 @@ mod tests {
             schema: Hash([9; 32]),
             invocation,
             reply_call,
-            before: StateCommitmentV3::Linear(Hash([11; 32])),
-            after: StateCommitmentV3::Linear(Hash([5; 32])),
+            before: StateCommitment::Linear(Hash([11; 32])),
+            after: StateCommitment::Linear(Hash([5; 32])),
             claim_commitment: Hash::digest(b"vos/attestation-claim/v3", &[&claim_wire]),
             input_commitment: Hash([13; 32]),
             authorization_policy: Hash([14; 32]),
@@ -138,7 +138,7 @@ mod tests {
         let resolver = move |name: &str, method: &str| {
             (name == "private-age" && method == IsAdult::METHOD).then(|| source.clone())
         };
-        let finalized = |_: &vos::v2::ReceiptVerificationRequestV2| ReceiptVerificationV2::Valid;
+        let finalized = |_: &vos::service::ReceiptVerificationRequest| ReceiptVerification::Valid;
         let verifier = |_: ProgramId, _: Hash, _: Hash, _: Hash, proof: &[u8]| proof == [1];
         let mut replay = AttestationReplayGuard::default();
         let mut context = VerificationContext::new(&resolver, &finalized, &verifier, &mut replay);

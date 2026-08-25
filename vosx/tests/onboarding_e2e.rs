@@ -99,8 +99,8 @@ fn find_endpoint(root: &Path) -> Option<PathBuf> {
     None
 }
 
-fn spawned_v2_root_id(log: &Path, name: &str) -> Option<String> {
-    let marker = format!("v2 root tree '{name}' spawned as ");
+fn spawned_service_root_id(log: &Path, name: &str) -> Option<String> {
+    let marker = format!("service root tree '{name}' spawned as ");
     fs::read_to_string(log)
         .ok()?
         .lines()
@@ -258,7 +258,7 @@ fn spawn_up_with_service_trust_and_connects(
     if let Some(path) = service_pvm {
         command.arg("--service-pvm").arg(path);
         if production_trust_socket.is_none() {
-            command.arg("--allow-v2-conformance");
+            command.arg("--allow-conformance");
         }
     }
     if let Some(path) = production_trust_socket {
@@ -293,8 +293,8 @@ struct TestProductionTrustSidecar {
 #[derive(Default)]
 struct TestProductionTrustObservations {
     tags: Vec<u8>,
-    installs: Vec<vos::v2::ServiceGenesisV2>,
-    receipts: Vec<vos::v2::ReceiptVerificationRequestV2>,
+    installs: Vec<vos::service::ServiceGenesis>,
+    receipts: Vec<vos::service::ReceiptVerificationRequest>,
 }
 
 impl TestProductionTrustSidecar {
@@ -315,7 +315,7 @@ impl TestProductionTrustSidecar {
     const POLICY: u8 = 5;
     const LOGICAL_TIMESLOT: u64 = 1_000;
 
-    fn start(path: PathBuf, policy: vos::v2::Hash) -> Self {
+    fn start(path: PathBuf, policy: vos::service::Hash) -> Self {
         let listener = UnixListener::bind(&path).expect("bind production trust sidecar");
         listener
             .set_nonblocking(true)
@@ -360,8 +360,10 @@ impl TestProductionTrustSidecar {
                 let payload_len = u32::from_le_bytes(request[7..11].try_into().unwrap()) as usize;
                 assert_eq!(payload_len, request.len() - 11);
 
-                let request_hash =
-                    vos::v2::Hash::digest(b"vos/production-trust-socket/request/v1", &[&request]);
+                let request_hash = vos::service::Hash::digest(
+                    b"vos/production-trust-socket/request/v1",
+                    &[&request],
+                );
                 let result = Self::classify(
                     tag,
                     &request[11..],
@@ -398,7 +400,7 @@ impl TestProductionTrustSidecar {
     }
 
     fn classify(tag: u8, payload: &[u8], observations: &mut TestProductionTrustObservations) -> u8 {
-        use vos::v2::V2Wire;
+        use vos::service::ServiceWire;
 
         let valid = match tag {
             Self::QUERY_POLICY if payload.is_empty() => {
@@ -414,21 +416,22 @@ impl TestProductionTrustSidecar {
                 .map(u64::from_le_bytes)
                 .is_ok_and(|slot| slot == Self::LOGICAL_TIMESLOT),
             Self::VERIFY_PROOF => Self::decode_pair(payload).is_some_and(|(request, proof)| {
-                vos::v2::ProofVerificationRequestV2::decode(request)
+                vos::service::ProofVerificationRequest::decode(request)
                     .is_ok_and(|request| request.proof_blob.matches(proof))
             }),
-            Self::VERIFY_INSTALL => match vos::v2::ServiceGenesisV2::decode(payload) {
+            Self::VERIFY_INSTALL => match vos::service::ServiceGenesis::decode(payload) {
                 Ok(genesis) => {
                     observations.installs.push(genesis);
                     true
                 }
                 Err(_) => false,
             },
-            Self::VERIFY_UPGRADE => vos::v2::ActorUpgradeV2::decode(payload).is_ok(),
+            Self::VERIFY_UPGRADE => vos::service::ActorUpgrade::decode(payload).is_ok(),
             Self::VERIFY_ROLE => {
-                vos::v2::RoleCredentialVerificationRequestV2::decode(payload).is_ok()
+                vos::service::RoleCredentialVerificationRequest::decode(payload).is_ok()
             }
-            Self::VERIFY_RECEIPT => match vos::v2::ReceiptVerificationRequestV2::decode(payload) {
+            Self::VERIFY_RECEIPT => match vos::service::ReceiptVerificationRequest::decode(payload)
+            {
                 Ok(request) => {
                     observations.receipts.push(request);
                     true
@@ -470,7 +473,11 @@ impl TestProductionTrustSidecar {
             .count()
     }
 
-    fn saw_install_for(&self, actor_name: &str, consistency: vos::v2::ConsistencyModeV2) -> bool {
+    fn saw_install_for(
+        &self,
+        actor_name: &str,
+        consistency: vos::service::ConsistencyMode,
+    ) -> bool {
         self.observations
             .lock()
             .unwrap()
@@ -485,8 +492,8 @@ impl TestProductionTrustSidecar {
     fn receipt_digests_for(
         &self,
         actor_name: &str,
-        consistency: vos::v2::ConsistencyModeV2,
-    ) -> Vec<vos::v2::Hash> {
+        consistency: vos::service::ConsistencyMode,
+    ) -> Vec<vos::service::Hash> {
         let observations = self.observations.lock().unwrap();
         let Some(service) = observations
             .installs
@@ -514,9 +521,9 @@ impl TestProductionTrustSidecar {
     fn new_receipt_digests_since(
         &self,
         actor_name: &str,
-        consistency: vos::v2::ConsistencyModeV2,
-        baseline: &[vos::v2::Hash],
-    ) -> Vec<vos::v2::Hash> {
+        consistency: vos::service::ConsistencyMode,
+        baseline: &[vos::service::Hash],
+    ) -> Vec<vos::service::Hash> {
         self.receipt_digests_for(actor_name, consistency)
             .into_iter()
             .filter(|digest| !baseline.contains(digest))
@@ -526,9 +533,9 @@ impl TestProductionTrustSidecar {
     fn newest_receipt_digest_since(
         &self,
         actor_name: &str,
-        consistency: vos::v2::ConsistencyModeV2,
-        baseline: &[vos::v2::Hash],
-    ) -> Option<vos::v2::Hash> {
+        consistency: vos::service::ConsistencyMode,
+        baseline: &[vos::service::Hash],
+    ) -> Option<vos::service::Hash> {
         let observations = self.observations.lock().unwrap();
         let service = observations
             .installs
@@ -558,8 +565,8 @@ fn combined_receipt_digests_for(
     left: &TestProductionTrustSidecar,
     right: &TestProductionTrustSidecar,
     actor_name: &str,
-    consistency: vos::v2::ConsistencyModeV2,
-) -> Vec<vos::v2::Hash> {
+    consistency: vos::service::ConsistencyMode,
+) -> Vec<vos::service::Hash> {
     let mut digests = left.receipt_digests_for(actor_name, consistency);
     for digest in right.receipt_digests_for(actor_name, consistency) {
         if !digests.contains(&digest) {
@@ -581,7 +588,7 @@ impl Drop for TestProductionTrustSidecar {
 
 fn counter_package_fixture(output_dir: &Path) -> PathBuf {
     let actor_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../examples/actors/target/riscv64em-vos/release/v2_counter.elf");
+        .join("../examples/actors/target/riscv64em-vos/release/service_counter.elf");
     assert!(
         actor_elf.is_file(),
         "build the public counter first: `just build-examples` ({})",
@@ -612,11 +619,11 @@ fn counter_package_fixture(output_dir: &Path) -> PathBuf {
 
 fn crdt_counter_package_fixture(output_dir: &Path) -> PathBuf {
     let actor_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-        "../tests/fixtures/v2/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter_v2.elf",
+        "../tests/fixtures/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
     );
     assert!(
         actor_elf.is_file(),
-        "build the v2 CRDT counter first: `just build-v2-registry-fixtures` ({})",
+        "build the service CRDT counter first: `just build-registry-fixtures` ({})",
         actor_elf.display(),
     );
     let build_data = output_dir.join("build-data");
@@ -663,9 +670,9 @@ fn authority_upgrade_package_fixture(
             "build",
             &actor,
             "--name",
-            vos::v2::ROLE_AUTHORITY_INSTANCE_V2,
+            vos::service::ROLE_AUTHORITY_INSTANCE_,
             "--version",
-            "migration-v2",
+            "migration",
             "--out-dir",
             &out,
         ],
@@ -675,7 +682,7 @@ fn authority_upgrade_package_fixture(
         package.is_file(),
         "vosx build must emit the root-signed authority candidate"
     );
-    let candidate = <vos::v2::VosPackageV2 as vos::v2::V2Wire>::decode(
+    let candidate = <vos::service::VosPackage as vos::service::ServiceWire>::decode(
         &fs::read(&package).expect("read authority candidate"),
     )
     .expect("decode authority candidate");
@@ -684,7 +691,7 @@ fn authority_upgrade_package_fixture(
             .expect("read canonical ABI-17 authority PVM");
     assert_ne!(
         candidate.manifest.actor_program,
-        vos::v2::ProgramId::of_pvm(&frozen),
+        vos::service::ProgramId::of_pvm(&frozen),
         "the migration gate must exercise a real authority code change",
     );
     package
@@ -695,7 +702,7 @@ fn assert_bundled_space_authority_matches_abi_17_program() {
     let bundled = fs::read(workspace.join("vosx/blobs/space_authority.pvm"))
         .expect("vosx ships the canonical authority PVM");
     assert_eq!(
-        hex::encode(vos::v2::ProgramId::of_pvm(&bundled).0),
+        hex::encode(vos::service::ProgramId::of_pvm(&bundled).0),
         "79099ccbec4e4dac7af893e153ba379a1d33aa75734daf1d93cbba3e684d65eb",
         "the built-in authority program must implement the current ABI-17 private-input contract",
     );
@@ -775,7 +782,7 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
     let data_b = TempDir::new("b-data");
     let cfg_b = TempDir::new("b-config");
 
-    // ── host A: create + boot + install a MEMBER-floor v2 actor ────
+    // ── host A: create + boot + install a MEMBER-floor service actor ────
     let (data_a, cfg_a, _daemon_a, log_a) = boot_admin_with_service(space, Some(&service_pvm));
     vosx_ok(
         data_a.path(),
@@ -890,7 +897,7 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
         },
     );
 
-    // (3) B starts the signed Member-floor v2 root and serves a real call.
+    // (3) B starts the signed Member-floor service root and serves a real call.
     // Registry sync alone cannot make this pass: B must fetch the exact
     // package, validate its service pin, open the guest-owned image, and
     // register the root route.
@@ -907,7 +914,7 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
         },
         || {
             format!(
-                "a call to the signed v2 counter on B never succeeded. B log:\n{}",
+                "a call to the signed service counter on B never succeeded. B log:\n{}",
                 fs::read_to_string(&log_b).unwrap_or_default(),
             )
         },
@@ -967,18 +974,19 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
 }
 
 #[test]
-fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
-    let space = "v2-root";
-    let data = TempDir::new("v2-root-data");
-    let config = TempDir::new("v2-root-config");
-    let dist = TempDir::new("v2-root-dist");
-    let upgrade_dist = TempDir::new("v2-root-upgrade-dist");
+fn signed_service_package_runs_and_reopens_through_the_space_daemon() {
+    let space = "root";
+    let data = TempDir::new("root-data");
+    let config = TempDir::new("root-config");
+    let dist = TempDir::new("root-dist");
+    let upgrade_dist = TempDir::new("root-upgrade-dist");
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    let actor_elf = workspace.join("examples/actors/target/riscv64em-vos/release/v2_counter.elf");
+    let actor_elf =
+        workspace.join("examples/actors/target/riscv64em-vos/release/service_counter.elf");
     let committed_service_pvm = workspace.join("services/vos-service/vos-service.pvm");
     assert!(
         actor_elf.is_file(),
-        "build the v2 daemon actor first: `cd examples/actors && cargo +nightly actor -p v2-counter`",
+        "build the service daemon actor first: `cd examples/actors && cargo +nightly actor -p counter`",
     );
     assert!(
         committed_service_pvm.is_file(),
@@ -989,7 +997,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
     // uncorrelated pair of files copied from build trees. Build and verify the
     // bundle with the shipped CLI, then use that exact service artifact for
     // the physical daemon/reopen path below.
-    let release_dir = dist.path().join("production-v2-release");
+    let release_dir = dist.path().join("production-release");
     let committed_service = committed_service_pvm.to_string_lossy().into_owned();
     let release_arg = release_dir.to_string_lossy().into_owned();
     vosx_ok(
@@ -1010,8 +1018,11 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
         &["release", "verify", &release_arg],
     );
     assert!(
-        verified.contains(&format!("ABI {}", vos::v2::ABI_VERSION))
-            && verified.contains(&format!("schema {}", vos::v2::SERVICE_STORE_SCHEMA_VERSION,)),
+        verified.contains(&format!("ABI {}", vos::service::ABI_VERSION))
+            && verified.contains(&format!(
+                "schema {}",
+                vos::service::SERVICE_STORE_SCHEMA_VERSION,
+            )),
         "release verification must report the pinned protocol: {verified}",
     );
     let authority_path = release_dir.join("space-authority.pvm");
@@ -1038,8 +1049,8 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
     );
     let service_pvm = release_dir.join("vos-service.pvm");
 
-    let invalid_data = TempDir::new("v2-root-invalid-profile-data");
-    let invalid_config = TempDir::new("v2-root-invalid-profile-config");
+    let invalid_data = TempDir::new("root-invalid-profile-data");
+    let invalid_config = TempDir::new("root-invalid-profile-config");
     let invalid_recipe = dist.path().join("invalid-profile.toml");
     fs::write(
         &invalid_recipe,
@@ -1057,7 +1068,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
         !implicit_trust.status.success()
             && String::from_utf8_lossy(&implicit_trust.stderr)
                 .contains("--production-trust-socket"),
-        "a signed v2 service must not select conformance implicitly: {}",
+        "a signed service service must not select conformance implicitly: {}",
         String::from_utf8_lossy(&implicit_trust.stderr),
     );
     assert!(
@@ -1108,7 +1119,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
         "vosx build must emit the upgrade package",
     );
     vosx_ok(data.path(), config.path(), &["space", "new", space]);
-    let first_log = data.path().join("v2-root-first.stderr");
+    let first_log = data.path().join("root-first.stderr");
     let first = Daemon(spawn_up_with_service(
         data.path(),
         config.path(),
@@ -1116,7 +1127,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
         &first_log,
         Some(&service_pvm),
     ));
-    wait_for_endpoint(data.path(), &first_log, "v2-root-first");
+    wait_for_endpoint(data.path(), &first_log, "root-first");
 
     let package_source = package.to_string_lossy().into_owned();
     vosx_ok(
@@ -1149,7 +1160,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
         },
         || {
             format!(
-                "the daemon never attached the installed v2 root service; log:\n{}",
+                "the daemon never attached the installed service root service; log:\n{}",
                 fs::read_to_string(&first_log).unwrap_or_default(),
             )
         },
@@ -1219,10 +1230,10 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
     assert_eq!(
         after_upgrade.trim(),
         "U64(3)",
-        "a package-only v2 upgrade must preserve actor state"
+        "a package-only service upgrade must preserve actor state"
     );
 
-    let backup_archive = dist.path().join("v2-root.vos-backup");
+    let backup_archive = dist.path().join("root.vos-backup");
     let backup_arg = backup_archive.to_string_lossy().into_owned();
     let live_backup = vosx(
         data.path(),
@@ -1259,7 +1270,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
         .join("cache/vosx/blobs")
         .join(hex::encode(upgrade_hash));
     fs::remove_file(&cached_upgrade).expect("remove the replacement package from the local cache");
-    let recovery_log = data.path().join("v2-root-cache-recovery.stderr");
+    let recovery_log = data.path().join("root-cache-recovery.stderr");
     let recovered = Daemon(spawn_up_with_service(
         data.path(),
         config.path(),
@@ -1298,15 +1309,15 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
         config.path(),
         &["space", "backup", space, &backup_arg],
     );
-    let restored_data = TempDir::new("v2-root-restored-data");
-    let restored_config = TempDir::new("v2-root-restored-config");
-    let restored_name = "v2-root-restored";
+    let restored_data = TempDir::new("root-restored-data");
+    let restored_config = TempDir::new("root-restored-config");
+    let restored_name = "root-restored";
     vosx_ok(
         restored_data.path(),
         restored_config.path(),
         &["space", "restore", &backup_arg, "--name", restored_name],
     );
-    let restored_log = restored_data.path().join("v2-root-restored.stderr");
+    let restored_log = restored_data.path().join("root-restored.stderr");
     let restored = Daemon(spawn_up_with_service(
         restored_data.path(),
         restored_config.path(),
@@ -1327,7 +1338,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
         },
         || {
             format!(
-                "the restored v2 root did not reopen its committed actor state; log:\n{}",
+                "the restored service root did not reopen its committed actor state; log:\n{}",
                 fs::read_to_string(&restored_log).unwrap_or_default(),
             )
         },
@@ -1335,7 +1346,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
     drop(restored);
 
     let restart_at = std::time::SystemTime::now();
-    let second_log = data.path().join("v2-root-second.stderr");
+    let second_log = data.path().join("root-second.stderr");
     let second = Daemon(spawn_up_with_service(
         data.path(),
         config.path(),
@@ -1353,7 +1364,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
         },
         || {
             format!(
-                "the daemon did not reopen the v2 root service; log:\n{}",
+                "the daemon did not reopen the service root service; log:\n{}",
                 fs::read_to_string(&second_log).unwrap_or_default(),
             )
         },
@@ -1370,13 +1381,13 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
         },
         || {
             format!(
-                "the reopened v2 service did not retain its committed state; log:\n{}",
+                "the reopened service service did not retain its committed state; log:\n{}",
                 fs::read_to_string(&second_log).unwrap_or_default(),
             )
         },
     );
 
-    let old_image = fs::read_dir(service_data_dir.join("v2-services"))
+    let old_image = fs::read_dir(service_data_dir.join("services"))
         .unwrap()
         .flatten()
         .map(|entry| entry.path())
@@ -1384,7 +1395,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
             path.extension()
                 .is_some_and(|extension| extension == "image")
         })
-        .expect("the first installation must own a durable v2 image");
+        .expect("the first installation must own a durable service image");
 
     vosx_ok(
         data.path(),
@@ -1414,7 +1425,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
 
     drop(second);
     let reinstall_at = std::time::SystemTime::now();
-    let third_log = data.path().join("v2-root-third.stderr");
+    let third_log = data.path().join("root-third.stderr");
     let _third = Daemon(spawn_up_with_service(
         data.path(),
         config.path(),
@@ -1432,7 +1443,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
         },
         || {
             format!(
-                "the daemon did not open the reinstalled v2 root; log:\n{}",
+                "the daemon did not open the reinstalled service root; log:\n{}",
                 fs::read_to_string(&third_log).unwrap_or_default(),
             )
         },
@@ -1458,7 +1469,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
     assert!(
         service_data_dir
             .join("trash")
-            .join("v2-services")
+            .join("services")
             .join(old_image.file_name().unwrap())
             .is_file(),
         "deleted installation image was not moved to recoverable trash",
@@ -1466,7 +1477,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
 }
 
 #[test]
-fn signed_v2_roots_run_under_production_trust_and_recover() {
+fn signed_service_roots_run_under_production_trust_and_recover() {
     let mut malformed_observations = TestProductionTrustObservations::default();
     assert_eq!(
         TestProductionTrustSidecar::classify(
@@ -1493,13 +1504,13 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
         "denied authority requests must not be recorded as valid observations",
     );
 
-    let space = "v2-production";
-    let data = TempDir::new("v2-production-data");
-    let config = TempDir::new("v2-production-config");
-    let dist = TempDir::new("v2-production-dist");
-    let crdt_dist = TempDir::new("v2-production-crdt-dist");
-    let authority_dist = TempDir::new("v2-production-authority-dist");
-    let sidecar_dir = TempDir::new("v2-production-sidecar");
+    let space = "production";
+    let data = TempDir::new("production-data");
+    let config = TempDir::new("production-config");
+    let dist = TempDir::new("production-dist");
+    let crdt_dist = TempDir::new("production-crdt-dist");
+    let authority_dist = TempDir::new("production-authority-dist");
+    let sidecar_dir = TempDir::new("production-sidecar");
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let service_pvm = workspace.join("services/vos-service/vos-service.pvm");
     assert!(
@@ -1518,7 +1529,7 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
     // published: the daemon cannot silently fall back to conformance when the
     // configured authority is absent.
     let trust_socket = sidecar_dir.path().join("authority.sock");
-    let unavailable_log = data.path().join("v2-production-unavailable.stderr");
+    let unavailable_log = data.path().join("production-unavailable.stderr");
     let mut unavailable = spawn_up_with_service_and_trust(
         data.path(),
         config.path(),
@@ -1530,7 +1541,7 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
     let unavailable_status = wait_for_daemon_exit(
         &mut unavailable,
         &unavailable_log,
-        "v2-production-missing-authority",
+        "production-missing-authority",
     );
     assert!(!unavailable_status.success());
     assert!(
@@ -1538,9 +1549,9 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
         "an unavailable production authority must fail before route publication",
     );
 
-    let policy = vos::v2::Hash([0x67; 32]);
+    let policy = vos::service::Hash([0x67; 32]);
     let sidecar = TestProductionTrustSidecar::start(trust_socket.clone(), policy);
-    let first_log = data.path().join("v2-production-first.stderr");
+    let first_log = data.path().join("production-first.stderr");
     let first = Daemon(spawn_up_with_service_and_trust(
         data.path(),
         config.path(),
@@ -1549,7 +1560,7 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
         Some(&service_pvm),
         Some(&trust_socket),
     ));
-    let endpoint = wait_for_endpoint(data.path(), &first_log, "v2-production-first");
+    let endpoint = wait_for_endpoint(data.path(), &first_log, "production-first");
 
     let authority_source = authority_candidate.to_string_lossy().into_owned();
     vosx_ok(
@@ -1559,7 +1570,7 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
             "space",
             "publish",
             space,
-            "space-authority:migration-v2",
+            "space-authority:migration",
             &authority_source,
         ],
     );
@@ -1570,8 +1581,8 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
             "space",
             "upgrade",
             space,
-            vos::v2::ROLE_AUTHORITY_INSTANCE_V2,
-            "space-authority:migration-v2",
+            vos::service::ROLE_AUTHORITY_INSTANCE_,
+            "space-authority:migration",
         ],
     );
     assert!(
@@ -1585,8 +1596,8 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
             "space",
             "upgrade",
             space,
-            vos::v2::ROLE_AUTHORITY_INSTANCE_V2,
-            "space-authority:migration-v2",
+            vos::service::ROLE_AUTHORITY_INSTANCE_,
+            "space-authority:migration",
         ],
     );
     assert!(
@@ -1753,26 +1764,32 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
     assert!(sidecar.saw(TestProductionTrustSidecar::CURRENT_TIMESLOT));
     assert!(sidecar.saw(TestProductionTrustSidecar::VERIFY_TIMESLOT));
     assert!(
-        sidecar.saw_install_for("production-counter", vos::v2::ConsistencyModeV2::Local,),
+        sidecar.saw_install_for("production-counter", vos::service::ConsistencyMode::Local,),
         "the independent authority did not decode and authorize the production-counter Install",
     );
     assert!(
-        sidecar.saw_install_for("production-raft-counter", vos::v2::ConsistencyModeV2::Raft,),
+        sidecar.saw_install_for(
+            "production-raft-counter",
+            vos::service::ConsistencyMode::Raft,
+        ),
         "the independent authority did not decode and authorize the Raft Install",
     );
     assert!(
-        sidecar.saw_install_for("production-crdt-counter", vos::v2::ConsistencyModeV2::Crdt,),
+        sidecar.saw_install_for(
+            "production-crdt-counter",
+            vos::service::ConsistencyMode::Crdt,
+        ),
         "the independent authority did not decode and authorize the CRDT Install",
     );
-    let raft_service_id = spawned_v2_root_id(&first_log, "production-raft-counter")
+    let raft_service_id = spawned_service_root_id(&first_log, "production-raft-counter")
         .expect("the production Raft counter spawn log must expose its concrete service id");
 
     // A production-sealed image cannot be reopened by omitting the authority.
     // The daemon itself remains available for legacy/control-plane traffic,
-    // while the v2 route stays fail-closed.
+    // while the service route stays fail-closed.
     drop(first);
     let _ = fs::remove_file(&endpoint);
-    let conformance_log = data.path().join("v2-production-no-authority.stderr");
+    let conformance_log = data.path().join("production-no-authority.stderr");
     let conformance = Daemon(spawn_up_with_service(
         data.path(),
         config.path(),
@@ -1780,7 +1797,7 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
         &conformance_log,
         Some(&service_pvm),
     ));
-    wait_for_endpoint(data.path(), &conformance_log, "v2-production-no-authority");
+    wait_for_endpoint(data.path(), &conformance_log, "production-no-authority");
     poll_until(
         40,
         || {
@@ -1789,12 +1806,12 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
                 .into_iter()
                 .all(|name| {
                     log.lines().any(|line| {
-                        line.contains(&format!("agent '{name}' v2 route failed to register"))
+                        line.contains(&format!("agent '{name}' service route failed to register"))
                             && line.contains("ProductionTrust(TrustRequired)")
                     })
                 });
             let raft_private = log.lines().any(|line| {
-                line.contains("persisted v2 Raft voter is retrying service open/replay")
+                line.contains("persisted service Raft voter is retrying service open/replay")
                     && line.contains(&format!("id={raft_service_id}"))
             });
             local_and_crdt_refused && raft_private
@@ -1841,7 +1858,7 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
     assert!(
         !fs::read_to_string(&conformance_log)
             .unwrap_or_default()
-            .contains("v2 root tree 'production-counter' spawned"),
+            .contains("service root tree 'production-counter' spawned"),
         "a production image must never attach through the conformance profile",
     );
 
@@ -1851,7 +1868,7 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
     if let Some(endpoint) = find_endpoint(data.path()) {
         let _ = fs::remove_file(endpoint);
     }
-    let recovery_log = data.path().join("v2-production-recovery.stderr");
+    let recovery_log = data.path().join("production-recovery.stderr");
     let _recovered = Daemon(spawn_up_with_service_and_trust(
         data.path(),
         config.path(),
@@ -1860,7 +1877,7 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
         Some(&service_pvm),
         Some(&trust_socket),
     ));
-    wait_for_endpoint(data.path(), &recovery_log, "v2-production-recovery");
+    wait_for_endpoint(data.path(), &recovery_log, "production-recovery");
     poll_until(
         40,
         || {
@@ -1891,7 +1908,7 @@ fn signed_v2_roots_run_under_production_trust_and_recover() {
 
 #[test]
 fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
-    let space = "v2-production-crdt-network";
+    let space = "production-crdt-network";
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let service_pvm = workspace.join("services/vos-service/vos-service.pvm");
     assert!(
@@ -1907,7 +1924,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
     let sidecar_dir = TempDir::new("production-crdt-sidecars");
     assert_bundled_space_authority_matches_abi_17_program();
     let package = crdt_counter_package_fixture(dist.path());
-    let policy = vos::v2::Hash([0x69; 32]);
+    let policy = vos::service::Hash([0x69; 32]);
     let trust_a_path = sidecar_dir.path().join("authority-a.sock");
     let trust_b_path = sidecar_dir.path().join("authority-b.sock");
     let trust_a = TestProductionTrustSidecar::start(trust_a_path.clone(), policy);
@@ -2043,7 +2060,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
                 &trust_a,
                 &trust_b,
                 "production-crdt-counter",
-                vos::v2::ConsistencyModeV2::Crdt,
+                vos::service::ConsistencyMode::Crdt,
             )
             .len()
                 >= 4
@@ -2054,7 +2071,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
         &trust_a,
         &trust_b,
         "production-crdt-counter",
-        vos::v2::ConsistencyModeV2::Crdt,
+        vos::service::ConsistencyMode::Crdt,
     );
     assert_eq!(
         receipts_before_a_mutation.len(),
@@ -2076,7 +2093,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
             trust_b
                 .new_receipt_digests_since(
                     "production-crdt-counter",
-                    vos::v2::ConsistencyModeV2::Crdt,
+                    vos::service::ConsistencyMode::Crdt,
                     &receipts_before_a_mutation,
                 )
                 .len()
@@ -2088,7 +2105,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
         &trust_a,
         &trust_b,
         "production-crdt-counter",
-        vos::v2::ConsistencyModeV2::Crdt,
+        vos::service::ConsistencyMode::Crdt,
     );
     let mut successful_b_state_reads = 0_usize;
     poll_until(
@@ -2118,7 +2135,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
     );
     let a_mutation_receipts = trust_b.new_receipt_digests_since(
         "production-crdt-counter",
-        vos::v2::ConsistencyModeV2::Crdt,
+        vos::service::ConsistencyMode::Crdt,
         &receipts_before_a_mutation,
     );
     assert_eq!(
@@ -2133,7 +2150,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
     let a_mutation_receipt = trust_b
         .newest_receipt_digest_since(
             "production-crdt-counter",
-            vos::v2::ConsistencyModeV2::Crdt,
+            vos::service::ConsistencyMode::Crdt,
             &receipts_before_a_mutation,
         )
         .expect("B retained A's exact newly verified mutation receipt");
@@ -2146,7 +2163,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
             trust_a
                 .new_receipt_digests_since(
                     "production-crdt-counter",
-                    vos::v2::ConsistencyModeV2::Crdt,
+                    vos::service::ConsistencyMode::Crdt,
                     &receipts_before_b_state_reads,
                 )
                 .len()
@@ -2158,7 +2175,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
         trust_a
             .new_receipt_digests_since(
                 "production-crdt-counter",
-                vos::v2::ConsistencyModeV2::Crdt,
+                vos::service::ConsistencyMode::Crdt,
                 &receipts_before_b_state_reads,
             )
             .len(),
@@ -2169,7 +2186,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
         &trust_a,
         &trust_b,
         "production-crdt-counter",
-        vos::v2::ConsistencyModeV2::Crdt,
+        vos::service::ConsistencyMode::Crdt,
     );
     assert_eq!(
         vosx_ok(
@@ -2186,7 +2203,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
             trust_a
                 .new_receipt_digests_since(
                     "production-crdt-counter",
-                    vos::v2::ConsistencyModeV2::Crdt,
+                    vos::service::ConsistencyMode::Crdt,
                     &receipts_before_b_mutation,
                 )
                 .len()
@@ -2216,7 +2233,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
         trust_a
             .new_receipt_digests_since(
                 "production-crdt-counter",
-                vos::v2::ConsistencyModeV2::Crdt,
+                vos::service::ConsistencyMode::Crdt,
                 &receipts_before_b_mutation,
             )
             .len(),
@@ -2226,7 +2243,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
     let b_mutation_receipt = trust_a
         .newest_receipt_digest_since(
             "production-crdt-counter",
-            vos::v2::ConsistencyModeV2::Crdt,
+            vos::service::ConsistencyMode::Crdt,
             &receipts_before_b_mutation,
         )
         .expect("A retained B's exact newly verified mutation receipt");
@@ -2283,7 +2300,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
 
 #[test]
 fn production_raft_root_survives_voter_join_leader_loss_and_backup_relocation() {
-    let space = "v2-production-raft-network";
+    let space = "production-raft-network";
     let root = "production-raft-cluster-counter";
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let service_pvm = workspace.join("services/vos-service/vos-service.pvm");
@@ -2301,7 +2318,7 @@ fn production_raft_root_survives_voter_join_leader_loss_and_backup_relocation() 
     let dist = TempDir::new("production-raft-network-dist");
     let sidecar_dir = TempDir::new("production-raft-sidecars");
     let package = counter_package_fixture(dist.path());
-    let policy = vos::v2::Hash([0x70; 32]);
+    let policy = vos::service::Hash([0x70; 32]);
     let trust_a_path = sidecar_dir.path().join("authority-a.sock");
     let trust_b_path = sidecar_dir.path().join("authority-b.sock");
     let trust_c_path = sidecar_dir.path().join("authority-c.sock");
@@ -2935,11 +2952,11 @@ fn boot_admin_with_service(
     ));
     wait_for_endpoint(data_a.path(), &log_a, "A");
     let counter_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-        "../tests/fixtures/v2/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter_v2.elf",
+        "../tests/fixtures/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
     );
     assert!(
         counter_elf.is_file(),
-        "build the onboarding CRDT fixture first: `just build-v2-registry-fixtures`",
+        "build the onboarding CRDT fixture first: `just build-registry-fixtures`",
     );
     let counter_source = counter_elf.to_string_lossy().into_owned();
     vosx_ok(

@@ -43,18 +43,18 @@ use super::log::{RaftLog, RaftMeta};
 pub(crate) const ENTRY_KIND_DATA: u8 = 0;
 pub(crate) const ENTRY_KIND_CONFIG_CHANGE: u8 = 1;
 
-/// Exact v2 service image at each durably applied Raft index. The live apply
+/// Exact service service image at each durably applied Raft index. The live apply
 /// loop appends here; compaction copies the image matching its exact boundary
 /// into `STATE_TABLE`, which remains frozen until the next compaction.
-pub(crate) const RAFT_APPLIED_STATE_V2: TableDefinition<u64, &[u8]> =
-    TableDefinition::new("raft_applied_state_v2");
-const RAFT_APPLIED_STATE_V2_MARKER_INDEX: u64 = 0;
-const RAFT_APPLIED_STATE_V2_MARKER: &[u8] = b"VOS_RAFT_APPLIED_STATE_V2";
+pub(crate) const RAFT_APPLIED_STATE_: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("raft_applied_state");
+const RAFT_APPLIED_STATE_MARKER_INDEX: u64 = 0;
+const RAFT_APPLIED_STATE_MARKER: &[u8] = b"VOS_RAFT_APPLIED_STATE_";
 /// Independent hard cap on post-apply images retained in addition to the
 /// marker row. The value currently matches the default worker compaction
 /// hysteresis, but pruning happens on every applied cursor advance—including
 /// single-node and follower operation—and does not depend on leader compaction.
-pub(crate) const RAFT_APPLIED_STATE_V2_RETENTION: u64 = 16;
+pub(crate) const RAFT_APPLIED_STATE_RETENTION: u64 = 16;
 
 /// Encode a `vos_raft::EntryKind<u16>` to its on-disk byte
 /// sequence. The leading byte is the kind tag; the rest is
@@ -340,19 +340,19 @@ impl Storage<u16> for RedbStorage {
             let (snapshot_state, prune_applied_images) = if let Some(state) = new_state.as_ref() {
                 (Some(state.clone()), batch.compact_to.is_some())
             } else if let Some((index, _)) = batch.compact_to {
-                let exact_v2_image = {
-                    let table = txn.open_table(RAFT_APPLIED_STATE_V2)?;
+                let exact_service_image = {
+                    let table = txn.open_table(RAFT_APPLIED_STATE_)?;
                     let exact = table.get(index)?.map(|value| value.value().to_vec());
-                    let is_v2 = table
-                        .get(RAFT_APPLIED_STATE_V2_MARKER_INDEX)?
-                        .is_some_and(|value| value.value() == RAFT_APPLIED_STATE_V2_MARKER);
-                    (exact, is_v2)
+                    let is = table
+                        .get(RAFT_APPLIED_STATE_MARKER_INDEX)?
+                        .is_some_and(|value| value.value() == RAFT_APPLIED_STATE_MARKER);
+                    (exact, is)
                 };
-                match exact_v2_image {
+                match exact_service_image {
                     (Some(value), _) => (Some(value), true),
                     (None, true) => {
                         return Err(CommitError::Config(alloc::format!(
-                            "raft v2 cannot compact index {index} without its exact applied service image"
+                            "raft service cannot compact index {index} without its exact applied service image"
                         )));
                     }
                     (None, false) => {
@@ -386,7 +386,7 @@ impl Storage<u16> for RedbStorage {
                 state_table.insert(STATE_KEY, state_bytes)?;
             }
             if prune_applied_images && let Some((compacted_index, _)) = batch.compact_to {
-                let mut table = txn.open_table(RAFT_APPLIED_STATE_V2)?;
+                let mut table = txn.open_table(RAFT_APPLIED_STATE_)?;
                 let keys = table
                     .range(1..=compacted_index)?
                     .map(|row| row.map(|(key, _)| key.value()))
@@ -445,18 +445,15 @@ impl Storage<u16> for RedbStorage {
     }
 }
 
-pub(crate) fn write_applied_state_v2_in_txn(
+pub(crate) fn write_applied_state_service_in_txn(
     txn: &redb::WriteTransaction,
     index: u64,
     state: &[u8],
 ) -> Result<(), CommitError> {
-    let mut table = txn.open_table(RAFT_APPLIED_STATE_V2)?;
-    table.insert(
-        RAFT_APPLIED_STATE_V2_MARKER_INDEX,
-        RAFT_APPLIED_STATE_V2_MARKER,
-    )?;
+    let mut table = txn.open_table(RAFT_APPLIED_STATE_)?;
+    table.insert(RAFT_APPLIED_STATE_MARKER_INDEX, RAFT_APPLIED_STATE_MARKER)?;
     table.insert(index, state)?;
-    let prune_through = index.saturating_sub(RAFT_APPLIED_STATE_V2_RETENTION);
+    let prune_through = index.saturating_sub(RAFT_APPLIED_STATE_RETENTION);
     if prune_through > 0 {
         let keys = table
             .range(1..=prune_through)?
@@ -658,7 +655,7 @@ mod tests {
             let txn = db.begin_write().unwrap();
             {
                 let mut t = txn.open_table(STATE_TABLE).unwrap();
-                t.insert(STATE_KEY, b"out-of-band-v2".as_slice()).unwrap();
+                t.insert(STATE_KEY, b"out-of-band".as_slice()).unwrap();
             }
             txn.commit().unwrap();
         }
@@ -666,10 +663,7 @@ mod tests {
         // Without the cache, `read_state` reflects the new on-disk
         // value immediately. (Pre-fix this returned the stale
         // `b"worker-v1"`.)
-        assert_eq!(
-            block_on(s.read_state()).unwrap(),
-            b"out-of-band-v2".to_vec()
-        );
+        assert_eq!(block_on(s.read_state()).unwrap(), b"out-of-band".to_vec());
 
         let _ = std::fs::remove_dir_all(dir);
     }

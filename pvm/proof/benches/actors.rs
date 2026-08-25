@@ -133,14 +133,14 @@ mod imp {
     fn load_fibonacci_blob() -> Option<Vec<u8>> {
         let blob_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../tests/fixtures/legacy-v1/actors/fibonacci/target/riscv64em-vos/release/fibonacci.pvm"
+            "/fixtures/fibonacci/target/riscv64em-vos/release/fibonacci.pvm"
         );
         if let Ok(data) = std::fs::read(blob_path) {
             return Some(data);
         }
         let elf_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../tests/fixtures/legacy-v1/actors/fibonacci/target/riscv64em-vos/release/fibonacci.elf"
+            "/fixtures/fibonacci/target/riscv64em-vos/release/fibonacci.elf"
         );
         let elf_data = match std::fs::read(elf_path) {
             Ok(b) => b,
@@ -161,10 +161,7 @@ mod imp {
     /// message is emitted here, so callers just `let Some(blob) = ... else
     /// { return; };`.
     fn load_actor_blob(name: &str) -> Option<Vec<u8>> {
-        let base = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../tests/fixtures/legacy-v1/actors/"
-        );
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/");
         let pvm_path = format!("{base}{name}/target/riscv64em-vos/release/{name}.pvm");
         if let Ok(data) = std::fs::read(&pvm_path) {
             return Some(data);

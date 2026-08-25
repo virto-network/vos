@@ -15,7 +15,7 @@
 //!
 //! Legacy Local parents store both together under the reserved
 //! `__vos_proofrec/<tag>` row and prune with an ordinary delete effect; legacy
-//! CRDT/Raft effect-log recording rejects capture. Service-v2 instead executes
+//! CRDT/Raft effect-log recording rejects capture. Service instead executes
 //! only package-bound Tasks during exact Refine and commits the entry to an
 //! owner-only producer sidecar before proposing the public transition. Those
 //! bytes never enter actor state, service snapshots, Raft, or CRDT transport;
@@ -202,7 +202,7 @@ impl ProofRecordEntry {
 
 /// Legacy guest-side API: read a captured `__vos_proofrec/<tag>` row back from
 /// THIS actor's own keyspace — the raw [`ProofRecordEntry`] bytes, or `None`
-/// when no record exists under the tag. Service-v2 intercepts the
+/// when no record exists under the tag. Service intercepts the
 /// invocation-local read with a redacted [`ProvableRecord`]; operators fetch
 /// the complete entry from the root host's producer sidecar instead.
 ///
@@ -215,7 +215,7 @@ pub fn read_record_entry(tag: &[u8; 32]) -> Option<Vec<u8>> {
 }
 
 /// Read the verifier-facing half of a record staged by the current Task
-/// execution. Service-v2 exposes only this redacted value to actor memory;
+/// execution. Service exposes only this redacted value to actor memory;
 /// the complete [`ProofRecordEntry`] remains in the producer-private host
 /// sidecar. Legacy storage rows decode through the same helper by discarding
 /// their private input half.

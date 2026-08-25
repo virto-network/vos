@@ -9,7 +9,7 @@
 //! those cosmetic changes — which is what the structural-edit
 //! workflow needs.
 //!
-//! v2 considered storing an rkyv-archived mirror of `syn::File`
+//! service considered storing an rkyv-archived mirror of `syn::File`
 //! instead, but `syn` doesn't expose its tree types as rkyv-able
 //! and mirroring the surface (every expression, every pattern…)
 //! is a much bigger project than the dedup feature warrants. The

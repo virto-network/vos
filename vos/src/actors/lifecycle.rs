@@ -541,14 +541,14 @@ pub fn dispatch_one<A: Actor>(raw: &[u8], actor: &mut A, ctx: &mut Context<A>) -
     dispatch_one_inner(raw, actor, ctx, None)
 }
 
-/// Dispatch one v2 actor slice with the invocation identity supplied by the
+/// Dispatch one service actor slice with the invocation identity supplied by the
 /// generic service envelope rather than an actor-message prefix.
 #[cfg(any(feature = "pvm", test))]
 pub(crate) fn dispatch_one_with_invocation<A: Actor>(
     raw: &[u8],
     actor: &mut A,
     ctx: &mut Context<A>,
-    invocation: crate::v2::InvocationId,
+    invocation: crate::service::InvocationId,
 ) -> DispatchResult {
     dispatch_one_inner(raw, actor, ctx, Some(invocation))
 }
@@ -558,15 +558,15 @@ fn dispatch_one_inner<A: Actor>(
     raw: &[u8],
     actor: &mut A,
     ctx: &mut Context<A>,
-    invocation: Option<crate::v2::InvocationId>,
+    invocation: Option<crate::service::InvocationId>,
 ) -> DispatchResult {
     // Reset the per-invocation forbidden flag so a prior refused
     // call doesn't poison this dispatch. Context lives across
     // continuation slices while one handler remains suspended.
     ctx.__reset_forbidden();
-    ctx.__set_invocation_id(invocation.unwrap_or(crate::v2::InvocationId::ZERO));
+    ctx.__set_invocation_id(invocation.unwrap_or(crate::service::InvocationId::ZERO));
 
-    // A v2 actor slice already received its invocation, origin, and roles from
+    // A service actor slice already received its invocation, origin, and roles from
     // the authenticated service envelope. Its message bytes are application
     // data and must never be reinterpreted as a legacy host prefix: doing so
     // would let an argument beginning with 0xFD replace that authenticated
@@ -597,7 +597,7 @@ fn dispatch_one_inner<A: Actor>(
         );
         let mut invocation_id = [0u8; 32];
         invocation_id.copy_from_slice(&raw[6..38]);
-        ctx.__set_invocation_id(crate::v2::InvocationId::new(invocation_id));
+        ctx.__set_invocation_id(crate::service::InvocationId::new(invocation_id));
         &raw[38..]
     // Stored v1 logs and older embedders may still carry only caller data.
     } else if raw.len() >= 6 && raw[0] == TAG_CALLER_PREFIX {
@@ -620,13 +620,13 @@ fn dispatch_one_inner<A: Actor>(
                 None
             },
         );
-        ctx.__set_invocation_id(crate::v2::InvocationId::ZERO);
+        ctx.__set_invocation_id(crate::service::InvocationId::ZERO);
         &raw[6..]
     } else {
         raw
     };
 
-    // VOS v2 has one application message wire: TAG_DYNAMIC followed by Msg.
+    // VOS service has one application message wire: TAG_DYNAMIC followed by Msg.
     // The old typed-enum rkyv fallback made generated message fields part of
     // the public ABI and prevented portable proof packages from being passed
     // as arguments.
@@ -709,7 +709,7 @@ mod tests {
 
     #[test]
     fn actor_slice_dispatch_preserves_envelope_invocation() {
-        let invocation = crate::v2::InvocationId::derive(b"actor-slice", b"invocation");
+        let invocation = crate::service::InvocationId::derive(b"actor-slice", b"invocation");
         let mut actor = InvocationProbe::create();
         let mut ctx = Context::new(ServiceId(0));
 
@@ -725,7 +725,7 @@ mod tests {
     fn actor_slice_dispatch_never_parses_caller_controlled_prefixes() {
         use crate::actors::auth::Caller;
 
-        let invocation = crate::v2::InvocationId::derive(b"actor-slice", b"authenticated");
+        let invocation = crate::service::InvocationId::derive(b"actor-slice", b"authenticated");
         let mut actor = InvocationProbe::create();
         let mut ctx = Context::new(ServiceId(0));
         ctx.set_caller(Caller::Unauthenticated);

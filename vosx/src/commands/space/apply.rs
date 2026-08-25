@@ -69,7 +69,7 @@ pub(crate) struct ApplyReport {
     /// weren't upgraded (needs `--upgrade`).
     upgrade_pending: Vec<String>,
     /// Changed implicit `name:recipe` instances that need an explicit
-    /// immutable target such as `program = "name:v2"`.
+    /// immutable target such as `program = "name:service"`.
     version_required: Vec<String>,
     /// Whether `local.toml` changed (or would change, under `--diff`).
     local_changed: bool,
@@ -296,7 +296,7 @@ fn preflight_one(
         if upgrade {
             anyhow::bail!(
                 "agent '{}': an upgrade requires an explicit new immutable target, e.g. \
-                 `program = \"{}:v2\"`",
+                 `program = \"{}:service\"`",
                 agent.name,
                 agent.name,
             );

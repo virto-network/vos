@@ -458,7 +458,7 @@ mod tests {
         let internal = t.methods.iter().find(|m| m.name == "internal").unwrap();
         assert!(stop.exposed_to_cli);
         assert!(!internal.exposed_to_cli);
-        // The metadata-v2 doc round-trips through the TOML cache.
+        // The metadata doc round-trips through the TOML cache.
         assert_eq!(stop.doc, "Stop the gateway.");
         let _ = std::fs::remove_file(&p);
     }

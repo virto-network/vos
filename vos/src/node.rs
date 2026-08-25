@@ -37,7 +37,7 @@ pub struct Envelope {
     pub from: ServiceId,
     pub to: ServiceId,
     pub payload: Vec<u8>,
-    /// Exact Noise-authenticated source of an inbound canonical v2 frame.
+    /// Exact Noise-authenticated source of an inbound canonical service frame.
     /// Local and not-yet-networked envelopes carry `None`.
     pub authenticated_source_peer: Option<Vec<u8>>,
     /// Exact destination selected from a trusted external-actor binding.
@@ -63,11 +63,11 @@ pub struct AgentResult {
     pub error: Option<String>,
 }
 
-/// Registration failures for one guest-owned v2 root service.
+/// Registration failures for one guest-owned service root service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum V2NodeRegistrationError {
+pub enum NodeRegistrationError {
     ServiceRouteOccupied(ServiceId),
-    ActorAlreadyRegistered(crate::v2::ActorId),
+    ActorAlreadyRegistered(crate::service::ActorId),
     CorruptServiceStore,
     LogicalTimeslotExhausted,
     LogicalTimeslotUnavailable,
@@ -78,10 +78,10 @@ pub enum V2NodeRegistrationError {
 /// node route and owning root service. Transport checks both fields; an
 /// `ActorId` collision on another root must never redirect a committed call.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct V2ActorRoute {
+struct ActorRoute {
     route: u32,
-    service: crate::v2::ServiceIdentityV2,
-    consistency: crate::v2::ConsistencyModeV2,
+    service: crate::service::ServiceIdentity,
+    consistency: crate::service::ConsistencyMode,
     /// Exact Raft group serving a locally attached root. Compact route
     /// prefixes are insufficient for authenticating a redirected leader.
     replication_id: Option<[u8; 32]>,
@@ -103,14 +103,14 @@ struct V2ActorRoute {
 /// roots when one group hosts more than one service route.
 #[cfg(all(feature = "network", feature = "storage"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct V2RaftTransportResolutionKey {
+struct RaftTransportResolutionKey {
     replication_id: [u8; 32],
     local_id: u16,
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
 #[derive(Debug, Clone)]
-enum V2RaftTransportResolution {
+enum RaftTransportResolution {
     Pending {
         generation: u64,
         candidate_cursor: usize,
@@ -129,7 +129,7 @@ enum V2RaftTransportResolution {
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-impl V2RaftTransportResolution {
+impl RaftTransportResolution {
     fn candidate_cursor(&self) -> usize {
         match self {
             Self::Pending {
@@ -146,12 +146,12 @@ impl V2RaftTransportResolution {
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-type V2RaftTransportResolutions =
-    Arc<Mutex<HashMap<V2RaftTransportResolutionKey, V2RaftTransportResolution>>>;
+type RaftTransportResolutions =
+    Arc<Mutex<HashMap<RaftTransportResolutionKey, RaftTransportResolution>>>;
 
-const V2_LOCAL_INVOKE_TIMEOUT: Duration = Duration::from_secs(10);
+const SERVICE_LOCAL_INVOKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn receive_v2_invocation_reply(
+fn receive_service_invocation_reply(
     reply: &mpsc::Receiver<Vec<u8>>,
     proof_requested: bool,
     deadline: Instant,
@@ -167,7 +167,7 @@ fn receive_v2_invocation_reply(
     }
 }
 
-fn send_v2_system_ingress(
+fn send_service_system_ingress(
     route: &mpsc::Sender<InvokeRequest>,
     ingress: &[u8],
 ) -> Result<mpsc::Receiver<Vec<u8>>, crate::actors::client::ClientError> {
@@ -200,7 +200,7 @@ fn send_v2_system_ingress(
 /// local Raft route lets the current leader either finish the same request or
 /// recover its durable dedup result.
 #[cfg(all(feature = "network", feature = "storage"))]
-enum V2AttestedRedriveAttempt {
+enum AttestedRedriveAttempt {
     /// No transport accepted the request, so this attempt cannot have
     /// committed it.
     NotSent,
@@ -210,25 +210,25 @@ enum V2AttestedRedriveAttempt {
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn receive_v2_attested_with_exact_redrive<Remote, Local, Backoff>(
+fn receive_service_attested_with_exact_redrive<Remote, Local, Backoff>(
     ingress: &[u8],
-    mut redirect: V2RaftRedirect,
+    mut redirect: RaftRedirect,
     mut remote_attempt: Remote,
     mut local_redrive: Local,
     mut backoff: Backoff,
 ) -> Result<Vec<u8>, crate::actors::client::ClientError>
 where
-    Remote: FnMut(V2RaftRedirect, &[u8]) -> V2AttestedRedriveAttempt,
-    Local: FnMut(&[u8]) -> V2AttestedRedriveAttempt,
+    Remote: FnMut(RaftRedirect, &[u8]) -> AttestedRedriveAttempt,
+    Local: FnMut(&[u8]) -> AttestedRedriveAttempt,
     Backoff: FnMut(),
 {
     let mut outcome_ambiguous = false;
     loop {
         match remote_attempt(redirect, ingress) {
-            V2AttestedRedriveAttempt::NotSent => {}
-            V2AttestedRedriveAttempt::Ambiguous => outcome_ambiguous = true,
-            V2AttestedRedriveAttempt::Reply(envelope) => {
-                if let Some(next) = decode_v2_raft_redirect(&envelope) {
+            AttestedRedriveAttempt::NotSent => {}
+            AttestedRedriveAttempt::Ambiguous => outcome_ambiguous = true,
+            AttestedRedriveAttempt::Reply(envelope) => {
+                if let Some(next) = decode_service_raft_redirect(&envelope) {
                     redirect = next;
                     backoff();
                     continue;
@@ -250,10 +250,10 @@ where
         }
 
         match local_redrive(ingress) {
-            V2AttestedRedriveAttempt::NotSent => {}
-            V2AttestedRedriveAttempt::Ambiguous => outcome_ambiguous = true,
-            V2AttestedRedriveAttempt::Reply(envelope) => {
-                if let Some(next) = decode_v2_raft_redirect(&envelope) {
+            AttestedRedriveAttempt::NotSent => {}
+            AttestedRedriveAttempt::Ambiguous => outcome_ambiguous = true,
+            AttestedRedriveAttempt::Reply(envelope) => {
+                if let Some(next) = decode_service_raft_redirect(&envelope) {
                     redirect = next;
                     backoff();
                     continue;
@@ -276,24 +276,24 @@ where
 /// The network ingress gate can spend this long consulting the registry to
 /// bind a compact voter slot back to its complete authenticated peer identity.
 #[cfg(feature = "network")]
-const V2_RAFT_VOTER_AUTH_TIMEOUT_MS: u64 = 5_000;
+const SERVICE_RAFT_VOTER_AUTH_TIMEOUT_MS: u64 = 5_000;
 
 /// Remote transport discovery is deliberately much shorter than an ingress
 /// operation. It runs off-router, is coalesced per root, and is retried from
 /// durable publication state, so a slow/dead bootstrap never needs to hold a
 /// global node thread for the full voter-authentication budget.
 #[cfg(all(feature = "network", feature = "storage"))]
-const V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(1);
+const SERVICE_RAFT_TRANSPORT_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(all(feature = "network", feature = "storage"))]
-const V2_RAFT_TRANSPORT_RESOLUTION_OWNERSHIP_GRACE: Duration = Duration::from_millis(250);
+const SERVICE_RAFT_TRANSPORT_RESOLUTION_OWNERSHIP_GRACE: Duration = Duration::from_millis(250);
 #[cfg(all(feature = "network", feature = "storage"))]
-const V2_RAFT_TRANSPORT_LEADER_CACHE_TTL: Duration = Duration::from_secs(1);
+const SERVICE_RAFT_TRANSPORT_LEADER_CACHE_TTL: Duration = Duration::from_secs(1);
 #[cfg(all(feature = "network", feature = "storage"))]
-const V2_RAFT_TRANSPORT_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+const SERVICE_RAFT_TRANSPORT_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 #[cfg(all(feature = "network", feature = "storage"))]
-const V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES: usize = 16;
+const SERVICE_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES: usize = 16;
 #[cfg(all(feature = "network", feature = "storage"))]
-const V2_RAFT_TRANSPORT_MAX_LEADER_HINTS: usize = 4;
+const SERVICE_RAFT_TRANSPORT_MAX_LEADER_HINTS: usize = 4;
 
 /// One end-to-end Raft invocation can consume voter authentication, one
 /// all-voter private-sidecar barrier, one read barrier, and up to three
@@ -303,44 +303,44 @@ const V2_RAFT_TRANSPORT_MAX_LEADER_HINTS: usize = 4;
 /// follower and redirected leader hops rather than restarting a per-hop
 /// timeout.
 #[cfg(all(feature = "storage", feature = "network"))]
-fn v2_raft_invoke_timeout(propose_timeout_ms: u64) -> Duration {
+fn service_raft_invoke_timeout(propose_timeout_ms: u64) -> Duration {
     Duration::from_millis(
-        V2_RAFT_VOTER_AUTH_TIMEOUT_MS
-            .saturating_add(V2_PRIVATE_INGRESS_STAGE_TIMEOUT_MS)
+        SERVICE_RAFT_VOTER_AUTH_TIMEOUT_MS
+            .saturating_add(SERVICE_PRIVATE_INGRESS_STAGE_TIMEOUT_MS)
             .saturating_add(propose_timeout_ms.saturating_mul(5)),
     )
 }
 
-impl std::fmt::Display for V2NodeRegistrationError {
+impl std::fmt::Display for NodeRegistrationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "cannot register VOS v2 root service: {self:?}")
+        write!(f, "cannot register VOS service root service: {self:?}")
     }
 }
 
-impl std::error::Error for V2NodeRegistrationError {}
+impl std::error::Error for NodeRegistrationError {}
 
 #[cfg(all(feature = "storage", feature = "network"))]
 #[derive(Debug)]
-pub enum V2RaftNodeRegistrationError<E> {
+pub enum RaftNodeRegistrationError<E> {
     Log(crate::commit::CommitError),
-    Open(crate::v2::LocalRootTreeOpenErrorV2<E>),
-    Registration(V2NodeRegistrationError),
+    Open(crate::service::LocalRootTreeOpenError<E>),
+    Registration(NodeRegistrationError),
     ReplicationHandlerOccupied([u8; 32]),
     InvalidVoterIdentity(u16),
-    CatchUp(crate::v2::LocalRootTreeInvokeErrorV2),
+    CatchUp(crate::service::LocalRootTreeInvokeError),
     ProductionPolicyMismatch,
     Promotion(String),
 }
 
 #[cfg(all(feature = "storage", feature = "network"))]
-impl<E: core::fmt::Debug> core::fmt::Display for V2RaftNodeRegistrationError<E> {
+impl<E: core::fmt::Debug> core::fmt::Display for RaftNodeRegistrationError<E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "cannot register Raft VOS v2 root tree: {self:?}")
+        write!(f, "cannot register Raft VOS service root tree: {self:?}")
     }
 }
 
 #[cfg(all(feature = "storage", feature = "network"))]
-impl<E: core::fmt::Debug> core::error::Error for V2RaftNodeRegistrationError<E> {}
+impl<E: core::fmt::Debug> core::error::Error for RaftNodeRegistrationError<E> {}
 
 impl AgentResult {
     /// Did the agent finish cleanly (no PVM panics, no host errors)?
@@ -1029,7 +1029,7 @@ struct InvokeRequest {
     /// redirected this Raft invocation. Only the network ingress may populate
     /// this field, after authenticating the forwarding peer as a current voter.
     #[cfg(all(feature = "network", feature = "storage"))]
-    delegated_origin: Option<crate::v2::Origin>,
+    delegated_origin: Option<crate::service::Origin>,
     /// Host-private marker for the canonical authority decision protocol.
     /// Ordinary actor calls cannot set it; a cross-node hop carries it only
     /// inside voter-authenticated Raft delegation.
@@ -1156,20 +1156,20 @@ pub struct VosNode {
     /// at thread spawn time) freezes A's view of the world before
     /// B exists, breaking cross-agent invoke order-independent.
     invoke_routes: InvokeRoutes,
-    /// Canonical v2 actor identity to local host route. Unlike `ServiceId`,
-    /// this identity is preserved end-to-end in WorkEnvelopeV2 and never
+    /// Canonical service actor identity to local host route. Unlike `ServiceId`,
+    /// this identity is preserved end-to-end in WorkEnvelope and never
     /// truncated into the legacy 32-bit namespace.
-    v2_actor_routes: Arc<RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>>,
-    /// Per-process entropy and monotone ordinal for host-originated v2 work.
+    service_actor_routes: Arc<RwLock<HashMap<crate::service::ActorId, ActorRoute>>>,
+    /// Per-process entropy and monotone ordinal for host-originated service work.
     /// The seed prevents fallback invocation identities repeating after a
     /// process restart.
-    v2_invocation_seed: [u8; 32],
-    v2_invocation_ordinal: AtomicU64,
-    /// Trusted local admission clock for v2 work. External ingress never
+    service_invocation_seed: [u8; 32],
+    service_invocation_ordinal: AtomicU64,
+    /// Trusted local admission clock for service work. External ingress never
     /// carries this value; the root-service thread stamps it immediately
     /// before scheduling. It is seeded from wall time so a process restart
     /// cannot reset durable deadline comparisons to one.
-    v2_logical_timeslot: Arc<AtomicU64>,
+    service_logical_timeslot: Arc<AtomicU64>,
     /// Reverse map `local_id → instance name`, populated at register
     /// time and read live by the auth path (the libp2p gate's
     /// actor-local probe and extension relays). Shared (cheap clone)
@@ -1259,30 +1259,30 @@ pub struct VosNode {
     raft_hosts: RaftHosts,
     /// Exact Raft group → root-owned private-ingress sidecar sink.
     #[cfg(all(feature = "network", feature = "storage"))]
-    v2_private_ingress_routes: V2PrivateIngressRoutes,
+    service_private_ingress_routes: PrivateIngressRoutes,
     /// Short-lived leader cache plus one in-flight marker per Raft root.
     /// Resolution workers never run on the global envelope router, and
     /// repeated 250 ms durable redrives coalesce behind the same marker.
     #[cfg(all(feature = "network", feature = "storage"))]
-    v2_raft_transport_resolutions: V2RaftTransportResolutions,
+    service_raft_transport_resolutions: RaftTransportResolutions,
     /// Monotone token used only to distinguish ownership of overlapping
     /// resolver workers. Candidate progress is stored per destination in the
     /// resolution entry and never depends on this node-global value.
     #[cfg(all(feature = "network", feature = "storage"))]
-    v2_raft_transport_ownership_generation: AtomicU64,
+    service_raft_transport_ownership_generation: AtomicU64,
     /// Prepared Raft roots remain absent from public route tables while voter
     /// promotion is pending. Background workers send a type-erased publication
     /// closure here once final non-joint membership is locally visible.
     #[cfg(all(feature = "network", feature = "storage"))]
-    pending_v2_root_ready_tx: mpsc::Sender<PendingV2RootReady>,
+    pending_service_root_ready_tx: mpsc::Sender<PendingRootReady>,
     #[cfg(all(feature = "network", feature = "storage"))]
-    pending_v2_root_ready_rx: mpsc::Receiver<PendingV2RootReady>,
+    pending_service_root_ready_rx: mpsc::Receiver<PendingRootReady>,
     #[cfg(all(feature = "network", feature = "storage"))]
-    pending_v2_root_threads: Vec<thread::JoinHandle<()>>,
+    pending_service_root_threads: Vec<thread::JoinHandle<()>>,
     #[cfg(all(feature = "network", feature = "storage"))]
-    pending_v2_root_ids: Arc<Mutex<std::collections::HashSet<u32>>>,
+    pending_service_root_ids: Arc<Mutex<std::collections::HashSet<u32>>>,
     #[cfg(all(feature = "network", feature = "storage"))]
-    pending_v2_root_actors: Arc<Mutex<std::collections::HashSet<crate::v2::ActorId>>>,
+    pending_service_root_actors: Arc<Mutex<std::collections::HashSet<crate::service::ActorId>>>,
     /// Optional manifest payload exposed to peers via
     /// [`Frame::ManifestReq`](crate::network::Frame::ManifestReq).
     /// Populated by [`set_manifest`](Self::set_manifest) before
@@ -1378,28 +1378,28 @@ type InvokeRoutes = Arc<Mutex<HashMap<u32, mpsc::Sender<InvokeRequest>>>>;
 /// Host-private sidecar request routed directly to one Raft root thread. It
 /// never shares the actor invocation channel or a guest-visible wire.
 #[cfg(all(feature = "network", feature = "storage"))]
-struct V2PrivateIngressUpload {
-    invocation: crate::v2::InvocationId,
-    reference: crate::v2::BlobRefV2,
+struct PrivateIngressUpload {
+    invocation: crate::service::InvocationId,
+    reference: crate::service::BlobRef,
     bytes: Vec<u8>,
     deadline: Instant,
-    state: Arc<Mutex<V2PrivateIngressUploadState>>,
+    state: Arc<Mutex<PrivateIngressUploadState>>,
     reply: mpsc::Sender<bool>,
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum V2PrivateIngressUploadState {
+enum PrivateIngressUploadState {
     Queued,
     Persisting,
     Cancelled,
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-struct V2PrivateIngressRoute {
-    tx: mpsc::SyncSender<V2PrivateIngressUpload>,
+struct PrivateIngressRoute {
+    tx: mpsc::SyncSender<PrivateIngressUpload>,
     quiescence_tx: mpsc::SyncSender<mpsc::Sender<bool>>,
-    barrier: V2PrivateIngressBarrier,
+    barrier: PrivateIngressBarrier,
     /// Expected replay-verification policy for this exact application group.
     /// Membership admission compares it with the authenticated join request
     /// before calling `change_membership`.
@@ -1407,57 +1407,57 @@ struct V2PrivateIngressRoute {
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-struct V2PrivateIngressBarrier(AtomicBool);
+struct PrivateIngressBarrier(AtomicBool);
 
 #[cfg(all(feature = "network", feature = "storage"))]
-impl V2PrivateIngressBarrier {
+impl PrivateIngressBarrier {
     fn new() -> Self {
         Self(AtomicBool::new(false))
     }
 
-    fn try_acquire(&self) -> Option<V2PrivateIngressBarrierGuard<'_>> {
+    fn try_acquire(&self) -> Option<PrivateIngressBarrierGuard<'_>> {
         self.0
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .ok()
-            .map(|_| V2PrivateIngressBarrierGuard(&self.0))
+            .map(|_| PrivateIngressBarrierGuard(&self.0))
     }
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-struct V2PrivateIngressBarrierGuard<'a>(&'a AtomicBool);
+struct PrivateIngressBarrierGuard<'a>(&'a AtomicBool);
 
 #[cfg(all(feature = "network", feature = "storage"))]
-impl Drop for V2PrivateIngressBarrierGuard<'_> {
+impl Drop for PrivateIngressBarrierGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-type V2PrivateIngressRoutes = Arc<RwLock<HashMap<[u8; 32], Arc<V2PrivateIngressRoute>>>>;
+type PrivateIngressRoutes = Arc<RwLock<HashMap<[u8; 32], Arc<PrivateIngressRoute>>>>;
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn pending_v2_private_ingress_route(
+fn pending_service_private_ingress_route(
     production_trust_policy: Option<[u8; 32]>,
-) -> Arc<V2PrivateIngressRoute> {
+) -> Arc<PrivateIngressRoute> {
     // Pending registration deliberately drops both receivers. Private-input
-    // staging and quiescence therefore fail immediately while the exact V2
+    // staging and quiescence therefore fail immediately while the exact Service
     // policy metadata remains visible to join admission.
     let (tx, _receiver) = mpsc::sync_channel(1);
     let (quiescence_tx, _quiescence_receiver) = mpsc::sync_channel(1);
-    Arc::new(V2PrivateIngressRoute {
+    Arc::new(PrivateIngressRoute {
         tx,
         quiescence_tx,
-        barrier: V2PrivateIngressBarrier::new(),
+        barrier: PrivateIngressBarrier::new(),
         production_trust_policy,
     })
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn remove_v2_private_ingress_route_if(
-    routes: &V2PrivateIngressRoutes,
+fn remove_service_private_ingress_route_if(
+    routes: &PrivateIngressRoutes,
     replication_id: &[u8; 32],
-    expected: &Arc<V2PrivateIngressRoute>,
+    expected: &Arc<PrivateIngressRoute>,
 ) {
     let mut routes = routes.write().unwrap();
     if routes
@@ -1469,36 +1469,36 @@ fn remove_v2_private_ingress_route_if(
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-struct V2PrivateIngressRegistration {
+struct PrivateIngressRegistration {
     replication_id: [u8; 32],
-    route: Arc<V2PrivateIngressRoute>,
-    receiver: mpsc::Receiver<V2PrivateIngressUpload>,
+    route: Arc<PrivateIngressRoute>,
+    receiver: mpsc::Receiver<PrivateIngressUpload>,
     quiescence_receiver: mpsc::Receiver<mpsc::Sender<bool>>,
-    routes: V2PrivateIngressRoutes,
+    routes: PrivateIngressRoutes,
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-const V2_PRIVATE_INGRESS_QUEUE_CAPACITY: usize = 16;
+const SERVICE_PRIVATE_INGRESS_QUEUE_CAPACITY: usize = 16;
 
 #[cfg(all(feature = "network", feature = "storage"))]
-const V2_PRIVATE_INGRESS_STAGE_TIMEOUT_MS: u64 = 5_000;
+const SERVICE_PRIVATE_INGRESS_STAGE_TIMEOUT_MS: u64 = 5_000;
 
 #[cfg(all(feature = "network", feature = "storage"))]
-const V2_PRIVATE_INGRESS_STAGE_TIMEOUT: Duration =
-    Duration::from_millis(V2_PRIVATE_INGRESS_STAGE_TIMEOUT_MS);
+const SERVICE_PRIVATE_INGRESS_STAGE_TIMEOUT: Duration =
+    Duration::from_millis(SERVICE_PRIVATE_INGRESS_STAGE_TIMEOUT_MS);
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn stage_v2_private_ingress_through_root(
-    tx: &mpsc::SyncSender<V2PrivateIngressUpload>,
-    invocation: crate::v2::InvocationId,
-    reference: crate::v2::BlobRefV2,
+fn stage_service_private_ingress_through_root(
+    tx: &mpsc::SyncSender<PrivateIngressUpload>,
+    invocation: crate::service::InvocationId,
+    reference: crate::service::BlobRef,
     bytes: Vec<u8>,
     timeout: Duration,
 ) -> bool {
-    let state = Arc::new(Mutex::new(V2PrivateIngressUploadState::Queued));
+    let state = Arc::new(Mutex::new(PrivateIngressUploadState::Queued));
     let (reply_tx, reply_rx) = mpsc::channel();
     if tx
-        .try_send(V2PrivateIngressUpload {
+        .try_send(PrivateIngressUpload {
             invocation,
             reference,
             bytes,
@@ -1518,12 +1518,12 @@ fn stage_v2_private_ingress_through_root(
         Err(mpsc::RecvTimeoutError::Timeout) => {
             let mut state = state.lock().unwrap();
             match *state {
-                V2PrivateIngressUploadState::Queued => {
-                    *state = V2PrivateIngressUploadState::Cancelled;
+                PrivateIngressUploadState::Queued => {
+                    *state = PrivateIngressUploadState::Cancelled;
                     false
                 }
-                V2PrivateIngressUploadState::Cancelled => false,
-                V2PrivateIngressUploadState::Persisting => {
+                PrivateIngressUploadState::Cancelled => false,
+                PrivateIngressUploadState::Persisting => {
                     // Persistence crossed its non-cancellable durability
                     // boundary before the timeout. Never report a negative
                     // acknowledgement while that write may still commit.
@@ -1536,13 +1536,13 @@ fn stage_v2_private_ingress_through_root(
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn begin_v2_private_ingress_upload(upload: &V2PrivateIngressUpload) -> bool {
+fn begin_service_private_ingress_upload(upload: &PrivateIngressUpload) -> bool {
     let mut state = upload.state.lock().unwrap();
-    if *state != V2PrivateIngressUploadState::Queued || Instant::now() >= upload.deadline {
-        *state = V2PrivateIngressUploadState::Cancelled;
+    if *state != PrivateIngressUploadState::Queued || Instant::now() >= upload.deadline {
+        *state = PrivateIngressUploadState::Cancelled;
         return false;
     }
-    *state = V2PrivateIngressUploadState::Persisting;
+    *state = PrivateIngressUploadState::Persisting;
     true
 }
 
@@ -1551,16 +1551,18 @@ fn begin_v2_private_ingress_upload(upload: &V2PrivateIngressUpload) -> bool {
 /// lookups bind compact voter slots to full PeerIds; requests fan out before
 /// waiting so one slow voter cannot consume every other voter's budget.
 #[cfg(all(feature = "network", feature = "storage"))]
-fn stage_v2_private_ingress_on_current_voters<B>(
-    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
-    request: &crate::v2::LocalWorkRequestV2,
-    reference: &crate::v2::BlobRefV2,
+fn stage_service_private_ingress_on_current_voters<B>(
+    service: &mut crate::service::LocalRootTreeService<B>,
+    request: &crate::service::LocalWorkRequest,
+    reference: &crate::service::BlobRef,
     shared_network: &SharedNetwork,
     invoke_routes: &InvokeRoutes,
 ) -> bool
 where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        >,
 {
     let Some((local_prefix, voters)) = service.steady_raft_voters() else {
         return false;
@@ -1594,7 +1596,7 @@ where
     if crate::network::derive_node_prefix(&network.peer_id()) != local_prefix {
         return false;
     }
-    let deadline = Instant::now() + V2_PRIVATE_INGRESS_STAGE_TIMEOUT;
+    let deadline = Instant::now() + SERVICE_PRIVATE_INGRESS_STAGE_TIMEOUT;
     let mut peers = Vec::with_capacity(remote_voters.len());
     for (index, prefix) in remote_voters.iter().copied().enumerate() {
         let remaining_voters = remote_voters.len().saturating_sub(index).max(1) as u32;
@@ -1655,26 +1657,26 @@ where
 #[cfg(all(feature = "network", feature = "storage"))]
 type RaftHosts = Arc<Mutex<HashMap<u32, [u8; 32]>>>;
 
-/// Type-erased completion of one prepared v2 Raft root. The promotion worker
+/// Type-erased completion of one prepared service Raft root. The promotion worker
 /// owns the concrete durable backend and root service until final membership
 /// is locally visible, then hands this closure back to the router thread for
 /// the short mutable-node publication step.
 #[cfg(all(feature = "network", feature = "storage"))]
-type PendingV2RootReady = Box<dyn FnOnce(&mut VosNode) + Send>;
+type PendingRootReady = Box<dyn FnOnce(&mut VosNode) + Send>;
 
 #[cfg(all(feature = "network", feature = "storage"))]
-struct NodeCommittedImageStoreV2<B>(Arc<Mutex<B>>);
+struct NodeCommittedImageStore<B>(Arc<Mutex<B>>);
 
 #[cfg(all(feature = "network", feature = "storage"))]
-impl<B> Clone for NodeCommittedImageStoreV2<B> {
+impl<B> Clone for NodeCommittedImageStore<B> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-impl<B: crate::v2::CommittedImageStoreV2> crate::v2::CommittedImageStoreV2
-    for NodeCommittedImageStoreV2<B>
+impl<B: crate::service::CommittedImageStore> crate::service::CommittedImageStore
+    for NodeCommittedImageStore<B>
 {
     type Error = B::Error;
 
@@ -1688,20 +1690,25 @@ impl<B: crate::v2::CommittedImageStoreV2> crate::v2::CommittedImageStoreV2
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-impl<B> crate::v2::ProofArtifactStoreV2 for NodeCommittedImageStoreV2<B>
+impl<B> crate::service::ProofArtifactStore for NodeCommittedImageStore<B>
 where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        >,
 {
-    type Error = <B as crate::v2::CommittedImageStoreV2>::Error;
+    type Error = <B as crate::service::CommittedImageStore>::Error;
 
-    fn load_proof(&self, reference: &crate::v2::BlobRefV2) -> Result<Option<Vec<u8>>, Self::Error> {
+    fn load_proof(
+        &self,
+        reference: &crate::service::BlobRef,
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
         self.0.lock().unwrap().load_proof(reference)
     }
 
     fn commit_proof(
         &mut self,
-        reference: &crate::v2::BlobRefV2,
+        reference: &crate::service::BlobRef,
         proof: &[u8],
     ) -> Result<(), Self::Error> {
         self.0.lock().unwrap().commit_proof(reference, proof)
@@ -1709,8 +1716,8 @@ where
 
     fn load_private_ingress(
         &self,
-        invocation: crate::v2::InvocationId,
-        reference: &crate::v2::BlobRefV2,
+        invocation: crate::service::InvocationId,
+        reference: &crate::service::BlobRef,
     ) -> Result<Option<Vec<u8>>, Self::Error> {
         self.0
             .lock()
@@ -1724,10 +1731,10 @@ where
 
     fn commit_private_ingress(
         &mut self,
-        invocation: crate::v2::InvocationId,
-        reference: &crate::v2::BlobRefV2,
+        invocation: crate::service::InvocationId,
+        reference: &crate::service::BlobRef,
         arguments: &[u8],
-        staging: crate::v2::PrivateIngressStagingV2,
+        staging: crate::service::PrivateIngressStaging,
     ) -> Result<bool, Self::Error> {
         self.0
             .lock()
@@ -1737,15 +1744,15 @@ where
 
     fn delete_private_ingress(
         &mut self,
-        invocation: crate::v2::InvocationId,
+        invocation: crate::service::InvocationId,
     ) -> Result<bool, Self::Error> {
         self.0.lock().unwrap().delete_private_ingress(invocation)
     }
 
     fn reconcile_private_ingresses(
         &mut self,
-        retained: &[(crate::v2::InvocationId, crate::v2::BlobRefV2)],
-        terminal: &[crate::v2::InvocationId],
+        retained: &[(crate::service::InvocationId, crate::service::BlobRef)],
+        terminal: &[crate::service::InvocationId],
     ) -> Result<(), Self::Error> {
         self.0
             .lock()
@@ -1755,7 +1762,7 @@ where
 
     fn load_producer_record(
         &self,
-        actor: crate::v2::ActorId,
+        actor: crate::service::ActorId,
         tag: &[u8; 32],
     ) -> Result<Option<Vec<u8>>, Self::Error> {
         self.0.lock().unwrap().load_producer_record(actor, tag)
@@ -1763,7 +1770,7 @@ where
 
     fn commit_producer_record(
         &mut self,
-        actor: crate::v2::ActorId,
+        actor: crate::service::ActorId,
         tag: &[u8; 32],
         record: &[u8],
     ) -> Result<bool, Self::Error> {
@@ -1775,7 +1782,7 @@ where
 
     fn delete_producer_record(
         &mut self,
-        actor: crate::v2::ActorId,
+        actor: crate::service::ActorId,
         tag: &[u8; 32],
     ) -> Result<bool, Self::Error> {
         self.0.lock().unwrap().delete_producer_record(actor, tag)
@@ -1783,15 +1790,15 @@ where
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-enum V2RaftRecoveryOpenError<E> {
+enum RaftRecoveryOpenError<E> {
     Log(crate::commit::CommitError),
-    Service(crate::v2::LocalRootTreeOpenErrorV2<E>),
+    Service(crate::service::LocalRootTreeOpenError<E>),
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-struct V2RaftRecoveryRuntime<B> {
-    config: crate::v2::LocalRootTreeConfigV2,
-    backend: NodeCommittedImageStoreV2<B>,
+struct RaftRecoveryRuntime<B> {
+    config: crate::service::LocalRootTreeConfig,
+    backend: NodeCommittedImageStore<B>,
     db: Arc<redb::Database>,
     raft_config: crate::raft::RaftConfig,
     worker: Arc<crate::raft::RaftWorker>,
@@ -1799,10 +1806,10 @@ struct V2RaftRecoveryRuntime<B> {
     network: Option<Arc<crate::network::Network>>,
     replication_id: [u8; 32],
     handler: Arc<dyn crate::network::RaftRpcHandler>,
-    expected_policy: Option<crate::v2::Hash>,
-    pending_route: Arc<V2PrivateIngressRoute>,
-    proof_verifier: Option<V2NodeAttestationProofVerifier>,
-    production_trust: Option<Arc<dyn crate::v2::ProductionTrustV2>>,
+    expected_policy: Option<crate::service::Hash>,
+    pending_route: Arc<PrivateIngressRoute>,
+    proof_verifier: Option<NodeAttestationProofVerifier>,
+    production_trust: Option<Arc<dyn crate::service::ProductionTrust>>,
     /// The persisted configuration cannot prove that this replica is outside
     /// the last committed voter set. This is a retention predicate only: a
     /// speculative configuration may require the worker for quorum recovery
@@ -1811,50 +1818,51 @@ struct V2RaftRecoveryRuntime<B> {
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-impl<B> V2RaftRecoveryRuntime<B>
+impl<B> RaftRecoveryRuntime<B>
 where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-        + Send
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        > + Send
         + 'static,
 {
     fn open(
         &self,
     ) -> Result<
-        crate::v2::LocalRootTreeServiceV2<NodeCommittedImageStoreV2<B>>,
-        V2RaftRecoveryOpenError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+        crate::service::LocalRootTreeService<NodeCommittedImageStore<B>>,
+        RaftRecoveryOpenError<<B as crate::service::CommittedImageStore>::Error>,
     > {
-        let log = crate::raft::RaftAccumulateLogV2::from_shared_worker(
+        let log = crate::raft::RaftAccumulateLog::from_shared_worker(
             self.db.clone(),
             self.raft_config.clone(),
             self.worker.clone(),
             self.apply_rx.clone(),
         )
-        .map_err(V2RaftRecoveryOpenError::Log)?;
+        .map_err(RaftRecoveryOpenError::Log)?;
         match self.production_trust.as_ref() {
-            Some(trust) => crate::v2::LocalRootTreeServiceV2::open_raft_production(
+            Some(trust) => crate::service::LocalRootTreeService::open_raft_production(
                 self.config.clone(),
                 self.backend.clone(),
                 log,
                 trust.clone(),
             ),
-            None => crate::v2::LocalRootTreeServiceV2::open_raft_with_proof_verifier(
+            None => crate::service::LocalRootTreeService::open_raft_with_proof_verifier(
                 self.config.clone(),
                 self.backend.clone(),
                 log,
                 self.proof_verifier
                     .clone()
-                    .unwrap_or_else(v2_deny_all_proof_verifier),
+                    .unwrap_or_else(service_deny_all_proof_verifier),
             ),
         }
-        .map_err(V2RaftRecoveryOpenError::Service)
+        .map_err(RaftRecoveryOpenError::Service)
     }
 
-    fn cleanup(&self, routes: &V2PrivateIngressRoutes) {
+    fn cleanup(&self, routes: &PrivateIngressRoutes) {
         if let Some(network) = self.network.as_ref() {
             network.unregister_raft_handler_if(&self.replication_id, &self.handler);
         }
-        remove_v2_private_ingress_route_if(routes, &self.replication_id, &self.pending_route);
+        remove_service_private_ingress_route_if(routes, &self.replication_id, &self.pending_route);
     }
 
     fn membership_definitively_removed_local_voter(&self) -> bool {
@@ -1885,13 +1893,15 @@ where
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-struct PreparedV2RaftRoot<B>
+struct PreparedRaftRoot<B>
 where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        >,
 {
-    service: Option<crate::v2::LocalRootTreeServiceV2<NodeCommittedImageStoreV2<B>>>,
-    runtime: V2RaftRecoveryRuntime<B>,
+    service: Option<crate::service::LocalRootTreeService<NodeCommittedImageStore<B>>>,
+    runtime: RaftRecoveryRuntime<B>,
 }
 
 /// Shared host-side reverse map: `local_id` (`id.0 & 0xFFFF`) →
@@ -2063,10 +2073,10 @@ type SharedNetwork = Arc<Mutex<Option<Arc<crate::network::Network>>>>;
 #[cfg(feature = "network")]
 struct NodeService {
     invoke_routes: InvokeRoutes,
-    /// Guest-owned root routes distinguish canonical v2 Raft delegation from
+    /// Guest-owned root routes distinguish canonical service Raft delegation from
     /// legacy Raft forwarding. Only the former consumes delegated origin and
     /// can safely omit the legacy host-role probes.
-    v2_actor_routes: Arc<RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>>,
+    service_actor_routes: Arc<RwLock<HashMap<crate::service::ActorId, ActorRoute>>>,
     /// Clone of the node's [`AgentNames`] reverse map, read by
     /// [`Self::dispatch_invoke`] to resolve the target's instance name
     /// for the actor-local grant probe — so an operator-written
@@ -2086,7 +2096,7 @@ struct NodeService {
     #[cfg(feature = "storage")]
     raft_hosts: RaftHosts,
     #[cfg(feature = "storage")]
-    v2_private_ingress_routes: V2PrivateIngressRoutes,
+    service_private_ingress_routes: PrivateIngressRoutes,
     shared_network: SharedNetwork,
     manifest: Arc<OnceLock<crate::network::ManifestReply>>,
     proof_blobs: ProofBlobStore,
@@ -2125,19 +2135,23 @@ const SYNC_FLOOR_TTL: Duration = Duration::from_secs(30);
 #[cfg(feature = "network")]
 impl NodeService {
     #[cfg(feature = "storage")]
-    fn target_is_local_v2_raft_root(&self, target: u32, target_unscoped: u32) -> bool {
-        self.local_v2_raft_root_route(target, target_unscoped)
+    fn target_is_local_service_raft_root(&self, target: u32, target_unscoped: u32) -> bool {
+        self.local_service_raft_root_route(target, target_unscoped)
             .is_some()
     }
 
     #[cfg(feature = "storage")]
-    fn local_v2_raft_root_route(&self, target: u32, target_unscoped: u32) -> Option<V2ActorRoute> {
-        self.v2_actor_routes
+    fn local_service_raft_root_route(
+        &self,
+        target: u32,
+        target_unscoped: u32,
+    ) -> Option<ActorRoute> {
+        self.service_actor_routes
             .read()
             .ok()?
             .values()
             .find(|route| {
-                route.consistency == crate::v2::ConsistencyModeV2::Raft
+                route.consistency == crate::service::ConsistencyMode::Raft
                     && route.authenticated_peer.is_none()
                     && (route.route == target || (route.route & 0xFFFF) == target_unscoped)
             })
@@ -2152,7 +2166,7 @@ impl NodeService {
     #[cfg(feature = "storage")]
     fn attest_registry_invite(&self, mut message: crate::value::Msg) -> Option<Vec<u8>> {
         use crate::actors::codec::{Decode, Encode};
-        use crate::v2::V2Wire;
+        use crate::service::ServiceWire;
 
         if message.name != "redeem_invite" {
             return None;
@@ -2185,34 +2199,34 @@ impl NodeService {
         else {
             return None;
         };
-        let space = crate::v2::SpaceId(space_bytes.as_slice().try_into().ok()?);
-        if space == crate::v2::SpaceId([0; 32]) || authority_replication_id == [0; 32] {
+        let space = crate::service::SpaceId(space_bytes.as_slice().try_into().ok()?);
+        if space == crate::service::SpaceId([0; 32]) || authority_replication_id == [0; 32] {
             return None;
         }
 
-        let root_service = crate::v2::RootServiceId(
-            crate::v2::Hash::digest(
-                b"vos/installed-root-service/v2",
+        let root_service = crate::service::RootServiceId(
+            crate::service::Hash::digest(
+                b"vos/installed-root-service/service",
                 &[
                     &space.0,
-                    crate::v2::ROLE_AUTHORITY_INSTANCE_V2.as_bytes(),
+                    crate::service::ROLE_AUTHORITY_INSTANCE_.as_bytes(),
                     &authority_replication_id,
                 ],
             )
             .0,
         );
-        let authority_actor = crate::v2::ActorId(
-            crate::v2::Hash::digest(
-                b"vos/installed-root-actor/v2",
+        let authority_actor = crate::service::ActorId(
+            crate::service::Hash::digest(
+                b"vos/installed-root-actor/service",
                 &[
                     &root_service.0,
-                    crate::v2::ROLE_AUTHORITY_INSTANCE_V2.as_bytes(),
+                    crate::service::ROLE_AUTHORITY_INSTANCE_.as_bytes(),
                 ],
             )
             .0,
         );
         let route = self
-            .v2_actor_routes
+            .service_actor_routes
             .read()
             .ok()?
             .get(&authority_actor)
@@ -2220,13 +2234,13 @@ impl NodeService {
             .filter(|route| {
                 route.service.space == space
                     && route.service.root_service == root_service
-                    && route.consistency == crate::v2::ConsistencyModeV2::Raft
+                    && route.consistency == crate::service::ConsistencyMode::Raft
                     && route.replication_id == Some(authority_replication_id)
                     && route.is_role_authority
                     && route.authenticated_peer.is_none()
             })?;
 
-        let redemption = crate::v2::RoleAuthorityInviteRedemptionV2 {
+        let redemption = crate::service::RoleAuthorityInviteRedemption {
             space,
             authority_replication_id,
             token_pub: token_pub.as_slice().try_into().ok()?,
@@ -2241,21 +2255,21 @@ impl NodeService {
         let redemption_wire = redemption.encode();
         let mut arguments = vec![crate::value::TAG_DYNAMIC];
         arguments.extend_from_slice(
-            &crate::value::Msg::new(crate::v2::ROLE_AUTHORITY_INVITE_METHOD_V2)
+            &crate::value::Msg::new(crate::service::ROLE_AUTHORITY_INVITE_METHOD_)
                 .with("redemption", redemption_wire.clone())
                 .encode(),
         );
-        let ingress = crate::v2::RootTreeInvocationV2 {
-            invocation: crate::v2::InvocationId::derive(
-                b"vos/invite-authority-redemption/v2",
+        let ingress = crate::service::RootTreeInvocation {
+            invocation: crate::service::InvocationId::derive(
+                b"vos/invite-authority-redemption/service",
                 &redemption_wire,
             ),
             target: authority_actor,
-            method: crate::v2::ROLE_AUTHORITY_INVITE_METHOD_V2.into(),
+            method: crate::service::ROLE_AUTHORITY_INVITE_METHOD_.into(),
             arguments,
             proof_requested: false,
         };
-        let reply = self.invoke_v2_authority_route(&route, ingress.encode())?;
+        let reply = self.invoke_service_authority_route(&route, ingress.encode())?;
         if <crate::value::Value as Decode>::try_decode(&reply).and_then(|value| value.as_bool())
             != Some(true)
         {
@@ -2290,7 +2304,11 @@ impl NodeService {
     }
 
     #[cfg(feature = "storage")]
-    fn invoke_v2_authority_route(&self, route: &V2ActorRoute, ingress: Vec<u8>) -> Option<Vec<u8>> {
+    fn invoke_service_authority_route(
+        &self,
+        route: &ActorRoute,
+        ingress: Vec<u8>,
+    ) -> Option<Vec<u8>> {
         let tx = self.invoke_routes.lock().ok()?.get(&route.route).cloned()?;
         let deadline = Instant::now().checked_add(route.invoke_timeout)?;
         let (reply_tx, reply_rx) = mpsc::channel();
@@ -2309,10 +2327,10 @@ impl NodeService {
         let envelope = reply_rx
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .ok()?;
-        if let Some(redirect) = decode_v2_raft_redirect(&envelope) {
+        if let Some(redirect) = decode_service_raft_redirect(&envelope) {
             let network = self.shared_network.lock().ok()?.clone()?;
             let status = network.local_raft_status(&route.replication_id?)?;
-            return send_v2_raft_invoke_exact(
+            return send_service_raft_invoke_exact(
                 &network,
                 &self.invoke_routes,
                 route,
@@ -2709,7 +2727,7 @@ impl NodeService {
     /// state machine, so carrying the origin they observed does not enlarge
     /// that trust set.
     #[cfg(feature = "storage")]
-    fn caller_is_v2_raft_voter(
+    fn caller_is_service_raft_voter(
         &self,
         target: u32,
         target_unscoped: u32,
@@ -2766,7 +2784,7 @@ fn registry_probe_reply(routes: &InvokeRoutes, payload: Vec<u8>) -> Option<Vec<u
     registry_probe_reply_with_timeout(
         routes,
         payload,
-        Duration::from_millis(V2_RAFT_VOTER_AUTH_TIMEOUT_MS),
+        Duration::from_millis(SERVICE_RAFT_VOTER_AUTH_TIMEOUT_MS),
     )
 }
 
@@ -2814,7 +2832,7 @@ fn lookup_node_member_from_routes(
     lookup_node_member_from_routes_with_timeout(
         routes,
         prefix,
-        Duration::from_millis(V2_RAFT_VOTER_AUTH_TIMEOUT_MS),
+        Duration::from_millis(SERVICE_RAFT_VOTER_AUTH_TIMEOUT_MS),
     )
 }
 
@@ -2953,7 +2971,7 @@ fn verifies_raft_voter_replacement_operator(
 /// network's prefix map is deliberately absent: a colliding connected peer
 /// must never participate in authority finality or response selection.
 #[cfg(all(feature = "network", feature = "storage"))]
-fn authenticated_v2_raft_leader_peer(
+fn authenticated_service_raft_leader_peer(
     status: &crate::network::RaftStatusReply,
     member: &crate::registry::MemberRow,
     leader_prefix: u16,
@@ -2974,13 +2992,13 @@ fn authenticated_v2_raft_leader_peer(
 /// change is returned here and reauthenticated before another send.
 #[cfg(all(feature = "network", feature = "storage"))]
 #[allow(clippy::too_many_arguments)]
-fn send_v2_raft_invoke_exact(
+fn send_service_raft_invoke_exact(
     network: &crate::network::Network,
     invoke_routes: &InvokeRoutes,
-    route: &V2ActorRoute,
+    route: &ActorRoute,
     mut status: crate::network::RaftStatusReply,
     mut leader_prefix: u16,
-    origin: crate::v2::Origin,
+    origin: crate::service::Origin,
     preserve_envelope: bool,
     role_authority_request: bool,
     root_upgrade_request: bool,
@@ -2994,9 +3012,9 @@ fn send_v2_raft_invoke_exact(
             return None;
         }
         let member = lookup_node_member_from_routes(invoke_routes, leader_prefix)?;
-        let peer = authenticated_v2_raft_leader_peer(&status, &member, leader_prefix)?;
+        let peer = authenticated_service_raft_leader_peer(&status, &member, leader_prefix)?;
         let leader_route = ServiceId::new(leader_prefix, ServiceId(route.route).local_id()).0;
-        let delegated = encode_v2_raft_delegation(
+        let delegated = encode_service_raft_delegation(
             origin,
             preserve_envelope,
             role_authority_request,
@@ -3079,29 +3097,29 @@ fn redeem_invite_is_expired(msg: &crate::value::Msg, now: Option<u64>) -> bool {
     now.is_none_or(|now| now >= expires_at)
 }
 
-/// Apply the same host-time admission check to the v2 authority's wrapped
+/// Apply the same host-time admission check to the service authority's wrapped
 /// root-tree invocation. Once admitted, the PVM replays only deterministic
 /// signature and delegation checks; wall time never enters actor state.
 #[cfg(feature = "network")]
 fn authority_invite_is_expired(msg: &[u8], now: Option<u64>) -> bool {
-    use crate::v2::V2Wire;
+    use crate::service::ServiceWire;
 
-    let Ok(invocation) = crate::v2::RootTreeInvocationV2::decode(msg) else {
+    let Ok(invocation) = crate::service::RootTreeInvocation::decode(msg) else {
         return false;
     };
-    if invocation.method != crate::v2::ROLE_AUTHORITY_INVITE_METHOD_V2 {
+    if invocation.method != crate::service::ROLE_AUTHORITY_INVITE_METHOD_ {
         return false;
     }
     let Some(arguments) = intercepted_msg(&invocation.arguments) else {
         return true;
     };
-    if arguments.name != crate::v2::ROLE_AUTHORITY_INVITE_METHOD_V2 {
+    if arguments.name != crate::service::ROLE_AUTHORITY_INVITE_METHOD_ {
         return true;
     }
     let Some(redemption) = arguments.args.get_bytes("redemption") else {
         return true;
     };
-    let Ok(redemption) = crate::v2::RoleAuthorityInviteRedemptionV2::decode(&redemption) else {
+    let Ok(redemption) = crate::service::RoleAuthorityInviteRedemption::decode(&redemption) else {
         return true;
     };
     now.is_none_or(|now| now >= redemption.expires_at)
@@ -3153,10 +3171,10 @@ impl crate::network::NetworkService for NodeService {
         // ordinary remote callers never get to construct it themselves.
         #[cfg(feature = "storage")]
         let (delegated_origin, preserve_envelope, role_authority_request, root_upgrade_request) =
-            match decode_v2_raft_delegation(&msg) {
+            match decode_service_raft_delegation(&msg) {
                 Ok(Some(delegated))
                     if caller_peer_id.as_ref().is_some_and(|peer| {
-                        self.caller_is_v2_raft_voter(to, to_unscoped, peer)
+                        self.caller_is_service_raft_voter(to, to_unscoped, peer)
                     }) =>
                 {
                     msg = delegated.ingress;
@@ -3181,7 +3199,7 @@ impl crate::network::NetworkService for NodeService {
         let root_upgrade_request = false;
         #[cfg(feature = "storage")]
         let authenticated_raft_delegation =
-            delegated_origin.is_some() && self.target_is_local_v2_raft_root(to, to_unscoped);
+            delegated_origin.is_some() && self.target_is_local_service_raft_root(to, to_unscoped);
         #[cfg(not(feature = "storage"))]
         let authenticated_raft_delegation = false;
 
@@ -3197,7 +3215,7 @@ impl crate::network::NetworkService for NodeService {
         let expired_authority_invite = self
             .agent_name_for(to_unscoped)
             .as_deref()
-            .is_some_and(|name| name == crate::v2::ROLE_AUTHORITY_INSTANCE_V2)
+            .is_some_and(|name| name == crate::service::ROLE_AUTHORITY_INSTANCE_)
             && authority_invite_is_expired(&msg, now);
         if expired_registry_invite || expired_authority_invite {
             warn!(peer = ?caller_peer_id, "redeem_invite refused: token expired");
@@ -3295,7 +3313,7 @@ impl crate::network::NetworkService for NodeService {
         };
         #[cfg(feature = "storage")]
         let raft_redrive = self
-            .local_v2_raft_root_route(to, to_unscoped)
+            .local_service_raft_root_route(to, to_unscoped)
             .map(|route| (route, msg.clone()));
         let (reply_tx, reply_rx) = mpsc::channel();
         // libp2p noise verified the PeerId at connect time; the
@@ -3318,11 +3336,11 @@ impl crate::network::NetworkService for NodeService {
         // is the correct deny-by-omission.
         let (space_role, actor_local_role) = if authenticated_raft_delegation {
             // The full-PeerId voter check above is the authority boundary for
-            // authenticated delegation. The canonical v2 root ingress accepts only public methods
+            // authenticated delegation. The canonical service root ingress accepts only public methods
             // and consumes `delegated_origin`, not host role bytes. Re-probing
             // the forwarding node's space/actor roles is therefore both
             // semantically irrelevant and two extra serial 5-second waits.
-            // Keep both absent so a future non-public v2 cutover fails closed
+            // Keep both absent so a future non-public service cutover fails closed
             // until it carries its own authenticated authorization evidence.
             (None, None)
         } else {
@@ -3418,7 +3436,7 @@ impl crate::network::NetworkService for NodeService {
         match reply_rx.recv_timeout(Duration::from_secs(300)).ok() {
             Some(env) => {
                 #[cfg(feature = "storage")]
-                if let Some(redirect) = decode_v2_raft_redirect(&env) {
+                if let Some(redirect) = decode_service_raft_redirect(&env) {
                     // A one-shot client normally knows only the daemon it
                     // dialled. Returning a compact leader prefix asks that
                     // unauthenticated client-side map to discover and trust a
@@ -3436,7 +3454,7 @@ impl crate::network::NetworkService for NodeService {
                                 let replication_id = route.replication_id?;
                                 let status = network.local_raft_status(&replication_id)?;
                                 let deadline = Instant::now().checked_add(route.invoke_timeout)?;
-                                send_v2_raft_invoke_exact(
+                                send_service_raft_invoke_exact(
                                     &network,
                                     &self.invoke_routes,
                                     &route,
@@ -3552,7 +3570,7 @@ impl crate::network::NetworkService for NodeService {
         bytes: Vec<u8>,
     ) -> bool {
         if bytes.is_empty()
-            || bytes.len() > crate::v2::ACTOR_PRIVATE_INPUT_MAX_BYTES
+            || bytes.len() > crate::service::ACTOR_PRIVATE_INPUT_MAX_BYTES
             || content_len != bytes.len() as u64
         {
             return false;
@@ -3577,30 +3595,30 @@ impl crate::network::NetworkService for NodeService {
         let Some(member) = self.lookup_node_member(prefix) else {
             return false;
         };
-        if authenticated_v2_raft_leader_peer(&status, &member, prefix) != Some(peer) {
+        if authenticated_service_raft_leader_peer(&status, &member, prefix) != Some(peer) {
             return false;
         }
-        let reference = crate::v2::BlobRefV2 {
-            hash: crate::v2::Hash(*content_hash),
+        let reference = crate::service::BlobRef {
+            hash: crate::service::Hash(*content_hash),
             len: content_len,
         };
         if !reference.matches(&bytes) {
             return false;
         }
         let Some(tx) = self
-            .v2_private_ingress_routes
+            .service_private_ingress_routes
             .read()
             .ok()
             .and_then(|routes| routes.get(replication_id).map(|route| route.tx.clone()))
         else {
             return false;
         };
-        stage_v2_private_ingress_through_root(
+        stage_service_private_ingress_through_root(
             &tx,
-            crate::v2::InvocationId(*invocation),
+            crate::service::InvocationId(*invocation),
             reference,
             bytes,
-            V2_PRIVATE_INGRESS_STAGE_TIMEOUT,
+            SERVICE_PRIVATE_INGRESS_STAGE_TIMEOUT,
         )
     }
 
@@ -3655,12 +3673,12 @@ impl crate::network::NetworkService for NodeService {
             return crate::network::RaftJoinResult::NotAuthorized;
         }
         let route = self
-            .v2_private_ingress_routes
+            .service_private_ingress_routes
             .read()
             .ok()
             .and_then(|routes| routes.get(replication_id).cloned());
         let Some(route) = route else {
-            // Legacy/non-v2 groups retain their existing join contract.
+            // Legacy/non groups retain their existing join contract.
             return if production_trust_policy.is_none() {
                 handler.handle_join(replication_id, joiner_prefix)
             } else {
@@ -3675,7 +3693,10 @@ impl crate::network::NetworkService for NodeService {
         };
         let (reply_tx, reply_rx) = mpsc::channel();
         if route.quiescence_tx.try_send(reply_tx).is_err()
-            || reply_rx.recv_timeout(V2_PRIVATE_INGRESS_STAGE_TIMEOUT).ok() != Some(true)
+            || reply_rx
+                .recv_timeout(SERVICE_PRIVATE_INGRESS_STAGE_TIMEOUT)
+                .ok()
+                != Some(true)
         {
             return crate::network::RaftJoinResult::Busy;
         }
@@ -3784,7 +3805,9 @@ impl crate::network::NetworkService for NodeService {
                 operation_epoch,
                 operator_signature,
             );
-            reply.recv_timeout(V2_PRIVATE_INGRESS_STAGE_TIMEOUT).ok()
+            reply
+                .recv_timeout(SERVICE_PRIVATE_INGRESS_STAGE_TIMEOUT)
+                .ok()
         };
 
         // Let the leader make the replacement-readiness observation. A
@@ -3813,7 +3836,7 @@ impl crate::network::NetworkService for NodeService {
                 } else {
                     network
                         .send_raft_status_req(replacement_peer, *replication_id)
-                        .recv_timeout(V2_PRIVATE_INGRESS_STAGE_TIMEOUT)
+                        .recv_timeout(SERVICE_PRIVATE_INGRESS_STAGE_TIMEOUT)
                         .ok()
                 }
             });
@@ -3830,12 +3853,12 @@ impl crate::network::NetworkService for NodeService {
         }
 
         let route = self
-            .v2_private_ingress_routes
+            .service_private_ingress_routes
             .read()
             .ok()
             .and_then(|routes| routes.get(replication_id).cloned());
         let Some(route) = route else {
-            // This production surface is intentionally limited to v2 roots;
+            // This production surface is intentionally limited to service roots;
             // legacy groups have no durable private-input quiescence contract.
             return RaftReplaceVoterResult::UnknownGroup;
         };
@@ -3844,7 +3867,10 @@ impl crate::network::NetworkService for NodeService {
         };
         let (reply_tx, reply_rx) = mpsc::channel();
         if route.quiescence_tx.try_send(reply_tx).is_err()
-            || reply_rx.recv_timeout(V2_PRIVATE_INGRESS_STAGE_TIMEOUT).ok() != Some(true)
+            || reply_rx
+                .recv_timeout(SERVICE_PRIVATE_INGRESS_STAGE_TIMEOUT)
+                .ok()
+                != Some(true)
         {
             return RaftReplaceVoterResult::Busy;
         }
@@ -4296,10 +4322,10 @@ impl VosNode {
     pub fn with_prefix(node_prefix: u16) -> Self {
         let (outbox_tx, outbox_rx) = mpsc::channel();
         #[cfg(all(feature = "network", feature = "storage"))]
-        let (pending_v2_root_ready_tx, pending_v2_root_ready_rx) = mpsc::channel();
-        let mut v2_invocation_seed = [0_u8; 32];
-        getrandom::getrandom(&mut v2_invocation_seed)
-            .expect("OS entropy for v2 host invocation identities");
+        let (pending_service_root_ready_tx, pending_service_root_ready_rx) = mpsc::channel();
+        let mut service_invocation_seed = [0_u8; 32];
+        getrandom::getrandom(&mut service_invocation_seed)
+            .expect("OS entropy for service host invocation identities");
         Self {
             node_prefix,
             next_local: AtomicU16::new(1), // 0 is reserved for registry
@@ -4308,10 +4334,10 @@ impl VosNode {
             outbox_tx,
             outbox_rx,
             invoke_routes: Arc::new(Mutex::new(HashMap::new())),
-            v2_actor_routes: Arc::new(RwLock::new(HashMap::new())),
-            v2_invocation_seed,
-            v2_invocation_ordinal: AtomicU64::new(1),
-            v2_logical_timeslot: Arc::new(AtomicU64::new(v2_wall_timeslot())),
+            service_actor_routes: Arc::new(RwLock::new(HashMap::new())),
+            service_invocation_seed,
+            service_invocation_ordinal: AtomicU64::new(1),
+            service_logical_timeslot: Arc::new(AtomicU64::new(service_wall_timeslot())),
             agent_names: Arc::new(std::sync::RwLock::new(HashMap::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             agent_shutdown: Arc::new(Mutex::new(HashMap::new())),
@@ -4327,21 +4353,21 @@ impl VosNode {
             #[cfg(all(feature = "network", feature = "storage"))]
             raft_hosts: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(feature = "network", feature = "storage"))]
-            v2_private_ingress_routes: Arc::new(RwLock::new(HashMap::new())),
+            service_private_ingress_routes: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(all(feature = "network", feature = "storage"))]
-            v2_raft_transport_resolutions: Arc::new(Mutex::new(HashMap::new())),
+            service_raft_transport_resolutions: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(all(feature = "network", feature = "storage"))]
-            v2_raft_transport_ownership_generation: AtomicU64::new(0),
+            service_raft_transport_ownership_generation: AtomicU64::new(0),
             #[cfg(all(feature = "network", feature = "storage"))]
-            pending_v2_root_ready_tx,
+            pending_service_root_ready_tx,
             #[cfg(all(feature = "network", feature = "storage"))]
-            pending_v2_root_ready_rx,
+            pending_service_root_ready_rx,
             #[cfg(all(feature = "network", feature = "storage"))]
-            pending_v2_root_threads: Vec::new(),
+            pending_service_root_threads: Vec::new(),
             #[cfg(all(feature = "network", feature = "storage"))]
-            pending_v2_root_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            pending_service_root_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
             #[cfg(all(feature = "network", feature = "storage"))]
-            pending_v2_root_actors: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            pending_service_root_actors: Arc::new(Mutex::new(std::collections::HashSet::new())),
             #[cfg(feature = "network")]
             manifest: Arc::new(OnceLock::new()),
             #[cfg(all(feature = "network", feature = "storage"))]
@@ -4507,7 +4533,7 @@ impl VosNode {
         // trait's empty-reply defaults.
         let service = Arc::new(NodeService {
             invoke_routes: self.invoke_routes.clone(),
-            v2_actor_routes: self.v2_actor_routes.clone(),
+            service_actor_routes: self.service_actor_routes.clone(),
             agent_names: self.agent_names.clone(),
             agent_shutdown: self.agent_shutdown.clone(),
             agent_info: self.agent_info.clone(),
@@ -4516,7 +4542,7 @@ impl VosNode {
             #[cfg(feature = "storage")]
             raft_hosts: self.raft_hosts.clone(),
             #[cfg(feature = "storage")]
-            v2_private_ingress_routes: self.v2_private_ingress_routes.clone(),
+            service_private_ingress_routes: self.service_private_ingress_routes.clone(),
             shared_network: self.shared_network.clone(),
             manifest: self.manifest.clone(),
             proof_blobs: self.proof_blobs.clone(),
@@ -4541,7 +4567,7 @@ impl VosNode {
         let outbox_tx = self.outbox_tx.clone();
         let activity = self.last_activity.clone();
         let shutdown = self.shutdown.clone();
-        let v2_actor_routes = self.v2_actor_routes.clone();
+        let service_actor_routes = self.service_actor_routes.clone();
         #[cfg(feature = "storage")]
         let invoke_routes = self.invoke_routes.clone();
         let network = Arc::new(network);
@@ -4553,16 +4579,16 @@ impl VosNode {
                     break;
                 }
                 if tell.payload.starts_with(b"VRT2") {
-                    use crate::v2::V2Wire;
+                    use crate::service::ServiceWire;
 
                     let peer = tell.peer.to_bytes();
-                    let crdt_sync = crate::v2::RootTreeTransportV2::decode(&tell.payload)
+                    let crdt_sync = crate::service::RootTreeTransport::decode(&tell.payload)
                         .ok()
                         .is_some_and(|transport| {
                             matches!(
                                 transport,
-                                crate::v2::RootTreeTransportV2::CrdtSyncChunk { .. }
-                                    | crate::v2::RootTreeTransportV2::CrdtSyncAccepted { .. }
+                                crate::service::RootTreeTransport::CrdtSyncChunk { .. }
+                                    | crate::service::RootTreeTransport::CrdtSyncAccepted { .. }
                             )
                         });
                     // The bridge binds the transport route to the complete
@@ -4575,15 +4601,19 @@ impl VosNode {
                             == ServiceId(tell.from).node_prefix();
                     let authenticated = authenticated_crdt
                         || (!crdt_sync
-                            && v2_transport_source_route(&v2_actor_routes, &tell.payload)
-                                .is_some_and(|route| match route.consistency {
-                                    crate::v2::ConsistencyModeV2::Local => {
+                            && service_transport_source_route(
+                                &service_actor_routes,
+                                &tell.payload,
+                            )
+                            .is_some_and(|route| {
+                                match route.consistency {
+                                    crate::service::ConsistencyMode::Local => {
                                         route.route == tell.from
                                             && route.authenticated_peer.as_deref()
                                                 == Some(peer.as_slice())
                                     }
                                     #[cfg(feature = "storage")]
-                                    crate::v2::ConsistencyModeV2::Raft => {
+                                    crate::service::ConsistencyMode::Raft => {
                                         raft_route_peer_is_current_leader(
                                             &route,
                                             ServiceId(tell.from),
@@ -4593,12 +4623,13 @@ impl VosNode {
                                         )
                                     }
                                     _ => false,
-                                }));
+                                }
+                            }));
                     if !authenticated {
                         warn!(
                             peer = %tell.peer,
                             from = tell.from,
-                            "node: rejected v2 root transport from an unbound authenticated peer"
+                            "node: rejected service root transport from an unbound authenticated peer"
                         );
                         continue;
                     }
@@ -4687,49 +4718,51 @@ impl VosNode {
         self.register_inner(config, id)
     }
 
-    /// Attach one already-opened guest-owned v2 root tree to a local host
+    /// Attach one already-opened guest-owned service root tree to a local host
     /// route. Direct public and canonical space-role calls execute through the
     /// service PVM; this thread never applies actor writes or effects natively.
-    pub fn register_v2_root_at_id<B>(
+    pub fn register_service_root_at_id<B>(
         &mut self,
         name: impl Into<String>,
-        mut service: crate::v2::LocalRootTreeServiceV2<B>,
+        mut service: crate::service::LocalRootTreeService<B>,
         id: ServiceId,
         network_reachable: bool,
-    ) -> Result<ServiceId, V2NodeRegistrationError>
+    ) -> Result<ServiceId, NodeRegistrationError>
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-            + Send
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            > + Send
             + 'static,
     {
-        install_v2_root_proof_verifier(&mut service, None)?;
-        self.validate_v2_root_registration(&service, id)?;
-        Ok(self.attach_v2_root_unchecked(name.into(), service, id, network_reachable, None))
+        install_service_root_proof_verifier(&mut service, None)?;
+        self.validate_service_root_registration(&service, id)?;
+        Ok(self.attach_service_root_unchecked(name.into(), service, id, network_reachable, None))
     }
 
-    /// Attach a v2 root with an explicit proof producer. Only roots registered
+    /// Attach a service root with an explicit proof producer. Only roots registered
     /// through this capability may execute methods whose signed policy is
     /// attested; ordinary registration remains fail-closed.
-    pub fn register_v2_root_at_id_with_producer<B, P>(
+    pub fn register_service_root_at_id_with_producer<B, P>(
         &mut self,
         name: impl Into<String>,
-        mut service: crate::v2::LocalRootTreeServiceV2<B>,
+        mut service: crate::service::LocalRootTreeService<B>,
         id: ServiceId,
         network_reachable: bool,
         producer: P,
-    ) -> Result<ServiceId, V2NodeRegistrationError>
+    ) -> Result<ServiceId, NodeRegistrationError>
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-            + Send
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            > + Send
             + 'static,
-        P: crate::AttestationProofBackendV2 + Send + 'static,
+        P: crate::AttestationProofBackend + Send + 'static,
     {
-        let producer = V2NodeAttestationProofProducer::new(producer);
-        install_v2_root_proof_verifier(&mut service, Some(producer.verifier()))?;
-        self.validate_v2_root_registration(&service, id)?;
-        Ok(self.attach_v2_root_unchecked(
+        let producer = NodeAttestationProofProducer::new(producer);
+        install_service_root_proof_verifier(&mut service, Some(producer.verifier()))?;
+        self.validate_service_root_registration(&service, id)?;
+        Ok(self.attach_service_root_unchecked(
             name.into(),
             service,
             id,
@@ -4742,100 +4775,119 @@ impl VosNode {
     /// producer. This is the least-authority registration for callers of an
     /// attested peer: incoming proofs are checked independently, while direct
     /// and inbox methods requiring proof production remain fail-closed.
-    pub fn register_v2_root_at_id_with_verifier<B, V>(
+    pub fn register_service_root_at_id_with_verifier<B, V>(
         &mut self,
         name: impl Into<String>,
-        mut service: crate::v2::LocalRootTreeServiceV2<B>,
+        mut service: crate::service::LocalRootTreeService<B>,
         id: ServiceId,
         network_reachable: bool,
         verifier: V,
-    ) -> Result<ServiceId, V2NodeRegistrationError>
+    ) -> Result<ServiceId, NodeRegistrationError>
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-            + Send
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            > + Send
             + 'static,
-        V: crate::AttestationProofVerifierV2 + Send + 'static,
+        V: crate::AttestationProofVerifier + Send + 'static,
     {
-        install_v2_root_proof_verifier(
+        install_service_root_proof_verifier(
             &mut service,
-            Some(v2_node_attestation_proof_verifier(verifier)),
+            Some(service_node_attestation_proof_verifier(verifier)),
         )?;
-        self.validate_v2_root_registration(&service, id)?;
-        Ok(self.attach_v2_root_unchecked(name.into(), service, id, network_reachable, None))
+        self.validate_service_root_registration(&service, id)?;
+        Ok(self.attach_service_root_unchecked(name.into(), service, id, network_reachable, None))
     }
 
-    fn validate_v2_root_registration<B>(
+    fn validate_service_root_registration<B>(
         &self,
-        service: &crate::v2::LocalRootTreeServiceV2<B>,
+        service: &crate::service::LocalRootTreeService<B>,
         id: ServiceId,
-    ) -> Result<(), V2NodeRegistrationError>
+    ) -> Result<(), NodeRegistrationError>
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            >,
     {
         if self.routes.contains_key(&id.0)
             || self.agent_info.read().unwrap().contains_key(&id.0)
             || self.invoke_routes.lock().unwrap().contains_key(&id.0)
         {
-            return Err(V2NodeRegistrationError::ServiceRouteOccupied(id));
+            return Err(NodeRegistrationError::ServiceRouteOccupied(id));
         }
         #[cfg(all(feature = "network", feature = "storage"))]
-        if self.pending_v2_root_ids.lock().unwrap().contains(&id.0) {
-            return Err(V2NodeRegistrationError::ServiceRouteOccupied(id));
+        if self
+            .pending_service_root_ids
+            .lock()
+            .unwrap()
+            .contains(&id.0)
+        {
+            return Err(NodeRegistrationError::ServiceRouteOccupied(id));
         }
         let actor = service.root_actor();
-        restore_v2_root_logical_timeslot(service, &self.v2_logical_timeslot)?;
-        if self.v2_actor_routes.read().unwrap().contains_key(&actor) {
-            return Err(V2NodeRegistrationError::ActorAlreadyRegistered(actor));
+        restore_service_root_logical_timeslot(service, &self.service_logical_timeslot)?;
+        if self
+            .service_actor_routes
+            .read()
+            .unwrap()
+            .contains_key(&actor)
+        {
+            return Err(NodeRegistrationError::ActorAlreadyRegistered(actor));
         }
         #[cfg(all(feature = "network", feature = "storage"))]
-        if self.pending_v2_root_actors.lock().unwrap().contains(&actor) {
-            return Err(V2NodeRegistrationError::ActorAlreadyRegistered(actor));
+        if self
+            .pending_service_root_actors
+            .lock()
+            .unwrap()
+            .contains(&actor)
+        {
+            return Err(NodeRegistrationError::ActorAlreadyRegistered(actor));
         }
         Ok(())
     }
 
-    fn attach_v2_root_unchecked<B>(
+    fn attach_service_root_unchecked<B>(
         &mut self,
         name: String,
-        service: crate::v2::LocalRootTreeServiceV2<B>,
+        service: crate::service::LocalRootTreeService<B>,
         id: ServiceId,
         network_reachable: bool,
-        proof_producer: Option<V2NodeAttestationProofProducer>,
+        proof_producer: Option<NodeAttestationProofProducer>,
     ) -> ServiceId
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-            + Send
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            > + Send
             + 'static,
     {
         let actor = service.root_actor();
-        let is_role_authority = name == crate::v2::ROLE_AUTHORITY_INSTANCE_V2;
+        let is_role_authority = name == crate::service::ROLE_AUTHORITY_INSTANCE_;
         let root_name = name.clone();
         #[cfg(all(feature = "storage", feature = "network"))]
         let invoke_timeout = service
             .raft_propose_timeout_ms()
-            .map(v2_raft_invoke_timeout)
-            .unwrap_or(V2_LOCAL_INVOKE_TIMEOUT);
+            .map(service_raft_invoke_timeout)
+            .unwrap_or(SERVICE_LOCAL_INVOKE_TIMEOUT);
         #[cfg(not(all(feature = "storage", feature = "network")))]
-        let invoke_timeout = V2_LOCAL_INVOKE_TIMEOUT;
+        let invoke_timeout = SERVICE_LOCAL_INVOKE_TIMEOUT;
         #[cfg(all(feature = "network", feature = "storage"))]
         if let Some(replication_id) = service.replication_id() {
             self.raft_hosts.lock().unwrap().insert(id.0, replication_id);
         }
         let service_identity = service.identity().clone();
         let consistency = match service.consistency() {
-            crate::v2::ConsistencyModeV2::Ephemeral => Consistency::Ephemeral,
-            crate::v2::ConsistencyModeV2::Local => Consistency::Local,
-            crate::v2::ConsistencyModeV2::Raft => Consistency::Raft,
-            crate::v2::ConsistencyModeV2::Crdt => Consistency::Crdt,
+            crate::service::ConsistencyMode::Ephemeral => Consistency::Ephemeral,
+            crate::service::ConsistencyMode::Local => Consistency::Local,
+            crate::service::ConsistencyMode::Raft => Consistency::Raft,
+            crate::service::ConsistencyMode::Crdt => Consistency::Crdt,
         };
         {
-            let mut actors = self.v2_actor_routes.write().unwrap();
+            let mut actors = self.service_actor_routes.write().unwrap();
             actors.insert(
                 actor,
-                V2ActorRoute {
+                ActorRoute {
                     route: id.0,
                     service: service_identity,
                     consistency: service.consistency(),
@@ -4863,37 +4915,37 @@ impl VosNode {
         );
         let shutdown = self.register_agent_shutdown(id);
         let activity = self.last_activity.clone();
-        let actor_routes = self.v2_actor_routes.clone();
+        let actor_routes = self.service_actor_routes.clone();
         let invoke_routes = self.invoke_routes.clone();
         #[cfg(feature = "network")]
         let shared_network = self.shared_network.clone();
-        let logical_timeslot = self.v2_logical_timeslot.clone();
+        let logical_timeslot = self.service_logical_timeslot.clone();
         let outbox = self.outbox_tx.clone();
         #[cfg(all(feature = "network", feature = "storage"))]
         let private_ingress_registration = service.replication_id().map(|replication_id| {
-            let (tx, rx) = mpsc::sync_channel(V2_PRIVATE_INGRESS_QUEUE_CAPACITY);
+            let (tx, rx) = mpsc::sync_channel(SERVICE_PRIVATE_INGRESS_QUEUE_CAPACITY);
             let (quiescence_tx, quiescence_rx) = mpsc::sync_channel(1);
-            let route = Arc::new(V2PrivateIngressRoute {
+            let route = Arc::new(PrivateIngressRoute {
                 tx,
                 quiescence_tx,
-                barrier: V2PrivateIngressBarrier::new(),
+                barrier: PrivateIngressBarrier::new(),
                 production_trust_policy: service.production_trust_policy_id().map(Into::into),
             });
-            self.v2_private_ingress_routes
+            self.service_private_ingress_routes
                 .write()
                 .unwrap()
                 .insert(replication_id, route.clone());
-            V2PrivateIngressRegistration {
+            PrivateIngressRegistration {
                 replication_id,
                 route,
                 receiver: rx,
                 quiescence_receiver: quiescence_rx,
-                routes: self.v2_private_ingress_routes.clone(),
+                routes: self.service_private_ingress_routes.clone(),
             }
         });
         self.agents.push(AgentHandle {
             join: Some(thread::spawn(move || {
-                v2_root_service_thread(
+                service_root_service_thread(
                     id,
                     root_name,
                     service,
@@ -4917,15 +4969,15 @@ impl VosNode {
         id
     }
 
-    /// Attach one Raft-backed v2 root tree to the node. The worker orders
-    /// canonical `AccumulateRequestV2` bytes; the root thread applies the
+    /// Attach one Raft-backed service root tree to the node. The worker orders
+    /// canonical `AccumulateRequest` bytes; the root thread applies the
     /// committed log through the same physical service PVM as local roots.
     #[cfg(all(feature = "storage", feature = "network"))]
     #[allow(clippy::too_many_arguments)]
-    pub fn register_v2_raft_root_at_id<B>(
+    pub fn register_service_raft_root_at_id<B>(
         &mut self,
         name: String,
-        config: crate::v2::LocalRootTreeConfigV2,
+        config: crate::service::LocalRootTreeConfig,
         backend: B,
         db: Arc<redb::Database>,
         raft_config: crate::raft::RaftConfig,
@@ -4933,15 +4985,16 @@ impl VosNode {
         network_reachable: bool,
     ) -> Result<
         ServiceId,
-        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+        RaftNodeRegistrationError<<B as crate::service::CommittedImageStore>::Error>,
     >
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-            + Send
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            > + Send
             + 'static,
     {
-        self.register_v2_raft_root_at_id_inner(
+        self.register_service_raft_root_at_id_inner(
             name,
             config,
             backend,
@@ -4962,27 +5015,28 @@ impl VosNode {
     /// conformance allowlists.
     #[cfg(all(feature = "storage", feature = "network"))]
     #[allow(clippy::too_many_arguments)]
-    pub fn register_v2_raft_root_at_id_production<B>(
+    pub fn register_service_raft_root_at_id_production<B>(
         &mut self,
         name: String,
-        config: crate::v2::LocalRootTreeConfigV2,
+        config: crate::service::LocalRootTreeConfig,
         backend: B,
         db: Arc<redb::Database>,
         raft_config: crate::raft::RaftConfig,
         id: ServiceId,
         network_reachable: bool,
-        trust: Arc<dyn crate::v2::ProductionTrustV2>,
+        trust: Arc<dyn crate::service::ProductionTrust>,
     ) -> Result<
         ServiceId,
-        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+        RaftNodeRegistrationError<<B as crate::service::CommittedImageStore>::Error>,
     >
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-            + Send
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            > + Send
             + 'static,
     {
-        self.register_v2_raft_root_at_id_inner(
+        self.register_service_raft_root_at_id_inner(
             name,
             config,
             backend,
@@ -4996,16 +5050,16 @@ impl VosNode {
         )
     }
 
-    /// Raft-backed counterpart of [`Self::register_v2_root_at_id_with_producer`].
+    /// Raft-backed counterpart of [`Self::register_service_root_at_id_with_producer`].
     /// The producer runs only on the current leader; the final proof-bearing
     /// Apply and proof bytes are quorum ordered for deterministic follower
     /// replay.
     #[cfg(all(feature = "storage", feature = "network"))]
     #[allow(clippy::too_many_arguments)]
-    pub fn register_v2_raft_root_at_id_with_producer<B, P>(
+    pub fn register_service_raft_root_at_id_with_producer<B, P>(
         &mut self,
         name: String,
-        config: crate::v2::LocalRootTreeConfigV2,
+        config: crate::service::LocalRootTreeConfig,
         backend: B,
         db: Arc<redb::Database>,
         raft_config: crate::raft::RaftConfig,
@@ -5014,18 +5068,19 @@ impl VosNode {
         producer: P,
     ) -> Result<
         ServiceId,
-        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+        RaftNodeRegistrationError<<B as crate::service::CommittedImageStore>::Error>,
     >
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-            + Send
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            > + Send
             + 'static,
-        P: crate::AttestationProofBackendV2 + Send + 'static,
+        P: crate::AttestationProofBackend + Send + 'static,
     {
-        let producer = V2NodeAttestationProofProducer::new(producer);
+        let producer = NodeAttestationProofProducer::new(producer);
         let verifier = producer.verifier();
-        self.register_v2_raft_root_at_id_inner(
+        self.register_service_raft_root_at_id_inner(
             name,
             config,
             backend,
@@ -5040,36 +5095,37 @@ impl VosNode {
     }
 
     /// Production-trust counterpart of
-    /// [`Self::register_v2_raft_root_at_id_with_producer`]. Proof production
+    /// [`Self::register_service_raft_root_at_id_with_producer`]. Proof production
     /// remains leader-local, while the supplied production policy verifies
     /// the resulting public input on the leader before proposal and on every
     /// replica during replay.
     #[cfg(all(feature = "storage", feature = "network"))]
     #[allow(clippy::too_many_arguments)]
-    pub fn register_v2_raft_root_at_id_production_with_producer<B, P>(
+    pub fn register_service_raft_root_at_id_production_with_producer<B, P>(
         &mut self,
         name: String,
-        config: crate::v2::LocalRootTreeConfigV2,
+        config: crate::service::LocalRootTreeConfig,
         backend: B,
         db: Arc<redb::Database>,
         raft_config: crate::raft::RaftConfig,
         id: ServiceId,
         network_reachable: bool,
-        trust: Arc<dyn crate::v2::ProductionTrustV2>,
+        trust: Arc<dyn crate::service::ProductionTrust>,
         producer: P,
     ) -> Result<
         ServiceId,
-        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+        RaftNodeRegistrationError<<B as crate::service::CommittedImageStore>::Error>,
     >
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-            + Send
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            > + Send
             + 'static,
-        P: crate::AttestationProofBackendV2 + Send + 'static,
+        P: crate::AttestationProofBackend + Send + 'static,
     {
-        let producer = V2NodeAttestationProofProducer::new(producer);
-        self.register_v2_raft_root_at_id_inner(
+        let producer = NodeAttestationProofProducer::new(producer);
+        self.register_service_raft_root_at_id_inner(
             name,
             config,
             backend,
@@ -5086,10 +5142,10 @@ impl VosNode {
     /// Raft-backed verifier-only registration for callers of attested roots.
     #[cfg(all(feature = "storage", feature = "network"))]
     #[allow(clippy::too_many_arguments)]
-    pub fn register_v2_raft_root_at_id_with_verifier<B, V>(
+    pub fn register_service_raft_root_at_id_with_verifier<B, V>(
         &mut self,
         name: String,
-        config: crate::v2::LocalRootTreeConfigV2,
+        config: crate::service::LocalRootTreeConfig,
         backend: B,
         db: Arc<redb::Database>,
         raft_config: crate::raft::RaftConfig,
@@ -5098,16 +5154,17 @@ impl VosNode {
         verifier: V,
     ) -> Result<
         ServiceId,
-        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+        RaftNodeRegistrationError<<B as crate::service::CommittedImageStore>::Error>,
     >
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-            + Send
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            > + Send
             + 'static,
-        V: crate::AttestationProofVerifierV2 + Send + 'static,
+        V: crate::AttestationProofVerifier + Send + 'static,
     {
-        self.register_v2_raft_root_at_id_inner(
+        self.register_service_raft_root_at_id_inner(
             name,
             config,
             backend,
@@ -5115,7 +5172,7 @@ impl VosNode {
             raft_config,
             id,
             network_reachable,
-            Some(v2_node_attestation_proof_verifier(verifier)),
+            Some(service_node_attestation_proof_verifier(verifier)),
             None,
             None,
         )
@@ -5123,29 +5180,30 @@ impl VosNode {
 
     #[cfg(all(feature = "storage", feature = "network"))]
     #[allow(clippy::too_many_arguments)]
-    fn register_v2_raft_root_at_id_inner<B>(
+    fn register_service_raft_root_at_id_inner<B>(
         &mut self,
         name: String,
-        config: crate::v2::LocalRootTreeConfigV2,
+        config: crate::service::LocalRootTreeConfig,
         backend: B,
         db: Arc<redb::Database>,
         raft_config: crate::raft::RaftConfig,
         id: ServiceId,
         network_reachable: bool,
-        proof_verifier: Option<V2NodeAttestationProofVerifier>,
-        proof_producer: Option<V2NodeAttestationProofProducer>,
-        production_trust: Option<Arc<dyn crate::v2::ProductionTrustV2>>,
+        proof_verifier: Option<NodeAttestationProofVerifier>,
+        proof_producer: Option<NodeAttestationProofProducer>,
+        production_trust: Option<Arc<dyn crate::service::ProductionTrust>>,
     ) -> Result<
         ServiceId,
-        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+        RaftNodeRegistrationError<<B as crate::service::CommittedImageStore>::Error>,
     >
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-            + Send
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            > + Send
             + 'static,
     {
-        let mut prepared = self.prepare_v2_raft_root(
+        let mut prepared = self.prepare_service_raft_root(
             config,
             backend,
             db,
@@ -5154,7 +5212,7 @@ impl VosNode {
             production_trust,
         )?;
         if prepared.service.is_none() {
-            return self.recover_persisted_v2_raft_root(
+            return self.recover_persisted_service_raft_root(
                 name,
                 id,
                 network_reachable,
@@ -5170,7 +5228,7 @@ impl VosNode {
                 Ok(installed) => installed,
                 Err(_error) if prepared.runtime.retain_replica => {
                     prepared.service = Some(service);
-                    return self.recover_persisted_v2_raft_root(
+                    return self.recover_persisted_service_raft_root(
                         name,
                         id,
                         network_reachable,
@@ -5179,14 +5237,16 @@ impl VosNode {
                     );
                 }
                 Err(error) => {
-                    prepared.runtime.cleanup(&self.v2_private_ingress_routes);
-                    return Err(V2RaftNodeRegistrationError::CatchUp(error));
+                    prepared
+                        .runtime
+                        .cleanup(&self.service_private_ingress_routes);
+                    return Err(RaftNodeRegistrationError::CatchUp(error));
                 }
             };
             if !installed {
                 if prepared.runtime.retain_replica {
                     prepared.service = Some(service);
-                    return self.recover_persisted_v2_raft_root(
+                    return self.recover_persisted_service_raft_root(
                         name,
                         id,
                         network_reachable,
@@ -5194,15 +5254,17 @@ impl VosNode {
                         prepared,
                     );
                 }
-                prepared.runtime.cleanup(&self.v2_private_ingress_routes);
-                return Err(V2RaftNodeRegistrationError::CatchUp(
-                    crate::v2::LocalRootTreeInvokeErrorV2::ServiceNotInstalled,
+                prepared
+                    .runtime
+                    .cleanup(&self.service_private_ingress_routes);
+                return Err(RaftNodeRegistrationError::CatchUp(
+                    crate::service::LocalRootTreeInvokeError::ServiceNotInstalled,
                 ));
             }
             if service.production_trust_policy_id() != Some(expected_policy) {
                 if prepared.runtime.retain_replica {
                     prepared.service = Some(service);
-                    return self.recover_persisted_v2_raft_root(
+                    return self.recover_persisted_service_raft_root(
                         name,
                         id,
                         network_reachable,
@@ -5210,13 +5272,17 @@ impl VosNode {
                         prepared,
                     );
                 }
-                prepared.runtime.cleanup(&self.v2_private_ingress_routes);
-                return Err(V2RaftNodeRegistrationError::ProductionPolicyMismatch);
+                prepared
+                    .runtime
+                    .cleanup(&self.service_private_ingress_routes);
+                return Err(RaftNodeRegistrationError::ProductionPolicyMismatch);
             }
         }
-        if let Err(error) = self.validate_v2_root_registration(&service, id) {
-            prepared.runtime.cleanup(&self.v2_private_ingress_routes);
-            return Err(V2RaftNodeRegistrationError::Registration(error));
+        if let Err(error) = self.validate_service_root_registration(&service, id) {
+            prepared
+                .runtime
+                .cleanup(&self.service_private_ingress_routes);
+            return Err(RaftNodeRegistrationError::Registration(error));
         }
         // A healthy application image is not membership authority. The
         // latest effective configuration may only be a speculative joint
@@ -5226,7 +5292,7 @@ impl VosNode {
         if !prepared.runtime.membership_committed_final_local_voter() {
             if prepared.runtime.retain_replica {
                 prepared.service = Some(service);
-                return self.recover_persisted_v2_raft_root(
+                return self.recover_persisted_service_raft_root(
                     name,
                     id,
                     network_reachable,
@@ -5234,13 +5300,23 @@ impl VosNode {
                     prepared,
                 );
             }
-            prepared.runtime.cleanup(&self.v2_private_ingress_routes);
-            return Err(V2RaftNodeRegistrationError::Promotion(
+            prepared
+                .runtime
+                .cleanup(&self.service_private_ingress_routes);
+            return Err(RaftNodeRegistrationError::Promotion(
                 "local replica is not a committed final voter".into(),
             ));
         }
         self.raft_hosts.lock().unwrap().insert(id.0, replication_id);
-        Ok(self.attach_v2_root_unchecked(name, service, id, network_reachable, proof_producer))
+        Ok(
+            self.attach_service_root_unchecked(
+                name,
+                service,
+                id,
+                network_reachable,
+                proof_producer,
+            ),
+        )
     }
 
     /// Keep an already-configured voter private but live while its service
@@ -5249,21 +5325,22 @@ impl VosNode {
     /// handler or drop the worker that the remaining voters count for quorum.
     #[cfg(all(feature = "storage", feature = "network"))]
     #[allow(clippy::too_many_arguments)]
-    fn recover_persisted_v2_raft_root<B>(
+    fn recover_persisted_service_raft_root<B>(
         &mut self,
         name: String,
         id: ServiceId,
         network_reachable: bool,
-        proof_producer: Option<V2NodeAttestationProofProducer>,
-        mut prepared: PreparedV2RaftRoot<B>,
+        proof_producer: Option<NodeAttestationProofProducer>,
+        mut prepared: PreparedRaftRoot<B>,
     ) -> Result<
         ServiceId,
-        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+        RaftNodeRegistrationError<<B as crate::service::CommittedImageStore>::Error>,
     >
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-            + Send
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            > + Send
             + 'static,
     {
         debug_assert!(prepared.runtime.retain_replica);
@@ -5271,30 +5348,49 @@ impl VosNode {
         if self.routes.contains_key(&id.0)
             || self.agent_info.read().unwrap().contains_key(&id.0)
             || self.invoke_routes.lock().unwrap().contains_key(&id.0)
-            || self.pending_v2_root_ids.lock().unwrap().contains(&id.0)
+            || self
+                .pending_service_root_ids
+                .lock()
+                .unwrap()
+                .contains(&id.0)
         {
-            prepared.runtime.cleanup(&self.v2_private_ingress_routes);
-            return Err(V2RaftNodeRegistrationError::Registration(
-                V2NodeRegistrationError::ServiceRouteOccupied(id),
+            prepared
+                .runtime
+                .cleanup(&self.service_private_ingress_routes);
+            return Err(RaftNodeRegistrationError::Registration(
+                NodeRegistrationError::ServiceRouteOccupied(id),
             ));
         }
-        if self.v2_actor_routes.read().unwrap().contains_key(&actor)
-            || self.pending_v2_root_actors.lock().unwrap().contains(&actor)
+        if self
+            .service_actor_routes
+            .read()
+            .unwrap()
+            .contains_key(&actor)
+            || self
+                .pending_service_root_actors
+                .lock()
+                .unwrap()
+                .contains(&actor)
         {
-            prepared.runtime.cleanup(&self.v2_private_ingress_routes);
-            return Err(V2RaftNodeRegistrationError::Registration(
-                V2NodeRegistrationError::ActorAlreadyRegistered(actor),
+            prepared
+                .runtime
+                .cleanup(&self.service_private_ingress_routes);
+            return Err(RaftNodeRegistrationError::Registration(
+                NodeRegistrationError::ActorAlreadyRegistered(actor),
             ));
         }
 
-        self.pending_v2_root_ids.lock().unwrap().insert(id.0);
-        self.pending_v2_root_actors.lock().unwrap().insert(actor);
-        let ready_tx = self.pending_v2_root_ready_tx.clone();
-        let pending_ids = self.pending_v2_root_ids.clone();
-        let pending_actors = self.pending_v2_root_actors.clone();
+        self.pending_service_root_ids.lock().unwrap().insert(id.0);
+        self.pending_service_root_actors
+            .lock()
+            .unwrap()
+            .insert(actor);
+        let ready_tx = self.pending_service_root_ready_tx.clone();
+        let pending_ids = self.pending_service_root_ids.clone();
+        let pending_actors = self.pending_service_root_actors.clone();
         let shutdown = self.shutdown.clone();
-        let logical_timeslot = self.v2_logical_timeslot.clone();
-        let pending_routes = self.v2_private_ingress_routes.clone();
+        let logical_timeslot = self.service_logical_timeslot.clone();
+        let pending_routes = self.service_private_ingress_routes.clone();
         let join = thread::spawn(move || {
             let mut next_warning = Instant::now();
             loop {
@@ -5318,7 +5414,7 @@ impl VosNode {
                         Ok(service) => prepared.service = Some(service),
                         Err(_) => {
                             if Instant::now() >= next_warning {
-                                warn!(%id, "persisted v2 Raft voter is retrying service open/replay");
+                                warn!(%id, "persisted service Raft voter is retrying service open/replay");
                                 next_warning = Instant::now() + Duration::from_secs(5);
                             }
                             thread::sleep(Duration::from_millis(100));
@@ -5331,13 +5427,13 @@ impl VosNode {
                     && prepared.runtime.expected_policy.is_none_or(|expected| {
                         service.production_trust_policy_id() == Some(expected)
                     })
-                    && restore_v2_root_logical_timeslot(service, &logical_timeslot).is_ok()
+                    && restore_service_root_logical_timeslot(service, &logical_timeslot).is_ok()
                     && prepared.runtime.membership_committed_final_local_voter();
                 if recovered {
                     break;
                 }
                 if Instant::now() >= next_warning {
-                    warn!(%id, "persisted v2 Raft voter remains private while catch-up retries");
+                    warn!(%id, "persisted service Raft voter remains private while catch-up retries");
                     next_warning = Instant::now() + Duration::from_secs(5);
                 }
                 thread::sleep(Duration::from_millis(100));
@@ -5351,13 +5447,13 @@ impl VosNode {
             let replication_id = runtime.replication_id;
             let ready_pending_ids = pending_ids.clone();
             let ready_pending_actors = pending_actors.clone();
-            let ready: PendingV2RootReady = Box::new(move |node| {
+            let ready: PendingRootReady = Box::new(move |node| {
                 if node.shutdown.load(Ordering::Relaxed) {
                     if let Some(network) = ready_network.as_ref() {
                         network.unregister_raft_handler_if(&replication_id, &ready_handler);
                     }
-                    remove_v2_private_ingress_route_if(
-                        &node.v2_private_ingress_routes,
+                    remove_service_private_ingress_route_if(
+                        &node.service_private_ingress_routes,
                         &replication_id,
                         &pending_route,
                     );
@@ -5366,7 +5462,13 @@ impl VosNode {
                     return;
                 }
                 node.raft_hosts.lock().unwrap().insert(id.0, replication_id);
-                node.attach_v2_root_unchecked(name, service, id, network_reachable, proof_producer);
+                node.attach_service_root_unchecked(
+                    name,
+                    service,
+                    id,
+                    network_reachable,
+                    proof_producer,
+                );
                 ready_pending_ids.lock().unwrap().remove(&id.0);
                 ready_pending_actors.lock().unwrap().remove(&actor);
             });
@@ -5376,7 +5478,7 @@ impl VosNode {
                 pending_actors.lock().unwrap().remove(&actor);
             }
         });
-        self.pending_v2_root_threads.push(join);
+        self.pending_service_root_threads.push(join);
         Ok(id)
     }
 
@@ -5390,10 +5492,10 @@ impl VosNode {
     /// membership.
     #[cfg(all(feature = "storage", feature = "network"))]
     #[allow(clippy::too_many_arguments)]
-    pub fn register_v2_raft_root_at_id_after_local_attach<B, F>(
+    pub fn register_service_raft_root_at_id_after_local_attach<B, F>(
         &mut self,
         name: String,
-        config: crate::v2::LocalRootTreeConfigV2,
+        config: crate::service::LocalRootTreeConfig,
         backend: B,
         db: Arc<redb::Database>,
         raft_config: crate::raft::RaftConfig,
@@ -5402,16 +5504,17 @@ impl VosNode {
         promote: F,
     ) -> Result<
         ServiceId,
-        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+        RaftNodeRegistrationError<<B as crate::service::CommittedImageStore>::Error>,
     >
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-            + Send
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            > + Send
             + 'static,
         F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool) -> Result<(), String> + Send + 'static,
     {
-        self.register_v2_raft_root_at_id_after_local_attach_inner(
+        self.register_service_raft_root_at_id_after_local_attach_inner(
             name,
             config,
             backend,
@@ -5432,31 +5535,36 @@ impl VosNode {
     /// genesis locally.
     #[cfg(all(feature = "storage", feature = "network"))]
     #[allow(clippy::too_many_arguments)]
-    pub fn register_v2_raft_root_at_id_after_local_attach_production<B, F>(
+    pub fn register_service_raft_root_at_id_after_local_attach_production<B, F>(
         &mut self,
         name: String,
-        config: crate::v2::LocalRootTreeConfigV2,
+        config: crate::service::LocalRootTreeConfig,
         backend: B,
         db: Arc<redb::Database>,
         raft_config: crate::raft::RaftConfig,
         id: ServiceId,
         network_reachable: bool,
-        trust: Arc<dyn crate::v2::ProductionTrustV2>,
+        trust: Arc<dyn crate::service::ProductionTrust>,
         promote: F,
     ) -> Result<
         ServiceId,
-        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+        RaftNodeRegistrationError<<B as crate::service::CommittedImageStore>::Error>,
     >
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-            + Send
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            > + Send
             + 'static,
-        F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool, crate::v2::Hash) -> Result<(), String>
+        F: FnOnce(
+                &crate::raft::WorkerHandle,
+                &AtomicBool,
+                crate::service::Hash,
+            ) -> Result<(), String>
             + Send
             + 'static,
     {
-        self.register_v2_raft_root_at_id_after_local_attach_inner(
+        self.register_service_raft_root_at_id_after_local_attach_inner(
             name,
             config,
             backend,
@@ -5478,17 +5586,17 @@ impl VosNode {
     }
 
     /// Producer-capable counterpart of
-    /// [`Self::register_v2_raft_root_at_id_after_local_attach`]. The proof
+    /// [`Self::register_service_raft_root_at_id_after_local_attach`]. The proof
     /// capability remains owned by the prepared replica and moves into the
     /// root thread only after voter promotion completes, so the replica is
     /// ready to prove attested direct and durable-inbox work before its route
     /// becomes public or it can serve as leader.
     #[cfg(all(feature = "storage", feature = "network"))]
     #[allow(clippy::too_many_arguments)]
-    pub fn register_v2_raft_root_at_id_after_local_attach_with_producer<B, P, F>(
+    pub fn register_service_raft_root_at_id_after_local_attach_with_producer<B, P, F>(
         &mut self,
         name: String,
-        config: crate::v2::LocalRootTreeConfigV2,
+        config: crate::service::LocalRootTreeConfig,
         backend: B,
         db: Arc<redb::Database>,
         raft_config: crate::raft::RaftConfig,
@@ -5498,19 +5606,20 @@ impl VosNode {
         promote: F,
     ) -> Result<
         ServiceId,
-        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+        RaftNodeRegistrationError<<B as crate::service::CommittedImageStore>::Error>,
     >
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-            + Send
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            > + Send
             + 'static,
-        P: crate::AttestationProofBackendV2 + Send + 'static,
+        P: crate::AttestationProofBackend + Send + 'static,
         F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool) -> Result<(), String> + Send + 'static,
     {
-        let producer = V2NodeAttestationProofProducer::new(producer);
+        let producer = NodeAttestationProofProducer::new(producer);
         let verifier = producer.verifier();
-        self.register_v2_raft_root_at_id_after_local_attach_inner(
+        self.register_service_raft_root_at_id_after_local_attach_inner(
             name,
             config,
             backend,
@@ -5526,39 +5635,44 @@ impl VosNode {
     }
 
     /// Producer-capable production counterpart of
-    /// [`Self::register_v2_raft_root_at_id_after_local_attach_production`].
+    /// [`Self::register_service_raft_root_at_id_after_local_attach_production`].
     /// The producer and trust capability remain private to the prepared
     /// replica and move into the root thread only after promotion succeeds.
     #[cfg(all(feature = "storage", feature = "network"))]
     #[allow(clippy::too_many_arguments)]
-    pub fn register_v2_raft_root_at_id_after_local_attach_production_with_producer<B, P, F>(
+    pub fn register_service_raft_root_at_id_after_local_attach_production_with_producer<B, P, F>(
         &mut self,
         name: String,
-        config: crate::v2::LocalRootTreeConfigV2,
+        config: crate::service::LocalRootTreeConfig,
         backend: B,
         db: Arc<redb::Database>,
         raft_config: crate::raft::RaftConfig,
         id: ServiceId,
         network_reachable: bool,
-        trust: Arc<dyn crate::v2::ProductionTrustV2>,
+        trust: Arc<dyn crate::service::ProductionTrust>,
         producer: P,
         promote: F,
     ) -> Result<
         ServiceId,
-        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+        RaftNodeRegistrationError<<B as crate::service::CommittedImageStore>::Error>,
     >
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-            + Send
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            > + Send
             + 'static,
-        P: crate::AttestationProofBackendV2 + Send + 'static,
-        F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool, crate::v2::Hash) -> Result<(), String>
+        P: crate::AttestationProofBackend + Send + 'static,
+        F: FnOnce(
+                &crate::raft::WorkerHandle,
+                &AtomicBool,
+                crate::service::Hash,
+            ) -> Result<(), String>
             + Send
             + 'static,
     {
-        let producer = V2NodeAttestationProofProducer::new(producer);
-        self.register_v2_raft_root_at_id_after_local_attach_inner(
+        let producer = NodeAttestationProofProducer::new(producer);
+        self.register_service_raft_root_at_id_after_local_attach_inner(
             name,
             config,
             backend,
@@ -5584,10 +5698,10 @@ impl VosNode {
     /// can validate proof sidecars before the public route appears.
     #[cfg(all(feature = "storage", feature = "network"))]
     #[allow(clippy::too_many_arguments)]
-    pub fn register_v2_raft_root_at_id_after_local_attach_with_verifier<B, V, F>(
+    pub fn register_service_raft_root_at_id_after_local_attach_with_verifier<B, V, F>(
         &mut self,
         name: String,
-        config: crate::v2::LocalRootTreeConfigV2,
+        config: crate::service::LocalRootTreeConfig,
         backend: B,
         db: Arc<redb::Database>,
         raft_config: crate::raft::RaftConfig,
@@ -5597,17 +5711,18 @@ impl VosNode {
         promote: F,
     ) -> Result<
         ServiceId,
-        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+        RaftNodeRegistrationError<<B as crate::service::CommittedImageStore>::Error>,
     >
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-            + Send
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            > + Send
             + 'static,
-        V: crate::AttestationProofVerifierV2 + Send + 'static,
+        V: crate::AttestationProofVerifier + Send + 'static,
         F: FnOnce(&crate::raft::WorkerHandle, &AtomicBool) -> Result<(), String> + Send + 'static,
     {
-        self.register_v2_raft_root_at_id_after_local_attach_inner(
+        self.register_service_raft_root_at_id_after_local_attach_inner(
             name,
             config,
             backend,
@@ -5615,7 +5730,7 @@ impl VosNode {
             raft_config,
             id,
             network_reachable,
-            Some(v2_node_attestation_proof_verifier(verifier)),
+            Some(service_node_attestation_proof_verifier(verifier)),
             None,
             None,
             move |worker, shutdown, _| promote(worker, shutdown),
@@ -5624,37 +5739,38 @@ impl VosNode {
 
     #[cfg(all(feature = "storage", feature = "network"))]
     #[allow(clippy::too_many_arguments)]
-    fn register_v2_raft_root_at_id_after_local_attach_inner<B, F>(
+    fn register_service_raft_root_at_id_after_local_attach_inner<B, F>(
         &mut self,
         name: String,
-        config: crate::v2::LocalRootTreeConfigV2,
+        config: crate::service::LocalRootTreeConfig,
         backend: B,
         db: Arc<redb::Database>,
         raft_config: crate::raft::RaftConfig,
         id: ServiceId,
         network_reachable: bool,
-        proof_verifier: Option<V2NodeAttestationProofVerifier>,
-        proof_producer: Option<V2NodeAttestationProofProducer>,
-        production_trust: Option<Arc<dyn crate::v2::ProductionTrustV2>>,
+        proof_verifier: Option<NodeAttestationProofVerifier>,
+        proof_producer: Option<NodeAttestationProofProducer>,
+        production_trust: Option<Arc<dyn crate::service::ProductionTrust>>,
         promote: F,
     ) -> Result<
         ServiceId,
-        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+        RaftNodeRegistrationError<<B as crate::service::CommittedImageStore>::Error>,
     >
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-            + Send
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            > + Send
             + 'static,
         F: FnOnce(
                 &crate::raft::WorkerHandle,
                 &AtomicBool,
-                Option<crate::v2::Hash>,
+                Option<crate::service::Hash>,
             ) -> Result<(), String>
             + Send
             + 'static,
     {
-        let mut prepared = self.prepare_v2_raft_root(
+        let mut prepared = self.prepare_service_raft_root(
             config,
             backend,
             db,
@@ -5663,7 +5779,7 @@ impl VosNode {
             production_trust,
         )?;
         if prepared.runtime.retain_replica {
-            return self.recover_persisted_v2_raft_root(
+            return self.recover_persisted_service_raft_root(
                 name,
                 id,
                 network_reachable,
@@ -5681,21 +5797,26 @@ impl VosNode {
         let handler = prepared.runtime.handler.clone();
         let expected_policy = prepared.runtime.expected_policy;
         let pending_route = prepared.runtime.pending_route.clone();
-        if let Err(error) = self.validate_v2_root_registration(&service, id) {
-            prepared.runtime.cleanup(&self.v2_private_ingress_routes);
-            return Err(V2RaftNodeRegistrationError::Registration(error));
+        if let Err(error) = self.validate_service_root_registration(&service, id) {
+            prepared
+                .runtime
+                .cleanup(&self.service_private_ingress_routes);
+            return Err(RaftNodeRegistrationError::Registration(error));
         }
 
         let actor = service.root_actor();
-        self.pending_v2_root_ids.lock().unwrap().insert(id.0);
-        self.pending_v2_root_actors.lock().unwrap().insert(actor);
-        let ready_tx = self.pending_v2_root_ready_tx.clone();
-        let pending_ids = self.pending_v2_root_ids.clone();
-        let pending_actors = self.pending_v2_root_actors.clone();
+        self.pending_service_root_ids.lock().unwrap().insert(id.0);
+        self.pending_service_root_actors
+            .lock()
+            .unwrap()
+            .insert(actor);
+        let ready_tx = self.pending_service_root_ready_tx.clone();
+        let pending_ids = self.pending_service_root_ids.clone();
+        let pending_actors = self.pending_service_root_actors.clone();
         let shutdown = self.shutdown.clone();
         let cleanup_network = network.clone();
         let cleanup_handler = handler.clone();
-        let pending_routes = self.v2_private_ingress_routes.clone();
+        let pending_routes = self.service_private_ingress_routes.clone();
         let cleanup_pending_route = pending_route.clone();
         // Keep the shared worker/apply receiver alive independently of the
         // service while the promotion callback runs.
@@ -5704,7 +5825,7 @@ impl VosNode {
             let promotion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 promote(&worker_handle, &shutdown, expected_policy)
             }))
-            .unwrap_or_else(|_| Err("prepared v2 Raft root promotion panicked".into()));
+            .unwrap_or_else(|_| Err("prepared service Raft root promotion panicked".into()));
             let outcome = promotion.and_then(|()| {
                 // `Ok(())` means final membership is committed. From here on
                 // this worker is quorum state, not disposable registration
@@ -5715,7 +5836,7 @@ impl VosNode {
                 loop {
                     if shutdown.load(Ordering::Relaxed) {
                         return Err(
-                            "node shut down while promoted v2 Raft root was catching up".into()
+                            "node shut down while promoted service Raft root was catching up".into()
                         );
                     }
                     let recovery = match service.catch_up() {
@@ -5728,7 +5849,7 @@ impl VosNode {
                         Err(error) => format!("catch-up failed: {error}"),
                     };
                     if Instant::now() >= next_warning {
-                        warn!(%id, %recovery, "promoted v2 Raft root remains private while recovering");
+                        warn!(%id, %recovery, "promoted service Raft root remains private while recovering");
                         next_warning = Instant::now() + Duration::from_secs(5);
                     }
                     thread::sleep(Duration::from_millis(100));
@@ -5739,13 +5860,13 @@ impl VosNode {
                 let ready_pending_ids = pending_ids.clone();
                 let ready_pending_actors = pending_actors.clone();
                 let ready_handler = handler.clone();
-                let ready: PendingV2RootReady = Box::new(move |node| {
+                let ready: PendingRootReady = Box::new(move |node| {
                     if node.shutdown.load(Ordering::Relaxed) {
                         if let Some(network) = ready_network.as_ref() {
                             network.unregister_raft_handler_if(&replication_id, &ready_handler);
                         }
-                        remove_v2_private_ingress_route_if(
-                            &node.v2_private_ingress_routes,
+                        remove_service_private_ingress_route_if(
+                            &node.service_private_ingress_routes,
                             &replication_id,
                             &pending_route,
                         );
@@ -5754,7 +5875,7 @@ impl VosNode {
                         return;
                     }
                     node.raft_hosts.lock().unwrap().insert(id.0, replication_id);
-                    node.attach_v2_root_unchecked(
+                    node.attach_service_root_unchecked(
                         name,
                         service,
                         id,
@@ -5772,7 +5893,7 @@ impl VosNode {
             if let Some(network) = cleanup_network.as_ref() {
                 network.unregister_raft_handler_if(&replication_id, &cleanup_handler);
             }
-            remove_v2_private_ingress_route_if(
+            remove_service_private_ingress_route_if(
                 &pending_routes,
                 &replication_id,
                 &cleanup_pending_route,
@@ -5780,31 +5901,32 @@ impl VosNode {
             pending_ids.lock().unwrap().remove(&id.0);
             pending_actors.lock().unwrap().remove(&actor);
             if let Err(error) = outcome {
-                warn!(%id, %error, "prepared v2 Raft root promotion deferred");
+                warn!(%id, %error, "prepared service Raft root promotion deferred");
             }
             drop(recovery_runtime);
         });
-        self.pending_v2_root_threads.push(join);
+        self.pending_service_root_threads.push(join);
         Ok(id)
     }
 
     #[cfg(all(feature = "storage", feature = "network"))]
-    fn prepare_v2_raft_root<B>(
+    fn prepare_service_raft_root<B>(
         &self,
-        config: crate::v2::LocalRootTreeConfigV2,
+        config: crate::service::LocalRootTreeConfig,
         backend: B,
         db: Arc<redb::Database>,
         raft_config: crate::raft::RaftConfig,
-        proof_verifier: Option<V2NodeAttestationProofVerifier>,
-        production_trust: Option<Arc<dyn crate::v2::ProductionTrustV2>>,
+        proof_verifier: Option<NodeAttestationProofVerifier>,
+        production_trust: Option<Arc<dyn crate::service::ProductionTrust>>,
     ) -> Result<
-        PreparedV2RaftRoot<B>,
-        V2RaftNodeRegistrationError<<B as crate::v2::CommittedImageStoreV2>::Error>,
+        PreparedRaftRoot<B>,
+        RaftNodeRegistrationError<<B as crate::service::CommittedImageStore>::Error>,
     >
     where
-        B: crate::v2::CommittedImageStoreV2
-            + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-            + Send
+        B: crate::service::CommittedImageStore
+            + crate::service::ProofArtifactStore<
+                Error = <B as crate::service::CommittedImageStore>::Error,
+            > + Send
             + 'static,
     {
         // Refuse packages whose canonical Install entry cannot cross the
@@ -5812,7 +5934,7 @@ impl VosNode {
         // worker. `open_raft` repeats this validation at its own trust
         // boundary, but that is intentionally later than replica startup.
         config.validate().map_err(|error| {
-            V2RaftNodeRegistrationError::Open(crate::v2::LocalRootTreeOpenErrorV2::InvalidConfig(
+            RaftNodeRegistrationError::Open(crate::service::LocalRootTreeOpenError::InvalidConfig(
                 error,
             ))
         })?;
@@ -5820,24 +5942,24 @@ impl VosNode {
         let mut voter_slots = BTreeMap::new();
         for (prefix, bytes) in &raft_config.voter_peer_ids {
             let peer = libp2p::PeerId::from_bytes(bytes)
-                .map_err(|_| V2RaftNodeRegistrationError::InvalidVoterIdentity(*prefix))?;
+                .map_err(|_| RaftNodeRegistrationError::InvalidVoterIdentity(*prefix))?;
             if crate::network::derive_node_prefix(&peer) != *prefix {
-                return Err(V2RaftNodeRegistrationError::InvalidVoterIdentity(*prefix));
+                return Err(RaftNodeRegistrationError::InvalidVoterIdentity(*prefix));
             }
             if voter_slots
                 .insert(*prefix, peer)
                 .is_some_and(|existing| existing != peer)
             {
-                return Err(V2RaftNodeRegistrationError::InvalidVoterIdentity(*prefix));
+                return Err(RaftNodeRegistrationError::InvalidVoterIdentity(*prefix));
             }
         }
         voter_peers.extend(voter_slots);
         let replication_id = raft_config.replication_id;
         let expected_policy = production_trust.as_ref().map(|trust| trust.policy_id());
         let persisted_config =
-            crate::raft::log::load_active_config(&db).map_err(V2RaftNodeRegistrationError::Log)?;
+            crate::raft::log::load_active_config(&db).map_err(RaftNodeRegistrationError::Log)?;
         let persisted_commit_index = crate::raft::log::RaftMeta::load(&db)
-            .map_err(V2RaftNodeRegistrationError::Log)?
+            .map_err(RaftNodeRegistrationError::Log)?
             .commit_index;
         let mut retain_replica = persisted_config.is_some_and(|record| {
             record.current.contains(&raft_config.me)
@@ -5851,11 +5973,11 @@ impl VosNode {
                     .log_index
                     .is_none_or(|index| index > persisted_commit_index)
         });
-        let pending_route = pending_v2_private_ingress_route(expected_policy.map(Into::into));
+        let pending_route = pending_service_private_ingress_route(expected_policy.map(Into::into));
         {
-            let mut routes = self.v2_private_ingress_routes.write().unwrap();
+            let mut routes = self.service_private_ingress_routes.write().unwrap();
             if routes.contains_key(&replication_id) {
-                return Err(V2RaftNodeRegistrationError::ReplicationHandlerOccupied(
+                return Err(RaftNodeRegistrationError::ReplicationHandlerOccupied(
                     replication_id,
                 ));
             }
@@ -5868,12 +5990,12 @@ impl VosNode {
             .and_then(|guard| guard.clone());
         let reservation = if let Some(network) = network.as_ref() {
             let Some(reservation) = network.reserve_raft_handler(replication_id) else {
-                remove_v2_private_ingress_route_if(
-                    &self.v2_private_ingress_routes,
+                remove_service_private_ingress_route_if(
+                    &self.service_private_ingress_routes,
                     &replication_id,
                     &pending_route,
                 );
-                return Err(V2RaftNodeRegistrationError::ReplicationHandlerOccupied(
+                return Err(RaftNodeRegistrationError::ReplicationHandlerOccupied(
                     replication_id,
                 ));
             };
@@ -5911,12 +6033,12 @@ impl VosNode {
             )
         {
             worker.shutdown();
-            remove_v2_private_ingress_route_if(
-                &self.v2_private_ingress_routes,
+            remove_service_private_ingress_route_if(
+                &self.service_private_ingress_routes,
                 &replication_id,
                 &pending_route,
             );
-            return Err(V2RaftNodeRegistrationError::ReplicationHandlerOccupied(
+            return Err(RaftNodeRegistrationError::ReplicationHandlerOccupied(
                 replication_id,
             ));
         }
@@ -5924,9 +6046,9 @@ impl VosNode {
         // now a no-op. Any earlier panic/error would instead remove only the
         // still-owned placeholder through its Drop implementation.
         drop(reservation);
-        let runtime = V2RaftRecoveryRuntime {
+        let runtime = RaftRecoveryRuntime {
             config,
-            backend: NodeCommittedImageStoreV2(Arc::new(Mutex::new(backend))),
+            backend: NodeCommittedImageStore(Arc::new(Mutex::new(backend))),
             db,
             raft_config,
             worker: Arc::new(worker),
@@ -5941,109 +6063,116 @@ impl VosNode {
             retain_replica,
         };
         match runtime.open() {
-            Ok(service) => Ok(PreparedV2RaftRoot {
+            Ok(service) => Ok(PreparedRaftRoot {
                 service: Some(service),
                 runtime,
             }),
             Err(error) if runtime.retain_replica => {
                 let reason = match error {
-                    V2RaftRecoveryOpenError::Log(_) => "Raft log open failed",
-                    V2RaftRecoveryOpenError::Service(_) => "service image open/replay failed",
+                    RaftRecoveryOpenError::Log(_) => "Raft log open failed",
+                    RaftRecoveryOpenError::Service(_) => "service image open/replay failed",
                 };
-                warn!(?replication_id, %reason, "persisted v2 Raft voter remains private while recovery retries");
-                Ok(PreparedV2RaftRoot {
+                warn!(?replication_id, %reason, "persisted service Raft voter remains private while recovery retries");
+                Ok(PreparedRaftRoot {
                     service: None,
                     runtime,
                 })
             }
-            Err(V2RaftRecoveryOpenError::Log(error)) => {
-                runtime.cleanup(&self.v2_private_ingress_routes);
-                Err(V2RaftNodeRegistrationError::Log(error))
+            Err(RaftRecoveryOpenError::Log(error)) => {
+                runtime.cleanup(&self.service_private_ingress_routes);
+                Err(RaftNodeRegistrationError::Log(error))
             }
-            Err(V2RaftRecoveryOpenError::Service(error)) => {
-                runtime.cleanup(&self.v2_private_ingress_routes);
-                Err(V2RaftNodeRegistrationError::Open(error))
+            Err(RaftRecoveryOpenError::Service(error)) => {
+                runtime.cleanup(&self.service_private_ingress_routes);
+                Err(RaftNodeRegistrationError::Open(error))
             }
         }
     }
 
-    /// Bind an externally owned v2 actor to an authenticated physical route.
+    /// Bind an externally owned service actor to an authenticated physical route.
     /// The caller must obtain `service` from trusted registry/consensus state;
     /// a peer transport envelope is never allowed to declare this mapping.
-    pub fn bind_v2_actor_route(
+    pub fn bind_service_actor_route(
         &self,
-        actor: crate::v2::ActorId,
-        service: crate::v2::ServiceIdentityV2,
-        consistency: crate::v2::ConsistencyModeV2,
+        actor: crate::service::ActorId,
+        service: crate::service::ServiceIdentity,
+        consistency: crate::service::ConsistencyMode,
         route: ServiceId,
         authenticated_peer: Vec<u8>,
-    ) -> Result<(), V2NodeRegistrationError> {
-        if consistency == crate::v2::ConsistencyModeV2::Raft {
+    ) -> Result<(), NodeRegistrationError> {
+        if consistency == crate::service::ConsistencyMode::Raft {
             // A Raft route without its group identity would pin transport to
             // one replica and become unsafe/stuck after leadership changes.
-            return Err(V2NodeRegistrationError::CorruptServiceStore);
+            return Err(NodeRegistrationError::CorruptServiceStore);
         }
-        self.bind_v2_actor_route_inner(actor, service, consistency, None, route, authenticated_peer)
+        self.bind_service_actor_route_inner(
+            actor,
+            service,
+            consistency,
+            None,
+            route,
+            authenticated_peer,
+        )
     }
 
     /// Bind an externally owned Raft actor to one authenticated bootstrap
     /// replica and its exact replication group. Transport resolves the
     /// current leader from this group on every retry; the bootstrap peer is
     /// never treated as permanent authority.
-    pub fn bind_v2_raft_actor_route(
+    pub fn bind_service_raft_actor_route(
         &self,
-        actor: crate::v2::ActorId,
-        service: crate::v2::ServiceIdentityV2,
+        actor: crate::service::ActorId,
+        service: crate::service::ServiceIdentity,
         replication_id: [u8; 32],
         route: ServiceId,
         authenticated_peer: Vec<u8>,
-    ) -> Result<(), V2NodeRegistrationError> {
+    ) -> Result<(), NodeRegistrationError> {
         if replication_id == [0; 32] {
-            return Err(V2NodeRegistrationError::CorruptServiceStore);
+            return Err(NodeRegistrationError::CorruptServiceStore);
         }
-        self.bind_v2_actor_route_inner(
+        self.bind_service_actor_route_inner(
             actor,
             service,
-            crate::v2::ConsistencyModeV2::Raft,
+            crate::service::ConsistencyMode::Raft,
             Some(replication_id),
             route,
             authenticated_peer,
         )
     }
 
-    fn bind_v2_actor_route_inner(
+    fn bind_service_actor_route_inner(
         &self,
-        actor: crate::v2::ActorId,
-        service: crate::v2::ServiceIdentityV2,
-        consistency: crate::v2::ConsistencyModeV2,
+        actor: crate::service::ActorId,
+        service: crate::service::ServiceIdentity,
+        consistency: crate::service::ConsistencyMode,
         replication_id: Option<[u8; 32]>,
         route: ServiceId,
         authenticated_peer: Vec<u8>,
-    ) -> Result<(), V2NodeRegistrationError> {
+    ) -> Result<(), NodeRegistrationError> {
         if authenticated_peer.is_empty() {
-            return Err(V2NodeRegistrationError::CorruptServiceStore);
+            return Err(NodeRegistrationError::CorruptServiceStore);
         }
         #[cfg(feature = "network")]
         {
             let peer = libp2p::PeerId::from_bytes(&authenticated_peer)
-                .map_err(|_| V2NodeRegistrationError::CorruptServiceStore)?;
+                .map_err(|_| NodeRegistrationError::CorruptServiceStore)?;
             if route.node_prefix() != crate::network::derive_node_prefix(&peer) {
-                return Err(V2NodeRegistrationError::CorruptServiceStore);
+                return Err(NodeRegistrationError::CorruptServiceStore);
             }
         }
-        let mut routes = self.v2_actor_routes.write().unwrap();
-        let candidate = V2ActorRoute {
+        let mut routes = self.service_actor_routes.write().unwrap();
+        let candidate = ActorRoute {
             route: route.0,
             service,
             consistency,
             replication_id,
             is_role_authority: false,
-            invoke_timeout: V2_LOCAL_INVOKE_TIMEOUT,
+            invoke_timeout: SERVICE_LOCAL_INVOKE_TIMEOUT,
             authenticated_peer: Some(authenticated_peer),
         };
         match routes.get(&actor) {
             Some(existing) if existing == &candidate => Ok(()),
-            Some(_) => Err(V2NodeRegistrationError::ActorAlreadyRegistered(actor)),
+            Some(_) => Err(NodeRegistrationError::ActorAlreadyRegistered(actor)),
             None => {
                 routes.insert(actor, candidate);
                 Ok(())
@@ -6362,15 +6491,15 @@ impl VosNode {
     }
 
     #[cfg(all(feature = "network", feature = "storage"))]
-    fn publish_ready_v2_raft_roots(&mut self) {
-        while let Ok(publish) = self.pending_v2_root_ready_rx.try_recv() {
+    fn publish_ready_service_raft_roots(&mut self) {
+        while let Ok(publish) = self.pending_service_root_ready_rx.try_recv() {
             publish(self);
             *self.last_activity.lock().unwrap() = Instant::now();
         }
         let mut index = 0;
-        while index < self.pending_v2_root_threads.len() {
-            if self.pending_v2_root_threads[index].is_finished() {
-                let thread = self.pending_v2_root_threads.swap_remove(index);
+        while index < self.pending_service_root_threads.len() {
+            if self.pending_service_root_threads[index].is_finished() {
+                let thread = self.pending_service_root_threads.swap_remove(index);
                 let _ = thread.join();
             } else {
                 index += 1;
@@ -6379,8 +6508,8 @@ impl VosNode {
     }
 
     #[cfg(all(feature = "network", feature = "storage"))]
-    fn has_pending_v2_raft_roots(&self) -> bool {
-        !self.pending_v2_root_ids.lock().unwrap().is_empty()
+    fn has_pending_service_raft_roots(&self) -> bool {
+        !self.pending_service_root_ids.lock().unwrap().is_empty()
     }
 
     /// Route messages until traffic — both outbox routing AND
@@ -6396,7 +6525,7 @@ impl VosNode {
         *self.last_activity.lock().unwrap() = Instant::now();
         loop {
             #[cfg(all(feature = "network", feature = "storage"))]
-            self.publish_ready_v2_raft_roots();
+            self.publish_ready_service_raft_roots();
             match self.outbox_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(envelope) => {
                     self.route(envelope);
@@ -6411,7 +6540,7 @@ impl VosNode {
                         .iter()
                         .all(|h| h.join.as_ref().is_none_or(|j| j.is_finished()));
                     #[cfg(all(feature = "network", feature = "storage"))]
-                    let all_done = all_done && !self.has_pending_v2_raft_roots();
+                    let all_done = all_done && !self.has_pending_service_raft_roots();
                     if all_done {
                         break;
                     }
@@ -6462,7 +6591,7 @@ impl VosNode {
     pub fn run_forever_with(&mut self, mut on_tick: impl FnMut(&mut Self)) {
         loop {
             #[cfg(all(feature = "network", feature = "storage"))]
-            self.publish_ready_v2_raft_roots();
+            self.publish_ready_service_raft_roots();
             match self.outbox_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(envelope) => {
                     self.route(envelope);
@@ -6478,7 +6607,7 @@ impl VosNode {
                         .iter()
                         .all(|h| h.join.as_ref().is_none_or(|j| j.is_finished()));
                     #[cfg(all(feature = "network", feature = "storage"))]
-                    let all_done = all_done && !self.has_pending_v2_raft_roots();
+                    let all_done = all_done && !self.has_pending_service_raft_roots();
                     if all_done {
                         break;
                     }
@@ -6571,7 +6700,12 @@ impl VosNode {
             .map(|m| m.contains_key(&id.0))
             .unwrap_or(false);
         #[cfg(all(feature = "network", feature = "storage"))]
-        let registered = registered || self.pending_v2_root_ids.lock().unwrap().contains(&id.0);
+        let registered = registered
+            || self
+                .pending_service_root_ids
+                .lock()
+                .unwrap()
+                .contains(&id.0);
         registered
     }
 
@@ -6748,30 +6882,30 @@ impl VosNode {
         self.invoke_with_timeout(target, msg, Duration::from_secs(10))
     }
 
-    /// Invoke one canonical v2 actor through its registered root service.
+    /// Invoke one canonical service actor through its registered root service.
     /// The node allocates a boot-unique invocation identity and preserves the
     /// full ActorId until guest Refine and Accumulate have both accepted it.
     pub fn invoke_actor(
         &self,
-        target: crate::v2::ActorId,
+        target: crate::service::ActorId,
         arguments: Vec<u8>,
     ) -> Result<Vec<u8>, crate::actors::client::ClientError> {
         self.invoke_actor_wire(target, arguments, false)
     }
 
-    /// Invoke an attested v2 actor method and return the proof package that
+    /// Invoke an attested service actor method and return the proof package that
     /// guest Accumulate committed beside the exact reply. Roots registered
     /// without an explicit producer reject this capability.
     pub fn invoke_actor_attested(
         &self,
-        target: crate::v2::ActorId,
+        target: crate::service::ActorId,
         arguments: Vec<u8>,
     ) -> Result<crate::actors::client::AttestedInvocationResult, crate::actors::client::ClientError>
     {
-        use crate::{Decode, v2::V2Wire};
+        use crate::{Decode, service::ServiceWire};
 
         let wire = self.invoke_actor_wire(target, arguments, true)?;
-        let result = crate::v2::RootTreeAttestedResultV2::decode(&wire)
+        let result = crate::service::RootTreeAttestedResult::decode(&wire)
             .map_err(|_| crate::actors::client::ClientError::Decode)?;
         let value = <crate::value::Value as Decode>::try_decode(&result.reply)
             .ok_or(crate::actors::client::ClientError::Decode)?;
@@ -6787,7 +6921,7 @@ impl VosNode {
 
     fn invoke_actor_wire(
         &self,
-        target: crate::v2::ActorId,
+        target: crate::service::ActorId,
         arguments: Vec<u8>,
         proof_requested: bool,
     ) -> Result<Vec<u8>, crate::actors::client::ClientError> {
@@ -6799,7 +6933,7 @@ impl VosNode {
         let message = <crate::value::Msg as Decode>::try_decode(&arguments[1..])
             .ok_or(crate::actors::client::ClientError::Decode)?;
         let binding = self
-            .v2_actor_routes
+            .service_actor_routes
             .read()
             .map_err(|_| crate::actors::client::ClientError::Unreachable)?
             .get(&target)
@@ -6816,28 +6950,33 @@ impl VosNode {
             .get(&route)
             .cloned()
             .ok_or(crate::actors::client::ClientError::Unreachable)?;
-        let ordinal = self.v2_invocation_ordinal.fetch_add(1, Ordering::Relaxed);
+        let ordinal = self
+            .service_invocation_ordinal
+            .fetch_add(1, Ordering::Relaxed);
         let mut nonce = Vec::with_capacity(72);
-        nonce.extend_from_slice(&self.v2_invocation_seed);
+        nonce.extend_from_slice(&self.service_invocation_seed);
         nonce.extend_from_slice(&ordinal.to_le_bytes());
         nonce.extend_from_slice(&target.0);
-        let ingress = crate::v2::RootTreeInvocationV2 {
-            invocation: crate::v2::InvocationId::derive(b"vos/node-root-invocation/v2", &nonce),
+        let ingress = crate::service::RootTreeInvocation {
+            invocation: crate::service::InvocationId::derive(
+                b"vos/node-root-invocation/service",
+                &nonce,
+            ),
             target,
             method: message.name,
             arguments,
             proof_requested,
         };
-        let ingress_wire = crate::v2::V2Wire::encode(&ingress);
-        let reply_rx = send_v2_system_ingress(&tx, &ingress_wire)?;
+        let ingress_wire = crate::service::ServiceWire::encode(&ingress);
+        let reply_rx = send_service_system_ingress(&tx, &ingress_wire)?;
         // Proof production is synchronous and currently has no cancellation
         // contract. Once an attested invocation is handed to the root driver,
         // reporting a local timeout would allow its Apply to commit after the
         // caller observed failure. Await its terminal disposition instead;
         // ordinary work retains the bounded route timeout.
-        let envelope = receive_v2_invocation_reply(&reply_rx, proof_requested, deadline)?;
+        let envelope = receive_service_invocation_reply(&reply_rx, proof_requested, deadline)?;
         #[cfg(all(feature = "network", feature = "storage"))]
-        if let Some(redirect) = decode_v2_raft_redirect(&envelope) {
+        if let Some(redirect) = decode_service_raft_redirect(&envelope) {
             let network = self
                 .shared_network
                 .lock()
@@ -6849,22 +6988,22 @@ impl VosNode {
                 let local_route = tx.clone();
                 let replication_id = binding.replication_id;
                 let remote_binding = binding.clone();
-                return receive_v2_attested_with_exact_redrive(
+                return receive_service_attested_with_exact_redrive(
                     &ingress_wire,
                     redirect,
                     |redirect, ingress| {
                         let Some(replication_id) = replication_id else {
-                            return V2AttestedRedriveAttempt::NotSent;
+                            return AttestedRedriveAttempt::NotSent;
                         };
                         let Some(status) = network.local_raft_status(&replication_id) else {
-                            return V2AttestedRedriveAttempt::NotSent;
+                            return AttestedRedriveAttempt::NotSent;
                         };
                         let Some(deadline) =
                             Instant::now().checked_add(remote_binding.invoke_timeout)
                         else {
-                            return V2AttestedRedriveAttempt::NotSent;
+                            return AttestedRedriveAttempt::NotSent;
                         };
-                        send_v2_raft_invoke_exact(
+                        send_service_raft_invoke_exact(
                             &network,
                             &self.invoke_routes,
                             &remote_binding,
@@ -6878,17 +7017,17 @@ impl VosNode {
                             deadline,
                         )
                         .map_or(
-                            V2AttestedRedriveAttempt::Ambiguous,
-                            V2AttestedRedriveAttempt::Reply,
+                            AttestedRedriveAttempt::Ambiguous,
+                            AttestedRedriveAttempt::Reply,
                         )
                     },
                     |ingress| {
-                        let Ok(reply) = send_v2_system_ingress(&local_route, ingress) else {
-                            return V2AttestedRedriveAttempt::NotSent;
+                        let Ok(reply) = send_service_system_ingress(&local_route, ingress) else {
+                            return AttestedRedriveAttempt::NotSent;
                         };
                         match reply.recv() {
-                            Ok(envelope) => V2AttestedRedriveAttempt::Reply(envelope),
-                            Err(_) => V2AttestedRedriveAttempt::Ambiguous,
+                            Ok(envelope) => AttestedRedriveAttempt::Reply(envelope),
+                            Err(_) => AttestedRedriveAttempt::Ambiguous,
                         }
                     },
                     || std::thread::sleep(Duration::from_millis(100)),
@@ -6901,7 +7040,7 @@ impl VosNode {
             let status = network
                 .local_raft_status(&replication_id)
                 .ok_or(crate::actors::client::ClientError::Unreachable)?;
-            let leader_envelope = send_v2_raft_invoke_exact(
+            let leader_envelope = send_service_raft_invoke_exact(
                 &network,
                 &self.invoke_routes,
                 &binding,
@@ -6988,15 +7127,15 @@ impl VosNode {
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .ok()?;
             #[cfg(all(feature = "network", feature = "storage"))]
-            if let Some(redirect) = decode_v2_raft_redirect(&envelope) {
+            if let Some(redirect) = decode_service_raft_redirect(&envelope) {
                 let net = self.shared_network.lock().ok().and_then(|g| g.clone())?;
                 let binding = self
-                    .v2_actor_routes
+                    .service_actor_routes
                     .read()
                     .ok()?
                     .values()
                     .find(|route| {
-                        route.consistency == crate::v2::ConsistencyModeV2::Raft
+                        route.consistency == crate::service::ConsistencyMode::Raft
                             && route.authenticated_peer.is_none()
                             && (route.route == target.0
                                 || (route.route & 0xFFFF) == target.local_id() as u32)
@@ -7004,7 +7143,7 @@ impl VosNode {
                     .cloned()?;
                 let replication_id = binding.replication_id?;
                 let status = net.local_raft_status(&replication_id)?;
-                return send_v2_raft_invoke_exact(
+                return send_service_raft_invoke_exact(
                     &net,
                     &self.invoke_routes,
                     &binding,
@@ -7058,8 +7197,8 @@ impl VosNode {
         if envelope.payload.starts_with(b"VRT2")
             && envelope.authenticated_source_peer.is_none()
             && let Some(binding) =
-                v2_transport_destination_route(&self.v2_actor_routes, &envelope.payload)
-            && binding.consistency == crate::v2::ConsistencyModeV2::Raft
+                service_transport_destination_route(&self.service_actor_routes, &envelope.payload)
+            && binding.consistency == crate::service::ConsistencyMode::Raft
         {
             let network = self.shared_network.lock().ok().and_then(|g| g.clone());
             let local_tx = (binding.authenticated_peer.is_none())
@@ -7087,13 +7226,13 @@ impl VosNode {
                 warn!(target = %envelope.to, "node: no local Raft root or network leader route");
                 return;
             };
-            self.route_v2_raft_transport_async(envelope, binding, network, local_tx);
+            self.route_service_raft_transport_async(envelope, binding, network, local_tx);
             return;
         }
 
         let target = envelope.to;
 
-        // Canonical v2 transport may deliberately target a remote PeerId
+        // Canonical service transport may deliberately target a remote PeerId
         // whose derived 16-bit prefix collides with this node. An explicit
         // trusted destination therefore wins over the lossy local-prefix
         // classification. Inbound frames carry only `authenticated_source_peer`
@@ -7104,26 +7243,26 @@ impl VosNode {
             #[cfg(feature = "network")]
             {
                 let Some(peer) = libp2p::PeerId::from_bytes(_peer_bytes).ok() else {
-                    warn!(%target, "node: v2 root envelope carried an invalid destination peer");
+                    warn!(%target, "node: service root envelope carried an invalid destination peer");
                     return;
                 };
-                use crate::v2::V2Wire;
-                let crdt_service = crate::v2::RootTreeTransportV2::decode(&envelope.payload)
+                use crate::service::ServiceWire;
+                let crdt_service = crate::service::RootTreeTransport::decode(&envelope.payload)
                     .ok()
                     .and_then(|transport| match transport {
-                        crate::v2::RootTreeTransportV2::CrdtSyncChunk { envelope, .. } => {
+                        crate::service::RootTreeTransport::CrdtSyncChunk { envelope, .. } => {
                             Some(envelope.service)
                         }
-                        crate::v2::RootTreeTransportV2::CrdtSyncAccepted { service, .. } => {
+                        crate::service::RootTreeTransport::CrdtSyncAccepted { service, .. } => {
                             Some(service)
                         }
                         _ => None,
                     });
-                let bound = self.v2_actor_routes.read().ok().is_some_and(|routes| {
+                let bound = self.service_actor_routes.read().ok().is_some_and(|routes| {
                     routes.values().any(|route| match crdt_service.as_ref() {
                         Some(service) => {
                             route.service == *service
-                                && route.consistency == crate::v2::ConsistencyModeV2::Crdt
+                                && route.consistency == crate::service::ConsistencyMode::Crdt
                                 && route.authenticated_peer.is_none()
                                 && ServiceId(route.route).local_id() == target.local_id()
                         }
@@ -7131,27 +7270,27 @@ impl VosNode {
                             route.route == target.0
                                 && matches!(
                                     route.consistency,
-                                    crate::v2::ConsistencyModeV2::Local
-                                        | crate::v2::ConsistencyModeV2::Raft
-                                        | crate::v2::ConsistencyModeV2::Crdt
+                                    crate::service::ConsistencyMode::Local
+                                        | crate::service::ConsistencyMode::Raft
+                                        | crate::service::ConsistencyMode::Crdt
                                 )
                                 && route.authenticated_peer.as_deref() == Some(_peer_bytes)
                         }
                     })
                 });
                 if !bound {
-                    warn!(%target, %peer, "node: v2 root envelope peer is not bound to its route");
+                    warn!(%target, %peer, "node: service root envelope peer is not bound to its route");
                     return;
                 }
                 let net = self.shared_network.lock().ok().and_then(|g| g.clone());
                 if let Some(net) = net {
                     net.send_tell(peer, envelope.from.0, envelope.to.0, envelope.payload);
                 } else {
-                    warn!(%target, %peer, "node: no network layer for exact v2 destination");
+                    warn!(%target, %peer, "node: no network layer for exact service destination");
                 }
             }
             #[cfg(not(feature = "network"))]
-            warn!(%target, "node: no network support for exact v2 destination");
+            warn!(%target, "node: no network support for exact service destination");
             return;
         }
 
@@ -7175,7 +7314,7 @@ impl VosNode {
             let net = self.shared_network.lock().ok().and_then(|g| g.clone());
             if let Some(net) = net {
                 if envelope.payload.starts_with(b"VRT2") {
-                    warn!(%target, "node: remote v2 envelope omitted its exact destination peer");
+                    warn!(%target, "node: remote service envelope omitted its exact destination peer");
                     return;
                 }
                 let prefix = target.node_prefix();
@@ -7200,10 +7339,10 @@ impl VosNode {
     /// duplicate 250 ms redrives are coalesced, successful leaders are cached
     /// briefly, and failures back off before durable state retries them.
     #[cfg(all(feature = "network", feature = "storage"))]
-    fn route_v2_raft_transport_async(
+    fn route_service_raft_transport_async(
         &self,
         envelope: Envelope,
-        binding: V2ActorRoute,
+        binding: ActorRoute,
         network: Arc<crate::network::Network>,
         local_tx: Option<mpsc::Sender<Envelope>>,
     ) {
@@ -7211,37 +7350,37 @@ impl VosNode {
             warn!(target = %envelope.to, "node: Raft transport route omitted its replication identity");
             return;
         };
-        let key = V2RaftTransportResolutionKey {
+        let key = RaftTransportResolutionKey {
             replication_id,
             local_id: ServiceId(binding.route).local_id(),
         };
         let now = Instant::now();
-        let (deadline, pending_until) = v2_raft_transport_resolution_deadlines(now);
+        let (deadline, pending_until) = service_raft_transport_resolution_deadlines(now);
         let mut ownership_generation = None;
         let mut resolution_candidate_cursor = None;
         let cached = {
-            let Ok(mut resolutions) = self.v2_raft_transport_resolutions.lock() else {
+            let Ok(mut resolutions) = self.service_raft_transport_resolutions.lock() else {
                 return;
             };
             let candidate_cursor = resolutions
                 .get(&key)
-                .map(V2RaftTransportResolution::candidate_cursor)
+                .map(RaftTransportResolution::candidate_cursor)
                 .unwrap_or(0);
             match resolutions.get(&key).cloned() {
-                Some(V2RaftTransportResolution::Resolved {
+                Some(RaftTransportResolution::Resolved {
                     peer, route, until, ..
                 }) if until > now => Some((peer, route)),
-                Some(V2RaftTransportResolution::Pending { until, .. }) if until > now => return,
-                Some(V2RaftTransportResolution::Backoff { until, .. }) if until > now => return,
+                Some(RaftTransportResolution::Pending { until, .. }) if until > now => return,
+                Some(RaftTransportResolution::Backoff { until, .. }) if until > now => return,
                 _ => {
                     let generation = self
-                        .v2_raft_transport_ownership_generation
+                        .service_raft_transport_ownership_generation
                         .fetch_add(1, Ordering::Relaxed);
                     ownership_generation = Some(generation);
                     resolution_candidate_cursor = Some(candidate_cursor);
                     resolutions.insert(
                         key,
-                        V2RaftTransportResolution::Pending {
+                        RaftTransportResolution::Pending {
                             generation,
                             candidate_cursor,
                             until: pending_until,
@@ -7253,7 +7392,7 @@ impl VosNode {
         };
 
         if let Some((peer, route)) = cached {
-            dispatch_resolved_v2_raft_transport(&network, local_tx, peer, route, envelope);
+            dispatch_resolved_service_raft_transport(&network, local_tx, peer, route, envelope);
             return;
         }
         let Some(ownership_generation) = ownership_generation else {
@@ -7263,11 +7402,11 @@ impl VosNode {
             return;
         };
 
-        let resolutions = self.v2_raft_transport_resolutions.clone();
+        let resolutions = self.service_raft_transport_resolutions.clone();
         let invoke_routes = self.invoke_routes.clone();
         let shutdown = self.shutdown.clone();
         thread::spawn(move || {
-            let (resolved, next_candidate_cursor) = resolve_v2_raft_leader_route_before(
+            let (resolved, next_candidate_cursor) = resolve_service_raft_leader_route_before(
                 &binding,
                 &network,
                 &invoke_routes,
@@ -7284,7 +7423,7 @@ impl VosNode {
             let owns_resolution = if let Ok(mut entries) = resolutions.lock() {
                 if !matches!(
                     entries.get(&key),
-                    Some(V2RaftTransportResolution::Pending { generation, candidate_cursor, until })
+                    Some(RaftTransportResolution::Pending { generation, candidate_cursor, until })
                         if *generation == ownership_generation
                             && *candidate_cursor == resolution_candidate_cursor
                             && *until == pending_until
@@ -7295,20 +7434,20 @@ impl VosNode {
                         Some((peer, route)) => {
                             entries.insert(
                                 key,
-                                V2RaftTransportResolution::Resolved {
+                                RaftTransportResolution::Resolved {
                                     peer: *peer,
                                     route: *route,
                                     candidate_cursor: next_candidate_cursor,
-                                    until: now + V2_RAFT_TRANSPORT_LEADER_CACHE_TTL,
+                                    until: now + SERVICE_RAFT_TRANSPORT_LEADER_CACHE_TTL,
                                 },
                             );
                         }
                         None => {
                             entries.insert(
                                 key,
-                                V2RaftTransportResolution::Backoff {
+                                RaftTransportResolution::Backoff {
                                     candidate_cursor: next_candidate_cursor,
-                                    until: now + V2_RAFT_TRANSPORT_RETRY_BACKOFF,
+                                    until: now + SERVICE_RAFT_TRANSPORT_RETRY_BACKOFF,
                                 },
                             );
                         }
@@ -7322,9 +7461,9 @@ impl VosNode {
                 return;
             }
             if let Some((peer, route)) = resolved {
-                dispatch_resolved_v2_raft_transport(&network, local_tx, peer, route, envelope);
+                dispatch_resolved_service_raft_transport(&network, local_tx, peer, route, envelope);
             } else {
-                warn!(target = %envelope.to, "node: no authenticated leader for Raft v2 transport");
+                warn!(target = %envelope.to, "node: no authenticated leader for Raft service transport");
             }
         });
     }
@@ -7346,14 +7485,14 @@ impl VosNode {
         self.signal_node_shutdown();
         #[cfg(all(feature = "network", feature = "storage"))]
         {
-            for thread in self.pending_v2_root_threads.drain(..) {
+            for thread in self.pending_service_root_threads.drain(..) {
                 let _ = thread.join();
             }
             // A promotion may have completed immediately before shutdown and
             // queued its publication closure. Execute it under the shutdown
             // flag so it unregisters the prepared Raft handler instead of
             // leaving it attached to a separately-owned Network.
-            self.publish_ready_v2_raft_roots();
+            self.publish_ready_service_raft_roots();
         }
         drop(self.outbox_tx);
         drop(self.routes); // drop agent inboxes so threads can detect disconnect
@@ -7394,14 +7533,14 @@ impl Default for VosNode {
     }
 }
 
-fn v2_root_origin(
+fn service_root_origin(
     caller: &crate::actors::Caller,
-    actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
-) -> Option<crate::v2::Origin> {
+    actor_routes: &RwLock<HashMap<crate::service::ActorId, ActorRoute>>,
+) -> Option<crate::service::Origin> {
     match caller {
-        crate::actors::Caller::Unauthenticated => Some(crate::v2::Origin::Anonymous),
-        crate::actors::Caller::System => Some(crate::v2::Origin::System),
-        crate::actors::Caller::Peer(peer) => Some(crate::v2::Origin::Member(
+        crate::actors::Caller::Unauthenticated => Some(crate::service::Origin::Anonymous),
+        crate::actors::Caller::System => Some(crate::service::Origin::System),
+        crate::actors::Caller::Peer(peer) => Some(crate::service::Origin::Member(
             crate::actors::context::authenticated_peer_subject(peer),
         )),
         crate::actors::Caller::Actor(route) => actor_routes
@@ -7409,11 +7548,11 @@ fn v2_root_origin(
             .ok()?
             .iter()
             .find_map(|(actor, candidate)| (candidate.route == route.0).then_some(*actor))
-            .map(crate::v2::Origin::Actor),
+            .map(crate::service::Origin::Actor),
     }
 }
 
-fn v2_wall_timeslot() -> u64 {
+fn service_wall_timeslot() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -7425,13 +7564,13 @@ fn v2_wall_timeslot() -> u64 {
 /// admission floor. Registration calls this before publishing any route, and
 /// repeats it for every opened root, so the shared counter starts above the
 /// greatest durable high-water on the node.
-fn restore_v2_logical_timeslot(
+fn restore_service_logical_timeslot(
     clock: &AtomicU64,
     committed_high_water: u64,
-) -> Result<(), V2NodeRegistrationError> {
+) -> Result<(), NodeRegistrationError> {
     let next = committed_high_water
         .checked_add(1)
-        .ok_or(V2NodeRegistrationError::LogicalTimeslotExhausted)?;
+        .ok_or(NodeRegistrationError::LogicalTimeslotExhausted)?;
     clock.fetch_max(next, Ordering::Relaxed);
     Ok(())
 }
@@ -7439,25 +7578,27 @@ fn restore_v2_logical_timeslot(
 /// Restore the node allocator from the service image currently visible after
 /// catch-up. A Raft follower may legitimately have no header until genesis is
 /// committed; every other root must already be installed at registration.
-fn restore_v2_root_logical_timeslot<B>(
-    service: &crate::v2::LocalRootTreeServiceV2<B>,
+fn restore_service_root_logical_timeslot<B>(
+    service: &crate::service::LocalRootTreeService<B>,
     clock: &AtomicU64,
-) -> Result<bool, V2NodeRegistrationError>
+) -> Result<bool, NodeRegistrationError>
 where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        >,
 {
     match service
         .store()
         .header()
-        .map_err(|_| V2NodeRegistrationError::CorruptServiceStore)?
+        .map_err(|_| NodeRegistrationError::CorruptServiceStore)?
     {
         Some(header) => {
-            restore_v2_logical_timeslot(clock, header.admission_timeslot_high_water)?;
+            restore_service_logical_timeslot(clock, header.admission_timeslot_high_water)?;
             Ok(true)
         }
-        None if service.consistency() == crate::v2::ConsistencyModeV2::Raft => Ok(false),
-        None => Err(V2NodeRegistrationError::CorruptServiceStore),
+        None if service.consistency() == crate::service::ConsistencyMode::Raft => Ok(false),
+        None => Err(NodeRegistrationError::CorruptServiceStore),
     }
 }
 
@@ -7465,8 +7606,8 @@ where
 /// high-water makes restart safe; wall time supplies a useful initial floor,
 /// and compare/exchange keeps concurrent service threads in one node-wide
 /// order even when the wall clock has not advanced.
-fn next_v2_logical_timeslot(clock: &AtomicU64) -> u64 {
-    let wall = v2_wall_timeslot();
+fn next_service_logical_timeslot(clock: &AtomicU64) -> u64 {
+    let wall = service_wall_timeslot();
     let mut observed = clock.load(Ordering::Relaxed);
     loop {
         let admitted = observed.max(wall);
@@ -7478,28 +7619,28 @@ fn next_v2_logical_timeslot(clock: &AtomicU64) -> u64 {
     }
 }
 
-fn send_v2_status(reply: ReplyChannel, status: u8, id: ServiceId) {
+fn send_service_status(reply: ReplyChannel, status: u8, id: ServiceId) {
     let _ = send_reply_capped(reply, encode_invoke_envelope(status, &[], &[]), id);
 }
 
 #[cfg(all(feature = "storage", feature = "network"))]
-const V2_RAFT_REDIRECT_STATUS: u8 = 0xFE;
+const SERVICE_RAFT_REDIRECT_STATUS: u8 = 0xFE;
 
 #[cfg(all(feature = "storage", feature = "network"))]
-const V2_RAFT_DELEGATION_MAGIC: [u8; 4] = *b"VRD4";
+const SERVICE_RAFT_DELEGATION_MAGIC: [u8; 4] = *b"VRD4";
 
 #[cfg(all(feature = "storage", feature = "network"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct V2RaftRedirect {
+struct RaftRedirect {
     leader_prefix: u16,
-    origin: crate::v2::Origin,
+    origin: crate::service::Origin,
     root_upgrade_request: bool,
 }
 
 #[cfg(all(feature = "storage", feature = "network"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct V2RaftDelegatedIngress {
-    origin: crate::v2::Origin,
+struct RaftDelegatedIngress {
+    origin: crate::service::Origin,
     /// Return the complete status/state/reply envelope to typed host callers.
     /// Actor/extension forwarding keeps the historical raw-reply contract.
     preserve_envelope: bool,
@@ -7511,69 +7652,75 @@ struct V2RaftDelegatedIngress {
 }
 
 #[cfg(all(feature = "storage", feature = "network"))]
-fn encode_v2_origin(wire: &mut Vec<u8>, origin: crate::v2::Origin) {
+fn encode_service_origin(wire: &mut Vec<u8>, origin: crate::service::Origin) {
     match origin {
-        crate::v2::Origin::Anonymous => wire.push(0),
-        crate::v2::Origin::Member(subject) => {
+        crate::service::Origin::Anonymous => wire.push(0),
+        crate::service::Origin::Member(subject) => {
             wire.push(1);
             wire.extend_from_slice(&subject.0);
         }
-        crate::v2::Origin::Actor(actor) => {
+        crate::service::Origin::Actor(actor) => {
             wire.push(2);
             wire.extend_from_slice(&actor.0);
         }
-        crate::v2::Origin::System => wire.push(3),
+        crate::service::Origin::System => wire.push(3),
     }
 }
 
 #[cfg(all(feature = "storage", feature = "network"))]
-fn decode_v2_origin(wire: &[u8], cursor: &mut usize) -> Option<crate::v2::Origin> {
+fn decode_service_origin(wire: &[u8], cursor: &mut usize) -> Option<crate::service::Origin> {
     let tag = *wire.get(*cursor)?;
     *cursor += 1;
     match tag {
-        0 => Some(crate::v2::Origin::Anonymous),
+        0 => Some(crate::service::Origin::Anonymous),
         1 | 2 => {
             let end = cursor.checked_add(32)?;
             let bytes: [u8; 32] = wire.get(*cursor..end)?.try_into().ok()?;
             *cursor = end;
             (tag == 1)
-                .then_some(crate::v2::Origin::Member(crate::v2::SubjectId(bytes)))
-                .or_else(|| Some(crate::v2::Origin::Actor(crate::v2::ActorId(bytes))))
+                .then_some(crate::service::Origin::Member(crate::service::SubjectId(
+                    bytes,
+                )))
+                .or_else(|| {
+                    Some(crate::service::Origin::Actor(crate::service::ActorId(
+                        bytes,
+                    )))
+                })
         }
-        3 => Some(crate::v2::Origin::System),
+        3 => Some(crate::service::Origin::System),
         _ => None,
     }
 }
 
 #[cfg(all(feature = "storage", feature = "network"))]
-fn encode_v2_raft_redirect(
+fn encode_service_raft_redirect(
     leader_prefix: u16,
-    origin: crate::v2::Origin,
+    origin: crate::service::Origin,
     root_upgrade_request: bool,
 ) -> Vec<u8> {
     let mut wire = Vec::with_capacity(37);
-    wire.push(V2_RAFT_REDIRECT_STATUS);
+    wire.push(SERVICE_RAFT_REDIRECT_STATUS);
     wire.extend_from_slice(&leader_prefix.to_le_bytes());
-    encode_v2_origin(&mut wire, origin);
+    encode_service_origin(&mut wire, origin);
     wire.push(u8::from(root_upgrade_request));
     wire
 }
 
 #[cfg(all(feature = "storage", feature = "network"))]
-fn decode_v2_raft_redirect(wire: &[u8]) -> Option<V2RaftRedirect> {
-    if wire.first().copied() != Some(V2_RAFT_REDIRECT_STATUS) || wire.len() < 4 {
+fn decode_service_raft_redirect(wire: &[u8]) -> Option<RaftRedirect> {
+    if wire.first().copied() != Some(SERVICE_RAFT_REDIRECT_STATUS) || wire.len() < 4 {
         return None;
     }
     let leader_prefix = u16::from_le_bytes([wire[1], wire[2]]);
     let mut cursor = 3;
-    let origin = decode_v2_origin(wire, &mut cursor)?;
+    let origin = decode_service_origin(wire, &mut cursor)?;
     let root_upgrade_request = match wire.get(cursor) {
         Some(0) => false,
         Some(1) => true,
         _ => return None,
     };
     cursor += 1;
-    (cursor == wire.len()).then_some(V2RaftRedirect {
+    (cursor == wire.len()).then_some(RaftRedirect {
         leader_prefix,
         origin,
         root_upgrade_request,
@@ -7581,26 +7728,26 @@ fn decode_v2_raft_redirect(wire: &[u8]) -> Option<V2RaftRedirect> {
 }
 
 #[cfg(all(feature = "storage", feature = "network"))]
-fn encode_v2_raft_delegation(
-    origin: crate::v2::Origin,
+fn encode_service_raft_delegation(
+    origin: crate::service::Origin,
     preserve_envelope: bool,
     role_authority_request: bool,
     root_upgrade_request: bool,
     ingress: &[u8],
 ) -> Vec<u8> {
     let mut wire = Vec::with_capacity(8 + 32 + ingress.len());
-    wire.extend_from_slice(&V2_RAFT_DELEGATION_MAGIC);
+    wire.extend_from_slice(&SERVICE_RAFT_DELEGATION_MAGIC);
     wire.push(u8::from(preserve_envelope));
     wire.push(u8::from(role_authority_request));
     wire.push(u8::from(root_upgrade_request));
-    encode_v2_origin(&mut wire, origin);
+    encode_service_origin(&mut wire, origin);
     wire.extend_from_slice(ingress);
     wire
 }
 
 #[cfg(all(feature = "storage", feature = "network"))]
-fn decode_v2_raft_delegation(wire: &[u8]) -> Result<Option<V2RaftDelegatedIngress>, ()> {
-    if !wire.starts_with(&V2_RAFT_DELEGATION_MAGIC) {
+fn decode_service_raft_delegation(wire: &[u8]) -> Result<Option<RaftDelegatedIngress>, ()> {
+    if !wire.starts_with(&SERVICE_RAFT_DELEGATION_MAGIC) {
         return Ok(None);
     }
     let preserve_envelope = match wire.get(4) {
@@ -7619,12 +7766,12 @@ fn decode_v2_raft_delegation(wire: &[u8]) -> Result<Option<V2RaftDelegatedIngres
         _ => return Err(()),
     };
     let mut cursor = 7;
-    let origin = decode_v2_origin(wire, &mut cursor).ok_or(())?;
+    let origin = decode_service_origin(wire, &mut cursor).ok_or(())?;
     let ingress = wire
         .get(cursor..)
         .filter(|bytes| !bytes.is_empty())
         .ok_or(())?;
-    Ok(Some(V2RaftDelegatedIngress {
+    Ok(Some(RaftDelegatedIngress {
         origin,
         preserve_envelope,
         role_authority_request,
@@ -7634,25 +7781,25 @@ fn decode_v2_raft_delegation(wire: &[u8]) -> Result<Option<V2RaftDelegatedIngres
 }
 
 #[derive(Default)]
-struct V2RootThreadState {
-    pending_callers: HashMap<crate::v2::InvocationId, Vec<V2PendingCaller>>,
-    publication_progress: HashMap<crate::v2::Hash, V2PublicationProgress>,
+struct RootThreadState {
+    pending_callers: HashMap<crate::service::InvocationId, Vec<PendingCaller>>,
+    publication_progress: HashMap<crate::service::Hash, PublicationProgress>,
     /// Bounded, acknowledged CRDT anti-entropy progress. This state is only a
     /// transport optimization: losing it restarts at chunk zero, which guest
     /// Accumulate safely classifies as an idempotent causal import.
     #[cfg(all(feature = "network", feature = "storage"))]
-    crdt_sync: Option<V2CrdtSyncProgress>,
+    crdt_sync: Option<CrdtSyncProgress>,
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-struct V2CrdtSyncProgress {
+struct CrdtSyncProgress {
     /// Newest local frontier offered after a peer finishes its current
     /// immutable transfer. Replacing these fields never resets topology or a
     /// peer's acknowledged chunk cursor.
-    latest_frontier: crate::v2::Hash,
-    latest_transfer: crate::v2::Hash,
-    latest_chunks: Arc<Vec<crate::v2::CrdtSyncEnvelopeV2>>,
-    peers: HashMap<Vec<u8>, V2CrdtPeerProgress>,
+    latest_frontier: crate::service::Hash,
+    latest_transfer: crate::service::Hash,
+    latest_chunks: Arc<Vec<crate::service::CrdtSyncEnvelope>>,
+    peers: HashMap<Vec<u8>, CrdtPeerProgress>,
     /// Full identities observed during the current successful roster scan.
     /// Peers absent when the scan closes are evicted together with any
     /// transfer generation they retained.
@@ -7667,12 +7814,12 @@ struct V2CrdtSyncProgress {
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-impl V2CrdtSyncProgress {
+impl CrdtSyncProgress {
     fn replace_latest(
         &mut self,
-        frontier: crate::v2::Hash,
-        transfer: crate::v2::Hash,
-        chunks: Vec<crate::v2::CrdtSyncEnvelopeV2>,
+        frontier: crate::service::Hash,
+        transfer: crate::service::Hash,
+        chunks: Vec<crate::service::CrdtSyncEnvelope>,
     ) {
         self.latest_frontier = frontier;
         self.latest_transfer = transfer;
@@ -7687,12 +7834,12 @@ impl V2CrdtSyncProgress {
 
 #[cfg(all(feature = "network", feature = "storage"))]
 #[derive(Default)]
-struct V2CrdtPeerProgress {
+struct CrdtPeerProgress {
     /// The peer finishes this immutable transfer even if the local frontier
     /// advances. Old chunk vectors are shared only by peers still using them
     /// and are released automatically after their final acknowledgement.
-    transfer: Option<crate::v2::Hash>,
-    chunks: Option<Arc<Vec<crate::v2::CrdtSyncEnvelopeV2>>>,
+    transfer: Option<crate::service::Hash>,
+    chunks: Option<Arc<Vec<crate::service::CrdtSyncEnvelope>>>,
     next_chunk: u32,
     /// Retry throttle for the current chunk (and for failed authorization).
     last_sent: Option<Instant>,
@@ -7702,8 +7849,8 @@ struct V2CrdtPeerProgress {
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-impl V2CrdtPeerProgress {
-    fn needs_transfer(&self, latest_transfer: crate::v2::Hash) -> bool {
+impl CrdtPeerProgress {
+    fn needs_transfer(&self, latest_transfer: crate::service::Hash) -> bool {
         self.transfer != Some(latest_transfer)
             || self
                 .chunks
@@ -7733,10 +7880,10 @@ impl V2CrdtPeerProgress {
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn v2_crdt_select_latest_peer_transfer(
-    peer: &mut V2CrdtPeerProgress,
-    latest_transfer: crate::v2::Hash,
-    latest_chunks: &Arc<Vec<crate::v2::CrdtSyncEnvelopeV2>>,
+fn service_crdt_select_latest_peer_transfer(
+    peer: &mut CrdtPeerProgress,
+    latest_transfer: crate::service::Hash,
+    latest_chunks: &Arc<Vec<crate::service::CrdtSyncEnvelope>>,
 ) {
     let complete = peer
         .chunks
@@ -7752,7 +7899,7 @@ fn v2_crdt_select_latest_peer_transfer(
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-struct V2CrdtRosterPage {
+struct CrdtRosterPage {
     peers: Vec<libp2p::PeerId>,
     next: Option<(u8, Vec<u8>)>,
 }
@@ -7760,72 +7907,76 @@ struct V2CrdtRosterPage {
 /// Type-erased proof backend shared only between one root thread and that
 /// root's Accumulate host. The mutex serializes expensive production with
 /// verification and keeps the backend out of node-global shared state.
-trait V2NodeAttestationProofProducerDyn: Send {
+trait NodeAttestationProofProducerDyn: Send {
     fn prove(
         &mut self,
-        request: &crate::AttestationProofRequestV2<'_>,
-    ) -> Result<crate::ProducedAttestationProofV2, ()>;
+        request: &crate::AttestationProofRequest<'_>,
+    ) -> Result<crate::ProducedAttestationProof, ()>;
 
-    fn verify(&mut self, request: &crate::v2::ProofVerificationRequestV2, proof: &[u8]) -> bool;
+    fn verify(&mut self, request: &crate::service::ProofVerificationRequest, proof: &[u8]) -> bool;
 }
 
-impl<P> V2NodeAttestationProofProducerDyn for P
+impl<P> NodeAttestationProofProducerDyn for P
 where
-    P: crate::AttestationProofBackendV2 + Send,
+    P: crate::AttestationProofBackend + Send,
 {
     fn prove(
         &mut self,
-        request: &crate::AttestationProofRequestV2<'_>,
-    ) -> Result<crate::ProducedAttestationProofV2, ()> {
-        crate::AttestationProofProducerV2::prove(self, request).map_err(|_| ())
+        request: &crate::AttestationProofRequest<'_>,
+    ) -> Result<crate::ProducedAttestationProof, ()> {
+        crate::AttestationProofProducer::prove(self, request).map_err(|_| ())
     }
 
-    fn verify(&mut self, request: &crate::v2::ProofVerificationRequestV2, proof: &[u8]) -> bool {
-        if <crate::v2::AttestationProofManifestV2 as crate::v2::V2Wire>::decode(proof).is_err() {
+    fn verify(&mut self, request: &crate::service::ProofVerificationRequest, proof: &[u8]) -> bool {
+        if <crate::service::AttestationProofManifest as crate::service::ServiceWire>::decode(proof)
+            .is_err()
+        {
             return false;
         }
-        crate::AttestationProofVerifierV2::verify(self, request, proof).unwrap_or(false)
+        crate::AttestationProofVerifier::verify(self, request, proof).unwrap_or(false)
     }
 }
 
 #[derive(Clone)]
-struct V2NodeAttestationProofProducer(Arc<Mutex<Box<dyn V2NodeAttestationProofProducerDyn>>>);
+struct NodeAttestationProofProducer(Arc<Mutex<Box<dyn NodeAttestationProofProducerDyn>>>);
 
-type V2NodeAttestationProofVerifier =
-    Arc<dyn Fn(&crate::v2::ProofVerificationRequestV2, &[u8]) -> bool + Send + Sync + 'static>;
+type NodeAttestationProofVerifier =
+    Arc<dyn Fn(&crate::service::ProofVerificationRequest, &[u8]) -> bool + Send + Sync + 'static>;
 
-fn v2_deny_all_proof_verifier() -> V2NodeAttestationProofVerifier {
+fn service_deny_all_proof_verifier() -> NodeAttestationProofVerifier {
     Arc::new(|_, _| false)
 }
 
-fn v2_node_attestation_proof_verifier<V>(verifier: V) -> V2NodeAttestationProofVerifier
+fn service_node_attestation_proof_verifier<V>(verifier: V) -> NodeAttestationProofVerifier
 where
-    V: crate::AttestationProofVerifierV2 + Send + 'static,
+    V: crate::AttestationProofVerifier + Send + 'static,
 {
     let verifier = Arc::new(Mutex::new(verifier));
     Arc::new(move |request, proof| {
-        if <crate::v2::AttestationProofManifestV2 as crate::v2::V2Wire>::decode(proof).is_err() {
+        if <crate::service::AttestationProofManifest as crate::service::ServiceWire>::decode(proof)
+            .is_err()
+        {
             return false;
         }
         verifier
             .lock()
             .map(|mut verifier| {
-                crate::AttestationProofVerifierV2::verify(&mut *verifier, request, proof)
+                crate::AttestationProofVerifier::verify(&mut *verifier, request, proof)
                     .unwrap_or(false)
             })
             .unwrap_or(false)
     })
 }
 
-impl V2NodeAttestationProofProducer {
+impl NodeAttestationProofProducer {
     fn new<P>(producer: P) -> Self
     where
-        P: crate::AttestationProofBackendV2 + Send + 'static,
+        P: crate::AttestationProofBackend + Send + 'static,
     {
         Self(Arc::new(Mutex::new(Box::new(producer))))
     }
 
-    fn verifier(&self) -> V2NodeAttestationProofVerifier {
+    fn verifier(&self) -> NodeAttestationProofVerifier {
         let backend = self.0.clone();
         Arc::new(move |request, proof| {
             backend
@@ -7836,37 +7987,39 @@ impl V2NodeAttestationProofProducer {
     }
 }
 
-impl crate::AttestationProofProducerV2 for V2NodeAttestationProofProducer {
+impl crate::AttestationProofProducer for NodeAttestationProofProducer {
     type Error = ();
 
     fn prove(
         &mut self,
-        request: &crate::AttestationProofRequestV2<'_>,
-    ) -> Result<crate::ProducedAttestationProofV2, Self::Error> {
+        request: &crate::AttestationProofRequest<'_>,
+    ) -> Result<crate::ProducedAttestationProof, Self::Error> {
         self.0.lock().map_err(|_| ())?.prove(request)
     }
 }
 
-fn install_v2_root_proof_verifier<B>(
-    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
-    verifier: Option<V2NodeAttestationProofVerifier>,
-) -> Result<(), V2NodeRegistrationError>
+fn install_service_root_proof_verifier<B>(
+    service: &mut crate::service::LocalRootTreeService<B>,
+    verifier: Option<NodeAttestationProofVerifier>,
+) -> Result<(), NodeRegistrationError>
 where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        >,
 {
-    let verifier = verifier.unwrap_or_else(v2_deny_all_proof_verifier);
+    let verifier = verifier.unwrap_or_else(service_deny_all_proof_verifier);
     service.store_mut().install_proof_verifier_arc(verifier);
     service
         .store_mut()
         .ensure_proof_verifier_provenance()
-        .map_err(|_| V2NodeRegistrationError::CorruptServiceStore)?;
+        .map_err(|_| NodeRegistrationError::CorruptServiceStore)?;
     service
         .refresh_proof_provenance_snapshot()
-        .map_err(|_| V2NodeRegistrationError::CorruptServiceStore)
+        .map_err(|_| NodeRegistrationError::CorruptServiceStore)
 }
 
-struct V2PendingCaller {
+struct PendingCaller {
     reply: ReplyChannel,
     /// Platform protocols may expose a stronger host result than the actor's
     /// committed reply bytes. The role authority uses this to return the
@@ -7877,33 +8030,33 @@ struct V2PendingCaller {
 }
 
 #[derive(Default)]
-struct V2PublicationProgress {
-    accepted_calls: std::collections::BTreeSet<crate::v2::CallId>,
+struct PublicationProgress {
+    accepted_calls: std::collections::BTreeSet<crate::service::CallId>,
     reply_accepted: bool,
 }
 
-fn v2_actor_route(
-    actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
-    actor: crate::v2::ActorId,
-) -> Option<V2ActorRoute> {
+fn service_actor_route(
+    actor_routes: &RwLock<HashMap<crate::service::ActorId, ActorRoute>>,
+    actor: crate::service::ActorId,
+) -> Option<ActorRoute> {
     actor_routes.read().ok()?.get(&actor).cloned()
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn v2_transport_destination_route(
-    actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
+fn service_transport_destination_route(
+    actor_routes: &RwLock<HashMap<crate::service::ActorId, ActorRoute>>,
     payload: &[u8],
-) -> Option<V2ActorRoute> {
-    use crate::v2::V2Wire;
+) -> Option<ActorRoute> {
+    use crate::service::ServiceWire;
 
-    let transport = crate::v2::RootTreeTransportV2::decode(payload).ok()?;
+    let transport = crate::service::RootTreeTransport::decode(payload).ok()?;
     let routes = actor_routes.read().ok()?;
     match transport {
-        crate::v2::RootTreeTransportV2::OutboxDelivery { message, .. } => routes
+        crate::service::RootTreeTransport::OutboxDelivery { message, .. } => routes
             .get(&message.to)
             .filter(|route| route.service == message.to_service)
             .cloned(),
-        crate::v2::RootTreeTransportV2::Reply {
+        crate::service::RootTreeTransport::Reply {
             caller,
             caller_service,
             ..
@@ -7911,23 +8064,23 @@ fn v2_transport_destination_route(
             .get(&caller)
             .filter(|route| route.service == caller_service)
             .cloned(),
-        crate::v2::RootTreeTransportV2::PublicationAccepted { service, .. } => routes
+        crate::service::RootTreeTransport::PublicationAccepted { service, .. } => routes
             .values()
             .find(|route| route.service == service)
             .cloned(),
-        crate::v2::RootTreeTransportV2::CrdtSyncChunk { envelope, .. } => routes
+        crate::service::RootTreeTransport::CrdtSyncChunk { envelope, .. } => routes
             .values()
             .find(|route| {
                 route.service == envelope.service
-                    && route.consistency == crate::v2::ConsistencyModeV2::Crdt
+                    && route.consistency == crate::service::ConsistencyMode::Crdt
                     && route.authenticated_peer.is_none()
             })
             .cloned(),
-        crate::v2::RootTreeTransportV2::CrdtSyncAccepted { service, .. } => routes
+        crate::service::RootTreeTransport::CrdtSyncAccepted { service, .. } => routes
             .values()
             .find(|route| {
                 route.service == service
-                    && route.consistency == crate::v2::ConsistencyModeV2::Crdt
+                    && route.consistency == crate::service::ConsistencyMode::Crdt
                     && route.authenticated_peer.is_none()
             })
             .cloned(),
@@ -7935,29 +8088,29 @@ fn v2_transport_destination_route(
 }
 
 #[cfg(feature = "network")]
-fn v2_transport_source_route(
-    actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
+fn service_transport_source_route(
+    actor_routes: &RwLock<HashMap<crate::service::ActorId, ActorRoute>>,
     payload: &[u8],
-) -> Option<V2ActorRoute> {
-    use crate::v2::V2Wire;
+) -> Option<ActorRoute> {
+    use crate::service::ServiceWire;
 
-    let transport = crate::v2::RootTreeTransportV2::decode(payload).ok()?;
+    let transport = crate::service::RootTreeTransport::decode(payload).ok()?;
     let routes = actor_routes.read().ok()?;
     let (actor, service) = match transport {
-        crate::v2::RootTreeTransportV2::OutboxDelivery { message, .. } => {
+        crate::service::RootTreeTransport::OutboxDelivery { message, .. } => {
             (message.from, message.from_service)
         }
-        crate::v2::RootTreeTransportV2::Reply { publication, .. } => {
+        crate::service::RootTreeTransport::Reply { publication, .. } => {
             let reply = publication.published.reply?;
             (reply.producer, publication.receipt.service)
         }
-        crate::v2::RootTreeTransportV2::PublicationAccepted {
+        crate::service::RootTreeTransport::PublicationAccepted {
             acceptor,
             acceptor_service,
             ..
         } => (acceptor, acceptor_service),
-        crate::v2::RootTreeTransportV2::CrdtSyncChunk { .. }
-        | crate::v2::RootTreeTransportV2::CrdtSyncAccepted { .. } => return None,
+        crate::service::RootTreeTransport::CrdtSyncChunk { .. }
+        | crate::service::RootTreeTransport::CrdtSyncAccepted { .. } => return None,
     };
     routes
         .get(&actor)
@@ -7969,7 +8122,7 @@ fn v2_transport_source_route(
 /// canonical enrolled-node row. A compact route prefix is used only to locate
 /// the row; collisions never satisfy the final full-PeerId comparison.
 #[cfg(all(feature = "network", feature = "storage"))]
-fn authenticated_v2_crdt_replica_peer(
+fn authenticated_service_crdt_replica_peer(
     invoke_routes: &InvokeRoutes,
     peer_bytes: &[u8],
     timeout: Duration,
@@ -7991,12 +8144,12 @@ fn authenticated_v2_crdt_replica_peer(
 /// root thread, so registries larger than one host-side scan budget continue
 /// from their last page instead of restarting at the first 1,024 rows.
 #[cfg(all(feature = "network", feature = "storage"))]
-fn v2_crdt_replica_roster_page(
+fn service_crdt_replica_roster_page(
     invoke_routes: &InvokeRoutes,
     after_kind: u8,
     after_key: Vec<u8>,
     timeout: Duration,
-) -> Option<V2CrdtRosterPage> {
+) -> Option<CrdtRosterPage> {
     use crate::actors::codec::{Decode, Encode};
     use crate::registry::{MEMBER_KIND_NODE, MemberPage};
     use crate::value::{Msg, TAG_DYNAMIC, Value};
@@ -8034,7 +8187,7 @@ fn v2_crdt_replica_roster_page(
     peers.dedup();
     let next = (page.more && page.next_kind == MEMBER_KIND_NODE)
         .then_some((page.next_kind, page.next_key));
-    Some(V2CrdtRosterPage { peers, next })
+    Some(CrdtRosterPage { peers, next })
 }
 
 /// Resolve the same per-agent sync floor used by the legacy pull service.
@@ -8042,7 +8195,7 @@ fn v2_crdt_replica_roster_page(
 /// timeout, malformed response, or lagging registry cannot open a private
 /// replica.
 #[cfg(all(feature = "network", feature = "storage"))]
-fn v2_crdt_sync_floor(
+fn service_crdt_sync_floor(
     invoke_routes: &InvokeRoutes,
     name: &str,
     timeout: Duration,
@@ -8069,7 +8222,7 @@ fn v2_crdt_sync_floor(
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn v2_crdt_registry_role(
+fn service_crdt_registry_role(
     invoke_routes: &InvokeRoutes,
     peer: &libp2p::PeerId,
     actor_name: Option<&str>,
@@ -8099,7 +8252,7 @@ fn v2_crdt_registry_role(
 /// authentication. Enrollment satisfies `Member`, but deliberately does not
 /// satisfy `Private`; private state requires a space or actor read grant.
 #[cfg(all(feature = "network", feature = "storage"))]
-fn v2_crdt_sync_peer_allowed(
+fn service_crdt_sync_peer_allowed(
     invoke_routes: &InvokeRoutes,
     peer: &libp2p::PeerId,
     name: &str,
@@ -8110,20 +8263,20 @@ fn v2_crdt_sync_peer_allowed(
     let Some(deadline) = Instant::now().checked_add(timeout) else {
         return false;
     };
-    match v2_crdt_sync_floor(
+    match service_crdt_sync_floor(
         invoke_routes,
         name,
         deadline.saturating_duration_since(Instant::now()),
     ) {
         Some(SyncFloor::Public | SyncFloor::Member) => true,
         Some(SyncFloor::Private) => {
-            v2_crdt_registry_role(
+            service_crdt_registry_role(
                 invoke_routes,
                 peer,
                 None,
                 deadline.saturating_duration_since(Instant::now()),
             ) >= AUTH_ROLE_READONLY
-                || v2_crdt_registry_role(
+                || service_crdt_registry_role(
                     invoke_routes,
                     peer,
                     Some(name),
@@ -8138,7 +8291,7 @@ fn v2_crdt_sync_peer_allowed(
 /// after the previous authentication attempt. The cursor is a key rather than
 /// a numeric index so roster growth does not reset progress to the first peers.
 #[cfg(all(feature = "network", feature = "storage"))]
-fn v2_crdt_fanout_order(mut peers: Vec<Vec<u8>>, after: Option<&[u8]>) -> Vec<Vec<u8>> {
+fn service_crdt_fanout_order(mut peers: Vec<Vec<u8>>, after: Option<&[u8]>) -> Vec<Vec<u8>> {
     peers.sort();
     peers.dedup();
     if peers.is_empty() {
@@ -8156,30 +8309,30 @@ fn v2_crdt_fanout_order(mut peers: Vec<Vec<u8>>, after: Option<&[u8]>) -> Vec<Ve
 /// The network hard cap is 8 MiB; every encoded VRT2 chunk is checked against
 /// this smaller bound before it can enter the node outbox.
 #[cfg(all(feature = "network", feature = "storage"))]
-const V2_CRDT_SYNC_CHUNK_MAX_BYTES: usize = 7 * 1024 * 1024;
+const SERVICE_CRDT_SYNC_CHUNK_MAX_BYTES: usize = 7 * 1024 * 1024;
 
 /// Thirty seconds with one unacknowledged chunk retire only that peer's
 /// immutable snapshot. Time spent waiting for the next fair fan-out turn is
 /// excluded. Recovery restarts from the newest transfer and guest dedup makes
 /// already imported chunks harmless.
 #[cfg(all(feature = "network", feature = "storage"))]
-const V2_CRDT_SYNC_TRANSFER_STALL: Duration = Duration::from_secs(30);
+const SERVICE_CRDT_SYNC_TRANSFER_STALL: Duration = Duration::from_secs(30);
 
 /// Bound synchronous authentication work as well as successful sends. Each
 /// attempt may perform both registry identity and sync-floor resolution.
 #[cfg(all(feature = "network", feature = "storage"))]
-const V2_CRDT_SYNC_ATTEMPT_BUDGET: usize = 4;
+const SERVICE_CRDT_SYNC_ATTEMPT_BUDGET: usize = 4;
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn v2_crdt_sync_delta(
-    service: &crate::v2::ServiceIdentityV2,
-    heads: &BTreeSet<crate::v2::Hash>,
-    nodes: &[crate::v2::CrdtSyncNodeV2],
-    blobs: &BTreeMap<crate::v2::Hash, crate::v2::ImportedBlobV2>,
-) -> crate::v2::CrdtSyncEnvelopeV2 {
+fn service_crdt_sync_delta(
+    service: &crate::service::ServiceIdentity,
+    heads: &BTreeSet<crate::service::Hash>,
+    nodes: &[crate::service::CrdtSyncNode],
+    blobs: &BTreeMap<crate::service::Hash, crate::service::ImportedBlob>,
+) -> crate::service::CrdtSyncEnvelope {
     let mut nodes = nodes.to_vec();
     nodes.sort_by_key(|node| node.change.cid());
-    crate::v2::CrdtSyncEnvelopeV2 {
+    crate::service::CrdtSyncEnvelope {
         service: service.clone(),
         advertised_heads: heads.iter().copied().collect(),
         nodes,
@@ -8193,14 +8346,14 @@ fn v2_crdt_sync_delta(
 /// commit and acknowledge every chunk independently; no process-memory
 /// reassembly is trusted for correctness or restart recovery.
 #[cfg(all(feature = "network", feature = "storage"))]
-fn v2_crdt_sync_chunks(
-    envelope: crate::v2::CrdtSyncEnvelopeV2,
+fn service_crdt_sync_chunks(
+    envelope: crate::service::CrdtSyncEnvelope,
     max_payload_bytes: usize,
-) -> Result<(crate::v2::Hash, Vec<crate::v2::CrdtSyncEnvelopeV2>), &'static str> {
-    use crate::v2::V2Wire;
+) -> Result<(crate::service::Hash, Vec<crate::service::CrdtSyncEnvelope>), &'static str> {
+    use crate::service::ServiceWire;
 
     let transfer = envelope.commitment();
-    if transfer == crate::v2::Hash::ZERO || envelope.nodes.is_empty() {
+    if transfer == crate::service::Hash::ZERO || envelope.nodes.is_empty() {
         return Err("empty CRDT synchronization export");
     }
     let mut ordered = envelope.nodes.clone();
@@ -8221,11 +8374,11 @@ fn v2_crdt_sync_chunks(
     // Derive the fixed wire cost from the codecs themselves. The empty shape
     // is used only for sizing (it is never decoded or transmitted); variable
     // heads, nodes and blobs are accounted below.
-    let fixed_wire_bytes = crate::v2::RootTreeTransportV2::CrdtSyncChunk {
+    let fixed_wire_bytes = crate::service::RootTreeTransport::CrdtSyncChunk {
         transfer,
         chunk_index: 0,
         chunk_count: u32::MAX,
-        envelope: crate::v2::CrdtSyncEnvelopeV2 {
+        envelope: crate::service::CrdtSyncEnvelope {
             service: envelope.service.clone(),
             advertised_heads: Vec::new(),
             nodes: Vec::new(),
@@ -8245,7 +8398,7 @@ fn v2_crdt_sync_chunks(
             .saturating_add(node.change.encode().len())
             .saturating_add(node.receipt.encode().len());
         let mut added_blobs = BTreeMap::new();
-        for reference in crate::v2::crdt_change_blob_references(&node.change) {
+        for reference in crate::service::crdt_change_blob_references(&node.change) {
             let Some(blob) = available_blobs.get(&reference.hash) else {
                 return Err("complete CRDT export omitted a referenced blob");
             };
@@ -8276,7 +8429,7 @@ fn v2_crdt_sync_chunks(
         if current_nodes.is_empty() {
             return Err("one CRDT causal node exceeds the transport frame budget");
         }
-        chunks.push(v2_crdt_sync_delta(
+        chunks.push(service_crdt_sync_delta(
             &envelope.service,
             &frontier,
             &current_nodes,
@@ -8297,7 +8450,7 @@ fn v2_crdt_sync_chunks(
         }
     }
     if !current_nodes.is_empty() {
-        chunks.push(v2_crdt_sync_delta(
+        chunks.push(service_crdt_sync_delta(
             &envelope.service,
             &frontier,
             &current_nodes,
@@ -8313,14 +8466,15 @@ fn v2_crdt_sync_chunks(
     }
     let chunk_count = chunks.len() as u32;
     for (index, chunk) in chunks.iter().enumerate() {
-        let wire = crate::v2::RootTreeTransportV2::CrdtSyncChunk {
+        let wire = crate::service::RootTreeTransport::CrdtSyncChunk {
             transfer,
             chunk_index: index as u32,
             chunk_count,
             envelope: chunk.clone(),
         }
         .encode();
-        if wire.len() > max_payload_bytes || crate::v2::RootTreeTransportV2::decode(&wire).is_err()
+        if wire.len() > max_payload_bytes
+            || crate::service::RootTreeTransport::decode(&wire).is_err()
         {
             return Err("constructed a non-canonical or oversized CRDT transport chunk");
         }
@@ -8332,13 +8486,13 @@ fn v2_crdt_sync_chunks(
 /// Comparing only the compact route is unsafe because different PeerIds can
 /// collide on its 16-bit node prefix and reuse the same local-id suffix.
 #[cfg(test)]
-fn authenticated_v2_actor_route(
-    actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
-    actor: crate::v2::ActorId,
+fn authenticated_service_actor_route(
+    actor_routes: &RwLock<HashMap<crate::service::ActorId, ActorRoute>>,
+    actor: crate::service::ActorId,
     route: ServiceId,
     authenticated_peer: Option<&[u8]>,
-) -> Option<V2ActorRoute> {
-    let binding = v2_actor_route(actor_routes, actor)?;
+) -> Option<ActorRoute> {
+    let binding = service_actor_route(actor_routes, actor)?;
     (binding.route == route.0 && binding.authenticated_peer.as_deref() == authenticated_peer)
         .then_some(binding)
 }
@@ -8350,7 +8504,7 @@ fn authenticated_v2_actor_route(
 /// are always resolved through the canonical NODE roster before acceptance.
 #[cfg(all(feature = "network", feature = "storage"))]
 fn raft_route_peer_is_current_leader(
-    binding: &V2ActorRoute,
+    binding: &ActorRoute,
     route: ServiceId,
     peer_bytes: &[u8],
     network: &crate::network::Network,
@@ -8377,7 +8531,7 @@ fn raft_route_peer_is_current_leader(
     }
     network
         .send_raft_status_req(peer, replication_id)
-        .recv_timeout(Duration::from_millis(V2_RAFT_VOTER_AUTH_TIMEOUT_MS))
+        .recv_timeout(Duration::from_millis(SERVICE_RAFT_VOTER_AUTH_TIMEOUT_MS))
         .ok()
         .is_some_and(|status| {
             status.present
@@ -8388,30 +8542,30 @@ fn raft_route_peer_is_current_leader(
 }
 
 #[cfg(all(feature = "network", feature = "storage", test))]
-fn resolve_v2_raft_leader_route(
-    binding: &V2ActorRoute,
+fn resolve_service_raft_leader_route(
+    binding: &ActorRoute,
     network: &crate::network::Network,
     invoke_routes: &InvokeRoutes,
 ) -> Option<(libp2p::PeerId, ServiceId)> {
-    resolve_v2_raft_leader_route_before(
+    resolve_service_raft_leader_route_before(
         binding,
         network,
         invoke_routes,
-        Instant::now() + V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT,
+        Instant::now() + SERVICE_RAFT_TRANSPORT_RESOLUTION_TIMEOUT,
         0,
     )
     .0
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn v2_raft_transport_resolution_deadlines(now: Instant) -> (Instant, Instant) {
-    let resolution_deadline = now + V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT;
-    let ownership_until = resolution_deadline + V2_RAFT_TRANSPORT_RESOLUTION_OWNERSHIP_GRACE;
+fn service_raft_transport_resolution_deadlines(now: Instant) -> (Instant, Instant) {
+    let resolution_deadline = now + SERVICE_RAFT_TRANSPORT_RESOLUTION_TIMEOUT;
+    let ownership_until = resolution_deadline + SERVICE_RAFT_TRANSPORT_RESOLUTION_OWNERSHIP_GRACE;
     (resolution_deadline, ownership_until)
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn v2_raft_transport_auth_windows(now: Instant, deadline: Instant) -> (Duration, Instant) {
+fn service_raft_transport_auth_windows(now: Instant, deadline: Instant) -> (Duration, Instant) {
     let auth_window = deadline
         .saturating_duration_since(now)
         .checked_div(2)
@@ -8420,7 +8574,7 @@ fn v2_raft_transport_auth_windows(now: Instant, deadline: Instant) -> (Duration,
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn v2_raft_transport_status_deadline(auth_deadline: Instant, deadline: Instant) -> Instant {
+fn service_raft_transport_status_deadline(auth_deadline: Instant, deadline: Instant) -> Instant {
     auth_deadline
         + deadline
             .saturating_duration_since(auth_deadline)
@@ -8429,8 +8583,8 @@ fn v2_raft_transport_status_deadline(auth_deadline: Instant, deadline: Instant) 
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn resolve_v2_raft_leader_route_before(
-    binding: &V2ActorRoute,
+fn resolve_service_raft_leader_route_before(
+    binding: &ActorRoute,
     network: &crate::network::Network,
     invoke_routes: &InvokeRoutes,
     deadline: Instant,
@@ -8459,13 +8613,13 @@ fn resolve_v2_raft_leader_route_before(
     let mut candidates = Vec::new();
     if let Some(status) = local_status.as_ref() {
         if let Some(prefix) = status.leader_hint {
-            push_v2_raft_prefix_candidate(&mut candidates, prefix);
+            push_service_raft_prefix_candidate(&mut candidates, prefix);
         }
         for prefix in status.active_voters() {
-            if candidates.len() >= V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES {
+            if candidates.len() >= SERVICE_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES {
                 break;
             }
-            push_v2_raft_prefix_candidate(&mut candidates, prefix);
+            push_service_raft_prefix_candidate(&mut candidates, prefix);
         }
     }
     let connected = network
@@ -8477,17 +8631,17 @@ fn resolve_v2_raft_leader_route_before(
                 .is_some_and(|(_, exact)| exact == peer)
         })
         .collect::<Vec<_>>();
-    let (connected_window, next_candidate_cursor) = v2_raft_connected_candidate_window(
+    let (connected_window, next_candidate_cursor) = service_raft_connected_candidate_window(
         connected,
         candidate_cursor,
-        V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES.saturating_sub(candidates.len()),
+        SERVICE_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES.saturating_sub(candidates.len()),
     );
     for peer in connected_window {
-        if candidates.len() >= V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES {
+        if candidates.len() >= SERVICE_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES {
             break;
         }
         let prefix = crate::network::derive_node_prefix(&peer);
-        push_v2_raft_peer_candidate(&mut candidates, prefix, peer);
+        push_service_raft_peer_candidate(&mut candidates, prefix, peer);
     }
 
     // Spend at most half the shared deadline on roster authentication. The
@@ -8496,11 +8650,16 @@ fn resolve_v2_raft_leader_route_before(
     // latter population is bounded above and stale disconnected peers are
     // evicted by the network layer.
     let auth_started = Instant::now();
-    let (bootstrap_budget, auth_deadline) = v2_raft_transport_auth_windows(auth_started, deadline);
+    let (bootstrap_budget, auth_deadline) =
+        service_raft_transport_auth_windows(auth_started, deadline);
     let mut authenticated = HashMap::new();
     if let Some((prefix, peer)) = exact_bootstrap
-        && let Some((peer, member)) =
-            authenticate_v2_raft_peer_candidate(invoke_routes, prefix, Some(peer), bootstrap_budget)
+        && let Some((peer, member)) = authenticate_service_raft_peer_candidate(
+            invoke_routes,
+            prefix,
+            Some(peer),
+            bootstrap_budget,
+        )
     {
         authenticated.insert(prefix, (peer, member));
     }
@@ -8516,7 +8675,7 @@ fn resolve_v2_raft_leader_route_before(
             continue;
         }
         let Some((peer, member)) =
-            authenticate_v2_raft_peer_candidate(invoke_routes, prefix, expected_peer, budget)
+            authenticate_service_raft_peer_candidate(invoke_routes, prefix, expected_peer, budget)
         else {
             continue;
         };
@@ -8541,8 +8700,11 @@ fn resolve_v2_raft_leader_route_before(
             )
         })
         .collect::<Vec<_>>();
-    let status_deadline = v2_raft_transport_status_deadline(auth_deadline, deadline);
-    observations.extend(collect_v2_raft_status_probes(&mut probes, status_deadline));
+    let status_deadline = service_raft_transport_status_deadline(auth_deadline, deadline);
+    observations.extend(collect_service_raft_status_probes(
+        &mut probes,
+        status_deadline,
+    ));
 
     // A cache is only one observation, never an authority to short-circuit
     // live voters. Prefer the highest term seen across every authenticated
@@ -8550,7 +8712,7 @@ fn resolve_v2_raft_leader_route_before(
     // collection, so a trusted bootstrap follower can introduce a leader that
     // was absent from both the local cache and connected-peer fallback.
     (
-        resolve_v2_raft_leader_observations(
+        resolve_service_raft_leader_observations(
             observations,
             &authenticated,
             invoke_routes,
@@ -8562,7 +8724,7 @@ fn resolve_v2_raft_leader_route_before(
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn v2_raft_connected_candidate_window(
+fn service_raft_connected_candidate_window(
     mut peers: Vec<libp2p::PeerId>,
     cursor: usize,
     limit: usize,
@@ -8582,7 +8744,7 @@ fn v2_raft_connected_candidate_window(
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn authenticate_v2_raft_peer_candidate(
+fn authenticate_service_raft_peer_candidate(
     invoke_routes: &InvokeRoutes,
     prefix: u16,
     expected_peer: Option<libp2p::PeerId>,
@@ -8597,7 +8759,10 @@ fn authenticate_v2_raft_peer_candidate(
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn push_v2_raft_prefix_candidate(candidates: &mut Vec<(u16, Option<libp2p::PeerId>)>, prefix: u16) {
+fn push_service_raft_prefix_candidate(
+    candidates: &mut Vec<(u16, Option<libp2p::PeerId>)>,
+    prefix: u16,
+) {
     if !candidates
         .iter()
         .any(|(candidate_prefix, candidate)| *candidate_prefix == prefix && candidate.is_none())
@@ -8607,7 +8772,7 @@ fn push_v2_raft_prefix_candidate(candidates: &mut Vec<(u16, Option<libp2p::PeerI
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn push_v2_raft_peer_candidate(
+fn push_service_raft_peer_candidate(
     candidates: &mut Vec<(u16, Option<libp2p::PeerId>)>,
     prefix: u16,
     peer: libp2p::PeerId,
@@ -8621,7 +8786,7 @@ fn push_v2_raft_peer_candidate(
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn ranked_v2_raft_leader_observations(
+fn ranked_service_raft_leader_observations(
     observations: Vec<(u16, crate::network::RaftStatusReply)>,
 ) -> Vec<(u16, crate::network::RaftStatusReply)> {
     let mut observations = observations
@@ -8647,14 +8812,14 @@ fn ranked_v2_raft_leader_observations(
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn resolve_v2_raft_leader_observations(
+fn resolve_service_raft_leader_observations(
     observations: Vec<(u16, crate::network::RaftStatusReply)>,
     authenticated: &HashMap<u16, (libp2p::PeerId, crate::registry::MemberRow)>,
     invoke_routes: &InvokeRoutes,
     local_id: u16,
     deadline: Instant,
 ) -> Option<(libp2p::PeerId, ServiceId)> {
-    let observations = ranked_v2_raft_leader_observations(observations);
+    let observations = ranked_service_raft_leader_observations(observations);
     let mut attempted = HashSet::new();
     let mut candidates = Vec::new();
     for (_, status) in observations {
@@ -8664,7 +8829,7 @@ fn resolve_v2_raft_leader_observations(
         if !attempted.insert(leader_prefix) {
             continue;
         }
-        if attempted.len() > V2_RAFT_TRANSPORT_MAX_LEADER_HINTS {
+        if attempted.len() > SERVICE_RAFT_TRANSPORT_MAX_LEADER_HINTS {
             break;
         }
         candidates.push((leader_prefix, status));
@@ -8673,7 +8838,8 @@ fn resolve_v2_raft_leader_observations(
     let candidate_count = candidates.len();
     for (index, (leader_prefix, status)) in candidates.into_iter().enumerate() {
         if let Some((_, member)) = authenticated.get(&leader_prefix)
-            && let Some(peer) = authenticated_v2_raft_leader_peer(&status, member, leader_prefix)
+            && let Some(peer) =
+                authenticated_service_raft_leader_peer(&status, member, leader_prefix)
         {
             return Some((peer, ServiceId::new(leader_prefix, local_id)));
         }
@@ -8684,11 +8850,12 @@ fn resolve_v2_raft_leader_observations(
             .checked_div(hints_left)
             .unwrap_or_default();
         let Some((_, member)) =
-            authenticate_v2_raft_peer_candidate(invoke_routes, leader_prefix, None, budget)
+            authenticate_service_raft_peer_candidate(invoke_routes, leader_prefix, None, budget)
         else {
             continue;
         };
-        if let Some(peer) = authenticated_v2_raft_leader_peer(&status, &member, leader_prefix) {
+        if let Some(peer) = authenticated_service_raft_leader_peer(&status, &member, leader_prefix)
+        {
             return Some((peer, ServiceId::new(leader_prefix, local_id)));
         }
     }
@@ -8696,7 +8863,7 @@ fn resolve_v2_raft_leader_observations(
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn collect_v2_raft_status_probes(
+fn collect_service_raft_status_probes(
     probes: &mut Vec<(u16, mpsc::Receiver<crate::network::RaftStatusReply>)>,
     deadline: Instant,
 ) -> Vec<(u16, crate::network::RaftStatusReply)> {
@@ -8724,7 +8891,7 @@ fn collect_v2_raft_status_probes(
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn dispatch_resolved_v2_raft_transport(
+fn dispatch_resolved_service_raft_transport(
     network: &crate::network::Network,
     local_tx: Option<mpsc::Sender<Envelope>>,
     peer: libp2p::PeerId,
@@ -8744,16 +8911,16 @@ fn dispatch_resolved_v2_raft_transport(
     }
 }
 
-fn authenticated_v2_actor_route_at_node(
-    actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
-    actor: crate::v2::ActorId,
+fn authenticated_service_actor_route_at_node(
+    actor_routes: &RwLock<HashMap<crate::service::ActorId, ActorRoute>>,
+    actor: crate::service::ActorId,
     route: ServiceId,
     authenticated_peer: Option<&[u8]>,
     invoke_routes: &InvokeRoutes,
     #[cfg(feature = "network")] shared_network: &SharedNetwork,
-) -> Option<V2ActorRoute> {
-    let binding = v2_actor_route(actor_routes, actor)?;
-    if binding.consistency != crate::v2::ConsistencyModeV2::Raft {
+) -> Option<ActorRoute> {
+    let binding = service_actor_route(actor_routes, actor)?;
+    if binding.consistency != crate::service::ConsistencyMode::Raft {
         return (binding.route == route.0
             && binding.authenticated_peer.as_deref() == authenticated_peer)
             .then_some(binding);
@@ -8783,18 +8950,20 @@ fn authenticated_v2_actor_route_at_node(
     None
 }
 
-fn prepare_v2_root_slot<B>(
-    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
+fn prepare_service_root_slot<B>(
+    service: &mut crate::service::LocalRootTreeService<B>,
     logical_timeslot: &AtomicU64,
 ) -> Result<u64, String>
 where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        >,
 {
     let floor = service
         .prepare_admission_barrier()
         .map_err(|error| format!("admission barrier failed: {error}"))?;
-    allocate_v2_root_slot_after_barrier(service, logical_timeslot, floor)
+    allocate_service_root_slot_after_barrier(service, logical_timeslot, floor)
         .map_err(|error| format!("logical-timeslot allocation failed: {error:?}"))
 }
 
@@ -8803,46 +8972,48 @@ where
 /// fetch-max plus allocation therefore orders delivery strictly after that
 /// work without running another service catch-up between allocation and the
 /// proposal.
-fn allocate_v2_root_slot_after_barrier<B>(
-    service: &crate::v2::LocalRootTreeServiceV2<B>,
+fn allocate_service_root_slot_after_barrier<B>(
+    service: &crate::service::LocalRootTreeService<B>,
     logical_timeslot: &AtomicU64,
     admission_floor: u64,
-) -> Result<u64, V2NodeRegistrationError>
+) -> Result<u64, NodeRegistrationError>
 where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        >,
 {
     let observed = service
         .production_logical_timeslot()
-        .map_err(|_| V2NodeRegistrationError::LogicalTimeslotUnavailable)?;
-    allocate_v2_observed_slot_after_barrier(logical_timeslot, admission_floor, observed)
+        .map_err(|_| NodeRegistrationError::LogicalTimeslotUnavailable)?;
+    allocate_service_observed_slot_after_barrier(logical_timeslot, admission_floor, observed)
 }
 
-fn allocate_v2_observed_slot_after_barrier(
+fn allocate_service_observed_slot_after_barrier(
     logical_timeslot: &AtomicU64,
     admission_floor: u64,
     observed: Option<u64>,
-) -> Result<u64, V2NodeRegistrationError> {
+) -> Result<u64, NodeRegistrationError> {
     if let Some(observed) = observed {
         if observed < admission_floor {
-            return Err(V2NodeRegistrationError::LogicalTimeslotRegressed);
+            return Err(NodeRegistrationError::LogicalTimeslotRegressed);
         }
         logical_timeslot.fetch_max(observed, Ordering::Relaxed);
         return Ok(observed);
     }
-    allocate_v2_conformance_slot_after_barrier(logical_timeslot, admission_floor)
+    allocate_service_conformance_slot_after_barrier(logical_timeslot, admission_floor)
 }
 
-fn v2_root_slot_failure_is_terminal(failure: V2NodeRegistrationError) -> bool {
-    matches!(failure, V2NodeRegistrationError::LogicalTimeslotExhausted)
+fn service_root_slot_failure_is_terminal(failure: NodeRegistrationError) -> bool {
+    matches!(failure, NodeRegistrationError::LogicalTimeslotExhausted)
 }
 
-fn allocate_v2_conformance_slot_after_barrier(
+fn allocate_service_conformance_slot_after_barrier(
     logical_timeslot: &AtomicU64,
     admission_floor: u64,
-) -> Result<u64, V2NodeRegistrationError> {
-    restore_v2_logical_timeslot(logical_timeslot, admission_floor)?;
-    Ok(next_v2_logical_timeslot(logical_timeslot))
+) -> Result<u64, NodeRegistrationError> {
+    restore_service_logical_timeslot(logical_timeslot, admission_floor)?;
+    Ok(next_service_logical_timeslot(logical_timeslot))
 }
 
 /// Ask the locally attached canonical Raft authority to finalize one exact
@@ -8850,18 +9021,18 @@ fn allocate_v2_conformance_slot_after_barrier(
 /// `System` origin through the existing voter-authenticated delegation wire;
 /// the returned assertion is still checked byte-for-byte against the target
 /// service's installed authority binding before it reaches guest Accumulate.
-fn request_v2_role_assertion(
-    authority: &crate::v2::RoleAuthorityBindingV2,
-    claim: &crate::v2::RoleAuthorizationClaimV2,
-    actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
+fn request_service_role_assertion(
+    authority: &crate::service::RoleAuthorityBinding,
+    claim: &crate::service::RoleAuthorizationClaim,
+    actor_routes: &RwLock<HashMap<crate::service::ActorId, ActorRoute>>,
     invoke_routes: &InvokeRoutes,
     #[cfg(feature = "network")] shared_network: &SharedNetwork,
-) -> Result<crate::v2::AccumulatedRoleAssertionV2, ()> {
-    use crate::{Decode, Encode, v2::V2Wire};
+) -> Result<crate::service::AccumulatedRoleAssertion, ()> {
+    use crate::{Decode, Encode, service::ServiceWire};
 
-    let route = v2_actor_route(actor_routes, authority.actor).filter(|route| {
+    let route = service_actor_route(actor_routes, authority.actor).filter(|route| {
         route.service == authority.service
-            && route.consistency == crate::v2::ConsistencyModeV2::Raft
+            && route.consistency == crate::service::ConsistencyMode::Raft
             && route.replication_id.is_some()
             && route.is_role_authority
             && route.authenticated_peer.is_none()
@@ -8871,14 +9042,14 @@ fn request_v2_role_assertion(
     };
     let mut arguments = vec![crate::value::TAG_DYNAMIC];
     arguments.extend_from_slice(
-        &crate::value::Msg::new(crate::v2::ROLE_AUTHORITY_DECISION_METHOD_V2)
+        &crate::value::Msg::new(crate::service::ROLE_AUTHORITY_DECISION_METHOD_)
             .with("claim", claim.encode())
             .encode(),
     );
-    let ingress = crate::v2::RootTreeInvocationV2 {
+    let ingress = crate::service::RootTreeInvocation {
         invocation: claim.authority_invocation(),
         target: authority.actor,
-        method: crate::v2::ROLE_AUTHORITY_DECISION_METHOD_V2.into(),
+        method: crate::service::ROLE_AUTHORITY_DECISION_METHOD_.into(),
         arguments,
         proof_requested: false,
     };
@@ -8909,17 +9080,17 @@ fn request_v2_role_assertion(
         .map_err(|_| ())?;
 
     #[cfg(all(feature = "network", feature = "storage"))]
-    let envelope = if let Some(redirect) = decode_v2_raft_redirect(&envelope) {
+    let envelope = if let Some(redirect) = decode_service_raft_redirect(&envelope) {
         let network = shared_network.lock().map_err(|_| ())?.clone().ok_or(())?;
         let replication_id = route.replication_id.ok_or(())?;
         let status = network.local_raft_status(&replication_id).ok_or(())?;
-        send_v2_raft_invoke_exact(
+        send_service_raft_invoke_exact(
             &network,
             invoke_routes,
             &route,
             status,
             redirect.leader_prefix,
-            crate::v2::Origin::System,
+            crate::service::Origin::System,
             true,
             true,
             false,
@@ -8937,9 +9108,9 @@ fn request_v2_role_assertion(
     else {
         return Err(());
     };
-    let assertion = crate::v2::AccumulatedRoleAssertionV2::decode(&bytes).map_err(|_| ())?;
+    let assertion = crate::service::AccumulatedRoleAssertion::decode(&bytes).map_err(|_| ())?;
     if assertion.claim != *claim
-        || assertion.receipt.consistency != crate::v2::ConsistencyModeV2::Raft
+        || assertion.receipt.consistency != crate::service::ConsistencyMode::Raft
         || !assertion.matches_authority(authority)
     {
         return Err(());
@@ -8948,18 +9119,21 @@ fn request_v2_role_assertion(
 }
 
 fn role_authority_reply_override<B>(
-    service: &crate::v2::LocalRootTreeServiceV2<B>,
+    service: &crate::service::LocalRootTreeService<B>,
     role_authority_request: bool,
-    ingress: &crate::v2::RootTreeInvocationV2,
-    committed: &crate::v2::CommittedRootTreeSliceV2,
+    ingress: &crate::service::RootTreeInvocation,
+    committed: &crate::service::CommittedRootTreeSlice,
 ) -> Option<Result<Vec<u8>, u8>>
 where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        >,
 {
-    use crate::{Decode, Encode, v2::V2Wire};
+    use crate::{Decode, Encode, service::ServiceWire};
 
-    if !role_authority_request || ingress.method != crate::v2::ROLE_AUTHORITY_DECISION_METHOD_V2 {
+    if !role_authority_request || ingress.method != crate::service::ROLE_AUTHORITY_DECISION_METHOD_
+    {
         return None;
     }
     let assertion = (|| {
@@ -8968,15 +9142,16 @@ where
                 .arguments
                 .strip_prefix(&[crate::value::TAG_DYNAMIC])?,
         )?;
-        if message.name != crate::v2::ROLE_AUTHORITY_DECISION_METHOD_V2 {
+        if message.name != crate::service::ROLE_AUTHORITY_DECISION_METHOD_ {
             return None;
         }
         let claim =
-            crate::v2::RoleAuthorizationClaimV2::decode(&message.args.get_bytes("claim")?).ok()?;
+            crate::service::RoleAuthorizationClaim::decode(&message.args.get_bytes("claim")?)
+                .ok()?;
         if claim.authority_invocation() != ingress.invocation {
             return None;
         }
-        let authority = crate::v2::RoleAuthorityBindingV2 {
+        let authority = crate::service::RoleAuthorityBinding {
             service: service.identity().clone(),
             actor: ingress.target,
         };
@@ -8990,45 +9165,49 @@ where
     Some(assertion.ok_or(crate::STATUS_FORBIDDEN))
 }
 
-fn v2_root_service_thread<B>(
+fn service_root_service_thread<B>(
     id: ServiceId,
     root_name: String,
-    mut service: crate::v2::LocalRootTreeServiceV2<B>,
+    mut service: crate::service::LocalRootTreeService<B>,
     inbox_rx: mpsc::Receiver<Envelope>,
     invoke_rx: mpsc::Receiver<InvokeRequest>,
     outbox: mpsc::Sender<Envelope>,
-    actor_routes: Arc<RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>>,
+    actor_routes: Arc<RwLock<HashMap<crate::service::ActorId, ActorRoute>>>,
     invoke_routes: InvokeRoutes,
     is_role_authority: bool,
     #[cfg(feature = "network")] shared_network: SharedNetwork,
-    mut proof_producer: Option<V2NodeAttestationProofProducer>,
+    mut proof_producer: Option<NodeAttestationProofProducer>,
     #[cfg(all(feature = "network", feature = "storage"))] private_ingress_registration: Option<
-        V2PrivateIngressRegistration,
+        PrivateIngressRegistration,
     >,
     logical_timeslot: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
     activity: ActivityClock,
 ) -> AgentResult
 where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>
-        + Send
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        > + Send
         + 'static,
 {
-    use crate::{Decode, v2::V2Wire};
+    use crate::{Decode, service::ServiceWire};
 
     let mut error = None;
-    let mut state = V2RootThreadState::default();
+    let mut state = RootThreadState::default();
     let mut last_transport_retry = Instant::now();
     match service.catch_up() {
         Ok(true) => {
-            if let Err(failure) = restore_v2_root_logical_timeslot(&service, &logical_timeslot) {
-                error!(%id, ?failure, "v2 root-tree startup clock restoration failed");
-                error = Some(format!("v2 root-tree clock restoration failed: {failure}"));
+            if let Err(failure) = restore_service_root_logical_timeslot(&service, &logical_timeslot)
+            {
+                error!(%id, ?failure, "service root-tree startup clock restoration failed");
+                error = Some(format!(
+                    "service root-tree clock restoration failed: {failure}"
+                ));
             }
         }
-        Ok(false) => info!(%id, "v2 Raft root is waiting for committed service genesis"),
-        Err(failure) => warn!(%id, ?failure, "v2 root-tree startup catch-up failed"),
+        Ok(false) => info!(%id, "service Raft root is waiting for committed service genesis"),
+        Err(failure) => warn!(%id, ?failure, "service root-tree startup catch-up failed"),
     }
     while error.is_none() && !shutdown.load(Ordering::Relaxed) {
         #[cfg(all(feature = "network", feature = "storage"))]
@@ -9041,7 +9220,7 @@ where
                 let Ok(upload) = private_ingress.receiver.try_recv() else {
                     break;
                 };
-                if !begin_v2_private_ingress_upload(&upload) {
+                if !begin_service_private_ingress_upload(&upload) {
                     let _ = upload.reply.send(false);
                     continue;
                 }
@@ -9055,7 +9234,7 @@ where
         }
         while let Ok(envelope) = inbox_rx.try_recv() {
             *activity.lock().unwrap() = Instant::now();
-            handle_v2_root_transport(
+            handle_service_root_transport(
                 id,
                 &root_name,
                 &mut service,
@@ -9075,7 +9254,7 @@ where
             // transition. Retry host-side deletion debt without changing the
             // committed invocation's disposition.
             service.retry_private_ingress_retirement();
-            retry_v2_root_transport(
+            retry_service_root_transport(
                 id,
                 &root_name,
                 &mut service,
@@ -9096,39 +9275,39 @@ where
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         *activity.lock().unwrap() = Instant::now();
-        let ingress = match crate::v2::RootTreeInvocationV2::decode(&req.msg) {
+        let ingress = match crate::service::RootTreeInvocation::decode(&req.msg) {
             Ok(ingress) => ingress,
             Err(_) => {
-                send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
+                send_service_status(req.reply, crate::STATUS_NOT_FOUND, id);
                 continue;
             }
         };
         if ingress.target != service.root_actor() {
-            send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
+            send_service_status(req.reply, crate::STATUS_NOT_FOUND, id);
             continue;
         }
         #[cfg(all(feature = "network", feature = "storage"))]
         let delegated_origin = req.delegated_origin;
         #[cfg(not(all(feature = "network", feature = "storage")))]
-        let delegated_origin: Option<crate::v2::Origin> = None;
+        let delegated_origin: Option<crate::service::Origin> = None;
         let origin = match delegated_origin {
-            Some(origin) if service.consistency() == crate::v2::ConsistencyModeV2::Raft => {
+            Some(origin) if service.consistency() == crate::service::ConsistencyMode::Raft => {
                 Some(origin)
             }
             Some(_) => None,
-            None => v2_root_origin(&req.caller, &actor_routes),
+            None => service_root_origin(&req.caller, &actor_routes),
         };
         let Some(origin) = origin else {
-            send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+            send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
             continue;
         };
-        if ingress.method == crate::v2::ROOT_UPGRADE_METHOD_V2 {
+        if ingress.method == crate::service::ROOT_UPGRADE_METHOD_ {
             let authorized = req.root_upgrade_request
                 || matches!(req.caller, crate::actors::Caller::System)
                 || req.space_role.is_some_and(|role| role >= AUTH_ROLE_ADMIN);
-            let upgrade = crate::v2::RootTreeUpgradeRequestV2::decode(&ingress.arguments);
+            let upgrade = crate::service::RootTreeUpgradeRequest::decode(&ingress.arguments);
             if ingress.proof_requested || !authorized || upgrade.is_err() {
-                send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                 continue;
             }
             match service.upgrade_root(upgrade.expect("checked above")) {
@@ -9137,43 +9316,43 @@ where
                     let envelope = encode_invoke_envelope(crate::STATUS_DONE, &[], &reply);
                     let _ = send_reply_capped(req.reply, envelope, id);
                 }
-                Err(crate::v2::LocalRootTreeInvokeErrorV2::Rejected(
-                    crate::v2::AccumulationRejectionV2::Unauthorized,
+                Err(crate::service::LocalRootTreeInvokeError::Rejected(
+                    crate::service::AccumulationRejection::Unauthorized,
                 ))
-                | Err(crate::v2::LocalRootTreeInvokeErrorV2::UpgradeUnsupported) => {
-                    send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                | Err(crate::service::LocalRootTreeInvokeError::UpgradeUnsupported) => {
+                    send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                 }
                 #[cfg(all(feature = "storage", feature = "network"))]
-                Err(failure @ crate::v2::LocalRootTreeInvokeErrorV2::Replication(_)) => {
-                    warn!(%id, ?failure, "v2 root upgrade leader barrier failed");
+                Err(failure @ crate::service::LocalRootTreeInvokeError::Replication(_)) => {
+                    warn!(%id, ?failure, "service root upgrade leader barrier failed");
                     if let Some(leader_prefix) = service.admission_leader_hint() {
                         let _ = send_reply_capped(
                             req.reply,
-                            encode_v2_raft_redirect(leader_prefix, origin, true),
+                            encode_service_raft_redirect(leader_prefix, origin, true),
                             id,
                         );
                     } else {
-                        send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                        send_service_status(req.reply, crate::STATUS_PANICKED, id);
                     }
                 }
                 Err(failure) => {
-                    error!(%id, ?failure, "v2 root upgrade failed");
-                    send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                    error!(%id, ?failure, "service root upgrade failed");
+                    send_service_status(req.reply, crate::STATUS_PANICKED, id);
                 }
             }
             continue;
         }
         if ingress.arguments.first() != Some(&crate::value::TAG_DYNAMIC) {
-            send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
+            send_service_status(req.reply, crate::STATUS_NOT_FOUND, id);
             continue;
         }
         let Some(message) = <crate::value::Msg as Decode>::try_decode(&ingress.arguments[1..])
         else {
-            send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
+            send_service_status(req.reply, crate::STATUS_NOT_FOUND, id);
             continue;
         };
         if message.name != ingress.method {
-            send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
+            send_service_status(req.reply, crate::STATUS_NOT_FOUND, id);
             continue;
         }
         // A role check is not a sufficient leadership gate: Raft exposes
@@ -9183,28 +9362,28 @@ where
         let admission_floor = match service.prepare_admission_barrier() {
             Ok(floor) => floor,
             Err(failure) => {
-                error!(%id, ?failure, "v2 root-tree admission barrier failed");
+                error!(%id, ?failure, "service root-tree admission barrier failed");
                 #[cfg(all(feature = "storage", feature = "network"))]
                 if let Some(leader_prefix) = service.admission_leader_hint() {
                     let _ = send_reply_capped(
                         req.reply,
-                        encode_v2_raft_redirect(leader_prefix, origin, false),
+                        encode_service_raft_redirect(leader_prefix, origin, false),
                         id,
                     );
                     continue;
                 }
-                send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                send_service_status(req.reply, crate::STATUS_PANICKED, id);
                 continue;
             }
         };
         if ingress.proof_requested
-            && (service.consistency() == crate::v2::ConsistencyModeV2::Crdt
+            && (service.consistency() == crate::service::ConsistencyMode::Crdt
                 || proof_producer.is_none())
         {
-            send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+            send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
             continue;
         }
-        let mut request = crate::v2::LocalWorkRequestV2 {
+        let mut request = crate::service::LocalWorkRequest {
             invocation: ingress.invocation,
             workflow_step: 0,
             // Scope excludes the scheduler observation slot. Use the first
@@ -9215,7 +9394,7 @@ where
             method: ingress.method.clone(),
             arguments: ingress.arguments.clone(),
             origin,
-            authorization: crate::v2::AuthorizationEvidenceV2::Public,
+            authorization: crate::service::AuthorizationEvidence::Public,
             causal_parent: None,
             parent_call: None,
             causal_context: None,
@@ -9228,8 +9407,8 @@ where
         let recovered_authorization = match service.recover_direct_authorization(&request) {
             Ok(authorization) => authorization,
             Err(failure) => {
-                warn!(%id, ?failure, "v2 direct invocation retry diverged");
-                send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                warn!(%id, ?failure, "service direct invocation retry diverged");
+                send_service_status(req.reply, crate::STATUS_PANICKED, id);
                 continue;
             }
         };
@@ -9240,35 +9419,35 @@ where
             // authority to execute the same scoped claim again. Accumulate
             // authenticates it through the retained ingress node/receipt;
             // fresh calls still take the authority path below.
-            if service.consistency() == crate::v2::ConsistencyModeV2::Crdt {
+            if service.consistency() == crate::service::ConsistencyMode::Crdt {
                 request.authorization = authorization;
             } else {
                 match &authorization {
-                    crate::v2::AuthorizationEvidenceV2::Public => {}
-                    crate::v2::AuthorizationEvidenceV2::Credential {
+                    crate::service::AuthorizationEvidence::Public => {}
+                    crate::service::AuthorizationEvidence::Credential {
                         policy,
                         credential_commitment,
                         bytes,
                     } => {
-                        let credential = match crate::v2::RoleCredentialV2::decode(bytes) {
+                        let credential = match crate::service::RoleCredential::decode(bytes) {
                             Ok(credential) => credential,
                             Err(_) => {
-                                send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                                send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                                 continue;
                             }
                         };
-                        let assertion = match crate::v2::AccumulatedRoleAssertionV2::decode(
+                        let assertion = match crate::service::AccumulatedRoleAssertion::decode(
                             &credential.authenticator,
                         ) {
                             Ok(assertion) => assertion,
                             Err(_) => {
-                                send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                                send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                                 continue;
                             }
                         };
                         let claim = &assertion.claim;
                         let Some(authority) = service.role_authority().cloned() else {
-                            send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                            send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                             continue;
                         };
                         let valid = credential.commitment() == *credential_commitment
@@ -9285,10 +9464,10 @@ where
                             && claim.method == ingress.method
                             && assertion.matches_authority(&authority);
                         if !valid {
-                            send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                            send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                             continue;
                         }
-                        let finalized = request_v2_role_assertion(
+                        let finalized = request_service_role_assertion(
                             &authority,
                             claim,
                             &actor_routes,
@@ -9297,7 +9476,7 @@ where
                             &shared_network,
                         );
                         if finalized.as_ref() != Ok(&assertion) {
-                            send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                            send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                             continue;
                         }
                         receipt_verifications.push(
@@ -9305,9 +9484,9 @@ where
                                 .authorize_finalized_receipt(authority.actor, &assertion.receipt),
                         );
                     }
-                    crate::v2::AuthorizationEvidenceV2::PrivateCredential { .. }
-                    | crate::v2::AuthorizationEvidenceV2::SystemCapability { .. } => {
-                        send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                    crate::service::AuthorizationEvidence::PrivateCredential { .. }
+                    | crate::service::AuthorizationEvidence::SystemCapability { .. } => {
+                        send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                         continue;
                     }
                 }
@@ -9317,12 +9496,12 @@ where
             let policy = match service.root_method_policy(&ingress.method) {
                 Ok(Some(policy)) => policy,
                 Ok(None) => {
-                    send_v2_status(req.reply, crate::STATUS_NOT_FOUND, id);
+                    send_service_status(req.reply, crate::STATUS_NOT_FOUND, id);
                     continue;
                 }
                 Err(failure) => {
-                    error!(%id, ?failure, "v2 root policy lookup failed");
-                    send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                    error!(%id, ?failure, "service root policy lookup failed");
+                    send_service_status(req.reply, crate::STATUS_PANICKED, id);
                     continue;
                 }
             };
@@ -9334,31 +9513,31 @@ where
             // assertion in its causal admission node, whose finalized receipt
             // is independently verified by every syncing replica.
             if policy.attested != ingress.proof_requested {
-                send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                 continue;
             }
             if !policy.public {
                 let Some(role) = policy.space_role.and_then(crate::SpaceRole::from_u8) else {
-                    send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                    send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                     continue;
                 };
                 if policy.actor_role.is_some() {
-                    send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                    send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                     continue;
                 }
                 let Some(authority) = service.role_authority().cloned() else {
-                    send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                    send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                     continue;
                 };
                 let claim = match service.role_authorization_claim(&request, role, &policy) {
                     Ok(claim) => claim,
                     Err(failure) => {
-                        warn!(%id, ?failure, "could not derive v2 role authorization claim");
-                        send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                        warn!(%id, ?failure, "could not derive service role authorization claim");
+                        send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                         continue;
                     }
                 };
-                let assertion = match request_v2_role_assertion(
+                let assertion = match request_service_role_assertion(
                     &authority,
                     &claim,
                     &actor_routes,
@@ -9368,13 +9547,13 @@ where
                 ) {
                     Ok(assertion) => assertion,
                     Err(()) => {
-                        send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                        send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                         continue;
                     }
                 };
                 receipt_verifications
                     .push(service.authorize_finalized_receipt(authority.actor, &assertion.receipt));
-                request.authorization = crate::v2::RoleCredentialV2 {
+                request.authorization = crate::service::RoleCredential {
                     holder: origin,
                     scope: claim.scope,
                     space_role: Some(role),
@@ -9386,36 +9565,36 @@ where
         }
         #[cfg(all(feature = "network", feature = "storage"))]
         let _private_ingress_barrier =
-            if service.consistency() == crate::v2::ConsistencyModeV2::Raft {
+            if service.consistency() == crate::service::ConsistencyMode::Raft {
                 let reference = match service.private_ingress_reference_for_request(&request) {
                     Ok(reference) => reference,
                     Err(failure) => {
-                        error!(%id, ?failure, "v2 private-ingress classification failed");
-                        send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                        error!(%id, ?failure, "service private-ingress classification failed");
+                        send_service_status(req.reply, crate::STATUS_PANICKED, id);
                         continue;
                     }
                 };
                 if let Some(reference) = reference {
                     let Some(registration) = private_ingress_registration.as_ref() else {
-                        error!(%id, "v2 Raft private ingress has no root-owned sidecar route");
-                        send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                        error!(%id, "service Raft private ingress has no root-owned sidecar route");
+                        send_service_status(req.reply, crate::STATUS_PANICKED, id);
                         continue;
                     };
                     let Some(guard) = registration.route.barrier.try_acquire() else {
                         // A membership change owns the same critical section.
                         // No request has entered the log, so a normal retry is
                         // safe and cannot observe a partial admission.
-                        send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                        send_service_status(req.reply, crate::STATUS_PANICKED, id);
                         continue;
                     };
-                    if !stage_v2_private_ingress_on_current_voters(
+                    if !stage_service_private_ingress_on_current_voters(
                         &mut service,
                         &request,
                         &reference,
                         &shared_network,
                         &invoke_routes,
                     ) {
-                        send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                        send_service_status(req.reply, crate::STATUS_PANICKED, id);
                         continue;
                     }
                     Some(guard)
@@ -9426,20 +9605,22 @@ where
                 None
             };
         // Nothing catches up again between this allocation and the proposal.
-        let final_slot =
-            match allocate_v2_root_slot_after_barrier(&service, &logical_timeslot, admission_floor)
-            {
-                Ok(slot) => slot,
-                Err(failure) => {
-                    warn!(%id, ?failure, "v2 root-tree admission clock restoration failed");
-                    send_v2_status(req.reply, crate::STATUS_PANICKED, id);
-                    if v2_root_slot_failure_is_terminal(failure) {
-                        error = Some(format!("v2 root-tree clock exhausted: {failure:?}"));
-                        break;
-                    }
-                    continue;
+        let final_slot = match allocate_service_root_slot_after_barrier(
+            &service,
+            &logical_timeslot,
+            admission_floor,
+        ) {
+            Ok(slot) => slot,
+            Err(failure) => {
+                warn!(%id, ?failure, "service root-tree admission clock restoration failed");
+                send_service_status(req.reply, crate::STATUS_PANICKED, id);
+                if service_root_slot_failure_is_terminal(failure) {
+                    error = Some(format!("service root-tree clock exhausted: {failure:?}"));
+                    break;
                 }
-            };
+                continue;
+            }
+        };
         request.logical_timeslot = final_slot;
         let committed = if request.proof_requested {
             let producer = proof_producer
@@ -9451,17 +9632,17 @@ where
                 producer,
             ) {
                 Ok(committed) => committed,
-                Err(crate::v2::AttestedRootTreeInvokeErrorV2::Root(
-                    crate::v2::LocalRootTreeInvokeErrorV2::Rejected(
-                        crate::v2::AccumulationRejectionV2::Unauthorized,
+                Err(crate::service::AttestedRootTreeInvokeError::Root(
+                    crate::service::LocalRootTreeInvokeError::Rejected(
+                        crate::service::AccumulationRejection::Unauthorized,
                     ),
                 )) => {
-                    send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                    send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                     continue;
                 }
                 Err(failure) => {
-                    error!(%id, ?failure, "v2 attested root invocation failed");
-                    send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                    error!(%id, ?failure, "service attested root invocation failed");
+                    send_service_status(req.reply, crate::STATUS_PANICKED, id);
                     continue;
                 }
             }
@@ -9470,15 +9651,15 @@ where
                 .invoke_after_admission_barrier_with_receipts(request, &receipt_verifications)
             {
                 Ok(committed) => committed,
-                Err(crate::v2::LocalRootTreeInvokeErrorV2::Rejected(
-                    crate::v2::AccumulationRejectionV2::Unauthorized,
+                Err(crate::service::LocalRootTreeInvokeError::Rejected(
+                    crate::service::AccumulationRejection::Unauthorized,
                 )) => {
-                    send_v2_status(req.reply, crate::STATUS_FORBIDDEN, id);
+                    send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                     continue;
                 }
                 Err(failure) => {
-                    error!(%id, ?failure, "v2 root invocation failed");
-                    send_v2_status(req.reply, crate::STATUS_PANICKED, id);
+                    error!(%id, ?failure, "service root invocation failed");
+                    send_service_status(req.reply, crate::STATUS_PANICKED, id);
                     continue;
                 }
             }
@@ -9489,11 +9670,11 @@ where
             &ingress,
             &committed,
         );
-        publish_v2_root_slice(
+        publish_service_root_slice(
             id,
             &mut service,
             committed,
-            Some(V2PendingCaller {
+            Some(PendingCaller {
                 reply: req.reply,
                 override_result,
                 attested: ingress.proof_requested,
@@ -9524,49 +9705,55 @@ where
     }
 }
 
-fn handle_v2_root_transport<B>(
+fn handle_service_root_transport<B>(
     id: ServiceId,
     root_name: &str,
-    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
+    service: &mut crate::service::LocalRootTreeService<B>,
     envelope: Envelope,
     outbox: &mpsc::Sender<Envelope>,
-    actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
+    actor_routes: &RwLock<HashMap<crate::service::ActorId, ActorRoute>>,
     invoke_routes: &InvokeRoutes,
     #[cfg(feature = "network")] shared_network: &SharedNetwork,
-    proof_producer: &mut Option<V2NodeAttestationProofProducer>,
+    proof_producer: &mut Option<NodeAttestationProofProducer>,
     logical_timeslot: &AtomicU64,
-    state: &mut V2RootThreadState,
+    state: &mut RootThreadState,
 ) where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        >,
 {
-    use crate::v2::V2Wire;
+    use crate::service::ServiceWire;
     #[cfg(not(all(feature = "network", feature = "storage")))]
     let _ = root_name;
 
-    let transport = match crate::v2::RootTreeTransportV2::decode(&envelope.payload) {
+    let transport = match crate::service::RootTreeTransport::decode(&envelope.payload) {
         Ok(transport) => transport,
         Err(failure) => {
-            warn!(%id, from = %envelope.from, ?failure, "rejected non-canonical v2 root transport");
+            warn!(%id, from = %envelope.from, ?failure, "rejected non-canonical service root transport");
             return;
         }
     };
     if matches!(
         &transport,
-        crate::v2::RootTreeTransportV2::CrdtSyncChunk { .. }
-            | crate::v2::RootTreeTransportV2::CrdtSyncAccepted { .. }
+        crate::service::RootTreeTransport::CrdtSyncChunk { .. }
+            | crate::service::RootTreeTransport::CrdtSyncAccepted { .. }
     ) {
         #[cfg(all(feature = "network", feature = "storage"))]
         let authenticated = envelope
             .authenticated_source_peer
             .as_deref()
             .and_then(|peer| {
-                authenticated_v2_crdt_replica_peer(invoke_routes, peer, Duration::from_millis(500))
+                authenticated_service_crdt_replica_peer(
+                    invoke_routes,
+                    peer,
+                    Duration::from_millis(500),
+                )
             })
             .filter(|peer| {
                 crate::network::derive_node_prefix(&peer) == envelope.from.node_prefix()
                     && envelope.from.local_id() == id.local_id()
-                    && v2_crdt_sync_peer_allowed(
+                    && service_crdt_sync_peer_allowed(
                         invoke_routes,
                         peer,
                         root_name,
@@ -9575,12 +9762,13 @@ fn handle_v2_root_transport<B>(
             });
         #[cfg(not(all(feature = "network", feature = "storage")))]
         let authenticated: Option<()> = None;
-        if authenticated.is_none() || service.consistency() != crate::v2::ConsistencyModeV2::Crdt {
-            warn!(%id, from = %envelope.from, "rejected unauthenticated or misrouted v2 CRDT sync");
+        if authenticated.is_none() || service.consistency() != crate::service::ConsistencyMode::Crdt
+        {
+            warn!(%id, from = %envelope.from, "rejected unauthenticated or misrouted service CRDT sync");
             return;
         }
         match transport {
-            crate::v2::RootTreeTransportV2::CrdtSyncChunk {
+            crate::service::RootTreeTransport::CrdtSyncChunk {
                 transfer,
                 chunk_index,
                 chunk_count: _,
@@ -9592,7 +9780,7 @@ fn handle_v2_root_transport<B>(
                 }
                 match service.sync_authenticated_crdt(sync_envelope) {
                     Ok(_) => {
-                        let accepted = crate::v2::RootTreeTransportV2::CrdtSyncAccepted {
+                        let accepted = crate::service::RootTreeTransport::CrdtSyncAccepted {
                             service: service.identity().clone(),
                             transfer,
                             next_chunk: chunk_index.saturating_add(1),
@@ -9606,11 +9794,11 @@ fn handle_v2_root_transport<B>(
                         });
                     }
                     Err(failure) => {
-                        warn!(%id, ?failure, "guest rejected authenticated v2 CRDT chunk");
+                        warn!(%id, ?failure, "guest rejected authenticated service CRDT chunk");
                     }
                 }
             }
-            crate::v2::RootTreeTransportV2::CrdtSyncAccepted {
+            crate::service::RootTreeTransport::CrdtSyncAccepted {
                 service: accepted_service,
                 transfer,
                 next_chunk,
@@ -9646,19 +9834,19 @@ fn handle_v2_root_transport<B>(
     // reply Apply entry before any follower executes it.
     if !matches!(
         service.consistency(),
-        crate::v2::ConsistencyModeV2::Local
-            | crate::v2::ConsistencyModeV2::Raft
-            | crate::v2::ConsistencyModeV2::Crdt
+        crate::service::ConsistencyMode::Local
+            | crate::service::ConsistencyMode::Raft
+            | crate::service::ConsistencyMode::Crdt
     ) {
-        warn!(%id, from = %envelope.from, "v2 root transport requires a Local, Raft, or CRDT destination");
+        warn!(%id, from = %envelope.from, "service root transport requires a Local, Raft, or CRDT destination");
         return;
     }
     match transport {
-        crate::v2::RootTreeTransportV2::OutboxDelivery {
+        crate::service::RootTreeTransport::OutboxDelivery {
             publication,
             message,
         } => {
-            let source = authenticated_v2_actor_route_at_node(
+            let source = authenticated_service_actor_route_at_node(
                 actor_routes,
                 message.from,
                 envelope.from,
@@ -9669,12 +9857,12 @@ fn handle_v2_root_transport<B>(
             );
             if message.to != service.root_actor()
                 || message.to_service != *service.identity()
-                || message.authorization != crate::v2::AuthorizationEvidenceV2::Public
+                || message.authorization != crate::service::AuthorizationEvidence::Public
                 || (message.proof_requested && proof_producer.is_none())
                 || (message.proof_requested
-                    && (service.consistency() == crate::v2::ConsistencyModeV2::Crdt
+                    && (service.consistency() == crate::service::ConsistencyMode::Crdt
                         || source.as_ref().is_some_and(|source| {
-                            source.consistency == crate::v2::ConsistencyModeV2::Crdt
+                            source.consistency == crate::service::ConsistencyMode::Crdt
                         })))
                 || source.as_ref().is_none_or(|source| {
                     source.service != publication.receipt.service
@@ -9683,12 +9871,12 @@ fn handle_v2_root_transport<B>(
                 })
                 || !matches!(
                     publication.receipt.consistency,
-                    crate::v2::ConsistencyModeV2::Local
-                        | crate::v2::ConsistencyModeV2::Raft
-                        | crate::v2::ConsistencyModeV2::Crdt
+                    crate::service::ConsistencyMode::Local
+                        | crate::service::ConsistencyMode::Raft
+                        | crate::service::ConsistencyMode::Crdt
                 )
             {
-                warn!(%id, from = %envelope.from, call = ?message.call_id, "rejected unauthenticated or unsupported v2 delivery");
+                warn!(%id, from = %envelope.from, call = ?message.call_id, "rejected unauthenticated or unsupported service delivery");
                 return;
             }
             // Establish leadership/current-state readiness before consulting
@@ -9698,7 +9886,7 @@ fn handle_v2_root_transport<B>(
             let admission_floor = match service.prepare_admission_barrier() {
                 Ok(floor) => floor,
                 Err(failure) => {
-                    warn!(%id, ?failure, "v2 delivery admission barrier failed");
+                    warn!(%id, ?failure, "service delivery admission barrier failed");
                     return;
                 }
             };
@@ -9710,7 +9898,7 @@ fn handle_v2_root_transport<B>(
                 None
             };
             let Some(method) = method else {
-                warn!(%id, call = ?message.call_id, "rejected non-dynamic v2 delivery");
+                warn!(%id, call = ?message.call_id, "rejected non-dynamic service delivery");
                 return;
             };
             let mut receipt_verifications =
@@ -9728,20 +9916,20 @@ fn handle_v2_root_transport<B>(
             };
             let authorization = if let Some(authorization) = recovered {
                 match &authorization {
-                    crate::v2::AuthorizationEvidenceV2::Public => {}
-                    crate::v2::AuthorizationEvidenceV2::Credential { bytes, .. } => {
+                    crate::service::AuthorizationEvidence::Public => {}
+                    crate::service::AuthorizationEvidence::Credential { bytes, .. } => {
                         let Some(authority) = service.role_authority().cloned() else {
                             warn!(%id, call = ?message.call_id, "admitted credential lost its pinned authority");
                             return;
                         };
-                        let assertion = crate::v2::RoleCredentialV2::decode(bytes).ok().and_then(
-                            |credential| {
-                                crate::v2::AccumulatedRoleAssertionV2::decode(
+                        let assertion = crate::service::RoleCredential::decode(bytes)
+                            .ok()
+                            .and_then(|credential| {
+                                crate::service::AccumulatedRoleAssertion::decode(
                                     &credential.authenticator,
                                 )
                                 .ok()
-                            },
-                        );
+                            });
                         let Some(assertion) =
                             assertion.filter(|assertion| assertion.matches_authority(&authority))
                         else {
@@ -9753,8 +9941,8 @@ fn handle_v2_root_transport<B>(
                                 .authorize_finalized_receipt(authority.actor, &assertion.receipt),
                         );
                     }
-                    crate::v2::AuthorizationEvidenceV2::PrivateCredential { .. }
-                    | crate::v2::AuthorizationEvidenceV2::SystemCapability { .. } => {
+                    crate::service::AuthorizationEvidence::PrivateCredential { .. }
+                    | crate::service::AuthorizationEvidence::SystemCapability { .. } => {
                         warn!(%id, call = ?message.call_id, "unsupported admitted delivery credential");
                         return;
                     }
@@ -9777,7 +9965,7 @@ fn handle_v2_root_transport<B>(
                     return;
                 }
                 if policy.public {
-                    crate::v2::AuthorizationEvidenceV2::Public
+                    crate::service::AuthorizationEvidence::Public
                 } else {
                     let Some(role) = policy.space_role.and_then(crate::SpaceRole::from_u8) else {
                         warn!(%id, call = ?message.call_id, "actor-local durable authorization remains fail-closed");
@@ -9803,7 +9991,7 @@ fn handle_v2_root_transport<B>(
                             return;
                         }
                     };
-                    let assertion = match request_v2_role_assertion(
+                    let assertion = match request_service_role_assertion(
                         &authority,
                         &claim,
                         actor_routes,
@@ -9820,8 +10008,8 @@ fn handle_v2_root_transport<B>(
                     receipt_verifications.push(
                         service.authorize_finalized_receipt(authority.actor, &assertion.receipt),
                     );
-                    crate::v2::RoleCredentialV2 {
-                        holder: crate::v2::Origin::Actor(message.from),
+                    crate::service::RoleCredential {
+                        holder: crate::service::Origin::Actor(message.from),
                         scope: claim.scope,
                         space_role: Some(role),
                         actor_role: None,
@@ -9830,19 +10018,19 @@ fn handle_v2_root_transport<B>(
                     .disclosed_evidence(policy.policy)
                 }
             };
-            receipt_verifications.sort_by_key(crate::v2::ReceiptVerificationRequestV2::hash);
+            receipt_verifications.sort_by_key(crate::service::ReceiptVerificationRequest::hash);
             // No service catch-up or authority call may occur after this
             // allocation and before proposal. The final slot observes any
             // node-clock advancement caused by the authority execution above,
             // so deadline validation uses the true delivery order.
-            let slot = match allocate_v2_root_slot_after_barrier(
+            let slot = match allocate_service_root_slot_after_barrier(
                 service,
                 logical_timeslot,
                 admission_floor,
             ) {
                 Ok(slot) => slot,
                 Err(failure) => {
-                    warn!(%id, ?failure, "could not allocate trusted v2 delivery slot");
+                    warn!(%id, ?failure, "could not allocate trusted service delivery slot");
                     return;
                 }
             };
@@ -9858,7 +10046,7 @@ fn handle_v2_root_transport<B>(
                 receipt_verifications,
             ) {
                 Ok(_) => {
-                    let accepted = crate::v2::RootTreeTransportV2::PublicationAccepted {
+                    let accepted = crate::service::RootTreeTransport::PublicationAccepted {
                         acceptor: service.root_actor(),
                         acceptor_service: service.identity().clone(),
                         service: source_service,
@@ -9873,7 +10061,7 @@ fn handle_v2_root_transport<B>(
                         authenticated_source_peer: None,
                         destination_peer: envelope.authenticated_source_peer.clone(),
                     });
-                    run_v2_root_inbox(
+                    run_service_root_inbox(
                         id,
                         service,
                         call,
@@ -9885,11 +10073,11 @@ fn handle_v2_root_transport<B>(
                     );
                 }
                 Err(failure) => {
-                    warn!(%id, ?call, ?failure, "destination guest rejected v2 delivery");
+                    warn!(%id, ?call, ?failure, "destination guest rejected service delivery");
                 }
             }
         }
-        crate::v2::RootTreeTransportV2::Reply {
+        crate::service::RootTreeTransport::Reply {
             caller,
             caller_service,
             caller_invocation,
@@ -9899,7 +10087,7 @@ fn handle_v2_root_transport<B>(
             let Some(reply) = publication.published.reply.clone() else {
                 return;
             };
-            let producer = authenticated_v2_actor_route_at_node(
+            let producer = authenticated_service_actor_route_at_node(
                 actor_routes,
                 reply.producer,
                 envelope.from,
@@ -9911,9 +10099,9 @@ fn handle_v2_root_transport<B>(
             if caller != service.root_actor()
                 || caller_service != *service.identity()
                 || (publication.published.attestation.is_some()
-                    && (service.consistency() == crate::v2::ConsistencyModeV2::Crdt
+                    && (service.consistency() == crate::service::ConsistencyMode::Crdt
                         || producer.as_ref().is_some_and(|producer| {
-                            producer.consistency == crate::v2::ConsistencyModeV2::Crdt
+                            producer.consistency == crate::service::ConsistencyMode::Crdt
                         })))
                 || producer.as_ref().is_none_or(|producer| {
                     producer.service != publication.receipt.service
@@ -9921,22 +10109,22 @@ fn handle_v2_root_transport<B>(
                 })
                 || !matches!(
                     publication.receipt.consistency,
-                    crate::v2::ConsistencyModeV2::Local
-                        | crate::v2::ConsistencyModeV2::Raft
-                        | crate::v2::ConsistencyModeV2::Crdt
+                    crate::service::ConsistencyMode::Local
+                        | crate::service::ConsistencyMode::Raft
+                        | crate::service::ConsistencyMode::Crdt
                 )
             {
-                warn!(%id, from = %envelope.from, call = ?reply.call_id, "rejected misrouted v2 reply");
+                warn!(%id, from = %envelope.from, call = ?reply.call_id, "rejected misrouted service reply");
                 return;
             }
-            let slot = match prepare_v2_root_slot(service, logical_timeslot) {
+            let slot = match prepare_service_root_slot(service, logical_timeslot) {
                 Ok(slot) => slot,
                 Err(failure) => {
-                    warn!(%id, ?failure, "could not allocate trusted v2 reply slot");
+                    warn!(%id, ?failure, "could not allocate trusted service reply slot");
                     return;
                 }
             };
-            let accumulated = crate::v2::AccumulatedReplyV2 {
+            let accumulated = crate::service::AccumulatedReply {
                 reply: reply.clone(),
                 receipt: publication.receipt.clone(),
                 attestation: publication.published.attestation.clone(),
@@ -9950,7 +10138,7 @@ fn handle_v2_root_transport<B>(
             let already = match service.reply_already_accumulated(caller_invocation, &accumulated) {
                 Ok(already) => already,
                 Err(failure) => {
-                    warn!(%id, ?failure, "could not inspect durable v2 reply admission");
+                    warn!(%id, ?failure, "could not inspect durable service reply admission");
                     return;
                 }
             };
@@ -9966,12 +10154,12 @@ fn handle_v2_root_transport<B>(
                 ) {
                     Ok(committed) => Some(committed),
                     Err(failure) => {
-                        warn!(%id, ?failure, "caller guest rejected finalized v2 reply");
+                        warn!(%id, ?failure, "caller guest rejected finalized service reply");
                         return;
                     }
                 }
             };
-            let accepted = crate::v2::RootTreeTransportV2::PublicationAccepted {
+            let accepted = crate::service::RootTreeTransport::PublicationAccepted {
                 acceptor: service.root_actor(),
                 acceptor_service: service.identity().clone(),
                 service: publication.receipt.service.clone(),
@@ -9987,10 +10175,18 @@ fn handle_v2_root_transport<B>(
                 destination_peer: envelope.authenticated_source_peer.clone(),
             });
             if let Some(committed) = committed {
-                publish_v2_root_slice(id, service, committed, None, outbox, actor_routes, state);
+                publish_service_root_slice(
+                    id,
+                    service,
+                    committed,
+                    None,
+                    outbox,
+                    actor_routes,
+                    state,
+                );
             }
         }
-        crate::v2::RootTreeTransportV2::PublicationAccepted {
+        crate::service::RootTreeTransport::PublicationAccepted {
             acceptor,
             acceptor_service,
             service: acknowledged_service,
@@ -9998,7 +10194,7 @@ fn handle_v2_root_transport<B>(
             publication,
             call,
         } => {
-            if service.consistency() == crate::v2::ConsistencyModeV2::Raft
+            if service.consistency() == crate::service::ConsistencyMode::Raft
                 && service.prepare_admission_barrier().is_err()
             {
                 // Progress is deliberately rebuilt by the current leader from
@@ -10007,7 +10203,7 @@ fn handle_v2_root_transport<B>(
                 // state which its leader cannot observe.
                 return;
             }
-            acknowledge_v2_root_publication(
+            acknowledge_service_root_publication(
                 id,
                 service,
                 envelope.from,
@@ -10026,30 +10222,32 @@ fn handle_v2_root_transport<B>(
                 state,
             )
         }
-        crate::v2::RootTreeTransportV2::CrdtSyncChunk { .. }
-        | crate::v2::RootTreeTransportV2::CrdtSyncAccepted { .. } => {
+        crate::service::RootTreeTransport::CrdtSyncChunk { .. }
+        | crate::service::RootTreeTransport::CrdtSyncAccepted { .. } => {
             unreachable!("CRDT transport returned from its fail-closed early handler")
         }
     }
 }
 
-fn publish_v2_root_slice<B>(
+fn publish_service_root_slice<B>(
     id: ServiceId,
-    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
-    committed: crate::v2::CommittedRootTreeSliceV2,
-    caller: Option<V2PendingCaller>,
+    service: &mut crate::service::LocalRootTreeService<B>,
+    committed: crate::service::CommittedRootTreeSlice,
+    caller: Option<PendingCaller>,
     outbox: &mpsc::Sender<Envelope>,
-    actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
-    state: &mut V2RootThreadState,
+    actor_routes: &RwLock<HashMap<crate::service::ActorId, ActorRoute>>,
+    state: &mut RootThreadState,
 ) where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        >,
 {
     if caller
         .as_ref()
         .is_some_and(|caller| caller.attested != committed.published.attestation.is_some())
     {
-        send_v2_status(
+        send_service_status(
             caller.expect("checked above").reply,
             crate::STATUS_PANICKED,
             id,
@@ -10081,9 +10279,9 @@ fn publish_v2_root_slice<B>(
                             id,
                         );
                     }
-                    Some(Err(status)) => send_v2_status(caller.reply, status, id),
+                    Some(Err(status)) => send_service_status(caller.reply, status, id),
                     None if caller.attested => {
-                        match encode_v2_attested_result(service, &committed.published) {
+                        match encode_service_attested_result(service, &committed.published) {
                             Some(result) => {
                                 let _ = send_reply_capped(
                                     caller.reply,
@@ -10091,7 +10289,7 @@ fn publish_v2_root_slice<B>(
                                     id,
                                 );
                             }
-                            None => send_v2_status(caller.reply, crate::STATUS_PANICKED, id),
+                            None => send_service_status(caller.reply, crate::STATUS_PANICKED, id),
                         }
                     }
                     None => match recovered_reply {
@@ -10102,55 +10300,57 @@ fn publish_v2_root_slice<B>(
                                 id,
                             );
                         }
-                        None => send_v2_status(caller.reply, crate::STATUS_PANICKED, id),
+                        None => send_service_status(caller.reply, crate::STATUS_PANICKED, id),
                     },
                 }
             }
         }
         return;
     };
-    queue_v2_root_publication(id, service, &publication, outbox, actor_routes, state);
+    queue_service_root_publication(id, service, &publication, outbox, actor_routes, state);
 }
 
-fn queue_v2_root_publication<B>(
+fn queue_service_root_publication<B>(
     id: ServiceId,
-    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
-    publication: &crate::v2::PublicationRecordV2,
+    service: &mut crate::service::LocalRootTreeService<B>,
+    publication: &crate::service::PublicationRecord,
     outbox: &mpsc::Sender<Envelope>,
-    actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
-    state: &mut V2RootThreadState,
+    actor_routes: &RwLock<HashMap<crate::service::ActorId, ActorRoute>>,
+    state: &mut RootThreadState,
 ) where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        >,
 {
-    use crate::v2::V2Wire;
+    use crate::service::ServiceWire;
 
     if publication.receipt.service != *service.identity() {
-        warn!(%id, "ignored a publication owned by another v2 root");
+        warn!(%id, "ignored a publication owned by another service root");
         return;
     }
     let ordinary_transport = matches!(
         service.consistency(),
-        crate::v2::ConsistencyModeV2::Local
-            | crate::v2::ConsistencyModeV2::Raft
-            | crate::v2::ConsistencyModeV2::Crdt
+        crate::service::ConsistencyMode::Local
+            | crate::service::ConsistencyMode::Raft
+            | crate::service::ConsistencyMode::Crdt
     ) && publication.receipt.consistency == service.consistency();
     if ordinary_transport {
         for message in &publication.published.outbox {
-            let Some(route) = v2_actor_route(actor_routes, message.to) else {
+            let Some(route) = service_actor_route(actor_routes, message.to) else {
                 continue;
             };
             if route.service != message.to_service
                 || !matches!(
                     route.consistency,
-                    crate::v2::ConsistencyModeV2::Local
-                        | crate::v2::ConsistencyModeV2::Raft
-                        | crate::v2::ConsistencyModeV2::Crdt
+                    crate::service::ConsistencyMode::Local
+                        | crate::service::ConsistencyMode::Raft
+                        | crate::service::ConsistencyMode::Crdt
                 )
             {
                 continue;
             }
-            let transport = crate::v2::RootTreeTransportV2::OutboxDelivery {
+            let transport = crate::service::RootTreeTransport::OutboxDelivery {
                 publication: publication.clone(),
                 message: message.clone(),
             };
@@ -10183,7 +10383,7 @@ fn queue_v2_root_publication<B>(
     }
 
     let Some(reply) = publication.published.reply.as_ref() else {
-        maybe_ack_v2_root_publication(id, service, publication, state);
+        maybe_ack_service_root_publication(id, service, publication, state);
         return;
     };
     if state
@@ -10195,7 +10395,7 @@ fn queue_v2_root_publication<B>(
         // publication acknowledgement failed. The caller channel is already
         // gone, so retries must drive the acknowledgement from durable
         // publication state rather than trying to deliver the reply again.
-        maybe_ack_v2_root_publication(id, service, publication, state);
+        maybe_ack_service_root_publication(id, service, publication, state);
         return;
     }
     let mut accepted = false;
@@ -10205,9 +10405,10 @@ fn queue_v2_root_publication<B>(
                 Some(Ok(result)) => encode_invoke_envelope(crate::STATUS_DONE, &[], &result),
                 Some(Err(status)) => encode_invoke_envelope(status, &[], &[]),
                 None if caller.attested => {
-                    let Some(result) = encode_v2_attested_result(service, &publication.published)
+                    let Some(result) =
+                        encode_service_attested_result(service, &publication.published)
                     else {
-                        send_v2_status(caller.reply, crate::STATUS_PANICKED, id);
+                        send_service_status(caller.reply, crate::STATUS_PANICKED, id);
                         continue;
                     };
                     encode_invoke_envelope(crate::STATUS_DONE, &[], &result)
@@ -10219,18 +10420,19 @@ fn queue_v2_root_publication<B>(
     } else {
         match service.publication_return_target(publication) {
             Ok(Some((actor, caller_service, caller_invocation))) => {
-                if ordinary_transport && let Some(route) = v2_actor_route(actor_routes, actor) {
+                if ordinary_transport && let Some(route) = service_actor_route(actor_routes, actor)
+                {
                     if route.service != caller_service
                         || !matches!(
                             route.consistency,
-                            crate::v2::ConsistencyModeV2::Local
-                                | crate::v2::ConsistencyModeV2::Raft
-                                | crate::v2::ConsistencyModeV2::Crdt
+                            crate::service::ConsistencyMode::Local
+                                | crate::service::ConsistencyMode::Raft
+                                | crate::service::ConsistencyMode::Crdt
                         )
                     {
                         return;
                     }
-                    let transport = crate::v2::RootTreeTransportV2::Reply {
+                    let transport = crate::service::RootTreeTransport::Reply {
                         caller: actor,
                         caller_service,
                         caller_invocation,
@@ -10242,7 +10444,7 @@ fn queue_v2_root_publication<B>(
                     if publication.published.attestation.is_some()
                         && matches!(
                             &transport,
-                            crate::v2::RootTreeTransportV2::Reply { proof: None, .. }
+                            crate::service::RootTreeTransport::Reply { proof: None, .. }
                         )
                     {
                         warn!(%id, "retained attested reply whose proof artifact is unavailable");
@@ -10260,7 +10462,7 @@ fn queue_v2_root_publication<B>(
                 }
             }
             Ok(None) => {}
-            Err(failure) => warn!(%id, ?failure, "could not recover v2 reply return route"),
+            Err(failure) => warn!(%id, ?failure, "could not recover service reply return route"),
         }
     }
     if accepted {
@@ -10269,19 +10471,21 @@ fn queue_v2_root_publication<B>(
             .entry(publication.commitment())
             .or_default()
             .reply_accepted = true;
-        maybe_ack_v2_root_publication(id, service, publication, state);
+        maybe_ack_service_root_publication(id, service, publication, state);
     }
 }
 
-fn encode_v2_attested_result<B>(
-    service: &crate::v2::LocalRootTreeServiceV2<B>,
-    published: &crate::v2::PublishedEffectsV2,
+fn encode_service_attested_result<B>(
+    service: &crate::service::LocalRootTreeService<B>,
+    published: &crate::service::PublishedEffects,
 ) -> Option<Vec<u8>>
 where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        >,
 {
-    use crate::v2::V2Wire;
+    use crate::service::ServiceWire;
 
     let reply = published.reply.as_ref()?;
     let attestation = published.attestation.as_deref()?.clone();
@@ -10289,7 +10493,7 @@ where
         return None;
     }
     let proof = service.attestation_proof(&attestation.proof.proof_blob)?;
-    let result = crate::v2::RootTreeAttestedResultV2 {
+    let result = crate::service::RootTreeAttestedResult {
         reply: reply.result.clone(),
         attestation,
         proof: proof.bytes,
@@ -10298,14 +10502,16 @@ where
     Some(result.encode())
 }
 
-fn maybe_ack_v2_root_publication<B>(
+fn maybe_ack_service_root_publication<B>(
     id: ServiceId,
-    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
-    publication: &crate::v2::PublicationRecordV2,
-    state: &mut V2RootThreadState,
+    service: &mut crate::service::LocalRootTreeService<B>,
+    publication: &crate::service::PublicationRecord,
+    state: &mut RootThreadState,
 ) where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        >,
 {
     let commitment = publication.commitment();
     let progress = state.publication_progress.entry(commitment).or_default();
@@ -10320,31 +10526,33 @@ fn maybe_ack_v2_root_publication<B>(
             Ok(_) => {
                 state.publication_progress.remove(&commitment);
             }
-            Err(failure) => warn!(%id, ?failure, "v2 publication acknowledgement failed"),
+            Err(failure) => warn!(%id, ?failure, "service publication acknowledgement failed"),
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn acknowledge_v2_root_publication<B>(
+fn acknowledge_service_root_publication<B>(
     id: ServiceId,
-    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
+    service: &mut crate::service::LocalRootTreeService<B>,
     from: ServiceId,
     authenticated_peer: Option<&[u8]>,
-    input: crate::v2::WorkInputIdV2,
-    acceptor: crate::v2::ActorId,
-    acceptor_service: crate::v2::ServiceIdentityV2,
-    acknowledged_service: crate::v2::ServiceIdentityV2,
-    commitment: crate::v2::Hash,
-    call: crate::v2::CallId,
+    input: crate::service::WorkInputId,
+    acceptor: crate::service::ActorId,
+    acceptor_service: crate::service::ServiceIdentity,
+    acknowledged_service: crate::service::ServiceIdentity,
+    commitment: crate::service::Hash,
+    call: crate::service::CallId,
     outbox: &mpsc::Sender<Envelope>,
-    actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
+    actor_routes: &RwLock<HashMap<crate::service::ActorId, ActorRoute>>,
     invoke_routes: &InvokeRoutes,
     #[cfg(feature = "network")] shared_network: &SharedNetwork,
-    state: &mut V2RootThreadState,
+    state: &mut RootThreadState,
 ) where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        >,
 {
     let Some(publication) = service.pending_publications().ok().and_then(|pending| {
         pending.into_iter().find(|candidate| {
@@ -10365,7 +10573,7 @@ fn acknowledge_v2_root_publication<B>(
         if acceptor != message.to || acceptor_service != message.to_service {
             return;
         }
-        if authenticated_v2_actor_route_at_node(
+        if authenticated_service_actor_route_at_node(
             actor_routes,
             acceptor,
             from,
@@ -10378,9 +10586,9 @@ fn acknowledge_v2_root_publication<B>(
             route.service == message.to_service
                 && matches!(
                     route.consistency,
-                    crate::v2::ConsistencyModeV2::Local
-                        | crate::v2::ConsistencyModeV2::Raft
-                        | crate::v2::ConsistencyModeV2::Crdt
+                    crate::service::ConsistencyMode::Local
+                        | crate::service::ConsistencyMode::Raft
+                        | crate::service::ConsistencyMode::Crdt
                 )
         }) {
             progress.accepted_calls.insert(call);
@@ -10401,7 +10609,7 @@ fn acknowledge_v2_root_publication<B>(
                 if acceptor != actor || acceptor_service != service {
                     return None;
                 }
-                authenticated_v2_actor_route_at_node(
+                authenticated_service_actor_route_at_node(
                     actor_routes,
                     actor,
                     from,
@@ -10414,9 +10622,9 @@ fn acknowledge_v2_root_publication<B>(
                     route.service == service
                         && matches!(
                             route.consistency,
-                            crate::v2::ConsistencyModeV2::Local
-                                | crate::v2::ConsistencyModeV2::Raft
-                                | crate::v2::ConsistencyModeV2::Crdt
+                            crate::service::ConsistencyMode::Local
+                                | crate::service::ConsistencyMode::Raft
+                                | crate::service::ConsistencyMode::Crdt
                         )
                 })
             });
@@ -10434,7 +10642,7 @@ fn acknowledge_v2_root_publication<B>(
         .all(|message| progress.accepted_calls.contains(&message.call_id));
     let reply_done = publication.published.reply.is_none() || progress.reply_accepted;
     if calls_done && !reply_done {
-        queue_v2_root_publication(id, service, &publication, outbox, actor_routes, state);
+        queue_service_root_publication(id, service, &publication, outbox, actor_routes, state);
         return;
     }
     if calls_done && reply_done {
@@ -10442,41 +10650,43 @@ fn acknowledge_v2_root_publication<B>(
             Ok(_) => {
                 state.publication_progress.remove(&commitment);
             }
-            Err(failure) => warn!(%id, ?failure, "v2 publication acknowledgement failed"),
+            Err(failure) => warn!(%id, ?failure, "service publication acknowledgement failed"),
         }
     }
 }
 
-fn run_v2_root_inbox<B>(
+fn run_service_root_inbox<B>(
     id: ServiceId,
-    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
-    call: crate::v2::CallId,
+    service: &mut crate::service::LocalRootTreeService<B>,
+    call: crate::service::CallId,
     outbox: &mpsc::Sender<Envelope>,
-    actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
-    proof_producer: &mut Option<V2NodeAttestationProofProducer>,
+    actor_routes: &RwLock<HashMap<crate::service::ActorId, ActorRoute>>,
+    proof_producer: &mut Option<NodeAttestationProofProducer>,
     logical_timeslot: &AtomicU64,
-    state: &mut V2RootThreadState,
+    state: &mut RootThreadState,
 ) where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        >,
 {
-    let slot = match prepare_v2_root_slot(service, logical_timeslot) {
+    let slot = match prepare_service_root_slot(service, logical_timeslot) {
         Ok(slot) => slot,
         Err(failure) => {
-            warn!(%id, ?failure, "could not allocate trusted v2 inbox slot");
+            warn!(%id, ?failure, "could not allocate trusted service inbox slot");
             return;
         }
     };
     let result = match service.invoke_inbox_after_barrier(call, slot) {
-        Err(crate::v2::LocalRootTreeInvokeErrorV2::ProofProducerRequired) => {
+        Err(crate::service::LocalRootTreeInvokeError::ProofProducerRequired) => {
             let Some(producer) = proof_producer.as_mut() else {
                 return;
             };
             match service.invoke_attested_inbox_after_barrier(call, slot, producer) {
                 Ok(committed) => Ok(committed),
-                Err(crate::v2::AttestedRootTreeInvokeErrorV2::Root(error)) => Err(error),
+                Err(crate::service::AttestedRootTreeInvokeError::Root(error)) => Err(error),
                 Err(failure) => {
-                    warn!(%id, ?call, ?failure, "v2 attested inbox execution failed");
+                    warn!(%id, ?call, ?failure, "service attested inbox execution failed");
                     return;
                 }
             }
@@ -10485,49 +10695,52 @@ fn run_v2_root_inbox<B>(
     };
     match result {
         Ok(committed) => {
-            publish_v2_root_slice(id, service, committed, None, outbox, actor_routes, state)
+            publish_service_root_slice(id, service, committed, None, outbox, actor_routes, state)
         }
-        Err(crate::v2::LocalRootTreeInvokeErrorV2::Schedule(
-            crate::v2::ScheduleErrorV2::DeadlineExpired(_),
+        Err(crate::service::LocalRootTreeInvokeError::Schedule(
+            crate::service::ScheduleError::DeadlineExpired(_),
         )) => {
             if let Err(failure) = service.retire_inbox_after_barrier(call, slot) {
-                warn!(%id, ?call, ?failure, "v2 expired inbox retirement failed");
+                warn!(%id, ?call, ?failure, "service expired inbox retirement failed");
             }
         }
-        Err(crate::v2::LocalRootTreeInvokeErrorV2::Schedule(
-            crate::v2::ScheduleErrorV2::ActorBusy(_) | crate::v2::ScheduleErrorV2::MissingInbox(_),
+        Err(crate::service::LocalRootTreeInvokeError::Schedule(
+            crate::service::ScheduleError::ActorBusy(_)
+            | crate::service::ScheduleError::MissingInbox(_),
         )) => {}
-        Err(failure) => warn!(%id, ?call, ?failure, "v2 admitted inbox execution failed"),
+        Err(failure) => warn!(%id, ?call, ?failure, "service admitted inbox execution failed"),
     }
 }
 
 #[cfg(all(feature = "network", feature = "storage"))]
-fn advertise_v2_crdt_root<B>(
+fn advertise_service_crdt_root<B>(
     id: ServiceId,
     root_name: &str,
-    service: &crate::v2::LocalRootTreeServiceV2<B>,
+    service: &crate::service::LocalRootTreeService<B>,
     outbox: &mpsc::Sender<Envelope>,
     invoke_routes: &InvokeRoutes,
     shared_network: &SharedNetwork,
-    state: &mut V2RootThreadState,
+    state: &mut RootThreadState,
 ) where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        >,
 {
-    use crate::v2::V2Wire;
+    use crate::service::ServiceWire;
 
     const RETRY: Duration = Duration::from_secs(5);
     const ROSTER_BUDGET: Duration = Duration::from_millis(250);
     const AUTH_BUDGET: Duration = Duration::from_millis(500);
 
-    if service.consistency() != crate::v2::ConsistencyModeV2::Crdt {
+    if service.consistency() != crate::service::ConsistencyMode::Crdt {
         return;
     }
     let commitment = match service.crdt_frontier_commitment() {
         Ok(Some(commitment)) => commitment,
         Ok(None) => return,
         Err(failure) => {
-            warn!(%id, ?failure, "could not identify canonical v2 CRDT frontier");
+            warn!(%id, ?failure, "could not identify canonical service CRDT frontier");
             return;
         }
     };
@@ -10541,24 +10754,25 @@ fn advertise_v2_crdt_root<B>(
             Ok(Some(envelope)) => envelope,
             Ok(None) => return,
             Err(failure) => {
-                warn!(%id, ?failure, "could not export canonical v2 CRDT frontier");
+                warn!(%id, ?failure, "could not export canonical service CRDT frontier");
                 return;
             }
         };
-        let (transfer, chunks) = match v2_crdt_sync_chunks(envelope, V2_CRDT_SYNC_CHUNK_MAX_BYTES) {
-            Ok(chunks) => chunks,
-            Err(failure) => {
-                warn!(%id, %failure, "could not split canonical v2 CRDT frontier");
-                return;
-            }
-        };
+        let (transfer, chunks) =
+            match service_crdt_sync_chunks(envelope, SERVICE_CRDT_SYNC_CHUNK_MAX_BYTES) {
+                Ok(chunks) => chunks,
+                Err(failure) => {
+                    warn!(%id, %failure, "could not split canonical service CRDT frontier");
+                    return;
+                }
+            };
         if let Some(progress) = state.crdt_sync.as_mut() {
             // A local write only replaces the newest offered snapshot. Every
             // peer retains its immutable transfer and acknowledgement index;
             // roster pagination and fair fan-out continue uninterrupted.
             progress.replace_latest(commitment, transfer, chunks);
         } else {
-            state.crdt_sync = Some(V2CrdtSyncProgress {
+            state.crdt_sync = Some(CrdtSyncProgress {
                 latest_frontier: commitment,
                 latest_transfer: transfer,
                 latest_chunks: Arc::new(chunks),
@@ -10587,7 +10801,7 @@ fn advertise_v2_crdt_root<B>(
     // eligible recipients; a 1,025th node is reached on the 17th drive rather
     // than making every attempt discard the first 1,024 rows.
     if now >= progress.next_roster_page {
-        match v2_crdt_replica_roster_page(
+        match service_crdt_replica_roster_page(
             invoke_routes,
             progress.roster_after_kind,
             progress.roster_after_key.clone(),
@@ -10618,7 +10832,7 @@ fn advertise_v2_crdt_root<B>(
 
     let latest_transfer = progress.latest_transfer;
     let latest_chunks = progress.latest_chunks.clone();
-    let peers = v2_crdt_fanout_order(
+    let peers = service_crdt_fanout_order(
         progress
             .peers
             .iter()
@@ -10632,7 +10846,7 @@ fn advertise_v2_crdt_root<B>(
             .collect(),
         progress.fanout_after.as_deref(),
     );
-    for peer_bytes in peers.into_iter().take(V2_CRDT_SYNC_ATTEMPT_BUDGET) {
+    for peer_bytes in peers.into_iter().take(SERVICE_CRDT_SYNC_ATTEMPT_BUDGET) {
         // Advance before the blocking probes. Rejection, timeout, malformed
         // registry data and send failure all consume one bounded attempt and
         // cannot make this peer monopolize the next drive.
@@ -10641,21 +10855,21 @@ fn advertise_v2_crdt_root<B>(
             continue;
         };
         let Some(peer) =
-            authenticated_v2_crdt_replica_peer(invoke_routes, &peer_bytes, AUTH_BUDGET)
+            authenticated_service_crdt_replica_peer(invoke_routes, &peer_bytes, AUTH_BUDGET)
         else {
             peer_progress.release_transfer();
             peer_progress.last_sent = Some(now);
             continue;
         };
         if peer == local_peer
-            || !v2_crdt_sync_peer_allowed(invoke_routes, &peer, root_name, AUTH_BUDGET)
+            || !service_crdt_sync_peer_allowed(invoke_routes, &peer, root_name, AUTH_BUDGET)
         {
             peer_progress.release_transfer();
             peer_progress.last_sent = Some(now);
             continue;
         }
-        peer_progress.release_stalled_transfer(now, V2_CRDT_SYNC_TRANSFER_STALL);
-        v2_crdt_select_latest_peer_transfer(peer_progress, latest_transfer, &latest_chunks);
+        peer_progress.release_stalled_transfer(now, SERVICE_CRDT_SYNC_TRANSFER_STALL);
+        service_crdt_select_latest_peer_transfer(peer_progress, latest_transfer, &latest_chunks);
         let Some(transfer) = peer_progress.transfer else {
             continue;
         };
@@ -10666,15 +10880,15 @@ fn advertise_v2_crdt_root<B>(
             continue;
         };
         let chunk_count = chunks.len() as u32;
-        let payload = crate::v2::RootTreeTransportV2::CrdtSyncChunk {
+        let payload = crate::service::RootTreeTransport::CrdtSyncChunk {
             transfer,
             chunk_index: peer_progress.next_chunk,
             chunk_count,
             envelope: chunk.clone(),
         }
         .encode();
-        if payload.len() > V2_CRDT_SYNC_CHUNK_MAX_BYTES {
-            warn!(%id, bytes = payload.len(), "refused oversized v2 CRDT transport chunk");
+        if payload.len() > SERVICE_CRDT_SYNC_CHUNK_MAX_BYTES {
+            warn!(%id, bytes = payload.len(), "refused oversized service CRDT transport chunk");
             continue;
         }
         let to = ServiceId::new(crate::network::derive_node_prefix(&peer), id.local_id());
@@ -10694,27 +10908,29 @@ fn advertise_v2_crdt_root<B>(
     }
 }
 
-fn retry_v2_root_transport<B>(
+fn retry_service_root_transport<B>(
     id: ServiceId,
     root_name: &str,
-    service: &mut crate::v2::LocalRootTreeServiceV2<B>,
+    service: &mut crate::service::LocalRootTreeService<B>,
     outbox: &mpsc::Sender<Envelope>,
-    actor_routes: &RwLock<HashMap<crate::v2::ActorId, V2ActorRoute>>,
+    actor_routes: &RwLock<HashMap<crate::service::ActorId, ActorRoute>>,
     invoke_routes: &InvokeRoutes,
     #[cfg(feature = "network")] shared_network: &SharedNetwork,
-    proof_producer: &mut Option<V2NodeAttestationProofProducer>,
+    proof_producer: &mut Option<NodeAttestationProofProducer>,
     logical_timeslot: &AtomicU64,
-    state: &mut V2RootThreadState,
+    state: &mut RootThreadState,
 ) where
-    B: crate::v2::CommittedImageStoreV2
-        + crate::v2::ProofArtifactStoreV2<Error = <B as crate::v2::CommittedImageStoreV2>::Error>,
+    B: crate::service::CommittedImageStore
+        + crate::service::ProofArtifactStore<
+            Error = <B as crate::service::CommittedImageStore>::Error,
+        >,
 {
     match service.catch_up() {
         Ok(true) => {}
         Ok(false) | Err(_) => return,
     }
     #[cfg(all(feature = "network", feature = "storage"))]
-    advertise_v2_crdt_root(
+    advertise_service_crdt_root(
         id,
         root_name,
         service,
@@ -10730,7 +10946,7 @@ fn retry_v2_root_transport<B>(
         Ok(None) => Some(
             logical_timeslot
                 .load(Ordering::Relaxed)
-                .max(v2_wall_timeslot()),
+                .max(service_wall_timeslot()),
         ),
         Err(failure) => {
             warn!(%id, ?failure, "production JAM timeslot is unavailable");
@@ -10743,48 +10959,54 @@ fn retry_v2_root_transport<B>(
         .flatten()
         .is_some_and(|deadline| observed_timeslot.is_some_and(|slot| slot >= deadline));
     if should_expire {
-        match prepare_v2_root_slot(service, logical_timeslot) {
+        match prepare_service_root_slot(service, logical_timeslot) {
             Ok(expiration_slot) => {
                 if let Err(failure) = service.expire_due_calls_after_barrier(expiration_slot) {
                     // Earlier expirations in the same drive may already be
                     // durable. Continue into outcome rediscovery instead of
                     // losing those workflows with the returned error.
-                    warn!(%id, ?failure, "v2 durable call expiration failed");
+                    warn!(%id, ?failure, "service durable call expiration failed");
                 }
             }
             Err(failure) => {
-                warn!(%id, ?failure, "could not allocate trusted v2 expiration slot");
+                warn!(%id, ?failure, "could not allocate trusted service expiration slot");
             }
         }
     }
     let pending_timeouts = match service.pending_timeout_resumes() {
         Ok(pending) => pending,
         Err(failure) => {
-            warn!(%id, ?failure, "could not rediscover durable v2 timeout outcomes");
+            warn!(%id, ?failure, "could not rediscover durable service timeout outcomes");
             Vec::new()
         }
     };
     for invocation in pending_timeouts {
-        let resume_slot = match prepare_v2_root_slot(service, logical_timeslot) {
+        let resume_slot = match prepare_service_root_slot(service, logical_timeslot) {
             Ok(slot) => slot,
             Err(failure) => {
-                warn!(%id, ?failure, ?invocation, "could not allocate v2 timeout-resume slot");
+                warn!(%id, ?failure, ?invocation, "could not allocate service timeout-resume slot");
                 continue;
             }
         };
         match service.resume_timeout_after_barrier(invocation, resume_slot) {
-            Ok(Some(committed)) => {
-                publish_v2_root_slice(id, service, committed, None, outbox, actor_routes, state)
-            }
+            Ok(Some(committed)) => publish_service_root_slice(
+                id,
+                service,
+                committed,
+                None,
+                outbox,
+                actor_routes,
+                state,
+            ),
             Ok(None) => {}
             Err(failure) => {
-                warn!(%id, ?failure, ?invocation, "v2 timed-out workflow resume failed")
+                warn!(%id, ?failure, ?invocation, "service timed-out workflow resume failed")
             }
         }
     }
     if let Ok(publications) = service.pending_publications()
         && (!publications.is_empty()
-            && (service.consistency() != crate::v2::ConsistencyModeV2::Raft
+            && (service.consistency() != crate::service::ConsistencyMode::Raft
                 || service.prepare_admission_barrier().is_ok()))
     {
         // Only the current source leader redrives Raft publications. After a
@@ -10792,18 +11014,18 @@ fn retry_v2_root_transport<B>(
         // durable publication, and learns prior admissions from the
         // destinations' duplicate acknowledgements.
         for publication in publications {
-            queue_v2_root_publication(id, service, &publication, outbox, actor_routes, state);
+            queue_service_root_publication(id, service, &publication, outbox, actor_routes, state);
         }
     }
     if matches!(
         service.consistency(),
-        crate::v2::ConsistencyModeV2::Local
-            | crate::v2::ConsistencyModeV2::Raft
-            | crate::v2::ConsistencyModeV2::Crdt
+        crate::service::ConsistencyMode::Local
+            | crate::service::ConsistencyMode::Raft
+            | crate::service::ConsistencyMode::Crdt
     ) && let Ok(pending) = service.pending_inbox_calls()
     {
         for (call, _) in pending {
-            run_v2_root_inbox(
+            run_service_root_inbox(
                 id,
                 service,
                 call,
@@ -10823,9 +11045,9 @@ fn retry_v2_root_transport<B>(
                 };
                 match service.invoke_admitted_attested(ingress.invocation, producer) {
                     Ok(committed) => Ok(committed),
-                    Err(crate::v2::AttestedRootTreeInvokeErrorV2::Root(error)) => Err(error),
+                    Err(crate::service::AttestedRootTreeInvokeError::Root(error)) => Err(error),
                     Err(failure) => {
-                        warn!(%id, ?failure, "v2 queued attested ingress retry failed");
+                        warn!(%id, ?failure, "service queued attested ingress retry failed");
                         continue;
                     }
                 }
@@ -10833,13 +11055,19 @@ fn retry_v2_root_transport<B>(
                 service.invoke_admitted(ingress.invocation)
             };
             match result {
-                Ok(committed) => {
-                    publish_v2_root_slice(id, service, committed, None, outbox, actor_routes, state)
-                }
-                Err(crate::v2::LocalRootTreeInvokeErrorV2::Schedule(
-                    crate::v2::ScheduleErrorV2::ActorBusy(_),
+                Ok(committed) => publish_service_root_slice(
+                    id,
+                    service,
+                    committed,
+                    None,
+                    outbox,
+                    actor_routes,
+                    state,
+                ),
+                Err(crate::service::LocalRootTreeInvokeError::Schedule(
+                    crate::service::ScheduleError::ActorBusy(_),
                 )) => {}
-                Err(failure) => warn!(%id, ?failure, "v2 queued ingress retry failed"),
+                Err(failure) => warn!(%id, ?failure, "service queued ingress retry failed"),
             }
         }
     }
@@ -10998,7 +11226,7 @@ fn agent_thread(
             match reply_rx.recv_timeout(std::time::Duration::from_secs(10)) {
                 Ok(envelope) => {
                     #[cfg(all(feature = "network", feature = "storage"))]
-                    if let Some(redirect) = decode_v2_raft_redirect(&envelope)
+                    if let Some(redirect) = decode_service_raft_redirect(&envelope)
                         && let Some(rep_id) = raft_forward_plan(&raft_fwd, id, target.0)
                     {
                         return agent_forward_to_raft_leader(
@@ -11703,7 +11931,7 @@ fn forbidden_envelope() -> Vec<u8> {
 /// implicit in the fact the log was committed.
 fn encode_replay_payload(
     prefix: &crate::effect_log::CallerPrefix,
-    invocation_id: crate::v2::InvocationId,
+    invocation_id: crate::service::InvocationId,
     msg: &[u8],
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(38 + msg.len());
@@ -11721,7 +11949,10 @@ fn encode_replay_payload(
 /// trustworthy origin (external libp2p Tells set
 /// attacker-controlled `from` fields), so the wrap *always*
 /// uses Unauthenticated regardless of `env.from`.
-fn wrap_with_unauthenticated_prefix(msg: &[u8], invocation_id: crate::v2::InvocationId) -> Vec<u8> {
+fn wrap_with_unauthenticated_prefix(
+    msg: &[u8],
+    invocation_id: crate::service::InvocationId,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(38 + msg.len());
     out.push(crate::actors::lifecycle::TAG_DISPATCH_PREFIX);
     out.push(0); // trust_flag = external (Unauthenticated)
@@ -11796,7 +12027,10 @@ fn drive_capturing_external(
 ///   [5] actor_local_role byte
 ///   [6..38] stable InvocationId
 ///   [38..] original message bytes
-fn encode_caller_prefix(req: &InvokeRequest, invocation_id: crate::v2::InvocationId) -> Vec<u8> {
+fn encode_caller_prefix(
+    req: &InvokeRequest,
+    invocation_id: crate::service::InvocationId,
+) -> Vec<u8> {
     let prefix = caller_prefix_bytes(req);
     let mut out = Vec::with_capacity(38 + req.msg.len());
     out.push(crate::actors::lifecycle::TAG_DISPATCH_PREFIX);
@@ -11833,14 +12067,14 @@ fn caller_prefix_bytes(req: &InvokeRequest) -> crate::effect_log::CallerPrefix {
 ///
 /// CRDT strategies return the exact identity of the durable event they will
 /// append, which is stable across retry and reconstructible during replay.
-/// Other production paths still await the v2 WorkEnvelope cutover, so they use
+/// Other production paths still await the service WorkEnvelope cutover, so they use
 /// a process-local monotone fallback. Those histories never merge as CRDT
 /// branches; the fallback exists so ordinary handlers still receive a distinct
 /// typed invocation identity in this staging runtime.
 fn next_dispatch_invocation_id(
     strategy: &dyn crate::commit::CommitStrategy,
     svc_id: ServiceId,
-) -> crate::v2::InvocationId {
+) -> crate::service::InvocationId {
     static NEXT_FALLBACK_INVOCATION: AtomicU64 = AtomicU64::new(1);
 
     strategy.pending_invocation_id().unwrap_or_else(|| {
@@ -11848,7 +12082,7 @@ fn next_dispatch_invocation_id(
         let mut nonce = [0u8; 12];
         nonce[..4].copy_from_slice(&svc_id.0.to_le_bytes());
         nonce[4..].copy_from_slice(&sequence.to_le_bytes());
-        crate::v2::InvocationId::derive(b"vos/host-dispatch/v2", &nonce)
+        crate::service::InvocationId::derive(b"vos/host-dispatch/service", &nonce)
     })
 }
 
@@ -13451,7 +13685,7 @@ async fn route_invoke(
     match outcome {
         AskOutcome::Reply(env) => {
             #[cfg(all(feature = "network", feature = "storage"))]
-            if let Some(redirect) = decode_v2_raft_redirect(&env) {
+            if let Some(redirect) = decode_service_raft_redirect(&env) {
                 return match forward_plan {
                     Some((rep_id, payload)) => {
                         forward_to_raft_leader(
@@ -13535,7 +13769,7 @@ fn agent_forward_to_raft_leader(
     target: u32,
     rep_id: [u8; 32],
     mut payload: Vec<u8>,
-    delegated_origin: Option<crate::v2::Origin>,
+    delegated_origin: Option<crate::service::Origin>,
 ) -> Option<Vec<u8>> {
     let net = fwd.network.lock().ok()?.clone()?;
     let st = net.local_raft_status(&rep_id)?;
@@ -13551,7 +13785,7 @@ fn agent_forward_to_raft_leader(
     let peer = net.peer_for_prefix(leader)?;
     let to = ((leader as u32) << 16) | (target & 0xFFFF);
     if let Some(origin) = delegated_origin {
-        payload = encode_v2_raft_delegation(origin, false, false, false, &payload);
+        payload = encode_service_raft_delegation(origin, false, false, false, &payload);
     }
     debug!(%from_id, target, leader, "agent ask: forwarding follower-dropped raft write to leader");
     let rx = net.send_invoke(peer, from_id.0, to, Vec::new(), payload);
@@ -13573,7 +13807,7 @@ async fn forward_to_raft_leader(
     target: u32,
     rep_id: [u8; 32],
     mut payload: Vec<u8>,
-    delegated_origin: Option<crate::v2::Origin>,
+    delegated_origin: Option<crate::service::Origin>,
 ) -> Option<Vec<u8>> {
     let net = fwd.network.lock().ok()?.clone()?;
     let st = net.local_raft_status(&rep_id)?;
@@ -13589,7 +13823,7 @@ async fn forward_to_raft_leader(
     let peer = net.peer_for_prefix(leader)?;
     let to = ((leader as u32) << 16) | (target & 0xFFFF);
     if let Some(origin) = delegated_origin {
-        payload = encode_v2_raft_delegation(origin, false, false, false, &payload);
+        payload = encode_service_raft_delegation(origin, false, false, false, &payload);
     }
     debug!(
         %extension_id, target, leader,
@@ -13629,7 +13863,7 @@ async fn forward_to_raft_leader(
     _target: u32,
     _rep_id: [u8; 32],
     _payload: Vec<u8>,
-    _delegated_origin: Option<crate::v2::Origin>,
+    _delegated_origin: Option<crate::service::Origin>,
 ) -> Option<Vec<u8>> {
     None
 }
@@ -14454,7 +14688,7 @@ mod tests {
     }
 
     #[test]
-    fn attested_v2_reply_does_not_time_out_a_non_cancellable_commit() {
+    fn attested_service_reply_does_not_time_out_a_non_cancellable_commit() {
         let (tx, rx) = mpsc::channel();
         let sender = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(25));
@@ -14464,14 +14698,14 @@ mod tests {
             .checked_add(Duration::from_millis(1))
             .unwrap();
         assert_eq!(
-            receive_v2_invocation_reply(&rx, true, expired).unwrap(),
+            receive_service_invocation_reply(&rx, true, expired).unwrap(),
             b"committed attestation",
         );
         sender.join().unwrap();
 
         let (_tx, rx) = mpsc::channel();
         assert!(matches!(
-            receive_v2_invocation_reply(&rx, false, Instant::now()),
+            receive_service_invocation_reply(&rx, false, Instant::now()),
             Err(crate::actors::client::ClientError::Unreachable)
         ));
     }
@@ -14481,49 +14715,49 @@ mod tests {
     fn redirected_attestation_redrives_the_exact_invocation_after_transport_loss() {
         use crate::actors::run::{STATUS_DONE, STATUS_FORBIDDEN, STATUS_PANICKED};
 
-        let request = crate::v2::RootTreeInvocationV2 {
-            invocation: crate::v2::InvocationId([3; 32]),
-            target: crate::v2::ActorId([4; 32]),
+        let request = crate::service::RootTreeInvocation {
+            invocation: crate::service::InvocationId([3; 32]),
+            target: crate::service::ActorId([4; 32]),
             method: "prove".into(),
             arguments: b"private reference".to_vec(),
             proof_requested: true,
         };
-        let ingress = crate::v2::V2Wire::encode(&request);
+        let ingress = crate::service::ServiceWire::encode(&request);
         let terminal = encode_invoke_envelope(STATUS_DONE, &[], b"committed proof");
         let mut remote_wires = Vec::new();
         let mut remote_prefixes = Vec::new();
         let mut local_wires = Vec::new();
         let mut backoffs = 0;
 
-        let result = receive_v2_attested_with_exact_redrive(
+        let result = receive_service_attested_with_exact_redrive(
             &ingress,
-            V2RaftRedirect {
+            RaftRedirect {
                 leader_prefix: 41,
-                origin: crate::v2::Origin::System,
+                origin: crate::service::Origin::System,
                 root_upgrade_request: false,
             },
             |redirect, wire| {
                 remote_prefixes.push(redirect.leader_prefix);
                 remote_wires.push(wire.to_vec());
                 match remote_wires.len() {
-                    1 => V2AttestedRedriveAttempt::Ambiguous,
-                    2 => V2AttestedRedriveAttempt::Reply(Vec::new()),
-                    3 => V2AttestedRedriveAttempt::Reply(encode_invoke_envelope(
+                    1 => AttestedRedriveAttempt::Ambiguous,
+                    2 => AttestedRedriveAttempt::Reply(Vec::new()),
+                    3 => AttestedRedriveAttempt::Reply(encode_invoke_envelope(
                         STATUS_PANICKED,
                         &[],
                         &[],
                     )),
-                    _ => V2AttestedRedriveAttempt::Reply(terminal.clone()),
+                    _ => AttestedRedriveAttempt::Reply(terminal.clone()),
                 }
             },
             |wire| {
                 local_wires.push(wire.to_vec());
                 let envelope = match local_wires.len() {
-                    1 => encode_v2_raft_redirect(42, crate::v2::Origin::System, false),
+                    1 => encode_service_raft_redirect(42, crate::service::Origin::System, false),
                     2 => encode_invoke_envelope(STATUS_FORBIDDEN, &[], &[]),
-                    _ => encode_v2_raft_redirect(43, crate::v2::Origin::System, false),
+                    _ => encode_service_raft_redirect(43, crate::service::Origin::System, false),
                 };
-                V2AttestedRedriveAttempt::Reply(envelope)
+                AttestedRedriveAttempt::Reply(envelope)
             },
             || backoffs += 1,
         )
@@ -15264,7 +15498,7 @@ mod tests {
         // Bytes 0..38 are the fixed-shape header; the original
         // payload trails verbatim.
         let inner = b"some-msg-bytes";
-        let invocation = crate::v2::InvocationId::derive(b"test", b"inbox");
+        let invocation = crate::service::InvocationId::derive(b"test", b"inbox");
         let wrapped = wrap_with_unauthenticated_prefix(inner, invocation);
         assert_eq!(
             wrapped[0],
@@ -15302,7 +15536,7 @@ mod tests {
         // decode as CALLER_SYSTEM, their historical replay identity.
         let inner = b"logged-msg";
         let recorded: crate::effect_log::CallerPrefix = [0, 1, 3, 0, 0];
-        let invocation = crate::v2::InvocationId::derive(b"test", b"replay");
+        let invocation = crate::service::InvocationId::derive(b"test", b"replay");
         let wrapped = encode_replay_payload(&recorded, invocation, inner);
         assert_eq!(wrapped[0], crate::actors::lifecycle::TAG_DISPATCH_PREFIX);
         assert_eq!(&wrapped[1..6], &recorded[..]);
@@ -15311,7 +15545,7 @@ mod tests {
 
         let legacy = encode_replay_payload(
             &crate::effect_log::CALLER_SYSTEM,
-            crate::v2::InvocationId::ZERO,
+            crate::service::InvocationId::ZERO,
             inner,
         );
         assert_eq!(legacy[1], 1, "legacy logs replay as trusted-System");
@@ -15333,7 +15567,7 @@ mod tests {
             .chain([1, 0, 0, 0, 0])
             .chain(b"would-be-admin-call".iter().copied())
             .collect();
-        let wrapped = wrap_with_unauthenticated_prefix(&forged, crate::v2::InvocationId::ZERO);
+        let wrapped = wrap_with_unauthenticated_prefix(&forged, crate::service::InvocationId::ZERO);
         // Host's prefix at 0..38, attacker's bytes start at 38.
         assert_eq!(wrapped[1], 0, "outer trust_flag must be 0");
         assert_eq!(
@@ -15390,41 +15624,41 @@ mod tests {
     }
 
     #[test]
-    fn v2_admission_slots_are_node_owned_and_monotone() {
-        let future = v2_wall_timeslot().saturating_add(1_000);
+    fn service_admission_slots_are_node_owned_and_monotone() {
+        let future = service_wall_timeslot().saturating_add(1_000);
         let clock = AtomicU64::new(future);
-        let first = next_v2_logical_timeslot(&clock);
-        let second = next_v2_logical_timeslot(&clock);
+        let first = next_service_logical_timeslot(&clock);
+        let second = next_service_logical_timeslot(&clock);
         assert_eq!(first, future);
         assert_eq!(second, future + 1);
     }
 
     #[test]
-    fn v2_admission_slots_restore_above_durable_high_water() {
-        let committed = v2_wall_timeslot().saturating_add(10_000);
+    fn service_admission_slots_restore_above_durable_high_water() {
+        let committed = service_wall_timeslot().saturating_add(10_000);
         let clock = AtomicU64::new(1);
-        restore_v2_logical_timeslot(&clock, committed).unwrap();
-        assert_eq!(next_v2_logical_timeslot(&clock), committed + 1);
-        assert_eq!(next_v2_logical_timeslot(&clock), committed + 2);
+        restore_service_logical_timeslot(&clock, committed).unwrap();
+        assert_eq!(next_service_logical_timeslot(&clock), committed + 1);
+        assert_eq!(next_service_logical_timeslot(&clock), committed + 2);
         assert_eq!(
-            restore_v2_logical_timeslot(&clock, u64::MAX),
-            Err(V2NodeRegistrationError::LogicalTimeslotExhausted)
+            restore_service_logical_timeslot(&clock, u64::MAX),
+            Err(NodeRegistrationError::LogicalTimeslotExhausted)
         );
     }
 
     #[test]
-    fn v2_delivery_slot_is_allocated_after_authority_clock_progress() {
-        let floor = v2_wall_timeslot().saturating_add(10_000);
+    fn service_delivery_slot_is_allocated_after_authority_clock_progress() {
+        let floor = service_wall_timeslot().saturating_add(10_000);
         let clock = AtomicU64::new(floor.saturating_add(1));
         let provisional = floor.saturating_add(1);
 
         // A same-node authority invocation consumes the provisional point in
         // the shared ordering before the destination proposes its delivery.
-        let authority_slot = next_v2_logical_timeslot(&clock);
+        let authority_slot = next_service_logical_timeslot(&clock);
         assert_eq!(authority_slot, provisional);
         let deadline = authority_slot.saturating_add(1);
         assert!(provisional < deadline, "the provisional claim is live");
-        let delivery_slot = allocate_v2_conformance_slot_after_barrier(&clock, floor)
+        let delivery_slot = allocate_service_conformance_slot_after_barrier(&clock, floor)
             .expect("slot remains available");
         assert!(delivery_slot > authority_slot);
         assert!(
@@ -15437,80 +15671,80 @@ mod tests {
     fn production_slots_are_exact_consensus_observations_and_never_regress() {
         let clock = AtomicU64::new(100);
         assert_eq!(
-            allocate_v2_observed_slot_after_barrier(&clock, 120, Some(121)),
+            allocate_service_observed_slot_after_barrier(&clock, 120, Some(121)),
             Ok(121),
         );
         assert_eq!(clock.load(Ordering::Relaxed), 121);
         assert_eq!(
-            allocate_v2_observed_slot_after_barrier(&clock, 121, Some(121)),
+            allocate_service_observed_slot_after_barrier(&clock, 121, Some(121)),
             Ok(121),
             "several transitions may share one consensus JAM slot",
         );
         assert_eq!(
-            allocate_v2_observed_slot_after_barrier(&clock, 121, Some(120)),
-            Err(V2NodeRegistrationError::LogicalTimeslotRegressed),
+            allocate_service_observed_slot_after_barrier(&clock, 121, Some(120)),
+            Err(NodeRegistrationError::LogicalTimeslotRegressed),
         );
         assert_eq!(
             clock.load(Ordering::Relaxed),
             121,
             "a stale provider observation cannot move the local floor backward",
         );
-        assert!(!v2_root_slot_failure_is_terminal(
-            V2NodeRegistrationError::LogicalTimeslotUnavailable,
+        assert!(!service_root_slot_failure_is_terminal(
+            NodeRegistrationError::LogicalTimeslotUnavailable,
         ));
-        assert!(!v2_root_slot_failure_is_terminal(
-            V2NodeRegistrationError::LogicalTimeslotRegressed,
+        assert!(!service_root_slot_failure_is_terminal(
+            NodeRegistrationError::LogicalTimeslotRegressed,
         ));
-        assert!(v2_root_slot_failure_is_terminal(
-            V2NodeRegistrationError::LogicalTimeslotExhausted,
+        assert!(service_root_slot_failure_is_terminal(
+            NodeRegistrationError::LogicalTimeslotExhausted,
         ));
     }
 
     #[test]
     #[cfg(all(feature = "network", feature = "storage"))]
-    fn v2_crdt_sync_is_split_into_causal_frame_bounded_chunks() {
-        use crate::v2::V2Wire;
+    fn service_crdt_sync_is_split_into_causal_frame_bounded_chunks() {
+        use crate::service::ServiceWire;
 
-        let service = crate::v2::ServiceIdentityV2 {
-            space: crate::v2::SpaceId([1; 32]),
-            root_service: crate::v2::RootServiceId([2; 32]),
-            deployment: crate::v2::DeploymentId([3; 32]),
-            service_program: crate::v2::ProgramId([4; 32]),
-            service_abi: crate::v2::ABI_VERSION,
-            execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
-            gas_schedule: crate::v2::GasScheduleV2::new(1_000_000, 1_000_000),
+        let service = crate::service::ServiceIdentity {
+            space: crate::service::SpaceId([1; 32]),
+            root_service: crate::service::RootServiceId([2; 32]),
+            deployment: crate::service::DeploymentId([3; 32]),
+            service_program: crate::service::ProgramId([4; 32]),
+            service_abi: crate::service::ABI_VERSION,
+            execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
+            gas_schedule: crate::service::GasSchedule::new(1_000_000, 1_000_000),
         };
-        let actor = crate::v2::ActorId([5; 32]);
+        let actor = crate::service::ActorId([5; 32]);
         let mut dependency = Vec::new();
         let mut nodes = Vec::new();
         for ordinal in 0..12u8 {
-            let ingress = crate::v2::CrdtIngressV2 {
+            let ingress = crate::service::CrdtIngress {
                 service: service.clone(),
-                invocation: crate::v2::InvocationId([ordinal.saturating_add(10); 32]),
+                invocation: crate::service::InvocationId([ordinal.saturating_add(10); 32]),
                 logical_timeslot: u64::from(ordinal) + 1,
                 target: actor,
                 method: "append".into(),
                 arguments: vec![ordinal; 768],
-                origin: crate::v2::Origin::Anonymous,
-                authorization: crate::v2::AuthorizationEvidenceV2::Public,
+                origin: crate::service::Origin::Anonymous,
+                authorization: crate::service::AuthorizationEvidence::Public,
                 authorization_blob: None,
                 imported_blobs: Vec::new(),
                 proof_requested: false,
             };
-            let change = crate::v2::CrdtChangeV2 {
-                id: crate::v2::CrdtChangeV2::derive_ingress_id(&ingress, &dependency),
+            let change = crate::service::CrdtChange {
+                id: crate::service::CrdtChange::derive_ingress_id(&ingress, &dependency),
                 work_hash: ingress.commitment(),
                 causal_dependencies: dependency.clone(),
                 causal_height: u64::from(ordinal) + 1,
                 operations: Vec::new(),
-                workflow: vec![crate::v2::WorkflowOperationV2::Ingress(ingress)],
+                workflow: vec![crate::service::WorkflowOperation::Ingress(ingress)],
                 materializations: Vec::new(),
                 awaited_reply: None,
                 exported_blobs: Vec::new(),
             };
             let cid = change.cid();
-            nodes.push(crate::v2::CrdtSyncNodeV2 {
-                receipt: crate::v2::AccumulationReceiptV2 {
+            nodes.push(crate::service::CrdtSyncNode {
+                receipt: crate::service::AccumulationReceipt {
                     service: service.clone(),
                     accepted_transition: change.receipt_commitment(),
                     reply_commitment: None,
@@ -15519,26 +15753,26 @@ mod tests {
                     resulting_crdt_heads: vec![cid],
                     sequence: change.causal_height,
                     checkpoint: 0,
-                    consistency: crate::v2::ConsistencyModeV2::Crdt,
+                    consistency: crate::service::ConsistencyMode::Crdt,
                 },
                 change,
             });
             dependency = vec![cid];
         }
         nodes.sort_by_key(|node| node.change.cid());
-        let envelope = crate::v2::CrdtSyncEnvelopeV2 {
+        let envelope = crate::service::CrdtSyncEnvelope {
             service,
             advertised_heads: dependency,
             nodes,
             provided_blobs: Vec::new(),
         };
         let cap = 3_200;
-        let (transfer, chunks) = v2_crdt_sync_chunks(envelope, cap).unwrap();
+        let (transfer, chunks) = service_crdt_sync_chunks(envelope, cap).unwrap();
         assert!(chunks.len() > 1, "the focused cap must force chunking");
         let chunks = Arc::new(chunks);
         let count = chunks.len() as u32;
         for (index, chunk) in chunks.iter().cloned().enumerate() {
-            let wire = crate::v2::RootTreeTransportV2::CrdtSyncChunk {
+            let wire = crate::service::RootTreeTransport::CrdtSyncChunk {
                 transfer,
                 chunk_index: index as u32,
                 chunk_count: count,
@@ -15546,21 +15780,21 @@ mod tests {
             }
             .encode();
             assert!(wire.len() <= cap, "every transport delta is frame-bounded");
-            crate::v2::RootTreeTransportV2::decode(&wire).unwrap();
+            crate::service::RootTreeTransport::decode(&wire).unwrap();
         }
 
         let peer_key = vec![0xA5];
         let selected_at = Instant::now();
-        let mut peer = V2CrdtPeerProgress::default();
-        v2_crdt_select_latest_peer_transfer(&mut peer, transfer, &chunks);
+        let mut peer = CrdtPeerProgress::default();
+        service_crdt_select_latest_peer_transfer(&mut peer, transfer, &chunks);
         assert_eq!(peer.transfer, Some(transfer));
         assert!(Arc::ptr_eq(peer.chunks.as_ref().unwrap(), &chunks));
 
-        let newer_frontier = crate::v2::Hash([0xE1; 32]);
-        let newer_transfer = crate::v2::Hash([0xE2; 32]);
+        let newer_frontier = crate::service::Hash([0xE1; 32]);
+        let newer_transfer = crate::service::Hash([0xE2; 32]);
         let newer_chunks = vec![chunks.last().unwrap().clone()];
-        let mut progress = V2CrdtSyncProgress {
-            latest_frontier: crate::v2::Hash([0xE0; 32]),
+        let mut progress = CrdtSyncProgress {
+            latest_frontier: crate::service::Hash([0xE0; 32]),
             latest_transfer: transfer,
             latest_chunks: chunks.clone(),
             peers: HashMap::from([(peer_key.clone(), peer)]),
@@ -15576,7 +15810,7 @@ mod tests {
         assert_eq!(progress.fanout_after, Some(peer_key.clone()));
 
         let peer = progress.peers.get_mut(&peer_key).unwrap();
-        v2_crdt_select_latest_peer_transfer(
+        service_crdt_select_latest_peer_transfer(
             peer,
             progress.latest_transfer,
             &progress.latest_chunks,
@@ -15587,7 +15821,7 @@ mod tests {
             "a frontier refresh cannot interrupt an in-flight peer transfer"
         );
         peer.next_chunk = chunks.len() as u32;
-        v2_crdt_select_latest_peer_transfer(
+        service_crdt_select_latest_peer_transfer(
             peer,
             progress.latest_transfer,
             &progress.latest_chunks,
@@ -15595,28 +15829,28 @@ mod tests {
         assert_eq!(peer.transfer, Some(newer_transfer));
         assert_eq!(peer.next_chunk, 0);
 
-        let after_two_cycles = selected_at + V2_CRDT_SYNC_TRANSFER_STALL * 2;
+        let after_two_cycles = selected_at + SERVICE_CRDT_SYNC_TRANSFER_STALL * 2;
         peer.next_chunk = 1;
         peer.awaiting_ack_since = None;
         assert!(
-            !peer.release_stalled_transfer(after_two_cycles, V2_CRDT_SYNC_TRANSFER_STALL),
+            !peer.release_stalled_transfer(after_two_cycles, SERVICE_CRDT_SYNC_TRANSFER_STALL),
             "an acknowledged peer may wait longer than the stall limit for its next fan-out turn"
         );
         assert_eq!(peer.transfer, Some(newer_transfer));
         assert_eq!(peer.next_chunk, 1);
 
-        peer.awaiting_ack_since = selected_at.checked_sub(V2_CRDT_SYNC_TRANSFER_STALL);
-        assert!(peer.release_stalled_transfer(selected_at, V2_CRDT_SYNC_TRANSFER_STALL));
+        peer.awaiting_ack_since = selected_at.checked_sub(SERVICE_CRDT_SYNC_TRANSFER_STALL);
+        assert!(peer.release_stalled_transfer(selected_at, SERVICE_CRDT_SYNC_TRANSFER_STALL));
         assert!(peer.transfer.is_none());
         assert!(peer.chunks.is_none());
 
         let retired = vec![0xB6];
         progress.peers.insert(
             retired.clone(),
-            V2CrdtPeerProgress {
+            CrdtPeerProgress {
                 transfer: Some(transfer),
                 chunks: Some(chunks),
-                ..V2CrdtPeerProgress::default()
+                ..CrdtPeerProgress::default()
             },
         );
         progress.finish_roster_scan();
@@ -15627,14 +15861,18 @@ mod tests {
 
     #[test]
     #[cfg(all(feature = "network", feature = "storage"))]
-    fn v2_crdt_private_floor_requires_a_space_or_actor_grant() {
+    fn service_crdt_private_floor_requires_a_space_or_actor_grant() {
         use crate::registry::SyncFloor;
 
         let peer = libp2p::PeerId::random();
         let check = |floor, space_role, actor_role| {
             let (routes, registry) = spawn_stub_sync_floor_registry(floor, space_role, actor_role);
-            let allowed =
-                v2_crdt_sync_peer_allowed(&routes, &peer, "private-board", Duration::from_secs(1));
+            let allowed = service_crdt_sync_peer_allowed(
+                &routes,
+                &peer,
+                "private-board",
+                Duration::from_secs(1),
+            );
             drop(routes);
             registry.join().unwrap();
             allowed
@@ -15667,13 +15905,13 @@ mod tests {
 
     #[test]
     #[cfg(all(feature = "network", feature = "storage"))]
-    fn v2_crdt_fanout_cursor_advances_after_failed_attempt_windows() {
+    fn service_crdt_fanout_cursor_advances_after_failed_attempt_windows() {
         let peers = (0u8..12).map(|peer| vec![peer]).collect::<Vec<_>>();
         let mut after = None;
         let mut attempted = BTreeSet::new();
         for _ in 0..3 {
-            let order = v2_crdt_fanout_order(peers.clone(), after.as_deref());
-            let window = &order[..V2_CRDT_SYNC_ATTEMPT_BUDGET];
+            let order = service_crdt_fanout_order(peers.clone(), after.as_deref());
+            let window = &order[..SERVICE_CRDT_SYNC_ATTEMPT_BUDGET];
             // Model every authorization attempt failing: no successful send
             // is needed for the cursor to reach the rest of the roster.
             attempted.extend(window.iter().cloned());
@@ -15681,16 +15919,16 @@ mod tests {
         }
         assert_eq!(attempted.len(), peers.len());
 
-        let wrapped = v2_crdt_fanout_order(peers, after.as_deref());
+        let wrapped = service_crdt_fanout_order(peers, after.as_deref());
         assert_eq!(
-            &wrapped[..V2_CRDT_SYNC_ATTEMPT_BUDGET],
+            &wrapped[..SERVICE_CRDT_SYNC_ATTEMPT_BUDGET],
             &[vec![0], vec![1], vec![2], vec![3]]
         );
     }
 
     #[test]
     #[cfg(all(feature = "network", feature = "storage"))]
-    fn v2_crdt_roster_pagination_progresses_beyond_sixteen_pages() {
+    fn service_crdt_roster_pagination_progresses_beyond_sixteen_pages() {
         use crate::actors::codec::Encode;
         use crate::registry::{MEMBER_KIND_NODE, MemberPage, MemberRow, NODE_ROLE_OBSERVER};
         use crate::value::Value;
@@ -15743,8 +15981,8 @@ mod tests {
         let mut peers = BTreeSet::new();
         let mut pages = 0;
         loop {
-            let page =
-                v2_crdt_replica_roster_page(&routes, kind, key, Duration::from_secs(1)).unwrap();
+            let page = service_crdt_replica_roster_page(&routes, kind, key, Duration::from_secs(1))
+                .unwrap();
             pages += 1;
             peers.extend(page.peers);
             let Some((next_kind, next_key)) = page.next else {
@@ -15760,72 +15998,76 @@ mod tests {
     }
 
     #[test]
-    fn v2_transport_peer_is_bound_to_the_exact_claimed_actor() {
-        let actor_a = crate::v2::ActorId([0xA1; 32]);
-        let actor_b = crate::v2::ActorId([0xB1; 32]);
+    fn service_transport_peer_is_bound_to_the_exact_claimed_actor() {
+        let actor_a = crate::service::ActorId([0xA1; 32]);
+        let actor_b = crate::service::ActorId([0xB1; 32]);
         let route = ServiceId::new(0xCAFE, 7);
-        let service = crate::v2::ServiceIdentityV2 {
-            space: crate::v2::SpaceId([1; 32]),
-            root_service: crate::v2::RootServiceId([2; 32]),
-            deployment: crate::v2::DeploymentId([3; 32]),
-            service_program: crate::v2::VOS_SERVICE_PROGRAM_ID,
-            service_abi: crate::v2::ABI_VERSION,
-            execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
-            gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
+        let service = crate::service::ServiceIdentity {
+            space: crate::service::SpaceId([1; 32]),
+            root_service: crate::service::RootServiceId([2; 32]),
+            deployment: crate::service::DeploymentId([3; 32]),
+            service_program: crate::service::VOS_SERVICE_PROGRAM_ID,
+            service_abi: crate::service::ABI_VERSION,
+            execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
+            gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
         };
         let routes = RwLock::new(HashMap::from([
             (
                 actor_a,
-                V2ActorRoute {
+                ActorRoute {
                     route: route.0,
                     service: service.clone(),
-                    consistency: crate::v2::ConsistencyModeV2::Local,
+                    consistency: crate::service::ConsistencyMode::Local,
                     replication_id: None,
                     is_role_authority: false,
-                    invoke_timeout: V2_LOCAL_INVOKE_TIMEOUT,
+                    invoke_timeout: SERVICE_LOCAL_INVOKE_TIMEOUT,
                     authenticated_peer: Some(vec![0xA2]),
                 },
             ),
             (
                 actor_b,
-                V2ActorRoute {
+                ActorRoute {
                     route: route.0,
                     service,
-                    consistency: crate::v2::ConsistencyModeV2::Raft,
+                    consistency: crate::service::ConsistencyMode::Raft,
                     replication_id: Some([0xB3; 32]),
                     is_role_authority: false,
-                    invoke_timeout: V2_LOCAL_INVOKE_TIMEOUT,
+                    invoke_timeout: SERVICE_LOCAL_INVOKE_TIMEOUT,
                     authenticated_peer: Some(vec![0xB2]),
                 },
             ),
         ]));
 
-        assert!(authenticated_v2_actor_route(&routes, actor_a, route, Some(&[0xA2])).is_some());
-        assert!(authenticated_v2_actor_route(&routes, actor_b, route, Some(&[0xB2])).is_some());
         assert!(
-            authenticated_v2_actor_route(&routes, actor_b, route, Some(&[0xA2])).is_none(),
+            authenticated_service_actor_route(&routes, actor_a, route, Some(&[0xA2])).is_some()
+        );
+        assert!(
+            authenticated_service_actor_route(&routes, actor_b, route, Some(&[0xB2])).is_some()
+        );
+        assert!(
+            authenticated_service_actor_route(&routes, actor_b, route, Some(&[0xA2])).is_none(),
             "a colliding Local route owned by peer A cannot authenticate Raft actor B"
         );
     }
 
     #[cfg(all(feature = "network", feature = "storage"))]
     fn raft_transport_ack(
-        acceptor: crate::v2::ActorId,
-        acceptor_service: crate::v2::ServiceIdentityV2,
-        destination_service: crate::v2::ServiceIdentityV2,
+        acceptor: crate::service::ActorId,
+        acceptor_service: crate::service::ServiceIdentity,
+        destination_service: crate::service::ServiceIdentity,
     ) -> Vec<u8> {
-        use crate::v2::V2Wire;
+        use crate::service::ServiceWire;
 
-        crate::v2::RootTreeTransportV2::PublicationAccepted {
+        crate::service::RootTreeTransport::PublicationAccepted {
             acceptor,
             acceptor_service,
             service: destination_service,
-            input: crate::v2::WorkInputIdV2 {
-                invocation: crate::v2::InvocationId([0x91; 32]),
+            input: crate::service::WorkInputId {
+                invocation: crate::service::InvocationId([0x91; 32]),
                 workflow_step: 0,
             },
-            publication: crate::v2::Hash([0x92; 32]),
-            call: crate::v2::CallId([0x93; 32]),
+            publication: crate::service::Hash([0x92; 32]),
+            call: crate::service::CallId([0x93; 32]),
         }
         .encode()
     }
@@ -15833,34 +16075,34 @@ mod tests {
     #[cfg(all(feature = "network", feature = "storage"))]
     #[test]
     fn networkless_raft_transport_reaches_an_attached_local_root() {
-        let actor = crate::v2::ActorId([0x81; 32]);
-        let acceptor = crate::v2::ActorId([0x82; 32]);
+        let actor = crate::service::ActorId([0x81; 32]);
+        let acceptor = crate::service::ActorId([0x82; 32]);
         let route = ServiceId::new(0x1234, 7);
-        let service = crate::v2::ServiceIdentityV2 {
-            space: crate::v2::SpaceId([1; 32]),
-            root_service: crate::v2::RootServiceId([2; 32]),
-            deployment: crate::v2::DeploymentId([3; 32]),
-            service_program: crate::v2::VOS_SERVICE_PROGRAM_ID,
-            service_abi: crate::v2::ABI_VERSION,
-            execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
-            gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
+        let service = crate::service::ServiceIdentity {
+            space: crate::service::SpaceId([1; 32]),
+            root_service: crate::service::RootServiceId([2; 32]),
+            deployment: crate::service::DeploymentId([3; 32]),
+            service_program: crate::service::VOS_SERVICE_PROGRAM_ID,
+            service_abi: crate::service::ABI_VERSION,
+            execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
+            gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
         };
-        let acceptor_service = crate::v2::ServiceIdentityV2 {
-            root_service: crate::v2::RootServiceId([4; 32]),
+        let acceptor_service = crate::service::ServiceIdentity {
+            root_service: crate::service::RootServiceId([4; 32]),
             ..service.clone()
         };
         let payload = raft_transport_ack(acceptor, acceptor_service, service.clone());
 
         let mut node = VosNode::new();
-        node.v2_actor_routes.write().unwrap().insert(
+        node.service_actor_routes.write().unwrap().insert(
             actor,
-            V2ActorRoute {
+            ActorRoute {
                 route: route.0,
                 service,
-                consistency: crate::v2::ConsistencyModeV2::Raft,
+                consistency: crate::service::ConsistencyMode::Raft,
                 replication_id: Some([0x83; 32]),
                 is_role_authority: false,
-                invoke_timeout: V2_LOCAL_INVOKE_TIMEOUT,
+                invoke_timeout: SERVICE_LOCAL_INVOKE_TIMEOUT,
                 authenticated_peer: None,
             },
         );
@@ -15904,7 +16146,7 @@ mod tests {
         let mut probes = vec![(0x1111, stalled_rx), (0x2222, leader_rx)];
         let started = Instant::now();
         let replies =
-            collect_v2_raft_status_probes(&mut probes, started + Duration::from_millis(100));
+            collect_service_raft_status_probes(&mut probes, started + Duration::from_millis(100));
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0].0, 0x2222);
         assert!(
@@ -15941,7 +16183,8 @@ mod tests {
             active_config_index: Some(12),
             leader_hint: Some(0x2222),
         };
-        let ranked = ranked_v2_raft_leader_observations(vec![(0x1111, stale), (0x2222, current)]);
+        let ranked =
+            ranked_service_raft_leader_observations(vec![(0x1111, stale), (0x2222, current)]);
         assert_eq!(
             ranked.first().and_then(|(_, status)| status.leader_hint),
             Some(0x2222),
@@ -15959,8 +16202,8 @@ mod tests {
         let shared_prefix = 0x5151;
         let mut candidates = Vec::new();
 
-        push_v2_raft_peer_candidate(&mut candidates, shared_prefix, exact);
-        push_v2_raft_peer_candidate(&mut candidates, shared_prefix, colliding);
+        push_service_raft_peer_candidate(&mut candidates, shared_prefix, exact);
+        push_service_raft_peer_candidate(&mut candidates, shared_prefix, colliding);
 
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0], (shared_prefix, Some(exact)));
@@ -15979,18 +16222,18 @@ mod tests {
         let mut observed_b = HashSet::new();
 
         for _ in 0..2 {
-            let (window_a, next_a) = v2_raft_connected_candidate_window(
+            let (window_a, next_a) = service_raft_connected_candidate_window(
                 peers.clone(),
                 cursor_a,
-                V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES,
+                SERVICE_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES,
             );
             cursor_a = next_a;
             observed_a.extend(window_a);
 
-            let (window_b, next_b) = v2_raft_connected_candidate_window(
+            let (window_b, next_b) = service_raft_connected_candidate_window(
                 peers.clone(),
                 cursor_b,
-                V2_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES,
+                SERVICE_RAFT_TRANSPORT_MAX_AMBIENT_CANDIDATES,
             );
             cursor_b = next_b;
             observed_b.extend(window_b);
@@ -16005,7 +16248,7 @@ mod tests {
         let mut cursor = 0;
         let mut observed = HashSet::new();
         for _ in 0..3 {
-            let (window, next) = v2_raft_connected_candidate_window(peers.clone(), cursor, 13);
+            let (window, next) = service_raft_connected_candidate_window(peers.clone(), cursor, 13);
             assert_eq!(window.len(), 13);
             cursor = next;
             observed.extend(window);
@@ -16093,7 +16336,7 @@ mod tests {
 
         let local_id = 0x4040;
         assert_eq!(
-            resolve_v2_raft_leader_observations(
+            resolve_service_raft_leader_observations(
                 observations,
                 &authenticated,
                 &routes,
@@ -16109,15 +16352,15 @@ mod tests {
     #[test]
     fn raft_discovery_ownership_outlives_its_shared_deadline() {
         let started = Instant::now();
-        let (deadline, ownership_until) = v2_raft_transport_resolution_deadlines(started);
+        let (deadline, ownership_until) = service_raft_transport_resolution_deadlines(started);
 
         assert_eq!(
             deadline.duration_since(started),
-            V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT
+            SERVICE_RAFT_TRANSPORT_RESOLUTION_TIMEOUT
         );
         assert_eq!(
             ownership_until.duration_since(deadline),
-            V2_RAFT_TRANSPORT_RESOLUTION_OWNERSHIP_GRACE
+            SERVICE_RAFT_TRANSPORT_RESOLUTION_OWNERSHIP_GRACE
         );
         assert!(
             ownership_until > deadline,
@@ -16129,8 +16372,8 @@ mod tests {
     #[test]
     fn exact_bootstrap_budget_is_independent_of_ambient_candidates() {
         let started = Instant::now();
-        let deadline = started + V2_RAFT_TRANSPORT_RESOLUTION_TIMEOUT;
-        let (exact_budget, auth_deadline) = v2_raft_transport_auth_windows(started, deadline);
+        let deadline = started + SERVICE_RAFT_TRANSPORT_RESOLUTION_TIMEOUT;
+        let (exact_budget, auth_deadline) = service_raft_transport_auth_windows(started, deadline);
 
         assert_eq!(exact_budget, Duration::from_millis(500));
         assert_eq!(
@@ -16138,7 +16381,7 @@ mod tests {
             Duration::from_millis(500)
         );
         assert_eq!(
-            v2_raft_transport_status_deadline(auth_deadline, deadline).duration_since(started),
+            service_raft_transport_status_deadline(auth_deadline, deadline).duration_since(started),
             Duration::from_millis(750),
             "the final quarter remains reserved for unseen leader authentication"
         );
@@ -16160,22 +16403,22 @@ mod tests {
             },
         ));
         let remote_peer = libp2p::PeerId::random();
-        let actor = crate::v2::ActorId([0x84; 32]);
-        let acceptor = crate::v2::ActorId([0x85; 32]);
+        let actor = crate::service::ActorId([0x84; 32]);
+        let acceptor = crate::service::ActorId([0x85; 32]);
         let remote_route = ServiceId::new(crate::network::derive_node_prefix(&remote_peer), 9);
-        let service = crate::v2::ServiceIdentityV2 {
-            space: crate::v2::SpaceId([5; 32]),
-            root_service: crate::v2::RootServiceId([6; 32]),
-            deployment: crate::v2::DeploymentId([7; 32]),
-            service_program: crate::v2::VOS_SERVICE_PROGRAM_ID,
-            service_abi: crate::v2::ABI_VERSION,
-            execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
-            gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
+        let service = crate::service::ServiceIdentity {
+            space: crate::service::SpaceId([5; 32]),
+            root_service: crate::service::RootServiceId([6; 32]),
+            deployment: crate::service::DeploymentId([7; 32]),
+            service_program: crate::service::VOS_SERVICE_PROGRAM_ID,
+            service_abi: crate::service::ABI_VERSION,
+            execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
+            gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
         };
         let payload = raft_transport_ack(
             acceptor,
-            crate::v2::ServiceIdentityV2 {
-                root_service: crate::v2::RootServiceId([8; 32]),
+            crate::service::ServiceIdentity {
+                root_service: crate::service::RootServiceId([8; 32]),
                 ..service.clone()
             },
             service.clone(),
@@ -16183,15 +16426,15 @@ mod tests {
 
         let mut node = VosNode::with_prefix(prefix);
         *node.shared_network.lock().unwrap() = Some(network.clone());
-        node.v2_actor_routes.write().unwrap().insert(
+        node.service_actor_routes.write().unwrap().insert(
             actor,
-            V2ActorRoute {
+            ActorRoute {
                 route: remote_route.0,
                 service,
-                consistency: crate::v2::ConsistencyModeV2::Raft,
+                consistency: crate::service::ConsistencyMode::Raft,
                 replication_id: Some([0x86; 32]),
                 is_role_authority: false,
-                invoke_timeout: V2_LOCAL_INVOKE_TIMEOUT,
+                invoke_timeout: SERVICE_LOCAL_INVOKE_TIMEOUT,
                 authenticated_peer: Some(remote_peer.to_bytes()),
             },
         );
@@ -16244,7 +16487,10 @@ mod tests {
             b"unrelated"
         );
         assert_eq!(
-            node.v2_raft_transport_resolutions.lock().unwrap().len(),
+            node.service_raft_transport_resolutions
+                .lock()
+                .unwrap()
+                .len(),
             1,
             "one destination has at most one resolver/cache entry"
         );
@@ -16472,41 +16718,41 @@ mod tests {
             }
         });
 
-        let service = crate::v2::ServiceIdentityV2 {
-            space: crate::v2::SpaceId([1; 32]),
-            root_service: crate::v2::RootServiceId([2; 32]),
-            deployment: crate::v2::DeploymentId([3; 32]),
-            service_program: crate::v2::VOS_SERVICE_PROGRAM_ID,
-            service_abi: crate::v2::ABI_VERSION,
-            execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
-            gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
+        let service = crate::service::ServiceIdentity {
+            space: crate::service::SpaceId([1; 32]),
+            root_service: crate::service::RootServiceId([2; 32]),
+            deployment: crate::service::DeploymentId([3; 32]),
+            service_program: crate::service::VOS_SERVICE_PROGRAM_ID,
+            service_abi: crate::service::ABI_VERSION,
+            execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
+            gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
         };
-        let destination = V2ActorRoute {
+        let destination = ActorRoute {
             route: ServiceId::new(prefix_a, 0x4040).0,
             service: service.clone(),
-            consistency: crate::v2::ConsistencyModeV2::Raft,
+            consistency: crate::service::ConsistencyMode::Raft,
             replication_id: Some(destination_replication),
             is_role_authority: false,
-            invoke_timeout: V2_LOCAL_INVOKE_TIMEOUT,
+            invoke_timeout: SERVICE_LOCAL_INVOKE_TIMEOUT,
             authenticated_peer: None,
         };
-        let source = V2ActorRoute {
+        let source = ActorRoute {
             route: ServiceId::new(prefix_b, 0x3030).0,
             service,
-            consistency: crate::v2::ConsistencyModeV2::Raft,
+            consistency: crate::service::ConsistencyMode::Raft,
             replication_id: Some(source_replication),
             is_role_authority: false,
-            invoke_timeout: V2_LOCAL_INVOKE_TIMEOUT,
+            invoke_timeout: SERVICE_LOCAL_INVOKE_TIMEOUT,
             authenticated_peer: None,
         };
 
         assert_eq!(
-            resolve_v2_raft_leader_route(&destination, &network_a, &routes),
+            resolve_service_raft_leader_route(&destination, &network_a, &routes),
             Some((peer_b, ServiceId::new(prefix_b, 0x4040))),
             "delivery follows the destination group's B leader"
         );
         assert_eq!(
-            resolve_v2_raft_leader_route(&source, &network_b, &routes),
+            resolve_service_raft_leader_route(&source, &network_b, &routes),
             Some((peer_a, ServiceId::new(prefix_a, 0x3030))),
             "acknowledgement independently follows the source group's A leader"
         );
@@ -16514,12 +16760,12 @@ mod tests {
         destination_leader.store(prefix_a, Ordering::Relaxed);
         source_leader.store(prefix_b, Ordering::Relaxed);
         assert_eq!(
-            resolve_v2_raft_leader_route(&destination, &network_a, &routes),
+            resolve_service_raft_leader_route(&destination, &network_a, &routes),
             Some((peer_a, ServiceId::new(prefix_a, 0x4040))),
             "a destination failover replaces the bootstrap route on the next retry"
         );
         assert_eq!(
-            resolve_v2_raft_leader_route(&source, &network_b, &routes),
+            resolve_service_raft_leader_route(&source, &network_b, &routes),
             Some((peer_b, ServiceId::new(prefix_b, 0x3030))),
             "acknowledgement routing follows an independent source failover"
         );
@@ -16534,12 +16780,12 @@ mod tests {
     #[test]
     fn raft_typed_invoke_budget_covers_every_bounded_stage() {
         assert_eq!(
-            v2_raft_invoke_timeout(5_000),
+            service_raft_invoke_timeout(5_000),
             Duration::from_secs(35),
             "voter auth + private staging + read barrier + genesis + admission + apply + margin",
         );
         assert_eq!(
-            v2_raft_invoke_timeout(2_000),
+            service_raft_invoke_timeout(2_000),
             Duration::from_secs(20),
             "the end-to-end budget follows the configured proposal timeout",
         );
@@ -16547,28 +16793,28 @@ mod tests {
 
     #[cfg(feature = "network")]
     #[test]
-    fn v2_exact_destination_precedes_a_colliding_local_prefix() {
+    fn service_exact_destination_precedes_a_colliding_local_prefix() {
         let remote_key = libp2p::identity::Keypair::generate_ed25519();
         let remote_peer = libp2p::PeerId::from(remote_key.public());
         let peer_bytes = remote_peer.to_bytes();
         let colliding_prefix = crate::network::derive_node_prefix(&remote_peer);
         let route = ServiceId::new(colliding_prefix, 7);
-        let actor = crate::v2::ActorId([0xD1; 32]);
-        let service = crate::v2::ServiceIdentityV2 {
-            space: crate::v2::SpaceId([4; 32]),
-            root_service: crate::v2::RootServiceId([5; 32]),
-            deployment: crate::v2::DeploymentId([6; 32]),
-            service_program: crate::v2::VOS_SERVICE_PROGRAM_ID,
-            service_abi: crate::v2::ABI_VERSION,
-            execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
-            gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
+        let actor = crate::service::ActorId([0xD1; 32]);
+        let service = crate::service::ServiceIdentity {
+            space: crate::service::SpaceId([4; 32]),
+            root_service: crate::service::RootServiceId([5; 32]),
+            deployment: crate::service::DeploymentId([6; 32]),
+            service_program: crate::service::VOS_SERVICE_PROGRAM_ID,
+            service_abi: crate::service::ABI_VERSION,
+            execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
+            gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
         };
 
         let mut node = VosNode::with_prefix(colliding_prefix);
-        node.bind_v2_actor_route(
+        node.bind_service_actor_route(
             actor,
             service,
-            crate::v2::ConsistencyModeV2::Local,
+            crate::service::ConsistencyMode::Local,
             route,
             peer_bytes.clone(),
         )
@@ -16608,12 +16854,12 @@ mod tests {
     }
 
     #[test]
-    fn v2_ingress_uses_the_canonical_peer_subject_identity() {
+    fn service_ingress_uses_the_canonical_peer_subject_identity() {
         let peer = vec![0xaa, 0xbb, 0xcc];
         let routes = RwLock::new(HashMap::new());
         assert_eq!(
-            v2_root_origin(&crate::actors::Caller::Peer(peer.clone()), &routes),
-            Some(crate::v2::Origin::Member(
+            service_root_origin(&crate::actors::Caller::Peer(peer.clone()), &routes),
+            Some(crate::service::Origin::Member(
                 crate::actors::context::authenticated_peer_subject(&peer)
             ))
         );
@@ -16622,25 +16868,26 @@ mod tests {
     #[test]
     fn raft_redirect_and_delegation_preserve_the_observed_origin() {
         for origin in [
-            crate::v2::Origin::System,
-            crate::v2::Origin::Anonymous,
-            crate::v2::Origin::Member(crate::v2::SubjectId([7; 32])),
-            crate::v2::Origin::Actor(crate::v2::ActorId([8; 32])),
+            crate::service::Origin::System,
+            crate::service::Origin::Anonymous,
+            crate::service::Origin::Member(crate::service::SubjectId([7; 32])),
+            crate::service::Origin::Actor(crate::service::ActorId([8; 32])),
         ] {
-            let redirect = encode_v2_raft_redirect(41, origin, false);
+            let redirect = encode_service_raft_redirect(41, origin, false);
             assert_eq!(
-                decode_v2_raft_redirect(&redirect),
-                Some(V2RaftRedirect {
+                decode_service_raft_redirect(&redirect),
+                Some(RaftRedirect {
                     leader_prefix: 41,
                     origin,
                     root_upgrade_request: false,
                 }),
                 "the follower's authenticated origin survives leader selection",
             );
-            let delegated = encode_v2_raft_delegation(origin, true, false, false, b"root ingress");
+            let delegated =
+                encode_service_raft_delegation(origin, true, false, false, b"root ingress");
             assert_eq!(
-                decode_v2_raft_delegation(&delegated),
-                Ok(Some(V2RaftDelegatedIngress {
+                decode_service_raft_delegation(&delegated),
+                Ok(Some(RaftDelegatedIngress {
                     origin,
                     preserve_envelope: true,
                     role_authority_request: false,
@@ -16649,17 +16896,17 @@ mod tests {
                 })),
             );
         }
-        let authority = encode_v2_raft_delegation(
-            crate::v2::Origin::System,
+        let authority = encode_service_raft_delegation(
+            crate::service::Origin::System,
             true,
             true,
             false,
             b"authority ingress",
         );
         assert_eq!(
-            decode_v2_raft_delegation(&authority),
-            Ok(Some(V2RaftDelegatedIngress {
-                origin: crate::v2::Origin::System,
+            decode_service_raft_delegation(&authority),
+            Ok(Some(RaftDelegatedIngress {
+                origin: crate::service::Origin::System,
                 preserve_envelope: true,
                 role_authority_request: true,
                 root_upgrade_request: false,
@@ -16667,17 +16914,17 @@ mod tests {
             })),
             "the host-private marker survives only inside authenticated Raft delegation",
         );
-        let upgrade = encode_v2_raft_delegation(
-            crate::v2::Origin::System,
+        let upgrade = encode_service_raft_delegation(
+            crate::service::Origin::System,
             true,
             false,
             true,
             b"upgrade ingress",
         );
         assert_eq!(
-            decode_v2_raft_delegation(&upgrade),
-            Ok(Some(V2RaftDelegatedIngress {
-                origin: crate::v2::Origin::System,
+            decode_service_raft_delegation(&upgrade),
+            Ok(Some(RaftDelegatedIngress {
+                origin: crate::service::Origin::System,
                 preserve_envelope: true,
                 role_authority_request: false,
                 root_upgrade_request: true,
@@ -16686,15 +16933,15 @@ mod tests {
             "the upgrade marker survives only inside authenticated Raft delegation",
         );
         assert!(
-            decode_v2_raft_delegation(b"ordinary ingress")
+            decode_service_raft_delegation(b"ordinary ingress")
                 .unwrap()
                 .is_none()
         );
-        assert!(decode_v2_raft_delegation(b"VRD4\x02\x00\x00bad").is_err());
-        assert!(decode_v2_raft_delegation(b"VRD4\x00\x02\x00bad").is_err());
-        assert!(decode_v2_raft_delegation(b"VRD4\x00\x00\x02bad").is_err());
+        assert!(decode_service_raft_delegation(b"VRD4\x02\x00\x00bad").is_err());
+        assert!(decode_service_raft_delegation(b"VRD4\x00\x02\x00bad").is_err());
+        assert!(decode_service_raft_delegation(b"VRD4\x00\x00\x02bad").is_err());
         assert!(
-            decode_v2_raft_delegation(b"VRD2\x00\x03old")
+            decode_service_raft_delegation(b"VRD2\x00\x03old")
                 .unwrap()
                 .is_none(),
             "the pre-marker delegation layout cannot be ambiguously decoded",
@@ -16731,7 +16978,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_host_envelopes_preserve_typed_failures() {
+    fn service_host_envelopes_preserve_typed_failures() {
         use crate::actors::client::{CallError, ClientError};
 
         assert!(matches!(
@@ -18158,7 +18405,7 @@ mod tests {
 
         let service = NodeService {
             invoke_routes: Arc::new(Mutex::new(routes)),
-            v2_actor_routes: Arc::new(RwLock::new(HashMap::new())),
+            service_actor_routes: Arc::new(RwLock::new(HashMap::new())),
             agent_names: Arc::new(std::sync::RwLock::new(names)),
             agent_shutdown: Arc::new(Mutex::new(HashMap::new())),
             agent_info: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -18167,7 +18414,7 @@ mod tests {
             #[cfg(feature = "storage")]
             raft_hosts: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "storage")]
-            v2_private_ingress_routes: Arc::new(RwLock::new(HashMap::new())),
+            service_private_ingress_routes: Arc::new(RwLock::new(HashMap::new())),
             shared_network: Arc::new(Mutex::new(None)),
             manifest: Arc::new(OnceLock::new()),
             proof_blobs: Arc::new(RwLock::new(HashMap::new())),
@@ -18527,14 +18774,14 @@ mod tests {
             leader_hint: Some(prefix),
         };
         assert_eq!(
-            authenticated_v2_raft_leader_peer(&status, &enrolled, prefix),
+            authenticated_service_raft_leader_peer(&status, &enrolled, prefix),
             Some(voter),
             "outbound authority routing selects the registry's full PeerId, not the prefix map",
         );
         let mut wrong_group = status;
         wrong_group.members.clear();
         assert!(
-            authenticated_v2_raft_leader_peer(&wrong_group, &enrolled, prefix).is_none(),
+            authenticated_service_raft_leader_peer(&wrong_group, &enrolled, prefix).is_none(),
             "the same roster peer is not trusted outside the authority's exact Raft group",
         );
     }
@@ -18616,7 +18863,7 @@ mod tests {
                 _chain: Vec<u32>,
                 msg: Vec<u8>,
             ) -> Vec<u8> {
-                assert!(msg.starts_with(&V2_RAFT_DELEGATION_MAGIC));
+                assert!(msg.starts_with(&SERVICE_RAFT_DELEGATION_MAGIC));
                 if msg.get(4) == Some(&1) {
                     encode_invoke_envelope(STATUS_DONE, &[], b"exact leader")
                 } else {
@@ -18674,24 +18921,24 @@ mod tests {
             }),
         );
 
-        let actor = crate::v2::ActorId([0xA8; 32]);
+        let actor = crate::service::ActorId([0xA8; 32]);
         let route = ServiceId::new(caller_prefix, 0xA9);
-        let service = crate::v2::ServiceIdentityV2 {
-            space: crate::v2::SpaceId([1; 32]),
-            root_service: crate::v2::RootServiceId([2; 32]),
-            deployment: crate::v2::DeploymentId([3; 32]),
-            service_program: crate::v2::VOS_SERVICE_PROGRAM_ID,
-            service_abi: crate::v2::ABI_VERSION,
-            execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
-            gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
+        let service = crate::service::ServiceIdentity {
+            space: crate::service::SpaceId([1; 32]),
+            root_service: crate::service::RootServiceId([2; 32]),
+            deployment: crate::service::DeploymentId([3; 32]),
+            service_program: crate::service::VOS_SERVICE_PROGRAM_ID,
+            service_abi: crate::service::ABI_VERSION,
+            execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
+            gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
         };
         let mut node = VosNode::with_prefix(caller_prefix);
-        node.v2_actor_routes.write().unwrap().insert(
+        node.service_actor_routes.write().unwrap().insert(
             actor,
-            V2ActorRoute {
+            ActorRoute {
                 route: route.0,
                 service,
-                consistency: crate::v2::ConsistencyModeV2::Raft,
+                consistency: crate::service::ConsistencyMode::Raft,
                 replication_id: Some(replication_id),
                 is_role_authority: false,
                 invoke_timeout: Duration::from_secs(5),
@@ -18704,9 +18951,9 @@ mod tests {
         let root = thread::spawn(move || {
             for _ in 0..3 {
                 let request = root_rx.recv().unwrap();
-                assert!(request.reply.send(encode_v2_raft_redirect(
+                assert!(request.reply.send(encode_service_raft_redirect(
                     voter_prefix,
-                    crate::v2::Origin::System,
+                    crate::service::Origin::System,
                     false,
                 )));
             }
@@ -18908,26 +19155,30 @@ mod tests {
         service.shared_network = Arc::new(Mutex::new(Some(network.clone())));
         let (sidecar_tx, sidecar_rx) = mpsc::sync_channel(1);
         let (quiescence_tx, _quiescence_rx) = mpsc::sync_channel(1);
-        service.v2_private_ingress_routes.write().unwrap().insert(
-            replication_id,
-            Arc::new(V2PrivateIngressRoute {
-                tx: sidecar_tx,
-                quiescence_tx,
-                barrier: V2PrivateIngressBarrier::new(),
-                production_trust_policy: None,
-            }),
-        );
+        service
+            .service_private_ingress_routes
+            .write()
+            .unwrap()
+            .insert(
+                replication_id,
+                Arc::new(PrivateIngressRoute {
+                    tx: sidecar_tx,
+                    quiescence_tx,
+                    barrier: PrivateIngressBarrier::new(),
+                    production_trust_policy: None,
+                }),
+            );
         let bytes = b"exact private ingress".to_vec();
-        let reference = crate::v2::BlobRefV2::of_bytes(&bytes);
-        let invocation = crate::v2::InvocationId([0x62; 32]);
+        let reference = crate::service::BlobRef::of_bytes(&bytes);
+        let invocation = crate::service::InvocationId([0x62; 32]);
         let expected_bytes = bytes.clone();
         let expected_reference = reference.clone();
         let sink = thread::spawn(move || {
-            let upload: V2PrivateIngressUpload = sidecar_rx.recv().unwrap();
+            let upload: PrivateIngressUpload = sidecar_rx.recv().unwrap();
             assert_eq!(upload.invocation, invocation);
             assert_eq!(upload.reference, expected_reference);
             assert_eq!(upload.bytes, expected_bytes);
-            assert!(begin_v2_private_ingress_upload(&upload));
+            assert!(begin_service_private_ingress_upload(&upload));
             upload.reply.send(true).unwrap();
         });
         assert!(service.store_private_ingress(
@@ -18985,19 +19236,19 @@ mod tests {
     fn timed_out_private_ingress_never_crosses_the_durable_boundary_later() {
         let (tx, rx) = mpsc::sync_channel(1);
         let bytes = b"cancel before persistence".to_vec();
-        let reference = crate::v2::BlobRefV2::of_bytes(&bytes);
-        assert!(!stage_v2_private_ingress_through_root(
+        let reference = crate::service::BlobRef::of_bytes(&bytes);
+        assert!(!stage_service_private_ingress_through_root(
             &tx,
-            crate::v2::InvocationId([0x71; 32]),
+            crate::service::InvocationId([0x71; 32]),
             reference,
             bytes,
             Duration::from_millis(1),
         ));
         let upload = rx.recv().unwrap();
-        assert!(!begin_v2_private_ingress_upload(&upload));
+        assert!(!begin_service_private_ingress_upload(&upload));
         assert_eq!(
             *upload.state.lock().unwrap(),
-            V2PrivateIngressUploadState::Cancelled,
+            PrivateIngressUploadState::Cancelled,
         );
     }
 
@@ -19093,14 +19344,14 @@ mod tests {
         let replication_id = [0x72; 32];
         let (sidecar_tx, _sidecar_rx) = mpsc::sync_channel(1);
         let (quiescence_tx, quiescence_rx) = mpsc::sync_channel(1);
-        let route = Arc::new(V2PrivateIngressRoute {
+        let route = Arc::new(PrivateIngressRoute {
             tx: sidecar_tx,
             quiescence_tx,
-            barrier: V2PrivateIngressBarrier::new(),
+            barrier: PrivateIngressBarrier::new(),
             production_trust_policy: None,
         });
         service
-            .v2_private_ingress_routes
+            .service_private_ingress_routes
             .write()
             .unwrap()
             .insert(replication_id, route.clone());
@@ -19315,14 +19566,14 @@ mod tests {
         let replication_id = [0x73; 32];
         let (sidecar_tx, _sidecar_rx) = mpsc::sync_channel(1);
         let (quiescence_tx, quiescence_rx) = mpsc::sync_channel(1);
-        let route = Arc::new(V2PrivateIngressRoute {
+        let route = Arc::new(PrivateIngressRoute {
             tx: sidecar_tx,
             quiescence_tx,
-            barrier: V2PrivateIngressBarrier::new(),
+            barrier: PrivateIngressBarrier::new(),
             production_trust_policy: None,
         });
         service
-            .v2_private_ingress_routes
+            .service_private_ingress_routes
             .write()
             .unwrap()
             .insert(replication_id, route.clone());
@@ -19519,7 +19770,7 @@ mod tests {
             )));
         });
         assert!(
-            authenticated_v2_crdt_replica_peer(
+            authenticated_service_crdt_replica_peer(
                 &routes,
                 &attacker.to_bytes(),
                 Duration::from_secs(1),
@@ -19662,7 +19913,10 @@ mod tests {
             let request = target_rx.recv().expect("delegated request reaches root");
             assert_eq!(request.space_role, None);
             assert_eq!(request.actor_local_role, None);
-            assert_eq!(request.delegated_origin, Some(crate::v2::Origin::System));
+            assert_eq!(
+                request.delegated_origin,
+                Some(crate::service::Origin::System)
+            );
             let _ = request.reply.send(encode_invoke_envelope(
                 STATUS_DONE,
                 &[],
@@ -19679,23 +19933,23 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(RwLock::new(HashMap::new())),
         );
-        service.v2_actor_routes.write().unwrap().insert(
-            crate::v2::ActorId([0xA5; 32]),
-            V2ActorRoute {
+        service.service_actor_routes.write().unwrap().insert(
+            crate::service::ActorId([0xA5; 32]),
+            ActorRoute {
                 route: target.0,
-                service: crate::v2::ServiceIdentityV2 {
-                    space: crate::v2::SpaceId([0xA6; 32]),
-                    root_service: crate::v2::RootServiceId([0xA7; 32]),
-                    deployment: crate::v2::DeploymentId([0xA8; 32]),
-                    service_program: crate::v2::VOS_SERVICE_PROGRAM_ID,
-                    service_abi: crate::v2::ABI_VERSION,
-                    execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID,
-                    gas_schedule: crate::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
+                service: crate::service::ServiceIdentity {
+                    space: crate::service::SpaceId([0xA6; 32]),
+                    root_service: crate::service::RootServiceId([0xA7; 32]),
+                    deployment: crate::service::DeploymentId([0xA8; 32]),
+                    service_program: crate::service::VOS_SERVICE_PROGRAM_ID,
+                    service_abi: crate::service::ABI_VERSION,
+                    execution_semantics: crate::service::EXECUTION_SEMANTICS_ID,
+                    gas_schedule: crate::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
                 },
-                consistency: crate::v2::ConsistencyModeV2::Raft,
+                consistency: crate::service::ConsistencyMode::Raft,
                 replication_id: Some(replication_id),
                 is_role_authority: false,
-                invoke_timeout: v2_raft_invoke_timeout(5_000),
+                invoke_timeout: service_raft_invoke_timeout(5_000),
                 authenticated_peer: None,
             },
         );
@@ -19716,8 +19970,13 @@ mod tests {
 
         let mut ingress = vec![TAG_DYNAMIC];
         ingress.extend_from_slice(&Msg::new("start").encode());
-        let delegated =
-            encode_v2_raft_delegation(crate::v2::Origin::System, true, false, false, &ingress);
+        let delegated = encode_service_raft_delegation(
+            crate::service::Origin::System,
+            true,
+            false,
+            false,
+            &ingress,
+        );
         let reply = service.dispatch_invoke(Some(voter), 0, target.0, Vec::new(), delegated);
         assert!(!reply.is_empty());
         assert_eq!(
@@ -20001,7 +20260,7 @@ mod tests {
     #[cfg(feature = "network")]
     fn redeem_invite_expiry_is_checked_at_admission_boundary() {
         use crate::actors::codec::Encode;
-        use crate::v2::V2Wire;
+        use crate::service::ServiceWire;
         use crate::value::{Msg, TAG_DYNAMIC};
         let before = Msg::new("redeem_invite").with("expires_at", 101u64);
         let boundary = Msg::new("redeem_invite").with("expires_at", 100u64);
@@ -20015,8 +20274,8 @@ mod tests {
         );
         assert!(!redeem_invite_is_expired(&Msg::new("programs"), Some(100)));
 
-        let redemption = crate::v2::RoleAuthorityInviteRedemptionV2 {
-            space: crate::v2::SpaceId([1; 32]),
+        let redemption = crate::service::RoleAuthorityInviteRedemption {
+            space: crate::service::SpaceId([1; 32]),
             authority_replication_id: [10; 32],
             token_pub: [2; 32],
             role: crate::SpaceRole::Member,
@@ -20029,14 +20288,14 @@ mod tests {
         };
         let mut arguments = vec![TAG_DYNAMIC];
         arguments.extend_from_slice(
-            &Msg::new(crate::v2::ROLE_AUTHORITY_INVITE_METHOD_V2)
+            &Msg::new(crate::service::ROLE_AUTHORITY_INVITE_METHOD_)
                 .with("redemption", redemption.encode())
                 .encode(),
         );
-        let invocation = crate::v2::RootTreeInvocationV2 {
-            invocation: crate::v2::InvocationId([8; 32]),
-            target: crate::v2::ActorId([9; 32]),
-            method: crate::v2::ROLE_AUTHORITY_INVITE_METHOD_V2.into(),
+        let invocation = crate::service::RootTreeInvocation {
+            invocation: crate::service::InvocationId([8; 32]),
+            target: crate::service::ActorId([9; 32]),
+            method: crate::service::ROLE_AUTHORITY_INVITE_METHOD_.into(),
             arguments,
             proof_requested: false,
         };
@@ -20056,7 +20315,7 @@ mod tests {
     ) -> NodeService {
         NodeService {
             invoke_routes: routes,
-            v2_actor_routes: Arc::new(RwLock::new(HashMap::new())),
+            service_actor_routes: Arc::new(RwLock::new(HashMap::new())),
             agent_names: Arc::new(std::sync::RwLock::new(HashMap::new())),
             agent_shutdown: shutdown,
             agent_info: info,
@@ -20065,7 +20324,7 @@ mod tests {
             #[cfg(feature = "storage")]
             raft_hosts: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "storage")]
-            v2_private_ingress_routes: Arc::new(RwLock::new(HashMap::new())),
+            service_private_ingress_routes: Arc::new(RwLock::new(HashMap::new())),
             shared_network: Arc::new(Mutex::new(None)),
             manifest: Arc::new(OnceLock::new()),
             proof_blobs: Arc::new(RwLock::new(HashMap::new())),
@@ -20343,7 +20602,7 @@ mod tests {
 
         let workspace = env!("CARGO_MANIFEST_DIR");
         let elf_path = format!(
-            "{workspace}/../tests/fixtures/legacy-v1/actors/probe/target/riscv64em-vos/release/probe.elf"
+            "{workspace}/../vos/tests/fixtures/probe/target/riscv64em-vos/release/probe.elf"
         );
         let Ok(elf) = std::fs::read(&elf_path) else {
             eprintln!("SKIP: probe ELF not built — run: just build-pvm");

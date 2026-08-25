@@ -269,7 +269,7 @@ pub fn invite_signed_bytes(
     }
 }
 
-/// Total ordering shared by the registry and canonical v2 authority for the
+/// Total ordering shared by the registry and canonical service authority for the
 /// single grant retained per subject.
 ///
 /// Root evidence dominates delegated evidence regardless of epoch. Otherwise
@@ -1592,34 +1592,13 @@ impl RegistryRef {
         peer_id: Vec<u8>,
         role: u8,
         epoch: u64,
-        auth: Vec<u8>,
-    ) -> Result<Status, ClientError> {
-        decode_rkyv(
-            self.call(
-                inv,
-                Msg::new("grant_role")
-                    .with("peer_id", peer_id)
-                    .with("role", role)
-                    .with("epoch", epoch)
-                    .with("auth", auth),
-            )
-            .await?,
-        )
-    }
-
-    pub async fn grant_role_v2<I: Invoker>(
-        &self,
-        inv: &mut I,
-        peer_id: Vec<u8>,
-        role: u8,
-        epoch: u64,
         authority_replication_id: Vec<u8>,
         auth: Vec<u8>,
     ) -> Result<Status, ClientError> {
         decode_rkyv(
             self.call(
                 inv,
-                Msg::new("grant_role_v2")
+                Msg::new("grant_role")
                     .with("peer_id", peer_id)
                     .with("role", role)
                     .with("epoch", epoch)
@@ -1635,32 +1614,13 @@ impl RegistryRef {
         inv: &mut I,
         peer_id: Vec<u8>,
         epoch: u64,
-        auth: Vec<u8>,
-    ) -> Result<Status, ClientError> {
-        decode_rkyv(
-            self.call(
-                inv,
-                Msg::new("revoke_role")
-                    .with("peer_id", peer_id)
-                    .with("epoch", epoch)
-                    .with("auth", auth),
-            )
-            .await?,
-        )
-    }
-
-    pub async fn revoke_role_v2<I: Invoker>(
-        &self,
-        inv: &mut I,
-        peer_id: Vec<u8>,
-        epoch: u64,
         authority_replication_id: Vec<u8>,
         auth: Vec<u8>,
     ) -> Result<Status, ClientError> {
         decode_rkyv(
             self.call(
                 inv,
-                Msg::new("revoke_role_v2")
+                Msg::new("revoke_role")
                     .with("peer_id", peer_id)
                     .with("epoch", epoch)
                     .with("authority_replication_id", authority_replication_id)

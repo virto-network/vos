@@ -39,7 +39,7 @@ const META_SNAP_TERM: &str = "snap_last_term";
 /// bootstraps so a restart never falls back to a stale static
 /// member seed.
 const META_ACTIVE_CONFIG: &str = "active_config";
-const ACTIVE_CONFIG_V2_MAGIC: &[u8; 4] = b"VAC2";
+const ACTIVE_CONFIG_MAGIC: &[u8; 4] = b"VAC2";
 
 /// One Raft log entry. Index is 1-based and contiguous.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -600,14 +600,14 @@ pub fn write_active_config_in_txn(
     joint_old: Option<&[u16]>,
 ) -> Result<(), CommitError> {
     let mut buf = Vec::with_capacity(
-        ACTIVE_CONFIG_V2_MAGIC.len()
+        ACTIVE_CONFIG_MAGIC.len()
             + 8
             + 1
             + joint_old.map_or(0, |j| 2 + 2 * j.len())
             + 2
             + 2 * current.len(),
     );
-    buf.extend_from_slice(ACTIVE_CONFIG_V2_MAGIC);
+    buf.extend_from_slice(ACTIVE_CONFIG_MAGIC);
     buf.extend_from_slice(&log_index.unwrap_or(u64::MAX).to_le_bytes());
     buf.push(joint_old.is_some() as u8);
     if let Some(prev) = joint_old {
@@ -636,7 +636,7 @@ pub fn load_active_config(
         return Ok(None);
     };
     let bytes = row.value();
-    let (log_index, mut pos) = if bytes.starts_with(ACTIVE_CONFIG_V2_MAGIC) {
+    let (log_index, mut pos) = if bytes.starts_with(ACTIVE_CONFIG_MAGIC) {
         let index = bytes
             .get(4..12)
             .ok_or_else(|| CommitError::Config("active_config row: truncated index".into()))?;

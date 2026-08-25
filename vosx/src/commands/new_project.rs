@@ -1,4 +1,4 @@
-//! `vosx new` v2 actor scaffolding.
+//! `vosx new` service actor scaffolding.
 
 use std::path::PathBuf;
 

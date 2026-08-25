@@ -18,7 +18,7 @@ use vos::registry::{RegistryRef, Status};
 use crate::blob_store::{self, BlobHash};
 use crate::commands::space::common::{
     consistency_from_u8, derive_hyperspace_id, instance_service_id, registry_replication_id,
-    v2_root_actor_id, v2_root_service_id,
+    service_root_actor_id, service_root_service_id,
 };
 use crate::commands::space::{payload_codec, reconcile, subscriptions};
 use crate::spaces_index;
@@ -32,15 +32,15 @@ pub struct Args {
     pub connect: Vec<String>,
     pub service_pvm: Option<PathBuf>,
     pub production_trust_socket: Option<PathBuf>,
-    pub allow_v2_conformance: bool,
+    pub allow_conformance: bool,
 }
 
 #[derive(Clone)]
-struct PinnedV2Service {
+struct PinnedService {
     pvm: std::sync::Arc<Vec<u8>>,
 }
 
-fn load_pinned_v2_service(path: Option<&Path>) -> anyhow::Result<Option<PinnedV2Service>> {
+fn load_pinned_service_service(path: Option<&Path>) -> anyhow::Result<Option<PinnedService>> {
     let Some(path) = path else {
         return Ok(None);
     };
@@ -48,61 +48,61 @@ fn load_pinned_v2_service(path: Option<&Path>) -> anyhow::Result<Option<PinnedV2
         .map_err(|error| anyhow::anyhow!("read pinned service PVM {}: {error}", path.display()))?;
     vos_pvm::program::parse_blob(&pvm)
         .ok_or_else(|| anyhow::anyhow!("{} is not a canonical JAR PVM", path.display()))?;
-    let actual = vos::v2::ProgramId::of_pvm(&pvm);
-    if actual != vos::v2::VOS_SERVICE_PROGRAM_ID {
+    let actual = vos::service::ProgramId::of_pvm(&pvm);
+    if actual != vos::service::VOS_SERVICE_PROGRAM_ID {
         anyhow::bail!(
             "{} has service ProgramId {}, expected the protocol-pinned {}",
             path.display(),
             hex::encode(actual.0),
-            hex::encode(vos::v2::VOS_SERVICE_PROGRAM_ID.0),
+            hex::encode(vos::service::VOS_SERVICE_PROGRAM_ID.0),
         );
     }
-    vos::v2::ServicePvmV2::new(pvm.clone(), vos::v2::VOS_SERVICE_PROGRAM_ID)
+    vos::service::ServicePvm::new(pvm.clone(), vos::service::VOS_SERVICE_PROGRAM_ID)
         .map_err(|error| anyhow::anyhow!("invalid generic service PVM: {error}"))?;
-    Ok(Some(PinnedV2Service {
+    Ok(Some(PinnedService {
         pvm: std::sync::Arc::new(pvm),
     }))
 }
 
-fn validate_v2_trust_mode(
+fn validate_service_trust_mode(
     has_service_pvm: bool,
     has_production_trust: bool,
     allow_conformance: bool,
 ) -> anyhow::Result<()> {
     if has_production_trust && allow_conformance {
         anyhow::bail!(
-            "choose exactly one v2 trust profile: --production-trust-socket or \
-             --allow-v2-conformance",
+            "choose exactly one service trust profile: --production-trust-socket or \
+             --allow-conformance",
         );
     }
     if !has_service_pvm && (has_production_trust || allow_conformance) {
-        anyhow::bail!("a v2 trust profile requires --service-pvm <exact-vos-service.pvm>",);
+        anyhow::bail!("a service trust profile requires --service-pvm <exact-vos-service.pvm>",);
     }
     if has_service_pvm && !has_production_trust && !allow_conformance {
         anyhow::bail!(
             "--service-pvm requires --production-trust-socket <socket>; use \
-             --allow-v2-conformance only for development and protocol tests",
+             --allow-conformance only for development and protocol tests",
         );
     }
     Ok(())
 }
 
-fn role_authority_package_version(actor_program: vos::v2::ProgramId) -> String {
+fn role_authority_package_version(actor_program: vos::service::ProgramId) -> String {
     format!(
-        "v2-service-{}-actor-{}",
-        hex::encode(vos::v2::VOS_SERVICE_PROGRAM_ID.0),
+        "service-{}-actor-{}",
+        hex::encode(vos::service::VOS_SERVICE_PROGRAM_ID.0),
         hex::encode(actor_program.0),
     )
 }
 
 /// Construct the frozen authority package contents for the current service
 /// ABI. The signature wrapper is intentionally supplied separately: it is not
-/// part of [`vos::v2::DeploymentId`]. The actor PVM is stable across releases,
+/// part of [`vos::service::DeploymentId`]. The actor PVM is stable across releases,
 /// while the package, deployment, and derived replication identities are
 /// deliberately ABI-scoped because the manifest binds the service program,
 /// ABI, and execution semantics.
-fn frozen_role_authority_package(public_key: Vec<u8>) -> anyhow::Result<vos::v2::VosPackageV2> {
-    use vos::v2::{V2Wire, artifact_hash};
+fn frozen_role_authority_package(public_key: Vec<u8>) -> anyhow::Result<vos::service::VosPackage> {
+    use vos::service::{ServiceWire, artifact_hash};
 
     let actor_pvm = crate::bundled::space_authority_pvm()
         .ok_or_else(|| anyhow::anyhow!("vosx was built without the canonical space-authority PVM"))?
@@ -114,22 +114,22 @@ fn frozen_role_authority_package(public_key: Vec<u8>) -> anyhow::Result<vos::v2:
     let schemas = schemas[..schemas_len].to_vec();
     let metadata = vos::metadata::decode(&schemas)
         .ok_or_else(|| anyhow::anyhow!("canonical space-authority metadata is invalid"))?;
-    let role_policies = vos::v2::PackageRolePoliciesV2::from_metadata(&metadata)?.encode();
-    let actor_program = vos::v2::ProgramId::of_pvm(&actor_pvm);
-    Ok(vos::v2::VosPackageV2 {
-        manifest: vos::v2::PackageManifestV2 {
-            name: vos::v2::ROLE_AUTHORITY_INSTANCE_V2.into(),
+    let role_policies = vos::service::PackageRolePolicies::from_metadata(&metadata)?.encode();
+    let actor_program = vos::service::ProgramId::of_pvm(&actor_pvm);
+    Ok(vos::service::VosPackage {
+        manifest: vos::service::PackageManifest {
+            name: vos::service::ROLE_AUTHORITY_INSTANCE_.into(),
             version: role_authority_package_version(actor_program),
-            service_abi: vos::v2::ABI_VERSION,
-            snapshot_version: vos::v2::SNAPSHOT_VERSION,
-            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
-            service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+            service_abi: vos::service::ABI_VERSION,
+            snapshot_version: vos::service::SNAPSHOT_VERSION,
+            execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
+            service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
             actor_program,
             crdt: false,
             interfaces_hash: artifact_hash(b"interfaces", &[]),
             role_policies_hash: artifact_hash(b"role-policies", &role_policies),
             schemas_hash: artifact_hash(b"schemas", &schemas),
-            task_dependencies_hash: vos::v2::task_dependencies_hash(&[]),
+            task_dependencies_hash: vos::service::task_dependencies_hash(&[]),
         },
         actor_pvm,
         generated_interfaces: vec![],
@@ -137,15 +137,15 @@ fn frozen_role_authority_package(public_key: Vec<u8>) -> anyhow::Result<vos::v2:
         schemas,
         task_dependencies: vec![],
         diagnostics: None,
-        deployment_signature: vos::v2::DeploymentSignatureV2 {
-            producer: vos::v2::ProducerId::of_public_key(&public_key),
+        deployment_signature: vos::service::DeploymentSignature {
+            producer: vos::service::ProducerId::of_public_key(&public_key),
             public_key,
             signature: vec![0],
         },
     })
 }
 
-fn frozen_role_authority_deployment() -> anyhow::Result<vos::v2::DeploymentId> {
+fn frozen_role_authority_deployment() -> anyhow::Result<vos::service::DeploymentId> {
     Ok(frozen_role_authority_package(Vec::new())?.deployment_id())
 }
 
@@ -154,7 +154,7 @@ fn frozen_role_authority_deployment() -> anyhow::Result<vos::v2::DeploymentId> {
 /// the signed package from the registry and never author substitutes.
 fn root_signed_role_authority_package(
     root: &libp2p::identity::Keypair,
-) -> anyhow::Result<vos::v2::VosPackageV2> {
+) -> anyhow::Result<vos::service::VosPackage> {
     let mut package = frozen_role_authority_package(root.public().encode_protobuf())?;
     package.deployment_signature.signature = root
         .sign(&package.signing_message())
@@ -166,17 +166,17 @@ fn root_signed_role_authority_package(
 /// On the immutable-root node, publish and install the canonical authority
 /// before application roots are resolved. Joiners wait for those signed
 /// registry rows rather than constructing another deployment.
-fn ensure_v2_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::Result<()> {
+fn ensure_service_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::Result<()> {
     use crate::commands::space::common::auto_replication_id;
-    use vos::v2::V2Wire;
+    use vos::service::ServiceWire;
 
     let reg = RegistryRef::at(ServiceId::REGISTRY);
     let root_peer = vos::block_on(reg.root(&mut &*node))
-        .map_err(|error| anyhow::anyhow!("query space root for v2 authority: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("query space root for service authority: {error}"))?;
     let operator_peer = node.operator_peer().map(<[u8]>::to_vec);
     if root_peer.is_empty() || operator_peer.as_deref() != Some(root_peer.as_slice()) {
         tracing::info!(
-            "v2 role authority is not installed locally; waiting for the space root's signed catalog rows"
+            "service role authority is not installed locally; waiting for the space root's signed catalog rows"
         );
         return Ok(());
     }
@@ -190,7 +190,7 @@ fn ensure_v2_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::Resul
         .map_err(|error| anyhow::anyhow!("cache canonical space-authority package: {error}"))?;
     let replication_id = auto_replication_id(
         &space_id,
-        vos::v2::ROLE_AUTHORITY_INSTANCE_V2,
+        vos::service::ROLE_AUTHORITY_INSTANCE_,
         &package_hash.0,
     );
     let cutover = vos::block_on(reg.role_authority_cutover(&mut &*node))
@@ -221,8 +221,8 @@ fn ensure_v2_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::Resul
         );
     }
 
-    if vos::block_on(reg.agent(&mut &*node, vos::v2::ROLE_AUTHORITY_INSTANCE_V2.into()))
-        .map_err(|error| anyhow::anyhow!("query v2 role authority: {error}"))?
+    if vos::block_on(reg.agent(&mut &*node, vos::service::ROLE_AUTHORITY_INSTANCE_.into()))
+        .map_err(|error| anyhow::anyhow!("query service role authority: {error}"))?
         .is_some()
     {
         return Ok(());
@@ -254,7 +254,7 @@ fn ensure_v2_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::Resul
     }
     let status = vos::block_on(reg.install(
         &mut &*node,
-        vos::v2::ROLE_AUTHORITY_INSTANCE_V2.into(),
+        vos::service::ROLE_AUTHORITY_INSTANCE_.into(),
         program_name,
         program_version,
         package_hash.0.to_vec(),
@@ -272,37 +272,39 @@ fn ensure_v2_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::Resul
     }
     tracing::info!(
         deployment = %hex::encode(package.deployment_id().0),
-        "installed root-signed canonical v2 role authority"
+        "installed root-signed canonical service role authority"
     );
     Ok(())
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    // Validate and open the requested v2 execution profile before resolving
+    // Validate and open the requested service execution profile before resolving
     // the trivalent target. Target resolution may scaffold a recipe space,
     // create its node identity, or persist an invite bearer, so an invalid
     // trust selection must fail before any of those durable mutations.
-    validate_v2_trust_mode(
+    validate_service_trust_mode(
         args.service_pvm.is_some(),
         args.production_trust_socket.is_some(),
-        args.allow_v2_conformance,
+        args.allow_conformance,
     )?;
-    let pinned_v2_service = load_pinned_v2_service(args.service_pvm.as_deref())?;
+    let pinned_service_service = load_pinned_service_service(args.service_pvm.as_deref())?;
     let production_trust = args
         .production_trust_socket
         .as_deref()
-        .map(super::production_trust::SocketProductionTrustV2::open)
+        .map(super::production_trust::SocketProductionTrust::open)
         .transpose()
         .map_err(|error| anyhow::anyhow!("open production trust authority: {error}"))?
-        .map(|trust| std::sync::Arc::new(trust) as std::sync::Arc<dyn vos::v2::ProductionTrustV2>);
+        .map(|trust| {
+            std::sync::Arc::new(trust) as std::sync::Arc<dyn vos::service::ProductionTrust>
+        });
     if let Some(trust) = production_trust.as_ref() {
         tracing::info!(
             policy = %hex::encode(trust.policy_id().0),
-            "v2 roots use the fail-closed production trust profile",
+            "service roots use the fail-closed production trust profile",
         );
-    } else if pinned_v2_service.is_some() {
+    } else if pinned_service_service.is_some() {
         tracing::warn!(
-            "signed v2 roots use the conformance-only trust seam; this mode is not production-safe",
+            "signed service roots use the conformance-only trust seam; this mode is not production-safe",
         );
     }
 
@@ -542,9 +544,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let agent_policies = agent_policies_from_local(&local_cfg)?;
     let device_secret_agents = device_secret_agents_from_local(&local_cfg);
     // Shared across bootstrap and runtime reconciliation. Bootstrap opens at
-    // most one v2 root synchronously; remaining rows inherit the same global
+    // most one service root synchronously; remaining rows inherit the same global
     // window/backoff and are opened only after the endpoint is published.
-    let mut v2_registration_backoff = V2RegistrationBackoff::default();
+    let mut service_registration_backoff = RegistrationBackoff::default();
 
     // Register node-local `.so` extensions from `local.toml`, returning
     // each one's effective relay caps for the endpoint descriptor
@@ -552,8 +554,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let extension_caps =
         register_extensions_from_local(&mut node, &local_cfg, &data_dir, local_prefix)?;
 
-    if pinned_v2_service.is_some() {
-        ensure_v2_role_authority(&node, space_id)?;
+    if pinned_service_service.is_some() {
+        ensure_service_role_authority(&node, space_id)?;
     }
 
     // Spawn every installed agent recorded in the registry.
@@ -566,9 +568,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         local_prefix,
         hyperspace.is_some(),
         &agent_policies,
-        pinned_v2_service.as_ref(),
+        pinned_service_service.as_ref(),
         production_trust.clone(),
-        &mut v2_registration_backoff,
+        &mut service_registration_backoff,
     )?;
 
     // Provision device-local secret seeds for agents that declared
@@ -602,7 +604,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             );
         }
         tracing::warn!(
-            "--once opens at most one v2 root during bootstrap; any additional v2 roots require \
+            "--once opens at most one service root during bootstrap; any additional service roots require \
              a long-running `space up {}` reconciliation pass",
             entry.name,
         );
@@ -703,11 +705,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 has_hyperspace,
                 &local_cfg,
                 &mut damped,
-                &mut v2_registration_backoff,
+                &mut service_registration_backoff,
                 &mut boot_grace,
                 &in_flight,
                 &agent_policies,
-                pinned_v2_service.as_ref(),
+                pinned_service_service.as_ref(),
                 production_trust.clone(),
             ) {
                 Ok(()) => query_warned = false,
@@ -1019,20 +1021,20 @@ fn authority_invite_redemption(
     holder_peer_id: Vec<u8>,
     redeem_signature: [u8; vos::registry::OP_SIG_LEN],
     holder_signature: Vec<u8>,
-) -> anyhow::Result<vos::v2::RoleAuthorityInviteRedemptionV2> {
+) -> anyhow::Result<vos::service::RoleAuthorityInviteRedemption> {
     let authority_replication_id = payload.authority_replication_id;
     if authority_replication_id == [0; 32] {
-        anyhow::bail!("invite is not bound to a canonical v2 role authority");
+        anyhow::bail!("invite is not bound to a canonical service role authority");
     }
     let role = match vos::SpaceRole::from_u8(payload.role) {
         Some(role @ (vos::SpaceRole::Member | vos::SpaceRole::Developer)) => role,
-        _ => anyhow::bail!("invite role {} is not canonical v2", payload.role),
+        _ => anyhow::bail!("invite role {} is not canonical service", payload.role),
     };
     let holder_signature = holder_signature
         .try_into()
         .map_err(|_| anyhow::anyhow!("node invite signature is not Ed25519"))?;
-    Ok(vos::v2::RoleAuthorityInviteRedemptionV2 {
-        space: vos::v2::SpaceId(payload.space_id),
+    Ok(vos::service::RoleAuthorityInviteRedemption {
+        space: vos::service::SpaceId(payload.space_id),
         authority_replication_id,
         token_pub: payload.token_pub,
         role,
@@ -1047,34 +1049,34 @@ fn authority_invite_redemption(
 
 #[cfg(test)]
 fn authority_invite_invocation(
-    redemption: &vos::v2::RoleAuthorityInviteRedemptionV2,
+    redemption: &vos::service::RoleAuthorityInviteRedemption,
     peer_prefix: u16,
-) -> (ServiceId, vos::v2::RootTreeInvocationV2) {
+) -> (ServiceId, vos::service::RootTreeInvocation) {
     use vos::Encode;
-    use vos::v2::V2Wire;
+    use vos::service::ServiceWire;
 
-    let root_service = v2_root_service_id(
+    let root_service = service_root_service_id(
         redemption.space,
-        vos::v2::ROLE_AUTHORITY_INSTANCE_V2,
+        vos::service::ROLE_AUTHORITY_INSTANCE_,
         redemption.authority_replication_id,
     );
-    let target = v2_root_actor_id(root_service, vos::v2::ROLE_AUTHORITY_INSTANCE_V2);
+    let target = service_root_actor_id(root_service, vos::service::ROLE_AUTHORITY_INSTANCE_);
     let redemption = redemption.encode();
     let mut arguments = vec![vos::value::TAG_DYNAMIC];
     arguments.extend_from_slice(
-        &vos::value::Msg::new(vos::v2::ROLE_AUTHORITY_INVITE_METHOD_V2)
+        &vos::value::Msg::new(vos::service::ROLE_AUTHORITY_INVITE_METHOD_)
             .with("redemption", redemption.clone())
             .encode(),
     );
     (
-        instance_service_id(vos::v2::ROLE_AUTHORITY_INSTANCE_V2, peer_prefix),
-        vos::v2::RootTreeInvocationV2 {
-            invocation: vos::v2::InvocationId::derive(
-                b"vos/invite-authority-redemption/v2",
+        instance_service_id(vos::service::ROLE_AUTHORITY_INSTANCE_, peer_prefix),
+        vos::service::RootTreeInvocation {
+            invocation: vos::service::InvocationId::derive(
+                b"vos/invite-authority-redemption/service",
                 &redemption,
             ),
             target,
-            method: vos::v2::ROLE_AUTHORITY_INVITE_METHOD_V2.into(),
+            method: vos::service::ROLE_AUTHORITY_INVITE_METHOD_.into(),
             arguments,
             proof_requested: false,
         },
@@ -1459,9 +1461,9 @@ fn spawn_installed_agents(
     local_prefix: u16,
     has_hyperspace: bool,
     policies: &AgentPolicies,
-    pinned_v2_service: Option<&PinnedV2Service>,
-    production_trust: Option<std::sync::Arc<dyn vos::v2::ProductionTrustV2>>,
-    v2_registration_backoff: &mut V2RegistrationBackoff,
+    pinned_service_service: Option<&PinnedService>,
+    production_trust: Option<std::sync::Arc<dyn vos::service::ProductionTrust>>,
+    service_registration_backoff: &mut RegistrationBackoff,
 ) -> anyhow::Result<std::collections::HashSet<String>> {
     use std::collections::HashSet;
     use vos::registry::{RegistryRef, Status};
@@ -1485,7 +1487,7 @@ fn spawn_installed_agents(
     // even for skipped agents (subscriptions filter, missing
     // blob, …) so we don't accidentally trash their state.
     let mut live_svc_ids: HashSet<u32> = HashSet::new();
-    let mut live_v2_services: HashSet<[u8; 32]> = HashSet::new();
+    let mut live_service_services: HashSet<[u8; 32]> = HashSet::new();
     let mut legacy_agents = HashSet::new();
     live_svc_ids.insert(ServiceId::REGISTRY.0);
     if has_hyperspace {
@@ -1498,9 +1500,9 @@ fn spawn_installed_agents(
     for a in agents.iter() {
         let svc_id = instance_service_id(&a.instance_name, local_prefix);
         live_svc_ids.insert(svc_id.0);
-        live_v2_services.insert(
-            v2_root_service_id(
-                vos::v2::SpaceId(space_id),
+        live_service_services.insert(
+            service_root_service_id(
+                vos::service::SpaceId(space_id),
                 &a.instance_name,
                 a.replication_id,
             )
@@ -1516,14 +1518,14 @@ fn spawn_installed_agents(
     // requires membership are narrowed out on a non-member. The runtime
     // reconciler re-evaluates each pass, so a row spawns if a grant lands later.
     let is_member = node_is_member(node, &reg, local_prefix);
-    let mut v2_registration_attempts = 0usize;
+    let mut service_registration_attempts = 0usize;
     let mut spawn_rows = agents.iter().collect::<Vec<_>>();
     spawn_rows.sort_by_key(|row| {
-        (row.instance_name != vos::v2::ROLE_AUTHORITY_INSTANCE_V2)
+        (row.instance_name != vos::service::ROLE_AUTHORITY_INSTANCE_)
             .then_some(row.instance_name.as_str())
     });
     for a in spawn_rows {
-        let is_role_authority = a.instance_name == vos::v2::ROLE_AUTHORITY_INSTANCE_V2;
+        let is_role_authority = a.instance_name == vos::service::ROLE_AUTHORITY_INSTANCE_;
         if !is_role_authority && !local_cfg.should_spawn(&a.instance_name) {
             tracing::debug!("skipping '{}' (not subscribed)", a.instance_name);
             continue;
@@ -1546,7 +1548,7 @@ fn spawn_installed_agents(
             a,
             &agents,
             policies,
-            pinned_v2_service,
+            pinned_service_service,
             &root_peer_id,
         ) {
             Ok(prepared) => prepared,
@@ -1558,8 +1560,8 @@ fn spawn_installed_agents(
                 continue;
             }
         };
-        let supports_raft = matches!(&prepared, RowConfig::Ready(_) | RowConfig::V2 { .. });
-        let is_v2 = matches!(&prepared, RowConfig::V2 { .. });
+        let supports_raft = matches!(&prepared, RowConfig::Ready(_) | RowConfig::Service { .. });
+        let is = matches!(&prepared, RowConfig::Service { .. });
         if matches!(&prepared, RowConfig::Ready(_)) {
             legacy_agents.insert(a.instance_name.clone());
         }
@@ -1581,7 +1583,7 @@ fn spawn_installed_agents(
                     leader,
                     known,
                     voter_peer_ids,
-                }) if !is_v2 => {
+                }) if !is => {
                     let Some(network) = node.network() else {
                         tracing::info!(
                             "agent '{}' (raft) deferred: no network attached",
@@ -1634,26 +1636,26 @@ fn spawn_installed_agents(
                     crate::commands::space::common::consistency_name(a.consistency),
                 );
             }
-            RowConfig::V2 {
+            RowConfig::Service {
                 config,
                 state_path,
                 network_reachable,
             } => {
                 let registration_key = (a.instance_name.clone(), a.program_hash);
-                if !take_v2_registration_attempt(
-                    &mut v2_registration_attempts,
-                    v2_registration_backoff,
+                if !take_service_registration_attempt(
+                    &mut service_registration_attempts,
+                    service_registration_backoff,
                     &registration_key,
                     std::time::Instant::now(),
                 ) {
                     tracing::debug!(
-                        "v2 root tree '{}' deferred until post-publication reconciliation",
+                        "service root tree '{}' deferred until post-publication reconciliation",
                         a.instance_name,
                     );
                     continue;
                 }
                 let svc_id = instance_service_id(&a.instance_name, local_prefix);
-                match register_v2_root_from_row(
+                match register_service_root_from_row(
                     node,
                     data_dir,
                     a.instance_name.clone(),
@@ -1667,23 +1669,23 @@ fn spawn_installed_agents(
                     production_trust.clone(),
                 ) {
                     Ok(id) => {
-                        v2_registration_backoff
+                        service_registration_backoff
                             .success(&registration_key, std::time::Instant::now());
                         tracing::info!(
-                            "v2 root tree '{}' as {id} ({})",
+                            "service root tree '{}' as {id} ({})",
                             a.instance_name,
                             crate::commands::space::common::consistency_name(a.consistency),
                         );
                     }
                     Err(error) => {
-                        let retryable = is_retryable_v2_registration_error(&error);
-                        v2_registration_backoff.finish(
+                        let retryable = is_retryable_service_registration_error(&error);
+                        service_registration_backoff.finish(
                             registration_key,
                             retryable,
                             std::time::Instant::now(),
                         );
                         tracing::warn!(
-                            "skipping agent '{}' — v2 route failed to register: {error}",
+                            "skipping agent '{}' — service route failed to register: {error}",
                             a.instance_name,
                         );
                     }
@@ -1706,9 +1708,9 @@ fn spawn_installed_agents(
                     a.consistency,
                 );
             }
-            RowConfig::UnsupportedV2Package(reason) => {
+            RowConfig::UnsupportedPackage(reason) => {
                 tracing::warn!(
-                    "skipping agent '{}' — unsupported v2 package: {reason}",
+                    "skipping agent '{}' — unsupported service package: {reason}",
                     a.instance_name,
                 );
             }
@@ -1745,7 +1747,7 @@ fn spawn_installed_agents(
     // a future `--undo` (or just an `ls`) can recover the bytes
     // instead of finding orphans.
     sweep_orphan_redbs(data_dir, &live_svc_ids);
-    sweep_orphan_v2_services(data_dir, &live_v2_services);
+    sweep_orphan_service_services(data_dir, &live_service_services);
 
     Ok(legacy_agents)
 }
@@ -1868,8 +1870,8 @@ const CHRONOS_FEED_EVERY: std::time::Duration = std::time::Duration::from_secs(1
 /// [`AgentConfig`].
 enum RowConfig {
     Ready(Box<AgentConfig>),
-    V2 {
-        config: Box<vos::v2::LocalRootTreeConfigV2>,
+    Service {
+        config: Box<vos::service::LocalRootTreeConfig>,
         state_path: PathBuf,
         network_reachable: bool,
     },
@@ -1882,16 +1884,16 @@ enum RowConfig {
     Deferred(String),
     /// Unrecognized consistency discriminant.
     BadConsistency,
-    /// The artifact is a signed v2 package, but this daemon cannot safely host
+    /// The artifact is a signed service package, but this daemon cannot safely host
     /// that particular row. Keep it installed and skip it without preventing
     /// the rest of the space from booting.
-    UnsupportedV2Package(String),
+    UnsupportedPackage(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RowCatalogSupport {
     LegacyHost,
-    V2Package,
+    ServicePackage,
 }
 
 /// Inspect the content-addressed artifact before any Raft membership action.
@@ -1899,28 +1901,28 @@ enum RowCatalogSupport {
 /// This deliberately does not parse/transpile legacy artifacts: that remains
 /// after Raft admission so deferred rows do not pay the expensive work every
 /// reconciliation pass. Recognizing the package magic is sufficient to keep
-/// unsupported v2 rows out of the legacy membership protocol.
+/// unsupported service rows out of the legacy membership protocol.
 fn catalog_artifact_support(artifact: &[u8]) -> RowCatalogSupport {
     if artifact.get(..4) == Some(b"VOSP") {
-        RowCatalogSupport::V2Package
+        RowCatalogSupport::ServicePackage
     } else {
         RowCatalogSupport::LegacyHost
     }
 }
 
 enum RoleAuthorityResolution {
-    Ready(vos::v2::RoleAuthorityBindingV2),
+    Ready(vos::service::RoleAuthorityBinding),
     MissingBlob,
     MissingAgent,
 }
 
-fn validate_exact_v2_package(
+fn validate_exact_service_package(
     exact_package: &[u8],
     instance_name: &str,
-) -> anyhow::Result<vos::v2::VosPackageV2> {
-    use vos::v2::V2Wire;
+) -> anyhow::Result<vos::service::VosPackage> {
+    use vos::service::ServiceWire;
 
-    let package = vos::v2::VosPackageV2::decode(exact_package)
+    let package = vos::service::VosPackage::decode(exact_package)
         .map_err(|error| anyhow::anyhow!("decode {instance_name} package: {error}"))?;
     package
         .validate()
@@ -1928,7 +1930,7 @@ fn validate_exact_v2_package(
     if package.encode() != exact_package {
         anyhow::bail!("{instance_name} package wire is not canonical");
     }
-    vos::v2::validate_actor_program_layout(&package.actor_pvm).map_err(|error| {
+    vos::service::validate_actor_program_layout(&package.actor_pvm).map_err(|error| {
         anyhow::anyhow!("{instance_name} actor PVM capability layout is invalid: {error}")
     })?;
     let public_key =
@@ -1943,35 +1945,35 @@ fn validate_exact_v2_package(
     Ok(package)
 }
 
-fn package_requires_role_authority(package: &vos::v2::VosPackageV2) -> anyhow::Result<bool> {
-    use vos::v2::V2Wire;
+fn package_requires_role_authority(package: &vos::service::VosPackage) -> anyhow::Result<bool> {
+    use vos::service::ServiceWire;
 
-    let policies = vos::v2::PackageRolePoliciesV2::decode(&package.role_policies)
+    let policies = vos::service::PackageRolePolicies::decode(&package.role_policies)
         .map_err(|error| anyhow::anyhow!("decode generated role policies: {error}"))?;
     Ok(policies.methods.iter().any(|method| !method.public))
 }
 
 pub(super) fn validate_role_authority_deployment(
-    package: &vos::v2::VosPackageV2,
+    package: &vos::service::VosPackage,
     root_peer_id: &[u8],
     consistency: Consistency,
 ) -> anyhow::Result<()> {
-    use vos::v2::V2Wire;
+    use vos::service::ServiceWire;
 
     package
         .validate()
         .map_err(|error| anyhow::anyhow!("validate space-authority package: {error}"))?;
-    vos::v2::validate_actor_program_layout(&package.actor_pvm).map_err(|error| {
+    vos::service::validate_actor_program_layout(&package.actor_pvm).map_err(|error| {
         anyhow::anyhow!("space-authority actor PVM capability layout is invalid: {error}")
     })?;
     if consistency != Consistency::Raft {
         anyhow::bail!(
             "{} must use Raft consistency",
-            vos::v2::ROLE_AUTHORITY_INSTANCE_V2
+            vos::service::ROLE_AUTHORITY_INSTANCE_
         );
     }
     let frozen = frozen_role_authority_package(Vec::new())?;
-    if package.manifest.name != vos::v2::ROLE_AUTHORITY_INSTANCE_V2 {
+    if package.manifest.name != vos::service::ROLE_AUTHORITY_INSTANCE_ {
         anyhow::bail!("installed space-authority has the wrong package name");
     }
     // Authority upgrades may replace code, version, and the resulting actor
@@ -1999,7 +2001,7 @@ pub(super) fn validate_role_authority_deployment(
     ) {
         anyhow::bail!("space-authority deployment signature is invalid");
     }
-    let policies = vos::v2::PackageRolePoliciesV2::decode(&package.role_policies)
+    let policies = vos::service::PackageRolePolicies::decode(&package.role_policies)
         .map_err(|error| anyhow::anyhow!("decode space-authority policies: {error}"))?;
     let mut methods = policies
         .methods
@@ -2009,10 +2011,14 @@ pub(super) fn validate_role_authority_deployment(
     methods.sort_unstable();
     if methods
         != vec![
-            (vos::v2::ROLE_AUTHORITY_DECISION_METHOD_V2, true, false),
-            (vos::v2::ROLE_AUTHORITY_MUTATION_METHOD_V2, true, false),
-            (vos::v2::ROLE_AUTHORITY_INVITE_METHOD_V2, true, false),
-            (vos::v2::ROLE_AUTHORITY_INVITE_REVOKE_METHOD_V2, true, false),
+            (vos::service::ROLE_AUTHORITY_DECISION_METHOD_, true, false),
+            (vos::service::ROLE_AUTHORITY_MUTATION_METHOD_, true, false),
+            (vos::service::ROLE_AUTHORITY_INVITE_METHOD_, true, false),
+            (
+                vos::service::ROLE_AUTHORITY_INVITE_REVOKE_METHOD_,
+                true,
+                false,
+            ),
         ]
     {
         anyhow::bail!("space-authority package exposes a non-canonical method policy surface");
@@ -2020,17 +2026,17 @@ pub(super) fn validate_role_authority_deployment(
     Ok(())
 }
 
-fn resolve_v2_role_authority(
+fn resolve_service_role_authority(
     space_id: [u8; 32],
     installed_agents: &[vos::registry::AgentRow],
     root_peer_id: &[u8],
 ) -> anyhow::Result<RoleAuthorityResolution> {
-    resolve_v2_role_authority_with(space_id, installed_agents, root_peer_id, |program_hash| {
+    resolve_service_role_authority_with(space_id, installed_agents, root_peer_id, |program_hash| {
         blob_store::cache_get(&BlobHash(program_hash)).map_err(Into::into)
     })
 }
 
-fn resolve_v2_role_authority_with(
+fn resolve_service_role_authority_with(
     space_id: [u8; 32],
     installed_agents: &[vos::registry::AgentRow],
     root_peer_id: &[u8],
@@ -2038,7 +2044,7 @@ fn resolve_v2_role_authority_with(
 ) -> anyhow::Result<RoleAuthorityResolution> {
     let Some(row) = installed_agents
         .iter()
-        .find(|row| row.instance_name == vos::v2::ROLE_AUTHORITY_INSTANCE_V2)
+        .find(|row| row.instance_name == vos::service::ROLE_AUTHORITY_INSTANCE_)
     else {
         return Ok(RoleAuthorityResolution::MissingAgent);
     };
@@ -2051,36 +2057,37 @@ fn resolve_v2_role_authority_with(
     let Some(exact_package) = load_package(row.program_hash)? else {
         return Ok(RoleAuthorityResolution::MissingBlob);
     };
-    if catalog_artifact_support(&exact_package) != RowCatalogSupport::V2Package {
-        anyhow::bail!("space-authority does not reference a signed v2 package");
+    if catalog_artifact_support(&exact_package) != RowCatalogSupport::ServicePackage {
+        anyhow::bail!("space-authority does not reference a signed service package");
     }
-    let package = validate_exact_v2_package(&exact_package, vos::v2::ROLE_AUTHORITY_INSTANCE_V2)?;
+    let package =
+        validate_exact_service_package(&exact_package, vos::service::ROLE_AUTHORITY_INSTANCE_)?;
     if package.manifest.name != row.program_name || package.manifest.version != row.program_version
     {
         anyhow::bail!("space-authority catalog row does not name its exact signed package");
     }
     validate_role_authority_deployment(&package, root_peer_id, consistency)?;
-    let space = vos::v2::SpaceId(space_id);
-    let root_service = v2_root_service_id(
+    let space = vos::service::SpaceId(space_id);
+    let root_service = service_root_service_id(
         space,
-        vos::v2::ROLE_AUTHORITY_INSTANCE_V2,
+        vos::service::ROLE_AUTHORITY_INSTANCE_,
         row.replication_id,
     );
     Ok(RoleAuthorityResolution::Ready(
-        vos::v2::RoleAuthorityBindingV2 {
-            service: vos::v2::ServiceIdentityV2 {
+        vos::service::RoleAuthorityBinding {
+            service: vos::service::ServiceIdentity {
                 space,
                 root_service,
                 // Actor upgrades preserve the authority service account's
                 // genesis identity. Dependent roots bind that stable service
                 // identity, not the catalog's current actor deployment.
                 deployment: frozen_role_authority_deployment()?,
-                service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
-                service_abi: vos::v2::ABI_VERSION,
-                execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
-                gas_schedule: vos::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
+                service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
+                service_abi: vos::service::ABI_VERSION,
+                execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
+                gas_schedule: vos::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
             },
-            actor: v2_root_actor_id(root_service, vos::v2::ROLE_AUTHORITY_INSTANCE_V2),
+            actor: service_root_actor_id(root_service, vos::service::ROLE_AUTHORITY_INSTANCE_),
         },
     ))
 }
@@ -2096,7 +2103,7 @@ fn agent_config_from_row(
     a: &vos::registry::AgentRow,
     installed_agents: &[vos::registry::AgentRow],
     policies: &AgentPolicies,
-    pinned_v2_service: Option<&PinnedV2Service>,
+    pinned_service_service: Option<&PinnedService>,
     root_peer_id: &[u8],
 ) -> anyhow::Result<RowConfig> {
     let Some(consistency) = consistency_from_u8(a.consistency) else {
@@ -2105,14 +2112,14 @@ fn agent_config_from_row(
     let program_hash = BlobHash(a.program_hash);
     let artifact = match blob_store::cache_get(&program_hash)? {
         Some(b) => b,
-        None => match recover_v2_catalog_artifact(data_dir, space_id, a, consistency)? {
+        None => match recover_service_catalog_artifact(data_dir, space_id, a, consistency)? {
             Some(bytes) => bytes,
             None => return Ok(RowConfig::MissingBlob),
         },
     };
-    if catalog_artifact_support(&artifact) == RowCatalogSupport::V2Package {
+    if catalog_artifact_support(&artifact) == RowCatalogSupport::ServicePackage {
         return Ok(
-            match v2_config_from_row(
+            match service_config_from_row(
                 data_dir,
                 space_id,
                 a,
@@ -2120,11 +2127,11 @@ fn agent_config_from_row(
                 policies,
                 consistency,
                 artifact,
-                pinned_v2_service,
+                pinned_service_service,
                 root_peer_id,
             ) {
                 Ok(config) => config,
-                Err(error) => RowConfig::UnsupportedV2Package(error.to_string()),
+                Err(error) => RowConfig::UnsupportedPackage(error.to_string()),
             },
         );
     }
@@ -2193,36 +2200,36 @@ fn agent_config_from_row(
 /// it from the committed log or installed snapshot before its worker starts.
 /// Upgrade availability is ordered before the registry CAS, so recovery never
 /// depends on the initiating operator remaining online.
-fn recover_v2_catalog_artifact(
+fn recover_service_catalog_artifact(
     data_dir: &Path,
     space_id: [u8; 32],
     row: &vos::registry::AgentRow,
     consistency: Consistency,
 ) -> anyhow::Result<Option<Vec<u8>>> {
-    use vos::v2::V2Wire;
+    use vos::service::ServiceWire;
 
-    let root_service = v2_root_service_id(
-        vos::v2::SpaceId(space_id),
+    let root_service = service_root_service_id(
+        vos::service::SpaceId(space_id),
         &row.instance_name,
         row.replication_id,
     );
     let image_path = data_dir
-        .join("v2-services")
+        .join("services")
         .join(format!("{}.image", hex::encode(root_service.0)));
     let image = match std::fs::read(&image_path) {
         Ok(image) => Some(image),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             return Err(anyhow::anyhow!(
-                "read v2 service image {} while recovering catalog artifact: {error}",
+                "read service service image {} while recovering catalog artifact: {error}",
                 image_path.display(),
             ));
         }
     };
     let mut artifact = if let Some(image) = image {
-        let snapshot = vos::v2::LocalJamStoreSnapshotV2::decode(&image).map_err(|error| {
+        let snapshot = vos::service::LocalJamStoreSnapshot::decode(&image).map_err(|error| {
             anyhow::anyhow!(
-                "decode v2 service image {} while recovering catalog artifact: {error}",
+                "decode service service image {} while recovering catalog artifact: {error}",
                 image_path.display(),
             )
         })?;
@@ -2236,28 +2243,29 @@ fn recover_v2_catalog_artifact(
         None
     };
     if artifact.is_none() && consistency == Consistency::Raft {
-        let raft_path = v2_raft_db_path(data_dir, root_service);
-        artifact = vos::raft::v2::recover_catalog_package_artifact(&raft_path, row.program_hash)
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "recover v2 package from durable Raft storage {}: {error}",
-                    raft_path.display(),
-                )
-            })?;
+        let raft_path = service_raft_db_path(data_dir, root_service);
+        artifact =
+            vos::raft::service::recover_catalog_package_artifact(&raft_path, row.program_hash)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "recover service package from durable Raft storage {}: {error}",
+                        raft_path.display(),
+                    )
+                })?;
     }
     let Some(artifact) = artifact else {
         return Ok(None);
     };
-    validate_exact_v2_package(&artifact, &row.instance_name)?;
+    validate_exact_service_package(&artifact, &row.instance_name)?;
     let cached = blob_store::cache_put(&artifact)
-        .map_err(|error| anyhow::anyhow!("cache recovered v2 package: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("cache recovered service package: {error}"))?;
     if cached.0 != row.program_hash {
-        anyhow::bail!("recovered v2 package changed content address while caching");
+        anyhow::bail!("recovered service package changed content address while caching");
     }
     Ok(Some(artifact))
 }
 
-fn v2_config_from_row(
+fn service_config_from_row(
     data_dir: &Path,
     space_id: [u8; 32],
     row: &vos::registry::AgentRow,
@@ -2265,15 +2273,15 @@ fn v2_config_from_row(
     policies: &AgentPolicies,
     consistency: Consistency,
     exact_package: Vec<u8>,
-    pinned: Option<&PinnedV2Service>,
+    pinned: Option<&PinnedService>,
     root_peer_id: &[u8],
 ) -> anyhow::Result<RowConfig> {
     let pinned = pinned.ok_or_else(|| {
         anyhow::anyhow!(
-            "signed v2 package requires `space up --service-pvm <exact-vos-service.pvm>`"
+            "signed service package requires `space up --service-pvm <exact-vos-service.pvm>`"
         )
     })?;
-    let package = validate_exact_v2_package(&exact_package, &row.instance_name)?;
+    let package = validate_exact_service_package(&exact_package, &row.instance_name)?;
     match (package.manifest.crdt, consistency) {
         (false, Consistency::Local | Consistency::Raft) => {}
         (false, Consistency::Crdt) => anyhow::bail!(
@@ -2284,7 +2292,7 @@ fn v2_config_from_row(
             anyhow::bail!("#[actor(crdt)] package must use CRDT consistency")
         }
         (_, Consistency::Ephemeral) => anyhow::bail!(
-            "v2 ephemeral hosting is not enabled; install the package with local consistency"
+            "service ephemeral hosting is not enabled; install the package with local consistency"
         ),
         (true, Consistency::Local) => anyhow::bail!(
             "#[actor(crdt)] package must use CRDT consistency, whose daemon driver is not attached yet"
@@ -2292,26 +2300,26 @@ fn v2_config_from_row(
     }
     if !row.install_args.is_empty() || !row.install_payloads.is_empty() {
         anyhow::bail!(
-            "legacy install args/on_start payloads are unsupported; initialize v2 actors through explicit invocations"
+            "legacy install args/on_start payloads are unsupported; initialize service actors through explicit invocations"
         );
     }
     if policies
         .get(&row.instance_name)
         .is_some_and(|policy| policy.tick_ms.is_some() || !policy.intra_caps.is_empty())
     {
-        anyhow::bail!("legacy tick/intra_caps policy is unsupported for v2 root services");
+        anyhow::bail!("legacy tick/intra_caps policy is unsupported for service root services");
     }
 
-    let space = vos::v2::SpaceId(space_id);
-    let root_service = v2_root_service_id(space, &row.instance_name, row.replication_id);
-    let root_actor = v2_root_actor_id(root_service, &row.instance_name);
+    let space = vos::service::SpaceId(space_id);
+    let root_service = service_root_service_id(space, &row.instance_name, row.replication_id);
+    let root_actor = service_root_actor_id(root_service, &row.instance_name);
     let deployment = package.deployment_id();
-    let is_role_authority = row.instance_name == vos::v2::ROLE_AUTHORITY_INSTANCE_V2;
+    let is_role_authority = row.instance_name == vos::service::ROLE_AUTHORITY_INSTANCE_;
     let role_authority = if is_role_authority {
         validate_role_authority_deployment(&package, root_peer_id, consistency)?;
         None
     } else if package_requires_role_authority(&package)? {
-        match resolve_v2_role_authority(space_id, installed_agents, root_peer_id)? {
+        match resolve_service_role_authority(space_id, installed_agents, root_peer_id)? {
             RoleAuthorityResolution::Ready(binding) => Some(binding),
             RoleAuthorityResolution::MissingBlob => return Ok(RowConfig::MissingBlob),
             RoleAuthorityResolution::MissingAgent => {
@@ -2334,53 +2342,53 @@ fn v2_config_from_row(
         Vec::new()
     };
     let state_path = data_dir
-        .join("v2-services")
+        .join("services")
         .join(format!("{}.image", hex::encode(root_service.0)));
     let device_secret_requested = policies
         .get(&row.instance_name)
         .is_some_and(|policy| policy.device_secret);
     if consistency == Consistency::Crdt && device_secret_requested {
-        anyhow::bail!("v2 CRDT roots do not support host-private device signing");
+        anyhow::bail!("service CRDT roots do not support host-private device signing");
     }
     let device_secret = device_secret_requested
-        .then(|| load_or_mint_v2_device_seed(data_dir, root_service))
+        .then(|| load_or_mint_service_device_seed(data_dir, root_service))
         .transpose()?
-        .map(vos::v2::DeviceSecretV2::new);
+        .map(vos::service::DeviceSecret::new);
     if let Some(secret) = device_secret.as_ref() {
         tracing::info!(
             actor = %row.instance_name,
             public_key = %hex::encode(secret.public_key()),
-            "configured host-private v2 device signer",
+            "configured host-private service device signer",
         );
     }
     let install_authenticator = package.deployment_signature.signature.clone();
-    let config = vos::v2::LocalRootTreeConfigV2 {
+    let config = vos::service::LocalRootTreeConfig {
         role_authority,
         service_pvm: pinned.pvm.as_ref().clone(),
         package,
-        service: vos::v2::ServiceIdentityV2 {
+        service: vos::service::ServiceIdentity {
             space,
             root_service,
             deployment,
-            service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
-            service_abi: vos::v2::ABI_VERSION,
-            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
-            gas_schedule: vos::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
+            service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
+            service_abi: vos::service::ABI_VERSION,
+            execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
+            gas_schedule: vos::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
         },
         root_actor,
         actor_name: row.instance_name.clone(),
         consistency: match consistency {
-            Consistency::Local => vos::v2::ConsistencyModeV2::Local,
-            Consistency::Raft => vos::v2::ConsistencyModeV2::Raft,
-            Consistency::Crdt => vos::v2::ConsistencyModeV2::Crdt,
-            _ => unreachable!("v2 consistency was validated above"),
+            Consistency::Local => vos::service::ConsistencyMode::Local,
+            Consistency::Raft => vos::service::ConsistencyMode::Raft,
+            Consistency::Crdt => vos::service::ConsistencyMode::Crdt,
+            _ => unreachable!("service consistency was validated above"),
         },
         initial_state,
         external_actors: Vec::new(),
-        install_authorization: vos::v2::AuthorizationEvidenceV2::SystemCapability {
-            capability: vos::v2::SystemCapabilityId(
-                vos::v2::Hash::digest(
-                    b"vos/space-install-capability/v2",
+        install_authorization: vos::service::AuthorizationEvidence::SystemCapability {
+            capability: vos::service::SystemCapabilityId(
+                vos::service::Hash::digest(
+                    b"vos/space-install-capability/service",
                     &[&space_id, &deployment.0],
                 )
                 .0,
@@ -2395,22 +2403,22 @@ fn v2_config_from_row(
         .validate()
         .map_err(|error| anyhow::anyhow!("invalid root-service configuration: {error:?}"))?;
 
-    Ok(RowConfig::V2 {
+    Ok(RowConfig::Service {
         config: Box::new(config),
         state_path,
         network_reachable: row.network_reachable,
     })
 }
 
-/// Load the host-private signer seed for one v2 root. Unlike the legacy
+/// Load the host-private signer seed for one service root. Unlike the legacy
 /// messenger seed this is never sent as an actor message: Refine exposes only
 /// signatures through `DEVICE_SIGN`. Raft operators must provision the same
 /// 32-byte file on every voter before allowing leadership transfer.
-fn load_or_mint_v2_device_seed(
+fn load_or_mint_service_device_seed(
     data_dir: &Path,
-    root_service: vos::v2::RootServiceId,
+    root_service: vos::service::RootServiceId,
 ) -> anyhow::Result<[u8; 32]> {
-    let dir = data_dir.join("v2-services");
+    let dir = data_dir.join("services");
     let dir_existed = dir.is_dir();
     std::fs::create_dir_all(&dir)?;
     if !dir_existed {
@@ -2418,29 +2426,29 @@ fn load_or_mint_v2_device_seed(
     }
     let path = dir.join(format!("{}.device-seed", hex::encode(root_service.0)));
     remove_stale_secret_temp(&path)?;
-    if let Some(seed) = read_v2_device_seed(&path)? {
+    if let Some(seed) = read_service_device_seed(&path)? {
         return Ok(seed);
     }
 
     let mut seed = [0u8; 32];
     getrandom::getrandom(&mut seed)
-        .map_err(|e| anyhow::anyhow!("OS entropy for v2 device seed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("OS entropy for service device seed: {e}"))?;
     create_secret_file_atomically(&path, &seed)?;
-    let persisted = read_v2_device_seed(&path)?.ok_or_else(|| {
+    let persisted = read_service_device_seed(&path)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "atomically created v2 device seed {} is not readable",
+            "atomically created service device seed {} is not readable",
             path.display()
         )
     })?;
     if persisted != seed {
         anyhow::bail!(
-            "atomically created v2 device seed {} changed before activation",
+            "atomically created service device seed {} changed before activation",
             path.display()
         );
     }
     tracing::warn!(
         ?path,
-        "minted a v2 device seed; copy this exact 0600 file to every Raft voter before failover"
+        "minted a service device seed; copy this exact 0600 file to every Raft voter before failover"
     );
     Ok(seed)
 }
@@ -2450,7 +2458,7 @@ fn secret_temp_path(path: &Path) -> anyhow::Result<std::path::PathBuf> {
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("secret path {} has no file name", path.display()))?
         .to_os_string();
-    name.push(".v2-next");
+    name.push(".next");
     Ok(path.with_file_name(name))
 }
 
@@ -2460,7 +2468,7 @@ fn remove_stale_secret_temp(path: &Path) -> anyhow::Result<()> {
     let temp = secret_temp_path(path)?;
     match std::fs::symlink_metadata(&temp) {
         Ok(metadata) if metadata.file_type().is_dir() => anyhow::bail!(
-            "v2 device seed temporary path {} is a directory",
+            "service device seed temporary path {} is a directory",
             temp.display()
         ),
         Ok(_) => {
@@ -2477,7 +2485,7 @@ fn remove_stale_secret_temp(path: &Path) -> anyhow::Result<()> {
 
 /// Open one existing signer seed without following links or blocking on a
 /// special file, then validate the metadata of the opened object itself.
-fn read_v2_device_seed(path: &Path) -> anyhow::Result<Option<[u8; 32]>> {
+fn read_service_device_seed(path: &Path) -> anyhow::Result<Option<[u8; 32]>> {
     use std::io::Read;
 
     let mut options = std::fs::OpenOptions::new();
@@ -2492,14 +2500,17 @@ fn read_v2_device_seed(path: &Path) -> anyhow::Result<Option<[u8; 32]>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(anyhow::anyhow!(
-                "cannot securely open v2 device seed {}: {error}",
+                "cannot securely open service device seed {}: {error}",
                 path.display()
             ));
         }
     };
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
-        anyhow::bail!("v2 device seed {} must be a regular file", path.display());
+        anyhow::bail!(
+            "service device seed {} must be a regular file",
+            path.display()
+        );
     }
     #[cfg(unix)]
     {
@@ -2507,14 +2518,14 @@ fn read_v2_device_seed(path: &Path) -> anyhow::Result<Option<[u8; 32]>> {
         let mode = metadata.permissions().mode() & 0o777;
         if mode != 0o600 {
             anyhow::bail!(
-                "v2 device seed {} must have mode 0600, found {mode:04o}",
+                "service device seed {} must have mode 0600, found {mode:04o}",
                 path.display()
             );
         }
     }
     if metadata.len() != 32 {
         anyhow::bail!(
-            "v2 device seed {} must contain exactly 32 bytes",
+            "service device seed {} must contain exactly 32 bytes",
             path.display()
         );
     }
@@ -2564,7 +2575,7 @@ fn create_secret_file_atomically(path: &Path, bytes: &[u8; 32]) -> anyhow::Resul
     if let Err(error) = activated {
         let _ = std::fs::remove_file(&temp);
         return Err(anyhow::anyhow!(
-            "cannot atomically activate v2 device seed {}: {error}",
+            "cannot atomically activate service device seed {}: {error}",
             path.display()
         ));
     }
@@ -2583,125 +2594,125 @@ fn sync_directory(path: &Path) -> anyhow::Result<()> {
 }
 
 #[derive(Debug)]
-struct RetryableV2RootRegistration(String);
+struct RetryableRootRegistration(String);
 
-impl core::fmt::Display for RetryableV2RootRegistration {
+impl core::fmt::Display for RetryableRootRegistration {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl std::error::Error for RetryableV2RootRegistration {}
+impl std::error::Error for RetryableRootRegistration {}
 
-fn is_retryable_v2_registration_error(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<RetryableV2RootRegistration>()
-        .is_some()
+fn is_retryable_service_registration_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RetryableRootRegistration>().is_some()
 }
 
-fn v2_registration_error(message: String, retryable: bool) -> anyhow::Error {
+fn service_registration_error(message: String, retryable: bool) -> anyhow::Error {
     if retryable {
-        anyhow::Error::new(RetryableV2RootRegistration(message))
+        anyhow::Error::new(RetryableRootRegistration(message))
     } else {
         anyhow::anyhow!(message)
     }
 }
 
-fn retryable_production_dispatch(error: &vos::v2::ServiceDispatchError) -> bool {
+fn retryable_production_dispatch(error: &vos::service::ServiceDispatchError) -> bool {
     matches!(
         error,
-        vos::v2::ServiceDispatchError::Pvm(
-            vos::v2::ServicePvmErrorV2::AccumulateHostRejected(_)
-                | vos::v2::ServicePvmErrorV2::KernelResourceUnavailable
-                | vos::v2::ServicePvmErrorV2::AccumulateCommitRejected
+        vos::service::ServiceDispatchError::Pvm(
+            vos::service::ServicePvmError::AccumulateHostRejected(_)
+                | vos::service::ServicePvmError::KernelResourceUnavailable
+                | vos::service::ServicePvmError::AccumulateCommitRejected
         )
     )
 }
 
-fn retryable_replicated_open_error<E>(error: &vos::v2::ReplicatedServiceErrorV2<E>) -> bool {
+fn retryable_replicated_open_error<E>(error: &vos::service::ReplicatedServiceError<E>) -> bool {
     matches!(
         error,
-        vos::v2::ReplicatedServiceErrorV2::Dispatch(error)
+        vos::service::ReplicatedServiceError::Dispatch(error)
             if retryable_production_dispatch(error)
     ) || matches!(
         error,
-        vos::v2::ReplicatedServiceErrorV2::ProofUnavailable
-            | vos::v2::ReplicatedServiceErrorV2::ReceiptUnavailable
+        vos::service::ReplicatedServiceError::ProofUnavailable
+            | vos::service::ReplicatedServiceError::ReceiptUnavailable
     )
 }
 
-fn retryable_production_open_error<E>(error: &vos::v2::LocalRootTreeOpenErrorV2<E>) -> bool {
+fn retryable_production_open_error<E>(error: &vos::service::LocalRootTreeOpenError<E>) -> bool {
     match error {
-        vos::v2::LocalRootTreeOpenErrorV2::Service(error) => retryable_production_dispatch(error),
-        vos::v2::LocalRootTreeOpenErrorV2::Replication(error) => {
+        vos::service::LocalRootTreeOpenError::Service(error) => {
+            retryable_production_dispatch(error)
+        }
+        vos::service::LocalRootTreeOpenError::Replication(error) => {
             retryable_replicated_open_error(error)
         }
         // Production history validation deliberately folds verifier denial
         // and unavailability into this fail-closed error. Retrying is safe and
         // lets a recovered authority complete the validation; a truly absent
         // artifact remains damped without being mistaken for bad config.
-        vos::v2::LocalRootTreeOpenErrorV2::ProofHistoryUnavailable => true,
+        vos::service::LocalRootTreeOpenError::ProofHistoryUnavailable => true,
         _ => false,
     }
 }
 
-fn retryable_production_invoke_error(error: &vos::v2::LocalRootTreeInvokeErrorV2) -> bool {
+fn retryable_production_invoke_error(error: &vos::service::LocalRootTreeInvokeError) -> bool {
     match error {
-        vos::v2::LocalRootTreeInvokeErrorV2::Service(error) => retryable_production_dispatch(error),
-        vos::v2::LocalRootTreeInvokeErrorV2::Replication(error) => {
+        vos::service::LocalRootTreeInvokeError::Service(error) => {
+            retryable_production_dispatch(error)
+        }
+        vos::service::LocalRootTreeInvokeError::Replication(error) => {
             retryable_replicated_open_error(error)
         }
-        vos::v2::LocalRootTreeInvokeErrorV2::ProofUnavailable => true,
+        vos::service::LocalRootTreeInvokeError::ProofUnavailable => true,
         _ => false,
     }
 }
 
-fn retryable_v2_node_registration_error(error: &vos::node::V2NodeRegistrationError) -> bool {
+fn retryable_service_node_registration_error(error: &vos::node::NodeRegistrationError) -> bool {
     matches!(
         error,
-        vos::node::V2NodeRegistrationError::LogicalTimeslotUnavailable
-            | vos::node::V2NodeRegistrationError::LogicalTimeslotRegressed
+        vos::node::NodeRegistrationError::LogicalTimeslotUnavailable
+            | vos::node::NodeRegistrationError::LogicalTimeslotRegressed
     )
 }
 
 fn retryable_production_raft_registration_error(
-    error: &vos::node::V2RaftNodeRegistrationError<std::io::Error>,
+    error: &vos::node::RaftNodeRegistrationError<std::io::Error>,
 ) -> bool {
     match error {
-        vos::node::V2RaftNodeRegistrationError::Open(error) => {
-            retryable_production_open_error(error)
-        }
-        vos::node::V2RaftNodeRegistrationError::CatchUp(error) => {
+        vos::node::RaftNodeRegistrationError::Open(error) => retryable_production_open_error(error),
+        vos::node::RaftNodeRegistrationError::CatchUp(error) => {
             retryable_production_invoke_error(error)
         }
-        vos::node::V2RaftNodeRegistrationError::Registration(error) => {
-            retryable_v2_node_registration_error(error)
+        vos::node::RaftNodeRegistrationError::Registration(error) => {
+            retryable_service_node_registration_error(error)
         }
         _ => false,
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn register_v2_root_from_row(
+fn register_service_root_from_row(
     node: &mut VosNode,
     data_dir: &Path,
     instance_name: String,
     replication_id: [u8; 32],
-    config: vos::v2::LocalRootTreeConfigV2,
+    config: vos::service::LocalRootTreeConfig,
     state_path: PathBuf,
     raft_seed: Option<RaftSeed>,
     local_prefix: u16,
     svc_id: ServiceId,
     network_reachable: bool,
-    production_trust: Option<std::sync::Arc<dyn vos::v2::ProductionTrustV2>>,
+    production_trust: Option<std::sync::Arc<dyn vos::service::ProductionTrust>>,
 ) -> anyhow::Result<ServiceId> {
     let production = production_trust.is_some();
-    let backend = vos::v2::FileCommittedImageStoreV2::new(state_path);
-    if config.consistency == vos::v2::ConsistencyModeV2::Raft {
+    let backend = vos::service::FileCommittedImageStore::new(state_path);
+    if config.consistency == vos::service::ConsistencyMode::Raft {
         let seed = raft_seed.ok_or_else(|| {
-            anyhow::anyhow!("v2 Raft root tree '{instance_name}' has no resolved voter set")
+            anyhow::anyhow!("service Raft root tree '{instance_name}' has no resolved voter set")
         })?;
-        let raft_path = v2_raft_db_path(data_dir, config.service.root_service);
+        let raft_path = service_raft_db_path(data_dir, config.service.root_service);
         if let Some(parent) = raft_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -2722,7 +2733,7 @@ fn register_v2_root_from_row(
                 voter_peer_ids,
             } => match production_trust {
                 Some(trust) => node
-                    .register_v2_raft_root_at_id_production(
+                    .register_service_raft_root_at_id_production(
                         instance_name,
                         config,
                         backend,
@@ -2734,13 +2745,13 @@ fn register_v2_root_from_row(
                     )
                     .map_err(|error| {
                         let retryable = retryable_production_raft_registration_error(&error);
-                        v2_registration_error(
-                            format!("register production v2 Raft root tree: {error}"),
+                        service_registration_error(
+                            format!("register production service Raft root tree: {error}"),
                             retryable,
                         )
                     }),
                 None => node
-                    .register_v2_raft_root_at_id(
+                    .register_service_raft_root_at_id(
                         instance_name,
                         config,
                         backend,
@@ -2749,22 +2760,22 @@ fn register_v2_root_from_row(
                         svc_id,
                         network_reachable,
                     )
-                    .map_err(|error| anyhow::anyhow!("register v2 Raft root tree: {error}")),
+                    .map_err(|error| anyhow::anyhow!("register service Raft root tree: {error}")),
             },
             RaftSeed::Join {
                 leader,
                 known,
                 voter_peer_ids,
             } => {
-                let network = node
-                    .network()
-                    .ok_or_else(|| anyhow::anyhow!("v2 Raft join requires an attached network"))?;
+                let network = node.network().ok_or_else(|| {
+                    anyhow::anyhow!("service Raft join requires an attached network")
+                })?;
                 let promotion_name = instance_name.clone();
                 let promotion_voter_peer_ids = voter_peer_ids.clone();
                 let raft_config = make_config(known.clone(), voter_peer_ids);
                 match production_trust {
                     Some(trust) => node
-                        .register_v2_raft_root_at_id_after_local_attach_production(
+                        .register_service_raft_root_at_id_after_local_attach_production(
                             instance_name,
                             config,
                             backend,
@@ -2774,7 +2785,7 @@ fn register_v2_root_from_row(
                             network_reachable,
                             trust,
                             move |worker, shutdown, policy| {
-                                promote_prepared_v2_raft_root(
+                                promote_prepared_service_raft_root(
                                     &network,
                                     &promotion_name,
                                     replication_id,
@@ -2790,13 +2801,13 @@ fn register_v2_root_from_row(
                         )
                         .map_err(|error| {
                             let retryable = retryable_production_raft_registration_error(&error);
-                            v2_registration_error(
-                                format!("register production v2 Raft root tree: {error}"),
+                            service_registration_error(
+                                format!("register production service Raft root tree: {error}"),
                                 retryable,
                             )
                         }),
                     None => node
-                        .register_v2_raft_root_at_id_after_local_attach(
+                        .register_service_raft_root_at_id_after_local_attach(
                             instance_name,
                             config,
                             backend,
@@ -2805,7 +2816,7 @@ fn register_v2_root_from_row(
                             svc_id,
                             network_reachable,
                             move |worker, shutdown| {
-                                promote_prepared_v2_raft_root(
+                                promote_prepared_service_raft_root(
                                     &network,
                                     &promotion_name,
                                     replication_id,
@@ -2819,36 +2830,39 @@ fn register_v2_root_from_row(
                                 )
                             },
                         )
-                        .map_err(|error| anyhow::anyhow!("register v2 Raft root tree: {error}")),
+                        .map_err(|error| {
+                            anyhow::anyhow!("register service Raft root tree: {error}")
+                        }),
                 }
             }
             RaftSeed::Defer(reason) => Err(anyhow::anyhow!(
-                "v2 Raft root tree '{instance_name}' remains deferred: {reason}"
+                "service Raft root tree '{instance_name}' remains deferred: {reason}"
             )),
         };
     }
 
     let service = match production_trust {
         Some(trust) => {
-            match vos::v2::LocalRootTreeServiceV2::open_production(config, backend, trust) {
+            match vos::service::LocalRootTreeService::open_production(config, backend, trust) {
                 Ok(service) => service,
                 Err(error) => {
                     let retryable = retryable_production_open_error(&error);
-                    return Err(v2_registration_error(
-                        format!("open production v2 root tree '{instance_name}': {error:?}"),
+                    return Err(service_registration_error(
+                        format!("open production service root tree '{instance_name}': {error:?}"),
                         retryable,
                     ));
                 }
             }
         }
-        None => vos::v2::LocalRootTreeServiceV2::open(config, backend)
-            .map_err(|error| anyhow::anyhow!("open v2 root tree '{instance_name}': {error:?}"))?,
+        None => vos::service::LocalRootTreeService::open(config, backend).map_err(|error| {
+            anyhow::anyhow!("open service root tree '{instance_name}': {error:?}")
+        })?,
     };
-    node.register_v2_root_at_id(instance_name, service, svc_id, network_reachable)
+    node.register_service_root_at_id(instance_name, service, svc_id, network_reachable)
         .map_err(|error| {
-            v2_registration_error(
-                format!("register v2 root tree: {error}"),
-                production && retryable_v2_node_registration_error(&error),
+            service_registration_error(
+                format!("register service root tree: {error}"),
+                production && retryable_service_node_registration_error(&error),
             )
         })
 }
@@ -2859,15 +2873,17 @@ fn legacy_raft_db_path(data_dir: &Path, svc_id: ServiceId) -> PathBuf {
         .join(format!("{:08x}.redb", svc_id.0))
 }
 
-fn v2_raft_db_path(data_dir: &Path, root_service: vos::v2::RootServiceId) -> PathBuf {
+fn service_raft_db_path(data_dir: &Path, root_service: vos::service::RootServiceId) -> PathBuf {
     data_dir
-        .join("v2-services")
+        .join("services")
         .join(format!("{}.raft.redb", hex::encode(root_service.0)))
 }
 
 fn raft_db_path_for_row(data_dir: &Path, svc_id: ServiceId, prepared: &RowConfig) -> PathBuf {
     match prepared {
-        RowConfig::V2 { config, .. } => v2_raft_db_path(data_dir, config.service.root_service),
+        RowConfig::Service { config, .. } => {
+            service_raft_db_path(data_dir, config.service.root_service)
+        }
         _ => legacy_raft_db_path(data_dir, svc_id),
     }
 }
@@ -2876,7 +2892,7 @@ fn raft_db_path_for_row(data_dir: &Path, svc_id: ServiceId, prepared: &RowConfig
 ///
 /// Resolve only artifacts that the legacy one-service-per-actor host may run.
 ///
-/// A signed v2 package is a root-tree deployment input, not an actor blob for
+/// A signed service package is a root-tree deployment input, not an actor blob for
 /// [`VosNode`]. Extracting its canonical actor PVM here would execute it in the
 /// native `RefinePayload`/`EffectLog` runtime and silently discard its pinned
 /// generic-service, deployment, policy, and guest-Accumulate semantics. Fail
@@ -2891,9 +2907,9 @@ fn actor_blob_from_catalog(
     artifact: Vec<u8>,
     instance_name: &str,
 ) -> anyhow::Result<CatalogActorArtifact> {
-    if catalog_artifact_support(&artifact) == RowCatalogSupport::V2Package {
+    if catalog_artifact_support(&artifact) == RowCatalogSupport::ServicePackage {
         anyhow::bail!(
-            "{instance_name} is a signed v2 package and cannot execute in the legacy actor host"
+            "{instance_name} is a signed service package and cannot execute in the legacy actor host"
         );
     }
     if artifact.get(..3) == Some(b"JAR") {
@@ -3041,7 +3057,7 @@ enum RaftSeed {
         members: Vec<u16>,
         voter_peer_ids: Vec<(u16, Vec<u8>)>,
     },
-    /// A live group exists, but this replica is not a voter yet. The v2 path
+    /// A live group exists, but this replica is not a voter yet. The service path
     /// starts its worker and validates its route before sending the join;
     /// legacy roots complete the old eager handshake immediately before spawn.
     Join {
@@ -3307,7 +3323,7 @@ fn request_raft_join(
     mut leader: u16,
     known: Vec<u16>,
     voter_peer_ids: &[(u16, Vec<u8>)],
-    production_trust_policy: Option<vos::v2::Hash>,
+    production_trust_policy: Option<vos::service::Hash>,
 ) -> anyhow::Result<Result<AcceptedRaftJoin, RejectedRaftJoin>> {
     use vos::network::RaftJoinResult;
 
@@ -3430,7 +3446,7 @@ fn join_raft_group(
     )
 }
 
-fn promote_prepared_v2_raft_root(
+fn promote_prepared_service_raft_root(
     net: &std::sync::Arc<vos::network::Network>,
     instance_name: &str,
     replication_id: [u8; 32],
@@ -3440,7 +3456,7 @@ fn promote_prepared_v2_raft_root(
     voter_peer_ids: Vec<(u16, Vec<u8>)>,
     worker: &vos::raft::WorkerHandle,
     shutdown: &std::sync::atomic::AtomicBool,
-    production_trust_policy: Option<vos::v2::Hash>,
+    production_trust_policy: Option<vos::service::Hash>,
 ) -> Result<(), String> {
     let mut membership_may_have_changed = false;
     let mut discovery_cursor = 0;
@@ -3542,32 +3558,33 @@ const MAX_SPAWNS_PER_PASS: usize = 4;
 /// Registration opens durable stores and may synchronously consult the
 /// production authority. Keep that blocking boundary to one root per router
 /// pass; ordinary legacy spawns retain their separate cap above.
-const MAX_V2_REGISTRATION_ATTEMPTS_PER_PASS: usize = 1;
-const V2_REGISTRATION_GLOBAL_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(2);
-const V2_REGISTRATION_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(10);
-const V2_REGISTRATION_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+const MAX_REGISTRATION_ATTEMPTS_PER_PASS: usize = 1;
+const SERVICE_REGISTRATION_GLOBAL_RETRY_GAP: std::time::Duration =
+    std::time::Duration::from_secs(2);
+const SERVICE_REGISTRATION_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(10);
+const SERVICE_REGISTRATION_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// A row condition already reported (and, for hard failures,
 /// permanently skipped): the damping key is `(instance_name,
 /// program_hash, kind)`, so reinstalling the same name with a new
 /// blob re-attempts and re-reports.
 type RowDamping = std::collections::HashSet<(String, [u8; 32], RowNote)>;
-type V2RegistrationKey = (String, [u8; 32]);
+type RegistrationKey = (String, [u8; 32]);
 
 #[derive(Debug, Clone, Copy)]
-struct V2RegistrationRetry {
+struct RegistrationRetry {
     failures: u8,
     not_before: std::time::Instant,
 }
 
 #[derive(Debug, Default)]
-struct V2RegistrationBackoff {
-    rows: std::collections::HashMap<V2RegistrationKey, V2RegistrationRetry>,
+struct RegistrationBackoff {
+    rows: std::collections::HashMap<RegistrationKey, RegistrationRetry>,
     global_not_before: Option<std::time::Instant>,
 }
 
-impl V2RegistrationBackoff {
-    fn ready(&self, key: &V2RegistrationKey, now: std::time::Instant) -> bool {
+impl RegistrationBackoff {
+    fn ready(&self, key: &RegistrationKey, now: std::time::Instant) -> bool {
         self.global_not_before
             .is_none_or(|deadline| now >= deadline)
             && self
@@ -3576,8 +3593,8 @@ impl V2RegistrationBackoff {
                 .is_none_or(|retry| now >= retry.not_before)
     }
 
-    fn finish(&mut self, key: V2RegistrationKey, retryable: bool, now: std::time::Instant) {
-        self.global_not_before = now.checked_add(V2_REGISTRATION_GLOBAL_RETRY_GAP);
+    fn finish(&mut self, key: RegistrationKey, retryable: bool, now: std::time::Instant) {
+        self.global_not_before = now.checked_add(SERVICE_REGISTRATION_GLOBAL_RETRY_GAP);
         if !retryable {
             self.rows.remove(&key);
             return;
@@ -3587,32 +3604,32 @@ impl V2RegistrationBackoff {
             .get(&key)
             .map_or(1, |retry| retry.failures.saturating_add(1));
         let multiplier = 1_u64 << u32::from(failures.saturating_sub(1).min(5));
-        let delay = V2_REGISTRATION_RETRY_BASE
+        let delay = SERVICE_REGISTRATION_RETRY_BASE
             .checked_mul(u32::try_from(multiplier).expect("bounded retry multiplier"))
-            .unwrap_or(V2_REGISTRATION_RETRY_MAX)
-            .min(V2_REGISTRATION_RETRY_MAX);
+            .unwrap_or(SERVICE_REGISTRATION_RETRY_MAX)
+            .min(SERVICE_REGISTRATION_RETRY_MAX);
         self.rows.insert(
             key,
-            V2RegistrationRetry {
+            RegistrationRetry {
                 failures,
                 not_before: now.checked_add(delay).unwrap_or(now),
             },
         );
     }
 
-    fn success(&mut self, key: &V2RegistrationKey, now: std::time::Instant) {
-        self.global_not_before = now.checked_add(V2_REGISTRATION_GLOBAL_RETRY_GAP);
+    fn success(&mut self, key: &RegistrationKey, now: std::time::Instant) {
+        self.global_not_before = now.checked_add(SERVICE_REGISTRATION_GLOBAL_RETRY_GAP);
         self.rows.remove(key);
     }
 }
 
-fn take_v2_registration_attempt(
+fn take_service_registration_attempt(
     attempts: &mut usize,
-    backoff: &V2RegistrationBackoff,
-    key: &V2RegistrationKey,
+    backoff: &RegistrationBackoff,
+    key: &RegistrationKey,
     now: std::time::Instant,
 ) -> bool {
-    if *attempts >= MAX_V2_REGISTRATION_ATTEMPTS_PER_PASS || !backoff.ready(key, now) {
+    if *attempts >= MAX_REGISTRATION_ATTEMPTS_PER_PASS || !backoff.ready(key, now) {
         return false;
     }
     *attempts += 1;
@@ -3646,8 +3663,8 @@ enum RowNote {
     BelowFloor,
 }
 
-fn v2_registration_note(error: &anyhow::Error) -> RowNote {
-    if is_retryable_v2_registration_error(error) {
+fn service_registration_note(error: &anyhow::Error) -> RowNote {
+    if is_retryable_service_registration_error(error) {
         RowNote::RegistrationWaiting
     } else {
         RowNote::Failed
@@ -3735,12 +3752,12 @@ fn reconcile_installed_agents(
     has_hyperspace: bool,
     local_cfg: &crate::commands::space::subscriptions::LocalConfig,
     damped: &mut RowDamping,
-    v2_registration_backoff: &mut V2RegistrationBackoff,
+    service_registration_backoff: &mut RegistrationBackoff,
     boot_grace: &mut BootGrace,
     in_flight: &InFlightBlobs,
     policies: &AgentPolicies,
-    pinned_v2_service: Option<&PinnedV2Service>,
-    production_trust: Option<std::sync::Arc<dyn vos::v2::ProductionTrustV2>>,
+    pinned_service_service: Option<&PinnedService>,
+    production_trust: Option<std::sync::Arc<dyn vos::service::ProductionTrust>>,
 ) -> anyhow::Result<()> {
     use vos::registry::{RegistryRef, Status};
 
@@ -3754,17 +3771,17 @@ fn reconcile_installed_agents(
     // whose sync floor requires membership are narrowed out below.
     let is_member = node_is_member(node, &reg, local_prefix);
     let mut spawned_this_pass = 0usize;
-    let mut v2_registration_attempts = 0usize;
+    let mut service_registration_attempts = 0usize;
     let mut spawn_rows = agents.iter().collect::<Vec<_>>();
     spawn_rows.sort_by_key(|row| {
-        (row.instance_name != vos::v2::ROLE_AUTHORITY_INSTANCE_V2)
+        (row.instance_name != vos::service::ROLE_AUTHORITY_INSTANCE_)
             .then_some(row.instance_name.as_str())
     });
     for a in spawn_rows {
         if spawned_this_pass >= MAX_SPAWNS_PER_PASS {
             break;
         }
-        let is_role_authority = a.instance_name == vos::v2::ROLE_AUTHORITY_INSTANCE_V2;
+        let is_role_authority = a.instance_name == vos::service::ROLE_AUTHORITY_INSTANCE_;
         if !is_role_authority && !local_cfg.should_spawn(&a.instance_name) {
             continue;
         }
@@ -3813,7 +3830,7 @@ fn reconcile_installed_agents(
             a,
             &agents,
             policies,
-            pinned_v2_service,
+            pinned_service_service,
             &root_peer_id,
         ) {
             Ok(prepared) => prepared,
@@ -3827,8 +3844,8 @@ fn reconcile_installed_agents(
                 continue;
             }
         };
-        let supports_raft = matches!(&prepared, RowConfig::Ready(_) | RowConfig::V2 { .. });
-        let is_v2 = matches!(&prepared, RowConfig::V2 { .. });
+        let supports_raft = matches!(&prepared, RowConfig::Ready(_) | RowConfig::Service { .. });
+        let is = matches!(&prepared, RowConfig::Service { .. });
         let raft_seed = if supports_raft
             && consistency_from_u8(a.consistency) == Some(Consistency::Raft)
         {
@@ -3850,7 +3867,7 @@ fn reconcile_installed_agents(
                     leader,
                     known,
                     voter_peer_ids,
-                }) if !is_v2 => {
+                }) if !is => {
                     let Some(network) = node.network() else {
                         continue;
                     };
@@ -3932,21 +3949,21 @@ fn reconcile_installed_agents(
                     }
                 }
             }
-            RowConfig::V2 {
+            RowConfig::Service {
                 config,
                 state_path,
                 network_reachable,
             } => {
                 let registration_key = (a.instance_name.clone(), a.program_hash);
-                if !take_v2_registration_attempt(
-                    &mut v2_registration_attempts,
-                    v2_registration_backoff,
+                if !take_service_registration_attempt(
+                    &mut service_registration_attempts,
+                    service_registration_backoff,
                     &registration_key,
                     std::time::Instant::now(),
                 ) {
                     continue;
                 }
-                match register_v2_root_from_row(
+                match register_service_root_from_row(
                     node,
                     data_dir,
                     a.instance_name.clone(),
@@ -3960,28 +3977,28 @@ fn reconcile_installed_agents(
                     production_trust.clone(),
                 ) {
                     Ok(id) => {
-                        v2_registration_backoff
+                        service_registration_backoff
                             .success(&registration_key, std::time::Instant::now());
                         damped.remove(&key(RowNote::RegistrationWaiting));
                         spawned_this_pass += 1;
-                        tracing::info!("v2 root tree '{}' spawned as {id}", a.instance_name);
+                        tracing::info!("service root tree '{}' spawned as {id}", a.instance_name);
                     }
                     Err(error) => {
-                        let retryable = is_retryable_v2_registration_error(&error);
-                        v2_registration_backoff.finish(
+                        let retryable = is_retryable_service_registration_error(&error);
+                        service_registration_backoff.finish(
                             registration_key,
                             retryable,
                             std::time::Instant::now(),
                         );
-                        let note = v2_registration_note(&error);
+                        let note = service_registration_note(&error);
                         if damped.insert(key(note)) {
                             tracing::warn!(
-                                "agent '{}' v2 route failed to register: {error}",
+                                "agent '{}' service route failed to register: {error}",
                                 a.instance_name,
                             );
                         } else if retryable {
                             tracing::debug!(
-                                "agent '{}' v2 route remains deferred: {error}",
+                                "agent '{}' service route remains deferred: {error}",
                                 a.instance_name,
                             );
                         }
@@ -4013,10 +4030,10 @@ fn reconcile_installed_agents(
                     );
                 }
             }
-            RowConfig::UnsupportedV2Package(reason) => {
+            RowConfig::UnsupportedPackage(reason) => {
                 if damped.insert(key(RowNote::Failed)) {
                     tracing::warn!(
-                        "skipping agent '{}' — unsupported v2 package: {reason}",
+                        "skipping agent '{}' — unsupported service package: {reason}",
                         a.instance_name,
                     );
                 }
@@ -4072,22 +4089,22 @@ fn sweep_orphan_redbs(data_dir: &std::path::Path, live: &std::collections::HashS
 /// Move service images and private side-store directories whose installation
 /// incarnation no longer exists in the registry into recoverable trash.
 ///
-/// A v2 installation is keyed by `(space, name, replication_id)`. The
+/// A service installation is keyed by `(space, name, replication_id)`. The
 /// registry forbids reusing a tombstoned replication id, so keeping an orphan
 /// in the active directory can only resurrect deleted state or collide with a
 /// later install. The image, Raft state, signer seed, incomplete seed staging,
 /// and the `.image.proofs` / `.image.records` side directories use the
 /// root-service hash prefix and are swept together on the next daemon boot.
-fn sweep_orphan_v2_services(
+fn sweep_orphan_service_services(
     data_dir: &std::path::Path,
     live: &std::collections::HashSet<[u8; 32]>,
 ) {
-    let services_dir = data_dir.join("v2-services");
+    let services_dir = data_dir.join("services");
     let entries = match std::fs::read_dir(&services_dir) {
         Ok(entries) => entries,
         Err(_) => return,
     };
-    let trash = data_dir.join("trash").join("v2-services");
+    let trash = data_dir.join("trash").join("services");
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name_str) = name.to_str() else {
@@ -4102,10 +4119,10 @@ fn sweep_orphan_v2_services(
             ".image"
                 | ".image.proofs"
                 | ".image.records"
-                | ".image.v2-next"
+                | ".image.next"
                 | ".raft.redb"
                 | ".device-seed"
-                | ".device-seed.v2-next"
+                | ".device-seed.next"
         ) {
             continue;
         }
@@ -4124,11 +4141,11 @@ fn sweep_orphan_v2_services(
         let destination = trash.join(name_str);
         match std::fs::rename(entry.path(), &destination) {
             Ok(()) => tracing::info!(
-                "moved orphan v2 service artifact to trash: {}",
+                "moved orphan service service artifact to trash: {}",
                 destination.display(),
             ),
             Err(error) => tracing::warn!(
-                "failed to trash orphan v2 service artifact {}: {error}",
+                "failed to trash orphan service service artifact {}: {error}",
                 entry.path().display(),
             ),
         }
@@ -4140,24 +4157,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn v2_device_seed_sidecar_is_stable_private_and_strictly_sized() {
+    fn service_device_seed_sidecar_is_stable_private_and_strictly_sized() {
         let directory = std::env::temp_dir().join(format!(
-            "vosx-v2-device-seed-{}-{}",
+            "vosx-device-seed-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos(),
         ));
-        let root = vos::v2::RootServiceId([0x91; 32]);
-        let first = load_or_mint_v2_device_seed(&directory, root).unwrap();
+        let root = vos::service::RootServiceId([0x91; 32]);
+        let first = load_or_mint_service_device_seed(&directory, root).unwrap();
         let path = directory
-            .join("v2-services")
+            .join("services")
             .join(format!("{}.device-seed", hex::encode(root.0)));
         let stale_temp = secret_temp_path(&path).unwrap();
         std::fs::write(&stale_temp, [0x92; 7]).unwrap();
         assert_eq!(
-            load_or_mint_v2_device_seed(&directory, root).unwrap(),
+            load_or_mint_service_device_seed(&directory, root).unwrap(),
             first
         );
         assert_eq!(std::fs::read(&path).unwrap(), first);
@@ -4174,7 +4191,7 @@ mod tests {
             );
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
             assert!(
-                load_or_mint_v2_device_seed(&directory, root)
+                load_or_mint_service_device_seed(&directory, root)
                     .unwrap_err()
                     .to_string()
                     .contains("mode 0600"),
@@ -4186,13 +4203,13 @@ mod tests {
             std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
             std::os::unix::fs::symlink(&target, &path).unwrap();
             assert!(
-                load_or_mint_v2_device_seed(&directory, root).is_err(),
+                load_or_mint_service_device_seed(&directory, root).is_err(),
                 "a symlink must never be followed as signer configuration"
             );
             std::fs::remove_file(&path).unwrap();
             std::fs::create_dir(&path).unwrap();
             assert!(
-                load_or_mint_v2_device_seed(&directory, root).is_err(),
+                load_or_mint_service_device_seed(&directory, root).is_err(),
                 "a non-regular seed path must fail without blocking"
             );
             std::fs::remove_dir(&path).unwrap();
@@ -4203,36 +4220,36 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
-        assert!(load_or_mint_v2_device_seed(&directory, root).is_err());
+        assert!(load_or_mint_service_device_seed(&directory, root).is_err());
         std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn v2_service_requires_an_explicit_trust_profile() {
-        assert!(validate_v2_trust_mode(false, false, false).is_ok());
-        assert!(validate_v2_trust_mode(true, true, false).is_ok());
-        assert!(validate_v2_trust_mode(true, false, true).is_ok());
+    fn service_service_requires_an_explicit_trust_profile() {
+        assert!(validate_service_trust_mode(false, false, false).is_ok());
+        assert!(validate_service_trust_mode(true, true, false).is_ok());
+        assert!(validate_service_trust_mode(true, false, true).is_ok());
 
-        let missing = validate_v2_trust_mode(true, false, false).unwrap_err();
+        let missing = validate_service_trust_mode(true, false, false).unwrap_err();
         assert!(missing.to_string().contains("--production-trust-socket"));
-        assert!(validate_v2_trust_mode(false, true, false).is_err());
-        assert!(validate_v2_trust_mode(false, false, true).is_err());
-        assert!(validate_v2_trust_mode(true, true, true).is_err());
+        assert!(validate_service_trust_mode(false, true, false).is_err());
+        assert!(validate_service_trust_mode(false, false, true).is_err());
+        assert!(validate_service_trust_mode(true, true, true).is_err());
     }
     use libp2p::identity::Keypair;
     use vos::metadata::{ActorMeta, MessageMeta};
     use vos::network::{RaftRole, RaftStatusReply};
-    use vos::v2::{
-        ActorUpgradeV2, DeploymentSignatureV2, Hash, PackageManifestV2, PackageRolePoliciesV2,
-        ProducerId, ProductionTrustDecisionV2, ProductionTrustErrorV2, ProductionTrustV2,
-        ProgramId, ProofVerificationRequestV2, ReceiptVerificationRequestV2,
-        RoleCredentialVerificationRequestV2, ServiceGenesisV2, V2Wire, VosPackageV2, artifact_hash,
+    use vos::service::{
+        ActorUpgrade, DeploymentSignature, Hash, PackageManifest, PackageRolePolicies, ProducerId,
+        ProductionTrust, ProductionTrustDecision, ProductionTrustError, ProgramId,
+        ProofVerificationRequest, ReceiptVerificationRequest, RoleCredentialVerificationRequest,
+        ServiceGenesis, ServiceWire, VosPackage, artifact_hash,
     };
 
     #[derive(Clone)]
     struct AllowProductionTrust(Hash);
 
-    impl ProductionTrustV2 for AllowProductionTrust {
+    impl ProductionTrust for AllowProductionTrust {
         fn policy_id(&self) -> Hash {
             self.0
         }
@@ -4241,42 +4258,39 @@ mod tests {
             Some(100)
         }
 
-        fn verify_logical_timeslot(&self, slot: u64) -> ProductionTrustDecisionV2 {
+        fn verify_logical_timeslot(&self, slot: u64) -> ProductionTrustDecision {
             if slot <= 100 {
-                ProductionTrustDecisionV2::Authorized
+                ProductionTrustDecision::Authorized
             } else {
-                ProductionTrustDecisionV2::Denied
+                ProductionTrustDecision::Denied
             }
         }
 
         fn verify_proof(
             &self,
-            _request: &ProofVerificationRequestV2,
+            _request: &ProofVerificationRequest,
             _proof: &[u8],
-        ) -> ProductionTrustDecisionV2 {
-            ProductionTrustDecisionV2::Authorized
+        ) -> ProductionTrustDecision {
+            ProductionTrustDecision::Authorized
         }
 
-        fn verify_install(&self, _genesis: &ServiceGenesisV2) -> ProductionTrustDecisionV2 {
-            ProductionTrustDecisionV2::Authorized
+        fn verify_install(&self, _genesis: &ServiceGenesis) -> ProductionTrustDecision {
+            ProductionTrustDecision::Authorized
         }
 
-        fn verify_upgrade(&self, _upgrade: &ActorUpgradeV2) -> ProductionTrustDecisionV2 {
-            ProductionTrustDecisionV2::Authorized
+        fn verify_upgrade(&self, _upgrade: &ActorUpgrade) -> ProductionTrustDecision {
+            ProductionTrustDecision::Authorized
         }
 
         fn verify_role_credential(
             &self,
-            _request: &RoleCredentialVerificationRequestV2,
-        ) -> ProductionTrustDecisionV2 {
-            ProductionTrustDecisionV2::Authorized
+            _request: &RoleCredentialVerificationRequest,
+        ) -> ProductionTrustDecision {
+            ProductionTrustDecision::Authorized
         }
 
-        fn verify_receipt(
-            &self,
-            _request: &ReceiptVerificationRequestV2,
-        ) -> ProductionTrustDecisionV2 {
-            ProductionTrustDecisionV2::Authorized
+        fn verify_receipt(&self, _request: &ReceiptVerificationRequest) -> ProductionTrustDecision {
+            ProductionTrustDecision::Authorized
         }
     }
 
@@ -4287,16 +4301,16 @@ mod tests {
     }
 
     impl SwitchProductionTrust {
-        fn decision(&self) -> ProductionTrustDecisionV2 {
+        fn decision(&self) -> ProductionTrustDecision {
             if self.available.load(std::sync::atomic::Ordering::Relaxed) {
-                ProductionTrustDecisionV2::Authorized
+                ProductionTrustDecision::Authorized
             } else {
-                ProductionTrustDecisionV2::Unavailable
+                ProductionTrustDecision::Unavailable
             }
         }
     }
 
-    impl ProductionTrustV2 for SwitchProductionTrust {
+    impl ProductionTrust for SwitchProductionTrust {
         fn policy_id(&self) -> Hash {
             self.policy
         }
@@ -4307,42 +4321,39 @@ mod tests {
                 .then_some(100)
         }
 
-        fn verify_logical_timeslot(&self, _slot: u64) -> ProductionTrustDecisionV2 {
+        fn verify_logical_timeslot(&self, _slot: u64) -> ProductionTrustDecision {
             self.decision()
         }
 
         fn verify_proof(
             &self,
-            _request: &ProofVerificationRequestV2,
+            _request: &ProofVerificationRequest,
             _proof: &[u8],
-        ) -> ProductionTrustDecisionV2 {
+        ) -> ProductionTrustDecision {
             self.decision()
         }
 
-        fn verify_install(&self, _genesis: &ServiceGenesisV2) -> ProductionTrustDecisionV2 {
+        fn verify_install(&self, _genesis: &ServiceGenesis) -> ProductionTrustDecision {
             self.decision()
         }
 
-        fn verify_upgrade(&self, _upgrade: &ActorUpgradeV2) -> ProductionTrustDecisionV2 {
+        fn verify_upgrade(&self, _upgrade: &ActorUpgrade) -> ProductionTrustDecision {
             self.decision()
         }
 
         fn verify_role_credential(
             &self,
-            _request: &RoleCredentialVerificationRequestV2,
-        ) -> ProductionTrustDecisionV2 {
+            _request: &RoleCredentialVerificationRequest,
+        ) -> ProductionTrustDecision {
             self.decision()
         }
 
-        fn verify_receipt(
-            &self,
-            _request: &ReceiptVerificationRequestV2,
-        ) -> ProductionTrustDecisionV2 {
+        fn verify_receipt(&self, _request: &ReceiptVerificationRequest) -> ProductionTrustDecision {
             self.decision()
         }
     }
 
-    const V2_META: ActorMeta = ActorMeta {
+    const SERVICE_META: ActorMeta = ActorMeta {
         actor_name: "counter",
         messages: &[MessageMeta {
             name: "value",
@@ -4378,39 +4389,45 @@ mod tests {
         ));
     }
 
-    fn signed_v2_package(service_program: ProgramId) -> VosPackageV2 {
-        signed_v2_package_with_consistency(service_program, false)
+    fn signed_service_package(service_program: ProgramId) -> VosPackage {
+        signed_service_package_with_consistency(service_program, false)
     }
 
-    fn signed_v2_package_with_consistency(service_program: ProgramId, crdt: bool) -> VosPackageV2 {
+    fn signed_service_package_with_consistency(
+        service_program: ProgramId,
+        crdt: bool,
+    ) -> VosPackage {
         let mut assembler = vos_pvm_compiler::assembler::Assembler::new();
         assembler
             .load_imm_64(vos_pvm_compiler::assembler::Reg::A0, 0)
             .ecalli(0);
         let actor_pvm = assembler.build();
-        let metadata_source = ActorMeta { crdt, ..V2_META };
+        let metadata_source = ActorMeta {
+            crdt,
+            ..SERVICE_META
+        };
         let (buffer, length) = vos::metadata::encode::<512>(&metadata_source);
         let schemas = buffer[..length].to_vec();
         let metadata = vos::metadata::decode(&schemas).unwrap();
-        let role_policies = PackageRolePoliciesV2::from_metadata(&metadata)
+        let role_policies = PackageRolePolicies::from_metadata(&metadata)
             .unwrap()
             .encode();
         let keypair = Keypair::generate_ed25519();
         let public_key = keypair.public().encode_protobuf();
-        let mut package = VosPackageV2 {
-            manifest: PackageManifestV2 {
+        let mut package = VosPackage {
+            manifest: PackageManifest {
                 name: "counter".into(),
                 version: "2.0.0".into(),
-                service_abi: vos::v2::ABI_VERSION,
-                snapshot_version: vos::v2::SNAPSHOT_VERSION,
-                execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+                service_abi: vos::service::ABI_VERSION,
+                snapshot_version: vos::service::SNAPSHOT_VERSION,
+                execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
                 service_program,
                 actor_program: ProgramId::of_pvm(&actor_pvm),
                 crdt,
                 interfaces_hash: artifact_hash(b"interfaces", &[]),
                 role_policies_hash: artifact_hash(b"role-policies", &role_policies),
                 schemas_hash: artifact_hash(b"schemas", &schemas),
-                task_dependencies_hash: vos::v2::task_dependencies_hash(&[]),
+                task_dependencies_hash: vos::service::task_dependencies_hash(&[]),
             },
             actor_pvm,
             generated_interfaces: vec![],
@@ -4418,7 +4435,7 @@ mod tests {
             schemas,
             task_dependencies: vec![],
             diagnostics: None,
-            deployment_signature: DeploymentSignatureV2 {
+            deployment_signature: DeploymentSignature {
                 producer: ProducerId::of_public_key(&public_key),
                 public_key,
                 signature: vec![0],
@@ -4451,7 +4468,7 @@ mod tests {
         let exact_package = package.encode();
         let program_hash = BlobHash::of(&exact_package).0;
         let row = vos::registry::AgentRow {
-            instance_name: vos::v2::ROLE_AUTHORITY_INSTANCE_V2.into(),
+            instance_name: vos::service::ROLE_AUTHORITY_INSTANCE_.into(),
             program_hash,
             program_name: package.manifest.name.clone(),
             program_version: package.manifest.version.clone(),
@@ -4463,7 +4480,7 @@ mod tests {
             install_payloads: Vec::new(),
         };
         let space_id = [92; 32];
-        let resolved = resolve_v2_role_authority_with(
+        let resolved = resolve_service_role_authority_with(
             space_id,
             std::slice::from_ref(&row),
             &root_peer,
@@ -4473,10 +4490,10 @@ mod tests {
         let RoleAuthorityResolution::Ready(binding) = resolved else {
             panic!("root-signed authority did not resolve")
         };
-        let space = vos::v2::SpaceId(space_id);
-        let root_service = v2_root_service_id(
+        let space = vos::service::SpaceId(space_id);
+        let root_service = service_root_service_id(
             space,
-            vos::v2::ROLE_AUTHORITY_INSTANCE_V2,
+            vos::service::ROLE_AUTHORITY_INSTANCE_,
             row.replication_id,
         );
         assert_eq!(binding.service.space, space);
@@ -4484,7 +4501,7 @@ mod tests {
         assert_eq!(binding.service.deployment, package.deployment_id());
         assert_eq!(
             binding.actor,
-            v2_root_actor_id(root_service, vos::v2::ROLE_AUTHORITY_INSTANCE_V2)
+            service_root_actor_id(root_service, vos::service::ROLE_AUTHORITY_INSTANCE_)
         );
 
         // A root-signed implementation/package revision with the exact
@@ -4492,7 +4509,7 @@ mod tests {
         // roots continue binding the frozen service deployment rather than
         // following the catalog's new actor deployment.
         let mut candidate = package.clone();
-        candidate.manifest.version = "authority-candidate-v2".into();
+        candidate.manifest.version = "authority-candidate".into();
         candidate.deployment_signature.signature = root
             .sign(&candidate.signing_message())
             .expect("sign authority candidate");
@@ -4504,7 +4521,7 @@ mod tests {
         let mut upgraded_row = row.clone();
         upgraded_row.program_hash = candidate_hash;
         upgraded_row.program_version = candidate.manifest.version.clone();
-        let upgraded = resolve_v2_role_authority_with(
+        let upgraded = resolve_service_role_authority_with(
             space_id,
             std::slice::from_ref(&upgraded_row),
             &root_peer,
@@ -4537,7 +4554,7 @@ mod tests {
         let package_hash = BlobHash::of(&package.encode()).0;
         let replication_id = crate::commands::space::common::auto_replication_id(
             &[92; 32],
-            vos::v2::ROLE_AUTHORITY_INSTANCE_V2,
+            vos::service::ROLE_AUTHORITY_INSTANCE_,
             &package_hash,
         );
 
@@ -4598,7 +4615,7 @@ mod tests {
             vec![14; vos::registry::OP_SIG_LEN],
         )
         .unwrap();
-        assert_eq!(redemption.space, vos::v2::SpaceId(payload.space_id));
+        assert_eq!(redemption.space, vos::service::SpaceId(payload.space_id));
         assert_eq!(redemption.authority_replication_id, [15; 32]);
         assert_eq!(redemption.role, vos::SpaceRole::Developer);
         assert_eq!(redemption.admin_peer_id, payload.admin_peer_id);
@@ -4610,28 +4627,31 @@ mod tests {
         let replication_id = [15; 32];
         let (route, invocation) = authority_invite_invocation(&redemption, 0x1234);
         let repeated = authority_invite_invocation(&redemption, 0x1234);
-        let root_service = v2_root_service_id(
-            vos::v2::SpaceId(payload.space_id),
-            vos::v2::ROLE_AUTHORITY_INSTANCE_V2,
+        let root_service = service_root_service_id(
+            vos::service::SpaceId(payload.space_id),
+            vos::service::ROLE_AUTHORITY_INSTANCE_,
             replication_id,
         );
         assert_eq!(
             route,
-            instance_service_id(vos::v2::ROLE_AUTHORITY_INSTANCE_V2, 0x1234)
+            instance_service_id(vos::service::ROLE_AUTHORITY_INSTANCE_, 0x1234)
         );
         assert_eq!(repeated, (route, invocation.clone()));
         assert_eq!(
             invocation.target,
-            v2_root_actor_id(root_service, vos::v2::ROLE_AUTHORITY_INSTANCE_V2)
+            service_root_actor_id(root_service, vos::service::ROLE_AUTHORITY_INSTANCE_)
         );
-        assert_eq!(invocation.method, vos::v2::ROLE_AUTHORITY_INVITE_METHOD_V2);
+        assert_eq!(
+            invocation.method,
+            vos::service::ROLE_AUTHORITY_INVITE_METHOD_
+        );
         assert!(!invocation.proof_requested);
         assert_eq!(invocation.arguments[0], vos::value::TAG_DYNAMIC);
         let message = vos::value::Msg::decode(&invocation.arguments[1..]);
-        assert_eq!(message.name, vos::v2::ROLE_AUTHORITY_INVITE_METHOD_V2);
+        assert_eq!(message.name, vos::service::ROLE_AUTHORITY_INVITE_METHOD_);
         let encoded_redemption = message.args.get("redemption").unwrap().as_bytes().unwrap();
         assert_eq!(
-            vos::v2::RoleAuthorityInviteRedemptionV2::decode(encoded_redemption).unwrap(),
+            vos::service::RoleAuthorityInviteRedemption::decode(encoded_redemption).unwrap(),
             redemption
         );
     }
@@ -4660,27 +4680,27 @@ mod tests {
         payload.authority_replication_id = [0; 32];
         assert!(
             authority_invite_redemption(&payload, vec![26; 38], [27; 64], vec![28; 64]).is_err(),
-            "a markerless legacy token never enters the v2 authority path"
+            "a markerless legacy token never enters the service authority path"
         );
     }
 
     #[test]
     fn only_generated_non_public_methods_require_the_role_authority() {
-        let mut package = signed_v2_package(vos::v2::VOS_SERVICE_PROGRAM_ID);
+        let mut package = signed_service_package(vos::service::VOS_SERVICE_PROGRAM_ID);
         assert!(!package_requires_role_authority(&package).unwrap());
-        let mut policies = PackageRolePoliciesV2::decode(&package.role_policies).unwrap();
+        let mut policies = PackageRolePolicies::decode(&package.role_policies).unwrap();
         policies.methods[0].public = false;
         policies.methods[0].actor_role = Some(7);
-        policies.methods[0].policy = vos::v2::method_role_policy_hash(None, Some(7)).unwrap();
+        policies.methods[0].policy = vos::service::method_role_policy_hash(None, Some(7)).unwrap();
         package.role_policies = policies.encode();
         assert!(package_requires_role_authority(&package).unwrap());
     }
 
     #[test]
-    fn signed_v2_packages_are_skippable_without_becoming_legacy_executables() {
+    fn signed_service_packages_are_skippable_without_becoming_legacy_executables() {
         assert_eq!(
             catalog_artifact_support(b"VOSP\x02\0package"),
-            RowCatalogSupport::V2Package,
+            RowCatalogSupport::ServicePackage,
         );
         assert_eq!(
             catalog_artifact_support(b"JAR\0canonical"),
@@ -4688,17 +4708,17 @@ mod tests {
         );
         assert!(
             actor_blob_from_catalog(b"VOSP\x02\0package".to_vec(), "counter").is_err(),
-            "the legacy host must never extract an actor from a v2 package",
+            "the legacy host must never extract an actor from a service package",
         );
     }
 
     #[test]
-    fn signed_ordinary_v2_packages_select_the_raft_root_driver() {
+    fn signed_ordinary_service_packages_select_the_raft_root_driver() {
         let service_pvm = std::fs::read(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../services/vos-service/vos-service.pvm"),
         )
         .expect("the protocol-pinned service artifact must be available to tests");
-        let package = signed_v2_package(vos::v2::VOS_SERVICE_PROGRAM_ID);
+        let package = signed_service_package(vos::service::VOS_SERVICE_PROGRAM_ID);
         let row = vos::registry::AgentRow {
             instance_name: "counter".into(),
             program_hash: [1; 32],
@@ -4711,11 +4731,11 @@ mod tests {
             install_args: vec![],
             install_payloads: vec![],
         };
-        let pinned = PinnedV2Service {
+        let pinned = PinnedService {
             pvm: std::sync::Arc::new(service_pvm),
         };
-        let resolved = v2_config_from_row(
-            Path::new("/tmp/vos-v2-config-test"),
+        let resolved = service_config_from_row(
+            Path::new("/tmp/vos-config-test"),
             [3; 32],
             &row,
             std::slice::from_ref(&row),
@@ -4725,34 +4745,34 @@ mod tests {
             Some(&pinned),
             &[],
         )
-        .expect("a signed ordinary v2 package may select Raft");
-        let RowConfig::V2 { config, .. } = resolved else {
-            panic!("v2 package fell through to the legacy runtime")
+        .expect("a signed ordinary service package may select Raft");
+        let RowConfig::Service { config, .. } = resolved else {
+            panic!("service package fell through to the legacy runtime")
         };
-        assert_eq!(config.consistency, vos::v2::ConsistencyModeV2::Raft);
+        assert_eq!(config.consistency, vos::service::ConsistencyMode::Raft);
     }
 
     #[test]
     fn three_voter_appended_upgrade_recovers_package_before_registration() {
-        use vos::v2::CommittedAccumulateLogV2 as _;
+        use vos::service::CommittedAccumulateLog as _;
 
         let directory = std::env::temp_dir().join(format!(
-            "vosx-v2-unapplied-upgrade-{}-{}",
+            "vosx-unapplied-upgrade-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos(),
         ));
-        std::fs::create_dir_all(directory.join("v2-services")).unwrap();
+        std::fs::create_dir_all(directory.join("services")).unwrap();
         let service_pvm = std::fs::read(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../services/vos-service/vos-service.pvm"),
         )
         .unwrap();
-        let pinned = PinnedV2Service {
+        let pinned = PinnedService {
             pvm: std::sync::Arc::new(service_pvm),
         };
-        let original = signed_v2_package(vos::v2::VOS_SERVICE_PROGRAM_ID);
+        let original = signed_service_package(vos::service::VOS_SERVICE_PROGRAM_ID);
         let mut row = vos::registry::AgentRow {
             instance_name: "counter".into(),
             program_hash: BlobHash::of(&original.encode()).0,
@@ -4766,9 +4786,9 @@ mod tests {
             install_payloads: vec![],
         };
         let space_id = [0xD2; 32];
-        let RowConfig::V2 {
+        let RowConfig::Service {
             config, state_path, ..
-        } = v2_config_from_row(
+        } = service_config_from_row(
             &directory,
             space_id,
             &row,
@@ -4781,22 +4801,24 @@ mod tests {
         )
         .unwrap()
         else {
-            panic!("signed package did not resolve to a v2 Raft root")
+            panic!("signed package did not resolve to a service Raft root")
         };
         let config = *config;
         let service_identity = config.service.clone();
         let root_actor = config.root_actor;
-        let raft_path = v2_raft_db_path(&directory, service_identity.root_service);
+        let raft_path = service_raft_db_path(&directory, service_identity.root_service);
         let voters = [0xD101, 0xD102, 0xD103];
         assert!(vos::raft::seed_initial_config(&raft_path, &voters).unwrap());
         let policy = Hash([0xD3; 32]);
         let trust = std::sync::Arc::new(AllowProductionTrust(policy));
-        let log =
-            vos::raft::v2::RaftAccumulateLogV2::open(&raft_path, vos::raft::RaftConfig::default())
-                .unwrap();
-        let service = vos::v2::LocalRootTreeServiceV2::open_raft_production(
+        let log = vos::raft::service::RaftAccumulateLog::open(
+            &raft_path,
+            vos::raft::RaftConfig::default(),
+        )
+        .unwrap();
+        let service = vos::service::LocalRootTreeService::open_raft_production(
             config.clone(),
-            vos::v2::FileCommittedImageStoreV2::new(state_path.clone()),
+            vos::service::FileCommittedImageStore::new(state_path.clone()),
             log,
             trust.clone(),
         )
@@ -4817,13 +4839,13 @@ mod tests {
             .sign(&replacement.signing_message())
             .unwrap();
         let package_wire = replacement.encode();
-        let upgrade_wire = vos::v2::RootTreeUpgradeRequestV2 {
+        let upgrade_wire = vos::service::RootTreeUpgradeRequest {
             expected_deployment: original.deployment_id(),
             expected_program: original.manifest.actor_program,
             replacement: replacement.clone(),
         }
         .encode();
-        let upgrade = vos::v2::ActorUpgradeV2 {
+        let upgrade = vos::service::ActorUpgrade {
             service: service_identity.clone(),
             actor: root_actor,
             expected_deployment: original.deployment_id(),
@@ -4832,37 +4854,42 @@ mod tests {
             replacement_program: replacement.manifest.actor_program,
             producer: replacement.deployment_signature.producer,
             role_policies: replacement.role_policies.clone(),
-            base: vos::v2::ConsistencyBaseV2::Linear {
+            base: vos::service::ConsistencyBase::Linear {
                 revision: header.revision,
                 state_root: header.state_root.unwrap(),
             },
-            authorization: vos::v2::AuthorizationEvidenceV2::SystemCapability {
-                capability: vos::v2::SystemCapabilityId(
+            authorization: vos::service::AuthorizationEvidence::SystemCapability {
+                capability: vos::service::SystemCapabilityId(
                     Hash::digest(
-                        b"vos/root-upgrade-capability/v2",
+                        b"vos/root-upgrade-capability/service",
                         &[&service_identity.root_service.0, &root_actor.0],
                     )
                     .0,
                 ),
-                authenticator: Hash::digest(b"vos/root-upgrade-authenticator/v2", &[&upgrade_wire])
-                    .0
-                    .to_vec(),
+                authenticator: Hash::digest(
+                    b"vos/root-upgrade-authenticator/service",
+                    &[&upgrade_wire],
+                )
+                .0
+                .to_vec(),
             },
         };
-        let mut log =
-            vos::raft::v2::RaftAccumulateLogV2::open(&raft_path, vos::raft::RaftConfig::default())
-                .unwrap();
+        let mut log = vos::raft::service::RaftAccumulateLog::open(
+            &raft_path,
+            vos::raft::RaftConfig::default(),
+        )
+        .unwrap();
         let committed = log
             .propose_at_with_availability(
-                &vos::v2::AccumulateRequestV2::UpgradeActor(upgrade).encode(),
+                &vos::service::AccumulateRequest::UpgradeActor(upgrade).encode(),
                 None,
                 Some(policy),
-                &[vos::v2::ImportedProgramV2 {
+                &[vos::service::ImportedProgram {
                     program: replacement.manifest.actor_program,
                     pvm: replacement.actor_pvm.clone(),
                 }],
-                &[vos::v2::ImportedBlobV2 {
-                    reference: vos::v2::BlobRefV2::of_bytes(&package_wire),
+                &[vos::service::ImportedBlob {
+                    reference: vos::service::BlobRef::of_bytes(&package_wire),
                     bytes: package_wire.clone(),
                 }],
                 &[],
@@ -4872,12 +4899,14 @@ mod tests {
         assert_eq!(log.applied_index().unwrap(), 1);
         drop(log);
 
-        let log =
-            vos::raft::v2::RaftAccumulateLogV2::open(&raft_path, vos::raft::RaftConfig::default())
-                .unwrap();
-        let upgraded_leader = vos::v2::LocalRootTreeServiceV2::open_raft_production(
+        let log = vos::raft::service::RaftAccumulateLog::open(
+            &raft_path,
+            vos::raft::RaftConfig::default(),
+        )
+        .unwrap();
+        let upgraded_leader = vos::service::LocalRootTreeService::open_raft_production(
             config,
-            vos::v2::FileCommittedImageStoreV2::new(state_path.clone()),
+            vos::service::FileCommittedImageStore::new(state_path.clone()),
             log,
             trust.clone(),
         )
@@ -4922,7 +4951,7 @@ mod tests {
         row.program_version = replacement.manifest.version.clone();
         let cache_path = blob_store::cache_path_for(&BlobHash(row.program_hash));
         let _ = std::fs::remove_file(&cache_path);
-        let RowConfig::V2 { config, .. } = agent_config_from_row(
+        let RowConfig::Service { config, .. } = agent_config_from_row(
             &directory,
             space_id,
             &row,
@@ -4959,12 +4988,14 @@ mod tests {
             meta.write_in_txn(&txn).unwrap();
             txn.commit().unwrap();
         }
-        let log =
-            vos::raft::v2::RaftAccumulateLogV2::open(&raft_path, vos::raft::RaftConfig::default())
-                .unwrap();
-        let recovered = vos::v2::LocalRootTreeServiceV2::open_raft_production(
+        let log = vos::raft::service::RaftAccumulateLog::open(
+            &raft_path,
+            vos::raft::RaftConfig::default(),
+        )
+        .unwrap();
+        let recovered = vos::service::LocalRootTreeService::open_raft_production(
             *config,
-            vos::v2::FileCommittedImageStoreV2::new(state_path),
+            vos::service::FileCommittedImageStore::new(state_path),
             log,
             trust,
         )
@@ -4983,7 +5014,7 @@ mod tests {
     #[test]
     fn daemon_local_registration_uses_the_supplied_production_policy() {
         let directory = std::env::temp_dir().join(format!(
-            "vosx-v2-production-local-{}-{}",
+            "vosx-production-local-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4995,7 +5026,7 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../services/vos-service/vos-service.pvm"),
         )
         .unwrap();
-        let package = signed_v2_package(vos::v2::VOS_SERVICE_PROGRAM_ID);
+        let package = signed_service_package(vos::service::VOS_SERVICE_PROGRAM_ID);
         let row = vos::registry::AgentRow {
             instance_name: "production-counter".into(),
             program_hash: [31; 32],
@@ -5008,14 +5039,14 @@ mod tests {
             install_args: vec![],
             install_payloads: vec![],
         };
-        let pinned = PinnedV2Service {
+        let pinned = PinnedService {
             pvm: std::sync::Arc::new(service_pvm),
         };
-        let RowConfig::V2 {
+        let RowConfig::Service {
             config,
             state_path,
             network_reachable,
-        } = v2_config_from_row(
+        } = service_config_from_row(
             &directory,
             [33; 32],
             &row,
@@ -5028,7 +5059,7 @@ mod tests {
         )
         .unwrap()
         else {
-            panic!("signed package did not resolve to a v2 root")
+            panic!("signed package did not resolve to a service root")
         };
         let config = *config;
         let reopen_config = config.clone();
@@ -5040,7 +5071,7 @@ mod tests {
         });
         let route = ServiceId::new(35, 36);
         let mut node = VosNode::with_prefix(35);
-        let unavailable = register_v2_root_from_row(
+        let unavailable = register_service_root_from_row(
             &mut node,
             &directory,
             row.instance_name.clone(),
@@ -5054,15 +5085,15 @@ mod tests {
             Some(trust.clone()),
         )
         .unwrap_err();
-        assert!(is_retryable_v2_registration_error(&unavailable));
+        assert!(is_retryable_service_registration_error(&unavailable));
         assert!(matches!(
-            v2_registration_note(&unavailable),
+            service_registration_note(&unavailable),
             RowNote::RegistrationWaiting
         ));
         assert!(!node.has_agent(route));
 
         available.store(true, std::sync::atomic::Ordering::Relaxed);
-        register_v2_root_from_row(
+        register_service_root_from_row(
             &mut node,
             &directory,
             row.instance_name,
@@ -5079,16 +5110,16 @@ mod tests {
         assert!(node.has_agent(route));
         assert!(node.collect().iter().all(vos::node::AgentResult::is_ok));
 
-        let backend = vos::v2::FileCommittedImageStoreV2::new(state_path.clone());
+        let backend = vos::service::FileCommittedImageStore::new(state_path.clone());
         assert!(matches!(
-            vos::v2::LocalRootTreeServiceV2::open(reopen_config.clone(), backend),
-            Err(vos::v2::LocalRootTreeOpenErrorV2::ProductionTrust(
-                ProductionTrustErrorV2::TrustRequired,
+            vos::service::LocalRootTreeService::open(reopen_config.clone(), backend),
+            Err(vos::service::LocalRootTreeOpenError::ProductionTrust(
+                ProductionTrustError::TrustRequired,
             )),
         ));
-        let reopened = vos::v2::LocalRootTreeServiceV2::open_production(
+        let reopened = vos::service::LocalRootTreeService::open_production(
             reopen_config,
-            vos::v2::FileCommittedImageStoreV2::new(state_path),
+            vos::service::FileCommittedImageStore::new(state_path),
             trust,
         )
         .unwrap();
@@ -5097,21 +5128,21 @@ mod tests {
     }
 
     #[test]
-    fn retryable_v2_registration_leaves_a_router_window_and_advances_to_other_rows() {
+    fn retryable_service_registration_leaves_a_router_window_and_advances_to_other_rows() {
         let first = ("first".to_owned(), [1; 32]);
         let second = ("second".to_owned(), [2; 32]);
         let now = std::time::Instant::now();
-        let mut backoff = V2RegistrationBackoff::default();
+        let mut backoff = RegistrationBackoff::default();
         assert!(backoff.ready(&first, now));
         let mut attempts = 0;
-        assert!(take_v2_registration_attempt(
+        assert!(take_service_registration_attempt(
             &mut attempts,
             &backoff,
             &first,
             now,
         ));
         assert!(
-            !take_v2_registration_attempt(&mut attempts, &backoff, &second, now),
+            !take_service_registration_attempt(&mut attempts, &backoff, &second, now),
             "bootstrap and reconciliation both admit only one open per pass"
         );
 
@@ -5119,13 +5150,13 @@ mod tests {
         assert!(!backoff.ready(&first, now));
         assert!(!backoff.ready(&second, now));
 
-        let next_pass = now + V2_REGISTRATION_GLOBAL_RETRY_GAP;
+        let next_pass = now + SERVICE_REGISTRATION_GLOBAL_RETRY_GAP;
         attempts = 0;
         assert!(
             backoff.ready(&second, next_pass),
             "another row becomes eligible after the global router window"
         );
-        assert!(take_v2_registration_attempt(
+        assert!(take_service_registration_attempt(
             &mut attempts,
             &backoff,
             &second,
@@ -5135,13 +5166,13 @@ mod tests {
             !backoff.ready(&first, next_pass),
             "the failed row remains under its longer per-row backoff"
         );
-        assert!(backoff.ready(&first, now + V2_REGISTRATION_RETRY_BASE));
+        assert!(backoff.ready(&first, now + SERVICE_REGISTRATION_RETRY_BASE));
     }
 
     #[test]
     fn daemon_raft_registration_orders_the_supplied_production_policy() {
         let directory = std::env::temp_dir().join(format!(
-            "vosx-v2-production-raft-{}-{}",
+            "vosx-production-raft-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -5153,7 +5184,7 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../services/vos-service/vos-service.pvm"),
         )
         .unwrap();
-        let package = signed_v2_package(vos::v2::VOS_SERVICE_PROGRAM_ID);
+        let package = signed_service_package(vos::service::VOS_SERVICE_PROGRAM_ID);
         let replication_id = [42; 32];
         let row = vos::registry::AgentRow {
             instance_name: "production-raft-counter".into(),
@@ -5167,14 +5198,14 @@ mod tests {
             install_args: vec![],
             install_payloads: vec![],
         };
-        let pinned = PinnedV2Service {
+        let pinned = PinnedService {
             pvm: std::sync::Arc::new(service_pvm),
         };
-        let RowConfig::V2 {
+        let RowConfig::Service {
             config,
             state_path,
             network_reachable,
-        } = v2_config_from_row(
+        } = service_config_from_row(
             &directory,
             [43; 32],
             &row,
@@ -5187,7 +5218,7 @@ mod tests {
         )
         .unwrap()
         else {
-            panic!("signed package did not resolve to a v2 Raft root")
+            panic!("signed package did not resolve to a service Raft root")
         };
         let root_service = config.service.root_service;
         let reopen_config = (*config).clone();
@@ -5196,7 +5227,7 @@ mod tests {
         let member = 45;
         let route = ServiceId::new(member, 46);
         let mut node = VosNode::with_prefix(member);
-        register_v2_root_from_row(
+        register_service_root_from_row(
             &mut node,
             &directory,
             row.instance_name,
@@ -5223,22 +5254,22 @@ mod tests {
             replication_id,
             ..vos::raft::RaftConfig::default()
         };
-        let raft_path = v2_raft_db_path(&directory, root_service);
-        let log = vos::raft::RaftAccumulateLogV2::open(&raft_path, raft_config.clone()).unwrap();
+        let raft_path = service_raft_db_path(&directory, root_service);
+        let log = vos::raft::RaftAccumulateLog::open(&raft_path, raft_config.clone()).unwrap();
         assert!(matches!(
-            vos::v2::LocalRootTreeServiceV2::open_raft(
+            vos::service::LocalRootTreeService::open_raft(
                 reopen_config.clone(),
-                vos::v2::FileCommittedImageStoreV2::new(reopen_state_path.clone()),
+                vos::service::FileCommittedImageStore::new(reopen_state_path.clone()),
                 log,
             ),
-            Err(vos::v2::LocalRootTreeOpenErrorV2::ProductionTrust(
-                ProductionTrustErrorV2::TrustRequired,
+            Err(vos::service::LocalRootTreeOpenError::ProductionTrust(
+                ProductionTrustError::TrustRequired,
             )),
         ));
-        let reopened = vos::v2::LocalRootTreeServiceV2::open_raft_production(
+        let reopened = vos::service::LocalRootTreeService::open_raft_production(
             reopen_config,
-            vos::v2::FileCommittedImageStoreV2::new(reopen_state_path),
-            vos::raft::RaftAccumulateLogV2::open(&raft_path, raft_config).unwrap(),
+            vos::service::FileCommittedImageStore::new(reopen_state_path),
+            vos::raft::RaftAccumulateLog::open(&raft_path, raft_config).unwrap(),
             std::sync::Arc::new(AllowProductionTrust(policy)),
         )
         .unwrap();
@@ -5247,12 +5278,13 @@ mod tests {
     }
 
     #[test]
-    fn signed_crdt_v2_packages_select_the_anti_entropy_root_driver() {
+    fn signed_crdt_service_packages_select_the_anti_entropy_root_driver() {
         let service_pvm = std::fs::read(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../services/vos-service/vos-service.pvm"),
         )
         .expect("the protocol-pinned service artifact must be available to tests");
-        let package = signed_v2_package_with_consistency(vos::v2::VOS_SERVICE_PROGRAM_ID, true);
+        let package =
+            signed_service_package_with_consistency(vos::service::VOS_SERVICE_PROGRAM_ID, true);
         let row = vos::registry::AgentRow {
             instance_name: "shared-counter".into(),
             program_hash: [11; 32],
@@ -5265,11 +5297,11 @@ mod tests {
             install_args: vec![],
             install_payloads: vec![],
         };
-        let pinned = PinnedV2Service {
+        let pinned = PinnedService {
             pvm: std::sync::Arc::new(service_pvm),
         };
-        let resolved = v2_config_from_row(
-            Path::new("/tmp/vos-v2-crdt-config-test"),
+        let resolved = service_config_from_row(
+            Path::new("/tmp/vos-crdt-config-test"),
             [13; 32],
             &row,
             std::slice::from_ref(&row),
@@ -5280,24 +5312,24 @@ mod tests {
             &[],
         )
         .expect("a signed #[actor(crdt)] package selects CRDT");
-        let RowConfig::V2 { config, .. } = resolved else {
-            panic!("v2 CRDT package fell through to the legacy runtime")
+        let RowConfig::Service { config, .. } = resolved else {
+            panic!("service CRDT package fell through to the legacy runtime")
         };
-        assert_eq!(config.consistency, vos::v2::ConsistencyModeV2::Crdt);
+        assert_eq!(config.consistency, vos::service::ConsistencyMode::Crdt);
     }
 
     #[test]
-    fn v2_raft_storage_is_scoped_to_the_installation_incarnation() {
-        let data = Path::new("/tmp/vos-v2-raft-path-test");
-        let first = v2_raft_db_path(data, vos::v2::RootServiceId([1; 32]));
-        let reinstalled = v2_raft_db_path(data, vos::v2::RootServiceId([2; 32]));
+    fn service_raft_storage_is_scoped_to_the_installation_incarnation() {
+        let data = Path::new("/tmp/vos-raft-path-test");
+        let first = service_raft_db_path(data, vos::service::RootServiceId([1; 32]));
+        let reinstalled = service_raft_db_path(data, vos::service::RootServiceId([2; 32]));
         assert_ne!(first, reinstalled);
         let expected = format!("{}.raft.redb", hex::encode([1; 32]));
         assert_eq!(
             first.file_name().and_then(|name| name.to_str()),
             Some(expected.as_str()),
         );
-        assert!(first.starts_with(data.join("v2-services")));
+        assert!(first.starts_with(data.join("services")));
     }
 
     #[test]
@@ -5371,16 +5403,16 @@ mod tests {
     }
 
     #[test]
-    fn orphan_v2_images_and_private_sidecars_move_to_recoverable_trash() {
+    fn orphan_service_images_and_private_sidecars_move_to_recoverable_trash() {
         let dir = std::env::temp_dir().join(format!(
-            "vosx-v2-orphan-sweep-{}-{}",
+            "vosx-orphan-sweep-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos(),
         ));
-        let services = dir.join("v2-services");
+        let services = dir.join("services");
         std::fs::create_dir_all(&services).unwrap();
         let active = [0x31; 32];
         let orphan = [0x42; 32];
@@ -5392,8 +5424,7 @@ mod tests {
         let orphan_raft = services.join(format!("{}.raft.redb", hex::encode(orphan)));
         let active_seed = services.join(format!("{}.device-seed", hex::encode(active)));
         let orphan_seed = services.join(format!("{}.device-seed", hex::encode(orphan)));
-        let orphan_seed_temp =
-            services.join(format!("{}.device-seed.v2-next", hex::encode(orphan)));
+        let orphan_seed_temp = services.join(format!("{}.device-seed.next", hex::encode(orphan)));
         std::fs::write(&active_image, b"active").unwrap();
         std::fs::write(&orphan_image, b"orphan").unwrap();
         std::fs::write(&active_raft, b"active raft").unwrap();
@@ -5406,7 +5437,7 @@ mod tests {
         std::fs::create_dir_all(&orphan_records).unwrap();
         std::fs::write(orphan_records.join("record"), b"private record").unwrap();
 
-        sweep_orphan_v2_services(&dir, &[active].into_iter().collect());
+        sweep_orphan_service_services(&dir, &[active].into_iter().collect());
 
         assert!(active_image.is_file());
         assert!(active_raft.is_file());
@@ -5419,37 +5450,37 @@ mod tests {
         assert!(!orphan_seed_temp.exists());
         assert!(
             dir.join("trash")
-                .join("v2-services")
+                .join("services")
                 .join(orphan_image.file_name().unwrap())
                 .is_file(),
         );
         assert!(
             dir.join("trash")
-                .join("v2-services")
+                .join("services")
                 .join(orphan_proofs.file_name().unwrap())
                 .is_dir(),
         );
         assert!(
             dir.join("trash")
-                .join("v2-services")
+                .join("services")
                 .join(orphan_records.file_name().unwrap())
                 .is_dir(),
         );
         assert!(
             dir.join("trash")
-                .join("v2-services")
+                .join("services")
                 .join(orphan_raft.file_name().unwrap())
                 .is_file(),
         );
         assert!(
             dir.join("trash")
-                .join("v2-services")
+                .join("services")
                 .join(orphan_seed.file_name().unwrap())
                 .is_file(),
         );
         assert!(
             dir.join("trash")
-                .join("v2-services")
+                .join("services")
                 .join(orphan_seed_temp.file_name().unwrap())
                 .is_file(),
         );

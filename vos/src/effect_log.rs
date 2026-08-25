@@ -102,7 +102,7 @@ pub struct EffectLog {
     /// trailing extension so every replay strategy restores it exactly.
     /// Legacy CRDT logs reconstruct it from the enclosing
     /// [`CrdtEvent`]'s `(origin, seq)`.
-    invocation_id: crate::v2::InvocationId,
+    invocation_id: crate::service::InvocationId,
 }
 
 impl EffectLog {
@@ -115,7 +115,7 @@ impl EffectLog {
             anchor: [0u8; 32],
             caller_prefix: CALLER_SYSTEM,
             invoke_effects: Vec::new(),
-            invocation_id: crate::v2::InvocationId::ZERO,
+            invocation_id: crate::service::InvocationId::ZERO,
         }
     }
 
@@ -134,12 +134,12 @@ impl EffectLog {
     }
 
     /// Record the stable identity the guest observed for this dispatch.
-    pub fn set_invocation_id(&mut self, invocation_id: crate::v2::InvocationId) {
+    pub fn set_invocation_id(&mut self, invocation_id: crate::service::InvocationId) {
         self.invocation_id = invocation_id;
     }
 
     /// Stable invocation identity reconstructed for dispatch or replay.
-    pub fn invocation_id(&self) -> crate::v2::InvocationId {
+    pub fn invocation_id(&self) -> crate::service::InvocationId {
         self.invocation_id
     }
 
@@ -207,7 +207,7 @@ impl EffectLog {
             buf.extend_from_slice(&(rec.effects.len() as u64).to_le_bytes());
             buf.extend_from_slice(&rec.effects);
         }
-        if self.invocation_id != crate::v2::InvocationId::ZERO {
+        if self.invocation_id != crate::service::InvocationId::ZERO {
             buf.push(INVOCATION_ID_EXTENSION);
             buf.extend_from_slice(self.invocation_id.as_bytes());
         }
@@ -256,7 +256,7 @@ impl EffectLog {
             });
         }
         let invocation_id = if pos == bytes.len() {
-            crate::v2::InvocationId::ZERO
+            crate::service::InvocationId::ZERO
         } else {
             if *bytes.get(pos)? != INVOCATION_ID_EXTENSION {
                 return None;
@@ -264,7 +264,7 @@ impl EffectLog {
             pos += 1;
             let mut invocation_id = [0u8; 32];
             invocation_id.copy_from_slice(take(bytes, &mut pos, 32)?);
-            crate::v2::InvocationId::new(invocation_id)
+            crate::service::InvocationId::new(invocation_id)
         };
         if pos != bytes.len() {
             return None;
@@ -295,7 +295,7 @@ impl EffectLog {
 /// re-numbering.
 ///
 /// Replay reads `event.log` and feeds it through the runtime exactly as the
-/// originating replica did. The handler-visible [`crate::v2::InvocationId`] is
+/// originating replica did. The handler-visible [`crate::service::InvocationId`] is
 /// deterministically reconstructed from `origin` and `seq`, so replay observes
 /// the same CRDT operation identity as the live dispatch.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -322,15 +322,15 @@ pub const CRDT_EVENT_VERSION: u8 = 1;
 
 impl CrdtEvent {
     /// Handler-visible identity corresponding to one durable CRDT event.
-    pub fn invocation_id_for(origin: [u8; 32], seq: u64) -> crate::v2::InvocationId {
+    pub fn invocation_id_for(origin: [u8; 32], seq: u64) -> crate::service::InvocationId {
         let mut nonce = [0u8; 40];
         nonce[..32].copy_from_slice(&origin);
         nonce[32..].copy_from_slice(&seq.to_le_bytes());
-        crate::v2::InvocationId::derive(b"vos/crdt-event/v2", &nonce)
+        crate::service::InvocationId::derive(b"vos/crdt-event/service", &nonce)
     }
 
     /// Handler-visible identity corresponding to this event.
-    pub fn invocation_id(&self) -> crate::v2::InvocationId {
+    pub fn invocation_id(&self) -> crate::service::InvocationId {
         Self::invocation_id_for(self.origin, self.seq)
     }
 
@@ -377,7 +377,9 @@ impl CrdtEvent {
         let seq = u64::from_le_bytes(bytes[33..41].try_into().ok()?);
         let log = EffectLog::from_bytes(&bytes[41..])?;
         let expected = Self::invocation_id_for(origin, seq);
-        if log.invocation_id() != crate::v2::InvocationId::ZERO && log.invocation_id() != expected {
+        if log.invocation_id() != crate::service::InvocationId::ZERO
+            && log.invocation_id() != expected
+        {
             return None;
         }
         Some(Self::new(origin, seq, log))
@@ -718,7 +720,7 @@ mod tests {
         let zero_bytes = zero.to_bytes();
 
         let mut current = zero.clone();
-        let invocation = crate::v2::InvocationId::derive(b"test", b"raft-replay");
+        let invocation = crate::service::InvocationId::derive(b"test", b"raft-replay");
         current.set_invocation_id(invocation);
         let current_bytes = current.to_bytes();
 
@@ -727,7 +729,7 @@ mod tests {
             EffectLog::from_bytes(&zero_bytes)
                 .expect("zero-identity decode")
                 .invocation_id(),
-            crate::v2::InvocationId::ZERO,
+            crate::service::InvocationId::ZERO,
         );
         assert_eq!(
             EffectLog::from_bytes(&current_bytes)

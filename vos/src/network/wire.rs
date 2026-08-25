@@ -132,7 +132,7 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// gigabyte allocations by claiming an absurd chain length.
 const MAX_CHAIN_LEN: usize = 32;
 
-/// Matches service-v2's private actor-input window. Reject oversized
+/// Matches service's private actor-input window. Reject oversized
 /// sidecars at the network decoder before allocating work the guest can never
 /// consume.
 const MAX_PRIVATE_INGRESS_BYTES: usize = 64 * 1024;

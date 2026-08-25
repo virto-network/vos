@@ -618,7 +618,7 @@ mod tests {
             &mut idx,
             SpaceEntry {
                 id: id.clone(),
-                name: "v2".into(),
+                name: "service".into(),
                 created_at: "y".into(),
                 data_dir: "".into(),
                 registry_hash: String::new(),
@@ -628,7 +628,7 @@ mod tests {
             },
         );
         assert_eq!(idx.spaces.len(), 1);
-        assert_eq!(idx.spaces[0].name, "v2");
+        assert_eq!(idx.spaces[0].name, "service");
     }
 
     #[test]

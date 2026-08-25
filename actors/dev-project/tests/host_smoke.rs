@@ -60,13 +60,13 @@ fn root_commit_and_fast_forward() {
     assert_eq!(row.files[0].path, "src/lib.rs");
 
     // Fast-forward — same file, new content.
-    let lib_hash_v2 = store::put_blob(&mut s, b"// lib.rs v2\n".to_vec());
+    let lib_hash = store::put_blob(&mut s, b"// lib.rs service\n".to_vec());
     let result2 = store::commit(
         &mut s,
         store::CommitInputs {
             parent: &root_commit,
             paths: &["src/lib.rs".to_string()],
-            blob_hashes: &lib_hash_v2,
+            blob_hashes: &lib_hash,
             branch: "main",
             intent_tag: INTENT_EDIT,
             intent_data: b"bump version".to_vec(),
@@ -540,7 +540,7 @@ fn merge_clean_independent_edits() {
     assert_eq!(base.status, STATUS_OK);
 
     // ours: edits a.rs.
-    let ours = commit_one_file(&mut s, "main", &base.hash, "src/a.rs", b"// a v2\n", 2);
+    let ours = commit_one_file(&mut s, "main", &base.hash, "src/a.rs", b"// a service\n", 2);
 
     // theirs: a separate branch off base that adds b.rs while
     // keeping the existing files (commits carry the full tree —
@@ -608,7 +608,7 @@ fn merge_records_conflict_then_subsequent_commit_resolves() {
     // head is what the merge below treats as "ours").
     let _ours = commit_one_file(&mut s, "main", &base.hash, "src/lib.rs", b"// ours v1\n", 2);
 
-    // theirs (off base): lib.rs v2 — same path, different content.
+    // theirs (off base): lib.rs service — same path, different content.
     let theirs = commit_one_file(
         &mut s,
         "feature",

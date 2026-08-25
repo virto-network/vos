@@ -101,7 +101,7 @@ File: `vosx/src/commands/dynamic.rs`.
   type to stderr. Non-bytes replies with `--out` write their text rendering.
 - Unit tests alongside the existing `apply_arg`/`parse_argv` tests.
 
-### 1.3 Metadata v2: doc strings + per-handler timeout
+### 1.3 Metadata service: doc strings + per-handler timeout
 
 Files: `vos/src/actors/metadata.rs`, `vos/vos-macros/src/lib.rs`,
 `vosx/src/commands/dynamic.rs`, `vosx/src/cli_cache.rs`.

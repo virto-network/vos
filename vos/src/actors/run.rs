@@ -129,7 +129,7 @@ enum AskInner {
     Immediate(Result<alloc::vec::Vec<u8>, super::value::InvokeError>),
     /// Deferred host I/O (worker path).
     HostIo(HostIo),
-    /// Finalization fork of a durable v2 await. The exact machine snapshot
+    /// Finalization fork of a durable service await. The exact machine snapshot
     /// resumes before this future is constructed, so this variant is never
     /// polled again after a committed reply is injected.
     #[cfg(feature = "pvm")]
@@ -735,7 +735,7 @@ pub fn run_task_service<A: super::Actor>(witness_ptr: *const u8, witness_cap: us
     halt_with_output_bound(&encoded, &io_hash);
 }
 
-/// Execute one canonical actor message as a nested JAR VM and return its v2
+/// Execute one canonical actor message as a nested JAR VM and return its service
 /// slice result through the move-only IPC DATA capability in slot 0.
 ///
 /// The generic service owns scheduling and transition construction. This
@@ -743,8 +743,8 @@ pub fn run_task_service<A: super::Actor>(witness_ptr: *const u8, witness_cap: us
 /// and reports buffered actor writes; it has no persistent host surface.
 #[cfg(feature = "service")]
 #[unsafe(link_section = ".bss.vos_actor_private")]
-static mut ACTOR_PRIVATE_BUFFER: [u8; crate::v2::ACTOR_PRIVATE_INPUT_MAX_BYTES] =
-    [0; crate::v2::ACTOR_PRIVATE_INPUT_MAX_BYTES];
+static mut ACTOR_PRIVATE_BUFFER: [u8; crate::service::ACTOR_PRIVATE_INPUT_MAX_BYTES] =
+    [0; crate::service::ACTOR_PRIVATE_INPUT_MAX_BYTES];
 
 #[cfg(feature = "service")]
 pub fn run_nested_actor_service<A: super::Actor>(
@@ -754,8 +754,8 @@ pub fn run_nested_actor_service<A: super::Actor>(
 ) -> ! {
     use super::context::ServiceId;
     use super::lifecycle::{self, DispatchResult};
-    use crate::v2::{
-        ActorCallResultV2, ActorPrivateInputV2, ActorSliceInputV2, ActorSliceOutputV2, V2Wire,
+    use crate::service::{
+        ActorCallResult, ActorPrivateInput, ActorSliceInput, ActorSliceOutput, ServiceWire,
     };
 
     crate::log_impl::install_pvm_logger();
@@ -763,7 +763,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
     crate::crdt::reset_actor_slice();
 
     let expected_address =
-        crate::v2::ACTOR_IPC_BASE_PAGE as u64 * javm_page_size_for_guest() as u64;
+        crate::service::ACTOR_IPC_BASE_PAGE as u64 * javm_page_size_for_guest() as u64;
     let page_size = javm_page_size_for_guest() as u64;
     let input_len = usize::try_from(input_len).expect("actor IPC input length exceeds usize");
     let capacity = usize::try_from(capacity).expect("actor IPC capacity exceeds usize");
@@ -777,20 +777,20 @@ pub fn run_nested_actor_service<A: super::Actor>(
         u32::try_from(capacity / page_size as usize).expect("actor IPC page count exceeds u32");
     assert!(crate::abi::pvm::ecall::map_cap_rw(
         0,
-        crate::v2::ACTOR_IPC_BASE_PAGE,
+        crate::service::ACTOR_IPC_BASE_PAGE,
         page_count,
     ));
 
     // SAFETY: MAP above established a readable DATA-cap range covering the
     // complete input. The service does not regain this cap until REPLY.
     let bytes = unsafe { core::slice::from_raw_parts(input_address as *const u8, input_len) };
-    let input = ActorSliceInputV2::decode(bytes).expect("invalid actor slice input");
+    let input = ActorSliceInput::decode(bytes).expect("invalid actor slice input");
     // SAFETY: each actor VM has an isolated memory image and dispatch is
     // non-reentrant, so this active VM exclusively owns its static buffer.
     let private_buffer = unsafe {
         core::slice::from_raw_parts_mut(
             core::ptr::addr_of_mut!(ACTOR_PRIVATE_BUFFER).cast::<u8>(),
-            crate::v2::ACTOR_PRIVATE_INPUT_MAX_BYTES,
+            crate::service::ACTOR_PRIVATE_INPUT_MAX_BYTES,
         )
     };
     let private_len = usize::try_from(crate::abi::pvm::hostcalls::actor_private_fetch(
@@ -801,7 +801,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
         private_len > 0 && private_len <= private_buffer.len(),
         "private actor input exceeds its deterministic bound"
     );
-    let ActorPrivateInputV2 {
+    let ActorPrivateInput {
         actor: actor_id,
         actor_tree,
         external_actors,
@@ -814,13 +814,13 @@ pub fn run_nested_actor_service<A: super::Actor>(
         origin_service,
         space_role,
         actor_role,
-    } = ActorPrivateInputV2::decode(&private_buffer[..private_len])
+    } = ActorPrivateInput::decode(&private_buffer[..private_len])
         .expect("invalid private actor input");
     assert_eq!(
         input.actor, actor_id,
         "shared actor route does not match the active private VM"
     );
-    let ActorSliceInputV2 {
+    let ActorSliceInput {
         actor: _,
         first_await_ordinal,
         message,
@@ -833,11 +833,11 @@ pub fn run_nested_actor_service<A: super::Actor>(
             .expect("invalid concurrent CRDT actor materialization");
     }
     // The legacy route-only ServiceId is deliberately not derived by
-    // truncating ActorId. Nested v2 actors retain their complete typed identity
-    // in Context and all v2 scheduler effects use that value.
+    // truncating ActorId. Nested service actors retain their complete typed identity
+    // in Context and all service scheduler effects use that value.
     let mut ctx = super::Context::new(ServiceId(0));
     ctx.__set_actor_id(actor_id);
-    ctx.__set_actor_tree_v2(
+    ctx.__set_actor_tree(
         actor_tree,
         external_actors,
         change.map(|change| change.change),
@@ -881,7 +881,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
     let yielded = matches!(dispatch, DispatchResult::Yielded) || ctx.self_scheduled();
     let forbidden = ctx.was_forbidden();
     let reply = ctx.take_reply_bytes();
-    let checkpoint = ctx.__take_checkpoint_v2();
+    let checkpoint = ctx.__take_checkpoint();
     let new_state = actor.encode();
     let state_changed = state.is_empty() || new_state != state;
     drop(actor);
@@ -904,7 +904,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
             (
                 crate::crdt::take_operations(actor_id, change)
                     .expect("nested CRDT actor must return its completed field operations"),
-                alloc::vec![crate::v2::ActorCrdtStateV2 {
+                alloc::vec![crate::service::ActorCrdtState {
                     actor: actor_id,
                     state: new_state,
                     next_dispatch_ordinal,
@@ -919,12 +919,12 @@ pub fn run_nested_actor_service<A: super::Actor>(
         ),
     };
     let writes = ctx
-        .__drain_actor_writes_v2(actor_id, super::storage::end_dispatch(), linear_state)
-        .expect("nested actor emitted an unsupported v2 effect");
-    let outbox = ctx.__drain_actor_calls_v2();
-    let spawns = ctx.__drain_actor_spawns_v2();
-    let (first_await_ordinal, next_await_ordinal) = ctx.__await_ordinal_range_v2();
-    let output = ActorSliceOutputV2 {
+        .__drain_actor_writes(actor_id, super::storage::end_dispatch(), linear_state)
+        .expect("nested actor emitted an unsupported service effect");
+    let outbox = ctx.__drain_actor_calls();
+    let spawns = ctx.__drain_actor_spawns();
+    let (first_await_ordinal, next_await_ordinal) = ctx.__await_ordinal_range();
+    let output = ActorSliceOutput {
         actor: actor_id,
         first_await_ordinal,
         next_await_ordinal,
@@ -940,7 +940,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
     };
     let effects = output.encode();
     assert!(
-        effects.len() <= crate::v2::ACTOR_PRIVATE_INPUT_MAX_BYTES,
+        effects.len() <= crate::service::ACTOR_PRIVATE_INPUT_MAX_BYTES,
         "actor slice effects exceed their deterministic bound"
     );
     assert_eq!(
@@ -948,7 +948,7 @@ pub fn run_nested_actor_service<A: super::Actor>(
         crate::abi::error::HOST_OK,
         "generic service rejected canonical actor effects"
     );
-    let encoded = ActorCallResultV2 {
+    let encoded = ActorCallResult {
         actor: actor_id,
         first_await_ordinal,
         next_await_ordinal,

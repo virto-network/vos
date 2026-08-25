@@ -1,4 +1,4 @@
-//! Build and verify one self-describing production-v2 artifact directory.
+//! Build and verify one self-describing production artifact directory.
 //!
 //! `vos-service.pvm` is the consensus program all hosts execute. The canonical
 //! `space-authority.pvm` is the ABI-17 authority identity sealed into new
@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, bail};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
-use vos::v2::{ProgramId, ServicePvmV2};
+use vos::service::{ProgramId, ServicePvm};
 
 use crate::bundled;
 
@@ -107,7 +107,10 @@ fn bundle(service_path: &Path, output: &Path) -> anyhow::Result<()> {
     fs::write(output.join(MANIFEST_FILE), manifest_bytes).context("write release manifest")?;
     verify(output).context("verify staged production release")?;
     guard.0 = None;
-    println!("bundled production v2 artifacts at {}", output.display());
+    println!(
+        "bundled production service artifacts at {}",
+        output.display()
+    );
     println!("  service_program_id = {}", manifest.service.program_id);
     println!("  authority_program_id = {}", manifest.authority.program_id);
     Ok(())
@@ -142,14 +145,14 @@ fn verify(directory: &Path) -> anyhow::Result<ReleaseManifest> {
 
 fn validate_service(bytes: &[u8]) -> anyhow::Result<()> {
     let actual = ProgramId::of_pvm(bytes);
-    if actual != vos::v2::VOS_SERVICE_PROGRAM_ID {
+    if actual != vos::service::VOS_SERVICE_PROGRAM_ID {
         bail!(
             "service PVM has program {}, expected protocol pin {}",
             hex::encode(actual.0),
-            hex::encode(vos::v2::VOS_SERVICE_PROGRAM_ID.0),
+            hex::encode(vos::service::VOS_SERVICE_PROGRAM_ID.0),
         );
     }
-    ServicePvmV2::new(bytes.to_vec(), actual)
+    ServicePvm::new(bytes.to_vec(), actual)
         .map_err(|error| anyhow::anyhow!("invalid canonical service PVM: {error}"))?;
     Ok(())
 }
@@ -170,9 +173,9 @@ fn manifest_for(service: &[u8], authority: &[u8]) -> ReleaseManifest {
     ReleaseManifest {
         format: RELEASE_FORMAT.into(),
         version: RELEASE_VERSION,
-        platform_abi: vos::v2::ABI_VERSION,
-        store_schema: vos::v2::SERVICE_STORE_SCHEMA_VERSION,
-        execution_semantics: hex::encode(vos::v2::EXECUTION_SEMANTICS_ID.0),
+        platform_abi: vos::service::ABI_VERSION,
+        store_schema: vos::service::SERVICE_STORE_SCHEMA_VERSION,
+        execution_semantics: hex::encode(vos::service::EXECUTION_SEMANTICS_ID.0),
         service: artifact(SERVICE_FILE, service),
         authority: artifact(AUTHORITY_FILE, authority),
     }
@@ -341,8 +344,11 @@ mod tests {
     fn manifest_binds_protocol_versions_and_both_artifacts() {
         let manifest = manifest_for(b"service", b"authority");
         assert_eq!(manifest.format, "VOSR1");
-        assert_eq!(manifest.platform_abi, vos::v2::ABI_VERSION);
-        assert_eq!(manifest.store_schema, vos::v2::SERVICE_STORE_SCHEMA_VERSION);
+        assert_eq!(manifest.platform_abi, vos::service::ABI_VERSION);
+        assert_eq!(
+            manifest.store_schema,
+            vos::service::SERVICE_STORE_SCHEMA_VERSION
+        );
         assert_eq!(manifest.service.file, SERVICE_FILE);
         assert_eq!(manifest.authority.file, AUTHORITY_FILE);
         assert_ne!(manifest.service.blake2b_256, manifest.authority.blake2b_256);

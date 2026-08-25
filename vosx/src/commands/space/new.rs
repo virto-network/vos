@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use vos::abi::service::ServiceId;
 use vos::node::{AgentConfig, Consistency, VosNode};
-use vos::registry::{AUTH_ROLE_ADMIN, NODE_ROLE_VOTER, RegistryRef, Status};
+use vos::registry::{NODE_ROLE_VOTER, RegistryRef, Status};
 
 use crate::blob_store::{self, BlobSource};
 use crate::commands::space::op_sign::op_auth;
@@ -179,33 +179,6 @@ pub(crate) fn scaffold(
         .map_err(|e| anyhow::anyhow!("genesis set_root failed: {e}"))?;
     if status != Status::Ok {
         anyhow::bail!("genesis set_root returned status {status}");
-    }
-
-    // Fresh registry, so the operator's grant epoch starts at 1 (the
-    // read returns 0). Sign the epoch into the canonical the same way
-    // the CLI does on every later grant.
-    let grant_epoch = vos::block_on(reg.peer_epoch(&mut &node, operator_peer_id.clone()))
-        .map_err(|e| anyhow::anyhow!("genesis peer_epoch failed: {e}"))?
-        + 1;
-    let grant_auth = op_auth(
-        &operator_kp,
-        "grant_role",
-        &[
-            &operator_peer_id,
-            &[AUTH_ROLE_ADMIN],
-            &grant_epoch.to_le_bytes(),
-        ],
-    )?;
-    let status = vos::block_on(reg.grant_role(
-        &mut &node,
-        operator_peer_id.clone(),
-        AUTH_ROLE_ADMIN,
-        grant_epoch,
-        grant_auth,
-    ))
-    .map_err(|e| anyhow::anyhow!("genesis grant_role failed: {e}"))?;
-    if status != Status::Ok {
-        anyhow::bail!("genesis grant_role returned status {status}");
     }
 
     let node_peer_id = peer_id.to_bytes();

@@ -1,5 +1,5 @@
 [package]
-name = "v2-shared-board"
+name = "shared-board"
 version.workspace = true
 edition.workspace = true
 

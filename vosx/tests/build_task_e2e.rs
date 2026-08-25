@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use vos::v2::{V2Wire, VosPackageV2};
+use vos::service::{ServiceWire, VosPackage};
 
 struct TempDir(PathBuf);
 
@@ -66,7 +66,7 @@ fn build_accepts_the_canonical_binary_task_project() {
 
     let bytes =
         std::fs::read(output.path().join("task-project-e2e.vos")).expect("read generated package");
-    let package = VosPackageV2::decode(&bytes).expect("decode generated package");
+    let package = VosPackage::decode(&bytes).expect("decode generated package");
     package.validate().expect("generated package is canonical");
     assert_eq!(package.task_dependencies.len(), 1);
     assert_eq!(

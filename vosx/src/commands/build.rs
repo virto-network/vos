@@ -1,19 +1,19 @@
-//! Build a canonical actor PVM and its signed `.vos` v2 package.
+//! Build a canonical actor PVM and its signed `.vos` service package.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, anyhow, bail};
-use vos::v2::{
-    DeploymentSignatureV2, PackageDiagnosticsV2, PackageManifestV2, PackageRolePoliciesV2,
-    PackageTaskDependencyV2, ProducerId, ProgramId, TaskDependencyV2, V2Wire, VosPackageV2,
+use vos::service::{
+    DeploymentSignature, PackageDiagnostics, PackageManifest, PackageRolePolicies,
+    PackageTaskDependency, ProducerId, ProgramId, ServiceWire, TaskDependency, VosPackage,
     artifact_hash, task_dependencies_hash,
 };
 
 const RUSTC_WRAPPER_MODE: &str = "VOSX_CANONICAL_RUSTC_WRAPPER";
 const RUSTC_WRAPPER_SOURCE_ROOT: &str = "VOSX_CANONICAL_SOURCE_ROOT";
-const RUSTC_UNIT_METADATA_DOMAIN: &[u8] = b"vos/rustc-unit-metadata/v2";
+const RUSTC_UNIT_METADATA_DOMAIN: &[u8] = b"vos/rustc-unit-metadata/service";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct RustcUnitIdentity {
@@ -66,7 +66,7 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
     if actor_pvm.is_empty() {
         bail!("{} produced an empty PVM", program.display());
     }
-    vos::v2::validate_actor_program_layout(&actor_pvm)
+    vos::service::validate_actor_program_layout(&actor_pvm)
         .map_err(|error| anyhow!("invalid canonical actor PVM capability layout: {error}"))?;
 
     let schemas = match args.schemas.as_deref() {
@@ -76,7 +76,7 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
     };
     let actor_metadata = vos::metadata::decode(&schemas).ok_or_else(|| {
         anyhow!(
-            "{} has no valid v2 actor schema; build from its ELF or pass --schemas with exact .vos_meta bytes",
+            "{} has no valid service actor schema; build from its ELF or pass --schemas with exact .vos_meta bytes",
             program.display()
         )
     })?;
@@ -104,7 +104,7 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
     {
         bail!("duplicate canonical Task dependency");
     }
-    let mut generated_policies = PackageRolePoliciesV2::from_metadata(&actor_metadata)?;
+    let mut generated_policies = PackageRolePolicies::from_metadata(&actor_metadata)?;
     generated_policies.task_dependencies = task_dependencies
         .iter()
         .map(|dependency| dependency.binding.clone())
@@ -125,18 +125,18 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
         None => generated_role_policies,
     };
     let source_map = read_optional(args.source_map.as_deref())?;
-    let service_program = vos::v2::VOS_SERVICE_PROGRAM_ID;
+    let service_program = vos::service::VOS_SERVICE_PROGRAM_ID;
     let actor_program = ProgramId::of_pvm(&actor_pvm);
 
     let public_key = keypair.public().encode_protobuf();
     let producer = ProducerId::of_public_key(&public_key);
-    let mut package = VosPackageV2 {
-        manifest: PackageManifestV2 {
+    let mut package = VosPackage {
+        manifest: PackageManifest {
             name: name.clone(),
             version: args.version,
-            service_abi: vos::v2::ABI_VERSION,
-            snapshot_version: vos::v2::SNAPSHOT_VERSION,
-            execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
+            service_abi: vos::service::ABI_VERSION,
+            snapshot_version: vos::service::SNAPSHOT_VERSION,
+            execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
             service_program,
             actor_program,
             crdt,
@@ -150,11 +150,11 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
         role_policies,
         schemas,
         task_dependencies,
-        diagnostics: (args.include_elf || !source_map.is_empty()).then_some(PackageDiagnosticsV2 {
+        diagnostics: (args.include_elf || !source_map.is_empty()).then_some(PackageDiagnostics {
             elf: (args.include_elf && !is_pvm).then_some(input),
             source_map: (!source_map.is_empty()).then_some(source_map),
         }),
-        deployment_signature: DeploymentSignatureV2 {
+        deployment_signature: DeploymentSignature {
             producer,
             public_key,
             signature: vec![0],
@@ -190,7 +190,7 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
     Ok(())
 }
 
-fn build_task_dependency(input: &Path) -> anyhow::Result<PackageTaskDependencyV2> {
+fn build_task_dependency(input: &Path) -> anyhow::Result<PackageTaskDependency> {
     let program = resolve_task_input(input)?;
     if program.extension().and_then(|extension| extension.to_str()) == Some("pvm") {
         bail!(
@@ -220,9 +220,9 @@ fn build_task_dependency(input: &Path) -> anyhow::Result<PackageTaskDependencyV2
             program.display()
         );
     }
-    Ok(PackageTaskDependencyV2 {
-        binding: TaskDependencyV2 {
-            task: vos::v2::Hash(vos::provable::task_blob_hash(&pvm)),
+    Ok(PackageTaskDependency {
+        binding: TaskDependency {
+            task: vos::service::Hash(vos::provable::task_blob_hash(&pvm)),
             program: ProgramId::of_pvm(&pvm),
             witness_address,
             witness_capacity,
@@ -545,7 +545,7 @@ fn canonical_rustc_unit_metadata(
     }
 
     let hash = vos::crypto::blake2b_hash::<16>(RUSTC_UNIT_METADATA_DOMAIN, &[&identity]);
-    format!("vos-actor-v2-{}", hex::encode(hash))
+    format!("vos-actor-{}", hex::encode(hash))
 }
 
 fn push_metadata_part(output: &mut Vec<u8>, label: &[u8], value: &OsStr) {
@@ -658,7 +658,7 @@ mod tests {
         fn new(label: &str) -> Self {
             let mut path = std::env::temp_dir();
             path.push(format!(
-                "vosx-v2-build-{label}-{}-{}",
+                "vosx-build-{label}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -698,7 +698,7 @@ mod tests {
         assert!(
             canonical[3]
                 .to_string_lossy()
-                .starts_with("-Cmetadata=vos-actor-v2-")
+                .starts_with("-Cmetadata=vos-actor-")
         );
         assert_eq!(canonical[4], "--remap-path-prefix=/checkout=vos-source");
     }
@@ -809,9 +809,9 @@ mod tests {
             Some("actors")
         );
         assert_eq!(
-            root.join("target/riscv64em-vos/release/v2_counter.elf"),
+            root.join("target/riscv64em-vos/release/service_counter.elf"),
             root.join("target/riscv64em-vos/release")
-                .join(format!("{}.elf", "v2-counter".replace('-', "_")))
+                .join(format!("{}.elf", "counter".replace('-', "_")))
         );
     }
 

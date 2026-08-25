@@ -1,5 +1,5 @@
 [package]
-name = "v2-private-age"
+name = "private-age"
 version.workspace = true
 edition.workspace = true
 

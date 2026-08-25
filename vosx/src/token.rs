@@ -76,7 +76,7 @@ pub struct InvitePayload {
     /// Expiry (unix seconds). Bound into the signed invite canonical,
     /// checked host-side at admission — never at CRDT replay.
     pub expires_at: u64,
-    /// Durable protocol marker pinning redemption to the canonical v2
+    /// Durable protocol marker pinning redemption to the canonical service
     /// authority incarnation. Markerless invitations are intentionally no
     /// longer representable: replica-local absence cannot prove legacy mode.
     pub authority_replication_id: [u8; 32],

@@ -25,7 +25,7 @@
 //!   on" from "the snapshots I've taken of it". An amend keeps the
 //!   change_id, mints a new commit hash, advances the ref. Latest
 //!   commit per change_id is what `log` surfaces. Working-state
-//!   semantics will be layered on top in v2.
+//!   semantics will be layered on top in service.
 //!
 //! Real-time collaborative editing (multiple agents editing the
 //! same project simultaneously) lands later via CRDT-mergeable

@@ -42,7 +42,7 @@ bank federation, without regressing it.
 - **jar (github.com/olanod/jar)**: JAM-alignment Phase 0 (hard-fork policy)
   + Phase 1 (host-owned SP, args ω7/ω8, refine IC 0 / accumulate IC 5,
   two-slot jump prologue; jar1 conformance gate holds, gp072 untouched).
-- **V2 production root stack**: request-byte Raft replay and snapshot catch-up,
+- **Service production root stack**: request-byte Raft replay and snapshot catch-up,
   CRDT causal execution and bounded anti-entropy, nested root-tree calls,
   durable deadlines, authenticated Local/Raft/CRDT transport, role authority,
   signed canonical packages, portable attestations, attested retries, idle
@@ -72,7 +72,7 @@ landed in later reviewed forms; it is not a source of commits to cherry-pick.
 The commit-by-commit disposition is retained in
 [`worktree-provable-audit.md`](worktree-provable-audit.md).
 The canonical service and Clerk content identities now also have one
-reproducible historical-source recipe: `support/v2-production-artifacts.toml`
+reproducible historical-source recipe: `support/production-artifacts.toml`
 pins the exact source revision and date-specific host/guest toolchains, while
 current-source builds are explicitly labeled migration candidates. The
 operator-specific Clerk `.vos` signature is a separate, explicit release step;
@@ -188,7 +188,7 @@ stands in for the on-chain settlement venue Wave 2 makes real.
   final membership, and an idempotent multi-root CLI workflow. The operator
   procedures and safety preconditions for both voter replacement and the
   guest-owned `UpgradeActor` path are explicit in
-  `docs/production-v2-operations.md`. Ordinary Local and Raft roots now have an
+  `docs/production-operations.md`. Ordinary Local and Raft roots now have an
   authenticated CLI/daemon entry point with exact retry and restart recovery.
   Canonical-authority upgrades now reuse that guest-owned path while preserving
   the frozen service binding and enforcing the immutable-root signature plus

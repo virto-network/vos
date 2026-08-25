@@ -2,10 +2,10 @@
 //!
 //! Two grant scopes:
 //!
-//! - **Space-level**: `<peer> -> <SpaceRole>`. When the canonical v2
+//! - **Space-level**: `<peer> -> <SpaceRole>`. When the canonical service
 //!   authority is installed, the immutable space root commits the same typed
 //!   subject, role, and epoch there after the legacy registry mutation.
-//! - **Actor-local** (`--in <actor>`): legacy v1 raw role bytes. V2 packages
+//! - **Actor-local** (`--in <actor>`): legacy v1 raw role bytes. Service packages
 //!   express authorization through generated space-role policies instead.
 //!
 //! Layout:
@@ -48,7 +48,7 @@ pub enum RoleCommand {
         #[arg(long = "in", value_name = "ACTOR")]
         agent: Option<String>,
     },
-    /// Grant a role to a peer. V2 space-level grants require the root identity.
+    /// Grant a role to a peer. Service space-level grants require the root identity.
     Grant {
         /// Multibase-encoded libp2p PeerId (`12D3KooW…`) or
         /// the literal `me` for the operator's

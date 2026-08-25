@@ -140,19 +140,19 @@ pub enum SpaceCommand {
         #[arg(long, value_name = "MULTIADDR")]
         connect: Vec<String>,
         /// Exact protocol-pinned generic service PVM used by installed `.vos`
-        /// v2 packages. Without it, v2 rows remain installed but are skipped.
+        /// service packages. Without it, service rows remain installed but are skipped.
         #[arg(long, value_name = "FILE")]
         service_pvm: Option<PathBuf>,
         /// Unix socket for the fail-closed JAM/consensus trust authority.
-        /// When set, all v2 roots use the production profile.
+        /// When set, all service roots use the production profile.
         #[arg(
             long,
             value_name = "SOCKET",
             requires = "service_pvm",
-            conflicts_with = "allow_v2_conformance"
+            conflicts_with = "allow_conformance"
         )]
         production_trust_socket: Option<PathBuf>,
-        /// Explicitly run signed v2 roots under the conformance-only trust
+        /// Explicitly run signed service roots under the conformance-only trust
         /// seam. This is for development and protocol tests; production
         /// operators must supply --production-trust-socket instead.
         #[arg(
@@ -160,7 +160,7 @@ pub enum SpaceCommand {
             requires = "service_pvm",
             conflicts_with = "production_trust_socket"
         )]
-        allow_v2_conformance: bool,
+        allow_conformance: bool,
     },
     /// Stop a running `space up` daemon by signalling its PID.
     /// SIGTERM by default (daemon flushes state, removes the
@@ -340,7 +340,7 @@ pub enum SpaceCommand {
         command: Option<members::MembersCommand>,
     },
     /// Manage auth-role grants. Subcommands: list, grant, revoke.
-    /// Bare `space role <space>` lists. When v2 is active, space-level
+    /// Bare `space role <space>` lists. When service is active, space-level
     /// mutations are also committed to the root-signed canonical authority;
     /// actor-local raw-byte grants remain a legacy v1 surface.
     Role {
@@ -421,7 +421,7 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             connect,
             service_pvm,
             production_trust_socket,
-            allow_v2_conformance,
+            allow_conformance,
         } => up::run(up::Args {
             query: space,
             once,
@@ -429,7 +429,7 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             connect,
             service_pvm,
             production_trust_socket,
-            allow_v2_conformance,
+            allow_conformance,
         }),
         SpaceCommand::Down {
             space,

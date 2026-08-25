@@ -73,7 +73,7 @@ object = { version = "0.36", default-features = false, features = ["std", "read_
 # `boot_token` + the host-local `device_id`. `std`-gated — the no_std riscv
 # guest reaches the host via the BOOT_CONTEXT ecall and never links this.
 getrandom = { version = "0.2", optional = true }
-# Host-only device signer used by v2 Refine. Application VMs receive only the
+# Host-only device signer used by service Refine. Application VMs receive only the
 # public key and Schnorr signature; the seed never enters guest memory. The
 # no_std actor/service builds do not enable `std`, so this dependency cannot
 # leak into a canonical guest artifact.
@@ -133,32 +133,13 @@ futures-channel = { version = "0.3", default-features = false, features = ["allo
 blake2b_simd = { version = "1", default-features = false }
 
 [dev-dependencies]
-# `default-features = false` so the `bin` feature stays off — host
-# tests just need the `CrdtCounterRef` typed surface from the
-# rlib, not the cdylib glue. The vos build for these dev-deps
-# pulls vos's own default features (std + http + storage + network)
-# via the test crate's own resolution so the integration tests can
-# `use vos::runtime::*` etc.
-crdt-counter = { path = "../tests/fixtures/legacy-v1/actors/crdt-counter", default-features = false }
-# Storage-type pressure fixture — the e2e drives a #[storage] map far
-# past the guest heap through the typed `BigMapRef`.
-big-map = { path = "../tests/fixtures/legacy-v1/actors/big-map", default-features = false }
-# Committed-storage fixture — the e2e drives a #[storage(committed)]
-# map's anchor_kind 0x02 chain through the typed `CommittedCounterRef`.
-committed-counter = { path = "../tests/fixtures/legacy-v1/actors/committed-counter", default-features = false }
-# Scheduler agent (the vos::agent::Tasks reference orchestrator) and
-# the tally Task fixture — dev-deps so host CI compiles their rlibs
-# even without the riscv toolchain; the e2e loads their pre-built ELFs
-# separately. `default-features = false` keeps the PVM bin glue out.
-scheduler = { path = "../tests/fixtures/legacy-v1/agents/scheduler", default-features = false }
-tally = { path = "../tests/fixtures/legacy-v1/actors/tally", default-features = false }
 # Built-in PVM actor — host tests need the typed `SpaceRegistryRef`
 # to drive the registry over the network. `default-features = false`
 # keeps the `bin` (PVM entry-point) glue out of the host link;
 # tests load the pre-built actor ELF separately and only need the
 # Ref surface from the rlib.
 space-registry = { path = "../actors/space-registry", default-features = false }
-# Canonical v2 authority state encoder used by the physical generic-service
+# Canonical service authority state encoder used by the physical generic-service
 # integration gate. The runtime itself remains application-agnostic.
 space-authority = { path = "../actors/space-authority", default-features = false }
 # The channel sequencer's reply types (`CommitOutcome` / `Status`), so the

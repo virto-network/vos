@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
-use vos::v2::{ProgramId, ServicePvmV2};
+use vos::service::{ProgramId, ServicePvm};
 
 pub fn run(elf: &Path, out: Option<PathBuf>) -> anyhow::Result<()> {
     let elf_bytes = std::fs::read(elf).with_context(|| format!("read {}", elf.display()))?;
@@ -26,10 +26,10 @@ fn canonical_service_pvm(elf: &[u8]) -> anyhow::Result<Vec<u8>> {
     if elf.is_empty() {
         bail!("service ELF is empty")
     }
-    let pvm = vos::v2::transpile_service_elf(elf)
+    let pvm = vos::service::transpile_service_elf(elf)
         .map_err(|error| anyhow!("transpile generic service ELF: {error:?}"))?;
     let program = ProgramId::of_pvm(&pvm);
-    ServicePvmV2::new(pvm.clone(), program).map_err(|error| {
+    ServicePvm::new(pvm.clone(), program).map_err(|error| {
         anyhow!("generic service has no valid JAM Refine/Accumulate entries: {error}")
     })?;
     Ok(pvm)

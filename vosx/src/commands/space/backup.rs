@@ -2,7 +2,7 @@
 //!
 //! The archive is a directory rather than an opaque tarball so operators can
 //! inspect and copy it with ordinary tools. `manifest.json` binds every byte
-//! under `data/` (redb files, v2 images, proof/private-input/record side
+//! under `data/` (redb files, service images, proof/private-input/record side
 //! stores, node identity and local policy) and `blobs/` (the content-addressed
 //! program cache). Restore verifies the complete archive before touching the
 //! destination and renames replaced state aside instead of deleting it.
@@ -976,8 +976,8 @@ mod tests {
         let data = root.join("source");
         let cache = root.join("cache");
         fs::create_dir_all(data.join("agents")).unwrap();
-        fs::create_dir_all(data.join("v2-services/root.image.proofs")).unwrap();
-        fs::create_dir_all(data.join("v2-services/root.image.records")).unwrap();
+        fs::create_dir_all(data.join("services/root.image.proofs")).unwrap();
+        fs::create_dir_all(data.join("services/root.image.records")).unwrap();
         fs::create_dir_all(&cache).unwrap();
         fs::write(data.join("node.key"), b"secret-node-key").unwrap();
         fs::write(
@@ -989,23 +989,19 @@ mod tests {
             b"registry-redb",
         )
         .unwrap();
+        fs::write(data.join("services/root.image"), b"committed-service-image").unwrap();
         fs::write(
-            data.join("v2-services/root.image"),
-            b"committed-service-image",
-        )
-        .unwrap();
-        fs::write(
-            data.join("v2-services/root.image.proofs/proof"),
+            data.join("services/root.image.proofs/proof"),
             b"proof-side-cas",
         )
         .unwrap();
         fs::write(
-            data.join("v2-services/root.image.records/record"),
+            data.join("services/root.image.records/record"),
             b"producer-private-record",
         )
         .unwrap();
         fs::write(data.join(".endpoint"), b"ephemeral").unwrap();
-        let blob = b"signed-v2-package";
+        let blob = b"signed-package";
         let hash = BlobHash::of(blob);
         fs::write(cache.join(hash.to_hex()), blob).unwrap();
         let entry = SpaceEntry {
@@ -1065,7 +1061,7 @@ mod tests {
             b"secret-node-key"
         );
         assert_eq!(
-            fs::read(destination.join("v2-services/root.image.records/record")).unwrap(),
+            fs::read(destination.join("services/root.image.records/record")).unwrap(),
             b"producer-private-record",
         );
         let restored_index = spaces_index::load_from(&index).unwrap();

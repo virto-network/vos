@@ -21,14 +21,14 @@ the user's critical path.
 | [`actors/`](actors/) | Built-in PVM actors bundled into `vosx` (e.g. `space-registry`) |
 | [`extensions/`](extensions/) | Native extension plugins loaded by the runtime (e.g. `http-gateway`) |
 | [`pvm/`](pvm/) | Virtual machine, compiler, and proof toolchain |
-| [`examples/`](examples/) | Four canonical v2 actor examples |
+| [`examples/`](examples/) | Four canonical service actor examples |
 | [`tests/fixtures/`](tests/fixtures/) | Test-only legacy, extension, WASM, and proving workloads |
 | [`tests/acceptance/clerk/`](tests/acceptance/clerk/) | Complex replicated-payment acceptance application |
 | [`docs/`](docs/) | The VOS Book (architecture, protocols, applications) |
 
 The clean-break service, continuation, wire, package and CRDT contracts—and
 their current implementation status—are documented in
-[`docs/runtime-v2.md`](docs/runtime-v2.md).
+[`docs/runtime.md`](docs/runtime.md).
 
 ## Quick start
 
@@ -36,7 +36,7 @@ their current implementation status—are documented in
 # Reproduce the protocol-pinned generic service from its recorded source and
 # toolchains. The recipe requires the pinned revision in local git history.
 just build-vos-service
-cp target/pinned-v2-artifacts/vos-service.pvm dist/vos-service.pvm
+cp target/pinned-production-artifacts/vos-service.pvm dist/vos-service.pvm
 
 # Build one canonical application PVM and its signed .vos package. The package
 # pins the service program above; developers do not implement Refine/Accumulate.
@@ -44,11 +44,11 @@ cargo run -p vosx -- build examples/actors/counter \
   --out-dir dist
 
 # Exercise all four public scenarios, including their canonical actor builds.
-just test-v2-examples
+just test-examples
 ```
 
 The immutable artifact provenance is recorded in
-[`support/v2-production-artifacts.toml`](support/v2-production-artifacts.toml).
+[`support/production-artifacts.toml`](support/production-artifacts.toml).
 Building current service sources is deliberately separate (`just
 build-vos-service-candidate`): that output is an upgrade candidate with a new
 identity, never an in-place replacement for the production pin.
@@ -59,21 +59,21 @@ release wrapper by naming the signing key explicitly—ambient XDG identity is
 never consulted by this recipe:
 
 ```bash
-just build-clerk-v2-package /secure/operator/identity.key
+just build-clerk-package /secure/operator/identity.key
 ```
 
-The space daemon installs signed v2 packages through the generic service PVM
+The space daemon installs signed service packages through the generic service PVM
 for Local, Raft, and CRDT roots, while legacy catalog rows continue on the old
 host. Supplying `--service-pvm` requires an explicit trust profile:
-`--production-trust-socket <path>` opens every v2 root through a fail-closed
+`--production-trust-socket <path>` opens every service root through a fail-closed
 local JAM/consensus authority sidecar. The development-only
-`--allow-v2-conformance` flag selects the protocol conformance seam instead;
+`--allow-conformance` flag selects the protocol conformance seam instead;
 it is never selected implicitly and is not production-safe. The production
 wire and policy contract are described in
-[`docs/runtime-v2.md`](docs/runtime-v2.md). `vosx run`
+[`docs/runtime.md`](docs/runtime.md). `vosx run`
 remains a legacy one-shot ELF/PVM runner and does not install `.vos` packages.
 The physical production-profile acceptance gate is `just
-test-v2-production-daemon`; it covers signed Local, single-voter Raft, and
+test-production-daemon`; it covers signed Local, single-voter Raft, and
 CRDT roots across durable restart, authenticated two-daemon CRDT convergence
 and receipt verification, plus three-voter Raft onboarding, follower ingress,
 leader failover, and restarted-voter catch-up under independently connected
@@ -83,7 +83,7 @@ implementations of the trust protocol.
 
 Stop the space daemon, then archive the complete space—not just its redb
 files. The `VOSB1` directory includes the node identity, Local/Raft/CRDT
-state, v2 root images, proof/private-input/prover-record side stores, local
+state, service root images, proof/private-input/prover-record side stores, local
 policy, and the content-addressed program cache under a per-file BLAKE2b-256
 manifest:
 
@@ -111,7 +111,7 @@ second physical copy without tying archive integrity to the live cache inode.
 Private side stores and `node.key` are sensitive: keep the backup on encrypted,
 access-controlled storage. The manifest detects corruption; preserve the
 printed manifest digest separately if it must also be authenticated against a
-hostile archive provider. `just test-v2-release-operations` exercises a
+hostile archive provider. `just test-release-operations` exercises a
 committed signed root through backup, fresh-directory restore, and reopen.
 The operator signing identity, canonical service PVM, and production-trust
 authority are deployment-level inputs rather than space data; back them up and
@@ -136,7 +136,7 @@ unique-name registries). Modes mix freely per-agent.
 
 Raft requires a cluster membership list (every replica's `node_prefix`). The
 daemon driver and package flow are documented in
-[`docs/runtime-v2.md`](docs/runtime-v2.md).
+[`docs/runtime.md`](docs/runtime.md).
 
 ```bash
 just test                              # rebuild artifacts + full integration suite
@@ -167,7 +167,7 @@ vosx space up "<paste-the-vos1-token>" \
 ```
 
 For local protocol development only, replace `--production-trust-socket` with
-`--allow-v2-conformance`. Production deployments must provide an authority.
+`--allow-conformance`. Production deployments must provide an authority.
 
 The TOML recipe is a devhelper, not the runtime source of truth —
 the registry is. A recipe is consumed once at genesis (the space's
@@ -180,7 +180,7 @@ To cancel an offline bearer before its first redemption, run
 `vosx space invite a revoke "<paste-the-vos1-token>"`. Once a token appears
 in `space invite a list`, `revoke` also accepts its displayed `token_pub`
 prefix. Invite revocation blocks later redemptions in both the registry and
-canonical v2 authority, but does not remove a role already granted; use
+canonical service authority, but does not remove a role already granted; use
 `space role a revoke <peer-id>` for that.
 
 ## Writing an actor

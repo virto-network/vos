@@ -103,7 +103,7 @@ impl ModelHandle {
         F: FnMut(&str) -> bool,
     {
         // Apply the Qwen2.5-Instruct chat template manually.
-        // Single-user-turn shape; multi-turn history is a v2 concern.
+        // Single-user-turn shape; multi-turn history is a service concern.
         let templated = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n");
         let encoding = self
             .tokenizer

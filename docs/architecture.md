@@ -78,8 +78,8 @@ the same evidence: the serving root first commits the holder grant through
 physical Accumulate in canonical `space-authority`, then signs that exact
 accepted redemption and records the attestation with the registry operation.
 A rejected authority redemption therefore leaves no effective registry role.
-Restricted v2 calls use an invocation-scoped authority reply and
-its finalized accumulation receipt; a daemon-local role lookup is not a v2
+Restricted service calls use an invocation-scoped authority reply and
+its finalized accumulation receipt; a daemon-local role lookup is not a service
 credential. Authority-aware tokens sign the authority's replication
 incarnation, and markerless tokens are no longer minted or accepted. Authority
 activation uses a read-only registry-guest preflight requiring exactly one

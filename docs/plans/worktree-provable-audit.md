@@ -1,7 +1,7 @@
 # `worktree-provable` disposition
 
 This records the explicit audit of the rescued branch
-`rescue/worktree-provable-20260722` (tip `f9d701a9`) against the reviewed v2
+`rescue/worktree-provable-20260722` (tip `f9d701a9`) against the reviewed service
 production line. It is a provenance record, not a branch to merge. The old
 commits are not patch-identical to master because their useful behavior was
 reworked behind the current service guest, storage, privacy, proof, and

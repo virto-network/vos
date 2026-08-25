@@ -117,7 +117,7 @@ pub struct AgentDelta<'a> {
     /// dispatch's re-emitted anchor against the value recorded in the
     /// log node ([`crate::effect_log::EffectLog::anchor`]).
     /// [`crate::effect_log::ANCHOR_UNRECORDED`] when the dispatch
-    /// carried no anchor (v2 blobs, old-style actors).
+    /// carried no anchor (service blobs, old-style actors).
     pub anchor: (u8, [u8; 32]),
     /// EffectLog node: inbound msg + depth-1 invoke replies, anchor
     /// stamped. `None` for commits with nothing to replay (post-replay
@@ -126,7 +126,7 @@ pub struct AgentDelta<'a> {
     /// At least one applied v3 work-result carried effects. Drives the
     /// durable-node rule: an effect-bearing dispatch must produce a
     /// durable log node even when the state blob is unchanged (e.g. a
-    /// Transfer-only dispatch). `false` for v2 deltas — those guests
+    /// Transfer-only dispatch). `false` for service deltas — those guests
     /// emit their full state unconditionally, so "carries effects"
     /// would turn every pure read into a node; value comparison decides
     /// for them instead.
@@ -163,9 +163,9 @@ pub trait CommitStrategy: Send {
     ///
     /// CRDT returns the identity of its next `(replica_origin, seq)` event so
     /// live execution and causal replay derive identical operation IDs.
-    /// Strategies whose v2 work envelope is not production-wired yet return
+    /// Strategies whose service work envelope is not production-wired yet return
     /// `None`; the host supplies a process-local unique fallback.
-    fn pending_invocation_id(&self) -> Option<crate::v2::InvocationId> {
+    fn pending_invocation_id(&self) -> Option<crate::service::InvocationId> {
         None
     }
 
@@ -192,7 +192,7 @@ pub trait CommitStrategy: Send {
     /// Skip rules: a delta with no writes and no effect-bearing log is
     /// a pure read — nothing persists, no node appends. A state write
     /// whose bytes equal the last committed state is treated as
-    /// unchanged (v2 guests re-emit their full state every dispatch).
+    /// unchanged (service guests re-emit their full state every dispatch).
     /// An effect-bearing delta appends a durable log node even when
     /// state is unchanged.
     fn commit(&mut self, delta: &AgentDelta<'_>) -> Result<CommitReceipt, CommitError>;
@@ -616,7 +616,7 @@ mod crdt {
     /// Pre-marker stores may contain the retired, pre-anchor EffectLog wire.
     /// Treating those nodes like hostile peer input would quarantine the whole
     /// legitimate history and make an actor appear fresh after restart. The
-    /// marker lets open fail with the v2 clean-break instruction while current
+    /// marker lets open fail with the service clean-break instruction while current
     /// stores can continue quarantining individual malformed peer nodes.
     pub(super) const REPLAY_FORMAT_KEY: &str = "crdt_replay_format";
     const REPLAY_FORMAT: &[u8] = b"VCR2";
@@ -962,7 +962,7 @@ mod crdt {
     }
 
     impl CommitStrategy for CrdtCommit {
-        fn pending_invocation_id(&self) -> Option<crate::v2::InvocationId> {
+        fn pending_invocation_id(&self) -> Option<crate::service::InvocationId> {
             Some(CrdtEvent::invocation_id_for(
                 self.replica_origin,
                 self.next_seq,
@@ -1118,10 +1118,10 @@ mod crdt {
             // — nothing persists, no node appends, no `seq` allocates.
             // An effect-bearing dispatch appends a node even when the
             // state blob is unchanged (a Transfer-only dispatch is
-            // real history that replay must reproduce). v2 deltas
+            // real history that replay must reproduce). service deltas
             // (`effect_bearing == false`) fall back to value
             // comparison, since those guests re-emit their full state
-            // on every halt — but a v2 dispatch that wrote KV rows
+            // on every halt — but a service dispatch that wrote KV rows
             // under an unchanged state blob still appends: every
             // persisted row must be replay-derivable, or the next
             // post-replay materialization (`commit_rebuilt`'s
@@ -1153,7 +1153,7 @@ mod crdt {
             if append_node {
                 let log = delta.log.expect("append_node implies a log");
                 let expected = CrdtEvent::invocation_id_for(self.replica_origin, self.next_seq);
-                if log.invocation_id() != crate::v2::InvocationId::ZERO
+                if log.invocation_id() != crate::service::InvocationId::ZERO
                     && log.invocation_id() != expected
                 {
                     return Err(CommitError::Config(
@@ -1458,7 +1458,7 @@ mod tests {
             logs.push(mk(b"msg-3", &[]));
 
             cc.commit_with_log(b"state-v1", &logs[0]).unwrap();
-            cc.commit_with_log(b"state-v2", &logs[1]).unwrap();
+            cc.commit_with_log(b"state", &logs[1]).unwrap();
             cc.commit_with_log(b"state-v3", &logs[2]).unwrap();
 
             assert_eq!(cc.clock().roots().len(), 1, "a linear chain has one head");
@@ -1998,12 +1998,12 @@ mod tests {
     #[cfg(feature = "storage")]
     #[test]
     fn crdt_row_writes_under_unchanged_state_append_history() {
-        // A v2-style dispatch (effect_bearing = false) that wrote KV
+        // A style dispatch (effect_bearing = false) that wrote KV
         // rows while re-emitting a byte-identical state blob must
         // append a DAG node: every persisted row has to be
         // replay-derivable, or the next post-replay whole-table swap
         // (commit_rebuilt) destroys it.
-        let path = temp_db_path("crdt_v2_rows");
+        let path = temp_db_path("crdt_service_rows");
         let mut cc = CrdtCommit::open(&path, [0u8; 32]).unwrap();
         let log1 = crate::effect_log::EffectLog::for_msg(b"m1".to_vec());
         let writes = [(
@@ -2035,7 +2035,7 @@ mod tests {
             .unwrap();
         assert!(
             receipt.node_appended,
-            "a row-bearing v2 dispatch is real history"
+            "a row-bearing service dispatch is real history"
         );
         assert_eq!(cc.replay_logs().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

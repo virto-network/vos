@@ -23,17 +23,6 @@ members = [
     "tests/fixtures/extensions/*",
 ]
 exclude = [
-    # Retired single-actor programs are test fixtures, not public examples.
-    "tests/fixtures/legacy-v1/agents/*",
-    "tests/fixtures/legacy-v1/actors/*",
-    # These specific actor/agent crates define their own `[workspace]` and
-    # must be excluded individually so Cargo does not treat them as nested
-    # workspace roots inside the main workspace.
-    "tests/fixtures/legacy-v1/actors/crdt-counter",
-    "tests/fixtures/legacy-v1/agents/scheduler",
-    "tests/fixtures/legacy-v1/actors/tally",
-    "tests/fixtures/legacy-v1/actors/big-map",
-    "tests/fixtures/legacy-v1/actors/committed-counter",
     "tests/fixtures/wasm/*",
     # Built-in PVM actors (riscv64em-vos target) live alongside
     # the workspace crates but build with their own toolchain.
@@ -63,8 +52,10 @@ exclude = [
     "extensions/http-gateway/test_fixtures/mock-registry",
     "extensions/http-gateway/test_fixtures/counter",
     "extensions/http-gateway/test_fixtures/kitchen-sink",
-    # Canonical no_std actor PVMs used only by v2 integration gates.
+    # Canonical no_std actor PVMs used only by service integration gates.
     "vos/tests/fixtures/*",
+    # Standalone proof workloads carry their own no_std workspaces.
+    "pvm/proof/fixtures/*",
     # transport-soundness Miri gate: a zero-dep, self-contained crate (own
     # `[workspace]`) run only under `cargo miri test` on the Miri nightly.
     # Excluded so `cargo build --workspace` + the pre-commit hook never try to
@@ -143,7 +134,7 @@ vos-pvm-compiler = { path = "pvm/compiler" }
 vos-pvm-codec = { path = "pvm/codec", default-features = false }
 vos-pvm-codec-derive = { path = "pvm/codec-derive" }
 
-# Stwo pinned to upstream rev `e1286720` (post-v2.2.0 perf cluster:
+# Stwo pinned to upstream rev `e1286720` (post.2.0 perf cluster:
 # parallel FFT/quotients/OOD #1304-1306, BaseColumnPool #1342,
 # subdomain quotients #1372/#1373, FRI fold parallelization
 # #1389/#1392/#1393). Lifted-protocol degree-≥2 block stands at this

@@ -540,7 +540,7 @@ fn absorb_work_result(
     svc_id: u32,
     payload: RefinePayload,
 ) -> Result<AbsorbedWorkResult, WorkResultError> {
-    if payload.version != crate::refine_payload::REFINE_PAYLOAD_V3
+    if payload.version != crate::refine_payload::REFINE_PAYLOAD_
         && payload.version != crate::refine_payload::REFINE_PAYLOAD_VERSION
     {
         return Err(WorkResultError::Malformed);
@@ -601,8 +601,8 @@ fn expected_anchor(
 fn claims_refine_payload(bytes: &[u8]) -> bool {
     matches!(
         bytes.first(),
-        Some(&crate::refine_payload::RETIRED_REFINE_PAYLOAD_V2)
-            | Some(&crate::refine_payload::REFINE_PAYLOAD_V3)
+        Some(&crate::refine_payload::RETIRED_REFINE_PAYLOAD_)
+            | Some(&crate::refine_payload::REFINE_PAYLOAD_)
             | Some(&crate::refine_payload::REFINE_PAYLOAD_VERSION)
     )
 }
@@ -828,7 +828,7 @@ impl<D: DataLayer> VosRuntime<D> {
     /// Take the `(kind, anchor)` of the first work-result applied for
     /// `svc_id` since the previous take — the anchor of the state the
     /// dispatch ran against. `None` when no anchored work-result was
-    /// applied (v2 blobs, old-style actors, pure-trap dispatches). The
+    /// applied (service blobs, old-style actors, pure-trap dispatches). The
     /// host stamps this into the dispatch's EffectLog before commit and
     /// compares it during replay.
     pub fn take_dispatch_anchor(&mut self, svc_id: ServiceId) -> Option<(u8, [u8; 32])> {
@@ -1088,7 +1088,7 @@ impl<D: DataLayer> VosRuntime<D> {
         let Some(header) = crate::pvm_image::ContinuationHeader::decode(header_bytes) else {
             return false;
         };
-        header.execution_semantics == crate::v2::EXECUTION_SEMANTICS_ID.0
+        header.execution_semantics == crate::service::EXECUTION_SEMANTICS_ID.0
             && self.data.contains(&header.commitment)
     }
 
@@ -2415,7 +2415,7 @@ fn handle_invoke(
     // Replay consumes those replicated bytes. Reject before execution in
     // either mode so neither the witness nor a ProofRecordEntry can enter
     // InvokeEffects. Local/Inactive parents keep the durable record in their
-    // own committed keyspace; service-v2 uses its producer-private sidecar.
+    // own committed keyspace; service uses its producer-private sidecar.
     if record_requested && mode.has_replication_context() {
         mode.reject_private_record();
         journal.private_record_rejected = true;
@@ -2820,7 +2820,7 @@ fn handle_invoke(
         // through the same journal overlay; see `expected_anchor`).
         // A mismatch means a buggy guest or a doctored blob — apply
         // nothing, surface a crash.
-        if payload.version >= crate::refine_payload::REFINE_PAYLOAD_V3 {
+        if payload.version >= crate::refine_payload::REFINE_PAYLOAD_ {
             let expected = if let Some(root) = journal.effective_read(
                 storage,
                 target_svc_id.0,
@@ -2908,7 +2908,7 @@ impl core::fmt::Display for ContinuationError {
                 f.write_str("kernel snapshot exceeds the continuation size limit")
             }
             Self::LegacyOrMalformedHeader => f.write_str(
-                "legacy or malformed continuation header (v2 requires service reset/reinstall)",
+                "legacy or malformed continuation header (service requires service reset/reinstall)",
             ),
             Self::ExecutionSemanticsMismatch => {
                 f.write_str("continuation belongs to different execution semantics")
@@ -2942,7 +2942,7 @@ fn save_continuation<D: crate::data_layer::DataLayer>(
     let header = crate::pvm_image::ContinuationHeader {
         snapshot_len,
         commitment,
-        execution_semantics: crate::v2::EXECUTION_SEMANTICS_ID.0,
+        execution_semantics: crate::service::EXECUTION_SEMANTICS_ID.0,
     };
     storage.write(
         ServiceId(svc_id),
@@ -2968,7 +2968,7 @@ fn load_continuation<D: crate::data_layer::DataLayer>(
     }
     let header = crate::pvm_image::ContinuationHeader::decode(header_bytes)
         .ok_or(ContinuationError::LegacyOrMalformedHeader)?;
-    if header.execution_semantics != crate::v2::EXECUTION_SEMANTICS_ID.0 {
+    if header.execution_semantics != crate::service::EXECUTION_SEMANTICS_ID.0 {
         return Err(ContinuationError::ExecutionSemanticsMismatch);
     }
     let body =
@@ -3049,8 +3049,8 @@ mod tests {
     }
 
     #[test]
-    fn retired_v2_work_result_remains_reserved_and_fail_loud() {
-        let retired = [crate::refine_payload::RETIRED_REFINE_PAYLOAD_V2, 0, 0, 0, 0];
+    fn retired_service_work_result_remains_reserved_and_fail_loud() {
+        let retired = [crate::refine_payload::RETIRED_REFINE_PAYLOAD_, 0, 0, 0, 0];
         assert!(claims_refine_payload(&retired));
         assert!(RefinePayload::decode(&retired).is_none());
     }

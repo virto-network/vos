@@ -1,17 +1,17 @@
-//! Canonical v2 role authority.
+//! Canonical service role authority.
 //!
 //! This actor is an ordinary stateful PVM installed as its own root service.
 //! It owns grants and revocation high-waters, verifies every mutation under
 //! the space's genesis Ed25519 identity, and emits only an exact
-//! invocation-scoped [`RoleAuthorizationClaimV2`] when the requested role is
+//! invocation-scoped [`RoleAuthorizationClaim`] when the requested role is
 //! currently live. The generic service's Accumulate receipt turns that reply
 //! into the credential accepted by another root service.
 
 use vos::prelude::*;
 use vos::registry::{invite_signed_bytes, role_grant_supersedes};
-use vos::v2::{
-    Origin, RoleAuthorityInviteRedemptionV2, RoleAuthorityInviteRevocationV2,
-    RoleAuthorityMutationV2, RoleAuthorizationClaimV2, SpaceId, SubjectId, V2Wire,
+use vos::service::{
+    Origin, RoleAuthorityInviteRedemption, RoleAuthorityInviteRevocation, RoleAuthorityMutation,
+    RoleAuthorizationClaim, ServiceWire, SpaceId, SubjectId,
 };
 
 #[derive(
@@ -44,7 +44,7 @@ pub fn initial_state(
 ) -> Option<Vec<u8>> {
     vos::registry::ed25519_pubkey_from_peer_id(&root_peer_id)?;
     (authority_replication_id != [0; 32]).then_some(())?;
-    let root = vos::v2::SubjectId::of_authenticated_peer(&root_peer_id);
+    let root = vos::service::SubjectId::of_authenticated_peer(&root_peer_id);
     let root_grantor_peer_id = root_peer_id.clone();
     Some(
         SpaceAuthority {
@@ -101,7 +101,7 @@ impl SpaceAuthority {
     /// per holder, making retries idempotent and stale signed operations inert.
     #[msg]
     fn mutate_role(&mut self, mutation: Vec<u8>, signature: Vec<u8>) -> bool {
-        let Ok(mutation) = RoleAuthorityMutationV2::decode(&mutation) else {
+        let Ok(mutation) = RoleAuthorityMutation::decode(&mutation) else {
             return false;
         };
         if mutation.space().0 != self.space
@@ -110,7 +110,7 @@ impl SpaceAuthority {
             return false;
         }
         match mutation {
-            RoleAuthorityMutationV2::Grant {
+            RoleAuthorityMutation::Grant {
                 holder,
                 role,
                 epoch,
@@ -122,9 +122,7 @@ impl SpaceAuthority {
                 self.root_origin(),
                 self.root_peer_id.clone(),
             ),
-            RoleAuthorityMutationV2::Revoke { holder, epoch, .. } => {
-                self.apply_revoke(holder, epoch)
-            }
+            RoleAuthorityMutation::Revoke { holder, epoch, .. } => self.apply_revoke(holder, epoch),
         }
     }
 
@@ -133,7 +131,7 @@ impl SpaceAuthority {
     /// by the serving host before this deterministic method is admitted.
     #[msg]
     fn redeem_invite(&mut self, redemption: Vec<u8>) -> bool {
-        let Ok(redemption) = RoleAuthorityInviteRedemptionV2::decode(&redemption) else {
+        let Ok(redemption) = RoleAuthorityInviteRedemption::decode(&redemption) else {
             return false;
         };
         if redemption.space.0 != self.space
@@ -193,7 +191,7 @@ impl SpaceAuthority {
     /// grow-only token set, so replay and merge order cannot resurrect it.
     #[msg]
     fn revoke_invite(&mut self, revocation: Vec<u8>, signature: Vec<u8>) -> bool {
-        let Ok(revocation) = RoleAuthorityInviteRevocationV2::decode(&revocation) else {
+        let Ok(revocation) = RoleAuthorityInviteRevocation::decode(&revocation) else {
             return false;
         };
         if revocation.space.0 != self.space
@@ -216,11 +214,11 @@ impl SpaceAuthority {
 
     /// Return the exact claim bytes only when the current grant satisfies its
     /// threshold. The generated actor ABI frames this `Vec<u8>` as
-    /// `Value::Bytes`; [`RoleAuthorizationClaimV2::authority_reply`] binds the
+    /// `Value::Bytes`; [`RoleAuthorizationClaim::authority_reply`] binds the
     /// same frame when validating the committed receipt.
     #[msg]
     fn authorize_role(&self, claim: Vec<u8>) -> Vec<u8> {
-        let Ok(claim) = RoleAuthorizationClaimV2::decode(&claim) else {
+        let Ok(claim) = RoleAuthorizationClaim::decode(&claim) else {
             return Vec::new();
         };
         if claim.space.0 != self.space || claim.audience.space.0 != self.space {
@@ -400,11 +398,11 @@ impl SpaceAuthority {
     }
 }
 
-fn holder_key(holder: vos::v2::Origin) -> Option<(u8, [u8; 32])> {
+fn holder_key(holder: vos::service::Origin) -> Option<(u8, [u8; 32])> {
     match holder {
-        vos::v2::Origin::Member(subject) => Some((0, subject.0)),
-        vos::v2::Origin::Actor(actor) => Some((1, actor.0)),
-        vos::v2::Origin::Anonymous | vos::v2::Origin::System => None,
+        vos::service::Origin::Member(subject) => Some((0, subject.0)),
+        vos::service::Origin::Actor(actor) => Some((1, actor.0)),
+        vos::service::Origin::Anonymous | vos::service::Origin::System => None,
     }
 }
 
@@ -413,9 +411,9 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use vos::abi::service::ServiceId;
-    use vos::v2::{
+    use vos::service::{
         ActorId, DeploymentId, Hash, InvocationId, Origin, ProgramId, RootServiceId,
-        ServiceIdentityV2, SubjectId,
+        ServiceIdentity, SubjectId,
     };
     use vos::{Decode, Message};
 
@@ -425,19 +423,19 @@ mod tests {
         peer
     }
 
-    fn claim(space: SpaceId, holder: Origin, role: SpaceRole) -> RoleAuthorizationClaimV2 {
-        RoleAuthorizationClaimV2 {
+    fn claim(space: SpaceId, holder: Origin, role: SpaceRole) -> RoleAuthorizationClaim {
+        RoleAuthorizationClaim {
             space,
             holder,
             role,
-            audience: ServiceIdentityV2 {
+            audience: ServiceIdentity {
                 space,
                 root_service: RootServiceId([3; 32]),
                 deployment: DeploymentId([4; 32]),
                 service_program: ProgramId([5; 32]),
-                service_abi: vos::v2::ABI_VERSION,
-                execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
-                gas_schedule: vos::v2::GasScheduleV2::new(1_000_000_000, 5_000_000_000),
+                service_abi: vos::service::ABI_VERSION,
+                execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
+                gas_schedule: vos::service::GasSchedule::new(1_000_000_000, 5_000_000_000),
             },
             invocation: InvocationId([6; 32]),
             scope: Hash([17; 32]),
@@ -455,7 +453,7 @@ mod tests {
     fn apply(
         actor: &mut SpaceAuthority,
         signing: &SigningKey,
-        mutation: RoleAuthorityMutationV2,
+        mutation: RoleAuthorityMutation,
     ) -> bool {
         let signature = signing.sign(&mutation.encode()).to_bytes().to_vec();
         dispatch(
@@ -479,7 +477,7 @@ mod tests {
         ))
     }
 
-    fn authorize(actor: &mut SpaceAuthority, claim: &RoleAuthorizationClaimV2) -> Vec<u8> {
+    fn authorize(actor: &mut SpaceAuthority, claim: &RoleAuthorizationClaim) -> Vec<u8> {
         dispatch(
             actor,
             AuthorizeRole {
@@ -495,7 +493,7 @@ mod tests {
         holder: &SigningKey,
         role: SpaceRole,
         expires_at: u64,
-    ) -> RoleAuthorityInviteRedemptionV2 {
+    ) -> RoleAuthorityInviteRedemption {
         let authority_replication_id = [90; 32];
         let token_pub = *token.verifying_key().as_bytes();
         let admin_peer_id = root_peer(admin);
@@ -509,7 +507,7 @@ mod tests {
         );
         let redeem =
             vos::registry::canonical_op_bytes("redeem_invite", &[&token_pub, &holder_peer_id]);
-        RoleAuthorityInviteRedemptionV2 {
+        RoleAuthorityInviteRedemption {
             space,
             authority_replication_id,
             token_pub,
@@ -523,7 +521,7 @@ mod tests {
         }
     }
 
-    fn redeem(actor: &mut SpaceAuthority, redemption: &RoleAuthorityInviteRedemptionV2) -> bool {
+    fn redeem(actor: &mut SpaceAuthority, redemption: &RoleAuthorityInviteRedemption) -> bool {
         dispatch(
             actor,
             RedeemInvite {
@@ -552,7 +550,7 @@ mod tests {
         assert!(apply(
             &mut actor,
             &signing,
-            RoleAuthorityMutationV2::Grant {
+            RoleAuthorityMutation::Grant {
                 space,
                 holder,
                 role: SpaceRole::Developer,
@@ -577,7 +575,7 @@ mod tests {
                 assert!(apply(
                     &mut authority,
                     &signing,
-                    RoleAuthorityMutationV2::Grant {
+                    RoleAuthorityMutation::Grant {
                         space,
                         holder,
                         role,
@@ -610,7 +608,7 @@ mod tests {
         let attacker = SigningKey::from_bytes(&[11; 32]);
         let space = SpaceId([12; 32]);
         let holder = Origin::Actor(ActorId([13; 32]));
-        let grant = RoleAuthorityMutationV2::Grant {
+        let grant = RoleAuthorityMutation::Grant {
             space,
             holder,
             role: SpaceRole::Admin,
@@ -622,7 +620,7 @@ mod tests {
         assert!(apply(
             &mut actor,
             &signing,
-            RoleAuthorityMutationV2::Revoke {
+            RoleAuthorityMutation::Revoke {
                 space,
                 holder,
                 epoch: 5,
@@ -649,14 +647,14 @@ mod tests {
         assert!(apply(
             &mut authority,
             &root,
-            RoleAuthorityMutationV2::Grant {
+            RoleAuthorityMutation::Grant {
                 space,
                 holder: admin_holder,
                 role: SpaceRole::Admin,
                 epoch: 2,
             },
         ));
-        let root_grant = RoleAuthorityMutationV2::Grant {
+        let root_grant = RoleAuthorityMutation::Grant {
             space,
             holder,
             role: SpaceRole::Developer,
@@ -693,7 +691,7 @@ mod tests {
         let signing = SigningKey::from_bytes(&[14; 32]);
         let space = SpaceId([15; 32]);
         let holder = Origin::Member(SubjectId([16; 32]));
-        let mutation = RoleAuthorityMutationV2::Grant {
+        let mutation = RoleAuthorityMutation::Grant {
             space,
             holder,
             role: SpaceRole::Admin,
@@ -717,7 +715,7 @@ mod tests {
         assert!(apply(
             &mut authority,
             &root,
-            RoleAuthorityMutationV2::Grant {
+            RoleAuthorityMutation::Grant {
                 space,
                 holder: admin_holder,
                 role: SpaceRole::Admin,
@@ -763,7 +761,7 @@ mod tests {
             second_developer.encode()
         );
 
-        let revocation = RoleAuthorityInviteRevocationV2 {
+        let revocation = RoleAuthorityInviteRevocation {
             space,
             token_pub: *token.verifying_key().as_bytes(),
             admin_peer_id: root_peer(&admin),
@@ -808,7 +806,7 @@ mod tests {
         assert!(apply(
             &mut authority,
             &root,
-            RoleAuthorityMutationV2::Revoke {
+            RoleAuthorityMutation::Revoke {
                 space,
                 holder: admin_holder,
                 epoch: 3,

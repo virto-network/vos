@@ -103,7 +103,7 @@ pub enum Status {
 /// `cipher_clerk::settlement::SettlementClaim::to_bytes` bytes; this byte
 /// tags which layout produced them so a Wave-2 claim schema can be
 /// distinguished without a store migration.
-pub const CLAIM_VERSION_V1: u8 = 1;
+pub const CLAIM_FORMAT: u8 = 1;
 
 // ── Wire types ──────────────────────────────────────────────────
 

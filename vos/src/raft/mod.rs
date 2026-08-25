@@ -1,7 +1,7 @@
 //! Raft consensus storage and strategy for VOS actors.
 //!
 //! The durable layer lives in [`log::RaftLog`] / [`log::RaftMeta`] on redb.
-//! [`v2::RaftAccumulateLogV2`] orders canonical JAM service requests and leaves
+//! [`service::RaftAccumulateLog`] orders canonical JAM service requests and leaves
 //! their application to the guest Accumulate entry. The native actor state
 //! machine uses the separate [`CommitStrategy`] implementation in
 //! [`strategy::RaftCommit`].
@@ -11,9 +11,9 @@ pub mod log;
 #[cfg(feature = "storage")]
 pub mod redb_storage;
 #[cfg(feature = "storage")]
-pub mod strategy;
+pub mod service;
 #[cfg(feature = "storage")]
-pub mod v2;
+pub mod strategy;
 #[cfg(all(feature = "storage", feature = "network"))]
 pub mod vos_transport;
 #[cfg(all(feature = "storage", feature = "network"))]
@@ -24,9 +24,9 @@ pub use log::{LogEntry, RAFT_LOG, RAFT_META, RaftLog, RaftMeta};
 #[cfg(feature = "storage")]
 pub use redb_storage::RedbStorage;
 #[cfg(feature = "storage")]
-pub use strategy::{RaftCommit, RaftConfig};
+pub use service::RaftAccumulateLog;
 #[cfg(feature = "storage")]
-pub use v2::RaftAccumulateLogV2;
+pub use strategy::{RaftCommit, RaftConfig};
 #[cfg(all(feature = "storage", feature = "network"))]
 pub use vos_transport::{VosTransport, VosTransportError};
 #[cfg(all(feature = "storage", feature = "network"))]

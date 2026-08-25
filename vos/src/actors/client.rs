@@ -11,7 +11,7 @@
 //! Application code normally receives a bound handle from
 //! [`Context::actor`](super::Context::actor) or
 //! [`Context::child`](super::Context::child). Those handles carry the full
-//! [`ActorId`](crate::v2::ActorId) used by the v2 scheduler. Raw refs retain a
+//! [`ActorId`](crate::service::ActorId) used by the service scheduler. Raw refs retain a
 //! route-only [`ServiceId`](super::context::ServiceId) constructor solely as
 //! an advanced adapter for legacy hosts.
 
@@ -70,7 +70,7 @@ pub enum ClientError {
     NotFound,
     /// `Context::child` resolved an actor outside the caller's owned tree.
     NotOwnedChild,
-    /// The requested child cannot be staged in the current v2 actor slice.
+    /// The requested child cannot be staged in the current service actor slice.
     SpawnUnavailable,
     /// The runtime returned an attestation package whose typed method, claim
     /// wire, or statement did not match the committed reply.
@@ -139,12 +139,12 @@ pub trait Invoker {
         payload: Vec<u8>,
     ) -> impl Future<Output = Result<Value, ClientError>> + '_;
 
-    /// Invoke a canonical v2 actor identity. Host-only legacy invokers do not
+    /// Invoke a canonical service actor identity. Host-only legacy invokers do not
     /// acquire an implicit ActorId-to-ServiceId mapping; they must override
     /// this method or report the target as unreachable.
     fn invoke_actor(
         &mut self,
-        _target: crate::v2::ActorId,
+        _target: crate::service::ActorId,
         _payload: Vec<u8>,
     ) -> impl Future<Output = Result<Value, ClientError>> + '_ {
         core::future::ready(Err(ClientError::Unreachable))
@@ -158,9 +158,9 @@ pub trait Invoker {
 pub struct AttestedInvocationResult {
     pub value: Value,
     pub producer_name: String,
-    pub producer: crate::v2::ProducerId,
-    pub statement: crate::AttestationStatementV3,
-    pub trace: crate::v2::Hash,
+    pub producer: crate::service::ProducerId,
+    pub statement: crate::AttestationStatement,
+    pub trace: crate::service::Hash,
     pub proof: Vec<u8>,
 }
 
@@ -208,7 +208,7 @@ pub trait AttestationInvoker: Invoker {
     /// value for a canonical actor identity.
     fn invoke_actor_attested(
         &mut self,
-        _target: crate::v2::ActorId,
+        _target: crate::service::ActorId,
         _payload: Vec<u8>,
     ) -> impl Future<Output = Result<AttestedInvocationResult, ClientError>> + '_ {
         core::future::ready(Err(ClientError::Unreachable))
@@ -217,14 +217,14 @@ pub trait AttestationInvoker: Invoker {
 
 /// Identity carried by a generated bound handle.
 ///
-/// `Actor` is the application-facing v2 form. `Service` exists only so the
+/// `Actor` is the application-facing service form. `Service` exists only so the
 /// legacy host/runtime adapter can keep driving raw service routes during the
 /// clean-break rollout; it is intentionally absent from the application
 /// prelude.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum ActorTarget {
-    Actor(crate::v2::ActorId),
+    Actor(crate::service::ActorId),
     Service(ServiceId),
 }
 
@@ -237,7 +237,7 @@ pub trait ActorReference: Copy {
         Self: 'a;
 
     fn bind<'a, I: Invoker + 'a>(
-        target: crate::v2::ActorId,
+        target: crate::service::ActorId,
         invoker: &'a mut I,
     ) -> Self::Handle<'a, I>;
 
@@ -281,7 +281,7 @@ impl<A: super::Actor> Invoker for super::Context<A> {
     #[allow(clippy::manual_async_fn)]
     fn invoke_actor(
         &mut self,
-        target: crate::v2::ActorId,
+        target: crate::service::ActorId,
         payload: Vec<u8>,
     ) -> impl Future<Output = Result<Value, ClientError>> + '_ {
         async move {
@@ -303,7 +303,7 @@ impl<A: super::Actor> AttestationInvoker for super::Context<A> {
 
     fn invoke_actor_attested(
         &mut self,
-        target: crate::v2::ActorId,
+        target: crate::service::ActorId,
         payload: Vec<u8>,
     ) -> impl Future<Output = Result<AttestedInvocationResult, ClientError>> + '_ {
         self.ask_actor_attested_raw(target, &payload, None)

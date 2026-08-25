@@ -196,7 +196,7 @@ pub enum Caller {
     /// bootstrap (which grants the operator their initial admin
     /// role *before* any libp2p connection exists), internal
     /// host probes, and other embedder-controlled entry points
-    /// land here. Treated as trusted by `has_role` until the v2
+    /// land here. Treated as trusted by `has_role` until the service
     /// authority service replaces bootstrap/replay calls with
     /// explicit capabilities; external peers cannot synthesize
     /// this variant.
@@ -254,7 +254,7 @@ impl Caller {
 /// they mean; the actor's own `Role` enum interprets them via this
 /// trait.
 ///
-/// The byte representation is part of the v2 package policy ABI. Implementors
+/// The byte representation is part of the service package policy ABI. Implementors
 /// must use the enum's `#[repr(u8)]` discriminant and preserve `Ord` ordering:
 /// if `left >= right`, `left.as_byte() >= right.as_byte()` must also hold.
 /// Generated method metadata and guest Accumulate rely on that canonical,

@@ -1580,29 +1580,29 @@ pub fn encode_chain_manifest_anchored(
     out
 }
 
-/// Wrap the prover's existing anchored segment list in the bounded v2
+/// Wrap the prover's existing anchored segment list in the bounded service
 /// attestation artifact contract. Segment hashes retain the node proof-CAS
 /// domain used by [`encode_chain_manifest_anchored`]; the wrapper adds the
-/// execution-semantics-derived proof-system identity and strict v2 wire
+/// execution-semantics-derived proof-system identity and strict service wire
 /// version without copying any segment body.
-pub fn encode_v2_attestation_manifest(
+pub fn encode_service_attestation_manifest(
     initial_root: [u8; 32],
     segment_hashes: &[[u8; 32]],
 ) -> Option<Vec<u8>> {
-    use vos::v2::{AttestationProofManifestV2, Hash, ProofArtifactIdV2, V2Wire};
+    use vos::service::{AttestationProofManifest, Hash, ProofArtifactId, ServiceWire};
 
-    let manifest = AttestationProofManifestV2 {
-        proof_system: AttestationProofManifestV2::proof_system(),
+    let manifest = AttestationProofManifest {
+        proof_system: AttestationProofManifest::proof_system(),
         initial_root: Hash(initial_root),
         segments: segment_hashes
             .iter()
             .copied()
-            .map(ProofArtifactIdV2)
+            .map(ProofArtifactId)
             .collect(),
     };
     let encoded = manifest.encode();
-    (encoded.len() <= vos::v2::MAX_ATTESTATION_PROOF_BYTES
-        && AttestationProofManifestV2::decode(&encoded).is_ok())
+    (encoded.len() <= vos::service::MAX_ATTESTATION_PROOF_BYTES
+        && AttestationProofManifest::decode(&encoded).is_ok())
     .then_some(encoded)
 }
 
@@ -2648,18 +2648,18 @@ mod job_tests {
     }
 
     #[test]
-    fn streamed_chain_hashes_wrap_in_the_v2_attestation_contract() {
-        use vos::v2::{AttestationProofManifestV2, ProofArtifactIdV2, V2Wire};
+    fn streamed_chain_hashes_wrap_in_the_service_attestation_contract() {
+        use vos::service::{AttestationProofManifest, ProofArtifactId, ServiceWire};
 
         let root = [0x71; 32];
         let segments = [[0x72; 32], [0x73; 32]];
-        let encoded = encode_v2_attestation_manifest(root, &segments).unwrap();
-        let decoded = AttestationProofManifestV2::decode(&encoded).unwrap();
+        let encoded = encode_service_attestation_manifest(root, &segments).unwrap();
+        let decoded = AttestationProofManifest::decode(&encoded).unwrap();
         assert_eq!(decoded.initial_root.0, root);
-        assert_eq!(decoded.segments, segments.map(ProofArtifactIdV2).to_vec());
+        assert_eq!(decoded.segments, segments.map(ProofArtifactId).to_vec());
         assert_eq!(
             decoded.proof_system,
-            AttestationProofManifestV2::proof_system()
+            AttestationProofManifest::proof_system()
         );
     }
 

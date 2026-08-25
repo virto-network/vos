@@ -1,6 +1,6 @@
 # VOS actor examples
 
-These examples use the clean v2 actor source surface. Platform rustflags add
+These examples use the clean service actor source surface. Platform rustflags add
 `no_std` and `no_main`; application source does not declare either attribute.
 
 - `counter`: ordinary Rust state for Local or Raft consistency.
@@ -15,11 +15,11 @@ These examples use the clean v2 actor source surface. Platform rustflags add
 From this directory, build the canonical actor ELFs:
 
 ```sh
-cargo +nightly actor -p v2-counter
-cargo +nightly actor -p v2-workflow
-cargo +nightly actor -p v2-private-age
-cargo +nightly actor -p v2-age-gate
-cargo +nightly actor -p v2-shared-board
+cargo +nightly actor -p counter
+cargo +nightly actor -p workflow
+cargo +nightly actor -p private-age
+cargo +nightly actor -p age-gate
+cargo +nightly actor -p shared-board
 ```
 
 Run the host-side convergence gate:

@@ -10,7 +10,7 @@
 //!   publish flow; bundled so `vosx dev new` can publish + install
 //!   the program in one shot without out-of-band scaffolding.
 //! - **space-authority**: canonical actor PVM used to construct the root-signed
-//!   authority package at first v2 startup. Package signing remains local to
+//!   authority package at first service startup. Package signing remains local to
 //!   the immutable space root.
 //!
 //! `build.rs` prefers the working-tree path under

@@ -82,16 +82,16 @@ use alloc::vec::Vec;
 /// Previous current version, accepted for already-installed actor blobs.
 /// Same strict-canonical rules and anchor-checked apply semantics as v4;
 /// carries no `app_public` field.
-pub const REFINE_PAYLOAD_V3: u8 = 0x03;
+pub const REFINE_PAYLOAD_: u8 = 0x03;
 /// Current wire version — what the guest framework emits.
 pub const REFINE_PAYLOAD_VERSION: u8 = 0x04;
 
-/// Retired v2 discriminator, permanently reserved at the runtime boundary.
+/// Retired service discriminator, permanently reserved at the runtime boundary.
 ///
 /// Its payload is intentionally no longer decodable, but recognizing the
-/// leading byte prevents complete v2 results from falling through to the
+/// leading byte prevents complete service results from falling through to the
 /// unrelated legacy status-envelope decoder.
-pub const RETIRED_REFINE_PAYLOAD_V2: u8 = 0x02;
+pub const RETIRED_REFINE_PAYLOAD_: u8 = 0x02;
 
 /// Flag bit: guest yielded; host should re-queue this service next tick.
 pub const FLAG_CONTINUE_NEXT: u8 = 0x01;
@@ -175,7 +175,7 @@ pub enum Effect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefinePayload {
     /// Wire version this payload was decoded from. VOS accepts canonical
-    /// v3/v4; retired v2 stores and actor blobs must be reinstalled.
+    /// v3/v4; retired service stores and actor blobs must be reinstalled.
     pub version: u8,
     /// Commitment kind for the state this refine ran against.
     pub anchor_kind: u8,
@@ -189,7 +189,7 @@ pub struct RefinePayload {
     pub effects: Vec<Effect>,
     /// App-level public bytes a provable Task designated via
     /// `vos::zk::bind_public` (v4 field; empty for non-binding actors and
-    /// for decoded v2/v3 payloads). Bound through `public'`/io-hash — see
+    /// for decoded service/v3 payloads). Bound through `public'`/io-hash — see
     /// [`folded_public`] — NOT through the transition digest.
     pub app_public: Vec<u8>,
     /// Guest requested to be re-scheduled next tick (yield_now / sleep).
@@ -245,12 +245,12 @@ impl RefinePayload {
 
     /// Decode from the wire, dispatching on the leading version byte:
     /// v4/v3 with the strict canonical rules (v3 carries no `app_public`
-    /// field — it decodes empty). Retired v2 and unknown versions fail
+    /// field — it decodes empty). Retired service and unknown versions fail
     /// hard rather than becoming migration input or falling through to
     /// defaults.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         match bytes.first()? {
-            &REFINE_PAYLOAD_VERSION | &REFINE_PAYLOAD_V3 => Self::decode_current(bytes),
+            &REFINE_PAYLOAD_VERSION | &REFINE_PAYLOAD_ => Self::decode_current(bytes),
             _ => None,
         }
     }
@@ -463,7 +463,7 @@ fn encode_effect(out: &mut Vec<u8>, eff: &Effect) {
 }
 
 /// Decode one effect. With `strict` (v3), the payload must be exactly
-/// consumed by the effect's fields; without (v2), inner slack is
+/// consumed by the effect's fields; without (service), inner slack is
 /// tolerated as inherited behavior.
 fn decode_effect(c: &mut Cursor<'_>, strict: bool) -> Option<Effect> {
     let tag = c.read_u8()?;
@@ -707,14 +707,14 @@ mod tests {
         }
         .encode();
         let mut v3 = v4[..v4.len() - 4].to_vec();
-        v3[0] = REFINE_PAYLOAD_V3;
+        v3[0] = REFINE_PAYLOAD_;
         let decoded = RefinePayload::decode(&v3).expect("v3 decodes");
-        assert_eq!(decoded.version, REFINE_PAYLOAD_V3);
+        assert_eq!(decoded.version, REFINE_PAYLOAD_);
         assert!(decoded.app_public.is_empty());
         assert_eq!(decoded.reply, vec![1, 2]);
         // v3 must NOT accept a trailing app_public field.
         let mut v3_with_field = v4.clone();
-        v3_with_field[0] = REFINE_PAYLOAD_V3;
+        v3_with_field[0] = REFINE_PAYLOAD_;
         assert!(RefinePayload::decode(&v3_with_field).is_none());
     }
 
@@ -759,7 +759,7 @@ mod tests {
         };
         let v4 = p.encode();
         let mut v3 = v4[..v4.len() - 4].to_vec();
-        v3[0] = REFINE_PAYLOAD_V3;
+        v3[0] = REFINE_PAYLOAD_;
         let d4 = RefinePayload::decode(&v4).unwrap().transition_digest();
         let d3 = RefinePayload::decode(&v3).unwrap().transition_digest();
         assert_ne!(d3, d4);
@@ -839,8 +839,8 @@ mod tests {
     }
 
     #[test]
-    fn v2_payloads_require_reset_and_reinstall() {
-        let legacy = [RETIRED_REFINE_PAYLOAD_V2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    fn service_payloads_require_reset_and_reinstall() {
+        let legacy = [RETIRED_REFINE_PAYLOAD_, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert!(RefinePayload::decode(&legacy).is_none());
     }
 

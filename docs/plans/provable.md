@@ -1,7 +1,7 @@
 # `#[provable]` — proofs of actor transitions
 
 Status: **W1–W4, the parent-side Clerk delegation, signed Local/Raft
-service-v2 Task execution, all-voter private ingress, producer-local durable
+service Task execution, all-voter private ingress, producer-local durable
 record storage, and the canonical Clerk package/Raft-root path are
 implemented. CRDT private-Task availability remains staged**.
 The first draft
@@ -83,7 +83,7 @@ Landed and gated; `#[provable]` composes it.
   (`CommittedMap::root()`) to name `root_before`/`root_after` — no
   framework anchor reinterpretation.
 - **Replay safety** (A10): ordinary legacy Task invoke effects re-absorb on
-  replay. Local service-v2 stores only an argument commitment in guest-owned
+  replay. Local service stores only an argument commitment in guest-owned
   ingress/workflow state, rehydrates the plaintext from a durable private
   sidecar, and persists completed records to a second producer-local sidecar
   before committing the public transition. Replicated recording remains
@@ -206,23 +206,23 @@ them and made records droppable — both wrong.
   invoke cleanly instead of misparsing the length (the wire-compat
   fix). The host persists `ProvableInput` + `ProvableRecord` keyed by
   `(svc, tag)` into the agent's own storage under a reserved
-  `__vos_proofrec/` prefix for the legacy Local runtime. Service-v2 instead
+  `__vos_proofrec/` prefix for the legacy Local runtime. Service instead
   keys an operator-private durable sidecar by `(ActorId, tag)`. The actor can
   read only the public `ProvableRecord` before returning; the secret input half
   never enters actor memory or state. A completed recorded `TaskRecord` is
   scrubbed, and the enclosing slice may not suspend after any record attempt.
   A separate invocation-keyed private-input sidecar commits before Local
-  admission; guest-owned rows retain only its `BlobRefV2`, and exact recovery
+  admission; guest-owned rows retain only its `BlobRef`, and exact recovery
   rehydrates that reference after restart. It is retired after terminal Apply.
   The record sidecar must commit before the corresponding Local transition;
   failure leaves the admitted input retryable. A record-enabled Task must
   complete in one invoke and its complete output must fit the caller buffer;
   queue-without-drive, failure, yield, or oversized output rejects the whole
-  service-v2 slice. The parent reads the staged record before its own
+  service slice. The parent reads the staged record before its own
   mutation and checks the selected Task, exact reply wire, and `app_public`
   rather than trusting the reply as a proxy for the proof statement. Legacy
   records export through the canonical `proof_record(tag)` ABI used by
-  `vosx zk prove --from` and are pruned by the app. Service-v2 exposes the
+  `vosx zk prove --from` and are pruned by the app. Service exposes the
   complete entry only through the root host's authenticated
   `producer_record`/`prune_producer_record` boundary; an actor message cannot
   retrieve its private half. Records are retired once a proof is published or
@@ -421,9 +421,9 @@ W1–W3 landed as described. **W4 landed** with these concrete pieces:
   they receive an authenticated typed transition contract.
 - **Canonical Clerk deployment content and operator signature.** The pinned
   recipe exports the source revision and invokes the date-pinned host/guest
-  toolchains recorded in `support/v2-production-artifacts.toml`, builds
+  toolchains recorded in `support/production-artifacts.toml`, builds
   `clerk-ledger`, and derives the immutable actor ProgramId, DeploymentId, and
-  `clerk-apply` Task content address. `just build-clerk-v2-package
+  `clerk-apply` Task content address. `just build-clerk-package
   /secure/operator/identity.key` then signs that content using only the
   explicitly named producer key. Exact `.vos` bytes are operator-specific and
   their digest becomes catalog/release metadata; they are not mislabeled as a

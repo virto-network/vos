@@ -391,7 +391,7 @@ pub trait NetworkService: Send + Sync {
     }
 
     /// Authenticate and perform one membership change as one host-side
-    /// critical section. V2 roots override this to serialize the change with
+    /// critical section. Service roots override this to serialize the change with
     /// private-ingress admission and to require a quiescent secret set before
     /// the joining voter can enter joint consensus.
     fn handle_raft_join(
@@ -2338,7 +2338,7 @@ fn handle_req_resp(
                     }
                     Frame::Tell { from, to, payload } => {
                         let claimed_prefix = (from >> 16) as u16;
-                        // Canonical v2 root transport is bound again to the
+                        // Canonical service root transport is bound again to the
                         // full PeerId at the node bridge. Let a correctly
                         // derived source through even when its 16-bit lookup
                         // prefix collides; ordinary legacy Tell still relies
@@ -3860,7 +3860,7 @@ mod tests {
             )
             .unwrap();
             cc_a.commit_with_log(b"v1", &log1).unwrap();
-            cc_a.commit_with_log(b"v2", &log2).unwrap();
+            cc_a.commit_with_log(b"service", &log2).unwrap();
             assert_eq!(cc_a.root_bytes().len(), 1);
         }
 
@@ -3987,7 +3987,7 @@ mod tests {
                 .unwrap();
         cc.commit_with_log(b"v1", &EffectLog::for_msg(b"first".to_vec()))
             .unwrap();
-        cc.commit_with_log(b"v2", &EffectLog::for_msg(b"second".to_vec()))
+        cc.commit_with_log(b"service", &EffectLog::for_msg(b"second".to_vec()))
             .unwrap();
         let expected_root = cc.root_bytes()[0];
         let expected_node_bytes = cc.get_node_bytes(&expected_root).unwrap().unwrap();

@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 use vos::registry::Status;
-use vos::v2::{V2Wire, VosPackageV2};
+use vos::service::{ServiceWire, VosPackage};
 
 use crate::blob_store::{self, BlobHash, BlobSource};
 use crate::bundled;
@@ -93,10 +93,10 @@ fn canonical_program(
         let crdt = vos::metadata::from_elf(&bytes).is_some_and(|meta| meta.crdt);
         return Ok((source_hash, bytes, None, crdt));
     }
-    let package = VosPackageV2::decode(&bytes)
-        .map_err(|error| anyhow::anyhow!("decode .vos v2 package: {error}"))?;
+    let package = VosPackage::decode(&bytes)
+        .map_err(|error| anyhow::anyhow!("decode .vos service package: {error}"))?;
     package.validate()?;
-    vos::v2::validate_actor_program_layout(&package.actor_pvm).map_err(|error| {
+    vos::service::validate_actor_program_layout(&package.actor_pvm).map_err(|error| {
         anyhow::anyhow!("package actor PVM capability layout is invalid: {error}")
     })?;
     if package.manifest.name != name || package.manifest.version != version {
@@ -222,7 +222,7 @@ fn forward_meta_blob(client: &DaemonClient, hash: &BlobHash, meta_blob: &[u8]) {
         return;
     }
     if let Err(e) = client.register_meta(hash.0.to_vec(), meta_blob.to_vec()) {
-        tracing::debug!("register_meta for v2 package skipped: {e}");
+        tracing::debug!("register_meta for service package skipped: {e}");
     }
 }
 
@@ -247,9 +247,9 @@ fn emit(name: &str, version: &str, hash: &BlobHash, already_present: bool) {
 mod tests {
     use libp2p::identity::Keypair;
     use vos::metadata::{ActorMeta, MessageMeta};
-    use vos::v2::{
-        DeploymentSignatureV2, Hash, PackageManifestV2, PackageRolePoliciesV2, ProducerId,
-        ProgramId, VosPackageV2, artifact_hash,
+    use vos::service::{
+        DeploymentSignature, Hash, PackageManifest, PackageRolePolicies, ProducerId, ProgramId,
+        VosPackage, artifact_hash,
     };
 
     use super::*;
@@ -277,7 +277,7 @@ mod tests {
         provable: false,
     };
 
-    fn signed_package() -> VosPackageV2 {
+    fn signed_package() -> VosPackage {
         let mut assembler = vos_pvm_compiler::assembler::Assembler::new();
         assembler
             .load_imm_64(vos_pvm_compiler::assembler::Reg::A0, 0)
@@ -286,26 +286,26 @@ mod tests {
         let (buffer, length) = vos::metadata::encode::<512>(&META);
         let schemas = buffer[..length].to_vec();
         let metadata = vos::metadata::decode(&schemas).unwrap();
-        let role_policies = PackageRolePoliciesV2::from_metadata(&metadata)
+        let role_policies = PackageRolePolicies::from_metadata(&metadata)
             .unwrap()
             .encode();
         let interfaces = Vec::new();
         let keypair = Keypair::generate_ed25519();
         let public_key = keypair.public().encode_protobuf();
-        let mut package = VosPackageV2 {
-            manifest: PackageManifestV2 {
+        let mut package = VosPackage {
+            manifest: PackageManifest {
                 name: "counter".into(),
                 version: "2.0.0".into(),
-                service_abi: vos::v2::ABI_VERSION,
-                snapshot_version: vos::v2::SNAPSHOT_VERSION,
-                execution_semantics: vos::v2::EXECUTION_SEMANTICS_ID,
-                service_program: vos::v2::VOS_SERVICE_PROGRAM_ID,
+                service_abi: vos::service::ABI_VERSION,
+                snapshot_version: vos::service::SNAPSHOT_VERSION,
+                execution_semantics: vos::service::EXECUTION_SEMANTICS_ID,
+                service_program: vos::service::VOS_SERVICE_PROGRAM_ID,
                 actor_program: ProgramId::of_pvm(&actor_pvm),
                 crdt: false,
                 interfaces_hash: artifact_hash(b"interfaces", &interfaces),
                 role_policies_hash: artifact_hash(b"role-policies", &role_policies),
                 schemas_hash: artifact_hash(b"schemas", &schemas),
-                task_dependencies_hash: vos::v2::task_dependencies_hash(&[]),
+                task_dependencies_hash: vos::service::task_dependencies_hash(&[]),
             },
             actor_pvm,
             generated_interfaces: interfaces,
@@ -313,7 +313,7 @@ mod tests {
             schemas,
             task_dependencies: vec![],
             diagnostics: None,
-            deployment_signature: DeploymentSignatureV2 {
+            deployment_signature: DeploymentSignature {
                 producer: ProducerId::of_public_key(&public_key),
                 public_key,
                 signature: vec![0],
@@ -324,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn publishing_v2_retains_the_exact_signed_package() {
+    fn publishing_service_retains_the_exact_signed_package() {
         let package = signed_package();
         let bytes = package.encode();
         let source_hash = BlobHash::of(&bytes);
@@ -339,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn publishing_v2_rejects_a_tampered_deployment_signature() {
+    fn publishing_service_rejects_a_tampered_deployment_signature() {
         let mut package = signed_package();
         package.deployment_signature.signature[0] ^= 0xff;
         let bytes = package.encode();

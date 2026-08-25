@@ -1,4 +1,4 @@
-//! Generic VOS v2 JAM service guest.
+//! Generic VOS service JAM service guest.
 //!
 //! The ELF exports the Gray Paper's two physical entries. `_start` is Refine
 //! (IC 0 after transpilation) and `accumulate` is Accumulate (IC 5). Registers
@@ -15,12 +15,12 @@ mod guest {
 
     use vos::abi::pvm::ecall;
     use vos::abi::{error, pvm::hostcalls};
-    use vos::v2::{
-        AccumulateRequestV2, AccumulationRejectionV2, AccumulationResultV2, ActorCallResultV2,
-        ActorEffectBatchV2, ActorSliceOutputV2, BlobRefV2, ConsistencyBaseV2, ContinuationChangeV2,
-        CrdtChangeV2, CrdtDispatchV2, CrdtMaterializationV2, GasAccountingV2,
-        GuestAccumulateStoreV2, ImportedBlobV2, MessageRecordV2, ProgramId, RefineOutputV2,
-        ReplyRecordV2, StateTreeStore, TransitionV2, V2Wire, WorkEnvelopeV2,
+    use vos::service::{
+        AccumulateRequest, AccumulationRejection, AccumulationResult, ActorCallResult,
+        ActorEffectBatch, ActorSliceOutput, BlobRef, ConsistencyBase, ContinuationChange,
+        CrdtChange, CrdtDispatch, CrdtMaterialization, GasAccounting,
+        GuestAccumulateStore, ImportedBlob, MessageRecord, ProgramId, RefineOutput,
+        ReplyRecord, StateTreeStore, Transition, ServiceWire, WorkEnvelope,
         execute_owned_canonical_guest_accumulate,
     };
 
@@ -31,8 +31,8 @@ mod guest {
     #[unsafe(link_section = ".bss.vos_service_transition")]
     static mut TRANSITION_BUFFER: [u8; TRANSITION_CAPACITY] = [0; TRANSITION_CAPACITY];
     #[unsafe(link_section = ".bss.vos_actor_effects")]
-    static mut ACTOR_EFFECT_BUFFER: [u8; vos::v2::ACTOR_EFFECT_BATCH_MAX_BYTES] =
-        [0; vos::v2::ACTOR_EFFECT_BATCH_MAX_BYTES];
+    static mut ACTOR_EFFECT_BUFFER: [u8; vos::service::ACTOR_EFFECT_BATCH_MAX_BYTES] =
+        [0; vos::service::ACTOR_EFFECT_BATCH_MAX_BYTES];
 
     #[repr(C)]
     struct OutputWindow {
@@ -72,16 +72,16 @@ mod guest {
     ) -> OutputWindow {
         // SAFETY: JAM initializes a readable argument window at (a0, a1).
         let input = unsafe { core::slice::from_raw_parts(arguments, arguments_len) };
-        let mut work = WorkEnvelopeV2::decode(input).unwrap_or_else(|_| fail_closed());
-        if work.service.service_abi != vos::v2::ABI_VERSION
-            || work.service.execution_semantics != vos::v2::EXECUTION_SEMANTICS_ID
+        let mut work = WorkEnvelope::decode(input).unwrap_or_else(|_| fail_closed());
+        if work.service.service_abi != vos::service::ABI_VERSION
+            || work.service.execution_semantics != vos::service::EXECUTION_SEMANTICS_ID
             || !work.base.mode_compatible(work.consistency)
         {
             fail_closed();
         }
 
         if actor_input_len > actor_ipc_capacity
-            || actor_input_len > vos::v2::ACTOR_SLICE_INPUT_MAX_BYTES
+            || actor_input_len > vos::service::ACTOR_SLICE_INPUT_MAX_BYTES
             || actor_ipc_capacity == 0
         {
             fail_closed();
@@ -90,12 +90,12 @@ mod guest {
         prepare_actor_cnodes(&work);
 
         let [actor_output_len, actor_status] = ecall::call_cap_pair(
-            ecall::local_cap_ref(vos::v2::TARGET_ACTOR_HANDLE_SLOT),
-            vos::v2::ACTOR_IPC_CAP_SLOT,
-            vos::v2::ACTOR_IPC_BASE_PAGE as u64 * 4096,
+            ecall::local_cap_ref(vos::service::TARGET_ACTOR_HANDLE_SLOT),
+            vos::service::ACTOR_IPC_CAP_SLOT,
+            vos::service::ACTOR_IPC_BASE_PAGE as u64 * 4096,
             actor_input_len as u64,
             actor_ipc_capacity as u64,
-            vos::v2::NESTED_ACTOR_CALL_MAGIC,
+            vos::service::NESTED_ACTOR_CALL_MAGIC,
         );
         if actor_status != 0 {
             fail_closed();
@@ -105,14 +105,14 @@ mod guest {
         if actor_output_len == 0 || actor_output_len > actor_ipc_capacity {
             fail_closed();
         }
-        let actor_output_address = vos::v2::ACTOR_IPC_BASE_PAGE as usize * 4096usize;
+        let actor_output_address = vos::service::ACTOR_IPC_BASE_PAGE as usize * 4096usize;
         // SAFETY: JAR returned and remapped the same invocation-owned DATA cap
         // after REPLY; the returned length is bounded by its capacity.
         let actor_output_bytes = unsafe {
             core::slice::from_raw_parts(actor_output_address as *const u8, actor_output_len)
         };
         let call_result =
-            ActorCallResultV2::decode(actor_output_bytes).unwrap_or_else(|_| fail_closed());
+            ActorCallResult::decode(actor_output_bytes).unwrap_or_else(|_| fail_closed());
         if call_result.actor != work.target
             || call_result.first_await_ordinal != 0
             || call_result.forbidden
@@ -124,14 +124,14 @@ mod guest {
         let effect_buffer = unsafe {
             core::slice::from_raw_parts_mut(
                 core::ptr::addr_of_mut!(ACTOR_EFFECT_BUFFER).cast::<u8>(),
-                vos::v2::ACTOR_EFFECT_BATCH_MAX_BYTES,
+                vos::service::ACTOR_EFFECT_BATCH_MAX_BYTES,
             )
         };
         let effect_len = hostcalls::actor_private_fetch(effect_buffer) as usize;
         if effect_len == 0 || effect_len > effect_buffer.len() {
             fail_closed();
         }
-        let effects = ActorEffectBatchV2::decode(&effect_buffer[..effect_len])
+        let effects = ActorEffectBatch::decode(&effect_buffer[..effect_len])
             .unwrap_or_else(|_| fail_closed());
         if let Some(checkpoint) = call_result.checkpoint.as_ref() {
             if checkpoint.input != work.input_id() {
@@ -149,7 +149,7 @@ mod guest {
                 if resume_len == 0 || resume_len > resume_buffer.len() {
                     fail_closed();
                 }
-                work = WorkEnvelopeV2::decode(&resume_buffer[..resume_len])
+                work = WorkEnvelope::decode(&resume_buffer[..resume_len])
                     .unwrap_or_else(|_| fail_closed());
             }
         }
@@ -160,12 +160,12 @@ mod guest {
                 || checkpoint.work_hash != work.hash()
                 || checkpoint.base_causal_height != work.base_causal_height
                 || checkpoint.change.map(|dispatch| dispatch.change)
-                    != CrdtChangeV2::derive_operation_scope(&work)
+                    != CrdtChange::derive_operation_scope(&work)
             {
                 fail_closed();
             }
         }
-        let imported = |actor: vos::v2::ActorId| {
+        let imported = |actor: vos::service::ActorId| {
             work.imported_actors
                 .binary_search_by_key(&actor, |candidate| candidate.actor)
                 .is_ok()
@@ -190,7 +190,7 @@ mod guest {
         let outbox = actor_output
             .outbox
             .iter()
-            .map(|call| MessageRecordV2 {
+            .map(|call| MessageRecord {
                 call_id: work.invocation.call_id(call.await_ordinal),
                 caller_invocation: work.invocation,
                 await_ordinal: call.await_ordinal,
@@ -248,8 +248,8 @@ mod guest {
         let mut base = work.base.clone();
         let mut work_hash = work.hash();
         let mut base_causal_height = work.base_causal_height;
-        let mut change = CrdtChangeV2::derive_operation_scope(&work)
-            .map(|change| CrdtDispatchV2 { change, ordinal: 0 });
+        let mut change = CrdtChange::derive_operation_scope(&work)
+            .map(|change| CrdtDispatch { change, ordinal: 0 });
         let mut continuations = alloc::vec::Vec::new();
         let mut exported_blobs = alloc::vec::Vec::new();
         if let Some(checkpoint) = actor_output.checkpoint {
@@ -259,7 +259,7 @@ mod guest {
             if !checkpoint.base.mode_compatible(work.consistency) {
                 fail_closed();
             }
-            let is_crdt = matches!(checkpoint.base, ConsistencyBaseV2::Crdt { .. });
+            let is_crdt = matches!(checkpoint.base, ConsistencyBase::Crdt { .. });
             if checkpoint.change.is_some() != is_crdt
                 || checkpoint.base_causal_height.is_some() != is_crdt
                 || checkpoint
@@ -296,7 +296,7 @@ mod guest {
                 {
                     fail_closed();
                 }
-                continuations.push(ContinuationChangeV2 {
+                continuations.push(ContinuationChange {
                     actor,
                     expected: checkpoint
                         .previously_suspended
@@ -314,7 +314,7 @@ mod guest {
             fail_closed();
         }
 
-        let reply = (!actor_output.yielded).then(|| ReplyRecordV2 {
+        let reply = (!actor_output.yielded).then(|| ReplyRecord {
             call_id: work
                 .parent_call
                 .unwrap_or_else(|| work.invocation.root_reply_id()),
@@ -322,14 +322,14 @@ mod guest {
             result: actor_output.reply,
         });
         let (writes, crdt_change, mut candidate_blobs) = match (&base, base_causal_height) {
-            (ConsistencyBaseV2::Linear { .. }, None) => {
+            (ConsistencyBase::Linear { .. }, None) => {
                 if !actor_output.crdt_operations.is_empty() || !actor_output.crdt_states.is_empty()
                 {
                     fail_closed();
                 }
                 (actor_output.writes, None, alloc::vec::Vec::new())
             }
-            (ConsistencyBaseV2::Crdt { heads }, Some(base_height)) => {
+            (ConsistencyBase::Crdt { heads }, Some(base_height)) => {
                 if !actor_output.writes.is_empty()
                     || !actor_output.spawns.is_empty()
                     || actor_output.crdt_states.is_empty()
@@ -361,14 +361,14 @@ mod guest {
                     .crdt_states
                     .into_iter()
                     .map(|state| {
-                        let reference = BlobRefV2::of_bytes(&state.state);
+                        let reference = BlobRef::of_bytes(&state.state);
                         candidates
                             .entry(reference.hash)
-                            .or_insert_with(|| ImportedBlobV2 {
+                            .or_insert_with(|| ImportedBlob {
                                 reference: reference.clone(),
                                 bytes: state.state,
                             });
-                        CrdtMaterializationV2 {
+                        CrdtMaterialization {
                             actor: state.actor,
                             state: reference,
                         }
@@ -376,8 +376,8 @@ mod guest {
                     .collect();
                 (
                     alloc::vec::Vec::new(),
-                    Some(CrdtChangeV2 {
-                        id: CrdtChangeV2::derive_id_from_work_hash(work_hash),
+                    Some(CrdtChange {
+                        id: CrdtChange::derive_id_from_work_hash(work_hash),
                         work_hash,
                         causal_dependencies: heads.clone(),
                         causal_height,
@@ -396,17 +396,17 @@ mod guest {
             .spawns
             .into_iter()
             .map(|spawn| {
-                let reference = BlobRefV2::of_bytes(&spawn.initial_state);
+                let reference = BlobRef::of_bytes(&spawn.initial_state);
                 if !candidate_blobs
                     .iter()
                     .any(|candidate| candidate.reference == reference)
                 {
-                    candidate_blobs.push(ImportedBlobV2 {
+                    candidate_blobs.push(ImportedBlob {
                         reference: reference.clone(),
                         bytes: spawn.initial_state,
                     });
                 }
-                vos::v2::ActorSpawnV2 {
+                vos::service::ActorSpawn {
                     actor: spawn.actor,
                     name: spawn.name,
                     parent: spawn.parent,
@@ -421,7 +421,7 @@ mod guest {
         {
             fail_closed();
         }
-        let mut transition = TransitionV2 {
+        let mut transition = Transition {
             service: work.service.clone(),
             consumed_input,
             target_deployment: work.target_deployment,
@@ -435,14 +435,14 @@ mod guest {
             outbox,
             reply,
             exported_blobs,
-            gas: GasAccountingV2::default(),
+            gas: GasAccounting::default(),
             proof: None,
         };
         let workflow = transition.workflow_operations_with_consumed_outbox(&work, consumed_outbox);
         if let Some(change) = transition.crdt_change.as_mut() {
             change.workflow = workflow;
         }
-        let encoded = RefineOutputV2 {
+        let encoded = RefineOutput {
             transition,
             candidate_blobs,
         }
@@ -464,11 +464,11 @@ mod guest {
     }
 
     fn aggregate_actor_effects(
-        work: &WorkEnvelopeV2,
-        call_result: &ActorCallResultV2,
-        batch: ActorEffectBatchV2,
-    ) -> ActorSliceOutputV2 {
-        let imported = |actor: vos::v2::ActorId| {
+        work: &WorkEnvelope,
+        call_result: &ActorCallResult,
+        batch: ActorEffectBatch,
+    ) -> ActorSliceOutput {
+        let imported = |actor: vos::service::ActorId| {
             work.imported_actors
                 .binary_search_by_key(&actor, |candidate| candidate.actor)
                 .is_ok()
@@ -502,7 +502,7 @@ mod guest {
                 continue;
             }
             match work.consistency {
-                vos::v2::ConsistencyModeV2::Crdt => {
+                vos::service::ConsistencyMode::Crdt => {
                     let [state] = output.crdt_states.as_slice() else {
                         fail_closed();
                     };
@@ -574,7 +574,7 @@ mod guest {
         }
         root.writes = writes
             .into_iter()
-            .map(|((actor, key), value)| vos::v2::ActorWriteV2 { actor, key, value })
+            .map(|((actor, key), value)| vos::service::ActorWrite { actor, key, value })
             .collect();
         crdt_operations.sort_by_key(|operation| {
             (
@@ -600,8 +600,8 @@ mod guest {
     /// in its owned tree. The generic service retains the HANDLEs; DOWNGRADE
     /// is the ordinary JAM/JAR authority-narrowing operation and does not add
     /// a VOS-specific kernel call surface.
-    fn prepare_actor_cnodes(work: &WorkEnvelopeV2) {
-        if work.imported_actors.len() > vos::v2::MAX_ROOT_TREE_ACTORS {
+    fn prepare_actor_cnodes(work: &WorkEnvelope) {
+        if work.imported_actors.len() > vos::service::MAX_ROOT_TREE_ACTORS {
             fail_closed();
         }
         // Every canonical actor manifest owns slot 0 for standalone args, but
@@ -612,7 +612,7 @@ mod guest {
             let handle = actor_handle_slot(work, actor.actor);
             if !ecall::move_cap(
                 ecall::cap_ref_through_handle(handle, 0),
-                ecall::cap_ref_through_handle(handle, vos::v2::ACTOR_SAVED_ARGS_CAP_SLOT),
+                ecall::cap_ref_through_handle(handle, vos::service::ACTOR_SAVED_ARGS_CAP_SLOT),
             ) {
                 fail_closed();
             }
@@ -624,7 +624,7 @@ mod guest {
                     continue;
                 }
                 let source_handle = actor_handle_slot(work, source.actor);
-                let callable_slot = vos::v2::ACTOR_CALLABLE_BASE_SLOT
+                let callable_slot = vos::service::ACTOR_CALLABLE_BASE_SLOT
                     .checked_add(source_index as u8)
                     .unwrap_or_else(|| fail_closed());
                 if !ecall::downgrade_cap(
@@ -637,11 +637,11 @@ mod guest {
         }
     }
 
-    fn restore_actor_cnodes(work: &WorkEnvelopeV2) {
+    fn restore_actor_cnodes(work: &WorkEnvelope) {
         for actor in &work.imported_actors {
             let handle = actor_handle_slot(work, actor.actor);
             if !ecall::move_cap(
-                ecall::cap_ref_through_handle(handle, vos::v2::ACTOR_SAVED_ARGS_CAP_SLOT),
+                ecall::cap_ref_through_handle(handle, vos::service::ACTOR_SAVED_ARGS_CAP_SLOT),
                 ecall::cap_ref_through_handle(handle, 0),
             ) {
                 fail_closed();
@@ -649,12 +649,12 @@ mod guest {
         }
     }
 
-    /// `ServicePvmV2` installs the target first and the remaining canonical
+    /// `ServicePvm` installs the target first and the remaining canonical
     /// actor-ID order after it. Recompute that physical HANDLE slot from the
     /// consensus work directory without trusting a native routing table.
-    fn actor_handle_slot(work: &WorkEnvelopeV2, actor: vos::v2::ActorId) -> u8 {
+    fn actor_handle_slot(work: &WorkEnvelope, actor: vos::service::ActorId) -> u8 {
         if actor == work.target {
-            return vos::v2::TARGET_ACTOR_HANDLE_SLOT;
+            return vos::service::TARGET_ACTOR_HANDLE_SLOT;
         }
         let ordinal = work
             .imported_actors
@@ -662,13 +662,13 @@ mod guest {
             .filter(|candidate| candidate.actor != work.target)
             .position(|candidate| candidate.actor == actor)
             .unwrap_or_else(|| fail_closed());
-        vos::v2::TARGET_ACTOR_HANDLE_SLOT
+        vos::service::TARGET_ACTOR_HANDLE_SLOT
             .checked_add(1)
             .and_then(|slot| slot.checked_add(ordinal as u8))
             .unwrap_or_else(|| fail_closed())
     }
 
-    /// Validate and stage one v2 install/transition using only standard JAM
+    /// Validate and stage one service install/transition using only standard JAM
     /// service storage and preimage capabilities. The outer JAR driver owns the
     /// transaction: returning successfully commits all calls atomically, while
     /// `fail_closed` makes it discard the entire staging area.
@@ -679,14 +679,14 @@ mod guest {
     ) -> OutputWindow {
         // SAFETY: JAM initializes a readable argument window at (a0, a1).
         let input = unsafe { core::slice::from_raw_parts(arguments, arguments_len) };
-        let result = match AccumulateRequestV2::decode(input) {
+        let result = match AccumulateRequest::decode(input) {
             Ok(request) => {
                 // Authenticate the already-canonical physical request bytes.
                 // This avoids re-encoding a large decoded package merely to
                 // present the same commitment to platform authority.
-                let install_authorized = matches!(&request, AccumulateRequestV2::Install(_))
+                let install_authorized = matches!(&request, AccumulateRequest::Install(_))
                     && hostcalls::verify_install_authorization(input) == error::HOST_OK;
-                let upgrade_authorized = matches!(&request, AccumulateRequestV2::UpgradeActor(_))
+                let upgrade_authorized = matches!(&request, AccumulateRequest::UpgradeActor(_))
                     && hostcalls::verify_upgrade_authorization(input) == error::HOST_OK;
                 execute_owned_canonical_guest_accumulate(
                     &mut JamAccumulateStore {
@@ -697,7 +697,7 @@ mod guest {
                 )
                 .unwrap_or_else(|_| fail_closed())
             }
-            Err(_) => AccumulationResultV2::Rejected(AccumulationRejectionV2::NonCanonical),
+            Err(_) => AccumulationResult::Rejected(AccumulationRejection::NonCanonical),
         };
         output(&result.encode())
     }
@@ -753,7 +753,7 @@ mod guest {
         }
     }
 
-    impl GuestAccumulateStoreV2 for JamAccumulateStore {
+    impl GuestAccumulateStore for JamAccumulateStore {
         fn logical_timeslot(&self) -> Result<Option<u64>, Self::Error> {
             let timeslot = hostcalls::accumulation_timeslot();
             Ok((timeslot != error::HOST_NONE).then_some(timeslot))
@@ -761,19 +761,19 @@ mod guest {
 
         fn authorize_install(
             &self,
-            _genesis: &vos::v2::ServiceGenesisV2,
+            _genesis: &vos::service::ServiceGenesis,
         ) -> Result<bool, Self::Error> {
             Ok(self.install_authorized)
         }
 
         fn authorize_upgrade(
             &self,
-            _upgrade: &vos::v2::ActorUpgradeV2,
+            _upgrade: &vos::service::ActorUpgrade,
         ) -> Result<bool, Self::Error> {
             Ok(self.upgrade_authorized)
         }
 
-        fn blob_available(&self, reference: &BlobRefV2) -> Result<bool, Self::Error> {
+        fn blob_available(&self, reference: &BlobRef) -> Result<bool, Self::Error> {
             let mut probe = [0u8; 1];
             let available = hostcalls::preimage_lookup(&reference.hash.0, &mut probe);
             Ok(available != error::HOST_NONE && available == reference.len)
@@ -781,7 +781,7 @@ mod guest {
 
         fn load_blob(
             &self,
-            reference: &BlobRefV2,
+            reference: &BlobRef,
         ) -> Result<Option<alloc::vec::Vec<u8>>, Self::Error> {
             let mut probe = [0u8; STORAGE_PROBE_CAPACITY];
             let len = hostcalls::preimage_lookup(&reference.hash.0, &mut probe);
@@ -804,14 +804,14 @@ mod guest {
                 }
                 bytes
             };
-            if BlobRefV2::of_bytes(&bytes) != *reference {
+            if BlobRef::of_bytes(&bytes) != *reference {
                 return Err(JamStoreError::ReadFailed);
             }
             Ok(Some(bytes))
         }
 
-        fn provide_blob(&mut self, bytes: &[u8]) -> Result<BlobRefV2, Self::Error> {
-            let reference = BlobRefV2::of_bytes(bytes);
+        fn provide_blob(&mut self, bytes: &[u8]) -> Result<BlobRef, Self::Error> {
+            let reference = BlobRef::of_bytes(bytes);
             if hostcalls::provide(&reference.hash.0, bytes) == error::HOST_OK {
                 Ok(reference)
             } else {
@@ -821,18 +821,18 @@ mod guest {
 
         fn verify_proof(
             &self,
-            request: &vos::v2::ProofVerificationRequestV2,
-        ) -> Result<vos::v2::ProofVerificationV2, Self::Error> {
+            request: &vos::service::ProofVerificationRequest,
+        ) -> Result<vos::service::ProofVerification, Self::Error> {
             Ok(match hostcalls::verify_proof(&request.encode()) {
-                error::HOST_OK => vos::v2::ProofVerificationV2::Valid,
-                error::HOST_NONE => vos::v2::ProofVerificationV2::Unavailable,
-                _ => vos::v2::ProofVerificationV2::Invalid,
+                error::HOST_OK => vos::service::ProofVerification::Valid,
+                error::HOST_NONE => vos::service::ProofVerification::Unavailable,
+                _ => vos::service::ProofVerification::Invalid,
             })
         }
 
         fn verify_role_credential(
             &self,
-            request: &vos::v2::RoleCredentialVerificationRequestV2,
+            request: &vos::service::RoleCredentialVerificationRequest,
         ) -> Result<bool, Self::Error> {
             Ok(hostcalls::verify_role_credential(&request.encode()) == error::HOST_OK)
         }
@@ -843,12 +843,12 @@ mod guest {
 
         fn verify_receipt(
             &self,
-            request: &vos::v2::ReceiptVerificationRequestV2,
-        ) -> Result<vos::v2::ReceiptVerificationV2, Self::Error> {
+            request: &vos::service::ReceiptVerificationRequest,
+        ) -> Result<vos::service::ReceiptVerification, Self::Error> {
             Ok(match hostcalls::verify_receipt(&request.encode()) {
-                error::HOST_OK => vos::v2::ReceiptVerificationV2::Valid,
-                error::HOST_NONE => vos::v2::ReceiptVerificationV2::Unavailable,
-                _ => vos::v2::ReceiptVerificationV2::Invalid,
+                error::HOST_OK => vos::service::ReceiptVerification::Valid,
+                error::HOST_NONE => vos::service::ReceiptVerification::Unavailable,
+                _ => vos::service::ReceiptVerification::Invalid,
             })
         }
     }

@@ -1,5 +1,5 @@
 [package]
-name = "v2-counter"
+name = "counter"
 version.workspace = true
 edition.workspace = true
 

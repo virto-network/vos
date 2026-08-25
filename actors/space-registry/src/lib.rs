@@ -265,7 +265,7 @@ pub struct SpaceRegistry {
     metas: StorageMap<[u8; 32], MetaRow>,
     /// Exact canonical-authority bindings, one private point row per peer.
     /// This is deliberately a separate storage namespace from `metas`: an
-    /// administrator may author program metadata, but only the dedicated v2
+    /// administrator may author program metadata, but only the dedicated service
     /// grant/redeem handlers can write this map. The value is the complete
     /// authority/grant binding digest checked by `effective_role`.
     #[storage]
@@ -1398,47 +1398,12 @@ impl SpaceRegistry {
 
     // ── Auth grants (Sprint 2) ─────────────────────────────────
 
-    /// Grant `role` to `peer_id` at `epoch`. `epoch` must be above the
-    /// peer's current [`peer_epoch`](Self::peer_epoch) (the CLI reads it
-    /// and signs `epoch + 1`); a grant at or below the peer's revoke
-    /// high-water is recorded but stays dominated, so a replayed
-    /// stale-epoch grant can never resurrect a revoked role. `peer_id`
-    /// is libp2p multihash bytes. The grant is attributed to its signer
-    /// (`grantor`) so [`effective_role`](Self::effective_role) can void
-    /// the subtree if the delegator is later revoked.
-    #[msg(role = SpaceRegistryRole::Admin)]
-    async fn grant_role(
-        &mut self,
-        peer_id: Vec<u8>,
-        role: u8,
-        epoch: u64,
-        auth: Vec<u8>,
-    ) -> Status {
-        if self.role_authority_cutover_id().is_some() {
-            return Status::Forbidden;
-        }
-        if !self.authorize_op(
-            &canonical_op_bytes("grant_role", &[&peer_id, &[role], &epoch.to_le_bytes()]),
-            &auth,
-        ) {
-            return Status::Forbidden;
-        }
-        if peer_id.is_empty() {
-            return Status::BadHash;
-        }
-        let Some((grantor, _)) = unpack_auth(&auth) else {
-            return Status::Forbidden;
-        };
-        self.store_role_grant(peer_id, role, epoch, grantor.to_vec());
-        Status::Ok
-    }
-
     /// Canonical-authority counterpart of `grant_role`. It is a distinct
     /// message so captured pre-cutover calls cannot be reinterpreted as
     /// post-cutover evidence. Only the immutable root may author it, and its
     /// exact winning row is bound to the sealed authority incarnation.
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn grant_role_v2(
+    async fn grant_role(
         &mut self,
         peer_id: Vec<u8>,
         role: u8,
@@ -1450,7 +1415,7 @@ impl SpaceRegistry {
             return Status::BadHash;
         };
         let canonical = canonical_op_bytes(
-            "grant_role_v2",
+            "grant_role",
             &[&peer_id, &[role], &epoch.to_le_bytes(), &authority],
         );
         if peer_id.is_empty()
@@ -1469,30 +1434,8 @@ impl SpaceRegistry {
         Status::Ok
     }
 
-    /// Revoke `peer_id` at `epoch`. Raises the peer's grow-only revoke
-    /// high-water, dominating every grant at or below `epoch` — so the
-    /// revoke is replay-position independent (a forged grant ground to
-    /// sort before this op is still voided once `effective_role`
-    /// recomputes). Re-granting later requires a fresh, higher epoch.
-    /// Always `Status::Ok`: revoking sets a floor even with no live grant
-    /// (it blocks a future replayed grant).
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn revoke_role(&mut self, peer_id: Vec<u8>, epoch: u64, auth: Vec<u8>) -> Status {
-        if self.role_authority_cutover_id().is_some() {
-            return Status::Forbidden;
-        }
-        if !self.authorize_op(
-            &canonical_op_bytes("revoke_role", &[&peer_id, &epoch.to_le_bytes()]),
-            &auth,
-        ) {
-            return Status::Forbidden;
-        }
-        self.raise_revoke_floor(&peer_id, epoch);
-        Status::Ok
-    }
-
-    #[msg(role = SpaceRegistryRole::Admin)]
-    async fn revoke_role_v2(
+    async fn revoke_role(
         &mut self,
         peer_id: Vec<u8>,
         epoch: u64,
@@ -1502,10 +1445,8 @@ impl SpaceRegistry {
         let Some(authority) = bytes_to_32(&authority_replication_id) else {
             return Status::BadHash;
         };
-        let canonical = canonical_op_bytes(
-            "revoke_role_v2",
-            &[&peer_id, &epoch.to_le_bytes(), &authority],
-        );
+        let canonical =
+            canonical_op_bytes("revoke_role", &[&peer_id, &epoch.to_le_bytes(), &authority]);
         if peer_id.is_empty()
             || self.role_authority_cutover_id() != Some(authority)
             || !self.authorize_root_op(&canonical, &auth)
@@ -2332,12 +2273,12 @@ fn peer_key(peer_id: &[u8]) -> [u8; 32] {
 /// bindings guest-owned durable state. Domain-separated keys cannot collide
 /// with a real content-addressed program except by breaking BLAKE2b.
 fn role_authority_cutover_key() -> [u8; 32] {
-    vos::crypto::blake2b_hash::<32>(b"space-registry/role-authority-cutover/v2", &[])
+    vos::crypto::blake2b_hash::<32>(b"space-registry/role-authority-cutover/service", &[])
 }
 
 fn role_authority_grant_binding(authority: [u8; 32], row: &AuthGrantRow) -> [u8; 32] {
     vos::crypto::blake2b_hash::<32>(
-        b"space-registry/role-authority-grant/v2",
+        b"space-registry/role-authority-grant/service",
         &[
             &authority,
             &row.peer_id,
@@ -2533,7 +2474,7 @@ mod tests {
         r
     }
 
-    /// Registry at the only safe legacy-to-v2 cutover point: the immutable
+    /// Registry at the only safe legacy-to cutover point: the immutable
     /// root is the sole enrolled node and the actor has atomically sealed an
     /// empty non-root role inventory to one authority incarnation.
     fn authority_registry() -> SpaceRegistry {
@@ -3265,7 +3206,7 @@ mod tests {
     }
 
     /// Root-signed canonical-authority grant after the guest-owned cutover.
-    fn grant_space_v2(r: &mut SpaceRegistry, peer: &[u8], role: u8) -> Status {
+    fn grant_space(r: &mut SpaceRegistry, peer: &[u8], role: u8) -> Status {
         let epoch = dispatch(
             r,
             PeerEpoch {
@@ -3274,13 +3215,13 @@ mod tests {
         ) + 1;
         dispatch(
             r,
-            GrantRoleV2 {
+            GrantRole {
                 peer_id: peer.to_vec(),
                 role,
                 epoch,
                 authority_replication_id: TEST_AUTHORITY_ID.to_vec(),
                 auth: root_auth(
-                    "grant_role_v2",
+                    "grant_role",
                     &[peer, &[role], &epoch.to_le_bytes(), &TEST_AUTHORITY_ID],
                 ),
             },
@@ -3305,7 +3246,7 @@ mod tests {
         )
     }
 
-    fn revoke_space_v2(r: &mut SpaceRegistry, peer: &[u8]) -> Status {
+    fn revoke_space(r: &mut SpaceRegistry, peer: &[u8]) -> Status {
         let epoch = dispatch(
             r,
             PeerEpoch {
@@ -3314,12 +3255,12 @@ mod tests {
         ) + 1;
         dispatch(
             r,
-            RevokeRoleV2 {
+            RevokeRole {
                 peer_id: peer.to_vec(),
                 epoch,
                 authority_replication_id: TEST_AUTHORITY_ID.to_vec(),
                 auth: root_auth(
-                    "revoke_role_v2",
+                    "revoke_role",
                     &[peer, &epoch.to_le_bytes(), &TEST_AUTHORITY_ID],
                 ),
             },
@@ -4391,7 +4332,7 @@ mod tests {
             Status::Forbidden,
             "a captured legacy message cannot cross the durable barrier",
         );
-        assert_eq!(grant_space_v2(&mut r, &holder, AUTH_ROLE_ADMIN), Status::Ok);
+        assert_eq!(grant_space(&mut r, &holder, AUTH_ROLE_ADMIN), Status::Ok);
         assert_eq!(
             dispatch(
                 &mut r,
@@ -4426,7 +4367,7 @@ mod tests {
             AUTH_ROLE_NONE,
             "unwitnessed late legacy evidence cannot authorize",
         );
-        assert_eq!(grant_space_v2(&mut r, &holder, AUTH_ROLE_ADMIN), Status::Ok);
+        assert_eq!(grant_space(&mut r, &holder, AUTH_ROLE_ADMIN), Status::Ok);
         assert_eq!(
             dispatch(
                 &mut r,
@@ -4883,10 +4824,7 @@ mod tests {
         for index in 0..1_050u32 {
             let mut peer = alloc::vec![0x2a; 38];
             peer[..4].copy_from_slice(&index.to_le_bytes());
-            assert_eq!(
-                grant_space_v2(&mut r, &peer, AUTH_ROLE_READONLY),
-                Status::Ok,
-            );
+            assert_eq!(grant_space(&mut r, &peer, AUTH_ROLE_READONLY), Status::Ok,);
             assert_eq!(
                 dispatch(&mut r, PeerRole { peer_id: peer }),
                 AUTH_ROLE_READONLY
@@ -5189,7 +5127,7 @@ mod tests {
         let victim = node_key(90);
         let victim_peer = node_peer_of(&victim);
         assert_eq!(
-            grant_space_v2(&mut r, &victim_peer, AUTH_ROLE_ADMIN),
+            grant_space(&mut r, &victim_peer, AUTH_ROLE_ADMIN),
             Status::Ok
         );
         assert_eq!(
@@ -5274,10 +5212,7 @@ mod tests {
         let mut r = authority_registry();
         let bob = SigningKey::from_bytes(&[11u8; 32]);
         let bob_peer = peer_id_for(&bob.verifying_key().to_bytes());
-        assert_eq!(
-            grant_space_v2(&mut r, &bob_peer, AUTH_ROLE_ADMIN),
-            Status::Ok
-        );
+        assert_eq!(grant_space(&mut r, &bob_peer, AUTH_ROLE_ADMIN), Status::Ok);
         let token = SigningKey::from_bytes(&[55u8; 32]);
         let node = node_key(66);
         let peer = node_peer_of(&node);
@@ -5294,7 +5229,7 @@ mod tests {
             ),
             AUTH_ROLE_READONLY
         );
-        assert_eq!(revoke_space_v2(&mut r, &bob_peer), Status::Ok);
+        assert_eq!(revoke_space(&mut r, &bob_peer), Status::Ok);
         assert_eq!(
             dispatch(&mut r, PeerRole { peer_id: peer }),
             AUTH_ROLE_NONE,

@@ -1150,7 +1150,7 @@ mod tests {
             1,
             0,
             true,
-            b"v2".to_vec(),
+            b"service".to_vec(),
             vec![0xAAAA, 0xBBBB],
             None,
             Some(3),
