@@ -106,7 +106,7 @@ if [[ $mode == all || $mode == service ]]; then
         cd "$build_root/services/vos-service"
         CARGO_TARGET_DIR="$cache_root/service" cargo "+$guest_toolchain" actor
     )
-    service_elf="$cache_root/service/riscv64em-javm/release/vos_service.elf"
+    service_elf="$cache_root/service/riscv64em-vos/release/vos_service.elf"
     actual_elf_digest=$(b2sum -l 256 "$service_elf")
     actual_elf_digest=${actual_elf_digest%% *}
     if [[ $actual_elf_digest != "$service_elf_digest" ]]; then
