@@ -20,7 +20,7 @@ pub fn run(path: PathBuf, crdt: bool) -> anyhow::Result<()> {
     std::fs::write(path.join("Cargo.toml"), cargo_toml(name))?;
     std::fs::write(path.join(".cargo/config.toml"), CONFIG)?;
     std::fs::write(path.join("rust-toolchain.toml"), TOOLCHAIN)?;
-    std::fs::write(path.join("riscv64em-javm.json"), TARGET)?;
+    std::fs::write(path.join("riscv64em-vos.json"), TARGET)?;
     std::fs::write(
         path.join("src/lib.rs"),
         if crdt {
@@ -154,7 +154,7 @@ channel = "nightly"
 components = ["rust-src"]
 "#;
 
-const CONFIG: &str = r#"[target.riscv64em-javm]
+const CONFIG: &str = r#"[target.riscv64em-vos]
 rustflags = [
     "-Zunstable-options",
     "-Zcrate-attr=no_std",
@@ -165,7 +165,7 @@ rustflags = [
 ]
 
 [alias]
-actor = "rustc --lib --crate-type bin -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --release --target riscv64em-javm.json"
+actor = "rustc --lib --crate-type bin -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --release --target riscv64em-vos.json"
 
 [unstable]
 json-target-spec = true
@@ -190,7 +190,7 @@ const TARGET: &str = r#"{
   "singlethread": true,
   "exe-suffix": ".elf",
   "os": "none",
-  "env": "javm",
+  "env": "vos_pvm",
   "pre-link-args": { "ld": ["--emit-relocs", "--unique"] }
 }
 "#;

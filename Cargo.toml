@@ -7,13 +7,14 @@ members = [
     "support/vos-raft",
     "support/vos-shell",
     "support/merkle-crdt",
-    "support/jar-revision-check",
-    "zkpvm",
-    # zkpvm-{precompiles,derive,verifier} live nested inside the
-    # zkpvm crate's directory tree.
-    "zkpvm/precompiles",
-    "zkpvm/derive",
-    "zkpvm/verifier",
+    "pvm/runtime",
+    "pvm/compiler",
+    "pvm/codec",
+    "pvm/codec-derive",
+    "pvm/proof",
+    "pvm/proof/precompiles",
+    "pvm/proof/derive",
+    "pvm/proof/verifier",
     "extensions/ai",
     "extensions/dev",
     "extensions/http-gateway",
@@ -34,7 +35,7 @@ exclude = [
     "tests/fixtures/legacy-v1/actors/big-map",
     "tests/fixtures/legacy-v1/actors/committed-counter",
     "tests/fixtures/wasm/*",
-    # Built-in PVM actors (riscv64em-javm target) live alongside
+    # Built-in PVM actors (riscv64em-vos target) live alongside
     # the workspace crates but build with their own toolchain.
     # Listing the directory itself keeps it from being picked
     # up as a workspace member.
@@ -48,10 +49,10 @@ exclude = [
     # Every actor crate, incl. those path-dep'd by host members as dev-deps
     # (Cargo would otherwise promote a member's path dep to a member).
     "actors/*",
-    # zkpvm-fuzz uses libfuzzer-sys + panic=abort + nightly-only
+    # vos-pvm-proof-fuzz uses libfuzzer-sys + panic=abort + nightly-only
     # rustc flags via `cargo fuzz`.  Excluding it from the main
     # workspace keeps `cargo build --workspace` working on stable.
-    "zkpvm/fuzz",
+    "pvm/proof/fuzz",
     # `extensions` is a parent directory holding extension
     # plugins; each sub-crate is listed in `members` explicitly.
     "extensions",
@@ -72,9 +73,9 @@ exclude = [
     # The on-chain settlement verifier: a verify-only Poseidon2-M31 stwo
     # verifier with its OWN `[workspace]`, pinning stwo with
     # `default-features = false`.  Excluded so its feature resolution never
-    # co-resolves with javm/prover-stwo (which would drag blst/rayon) — that
+    # co-resolves with the prover workspace (which would drag blst/rayon) — that
     # isolation is what makes it buildable for wasm32/PVM.
-    "zkpvm/settlement-verifier",
+    "pvm/proof/settlement-verifier",
 ]
 
 [workspace.package]
@@ -103,12 +104,12 @@ readme = "README.md"
 lto = "fat"
 codegen-units = 1
 
-# `cargo test` builds Stwo's SIMD prover and the zkpvm trace/constraint
+# `cargo test` builds Stwo's SIMD prover and the vos-pvm-proof trace/constraint
 # code at opt-level 0, where the prover runs several times slower and holds
 # its multi-GB FRI working set for longer. Optimize just the proving-hot
 # crates (leaving the rest of the workspace at opt-level 0 for fast
 # incremental compiles); these crates rarely recompile, so the cost is paid
-# once. debug-assertions stay on so zkpvm's internal invariant checks still
+# once. debug-assertions stay on so vos-pvm-proof's internal invariant checks still
 # fire in tests. Measured on the reference box: a log14-padded prove drops
 # ~4.4s → ~3.5s; turning debug-assertions off on these crates would reach
 # ~2.6s (near the ~2.3s fat-LTO release) at the cost of those checks.
@@ -117,43 +118,42 @@ codegen-units = 1
 opt-level = 3
 [profile.test.package.stwo-constraint-framework]
 opt-level = 3
-[profile.test.package.zkpvm]
+[profile.test.package.vos-pvm-proof]
 opt-level = 3
-[profile.test.package.zkpvm-verifier]
+[profile.test.package.vos-pvm-proof-verifier]
 opt-level = 3
 
 [profile.dev.package.stwo]
 opt-level = 3
 [profile.dev.package.stwo-constraint-framework]
 opt-level = 3
-[profile.dev.package.zkpvm]
+[profile.dev.package.vos-pvm-proof]
 opt-level = 3
-[profile.dev.package.zkpvm-verifier]
+[profile.dev.package.vos-pvm-proof-verifier]
 opt-level = 3
 
 [workspace.dependencies]
 # Internal crates
-zkpvm = { path = "zkpvm" }
-zkpvm-derive = { path = "zkpvm/derive" }
-zkpvm-verifier = { path = "zkpvm/verifier" }
-zkpvm-precompiles = { path = "zkpvm/precompiles" }
-# VOS v2 has one execution identity. Every VM, transpiler, tracer, verifier,
-# and fuzz harness must use this exact JAR revision (enforced by
-# `cargo run -p jar-revision-check`).
-javm = { git = "https://github.com/olanod/jar.git", rev = "41d31e64b0f5d6c57a43769d7b8785556a311684", version = "0.4" }
-grey-transpiler = { git = "https://github.com/olanod/jar.git", rev = "41d31e64b0f5d6c57a43769d7b8785556a311684", version = "0.1" }
+vos-pvm-proof = { path = "pvm/proof" }
+vos-pvm-proof-derive = { path = "pvm/proof/derive" }
+vos-pvm-proof-verifier = { path = "pvm/proof/verifier" }
+vos-pvm-precompiles = { path = "pvm/proof/precompiles" }
+vos-pvm = { path = "pvm/runtime" }
+vos-pvm-compiler = { path = "pvm/compiler" }
+vos-pvm-codec = { path = "pvm/codec", default-features = false }
+vos-pvm-codec-derive = { path = "pvm/codec-derive" }
 
 # Stwo pinned to upstream rev `e1286720` (post-v2.2.0 perf cluster:
 # parallel FFT/quotients/OOD #1304-1306, BaseColumnPool #1342,
 # subdomain quotients #1372/#1373, FRI fold parallelization
 # #1389/#1392/#1393). Lifted-protocol degree-≥2 block stands at this
-# rev — see zkpvm/STWO_2.2.0_MIGRATION.md.
+# rev — see pvm/proof/STWO_2.2.0_MIGRATION.md.
 #
 # Declared with NO features here (workspace-inherited features are
 # additive — a member can add but never remove them).  Prover-side
-# builds get `std,prover,parallel` via zkpvm's `prover` feature
-# (`stwo/std` etc. in zkpvm/Cargo.toml); the verifier-only path
-# (`zkpvm-verifier` for wasm32) stays feature-less so no rayon/std
+# builds get `std,prover,parallel` via vos-pvm-proof's `prover` feature
+# (`stwo/std` etc. in pvm/proof/Cargo.toml); the verifier-only path
+# (`vos-pvm-proof-verifier` for wasm32) stays feature-less so no rayon/std
 # machinery leaks into a verify-only build.
 stwo = { git = "https://github.com/starkware-libs/stwo", rev = "e1286720", default-features = false }
 stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo", rev = "e1286720", default-features = false }

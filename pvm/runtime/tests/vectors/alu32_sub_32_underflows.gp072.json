@@ -1,0 +1,55 @@
+{
+  "backends": [
+    "interpreter",
+    "recompiler"
+  ],
+  "expected": {
+    "gas": 98,
+    "memory": [],
+    "pc": 3,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x1",
+      "0xffffffffffffffff",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ],
+    "status": "trap"
+  },
+  "family": "alu32",
+  "initial": {
+    "gas": 100,
+    "memory": [],
+    "page_map": [],
+    "pc": 0,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x1",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "alu32_sub_32_underflows",
+  "program": {
+    "bitmask": "0x09",
+    "code": "0xbf320400",
+    "jump_table": []
+  }
+}

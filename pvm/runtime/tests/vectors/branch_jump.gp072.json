@@ -1,0 +1,55 @@
+{
+  "backends": [
+    "interpreter",
+    "recompiler"
+  ],
+  "expected": {
+    "gas": 97,
+    "memory": [],
+    "pc": 6,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x1",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ],
+    "status": "trap"
+  },
+  "family": "branch",
+  "initial": {
+    "gas": 100,
+    "memory": [],
+    "page_map": [],
+    "pc": 0,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "branch_jump",
+  "program": {
+    "bitmask": "0x4d",
+    "code": "0x28030033050100",
+    "jump_table": []
+  }
+}

@@ -1,6 +1,6 @@
 //! PVM-actor no_std runtime shims.
 //!
-//! The riscv64em-javm target has no native atomics and no OS entropy.
+//! The riscv64em-vos target has no native atomics and no OS entropy.
 
 /// `critical-section`: mls-rs's no_std build and the messenger's own
 /// `spin::Mutex` storage emulate atomics through `portable-atomic`, which needs a

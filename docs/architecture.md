@@ -41,7 +41,7 @@ satisfy it.
 | Extensions | Native host plugins outside the sandbox | [Extensions](extensions.md) |
 | Identity | Per-space keys, devices, recovery | [Identity](identity.md) |
 | Authorization | Who may call what (roles, ACLs, anon credentials) | [Authorization](authorization.md) |
-| zkPVM | Succinct proofs of PVM execution | [zkPVM](zkpvm.md) |
+| PVM proofs | Succinct proofs of PVM execution | [PVM proofs](pvm-proofs.md) |
 
 ## Actors
 

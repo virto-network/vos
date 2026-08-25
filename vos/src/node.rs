@@ -14660,13 +14660,13 @@ mod tests {
 
         let workspace = env!("CARGO_MANIFEST_DIR");
         let elf_path = format!(
-            "{workspace}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf"
+            "{workspace}/../actors/space-registry/target/riscv64em-vos/release/space_registry.elf"
         );
         let Ok(elf) = std::fs::read(&elf_path) else {
             eprintln!("SKIP: space-registry ELF not built — run: just build-registry");
             return;
         };
-        let blob = grey_transpiler::link_elf(&elf).expect("registry transpiles");
+        let blob = vos_pvm_compiler::link_elf(&elf).expect("registry transpiles");
 
         // ── Identities ──────────────────────────────────────────────
         const ADMIN: u8 = 3; // space_registry::AUTH_ROLE_ADMIN
@@ -20343,13 +20343,13 @@ mod tests {
 
         let workspace = env!("CARGO_MANIFEST_DIR");
         let elf_path = format!(
-            "{workspace}/../tests/fixtures/legacy-v1/actors/probe/target/riscv64em-javm/release/probe.elf"
+            "{workspace}/../tests/fixtures/legacy-v1/actors/probe/target/riscv64em-vos/release/probe.elf"
         );
         let Ok(elf) = std::fs::read(&elf_path) else {
             eprintln!("SKIP: probe ELF not built — run: just build-pvm");
             return;
         };
-        let blob = grey_transpiler::link_elf(&elf).expect("probe transpiles");
+        let blob = vos_pvm_compiler::link_elf(&elf).expect("probe transpiles");
 
         let mut runtime = VosRuntime::new();
         let blob_idx = runtime.register_service_blob(blob);
@@ -20430,13 +20430,13 @@ mod tests {
 
         let workspace = env!("CARGO_MANIFEST_DIR");
         let elf_path = format!(
-            "{workspace}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf"
+            "{workspace}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf"
         );
         let Ok(elf) = std::fs::read(&elf_path) else {
             eprintln!("SKIP: scheduler ELF not built — run: cargo +nightly actor");
             return;
         };
-        let blob = grey_transpiler::link_elf(&elf).expect("scheduler transpiles");
+        let blob = vos_pvm_compiler::link_elf(&elf).expect("scheduler transpiles");
 
         let mut runtime = VosRuntime::new();
         let blob_idx = runtime.register_service_blob(blob);

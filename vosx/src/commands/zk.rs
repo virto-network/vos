@@ -12,7 +12,7 @@
 //! pinnable masked root is pending `docs/design/masked-image-root.md`).
 //!
 //! The CLI owns the ELF/transpile half (which `vosx` already does everywhere):
-//! read the ELF → transpile to a PVM blob (`grey_transpiler`) → locate
+//! read the ELF → transpile to a PVM blob (`vos_pvm_compiler`) → locate
 //! `__VOS_WITNESS` → write the catalog TOML. The heavy zkpvm half — trace the
 //! unpatched image for its page-Merkle root, and prove one representative
 //! canonical segment per distinct shape to measure the commitment allowlist —
@@ -94,7 +94,7 @@ pub struct PinArgs {
     /// Recorded in the pin — the prover must cut with the same value.
     #[arg(long, value_name = "N", default_value_t = 0)]
     page_budget: u64,
-    /// File holding the canonical forcing profile: `zkpvm::chip_idx::COUNT`
+    /// File holding the canonical forcing profile: `vos_pvm_proof::chip_idx::COUNT`
     /// unsigned integers, whitespace/comma/newline separated (`0` = not
     /// forced). Omit to DERIVE the profile from the `--witness` run
     /// (per-chip max natural log_size over every `--seg-steps` window) —
@@ -227,7 +227,7 @@ fn pin(args: PinArgs) -> Result<()> {
     // ── ELF/transpile half (host-owned; no zkpvm) ────────────────────
     let elf = std::fs::read(&args.elf)
         .with_context(|| format!("read provable ELF {}", args.elf.display()))?;
-    let blob = grey_transpiler::link_elf(&elf)
+    let blob = vos_pvm_compiler::link_elf(&elf)
         .map_err(|e| anyhow!("transpile {}: {e:?}", args.elf.display()))?;
     let waddr = witness_addr(&elf).with_context(|| {
         format!(
@@ -481,7 +481,7 @@ fn prove(args: ProveArgs) -> Result<()> {
         (None, Some(path)) => {
             let elf =
                 std::fs::read(path).with_context(|| format!("read ELF {}", path.display()))?;
-            grey_transpiler::link_elf(&elf)
+            vos_pvm_compiler::link_elf(&elf)
                 .map_err(|e| anyhow!("transpile {}: {e:?}", path.display()))?
         }
         (None, None) => bail!("pass the Task's build: --blob <FILE> or --elf <FILE>"),

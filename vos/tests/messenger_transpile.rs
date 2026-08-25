@@ -5,7 +5,7 @@
 //! `#[actor]` riscv64 build flavor — the deterministic host-seeded MLS stack,
 //! the custom storage + crypto providers, the channel-actor RPC clients, the
 //! poll loop — and gates the resulting ELF through
-//! `grey_transpiler::link_elf`. A clean transpile is the proof that the real
+//! `vos_pvm_compiler::link_elf`. A clean transpile is the proof that the real
 //! messenger runs as one portable PVM bytecode.
 //!
 //! The messenger is its own workspace under `actors/`, so its ELF lands in the
@@ -17,7 +17,7 @@
 fn messenger_actor_elf_transpiles() {
     let workspace = env!("CARGO_MANIFEST_DIR");
     let path =
-        format!("{workspace}/../actors/messenger/target/riscv64em-javm/release/messenger.elf");
+        format!("{workspace}/../actors/messenger/target/riscv64em-vos/release/messenger.elf");
     let elf = match std::fs::read(&path) {
         Ok(d) => d,
         Err(_) => {
@@ -29,7 +29,7 @@ fn messenger_actor_elf_transpiles() {
         }
     };
 
-    let blob = grey_transpiler::link_elf(&elf).expect(
+    let blob = vos_pvm_compiler::link_elf(&elf).expect(
         "the no_std messenger PVM actor (mls-rs + deterministic providers + \
          channel RPC + poll loop) must transpile through link_elf",
     );

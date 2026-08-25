@@ -1,0 +1,411 @@
+#![cfg(feature = "prover")]
+
+use vos_pvm::instruction::Opcode;
+use vos_pvm::interpreter::Interpreter;
+// Memory is now flat_mem in Interpreter
+use vos_pvm::PVM_REGISTER_COUNT;
+
+use vos_pvm_proof::core::tracing::TracingPvm;
+use vos_pvm_proof::{prove, verify};
+
+fn prove_and_verify(steps: Vec<vos_pvm_proof::core::step::PvmStep>, code: &[u8], bitmask: &[u8]) {
+    for (i, s) in steps.iter().enumerate() {
+        eprintln!(
+            "  step {i}: pc={} opcode={:?} mem_r={:?} mem_w={:?}",
+            s.pc,
+            s.opcode,
+            s.mem_read.as_ref().map(|r| (r.address, r.value, r.size)),
+            s.mem_write.as_ref().map(|w| (w.address, w.value, w.size))
+        );
+    }
+    let mut side_note = vos_pvm_proof::SideNote::new(steps, code.to_vec(), bitmask.to_vec());
+    match prove(&mut side_note) {
+        Ok(proof) => verify(proof, &side_note).expect("verification failed"),
+        Err(e) => panic!("proving failed: {e:?}"),
+    }
+}
+
+#[test]
+fn prove_store_only() {
+    // Just a store followed by trap
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 42;
+    regs[1] = 0x1000;
+
+    let mut memory = vec![0u8; 4 * 1024 * 1024];
+
+    let code = vec![
+        Opcode::StoreIndU8 as u8,
+        0x10,
+        0,
+        0,
+        0,
+        0,
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 0, 0, 0, 1];
+
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10000,
+        25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let exit = tracing.run();
+    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    let steps = tracing.into_trace();
+    assert_eq!(steps.len(), 2);
+    assert!(steps[0].mem_write.is_some());
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+fn prove_store_and_load_u8() {
+    // Program:
+    //   StoreIndU8: mem[φ[1] + 0] = φ[0] (store low byte of reg 0)
+    //   LoadIndU8:  φ[2] = mem[φ[1] + 0] (load byte back)
+    //   Trap
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 42; // value to store
+    regs[1] = 0x1000; // base address
+
+    let mut memory = vec![0u8; 4 * 1024 * 1024];
+
+    // StoreIndU8 (opcode 120): TwoRegOneImm [opcode, ra|(rb<<4), imm...]
+    //   ra=0 (value source), rb=1 (base addr), imm=0 (offset)
+    // LoadIndU8 (opcode 124): TwoRegOneImm [opcode, ra|(rb<<4), imm...]
+    //   ra=2 (dest), rb=1 (base addr), imm=0 (offset)
+    let code = vec![
+        Opcode::StoreIndU8 as u8,
+        0x10,
+        0,
+        0,
+        0,
+        0, // offset 0: StoreIndU8 ra=0,rb=1,imm=0
+        Opcode::LoadIndU8 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0,                  // offset 6: LoadIndU8 ra=2,rb=1,imm=0
+        Opcode::Trap as u8, // offset 12
+    ];
+    let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
+
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10000,
+        25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let exit = tracing.run();
+    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+
+    let steps = tracing.into_trace();
+    assert_eq!(steps.len(), 3); // Store, Load, Trap
+
+    // Verify memory was traced
+    assert!(steps[0].mem_write.is_some());
+    let w = steps[0].mem_write.as_ref().unwrap();
+    assert_eq!(w.address, 0x1000);
+    assert_eq!(w.value, 42);
+    assert_eq!(w.size, 1);
+
+    assert!(steps[1].mem_read.is_some());
+    let r = steps[1].mem_read.as_ref().unwrap();
+    assert_eq!(r.address, 0x1000);
+    assert_eq!(r.value, 42);
+    assert_eq!(r.size, 1);
+
+    // φ[2] should have the loaded value
+    assert_eq!(steps[1].regs_after[2], 42);
+
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+fn prove_store_and_load_u64() {
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 0xDEAD_BEEF_CAFE_BABE;
+    regs[1] = 0x2000;
+
+    let mut memory = vec![0u8; 4 * 1024 * 1024];
+
+    let code = vec![
+        Opcode::StoreIndU64 as u8,
+        0x10,
+        0,
+        0,
+        0,
+        0,
+        Opcode::LoadIndU64 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0,
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
+
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10000,
+        25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let exit = tracing.run();
+    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+
+    let steps = tracing.into_trace();
+    assert_eq!(steps[1].regs_after[2], 0xDEAD_BEEF_CAFE_BABE);
+
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+fn prove_store_load_u64_crossing_page_boundaries() {
+    // Regression: a MISALIGNED 8-byte access whose bytes cross a 256-byte
+    // (and here also a 65536-byte) boundary. Base 0x2fffb: bytes land at
+    // 0x2fffb..0x30002, crossing 0x30000 — so the byte addresses need carry
+    // propagation across address bytes 0 AND 1 (c1 and c2). Emitting each
+    // byte's memory-lookup address as `addr[0] + i` on the low byte alone
+    // would give bytes past the boundary a low byte of 256/257/… with the
+    // higher bytes un-incremented — mismatching the MemoryChip ledger's
+    // canonical address and leaving the memory logup unbalanced. Aligned
+    // accesses (addr[0] ∈ {0,8,…,248}) never overflow, so such a flaw stays
+    // latent until a misaligned cross-boundary store appears in real code
+    // (the cipher-clerk SMT-root recompute). This proves+verifies only with
+    // the per-byte address carry chain.
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 0xDEAD_BEEF_CAFE_BABE;
+    regs[1] = 0x2fffb; // base[0]=0xfb, base[1]=0xff → +i crosses 0x30000
+
+    let memory = vec![0u8; 4 * 1024 * 1024];
+
+    let code = vec![
+        Opcode::StoreIndU64 as u8,
+        0x10,
+        0,
+        0,
+        0,
+        0,
+        Opcode::LoadIndU64 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0,
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
+
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10000,
+        25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let exit = tracing.run();
+    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+
+    let steps = tracing.into_trace();
+    // The store really crossed the boundary, and the load read it back.
+    let w = steps[0].mem_write.as_ref().expect("store");
+    assert_eq!(w.address, 0x2fffb);
+    assert_eq!(w.size, 8);
+    assert_eq!(steps[1].regs_after[2], 0xDEAD_BEEF_CAFE_BABE);
+
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+fn prove_multiple_stores_same_addr() {
+    // Write twice to the same address, then read
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 10; // first value
+    regs[1] = 0x1000; // address
+    regs[3] = 20; // second value
+
+    let mut memory = vec![0u8; 4 * 1024 * 1024];
+
+    // Store 10, store 20, load (should get 20)
+    let code = vec![
+        Opcode::StoreIndU8 as u8,
+        0x10,
+        0,
+        0,
+        0,
+        0, // mem[φ[1]+0] = φ[0]=10 (ra=0,rb=1)
+        Opcode::StoreIndU8 as u8,
+        0x13,
+        0,
+        0,
+        0,
+        0, // mem[φ[1]+0] = φ[3]=20 (ra=3,rb=1)
+        Opcode::LoadIndU8 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0, // φ[2] = mem[φ[1]+0] (ra=2,rb=1)
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
+
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10000,
+        25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let exit = tracing.run();
+    eprintln!("exit: {exit:?}");
+
+    let steps = tracing.into_trace();
+    for (i, s) in steps.iter().enumerate() {
+        eprintln!(
+            "  step {i}: pc={} opcode={:?} regs[0..4]={:?}",
+            s.pc,
+            s.opcode,
+            &s.regs_after[..4]
+        );
+    }
+    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+    assert_eq!(steps.len(), 4);
+    assert_eq!(steps[2].regs_after[2], 20); // should read the second write
+
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+// ── StoreImm direct + StoreImmInd value/address binding ──────────────────
+
+#[test]
+fn prove_store_imm_u8_then_load() {
+    // StoreImmU8 (TwoImm direct): mem[imm_x=0x1000] = imm_y=0x42.
+    // Then read back via LoadIndU8.  The AIR binds:
+    //   - MemAddr = ImmBytes[0..4] (= imm_x), via the widened
+    //     `IsLoadDirect+IsStoreDirect+IsStoreImmDirect` gate.
+    //   - MemValue = ImmYBytes (= imm_y) on active bytes.
+    //
+    // TwoImm encoding: [opcode, lx_byte, imm_x_bytes(lx), imm_y_bytes(ly)]
+    //   lx = 4 (4-byte address), ly is implied by skip_len.
+    //
+    // For our 6-byte payload after opcode (lx_byte + 4 + 1):
+    //   skip_len = 6.
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[1] = 0x1000; // base for the load
+
+    let memory = vec![0u8; 4 * 1024 * 1024];
+
+    let code = vec![
+        Opcode::StoreImmU8 as u8, // 30
+        4,                        // lx_byte: imm_x is 4 bytes
+        0x00,
+        0x10,
+        0x00,
+        0x00, // imm_x = 0x1000 LE
+        0x42, // imm_y = 0x42
+        Opcode::LoadIndU8 as u8,
+        0x12,
+        0,
+        0,
+        0,
+        0,
+        Opcode::Trap as u8,
+    ];
+    // Bitmask: instruction 0 is 7 bytes (opcode + 6 payload),
+    //          instruction 1 is 6 bytes (opcode + 5 payload),
+    //          instruction 2 is 1 byte.
+    let bitmask = vec![1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
+
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10_000,
+        25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    assert_eq!(tracing.run(), vos_pvm::ExitReason::Trap);
+    let steps = tracing.into_trace();
+
+    assert_eq!(steps[1].regs_after[2], 0x42);
+    prove_and_verify(steps, &code, &bitmask);
+}
+
+#[test]
+fn prove_store_load_with_alu() {
+    // ALU + memory mixed: compute a value, store it, load it back
+    // φ[2] = φ[0] + φ[1] = 150
+    // mem[0x1000] = φ[2]
+    // φ[3] = mem[0x1000]
+    let mut regs = [0u64; PVM_REGISTER_COUNT];
+    regs[0] = 100;
+    regs[1] = 50;
+    regs[4] = 0x1000; // address register
+
+    let mut memory = vec![0u8; 4 * 1024 * 1024];
+
+    let code = vec![
+        Opcode::Add64 as u8,
+        0x10,
+        2, // φ[2] = φ[0]+φ[1] = 150
+        Opcode::StoreIndU8 as u8,
+        0x42,
+        0,
+        0,
+        0,
+        0, // mem[φ[4]+0] = φ[2] (ra=2,rb=4)
+        Opcode::LoadIndU8 as u8,
+        0x43,
+        0,
+        0,
+        0,
+        0, // φ[3] = mem[φ[4]+0] (ra=3,rb=4)
+        Opcode::Trap as u8,
+    ];
+    let bitmask = vec![1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1];
+
+    let pvm = Interpreter::new(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        regs,
+        memory,
+        10000,
+        25,
+    );
+    let mut tracing = TracingPvm::new(pvm);
+    let exit = tracing.run();
+    assert_eq!(exit, vos_pvm::ExitReason::Trap);
+
+    let steps = tracing.into_trace();
+    assert_eq!(steps.len(), 4);
+    assert_eq!(steps[0].regs_after[2], 150); // Add64
+    assert_eq!(steps[2].regs_after[3], 150); // LoadIndU8 reads back 150
+
+    prove_and_verify(steps, &code, &bitmask);
+}

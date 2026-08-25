@@ -1,0 +1,55 @@
+{
+  "backends": [
+    "interpreter",
+    "recompiler"
+  ],
+  "expected": {
+    "gas": 98,
+    "memory": [],
+    "pc": 10,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x123456789abcdef0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ],
+    "status": "trap"
+  },
+  "family": "load_imm",
+  "initial": {
+    "gas": 100,
+    "memory": [],
+    "page_map": [],
+    "pc": 0,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "load_imm_load_imm_64",
+  "program": {
+    "bitmask": "0x0104",
+    "code": "0x1402f0debc9a7856341200",
+    "jump_table": []
+  }
+}

@@ -23,7 +23,7 @@
 //!
 //! - **Which program** ran is established by the proof's *program
 //!   commitment* (the preprocessed-trace Merkle root, see
-//!   `zkpvm::program_commitment_of_proof`).  The verifier supplies a
+//!   `vos_pvm_proof::program_commitment_of_proof`).  The verifier supplies a
 //!   trusted commitment to `verify_standalone`, which rejects any proof
 //!   of a different program.  A name-tag in the hash would be a third,
 //!   redundant copy of identity — and a *claim* (a tag can be reused for
@@ -52,7 +52,7 @@
 //!    operands on the Gray Paper halt jump (see `actors::run`'s
 //!    `halt_with_output_bound`). The closing chip pins the final-register
 //!    columns and the verifier's boundary-binding check
-//!    (`zkpvm::boundary_binding`) equates `final_state.registers` to
+//!    (`vos_pvm_proof::boundary_binding`) equates `final_state.registers` to
 //!    them — no new hostcall, no prover changes. That equality binds the
 //!    public registers to the committed closing-chip columns, and those
 //!    columns are pinned to the trace's true final registers by
@@ -61,9 +61,9 @@
 //!    `(reg, ts)` sortedness gadget, and an `is_write` tuple limb — so a
 //!    forged closing read (and hence a forged io-hash) is rejected
 //!    in-circuit, sound against a from-scratch prover (gate:
-//!    `zkpvm/tests/ledger_readconsistency_gate.rs`).
+//!    `pvm/proof/tests/ledger_readconsistency_gate.rs`).
 //! 3. The host verifier reconstructs the hash from the proof via
-//!    [`zkpvm::Proof::public_io_hash`] and compares it against a locally
+//!    [`vos_pvm_proof::Proof::public_io_hash`] and compares it against a locally
 //!    recomputed [`compute_io_hash`] — alongside the STARK validity
 //!    check against the trusted program commitment.
 //!
@@ -207,7 +207,7 @@ pub unsafe fn read_witness_buffer(ptr: *const u8, cap: usize) -> Option<Witness>
 /// isn't an ELF, the symbol is absent, or its address is `0` (unresolved).
 ///
 /// The transpiled PVM blob preserves the ELF's flat-memory layout, so this
-/// address equals the blob offset `zkpvm::actor::trace_blob_with_patches`
+/// address equals the blob offset `vos_pvm_proof::actor::trace_blob_with_patches`
 /// (and hence the prover's `prove` / `prove_chain`) expects. A caller that
 /// holds an actor ELF transpiles it and locates the witness buffer here,
 /// then hands both to the (ELF-agnostic) prover.
@@ -323,7 +323,7 @@ pub fn __take_pending_io_hash() -> Option<[u8; 32]> {
 ///
 /// Computes [`compute_io_hash_typed`] and stashes it; `run_refine_service`
 /// places it into the final-state register window φ[9..12] at halt,
-/// making it the proof's [`zkpvm::Proof::public_io_hash`]. The host
+/// making it the proof's [`vos_pvm_proof::Proof::public_io_hash`]. The host
 /// verifier checks it against a recomputed `compute_io_hash` over the
 /// same `(public, return)`.
 ///
@@ -457,7 +457,7 @@ pub struct ProgramPin {
     /// preprocessed-trace Merkle roots (`{C_0, C_1, …}`), one per distinct
     /// canonical segment shape. Fed to `verify_chain` as `allowlist`.
     pub commitments: alloc::vec::Vec<alloc::string::String>,
-    /// Canonical forcing profile (`[u32; zkpvm::chip_idx::COUNT]`, `0` = not
+    /// Canonical forcing profile (`[u32; vos_pvm_proof::chip_idx::COUNT]`, `0` = not
     /// forced). The prover pads each forcing-set chip up to this so every
     /// segment shares one `log_size` and lands in `commitments`.
     pub canonical_profile: alloc::vec::Vec<u32>,
@@ -465,7 +465,7 @@ pub struct ProgramPin {
     pub seg_steps: u64,
     /// Per-segment touched-page budget the chain was cut with (`0` = uniform
     /// step cut). When non-zero, windows come from the content-budgeted cut
-    /// (`zkpvm::segment::segment_bounds_budgeted`) — the prover MUST cut with
+    /// (`vos_pvm_proof::segment::segment_bounds_budgeted`) — the prover MUST cut with
     /// the same `(seg_steps, page_budget)` this pin was measured against, or
     /// the chain lands on commitments outside `commitments`. Defaults to `0`
     /// so catalogs written before the field exist load unchanged.
@@ -481,7 +481,7 @@ pub struct ProgramPin {
     /// a verifier cannot anchor against this value. The pinnable value is the
     /// MASKED image root (witness region excluded), pending the design in
     /// `docs/design/masked-image-root.md`; do not wire any verifier to this
-    /// field. See `zkpvm::page_merkle::image_root`.
+    /// field. See `vos_pvm_proof::page_merkle::image_root`.
     pub unpatched_image_root: alloc::string::String,
 }
 

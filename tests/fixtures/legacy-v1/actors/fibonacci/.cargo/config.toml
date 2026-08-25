@@ -2,7 +2,7 @@
 # build flavors. `-Zcrate-attr` injects crate-level attributes the
 # user shouldn't have to write.
 
-[target.riscv64em-javm]
+[target.riscv64em-vos]
 rustflags = [
     "-Zunstable-options",
     "-Zcrate-attr=no_std",
@@ -21,7 +21,7 @@ rustflags = [
 # `cargo actor` produces the riscv64 ELF (compiles the lib as a bin so
 # the PVM entry point is emitted); `cargo wasm` the wasm32 cdylib.
 [alias]
-actor = "rustc --lib --crate-type bin -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --release --target riscv64em-javm.json"
+actor = "rustc --lib --crate-type bin -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --release --target riscv64em-vos.json"
 wasm = "build --release --no-default-features --target wasm32-unknown-unknown"
 
 [unstable]

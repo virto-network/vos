@@ -20,7 +20,7 @@ the user's critical path.
 | [`vosx/`](vosx/) | Operator-facing CLI (`vosx run …`, `vosx space …`) — see its [README](vosx/README.md) |
 | [`actors/`](actors/) | Built-in PVM actors bundled into `vosx` (e.g. `space-registry`) |
 | [`extensions/`](extensions/) | Native extension plugins loaded by the runtime (e.g. `http-gateway`) |
-| [`zkpvm/`](zkpvm/) | ZK proving for PVM bytecode via Stwo |
+| [`pvm/`](pvm/) | Virtual machine, compiler, and proof toolchain |
 | [`examples/`](examples/) | Four canonical v2 actor examples |
 | [`tests/fixtures/`](tests/fixtures/) | Test-only legacy, extension, WASM, and proving workloads |
 | [`tests/acceptance/clerk/`](tests/acceptance/clerk/) | Complex replicated-payment acceptance application |

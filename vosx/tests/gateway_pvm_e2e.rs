@@ -67,13 +67,13 @@ fn gateway_so() -> PathBuf {
 
 fn actor_elf(name: &str) -> PathBuf {
     workspace().join(format!(
-        "tests/fixtures/legacy-v1/actors/{name}/target/riscv64em-javm/release/{name}.elf"
+        "tests/fixtures/legacy-v1/actors/{name}/target/riscv64em-vos/release/{name}.elf"
     ))
 }
 
 fn committed_counter_elf() -> PathBuf {
     workspace().join(
-        "tests/fixtures/legacy-v1/actors/committed-counter/target/riscv64em-javm/release/committed_counter.elf",
+        "tests/fixtures/legacy-v1/actors/committed-counter/target/riscv64em-vos/release/committed_counter.elf",
     )
 }
 

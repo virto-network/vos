@@ -1,0 +1,54 @@
+{
+  "backends": [
+    "interpreter"
+  ],
+  "expected": {
+    "gas": 0,
+    "memory": [],
+    "pc": 5,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ],
+    "status": "out_of_gas"
+  },
+  "family": "flow",
+  "initial": {
+    "gas": 5,
+    "memory": [],
+    "page_map": [],
+    "pc": 0,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "flow_out_of_gas_straight_line",
+  "program": {
+    "bitmask": "0xff03",
+    "code": "0x01010101010101010101",
+    "jump_table": []
+  }
+}

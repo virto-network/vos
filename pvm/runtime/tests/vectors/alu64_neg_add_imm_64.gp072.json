@@ -1,0 +1,55 @@
+{
+  "backends": [
+    "interpreter",
+    "recompiler"
+  ],
+  "expected": {
+    "gas": 98,
+    "memory": [],
+    "pc": 3,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0xfffffffffffffffe",
+      "0x7",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ],
+    "status": "trap"
+  },
+  "family": "alu64",
+  "initial": {
+    "gas": 100,
+    "memory": [],
+    "page_map": [],
+    "pc": 0,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x7",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "alu64_neg_add_imm_64",
+  "program": {
+    "bitmask": "0x09",
+    "code": "0x9a320500",
+    "jump_table": []
+  }
+}

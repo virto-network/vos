@@ -100,7 +100,7 @@ mod pvm {
     /// no-ops, while exact restores continue past their captured boundary.
     ///
     /// Uses `set_logger_racy` / `set_max_level_racy` because the
-    /// riscv64em-javm target lacks `target_has_atomic = "ptr"`
+    /// riscv64em-vos target lacks `target_has_atomic = "ptr"`
     /// (embedded profile, no atomic ops). PVM is single-threaded
     /// by construction, so the racy variants — which require the
     /// caller to guarantee no concurrent access — are sound here.
@@ -126,7 +126,7 @@ pub(crate) fn install_pvm_logger() {
 // (emitted by `__vos_emit_worker_glue!`) rather than here. Two
 // reasons: (1) the impl needs `std::io::stderr`, and vos's
 // `worker` feature can't pull `std` without dragging in the
-// heavy host-runtime deps (javm, libp2p, etc.) that hide behind
+// heavy host-runtime deps (vos_pvm, libp2p, etc.) that hide behind
 // vos's `std` feature; (2) the worker target is the user's
 // cdylib build, where std is always available regardless of
 // what features vos itself enables. Emitting in the user crate

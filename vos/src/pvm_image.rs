@@ -1,7 +1,7 @@
 //! Durable JAVM kernel continuation envelope.
 //!
 //! The small header lives in service storage. Its content-addressed body is
-//! the canonical `javm::snapshot::KernelSnapshot` wire, including exact PCs,
+//! the canonical `vos_pvm::snapshot::KernelSnapshot` wire, including exact PCs,
 //! registers, gas, capabilities, nested call stack, scheduler state, and
 //! memory blocks. The runtime never reconstructs a continuation from a flat
 //! memory image or starts it at PC 0.

@@ -14,7 +14,7 @@
 //!
 //! - `prove(pvm_blob, witness_bytes, witness_addr) -> Vec<u8>` — patch
 //!   `witness_bytes` at `witness_addr` (skipped when empty), trace,
-//!   `prove_mobile`, and return the bincode-serialized `zkpvm::Proof`.
+//!   `prove_mobile`, and return the bincode-serialized `vos_pvm_proof::Proof`.
 //!   Empty `Vec` on any failure. A single proof is one deliverable
 //!   payload, so the caller content-addresses the bytes into the host
 //!   proof-blob store (`put_proof_blob`) and ships the 32-byte hash.
@@ -97,8 +97,8 @@
 use vos::jobs::JobQueue;
 use vos::prelude::*;
 use vos::provable::{ProofRecordEntry, ProvableRecord};
-use zkpvm::{Proof, SegmentState, prove_canonical, prove_mobile};
-use zkpvm_verifier::{CommitmentHash, verify_standalone};
+use vos_pvm_proof::{Proof, SegmentState, prove_canonical, prove_mobile};
+use vos_pvm_proof_verifier::{CommitmentHash, verify_standalone};
 
 /// Gas bound for tracing a provable actor. Generous — an actor that
 /// exceeds it traces to `OutOfGas` and the prove fails (empty reply).
@@ -224,7 +224,7 @@ impl Prover {
 
     /// Prove `pvm_blob` over the caller-supplied opaque `witness_bytes`,
     /// injected at `witness_addr`. Returns bincode-serialized
-    /// `zkpvm::Proof` bytes, or an empty `Vec` on any failure (unparseable
+    /// `vos_pvm_proof::Proof` bytes, or an empty `Vec` on any failure (unparseable
     /// blob / patch out of range / prove failed). The caller CASes the
     /// bytes via the host proof-blob store.
     #[msg]
@@ -635,7 +635,7 @@ impl Prover {
     ///   * the ENTERING-IMAGE page-Merkle root over the UNPATCHED image
     ///     (diagnostic — see `ChainManifest::initial_root`),
     ///   * when `profile` is EMPTY, the canonical forcing profile itself
-    ///     ([`zkpvm::canonical_profile_for`] over the witness run — same
+    ///     ([`vos_pvm_proof::canonical_profile_for`] over the witness run — same
     ///     derivation as `measure_floors`, from the one trace this
     ///     measurement already makes), and
     ///   * when a representative `witness_bytes` is supplied, the canonical
@@ -679,7 +679,7 @@ impl Prover {
     /// the `profile` input `measure_catalog` and `prove_chain` consume.
     /// Traces the witness-injected run, segments it, and returns the
     /// per-chip elementwise MAX of every window's natural main-trace
-    /// `log_size` (`[u32; zkpvm::chip_idx::COUNT]`). Trace + trace-gen only
+    /// `log_size` (`[u32; vos_pvm_proof::chip_idx::COUNT]`). Trace + trace-gen only
     /// (no commit, no FRI), so it is far lighter than `measure_catalog` —
     /// but still minutes on a multi-million-step trace, so callers drive it
     /// with the same extended timeout. The floors are the observed
@@ -823,7 +823,8 @@ fn retrace_io_hash(pvm_blob: &[u8], witness_bytes: &[u8], witness_addr: usize) -
     let pvm_blob = pvm_blob.to_vec();
     let witness_bytes = witness_bytes.to_vec();
     run_on_large_stack(move || {
-        let (mut interp, mut img) = zkpvm::actor::interpreter_from_blob(&pvm_blob, TRACE_GAS)?;
+        let (mut interp, mut img) =
+            vos_pvm_proof::actor::interpreter_from_blob(&pvm_blob, TRACE_GAS)?;
         let end = witness_addr.checked_add(witness_bytes.len())?;
         if end > img.len() {
             return None;
@@ -833,8 +834,8 @@ fn retrace_io_hash(pvm_blob: &[u8], witness_bytes: &[u8], witness_addr: usize) -
             let address = u32::try_from(witness_addr + index).ok()?;
             interp.write_u8(address, byte).ok()?;
         }
-        let mut tracing = zkpvm::core::tracing::TracingPvm::new(interp);
-        // zkpvm pins its own javm revision, so its ExitReason is a
+        let mut tracing = vos_pvm_proof::core::tracing::TracingPvm::new(interp);
+        // zkpvm pins its own vos_pvm revision, so its ExitReason is a
         // different type than vos's — compare the Debug form. The
         // current Task ABI terminates only through the dedicated HALT
         // address; retired root-reply hostcall termination is rejected.
@@ -962,8 +963,8 @@ fn measure_catalog_inner(
     // trace resident just for its initial image. DIAGNOSTIC — NOT the
     // verifier's entering-image pin (a witness-injecting program's live
     // segment-0 root is the PATCHED root); see `ChainManifest::initial_root`.
-    let (_interp, unpatched_mem) = zkpvm::actor::interpreter_from_blob(pvm_blob, gas)?;
-    let image_root = zkpvm::page_merkle::image_root(&unpatched_mem);
+    let (_interp, unpatched_mem) = vos_pvm_proof::actor::interpreter_from_blob(pvm_blob, gas)?;
+    let image_root = vos_pvm_proof::page_merkle::image_root(&unpatched_mem);
     drop(unpatched_mem);
     // Measure the commitment allowlist only when a representative witness is
     // supplied; the `--allowlist` re-pin path passes an empty witness and
@@ -1032,7 +1033,7 @@ fn scan_chain(
     let mut stream = trace_stream(pvm_blob, witness, witness_addr, seg_steps, page_budget, gas)?;
     let mut bounds = Vec::new();
     let mut comb_counts = Vec::new();
-    let mut floors = zkpvm::NaturalFloors::new();
+    let mut floors = vos_pvm_proof::NaturalFloors::new();
     while let Some(b) = stream.next_window() {
         bounds.push(b);
         comb_counts.push(stream.fixed_base_calls());
@@ -1110,7 +1111,9 @@ fn measure_commitments(
         }
         let mut sn = stream.side_note();
         let proof = prove_canonical(&mut sn, profile).ok()?;
-        let c = zkpvm::recursion_pcs::commitment_bytes(&zkpvm::program_commitment_of_proof(&proof));
+        let c = vos_pvm_proof::recursion_pcs::commitment_bytes(
+            &vos_pvm_proof::program_commitment_of_proof(&proof),
+        );
         if seen.insert(c) {
             out.push(c);
         }
@@ -1128,7 +1131,7 @@ fn measure_commitments(
 /// The floors measurement behind [`Prover::measure_floors`] — trace-gen of
 /// every component over every window, so it runs on a large-stack thread
 /// like the other measure/prove paths. One streaming pass
-/// ([`zkpvm::NaturalFloors`] over each window as the tracer completes it),
+/// ([`vos_pvm_proof::NaturalFloors`] over each window as the tracer completes it),
 /// so the multi-million-step trace is never resident. An empty `witness`
 /// traces the unpatched image (a program that takes no witness); a
 /// witness-taking program MUST supply a representative witness, because
@@ -1156,7 +1159,7 @@ pub fn measure_floors(
             page_budget,
             gas,
         )?;
-        let mut floors = zkpvm::NaturalFloors::new();
+        let mut floors = vos_pvm_proof::NaturalFloors::new();
         while stream.next_window().is_some() {
             floors.observe(&mut stream.side_note());
         }
@@ -1329,16 +1332,20 @@ fn trace_blob(
     pvm_blob: &[u8],
     witness_bytes: &[u8],
     witness_addr: usize,
-) -> Option<zkpvm::SideNote> {
+) -> Option<vos_pvm_proof::SideNote> {
     if witness_bytes.is_empty() {
-        zkpvm::actor::trace_blob(pvm_blob, TRACE_GAS)
+        vos_pvm_proof::actor::trace_blob(pvm_blob, TRACE_GAS)
     } else {
-        zkpvm::actor::trace_blob_with_patches(pvm_blob, TRACE_GAS, &[(witness_addr, witness_bytes)])
+        vos_pvm_proof::actor::trace_blob_with_patches(
+            pvm_blob,
+            TRACE_GAS,
+            &[(witness_addr, witness_bytes)],
+        )
     }
 }
 
 /// [`trace_blob`] in STREAMING chain form: the traced run as a
-/// [`zkpvm::segment::TraceStream`] cutting `(seg_steps, page_budget)`
+/// [`vos_pvm_proof::segment::TraceStream`] cutting `(seg_steps, page_budget)`
 /// windows online (`0` = uniform step cut) — what every CHAIN path here
 /// drives, proving/measuring each window as the tracer completes it, so
 /// the multi-million-step trace is never resident (peak step storage is
@@ -1350,11 +1357,11 @@ fn trace_stream(
     seg_steps: usize,
     page_budget: usize,
     gas: u64,
-) -> Option<zkpvm::segment::TraceStream<zkpvm::segment::TracingSource>> {
+) -> Option<vos_pvm_proof::segment::TraceStream<vos_pvm_proof::segment::TracingSource>> {
     if witness_bytes.is_empty() {
-        zkpvm::actor::trace_stream(pvm_blob, gas, seg_steps, page_budget)
+        vos_pvm_proof::actor::trace_stream(pvm_blob, gas, seg_steps, page_budget)
     } else {
-        zkpvm::actor::trace_stream_with_patches(
+        vos_pvm_proof::actor::trace_stream_with_patches(
             pvm_blob,
             gas,
             &[(witness_addr, witness_bytes)],
@@ -1407,10 +1414,10 @@ pub fn verify_proof_bytes(
 /// proven (in chain order) and returning the chain's ENTERING-IMAGE root —
 /// segment 0's `initial_state.memory_root`, the
 /// [`encode_chain_manifest_anchored`] anchor. One streaming pass
-/// ([`zkpvm::segment::TraceStream`]): the tracer runs interleaved with
+/// ([`vos_pvm_proof::segment::TraceStream`]): the tracer runs interleaved with
 /// proving, each window cut online (uniform `seg_steps`, or
 /// content-budgeted when `page_budget > 0` — bit-identical to the offline
-/// cut) and proven with [`zkpvm::prove_canonical`] against the
+/// cut) and proven with [`vos_pvm_proof::prove_canonical`] against the
 /// caller-supplied `profile` as the tracer completes it. The sink owns each
 /// segment's bytes and decides their fate (publish to a CAS, collect,
 /// discard); returning `None` from it ABORTS the remaining chain. `None` on
@@ -1507,7 +1514,7 @@ pub fn prove_chain_segments(
 /// single hash rides in the caller's proof reference.
 ///
 /// [`Self::initial_root`] is the entering-image ANCHOR: the page-Merkle root of
-/// the RAM image segment 0 runs against (`zkpvm::page_merkle::image_root` over
+/// the RAM image segment 0 runs against (`vos_pvm_proof::page_merkle::image_root` over
 /// the producer's initial image, which for an honest chain equals
 /// `proofs[0].initial_state.memory_root`). [`verify_chain`] checks segment 0's
 /// `initial_state.memory_root` against it — the memory analogue of the
@@ -1558,7 +1565,7 @@ pub fn encode_chain_manifest(segment_hashes: &[[u8; 32]]) -> Vec<u8> {
 /// Encode an ANCHORED [`ChainManifest`]: the entering-image page-Merkle root
 /// followed by the per-segment proof CAS hashes (flat `[root:32][seg:32]…`).
 /// [`verify_chain`] checks segment 0's `initial_state.memory_root` against
-/// `initial_root`. Compute `initial_root` via `zkpvm::page_merkle::image_root`
+/// `initial_root`. Compute `initial_root` via `vos_pvm_proof::page_merkle::image_root`
 /// over the initial image the chain was traced from — equivalently, the first
 /// segment proof's `initial_state.memory_root`.
 pub fn encode_chain_manifest_anchored(
@@ -1929,7 +1936,7 @@ mod anchor_tests {
     //! anchor as the accept/reject cause.
     use super::*;
     use test_trace::straight_line_side_note;
-    use zkpvm::prove_mobile;
+    use vos_pvm_proof::prove_mobile;
 
     /// Prove a tiny 2-op program as one MOBILE segment; return its bincode(Proof)
     /// blob, its program commitment, and its entering-image root.
@@ -1988,11 +1995,11 @@ mod test_trace {
     //! Shared tiny-trace fixture: a straight-line `Add64` program traced
     //! into a [`SideNote`] (or packaged as a JAR blob), small enough to
     //! prove in-test.
-    use javm::PVM_REGISTER_COUNT;
-    use javm::instruction::Opcode;
-    use javm::interpreter::Interpreter;
-    use zkpvm::SideNote;
-    use zkpvm::core::tracing::TracingPvm;
+    use vos_pvm::PVM_REGISTER_COUNT;
+    use vos_pvm::instruction::Opcode;
+    use vos_pvm::interpreter::Interpreter;
+    use vos_pvm_proof::SideNote;
+    use vos_pvm_proof::core::tracing::TracingPvm;
 
     /// The straight-line program bytes: `n_adds` `Add64` ops followed by
     /// `Trap`, plus the instruction-start bitmask.
@@ -2026,7 +2033,7 @@ mod test_trace {
             25,
         );
         let mut tracing = TracingPvm::new(pvm);
-        assert_eq!(tracing.run(), javm::ExitReason::Trap);
+        assert_eq!(tracing.run(), vos_pvm::ExitReason::Trap);
         SideNote::new(tracing.into_trace(), code, bitmask).with_memory(mem)
     }
 
@@ -2036,7 +2043,7 @@ mod test_trace {
     /// end-to-end on a REAL, cheap program.
     pub fn straight_line_blob(n_adds: u8) -> Vec<u8> {
         let (code, bitmask) = straight_line_code(n_adds);
-        javm::program::build_simple_blob(&code, &bitmask, &[])
+        vos_pvm::program::build_simple_blob(&code, &bitmask, &[])
     }
 
     /// [`straight_line_blob`] plus one zero-initialized writable DATA
@@ -2045,8 +2052,8 @@ mod test_trace {
     /// measurement) need a blob whose flat_mem is non-empty. The program
     /// never touches memory, so the patch leaves execution unchanged.
     pub fn straight_line_blob_with_ram(n_adds: u8) -> Vec<u8> {
-        use javm::cap::Access;
-        use javm::program::{CapEntryType, CapManifestEntry, build_blob};
+        use vos_pvm::cap::Access;
+        use vos_pvm::program::{CapEntryType, CapManifestEntry, build_blob};
         let (code, bitmask) = straight_line_code(n_adds);
         // The CODE sub-blob layout `build_simple_blob` packs:
         // jump_len(4) + entry_size(1) + code_len(4) + code + packed bitmask.
@@ -2089,7 +2096,7 @@ mod test_trace {
 
 #[cfg(test)]
 mod floors_tests {
-    //! Floors derivation (`zkpvm::canonical_profile_for` behind
+    //! Floors derivation (`vos_pvm_proof::canonical_profile_for` behind
     //! `measure_floors`) — the derived profile must make a chain's windows
     //! collapse onto one commitment, and the blob/seg_steps paths must fail
     //! soft. The heavy real-program run (voucher-check floors per
@@ -2107,15 +2114,17 @@ mod floors_tests {
                 let full = straight_line_side_note(6);
                 let n = full.steps.len();
                 let seg = n.div_ceil(2);
-                let bounds = zkpvm::segment::segment_bounds(n, seg);
+                let bounds = vos_pvm_proof::segment::segment_bounds(n, seg);
                 assert_eq!(bounds.len(), 2, "the trace must split into two windows");
 
-                let floors = zkpvm::canonical_profile_for(&full, seg).expect("floors derive");
-                assert_eq!(floors.len(), zkpvm::chip_idx::COUNT);
+                let floors =
+                    vos_pvm_proof::canonical_profile_for(&full, seg).expect("floors derive");
+                assert_eq!(floors.len(), vos_pvm_proof::chip_idx::COUNT);
 
                 // Monotonicity: a window's events are a subset of the whole
                 // trace's, so whole-trace naturals dominate windowed floors.
-                let whole = zkpvm::canonical_profile_for(&full, n).expect("whole-trace floors");
+                let whole =
+                    vos_pvm_proof::canonical_profile_for(&full, n).expect("whole-trace floors");
                 for (i, (w, f)) in whole.iter().zip(&floors).enumerate() {
                     assert!(
                         w >= f,
@@ -2128,12 +2137,12 @@ mod floors_tests {
                 let commitments: Vec<_> = bounds
                     .iter()
                     .map(|&(a, b)| {
-                        let mut sn = zkpvm::segment::segment_side_note(&full, a, b);
+                        let mut sn = vos_pvm_proof::segment::segment_side_note(&full, a, b);
                         let proof = prove_canonical(&mut sn, &floors)
                             .expect("canonical prove under derived floors");
-                        zkpvm::recursion_pcs::commitment_bytes(&zkpvm::program_commitment_of_proof(
-                            &proof,
-                        ))
+                        vos_pvm_proof::recursion_pcs::commitment_bytes(
+                            &vos_pvm_proof::program_commitment_of_proof(&proof),
+                        )
                     })
                     .collect();
                 assert_eq!(
@@ -2155,7 +2164,7 @@ mod floors_tests {
         );
         let full = straight_line_side_note(2);
         assert_eq!(
-            zkpvm::canonical_profile_for(&full, 0),
+            vos_pvm_proof::canonical_profile_for(&full, 0),
             None,
             "seg_steps = 0 must refuse, not panic"
         );
@@ -2231,10 +2240,10 @@ mod chain_stream_tests {
 
             // The retired pipeline, inlined: hold the whole compact
             // trace, cut offline, prove via the forward cursor.
-            let full = zkpvm::actor::trace_blob_compact(&blob, super::TRACE_GAS)
+            let full = vos_pvm_proof::actor::trace_blob_compact(&blob, super::TRACE_GAS)
                 .expect("compact-holder trace");
-            let bounds = zkpvm::segment::segment_bounds(full.num_steps(), SEG_STEPS);
-            let mut cursor = zkpvm::segment::CompactSegmentCursor::new(&full);
+            let bounds = vos_pvm_proof::segment::segment_bounds(full.num_steps(), SEG_STEPS);
+            let mut cursor = vos_pvm_proof::segment::CompactSegmentCursor::new(&full);
             let mut via_holder: Vec<Vec<u8>> = Vec::new();
             for &(a, b) in &bounds {
                 let mut sn = cursor.side_note(a, b);
@@ -2276,7 +2285,7 @@ mod chain_stream_tests {
             let n = u32::from_le_bytes(out[32..36].try_into().unwrap()) as usize;
             assert_eq!(
                 n,
-                zkpvm::chip_idx::COUNT,
+                vos_pvm_proof::chip_idx::COUNT,
                 "the derived profile is full-width"
             );
             let floors: Vec<u32> = (0..n)
@@ -2288,36 +2297,39 @@ mod chain_stream_tests {
                 tail.chunks(32).map(|c| c.try_into().unwrap()).collect();
 
             let (_interp, unpatched) =
-                zkpvm::actor::interpreter_from_blob(&blob, GAS).expect("parse blob");
+                vos_pvm_proof::actor::interpreter_from_blob(&blob, GAS).expect("parse blob");
             assert_eq!(
                 image_root,
-                zkpvm::page_merkle::image_root(&unpatched),
+                vos_pvm_proof::page_merkle::image_root(&unpatched),
                 "the echoed root is the unpatched pre-run image's"
             );
 
             // The reference: the compact-holder pipeline over the same
             // patched trace, mirroring the probe selection ({0, last} —
             // no ristretto, so every comb count is 0) and its dedup.
-            let full =
-                zkpvm::actor::trace_blob_compact_with_patches(&blob, GAS, &[(WADDR, &witness)])
-                    .expect("compact-holder trace");
-            let bounds = zkpvm::segment::segment_bounds(full.num_steps(), SEG_STEPS);
+            let full = vos_pvm_proof::actor::trace_blob_compact_with_patches(
+                &blob,
+                GAS,
+                &[(WADDR, &witness)],
+            )
+            .expect("compact-holder trace");
+            let bounds = vos_pvm_proof::segment::segment_bounds(full.num_steps(), SEG_STEPS);
             assert!(bounds.len() >= 2, "the fixture must cut into a real chain");
-            let floors_ref =
-                zkpvm::canonical_profile_for_bounds_compact(&full, &bounds).expect("holder floors");
+            let floors_ref = vos_pvm_proof::canonical_profile_for_bounds_compact(&full, &bounds)
+                .expect("holder floors");
             assert_eq!(
                 floors, floors_ref,
                 "streaming-derived floors must match the holder derivation"
             );
-            let mut cursor = zkpvm::segment::CompactSegmentCursor::new(&full);
+            let mut cursor = vos_pvm_proof::segment::CompactSegmentCursor::new(&full);
             let mut seen = std::collections::BTreeSet::new();
             let mut expected = Vec::new();
             for &(a, b) in [bounds[0], bounds[bounds.len() - 1]].iter() {
                 let mut sn = cursor.side_note(a, b);
                 assert!(sn.ristretto_comb_calls.is_empty(), "comb-free fixture");
                 let proof = prove_canonical(&mut sn, &floors_ref).expect("prove probe window");
-                let c = zkpvm::recursion_pcs::commitment_bytes(
-                    &zkpvm::program_commitment_of_proof(&proof),
+                let c = vos_pvm_proof::recursion_pcs::commitment_bytes(
+                    &vos_pvm_proof::program_commitment_of_proof(&proof),
                 );
                 if seen.insert(c) {
                     expected.push(c);

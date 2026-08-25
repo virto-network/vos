@@ -29,7 +29,7 @@ name = "counter"
 # Registry admission requires the explicit #[actor(crdt)] fixture. Do not
 # replace this with legacy-v1/actors/crdt-counter: that plain actor exists only
 # for old EffectLog replay tests.
-path = "../v2/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter_v2.elf"
+path = "../v2/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter_v2.elf"
 consistency = "crdt"
 on_start = [
   { msg = "inc" },

@@ -5670,7 +5670,7 @@ mod tests {
         let mut store = MemStore::default();
         let initial = store.provide_blob(b"state").unwrap();
         store.programs.insert(program(), FIXTURE_ACTOR_PVM.to_vec());
-        let task_pvm = grey_transpiler::assembler::Assembler::new().build();
+        let task_pvm = vos_pvm_compiler::assembler::Assembler::new().build();
         let task_program = ProgramId::of_pvm(&task_pvm);
         let role_policies = PackageRolePoliciesV2 {
             methods: vec![],
@@ -5773,7 +5773,7 @@ mod tests {
         let mut store = MemStore::default();
         let (_, install) = install_fixture(&mut store, ConsistencyModeV2::Raft, b"state");
         let mut upgrade = upgrade_fixture(install.resulting_state_root.unwrap());
-        let task_pvm = grey_transpiler::assembler::Assembler::new().build();
+        let task_pvm = vos_pvm_compiler::assembler::Assembler::new().build();
         let task_program = ProgramId::of_pvm(&task_pvm);
         store.programs.insert(task_program, task_pvm);
         let mut policies = PackageRolePoliciesV2::decode(&upgrade.role_policies).unwrap();

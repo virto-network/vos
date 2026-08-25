@@ -1,0 +1,55 @@
+{
+  "backends": [
+    "interpreter",
+    "recompiler"
+  ],
+  "expected": {
+    "gas": 98,
+    "memory": [],
+    "pc": 3,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0xffffffffffffffdd",
+      "0x5",
+      "0xfffffffffffffff9",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ],
+    "status": "trap"
+  },
+  "family": "muldiv",
+  "initial": {
+    "gas": 100,
+    "memory": [],
+    "page_map": [],
+    "pc": 0,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0xffffffffffffffdd",
+      "0x5",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "muldiv_div_s_64",
+  "program": {
+    "bitmask": "0x09",
+    "code": "0xcc320400",
+    "jump_table": []
+  }
+}

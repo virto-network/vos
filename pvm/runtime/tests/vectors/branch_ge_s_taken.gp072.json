@@ -1,0 +1,55 @@
+{
+  "backends": [
+    "interpreter",
+    "recompiler"
+  ],
+  "expected": {
+    "gas": 97,
+    "memory": [],
+    "pc": 9,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x1",
+      "0xffffffffffffffff",
+      "0x0",
+      "0x1",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ],
+    "status": "trap"
+  },
+  "family": "branch",
+  "initial": {
+    "gas": 100,
+    "memory": [],
+    "page_map": [],
+    "pc": 0,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x1",
+      "0xffffffffffffffff",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "branch_ge_s_taken",
+  "program": {
+    "bitmask": "0x7902",
+    "code": "0xaf320600000033050100",
+    "jump_table": []
+  }
+}

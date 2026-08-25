@@ -9,7 +9,7 @@ use vos::runtime::VosRuntime;
 fn example_elf(name: &str) -> Vec<u8> {
     let workspace = env!("CARGO_MANIFEST_DIR");
     let path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/{name}/target/riscv64em-javm/release/{name}.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/{name}/target/riscv64em-vos/release/{name}.elf",
         workspace
     );
     match std::fs::read(&path) {
@@ -20,7 +20,7 @@ fn example_elf(name: &str) -> Vec<u8> {
 
 /// Transpile an ELF to a JAM service PVM blob (single refine entry at PC=0).
 fn transpile_actor(elf_data: &[u8]) -> Vec<u8> {
-    grey_transpiler::link_elf(elf_data).expect("transpile failed")
+    vos_pvm_compiler::link_elf(elf_data).expect("transpile failed")
 }
 
 /// Register a service blob and create a service.
@@ -79,7 +79,7 @@ fn agent_service_lifecycle() {
     // The scheduler agent is a service. Verify it inits and halts.
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -123,7 +123,7 @@ fn cooperative_loop_with_greeter() {
     // Full cooperative test: scheduler agent invokes greeter.
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -190,7 +190,7 @@ fn cooperative_loop_with_greeter() {
 fn scheduler_keeps_driving_yielding_counter() {
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let scheduler_data = match std::fs::read(&agent_path) {
@@ -268,7 +268,7 @@ fn refine_completes_and_clears_continuation() {
     // loop test.)
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -427,7 +427,7 @@ fn pvm_agent_invokes_extension_via_external_handler() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -515,7 +515,7 @@ fn recording_session_captures_invoke_replies() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -627,7 +627,7 @@ fn replay_session_short_circuits_external_invoke() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -765,7 +765,7 @@ fn crdt_consistency_without_data_dir_fails_loud() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -776,7 +776,7 @@ fn crdt_consistency_without_data_dir_fails_loud() {
         }
     };
 
-    let blob = grey_transpiler::link_elf(&agent_data).expect("transpile");
+    let blob = vos_pvm_compiler::link_elf(&agent_data).expect("transpile");
     let mut node = VosNode::new();
     // Provide replication_id so the data_dir check fires next —
     // this test is specifically about the data_dir requirement.
@@ -818,7 +818,7 @@ fn crdt_consistency_without_replication_id_fails_loud() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -828,7 +828,7 @@ fn crdt_consistency_without_replication_id_fails_loud() {
             return;
         }
     };
-    let blob = grey_transpiler::link_elf(&agent_data).expect("transpile");
+    let blob = vos_pvm_compiler::link_elf(&agent_data).expect("transpile");
     let dir = std::env::temp_dir().join(format!(
         "vos_crdt_no_repid_{}_{}",
         std::process::id(),
@@ -878,7 +878,7 @@ fn cross_agent_invoke_returns_typed_reply() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let math_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/math/target/riscv64em-javm/release/math.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/math/target/riscv64em-vos/release/math.elf",
         workspace,
     );
     let math_data = match std::fs::read(&math_path) {
@@ -888,7 +888,7 @@ fn cross_agent_invoke_returns_typed_reply() {
             return;
         }
     };
-    let math_blob = grey_transpiler::link_elf(&math_data).expect("transpile");
+    let math_blob = vos_pvm_compiler::link_elf(&math_data).expect("transpile");
 
     // Spin up a node in a background thread so we can drive it
     // synchronously from the test. The node's run_until_idle
@@ -943,7 +943,7 @@ fn pushy_vec_push_grows_correctly() {
     use vos::node::{AgentConfig, VosNode};
 
     let pushy_data = example_elf("pushy");
-    let pushy_blob = grey_transpiler::link_elf(&pushy_data).expect("transpile pushy");
+    let pushy_blob = vos_pvm_compiler::link_elf(&pushy_data).expect("transpile pushy");
 
     let mut node = VosNode::new();
     let pushy_id = node.register(AgentConfig::new(pushy_blob));
@@ -1024,11 +1024,11 @@ fn crdt_cross_agent_invoke_records_reply_in_dag() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let scheduler_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace,
     );
     let greeter_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/greeter/target/riscv64em-javm/release/greeter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/greeter/target/riscv64em-vos/release/greeter.elf",
         workspace,
     );
     let scheduler_data = match std::fs::read(&scheduler_path) {
@@ -1046,8 +1046,8 @@ fn crdt_cross_agent_invoke_records_reply_in_dag() {
         }
     };
 
-    let scheduler_blob = grey_transpiler::link_elf(&scheduler_data).expect("transpile");
-    let greeter_blob = grey_transpiler::link_elf(&greeter_data).expect("transpile");
+    let scheduler_blob = vos_pvm_compiler::link_elf(&scheduler_data).expect("transpile");
+    let greeter_blob = vos_pvm_compiler::link_elf(&greeter_data).expect("transpile");
 
     let data_dir = std::env::temp_dir().join(format!(
         "vos_crdt_xagent_{}_{}",
@@ -1146,11 +1146,11 @@ fn cross_agent_invoke_routes_through_node() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let scheduler_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace,
     );
     let greeter_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/greeter/target/riscv64em-javm/release/greeter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/greeter/target/riscv64em-vos/release/greeter.elf",
         workspace,
     );
     let scheduler_data = match std::fs::read(&scheduler_path) {
@@ -1168,8 +1168,8 @@ fn cross_agent_invoke_routes_through_node() {
         }
     };
 
-    let scheduler_blob = grey_transpiler::link_elf(&scheduler_data).expect("transpile sched");
-    let greeter_blob = grey_transpiler::link_elf(&greeter_data).expect("transpile greeter");
+    let scheduler_blob = vos_pvm_compiler::link_elf(&scheduler_data).expect("transpile sched");
+    let greeter_blob = vos_pvm_compiler::link_elf(&greeter_data).expect("transpile greeter");
 
     let mut node = VosNode::new();
 
@@ -1219,7 +1219,7 @@ fn recording_cap_truncates_oversized_invoke_output() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -1313,7 +1313,7 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -1334,7 +1334,7 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
     ));
     let _ = std::fs::remove_dir_all(&data_dir);
 
-    let blob = grey_transpiler::link_elf(&agent_data).expect("transpile");
+    let blob = vos_pvm_compiler::link_elf(&agent_data).expect("transpile");
 
     // Scheduler needs its `children` init arg in storage before
     // dispatch — an empty list is fine, we're just proving the
@@ -1446,7 +1446,7 @@ fn crdt_agent_populates_dag_and_state_on_dispatch() {
         t.len().unwrap()
     };
 
-    let blob2 = grey_transpiler::link_elf(&agent_data).expect("transpile");
+    let blob2 = vos_pvm_compiler::link_elf(&agent_data).expect("transpile");
     let init_bytes2 = {
         let args =
             vos::init::InitArgs::new().with("children", vos::init::InitValue::ListU32(Vec::new()));
@@ -1555,7 +1555,7 @@ fn fetch_at_buf_size_boundary_delivers_message() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -1565,7 +1565,7 @@ fn fetch_at_buf_size_boundary_delivers_message() {
             return;
         }
     };
-    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+    let counter_blob = vos_pvm_compiler::link_elf(&counter_data).expect("transpile");
 
     let mut node = VosNode::new();
     let id = node.register(AgentConfig::new(counter_blob));
@@ -1636,7 +1636,7 @@ fn fetch_over_buf_size_boundary_is_refused() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -1646,7 +1646,7 @@ fn fetch_over_buf_size_boundary_is_refused() {
             return;
         }
     };
-    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+    let counter_blob = vos_pvm_compiler::link_elf(&counter_data).expect("transpile");
 
     let mut node = VosNode::new();
     let id = node.register(AgentConfig::new(counter_blob));
@@ -1704,7 +1704,7 @@ fn crdt_counter_local_invoke_smoke() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
         workspace,
     );
     let data = match std::fs::read(&counter_path) {
@@ -1714,7 +1714,7 @@ fn crdt_counter_local_invoke_smoke() {
             return;
         }
     };
-    let blob = grey_transpiler::link_elf(&data).expect("transpile");
+    let blob = vos_pvm_compiler::link_elf(&data).expect("transpile");
     let mut node = VosNode::new();
     let id = node.register(AgentConfig::new(blob));
 
@@ -1739,7 +1739,7 @@ fn crdt_counter_init_payloads_dispatch() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
         workspace,
     );
     let data = match std::fs::read(&counter_path) {
@@ -1749,7 +1749,7 @@ fn crdt_counter_init_payloads_dispatch() {
             return;
         }
     };
-    let blob = grey_transpiler::link_elf(&data).expect("transpile");
+    let blob = vos_pvm_compiler::link_elf(&data).expect("transpile");
 
     let dir = std::env::temp_dir().join(format!(
         "vos_init_payload_{}_{}",
@@ -1837,7 +1837,7 @@ fn crdt_counter_converges_across_nodes_live() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -1847,7 +1847,7 @@ fn crdt_counter_converges_across_nodes_live() {
             return;
         }
     };
-    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+    let counter_blob = vos_pvm_compiler::link_elf(&counter_data).expect("transpile");
 
     // Each node needs its own data dir + libp2p identity. Make a
     // shared replication_id so both nodes' counter replicas land
@@ -2058,7 +2058,7 @@ fn crdt_scheduler_install_propagates_across_nodes() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let scheduler_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace,
     );
     let scheduler_data = match std::fs::read(&scheduler_path) {
@@ -2068,7 +2068,7 @@ fn crdt_scheduler_install_propagates_across_nodes() {
             return;
         }
     };
-    let scheduler_blob = grey_transpiler::link_elf(&scheduler_data).expect("transpile");
+    let scheduler_blob = vos_pvm_compiler::link_elf(&scheduler_data).expect("transpile");
 
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2248,7 +2248,7 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -2258,7 +2258,7 @@ fn crdt_counter_burst_converges_under_concurrent_load() {
             return;
         }
     };
-    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+    let counter_blob = vos_pvm_compiler::link_elf(&counter_data).expect("transpile");
 
     const PER_SIDE: u32 = 5;
     const EXPECTED: u64 = (PER_SIDE as u64) * 2;
@@ -2475,7 +2475,7 @@ fn crdt_counter_restart_replays_state_from_disk() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -2485,7 +2485,7 @@ fn crdt_counter_restart_replays_state_from_disk() {
             return;
         }
     };
-    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+    let counter_blob = vos_pvm_compiler::link_elf(&counter_data).expect("transpile");
 
     let dir = std::env::temp_dir().join(format!(
         "vos_restart_{}_{}",
@@ -2616,7 +2616,7 @@ fn crdt_counter_survives_corrupted_persisted_state() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -2626,7 +2626,7 @@ fn crdt_counter_survives_corrupted_persisted_state() {
             return;
         }
     };
-    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+    let counter_blob = vos_pvm_compiler::link_elf(&counter_data).expect("transpile");
 
     let dir = std::env::temp_dir().join(format!(
         "vos_corrupt_{}_{}",
@@ -2766,7 +2766,7 @@ fn invoke_with_oversized_external_reply_does_not_corrupt_caller() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace,
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -2855,7 +2855,7 @@ fn crdt_counter_survives_handler_panic_and_keeps_dispatching() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -2865,7 +2865,7 @@ fn crdt_counter_survives_handler_panic_and_keeps_dispatching() {
             return;
         }
     };
-    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+    let counter_blob = vos_pvm_compiler::link_elf(&counter_data).expect("transpile");
 
     let dir = std::env::temp_dir().join(format!(
         "vos_panic_{}_{}",
@@ -2972,7 +2972,7 @@ fn crdt_counter_shutdown_under_active_load() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -2982,7 +2982,7 @@ fn crdt_counter_shutdown_under_active_load() {
             return;
         }
     };
-    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+    let counter_blob = vos_pvm_compiler::link_elf(&counter_data).expect("transpile");
 
     let dir = std::env::temp_dir().join(format!(
         "vos_shut_{}_{}",
@@ -3133,7 +3133,7 @@ fn crdt_counter_offline_node_catches_up_after_restart() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -3143,7 +3143,7 @@ fn crdt_counter_offline_node_catches_up_after_restart() {
             return;
         }
     };
-    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+    let counter_blob = vos_pvm_compiler::link_elf(&counter_data).expect("transpile");
 
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3387,7 +3387,7 @@ fn scheduler_drops_non_existent_children_and_keeps_others_running() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace,
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -3524,7 +3524,7 @@ fn crdt_read_only_get_does_not_append_dag_nodes() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -3534,7 +3534,7 @@ fn crdt_read_only_get_does_not_append_dag_nodes() {
             return;
         }
     };
-    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+    let counter_blob = vos_pvm_compiler::link_elf(&counter_data).expect("transpile");
 
     let dir = std::env::temp_dir().join(format!(
         "vos_dag_growth_{}_{}",
@@ -3604,7 +3604,7 @@ fn crdt_read_only_get_does_not_append_dag_nodes() {
     {
         let mut node = VosNode::new();
         let id = node.register(
-            AgentConfig::new(grey_transpiler::link_elf(&counter_data).expect("transpile"))
+            AgentConfig::new(vos_pvm_compiler::link_elf(&counter_data).expect("transpile"))
                 .with_consistency(Consistency::Crdt)
                 .persist(&dir)
                 .with_replication_id(rep_id),
@@ -3632,7 +3632,7 @@ fn crdt_read_only_get_does_not_append_dag_nodes() {
     {
         let mut node = VosNode::new();
         let id = node.register(
-            AgentConfig::new(grey_transpiler::link_elf(&counter_data).expect("transpile"))
+            AgentConfig::new(vos_pvm_compiler::link_elf(&counter_data).expect("transpile"))
                 .with_consistency(Consistency::Crdt)
                 .persist(&dir)
                 .with_replication_id(rep_id),
@@ -3678,7 +3678,7 @@ fn raft_counter_single_node_replays_log_after_restart() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -3688,7 +3688,7 @@ fn raft_counter_single_node_replays_log_after_restart() {
             return;
         }
     };
-    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+    let counter_blob = vos_pvm_compiler::link_elf(&counter_data).expect("transpile");
 
     let dir = std::env::temp_dir().join(format!(
         "vos_raft_phase1_{}_{}",
@@ -3825,7 +3825,7 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -3835,7 +3835,7 @@ fn raft_counter_three_node_replicates_state_to_all_replicas() {
             return;
         }
     };
-    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+    let counter_blob = vos_pvm_compiler::link_elf(&counter_data).expect("transpile");
 
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4107,7 +4107,7 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let counter_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
         workspace,
     );
     let counter_data = match std::fs::read(&counter_path) {
@@ -4117,7 +4117,7 @@ fn raft_three_node_cluster_compacts_log_after_replication() {
             return;
         }
     };
-    let counter_blob = grey_transpiler::link_elf(&counter_data).expect("transpile");
+    let counter_blob = vos_pvm_compiler::link_elf(&counter_data).expect("transpile");
 
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4359,7 +4359,7 @@ fn external_invoke_yielded_surfaces_as_invoke_yielded() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace,
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -4446,7 +4446,7 @@ fn invoked_child_storage_isolated_from_parent_journal() {
     // returns. Counter then progresses normally: 1, 2, 3, 4, ...
     let workspace = env!("CARGO_MANIFEST_DIR");
     let agent_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace,
     );
     let agent_data = match std::fs::read(&agent_path) {
@@ -5192,7 +5192,7 @@ fn hyperspace_resolve_returns_remote_host_prefix() {
     use vos::node::{AgentConfig, Consistency, VosNode};
 
     let registry_path = format!(
-        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        "{}/../actors/space-registry/target/riscv64em-vos/release/space_registry.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let registry_elf = match std::fs::read(&registry_path) {
@@ -5202,7 +5202,7 @@ fn hyperspace_resolve_returns_remote_host_prefix() {
             return;
         }
     };
-    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile");
+    let registry_blob = vos_pvm_compiler::link_elf(&registry_elf).expect("transpile");
 
     // Each node gets its own data dir + libp2p identity. The
     // hyperspace replication_id is shared so both HYPERSPACE_REGISTRY
@@ -5404,7 +5404,7 @@ fn crdt_registry_writes_and_deletes_converge_across_replicas() {
     use vos::node::{AgentConfig, Consistency, VosNode};
 
     let registry_path = format!(
-        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        "{}/../actors/space-registry/target/riscv64em-vos/release/space_registry.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let registry_elf = match std::fs::read(&registry_path) {
@@ -5414,7 +5414,7 @@ fn crdt_registry_writes_and_deletes_converge_across_replicas() {
             return;
         }
     };
-    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile");
+    let registry_blob = vos_pvm_compiler::link_elf(&registry_elf).expect("transpile");
 
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5649,7 +5649,7 @@ fn registry_authority_survives_state_blob_drift() {
     use vos::node::{AgentConfig, Consistency, VosNode};
 
     let registry_path = format!(
-        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        "{}/../actors/space-registry/target/riscv64em-vos/release/space_registry.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let registry_elf = match std::fs::read(&registry_path) {
@@ -5659,7 +5659,7 @@ fn registry_authority_survives_state_blob_drift() {
             return;
         }
     };
-    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile");
+    let registry_blob = vos_pvm_compiler::link_elf(&registry_elf).expect("transpile");
 
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5793,7 +5793,7 @@ fn members_pager_terminates_one_row_at_a_time() {
     use vos::node::{AgentConfig, Consistency, VosNode};
 
     let registry_path = format!(
-        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        "{}/../actors/space-registry/target/riscv64em-vos/release/space_registry.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let registry_elf = match std::fs::read(&registry_path) {
@@ -5803,7 +5803,7 @@ fn members_pager_terminates_one_row_at_a_time() {
             return;
         }
     };
-    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile");
+    let registry_blob = vos_pvm_compiler::link_elf(&registry_elf).expect("transpile");
 
     let root_key = SigningKey::from_bytes(&[13u8; 32]);
     let peer_id_for = |pk: [u8; 32]| -> Vec<u8> {
@@ -5936,15 +5936,15 @@ fn cross_space_bridge_forward_dispatches_to_local_target() {
     use vos::value::{Msg, TAG_DYNAMIC};
 
     let registry_path = format!(
-        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        "{}/../actors/space-registry/target/riscv64em-vos/release/space_registry.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let bridge_path = format!(
-        "{}/../actors/space-bridge/target/riscv64em-javm/release/space_bridge.elf",
+        "{}/../actors/space-bridge/target/riscv64em-vos/release/space_bridge.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let counter_path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let registry_elf = match std::fs::read(&registry_path) {
@@ -5968,9 +5968,9 @@ fn cross_space_bridge_forward_dispatches_to_local_target() {
             return;
         }
     };
-    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile registry");
-    let bridge_blob = grey_transpiler::link_elf(&bridge_elf).expect("transpile bridge");
-    let counter_blob = grey_transpiler::link_elf(&counter_elf).expect("transpile counter");
+    let registry_blob = vos_pvm_compiler::link_elf(&registry_elf).expect("transpile registry");
+    let bridge_blob = vos_pvm_compiler::link_elf(&bridge_elf).expect("transpile bridge");
+    let counter_blob = vos_pvm_compiler::link_elf(&counter_elf).expect("transpile counter");
 
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -6251,7 +6251,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
     use vos::node::{AgentConfig, VosNode};
 
     let path = format!(
-        "{}/../actors/clerk-ledger/target/riscv64em-javm/release/clerk_ledger.elf",
+        "{}/../actors/clerk-ledger/target/riscv64em-vos/release/clerk_ledger.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let elf = match std::fs::read(&path) {
@@ -6261,7 +6261,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
             return;
         }
     };
-    let blob = grey_transpiler::link_elf(&elf).expect("transpile clerk-ledger");
+    let blob = vos_pvm_compiler::link_elf(&elf).expect("transpile clerk-ledger");
     let clerk_apply_elf = match std::fs::read(clerk_apply_elf_path()) {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -6870,7 +6870,7 @@ fn clerk_ledger_bootstrap_and_create_account() {
 
 /// Per-segment step budget for canonical chain proving. Together with
 /// [`VOUCHER_CHECK_PAGE_BUDGET`] it fixes the content-budgeted cut
-/// (`zkpvm::segment::segment_bounds_budgeted`) the canonical profile +
+/// (`vos_pvm_proof::segment::segment_bounds_budgeted`) the canonical profile +
 /// commitment allowlist were measured against; a different cut reshapes
 /// the windows and lands the chain on commitments outside the allowlist.
 const CHAIN_SEG_STEPS: usize = 32_000;
@@ -6880,7 +6880,7 @@ const CHAIN_SEG_STEPS: usize = 32_000;
 /// and with it the boundary chip (the widest chip in the AIR), so the page
 /// budget, not the step budget, bounds a window's committed cells: at
 /// (32k, 8) every window proves at roughly a third of the uniform-100k
-/// cut's RAM (see zkpvm/docs/plans/mobile-proving.md Wave 5.1).
+/// cut's RAM (see pvm/proof/docs/plans/mobile-proving.md Wave 5.1).
 const VOUCHER_CHECK_PAGE_BUDGET: usize = 8;
 
 /// Gas bound for tracing the voucher-check transition (matches the prover's
@@ -6888,11 +6888,11 @@ const VOUCHER_CHECK_PAGE_BUDGET: usize = 8;
 const VC_TRACE_GAS: u64 = 100_000_000;
 
 /// Canonical-shape forcing profile for `voucher-check`, indexed by
-/// `zkpvm::chip_idx`. `zkpvm::prove_canonical` pads each forcing-set chip's
+/// `vos_pvm_proof::chip_idx`. `vos_pvm_proof::prove_canonical` pads each forcing-set chip's
 /// main trace up to `PROFILE[chip_idx]` so every window's
 /// preprocessed-bearing chips share one `log_size`; `0` = not forced.
 ///
-/// These are the DERIVED floors (`zkpvm::canonical_profile_for_bounds`)
+/// These are the DERIVED floors (`vos_pvm_proof::canonical_profile_for_bounds`)
 /// over the budgeted cut: the per-chip elementwise MAX of every window's
 /// natural main-trace `log_size` — dense, unlike the retired hand-tuned
 /// profile, which forced only the content-scaling chips. Chips whose size
@@ -6945,7 +6945,7 @@ fn voucher_check_elf_path() -> std::path::PathBuf {
         return std::path::PathBuf::from(p);
     }
     std::path::PathBuf::from(format!(
-        "{}/../tests/fixtures/legacy-v1/actors/voucher-check/target/riscv64em-javm/release/voucher-check.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/voucher-check/target/riscv64em-vos/release/voucher-check.elf",
         env!("CARGO_MANIFEST_DIR"),
     ))
 }
@@ -6958,7 +6958,7 @@ fn voucher_check_elf_path() -> std::path::PathBuf {
 fn voucher_check_pvm() -> (Vec<u8>, usize) {
     let elf = std::fs::read(voucher_check_elf_path())
         .expect("voucher-check.elf not built — run `just build-voucher-check`");
-    let blob = grey_transpiler::link_elf(&elf).expect("transpile voucher-check");
+    let blob = vos_pvm_compiler::link_elf(&elf).expect("transpile voucher-check");
     let addr = vos::zk::witness_addr(&elf).expect("voucher-check.elf must export __VOS_WITNESS");
     (blob, addr as usize)
 }
@@ -6995,7 +6995,7 @@ fn voucher_check_profile_floors_cover_natural_sizes() {
     // One streaming pass (trace interleaved with the window walk, online
     // budgeted cut — bit-identical to offline `segment_bounds_budgeted`):
     // the transition's trace is never resident.
-    let mut stream = zkpvm::actor::trace_stream_with_patches(
+    let mut stream = vos_pvm_proof::actor::trace_stream_with_patches(
         &blob,
         VC_TRACE_GAS,
         &[(addr, &witness_buf)],
@@ -7007,7 +7007,7 @@ fn voucher_check_profile_floors_cover_natural_sizes() {
     while stream.next_window().is_some() {
         windows += 1;
         let mut sn = stream.side_note();
-        let naturals = zkpvm::natural_log_sizes_for(&mut sn, &forced);
+        let naturals = vos_pvm_proof::natural_log_sizes_for(&mut sn, &forced);
         for (m, n) in max_natural.iter_mut().zip(naturals) {
             *m = (*m).max(n);
         }
@@ -7048,7 +7048,7 @@ fn voucher_check_profile_floors_cover_natural_sizes() {
 /// (and re-pin the `allowlist` any verification system configured with
 /// `set_prover`).
 ///
-/// Rides the STREAMING chain driver (`zkpvm::actor::trace_stream_with_
+/// Rides the STREAMING chain driver (`vos_pvm_proof::actor::trace_stream_with_
 /// patches`) end to end — a metadata pass then a probe-prove pass, the
 /// production `prove_chain` shape — so reproducing the pinned values here
 /// also certifies the streaming path emits the deployed commitments.
@@ -7073,7 +7073,7 @@ fn voucher_check_commitment_drift_guard() {
     // budgeted cut — bit-identical to offline `segment_bounds_budgeted` —
     // plus each window's comb-call count; the trace is never resident.
     let stream = || {
-        zkpvm::actor::trace_stream_with_patches(
+        vos_pvm_proof::actor::trace_stream_with_patches(
             &blob,
             VC_TRACE_GAS,
             &[(addr, &witness_buf)],
@@ -7111,12 +7111,14 @@ fn voucher_check_commitment_drift_guard() {
             continue;
         }
         let mut sn = prover.side_note();
-        let proof = zkpvm::prove_canonical(&mut sn, &VOUCHER_CHECK_CANONICAL_PROFILE)
+        let proof = vos_pvm_proof::prove_canonical(&mut sn, &VOUCHER_CHECK_CANONICAL_PROFILE)
             .unwrap_or_else(|e| panic!("prove_canonical seg {i} {expected:?}: {e:?}"));
         // Channel-agnostic 32-byte form ([u8; 32] under Blake2s).
         commitments.push((
             i,
-            zkpvm::recursion_pcs::commitment_bytes(&zkpvm::program_commitment_of_proof(&proof)),
+            vos_pvm_proof::recursion_pcs::commitment_bytes(
+                &vos_pvm_proof::program_commitment_of_proof(&proof),
+            ),
         ));
     }
     assert!(
@@ -7163,11 +7165,15 @@ fn voucher_check_allowlist_coverage() {
     let registrar = cipher_clerk::crypto::Keypair::generate();
     let (public, witness, _v, _b) = build_conservation_transition(&registrar);
     let witness_buf = encode_witness_payload(&public.encode(), &witness.encode());
-    let full = zkpvm::actor::trace_blob_with_patches(&blob, VC_TRACE_GAS, &[(addr, &witness_buf)])
-        .expect("trace the conservation transition");
+    let full =
+        vos_pvm_proof::actor::trace_blob_with_patches(&blob, VC_TRACE_GAS, &[(addr, &witness_buf)])
+            .expect("trace the conservation transition");
     let total = full.steps.len();
-    let bounds =
-        zkpvm::segment::segment_bounds_budgeted(&full, CHAIN_SEG_STEPS, VOUCHER_CHECK_PAGE_BUDGET);
+    let bounds = vos_pvm_proof::segment::segment_bounds_budgeted(
+        &full,
+        CHAIN_SEG_STEPS,
+        VOUCHER_CHECK_PAGE_BUDGET,
+    );
     let n = bounds.len();
     eprintln!(
         "total steps = {total}, windows = {n}, cut = ({CHAIN_SEG_STEPS}, {VOUCHER_CHECK_PAGE_BUDGET})"
@@ -7175,7 +7181,7 @@ fn voucher_check_allowlist_coverage() {
 
     // Comb-count per window (trace-only — no proving), via one forward
     // cursor pass — O(N) slicing instead of the per-window prefix replay.
-    let mut scan = zkpvm::segment::SegmentCursor::new(&full);
+    let mut scan = vos_pvm_proof::segment::SegmentCursor::new(&full);
     let counts: Vec<usize> = bounds
         .iter()
         .map(|&(a, b)| scan.side_note(a, b).ristretto_comb_calls.len())
@@ -7206,13 +7212,15 @@ fn voucher_check_allowlist_coverage() {
     let mut commit_of: std::collections::BTreeMap<usize, [u8; 32]> = Default::default();
     // Fresh cursor for the probe pass (the scan cursor can't rewind); the
     // probe set is ascending, and skipped windows advance the image cheaply.
-    let mut cursor = zkpvm::segment::SegmentCursor::new(&full);
+    let mut cursor = vos_pvm_proof::segment::SegmentCursor::new(&full);
     for i in probe {
         let (a, b) = bounds[i];
         let mut sn = cursor.side_note(a, b);
-        let proof = zkpvm::prove_canonical(&mut sn, &VOUCHER_CHECK_CANONICAL_PROFILE)
+        let proof = vos_pvm_proof::prove_canonical(&mut sn, &VOUCHER_CHECK_CANONICAL_PROFILE)
             .unwrap_or_else(|e| panic!("prove_canonical seg {i} [{a},{b}): {e:?}"));
-        let c = zkpvm::recursion_pcs::commitment_bytes(&zkpvm::program_commitment_of_proof(&proof));
+        let c = vos_pvm_proof::recursion_pcs::commitment_bytes(
+            &vos_pvm_proof::program_commitment_of_proof(&proof),
+        );
         eprintln!(
             "seg {i:3} steps={:7} combs={} commitment={} in_allowlist={}",
             b - a,
@@ -7434,7 +7442,7 @@ fn witnessed_transfer_elf_path() -> std::path::PathBuf {
         return std::path::PathBuf::from(p);
     }
     std::path::PathBuf::from(format!(
-        "{}/../tests/fixtures/legacy-v1/actors/witnessed-transfer/target/riscv64em-javm/release/witnessed_transfer.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/witnessed-transfer/target/riscv64em-vos/release/witnessed_transfer.elf",
         env!("CARGO_MANIFEST_DIR"),
     ))
 }
@@ -7443,7 +7451,7 @@ fn witnessed_transfer_elf_path() -> std::path::PathBuf {
 fn witnessed_transfer_pvm() -> (Vec<u8>, usize) {
     let elf = std::fs::read(witnessed_transfer_elf_path())
         .expect("witnessed-transfer.elf not built — run `just build-witnessed-transfer`");
-    let blob = grey_transpiler::link_elf(&elf).expect("transpile witnessed-transfer");
+    let blob = vos_pvm_compiler::link_elf(&elf).expect("transpile witnessed-transfer");
     let addr =
         vos::zk::witness_addr(&elf).expect("witnessed-transfer.elf must export __VOS_WITNESS");
     (blob, addr as usize)
@@ -7561,8 +7569,8 @@ fn wt_trace(
     [u8; 32],
     Option<vos::refine_payload::RefinePayload>,
 ) {
-    let (mut interp, mut img) =
-        zkpvm::actor::interpreter_from_blob(blob, gas).expect("parse witnessed-transfer blob");
+    let (mut interp, mut img) = vos_pvm_proof::actor::interpreter_from_blob(blob, gas)
+        .expect("parse witnessed-transfer blob");
     let end = addr + task_input.len();
     assert!(end <= img.len(), "witness buffer overruns the guest image");
     img[addr..end].copy_from_slice(task_input);
@@ -7574,7 +7582,7 @@ fn wt_trace(
             )
             .expect("witness write is in bounds");
     }
-    let mut tracing = zkpvm::core::tracing::TracingPvm::new(interp);
+    let mut tracing = vos_pvm_proof::core::tracing::TracingPvm::new(interp);
     let reason = tracing.run_with_vos_stubs();
     let exit = format!("{reason:?} pc={}", tracing.pvm.pc);
     let steps = tracing.num_steps();
@@ -7800,15 +7808,15 @@ fn clerk_ledger_two_bank_federation() {
 
     // ── Load ELFs ───────────────────────────────────────────────
     let registry_path = format!(
-        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        "{}/../actors/space-registry/target/riscv64em-vos/release/space_registry.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let bridge_path = format!(
-        "{}/../actors/space-bridge/target/riscv64em-javm/release/space_bridge.elf",
+        "{}/../actors/space-bridge/target/riscv64em-vos/release/space_bridge.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let ledger_path = format!(
-        "{}/../actors/clerk-ledger/target/riscv64em-javm/release/clerk_ledger.elf",
+        "{}/../actors/clerk-ledger/target/riscv64em-vos/release/clerk_ledger.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let registry_elf = match std::fs::read(&registry_path) {
@@ -7833,7 +7841,7 @@ fn clerk_ledger_two_bank_federation() {
         }
     };
     let clerk_bridge_path = format!(
-        "{}/../actors/clerk-bridge/target/riscv64em-javm/release/clerk_bridge.elf",
+        "{}/../actors/clerk-bridge/target/riscv64em-vos/release/clerk_bridge.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let clerk_bridge_elf = match std::fs::read(&clerk_bridge_path) {
@@ -7843,11 +7851,11 @@ fn clerk_ledger_two_bank_federation() {
             return;
         }
     };
-    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile registry");
-    let bridge_blob = grey_transpiler::link_elf(&bridge_elf).expect("transpile bridge");
-    let ledger_blob = grey_transpiler::link_elf(&ledger_elf).expect("transpile clerk-ledger");
+    let registry_blob = vos_pvm_compiler::link_elf(&registry_elf).expect("transpile registry");
+    let bridge_blob = vos_pvm_compiler::link_elf(&bridge_elf).expect("transpile bridge");
+    let ledger_blob = vos_pvm_compiler::link_elf(&ledger_elf).expect("transpile clerk-ledger");
     let clerk_bridge_blob =
-        grey_transpiler::link_elf(&clerk_bridge_elf).expect("transpile clerk-bridge");
+        vos_pvm_compiler::link_elf(&clerk_bridge_elf).expect("transpile clerk-bridge");
 
     // Each test invocation gets isolated redb directories so two
     // CRDT-persisted REGISTRY replicas don't fight over a shared file.
@@ -9379,7 +9387,7 @@ fn clerk_ledger_two_bank_federation() {
     // voucher-proof/v0-placeholder" || public_bytes). Cryptographic
     // zk verification is gated on the prove path being unblocked
     // (zkpvm task #7); once it is, the placeholder swap to
-    // `zkpvm_verifier::verify_standalone` is a single-function
+    // `vos_pvm_proof_verifier::verify_standalone` is a single-function
     // change. The WIRE shape this section pins is invariant.
     //
     // In-bridge verification (clerk-bridge.submit_voucher dispatching
@@ -9495,7 +9503,7 @@ fn clerk_ledger_two_bank_federation() {
     // Status::ProofInvalid.
     //
     // Why a host extension rather than in-actor verification:
-    // zkpvm-verifier can't build for riscv64em-javm today (task
+    // zkpvm-verifier can't build for riscv64em-vos today (task
     // #1 spike). The prover runs natively as a `.so` and the
     // bridge dispatches via `ctx.ask`; same trust boundary in
     // effect — the actor still decides whether to accept.
@@ -10072,11 +10080,11 @@ fn raft_clerk_ledger_operator_gate_under_leader_forward() {
 
     // ── Load ELFs ───────────────────────────────────────────────
     let ledger_path = format!(
-        "{}/../actors/clerk-ledger/target/riscv64em-javm/release/clerk_ledger.elf",
+        "{}/../actors/clerk-ledger/target/riscv64em-vos/release/clerk_ledger.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let registry_path = format!(
-        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        "{}/../actors/space-registry/target/riscv64em-vos/release/space_registry.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let ledger_elf = match std::fs::read(&ledger_path) {
@@ -10093,8 +10101,9 @@ fn raft_clerk_ledger_operator_gate_under_leader_forward() {
             return;
         }
     };
-    let ledger_blob = grey_transpiler::link_elf(&ledger_elf).expect("transpile clerk-ledger");
-    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile space-registry");
+    let ledger_blob = vos_pvm_compiler::link_elf(&ledger_elf).expect("transpile clerk-ledger");
+    let registry_blob =
+        vos_pvm_compiler::link_elf(&registry_elf).expect("transpile space-registry");
 
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -10537,11 +10546,11 @@ fn raft_clerk_settle_bilateral_settlement() {
 
     // ── Load ELFs ───────────────────────────────────────────────
     let settle_path = format!(
-        "{}/../actors/clerk-settle/target/riscv64em-javm/release/clerk_settle.elf",
+        "{}/../actors/clerk-settle/target/riscv64em-vos/release/clerk_settle.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let registry_path = format!(
-        "{}/../actors/space-registry/target/riscv64em-javm/release/space_registry.elf",
+        "{}/../actors/space-registry/target/riscv64em-vos/release/space_registry.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let settle_elf = match std::fs::read(&settle_path) {
@@ -10558,8 +10567,9 @@ fn raft_clerk_settle_bilateral_settlement() {
             return;
         }
     };
-    let settle_blob = grey_transpiler::link_elf(&settle_elf).expect("transpile clerk-settle");
-    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile space-registry");
+    let settle_blob = vos_pvm_compiler::link_elf(&settle_elf).expect("transpile clerk-settle");
+    let registry_blob =
+        vos_pvm_compiler::link_elf(&registry_elf).expect("transpile space-registry");
 
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -10936,7 +10946,7 @@ fn multi_node_three_space_settlement_capstone() {
     // ── Load ELFs ───────────────────────────────────────────────
     let mk_path = |crate_dir: &str, elf: &str| {
         format!(
-            "{}/../actors/{crate_dir}/target/riscv64em-javm/release/{elf}",
+            "{}/../actors/{crate_dir}/target/riscv64em-vos/release/{elf}",
             env!("CARGO_MANIFEST_DIR"),
         )
     };
@@ -10959,9 +10969,10 @@ fn multi_node_three_space_settlement_capstone() {
     ) else {
         return;
     };
-    let settle_blob = grey_transpiler::link_elf(&settle_elf).expect("transpile clerk-settle");
-    let bridge_blob = grey_transpiler::link_elf(&bridge_elf).expect("transpile clerk-bridge");
-    let registry_blob = grey_transpiler::link_elf(&registry_elf).expect("transpile space-registry");
+    let settle_blob = vos_pvm_compiler::link_elf(&settle_elf).expect("transpile clerk-settle");
+    let bridge_blob = vos_pvm_compiler::link_elf(&bridge_elf).expect("transpile clerk-bridge");
+    let registry_blob =
+        vos_pvm_compiler::link_elf(&registry_elf).expect("transpile space-registry");
 
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -11707,7 +11718,7 @@ fn replay_reabsorbs_task_effects() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let sched_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let sched_elf = match std::fs::read(&sched_path) {
@@ -11802,7 +11813,7 @@ fn task_storage_reads_come_from_the_witness() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let sched_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let sched_elf = match std::fs::read(&sched_path) {
@@ -11909,7 +11920,7 @@ fn provable_task_captures_a_durable_re_traceable_record() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let sched_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let sched_elf = match std::fs::read(&sched_path) {
@@ -11978,7 +11989,8 @@ fn provable_task_captures_a_durable_re_traceable_record() {
     // The stored witness bytes re-trace to the record's bound io-hash —
     // the producer can later prove exactly this transition, offline.
     let (mut interp, mut img) =
-        zkpvm::actor::interpreter_from_blob(&tally_blob, 100_000_000).expect("parse tally blob");
+        vos_pvm_proof::actor::interpreter_from_blob(&tally_blob, 100_000_000)
+            .expect("parse tally blob");
     let w = &entry.input.witness_bytes;
     let (start, end) = (witness_addr as usize, witness_addr as usize + w.len());
     img[start..end].copy_from_slice(w);
@@ -11990,7 +12002,7 @@ fn provable_task_captures_a_durable_re_traceable_record() {
             )
             .expect("witness write is in bounds");
     }
-    let mut tracing = zkpvm::core::tracing::TracingPvm::new(interp);
+    let mut tracing = vos_pvm_proof::core::tracing::TracingPvm::new(interp);
     let exit = format!("{:?}", tracing.run_with_vos_stubs());
     assert!(exit == "Halt", "the re-trace must halt cleanly, got {exit}");
     let mut io = [0u8; 32];
@@ -12104,7 +12116,7 @@ fn provable_capture_rejects_the_complete_replicated_dispatch() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let sched_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let sched_elf = match std::fs::read(&sched_path) {
@@ -12202,7 +12214,7 @@ fn provable_record_flag_never_reaches_a_peer_invoke() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let sched_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let sched_elf = match std::fs::read(&sched_path) {
@@ -12258,7 +12270,7 @@ fn capture_rooted_record() -> Option<(vos::provable::ProofRecordEntry, Vec<u8>, 
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let sched_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let sched_elf = match std::fs::read(&sched_path) {
@@ -12577,7 +12589,7 @@ fn clerk_apply_elf_path() -> std::path::PathBuf {
         return std::path::PathBuf::from(p);
     }
     std::path::PathBuf::from(format!(
-        "{}/../tests/fixtures/provable/clerk-apply/target/vosx-canonical/riscv64em-javm/release/clerk-apply.elf",
+        "{}/../tests/fixtures/provable/clerk-apply/target/vosx-canonical/riscv64em-vos/release/clerk-apply.elf",
         env!("CARGO_MANIFEST_DIR"),
     ))
 }
@@ -12685,7 +12697,7 @@ fn clerk_apply_task_captures_a_conservation_record() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let sched_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let sched_elf = match std::fs::read(&sched_path) {
@@ -12807,7 +12819,7 @@ fn clerk_apply_task_captures_a_conservation_record() {
     // LIVE ≡ TRACED: the stored witness re-traces (the prover's path) to
     // the SAME io-hash the live invoke captured — so a proof of this
     // record will carry exactly this binding, exercised end to end.
-    let (mut interp, _) = zkpvm::actor::interpreter_from_blob(&clerk_blob, 500_000_000)
+    let (mut interp, _) = vos_pvm_proof::actor::interpreter_from_blob(&clerk_blob, 500_000_000)
         .expect("parse clerk-apply blob");
     let w = &entry.input.witness_bytes;
     let witness_addr = u32::try_from(witness_addr).expect("witness address fits the PVM address");
@@ -12816,7 +12828,7 @@ fn clerk_apply_task_captures_a_conservation_record() {
             .write_u8(witness_addr + offset as u32, byte)
             .expect("write witness into clerk-apply memory");
     }
-    let mut tracing = zkpvm::core::tracing::TracingPvm::new(interp);
+    let mut tracing = vos_pvm_proof::core::tracing::TracingPvm::new(interp);
     let exit = format!("{:?}", tracing.run_with_vos_stubs());
     assert_eq!(exit, "Halt", "clean canonical halt");
     assert!(
@@ -12880,7 +12892,7 @@ fn task_invoke_live_equals_traced() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let sched_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let sched_elf = match std::fs::read(&sched_path) {
@@ -12960,7 +12972,8 @@ fn task_invoke_live_equals_traced() {
         .task_initial_image(&task_hash, &[], &add_msg, &[])
         .expect("live task image");
     let (mut interp, mut traced_img) =
-        zkpvm::actor::interpreter_from_blob(&tally_blob, 100_000_000).expect("parse tally blob");
+        vos_pvm_proof::actor::interpreter_from_blob(&tally_blob, 100_000_000)
+            .expect("parse tally blob");
     let (start, end) = (witness_addr as usize, witness_addr as usize + input.len());
     traced_img[start..end].copy_from_slice(&input);
     for (offset, byte) in input.iter().copied().enumerate() {
@@ -12978,9 +12991,9 @@ fn task_invoke_live_equals_traced() {
         "live and traced initial images must be byte-identical"
     );
 
-    let mut tracing = zkpvm::core::tracing::TracingPvm::new(interp);
-    // zkpvm pins its own javm rev, so its ExitReason is a different
-    // type than vos's javm — compare the Debug form; the decodable current
+    let mut tracing = vos_pvm_proof::core::tracing::TracingPvm::new(interp);
+    // zkpvm pins its own vos_pvm rev, so its ExitReason is a different
+    // type than vos's vos_pvm — compare the Debug form; the decodable current
     // payload below is the real halt proof.
     let exit = format!("{:?}", tracing.run_with_vos_stubs());
     assert!(exit == "Halt", "traced task must halt cleanly, got {exit}");
@@ -13043,7 +13056,7 @@ fn task_suspension_resumes_through_task_record() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let sched_path = format!(
-        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-javm/release/scheduler.elf",
+        "{}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf",
         workspace
     );
     let sched_elf = match std::fs::read(&sched_path) {
@@ -13164,10 +13177,14 @@ fn voucher_check_chain_anchor_path() {
     // image_root` over the entering image equals segment 0's proved
     // `initial_state.memory_root` by construction (the value an anchored manifest
     // carries), so an anchored-manifest producer computes it exactly this way.
-    let entering_root = zkpvm::page_merkle::image_root(
-        &zkpvm::actor::trace_blob_with_patches(&blob, VC_TRACE_GAS, &[(addr, &witness_buf)])
-            .expect("trace the entering image")
-            .initial_memory,
+    let entering_root = vos_pvm_proof::page_merkle::image_root(
+        &vos_pvm_proof::actor::trace_blob_with_patches(
+            &blob,
+            VC_TRACE_GAS,
+            &[(addr, &witness_buf)],
+        )
+        .expect("trace the entering image")
+        .initial_memory,
     );
 
     // Honest chain + CORRECT entering root: verifies (allowlist + continuity +
@@ -13299,7 +13316,7 @@ fn storage_map_outgrows_guest_heap() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/big-map/target/riscv64em-javm/release/big_map.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/big-map/target/riscv64em-vos/release/big_map.elf",
         workspace,
     );
     let data = match std::fs::read(&path) {
@@ -13309,7 +13326,7 @@ fn storage_map_outgrows_guest_heap() {
             return;
         }
     };
-    let blob = grey_transpiler::link_elf(&data).expect("transpile big-map");
+    let blob = vos_pvm_compiler::link_elf(&data).expect("transpile big-map");
 
     let mut node = VosNode::new();
     let id = node.register(AgentConfig::new(blob));
@@ -13395,7 +13412,7 @@ fn clerk_ledger_capstone_ten_thousand_accounts() {
     const BATCH: usize = 8; // sized to the 4 KiB message cap
 
     let path = format!(
-        "{}/../actors/clerk-ledger/target/riscv64em-javm/release/clerk_ledger.elf",
+        "{}/../actors/clerk-ledger/target/riscv64em-vos/release/clerk_ledger.elf",
         env!("CARGO_MANIFEST_DIR"),
     );
     let elf = match std::fs::read(&path) {
@@ -13405,7 +13422,7 @@ fn clerk_ledger_capstone_ten_thousand_accounts() {
             return;
         }
     };
-    let blob = grey_transpiler::link_elf(&elf).expect("transpile clerk-ledger");
+    let blob = vos_pvm_compiler::link_elf(&elf).expect("transpile clerk-ledger");
 
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -13601,7 +13618,7 @@ fn committed_map_anchors_with_smt_roots() {
 
     let workspace = env!("CARGO_MANIFEST_DIR");
     let path = format!(
-        "{}/../tests/fixtures/legacy-v1/actors/committed-counter/target/riscv64em-javm/release/committed_counter.elf",
+        "{}/../tests/fixtures/legacy-v1/actors/committed-counter/target/riscv64em-vos/release/committed_counter.elf",
         workspace,
     );
     let data = match std::fs::read(&path) {
@@ -13611,7 +13628,7 @@ fn committed_map_anchors_with_smt_roots() {
             return;
         }
     };
-    let blob = grey_transpiler::link_elf(&data).expect("transpile committed-counter");
+    let blob = vos_pvm_compiler::link_elf(&data).expect("transpile committed-counter");
 
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -7,7 +7,7 @@
 //! destination aliased its base operand. Driven by
 //! `pushy_vec_push_grows_correctly` in
 //! `crates/vos/tests/elf_integration.rs`; fix lives in
-//! `jar/grey/crates/javm/src/recompiler/codegen.rs::update_reg_defs`.
+//! `jar/grey/crates/vos_pvm/src/recompiler/codegen.rs::update_reg_defs`.
 
 use vos::prelude::*;
 

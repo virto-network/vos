@@ -1,0 +1,17 @@
+[package]
+name = "vos-pvm-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SCALE codec without compact encoding. Fixed-width LE integers, u32 count-prefixed arrays."
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+thiserror = "2"
+scale-derive = { package = "vos-pvm-codec-derive", path = "../codec-derive" }
+
+[dev-dependencies]
+proptest = "1"

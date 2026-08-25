@@ -10,22 +10,22 @@ version = "0.1.0"
 # plus the per-space directory and the chronos randomness beacon (raft).
 [[agent]]
 name = "msg-general-log"
-path = "../../../actors/msg-log/target/riscv64em-javm/release/msg_log.elf"
+path = "../../../actors/msg-log/target/riscv64em-vos/release/msg_log.elf"
 consistency = "crdt"
 
 [[agent]]
 name = "msg-general-ctl"
-path = "../../../actors/msg-ctl/target/riscv64em-javm/release/msg_ctl.elf"
+path = "../../../actors/msg-ctl/target/riscv64em-vos/release/msg_ctl.elf"
 consistency = "raft"
 
 [[agent]]
 name = "msg-directory"
-path = "../../../actors/msg-directory/target/riscv64em-javm/release/msg_directory.elf"
+path = "../../../actors/msg-directory/target/riscv64em-vos/release/msg_directory.elf"
 consistency = "raft"
 
 [[agent]]
 name = "chronos"
-path = "../../../actors/chronos/target/riscv64em-javm/release/chronos.elf"
+path = "../../../actors/chronos/target/riscv64em-vos/release/chronos.elf"
 consistency = "raft"
 
 # The messenger is a device-local PVM agent: it holds this node's private MLS
@@ -34,7 +34,7 @@ consistency = "raft"
 # (admin — `messenger create` installs a channel's agent pair).
 [[agent]]
 name = "messenger"
-path = "../../../actors/messenger/target/riscv64em-javm/release/messenger.elf"
+path = "../../../actors/messenger/target/riscv64em-vos/release/messenger.elf"
 consistency = "local"
 device_secret = true
 tick_ms = 500

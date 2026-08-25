@@ -568,7 +568,7 @@ mod tests {
     }
 
     fn package() -> VosPackageV2 {
-        let pvm = grey_transpiler::assembler::Assembler::new().build();
+        let pvm = vos_pvm_compiler::assembler::Assembler::new().build();
         let interfaces = b"interface".to_vec();
         let (schemas, policies) = schema_and_policies();
         VosPackageV2 {
@@ -614,7 +614,7 @@ mod tests {
     #[test]
     fn task_dependencies_are_signed_canonical_package_content() {
         let mut package = package();
-        let task_pvm = grey_transpiler::assembler::Assembler::new().build();
+        let task_pvm = vos_pvm_compiler::assembler::Assembler::new().build();
         let binding = TaskDependencyV2 {
             task: Hash(crate::provable::task_blob_hash(&task_pvm)),
             program: ProgramId::of_pvm(&task_pvm),

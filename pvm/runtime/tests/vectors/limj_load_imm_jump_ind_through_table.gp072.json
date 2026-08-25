@@ -1,0 +1,57 @@
+{
+  "backends": [
+    "interpreter",
+    "recompiler"
+  ],
+  "expected": {
+    "gas": 97,
+    "memory": [],
+    "pc": 8,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x37",
+      "0x2",
+      "0x0",
+      "0x1",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ],
+    "status": "trap"
+  },
+  "family": "limj",
+  "initial": {
+    "gas": 100,
+    "memory": [],
+    "page_map": [],
+    "pc": 0,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x2",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "limj_load_imm_jump_ind_through_table",
+  "program": {
+    "bitmask": "0x3101",
+    "code": "0xb43201370033050100",
+    "jump_table": [
+      5
+    ]
+  }
+}

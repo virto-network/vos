@@ -85,11 +85,11 @@
 use crate::abi::error;
 use crate::abi::hostcall;
 use crate::abi::service::ServiceId;
-use javm::kernel::{InvocationKernel, KernelResult};
-use javm::snapshot::KernelSnapshot;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use tracing::error;
+use vos_pvm::kernel::{InvocationKernel, KernelResult};
+use vos_pvm::snapshot::KernelSnapshot;
 
 use crate::data_layer::{DataLayer, MemoryDataLayer};
 use crate::refine_payload::{Effect, RefinePayload};
@@ -209,7 +209,7 @@ fn mint_boot_context(svc_id: u32) -> [u8; BOOT_CONTEXT_LEN] {
 /// JAVM owns the JAM-reserved protocol range 1..=28; VOS capabilities live in
 /// explicitly supplied high slots and are never mistaken for JAM host ABI.
 ///
-/// Slot layout (`zkpvm/src/core/ecall.rs` is the source of truth):
+/// Slot layout (`pvm/proof/src/core/ecall.rs` is the source of truth):
 ///
 ///   100 = blake2b_compress
 ///   110 = ristretto_scalar_mult
@@ -228,9 +228,9 @@ fn mint_boot_context(svc_id: u32) -> [u8; BOOT_CONTEXT_LEN] {
 /// kernel before its first run. An exact restore reconstructs the captured
 /// capability table and must not reinstall or renumber these slots.
 fn install_vos_runtime_caps(kernel: &mut InvocationKernel) {
-    use javm::cap::{Cap, ProtocolCap};
-    // Source-of-truth IDs live in `zkpvm::core::ecall`, mirrored on
-    // the guest side in `zkpvm::precompiles::ecalls`. We import
+    use vos_pvm::cap::{Cap, ProtocolCap};
+    // Source-of-truth IDs live in `vos_pvm_proof::core::ecall`, mirrored on
+    // the guest side in `vos_pvm_proof::precompiles::ecalls`. We import
     // blake2b from `vos::crypto` (it's the only one with a host-side
     // handler today); ristretto IDs are hardcoded here until vos
     // grows its own handler — the install is a no-op for slots
@@ -264,9 +264,9 @@ fn install_vos_runtime_caps(kernel: &mut InvocationKernel) {
 /// otherwise so the caller falls through to its own dispatch.
 ///
 /// EXECUTION PARITY — live ≡ honestly traced. The prover's tracer
-/// (`zkpvm::core::tracing::TracingPvm::step_with_vos_stubs`) executes the
+/// (`vos_pvm_proof::core::tracing::TracingPvm::step_with_vos_stubs`) executes the
 /// identical curve arithmetic through the same `curve25519-dalek`
-/// reference (`zkpvm_precompiles`'s host fallback is byte-for-byte the
+/// reference (`vos_pvm_precompiles`'s host fallback is byte-for-byte the
 /// tracer's `*_sw` functions). This is not proof soundness: the current AIR
 /// records the observed inputs and outputs without constraining the curve/
 /// scalar relation. Recorded Tasks therefore reject these calls, and the
@@ -286,7 +286,7 @@ fn install_vos_runtime_caps(kernel: &mut InvocationKernel) {
 /// fail-closed for live execution; recorded Tasks do not reach this path.
 #[cfg(feature = "std")]
 fn handle_precompile_ecall(k: &mut InvocationKernel, call_id: u32) -> bool {
-    use zkpvm_precompiles::{
+    use vos_pvm_precompiles::{
         ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT, ECALL_SCALAR_ADD_MOD_L,
         ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L, ristretto_point_add,
         ristretto_scalar_mult, scalar_add_mod_l, scalar_from_bytes_mod_order_wide,
@@ -338,7 +338,7 @@ fn handle_precompile_ecall(k: &mut InvocationKernel, call_id: u32) -> bool {
 
 #[cfg(feature = "std")]
 fn is_unconstrained_crypto_precompile(call_id: u32) -> bool {
-    use zkpvm_precompiles::{
+    use vos_pvm_precompiles::{
         ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT, ECALL_SCALAR_ADD_MOD_L,
         ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
     };
@@ -732,7 +732,7 @@ pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     pub data: D,
     /// JIT compile cache — avoids re-compiling the same PVM blob on
     /// every child invocation.
-    code_cache: javm::CodeCache,
+    code_cache: vos_pvm::CodeCache,
     /// Optional handler for INVOKE targets not in this runtime.
     external_invoke: Option<ExternalInvokeFn>,
     /// Side-channel mode for the current dispatch.
@@ -814,7 +814,7 @@ impl<D: DataLayer> VosRuntime<D> {
             work_result_rejects: 0,
             gas,
             data,
-            code_cache: javm::CodeCache::new(),
+            code_cache: vos_pvm::CodeCache::new(),
             external_invoke: None,
             effect_mode: crate::effect_log::EffectMode::Inactive,
             last_reply: HashMap::new(),
@@ -1160,7 +1160,7 @@ impl<D: DataLayer> VosRuntime<D> {
                     let mut kernel = match InvocationKernel::restore(
                         blob,
                         &snapshot,
-                        javm::PvmBackend::Default,
+                        vos_pvm::PvmBackend::Default,
                         Some(&mut self.code_cache),
                     ) {
                         Ok(k) => k,
@@ -1204,7 +1204,7 @@ impl<D: DataLayer> VosRuntime<D> {
                     let _ = kernel
                         .vm_arena
                         .vm_mut(0)
-                        .transition(javm::vm_pool::VmState::Running);
+                        .transition(vos_pvm::vm_pool::VmState::Running);
                 }
 
                 // Stage FETCH items (raw transfers become one item each).
@@ -1539,7 +1539,7 @@ fn run_refine_kernel(
     task_witness: &HashMap<[u8; 32], (u32, u32)>,
     services: &HashMap<u32, ServiceInfo>,
     mode: &mut crate::effect_log::EffectMode,
-    code_cache: &mut javm::CodeCache,
+    code_cache: &mut vos_pvm::CodeCache,
     next_id: &mut u32,
     external_invoke: &Option<ExternalInvokeFn>,
 ) -> RefineKernelExit {
@@ -1593,7 +1593,7 @@ fn run_refine_kernel(
                 *kernel = match InvocationKernel::restore(
                     canonical_blob,
                     &snapshot,
-                    javm::PvmBackend::Default,
+                    vos_pvm::PvmBackend::Default,
                     Some(code_cache),
                 ) {
                     Ok(kernel) => kernel,
@@ -1652,7 +1652,7 @@ fn handle_refine_hostcall(
     blob_by_hash: &HashMap<[u8; 32], usize>,
     task_witness: &HashMap<[u8; 32], (u32, u32)>,
     services: &HashMap<u32, ServiceInfo>,
-    code_cache: &mut javm::CodeCache,
+    code_cache: &mut vos_pvm::CodeCache,
     depth: usize,
     next_id: &mut u32,
     external_invoke: &Option<ExternalInvokeFn>,
@@ -2014,7 +2014,7 @@ pub(crate) fn build_task_kernel(
     witness_addr: u32,
     input: &[u8],
     gas: Gas,
-    code_cache: &mut javm::CodeCache,
+    code_cache: &mut vos_pvm::CodeCache,
 ) -> Option<InvocationKernel> {
     build_task_kernel_with_backend(
         blob,
@@ -2022,7 +2022,7 @@ pub(crate) fn build_task_kernel(
         input,
         gas,
         code_cache,
-        javm::PvmBackend::Default,
+        vos_pvm::PvmBackend::Default,
     )
 }
 
@@ -2031,10 +2031,10 @@ pub(crate) fn build_task_kernel_with_backend(
     witness_addr: u32,
     input: &[u8],
     gas: Gas,
-    code_cache: &mut javm::CodeCache,
-    backend: javm::PvmBackend,
+    code_cache: &mut vos_pvm::CodeCache,
+    backend: vos_pvm::PvmBackend,
 ) -> Option<InvocationKernel> {
-    let mut child = if backend == javm::PvmBackend::Default {
+    let mut child = if backend == vos_pvm::PvmBackend::Default {
         InvocationKernel::new_cached(blob, &[], gas, code_cache).ok()?
     } else {
         InvocationKernel::new_with_backend(blob, &[], gas, backend).ok()?
@@ -2044,7 +2044,7 @@ pub(crate) fn build_task_kernel_with_backend(
     child
         .vm_arena
         .vm_mut(0)
-        .transition(javm::vm_pool::VmState::Running)
+        .transition(vos_pvm::vm_pool::VmState::Running)
         .ok()?;
     if !input.is_empty() && !child.write_data_cap_window(witness_addr, input) {
         return None;
@@ -2156,7 +2156,7 @@ fn run_task_invoke(
     record_tag: Option<&[u8; 32]>,
     gas: Gas,
     journal: &mut RefineJournal,
-    code_cache: &mut javm::CodeCache,
+    code_cache: &mut vos_pvm::CodeCache,
     output_ptr: u32,
     output_buf_len: usize,
     depth: usize,
@@ -2386,7 +2386,7 @@ fn handle_invoke(
     services: &HashMap<u32, ServiceInfo>,
     storage: &mut ServiceStorage,
     preimages: &HashMap<[u8; 32], Vec<u8>>,
-    code_cache: &mut javm::CodeCache,
+    code_cache: &mut vos_pvm::CodeCache,
     journal: &mut RefineJournal,
     depth: usize,
     next_id: &mut u32,
@@ -2679,7 +2679,7 @@ fn handle_invoke(
     let _ = child
         .vm_arena
         .vm_mut(0)
-        .transition(javm::vm_pool::VmState::Running);
+        .transition(vos_pvm::vm_pool::VmState::Running);
 
     // Delimit this child invoke's journal contributions — the state
     // delivery below, the child's own hostcall writes, and anything a
@@ -2898,7 +2898,7 @@ enum ContinuationError {
     MissingBody,
     LengthMismatch,
     CommitmentMismatch,
-    InvalidSnapshot(javm::snapshot::SnapshotError),
+    InvalidSnapshot(vos_pvm::snapshot::SnapshotError),
 }
 
 impl core::fmt::Display for ContinuationError {
@@ -3005,8 +3005,8 @@ mod tests {
 
     #[test]
     fn task_kernel_creation_requires_exact_witness_injection() {
-        let blob = grey_transpiler::assembler::Assembler::new().build();
-        let mut cache = javm::CodeCache::new();
+        let blob = vos_pvm_compiler::assembler::Assembler::new().build();
+        let mut cache = vos_pvm::CodeCache::new();
         assert!(
             build_task_kernel_with_backend(
                 &blob,
@@ -3014,7 +3014,7 @@ mod tests {
                 b"private witness",
                 1_000_000,
                 &mut cache,
-                javm::PvmBackend::ForceInterpreter,
+                vos_pvm::PvmBackend::ForceInterpreter,
             )
             .is_none(),
             "an unmapped witness window must never yield a runnable Task",
@@ -3023,7 +3023,7 @@ mod tests {
 
     #[test]
     fn recorded_tasks_classify_every_unconstrained_crypto_precompile() {
-        use zkpvm_precompiles::{
+        use vos_pvm_precompiles::{
             ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT, ECALL_SCALAR_ADD_MOD_L,
             ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
         };
@@ -3056,7 +3056,7 @@ mod tests {
     }
 
     fn exact_resume_blob() -> Vec<u8> {
-        use grey_transpiler::assembler::{Assembler, Reg};
+        use vos_pvm_compiler::assembler::{Assembler, Reg};
 
         let mut asm = Assembler::new();
         // This register and stack write model code and a stack local before
@@ -3071,8 +3071,8 @@ mod tests {
         asm.build()
     }
 
-    fn snapshot_exact_resume(blob: &[u8], backend: javm::PvmBackend) -> KernelSnapshot {
-        use grey_transpiler::assembler::Reg;
+    fn snapshot_exact_resume(blob: &[u8], backend: vos_pvm::PvmBackend) -> KernelSnapshot {
+        use vos_pvm_compiler::assembler::Reg;
 
         let mut kernel = InvocationKernel::new_with_backend(blob, &[], DEFAULT_GAS, backend)
             .expect("test kernel initializes");
@@ -3080,7 +3080,7 @@ mod tests {
         kernel
             .vm_arena
             .vm_mut(0)
-            .transition(javm::vm_pool::VmState::Running)
+            .transition(vos_pvm::vm_pool::VmState::Running)
             .expect("root VM starts");
         assert!(matches!(
             kernel.run(),
@@ -3096,8 +3096,8 @@ mod tests {
 
     #[test]
     fn persisted_continuation_resumes_exact_pc_register_and_stack() {
-        use grey_transpiler::assembler::Reg;
-        use javm::PvmBackend;
+        use vos_pvm::PvmBackend;
+        use vos_pvm_compiler::assembler::Reg;
 
         let blob = exact_resume_blob();
         let snapshot = snapshot_exact_resume(&blob, PvmBackend::ForceInterpreter);
@@ -3140,7 +3140,7 @@ mod tests {
 
     #[test]
     fn continuation_load_rejects_unavailable_tampered_and_legacy_bodies() {
-        use javm::PvmBackend;
+        use vos_pvm::PvmBackend;
 
         let blob = exact_resume_blob();
         let snapshot = snapshot_exact_resume(&blob, PvmBackend::ForceInterpreter);

@@ -581,7 +581,7 @@ impl Drop for TestProductionTrustSidecar {
 
 fn counter_package_fixture(output_dir: &Path) -> PathBuf {
     let actor_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../examples/actors/target/riscv64em-javm/release/v2_counter.elf");
+        .join("../examples/actors/target/riscv64em-vos/release/v2_counter.elf");
     assert!(
         actor_elf.is_file(),
         "build the public counter first: `just build-examples` ({})",
@@ -612,7 +612,7 @@ fn counter_package_fixture(output_dir: &Path) -> PathBuf {
 
 fn crdt_counter_package_fixture(output_dir: &Path) -> PathBuf {
     let actor_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-        "../tests/fixtures/v2/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter_v2.elf",
+        "../tests/fixtures/v2/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter_v2.elf",
     );
     assert!(
         actor_elf.is_file(),
@@ -648,7 +648,7 @@ fn authority_upgrade_package_fixture(
     output_dir: &Path,
 ) -> PathBuf {
     let actor_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../actors/space-authority/target/riscv64em-javm/release/space_authority.elf");
+        .join("../actors/space-authority/target/riscv64em-vos/release/space_authority.elf");
     assert!(
         actor_elf.is_file(),
         "build the authority candidate first: `just build-authority-upgrade-candidate` ({})",
@@ -974,7 +974,7 @@ fn signed_v2_package_runs_and_reopens_through_the_space_daemon() {
     let dist = TempDir::new("v2-root-dist");
     let upgrade_dist = TempDir::new("v2-root-upgrade-dist");
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    let actor_elf = workspace.join("examples/actors/target/riscv64em-javm/release/v2_counter.elf");
+    let actor_elf = workspace.join("examples/actors/target/riscv64em-vos/release/v2_counter.elf");
     let committed_service_pvm = workspace.join("services/vos-service/vos-service.pvm");
     assert!(
         actor_elf.is_file(),
@@ -2934,8 +2934,9 @@ fn boot_admin_with_service(
         service_pvm,
     ));
     wait_for_endpoint(data_a.path(), &log_a, "A");
-    let counter_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../tests/fixtures/v2/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter_v2.elf");
+    let counter_elf = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../tests/fixtures/v2/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter_v2.elf",
+    );
     assert!(
         counter_elf.is_file(),
         "build the onboarding CRDT fixture first: `just build-v2-registry-fixtures`",

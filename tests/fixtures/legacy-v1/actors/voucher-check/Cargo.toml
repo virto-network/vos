@@ -8,7 +8,7 @@ edition = "2024"
 [features]
 # `bin` gates the PVM entry-point block (`_start` + `accumulate`)
 # emitted by `#[actor]`. Default-on so a plain `cargo build` for
-# the riscv64em-javm target produces a non-empty ELF; turn off via
+# the riscv64em-vos target produces a non-empty ELF; turn off via
 # `default-features = false` when depending on this crate purely
 # as a typed Ref source (no symbols).
 default = ["bin"]
@@ -19,7 +19,7 @@ level = "allow"
 check-cfg = ['cfg(feature, values("pvm", "service", "extension", "wasm"))']
 
 # Mode::External voucher proof — the PVM guest binary whose execution
-# IS the zkpvm-proved witness for cipher_clerk::voucher::proof::check.
+# IS the vos-pvm-proof-proved witness for cipher_clerk::voucher::proof::check.
 #
 # Two ways the prover invokes this binary:
 #

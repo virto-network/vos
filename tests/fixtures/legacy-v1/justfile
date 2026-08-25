@@ -1,6 +1,6 @@
 # Per-actor PVM builds. Each actor's `.cargo/config.toml`
 # defines `cargo actor` as `cargo build -Zbuild-std=core,alloc,compiler_builtins
-# --release --target riscv64em-javm.json`. Plain `cargo build`
+# --release --target riscv64em-vos.json`. Plain `cargo build`
 # can't substitute — actors only declare their `vos` dep
 # under `[target.'cfg(target_arch = "riscv64")']`, so a host
 # build sees no vos and the imports fail.

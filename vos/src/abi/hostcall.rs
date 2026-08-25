@@ -2,7 +2,7 @@
 //!
 //! IDs match the canonical slot numbers in `spec/Jar/JAVM/Capability.lean`
 //! (`protocolGas = 1`, `protocolFetch = 2`, ... `protocolQuota = 28`).
-//! When a guest executes `ecalli N` the javm kernel looks up cap slot `N`
+//! When a guest executes `ecalli N` the vos_pvm kernel looks up cap slot `N`
 //! in the active VM's cap table; for slots 1..=28 the kernel pre-populates
 //! `Cap::Protocol(ProtocolCap { id: N })` which exits to the host as
 //! `KernelResult::ProtocolCall { slot: N }`. The host is responsible for
@@ -57,7 +57,7 @@ pub const QUOTA: u32 = 28;
 // These share the program-cap range the blake2b/ristretto precompiles squat
 // (`vos::crypto` IDs 100/110..=114). The host installs a cap for each slot so a
 // guest `ecalli N` resolves to a `ProtocolCall { slot: N }` the runtime handles
-// rather than `RESULT_WHAT`. All fit javm's `imm <= 127` budget.
+// rather than `RESULT_WHAT`. All fit vos_pvm's `imm <= 127` budget.
 
 /// Declare that the current actor dispatch is about to retain a
 /// producer-private provable Task input in its serialized state.
@@ -191,9 +191,12 @@ mod tests {
 
     #[test]
     fn proof_tracer_uses_the_same_scheduler_capability_ids() {
-        assert_eq!(GROW_HEAP, zkpvm::core::ecall::ECALL_VOS_GROW_HEAP);
-        assert_eq!(DEBUG_WRITE, zkpvm::core::ecall::ECALL_VOS_DEBUG_WRITE);
-        assert_eq!(INVOKE, zkpvm::core::ecall::ECALL_VOS_INVOKE);
+        assert_eq!(GROW_HEAP, vos_pvm_proof::core::ecall::ECALL_VOS_GROW_HEAP);
+        assert_eq!(
+            DEBUG_WRITE,
+            vos_pvm_proof::core::ecall::ECALL_VOS_DEBUG_WRITE
+        );
+        assert_eq!(INVOKE, vos_pvm_proof::core::ecall::ECALL_VOS_INVOKE);
     }
 
     #[test]

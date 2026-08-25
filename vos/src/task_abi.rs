@@ -3,7 +3,7 @@
 //! A Task invocation delivers `(state, msg)` by patching the child's
 //! initial memory image at its witness-buffer address — the same
 //! `__VOS_WITNESS` channel the prover's tracer patches
-//! (`zkpvm::actor::trace_blob_with_patches`), and the same shape as a
+//! (`vos_pvm_proof::actor::trace_blob_with_patches`), and the same shape as a
 //! JAM work-package payload. The live invocation and a traced
 //! re-execution therefore start from byte-identical images: proving a
 //! recorded Task invocation is a literal replay of bytes the parent

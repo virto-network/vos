@@ -60,7 +60,7 @@ fn run_with_signer(args: Args, keypair: &libp2p::identity::Keypair) -> anyhow::R
     let actor_pvm = if is_pvm {
         input.clone()
     } else {
-        grey_transpiler::link_elf(&input)
+        vos_pvm_compiler::link_elf(&input)
             .map_err(|error| anyhow!("transpile {}: {error:?}", program.display()))?
     };
     if actor_pvm.is_empty() {
@@ -199,7 +199,7 @@ fn build_task_dependency(input: &Path) -> anyhow::Result<PackageTaskDependencyV2
         );
     }
     let elf = std::fs::read(&program).with_context(|| format!("read {}", program.display()))?;
-    let pvm = grey_transpiler::link_elf(&elf)
+    let pvm = vos_pvm_compiler::link_elf(&elf)
         .map_err(|error| anyhow!("transpile Task {}: {error:?}", program.display()))?;
     if pvm.is_empty() {
         bail!("{} produced an empty Task PVM", program.display());
@@ -379,7 +379,7 @@ fn resolve_program_input(input: &Path) -> anyhow::Result<PathBuf> {
         );
     }
     let elf = target_dir
-        .join("riscv64em-javm/release")
+        .join("riscv64em-vos/release")
         .join(format!("{actor_target_name}.elf"));
     if !elf.is_file() {
         bail!(
@@ -609,12 +609,12 @@ fn actor_build_root(project: &Path) -> anyhow::Result<PathBuf> {
         .ancestors()
         .find(|candidate| {
             candidate.join(".cargo/config.toml").is_file()
-                && candidate.join("riscv64em-javm.json").is_file()
+                && candidate.join("riscv64em-vos.json").is_file()
         })
         .map(Path::to_path_buf)
         .ok_or_else(|| {
             anyhow!(
-                "{} is missing the VOS .cargo/config.toml and riscv64em-javm.json build configuration",
+                "{} is missing the VOS .cargo/config.toml and riscv64em-vos.json build configuration",
                 project.display()
             )
         })
@@ -809,8 +809,8 @@ mod tests {
             Some("actors")
         );
         assert_eq!(
-            root.join("target/riscv64em-javm/release/v2_counter.elf"),
-            root.join("target/riscv64em-javm/release")
+            root.join("target/riscv64em-vos/release/v2_counter.elf"),
+            root.join("target/riscv64em-vos/release")
                 .join(format!("{}.elf", "v2-counter".replace('-', "_")))
         );
     }
@@ -843,7 +843,7 @@ mod tests {
         };
 
         let temp = TempDir::new("deterministic");
-        let actor_pvm = grey_transpiler::assembler::Assembler::new().build();
+        let actor_pvm = vos_pvm_compiler::assembler::Assembler::new().build();
         let (metadata, metadata_len) = vos::metadata::encode::<512>(&META);
         std::fs::write(temp.0.join("actor.pvm"), &actor_pvm).unwrap();
         std::fs::write(temp.0.join("actor.meta"), &metadata[..metadata_len]).unwrap();

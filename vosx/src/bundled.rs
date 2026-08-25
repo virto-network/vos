@@ -14,7 +14,7 @@
 //!   the immutable space root.
 //!
 //! `build.rs` prefers the working-tree path under
-//! `actors/<name>/target/riscv64em-javm/release/` and falls back to
+//! `actors/<name>/target/riscv64em-vos/release/` and falls back to
 //! `vosx/blobs/<name>.elf` (checked into the crate). When neither
 //! is present the bundle is empty and the runtime falls back to
 //! requiring an explicit `--registry` / `--program-source` arg

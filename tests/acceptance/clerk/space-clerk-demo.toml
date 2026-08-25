@@ -26,7 +26,7 @@ name = "clerk-ledger"
 # seal forbids widening Local -> Raft later). A single node self-elects, so
 # this drives fine from the gateway; the full HA story is the multi-node
 # bank manifests (tests/acceptance/clerk/space-bank-a.toml).
-path = "../../../actors/clerk-ledger/target/riscv64em-javm/release/clerk_ledger.elf"
+path = "../../../actors/clerk-ledger/target/riscv64em-vos/release/clerk_ledger.elf"
 consistency = "raft"
 
 [[agent]]
@@ -34,7 +34,7 @@ name = "clerk-bridge"
 # Local + network_reachable: the bridge holds the F2 anchor, dedup set, and
 # per-window receiver-term sums (must persist), and answers peer banks over
 # the network. NOT Ephemeral.
-path = "../../../actors/clerk-bridge/target/riscv64em-javm/release/clerk_bridge.elf"
+path = "../../../actors/clerk-bridge/target/riscv64em-vos/release/clerk_bridge.elf"
 consistency = "local"
 network_reachable = true
 

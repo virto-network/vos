@@ -1019,63 +1019,63 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
 
 fn greeter_elf() -> Vec<u8> {
     required_elf(
-        "../tests/fixtures/legacy-v1/actors/greeter/target/riscv64em-javm/release/greeter.elf",
+        "../tests/fixtures/legacy-v1/actors/greeter/target/riscv64em-vos/release/greeter.elf",
         "just build-v2-pvm-test-artifacts",
     )
 }
 
 fn probe_elf() -> Vec<u8> {
     required_elf(
-        "../tests/fixtures/legacy-v1/actors/probe/target/riscv64em-javm/release/probe.elf",
+        "../tests/fixtures/legacy-v1/actors/probe/target/riscv64em-vos/release/probe.elf",
         "just build-v2-pvm-test-artifacts",
     )
 }
 
 fn tally_elf() -> Vec<u8> {
     required_elf(
-        "../tests/fixtures/legacy-v1/actors/tally/target/riscv64em-javm/release/tally.elf",
+        "../tests/fixtures/legacy-v1/actors/tally/target/riscv64em-vos/release/tally.elf",
         "just build-v2-pvm-test-artifacts",
     )
 }
 
 fn crdt_counter_v2_elf() -> Vec<u8> {
     required_elf(
-        "tests/fixtures/crdt-counter-v2/target/riscv64em-javm/release/crdt_counter_v2_fixture.elf",
+        "tests/fixtures/crdt-counter-v2/target/riscv64em-vos/release/crdt_counter_v2_fixture.elf",
         "just build-v2-pvm-test-artifacts",
     )
 }
 
 fn workflow_v2_elf() -> Vec<u8> {
     required_elf(
-        "tests/fixtures/workflow-v2/target/riscv64em-javm/release/workflow_v2_fixture.elf",
+        "tests/fixtures/workflow-v2/target/riscv64em-vos/release/workflow_v2_fixture.elf",
         "just build-v2-pvm-test-artifacts",
     )
 }
 
 fn cycle_v2_elf() -> Vec<u8> {
     required_elf(
-        "tests/fixtures/cycle-v2/target/riscv64em-javm/release/cycle_v2_fixture.elf",
+        "tests/fixtures/cycle-v2/target/riscv64em-vos/release/cycle_v2_fixture.elf",
         "just build-v2-pvm-test-artifacts",
     )
 }
 
 fn space_authority_elf() -> Vec<u8> {
     required_elf(
-        "../actors/space-authority/target/riscv64em-javm/release/space_authority.elf",
+        "../actors/space-authority/target/riscv64em-vos/release/space_authority.elf",
         "just build-v2-pvm-test-artifacts",
     )
 }
 
 fn clerk_ledger_elf() -> Vec<u8> {
     required_elf(
-        "../actors/clerk-ledger/target/riscv64em-javm/release/clerk_ledger.elf",
+        "../actors/clerk-ledger/target/riscv64em-vos/release/clerk_ledger.elf",
         "just build-v2-pvm-test-artifacts",
     )
 }
 
 fn clerk_bridge_elf() -> Vec<u8> {
     required_elf(
-        "../actors/clerk-bridge/target/riscv64em-javm/release/clerk_bridge.elf",
+        "../actors/clerk-bridge/target/riscv64em-vos/release/clerk_bridge.elf",
         "just build-v2-pvm-test-artifacts",
     )
 }
@@ -1136,9 +1136,9 @@ fn install_test_voter_registry(
 }
 
 fn actor_pvm(result: u64) -> Vec<u8> {
-    let mut assembler = grey_transpiler::assembler::Assembler::new();
+    let mut assembler = vos_pvm_compiler::assembler::Assembler::new();
     assembler
-        .load_imm_64(grey_transpiler::assembler::Reg::A0, result)
+        .load_imm_64(vos_pvm_compiler::assembler::Reg::A0, result)
         .ecalli(0);
     assembler.build()
 }
@@ -1267,7 +1267,7 @@ fn canonical_guest_refine_runs_at_ic0_and_returns_nested_transition() {
     let pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let service = ServicePvmV2::new(pvm.clone(), ProgramId::of_pvm(&pvm))
         .expect("generic service has the GP IC0/IC5 entries");
-    let actor = grey_transpiler::link_elf(&actor_elf).expect("canonical actor ELF transpiles");
+    let actor = vos_pvm_compiler::link_elf(&actor_elf).expect("canonical actor ELF transpiles");
     let actor_program = ProgramId::of_pvm(&actor);
     let state_bytes = Vec::new();
     let state = BlobRefV2::of_bytes(&state_bytes);
@@ -1330,7 +1330,7 @@ fn signed_test_package(
     actor_elf: &[u8],
     signer: &libp2p::identity::Keypair,
 ) -> (VosPackageV2, String) {
-    let actor_pvm = grey_transpiler::link_elf(actor_elf).expect("actor transpiles");
+    let actor_pvm = vos_pvm_compiler::link_elf(actor_elf).expect("actor transpiles");
     let schemas = vos::metadata::raw_section_from_elf(actor_elf).expect("actor metadata");
     let metadata = vos::metadata::decode(&schemas).expect("valid actor metadata");
     let policies = PackageRolePoliciesV2::from_metadata(&metadata)
@@ -2094,7 +2094,7 @@ fn fresh_production_joiner_must_match_policy_before_voter_promotion() {
 
     let mut leader = VosNode::with_prefix(leader_prefix);
     let registry_pvm =
-        grey_transpiler::link_elf(include_bytes!("../../vosx/blobs/space_registry.elf"))
+        vos_pvm_compiler::link_elf(include_bytes!("../../vosx/blobs/space_registry.elf"))
             .expect("the bundled registry transpiles");
     install_test_voter_registry(
         &mut leader,
@@ -2862,7 +2862,7 @@ fn raft_attested_root_orders_only_the_final_proved_apply() {
 
 #[test]
 fn signed_task_dependencies_install_and_survive_durable_reopen() {
-    let task_pvm = grey_transpiler::assembler::Assembler::new().build();
+    let task_pvm = vos_pvm_compiler::assembler::Assembler::new().build();
     let (config, binding) =
         signed_task_dependency_config(task_pvm.clone(), ConsistencyModeV2::Local);
     let service = LocalRootTreeServiceV2::open(config.clone(), FailableCommittedImages::default())
@@ -2898,7 +2898,7 @@ fn signed_task_refine_redacts_actor_memory_and_reopens_local_producer_sidecar() 
     let task_elf = tally_elf();
     let (witness_address, witness_capacity) =
         vos::zk::witness_symbol(&task_elf).expect("tally exports its witness window");
-    let task_pvm = grey_transpiler::link_elf(&task_elf).expect("tally Task transpiles");
+    let task_pvm = vos_pvm_compiler::link_elf(&task_elf).expect("tally Task transpiles");
     let (config, binding) = signed_task_dependency_actor_config(
         &probe_elf(),
         task_pvm,
@@ -2982,7 +2982,7 @@ fn signed_task_refine_redacts_actor_memory_and_reopens_local_producer_sidecar() 
             &prepared.imports,
             TEST_GAS_SCHEDULE.refine,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceRecompiler,
+            vos_pvm::PvmBackend::ForceRecompiler,
         )
         .expect("recompiler executes signed Task Refine");
     let traced = physical
@@ -3107,7 +3107,7 @@ fn deferred_provable_task_is_rejected_before_apply_proposal() {
     let task_elf = tally_elf();
     let (witness_address, witness_capacity) =
         vos::zk::witness_symbol(&task_elf).expect("tally exports its witness window");
-    let task_pvm = grey_transpiler::link_elf(&task_elf).expect("tally Task transpiles");
+    let task_pvm = vos_pvm_compiler::link_elf(&task_elf).expect("tally Task transpiles");
     let (config, binding) = signed_task_dependency_actor_config(
         &probe_elf(),
         task_pvm,
@@ -3159,7 +3159,7 @@ fn completed_recorded_task_cannot_export_parent_checkpoint_memory() {
     let task_elf = tally_elf();
     let (witness_address, witness_capacity) =
         vos::zk::witness_symbol(&task_elf).expect("tally exports its witness window");
-    let task_pvm = grey_transpiler::link_elf(&task_elf).expect("tally Task transpiles");
+    let task_pvm = vos_pvm_compiler::link_elf(&task_elf).expect("tally Task transpiles");
     let (config, binding) = signed_task_dependency_actor_config(
         &probe_elf(),
         task_pvm,
@@ -3210,7 +3210,7 @@ fn producer_record_capture_is_count_bounded_per_slice() {
     let task_elf = tally_elf();
     let (witness_address, witness_capacity) =
         vos::zk::witness_symbol(&task_elf).expect("tally exports its witness window");
-    let task_pvm = grey_transpiler::link_elf(&task_elf).expect("tally Task transpiles");
+    let task_pvm = vos_pvm_compiler::link_elf(&task_elf).expect("tally Task transpiles");
     let (config, binding) = signed_task_dependency_actor_config(
         &probe_elf(),
         task_pvm,
@@ -3280,7 +3280,7 @@ fn raft_task_dependencies_use_private_ingress_while_crdt_remains_rejected() {
 
 #[test]
 fn single_voter_raft_task_ingress_is_private_durable_and_retryable() {
-    let task_pvm = grey_transpiler::assembler::Assembler::new().build();
+    let task_pvm = vos_pvm_compiler::assembler::Assembler::new().build();
     let (config, _) = signed_task_dependency_config(task_pvm, ConsistencyModeV2::Raft);
     let actor = config.root_actor;
     let directory = std::env::temp_dir().join(format!(
@@ -4592,19 +4592,19 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
     );
 
     let mut invalid_layout = config.clone();
-    let parsed = javm::program::parse_blob(&invalid_layout.package.actor_pvm)
+    let parsed = vos_pvm::program::parse_blob(&invalid_layout.package.actor_pvm)
         .expect("canonical actor PVM parses");
     let mut caps = parsed.caps.clone();
-    caps.push(javm::program::CapManifestEntry {
+    caps.push(vos_pvm::program::CapManifestEntry {
         cap_index: vos::v2::ACTOR_CALLABLE_BASE_SLOT,
-        cap_type: javm::program::CapEntryType::Data,
+        cap_type: vos_pvm::program::CapEntryType::Data,
         base_page: 0,
         page_count: 0,
-        init_access: javm::cap::Access::RW,
+        init_access: vos_pvm::cap::Access::RW,
         data_offset: 0,
         data_len: 0,
     });
-    invalid_layout.package.actor_pvm = javm::program::build_blob(
+    invalid_layout.package.actor_pvm = vos_pvm::program::build_blob(
         parsed.header.memory_pages,
         parsed.header.invoke_cap,
         parsed.header.stack_top,
@@ -5672,7 +5672,7 @@ fn node_ingress_uses_canonical_authority_for_raft_and_crdt_targets() {
     let crdt_route = ServiceId::new(node_prefix, 0x3a02);
     let mut node = VosNode::with_prefix(node_prefix);
     let registry_pvm =
-        grey_transpiler::link_elf(include_bytes!("../../vosx/blobs/space_registry.elf"))
+        vos_pvm_compiler::link_elf(include_bytes!("../../vosx/blobs/space_registry.elf"))
             .expect("the bundled registry transpiles for the legacy-role adversary");
     install_test_voter_registry(&mut node, registry_pvm, &[]);
     {
@@ -6310,7 +6310,7 @@ fn node_registers_a_raft_root_through_the_canonical_request_log() {
 
 #[test]
 fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
-    let task_pvm = grey_transpiler::assembler::Assembler::new().build();
+    let task_pvm = vos_pvm_compiler::assembler::Assembler::new().build();
     let (mut config, _) = signed_task_dependency_config(task_pvm, ConsistencyModeV2::Raft);
     let authority_signer = libp2p::identity::Keypair::generate_ed25519();
     config.actor_name = vos::v2::ROLE_AUTHORITY_INSTANCE_V2.into();
@@ -6387,7 +6387,7 @@ fn network_ingress_to_a_raft_root_follower_redirects_to_the_leader() {
     let mut node_a = VosNode::with_prefix(prefix_a);
     let mut node_b = VosNode::with_prefix(prefix_b);
     let registry_pvm =
-        grey_transpiler::link_elf(include_bytes!("../../vosx/blobs/space_registry.elf"))
+        vos_pvm_compiler::link_elf(include_bytes!("../../vosx/blobs/space_registry.elf"))
             .expect("committed space-registry ELF transpiles");
     let voters = [(prefix_a, peer_a.to_bytes()), (prefix_b, peer_b.to_bytes())];
     install_test_voter_registry(&mut node_a, registry_pvm.clone(), &voters);
@@ -8708,7 +8708,7 @@ fn node_routes_raft_cross_root_reply_between_different_leaders() {
     let mut node_a = VosNode::with_prefix(prefix_a);
     let mut node_b = VosNode::with_prefix(prefix_b);
     let registry_pvm =
-        grey_transpiler::link_elf(include_bytes!("../../vosx/blobs/space_registry.elf"))
+        vos_pvm_compiler::link_elf(include_bytes!("../../vosx/blobs/space_registry.elf"))
             .expect("committed space-registry ELF transpiles");
     let voters = [(prefix_a, peer_a.to_bytes()), (prefix_b, peer_b.to_bytes())];
     install_test_voter_registry(&mut node_a, registry_pvm.clone(), &voters);
@@ -9397,7 +9397,7 @@ fn node_anti_entropy_converges_authenticated_crdt_roots_across_restart() {
     let mut node_a = VosNode::with_prefix(prefix_a);
     let mut node_b = VosNode::with_prefix(prefix_b);
     let registry_pvm =
-        grey_transpiler::link_elf(include_bytes!("../../vosx/blobs/space_registry.elf"))
+        vos_pvm_compiler::link_elf(include_bytes!("../../vosx/blobs/space_registry.elf"))
             .expect("committed space-registry ELF transpiles");
     let voters = [(prefix_a, peer_a.to_bytes()), (prefix_b, peer_b.to_bytes())];
     install_test_voter_registry(&mut node_a, registry_pvm.clone(), &voters);
@@ -9472,7 +9472,7 @@ fn node_anti_entropy_converges_authenticated_crdt_roots_across_restart() {
 
 #[test]
 fn same_package_child_spawn_commits_before_the_child_becomes_callable() {
-    let actor_pvm = grey_transpiler::link_elf(&workflow_v2_elf()).unwrap();
+    let actor_pvm = vos_pvm_compiler::link_elf(&workflow_v2_elf()).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_bytes = Vec::new();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
@@ -9683,7 +9683,7 @@ fn same_package_child_spawn_commits_before_the_child_becomes_callable() {
 
 #[test]
 fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
-    let actor_pvm = grey_transpiler::link_elf(&workflow_v2_elf()).unwrap();
+    let actor_pvm = vos_pvm_compiler::link_elf(&workflow_v2_elf()).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_bytes = Vec::new();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
@@ -10052,7 +10052,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
             &nested.imports,
             1_000_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceRecompiler,
+            vos_pvm::PvmBackend::ForceRecompiler,
         )
         .unwrap();
     assert_eq!(recompiled.bytes, first_bytes.bytes);
@@ -10234,7 +10234,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
             &resumed.imports,
             1_000_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceInterpreter,
+            vos_pvm::PvmBackend::ForceInterpreter,
         )
         .expect("the reply resumes the child and then its suspended root caller");
     assert_eq!(
@@ -10244,7 +10244,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
                 &resumed.imports,
                 1_000_000_000,
                 &NoRefineProtocolHostV2,
-                javm::PvmBackend::ForceRecompiler,
+                vos_pvm::PvmBackend::ForceRecompiler,
             )
             .unwrap(),
         resumed_bytes,
@@ -10794,7 +10794,7 @@ fn same_tree_calls_resume_exact_stacks_and_allocate_tree_wide_call_ids() {
 #[test]
 fn private_actor_input_is_bounded_before_entering_the_compact_guest_heap() {
     let actor_elf = greeter_elf();
-    let actor = grey_transpiler::link_elf(&actor_elf).expect("canonical actor ELF transpiles");
+    let actor = vos_pvm_compiler::link_elf(&actor_elf).expect("canonical actor ELF transpiles");
     let actor_program = ProgramId::of_pvm(&actor);
     let state_bytes = vec![0; vos::v2::ACTOR_SLICE_INPUT_MAX_BYTES];
     let state = BlobRefV2::of_bytes(&state_bytes);
@@ -10829,7 +10829,7 @@ fn private_actor_input_is_bounded_before_entering_the_compact_guest_heap() {
 
 #[test]
 fn same_tree_causal_cycles_return_an_explicit_guest_error() {
-    let actor_pvm = grey_transpiler::link_elf(&cycle_v2_elf()).unwrap();
+    let actor_pvm = vos_pvm_compiler::link_elf(&cycle_v2_elf()).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_bytes = Vec::new();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
@@ -11034,7 +11034,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
     let service_elf = service_elf();
     let actor_elf = crdt_counter_v2_elf();
     let service_pvm = vos::v2::transpile_service_elf(&service_elf).unwrap();
-    let actor_pvm = grey_transpiler::link_elf(&actor_elf).unwrap();
+    let actor_pvm = vos_pvm_compiler::link_elf(&actor_elf).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_bytes = Vec::new();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
@@ -11400,7 +11400,7 @@ fn canonical_crdt_slice_refines_and_accumulates_without_native_apply() {
 #[test]
 fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
     let actor_elf = crdt_counter_v2_elf();
-    let actor_pvm = grey_transpiler::link_elf(&actor_elf).unwrap();
+    let actor_pvm = vos_pvm_compiler::link_elf(&actor_elf).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_bytes = Vec::new();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
@@ -11596,7 +11596,7 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
             &first.imports,
             1_000_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceInterpreter,
+            vos_pvm::PvmBackend::ForceInterpreter,
         )
         .unwrap();
     assert_eq!(
@@ -11606,7 +11606,7 @@ fn crdt_root_tree_aggregates_repeated_child_dispatches_privately() {
                 &first.imports,
                 1_000_000_000,
                 &NoRefineProtocolHostV2,
-                javm::PvmBackend::ForceRecompiler,
+                vos_pvm::PvmBackend::ForceRecompiler,
             )
             .unwrap(),
         interpreted,
@@ -12064,7 +12064,7 @@ fn canonical_crdt_resume_rebinds_the_post_await_change_identity() {
     let service_elf = service_elf();
     let actor_elf = crdt_counter_v2_elf();
     let service_pvm = vos::v2::transpile_service_elf(&service_elf).unwrap();
-    let actor_pvm = grey_transpiler::link_elf(&actor_elf).unwrap();
+    let actor_pvm = vos_pvm_compiler::link_elf(&actor_elf).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_bytes = Vec::new();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
@@ -12317,7 +12317,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
     let service_pvm = vos::v2::transpile_service_elf(&service_elf).unwrap();
     let service_program = ProgramId::of_pvm(&service_pvm);
     let service = ServicePvmV2::new(service_pvm.clone(), service_program).unwrap();
-    let actor = grey_transpiler::link_elf(&actor_elf).unwrap();
+    let actor = vos_pvm_compiler::link_elf(&actor_elf).unwrap();
     let actor_program = ProgramId::of_pvm(&actor);
     let initial_state = Vec::new();
     let initial_state_ref = BlobRefV2::of_bytes(&initial_state);
@@ -12408,7 +12408,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
             &first_imports,
             100_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceInterpreter,
+            vos_pvm::PvmBackend::ForceInterpreter,
         )
         .unwrap();
     let deterministic_retry = service
@@ -12417,7 +12417,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
             &first_imports,
             100_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceInterpreter,
+            vos_pvm::PvmBackend::ForceInterpreter,
         )
         .unwrap();
     assert_eq!(
@@ -12430,7 +12430,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
             &first_imports,
             100_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceRecompiler,
+            vos_pvm::PvmBackend::ForceRecompiler,
         )
         .unwrap();
     assert_eq!(
@@ -12468,7 +12468,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
             &checkpoint_request.encode(),
             5_000_000_000,
             &mut interpreted_host,
-            javm::PvmBackend::ForceInterpreter,
+            vos_pvm::PvmBackend::ForceInterpreter,
         )
         .expect("the canonical Accumulate guest runs in the interpreter");
     let recompiled_accumulate = service
@@ -12476,7 +12476,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
             &checkpoint_request.encode(),
             5_000_000_000,
             &mut recompiled_host,
-            javm::PvmBackend::ForceRecompiler,
+            vos_pvm::PvmBackend::ForceRecompiler,
         )
         .expect("the canonical Accumulate guest runs in the recompiler");
     assert_eq!(
@@ -12559,7 +12559,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
             &resumed_imports,
             100_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceInterpreter,
+            vos_pvm::PvmBackend::ForceInterpreter,
         )
         .unwrap();
     let recompiled_resumed = service
@@ -12568,7 +12568,7 @@ fn yielding_actor_restores_exactly_from_committed_snapshot() {
             &resumed_imports,
             100_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceRecompiler,
+            vos_pvm::PvmBackend::ForceRecompiler,
         )
         .unwrap();
     assert_eq!(
@@ -12643,7 +12643,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
     let service_program = ProgramId::of_pvm(&service_pvm);
     let service = ServicePvmV2::new(service_pvm.clone(), service_program).unwrap();
     let actor_elf = probe_elf();
-    let actor = grey_transpiler::link_elf(&actor_elf).unwrap();
+    let actor = vos_pvm_compiler::link_elf(&actor_elf).unwrap();
     let actor_program = ProgramId::of_pvm(&actor);
     let initial_state = Vec::new();
     let initial_state_ref = BlobRefV2::of_bytes(&initial_state);
@@ -12726,7 +12726,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             &first_imports,
             100_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceInterpreter,
+            vos_pvm::PvmBackend::ForceInterpreter,
         )
         .unwrap();
     assert_eq!(
@@ -12736,7 +12736,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
                 &first_imports,
                 100_000_000,
                 &NoRefineProtocolHostV2,
-                javm::PvmBackend::ForceRecompiler,
+                vos_pvm::PvmBackend::ForceRecompiler,
             )
             .unwrap(),
         first_output,
@@ -12929,7 +12929,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             &timed_out.imports,
             100_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceInterpreter,
+            vos_pvm::PvmBackend::ForceInterpreter,
         )
         .expect("the interpreter injects the committed timeout");
     let recompiled_timeout = service
@@ -12938,7 +12938,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             &timed_out.imports,
             100_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceRecompiler,
+            vos_pvm::PvmBackend::ForceRecompiler,
         )
         .expect("the recompiler injects the same committed timeout");
     assert_eq!(timed_out_output, recompiled_timeout);
@@ -12986,7 +12986,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             &expanded.imports,
             100_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceInterpreter,
+            vos_pvm::PvmBackend::ForceInterpreter,
         )
         .expect("a newer tree directory does not rewrite the suspended JAR layout");
     assert_eq!(expanded_timeout.bytes, timed_out_output.bytes);
@@ -13098,7 +13098,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             &resumed_imports,
             100_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceInterpreter,
+            vos_pvm::PvmBackend::ForceInterpreter,
         ),
         Err(ServicePvmErrorV2::ContinuationMismatch),
         "a different accumulated CallId cannot resume this machine"
@@ -13110,7 +13110,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
             &resumed_imports,
             100_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceInterpreter,
+            vos_pvm::PvmBackend::ForceInterpreter,
         )
         .unwrap();
     assert_eq!(
@@ -13120,7 +13120,7 @@ fn awaited_reply_is_injected_at_the_exact_machine_boundary() {
                 &resumed_imports,
                 100_000_000,
                 &NoRefineProtocolHostV2,
-                javm::PvmBackend::ForceRecompiler,
+                vos_pvm::PvmBackend::ForceRecompiler,
             )
             .unwrap(),
         resumed_output,
@@ -13202,7 +13202,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
     let service_pvm = vos::v2::transpile_service_elf(&service_elf()).unwrap();
     let service_program = ProgramId::of_pvm(&service_pvm);
     let service = ServicePvmV2::new(service_pvm.clone(), service_program).unwrap();
-    let actor = grey_transpiler::link_elf(&probe_elf()).unwrap();
+    let actor = vos_pvm_compiler::link_elf(&probe_elf()).unwrap();
     let actor_program = ProgramId::of_pvm(&actor);
     let initial_state = Vec::new();
     let initial_state_ref = BlobRefV2::of_bytes(&initial_state);
@@ -13383,7 +13383,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
             &initial.imports,
             100_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceInterpreter,
+            vos_pvm::PvmBackend::ForceInterpreter,
         )
         .unwrap();
     assert_eq!(
@@ -13393,7 +13393,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
                 &initial.imports,
                 100_000_000,
                 &NoRefineProtocolHostV2,
-                javm::PvmBackend::ForceRecompiler,
+                vos_pvm::PvmBackend::ForceRecompiler,
             )
             .unwrap(),
         initial_output
@@ -13501,7 +13501,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
             &timeout_resume.imports,
             100_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceInterpreter,
+            vos_pvm::PvmBackend::ForceInterpreter,
         ) {
             Ok(output) => break output,
             Err(ServicePvmErrorV2::ActorStorageWitnessRequired(requests)) => {
@@ -13522,7 +13522,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
                 &timeout_resume.imports,
                 100_000_000,
                 &NoRefineProtocolHostV2,
-                javm::PvmBackend::ForceRecompiler,
+                vos_pvm::PvmBackend::ForceRecompiler,
             )
             .unwrap(),
         timeout_output
@@ -13688,7 +13688,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
             &first_resume.imports,
             100_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceInterpreter,
+            vos_pvm::PvmBackend::ForceInterpreter,
         ) {
             Ok(output) => break output,
             Err(ServicePvmErrorV2::ActorStorageWitnessRequired(requests)) => {
@@ -13722,7 +13722,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
                 &first_resume.imports,
                 100_000_000,
                 &NoRefineProtocolHostV2,
-                javm::PvmBackend::ForceRecompiler,
+                vos_pvm::PvmBackend::ForceRecompiler,
             )
             .unwrap(),
         first_resumed_output
@@ -13855,7 +13855,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
             &second_resume.imports,
             100_000_000,
             &NoRefineProtocolHostV2,
-            javm::PvmBackend::ForceInterpreter,
+            vos_pvm::PvmBackend::ForceInterpreter,
         )
         .unwrap();
     assert_eq!(
@@ -13865,7 +13865,7 @@ fn durable_inbox_work_survives_two_exact_awaits_and_two_restarts() {
                 &second_resume.imports,
                 100_000_000,
                 &NoRefineProtocolHostV2,
-                javm::PvmBackend::ForceRecompiler,
+                vos_pvm::PvmBackend::ForceRecompiler,
             )
             .unwrap(),
         completed_output
@@ -15312,7 +15312,7 @@ fn attested_driver_rejects_a_transition_not_produced_by_exact_refine() {
     let elf = service_elf();
     let service_pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let service_program = ProgramId::of_pvm(&service_pvm);
-    let actor_pvm = grey_transpiler::link_elf(&greeter_elf()).unwrap();
+    let actor_pvm = vos_pvm_compiler::link_elf(&greeter_elf()).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_bytes = Vec::new();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
@@ -15598,7 +15598,7 @@ fn physical_guest_rejects_the_missing_preimage_length_sentinel() {
 
 #[test]
 fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
-    let actor_pvm = grey_transpiler::link_elf(&workflow_v2_elf()).unwrap();
+    let actor_pvm = vos_pvm_compiler::link_elf(&workflow_v2_elf()).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_bytes = Vec::new();
     let initial = BlobRefV2::of_bytes(&initial_bytes);
@@ -15832,7 +15832,7 @@ fn attested_cross_root_transport_proves_and_resumes_the_bound_package() {
 fn crdt_delivery_is_causal_physical_and_restart_drainable_after_sync() {
     let service_pvm = vos::v2::transpile_service_elf(&service_elf()).unwrap();
     let service_program = ProgramId::of_pvm(&service_pvm);
-    let actor_pvm = grey_transpiler::link_elf(&crdt_counter_v2_elf()).unwrap();
+    let actor_pvm = vos_pvm_compiler::link_elf(&crdt_counter_v2_elf()).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_state = Vec::new();
     let initial_state_ref = BlobRefV2::of_bytes(&initial_state);
@@ -15995,7 +15995,7 @@ fn crdt_delivery_is_causal_physical_and_restart_drainable_after_sync() {
 fn finalized_outbox_is_durably_routed_across_service_restarts() {
     let service_pvm = vos::v2::transpile_service_elf(&service_elf()).unwrap();
     let service_program = ProgramId::of_pvm(&service_pvm);
-    let actor_pvm = grey_transpiler::link_elf(&probe_elf()).unwrap();
+    let actor_pvm = vos_pvm_compiler::link_elf(&probe_elf()).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_state = Vec::new();
     let initial_state_ref = BlobRefV2::of_bytes(&initial_state);
@@ -16473,7 +16473,7 @@ fn finalized_outbox_is_durably_routed_across_service_restarts() {
 fn raft_delivery_and_reply_verifiers_replay_before_physical_accumulate() {
     let service_pvm = vos::v2::transpile_service_elf(&service_elf()).unwrap();
     let service_program = ProgramId::of_pvm(&service_pvm);
-    let actor_pvm = grey_transpiler::link_elf(&probe_elf()).unwrap();
+    let actor_pvm = vos_pvm_compiler::link_elf(&probe_elf()).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_state = Vec::new();
     let initial_state_ref = BlobRefV2::of_bytes(&initial_state);
@@ -18057,7 +18057,7 @@ fn raft_orders_only_the_proved_attested_apply_and_followers_verify_it() {
     let elf = service_elf();
     let service_pvm = vos::v2::transpile_service_elf(&elf).expect("generic service ELF transpiles");
     let service_program = ProgramId::of_pvm(&service_pvm);
-    let actor_pvm = grey_transpiler::link_elf(&greeter_elf()).unwrap();
+    let actor_pvm = vos_pvm_compiler::link_elf(&greeter_elf()).unwrap();
     let actor_program = ProgramId::of_pvm(&actor_pvm);
     let initial_bytes = Vec::new();
     let initial = BlobRefV2::of_bytes(&initial_bytes);

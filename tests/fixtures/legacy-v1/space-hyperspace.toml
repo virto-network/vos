@@ -18,13 +18,13 @@ version = "0.1.0"
 hyperspace = "demo-hub"
 # vosx loads this elf for the registry actor. Resolved relative
 # to the recipe directory. Future cycles will embed the actor.
-registry_blob = "../../../actors/space-registry/target/riscv64em-javm/release/space-registry.elf"
+registry_blob = "../../../actors/space-registry/target/riscv64em-vos/release/space-registry.elf"
 
 [[agent]]
 name = "counter"
 # This is the explicit #[actor(crdt)] registry fixture, distinct from the
 # plain counter retained for v1 replay tests.
-path = "../v2/actors/crdt-counter/target/riscv64em-javm/release/crdt_counter_v2.elf"
+path = "../v2/actors/crdt-counter/target/riscv64em-vos/release/crdt_counter_v2.elf"
 consistency = "crdt"
 provides = ["counter", "demo-service"]
 on_start = [

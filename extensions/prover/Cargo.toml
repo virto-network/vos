@@ -3,35 +3,35 @@ name = "prover-extension"
 version = "0.1.0"
 edition = "2024"
 
-# General-purpose host-side zkpvm prover + verifier over transpiled PVM
+# General-purpose host-side vos-pvm-proof prover + verifier over transpiled PVM
 # blobs. The caller delivers the PVM blob + the `__VOS_WITNESS` address +
 # opaque witness bytes; the prover patches the witness into the blob,
 # proves the trace, and composes STARK validity with the tagless
 # io-binding. It is a PURE PVM prover: it carries no per-program crypto
-# knowledge and no ELF/transpile machinery (no grey-transpiler, no ELF
+# knowledge and no ELF/transpile machinery (no vos-pvm-compiler, no ELF
 # symbol reader). A bridge dispatches `prove` / `verify` here.
 #
-# Lives as a native `.so` because zkpvm-verifier can't build for the PVM
+# Lives as a native `.so` because vos-pvm-proof-verifier can't build for the PVM
 # guest (javm -> blst C-build + workspace stwo feature inheritance), so
 # in-actor verification isn't viable — see the general-prover plan.
 #
 # The `measure_catalog` handler also serves the `vosx zk pin` publish-time
 # tool: the CLI transpiles the ELF and reads `__VOS_WITNESS` itself (this
 # stays a pure PVM prover), then invokes `measure_catalog` for the heavy
-# zkpvm measurement. That keeps the zkpvm dependency out of `vosx` entirely.
+# vos-pvm-proof measurement. That keeps the vos-pvm-proof dependency out of `vosx` entirely.
 
 [features]
 default = ["bin", "extension"]
 bin = []
 extension = []
-# Forward zkpvm's row-by-row constraint asserter (no FRI/blowup/commit, so
+# Forward vos-pvm-proof's row-by-row constraint asserter (no FRI/blowup/commit, so
 # far lighter than a full prove) for verifying large traces that OOM under
 # `prove`. Test-only: `cargo test -p prover-extension --features debug-constraints`.
-debug-constraints = ["zkpvm/debug-internals"]
+debug-constraints = ["vos-pvm-proof/debug-internals"]
 # Native-recursion Stage-0 (P5.0/P5.1): prove + verify under the Poseidon2-M31
 # PCS. Flips `CommitmentHash` to `P2Hash`; the re-bake recipe + drift guard
 # recompute `{C_0,C_1}` under the new hash. Off by default (production Blake2s).
-poseidon2-channel = ["zkpvm/poseidon2-channel", "zkpvm-verifier/poseidon2-channel"]
+poseidon2-channel = ["vos-pvm-proof/poseidon2-channel", "vos-pvm-proof-verifier/poseidon2-channel"]
 
 [lints.rust.unexpected_cfgs]
 level = "allow"
@@ -42,15 +42,15 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 vos = { path = "../../vos", default-features = false, features = ["extension"] }
-# zkpvm prover (trace_blob + prove_mobile / prove_canonical) and the
+# vos-pvm-proof prover (trace_blob + prove_mobile / prove_canonical) and the
 # host-side standalone verifier. The caller delivers the transpiled PVM
 # blob, so no ELF/transpile machinery lives here.
-zkpvm = { workspace = true }
-zkpvm-verifier = { workspace = true }
+vos-pvm-proof = { workspace = true }
+vos-pvm-proof-verifier = { workspace = true }
 bincode = "1"
 
 [dev-dependencies]
 # Hand-built tiny PVM program for the entering-image anchor test: prove one
 # real MOBILE segment cheaply (no voucher-check ELF, no heavy chain) and drive
 # the per-segment anchor check directly.
-javm = { workspace = true }
+vos-pvm = { workspace = true }

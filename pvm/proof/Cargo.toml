@@ -1,0 +1,149 @@
+[package]
+name = "vos-pvm-proof"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[features]
+default = ["prover"]
+# Prover-side: trace generation, proof creation, the tracer, blake3 commitments,
+# and parallel iteration.  Disable for a verifier-only build (smaller dep tree,
+# no_std-friendly, builds for wasm32-unknown-unknown).
+#
+# `javm` (the reference PVM interpreter the tracer drives) is prover-only:
+# the verifier never executes PVM code, and javm does not build on 32-bit
+# targets (CODE_WINDOW_SIZE = 1 << 32 overflows usize), so it must stay out
+# of the wasm32 verifier graph.
+#
+# The stwo `std`/`prover`/`parallel` features are forwarded here rather than
+# pinned at the workspace `[workspace.dependencies]` entry: workspace-inherited
+# features are additive (a member cannot remove them), and the verifier-only
+# build needs feature-less stwo (no rayon).  Proof types and verification are
+# in stwo's always-compiled core, so the verifier path needs no stwo features.
+prover = [
+    "dep:vos-pvm",
+    "dep:rayon",
+    "dep:blake3",
+    "dep:curve25519-dalek",
+    "stwo/std",
+    "stwo/prover",
+    "stwo/parallel",
+    "stwo-constraint-framework/std",
+    "stwo-constraint-framework/prover",
+    "stwo-constraint-framework/parallel",
+    "serde/std",
+    "num-traits/std",
+]
+# Diagnostic helpers (`debug_claimed_sums`) for prover-side debugging of
+# logup imbalances.  Off by default so the production prover surface
+# stays clean; turn on with `--features debug-internals` to bisect
+# "ConstraintsNotSatisfied" vs. "claimed logup sum is not zero" failure
+# modes when adding constraints.
+debug-internals = ["prover"]
+# Native-recursion Stage-0 (P5.0): swap the segment PCS commit + Fiat-Shamir
+# transcript from production Blake2s to the M31-algebraic Poseidon2-M31 stack
+# (`src/poseidon2`), retargeting the commit/prove backend to CpuBackend. Selects
+# the `recursion_pcs` aliases; bumps the proof wire format. Off by default — the
+# production mobile prover stays on Blake2s/SimdBackend.
+poseidon2-channel = []
+
+[dependencies]
+vos-pvm-proof-derive = { workspace = true }
+vos-pvm = { workspace = true, optional = true }
+stwo = { workspace = true }
+stwo-constraint-framework = { workspace = true }
+# NOT workspace-inherited (workspace-inherited features are additive and the
+# workspace pins carry default features = std): a verify-only build must stay
+# libstd-free so a no_std runtime (e.g. a wasm PVF built with -Zbuild-std) can
+# link the verifier without a duplicate-lang-item clash against its own panic
+# handler. The `prover` feature adds `serde/std` / `num-traits/std` back for
+# native prover builds.
+# Same shape settlement-verifier pins (the proven riscv64em no_std graph).
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+num-traits = { version = "0.2", default-features = false }
+impl-trait-for-tuples = { workspace = true }
+rayon = { workspace = true, optional = true }
+blake3 = { version = "1", optional = true }
+# Host-side reference implementation of Ristretto scalar mult, used by
+# the TracingPvm precompile capture path so the prover can record the
+# canonical output bytes alongside the call.  Same crate cipher-clerk
+# uses for its on-chain math, so the precompile boundary is by-
+# construction agreement with cipher-clerk's own crypto.
+curve25519-dalek = { version = "4.1", optional = true, default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
+
+[dev-dependencies]
+# Carries the `SLT rd, x0, rs2` x0-as-rs1 lowering the voucher-check ELF needs,
+# plus the `SLLI/SRLI/SRAI rd, x0, n` fix (shift x0 → 0, not RA) that makes the
+# settlement verify ACCEPT on the JAM PVM (tests/settle_run.rs).
+vos-pvm-compiler = { workspace = true }
+bincode = "1"
+# no_std + serde wire format shared with the PVM settlement verifier
+# (settlement-verifier): the fixture this crate serializes is deserialized there.
+postcard = { version = "1", features = ["alloc"] }
+vos-pvm-proof-verifier = { workspace = true }
+curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables"] }
+# Dynamic-witness smoke test (voucher_check_smoke.rs) builds
+# cipher-clerk Public/Secret rkyv archives to feed voucher-check's
+# WITNESS_BUFFER region — exercises the per-voucher proof path.
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false, features = ["viewing-keys", "voucher", "helpers"] }
+rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck", "little_endian", "pointer_width_32"] }
+
+# Both examples demonstrate the prover end-to-end; mark them
+# prover-only so a verifier-only build (`--no-default-features`) skips
+# them instead of failing on the unresolved prover surface. (Examples
+# can't use a `#![cfg]` gate like the integration tests — a cfg'd-out
+# example has no `main`.)
+# On-device proving benchmark (mobile-proving plan, ARM bring-up): the
+# binary to cross-compile for aarch64 and run on a phone.  A [[bin]]
+# rather than an example so a cross-build pulls only the prover's own
+# dependency tree — examples/tests build against dev-deps (git + local
+# path crates) that have no business in a device image.
+[[bin]]
+name = "mobile_bench"
+required-features = ["prover"]
+
+[[example]]
+name = "multi_segment"
+required-features = ["prover"]
+
+[[example]]
+name = "prove_and_verify"
+required-features = ["prover"]
+
+# Proving benchmarks (measurement, not correctness — see benches/prove.rs).
+# `harness = false` + a custom `main` keeps them out of `cargo test` and runs
+# them serially (one prove at a time, so large traces never contend for RAM).
+#   cargo bench --bench prove                 # default safe set
+#   cargo bench --bench prove -- log16        # a specific heavy one
+[[bench]]
+name = "prove"
+harness = false
+required-features = ["prover"]
+
+# Actor-workload proving benchmarks (measurement, not correctness — see
+# benches/actors.rs).  Same `harness = false` + custom `main` pattern as the
+# `prove` bench: kept out of `cargo test`, run serially so a large actor trace
+# never contends for RAM with another.
+#   cargo bench --bench actors                              # default safe set
+#   cargo bench --bench actors -- profile_clerk_refine_bench  # a heavy one
+[[bench]]
+name = "actors"
+harness = false
+required-features = ["prover"]
+
+[lints.clippy]
+module-inception = { level = "allow", priority = 0 }
+# AIR fill code is byte-position-indexed throughout (val_b[0..8],
+# carry chains, schoolbook positions).  `for i in 0..8 { col[i] =
+# ... }` is the natural shape; the iterator-based clippy suggestion
+# (`for (i, item) in col.iter_mut().enumerate()`) obscures that
+# `i` is a position in the constrained byte layout.
+needless_range_loop = { level = "allow", priority = 0 }
+# Lookup-tuple builders take many small arguments by design (one
+# per column); collapsing them into a struct-arg would just rename
+# the same parameters.
+too_many_arguments = { level = "allow", priority = 0 }
+# Hand-formatted ASCII tables / continuation lines in doc-comments
+# don't always satisfy the markdown 2-space-indent rule; the
+# rendered output is fine in both rustdoc and our review tooling.
+doc_lazy_continuation = { level = "allow", priority = 0 }

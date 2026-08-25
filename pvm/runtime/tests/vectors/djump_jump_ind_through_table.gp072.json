@@ -1,0 +1,57 @@
+{
+  "backends": [
+    "interpreter",
+    "recompiler"
+  ],
+  "expected": {
+    "gas": 97,
+    "memory": [],
+    "pc": 8,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x2",
+      "0x0",
+      "0x0",
+      "0x1",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ],
+    "status": "trap"
+  },
+  "family": "djump",
+  "initial": {
+    "gas": 100,
+    "memory": [],
+    "page_map": [],
+    "pc": 0,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x2",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "djump_jump_ind_through_table",
+  "program": {
+    "bitmask": "0x3d01",
+    "code": "0x320200000033050100",
+    "jump_table": [
+      5
+    ]
+  }
+}

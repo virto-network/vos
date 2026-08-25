@@ -208,7 +208,7 @@ just build-actor messenger          # = cd actors/messenger && cargo +nightly ac
 ```
 
 The crate is its own workspace; the ELF lands in
-`actors/messenger/target/riscv64em-javm/release/messenger.elf`. The transpile
+`actors/messenger/target/riscv64em-vos/release/messenger.elf`. The transpile
 gate (`cargo test -p vos --test messenger_transpile`) checks it links through
 `grey_transpiler::link_elf`; `messenger_pvm` checks it *executes* in a bare
 runtime. Manifests load it as a device-local agent:
@@ -216,7 +216,7 @@ runtime. Manifests load it as a device-local agent:
 ```toml
 [[agent]]
 name = "messenger"
-path = "../actors/messenger/target/riscv64em-javm/release/messenger.elf"
+path = "../actors/messenger/target/riscv64em-vos/release/messenger.elf"
 consistency = "local"
 device_secret = true
 tick_ms = 500

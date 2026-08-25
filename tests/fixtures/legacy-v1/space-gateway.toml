@@ -67,12 +67,12 @@ version = "0.1.0"
 
 [[agent]]
 name = "counter"
-path = "actors/committed-counter/target/riscv64em-javm/release/committed_counter.elf"
+path = "actors/committed-counter/target/riscv64em-vos/release/committed_counter.elf"
 consistency = "local"
 
 [[agent]]
 name = "greeter"
-path = "actors/greeter/target/riscv64em-javm/release/greeter.elf"
+path = "actors/greeter/target/riscv64em-vos/release/greeter.elf"
 consistency = "ephemeral"
 
 # ── Gateway extension ────────────────────────────────────────────

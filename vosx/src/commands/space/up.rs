@@ -46,7 +46,7 @@ fn load_pinned_v2_service(path: Option<&Path>) -> anyhow::Result<Option<PinnedV2
     };
     let pvm = std::fs::read(path)
         .map_err(|error| anyhow::anyhow!("read pinned service PVM {}: {error}", path.display()))?;
-    javm::program::parse_blob(&pvm)
+    vos_pvm::program::parse_blob(&pvm)
         .ok_or_else(|| anyhow::anyhow!("{} is not a canonical JAR PVM", path.display()))?;
     let actual = vos::v2::ProgramId::of_pvm(&pvm);
     if actual != vos::v2::VOS_SERVICE_PROGRAM_ID {
@@ -107,7 +107,7 @@ fn frozen_role_authority_package(public_key: Vec<u8>) -> anyhow::Result<vos::v2:
     let actor_pvm = crate::bundled::space_authority_pvm()
         .ok_or_else(|| anyhow::anyhow!("vosx was built without the canonical space-authority PVM"))?
         .to_vec();
-    javm::program::parse_blob(&actor_pvm)
+    vos_pvm::program::parse_blob(&actor_pvm)
         .ok_or_else(|| anyhow::anyhow!("bundled space-authority PVM is invalid"))?;
     let (schemas, schemas_len) =
         vos::metadata::encode::<16384>(&space_authority::SpaceAuthorityMsg::META);
@@ -333,7 +333,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     };
     // Cache stores raw ELF bytes (hash addresses the source); the
     // PVM kernel needs the transpiled JAR blob.
-    let blob = grey_transpiler::link_elf(&elf)
+    let blob = vos_pvm_compiler::link_elf(&elf)
         .map_err(|e| anyhow::anyhow!("transpile registry elf: {e:?}"))?;
 
     let space_id = entry
@@ -2897,11 +2897,11 @@ fn actor_blob_from_catalog(
         );
     }
     if artifact.get(..3) == Some(b"JAR") {
-        javm::program::parse_blob(&artifact)
+        vos_pvm::program::parse_blob(&artifact)
             .ok_or_else(|| anyhow::anyhow!("{instance_name} canonical PVM is invalid"))?;
         return Ok(CatalogActorArtifact::LegacyExecutable(artifact));
     }
-    grey_transpiler::link_elf(&artifact)
+    vos_pvm_compiler::link_elf(&artifact)
         .map(CatalogActorArtifact::LegacyExecutable)
         .map_err(|error| anyhow::anyhow!("transpile legacy {instance_name}: {error:?}"))
 }
@@ -4383,9 +4383,9 @@ mod tests {
     }
 
     fn signed_v2_package_with_consistency(service_program: ProgramId, crdt: bool) -> VosPackageV2 {
-        let mut assembler = grey_transpiler::assembler::Assembler::new();
+        let mut assembler = vos_pvm_compiler::assembler::Assembler::new();
         assembler
-            .load_imm_64(grey_transpiler::assembler::Reg::A0, 0)
+            .load_imm_64(vos_pvm_compiler::assembler::Reg::A0, 0)
             .ecalli(0);
         let actor_pvm = assembler.build();
         let metadata_source = ActorMeta { crdt, ..V2_META };

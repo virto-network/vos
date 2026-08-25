@@ -1,4 +1,4 @@
-[target.riscv64em-javm]
+[target.riscv64em-vos]
 rustflags = [
     "-Zunstable-options",
     "-Zcrate-attr=no_std",
@@ -9,7 +9,7 @@ rustflags = [
 ]
 
 [alias]
-actor = "rustc --lib --crate-type bin -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --release --target riscv64em-javm.json"
+actor = "rustc --lib --crate-type bin -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --release --target riscv64em-vos.json"
 
 [unstable]
 json-target-spec = true

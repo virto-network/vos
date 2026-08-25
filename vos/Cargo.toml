@@ -1,6 +1,6 @@
 [package]
 name = "vos"
-description = "VOS runtime: a deterministic actor host on a JAM-aligned PVM (RISC-V), with per-agent CRDT or Raft replication, libp2p transport, and content-addressed storage."
+description = "VOS runtime: a deterministic actor host with CRDT or Raft replication, libp2p transport, and content-addressed storage."
 keywords = ["vos", "p2p", "actor", "pvm", "crdt"]
 categories = ["network-programming", "embedded", "wasm"]
 version.workspace = true
@@ -13,7 +13,7 @@ readme.workspace = true
 
 [features]
 default = ["std", "http", "storage", "network"]
-std = ["dep:javm", "dep:grey-transpiler", "dep:toml", "dep:serde", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading", "dep:object", "dep:async-io", "dep:async-executor", "dep:futures-lite", "dep:futures-channel", "dep:futures-rustls", "dep:rustls-pemfile", "dep:getrandom", "dep:zkpvm-precompiles", "dep:cipher-clerk", "dep:rand_chacha", "dep:zeroize"]
+std = ["dep:vos-pvm", "dep:vos-pvm-compiler", "dep:toml", "dep:serde", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading", "dep:object", "dep:async-io", "dep:async-executor", "dep:futures-lite", "dep:futures-channel", "dep:futures-rustls", "dep:rustls-pemfile", "dep:getrandom", "dep:vos-pvm-precompiles", "dep:cipher-clerk", "dep:rand_chacha", "dep:zeroize"]
 macros = ["dep:vos-macros"]
 pvm = []
 service = ["pvm"]
@@ -21,7 +21,7 @@ service-runtime = ["service"]
 # NOTE: the ZK actor-IO binding is tagless (`vos::zk`) — the io-hash
 # primitive `compute_io_hash` is pure and always available (guest +
 # host).  Proof *verification* (STARK validity ∧ io-binding) lives in
-# the `prover` host extension, which depends on `zkpvm-verifier`
+# the `prover` host extension, which depends on `vos-pvm-proof-verifier`
 # directly; vos itself does not pull a verifier, so there is no
 # `zk-verify` feature.
 extension = ["macros"]
@@ -49,18 +49,15 @@ rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytech
 # the same facade and bridge to tracing if it wants.
 log = { version = "0.4", default-features = false }
 
-# std-only: PVM runtime and vosx binary dependencies.
-# Both crates are pinned by git rev during local development; the
-# `version` is what crates.io uses when the published vos package
-# resolves them (the git URL is stripped at publish time).
-javm = { workspace = true, optional = true }
-grey-transpiler = { workspace = true, optional = true }
-# Host-side execution of the zkpvm Ristretto/scalar precompile ECALLs, so
+# std-only: workspace-owned PVM runtime and compiler dependencies.
+vos-pvm = { workspace = true, optional = true }
+vos-pvm-compiler = { workspace = true, optional = true }
+# Host-side execution of the vos-pvm-proof Ristretto/scalar precompile ECALLs, so
 # a pvm-precompile actor (cipher-clerk crypto) runs LIVE in the runtime
 # bit-identically to the prover's tracer — the `ristretto` feature's
 # host functions fall through to curve25519-dalek off-target. Host-only
 # (behind `std`); the guest emits the ECALLs, it doesn't link this.
-zkpvm-precompiles = { workspace = true, features = ["ristretto"], optional = true }
+vos-pvm-precompiles = { workspace = true, features = ["ristretto"], optional = true }
 toml = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 pollster = { version = "0.3", optional = true }
@@ -193,11 +190,11 @@ clerk-settle = { path = "../actors/clerk-settle", default-features = false }
 # caller-supplied allowlist) and use it as a blob_get probe in
 # proof_blob_cross_node.
 prover-extension = { path = "../extensions/prover" }
-# zkpvm canonical prover + segmentation — the `voucher_check_commitment_
+# vos-pvm-proof canonical prover + segmentation — the `voucher_check_commitment_
 # drift_guard` re-derives the pinned VOUCHER_CHECK_COMMITMENTS by proving
 # two canonical segments. Already in the dev-dep graph via prover-extension;
 # named directly here so the guard can call it.
-zkpvm = { workspace = true }
+vos-pvm-proof = { workspace = true }
 # Host-side cipher-clerk with `signing` so tests can build
 # signed CreateAccount events to push through the ledger. Pulls in
 # OsRng-backed signing — fine on host; the actor itself never

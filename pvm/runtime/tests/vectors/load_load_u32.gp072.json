@@ -1,0 +1,71 @@
+{
+  "backends": [
+    "interpreter",
+    "recompiler"
+  ],
+  "expected": {
+    "gas": 98,
+    "memory": [],
+    "pc": 5,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x84838281",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ],
+    "status": "trap"
+  },
+  "family": "load",
+  "initial": {
+    "gas": 100,
+    "memory": [
+      {
+        "address": 65536,
+        "contents": "0x8182838485868788898a8b8c8d8e8f90"
+      }
+    ],
+    "page_map": [
+      {
+        "access": "ro",
+        "address": 65536,
+        "length": 4096
+      },
+      {
+        "access": "rw",
+        "address": 131072,
+        "length": 4096
+      }
+    ],
+    "pc": 0,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "load_load_u32",
+  "program": {
+    "bitmask": "0x21",
+    "code": "0x380200000100",
+    "jump_table": []
+  }
+}

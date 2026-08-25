@@ -100,7 +100,7 @@ fn provision(rt: &mut VosRuntime, id: ServiceId, nickname: &str) {
 fn messenger_elf() -> Option<Vec<u8>> {
     let workspace = env!("CARGO_MANIFEST_DIR");
     let path =
-        format!("{workspace}/../actors/messenger/target/riscv64em-javm/release/messenger.elf");
+        format!("{workspace}/../actors/messenger/target/riscv64em-vos/release/messenger.elf");
     match std::fs::read(&path) {
         Ok(d) => Some(d),
         Err(_) => {
@@ -116,7 +116,7 @@ fn messenger_elf() -> Option<Vec<u8>> {
 /// Transpile + register the messenger in a fresh runtime.
 fn boot() -> (VosRuntime, ServiceId) {
     let elf = messenger_elf().expect("messenger ELF present (checked by caller)");
-    let blob = grey_transpiler::link_elf(&elf).expect("transpile messenger");
+    let blob = vos_pvm_compiler::link_elf(&elf).expect("transpile messenger");
     let mut rt = VosRuntime::new();
     let blob_idx = rt.register_service_blob(blob);
     let id = rt.register_service(blob_idx);

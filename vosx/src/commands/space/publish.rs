@@ -278,9 +278,9 @@ mod tests {
     };
 
     fn signed_package() -> VosPackageV2 {
-        let mut assembler = grey_transpiler::assembler::Assembler::new();
+        let mut assembler = vos_pvm_compiler::assembler::Assembler::new();
         assembler
-            .load_imm_64(grey_transpiler::assembler::Reg::A0, 0)
+            .load_imm_64(vos_pvm_compiler::assembler::Reg::A0, 0)
             .ecalli(0);
         let actor_pvm = assembler.build();
         let (buffer, length) = vos::metadata::encode::<512>(&META);

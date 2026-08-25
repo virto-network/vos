@@ -25,7 +25,7 @@ unexpected_cfgs = { level = "allow" }
 # applies the live writes against the attested root.
 #
 # Built via `cargo +nightly build --release` (the .cargo/config.toml pins
-# the riscv64em-javm target + build-std, exactly like voucher-check).
+# the riscv64em-vos target + build-std, exactly like voucher-check).
 
 [dependencies]
 vos = { path = "../../../../vos", default-features = false, features = ["macros", "service"] }
@@ -33,7 +33,7 @@ clerk-witness = { path = "../../../../clerk-witness", default-features = false }
 cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false }
 
 # The proof-producing Task deliberately uses cipher-clerk's software
-# Ristretto/scalar arithmetic. zkpvm's precompile AIR currently binds the
+# Ristretto/scalar arithmetic. vos-pvm-proof's precompile AIR currently binds the
 # ECALL boundary bytes but not their arithmetic relation, so enabling
 # `pvm-precompile` here would let an adversarial prover forge signature
 # verification outputs. `signing`/`helpers` stay OFF: the Task only decodes

@@ -2,7 +2,7 @@
 //!
 //! Two source paths, tried in order:
 //!
-//! 1. **Dev path**: `actors/space-registry/target/riscv64em-javm/release/space_registry.elf`,
+//! 1. **Dev path**: `actors/space-registry/target/riscv64em-vos/release/space_registry.elf`,
 //!    produced by `cargo actor` in that crate's directory. Inside
 //!    this workspace it's the fresh build; consumed by working-tree
 //!    builds and tests so changes show up immediately.
@@ -118,7 +118,7 @@ fn bundle_actor(
         .join("actors")
         .join(actor_dir)
         .join("target")
-        .join("riscv64em-javm")
+        .join("riscv64em-vos")
         .join("release")
         .join(elf_filename);
     let shipped_path = manifest_dir.join("blobs").join(elf_filename);

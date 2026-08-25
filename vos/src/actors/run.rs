@@ -330,14 +330,14 @@ fn halt_with_output(data: &[u8]) -> ! {
 /// only its target register, so a0-a5 persist unchanged into
 /// `final_state.registers`, where Phase Z0's closing chip pins the
 /// columns and the verifier's boundary-binding check equates the
-/// metadata to them (`zkpvm::Proof::public_io_hash`). No new hostcall, no
+/// metadata to them (`vos_pvm_proof::Proof::public_io_hash`). No new hostcall, no
 /// tracer/prover cooperation, no register-ledger surgery: it is ordinary
 /// register state at halt.  The closing-read column binds to the true
 /// final register via the register-ledger read-consistency (v6: cross-row
 /// `prev_value` + `(reg, ts)` sortedness + `is_write` limb), which is
 /// sound against a from-scratch prover (gate
-/// `zkpvm/tests/ledger_readconsistency_gate.rs`) — see `crate::zk` and
-/// `zkpvm::chips::register_memory_closing`.
+/// `pvm/proof/tests/ledger_readconsistency_gate.rs`) — see `crate::zk` and
+/// `vos_pvm_proof::chips::register_memory_closing`.
 ///
 /// a2→φ[9], a3→φ[10], a4→φ[11], a5→φ[12] per grey-transpiler's RISC-V→PVM
 /// mapping — the exact window `public_io_hash` reconstructs.
@@ -983,8 +983,8 @@ pub fn run_nested_actor_service<A: super::Actor>(
 
 #[cfg(feature = "service")]
 const fn javm_page_size_for_guest() -> usize {
-    // This is the GP/JAR page size. Keep the guest free of a javm dependency;
-    // the workspace-side host checks the same value through javm::PVM_PAGE_SIZE.
+    // This is the GP/JAR page size. Keep the guest free of a vos_pvm dependency;
+    // the workspace-side host checks the same value through vos_pvm::PVM_PAGE_SIZE.
     1 << 12
 }
 

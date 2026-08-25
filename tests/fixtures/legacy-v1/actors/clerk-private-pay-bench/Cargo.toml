@@ -17,16 +17,15 @@ vos = { path = "../../../../../vos", default-features = false, features = ["macr
 cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", rev = "e9a7b0851f183c14dbd1635dbf0437c86682ad6f", default-features = false, features = ["signing", "viewing-keys", "notes", "pvm-precompile"] }
 # cipher-clerk's `signing` feature pulls in rand_core/getrandom for OsRng;
 # we never actually invoke OsRng (we use a deterministic seeded RNG) but
-# need a custom backend so getrandom links on the riscv64em-javm target.
+# need a custom backend so getrandom links on the riscv64em-vos target.
 getrandom = { version = "0.2", default-features = false, features = ["custom"] }
 rand_core = { version = "0.6", default-features = false }
 blake2 = { version = "0.10", default-features = false }
-# Step 1 verification: depend on zkpvm-precompiles (no_std, no
+# Step 1 verification: depend on vos-pvm-precompiles (no_std, no
 # host-fallback feature) so the on-target inline-asm path
-# compiles for riscv64em-javm.
-# Match CipherClerk's immutable source exactly so Cargo resolves one
-# precompile package rather than two source-distinct copies.
-zkpvm-precompiles = { git = "https://codeberg.org/Virto/VOS.git", rev = "9f5337fb39ccad5b779cf72cbd617e726e325aed" }
+# compiles for riscv64em-vos.
+# Use the precompile ABI owned by this repository.
+vos-pvm-precompiles = { path = "../../../../../pvm/proof/precompiles" }
 
 [profile.release]
 opt-level = "s"

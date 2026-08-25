@@ -51,7 +51,7 @@
 
 use vos::prelude::*;
 // `to_string()` on primitives lives on `alloc::string::ToString`, which
-// is in `std::prelude` on the host but not the riscv64em-javm `no_std`
+// is in `std::prelude` on the host but not the riscv64em-vos `no_std`
 // build. Import it explicitly so the tree/merge reply builders compile
 // for both.
 #[allow(unused_imports)]
@@ -496,7 +496,7 @@ pub mod store {
     use super::*;
     // `to_string()` etc. live on `alloc::string::ToString`, which
     // is in `std::prelude` on the host but not in the riscv64em-
-    // javm `no_std` build. Explicitly importing keeps the same
+    // vos_pvm `no_std` build. Explicitly importing keeps the same
     // source path compiling for both flavors.
     #[allow(unused_imports)]
     use alloc::string::ToString;

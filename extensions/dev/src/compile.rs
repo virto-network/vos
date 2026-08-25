@@ -3,14 +3,14 @@
 //! Fetches a `CommitNode` from a dev-project actor, materialises
 //! every referenced blob under a tempdir mirroring the project's
 //! path structure, synthesises the build infra (Cargo.toml +
-//! .cargo/config.toml + rust-toolchain.toml + the riscv64em-javm
+//! .cargo/config.toml + rust-toolchain.toml + the riscv64em-vos
 //! target spec), invokes cargo, transpiles the resulting RISC-V
-//! ELF through `grey_transpiler::link_elf`, stores the resulting
+//! ELF through `vos_pvm_compiler::link_elf`, stores the resulting
 //! PVM blob back into the project via `put_blob`, and returns the
 //! blob's hash.
 //!
 //! v1 keeps the synthesised crate name fixed (`actor`) so the
-//! output ELF is always at `target/riscv64em-javm/release/actor.elf`
+//! output ELF is always at `target/riscv64em-vos/release/actor.elf`
 //! — saves the extension a round trip to fetch the project's
 //! display name. Phase 2's AST blobs and Phase 5's cross-project
 //! deps will revisit that, but for v1 every dev-project compiles
@@ -33,16 +33,16 @@ use crate::DevCtx;
 
 // ── Embedded build infra (synced from the workspace at build time) ───
 
-/// The riscv64em-javm rustc target spec. Lives next to the
+/// The riscv64em-vos rustc target spec. Lives next to the
 /// dev-project actor so the same JSON drives both the bundled
 /// actor build and synthesised compiles.
-const RISCV_TARGET_JSON: &str = include_str!("../../../actors/dev-project/riscv64em-javm.json");
+const RISCV_TARGET_JSON: &str = include_str!("../../../actors/dev-project/riscv64em-vos.json");
 
 /// Toolchain pin baked into every synthesised project. We
 /// deliberately *don't* mirror the workspace's
 /// `rust-toolchain.toml` here: the workspace pins
 /// `nightly-2025-05-09` for zkpvm reproducibility, but that
-/// nightly is too old to accept the riscv64em-javm JSON target
+/// nightly is too old to accept the riscv64em-vos JSON target
 /// spec's current shape. Pinning the generic `nightly` channel
 /// means the synthesised build picks up whatever fresh nightly
 /// the operator's rustup default points at — same one the
@@ -349,7 +349,7 @@ pub async fn compile_project(
             "-Zbuild-std-features=compiler-builtins-mem",
             "--release",
             "--target",
-            "riscv64em-javm.json",
+            "riscv64em-vos.json",
         ])
         .env_remove("RUSTUP_TOOLCHAIN")
         .current_dir(project_root)
@@ -366,7 +366,7 @@ pub async fn compile_project(
     // ── 5. Read the produced ELF (synthesised crate name = "actor")
     let elf_path = project_root
         .join("target")
-        .join("riscv64em-javm")
+        .join("riscv64em-vos")
         .join("release")
         .join("actor.elf");
     let elf_bytes = match fs::read(&elf_path) {
@@ -388,7 +388,7 @@ pub async fn compile_project(
     //    PVM blob directly would force the install path to
     //    distinguish "pre-transpiled" from "needs transpile"
     //    bytes, which is more breakage than it's worth.
-    if let Err(e) = grey_transpiler::link_elf(&elf_bytes) {
+    if let Err(e) = vos_pvm_compiler::link_elf(&elf_bytes) {
         return CompileOutcome::err(COMPILE_STATUS_TRANSPILE_FAILED, format!("{e:?}"));
     }
 
@@ -659,7 +659,7 @@ fn write_build_infra(root: &Path, metadata: &dev_project::ProjectMetadata) -> Re
     fs::write(cargo_dir.join("config.toml"), CARGO_CONFIG_TOML).map_err(|e| e.to_string())?;
 
     fs::write(root.join("rust-toolchain.toml"), RUST_TOOLCHAIN).map_err(|e| e.to_string())?;
-    fs::write(root.join("riscv64em-javm.json"), RISCV_TARGET_JSON).map_err(|e| e.to_string())?;
+    fs::write(root.join("riscv64em-vos.json"), RISCV_TARGET_JSON).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -719,7 +719,7 @@ panic = "abort"
 /// `tests/fixtures/legacy-v1/actors/*/`.cargo/config.toml looks like — the rustflags
 /// inject the `no_std` / `no_main` crate attrs that PVM actors
 /// expect, and `json-target-spec` lets `--target X.json` resolve.
-const CARGO_CONFIG_TOML: &str = r#"[target.riscv64em-javm]
+const CARGO_CONFIG_TOML: &str = r#"[target.riscv64em-vos]
 rustflags = [
     "-Zunstable-options",
     "-Zcrate-attr=no_std",

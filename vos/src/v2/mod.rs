@@ -180,7 +180,7 @@ pub const MAX_ACTOR_STORAGE_KEY_BYTES: usize = 4096;
 pub const MAX_ACTOR_STORAGE_WITNESS_BYTES: usize = 1024 * 1024;
 
 #[cfg(feature = "std")]
-const _: () = assert!(MAX_ROOT_TREE_ACTORS + 1 == javm::vm_pool::MAX_CODE_CAPS);
+const _: () = assert!(MAX_ROOT_TREE_ACTORS + 1 == vos_pvm::vm_pool::MAX_CODE_CAPS);
 
 /// Maximum UTF-8 byte length of one actor's parent-scoped name.
 pub const MAX_ACTOR_NAME_BYTES: usize = 128;

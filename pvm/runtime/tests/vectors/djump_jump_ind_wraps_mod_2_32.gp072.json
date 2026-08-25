@@ -1,0 +1,55 @@
+{
+  "backends": [
+    "interpreter",
+    "recompiler"
+  ],
+  "expected": {
+    "gas": 99,
+    "memory": [],
+    "pc": 0,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x1ffff0000",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ],
+    "status": "halt"
+  },
+  "family": "djump",
+  "initial": {
+    "gas": 100,
+    "memory": [],
+    "page_map": [],
+    "pc": 0,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x1ffff0000",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "djump_jump_ind_wraps_mod_2_32",
+  "program": {
+    "bitmask": "0x05",
+    "code": "0x320200",
+    "jump_table": []
+  }
+}

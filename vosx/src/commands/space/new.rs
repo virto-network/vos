@@ -125,7 +125,7 @@ pub(crate) fn scaffold(
     // 1. Resolve and cache the registry blob — explicit
     //    --registry first, bundled fallback otherwise.
     let (registry_hash, registry_bytes, registry_label) = resolve_registry_source(registry)?;
-    let registry_blob = grey_transpiler::link_elf(&registry_bytes)
+    let registry_blob = vos_pvm_compiler::link_elf(&registry_bytes)
         .map_err(|e| anyhow::anyhow!("transpile registry elf: {e:?}"))?;
 
     // 2. Generate a per-space libp2p keypair + derive prefix.

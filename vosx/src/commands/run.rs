@@ -60,7 +60,7 @@ fn load_blob(path: &Path) -> Vec<u8> {
     let data = load_file(path);
     match path.extension().and_then(|e| e.to_str()) {
         Some("pvm") => data,
-        _ => grey_transpiler::link_elf(&data)
+        _ => vos_pvm_compiler::link_elf(&data)
             .unwrap_or_else(|e| die(&format!("transpiling '{}': {e:?}", path.display()))),
     }
 }

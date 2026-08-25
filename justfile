@@ -10,7 +10,7 @@ default:
 # Build the workspace crates, extensions, and PVM actors.
 build: build-crates build-extensions build-pvm
 
-# Build workspace crates (vos, vosx, zkpvm, support crates, etc.).
+# Build workspace crates (VOS, the PVM toolchain, and support crates).
 build-crates:
     cargo build
 
@@ -100,11 +100,11 @@ build-clerk-v2-package signer:
 # replaces the committed production PVM or the pinned fresh-build fixture.
 build-vos-service-candidate:
     cd services/vos-service; cargo actor
-    @echo "candidate ELF: services/vos-service/target/riscv64em-javm/release/vos_service.elf"
+    @echo "candidate ELF: services/vos-service/target/riscv64em-vos/release/vos_service.elf"
 
 # Refresh the bundled space-registry ELF shipped with vosx.
 refresh-bundled-registry: (build-actor "space-registry")
-    cp actors/space-registry/target/riscv64em-javm/release/space_registry.elf \
+    cp actors/space-registry/target/riscv64em-vos/release/space_registry.elf \
        vosx/blobs/space_registry.elf
 
 # Build a deliberately distinct, contract-compatible authority PVM for the
@@ -113,7 +113,7 @@ refresh-bundled-registry: (build-actor "space-registry")
 build-authority-upgrade-candidate:
     cd actors/space-authority; cargo +nightly actor --features migration-fixture
     cargo run -p vosx -- build \
-      actors/space-authority/target/riscv64em-javm/release/space_authority.elf \
+      actors/space-authority/target/riscv64em-vos/release/space_authority.elf \
       --name space-authority \
       --version artifact-only --out-dir target/bundled-space-authority
     @echo "candidate: target/bundled-space-authority/space-authority.pvm"
@@ -137,12 +137,12 @@ package-v2-production-release out="target/production-v2-release": build-authorit
 
 # Refresh the bundled dev-project ELF shipped with vosx.
 refresh-bundled-dev-project: (build-actor "dev-project")
-    cp actors/dev-project/target/riscv64em-javm/release/dev_project.elf \
+    cp actors/dev-project/target/riscv64em-vos/release/dev_project.elf \
        vosx/blobs/dev_project.elf
 
-# Build the on-chain settlement-verifier ELF for the JAM PVM (riscv64em-javm).
+# Build the settlement-verifier ELF for the VOS PVM target.
 build-settle:
-    cd zkpvm/settlement-verifier; cargo build --release --target riscv64em-javm.json \
+    cd pvm/proof/settlement-verifier; cargo build --release --target riscv64em-vos.json \
       -Zbuild-std=core,alloc,compiler_builtins \
       -Zbuild-std-features=compiler-builtins-mem \
       --features pvm-settle --bin settle
@@ -197,54 +197,47 @@ test-v2-production-daemon: build-v2-daemon-root-artifacts build-v2-registry-fixt
 test-one name: build-extensions
     cargo test -p vos {{name}} -- --nocapture
 
-# Run the full zkpvm test suite.
-test-zkpvm:
-    cargo test -p zkpvm
+# Run the full PVM proof test suite.
+test-pvm-proof:
+    cargo test -p vos-pvm-proof
 
-# Run only the fast zkpvm tests.
-test-zkpvm-fast:
-    cargo test -p zkpvm --lib --test add64_e2e --test memory --test control_flow
+# Run only the fast PVM proof tests.
+test-pvm-proof-fast:
+    cargo test -p vos-pvm-proof --lib --test add64_e2e --test memory --test control_flow
 
 # ── Benchmarks ──────────────────────────────────────────────────────
 
-# Run the zkpvm proving benchmarks. Pass a filter to select benches
+# Run the PVM proving benchmarks. Pass a filter to select benches
 # (e.g., `just bench log16`).
 bench filter="":
-    cargo bench -p zkpvm --bench prove -- {{filter}}
+    cargo bench -p vos-pvm-proof --bench prove -- {{filter}}
 
 # ── Run ───────────────────────────────────────────────────────────────
 
 # Run a retired v1 fixture as a one-shot, no space, no networking.
 run-actor name="greeter": build-pvm
-    cargo run --bin vosx -- run tests/fixtures/legacy-v1/actors/{{name}}/target/riscv64em-javm/release/{{name}}.elf
+    cargo run --bin vosx -- run tests/fixtures/legacy-v1/actors/{{name}}/target/riscv64em-vos/release/{{name}}.elf
 
-# ── zkpvm verifier ──────────────────────────────────────────────────
+# ── PVM proof verifier ──────────────────────────────────────────────────
 
 # Check the verifier-only path builds without std.
-check-zkpvm-no-std:
-    cargo build -p zkpvm --no-default-features
-    cargo build -p zkpvm-verifier
+check-pvm-proof-no-std:
+    cargo build -p vos-pvm-proof --no-default-features
+    cargo build -p vos-pvm-proof-verifier
 
-# Build the zkpvm verifier for wasm32-unknown-unknown.
-check-zkpvm-wasm:
+# Build the PVM proof verifier for wasm32-unknown-unknown.
+check-pvm-proof-wasm:
     rustup target add wasm32-unknown-unknown
-    cargo build -p zkpvm-verifier --target wasm32-unknown-unknown
+    cargo build -p vos-pvm-proof-verifier --target wasm32-unknown-unknown
 
 # ── Maintenance ───────────────────────────────────────────────────────
 
 # Check everything compiles without producing artifacts.
 check:
-    cargo run -p jar-revision-check
     cargo check --all-targets
-
-# Reject mixed JAVM/transpiler/tracer/verifier revisions, including excluded
-# fuzz and benchmark workspaces.
-check-jar-revisions:
-    cargo run -p jar-revision-check
 
 # Run the same checks the pre-commit and pre-push hooks run.
 check-all:
-    cargo run -p jar-revision-check
     cargo fmt -- --check
     cargo clippy --workspace -- -D warnings \
         -A clippy::too_many_arguments \

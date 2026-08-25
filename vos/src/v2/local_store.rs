@@ -11,7 +11,7 @@ use core::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use javm::kernel::InvocationKernel;
+use vos_pvm::kernel::InvocationKernel;
 
 use crate::attestation::AttestationProofHostV2;
 

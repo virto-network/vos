@@ -14,7 +14,7 @@
 - [Networking & Transport](transport.md)
 - [Identity](identity.md)
 - [Authorization](authorization.md)
-- [zkPVM](zkpvm.md)
+- [PVM proofs](pvm-proofs.md)
 - [SDK & Developer Experience](sdk.md)
 - [Performance & Scalability](performance.md)
 

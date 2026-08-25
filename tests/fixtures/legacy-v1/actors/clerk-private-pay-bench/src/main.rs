@@ -33,7 +33,7 @@ use core::result::Result as StdResult;
 use rand_core::RngCore as _;
 
 // cipher-clerk's `signing` feature transitively enables
-// `rand_core/getrandom`, which won't link on the riscv64em-javm target
+// `rand_core/getrandom`, which won't link on the riscv64em-vos target
 // without a custom backend.  We never actually call OsRng (DetRng
 // supplies all randomness) so the stub returns UNSUPPORTED — if
 // anything ever invokes it, the call site will surface a clear error
@@ -169,7 +169,7 @@ impl DetRng {
         // Route through the blake2b precompile so DetRng's RNG fills
         // don't fill the trace with thousands of pure-Rust blake2 ops.
         let counter_bytes = self.counter.to_le_bytes();
-        self.buf = zkpvm_precompiles::blake2b_hash::<32>(&self.seed, &[&counter_bytes]);
+        self.buf = vos_pvm_precompiles::blake2b_hash::<32>(&self.seed, &[&counter_bytes]);
         self.counter = self.counter.wrapping_add(1);
         self.buf_pos = 0;
     }

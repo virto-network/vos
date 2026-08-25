@@ -1,0 +1,72 @@
+{
+  "backends": [
+    "interpreter",
+    "recompiler"
+  ],
+  "expected": {
+    "gas": 99,
+    "memory": [],
+    "page_fault_address": 196608,
+    "pc": 0,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ],
+    "status": "page_fault"
+  },
+  "family": "store",
+  "initial": {
+    "gas": 100,
+    "memory": [
+      {
+        "address": 65536,
+        "contents": "0x8182838485868788898a8b8c8d8e8f90"
+      }
+    ],
+    "page_map": [
+      {
+        "access": "ro",
+        "address": 65536,
+        "length": 4096
+      },
+      {
+        "access": "rw",
+        "address": 131072,
+        "length": 4096
+      }
+    ],
+    "pc": 0,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "store_store_fault_unmapped",
+  "program": {
+    "bitmask": "0x21",
+    "code": "0x3e0200000300",
+    "jump_table": []
+  }
+}

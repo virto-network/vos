@@ -43,7 +43,7 @@ version = "0.1.0"
 
 [[agent]]
 name = "scheduler"
-path = "agents/scheduler/target/riscv64em-javm/release/scheduler.elf"
+path = "agents/scheduler/target/riscv64em-vos/release/scheduler.elf"
 consistency = "ephemeral"
 # Cross-agent invoke is wired through the node — the scheduler can
 # ctx.ask() each of its children. Names in `init.children` resolve
@@ -54,9 +54,9 @@ init = { children = ["greeter", "counter", "fizzbuzz"] }
 # inherits the parent agent's consistency. They're independent PVM
 # services; the parent invokes them via the cross-agent path.
 actors = [
-  { name = "greeter",  path = "actors/greeter/target/riscv64em-javm/release/greeter.elf" },
-  { name = "counter",  path = "actors/counter/target/riscv64em-javm/release/counter.elf" },
-  { name = "fizzbuzz", path = "actors/fizzbuzz/target/riscv64em-javm/release/fizzbuzz.elf" },
+  { name = "greeter",  path = "actors/greeter/target/riscv64em-vos/release/greeter.elf" },
+  { name = "counter",  path = "actors/counter/target/riscv64em-vos/release/counter.elf" },
+  { name = "fizzbuzz", path = "actors/fizzbuzz/target/riscv64em-vos/release/fizzbuzz.elf" },
 ]
 
 # ── Extensions ───────────────────────────────────────────────────

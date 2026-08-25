@@ -8,13 +8,13 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
-use javm::cap::{Access, CallableCap, Cap, DataCap, ProtocolCap};
-use javm::kernel::{
+use vos_pvm::cap::{Access, CallableCap, Cap, DataCap, ProtocolCap};
+use vos_pvm::kernel::{
     DispatchResult, DormantProgram, InvocationKernel, KernelInstructionObservation, KernelResult,
 };
-use javm::program::{CapEntryType, cap_data, parse_blob, parse_code_blob};
-use javm::snapshot::KernelSnapshot;
-use javm::vm_pool::VmState;
+use vos_pvm::program::{CapEntryType, cap_data, parse_blob, parse_code_blob};
+use vos_pvm::snapshot::KernelSnapshot;
+use vos_pvm::vm_pool::VmState;
 
 use super::{
     ACCUMULATE_ENTRY_IC, ACTOR_EFFECT_BATCH_MAX_BYTES, ACTOR_IPC_BASE_PAGE, ACTOR_IPC_CAP_SLOT,
@@ -41,9 +41,9 @@ const ACTOR_STACK_OBJECT_CAP: u64 = 65;
 pub const SERVICE_ARGUMENT_PAGES_V2: u32 = 2048;
 
 /// Transpile the protocol infrastructure ELF with the v2 standard argument
-/// window. Application actor ELFs continue to use `grey_transpiler::link_elf`.
-pub fn transpile_service_elf(elf: &[u8]) -> Result<Vec<u8>, grey_transpiler::TranspileError> {
-    grey_transpiler::link_elf_with_argument_pages(elf, SERVICE_ARGUMENT_PAGES_V2)
+/// window. Application actor ELFs continue to use `vos_pvm_compiler::link_elf`.
+pub fn transpile_service_elf(elf: &[u8]) -> Result<Vec<u8>, vos_pvm_compiler::TranspileError> {
+    vos_pvm_compiler::link_elf_with_argument_pages(elf, SERVICE_ARGUMENT_PAGES_V2)
 }
 
 /// Result of one completed service-PVM execution slice.
@@ -279,32 +279,32 @@ impl RefineTraceRecorderV2 {
         }
     }
 
-    fn exit(&mut self, exit: Option<&javm::ExitReason>) {
+    fn exit(&mut self, exit: Option<&vos_pvm::ExitReason>) {
         match exit {
             None => {
                 self.state.update(&[0]);
             }
-            Some(javm::ExitReason::Halt) => {
+            Some(vos_pvm::ExitReason::Halt) => {
                 self.state.update(&[1]);
             }
-            Some(javm::ExitReason::Trap) => {
+            Some(vos_pvm::ExitReason::Trap) => {
                 self.state.update(&[2]);
             }
-            Some(javm::ExitReason::Panic) => {
+            Some(vos_pvm::ExitReason::Panic) => {
                 self.state.update(&[3]);
             }
-            Some(javm::ExitReason::OutOfGas) => {
+            Some(vos_pvm::ExitReason::OutOfGas) => {
                 self.state.update(&[4]);
             }
-            Some(javm::ExitReason::PageFault(address)) => {
+            Some(vos_pvm::ExitReason::PageFault(address)) => {
                 self.state.update(&[5]);
                 self.u32(*address);
             }
-            Some(javm::ExitReason::HostCall(id)) => {
+            Some(vos_pvm::ExitReason::HostCall(id)) => {
                 self.state.update(&[6]);
                 self.u32(*id);
             }
-            Some(javm::ExitReason::Ecall) => {
+            Some(vos_pvm::ExitReason::Ecall) => {
                 self.state.update(&[7]);
             }
         }
@@ -648,7 +648,7 @@ struct ActorRefineRuntimeV2 {
     actor_by_vm: Vec<Option<super::ActorId>>,
     private_inputs: BTreeMap<super::ActorId, ActorPrivateInputV2>,
     task_programs: BTreeMap<(super::ActorId, Hash), TaskProgramV2>,
-    task_code_cache: javm::CodeCache,
+    task_code_cache: vos_pvm::CodeCache,
     task_gas_used: u64,
     record_intents: BTreeMap<super::ActorId, u32>,
     record_attempts: BTreeMap<super::ActorId, u32>,
@@ -788,7 +788,7 @@ impl ActorRefineRuntimeV2 {
             actor_by_vm,
             private_inputs,
             task_programs,
-            task_code_cache: javm::CodeCache::new(),
+            task_code_cache: vos_pvm::CodeCache::new(),
             task_gas_used: 0,
             record_intents: BTreeMap::new(),
             record_attempts: BTreeMap::new(),
@@ -929,7 +929,7 @@ impl ActorRefineRuntimeV2 {
         // canonical interpreter in both ordinary Refine and traced replay so
         // instruction charging and the near-budget outcome cannot depend on
         // which backend happened to run the enclosing service VM.
-        let task_backend = javm::PvmBackend::ForceInterpreter;
+        let task_backend = vos_pvm::PvmBackend::ForceInterpreter;
         let Some(mut child) = crate::runtime::build_task_kernel_with_backend(
             &program.pvm,
             program.witness_address,
@@ -1435,7 +1435,7 @@ impl ServicePvmV2 {
         run_refine_kernel(
             kernel,
             host,
-            javm::PvmBackend::Default,
+            vos_pvm::PvmBackend::Default,
             true,
             None,
             None,
@@ -1465,7 +1465,7 @@ impl ServicePvmV2 {
             imports,
             gas_limit,
             host,
-            javm::PvmBackend::Default,
+            vos_pvm::PvmBackend::Default,
         )
     }
 
@@ -1478,7 +1478,7 @@ impl ServicePvmV2 {
         imports: &RefineImportsV2,
         gas_limit: u64,
         host: &H,
-        backend: javm::PvmBackend,
+        backend: vos_pvm::PvmBackend,
     ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
         self.refine_actor_tree_internal(arguments, imports, gas_limit, host, backend, false)
     }
@@ -1499,7 +1499,7 @@ impl ServicePvmV2 {
             imports,
             gas_limit,
             host,
-            javm::PvmBackend::ForceInterpreter,
+            vos_pvm::PvmBackend::ForceInterpreter,
             true,
         )
     }
@@ -1510,7 +1510,7 @@ impl ServicePvmV2 {
         imports: &RefineImportsV2,
         gas_limit: u64,
         host: &H,
-        backend: javm::PvmBackend,
+        backend: vos_pvm::PvmBackend,
         traced: bool,
     ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
         let work = WorkEnvelopeV2::decode(arguments)
@@ -1745,7 +1745,7 @@ impl ServicePvmV2 {
             None,
             &[],
             &[],
-            javm::PvmBackend::Default,
+            vos_pvm::PvmBackend::Default,
         )
     }
 
@@ -1766,7 +1766,7 @@ impl ServicePvmV2 {
             None,
             programs,
             blobs,
-            javm::PvmBackend::Default,
+            vos_pvm::PvmBackend::Default,
         )
     }
 
@@ -1786,7 +1786,7 @@ impl ServicePvmV2 {
             Some(logical_timeslot),
             &[],
             &[],
-            javm::PvmBackend::Default,
+            vos_pvm::PvmBackend::Default,
         )
     }
 
@@ -1806,7 +1806,7 @@ impl ServicePvmV2 {
             Some(logical_timeslot),
             programs,
             blobs,
-            javm::PvmBackend::Default,
+            vos_pvm::PvmBackend::Default,
         )
     }
 
@@ -1817,7 +1817,7 @@ impl ServicePvmV2 {
         arguments: &[u8],
         gas_limit: u64,
         host: &mut H,
-        backend: javm::PvmBackend,
+        backend: vos_pvm::PvmBackend,
     ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
         self.accumulate_at_with_backend(arguments, gas_limit, host, None, &[], &[], backend)
     }
@@ -1830,7 +1830,7 @@ impl ServicePvmV2 {
         logical_timeslot: Option<u64>,
         programs: &[super::ImportedProgramV2],
         blobs: &[super::ImportedBlobV2],
-        backend: javm::PvmBackend,
+        backend: vos_pvm::PvmBackend,
     ) -> Result<ServicePvmOutputV2, ServicePvmErrorV2> {
         let mut kernel =
             InvocationKernel::new_with_backend(&self.program, arguments, gas_limit, backend)
@@ -1928,17 +1928,19 @@ impl ServicePvmV2 {
     }
 }
 
-fn map_kernel_initialization_error(error: javm::kernel::KernelError) -> ServicePvmErrorV2 {
+fn map_kernel_initialization_error(error: vos_pvm::kernel::KernelError) -> ServicePvmErrorV2 {
     match error {
-        javm::kernel::KernelError::MemoryError
-        | javm::kernel::KernelError::OutOfMemory
-        | javm::kernel::KernelError::CompileError => ServicePvmErrorV2::KernelResourceUnavailable,
-        javm::kernel::KernelError::InvalidBlob
-        | javm::kernel::KernelError::OutOfGas
-        | javm::kernel::KernelError::TooManyCodeCaps
-        | javm::kernel::KernelError::CapTableFull
-        | javm::kernel::KernelError::ImportHandleUnavailable(_)
-        | javm::kernel::KernelError::TooManyVms => ServicePvmErrorV2::InvalidProgram,
+        vos_pvm::kernel::KernelError::MemoryError
+        | vos_pvm::kernel::KernelError::OutOfMemory
+        | vos_pvm::kernel::KernelError::CompileError => {
+            ServicePvmErrorV2::KernelResourceUnavailable
+        }
+        vos_pvm::kernel::KernelError::InvalidBlob
+        | vos_pvm::kernel::KernelError::OutOfGas
+        | vos_pvm::kernel::KernelError::TooManyCodeCaps
+        | vos_pvm::kernel::KernelError::CapTableFull
+        | vos_pvm::kernel::KernelError::ImportHandleUnavailable(_)
+        | vos_pvm::kernel::KernelError::TooManyVms => ServicePvmErrorV2::InvalidProgram,
     }
 }
 
@@ -2076,10 +2078,10 @@ fn install_actor_ipc(
         .len()
         .checked_add(MIN_ACTOR_OUTPUT_HEADROOM)
         .ok_or(ServicePvmErrorV2::ActorIpcExhausted)?;
-    let page_count = u32::try_from(minimum_capacity.div_ceil(javm::PVM_PAGE_SIZE as usize))
+    let page_count = u32::try_from(minimum_capacity.div_ceil(vos_pvm::PVM_PAGE_SIZE as usize))
         .map_err(|_| ServicePvmErrorV2::ActorIpcExhausted)?;
     let capacity = page_count
-        .checked_mul(javm::PVM_PAGE_SIZE)
+        .checked_mul(vos_pvm::PVM_PAGE_SIZE)
         .ok_or(ServicePvmErrorV2::ActorIpcExhausted)?;
     if page_count == 0
         || page_count > MAX_ACTOR_IPC_PAGES
@@ -2251,7 +2253,7 @@ fn stage_attestation_proof(
         Some(Cap::Data(data))
             if data.base_offset == Some(ACTOR_IPC_BASE_PAGE) && data.access == Some(Access::RW) =>
         {
-            data.mapped_page_count() as usize * javm::PVM_PAGE_SIZE as usize
+            data.mapped_page_count() as usize * vos_pvm::PVM_PAGE_SIZE as usize
         }
         _ => return Err(ServicePvmErrorV2::ActorIpcSetupFailed),
     };
@@ -2262,7 +2264,7 @@ fn stage_attestation_proof(
         return Err(ServicePvmErrorV2::ActorIpcExhausted);
     }
     let offset = capacity - proof.len();
-    let address = ACTOR_IPC_BASE_PAGE as usize * javm::PVM_PAGE_SIZE as usize + offset;
+    let address = ACTOR_IPC_BASE_PAGE as usize * vos_pvm::PVM_PAGE_SIZE as usize + offset;
     let address = u32::try_from(address).map_err(|_| ServicePvmErrorV2::ActorIpcExhausted)?;
     if !kernel.write_data_cap_window(address, proof) {
         return Err(ServicePvmErrorV2::ActorIpcSetupFailed);
@@ -2383,7 +2385,7 @@ fn suspended_actor_stack(
 fn run_refine_kernel<H: RefineProtocolHostV2>(
     mut kernel: InvocationKernel,
     host: &H,
-    backend: javm::PvmBackend,
+    backend: vos_pvm::PvmBackend,
     fresh: bool,
     suspension_work: Option<&WorkEnvelopeV2>,
     invocation_layout: Option<(&[u8], &[DormantProgram<'_>])>,
@@ -2827,7 +2829,7 @@ mod tests {
     use super::*;
 
     const SYNTHETIC_SERVICE_GAS: u64 = 10_000_000;
-    use grey_transpiler::assembler::Reg;
+    use vos_pvm_compiler::assembler::Reg;
 
     #[test]
     fn device_signer_seed_derivation_is_stable_and_redacted() {
@@ -3015,7 +3017,7 @@ mod tests {
 
     fn emit_halt(code: &mut Vec<u8>, bitmask: &mut Vec<u8>) {
         let mut load = vec![20, Reg::T0 as u8];
-        load.extend_from_slice(&(javm::PVM_HALT_ADDR as u64).to_le_bytes());
+        load.extend_from_slice(&(vos_pvm::PVM_HALT_ADDR as u64).to_le_bytes());
         emit_instruction(code, bitmask, &load);
         let mut jump = vec![50, Reg::T0 as u8];
         jump.extend_from_slice(&0u32.to_le_bytes());
@@ -3073,7 +3075,7 @@ mod tests {
         code[1..5].copy_from_slice(&(refine_body as i32).to_le_bytes());
         code[6..10].copy_from_slice(&((accumulate_body as i32) - 5).to_le_bytes());
 
-        let program = grey_transpiler::emitter::build_service_program_with_args_pages(
+        let program = vos_pvm_compiler::emitter::build_service_program_with_args_pages(
             &code,
             &bitmask,
             &[],
@@ -3247,7 +3249,7 @@ mod tests {
             Err(ServicePvmErrorV2::ProgramIdMismatch)
         ));
 
-        let actor = grey_transpiler::assembler::Assembler::new().build();
+        let actor = vos_pvm_compiler::assembler::Assembler::new().build();
         assert!(matches!(
             ServicePvmV2::new(actor.clone(), ProgramId::of_pvm(&actor)),
             Err(ServicePvmErrorV2::InvalidServiceEntries)
@@ -3258,12 +3260,12 @@ mod tests {
     fn root_tree_actor_limit_matches_the_pinned_jar_kernel() {
         assert_eq!(
             MAX_ROOT_TREE_ACTORS + 1,
-            javm::vm_pool::MAX_CODE_CAPS,
+            vos_pvm::vm_pool::MAX_CODE_CAPS,
             "one shared JAR code-capability entry is consumed by the service",
         );
 
         let service = two_entry_program(None);
-        let actor = grey_transpiler::assembler::Assembler::new().build();
+        let actor = vos_pvm_compiler::assembler::Assembler::new().build();
         let actors = (0..MAX_ROOT_TREE_ACTORS)
             .map(|ordinal| DormantProgram {
                 blob: actor.as_slice(),
@@ -3276,7 +3278,7 @@ mod tests {
                 &[],
                 SYNTHETIC_SERVICE_GAS,
                 &actors,
-                javm::PvmBackend::ForceInterpreter,
+                vos_pvm::PvmBackend::ForceInterpreter,
             )
             .is_ok()
         );
@@ -3292,7 +3294,7 @@ mod tests {
                 &[],
                 SYNTHETIC_SERVICE_GAS,
                 &too_many,
-                javm::PvmBackend::ForceInterpreter,
+                vos_pvm::PvmBackend::ForceInterpreter,
             )
             .is_err()
         );
@@ -3300,9 +3302,9 @@ mod tests {
 
     #[test]
     fn actor_manifests_cannot_occupy_scheduler_capability_slots() {
-        use javm::program::{CapManifestEntry, build_blob};
+        use vos_pvm::program::{CapManifestEntry, build_blob};
 
-        let actor = grey_transpiler::assembler::Assembler::new().build();
+        let actor = vos_pvm_compiler::assembler::Assembler::new().build();
         validate_actor_program_layout(&actor).unwrap();
         let parsed = parse_blob(&actor).unwrap();
         let mut caps = parsed.caps.clone();
@@ -3334,7 +3336,7 @@ mod tests {
         let mut bitmask = vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0];
         emit_halt(&mut code, &mut bitmask);
         emit_halt(&mut code, &mut bitmask);
-        let program = grey_transpiler::emitter::build_service_program(
+        let program = vos_pvm_compiler::emitter::build_service_program(
             &code,
             &bitmask,
             &[],
@@ -3377,7 +3379,7 @@ mod tests {
                 &input,
                 SYNTHETIC_SERVICE_GAS,
                 &mut interpreted_host,
-                javm::PvmBackend::ForceInterpreter,
+                vos_pvm::PvmBackend::ForceInterpreter,
             )
             .unwrap();
         let recompiled = service
@@ -3385,7 +3387,7 @@ mod tests {
                 &input,
                 SYNTHETIC_SERVICE_GAS,
                 &mut recompiled_host,
-                javm::PvmBackend::ForceRecompiler,
+                vos_pvm::PvmBackend::ForceRecompiler,
             )
             .unwrap();
 

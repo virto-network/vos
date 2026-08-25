@@ -1,0 +1,16 @@
+[package]
+name = "vos-pvm-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RISC-V ELF to VOS PVM compiler"
+
+[dependencies]
+vos-pvm = { path = "../runtime" }
+scale = { package = "vos-pvm-codec", path = "../codec" }
+thiserror = "2"
+tracing = "0.1"
+tracing-test = "0.2"
+
+[dev-dependencies]
+proptest = "1"

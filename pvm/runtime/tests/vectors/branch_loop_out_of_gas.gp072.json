@@ -1,0 +1,54 @@
+{
+  "backends": [
+    "interpreter"
+  ],
+  "expected": {
+    "gas": 0,
+    "memory": [],
+    "pc": 7,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x1",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ],
+    "status": "out_of_gas"
+  },
+  "family": "branch",
+  "initial": {
+    "gas": 5,
+    "memory": [],
+    "page_map": [],
+    "pc": 0,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "branch_loop_out_of_gas",
+  "program": {
+    "bitmask": "0x9904",
+    "code": "0x330203019522ff5202fd00",
+    "jump_table": []
+  }
+}

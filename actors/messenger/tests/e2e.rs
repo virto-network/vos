@@ -62,19 +62,19 @@ fn vosx_bin() -> PathBuf {
 }
 
 fn messenger_elf() -> PathBuf {
-    workspace().join("actors/messenger/target/riscv64em-javm/release/messenger.elf")
+    workspace().join("actors/messenger/target/riscv64em-vos/release/messenger.elf")
 }
 
 fn msg_log_elf() -> PathBuf {
-    workspace().join("actors/msg-log/target/riscv64em-javm/release/msg_log.elf")
+    workspace().join("actors/msg-log/target/riscv64em-vos/release/msg_log.elf")
 }
 
 fn msg_ctl_elf() -> PathBuf {
-    workspace().join("actors/msg-ctl/target/riscv64em-javm/release/msg_ctl.elf")
+    workspace().join("actors/msg-ctl/target/riscv64em-vos/release/msg_ctl.elf")
 }
 
 fn msg_directory_elf() -> PathBuf {
-    workspace().join("actors/msg-directory/target/riscv64em-javm/release/msg_directory.elf")
+    workspace().join("actors/msg-directory/target/riscv64em-vos/release/msg_directory.elf")
 }
 
 fn ensure_built() {

@@ -1,0 +1,54 @@
+{
+  "backends": [
+    "interpreter"
+  ],
+  "expected": {
+    "gas": 0,
+    "memory": [],
+    "pc": 0,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ],
+    "status": "out_of_gas"
+  },
+  "family": "flow",
+  "initial": {
+    "gas": 0,
+    "memory": [],
+    "page_map": [],
+    "pc": 0,
+    "regs": [
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x0"
+    ]
+  },
+  "name": "flow_out_of_gas_zero_budget",
+  "program": {
+    "bitmask": "0x01",
+    "code": "0x00",
+    "jump_table": []
+  }
+}

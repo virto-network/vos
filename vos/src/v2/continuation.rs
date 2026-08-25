@@ -23,7 +23,7 @@ pub struct ContinuationProgramV2 {
 }
 
 /// Durable actor-tree checkpoint. `kernel_snapshot` is the canonical
-/// `javm::snapshot::KernelSnapshot::to_bytes()` representation.
+/// `vos_pvm::snapshot::KernelSnapshot::to_bytes()` representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContinuationSnapshotV2 {
     pub snapshot_version: u16,
