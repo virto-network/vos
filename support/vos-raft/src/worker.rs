@@ -494,9 +494,6 @@ impl<N: NodeId> Worker<N> {
     /// dropped — host-side logging captures the underlying
     /// cause).
     ///
-    /// This is the recommended replacement for the older
-    /// [`Worker::init_failed`] polling API. A typical pattern:
-    ///
     /// ```ignore
     /// let worker = Worker::spawn(storage, transport, cfg, None);
     /// worker.wait_init().expect("raft init failed");
@@ -513,15 +510,6 @@ impl<N: NodeId> Worker<N> {
             Some(false) => Err(()),
             None => unreachable!("loop guarantees Some"),
         }
-    }
-
-    /// `true` if the worker thread exited with an init failure.
-    /// Non-blocking peek; `false` either means init succeeded
-    /// OR the worker is still trying. Prefer
-    /// [`Worker::wait_init`] which blocks until the result is
-    /// known.
-    pub fn init_failed(&self) -> bool {
-        matches!(*self.init.0.lock().unwrap(), Some(false))
     }
 
     /// Cheap clone-able handle.

@@ -43,7 +43,7 @@
 //!   proven and only its 32-byte hash is retained, so peak memory holds
 //!   ~one segment regardless of chain length. Returns the anchored
 //!   [`ChainManifest`] input (`[entering_root:32][seg_hash:32]…`, i.e.
-//!   [`encode_chain_manifest_anchored`]); the caller CASes that manifest
+//!   [`encode_chain_manifest`]); the caller CASes that manifest
 //!   and ships its single hash. Empty `Vec` on any failure.
 //!
 //! - `verify_chain(allowlist, proof_hash, public_bytes, return_bytes,
@@ -158,7 +158,7 @@ fn run_on_large_stack<T: Send + 'static>(
 // proven, retaining only the 32-byte hashes — peak memory holds ~one segment
 // (~3 MiB) instead of the whole chain (~N × 3 MiB, ~0.9 GB at 293 segments)
 // parked in the JobQueue until `job_release`. The job result / sync reply is
-// the tiny anchored-manifest input (`encode_chain_manifest_anchored(root,
+// the tiny anchored-manifest input (`encode_chain_manifest(root,
 // hashes)`, 32·(N+1) bytes); the requester CASes that manifest and ships its
 // single hash — the per-segment `put_proof_blob` dance it used to run over the
 // full proof bytes is gone.
@@ -279,7 +279,7 @@ impl Prover {
     /// is published into the host proof-blob CAS (`ctx.blob_put`) as it is
     /// proven and dropped, so peak memory holds ~one segment (~3 MiB)
     /// regardless of chain length. Returns the anchored [`ChainManifest`]
-    /// input — [`encode_chain_manifest_anchored`]`(entering_root,
+    /// input — [`encode_chain_manifest`]`(entering_root,
     /// segment_hashes)`, `32·(N+1)` bytes. Empty `Vec` on any failure
     /// (including a failed publish, which aborts the remaining prove).
     ///
@@ -311,7 +311,7 @@ impl Prover {
         )
         .await
         {
-            Some((root, hashes)) => encode_chain_manifest_anchored(root, &hashes),
+            Some((root, hashes)) => encode_chain_manifest(root, &hashes),
             None => Vec::new(),
         }
     }
@@ -327,8 +327,7 @@ impl Prover {
     /// (a from-scratch prover splicing a foreign program matches none);
     /// (2) STARK validity (`verify_standalone`, MOBILE) + boundary continuity
     /// onto the previous segment; (2a) the ENTERING-IMAGE ANCHOR — segment 0's
-    /// `initial_state.memory_root` equals the manifest's `initial_root` (skipped
-    /// only when the manifest is unanchored — the all-zero sentinel), which
+    /// `initial_state.memory_root` equals the manifest's `initial_root`, which
     /// rejects a chain spliced onto a doctored initial RAM image; and, on the
     /// FINAL segment, (3) the tagless io-binding
     /// (`compute_io_hash(public_bytes, return_bytes)`), which the guest binds at
@@ -402,7 +401,7 @@ impl Prover {
         .await
         {
             Some((root, hashes)) => {
-                let manifest = encode_chain_manifest_anchored(root, &hashes);
+                let manifest = encode_chain_manifest(root, &hashes);
                 let Some(hash) = ctx.blob_put(manifest.clone()).await else {
                     return Vec::new();
                 };
@@ -606,7 +605,7 @@ impl Prover {
 
     /// Drain an async prove job's output — the standard `job_poll` reply
     /// (`Args { data, done, error }`). For a completed job `data` is the
-    /// anchored [`ChainManifest`] input ([`encode_chain_manifest_anchored`]
+    /// anchored [`ChainManifest`] input ([`encode_chain_manifest`]
     /// bytes, `32·(N+1)` — the per-segment proofs are already in the host CAS,
     /// published by `tick` as they were proven); the requester CASes the
     /// manifest and ships its hash. `done` flips at the terminal state;
@@ -713,8 +712,7 @@ impl Prover {
 /// fetch + verify + DROP each listed segment proof (peak memory ~one
 /// proof regardless of chain length). Per segment it composes allowlist
 /// membership, STARK validity + boundary continuity, the entering-image
-/// anchor on segment 0 (skipped for an unanchored manifest — the
-/// all-zero sentinel), and the tagless io-binding on the FINAL segment.
+/// anchor on segment 0, and the tagless io-binding on the FINAL segment.
 /// Any missing blob rejects — indistinguishable from tampering, by
 /// design. Returns 1/0.
 async fn verify_chain_via_cas(
@@ -749,11 +747,8 @@ async fn verify_chain_via_cas(
     if manifest.segments.is_empty() || manifest.segments.len() > MAX_CHAIN_SEGMENTS {
         return 0;
     }
-    // The entering-image anchor: segment 0 must start from the manifest's
-    // declared entering root (skipped when the manifest is unanchored — the
-    // all-zero sentinel). See `ChainManifest::initial_root`.
-    let expected_initial_root =
-        (manifest.initial_root != UNANCHORED_ROOT).then_some(manifest.initial_root);
+    // Segment 0 must start from the manifest's declared entering root.
+    let expected_initial_root = manifest.initial_root;
     // 2) STREAM the chain: fetch each per-segment proof, verify it, and DROP
     //    it before fetching the next — so peak memory holds ~ONE proof
     //    regardless of chain length (a phone-class verifier can check a
@@ -772,7 +767,7 @@ async fn verify_chain_via_cas(
             blob,
             &allowlist,
             prev_final.take(),
-            expected_initial_root,
+            Some(expected_initial_root),
             i == n - 1,
             public_bytes,
             return_bytes,
@@ -865,6 +860,7 @@ pub fn verify_record_segments(
     allowlist_bytes: &[u8],
     record: &ProvableRecord,
     segment_blobs: &[Vec<u8>],
+    expected_initial_root: [u8; 32],
     expected_root_before: Option<[u8; 32]>,
 ) -> bool {
     if !record.io_consistent() {
@@ -878,6 +874,7 @@ pub fn verify_record_segments(
     verify_chain_segments(
         allowlist_bytes,
         segment_blobs,
+        expected_initial_root,
         &record.public_prime(),
         &record.reply,
     )
@@ -1185,7 +1182,7 @@ struct JobCallback {
 /// Advance AT MOST ONE pending job: prove the FIFO-oldest job in `pending`
 /// STREAMING — each proved segment is handed to `put` (the host CAS publish)
 /// and only its 32-byte hash is retained — then push the job's result (the
-/// anchored-manifest input, [`encode_chain_manifest_anchored`]) or failure
+/// anchored-manifest input, [`encode_chain_manifest`]) or failure
 /// into `queue`, and return the callback intent (`None` when nothing is
 /// pending). Generic over the async `put` so the prove→publish→state→callback
 /// logic is unit-testable without a host `Context`; the tick handler passes
@@ -1234,7 +1231,7 @@ async fn advance_one_job(
     .await
     {
         Some((root, hashes)) => {
-            queue.push(job.id, &encode_chain_manifest_anchored(root, &hashes));
+            queue.push(job.id, &encode_chain_manifest(root, &hashes));
             queue.finish(job.id);
             (JOB_DONE, hashes.len() as u64)
         }
@@ -1259,7 +1256,7 @@ async fn advance_one_job(
 /// Peak retention is therefore ~one segment in flight (the channel holds one
 /// while the worker proves the next) instead of the whole chain. Returns
 /// `(entering_root, segment_hashes)` — exactly the
-/// [`encode_chain_manifest_anchored`] inputs; `None` on any failure. A failed
+/// [`encode_chain_manifest`] inputs; `None` on any failure. A failed
 /// `put` drops the receiver, which fails the worker's next send and so aborts
 /// the remaining prove instead of letting it run unobserved.
 async fn prove_chain_publishing(
@@ -1308,7 +1305,7 @@ async fn prove_chain_publishing(
 
 /// The entering-image root of a proved chain: segment 0's
 /// `initial_state.memory_root`. `None` if the chain is empty or segment 0 won't
-/// decode. A producer feeds this to [`encode_chain_manifest_anchored`] so the
+/// decode. A producer feeds this to [`encode_chain_manifest`] so the
 /// shipped manifest anchors segment 0 — the value `verify_chain` checks it
 /// against. Serves producers holding already-proved segment bytes;
 /// [`prove_chain_segments_with`] returns the same root directly.
@@ -1412,7 +1409,7 @@ pub fn verify_proof_bytes(
 /// STREAMING each segment's `bincode(Proof)` bytes into `sink` as it is
 /// proven (in chain order) and returning the chain's ENTERING-IMAGE root —
 /// segment 0's `initial_state.memory_root`, the
-/// [`encode_chain_manifest_anchored`] anchor. One streaming pass
+/// [`encode_chain_manifest`] anchor. One streaming pass
 /// ([`vos_pvm_proof::segment::TraceStream`]): the tracer runs interleaved with
 /// proving, each window cut online (uniform `seg_steps`, or
 /// content-budgeted when `page_budget > 0` — bit-identical to the offline
@@ -1526,12 +1523,9 @@ pub fn prove_chain_segments(
 /// content-addressed into the manifest (hence signed wherever the manifest hash
 /// rides), so it is a COMMITTED, auditable part of the statement — but because a
 /// producer builds it to match its own segment 0, the anchor's full teeth come
-/// from a verifier that ALSO pins this root against the program's published
+/// from a verifier that also pins this root against the program's published
 /// entering image (the `vosx zk pin` catalog's `unpatched_image_root`, modulo
-/// the witness the live run injects). An all-zero `initial_root` is the "no
-/// anchor" sentinel (a real image root is never all-zero) that the legacy
-/// [`encode_chain_manifest`] carries, and the anchor check is then skipped — an
-/// out-of-band-anchored deployment's opt-out.
+/// the witness the live run injects).
 ///
 /// Because the manifest is content-addressed, `initial_root` + the segment list
 /// (count + order) are integrity-bound to the manifest hash — the value a caller
@@ -1540,37 +1534,19 @@ pub fn prove_chain_segments(
 /// boundary continuity, and the final io-binding, cannot be fooled by a
 /// truncated, reordered, spliced, or re-anchored manifest.
 pub struct ChainManifest {
-    /// Entering-image page-Merkle root anchor; the all-zero sentinel = unanchored.
+    /// Entering-image page-Merkle root anchor.
     pub initial_root: [u8; 32],
     /// Per-segment proof CAS hashes, in chain order.
     pub segments: Vec<[u8; 32]>,
 }
 
-/// The all-zero "no entering-image anchor" sentinel (see [`ChainManifest`]).
-/// A genuine page-Merkle image root is never all-zero, so it can't collide with
-/// a real anchor.
-const UNANCHORED_ROOT: [u8; 32] = [0u8; 32];
-
-/// Encode an UNANCHORED [`ChainManifest`] — segment hashes with no
-/// entering-image anchor (`initial_root` = the all-zero sentinel), so the
-/// streaming verifier SKIPS the anchor check. Kept for callers that anchor the
-/// entering image out-of-band; prefer [`encode_chain_manifest_anchored`] so a
-/// chain spliced onto a doctored initial image is rejected. Tiny
-/// (`32·(N+1)` bytes), so it always rides a single cross-node frame.
-pub fn encode_chain_manifest(segment_hashes: &[[u8; 32]]) -> Vec<u8> {
-    encode_chain_manifest_anchored(UNANCHORED_ROOT, segment_hashes)
-}
-
-/// Encode an ANCHORED [`ChainManifest`]: the entering-image page-Merkle root
+/// Encode a [`ChainManifest`]: the entering-image page-Merkle root
 /// followed by the per-segment proof CAS hashes (flat `[root:32][seg:32]…`).
 /// [`verify_chain`] checks segment 0's `initial_state.memory_root` against
 /// `initial_root`. Compute `initial_root` via `vos_pvm_proof::page_merkle::image_root`
 /// over the initial image the chain was traced from — equivalently, the first
 /// segment proof's `initial_state.memory_root`.
-pub fn encode_chain_manifest_anchored(
-    initial_root: [u8; 32],
-    segment_hashes: &[[u8; 32]],
-) -> Vec<u8> {
+pub fn encode_chain_manifest(initial_root: [u8; 32], segment_hashes: &[[u8; 32]]) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 * (segment_hashes.len() + 1));
     out.extend_from_slice(&initial_root);
     for h in segment_hashes {
@@ -1581,9 +1557,9 @@ pub fn encode_chain_manifest_anchored(
 
 /// Wrap the prover's existing anchored segment list in the bounded service
 /// attestation artifact contract. Segment hashes retain the node proof-CAS
-/// domain used by [`encode_chain_manifest_anchored`]; the wrapper adds the
-/// execution-semantics-derived proof-system identity and strict service wire
-/// version without copying any segment body.
+/// domain used by [`encode_chain_manifest`]; the wrapper adds the
+/// execution-semantics-derived proof-system identity without copying any
+/// segment body.
 pub fn encode_service_attestation_manifest(
     initial_root: [u8; 32],
     segment_hashes: &[[u8; 32]],
@@ -1615,6 +1591,9 @@ pub fn decode_chain_manifest(bytes: &[u8]) -> Option<ChainManifest> {
     let mut chunks = bytes.chunks_exact(32);
     let mut initial_root = [0u8; 32];
     initial_root.copy_from_slice(chunks.next()?);
+    if initial_root == [0u8; 32] {
+        return None;
+    }
     let segments = chunks
         .map(|c| {
             let mut h = [0u8; 32];
@@ -1639,8 +1618,7 @@ pub fn decode_chain_manifest(bytes: &[u8]) -> Option<ChainManifest> {
 ///      MOBILE) + boundary continuity (each segment's `initial_state` equals
 ///      the previous segment's `final_state`);
 ///   2a. entering-image anchor — segment 0's `initial_state.memory_root` equals
-///      the caller's `expected_initial_root` (via
-///      [`verify_chain_segments_anchored`]; skipped in this un-anchored form);
+///      the caller's `expected_initial_root`;
 ///   3. tagless io-binding on the FINAL segment — `public_io_hash() ==
 ///      compute_io_hash(public, return)` (the guest binds it at halt, i.e. the
 ///      last segment).
@@ -1655,30 +1633,7 @@ pub fn decode_chain_manifest(bytes: &[u8]) -> Option<ChainManifest> {
 pub fn verify_chain_segments(
     allowlist_bytes: &[u8],
     segment_blobs: &[Vec<u8>],
-    public_bytes: &[u8],
-    return_bytes: &[u8],
-) -> bool {
-    // No entering-image anchor — the caller anchors the entering image
-    // out-of-band (or not at all). Use [`verify_chain_segments_anchored`] to
-    // reject a chain spliced onto a doctored initial image.
-    verify_chain_segments_anchored(
-        allowlist_bytes,
-        segment_blobs,
-        None,
-        public_bytes,
-        return_bytes,
-    )
-}
-
-/// [`verify_chain_segments`] plus the entering-image anchor: when
-/// `expected_initial_root` is `Some`, segment 0's `initial_state.memory_root`
-/// must equal it (the offline mirror of the `verify_chain` handler's
-/// manifest-carried anchor). `None` restores the un-anchored behaviour. See
-/// [`ChainManifest::initial_root`] for why the anchor matters.
-pub fn verify_chain_segments_anchored(
-    allowlist_bytes: &[u8],
-    segment_blobs: &[Vec<u8>],
-    expected_initial_root: Option<[u8; 32]>,
+    expected_initial_root: [u8; 32],
     public_bytes: &[u8],
     return_bytes: &[u8],
 ) -> bool {
@@ -1701,7 +1656,7 @@ pub fn verify_chain_segments_anchored(
             blob.clone(),
             &allowlist,
             prev_final.take(),
-            expected_initial_root,
+            Some(expected_initial_root),
             i == n - 1,
             public_bytes,
             return_bytes,
@@ -1882,7 +1837,7 @@ mod record_tests {
         let mut doctored = record.clone();
         doctored.reply.push(9);
         assert!(!verify_record_segments(
-            &allowlist, &doctored, &segments, None
+            &allowlist, &doctored, &segments, [0x22; 32], None
         ));
 
         // The settlement check: right root passes THAT gate (then fails
@@ -1891,12 +1846,14 @@ mod record_tests {
             &allowlist,
             &record,
             &segments,
+            [0x22; 32],
             Some([0xAA; 32]), // correct root_before — rejection is the chain's
         ));
         assert!(!verify_record_segments(
             &allowlist,
             &record,
             &segments,
+            [0x22; 32],
             Some([0x77; 32])
         ));
 
@@ -1912,13 +1869,14 @@ mod record_tests {
             &allowlist,
             &rootless,
             &segments,
+            [0x22; 32],
             Some([0xAA; 32])
         ));
 
         // A consistent record over a garbage chain still rejects (the
         // chain half of the composition).
         assert!(!verify_record_segments(
-            &allowlist, &record, &segments, None
+            &allowlist, &record, &segments, [0x22; 32], None
         ));
     }
 }
@@ -1961,7 +1919,6 @@ mod anchor_tests {
             verify_segment_on_large_stack(blob.clone(), &allowlist, None, expected, false, &[], &[])
                 .is_some()
         };
-        assert!(verify(None), "no anchor must not reject (anchor is opt-in)");
         assert!(
             verify(Some(root)),
             "the correct entering root must pass the anchor"
@@ -1977,11 +1934,10 @@ mod anchor_tests {
         // declaring a mismatched entering root makes verify_chain reject segment
         // 0. This is the exact extraction `verify_chain` performs
         // (`(root != UNANCHORED).then_some(root)`), minus the CAS fetch.
-        let manifest = decode_chain_manifest(&encode_chain_manifest_anchored(wrong, &[[7u8; 32]]))
+        let manifest = decode_chain_manifest(&encode_chain_manifest(wrong, &[[7u8; 32]]))
             .expect("anchored manifest decodes");
         assert_eq!(manifest.initial_root, wrong);
-        let handler_anchor =
-            (manifest.initial_root != UNANCHORED_ROOT).then_some(manifest.initial_root);
+        let handler_anchor = Some(manifest.initial_root);
         assert!(
             !verify(handler_anchor),
             "verify_chain rejects when the manifest declares a mismatched entering root"

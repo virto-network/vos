@@ -379,10 +379,8 @@ fn propose_storage_failure_surfaces_to_caller_and_worker_recovers() {
     worker.shutdown();
 }
 
-/// A `load_meta` failure during worker startup is now
-/// observable via [`Worker::init_failed`]: the worker thread
-/// exits with `Err` from `run_worker`, which the spawn helper
-/// catches and surfaces through the shared atomic flag.
+/// A `load_meta` failure during worker startup is observable through
+/// `wait_init`: the worker exits and reports the failed initialization.
 #[test]
 fn worker_signals_init_failure_on_load_meta_error() {
     let storage = FaultStorage::new(MemStorage::<u16>::new());
@@ -407,16 +405,7 @@ fn worker_signals_init_failure_on_load_meta_error() {
         matches!(r, Err(())),
         "wait_init must return Err after load_meta returns Err, got {r:?}",
     );
-    // Backwards-compat: the legacy init_failed() peek also
-    // reflects the failure now.
-    assert!(
-        worker.init_failed(),
-        "init_failed peek must agree with wait_init",
-    );
-
-    // Happy-path complement: with no fault, wait_init returns
-    // Ok and init_failed stays false. Catches a regression that
-    // defaulted the flag to true.
+    // Happy-path complement: with no fault, wait_init returns Ok.
     {
         let healthy_storage = FaultStorage::new(MemStorage::<u16>::new());
         let healthy_worker = Worker::spawn_with(
@@ -432,15 +421,10 @@ fn worker_signals_init_failure_on_load_meta_error() {
             matches!(ok, Ok(())),
             "wait_init must return Ok when load_meta succeeded, got {ok:?}",
         );
-        assert!(
-            !healthy_worker.init_failed(),
-            "init_failed must be false when init succeeded",
-        );
         healthy_worker.shutdown();
     }
 
-    // Also still verify the legacy signal: snapshot() returns
-    // None because the worker is gone.
+    // The worker is gone after the failed initialization.
     let h = worker.handler();
     let snap = block_on(h.snapshot());
     assert!(
