@@ -4,13 +4,13 @@ format = 1
 # pinned together after the compact Refine-work capability landed. The Clerk
 # `.vos` signature wrapper is operator-specific and is intentionally not a
 # repository-global artifact identity; releases select its signer explicitly.
-source_revision = "7a83ebc868481d6e9a2d7ba0aacae974e9450606"
+source_revision = "8a463f2a1ad4dd9c4f1b61dfb6d694997c8bbc94"
 guest_toolchain = "nightly-2026-03-20"
 host_toolchain = "nightly-2025-05-09"
 
-service_program_id = "cffdeadbc85cd7693cd953e70940ac237c26a209c6c4bdaae6fc47bc165b34df"
-service_elf_blake2b_256 = "85550e5b7d1153c7d758b7487bfe0bd01fe2fb1320961005dabaec25bdd690f6"
-service_pvm_blake2b_256 = "ca1b2c655d642d5473e7a543d19390fa372d74c7233f2438e3911f1f0397b39b"
+service_program_id = "0405d99dc2b72aa5146838323b06ba419bf0a35295ba08ddef1fdb8e5cf9052f"
+service_elf_blake2b_256 = "621f47efb08a7f02164d48f1d3ea9498356248fe99160a7a4bb5b28bebb5eeea"
+service_pvm_blake2b_256 = "830f5fa009acfb4d1820ac934802e14f4e2041467c3f8d5fee0cba83f457e2ab"
 
 authority_program_id = "48792b3fb57772ec76ddcb5dd985cc7d14f87a820814e4040a6012eef924c672"
 authority_pvm_blake2b_256 = "b42e12a7a6bbaa062914adf3aa23ab831e8ef8534f757d2ca05af35a344e4f45"
