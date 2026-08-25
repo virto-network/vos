@@ -761,14 +761,56 @@ pub(crate) fn sign_catalog_op_on_relay(
 // `Msg` whose name is the handler's name and whose arg keys are the
 // handler's param names, frames it `TAG_DYNAMIC`, invokes, and decodes
 // the reply `Value` into the row/status types above — byte-identical to
-// the wire the generated ref emitted, so the daemon's sign-on-relay and
-// the actor's verifier are unaffected. Generic over `Invoker`, so the
+// the registry guest consumes. Generic over `RegistryInvoker`, so the
 // same code drives a network invoke (CLI → daemon, arriving as
-// `Caller::Peer`) and a local in-process invoke (daemon → its own
-// registry, arriving as `Caller::System`).
+// `Caller::Peer`) and a local in-process control-plane invoke.
 
 use crate::abi::service::ServiceId;
-use crate::actors::client::{ClientError, Invoker};
+use crate::actors::client::ClientError;
+
+/// Route-oriented invocation reserved for the built-in registry control plane.
+/// Application actor references use `ActorId` through `actors::Invoker`.
+pub trait RegistryInvoker {
+    fn invoke_registry(
+        &mut self,
+        target: ServiceId,
+        payload: Vec<u8>,
+    ) -> impl core::future::Future<Output = Result<Value, ClientError>> + '_;
+}
+
+impl<A: crate::Actor> RegistryInvoker for crate::Context<A> {
+    async fn invoke_registry(
+        &mut self,
+        target: ServiceId,
+        payload: Vec<u8>,
+    ) -> Result<Value, ClientError> {
+        self.ask_raw(target, &payload)
+            .await
+            .map_err(ClientError::from)
+    }
+}
+
+#[cfg(feature = "std")]
+impl RegistryInvoker for &crate::node::VosNode {
+    async fn invoke_registry(
+        &mut self,
+        target: ServiceId,
+        payload: Vec<u8>,
+    ) -> Result<Value, ClientError> {
+        match crate::node::VosNode::invoke(self, target, payload) {
+            Some(bytes)
+                if bytes.len() == 5
+                    && bytes[0] == crate::STATUS_FORBIDDEN
+                    && bytes[1..] == [0, 0, 0, 0] =>
+            {
+                Err(ClientError::Forbidden)
+            }
+            Some(bytes) if bytes.is_empty() => Ok(Value::Unit),
+            Some(bytes) => Ok(<Value as crate::Decode>::decode(&bytes)),
+            None => Err(ClientError::Unreachable),
+        }
+    }
+}
 
 /// Decode a `Value::Bytes` rkyv reply into `T` (checked access), mapping
 /// a wrong-shape or undecodable reply to the matching `ClientError` —
@@ -780,20 +822,12 @@ fn decode_rkyv<T: crate::Decode>(value: Value) -> Result<T, ClientError> {
     }
 }
 
-/// Decode the current tagged `Option<T>` reply while retaining read-only
-/// compatibility with bundled legacy-v1 registry actors.
+/// Decode the canonical tagged `Option<T>` reply.
 fn decode_opt<T: crate::Decode>(value: Value) -> Result<Option<T>, ClientError> {
     match value {
-        Value::Unit => Ok(None),
-        Value::Bytes(b) if b.is_empty() => Ok(None),
         Value::Bytes(b) if b.as_slice() == [0] => Ok(None),
-        Value::Bytes(b) => {
-            let payload = if b.first() == Some(&1) {
-                &b[1..]
-            } else {
-                b.as_slice()
-            };
-            T::try_decode(payload).map(Some).ok_or(ClientError::Decode)
+        Value::Bytes(b) if b.first() == Some(&1) => {
+            T::try_decode(&b[1..]).map(Some).ok_or(ClientError::Decode)
         }
         other => Err(ClientError::UnexpectedReply(alloc::format!("{other:?}"))),
     }
@@ -827,12 +861,12 @@ impl RegistryRef {
 
     /// Frame `msg` as `[TAG_DYNAMIC][rkyv Msg]` and invoke, returning the
     /// decoded reply `Value`. The single funnel every method goes through.
-    async fn call<I: Invoker>(&self, inv: &mut I, msg: Msg) -> Result<Value, ClientError> {
+    async fn call<I: RegistryInvoker>(&self, inv: &mut I, msg: Msg) -> Result<Value, ClientError> {
         let encoded = msg.encode();
         let mut payload = Vec::with_capacity(1 + encoded.len());
         payload.push(TAG_DYNAMIC);
         payload.extend_from_slice(&encoded);
-        inv.invoke(self.target, payload).await
+        inv.invoke_registry(self.target, payload).await
     }
 
     // ── Catalog reads ─────────────────────────────────────────────
@@ -842,7 +876,7 @@ impl RegistryRef {
     /// last returned row's name while the page's `more` flag
     /// is set. `budget` caps the page (0 = the registry's max). Prefer
     /// [`programs_all`](Self::programs_all) unless paging by hand.
-    pub async fn programs<I: Invoker>(
+    pub async fn programs<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         after_name: String,
@@ -862,7 +896,7 @@ impl RegistryRef {
     /// Drain the whole program catalog into one `Vec` (name order).
     /// Callers that need the full set — `space programs`, `space info`,
     /// manifest export — use this.
-    pub async fn programs_all<I: Invoker>(
+    pub async fn programs_all<I: RegistryInvoker>(
         &self,
         inv: &mut I,
     ) -> Result<Vec<ProgramRow>, ClientError> {
@@ -879,7 +913,7 @@ impl RegistryRef {
         Ok(out)
     }
 
-    pub async fn program<I: Invoker>(
+    pub async fn program<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         name: String,
@@ -892,7 +926,7 @@ impl RegistryRef {
 
     /// The catalogued program (if any) whose `hash` matches — a targeted
     /// lookup so a hash-membership check needn't drain the whole catalog.
-    pub async fn program_by_hash<I: Invoker>(
+    pub async fn program_by_hash<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         hash: Vec<u8>,
@@ -908,7 +942,7 @@ impl RegistryRef {
     /// row's `instance_name` while `more` is set. `budget` caps the page
     /// (0 = the registry's max). Prefer [`agents_all`](Self::agents_all)
     /// unless paging by hand.
-    pub async fn agents<I: Invoker>(
+    pub async fn agents<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         after_name: String,
@@ -927,7 +961,10 @@ impl RegistryRef {
 
     /// Drain the whole installed-agent roster into one `Vec`
     /// (`instance_name` order).
-    pub async fn agents_all<I: Invoker>(&self, inv: &mut I) -> Result<Vec<AgentRow>, ClientError> {
+    pub async fn agents_all<I: RegistryInvoker>(
+        &self,
+        inv: &mut I,
+    ) -> Result<Vec<AgentRow>, ClientError> {
         let mut out: Vec<AgentRow> = Vec::new();
         loop {
             let after = out
@@ -944,7 +981,7 @@ impl RegistryRef {
         Ok(out)
     }
 
-    pub async fn agent<I: Invoker>(
+    pub async fn agent<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         instance_name: String,
@@ -958,7 +995,7 @@ impl RegistryRef {
     /// The first installed agent (in `instance_name` order) whose name
     /// starts with `prefix` and ends with `suffix` — a template lookup so a
     /// caller cloning a channel's program rows needn't drain the roster.
-    pub async fn agent_by_pattern<I: Invoker>(
+    pub async fn agent_by_pattern<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         prefix: String,
@@ -979,7 +1016,7 @@ impl RegistryRef {
     /// order. Same cursor/`more` contract as [`agents`](Self::agents).
     /// Prefer [`agent_names_all`](Self::agent_names_all) unless paging by
     /// hand.
-    pub async fn agent_names<I: Invoker>(
+    pub async fn agent_names<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         after_name: String,
@@ -998,7 +1035,7 @@ impl RegistryRef {
 
     /// Drain every installed-agent name into one `Vec<String>`
     /// (`instance_name` order).
-    pub async fn agent_names_all<I: Invoker>(
+    pub async fn agent_names_all<I: RegistryInvoker>(
         &self,
         inv: &mut I,
     ) -> Result<Vec<String>, ClientError> {
@@ -1015,7 +1052,7 @@ impl RegistryRef {
         Ok(out)
     }
 
-    pub async fn meta_for_instance<I: Invoker>(
+    pub async fn meta_for_instance<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         name: String,
@@ -1030,7 +1067,7 @@ impl RegistryRef {
     /// [`members_all`](Self::members_all) unless you are paging by hand;
     /// pass `(0, [])` to start and continue from the returned page's
     /// `(next_kind, next_key)` while `more` is true. `budget` caps the page.
-    pub async fn members<I: Invoker>(
+    pub async fn members<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         after_kind: u8,
@@ -1052,7 +1089,7 @@ impl RegistryRef {
     /// Drain the whole member roster into one `Vec` (nodes then
     /// identities). Callers that need the full set — voter-set
     /// derivation, `space members`, catalog export — use this.
-    pub async fn members_all<I: Invoker>(
+    pub async fn members_all<I: RegistryInvoker>(
         &self,
         inv: &mut I,
     ) -> Result<Vec<MemberRow>, ClientError> {
@@ -1071,13 +1108,13 @@ impl RegistryRef {
         Ok(out)
     }
 
-    pub async fn root<I: Invoker>(&self, inv: &mut I) -> Result<Vec<u8>, ClientError> {
+    pub async fn root<I: RegistryInvoker>(&self, inv: &mut I) -> Result<Vec<u8>, ClientError> {
         decode_bytes(self.call(inv, Msg::new("root")).await?)
     }
 
     // ── Auth reads ────────────────────────────────────────────────
 
-    pub async fn peer_role<I: Invoker>(
+    pub async fn peer_role<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         peer_id: Vec<u8>,
@@ -1089,7 +1126,7 @@ impl RegistryRef {
             .ok_or_else(|| ClientError::UnexpectedReply(alloc::format!("{v:?}")))
     }
 
-    pub async fn peer_epoch<I: Invoker>(
+    pub async fn peer_epoch<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         peer_id: Vec<u8>,
@@ -1106,7 +1143,11 @@ impl RegistryRef {
     /// enrollment is non-secret membership metadata. Used to decide
     /// whether this node is a space member before spawning agents
     /// whose sync floor requires membership.
-    pub async fn node_role<I: Invoker>(&self, inv: &mut I, prefix: u64) -> Result<u8, ClientError> {
+    pub async fn node_role<I: RegistryInvoker>(
+        &self,
+        inv: &mut I,
+        prefix: u64,
+    ) -> Result<u8, ClientError> {
         let v = self
             .call(inv, Msg::new("node_role").with("prefix", prefix))
             .await?;
@@ -1118,7 +1159,7 @@ impl RegistryRef {
     /// `after_peer` to start; continue from the returned [`AuthGrantPage::next`]
     /// until it comes back empty. `budget` caps the page (0 = the
     /// registry's max).
-    pub async fn auth_grants<I: Invoker>(
+    pub async fn auth_grants<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         after_peer: Vec<u8>,
@@ -1137,7 +1178,7 @@ impl RegistryRef {
 
     // ── Genesis / catalog mutators ────────────────────────────────
 
-    pub async fn set_root<I: Invoker>(
+    pub async fn set_root<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         root: Vec<u8>,
@@ -1153,7 +1194,7 @@ impl RegistryRef {
     /// the genesis; it lets `redeem_invite` bind the invite canonical to
     /// THIS space so an invite can't be replayed at another space the
     /// same operator runs (the genesis root alone can't distinguish them).
-    pub async fn set_space_id<I: Invoker>(
+    pub async fn set_space_id<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         space_id: Vec<u8>,
@@ -1165,16 +1206,19 @@ impl RegistryRef {
     }
 
     /// This space's anchored `space_id`, or empty if never set.
-    pub async fn space_id<I: Invoker>(&self, inv: &mut I) -> Result<Vec<u8>, ClientError> {
+    pub async fn space_id<I: RegistryInvoker>(&self, inv: &mut I) -> Result<Vec<u8>, ClientError> {
         decode_bytes(self.call(inv, Msg::new("space_id")).await?)
     }
 
     /// Durable guest-owned role-authority binding.
-    pub async fn role_authority<I: Invoker>(&self, inv: &mut I) -> Result<Vec<u8>, ClientError> {
+    pub async fn role_authority<I: RegistryInvoker>(
+        &self,
+        inv: &mut I,
+    ) -> Result<Vec<u8>, ClientError> {
         decode_bytes(self.call(inv, Msg::new("role_authority")).await?)
     }
 
-    pub async fn set_role_authority<I: Invoker>(
+    pub async fn set_role_authority<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         authority_replication_id: Vec<u8>,
@@ -1191,7 +1235,7 @@ impl RegistryRef {
         )
     }
 
-    pub async fn publish<I: Invoker>(
+    pub async fn publish<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         name: String,
@@ -1212,7 +1256,7 @@ impl RegistryRef {
         )
     }
 
-    pub async fn register_meta<I: Invoker>(
+    pub async fn register_meta<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         program_hash: Vec<u8>,
@@ -1231,7 +1275,7 @@ impl RegistryRef {
         )
     }
 
-    pub async fn register_extension_meta<I: Invoker>(
+    pub async fn register_extension_meta<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         instance_name: String,
@@ -1250,7 +1294,7 @@ impl RegistryRef {
         )
     }
 
-    pub async fn unpublish<I: Invoker>(
+    pub async fn unpublish<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         name: String,
@@ -1266,7 +1310,7 @@ impl RegistryRef {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn install<I: Invoker>(
+    pub async fn install<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         instance_name: String,
@@ -1296,7 +1340,7 @@ impl RegistryRef {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn upgrade<I: Invoker>(
+    pub async fn upgrade<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         instance_name: String,
@@ -1319,7 +1363,7 @@ impl RegistryRef {
         )
     }
 
-    pub async fn uninstall<I: Invoker>(
+    pub async fn uninstall<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         instance_name: String,
@@ -1336,7 +1380,7 @@ impl RegistryRef {
         )
     }
 
-    pub async fn add_node<I: Invoker>(
+    pub async fn add_node<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         prefix: u32,
@@ -1357,7 +1401,7 @@ impl RegistryRef {
         )
     }
 
-    pub async fn remove_node<I: Invoker>(
+    pub async fn remove_node<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         prefix: u32,
@@ -1374,7 +1418,7 @@ impl RegistryRef {
         )
     }
 
-    pub async fn add_identity<I: Invoker>(
+    pub async fn add_identity<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         public_key: Vec<u8>,
@@ -1395,7 +1439,7 @@ impl RegistryRef {
         )
     }
 
-    pub async fn remove_identity<I: Invoker>(
+    pub async fn remove_identity<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         public_key: Vec<u8>,
@@ -1412,7 +1456,7 @@ impl RegistryRef {
         )
     }
 
-    pub async fn grant_role<I: Invoker>(
+    pub async fn grant_role<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         peer_id: Vec<u8>,
@@ -1435,7 +1479,7 @@ impl RegistryRef {
         )
     }
 
-    pub async fn revoke_role<I: Invoker>(
+    pub async fn revoke_role<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         peer_id: Vec<u8>,
@@ -1456,7 +1500,7 @@ impl RegistryRef {
         )
     }
 
-    pub async fn register_remote<I: Invoker>(
+    pub async fn register_remote<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         instance_name: String,
@@ -1486,7 +1530,7 @@ impl RegistryRef {
     /// (set via `set_space_id`), not a caller-supplied value. No expiry
     /// check happens here (checked host-side at admission).
     #[allow(clippy::too_many_arguments)]
-    pub async fn redeem_invite<I: Invoker>(
+    pub async fn redeem_invite<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         token_pub: Vec<u8>,
@@ -1522,7 +1566,7 @@ impl RegistryRef {
     /// Revoke an invite token (admin-signed). Grow-only: flips the
     /// token's `revoked` flag so no future redemption succeeds and no
     /// replayed redeem can clear it. Idempotent.
-    pub async fn revoke_invite<I: Invoker>(
+    pub async fn revoke_invite<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         token_pub: Vec<u8>,
@@ -1542,7 +1586,7 @@ impl RegistryRef {
     /// One page of the invites table. Pass an empty `after` to start;
     /// continue from the returned [`InvitePage::next`] until it comes
     /// back empty. `budget` caps the page (0 = the registry's max).
-    pub async fn invites<I: Invoker>(
+    pub async fn invites<I: RegistryInvoker>(
         &self,
         inv: &mut I,
         after: Vec<u8>,
@@ -1638,10 +1682,7 @@ mod tests {
             .with("from_hash", alloc::vec![7u8; 32]);
         assert_eq!(
             catalog_op_canonical(&m).unwrap(),
-            canonical_op_bytes(
-                "upgrade",
-                &[b"msg-x-log", b"p", &[5u8; 32], &[7u8; 32]]
-            ),
+            canonical_op_bytes("upgrade", &[b"msg-x-log", b"p", &[5u8; 32], &[7u8; 32]]),
         );
     }
 

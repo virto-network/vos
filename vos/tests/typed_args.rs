@@ -18,7 +18,9 @@
 #![allow(unexpected_cfgs)]
 
 use vos::abi::service::ServiceId;
-use vos::actors::client::{AttestationInvoker, AttestedInvocationResult, ClientError, Invoker};
+use vos::actors::client::{
+    ActorReference, AttestationInvoker, AttestedInvocationResult, ClientError, Invoker,
+};
 use vos::service::{
     AccumulationReceipt, ActorId, ConsistencyMode, DeploymentId, Hash, InvocationId, ProducerId,
     ProgramId, ReplyRecord, RootServiceId, ServiceIdentity, SpaceId,
@@ -433,9 +435,9 @@ fn attested_handle_returns_a_typed_package_not_a_bare_claim() {
     let mut invoker = MockAttestationInvoker {
         result: Some(attested_receipt_result(&claim)),
     };
-    let vault = VaultRef::at(ServiceId(5));
+    let mut vault = VaultRef::bind(ActorId([5; 32]), &mut invoker);
     let package: vos::Attestation<Receipt, fixture::LastReceipt> =
-        vos::block_on(vault.last_receipt(&mut invoker)).unwrap();
+        vos::block_on(vault.last_receipt()).unwrap();
     assert_eq!(package.unverified_preview(), &claim);
     assert_eq!(package.statement().method, "last_receipt");
     assert_eq!(package.producer(), ProducerId([15; 32]));
@@ -463,9 +465,9 @@ fn attested_handle_rejects_a_reply_that_does_not_match_the_statement() {
     let mut invoker = MockAttestationInvoker {
         result: Some(result),
     };
-    let vault = VaultRef::at(ServiceId(5));
+    let mut vault = VaultRef::bind(ActorId([5; 32]), &mut invoker);
     assert!(matches!(
-        vos::block_on(vault.last_receipt(&mut invoker)),
+        vos::block_on(vault.last_receipt()),
         Err(ClientError::InvalidAttestation(
             vos::AttestationError::ClaimCommitmentMismatch
         ))
@@ -528,7 +530,7 @@ fn bound_handle_methods_do_not_take_an_invoker_argument() {
         actor: None,
     };
     let mut handle = VaultRef::bind(actor, &mut invoker);
-    assert_eq!(handle.actor_id(), Some(actor));
+    assert_eq!(handle.actor_id(), actor);
     let value = vos::block_on(handle.deposit(42)).unwrap();
     assert_eq!(value, 42);
     assert_eq!(invoker.actor, Some(actor));
@@ -591,14 +593,6 @@ struct BoundMockInvoker {
 struct DeniedBoundInvoker;
 
 impl Invoker for DeniedBoundInvoker {
-    fn invoke(
-        &mut self,
-        _target: ServiceId,
-        _payload: Vec<u8>,
-    ) -> impl core::future::Future<Output = core::result::Result<Value, ClientError>> + '_ {
-        core::future::ready(Err(ClientError::Unreachable))
-    }
-
     fn invoke_actor(
         &mut self,
         _target: ActorId,
@@ -609,14 +603,6 @@ impl Invoker for DeniedBoundInvoker {
 }
 
 impl Invoker for BoundMockInvoker {
-    fn invoke(
-        &mut self,
-        _target: ServiceId,
-        _payload: Vec<u8>,
-    ) -> impl core::future::Future<Output = core::result::Result<Value, ClientError>> + '_ {
-        core::future::ready(Err(ClientError::Unreachable))
-    }
-
     fn invoke_actor(
         &mut self,
         target: ActorId,
@@ -628,9 +614,9 @@ impl Invoker for BoundMockInvoker {
 }
 
 impl Invoker for MockInvoker {
-    fn invoke(
+    fn invoke_actor(
         &mut self,
-        _target: ServiceId,
+        _target: ActorId,
         _payload: Vec<u8>,
     ) -> impl core::future::Future<Output = core::result::Result<Value, ClientError>> + '_ {
         let reply = self.reply.clone();
@@ -639,9 +625,9 @@ impl Invoker for MockInvoker {
 }
 
 impl Invoker for MockAttestationInvoker {
-    fn invoke(
+    fn invoke_actor(
         &mut self,
-        _target: ServiceId,
+        _target: ActorId,
         _payload: Vec<u8>,
     ) -> impl core::future::Future<Output = core::result::Result<Value, ClientError>> + '_ {
         async { Err(ClientError::Unreachable) }
@@ -649,17 +635,6 @@ impl Invoker for MockAttestationInvoker {
 }
 
 impl AttestationInvoker for MockAttestationInvoker {
-    fn invoke_attested(
-        &mut self,
-        _target: ServiceId,
-        _payload: Vec<u8>,
-    ) -> impl core::future::Future<
-        Output = core::result::Result<AttestedInvocationResult, ClientError>,
-    > + '_ {
-        let result = self.result.take().ok_or(ClientError::Unreachable);
-        async move { result }
-    }
-
     fn invoke_actor_attested(
         &mut self,
         _target: ActorId,
@@ -765,9 +740,9 @@ struct CapturingInvoker {
 }
 
 impl Invoker for CapturingInvoker {
-    fn invoke(
+    fn invoke_actor(
         &mut self,
-        _target: ServiceId,
+        _target: ActorId,
         payload: Vec<u8>,
     ) -> impl core::future::Future<Output = core::result::Result<Value, ClientError>> + '_ {
         self.payload = Some(payload);
@@ -807,8 +782,8 @@ fn ref_decodes_valid_custom_reply() {
     let mut inv = MockInvoker {
         reply: Value::Bytes(rkyv_bytes!(receipt)),
     };
-    let vault = VaultRef::at(ServiceId(5));
-    let got = vos::block_on(vault.read_receipt(&mut inv)).expect("valid reply decodes");
+    let mut vault = VaultRef::bind(ActorId([5; 32]), &mut inv);
+    let got = vos::block_on(vault.read_receipt()).expect("valid reply decodes");
     assert_eq!(got, receipt);
 }
 
@@ -820,8 +795,8 @@ fn ref_rejects_corrupted_custom_reply() {
     let mut inv = MockInvoker {
         reply: Value::Bytes(vec![0xff, 0x00, 0x13, 0x37]),
     };
-    let vault = VaultRef::at(ServiceId(5));
-    let got = vos::block_on(vault.read_receipt(&mut inv));
+    let mut vault = VaultRef::bind(ActorId([5; 32]), &mut inv);
+    let got = vos::block_on(vault.read_receipt());
     assert!(
         matches!(got, Err(ClientError::Decode)),
         "corrupted reply bytes must fail checked decode, got {got:?}"
@@ -841,8 +816,8 @@ fn ref_rejects_truncated_custom_reply() {
     let mut inv = MockInvoker {
         reply: Value::Bytes(bytes),
     };
-    let vault = VaultRef::at(ServiceId(5));
-    let got = vos::block_on(vault.read_receipt(&mut inv));
+    let mut vault = VaultRef::bind(ActorId([5; 32]), &mut inv);
+    let got = vos::block_on(vault.read_receipt());
     assert!(
         matches!(got, Err(ClientError::Decode)),
         "truncated reply must fail checked decode, got {got:?}"
@@ -860,8 +835,8 @@ fn from_msg_rejects_unknown_method() {
 fn scalar_arg_keeps_its_wire_shape() {
     // A scalar travels as its canonical `Value` variant, not rkyv-wrapped.
     let mut inv = CapturingInvoker::default();
-    let vault = VaultRef::at(ServiceId(1));
-    let _ = vos::block_on(vault.deposit(&mut inv, 500u64)).expect("invoke");
+    let mut vault = VaultRef::bind(ActorId([1; 32]), &mut inv);
+    let _ = vos::block_on(vault.deposit(500u64)).expect("invoke");
     let msg = inv.captured_msg();
     assert_eq!(msg.name, "deposit");
     assert_eq!(msg.args.get("amount"), Some(&Value::U64(500)));
@@ -878,8 +853,8 @@ fn custom_struct_arg_round_trips_ref_to_from_msg() {
         tag: [7u8; 32],
     };
     let mut inv = CapturingInvoker::default();
-    let vault = VaultRef::at(ServiceId(5));
-    let _ = vos::block_on(vault.record(&mut inv, receipt.clone())).expect("invoke");
+    let mut vault = VaultRef::bind(ActorId([5; 32]), &mut inv);
+    let _ = vos::block_on(vault.record(receipt.clone())).expect("invoke");
     let msg = inv.captured_msg();
     // On the wire, a custom struct is rkyv bytes.
     assert!(
@@ -902,15 +877,15 @@ fn portable_attestation_round_trips_as_a_generated_actor_argument() {
     let mut producer = MockAttestationInvoker {
         result: Some(attested_receipt_result(&claim)),
     };
-    let package = vos::block_on(VaultRef::at(ServiceId(5)).last_receipt(&mut producer)).unwrap();
+    let mut vault = VaultRef::bind(ActorId([5; 32]), &mut producer);
+    let package = vos::block_on(vault.last_receipt()).unwrap();
 
     let mut gate_invoker = CapturingInvoker {
         reply: Some(Value::Bool(true)),
         ..Default::default()
     };
-    let received =
-        vos::block_on(GateRef::at(ServiceId(6)).receive_package(&mut gate_invoker, package))
-            .unwrap();
+    let mut gate = GateRef::bind(ActorId([6; 32]), &mut gate_invoker);
+    let received = vos::block_on(gate.receive_package(package)).unwrap();
     assert!(received);
     let GateMsg::ReceivePackage(message) = GateMsg::from_msg(&gate_invoker.captured_msg()).unwrap();
     assert_eq!(message.package.unverified_preview(), &claim);
@@ -920,8 +895,8 @@ fn portable_attestation_round_trips_as_a_generated_actor_argument() {
 fn vec_byte_array_arg_round_trips() {
     let roots = vec![[1u8; 32], [2u8; 32], [3u8; 32]];
     let mut inv = CapturingInvoker::default();
-    let vault = VaultRef::at(ServiceId(9));
-    let _ = vos::block_on(vault.pin_roots(&mut inv, roots.clone())).expect("invoke");
+    let mut vault = VaultRef::bind(ActorId([9; 32]), &mut inv);
+    let _ = vos::block_on(vault.pin_roots(roots.clone())).expect("invoke");
     let msg = inv.captured_msg();
     let VaultMsg::PinRoots(inner) =
         VaultMsg::from_msg(&msg).expect("from_msg decodes Vec<[u8;32]>")
@@ -955,8 +930,8 @@ fn byte_array_arg_and_reply_travel_as_raw_bytes() {
         reply: Some(Value::Bytes(root.to_vec())),
         ..Default::default()
     };
-    let vault = VaultRef::at(ServiceId(3));
-    let got = vos::block_on(vault.echo_root(&mut inv, root)).expect("invoke");
+    let mut vault = VaultRef::bind(ActorId([3; 32]), &mut inv);
+    let got = vos::block_on(vault.echo_root(root)).expect("invoke");
     // Reply decodes back into the fixed array (G26 reply path).
     assert_eq!(got, root);
     let msg = inv.captured_msg();
@@ -978,8 +953,8 @@ fn byte_array_reply_wrong_length_is_rejected() {
         reply: Some(Value::Bytes(vec![0u8; 31])),
         ..Default::default()
     };
-    let vault = VaultRef::at(ServiceId(3));
-    let got = vos::block_on(vault.echo_root(&mut inv, [0u8; 32]));
+    let mut vault = VaultRef::bind(ActorId([3; 32]), &mut inv);
+    let got = vos::block_on(vault.echo_root([0u8; 32]));
     assert!(
         matches!(got, Err(ClientError::Decode)),
         "31 bytes must not decode into [u8;32], got {got:?}"

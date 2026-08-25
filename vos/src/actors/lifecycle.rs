@@ -554,12 +554,12 @@ fn dispatch_one_inner<A: Actor>(
         raw
     } else if should_decode_dispatch_prefix(raw, actor_slice) {
         use super::auth::Caller;
-        let trust_flag = raw[1];
+        let internal_origin = raw[1];
         let has_space = raw[2] != 0;
         let space_byte = raw[3];
         let has_actor_local = raw[4] != 0;
         let actor_local_byte = raw[5];
-        ctx.set_caller(if trust_flag == 1 {
+        ctx.set_caller(if internal_origin == 1 {
             Caller::System
         } else {
             Caller::Unauthenticated

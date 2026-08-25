@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use vos::abi::service::ServiceId;
-use vos::actors::client::{ClientError, Invoker};
+use vos::actors::client::ClientError;
 use vos::node::{AgentConfig, Consistency, VosNode};
+use vos::registry::RegistryInvoker;
 use vos::registry::{RegistryRef, Status};
 
 use crate::blob_store::{self, BlobHash};
@@ -920,7 +921,7 @@ fn register_extensions_from_local(
 
 // ── Invite redemption (boot tick) ────────────────────────────────────
 
-/// A bounded-timeout [`Invoker`] over the running node — so a redeem
+/// A bounded registry invocation over the running node, so a redeem
 /// attempt to a slow or vanished bootnode can't stall the router tick
 /// for the node's 10 s default.
 struct TimedNode<'a> {
@@ -939,8 +940,8 @@ fn decode_timed_node_reply(outcome: Option<Vec<u8>>) -> Result<vos::value::Value
     }
 }
 
-impl Invoker for TimedNode<'_> {
-    fn invoke(
+impl RegistryInvoker for TimedNode<'_> {
+    fn invoke_registry(
         &mut self,
         target: ServiceId,
         payload: Vec<u8>,

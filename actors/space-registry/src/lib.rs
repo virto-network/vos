@@ -110,10 +110,9 @@ pub struct ExtensionMetaRow {
 /// (stored as a SpaceRole byte) can be reinterpreted in this
 /// enum's vocabulary via [`SPACE_ROLE_MAP`](SpaceRegistry::SPACE_ROLE_MAP).
 ///
-/// Each #[msg(role = SpaceRegistryRole::Admin)] handler runs the
-/// M6 macro-emitted check against the caller's effective role
-/// before the handler body executes; the host dispatch populates the
-/// caller's space role from `peer_role`.
+/// Public reads use this role vocabulary. Mutations authenticate their
+/// canonical operation bytes inside the handler so live execution and causal
+/// replay apply exactly the same rule.
 #[derive(
     vos::rkyv::Archive,
     vos::rkyv::Serialize,
@@ -436,7 +435,7 @@ impl SpaceRegistry {
 
     /// Bind the registry to the immutable root's canonical role authority.
     /// First write wins and an identical retry is idempotent.
-    #[msg(role = SpaceRegistryRole::Admin)]
+    #[msg]
     async fn set_role_authority(
         &mut self,
         authority_replication_id: Vec<u8>,
@@ -469,7 +468,7 @@ impl SpaceRegistry {
     /// Publish a named program. A repeated identical publication is
     /// idempotent; a different artifact atomically moves the name while
     /// installed agents remain pinned to their exact hash.
-    #[msg(role = SpaceRegistryRole::Admin)]
+    #[msg]
     async fn publish(&mut self, name: String, hash: Vec<u8>, crdt: bool, auth: Vec<u8>) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes("publish", &[name.as_bytes(), &hash, &[crdt as u8]]),
@@ -508,7 +507,7 @@ impl SpaceRegistry {
 
     /// Remove a program from the catalog. Errors with
     /// `Status::InUse` if any agent still references the artifact.
-    #[msg(role = SpaceRegistryRole::Admin)]
+    #[msg]
     async fn unpublish(&mut self, name: String, auth: Vec<u8>) -> Status {
         if !self.authorize_op(&canonical_op_bytes("unpublish", &[name.as_bytes()]), &auth) {
             return Status::Forbidden;
@@ -577,7 +576,7 @@ impl SpaceRegistry {
     /// existing `ProgramRow` — schema can be registered before
     /// the program is published if the orchestrator prefers
     /// that order.
-    #[msg(role = SpaceRegistryRole::Admin)]
+    #[msg]
     async fn register_meta(
         &mut self,
         program_hash: Vec<u8>,
@@ -656,7 +655,7 @@ impl SpaceRegistry {
     /// zero-method surface — and lets a re-deploy genuinely roll
     /// back a previously-published surface rather than leaving
     /// behind a stale row.
-    #[msg(role = SpaceRegistryRole::Admin)]
+    #[msg]
     async fn register_extension_meta(
         &mut self,
         instance_name: String,
@@ -694,7 +693,7 @@ impl SpaceRegistry {
     /// Instantiate a program as an agent. The caller resolves
     /// `program_name` to a hash and passes
     /// the hash so the install pins to a specific blob.
-    #[msg(role = SpaceRegistryRole::Admin)]
+    #[msg]
     async fn install(
         &mut self,
         instance_name: String,
@@ -823,7 +822,7 @@ impl SpaceRegistry {
 
     /// Tombstone an agent. Local data on each replica moves to
     /// trash on the host side; the registry just removes the row.
-    #[msg(role = SpaceRegistryRole::Admin)]
+    #[msg]
     async fn uninstall(&mut self, instance_name: String, auth: Vec<u8>) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes("uninstall", &[instance_name.as_bytes()]),
@@ -853,7 +852,7 @@ impl SpaceRegistry {
     /// instance back to a superseded artifact) finds a stale base and is
     /// refused. Each upgrade is
     /// pinned to the exact state it was authored against.
-    #[msg(role = SpaceRegistryRole::Admin)]
+    #[msg]
     async fn upgrade(
         &mut self,
         instance_name: String,
@@ -1088,7 +1087,7 @@ impl SpaceRegistry {
     /// Add a Node member. Idempotent in `prefix` — re-adding
     /// updates `peer_id` and `role`. `role` is
     /// `NODE_ROLE_VOTER` or `NODE_ROLE_OBSERVER`.
-    #[msg(role = SpaceRegistryRole::Admin)]
+    #[msg]
     async fn add_node(&mut self, prefix: u32, peer_id: Vec<u8>, role: u8, auth: Vec<u8>) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes("add_node", &[&prefix.to_le_bytes(), &peer_id, &[role]]),
@@ -1112,7 +1111,7 @@ impl SpaceRegistry {
         Status::Ok
     }
 
-    #[msg(role = SpaceRegistryRole::Admin)]
+    #[msg]
     async fn remove_node(&mut self, prefix: u32, auth: Vec<u8>) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes("remove_node", &[&prefix.to_le_bytes()]),
@@ -1132,7 +1131,7 @@ impl SpaceRegistry {
     /// when an identity-authored message arrives at an agent.
     /// `proof_kind` is `PROOF_KIND_MERKLE_INCLUSION` (v1) or
     /// `PROOF_KIND_ZK` (future).
-    #[msg(role = SpaceRegistryRole::Admin)]
+    #[msg]
     async fn add_identity(
         &mut self,
         public_key: Vec<u8>,
@@ -1166,7 +1165,7 @@ impl SpaceRegistry {
         Status::Ok
     }
 
-    #[msg(role = SpaceRegistryRole::Admin)]
+    #[msg]
     async fn remove_identity(&mut self, public_key: Vec<u8>, auth: Vec<u8>) -> Status {
         if !self.authorize_op(
             &canonical_op_bytes("remove_identity", &[&public_key]),
@@ -1291,7 +1290,7 @@ impl SpaceRegistry {
     /// message so captured pre-cutover calls cannot be reinterpreted as
     /// post-cutover evidence. Only the immutable root may author it, and its
     /// exact winning row is bound to the sealed authority incarnation.
-    #[msg(role = SpaceRegistryRole::Admin)]
+    #[msg]
     async fn grant_role(
         &mut self,
         peer_id: Vec<u8>,
@@ -1323,7 +1322,7 @@ impl SpaceRegistry {
         Status::Ok
     }
 
-    #[msg(role = SpaceRegistryRole::Admin)]
+    #[msg]
     async fn revoke_role(
         &mut self,
         peer_id: Vec<u8>,
@@ -1590,7 +1589,7 @@ impl SpaceRegistry {
     /// `Status::Ok` once authorized (marking a floor even with no live
     /// row). Existing already-granted roles are NOT clawed back here —
     /// that is `revoke_role`'s job (decision 6).
-    #[msg(role = SpaceRegistryRole::Admin)]
+    #[msg]
     async fn revoke_invite(&mut self, token_pub: Vec<u8>, auth: Vec<u8>) -> Status {
         if !self.authorize_op(&canonical_op_bytes("revoke_invite", &[&token_pub]), &auth) {
             return Status::Forbidden;
@@ -1706,9 +1705,7 @@ impl SpaceRegistry {
     /// peer whose grant chain bottoms out at the root and is not
     /// dominated by a revoke (see [`effective_role`](Self::effective_role)).
     ///
-    /// This runs at handler time on BOTH the live dispatch and every
-    /// peer's causal replay (where the op arrives as `Caller::System`
-    /// and the `#[msg(role)]` gate is a no-op). So a forged op merged
+    /// This runs at handler time on both live dispatch and causal replay. A forged op merged
     /// via CRDT — a fabricated AuthGrantRow{ADMIN} or MemberRow{VOTER}
     /// — is refused on each honest node unless it carries a signature
     /// an admin (or the root) actually produced.

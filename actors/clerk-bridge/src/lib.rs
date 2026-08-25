@@ -1323,15 +1323,11 @@ impl ClerkBridge {
             return early_redeem(Status::VoucherInvalid);
         }
 
-        // Cross-actor dispatch: invoke clerk-ledger's
-        // apply_transfer handler on the same node. The mailbox
-        // routes by ServiceId; clerk-bridge and clerk-ledger run
-        // on the same node so this is a local dispatch (no libp2p
-        // hop).
-        let ledger = ClerkLedgerRef::at(ServiceId(self.local_ledger_id));
+        let Ok(mut ledger) = ctx.actor::<ClerkLedgerRef>("clerk-ledger").await else {
+            return early_redeem(Status::LedgerRejected);
+        };
         let Ok(ledger_status) = ledger
             .apply_transfer(
-                ctx,
                 inflow_transfer_bytes,
                 inflow_openings_bytes,
                 batch_seed_timestamp,

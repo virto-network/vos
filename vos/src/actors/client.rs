@@ -8,14 +8,11 @@
 //! [`Context<A>`](super::Context) is the invoker) and from host
 //! code (where `&VosNode` is the invoker, gated on `std`).
 //!
-//! Application code normally receives a bound handle from
+//! Application code receives a bound handle from
 //! [`Context::actor`](super::Context::actor) or
 //! [`Context::child`](super::Context::child). Those handles carry the full
-//! [`ActorId`](crate::service::ActorId) used by the service scheduler. Raw refs retain a
-//! route-only [`ServiceId`](super::context::ServiceId) constructor solely as
-//! an advanced adapter for legacy hosts.
+//! [`ActorId`](crate::service::ActorId) used by the service scheduler.
 
-use super::context::ServiceId;
 use super::value::Value;
 use alloc::{string::String, vec::Vec};
 use core::{
@@ -131,24 +128,12 @@ impl From<super::value::InvokeError> for ClientError {
 /// `Ref` methods are generic over `<I: Invoker>` so the same typed
 /// surface works in both worlds.
 pub trait Invoker {
-    /// Invoke `target` with the already-encoded `payload`
-    /// (`[TAG_DYNAMIC] ++ rkyv(Msg)`) and return the decoded reply.
-    fn invoke(
-        &mut self,
-        target: ServiceId,
-        payload: Vec<u8>,
-    ) -> impl Future<Output = Result<Value, ClientError>> + '_;
-
-    /// Invoke a canonical service actor identity. Host-only legacy invokers do not
-    /// acquire an implicit ActorId-to-ServiceId mapping; they must override
-    /// this method or report the target as unreachable.
+    /// Invoke a canonical actor identity with an encoded dynamic message.
     fn invoke_actor(
         &mut self,
-        _target: crate::service::ActorId,
-        _payload: Vec<u8>,
-    ) -> impl Future<Output = Result<Value, ClientError>> + '_ {
-        core::future::ready(Err(ClientError::Unreachable))
-    }
+        target: crate::service::ActorId,
+        payload: Vec<u8>,
+    ) -> impl Future<Output = Result<Value, ClientError>> + '_;
 }
 
 /// Runtime result for an attested invocation. The generated client decodes
@@ -197,35 +182,11 @@ impl Future for AttestedAsk {
 /// Ordinary invokers cannot accidentally receive an unproved value from an
 /// attested generated handle.
 pub trait AttestationInvoker: Invoker {
-    fn invoke_attested(
-        &mut self,
-        target: ServiceId,
-        payload: Vec<u8>,
-    ) -> impl Future<Output = Result<AttestedInvocationResult, ClientError>> + '_;
-
-    /// Attested counterpart of [`Invoker::invoke_actor`]. The default rejects
-    /// the call so an adapter cannot accidentally return an unproved legacy
-    /// value for a canonical actor identity.
     fn invoke_actor_attested(
         &mut self,
-        _target: crate::service::ActorId,
-        _payload: Vec<u8>,
-    ) -> impl Future<Output = Result<AttestedInvocationResult, ClientError>> + '_ {
-        core::future::ready(Err(ClientError::Unreachable))
-    }
-}
-
-/// Identity carried by a generated bound handle.
-///
-/// `Actor` is the application-facing service form. `Service` exists only so the
-/// legacy host/runtime adapter can keep driving raw service routes during the
-/// clean-break rollout; it is intentionally absent from the application
-/// prelude.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[doc(hidden)]
-pub enum ActorTarget {
-    Actor(crate::service::ActorId),
-    Service(ServiceId),
+        target: crate::service::ActorId,
+        payload: Vec<u8>,
+    ) -> impl Future<Output = Result<AttestedInvocationResult, ClientError>> + '_;
 }
 
 /// Implemented by every macro-generated `{Actor}Ref`. It binds a canonical
@@ -240,14 +201,6 @@ pub trait ActorReference: Copy {
         target: crate::service::ActorId,
         invoker: &'a mut I,
     ) -> Self::Handle<'a, I>;
-
-    /// Advanced legacy-host adapter. Application code should resolve actors
-    /// through `Context` and receive an ActorId-bound handle instead.
-    #[doc(hidden)]
-    fn bind_service<'a, I: Invoker + 'a>(
-        target: ServiceId,
-        invoker: &'a mut I,
-    ) -> Self::Handle<'a, I>;
 }
 
 /// Compile-time relationship between an actor state type and the generated
@@ -260,24 +213,7 @@ pub trait ActorReferenceFor<A: super::Actor>: ActorReference {}
 /// Generic spelling for a bound macro-generated actor handle.
 pub type ActorHandle<'a, R, I> = <R as ActorReference>::Handle<'a, I>;
 
-// `Context<A>` already exposes the right primitive — `ask_raw` returns
-// an `Ask` future yielding `Result<Value, InvokeError>`. The Invoker
-// shape just collapses `InvokeError` into `ClientError::Unreachable`,
-// matching what the old `ActorClient` emission produced.
 impl<A: super::Actor> Invoker for super::Context<A> {
-    #[allow(clippy::manual_async_fn)]
-    fn invoke(
-        &mut self,
-        target: ServiceId,
-        payload: Vec<u8>,
-    ) -> impl Future<Output = Result<Value, ClientError>> + '_ {
-        async move {
-            self.ask_raw(target, &payload)
-                .await
-                .map_err(ClientError::from)
-        }
-    }
-
     #[allow(clippy::manual_async_fn)]
     fn invoke_actor(
         &mut self,
@@ -293,14 +229,6 @@ impl<A: super::Actor> Invoker for super::Context<A> {
 }
 
 impl<A: super::Actor> AttestationInvoker for super::Context<A> {
-    fn invoke_attested(
-        &mut self,
-        _target: ServiceId,
-        _payload: Vec<u8>,
-    ) -> impl Future<Output = Result<AttestedInvocationResult, ClientError>> + '_ {
-        AttestedAsk::ready(Err(ClientError::Unreachable))
-    }
-
     fn invoke_actor_attested(
         &mut self,
         target: crate::service::ActorId,

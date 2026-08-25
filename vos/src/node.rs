@@ -11861,7 +11861,7 @@ fn drive_capturing_external(
 /// Layout (38 bytes header + original message):
 ///
 ///   [0] TAG_DISPATCH_PREFIX (0xFD)
-///   [1] trust_flag: 1 iff caller is System/Actor (intra-process)
+///   [1] internal_origin: 1 iff caller is System/Actor (intra-process)
 ///   [2] has_space_role: 0 / 1
 ///   [3] space_role byte
 ///   [4] has_actor_local_role: 0 / 1
@@ -11886,7 +11886,14 @@ fn encode_caller_prefix(
 /// under the original caller's authority (a role-refused dispatch must
 /// replay as refused).
 fn caller_prefix_bytes(req: &InvokeRequest) -> crate::effect_log::CallerPrefix {
-    let trust_flag: u8 = if req.caller.is_trusted() { 1 } else { 0 };
+    let internal_origin: u8 = if matches!(
+        req.caller,
+        crate::actors::Caller::System | crate::actors::Caller::Actor(_)
+    ) {
+        1
+    } else {
+        0
+    };
     let (has_space, space_byte) = match req.space_role {
         Some(b) => (1u8, b),
         None => (0u8, 0u8),
@@ -11896,7 +11903,7 @@ fn caller_prefix_bytes(req: &InvokeRequest) -> crate::effect_log::CallerPrefix {
         None => (0u8, 0u8),
     };
     [
-        trust_flag,
+        internal_origin,
         has_space,
         space_byte,
         has_actor_local,
@@ -12678,10 +12685,8 @@ pub const HYPERSPACE_REGISTRY_AGENT_NAME: &str = "hyperspace-registry";
 /// `min(caller's space role, the extension's declared cap ceiling for
 /// the target)`. The extension can never *amplify* the caller, and
 /// the caller can never reach actors the extension didn't declare.
-/// The returned caller is always NON-trusted (Peer or
-/// Unauthenticated) so the downstream actor's role check actually
-/// consults the (capped) `space_role` rather than short-circuiting
-/// through the [`Caller::is_trusted`] bypass.
+/// The returned caller is a peer or anonymous; role authority is always the
+/// intersection of the explicitly carried space role and the extension cap.
 ///
 /// - No matching cap → `(Unauthenticated, None)`: the extension has
 ///   no authority for this target; role-gated handlers refuse.
@@ -12689,10 +12694,8 @@ pub const HYPERSPACE_REGISTRY_AGENT_NAME: &str = "hyperspace-registry";
 ///   with no external caller) → `(Unauthenticated, None)`.
 /// - Peer caller → relays the peer's identity + `min(space_role,
 ///   ceiling)`.
-/// - System / Actor caller (trusted incoming) → relays anonymously
-///   (`Unauthenticated`) carrying `min(Admin, ceiling)`: trusted
-///   callers have full authority, but the cap still bounds it, and
-///   dropping the trusted variant keeps the cap effective.
+/// - System / Actor caller → relays anonymously with only an explicitly
+///   carried role. Origin kind alone grants nothing.
 fn resolve_relay_caller(
     propagated: Option<&PropagatedCaller>,
     caps: &[crate::actors::IntraCap],
@@ -12707,21 +12710,14 @@ fn resolve_relay_caller(
         return (Caller::Unauthenticated, None);
     };
     // The caller's effective space-wide authority entering the relay.
-    let carried: Option<SpaceRole> = match &pc.caller {
-        Caller::Peer(_) => pc.space_role.and_then(SpaceRole::from_u8),
-        // Trusted incoming (host-initiated or intra-system) carries
-        // full authority — but is still bounded by the cap below.
-        Caller::System | Caller::Actor(_) => Some(SpaceRole::Admin),
-        Caller::Unauthenticated => None,
-    };
+    let carried = pc.space_role.and_then(SpaceRole::from_u8);
     let Some(carried) = carried else {
         return (Caller::Unauthenticated, None);
     };
     let effective = carried.min(ceiling);
-    // The carrier must be non-trusted so the downstream role check
-    // uses the capped space_role instead of short-circuiting.
-    // Preserve the peer's identity (audit / future per-target
-    // actor-local lookups); relay trusted callers anonymously.
+    // Preserve a peer identity for audit and actor-local lookups. Internal
+    // origins are anonymous at this boundary; their explicit role remains
+    // capped in the same way as a peer's.
     let carrier = match &pc.caller {
         Caller::Peer(bytes) => Caller::Peer(bytes.clone()),
         _ => Caller::Unauthenticated,
@@ -15053,20 +15049,21 @@ mod tests {
             (Caller::Unauthenticated, None),
         );
 
-        // 7. Trusted incoming (System / Actor) → relayed ANONYMOUSLY
-        //    (non-trusted carrier) but still capped, so the cap binds.
-        for trusted in [Caller::System, Caller::Actor(ServiceId(9))] {
-            let p_trusted = pc(trusted, None);
-            let (c, sr) = resolve_relay_caller(Some(&p_trusted), &dev_cap, Some("space-registry"));
-            assert!(
-                !c.is_trusted(),
-                "carrier must be non-trusted so the cap is not bypassed: {c:?}",
+        // 7. Internal origin kind grants nothing. An explicitly carried role
+        //    is still capped and relayed anonymously.
+        for internal in [Caller::System, Caller::Actor(ServiceId(9))] {
+            let p_internal = pc(internal.clone(), None);
+            assert_eq!(
+                resolve_relay_caller(Some(&p_internal), &dev_cap, Some("space-registry")),
+                (Caller::Unauthenticated, None),
             );
+            let p_internal = pc(internal, Some(SpaceRole::Admin));
+            let (c, sr) = resolve_relay_caller(Some(&p_internal), &dev_cap, Some("space-registry"));
             assert_eq!(c, Caller::Unauthenticated);
             assert_eq!(
                 sr,
                 Some(SpaceRole::Developer.as_u8()),
-                "Admin capped to ceiling"
+                "explicit Admin role is capped to the extension ceiling"
             );
         }
 

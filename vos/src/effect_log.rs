@@ -25,12 +25,12 @@ use alloc::vec::Vec;
 pub const ANCHOR_UNRECORDED: u8 = 0xFF;
 
 /// Caller-prefix bytes recorded per dispatch — the wire the host
-/// prepends so the guest's dispatch gate sees the caller's trust flag
+/// prepends so the guest's dispatch gate sees whether the origin is internal
 /// and role grants: `[trust_flag, has_space_role, space_role,
 /// has_actor_local_role, actor_local_role]`. Recording them makes
 /// replay re-run each dispatch under the ORIGINAL caller's authority,
 /// so a role-refused dispatch replays as refused — replaying everything
-/// as trusted-System would re-admit refused calls and diverge the
+/// as System would change observable origin and diverge the
 /// rebuilt state from the committed history.
 pub type CallerPrefix = [u8; 5];
 

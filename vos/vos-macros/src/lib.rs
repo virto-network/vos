@@ -1419,100 +1419,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // ── Unified Ref emission ────────────────────────────────────
     //
-    // `{Actor}Ref` is the typed reference for both call sites:
-    //
-    //   - inside a PVM actor handler, with `ctx` as the invoker
-    //     (`Context<A>: Invoker`),
-    //   - from host code, with `&node` as the invoker (gated on
-    //     vos's `std` feature where `&VosNode: Invoker` lives).
-    //
-    // Raw refs hold only a legacy `ServiceId`, no_std + dep-free. Each method
-    // takes `&mut impl Invoker` as its first parameter. Methods
-    // are `async`; host callers wrap them with `vos::block_on`.
+    // `{Actor}Ref` is a typed namespace and compile-time relationship between
+    // an actor state and its generated handle. Handles always bind a complete
+    // ActorId; route-only application references do not exist.
     let ref_struct_name = format_ident!("{}Ref", actor_name);
-    let ref_methods_emit: Vec<proc_macro2::TokenStream> = client_methods
-        .iter()
-        .map(|m| {
-            let method_ident = &m.wire_name;
-            let wire_name = m.wire_name.to_string();
-            let arg_decls: Vec<proc_macro2::TokenStream> = m
-                .args
-                .iter()
-                .map(|(n, t)| {
-                    quote! { #n: #t }
-                })
-                .collect();
-            let with_calls: Vec<proc_macro2::TokenStream> =
-                m.args.iter().map(|(n, t)| ref_arg_with(n, t)).collect();
-            let return_ty: proc_macro2::TokenStream = match &m.success_ty {
-                None => quote! { () },
-                Some(t) => quote! { #t },
-            };
-            let method_marker = format_ident!("{}", to_pascal_case(&wire_name));
-            let value_ident = format_ident!("__value");
-            let decode = client_decode_body(&m.success_ty, &value_ident);
-            if m.attested {
-                quote! {
-                    pub async fn #method_ident<__I: vos::actors::client::AttestationInvoker>(
-                        &self,
-                        __inv: &mut __I,
-                        #( #arg_decls ),*
-                    ) -> core::result::Result<
-                        vos::Attestation<#return_ty, #method_marker>,
-                        vos::actors::client::ClientError,
-                    > {
-                        use vos::Encode;
-                        let __msg = vos::value::Msg::new(#wire_name)
-                            #( #with_calls )*;
-                        let __encoded = __msg.encode();
-                        let mut __payload = alloc::vec::Vec::with_capacity(1 + __encoded.len());
-                        __payload.push(vos::value::TAG_DYNAMIC);
-                        __payload.extend_from_slice(&__encoded);
-                        let vos::actors::client::AttestedInvocationResult {
-                            value: #value_ident,
-                            producer_name: __producer_name,
-                            producer: __producer,
-                            statement: __statement,
-                            trace: __trace,
-                            proof: __proof,
-                        } = __inv.invoke_attested(self.target, __payload).await?;
-                        let __claim_wire = vos::Encode::encode(&#value_ident);
-                        let __preview: #return_ty = (#decode)?;
-                        vos::Attestation::__from_runtime_wire(
-                            __producer_name,
-                            __producer,
-                            __statement,
-                            __trace,
-                            __claim_wire,
-                            __preview,
-                            __proof,
-                        )
-                        .map_err(vos::actors::client::ClientError::InvalidAttestation)
-                    }
-                }
-            } else {
-                quote! {
-                    pub async fn #method_ident<__I: vos::actors::client::Invoker>(
-                        &self,
-                        __inv: &mut __I,
-                        #( #arg_decls ),*
-                    ) -> core::result::Result<#return_ty, vos::actors::client::ClientError> {
-                        use vos::Encode;
-                        let __msg = vos::value::Msg::new(#wire_name)
-                            #( #with_calls )*;
-                        let __encoded = __msg.encode();
-                        let mut __payload = alloc::vec::Vec::with_capacity(1 + __encoded.len());
-                        __payload.push(vos::value::TAG_DYNAMIC);
-                        __payload.extend_from_slice(&__encoded);
-                        let #value_ident: vos::value::Value =
-                            __inv.invoke(self.target, __payload).await?;
-                        #decode
-                    }
-                }
-            }
-        })
-        .collect();
-
     let handle_methods_emit: Vec<proc_macro2::TokenStream> = client_methods
         .iter()
         .map(|m| {
@@ -1555,16 +1465,9 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                             statement: __statement,
                             trace: __trace,
                             proof: __proof,
-                        } = match self.target {
-                            vos::actors::client::ActorTarget::Actor(__actor) => self
-                                .invoker
-                                .invoke_actor_attested(__actor, __payload)
-                                .await?,
-                            vos::actors::client::ActorTarget::Service(__service) => self
-                                .invoker
-                                .invoke_attested(__service, __payload)
-                                .await?,
-                        };
+                        } = self.invoker
+                            .invoke_actor_attested(self.target, __payload)
+                            .await?;
                         let __claim_wire = vos::Encode::encode(&__value);
                         let __preview: #return_ty = (#decode)?;
                         vos::Attestation::__from_runtime_wire(
@@ -1592,16 +1495,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                         let mut __payload = alloc::vec::Vec::with_capacity(1 + __encoded.len());
                         __payload.push(vos::value::TAG_DYNAMIC);
                         __payload.extend_from_slice(&__encoded);
-                        let #value_ident: vos::value::Value = match self.target {
-                            vos::actors::client::ActorTarget::Actor(__actor) => self
-                                .invoker
-                                .invoke_actor(__actor, __payload)
-                                .await?,
-                            vos::actors::client::ActorTarget::Service(__service) => self
-                                .invoker
-                                .invoke(__service, __payload)
-                                .await?,
-                        };
+                        let #value_ident: vos::value::Value = self
+                            .invoker
+                            .invoke_actor(self.target, __payload)
+                            .await?;
                         #decode
                     }
                 }
@@ -1612,37 +1509,17 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let ref_emission = quote! {
         #[derive(Copy, Clone)]
-        pub struct #ref_struct_name {
-            target: vos::abi::service::ServiceId,
-        }
-
-        impl #ref_struct_name {
-            /// Advanced host/runtime adapter for an explicit route-only ID.
-            #[doc(hidden)]
-            pub const fn at(target: vos::abi::service::ServiceId) -> Self {
-                Self { target }
-            }
-
-            /// The `ServiceId` this ref points at.
-            pub const fn id(&self) -> vos::abi::service::ServiceId {
-                self.target
-            }
-
-            #( #ref_methods_emit )*
-        }
+        pub struct #ref_struct_name;
 
         pub struct #handle_struct_name<'a, __I: vos::actors::client::Invoker> {
-            target: vos::actors::client::ActorTarget,
+            target: vos::ActorId,
             invoker: &'a mut __I,
         }
 
         impl<'a, __I: vos::actors::client::Invoker> #handle_struct_name<'a, __I> {
             /// Canonical identity carried by an application-facing handle.
-            pub const fn actor_id(&self) -> core::option::Option<vos::ActorId> {
-                match self.target {
-                    vos::actors::client::ActorTarget::Actor(actor) => core::option::Option::Some(actor),
-                    vos::actors::client::ActorTarget::Service(_) => core::option::Option::None,
-                }
+            pub const fn actor_id(&self) -> vos::ActorId {
+                self.target
             }
 
             #( #handle_methods_emit )*
@@ -1657,17 +1534,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 invoker: &'a mut __I,
             ) -> Self::Handle<'a, __I> {
                 #handle_struct_name {
-                    target: vos::actors::client::ActorTarget::Actor(target),
-                    invoker,
-                }
-            }
-
-            fn bind_service<'a, __I: vos::actors::client::Invoker + 'a>(
-                target: vos::abi::service::ServiceId,
-                invoker: &'a mut __I,
-            ) -> Self::Handle<'a, __I> {
-                #handle_struct_name {
-                    target: vos::actors::client::ActorTarget::Service(target),
+                    target,
                     invoker,
                 }
             }

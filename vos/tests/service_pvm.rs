@@ -1097,15 +1097,13 @@ fn install_test_voter_registry(
     voters: &[(u16, Vec<u8>)],
 ) {
     use ed25519_dalek::{Signer, SigningKey};
-    use space_registry::{
-        NODE_ROLE_VOTER, SpaceRegistryRef, Status, canonical_op_bytes, pack_auth,
-    };
+    use space_registry::{NODE_ROLE_VOTER, Status, canonical_op_bytes, pack_auth};
 
     node.register_at_id(
         vos::node::AgentConfig::new(registry_pvm),
         ServiceId::REGISTRY,
     );
-    let registry = SpaceRegistryRef::at(ServiceId::REGISTRY);
+    let registry = vos::registry::RegistryRef::at(ServiceId::REGISTRY);
     let root_key = SigningKey::from_bytes(&[0xB9; 32]);
     let mut root_peer = vec![0x00u8, 0x24, 0x08, 0x01, 0x12, 0x20];
     root_peer.extend_from_slice(&root_key.verifying_key().to_bytes());

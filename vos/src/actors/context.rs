@@ -396,14 +396,7 @@ impl<A: Actor> Context<A> {
 
     /// True iff the caller's effective role satisfies `required`
     /// — i.e. `>=` in the actor's role hierarchy.
-    /// System and actor origins temporarily bypass this check because the
-    /// legacy bootstrap and replay paths cannot carry role bytes. The service
-    /// authority cutover removes this compatibility boundary only after
-    /// those callers carry explicit platform capabilities.
     pub fn has_role(&self, required: A::Role) -> bool {
-        if self.caller.is_trusted() {
-            return true;
-        }
         let required_byte = required.as_byte();
         if required_byte == u8::MAX || A::Role::from_byte(required_byte) != Some(required) {
             return false;
@@ -1082,109 +1075,22 @@ impl<A: Actor> Context<A> {
         crate::effects::bytestream::decode_resp_bytes(&resp)
     }
 
-    /// Resolve an installed agent's name to its node-local
-    /// `ServiceId` (packed as u32) by asking the well-known
-    /// `ServiceId::REGISTRY` service. Returns 0 when no agent
-    /// with that name is installed **or** when the registry
-    /// invoke fails for any reason — the two cases are
-    /// indistinguishable from the return value alone, so
-    /// failures emit a `log::warn!` for debugging. Callers that
-    /// need explicit error handling should use
-    /// [`Context::ask`] against `ServiceId::REGISTRY` directly.
-    ///
-    /// Thin convenience over `ctx.ask(REGISTRY, Msg::new("resolve")…)`
-    /// so actor crates don't need to depend on the registry's
-    /// typed Ref to use it. The returned id is dispatchable via
-    /// `ctx.tell` / `ctx.send` — same formula `space up` uses
-    /// when registering installed agents on this node.
-    ///
-    /// **Eventual consistency**: if the local registry replica
-    /// hasn't yet seen a fresh `install` from another node
-    /// (CRDT replication lag), `resolve` returns 0 transiently
-    /// even though the agent exists in the space. Callers that
-    /// need stronger semantics should retry, or watch for the
-    /// agent's appearance via subscriptions.
-    ///
-    /// ```ignore
-    /// let counter = ctx.resolve("counter").await;
-    /// if counter != 0 {
-    ///     ctx.tell(ServiceId(counter), &Msg::new("inc"));
-    /// }
-    /// ```
-    ///
-    /// **Hyperspace fall-through**: when the local registry returns 0
-    /// (not found), the call unconditionally re-asks
-    /// [`ServiceId::HYPERSPACE_REGISTRY`]. On nodes whose space
-    /// declared `hyperspace = "name"` in its manifest, that's a real
-    /// lookup against the shared cross-space registry. On nodes
-    /// without a hyperspace replica the second ask returns
-    /// `InvokeError::NotFound` cheaply, surfaced here as 0.
-    ///
-    /// Cost: every miss now pays two invokes instead of one. PVM
-    /// invokes are synchronous so this is small; if it ever shows up
-    /// in a profile, an explicit `resolve_in_hyperspace` could
-    /// replace the auto-fallthrough.
-    pub async fn resolve(&mut self, name: impl Into<alloc::string::String>) -> u32 {
-        let name = name.into();
-        let prefix = self.id.node_prefix();
-
-        let mut msg = super::value::Msg::new("resolve");
-        msg = msg.with("name", name.clone());
-        msg = msg.with("caller_prefix", prefix as u64);
-        let primary = self.ask(ServiceId::REGISTRY, &msg).await;
-        let local = match primary {
-            Ok(super::value::Value::U32(n)) => n,
-            Ok(other) => {
-                crate::log::warn!(
-                    "Context::resolve: local registry returned non-U32 reply ({other:?}); treating as not-found",
-                );
-                0
-            }
-            Err(e) => {
-                crate::log::warn!(
-                    "Context::resolve: local registry invoke failed: {e}; treating as not-found",
-                );
-                0
-            }
-        };
-        if local != 0 {
-            return local;
-        }
-
-        // Local miss — try the hyperspace registry. On nodes without
-        // one this errors with NotFound which we surface as 0.
-        let mut msg = super::value::Msg::new("resolve");
-        msg = msg.with("name", name);
-        msg = msg.with("caller_prefix", prefix as u64);
-        match self.ask(ServiceId::HYPERSPACE_REGISTRY, &msg).await {
-            Ok(super::value::Value::U32(n)) => n,
-            _ => 0,
-        }
-    }
-
-    /// Resolve an installed root actor by name and bind its generated typed
-    /// reference to this context. Generated handle methods need no separate
-    /// `ctx` argument.
+    /// Resolve an actor from this root's authenticated directory and bind its
+    /// generated typed reference to this context.
     pub async fn actor<'a, R: super::client::ActorReference + 'a>(
         &'a mut self,
         name: impl Into<alloc::string::String>,
     ) -> Result<R::Handle<'a, Self>, super::client::ClientError> {
         let name = name.into();
-        if self.actor_id.is_some() {
-            let actor = self
-                .resolve_owned_actor(None, &name)
-                .or_else(|| {
-                    self.resolve_external_actor(&name)
-                        .map(|binding| binding.actor)
-                })
-                .ok_or(super::client::ClientError::NotFound)?;
-            return Ok(R::bind(actor, self));
-        }
-        let id = self.resolve(name).await;
-        if id == 0 {
-            return Err(super::client::ClientError::NotFound);
-        }
-        Ok(R::bind_service(ServiceId(id), self))
+        self.actor_id.ok_or(super::client::ClientError::NotFound)?;
+        let actor = self
+            .resolve_owned_actor(None, &name)
+            .or_else(|| {
+                self.resolve_external_actor(&name)
+                    .map(|binding| binding.actor)
+            })
+            .ok_or(super::client::ClientError::NotFound)?;
+        Ok(R::bind(actor, self))
     }
 
     /// Resolve an existing actor directly owned by the current actor. Under service
@@ -1195,21 +1101,13 @@ impl<A: Actor> Context<A> {
         name: impl Into<alloc::string::String>,
     ) -> Result<R::Handle<'a, Self>, super::client::ClientError> {
         let name = name.into();
-        if let Some(parent) = self.actor_id {
-            let actor = self
-                .resolve_owned_actor(Some(parent), &name)
-                .ok_or(super::client::ClientError::NotOwnedChild)?;
-            return Ok(R::bind(actor, self));
-        }
-        let id = self.resolve(name).await;
-        if id == 0 {
-            return Err(super::client::ClientError::NotFound);
-        }
-        let target = ServiceId(id);
-        if target.node_prefix() != self.id.node_prefix() {
-            return Err(super::client::ClientError::NotOwnedChild);
-        }
-        Ok(R::bind_service(target, self))
+        let parent = self
+            .actor_id
+            .ok_or(super::client::ClientError::NotOwnedChild)?;
+        let actor = self
+            .resolve_owned_actor(Some(parent), &name)
+            .ok_or(super::client::ClientError::NotOwnedChild)?;
+        Ok(R::bind(actor, self))
     }
 
     /// Create and initialize an owned child. This is the only beginner API
@@ -1276,15 +1174,8 @@ impl<A: Actor> Context<A> {
                 return Err(super::client::ClientError::SpawnUnavailable);
             }
         }
-        let request = super::value::Msg::new("spawn_child")
-            .with("owner", self.id.0)
-            .with("name", name)
-            .with("init", super::value::Value::Bytes(init.encode()));
-        let id = match self.ask(ServiceId::REGISTRY, &request).await {
-            Ok(super::value::Value::U32(id)) if id != 0 => id,
-            _ => return Err(super::client::ClientError::Unreachable),
-        };
-        Ok(R::bind_service(ServiceId(id), self))
+        let _ = (name, init);
+        Err(super::client::ClientError::SpawnUnavailable)
     }
 
     // --- Host I/O (worker mode) ---
@@ -1989,12 +1880,6 @@ mod tests {
             _invoker: &'a mut I,
         ) -> Self::Handle<'a, I> {
         }
-
-        fn bind_service<'a, I: crate::actors::client::Invoker + 'a>(
-            _target: ServiceId,
-            _invoker: &'a mut I,
-        ) -> Self::Handle<'a, I> {
-        }
     }
 
     impl crate::actors::client::ActorReferenceFor<TestActor> for TestRef {}
@@ -2494,17 +2379,17 @@ mod tests {
     }
 
     #[test]
-    fn intra_system_actor_caller_is_trusted_during_legacy_bootstrap() {
+    fn intra_system_actor_caller_needs_an_explicit_role() {
         let ctx: Context<FixtureActor> = fixture_ctx_with(Caller::Actor(ServiceId(99)), None, None);
-        assert!(ctx.has_role(FixtureRole::Maintainer));
-        assert_eq!(ctx.ensure_role(FixtureRole::Maintainer), Ok(()));
+        assert!(!ctx.has_role(FixtureRole::Maintainer));
+        assert_eq!(ctx.ensure_role(FixtureRole::Maintainer), Err(Forbidden));
     }
 
     #[test]
-    fn system_caller_is_trusted_during_legacy_bootstrap() {
+    fn system_caller_needs_an_explicit_role() {
         let ctx: Context<FixtureActor> = fixture_ctx_with(Caller::System, None, None);
-        assert!(ctx.has_role(FixtureRole::Maintainer));
-        assert_eq!(ctx.ensure_role(FixtureRole::Maintainer), Ok(()));
+        assert!(!ctx.has_role(FixtureRole::Maintainer));
+        assert_eq!(ctx.ensure_role(FixtureRole::Maintainer), Err(Forbidden));
     }
 
     #[test]

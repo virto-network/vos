@@ -226,16 +226,6 @@ impl Caller {
         !matches!(self, Self::Unauthenticated)
     }
 
-    /// True iff the caller is trusted by virtue of originating
-    /// inside the daemon process — [`Self::System`] (host-
-    /// initiated) or [`Self::Actor`] (intra-system invoke).
-    /// `Context::has_role` short-circuits these variants to
-    /// `true` until internal callers are migrated to explicit
-    /// authority capabilities.
-    pub const fn is_trusted(&self) -> bool {
-        matches!(self, Self::System | Self::Actor(_))
-    }
-
     /// Bytes the registry's grant table keys on. `None` for
     /// callers that don't have a binding (Unauthenticated /
     /// System / intra-system Actor calls — those are
@@ -623,19 +613,6 @@ mod tests {
         assert!(Caller::System.is_authenticated());
         assert!(Caller::Peer(alloc::vec![1, 2, 3]).is_authenticated());
         assert!(Caller::Actor(crate::actors::context::ServiceId(42)).is_authenticated());
-    }
-
-    #[test]
-    fn caller_is_trusted() {
-        // Trust shortcut: anything originating inside the
-        // daemon process (System, Actor) bypasses role checks.
-        // External-identity variants (Unauthenticated, Peer)
-        // must NOT bypass — they have to go through the
-        // registry's grant lookup.
-        assert!(!Caller::Unauthenticated.is_trusted());
-        assert!(!Caller::Peer(alloc::vec![1]).is_trusted());
-        assert!(Caller::System.is_trusted());
-        assert!(Caller::Actor(crate::actors::context::ServiceId(0)).is_trusted());
     }
 
     #[test]
