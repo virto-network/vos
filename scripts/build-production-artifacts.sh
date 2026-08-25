@@ -164,7 +164,15 @@ if [[ $mode == all || $mode == registry ]]; then
             --name space-registry \
             --out-dir "$registry_out"
     )
-    registry_elf="$build_root/actors/space-registry/target/vosx-canonical/riscv64em-vos/release/space_registry.elf"
+    mapfile -d '' registry_elfs < <(
+        find "$build_root/actors/space-registry/target/vosx-canonical" \
+            -type f -path '*/riscv64em-vos/release/space_registry.elf' -print0
+    )
+    if [[ ${#registry_elfs[@]} -ne 1 ]]; then
+        echo "canonical registry build produced ${#registry_elfs[@]} ELF artifacts; expected exactly one" >&2
+        exit 1
+    fi
+    registry_elf=${registry_elfs[0]}
     actual_registry_digest=$(b2sum -l 256 "$registry_elf")
     actual_registry_digest=${actual_registry_digest%% *}
     if [[ $actual_registry_digest != "$registry_elf_digest" ]]; then
