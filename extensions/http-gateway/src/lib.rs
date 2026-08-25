@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! GET  /<agent-name>/<method>?key1=val1&key2=val2     → query
-//! POST /<agent-name>/<method>   body: {"k1":"v1",...} → command
+//! POST /<agent-name>/<method>   body: {"key":"value",...} → command
 //! ```
 //!
 //! The `<agent-name>` segment resolves through the registry actor at

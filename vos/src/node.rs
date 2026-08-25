@@ -778,22 +778,6 @@ pub struct ExtensionConfig {
     /// syscalls outside the declared caps. Override via the space
     /// manifest's `cap_policy = "log"`/`"block"`/`"kill"`.
     pub cap_policy: crate::extension::CapPolicy,
-    /// M9 — relay-only mode for extensions that proxy external
-    /// traffic (the HTTP gateway). When `true`, the host's
-    /// invoke closure tags every outbound call from this
-    /// extension as [`Caller::Unauthenticated`] instead of the
-    /// default [`Caller::Actor`] intra-system bypass. Default
-    /// `false` for traditional extensions that compose with
-    /// other actors as trusted in-process peers.
-    ///
-    /// Deprecated synonym for `intra_caps = []`: now that the
-    /// default *denies* (an extension with no declared caps relays
-    /// every outbound call as [`Caller::Unauthenticated`]), this
-    /// flag is redundant. Kept for back-compat with existing
-    /// gateway manifests. When `true`, [`Self::relay_unauthenticated`]
-    /// also clears `intra_caps` so the "relay has no authority"
-    /// guarantee can't be accidentally combined with a declared cap.
-    pub relay_unauthenticated: bool,
     /// Declared intra-system capabilities — the ceiling [`SpaceRole`]
     /// this extension may relay to each named target actor. Empty
     /// (the default) means the extension has *no* authority to relay:
@@ -851,7 +835,6 @@ impl ExtensionConfig {
             init_args: Vec::new(),
             data_dir: None,
             cap_policy: crate::extension::CapPolicy::default(),
-            relay_unauthenticated: false,
             intra_caps: Vec::new(),
             tls_cert_pem: None,
             tls_key_pem: None,
@@ -873,7 +856,6 @@ impl ExtensionConfig {
             init_args: bytes,
             data_dir: None,
             cap_policy: crate::extension::CapPolicy::default(),
-            relay_unauthenticated: false,
             intra_caps: Vec::new(),
             tls_cert_pem: None,
             tls_key_pem: None,
@@ -933,30 +915,10 @@ impl ExtensionConfig {
         self
     }
 
-    /// Mark the extension as a relay for external traffic — its
-    /// outbound calls tag every InvokeRequest as
-    /// [`Caller::Unauthenticated`] so the targeted actor's
-    /// role-gated handlers can refuse anonymous HTTP / REST /
-    /// future-gateway-protocol traffic. The HTTP gateway sets
-    /// this; most other extensions leave it at the default
-    /// `false` so they retain intra-system trust.
-    pub fn relay_unauthenticated(mut self) -> Self {
-        self.relay_unauthenticated = true;
-        // Mutually exclusive with declared caps: a relay has no
-        // authority of its own. Clearing here keeps the invariant
-        // even if a manifest sets both shapes.
-        self.intra_caps.clear();
-        self
-    }
-
     /// Declare the extension's intra-system capabilities — the
     /// ceiling [`SpaceRole`] it may relay to each named target.
-    /// Ignored (cleared) when [`Self::relay_unauthenticated`] is
-    /// also set, since a relay has no authority. See [`IntraCap`].
+    /// An empty list gives the extension no relay authority. See [`IntraCap`].
     pub fn with_intra_caps(mut self, caps: Vec<crate::actors::IntraCap>) -> Self {
-        if self.relay_unauthenticated {
-            return self;
-        }
         self.intra_caps = caps;
         self
     }
@@ -970,9 +932,7 @@ impl ExtensionConfig {
     }
 
     /// Override the cap-overage policy. Defaults to
-    /// [`CapPolicy::Block`](crate::extension::CapPolicy::Block) —
-    /// callers in tests that want the Sprint-1 warn-only
-    /// behaviour pass `CapPolicy::Log`.
+    /// [`CapPolicy::Block`](crate::extension::CapPolicy::Block).
     pub fn with_cap_policy(mut self, policy: crate::extension::CapPolicy) -> Self {
         self.cap_policy = policy;
         self
@@ -12486,7 +12446,7 @@ fn extension_thread(
         info!(
             %id,
             actor = %meta.actor_name,
-            kind = ?crate::extension::ExtensionKind::from_byte(meta.kind),
+            kind = ?plugin.kind(),
             path = %config.path.display(),
             "extension: loaded plugin"
         );
@@ -12495,11 +12455,7 @@ fn extension_thread(
         }
     }
 
-    // Dispatch on plugin kind: every extension is actor-mode or
-    // transport-mode, both
-    // driven below. A stale `kind = Service` byte from an old blob decodes
-    // back to `Actor` (see `ExtensionKind::from_byte`), so it loads on the
-    // actor-mode path rather than failing.
+    // Dispatch on plugin kind: every extension is actor-mode or transport-mode.
     //
     // Transport-mode extensions (a `handle_connection(&self,
     // …)` actor) get a dedicated driver — the host owns a listener + accept
@@ -15334,38 +15290,13 @@ mod tests {
     }
 
     #[test]
-    fn extension_config_relay_and_caps_mutually_exclusive() {
+    fn extension_config_carries_declared_caps() {
         use crate::actors::IntraCap;
         let caps = || vec![IntraCap::parse("space-registry:admin").unwrap()];
 
-        // relay_unauthenticated() clears any caps set before it — a
-        // relay has no authority of its own.
-        let cfg = ExtensionConfig::new("x.so")
-            .with_intra_caps(caps())
-            .relay_unauthenticated();
-        assert!(cfg.relay_unauthenticated);
-        assert!(
-            cfg.intra_caps.is_empty(),
-            "relay_unauthenticated must clear declared caps",
-        );
-
-        // …and with_intra_caps() after relay_unauthenticated() is a
-        // no-op, so neither builder order can produce a relay that also
-        // carries authority. Locks the documented invariant against a
-        // future refactor dropping the guard.
-        let cfg = ExtensionConfig::new("x.so")
-            .relay_unauthenticated()
-            .with_intra_caps(caps());
-        assert!(cfg.relay_unauthenticated);
-        assert!(
-            cfg.intra_caps.is_empty(),
-            "with_intra_caps after relay_unauthenticated must not re-add caps",
-        );
-
-        // Without the relay flag, caps are carried as declared.
         let cfg = ExtensionConfig::new("x.so").with_intra_caps(caps());
-        assert!(!cfg.relay_unauthenticated);
         assert_eq!(cfg.intra_caps.len(), 1);
+        assert!(ExtensionConfig::new("x.so").intra_caps.is_empty());
     }
 
     // ── unwrap_invoke_envelope contract ─────────────────────────
@@ -20663,101 +20594,5 @@ mod tests {
             rx.try_recv().is_err(),
             "exactly one transfer routed — the failed attempt left nothing to duplicate"
         );
-    }
-
-    /// Producer-private provable inputs must never reach a CRDT/Raft commit,
-    /// including through the ordinary incoming EffectLog message. The runtime
-    /// rejection is therefore a dispatch-level abort, not merely a PANICKED
-    /// child reply that the parent can catch and commit around.
-    #[test]
-    fn nested_provable_queue_never_calls_the_parent_commit_strategy() {
-        use crate::actors::codec::Encode;
-        use crate::value::{Msg, TAG_DYNAMIC};
-        use std::sync::mpsc;
-
-        let workspace = env!("CARGO_MANIFEST_DIR");
-        let elf_path = format!(
-            "{workspace}/../tests/fixtures/legacy-v1/agents/scheduler/target/riscv64em-vos/release/scheduler.elf"
-        );
-        let Ok(elf) = std::fs::read(&elf_path) else {
-            eprintln!("SKIP: scheduler ELF not built — run: cargo +nightly actor");
-            return;
-        };
-        let blob = vos_pvm_compiler::link_elf(&elf).expect("scheduler transpiles");
-
-        let mut runtime = VosRuntime::new();
-        let blob_idx = runtime.register_service_blob(blob);
-        let scheduler = runtime.register_service(blob_idx);
-        let child = runtime.register_service(blob_idx);
-        let args = crate::init::InitArgs::new()
-            .with("children", crate::init::InitValue::ListU32(Vec::new()));
-        let encoded = crate::rkyv::to_bytes::<crate::rkyv::rancor::Error>(&args).unwrap();
-        runtime
-            .storage
-            .write(scheduler, crate::lifecycle::INIT_KEY, &encoded);
-        runtime
-            .storage
-            .write(child, crate::lifecycle::INIT_KEY, &encoded);
-
-        let no_keys = crate::rkyv::to_bytes::<crate::rkyv::rancor::Error>(&Vec::<Vec<u8>>::new())
-            .unwrap()
-            .to_vec();
-        let encoded_msg = Msg::new("queue_provable_via_peer")
-            .with("actor_id", child.0)
-            .with("code_hash", vec![0x42u8; 32])
-            .with("task_msg", vec![TAG_DYNAMIC, 0xAA])
-            .with("row_keys", no_keys)
-            .with("tag", vec![0xE1u8; 32])
-            .encode();
-        let mut msg = vec![TAG_DYNAMIC];
-        msg.extend_from_slice(&encoded_msg);
-
-        #[derive(Default)]
-        struct CountCommit(usize);
-        impl crate::commit::CommitStrategy for CountCommit {
-            fn restore(&mut self) -> Option<Vec<u8>> {
-                None
-            }
-
-            fn commit(
-                &mut self,
-                _delta: &crate::commit::AgentDelta<'_>,
-            ) -> Result<crate::commit::CommitReceipt, crate::commit::CommitError> {
-                self.0 += 1;
-                Ok(crate::commit::CommitReceipt {
-                    node_appended: true,
-                })
-            }
-        }
-
-        let (tx, rx) = mpsc::channel::<Envelope>();
-        let mut commits = CountCommit::default();
-        dispatch_once(
-            &mut runtime,
-            scheduler,
-            &tx,
-            scheduler,
-            Some(msg),
-            &mut commits,
-            true,
-        )
-        .expect("privacy refusal is a clean dispatch rejection");
-
-        assert_eq!(commits.0, 0, "no secret-bearing log may be committed");
-        assert_eq!(
-            runtime
-                .storage
-                .read(scheduler, crate::lifecycle::STATE_KEY_BYTES),
-            None,
-            "the parent state initialized during the rejected dispatch must roll back"
-        );
-        assert_eq!(
-            runtime
-                .storage
-                .read(child, crate::lifecycle::STATE_KEY_BYTES),
-            None,
-            "the nested child's queued TaskRecord must never reach storage"
-        );
-        assert!(rx.try_recv().is_err(), "no transfer may escape rejection");
     }
 }

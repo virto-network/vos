@@ -119,8 +119,6 @@ pub struct ExtensionLocal {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap_policy: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub relay_unauthenticated: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intra_caps: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -347,7 +345,6 @@ mod tests {
                 name: "gateway".into(),
                 path: "libgateway.so".into(),
                 cap_policy: Some("log".into()),
-                relay_unauthenticated: true,
                 intra_caps: vec![],
                 tick_ms: None,
                 init,

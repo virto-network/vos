@@ -5,9 +5,8 @@
 //!   - `meta_for_instance(name) -> Vec<u8>` — schema blob
 //!
 //! The actor is hardcoded against the fixture install order
-//! (`counter` at id 1, `kitchen` at id 2); the schema blob for
-//! `kitchen` is encoded at compile time from a verbatim
-//! restatement of `kitchen-sink`'s handler signatures. We can't
+//! (`counter` at id 1, `kitchen` at id 2); both schema blobs are encoded at
+//! compile time from verbatim restatements of their handler signatures. We can't
 //! `include_bytes!` the kitchen-sink `.so`'s ELF section because
 //! host-native cdylibs don't carry `.vos_meta` (it's a PVM-side
 //! convention), so we hand-keep the table here. If kitchen-sink's
@@ -15,8 +14,8 @@
 //! dispatch_e2e suite's coercion-aware tests will catch that.
 //!
 //! Mappings:
-//!   "counter" → 1, no schema (legacy permissive path)
-//!   "kitchen" → 2, full schema below
+//!   "counter" → 1, counter schema below
+//!   "kitchen" → 2, kitchen schema below
 //!   _         → 0 / empty  (gateway: unknown → 404)
 
 use vos::metadata::{ActorMeta, FieldMeta, MessageMeta, encode};
@@ -208,11 +207,49 @@ const KITCHEN_META: ActorMeta = ActorMeta {
     provable: false,
 };
 
+const COUNTER_META: ActorMeta = ActorMeta {
+    actor_name: "Counter",
+    messages: &[
+        MessageMeta {
+            name: "inc",
+            is_query: false,
+            fields: &[],
+            returns: "u32",
+            doc: "",
+            timeout_ms: 0,
+            mode: 0,
+            attested: false,
+            space_role: None,
+            actor_role: None,
+        },
+        MessageMeta {
+            name: "get",
+            is_query: true,
+            fields: &[],
+            returns: "u32",
+            doc: "",
+            timeout_ms: 0,
+            mode: 0,
+            attested: false,
+            space_role: None,
+            actor_role: None,
+        },
+    ],
+    constructor: &[],
+    kind: 0,
+    caps: &[],
+    cli_methods: &[],
+    doc: "",
+    crdt: false,
+    provable: false,
+};
+
 /// Pre-encoded meta blob — same wire bytes the bundled registry's
 /// `.vos_meta` section carries on PVM actors. Generated at const
 /// eval; `LEN` is the actual byte count, `BUF` holds it plus
 /// trailing zeros up to the fixed-size buffer.
 const KITCHEN_META_ENCODED: ([u8; 1024], usize) = encode::<1024>(&KITCHEN_META);
+const COUNTER_META_ENCODED: ([u8; 1024], usize) = encode::<1024>(&COUNTER_META);
 
 #[actor]
 #[derive(Default)]
@@ -235,13 +272,13 @@ impl MockRegistry {
 
     /// Schema-blob lookup. Returns the same wire format the
     /// production registry serves: raw `.vos_meta` section bytes.
-    /// Only `kitchen` has a schema in this fixture — `counter`
-    /// is intentionally schema-less so dispatch_e2e can also
-    /// exercise the gateway's legacy pre-schema fallback path
-    /// when no meta is available.
     #[msg]
     async fn meta_for_instance(&self, name: String, _ctx: &mut Context<Self>) -> Vec<u8> {
         match name.as_str() {
+            "counter" => {
+                let (buf, len) = COUNTER_META_ENCODED;
+                buf[..len].to_vec()
+            }
             "kitchen" => {
                 let (buf, len) = KITCHEN_META_ENCODED;
                 buf[..len].to_vec()

@@ -97,7 +97,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
 # `opt-level = "s"` requires a vos-pvm-compiler that doesn't fuse a left immediate
-# into SLT/SLTU (see the jar pin in ../../vos/Cargo.toml); an older one
+# into SLT/SLTU (see the compiler pin in ../../vos/Cargo.toml); an older one
 # miscompiles the mls-rs HKDF→Ed25519 path — `vos/tests/messenger_pvm` guards it.
 [profile.release]
 opt-level = "s"

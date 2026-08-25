@@ -392,8 +392,8 @@ pub trait ProofArtifactStore {
         terminal: &[super::InvocationId],
     ) -> Result<(), Self::Error>;
 
-    /// Load one producer-private Task record. The default keeps compatibility
-    /// with proof-only test backends while reporting that no record exists.
+    /// Load one producer-private Task record. Backends without a record store
+    /// report that no record exists.
     fn load_producer_record(
         &self,
         _actor: ActorId,

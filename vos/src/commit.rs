@@ -117,13 +117,13 @@ pub struct AgentDelta<'a> {
     /// dispatch's re-emitted anchor against the value recorded in the
     /// log node ([`crate::effect_log::EffectLog::anchor`]).
     /// [`crate::effect_log::ANCHOR_UNRECORDED`] when the dispatch
-    /// carried no anchor (service blobs, old-style actors).
+    /// carried no anchor.
     pub anchor: (u8, [u8; 32]),
     /// EffectLog node: inbound msg + depth-1 invoke replies, anchor
     /// stamped. `None` for commits with nothing to replay (post-replay
     /// materialization, follower apply, extension persistence).
     pub log: Option<&'a crate::effect_log::EffectLog>,
-    /// At least one applied v3 work-result carried effects. Drives the
+    /// At least one applied work result carried effects. Drives the
     /// durable-node rule: an effect-bearing dispatch must produce a
     /// durable log node even when the state blob is unchanged (e.g. a
     /// Transfer-only dispatch). `false` for service deltas — those guests
@@ -1457,9 +1457,9 @@ mod tests {
             logs.push(mk(b"msg-2", &[b"r2a", b"r2b"]));
             logs.push(mk(b"msg-3", &[]));
 
-            cc.commit_with_log(b"state-v1", &logs[0]).unwrap();
+            cc.commit_with_log(b"state-a", &logs[0]).unwrap();
             cc.commit_with_log(b"state", &logs[1]).unwrap();
-            cc.commit_with_log(b"state-v3", &logs[2]).unwrap();
+            cc.commit_with_log(b"state-c", &logs[2]).unwrap();
 
             assert_eq!(cc.clock().roots().len(), 1, "a linear chain has one head");
         }
@@ -1468,7 +1468,7 @@ mod tests {
         // and hands back all three logs in causal order.
         {
             let mut cc = CrdtCommit::open(&path, [0u8; 32]).unwrap();
-            assert_eq!(cc.restore().as_deref(), Some(&b"state-v3"[..]));
+            assert_eq!(cc.restore().as_deref(), Some(&b"state-c"[..]));
             assert_eq!(cc.clock().roots().len(), 1);
 
             let replay = cc.replay_logs().unwrap();
@@ -1796,9 +1796,9 @@ mod tests {
     #[cfg(feature = "storage")]
     #[test]
     fn effect_bearing_unchanged_state_appends_node() {
-        // The durable-node rule: a v3 dispatch that carried effects but
+        // The durable-node rule: a dispatch that carried effects but
         // left the state blob unchanged (e.g. Transfer-only) MUST land
-        // in durable history — the pre-A8 skip dropped these entirely.
+        // in durable history.
         // A pure read (no effects) still appends nothing.
         use crate::effect_log::EffectLog;
 

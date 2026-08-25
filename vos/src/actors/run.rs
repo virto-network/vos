@@ -333,7 +333,7 @@ fn halt_with_output(data: &[u8]) -> ! {
 /// metadata to them (`vos_pvm_proof::Proof::public_io_hash`). No new hostcall, no
 /// tracer/prover cooperation, no register-ledger surgery: it is ordinary
 /// register state at halt.  The closing-read column binds to the true
-/// final register via the register-ledger read-consistency (v6: cross-row
+/// final register via the register-ledger read-consistency (cross-row
 /// `prev_value` + `(reg, ts)` sortedness + `is_write` limb), which is
 /// sound against a from-scratch prover (gate
 /// `pvm/proof/tests/ledger_readconsistency_gate.rs`) — see `crate::zk` and
@@ -728,7 +728,7 @@ pub fn run_task_service<A: super::Actor>(witness_ptr: *const u8, witness_cap: us
         &app_public,
     );
     let io_hash = crate::zk::compute_io_hash(&public_prime, &payload.reply);
-    // Surface the folded bytes in the v4 payload so the host's record
+    // Surface the folded bytes in the payload so the host's record
     // capture can persist what a verifier reconstructs public' from.
     payload.app_public = app_public;
     let encoded = payload.encode();

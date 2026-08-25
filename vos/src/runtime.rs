@@ -1,12 +1,12 @@
 //! VosRuntime — thin native host driving VOS services.
 //!
-//! Manages per-service invocations of the JAVM `InvocationKernel`,
+//! Manages per-service invocations of the PVM `InvocationKernel`,
 //! handles protocol-cap hostcalls, and routes cross-service transfers
 //! across ticks.
 //!
 //! ## Execution model (service platform-aligned, refine-only top level)
 //!
-//! The JAVM kernel runs a single entry at PC=0 — the PVM refine body.
+//! The kernel runs a single entry at PC=0 — the actor refine body.
 //! VOS drives top-level services exclusively in refine:
 //!
 //!   * **Refine is the hot loop.** State-mutating hostcalls issued
@@ -18,7 +18,7 @@
 //!     verifies and absorbs into the same journal
 //!     ([`absorb_work_result`]). There is no host state special-case:
 //!     the work-result bytes are the whole truth.
-//!   * **The anchor chain.** Each v3 work-result carries an anchor
+//!   * **The anchor chain.** Each work result carries an anchor
 //!     committing to the state it ran against. The host checks it
 //!     against the *effective* state — the journal-overlay view
 //!     ([`RefineJournal::journaled_read`]) falling back to committed
@@ -42,9 +42,8 @@
 //! When on-chain bridging lands, journaled cross-service transfers will
 //! be routed to a pallet submission instead of `pending_transfers`.
 //!
-//! Only canonical `RefinePayload` v3 is accepted. Older blobs require reset
-//! and reinstall; unknown versions and malformed payloads fail loud (treated
-//! like a trapped dispatch), never silently as defaults.
+//! Only the canonical `RefinePayload` is accepted. Unknown or malformed
+//! payloads fail loud like a trapped dispatch.
 //!
 //! Self-directed transfers (a service sending to itself) become fresh
 //! **intra-round invocations** after the current handler is idle, capped by
@@ -56,7 +55,7 @@
 //! ## Exact continuations
 //!
 //! `yield_now`/`sleep` invokes the VOS suspension capability before the guest
-//! observes its result. Refine snapshots the complete JAVM kernel at that
+//! observes its result. Refine snapshots the complete PVM kernel at that
 //! boundary, including the exact PC, registers, heap, capabilities, nested
 //! call stack, scheduler, and pending result location. The live fork receives
 //! `0` and emits the transition up to the await. Once committed, restore
@@ -206,7 +205,7 @@ fn mint_boot_context(svc_id: u32) -> [u8; BOOT_CONTEXT_LEN] {
 }
 
 /// Supply VOS runtime and crypto capabilities in the active VM's cap table.
-/// JAVM owns the service platform-reserved protocol range 1..=28; VOS capabilities live in
+/// The service platform owns protocol slots 1..=28; VOS capabilities live in
 /// explicitly supplied high slots and are never mistaken for service platform host ABI.
 ///
 /// Slot layout (`pvm/proof/src/core/ecall.rs` is the source of truth):
@@ -224,7 +223,7 @@ fn mint_boot_context(svc_id: u32) -> [u8; BOOT_CONTEXT_LEN] {
 ///   121 = now_ms
 ///   122 = suspend
 ///
-/// All fit in JAVM's `imm ≤ 127` budget. Call this once for each fresh
+/// All fit in the PVM's `imm ≤ 127` budget. Call this once for each fresh
 /// kernel before its first run. An exact restore reconstructs the captured
 /// capability table and must not reinstall or renumber these slots.
 fn install_vos_runtime_caps(kernel: &mut InvocationKernel) {
@@ -501,10 +500,9 @@ struct JournalMark {
 /// way, nothing from the work-result applies and its reply is dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkResultError {
-    /// The halt output claimed a known RefinePayload version but did not
-    /// decode (v3: strict canonical rules). Fail-loud, like a trap.
+    /// The halt output claimed the RefinePayload format but did not decode.
     Malformed,
-    /// The v3 anchor did not commit to the effective state the
+    /// The anchor did not commit to the effective state the
     /// work-result would apply against — a stale work-result (or a
     /// divergent replica / buggy guest on the serialized path).
     AnchorMismatch,
@@ -760,13 +758,13 @@ pub struct VosRuntime<D: DataLayer = MemoryDataLayer> {
     /// whole-agent delta the host commits durably
     /// ([`crate::commit::AgentDelta`]); `None` values are delete
     /// tombstones. Child-row writes are excluded (children with rows
-    /// are a legacy shape the Tasks model retires); continuation
+    /// are unsupported); continuation
     /// headers never ride the journal, so host bookkeeping never
     /// appears here.
     ///
     /// [`take_dispatch_delta`]: VosRuntime::take_dispatch_delta
     dispatch_writes: HashMap<u32, Vec<(Vec<u8>, Option<Vec<u8>>)>>,
-    /// Per-service marker: some applied v3 work-result carried effects
+    /// Per-service marker: some applied work result carried effects
     /// since the last [`take_dispatch_delta`]. Input to the
     /// durable-node rule.
     ///
@@ -827,7 +825,7 @@ impl<D: DataLayer> VosRuntime<D> {
     /// Take the dispatch's whole-agent storage delta for `svc_id` since
     /// the previous take: the ordered mutations that landed on the
     /// service's own rows (`STATE_KEY` included; `None` = delete) and
-    /// whether any applied v3 work-result carried effects. The host
+    /// whether any applied work result carried effects. The host
     /// commits these as one [`crate::commit::AgentDelta`].
     pub fn take_dispatch_delta(
         &mut self,
@@ -1865,14 +1863,12 @@ fn handle_refine_hostcall(
 /// are irrelevant to the caller's session.
 ///
 /// **Buffer cap enforcement.** When the caller's `output` register
-/// carries a non-zero length in its high 32 bits (`output_buf_len`),
-/// the runtime refuses to write more than that into the caller's
+/// carries its length in the high 32 bits (`output_buf_len`), the runtime
+/// refuses to write more than that into the caller's
 /// PVM memory. An over-cap reply is replaced with a one-byte
 /// `STATUS_TOO_BIG` envelope at the caller's `output_ptr`, so the
 /// guest sees `InvokeError::TooBig` — distinct from a crash — rather
-/// than having its buffer silently overrun. A length of 0 means a
-/// legacy guest predating the ABI extension — fall through to the
-/// unbounded write.
+/// than having its buffer silently overrun. A zero length is invalid.
 ///
 /// **Recording cap enforcement.** When recording, the session
 /// carries a per-reply byte cap (16 KiB by default). Outputs larger
@@ -1897,7 +1893,7 @@ fn record_and_write_invoke(
     // (not STATUS_PANICKED) so the guest can tell an oversize reply from a
     // real crash. Feed the recording log the same marker so replay sees
     // the same observation.
-    if output_buf_len > 0 && output.len() > output_buf_len {
+    if output_buf_len == 0 || output.len() > output_buf_len {
         let truncated = alloc::vec![STATUS_TOO_BIG];
         if depth == 1
             && let crate::effect_log::EffectMode::Recording(s) = mode
@@ -1930,54 +1926,45 @@ fn record_and_write_invoke(
 /// extended layout (flag bits in the length word — see
 /// `lifecycle::invoke_hash_full`) carries the row keys the caller named
 /// and/or a 32-byte record tag between the state and the message. Inputs
-/// shorter than the length prefix are all message (legacy raw invokes). A
-/// malformed keys/tag section degrades to "no keys, no tag, rest is
-/// message": the child then panics on its first unproven read instead of
-/// the host guessing.
+/// Malformed lengths, row sections, or record tags are rejected.
 pub(crate) fn split_invoke_input(
     input: &[u8],
-) -> (&[u8], alloc::vec::Vec<&[u8]>, Option<[u8; 32]>, &[u8]) {
-    if input.len() < 4 {
-        return (&[], alloc::vec::Vec::new(), None, input);
-    }
-    let len_word = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
+) -> Option<(&[u8], alloc::vec::Vec<&[u8]>, Option<[u8; 32]>, &[u8])> {
+    let word = input.get(..4)?;
+    let len_word = u32::from_le_bytes(word.try_into().ok()?);
     let state_len = (len_word & !crate::lifecycle::INVOKE_INPUT_FLAG_MASK) as usize;
-    let state_end = (4 + state_len).min(input.len());
+    let state_end = 4usize.checked_add(state_len)?;
+    if state_end > input.len() {
+        return None;
+    }
     let state = &input[4..state_end];
     let mut rest = &input[state_end..];
     let mut row_keys = alloc::vec::Vec::new();
-    if len_word & crate::lifecycle::INVOKE_INPUT_HAS_ROWS != 0 && rest.len() >= 4 {
-        let n = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-        let mut at = 4;
+    if len_word & crate::lifecycle::INVOKE_INPUT_HAS_ROWS != 0 {
+        let count = rest.get(..4)?;
+        let n = u32::from_le_bytes(count.try_into().ok()?) as usize;
+        let mut at: usize = 4;
         let mut keys = alloc::vec::Vec::with_capacity(n);
-        let mut ok = true;
         for _ in 0..n {
-            if at + 2 > rest.len() {
-                ok = false;
-                break;
-            }
-            let klen = u16::from_le_bytes([rest[at], rest[at + 1]]) as usize;
-            at += 2;
-            if at + klen > rest.len() {
-                ok = false;
-                break;
-            }
-            keys.push(&rest[at..at + klen]);
-            at += klen;
+            let key_len_end = at.checked_add(2)?;
+            let key_len_bytes = rest.get(at..key_len_end)?;
+            let klen = u16::from_le_bytes(key_len_bytes.try_into().ok()?) as usize;
+            at = key_len_end;
+            let key_end = at.checked_add(klen)?;
+            keys.push(rest.get(at..key_end)?);
+            at = key_end;
         }
-        if ok {
-            row_keys = keys;
-            rest = &rest[at..];
-        }
+        row_keys = keys;
+        rest = rest.get(at..)?;
     }
     let mut tag = None;
-    if len_word & crate::lifecycle::INVOKE_INPUT_RECORD != 0 && rest.len() >= 32 {
+    if len_word & crate::lifecycle::INVOKE_INPUT_RECORD != 0 {
         let mut t = [0u8; 32];
-        t.copy_from_slice(&rest[..32]);
+        t.copy_from_slice(rest.get(..32)?);
         tag = Some(t);
-        rest = &rest[32..];
+        rest = rest.get(32..)?;
     }
-    (state, row_keys, tag, rest)
+    Some((state, row_keys, tag, rest))
 }
 
 /// Does this invoke request provable-record capture?
@@ -2381,18 +2368,15 @@ fn handle_invoke(
     let input_ptr = caller.active_reg(8) as u32;
     let input_len = caller.active_reg(9) as usize;
     let gas_limit = caller.active_reg(10);
-    // Output register is packed: low 32 bits are the PVM address,
-    // high 32 bits are the buffer length. Legacy guests that
-    // predate this packing pass 0 in the high bits, in which case
-    // `record_and_write_invoke` skips the buffer cap and writes
-    // unbounded (preserving prior behaviour).
+    // Output register is packed: low 32 bits are the PVM address and high
+    // 32 bits are the buffer length.
     let output_packed = caller.active_reg(11);
     let output_ptr = output_packed as u32;
     let output_buf_len = (output_packed >> 32) as u32 as usize;
     let input = kread(caller, input_ptr, input_len);
     let record_requested = invoke_input_requests_record(&input);
 
-    // Provable input contains the exact secret witness. This legacy runtime's
+    // Provable input contains the exact secret witness. This runtime's
     // Recording log is serialized into a CRDT node or Raft entry, while
     // Replay consumes those replicated bytes. Reject before execution in
     // either mode so neither the witness nor a ProofRecordEntry can enter
@@ -2475,7 +2459,16 @@ fn handle_invoke(
         && let Some(&blob_idx) = blob_by_hash.get(&code_hash)
         && let Some(blob) = blobs.get(blob_idx)
     {
-        let (state, row_keys, record_tag, msg) = split_invoke_input(&input);
+        let Some((state, row_keys, record_tag, msg)) = split_invoke_input(&input) else {
+            return record_and_write_invoke(
+                caller,
+                output_ptr,
+                output_buf_len,
+                &[STATUS_PANICKED],
+                depth,
+                mode,
+            );
+        };
         // Resolve the caller-named row keys against the invoking
         // parent's EFFECTIVE keyspace (the same overlay its own reads
         // see) — a Task reads the parent's rows and folds its effects
@@ -2682,7 +2675,7 @@ fn handle_invoke(
     // child's message loop, where an empty one (fresh spawn) reads as
     // "no more mail" and stops the loop before the message arrives, and
     // a non-empty one mis-dispatches as a message. The FETCH-delivered
-    // state channel (`run_refine` legacy children) is retired; READ is
+    // state channel is unsupported; READ is
     // the one state channel.
     let mut child_items = if input.len() >= 4 {
         let state_len = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
@@ -2708,7 +2701,7 @@ fn handle_invoke(
 
     // The state the child will observe as its prior state — the journal
     // overlay (the delivery write above included) falling back to
-    // committed storage. This is what the child's v3 anchor must commit
+    // committed storage. This is what the child's anchor must commit
     // to, and what the envelope echoes when the child's state is
     // unchanged, so parents always see the authoritative full state.
     let child_prior_state: Vec<u8> = journal
@@ -2873,7 +2866,7 @@ fn handle_invoke(
 #[derive(Debug)]
 enum ContinuationError {
     SnapshotTooLarge,
-    LegacyOrMalformedHeader,
+    UnsupportedOrMalformedHeader,
     ExecutionSemanticsMismatch,
     MissingBody,
     LengthMismatch,
@@ -2887,8 +2880,8 @@ impl core::fmt::Display for ContinuationError {
             Self::SnapshotTooLarge => {
                 f.write_str("kernel snapshot exceeds the continuation size limit")
             }
-            Self::LegacyOrMalformedHeader => f.write_str(
-                "legacy or malformed continuation header (service requires service reset/reinstall)",
+            Self::UnsupportedOrMalformedHeader => f.write_str(
+                "unsupported or malformed continuation header (service requires reset or restore)",
             ),
             Self::ExecutionSemanticsMismatch => {
                 f.write_str("continuation belongs to different execution semantics")
@@ -2898,7 +2891,7 @@ impl core::fmt::Display for ContinuationError {
             Self::CommitmentMismatch => {
                 f.write_str("continuation body does not match its commitment")
             }
-            Self::InvalidSnapshot(err) => write!(f, "invalid JAVM kernel snapshot: {err}"),
+            Self::InvalidSnapshot(err) => write!(f, "invalid PVM kernel snapshot: {err}"),
         }
     }
 }
@@ -2932,8 +2925,7 @@ fn save_continuation<D: crate::data_layer::DataLayer>(
     Ok(())
 }
 
-/// Load and authenticate an exact kernel continuation. Old flat-memory
-/// headers are rejected explicitly instead of silently replaying from PC 0.
+/// Load and authenticate an exact kernel continuation.
 fn load_continuation<D: crate::data_layer::DataLayer>(
     storage: &ServiceStorage,
     data: &D,
@@ -2947,7 +2939,7 @@ fn load_continuation<D: crate::data_layer::DataLayer>(
         return Ok(None);
     }
     let header = crate::pvm_image::ContinuationHeader::decode(header_bytes)
-        .ok_or(ContinuationError::LegacyOrMalformedHeader)?;
+        .ok_or(ContinuationError::UnsupportedOrMalformedHeader)?;
     if header.execution_semantics != crate::service::EXECUTION_SEMANTICS_ID.0 {
         return Err(ContinuationError::ExecutionSemanticsMismatch);
     }
@@ -3112,7 +3104,7 @@ mod tests {
     }
 
     #[test]
-    fn continuation_load_rejects_unavailable_tampered_and_legacy_bodies() {
+    fn continuation_load_rejects_unavailable_tampered_and_unsupported_bodies() {
         use vos_pvm::PvmBackend;
 
         let blob = exact_resume_blob();
@@ -3146,11 +3138,11 @@ mod tests {
         storage.write(
             ServiceId(9),
             crate::lifecycle::CONTINUATION_HEADER_KEY,
-            b"VPVM\x02legacy-v1-memory-image",
+            b"unsupported-continuation-image",
         );
         assert!(matches!(
             load_continuation(&storage, &data, 9),
-            Err(ContinuationError::LegacyOrMalformedHeader)
+            Err(ContinuationError::UnsupportedOrMalformedHeader)
         ));
     }
 
@@ -3201,7 +3193,7 @@ mod tests {
 
         // Base: no flags.
         let base = build(b"ST", &[], None, b"MSG");
-        let (s, k, t, m) = split_invoke_input(&base);
+        let (s, k, t, m) = split_invoke_input(&base).expect("canonical input");
         assert_eq!(s, b"ST");
         assert!(k.is_empty());
         assert_eq!(t, None);
@@ -3210,7 +3202,7 @@ mod tests {
         // Record only: the tag rides between state and msg.
         let tag = [7u8; 32];
         let rec = build(b"ST", &[], Some(tag), b"MSG");
-        let (s, k, t, m) = split_invoke_input(&rec);
+        let (s, k, t, m) = split_invoke_input(&rec).expect("canonical input");
         assert_eq!(s, b"ST");
         assert!(k.is_empty());
         assert_eq!(t, Some(tag));
@@ -3220,18 +3212,16 @@ mod tests {
 
         // Rows AND record together, in order.
         let both = build(b"ST", &[b"k1", b"key2"], Some(tag), b"MSG");
-        let (s, k, t, m) = split_invoke_input(&both);
+        let (s, k, t, m) = split_invoke_input(&both).expect("canonical input");
         assert_eq!(s, b"ST");
         assert_eq!(k, vec![&b"k1"[..], &b"key2"[..]]);
         assert_eq!(t, Some(tag));
         assert_eq!(m, b"MSG");
 
-        // Reserved-bit safety: an OLD host masks only HAS_ROWS, so a
-        // record-flagged length word reads as a ~1 GiB state_len and
-        // consumes the whole input as state — the child gets garbage and
-        // traps, rather than the tag being misread as state bytes.
-        let record_word = 2u32 | INVOKE_INPUT_RECORD;
-        assert!((record_word & !INVOKE_INPUT_HAS_ROWS) as usize > 0x1000_0000);
+        assert!(split_invoke_input(&[]).is_none());
+        assert!(split_invoke_input(&[8, 0, 0, 0]).is_none());
+        assert!(split_invoke_input(&(INVOKE_INPUT_HAS_ROWS | 0).to_le_bytes()).is_none());
+        assert!(split_invoke_input(&(INVOKE_INPUT_RECORD | 0).to_le_bytes()).is_none());
     }
 
     #[test]
@@ -3249,7 +3239,7 @@ mod tests {
         assert_eq!(rt.blob_by_hash.get(&blob_hash(&a)), Some(&idx));
     }
 
-    // ── Strict v3 work-result application ───────────────────────────
+    // ── Strict work-result application ───────────────────────────
     //
     // These drive the same `absorb_work_result` the tick loop uses.
 

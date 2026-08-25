@@ -1,33 +1,4 @@
-//! `vosx space role` — list, grant, revoke auth role grants.
-//!
-//! Two grant scopes:
-//!
-//! - **Space-level**: `<peer> -> <SpaceRole>`. When the canonical service
-//!   authority is installed, the immutable space root commits the same typed
-//!   subject, role, and epoch there after the legacy registry mutation.
-//! - **Actor-local** (`--in <actor>`): legacy v1 raw role bytes. Service packages
-//!   express authorization through generated space-role policies instead.
-//!
-//! Layout:
-//!
-//! ```text
-//! vosx space role <space> list                                 # default
-//! vosx space role <space> grant <peer> <role>                  # space-level
-//! vosx space role <space> grant <peer> <role> --in <actor>     # actor-local
-//! vosx space role <space> revoke <peer>                        # space-level
-//! vosx space role <space> revoke <peer> --in <actor>           # actor-local
-//! ```
-//!
-//! The `<peer>` argument accepts:
-//! - `me` — shortcut for the operator's persistent identity
-//!   (`vosx whoami` PeerId). Convenient for self-enrollment via
-//!   another admin's CLI.
-//! - A multibase-encoded libp2p PeerId (`12D3KooW…`).
-//!
-//! For actor-local grants, `<role>` is the *target actor's*
-//! role byte (parsed as a decimal `0..255`); the registry stores
-//! it opaquely. v1 doesn't query the actor's role-name table —
-//! operators reference the discriminant directly.
+//! `vosx space role` lists and changes space membership roles.
 
 use clap::Subcommand;
 use serde::Serialize;
@@ -40,38 +11,22 @@ use crate::output;
 
 #[derive(Subcommand, Debug)]
 pub enum RoleCommand {
-    /// List auth grants. With `--in <actor>`, lists actor-local
-    /// grants; without, lists space-level grants.
-    List {
-        /// Show actor-local grants for this agent instead of
-        /// space-level grants.
-        #[arg(long = "in", value_name = "ACTOR")]
-        agent: Option<String>,
-    },
-    /// Grant a role to a peer. Service space-level grants require the root identity.
+    /// List space role grants.
+    List,
+    /// Grant a space role to a peer. Requires the root identity.
     Grant {
         /// Multibase-encoded libp2p PeerId (`12D3KooW…`) or
         /// the literal `me` for the operator's
         /// `$XDG_CONFIG_HOME/vosx/identity.key`.
         peer: String,
-        /// Space-level: `admin`, `developer`, `read`, `none`.
-        /// Actor-local (with `--in`): a numeric role byte
-        /// interpreted in the target actor's `Role` enum.
+        /// One of: `admin`, `developer`, `read`, `none`.
         role: String,
-        /// Scope the grant to a specific actor instance,
-        /// overriding the space-level mapping for that actor.
-        #[arg(long = "in", value_name = "ACTOR")]
-        agent: Option<String>,
     },
     /// Remove a peer's grant. Equivalent to `grant <peer> none`
     /// but also removes the table row so listings stay tidy.
     Revoke {
         /// Same accepted forms as `grant`.
         peer: String,
-        /// Scope the revocation to a specific actor instance.
-        /// Space-level grant is unaffected.
-        #[arg(long = "in", value_name = "ACTOR")]
-        agent: Option<String>,
     },
 }
 
@@ -87,157 +42,79 @@ struct GrantView {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    match args.command.unwrap_or(RoleCommand::List { agent: None }) {
-        RoleCommand::List { agent } => list(&args.space, agent.as_deref()),
-        RoleCommand::Grant { peer, role, agent } => {
-            grant(&args.space, &peer, &role, agent.as_deref())
-        }
-        RoleCommand::Revoke { peer, agent } => revoke(&args.space, &peer, agent.as_deref()),
+    match args.command.unwrap_or(RoleCommand::List) {
+        RoleCommand::List => list(&args.space),
+        RoleCommand::Grant { peer, role } => grant(&args.space, &peer, &role),
+        RoleCommand::Revoke { peer } => revoke(&args.space, &peer),
     }
 }
 
-fn list(space: &str, agent: Option<&str>) -> anyhow::Result<()> {
-    DaemonClient::with_connect(space, |client| match agent {
-        // Actor-local listing — rows are (peer, agent, role byte)
-        // tuples; role is opaque to the CLI in v1.
-        Some(name) => {
-            let grants = client.actor_acls()?;
-            let filtered: Vec<_> = grants.iter().filter(|g| g.agent_name == name).collect();
-            if output::is_json() {
-                #[derive(Serialize)]
-                struct ActorGrantView {
-                    peer_id: String,
-                    agent: String,
-                    role: u8,
-                }
-                let view: Vec<ActorGrantView> = filtered
-                    .iter()
-                    .map(|g| ActorGrantView {
-                        peer_id: peer_id_label(&g.peer_id),
-                        agent: g.agent_name.clone(),
-                        role: g.role,
-                    })
-                    .collect();
-                output::print_json(&view);
-                return Ok(());
-            }
-            if filtered.is_empty() {
-                println!(
-                    "no actor-local grants for '{name}'. add one with \
-                     `vosx space role grant <peer> <role-byte> --in {name}`."
-                );
-                return Ok(());
-            }
-            println!("{:<5}  PEER_ID", "ROLE");
-            for g in &filtered {
-                println!("{:<5}  {}", g.role, peer_id_label(&g.peer_id));
-            }
-            Ok(())
+fn list(space: &str) -> anyhow::Result<()> {
+    DaemonClient::with_connect(space, |client| {
+        let grants = client.auth_grants()?;
+        if output::is_json() {
+            let view: Vec<GrantView> = grants
+                .iter()
+                .map(|g| GrantView {
+                    peer_id: peer_id_label(&g.peer_id),
+                    role: role_name(g.role),
+                })
+                .collect();
+            output::print_json(&view);
+            return Ok(());
         }
-        None => {
-            let grants = client.auth_grants()?;
-            if output::is_json() {
-                let view: Vec<GrantView> = grants
-                    .iter()
-                    .map(|g| GrantView {
-                        peer_id: peer_id_label(&g.peer_id),
-                        role: role_name(g.role),
-                    })
-                    .collect();
-                output::print_json(&view);
-                return Ok(());
-            }
-            if grants.is_empty() {
-                println!("no auth grants. add one with `vosx space role grant <peer> <role>`.");
-                return Ok(());
-            }
-            println!("{:<10}  PEER_ID", "ROLE");
-            for g in &grants {
-                println!("{:<10}  {}", role_name(g.role), peer_id_label(&g.peer_id));
-            }
-            Ok(())
+        if grants.is_empty() {
+            println!("no auth grants. add one with `vosx space role grant <peer> <role>`.");
+            return Ok(());
         }
+        println!("{:<10}  PEER_ID", "ROLE");
+        for g in &grants {
+            println!("{:<10}  {}", role_name(g.role), peer_id_label(&g.peer_id));
+        }
+        Ok(())
     })
 }
 
-fn grant(space: &str, peer_arg: &str, role_str: &str, agent: Option<&str>) -> anyhow::Result<()> {
-    let peer_id = resolve_peer(peer_arg)?;
-    DaemonClient::with_connect(space, |client| match agent {
-        Some(name) => {
-            // Actor-local raw role bytes are retained only for v1 actors.
-            let role: u8 = role_str
-                .parse()
-                .map_err(|_| anyhow::anyhow!("actor-local role must be a 0..255 byte"))?;
-            let status = client.grant_actor_role(peer_id.to_bytes(), name.to_string(), role)?;
-            if status != Status::Ok {
-                anyhow::bail!("grant_actor_role returned status {status}");
-            }
-            if output::is_json() {
-                #[derive(Serialize)]
-                struct V {
-                    peer_id: String,
-                    agent: String,
-                    role: u8,
-                }
-                output::print_json(&V {
-                    peer_id: peer_id.to_string(),
-                    agent: name.to_string(),
-                    role,
-                });
-            } else {
-                println!("granted role {role} to {peer_id} in {name}");
-            }
-            Ok(())
-        }
-        None => {
-            let role = parse_role(role_str)?;
-            let status = client.grant_role(peer_id.to_bytes(), role)?;
-            if status != Status::Ok {
-                anyhow::bail!("grant_role returned status {status}");
-            }
-            if output::is_json() {
-                output::print_json(&GrantView {
-                    peer_id: peer_id.to_string(),
-                    role: role_name(role),
-                });
-            } else {
-                println!("granted {} to {peer_id}", role_name(role));
-            }
-            Ok(())
-        }
-    })
-}
-
-fn revoke(space: &str, peer_arg: &str, agent: Option<&str>) -> anyhow::Result<()> {
+fn grant(space: &str, peer_arg: &str, role_str: &str) -> anyhow::Result<()> {
     let peer_id = resolve_peer(peer_arg)?;
     DaemonClient::with_connect(space, |client| {
-        let status = match agent {
-            Some(name) => client.revoke_actor_role(peer_id.to_bytes(), name.to_string())?,
-            None => client.revoke_role(peer_id.to_bytes())?,
-        };
+        let role = parse_role(role_str)?;
+        let status = client.grant_role(peer_id.to_bytes(), role)?;
+        if status != Status::Ok {
+            anyhow::bail!("grant_role returned status {status}");
+        }
+        if output::is_json() {
+            output::print_json(&GrantView {
+                peer_id: peer_id.to_string(),
+                role: role_name(role),
+            });
+        } else {
+            println!("granted {} to {peer_id}", role_name(role));
+        }
+        Ok(())
+    })
+}
+
+fn revoke(space: &str, peer_arg: &str) -> anyhow::Result<()> {
+    let peer_id = resolve_peer(peer_arg)?;
+    DaemonClient::with_connect(space, |client| {
+        let status = client.revoke_role(peer_id.to_bytes())?;
         match status {
             Status::Ok => {
                 if output::is_json() {
                     #[derive(Serialize)]
                     struct V {
                         peer_id: String,
-                        agent: Option<String>,
                     }
                     output::print_json(&V {
                         peer_id: peer_id.to_string(),
-                        agent: agent.map(String::from),
                     });
-                } else if let Some(name) = agent {
-                    println!("revoked actor-local grant for {peer_id} in {name}");
                 } else {
                     println!("revoked grant for {peer_id}");
                 }
                 Ok(())
             }
-            Status::NotFound => match agent {
-                Some(name) => anyhow::bail!("no actor-local grant for {peer_id} in {name}"),
-                None => anyhow::bail!("no grant for {peer_id}"),
-            },
+            Status::NotFound => anyhow::bail!("no grant for {peer_id}"),
             other => anyhow::bail!("revoke returned status {other}"),
         }
     })

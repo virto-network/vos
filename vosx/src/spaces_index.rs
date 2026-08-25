@@ -605,7 +605,7 @@ mod tests {
             &mut idx,
             SpaceEntry {
                 id: id.clone(),
-                name: "v1".into(),
+                name: "primary".into(),
                 created_at: "x".into(),
                 data_dir: "".into(),
                 registry_hash: String::new(),

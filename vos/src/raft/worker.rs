@@ -1137,7 +1137,7 @@ mod tests {
             1,
             0,
             true,
-            b"v1".to_vec(),
+            b"state-a".to_vec(),
             vec![0xAAAA, 0xBBBB],
             None,
             Some(5),

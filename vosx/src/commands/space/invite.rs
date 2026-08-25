@@ -229,9 +229,9 @@ fn mint(args: Args) -> anyhow::Result<()> {
             );
         }
 
-        let authority_replication_id = client.role_authority_cutover_id()?.ok_or_else(|| {
+        let authority_replication_id = client.role_authority_id()?.ok_or_else(|| {
             anyhow::anyhow!(
-                "invite minting is disabled until the immutable root completes canonical role-authority cutover; start the root with --service-pvm and retry"
+                "invite minting requires the canonical role authority; start the root with --service-pvm and retry"
             )
         })?;
 

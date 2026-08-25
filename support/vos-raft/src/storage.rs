@@ -38,8 +38,8 @@ use crate::meta::Meta;
 /// `log_index` identifies the log/snapshot boundary that made this view
 /// effective.  Consumers must compare it with the durable `commit_index`
 /// before treating exclusion from the view as a committed removal.
-/// `None` represents legacy or otherwise unknown provenance and must not be
-/// used as proof of a committed removal.
+/// `None` represents unknown provenance and must not be used as proof of a
+/// committed removal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveConfigRecord<N: NodeId> {
     pub log_index: Option<u64>,

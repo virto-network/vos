@@ -5,7 +5,7 @@
 //! a proof that the output was computed correctly from that input under their
 //! public key — and *nobody*, including the holder, can choose the output
 //! (it is a deterministic function of the secret key and the input). That is
-//! exactly what chronos needs to kill the v0 leader's entropy grind: each raft
+//! exactly what chronos needs to prevent a leader's entropy grind: each raft
 //! voter contributes a VRF output over the public round input
 //! `α = blake2b(prev_beacon ‖ epoch)`, the committee combines them, and the
 //! result is unbiasable as long as one voter is honest.

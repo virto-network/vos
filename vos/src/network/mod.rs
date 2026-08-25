@@ -3859,7 +3859,7 @@ mod tests {
                 rep_id,
             )
             .unwrap();
-            cc_a.commit_with_log(b"v1", &log1).unwrap();
+            cc_a.commit_with_log(b"first", &log1).unwrap();
             cc_a.commit_with_log(b"service", &log2).unwrap();
             assert_eq!(cc_a.root_bytes().len(), 1);
         }
@@ -3985,7 +3985,7 @@ mod tests {
         let mut cc =
             CrdtCommit::from_db_arc_locked(slot_for_writes.db, slot_for_writes.commit_lock, rep_id)
                 .unwrap();
-        cc.commit_with_log(b"v1", &EffectLog::for_msg(b"first".to_vec()))
+        cc.commit_with_log(b"state-a", &EffectLog::for_msg(b"first".to_vec()))
             .unwrap();
         cc.commit_with_log(b"service", &EffectLog::for_msg(b"second".to_vec()))
             .unwrap();
@@ -4100,7 +4100,7 @@ mod tests {
         let mut cc =
             CrdtCommit::from_db_arc_locked(slot_for_writes.db, slot_for_writes.commit_lock, rep_id)
                 .unwrap();
-        cc.commit_with_log(b"v1", &EffectLog::for_msg(b"secret".to_vec()))
+        cc.commit_with_log(b"state-a", &EffectLog::for_msg(b"secret".to_vec()))
             .unwrap();
         let root = cc.root_bytes()[0];
         drop(cc);

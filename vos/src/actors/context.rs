@@ -1598,7 +1598,7 @@ impl<A: Actor> Context<A> {
 
     // ── Refine output packing (framework-internal) ───────────────────
 
-    /// Drain the pending effect queues into a v3 `RefinePayload` ready to
+    /// Drain the pending effect queues into a `RefinePayload` ready to
     /// be emitted as the refine output. Used by `run_refine_service`.
     ///
     /// `(anchor_kind, anchor)` commit to the state this refine ran
@@ -1659,7 +1659,7 @@ impl<A: Actor> Context<A> {
     /// Drain the state-row effects supported by the service nested actor slice.
     /// Messaging and service-management effects are deliberately rejected
     /// until the root-tree scheduler can translate them into typed
-    /// inbox/outbox records without falling back to the v1 effect journal.
+    /// inbox/outbox records.
     #[cfg(feature = "pvm")]
     #[doc(hidden)]
     pub fn __drain_actor_writes(

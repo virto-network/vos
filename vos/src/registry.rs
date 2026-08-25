@@ -320,25 +320,6 @@ pub struct AuthGrantRow {
     pub grantor: Vec<u8>,
 }
 
-/// Per-(PeerId, agent_name) ACL row — the actor-local override table.
-/// Lookup precedence in the dispatch path is `actor_acls` keyed on
-/// `(peer_id, agent_name)`, falling back to `auth_grants` keyed on
-/// `peer_id` (space-level). `role` discriminants are interpreted in the
-/// *target actor's* `Role` enum; the registry stores them opaquely.
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
-#[rkyv(crate = rkyv)]
-pub struct ActorAclRow {
-    pub peer_id: Vec<u8>,
-    pub agent_name: String,
-    pub role: u8,
-    /// Monotonic grant epoch — see [`AuthGrantRow::epoch`]. Compared
-    /// against the matching per-actor revoke high-water.
-    pub epoch: u64,
-    /// PeerId of the delegator. The actor-local grant counts only if the
-    /// grantor is a transitively-effective *space* admin.
-    pub grantor: Vec<u8>,
-}
-
 /// One page of [`RegistryRef::auth_grants`]. The registry keeps one grant
 /// row per peer and drops revoked/ineffective ones from `grants`, so a
 /// natural-key cursor over the returned rows would skip past scanned-but-
@@ -350,18 +331,6 @@ pub struct ActorAclRow {
 pub struct AuthGrantPage {
     pub grants: Vec<AuthGrantRow>,
     pub next: Vec<u8>,
-}
-
-/// One page of [`RegistryRef::actor_acls`]. Same filtered-cursor shape as
-/// [`AuthGrantPage`], but the actor-local key is `(peer_id, agent_name)`,
-/// so the continuation cursor is the last *scanned* pair (both empty when
-/// the scan reached the end).
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq, Eq)]
-#[rkyv(crate = rkyv)]
-pub struct ActorAclPage {
-    pub acls: Vec<ActorAclRow>,
-    pub next_peer: Vec<u8>,
-    pub next_agent: String,
 }
 
 /// One page of [`RegistryRef::members`]. Members are two key spaces —
@@ -470,9 +439,6 @@ pub enum Status {
     /// CRDT consistency was requested for a catalog entry whose signed
     /// publication does not declare `#[actor(crdt)]`.
     CrdtOptInRequired = 12,
-    /// Canonical role-authority cutover requires one fully synchronized
-    /// registry replica and no legacy role evidence that could remain live.
-    AuthorityCutoverNotQuiescent = 13,
 }
 
 impl Status {
@@ -493,7 +459,6 @@ impl Status {
             10 => Some(Self::ReplicationIdReused),
             11 => Some(Self::StaleUpgrade),
             12 => Some(Self::CrdtOptInRequired),
-            13 => Some(Self::AuthorityCutoverNotQuiescent),
             _ => None,
         }
     }
@@ -515,7 +480,6 @@ impl core::fmt::Display for Status {
             Status::ReplicationIdReused => "replication id reused",
             Status::StaleUpgrade => "stale upgrade",
             Status::CrdtOptInRequired => "CRDT consistency requires #[actor(crdt)]",
-            Status::AuthorityCutoverNotQuiescent => "role-authority cutover is not quiescent",
         })
     }
 }
@@ -553,11 +517,9 @@ pub fn raft_voter_replacement_signed_bytes(
     )
 }
 
-/// Root-signed cutover barrier. Once committed, the registry refuses legacy
-/// role grants and markerless invite redemption and accepts only evidence
-/// bound to this exact authority incarnation.
-pub fn role_authority_cutover_signed_bytes(authority_replication_id: &[u8; 32]) -> Vec<u8> {
-    canonical_op_bytes("seal_role_authority", &[authority_replication_id])
+/// Root-signed binding between a registry and its role authority.
+pub fn role_authority_signed_bytes(authority_replication_id: &[u8; 32]) -> Vec<u8> {
+    canonical_op_bytes("set_role_authority", &[authority_replication_id])
 }
 
 /// Root-host attestation emitted only after the canonical authority has
@@ -1193,24 +1155,6 @@ impl RegistryRef {
             .ok_or_else(|| ClientError::UnexpectedReply(alloc::format!("{v:?}")))
     }
 
-    pub async fn actor_epoch<I: Invoker>(
-        &self,
-        inv: &mut I,
-        peer_id: Vec<u8>,
-        agent_name: String,
-    ) -> Result<u64, ClientError> {
-        let v = self
-            .call(
-                inv,
-                Msg::new("actor_epoch")
-                    .with("peer_id", peer_id)
-                    .with("agent_name", agent_name),
-            )
-            .await?;
-        v.as_u64()
-            .ok_or_else(|| ClientError::UnexpectedReply(alloc::format!("{v:?}")))
-    }
-
     /// One page of the effective space-level grants. Pass an empty
     /// `after_peer` to start; continue from the returned [`AuthGrantPage::next`]
     /// until it comes back empty. `budget` caps the page (0 = the
@@ -1226,28 +1170,6 @@ impl RegistryRef {
                 inv,
                 Msg::new("auth_grants")
                     .with("after_peer", after_peer)
-                    .with("budget", budget),
-            )
-            .await?,
-        )
-    }
-
-    /// One page of the effective actor-local ACLs. Continue from the
-    /// returned [`ActorAclPage::next_peer`]/`next_agent` until both come
-    /// back empty. `budget` caps the page (0 = the registry's max).
-    pub async fn actor_acls<I: Invoker>(
-        &self,
-        inv: &mut I,
-        after_peer: Vec<u8>,
-        after_agent: String,
-        budget: u32,
-    ) -> Result<ActorAclPage, ClientError> {
-        decode_rkyv(
-            self.call(
-                inv,
-                Msg::new("actor_acls")
-                    .with("after_peer", after_peer)
-                    .with("after_agent", after_agent)
                     .with("budget", budget),
             )
             .await?,
@@ -1288,16 +1210,12 @@ impl RegistryRef {
         decode_bytes(self.call(inv, Msg::new("space_id")).await?)
     }
 
-    /// Durable guest-owned role-authority cutover marker, or empty while the
-    /// registry remains in legacy role mode.
-    pub async fn role_authority_cutover<I: Invoker>(
-        &self,
-        inv: &mut I,
-    ) -> Result<Vec<u8>, ClientError> {
-        decode_bytes(self.call(inv, Msg::new("role_authority_cutover")).await?)
+    /// Durable guest-owned role-authority binding.
+    pub async fn role_authority<I: Invoker>(&self, inv: &mut I) -> Result<Vec<u8>, ClientError> {
+        decode_bytes(self.call(inv, Msg::new("role_authority")).await?)
     }
 
-    pub async fn seal_role_authority<I: Invoker>(
+    pub async fn set_role_authority<I: Invoker>(
         &self,
         inv: &mut I,
         authority_replication_id: Vec<u8>,
@@ -1306,24 +1224,11 @@ impl RegistryRef {
         decode_rkyv(
             self.call(
                 inv,
-                Msg::new("seal_role_authority")
+                Msg::new("set_role_authority")
                     .with("authority_replication_id", authority_replication_id)
                     .with("auth", auth),
             )
             .await?,
-        )
-    }
-
-    /// Read-only operator preflight for the canonical authority cutover. A
-    /// successful result is advisory: the signed seal itself is monotone and
-    /// never becomes replay-conditional on this replica's materialized rows.
-    pub async fn role_authority_cutover_preflight<I: Invoker>(
-        &self,
-        inv: &mut I,
-    ) -> Result<Status, ClientError> {
-        decode_rkyv(
-            self.call(inv, Msg::new("role_authority_cutover_preflight"))
-                .await?,
         )
     }
 
@@ -1590,51 +1495,6 @@ impl RegistryRef {
                     .with("peer_id", peer_id)
                     .with("epoch", epoch)
                     .with("authority_replication_id", authority_replication_id)
-                    .with("auth", auth),
-            )
-            .await?,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn grant_actor_role<I: Invoker>(
-        &self,
-        inv: &mut I,
-        peer_id: Vec<u8>,
-        agent_name: String,
-        role: u8,
-        epoch: u64,
-        auth: Vec<u8>,
-    ) -> Result<Status, ClientError> {
-        decode_rkyv(
-            self.call(
-                inv,
-                Msg::new("grant_actor_role")
-                    .with("peer_id", peer_id)
-                    .with("agent_name", agent_name)
-                    .with("role", role)
-                    .with("epoch", epoch)
-                    .with("auth", auth),
-            )
-            .await?,
-        )
-    }
-
-    pub async fn revoke_actor_role<I: Invoker>(
-        &self,
-        inv: &mut I,
-        peer_id: Vec<u8>,
-        agent_name: String,
-        epoch: u64,
-        auth: Vec<u8>,
-    ) -> Result<Status, ClientError> {
-        decode_rkyv(
-            self.call(
-                inv,
-                Msg::new("revoke_actor_role")
-                    .with("peer_id", peer_id)
-                    .with("agent_name", agent_name)
-                    .with("epoch", epoch)
                     .with("auth", auth),
             )
             .await?,

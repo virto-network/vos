@@ -39,14 +39,14 @@ pub const SERVICE_ID_RAW: u32 = 0;
 // verifier-side `verify_op_sig` (ed25519) stays here (below), consuming
 // the moved `ed25519_pubkey_from_peer_id`.
 pub use vos::registry::{
-    AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, ActorAclPage,
-    ActorAclRow, AgentNamePage, AgentPage, AgentRow, AuthGrantPage, AuthGrantRow, BINDING_DOMAIN,
-    InvitePage, InviteRow, MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, MemberPage, MemberRow,
-    NODE_ROLE_OBSERVER, NODE_ROLE_VOTER, OP_SIG_LEN, PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK,
-    ProgramPage, ProgramRow, REGISTRY_OP_DOMAIN, SPACE_ID_DOMAIN_TAG, Status, SyncFloor,
-    binding_signed_bytes, canonical_op_bytes, ed25519_pubkey_from_peer_id, instance_service_id,
-    invite_signed_bytes, pack_auth, role_authority_cutover_signed_bytes,
-    role_authority_invite_attestation_signed_bytes, role_grant_supersedes,
+    AUTH_ROLE_ADMIN, AUTH_ROLE_DEVELOPER, AUTH_ROLE_NONE, AUTH_ROLE_READONLY, AgentNamePage,
+    AgentPage, AgentRow, AuthGrantPage, AuthGrantRow, BINDING_DOMAIN, InvitePage, InviteRow,
+    MEMBER_KIND_IDENTITY, MEMBER_KIND_NODE, MemberPage, MemberRow, NODE_ROLE_OBSERVER,
+    NODE_ROLE_VOTER, OP_SIG_LEN, PROOF_KIND_MERKLE_INCLUSION, PROOF_KIND_ZK, ProgramPage,
+    ProgramRow, REGISTRY_OP_DOMAIN, SPACE_ID_DOMAIN_TAG, Status, SyncFloor, binding_signed_bytes,
+    canonical_op_bytes, ed25519_pubkey_from_peer_id, instance_service_id, invite_signed_bytes,
+    pack_auth, role_authority_invite_attestation_signed_bytes, role_authority_signed_bytes,
+    role_grant_supersedes,
 };
 
 // ── Programs ──────────────────────────────────────────────────────
@@ -89,7 +89,7 @@ pub struct ExtensionMetaRow {
 
 // ── Members ──────────────────────────────────────────────────────
 
-// ── Auth grants (Sprint 2) ────────────────────────────────────────
+// ── Auth grants ───────────────────────────────────────────────────
 //
 // Separate table from `MemberRow` because the existing `role`
 // field is a Raft-consensus concern (`NODE_ROLE_VOTER` /
@@ -112,9 +112,8 @@ pub struct ExtensionMetaRow {
 ///
 /// Each #[msg(role = SpaceRegistryRole::Admin)] handler runs the
 /// M6 macro-emitted check against the caller's effective role
-/// before the handler body executes; the M5 host dispatch
-/// populates the caller's bytes from `peer_role` and
-/// `actor_role`.
+/// before the handler body executes; the host dispatch populates the
+/// caller's space role from `peer_role`.
 #[derive(
     vos::rkyv::Archive,
     vos::rkyv::Serialize,
@@ -275,13 +274,6 @@ pub struct SpaceRegistry {
     /// lets upgrades resync from the DAG.
     #[storage]
     auth_grants: StorageMap<[u8; 32], AuthGrantRow>,
-    /// M4 — per-(peer, agent) actor-local ACL overrides, one row per pair.
-    /// A `#[storage]` map keyed by `acl_key(peer_id, agent_name)`. Empty
-    /// until an operator calls `grant_actor_role`. Falls through to
-    /// `auth_grants` (space-level) when no actor-local grant exists for
-    /// `(peer, target_agent)`.
-    #[storage]
-    actor_acls: StorageMap<[u8; 32], ActorAclRow>,
     /// Grow-only revoke high-waters for space-level grants, one row per
     /// peer. A `#[storage]` map keyed by `peer_key(peer_id)` so the
     /// floors live beside the grant rows they dominate: a state-blob
@@ -293,10 +285,6 @@ pub struct SpaceRegistry {
     /// can't be undone by replaying a stale-epoch grant.
     #[storage]
     revoke_epochs: StorageMap<[u8; 32], u64>,
-    /// Grow-only revoke high-waters for actor-local grants, keyed by
-    /// `acl_key(peer_id, agent_name)`. Sibling of `revoke_epochs`.
-    #[storage]
-    actor_revoke_epochs: StorageMap<[u8; 32], u64>,
     /// Populated on the hyperspace registry replica only — the local
     /// space-registry leaves this empty so its `resolve` keeps the
     /// in-space behaviour (caller_prefix == host). A `#[storage]` map
@@ -324,6 +312,9 @@ pub struct SpaceRegistry {
     /// floors it governs — see `revoke_epochs`.
     #[storage]
     root: StorageValue<Vec<u8>>,
+    /// Immutable identity of the role-authority service for this space.
+    #[storage]
+    role_authority: StorageValue<[u8; 32]>,
     /// This space's `space_id` (blake2b of the genesis DAG root),
     /// anchored once at boot (first-write-wins). Unlike `root` — the
     /// operator's CLI identity, which is SHARED across every space that
@@ -368,12 +359,11 @@ impl SpaceRegistry {
             authority_grant_witnesses: StorageMap::default(),
             extension_metas: StorageMap::default(),
             auth_grants: StorageMap::default(),
-            actor_acls: StorageMap::default(),
             revoke_epochs: StorageMap::default(),
-            actor_revoke_epochs: StorageMap::default(),
             host_mappings: StorageMap::default(),
             consistency_floors: StorageMap::default(),
             root: StorageValue::default(),
+            role_authority: StorageValue::default(),
             space_id: StorageValue::default(),
             used_replication_ids: StorageSet::default(),
             invites: StorageMap::default(),
@@ -436,43 +426,18 @@ impl SpaceRegistry {
         self.space_id_bytes()
     }
 
-    /// Exact canonical-authority incarnation sealed into this registry, or
-    /// empty while the registry is still in legacy role mode. The marker is
-    /// guest-owned durable state; catalog presence or replica-local absence
-    /// is never used as a protocol-mode decision.
+    /// Exact canonical role-authority incarnation bound to this registry.
     #[msg]
-    async fn role_authority_cutover(&self) -> Vec<u8> {
-        self.role_authority_cutover_id()
+    async fn role_authority(&self) -> Vec<u8> {
+        self.role_authority_id()
             .map(|id| id.to_vec())
             .unwrap_or_default()
     }
 
-    /// Advisory operator check performed immediately before sealing. It is
-    /// deliberately read-only: the durable root-signed seal below must replay
-    /// monotonically even when a concurrent legacy CRDT row materializes in a
-    /// different order. Such a late row remains ineffective because it lacks
-    /// a canonical-authority witness.
-    #[msg]
-    async fn role_authority_cutover_preflight(&self) -> Status {
-        let enrolled_nodes = self.nodes.iter_from(&0).take(2).count();
-        if enrolled_nodes == 1
-            && !self.has_role_authority_cutover_blockers()
-            && !self.has_actor_authority_cutover_blockers()
-        {
-            Status::Ok
-        } else {
-            Status::AuthorityCutoverNotQuiescent
-        }
-    }
-
-    /// Monotonically close legacy role admission before installing the
-    /// canonical authority. Quiescence is an operator preflight, never a
-    /// replay-time condition: once the immutable root signs this seal, every
-    /// valid replay recreates it. Unseen concurrent legacy rows remain
-    /// harmless because post-cutover roles count only with an exact
-    /// authority-attested point witness.
+    /// Bind the registry to the immutable root's canonical role authority.
+    /// First write wins and an identical retry is idempotent.
     #[msg(role = SpaceRegistryRole::Admin)]
-    async fn seal_role_authority(
+    async fn set_role_authority(
         &mut self,
         authority_replication_id: Vec<u8>,
         auth: Vec<u8>,
@@ -482,27 +447,20 @@ impl SpaceRegistry {
         };
         if authority_replication_id == [0; 32]
             || !self.authorize_root_op(
-                &role_authority_cutover_signed_bytes(&authority_replication_id),
+                &role_authority_signed_bytes(&authority_replication_id),
                 &auth,
             )
         {
             return Status::Forbidden;
         }
-        if let Some(current) = self.role_authority_cutover_id() {
+        if let Some(current) = self.role_authority_id() {
             return if current == authority_replication_id {
                 Status::Ok
             } else {
                 Status::Forbidden
             };
         }
-        let key = role_authority_cutover_key();
-        self.metas.insert(
-            &key,
-            &MetaRow {
-                program_hash: key,
-                blob: authority_replication_id.to_vec(),
-            },
-        );
+        self.role_authority.set(&authority_replication_id);
         Status::Ok
     }
 
@@ -635,12 +593,6 @@ impl SpaceRegistry {
         let Some(program_hash) = bytes_to_32(&program_hash) else {
             return Status::BadHash;
         };
-        // The cutover row is guest-owned protocol state, not a program's
-        // metadata. Authority witnesses live in their own private StorageMap,
-        // so no metadata key can alias, overwrite, or pre-seed them.
-        if program_hash == role_authority_cutover_key() {
-            return Status::Forbidden;
-        }
         // Upsert: one point write, keyed by the program hash.
         self.metas
             .insert(&program_hash, &MetaRow { program_hash, blob });
@@ -1365,7 +1317,7 @@ impl SpaceRegistry {
             &[&peer_id, &[role], &epoch.to_le_bytes(), &authority],
         );
         if peer_id.is_empty()
-            || self.role_authority_cutover_id() != Some(authority)
+            || self.role_authority_id() != Some(authority)
             || !self.authorize_root_op(&canonical, &auth)
         {
             return Status::Forbidden;
@@ -1394,7 +1346,7 @@ impl SpaceRegistry {
         let canonical =
             canonical_op_bytes("revoke_role", &[&peer_id, &epoch.to_le_bytes(), &authority]);
         if peer_id.is_empty()
-            || self.role_authority_cutover_id() != Some(authority)
+            || self.role_authority_id() != Some(authority)
             || !self.authorize_root_op(&canonical, &auth)
         {
             return Status::Forbidden;
@@ -1576,7 +1528,7 @@ impl SpaceRegistry {
         let Some(authority_replication_id) = bytes_to_32(&authority_replication_id) else {
             return Status::BadHash;
         };
-        if self.role_authority_cutover_id() != Some(authority_replication_id) {
+        if self.role_authority_id() != Some(authority_replication_id) {
             return Status::Forbidden;
         }
         // The root host adds this signature only after the canonical Raft
@@ -1695,197 +1647,6 @@ impl SpaceRegistry {
             next,
         }
     }
-
-    // ── Actor-local ACLs (M4) ──────────────────────────────────
-    //
-    // Sibling of the space-level `auth_grants` quartet above —
-    // same shape, scoped by `agent_name`. The dispatch path in
-    // vos/src/node.rs (M5) consults this table first; misses
-    // fall through to `auth_grants` mapped via the actor's
-    // `SPACE_ROLE_MAP`. CLI surface (`vosx space role
-    // --in <actor>`) lands in M8.
-
-    /// Grant `role` to `peer_id` *scoped to* `agent_name`.
-    /// Idempotent — re-granting the same role is a no-op;
-    /// changing the role updates in place. `role` is interpreted
-    /// in the target actor's `Role` enum (not `SpaceRole`).
-    #[msg(role = SpaceRegistryRole::Admin)]
-    async fn grant_actor_role(
-        &mut self,
-        peer_id: Vec<u8>,
-        agent_name: String,
-        role: u8,
-        epoch: u64,
-        auth: Vec<u8>,
-    ) -> Status {
-        if self.role_authority_cutover_id().is_some() {
-            return Status::Forbidden;
-        }
-        if !self.authorize_op(
-            &canonical_op_bytes(
-                "grant_actor_role",
-                &[
-                    &peer_id,
-                    agent_name.as_bytes(),
-                    &[role],
-                    &epoch.to_le_bytes(),
-                ],
-            ),
-            &auth,
-        ) {
-            return Status::Forbidden;
-        }
-        if peer_id.is_empty() || agent_name.is_empty() {
-            return Status::BadHash;
-        }
-        let Some((grantor, _)) = unpack_auth(&auth) else {
-            return Status::Forbidden;
-        };
-        let grantor = grantor.to_vec();
-        // One row per (peer, agent): same root-dominates ordering as the
-        // space-level grants (see `grant_supersedes`). A fresh pair always
-        // supersedes.
-        let key = acl_key(&peer_id, &agent_name);
-        let supersedes = match self.actor_acls.get(&key) {
-            Some(cur) => role_grant_supersedes(
-                epoch,
-                &grantor,
-                role,
-                cur.epoch,
-                &cur.grantor,
-                cur.role,
-                &self.root_bytes(),
-            ),
-            None => true,
-        };
-        if supersedes {
-            self.actor_acls.insert(
-                &key,
-                &ActorAclRow {
-                    peer_id,
-                    agent_name,
-                    role,
-                    epoch,
-                    grantor,
-                },
-            );
-        }
-        Status::Ok
-    }
-
-    /// Revoke the actor-local grant for `(peer_id, agent_name)` at
-    /// `epoch`, raising its grow-only revoke high-water (replay-position
-    /// independent — see [`revoke_role`](Self::revoke_role)). Always
-    /// `Status::Ok`. Does not affect the space-level grant.
-    #[msg(role = SpaceRegistryRole::Admin)]
-    async fn revoke_actor_role(
-        &mut self,
-        peer_id: Vec<u8>,
-        agent_name: String,
-        epoch: u64,
-        auth: Vec<u8>,
-    ) -> Status {
-        if self.role_authority_cutover_id().is_some() {
-            return Status::Forbidden;
-        }
-        if !self.authorize_op(
-            &canonical_op_bytes(
-                "revoke_actor_role",
-                &[&peer_id, agent_name.as_bytes(), &epoch.to_le_bytes()],
-            ),
-            &auth,
-        ) {
-            return Status::Forbidden;
-        }
-        self.raise_actor_revoke_floor(&peer_id, &agent_name, epoch);
-        Status::Ok
-    }
-
-    /// Current freshness epoch for an actor-local `(peer_id,
-    /// agent_name)` grant — the higher of its stored grant epoch and
-    /// its revoke high-water. The CLI reads this before authoring a
-    /// `grant_actor_role`/`revoke_actor_role` and signs `epoch + 1`.
-    #[msg]
-    async fn actor_epoch(&self, peer_id: Vec<u8>, agent_name: String) -> u64 {
-        let grant = self
-            .actor_acls
-            .get(&acl_key(&peer_id, &agent_name))
-            .map(|a| a.epoch)
-            .unwrap_or(0);
-        grant.max(self.actor_revoke_floor(&peer_id, &agent_name))
-    }
-
-    /// Look up the actor-local role byte granted to `peer_id`
-    /// for `agent_name`. Returns `AUTH_ROLE_NONE` when no such
-    /// row exists — the dispatch path then falls back to the
-    /// space-level grant. (The byte 0 is overloaded with
-    /// `AUTH_ROLE_NONE` for the space-level path; actor `Role`
-    /// enums may legitimately assign 0 to their lowest tier.
-    /// `actor_acl` would shadow that with "no grant", so the
-    /// dispatch path uses the `Option<u8>` variant in M5 to
-    /// distinguish "no row" from "row with role 0".)
-    #[msg]
-    async fn actor_role(&self, peer_id: Vec<u8>, agent_name: String) -> u8 {
-        // Effective role: revoke-dominated or ineffective-grantor grants
-        // resolve to AUTH_ROLE_NONE, which the host dispatch path treats
-        // as "no grant" (falling through to the space-level role).
-        self.effective_actor_role(&peer_id, &agent_name)
-            .unwrap_or(AUTH_ROLE_NONE)
-    }
-
-    /// One page of actor-local ACLs, resolved to *effective* roles — for
-    /// `vosx space role list --in <actor>` and operator audit. Rows with no
-    /// effective grant (revoked or revoked-delegator) are omitted from
-    /// `acls`; the returned [`ActorAclPage`] cursor tracks the last
-    /// *scanned* `(peer, agent)` so the caller pages the whole table.
-    /// Empty `after_peer`/`after_agent` starts; continue until both are
-    /// empty. `budget` caps the page.
-    #[msg]
-    async fn actor_acls(
-        &self,
-        after_peer: Vec<u8>,
-        after_agent: String,
-        budget: u32,
-    ) -> ActorAclPage {
-        let skip = (!after_peer.is_empty() || !after_agent.is_empty())
-            .then(|| acl_key(&after_peer, &after_agent));
-        let start = skip.unwrap_or([0u8; 32]);
-        let mut raw = self
-            .actor_acls
-            .iter_from(&start)
-            .filter(move |(k, _)| skip != Some(*k))
-            .map(|(_, a)| a);
-        let (page, more) = fill_page(
-            &mut raw,
-            page_rows(budget).min(ROLE_PAGE_MAX_ROWS),
-            PAGE_BYTE_BUDGET,
-        );
-        let (next_peer, next_agent) = if more {
-            page.last()
-                .map(|a| (a.peer_id.clone(), a.agent_name.clone()))
-                .unwrap_or_default()
-        } else {
-            (Vec::new(), String::new())
-        };
-        let acls = page
-            .into_iter()
-            .filter_map(|a| {
-                self.effective_actor_role(&a.peer_id, &a.agent_name)
-                    .map(|role| ActorAclRow {
-                        peer_id: a.peer_id,
-                        agent_name: a.agent_name,
-                        role,
-                        epoch: a.epoch,
-                        grantor: a.grantor,
-                    })
-            })
-            .collect();
-        ActorAclPage {
-            acls,
-            next_peer,
-            next_agent,
-        }
-    }
 }
 
 // ── Signed-op authorization ────────────────────────────────────────
@@ -1927,36 +1688,12 @@ impl SpaceRegistry {
         self.auth_grants.get(&key)
     }
 
-    fn role_authority_cutover_id(&self) -> Option<[u8; 32]> {
-        let key = role_authority_cutover_key();
-        let row = self.metas.get(&key)?;
-        if row.program_hash != key || row.blob.len() < 32 {
-            return None;
-        }
-        bytes_to_32(&row.blob[..32]).filter(|id| *id != [0; 32])
-    }
-
-    fn has_role_authority_cutover_blockers(&self) -> bool {
-        let root = self.root_bytes();
-        self.auth_grants
-            .iter_from(&[0; 32])
-            .map(|(_, grant)| grant)
-            .any(|grant| {
-                grant.peer_id != root
-                    && (self.effective_role(&grant.peer_id) != AUTH_ROLE_NONE
-                        || self.revoke_floor(&grant.peer_id) < grant.epoch)
-            })
-    }
-
-    fn has_actor_authority_cutover_blockers(&self) -> bool {
-        self.actor_acls
-            .iter_from(&[0; 32])
-            .map(|(_, grant)| grant)
-            .any(|grant| self.actor_revoke_floor(&grant.peer_id, &grant.agent_name) < grant.epoch)
+    fn role_authority_id(&self) -> Option<[u8; 32]> {
+        self.role_authority.get().filter(|id| *id != [0; 32])
     }
 
     fn bind_authority_grant(&mut self, authority: [u8; 32], row: &AuthGrantRow) {
-        if self.role_authority_cutover_id() != Some(authority) {
+        if self.role_authority_id() != Some(authority) {
             return;
         }
         let peer = peer_key(&row.peer_id);
@@ -2034,23 +1771,6 @@ impl SpaceRegistry {
         }
     }
 
-    /// Grow-only revoke high-water for an actor-local `(peer_id,
-    /// agent_name)` grant, or 0 if never revoked.
-    fn actor_revoke_floor(&self, peer_id: &[u8], agent_name: &str) -> u64 {
-        self.actor_revoke_epochs
-            .get(&acl_key(peer_id, agent_name))
-            .unwrap_or(0)
-    }
-
-    /// Raise (never lower) the actor revoke high-water for `(peer_id,
-    /// agent_name)`.
-    fn raise_actor_revoke_floor(&mut self, peer_id: &[u8], agent_name: &str, epoch: u64) {
-        if epoch > self.actor_revoke_floor(peer_id, agent_name) {
-            self.actor_revoke_epochs
-                .insert(&acl_key(peer_id, agent_name), &epoch);
-        }
-    }
-
     /// True when `signer` is the genesis root or a transitively
     /// effective ADMIN. The root is the supreme signer — before genesis
     /// sets one, `self.root` is empty and every signed mutator fails
@@ -2073,6 +1793,13 @@ impl SpaceRegistry {
     /// before its own revoke during replay) retroactively voids the
     /// whole delegation subtree.
     fn effective_role(&self, peer_id: &[u8]) -> u8 {
+        let root = self.root_bytes();
+        if !root.is_empty() && root.as_slice() == peer_id {
+            return AUTH_ROLE_ADMIN;
+        }
+        let Some(authority) = self.role_authority_id() else {
+            return AUTH_ROLE_NONE;
+        };
         // The peer's own grant carries the candidate result; the walk
         // below decides whether it counts.
         let Some(first) = self.auth_grants.get(&peer_key(peer_id)) else {
@@ -2082,11 +1809,7 @@ impl SpaceRegistry {
             return AUTH_ROLE_NONE;
         }
         let role = first.role;
-        let root = self.root_bytes();
-        let authority = self.role_authority_cutover_id();
-        if first.peer_id != root
-            && authority.is_some_and(|id| !self.authority_grant_is_bound(id, &first))
-        {
+        if !self.authority_grant_is_bound(authority, &first) {
             return AUTH_ROLE_NONE;
         }
         // Walk the grantor chain iteratively, holding ONE decoded row
@@ -2115,32 +1838,11 @@ impl SpaceRegistry {
             if row.epoch <= self.revoke_floor(&grantor) || row.role != AUTH_ROLE_ADMIN {
                 return AUTH_ROLE_NONE;
             }
-            if authority.is_some_and(|id| !self.authority_grant_is_bound(id, &row)) {
+            if !self.authority_grant_is_bound(authority, &row) {
                 return AUTH_ROLE_NONE;
             }
             grantor = row.grantor;
             hops += 1;
-        }
-    }
-
-    /// Effective actor-local role of `(peer_id, agent_name)`. Like
-    /// [`effective_role`](Self::effective_role): the grant counts only
-    /// while its epoch is above the matching actor revoke high-water
-    /// AND its `grantor` is an effective *space* admin. Returns `None`
-    /// when there is no row at all so the dispatch path can tell "no
-    /// grant" from "role 0".
-    fn effective_actor_role(&self, peer_id: &[u8], agent_name: &str) -> Option<u8> {
-        if self.role_authority_cutover_id().is_some() {
-            return None;
-        }
-        let row = self.actor_acls.get(&acl_key(peer_id, agent_name))?;
-        if row.epoch <= self.actor_revoke_floor(peer_id, agent_name) {
-            return None;
-        }
-        if self.is_effective_admin(&row.grantor) {
-            Some(row.role)
-        } else {
-            None
         }
     }
 }
@@ -2214,14 +1916,6 @@ fn peer_key(peer_id: &[u8]) -> [u8; 32] {
     vos::crypto::blake2b_hash::<32>(b"space-registry/peer-key", &[peer_id])
 }
 
-/// Reserved rows in the existing metadata keyspace avoid changing the
-/// archived `SpaceRegistry` struct while still making cutover and per-grant
-/// bindings guest-owned durable state. Domain-separated keys cannot collide
-/// with a real content-addressed program except by breaking BLAKE2b.
-fn role_authority_cutover_key() -> [u8; 32] {
-    vos::crypto::blake2b_hash::<32>(b"space-registry/role-authority-cutover/service", &[])
-}
-
 fn role_authority_grant_binding(authority: [u8; 32], row: &AuthGrantRow) -> [u8; 32] {
     vos::crypto::blake2b_hash::<32>(
         b"space-registry/role-authority-grant/service",
@@ -2239,20 +1933,6 @@ fn role_authority_grant_witness_key(authority: [u8; 32], peer: [u8; 32]) -> [u8;
     vos::crypto::blake2b_hash::<32>(
         b"space-registry/role-authority-grant-witness",
         &[&authority, &peer],
-    )
-}
-
-/// Fixed-width `StorageMap` key for an actor-local `(peer_id, agent_name)`
-/// grant. Length-prefix the peer id so `(p‖q, name)` and `(p, q‖name)`
-/// can't collide into the same key.
-fn acl_key(peer_id: &[u8], agent_name: &str) -> [u8; 32] {
-    vos::crypto::blake2b_hash::<32>(
-        b"space-registry/acl-key",
-        &[
-            &(peer_id.len() as u32).to_be_bytes(),
-            peer_id,
-            agent_name.as_bytes(),
-        ],
     )
 }
 
@@ -2288,7 +1968,7 @@ fn may_transition_to(floor: u8, requested: u8) -> bool {
 // ── Signed registry ops ──────────────────────────────────
 //
 // The authority-critical mutations — the auth-grant table
-// (`grant_role`/`revoke_role`/`grant_actor_role`/`revoke_actor_role`)
+// (`grant_role`/`revoke_role`)
 // and the member table (`add_node`/`remove_node`/`add_identity`/
 // `remove_identity`) — carry an `auth` blob: the signer's PeerId
 // bytes followed by an ed25519 signature over the op's canonical

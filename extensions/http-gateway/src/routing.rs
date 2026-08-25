@@ -233,26 +233,16 @@ async fn handle(req: &Request, inner: &Inner, ctx: &mut Context<HttpGateway>) ->
         None => return text(404, format!("unknown agent '{agent}'")),
     };
 
-    // Look up (and lazily cache) the actor's schema. With it,
-    // `build_msg` can coerce query/JSON values to the handler's
-    // declared types AND reject unknown methods / type mismatches
-    // up front. Without meta the gateway falls back to today's
-    // permissive pass-through: pass whatever the wire produced
-    // and let the actor's `from_msg` decide.
-    let meta = ensure_meta_cached(ctx, inner, target, &agent).await;
-    let method_meta = meta
-        .as_ref()
-        .and_then(|m| m.messages.iter().find(|msg| msg.name == method).cloned());
-
-    // Typed-error gate: when the actor's schema is known and the
-    // requested method isn't in it, return 404 immediately. The
-    // permissive "200 null" fallback stays for actors that haven't
-    // registered meta (older binaries, hash drift).
-    if meta.is_some() && method_meta.is_none() {
+    // Look up the actor's schema. Dynamic HTTP dispatch is schema-bound so
+    // method and argument validation cannot drift from the actor contract.
+    let Some(meta) = ensure_meta_cached(ctx, inner, target, &agent).await else {
+        return text(502, format!("schema unavailable for agent '{agent}'"));
+    };
+    let Some(method_meta) = meta.messages.iter().find(|msg| msg.name == method).cloned() else {
         return text(404, format!("unknown method '{method}' on agent '{agent}'"));
-    }
+    };
 
-    let msg = match build_msg(method, method_meta.as_ref(), req) {
+    let msg = match build_msg(method, &method_meta, req) {
         Ok(m) => m,
         Err(r) => return r,
     };
@@ -269,7 +259,7 @@ async fn handle(req: &Request, inner: &Inner, ctx: &mut Context<HttpGateway>) ->
     // dispatch failure (panic / non-DONE status / no route / timeout) →
     // `502`. This is what preserves the panic→502 distinction in
     // transport mode.
-    let ret_ty = method_meta.as_ref().map(|m| m.returns.as_str());
+    let ret_ty = Some(method_meta.returns.as_str());
     match ctx.ask_dispatch(target, &payload).await {
         Some(reply_bytes) if reply_bytes.is_empty() => {
             // Handler returned `()` successfully → JSON null.
@@ -648,26 +638,19 @@ async fn resolve(ctx: &mut Context<HttpGateway>, name: &str) -> Option<ServiceId
 #[allow(clippy::result_large_err)]
 fn build_msg(
     method: String,
-    method_meta: Option<&vos::metadata::ParsedMessage>,
+    method_meta: &vos::metadata::ParsedMessage,
     req: &Request,
 ) -> core::result::Result<Msg, Response> {
     use vos::value::Value;
     let mut msg = Msg::new(method);
     let mut seen_keys: Vec<String> = Vec::new();
-    // Pulls the typed result from `coerce_to_type` when the
-    // schema is known and a field declaration matches; signals
+    // Pulls the typed result from `coerce_to_type` when a field declaration
+    // matches; signals
     // a failed parse via `Err(Response)` so build_msg can 400
     // instead of silently passing through a wrong-typed value.
-    // When schema is unknown OR the field isn't in the
-    // declared list (typo, gateway-injected key), the original
-    // value passes through — preserves today's permissive
-    // pre-schema behaviour for that codepath.
     let coerce = |key: &str, v: Value| -> Result<Value, Response> {
-        let Some(meta) = method_meta else {
-            return Ok(v);
-        };
-        let Some(field) = meta.fields.iter().find(|f| f.name == key) else {
-            return Ok(v);
+        let Some(field) = method_meta.fields.iter().find(|f| f.name == key) else {
+            return Err(text(400, format!("unknown argument '{key}'")));
         };
         match coerce_to_type(v, &field.ty) {
             Some(coerced) => Ok(coerced),
@@ -712,14 +695,9 @@ fn build_msg(
     // actor's `from_msg` would silently return None and the
     // request would round-trip to a 502. Surface as 400 with
     // the missing field name so clients can fix their request.
-    // Skipped when no schema is registered (the pre-schema
-    // permissive fallback): without meta the gateway has no way to know what
-    // "required" means.
-    if let Some(meta) = method_meta {
-        for field in &meta.fields {
-            if !seen_keys.iter().any(|k| k.as_str() == field.name) {
-                return Err(text(400, format!("missing required arg '{}'", field.name)));
-            }
+    for field in &method_meta.fields {
+        if !seen_keys.iter().any(|k| k.as_str() == field.name) {
+            return Err(text(400, format!("missing required arg '{}'", field.name)));
         }
     }
     Ok(msg)
@@ -740,9 +718,7 @@ fn coerce_to_type(v: vos::value::Value, ty: &str) -> Option<vos::value::Value> {
     } else {
         None
     };
-    // Types are recorded whitespace-free by the macro; older binaries
-    // may still carry a pretty-printed `Vec < u8 >`, so strip whitespace
-    // to match either spelling.
+    // Normalize the Rust type spelling emitted by token formatting.
     let ty: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
     // `Vec<u8>` and `[u8; N]` handler args both need `Value::Bytes`,
     // which the JSON layer never produces directly. Accept either a hex
@@ -807,10 +783,8 @@ fn coerce_to_type(v: vos::value::Value, ty: &str) -> Option<vos::value::Value> {
     }
 }
 
-/// Fetch the actor's schema from the registry on a cache miss; return
-/// the cached entry on a hit. The cache distinguishes "not yet asked"
-/// (absent) from "asked, no schema available" (`Some(None)`), so a
-/// permanent miss costs at most one round trip per gateway lifetime.
+/// Fetch the actor's schema from the registry on a cache miss and return the
+/// cached entry on a hit. A missing schema is cached for the TTL.
 async fn ensure_meta_cached(
     ctx: &mut Context<HttpGateway>,
     inner: &Inner,

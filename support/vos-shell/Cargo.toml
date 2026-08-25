@@ -9,7 +9,7 @@ description = "Sandboxed nushell-backed console engine for VOS spaces"
 [dependencies]
 # Type-only dependency on vos: we need the dynamic value types, schema
 # decoder, ServiceId, Caller and status constants — all unconditional —
-# but NOT the `std` feature (which drags in javm/clap/libp2p). The host
+# but NOT the `std` feature (which pulls in the native runtime and networking). The host
 # binaries that link vos-shell (vosx, the ssh extension) enable those
 # features themselves; cargo unifies them at the leaf.
 vos = { path = "../../vos", default-features = false }

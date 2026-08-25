@@ -1,7 +1,7 @@
 //! Explicit CRDT installation fixture.
 //!
 //! This retains the former public CRDT counter for registry and package gates.
-//! It is deliberately separate from the plain legacy-v1 replay fixture.
+//! It is deliberately isolated so CRDT behavior is tested explicitly.
 
 use vos::prelude::*;
 

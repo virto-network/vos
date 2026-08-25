@@ -118,20 +118,4 @@ mod tests {
         assert_eq!(back.extensions[0].caps, vec!["space-registry:admin"]);
         assert!(back.extensions[1].caps.is_empty());
     }
-
-    #[test]
-    fn legacy_endpoint_without_extensions_still_parses() {
-        // A `.endpoint` written by a daemon predating the caps field
-        // must still load — `#[serde(default)]` fills an empty list so
-        // upgrading the binary doesn't strand running spaces.
-        let legacy = r#"
-            peer_id = "12D3KooW"
-            multiaddrs = ["/ip4/127.0.0.1/tcp/4001"]
-            prefix = 7
-            pid = 99
-        "#;
-        let ep: Endpoint = toml::from_str(legacy).unwrap();
-        assert!(ep.extensions.is_empty());
-        assert_eq!(ep.prefix, 7);
-    }
 }

@@ -938,7 +938,7 @@ impl DaemonClient {
 
     pub fn grant_role(&self, peer_id: Vec<u8>, role: u8) -> anyhow::Result<Status> {
         let authority = self
-            .role_authority_cutover_id()?
+            .role_authority_id()?
             .ok_or_else(|| anyhow::anyhow!("the space role authority is not installed"))?;
         self.require_service_role_authority_root()?;
         // Read the peer's current freshness epoch and sign `epoch + 1`
@@ -972,7 +972,7 @@ impl DaemonClient {
 
     pub fn revoke_role(&self, peer_id: Vec<u8>) -> anyhow::Result<Status> {
         let authority = self
-            .role_authority_cutover_id()?
+            .role_authority_id()?
             .ok_or_else(|| anyhow::anyhow!("the space role authority is not installed"))?;
         self.require_service_role_authority_root()?;
         let epoch = self.peer_epoch(peer_id.clone())? + 1;
@@ -1000,9 +1000,9 @@ impl DaemonClient {
         Ok(status)
     }
 
-    pub fn role_authority_cutover_id(&self) -> anyhow::Result<Option<[u8; 32]>> {
-        let marker = vos::block_on(self.registry().role_authority_cutover(&mut &self.node))
-            .map_err(|error| anyhow::anyhow!("registry.role_authority_cutover(): {error}"))?;
+    pub fn role_authority_id(&self) -> anyhow::Result<Option<[u8; 32]>> {
+        let marker = vos::block_on(self.registry().role_authority(&mut &self.node))
+            .map_err(|error| anyhow::anyhow!("registry.role_authority(): {error}"))?;
         if marker.is_empty() {
             return Ok(None);
         }
@@ -1071,16 +1071,6 @@ impl DaemonClient {
             .map_err(|e| anyhow::anyhow!("registry.peer_epoch(): {e}"))
     }
 
-    /// Current freshness epoch for an actor-local `(peer_id, agent_name)`
-    /// grant.
-    fn actor_epoch(&self, peer_id: Vec<u8>, agent_name: String) -> anyhow::Result<u64> {
-        vos::block_on(
-            self.registry()
-                .actor_epoch(&mut &self.node, peer_id, agent_name),
-        )
-        .map_err(|e| anyhow::anyhow!("registry.actor_epoch(): {e}"))
-    }
-
     #[allow(dead_code)] // exposed for tooling; CLI consumers use `space role list`.
     pub fn peer_role(&self, peer_id: Vec<u8>) -> anyhow::Result<u8> {
         vos::block_on(self.registry().peer_role(&mut &self.node, peer_id))
@@ -1129,13 +1119,13 @@ impl DaemonClient {
     /// canonical is just `("revoke_invite", [token_pub])` — no epoch,
     /// unlike grant/revoke_role.
     pub fn revoke_invite(&self, token_pub: Vec<u8>) -> anyhow::Result<Status> {
-        if self.role_authority_cutover_id()?.is_some() {
-            let token: [u8; 32] = token_pub
-                .as_slice()
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("invite token public key is not 32 bytes"))?;
-            self.commit_service_invite_revocation(token)?;
-        }
+        self.role_authority_id()?
+            .ok_or_else(|| anyhow::anyhow!("the space role authority is unavailable"))?;
+        let token: [u8; 32] = token_pub
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invite token public key is not 32 bytes"))?;
+        self.commit_service_invite_revocation(token)?;
         let auth = op_auth(&self.signer, "revoke_invite", &[&token_pub])?;
         vos::block_on(
             self.registry()
@@ -1173,91 +1163,6 @@ impl DaemonClient {
             anyhow::bail!("space-authority rejected the signed invite revocation");
         }
         Ok(())
-    }
-
-    // ── Actor-local grants ────────────────────────────────
-
-    pub fn grant_actor_role(
-        &self,
-        peer_id: Vec<u8>,
-        agent_name: String,
-        role: u8,
-    ) -> anyhow::Result<Status> {
-        if self.role_authority_cutover_id()?.is_some() {
-            anyhow::bail!(
-                "actor-local registry roles are unavailable after canonical authority cutover"
-            );
-        }
-        let epoch = self.actor_epoch(peer_id.clone(), agent_name.clone())? + 1;
-        let auth = op_auth(
-            &self.signer,
-            "grant_actor_role",
-            &[
-                &peer_id,
-                agent_name.as_bytes(),
-                &[role],
-                &epoch.to_le_bytes(),
-            ],
-        )?;
-        vos::block_on(self.registry().grant_actor_role(
-            &mut &self.node,
-            peer_id,
-            agent_name,
-            role,
-            epoch,
-            auth,
-        ))
-        .map_err(|e| anyhow::anyhow!("registry.grant_actor_role(): {e}"))
-    }
-
-    pub fn revoke_actor_role(
-        &self,
-        peer_id: Vec<u8>,
-        agent_name: String,
-    ) -> anyhow::Result<Status> {
-        if self.role_authority_cutover_id()?.is_some() {
-            anyhow::bail!(
-                "actor-local registry roles are unavailable after canonical authority cutover"
-            );
-        }
-        let epoch = self.actor_epoch(peer_id.clone(), agent_name.clone())? + 1;
-        let auth = op_auth(
-            &self.signer,
-            "revoke_actor_role",
-            &[&peer_id, agent_name.as_bytes(), &epoch.to_le_bytes()],
-        )?;
-        vos::block_on(self.registry().revoke_actor_role(
-            &mut &self.node,
-            peer_id,
-            agent_name,
-            epoch,
-            auth,
-        ))
-        .map_err(|e| anyhow::anyhow!("registry.revoke_actor_role(): {e}"))
-    }
-
-    pub fn actor_acls(&self) -> anyhow::Result<Vec<vos::registry::ActorAclRow>> {
-        // Drain every page (cursor = last scanned (peer, agent); both empty
-        // ends the walk) so callers keep the whole-catalog view.
-        let mut out = Vec::new();
-        let mut after_peer: Vec<u8> = Vec::new();
-        let mut after_agent = String::new();
-        loop {
-            let page = vos::block_on(self.registry().actor_acls(
-                &mut &self.node,
-                after_peer,
-                after_agent,
-                0,
-            ))
-            .map_err(|e| anyhow::anyhow!("registry.actor_acls(): {e}"))?;
-            out.extend(page.acls);
-            if page.next_peer.is_empty() && page.next_agent.is_empty() {
-                break;
-            }
-            after_peer = page.next_peer;
-            after_agent = page.next_agent;
-        }
-        Ok(out)
     }
 }
 

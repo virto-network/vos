@@ -516,7 +516,6 @@ pub(crate) fn project_node_local(
             name: e.name.clone(),
             path: absolutize(recipe_dir, &e.path),
             cap_policy: e.cap_policy.clone(),
-            relay_unauthenticated: e.relay_unauthenticated,
             intra_caps: e.intra_caps.clone(),
             tick_ms: e.tick_ms,
             init: e.init.clone(),

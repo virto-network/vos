@@ -1,4 +1,4 @@
-//! Durable JAVM kernel continuation envelope.
+//! Durable PVM kernel continuation envelope.
 //!
 //! The small header lives in service storage. Its content-addressed body is
 //! the canonical `vos_pvm::snapshot::KernelSnapshot` wire, including exact PCs,

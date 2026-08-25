@@ -7,7 +7,7 @@
 //! byte blob, and halts with that blob as its output. Every consumer
 //! applies the identical byte-defined semantic: the VOS host drain, the
 //! child-invoke conversion, a guest APPLY on a service platform host, and any
-//! prover/verifier (see `docs/design/work-result-contract.md`).
+//! prover/verifier.
 //!
 //! This module is `no_std` so the same constants and helpers are visible
 //! to both the guest framework (encoding) and the host runtime (parsing).
@@ -36,7 +36,7 @@
 //! The trailing `app_public` field carries the app-level
 //! public bytes a provable Task designated via `vos::zk::bind_public`.
 //! The guest already folds them into its bound io-hash (see
-//! [`folded_public`]); v4 is what SURFACES them to the host, so the
+//! [`folded_public`]); the wire surfaces them to the host, so the
 //! captured `ProvableRecord` can carry the bytes a verifier needs to
 //! reconstruct `public'`. `app_public` is bound through `public'`/io-hash,
 //! not the transition digest.
@@ -254,7 +254,7 @@ impl RefinePayload {
         let effects_count = c.read_u16()? as usize;
         let mut effects = Vec::with_capacity(effects_count);
         for _ in 0..effects_count {
-            effects.push(decode_effect(&mut c, true)?);
+            effects.push(decode_effect(&mut c)?);
         }
         let app_public_len = c.read_u32()? as usize;
         let app_public = c.read_bytes(app_public_len)?.to_vec();
@@ -375,7 +375,7 @@ pub(crate) fn decode_effects(bytes: &[u8]) -> Option<Vec<Effect>> {
     let count = c.read_u16()? as usize;
     let mut effects = Vec::with_capacity(count);
     for _ in 0..count {
-        effects.push(decode_effect(&mut c, true)?);
+        effects.push(decode_effect(&mut c)?);
     }
     if !c.is_exhausted() {
         return None;
@@ -424,10 +424,8 @@ fn encode_effect(out: &mut Vec<u8>, eff: &Effect) {
     }
 }
 
-/// Decode one effect. With `strict` (v3), the payload must be exactly
-/// consumed by the effect's fields; without (service), inner slack is
-/// tolerated as inherited behavior.
-fn decode_effect(c: &mut Cursor<'_>, strict: bool) -> Option<Effect> {
+/// Decode one effect. The payload must be consumed exactly.
+fn decode_effect(c: &mut Cursor<'_>) -> Option<Effect> {
     let tag = c.read_u8()?;
     let payload_len = c.read_u32()? as usize;
     let payload = c.read_bytes(payload_len)?;
@@ -471,7 +469,7 @@ fn decode_effect(c: &mut Cursor<'_>, strict: bool) -> Option<Effect> {
         }
         _ => return None,
     };
-    if strict && !pc.is_exhausted() {
+    if !pc.is_exhausted() {
         return None;
     }
     Some(eff)

@@ -1,4 +1,4 @@
-//! Host-side chronos feeder — drives the per-space `chronos` clock + v1
+//! Host-side chronos feeder — drives the per-space `chronos` clock and
 //! bias-resistance protocol from a daemon's periodic hook.
 //!
 //! Split out of the vosx daemon so it lives next to the protocol it speaks
@@ -30,7 +30,7 @@ const VOS_COMMON_ERA_MS: u64 = 1_704_067_200_000;
 /// take effect within this many seconds.
 const VOTERS_REFRESH_PASSES: u32 = 8;
 
-/// Drives the per-space `chronos` clock + v1 bias-resistance protocol from a
+/// Drives the per-space `chronos` clock and bias-resistance protocol from a
 /// daemon's periodic hook. Holds the node's static VRF keypair (derived once
 /// from `node.key`) and the cross-pass feed state.
 ///
@@ -63,7 +63,7 @@ const VOTERS_REFRESH_PASSES: u32 = 8;
 /// 3. Reads (`now`, `committee`, `open_rounds`) come from the **local** replica
 ///    (cheap, no network hop); only the writes target the leader.
 ///
-/// The feeder keeps its per-pass footprint close to v0's single `advance`
+/// The feeder keeps its per-pass footprint close to a single `advance`
 /// (cached voter set, enrol/reveal tracking) because a raft actor that commits
 /// continuously is sensitive to extra per-commit work: the agent only reloads
 /// (soft-restarts) when committed entries are ahead of what it has applied, so
@@ -96,7 +96,7 @@ pub struct ChronosFeeder {
     last_committee: Option<Vec<Vec<u8>>>,
     /// Cached registry voter set + a refresh countdown, so the feeder doesn't
     /// re-read the registry every pass — keeping its per-pass footprint close to
-    /// v0's single `advance`, which a raft actor (it soft-restarts after every
+    /// a single `advance`, which a raft actor (it soft-restarts after every
     /// commit) tolerates without the feeder's calls piling up behind a restart.
     voters_cache: Vec<Vec<u8>>,
     voters_ttl: u32,

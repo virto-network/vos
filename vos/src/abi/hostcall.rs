@@ -1,6 +1,6 @@
 //! PVM/service platform protocol capability numbering.
 //!
-//! IDs match the canonical slot numbers in `spec/Jar/JAVM/Capability.lean`
+//! IDs match the canonical PVM capability slots
 //! (`protocolGas = 1`, `protocolFetch = 2`, ... `protocolQuota = 28`).
 //! When a guest executes `ecalli N` the vos_pvm kernel looks up cap slot `N`
 //! in the active VM's cap table; for slots 1..=28 the kernel pre-populates
@@ -22,7 +22,7 @@
 //!
 //! Slots 10..=14 are reserved by the spec for future protocol caps and VOS
 //! never assigns them. Scheduler-supplied VOS capabilities use explicit high
-//! slots below the JAVM immediate limit.
+//! slots below the PVM immediate limit.
 
 // --- Spec-canonical protocol caps (slots 1..=28) ---
 
@@ -129,7 +129,7 @@ pub const ACCUMULATION_TIMESLOT: u32 = NOW_MS;
 
 /// Durable actor suspension boundary supplied by the VOS scheduler.
 ///
-/// Refine captures the complete nested JAVM kernel before this call observes
+/// Refine captures the complete nested PVM kernel before this call observes
 /// a result. A result of `0` drives the transition-finalization branch; after
 /// that transition commits, restoring the snapshot injects `1` and execution
 /// continues immediately after the source-level `.await`.
@@ -185,7 +185,7 @@ mod tests {
         assert!(supplied.iter().all(|slot| !(1..=28).contains(slot)));
         for (index, slot) in supplied.iter().enumerate() {
             assert!(!supplied[..index].contains(slot));
-            assert!(*slot <= 127, "JAVM ecall immediate overflow");
+            assert!(*slot <= 127, "PVM ecall immediate overflow");
         }
     }
 

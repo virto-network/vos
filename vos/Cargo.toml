@@ -147,9 +147,6 @@ space-authority = { path = "../actors/space-authority", default-features = false
 # external-invoke seam and drive `commit_chain_op`'s catch-up loop without a
 # live sequencer. `default-features = false` keeps the PVM bin glue out.
 msg-ctl = { path = "../actors/msg-ctl", default-features = false }
-# Same shape — host tests use the typed SpaceBridgeRef to invoke
-# the bridge actor's where_am_i / forward handlers over libp2p.
-space-bridge = { path = "../actors/space-bridge", default-features = false }
 # Per-bank stateful clerk agent — host tests use ClerkLedgerRef to
 # drive bootstrap / create_account / account against the wire ABI.
 clerk-ledger = { path = "../actors/clerk-ledger", default-features = false }

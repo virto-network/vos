@@ -636,18 +636,16 @@ pub fn load_active_config(
         return Ok(None);
     };
     let bytes = row.value();
-    let (log_index, mut pos) = if bytes.starts_with(ACTIVE_CONFIG_MAGIC) {
-        let index = bytes
-            .get(4..12)
-            .ok_or_else(|| CommitError::Config("active_config row: truncated index".into()))?;
-        let index = u64::from_le_bytes(index.try_into().expect("eight-byte slice"));
-        ((index != u64::MAX).then_some(index), 12)
-    } else {
-        // Legacy rows did not retain the configuration entry index. They are
-        // still usable for replication, but must never prove that a local
-        // voter's exclusion was committed.
-        (None, 0)
-    };
+    if !bytes.starts_with(ACTIVE_CONFIG_MAGIC) {
+        return Err(CommitError::Config(
+            "active_config row: unsupported encoding; reset or restore the service".into(),
+        ));
+    }
+    let index = bytes
+        .get(4..12)
+        .ok_or_else(|| CommitError::Config("active_config row: truncated index".into()))?;
+    let index = u64::from_le_bytes(index.try_into().expect("eight-byte slice"));
+    let (log_index, mut pos) = ((index != u64::MAX).then_some(index), 12);
     let flag = *bytes
         .get(pos)
         .ok_or_else(|| CommitError::Config("active_config row: empty".into()))?;
@@ -948,26 +946,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_active_config_has_no_committed_removal_evidence() {
+    fn unsupported_active_config_is_rejected() {
         let (db, dir) = temp_db();
         let txn = db.begin_write().unwrap();
-        let mut legacy = alloc::vec![0]; // steady configuration
-        encode_prefix_list(&mut legacy, &[0xBBBB]);
+        let mut unsupported = alloc::vec![0];
+        encode_prefix_list(&mut unsupported, &[0xBBBB]);
         txn.open_table(RAFT_META)
             .unwrap()
-            .insert(META_ACTIVE_CONFIG, legacy.as_slice())
+            .insert(META_ACTIVE_CONFIG, unsupported.as_slice())
             .unwrap();
         txn.commit().unwrap();
 
-        assert_eq!(
-            load_active_config(&db).unwrap(),
-            Some(vos_raft::ActiveConfigRecord {
-                log_index: None,
-                current: alloc::vec![0xBBBB],
-                joint_old: None,
-            }),
-            "legacy membership remains usable but cannot prove removal committed",
-        );
+        let error = load_active_config(&db).expect_err("unsupported membership must fail closed");
+        assert!(error.to_string().contains("unsupported encoding"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

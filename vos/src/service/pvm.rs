@@ -874,7 +874,10 @@ impl ActorRefineRuntime {
         let task = Hash(hash_bytes.try_into().map_err(|_| {
             ServicePvmError::RefineHostRejected(crate::abi::hostcall::INVOKE as u8)
         })?);
-        let (state, row_keys, tag, message) = crate::runtime::split_invoke_input(&input);
+        let Some((state, row_keys, tag, message)) = crate::runtime::split_invoke_input(&input)
+        else {
+            return Self::write_task_result(kernel, &[STATUS_PANICKED]);
+        };
         if !row_keys.is_empty() {
             // Parent-row imports need their own base-authenticated witness
             // channel. The first production Task surface is intentionally

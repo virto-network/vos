@@ -12,7 +12,7 @@ edition = "2024"
 # symbol reader). A bridge dispatches `prove` / `verify` here.
 #
 # Lives as a native `.so` because vos-pvm-proof-verifier can't build for the PVM
-# guest (javm -> blst C-build + workspace stwo feature inheritance), so
+# guest (native proof dependencies and workspace feature inheritance), so
 # in-actor verification isn't viable — see the general-prover plan.
 #
 # The `measure_catalog` handler also serves the `vosx zk pin` publish-time

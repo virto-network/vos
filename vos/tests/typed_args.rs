@@ -858,8 +858,7 @@ fn from_msg_rejects_unknown_method() {
 
 #[test]
 fn scalar_arg_keeps_its_wire_shape() {
-    // A whitelisted scalar must still travel as its own `Value`
-    // variant, not rkyv-wrapped — this is the backward-compat contract.
+    // A scalar travels as its canonical `Value` variant, not rkyv-wrapped.
     let mut inv = CapturingInvoker::default();
     let vault = VaultRef::at(ServiceId(1));
     let _ = vos::block_on(vault.deposit(&mut inv, 500u64)).expect("invoke");

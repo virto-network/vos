@@ -6,7 +6,7 @@
 //! - A small **header** (snapshot length, execution semantics, commitment)
 //!   that lives in the service's on-chain storage. See
 //!   [`crate::pvm_image::ContinuationHeader`].
-//! - A large **body** (the portable JAVM kernel snapshot wire) that lives in
+//! - A large **body** (the portable PVM kernel snapshot) that lives in
 //!   the data-availability layer, content-addressed by its blake2b hash.
 //!
 //! [`DataLayer`] abstracts the body store. The default in-process

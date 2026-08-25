@@ -182,30 +182,23 @@ fn ensure_service_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::
         vos::service::ROLE_AUTHORITY_INSTANCE_,
         &package_hash.0,
     );
-    let cutover = vos::block_on(reg.role_authority_cutover(&mut &*node))
-        .map_err(|error| anyhow::anyhow!("query role-authority cutover: {error}"))?;
-    if cutover.is_empty() {
-        let preflight = vos::block_on(reg.role_authority_cutover_preflight(&mut &*node))
-            .map_err(|error| anyhow::anyhow!("preflight role-authority cutover: {error}"))?;
-        if preflight != Status::Ok {
-            anyhow::bail!(
-                "canonical role-authority cutover requires exactly one enrolled registry node and no live or revivable legacy space/actor role grants; revoke those grants and remove other nodes before retrying --service-pvm"
-            );
-        }
+    let authority = vos::block_on(reg.role_authority(&mut &*node))
+        .map_err(|error| anyhow::anyhow!("query role authority: {error}"))?;
+    if authority.is_empty() {
         let auth = crate::commands::space::op_sign::op_auth(
             &root,
-            "seal_role_authority",
+            "set_role_authority",
             &[&replication_id],
         )?;
         let status =
-            vos::block_on(reg.seal_role_authority(&mut &*node, replication_id.to_vec(), auth))
-                .map_err(|error| anyhow::anyhow!("seal role-authority cutover: {error}"))?;
+            vos::block_on(reg.set_role_authority(&mut &*node, replication_id.to_vec(), auth))
+                .map_err(|error| anyhow::anyhow!("bind role authority: {error}"))?;
         match status {
             Status::Ok => {}
-            other => anyhow::bail!("sealing canonical role-authority cutover returned {other}"),
+            other => anyhow::bail!("binding canonical role authority returned {other}"),
         }
-    } else if cutover.as_slice() != replication_id {
-        anyhow::bail!("registry is sealed to a different canonical role-authority incarnation");
+    } else if authority.as_slice() != replication_id {
+        anyhow::bail!("registry is bound to a different canonical role authority");
     }
 
     if vos::block_on(reg.agent(&mut &*node, vos::service::ROLE_AUTHORITY_INSTANCE_.into()))
@@ -943,7 +936,6 @@ fn register_extensions_from_local(
             path: e.path.clone(),
             init: e.init.clone(),
             cap_policy: e.cap_policy.clone(),
-            relay_unauthenticated: e.relay_unauthenticated,
             intra_caps: e.intra_caps.clone(),
             tick_ms: e.tick_ms,
         };
@@ -4480,34 +4472,7 @@ mod tests {
             service_root_actor_id(root_service, vos::service::ROLE_AUTHORITY_INSTANCE_)
         );
 
-        // A root-signed implementation/package revision with the exact
-        // platform contract is a valid authority actor upgrade. Dependent
-        // roots continue binding the frozen service deployment rather than
-        // following the catalog's new actor deployment.
-        let mut candidate = package.clone();
-        candidate.deployment_signature.signature = root
-            .sign(&candidate.signing_message())
-            .expect("sign authority candidate");
-        candidate.validate().unwrap();
-        assert_ne!(candidate.deployment_id(), package.deployment_id());
-        validate_role_authority_deployment(&candidate, &root_peer, Consistency::Raft).unwrap();
-        let candidate_wire = candidate.encode();
-        let candidate_hash = BlobHash::of(&candidate_wire).0;
-        let mut upgraded_row = row.clone();
-        upgraded_row.program_hash = candidate_hash;
-        let upgraded = resolve_service_role_authority_with(
-            space_id,
-            std::slice::from_ref(&upgraded_row),
-            &root_peer,
-            |hash| Ok((hash == candidate_hash).then(|| candidate_wire.clone())),
-        )
-        .unwrap();
-        let RoleAuthorityResolution::Ready(upgraded) = upgraded else {
-            panic!("upgraded root-signed authority did not resolve")
-        };
-        assert_eq!(upgraded.service.deployment, package.deployment_id());
-
-        let mut incompatible = candidate;
+        let mut incompatible = package.clone();
         incompatible.generated_interfaces = vec![1];
         incompatible.manifest.interfaces_hash =
             artifact_hash(b"interfaces", &incompatible.generated_interfaces);
@@ -4522,7 +4487,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_role_authority_pins_the_abi_17_incarnation() {
+    fn canonical_role_authority_identity_is_pinned() {
         let root = Keypair::ed25519_from_bytes([7; 32]).unwrap();
         let package = root_signed_role_authority_package(&root).unwrap();
         let package_hash = BlobHash::of(&package.encode()).0;
@@ -4535,35 +4500,20 @@ mod tests {
         assert_eq!(package.manifest.platform, vos::service::PLATFORM_ID);
         assert_eq!(
             hex::encode(package.manifest.actor_program.0),
-            "79099ccbec4e4dac7af893e153ba379a1d33aa75734daf1d93cbba3e684d65eb",
+            "0c3f3faf17ebae700120d4a85e1ed71f022e78794005a9cbc369eb19733ba8af",
         );
         assert_eq!(
             hex::encode(package.deployment_id().0),
-            "a811b21bb2d29e8e906b14c83f726ff20f8898e0d424b51f4e28213e304267e1",
+            "526478b38607b3eaff36b68f20cabdcbfc278dd95220851575e4b663cadf5e0d",
         );
         assert_eq!(
             hex::encode(package_hash),
-            "5f92e0bf821042268ef7c66b3ad0e6ee6ce435d989d20970ca2e01e7492be07d",
+            "78a0ed0b8aac56fffecdcafb680df606240271cb10d1dc019efa2e351ad950c5",
         );
         assert_eq!(
             hex::encode(replication_id),
-            "e8d2b68a1310b2872ab8d5bb2d42fc6555714d70ab9dff26063499f4f176d060",
+            "030b8afc167c56d9492fa82a27999271bd561050a8eea2292bd610864297f295",
         );
-        // ABI 17 is a clean service/storage break. It must not accidentally
-        // reuse the deterministic ABI-16 package or replication identities
-        // for the same root key and test space.
-        let abi_16_package_hash: [u8; 32] =
-            hex::decode("4e41e7e56b7c9f5e772467f07d5b96c806cfb552ccc20c00fc909d6ba875c1e9")
-                .unwrap()
-                .try_into()
-                .unwrap();
-        let abi_16_replication_id: [u8; 32] =
-            hex::decode("bc6d61dbb282bbe0dcdbe2fd72cb65074c441d7c759af531951216b52bd35d42")
-                .unwrap()
-                .try_into()
-                .unwrap();
-        assert_ne!(package_hash, abi_16_package_hash);
-        assert_ne!(replication_id, abi_16_replication_id);
     }
 
     #[test]

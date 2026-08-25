@@ -640,13 +640,13 @@ mod tests {
         let (db, dir) = temp_db();
         let mut s = RedbStorage::open(db.clone()).unwrap();
 
-        // Worker writes v1 through commit_batch.
+        // The worker writes its first state through commit_batch.
         block_on(s.commit_batch(WriteBatch {
-            state: Some(b"worker-v1".to_vec()),
+            state: Some(b"worker-a".to_vec()),
             ..Default::default()
         }))
         .unwrap();
-        assert_eq!(block_on(s.read_state()).unwrap(), b"worker-v1".to_vec());
+        assert_eq!(block_on(s.read_state()).unwrap(), b"worker-a".to_vec());
 
         // Out-of-band writer (mimicking `RaftCommit::commit_with_log`)
         // overwrites the state row WITHOUT going through the
@@ -662,7 +662,7 @@ mod tests {
 
         // Without the cache, `read_state` reflects the new on-disk
         // value immediately. (Pre-fix this returned the stale
-        // `b"worker-v1"`.)
+        // `b"worker-a"`.)
         assert_eq!(block_on(s.read_state()).unwrap(), b"out-of-band".to_vec());
 
         let _ = std::fs::remove_dir_all(dir);

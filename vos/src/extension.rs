@@ -33,15 +33,12 @@ use alloc::vec::Vec;
 /// What kind of extension this is — `Actor` (request-driven, the
 /// default) or `Transport` (a `handle_connection(&self, …)` server).
 ///
-/// Encoded as a trailing byte in the `.vos_meta` blob;
-/// pre-discriminant blobs (and a stale `kind = 1` service byte) default to `Actor`. The loader dispatches on
-/// this value in `extension_thread`.
+/// Encoded in the `.vos_meta` blob. Unknown values are rejected.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ExtensionKind {
     /// Request-driven: handler runs to completion per-dispatch.
-    /// Today's behavior. The default for unspecified or
-    /// previously-encoded metadata blobs.
+    /// The default for request-driven extensions.
     #[default]
     Actor = 0,
     /// Transport: a `handle_connection(&self, ctx,
@@ -54,13 +51,12 @@ pub enum ExtensionKind {
 }
 
 impl ExtensionKind {
-    /// Decode a metadata `kind` byte. Unknown values fall back to
-    /// `Actor` so newer extension blobs stay loadable on older
-    /// hosts.
-    pub const fn from_byte(b: u8) -> Self {
+    /// Decode a metadata `kind` byte.
+    pub const fn from_byte(b: u8) -> Option<Self> {
         match b {
-            2 => Self::Transport,
-            _ => Self::Actor,
+            0 => Some(Self::Actor),
+            2 => Some(Self::Transport),
+            _ => None,
         }
     }
 }
@@ -307,9 +303,10 @@ mod host {
                     Vec::new()
                 };
 
-                let kind = crate::actors::metadata::decode(&meta_bytes)
-                    .map(|m| ExtensionKind::from_byte(m.kind))
-                    .unwrap_or(ExtensionKind::Actor);
+                let meta = crate::actors::metadata::decode(&meta_bytes)
+                    .ok_or_else(|| "missing or malformed extension metadata".to_string())?;
+                let kind = ExtensionKind::from_byte(meta.kind)
+                    .ok_or_else(|| format!("unknown extension kind {}", meta.kind))?;
 
                 // Only Actor + Transport remain; both use the per-task executor
                 // ABI, Transport additionally requiring conn_new2.
@@ -319,12 +316,9 @@ mod host {
                     // (resolved below); the host branches on `plugin.kind()` to
                     // pick the transport accept-loop driver.
                     ExtensionKind::Actor | ExtensionKind::Transport => {
-                        // Per-task executor ABI. The current symbol names
-                        // mean a stale `.so` (which exports the earlier
-                        // `vos_extension_submit`/`poll_event`/`provide`, or the
-                        // even older single-future `dispatch`/`poll`/…) fails to
-                        // load here with a clear "missing" error instead of being
-                        // driven through an incompatible ABI.
+                        // Per-task executor ABI. Missing canonical symbols
+                        // extension task functions fail to load here with a
+                        // clear error.
                         let task_new_fn = *lib
                             .get::<TaskNewFn>(b"vos_extension_task_new")
                             .map_err(|e| format!("missing vos_extension_task_new: {e}"))?;
@@ -728,13 +722,11 @@ mod cap_policy {
     /// host today — there is no cap-gating layer in the actor / transport
     /// host ABI; a future enforcement layer will consult it.
     ///
-    /// Order matters for serde round-trip — `Log` first so the
-    /// default-derived discriminant matches the legacy Sprint-1 behaviour.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub enum CapPolicy {
-        /// Log a warning and let the call through (Sprint 1 behaviour).
+        /// Log a warning and let the call through.
         Log,
-        /// Refuse the call (Sprint 2 default).
+        /// Refuse the call.
         #[default]
         Block,
         /// Refuse + wind the extension down. For adversarial multi-tenant
@@ -818,7 +810,7 @@ mod tests {
         // Echo declares no kind — defaults to Actor.
         assert_eq!(
             ExtensionKind::from_byte(meta.kind),
-            ExtensionKind::Actor,
+            Some(ExtensionKind::Actor),
             "echo extension should be Actor-kind"
         );
 
@@ -852,12 +844,10 @@ mod tests {
 
     #[test]
     fn extension_kind_from_byte_round_trip() {
-        assert_eq!(ExtensionKind::from_byte(0), ExtensionKind::Actor);
-        assert_eq!(ExtensionKind::from_byte(2), ExtensionKind::Transport);
-        // The unused byte 1 and any other unknown value fall back to
-        // Actor for forward-compat.
-        assert_eq!(ExtensionKind::from_byte(1), ExtensionKind::Actor);
-        assert_eq!(ExtensionKind::from_byte(7), ExtensionKind::Actor);
-        assert_eq!(ExtensionKind::from_byte(255), ExtensionKind::Actor);
+        assert_eq!(ExtensionKind::from_byte(0), Some(ExtensionKind::Actor));
+        assert_eq!(ExtensionKind::from_byte(2), Some(ExtensionKind::Transport));
+        assert_eq!(ExtensionKind::from_byte(1), None);
+        assert_eq!(ExtensionKind::from_byte(7), None);
+        assert_eq!(ExtensionKind::from_byte(255), None);
     }
 }

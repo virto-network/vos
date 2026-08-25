@@ -90,16 +90,6 @@ pub struct ExtensionDef {
     /// [`Recipe::cap_policy`]. Useful for relaxing one
     /// extension to `"log"` while keeping the rest at `"block"`.
     pub cap_policy: Option<String>,
-    /// This extension is a relay for *external* traffic (HTTP
-    /// gateway, future REST adapters). When `true`, the extension's
-    /// outbound calls tag every InvokeRequest as
-    /// [`Caller::Unauthenticated`] so the targeted actor's
-    /// role-gated handlers refuse anonymous traffic.
-    ///
-    /// Defaults to `false` — most extensions compose with
-    /// other actors as trusted in-process peers.
-    #[serde(default)]
-    pub relay_unauthenticated: bool,
     /// Declared intra-system capabilities — `"actor:role"` strings
     /// bounding what this extension may relay to other actors. Empty
     /// (the default) denies all role-gated relays: outbound calls
@@ -313,28 +303,14 @@ pub(crate) fn register_extension(
             .map_err(|e| anyhow::anyhow!("extension '{}': {e}", ext.name))?;
         intra_caps.push(cap);
     }
-    if ext.relay_unauthenticated && !intra_caps.is_empty() {
-        tracing::warn!(
-            "extension '{}': relay_unauthenticated=true overrides intra_caps \
-             ({} declared) — a relay has no authority of its own, so the caps \
-             are ignored",
-            ext.name,
-            intra_caps.len(),
-        );
-    }
-
     // Operator visibility. `intra_caps` are host-side daemon
     // config (not replicated registry state). Render the *effective*
-    // caps (relay mode collapses to none) for the boot log, warn
+    // caps for the boot log, warn
     // loudly on footgun wildcards, and capture the canonical tokens to
     // return — the caller stamps them into the local endpoint
     // descriptor so `space describe` / `space caps` can surface them
     // without scraping the log.
-    let effective_caps: &[vos::IntraCap] = if ext.relay_unauthenticated {
-        &[]
-    } else {
-        &intra_caps
-    };
+    let effective_caps: &[vos::IntraCap] = &intra_caps;
     let effective_tokens: Vec<String> = effective_caps.iter().map(|c| c.to_string()).collect();
     tracing::info!(
         "extension '{}' intra_caps: {}",
@@ -357,11 +333,7 @@ pub(crate) fn register_extension(
     // this extension's ServiceId — letting it be the *target* of a
     // named intra_cap or an actor-local grant.
     let cfg = cfg.with_name(ext.name.clone());
-    let cfg = if ext.relay_unauthenticated {
-        cfg.relay_unauthenticated()
-    } else {
-        cfg.with_intra_caps(intra_caps)
-    };
+    let cfg = cfg.with_intra_caps(intra_caps);
 
     // Periodic `tick` cadence. `with_tick_ms` treats 0 as off.
     let cfg = match ext.tick_ms {

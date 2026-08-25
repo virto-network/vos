@@ -1088,8 +1088,8 @@ where
     /// Raft endpoint alive until confirmation commits.
     retirement_final_index: Option<u64>,
     /// Index of the log or installed snapshot that established
-    /// `effective_cfg`. `None` only for legacy persisted data that lacked
-    /// provenance. Lets log-mutation paths
+    /// `effective_cfg`. `None` means no durable configuration boundary has
+    /// been established. Lets log-mutation paths
     /// skip re-scanning the entire live log on every truncate
     /// — only a truncate that drops below this index actually
     /// invalidates the cached active config.
@@ -1245,7 +1245,7 @@ where
 
 /// Result of scanning the live log for the most recent
 /// `ConfigChange`. `active_config_index` is the durable evidence index
-/// (`0` for the initial `cfg.members`; None only for a legacy row),
+/// (`0` for the initial `cfg.members`; `None` when none is established),
 /// used by callers to decide
 /// whether a future log mutation requires a fresh scan.
 struct ConfigRecovery<N: NodeId> {
@@ -1254,8 +1254,8 @@ struct ConfigRecovery<N: NodeId> {
     /// finalization is pending.
     pending_joint: Option<u64>,
     /// Durable boundary that established `active`: a log/snapshot index,
-    /// `0` for static genesis membership, or `None` for legacy persisted
-    /// data without provenance.
+    /// `0` for static genesis membership, or `None` before membership is
+    /// durably established.
     active_config_index: Option<u64>,
     /// Old-only voters from a live joint/final pair, keyed by the final
     /// configuration index they still need to observe as committed.
@@ -1440,8 +1440,8 @@ where
     // No `ConfigChange` in the live log. On the boot path, the
     // persisted active_config row is the only place a
     // recently-compacted membership view can live. New rows retain the
-    // log/snapshot boundary that established the view; legacy rows remain
-    // usable but deliberately carry no committed-removal evidence.
+    // log/snapshot boundary that established the view. A row without that
+    // evidence cannot prove a committed removal.
     if consult_persisted && let Some(record) = storage.active_config().await? {
         return Ok(ConfigRecovery {
             active: ActiveConfig {

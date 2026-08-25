@@ -321,8 +321,8 @@ pub fn invoke_hash(code_hash: &[u8; 32], message: &[u8], state: &[u8]) -> Invoke
 
 /// Flag bit in the invoke input's leading `state_len` word marking the
 /// extended layout that carries witnessed-row keys. State blobs are
-/// nowhere near 2 GiB, so the bit is otherwise dead; legacy inputs
-/// (and every service invoke) keep the flag clear and parse as
+/// nowhere near 2 GiB, so the bit is otherwise dead; ordinary invokes
+/// keep the flag clear and parse as
 /// `[state_len:4][state][msg]`.
 pub const INVOKE_INPUT_HAS_ROWS: u32 = 0x8000_0000;
 
@@ -330,10 +330,7 @@ pub const INVOKE_INPUT_HAS_ROWS: u32 = 0x8000_0000;
 /// a caller-supplied 32-byte tag (between the row keys, if any, and the
 /// message) under which the host persists a durable proof record. Bit 30,
 /// beside [`INVOKE_INPUT_HAS_ROWS`] (bit 31). The remaining high bits are
-/// reserved-must-be-zero: an older host masks only bit 31, so a
-/// record-flagged input parses with a huge `state_len` and fails cleanly
-/// (the child gets garbage and traps) rather than silently misreading the
-/// tag as state.
+/// reserved and must be zero.
 pub const INVOKE_INPUT_RECORD: u32 = 0x4000_0000;
 
 /// The high bits of the leading length word reserved for invoke-input

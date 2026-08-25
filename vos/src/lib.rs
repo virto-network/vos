@@ -198,7 +198,7 @@ pub use actors::run_refine_entry;
 #[cfg(feature = "service")]
 pub use actors::{run_nested_actor_entry, run_task_entry};
 #[cfg(feature = "macros")]
-pub use vos_macros::{actor, actor as document, actor as agent, actor as skill, messages};
+pub use vos_macros::{actor, messages};
 
 /// The agent model: parent-managed children — `Tasks` tables of
 /// `Child::{Task, Peer}` records, spawned and driven from handlers.
