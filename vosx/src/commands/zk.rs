@@ -71,7 +71,7 @@ pub enum ZkCommand {
     Prove(ProveArgs),
     /// Verify a shipped provable-Task record against its proved chain — the
     /// witness-free third-party check: catalog allowlist for the record's
-    /// pinned (name, version), the record-reconstructed io-binding, and the
+    /// content-addressed pin, the record-reconstructed io-binding, and the
     /// caller's expected prior state root. Drives the prover extension's
     /// `verify_record` (segments stream from the host proof CAS).
     Verify(VerifyArgs),
@@ -105,8 +105,7 @@ pub struct PinArgs {
     /// the same format `--profile` reads.
     #[arg(long, value_name = "FILE")]
     profile_out: Option<PathBuf>,
-    /// Catalog TOML to write (appends a new version of this program;
-    /// created if absent).
+    /// Catalog TOML to write (appends an immutable pin; created if absent).
     #[arg(long, value_name = "FILE")]
     out: PathBuf,
     /// Representative exact witness payload to inject at `__VOS_WITNESS`
@@ -156,7 +155,7 @@ pub struct ProveArgs {
     /// the record's task_hash; `--name` overrides.
     #[arg(long, value_name = "FILE")]
     catalog: PathBuf,
-    /// Resolve the pin by catalog name (latest version) instead of by
+    /// Resolve the most recently appended pin by catalog name instead of by
     /// the record's task_hash.
     #[arg(long)]
     name: Option<String>,
@@ -165,7 +164,7 @@ pub struct ProveArgs {
     #[arg(long, value_name = "FILE")]
     out: Option<PathBuf>,
     /// Write the completed verifier-facing record here — the stored
-    /// record with its catalog identity (name, version) resolved in.
+    /// record with its catalog name and content identity resolved in.
     /// This is what ships to a counterparty next to the manifest hash.
     #[arg(long, value_name = "FILE")]
     record_out: Option<PathBuf>,
@@ -195,7 +194,7 @@ pub struct VerifyArgs {
     #[arg(long, value_name = "HEX64")]
     proof: String,
     /// Catalog TOML — the VERIFIER's trusted allowlist source. The
-    /// record's pinned (catalog_name, catalog_version) selects the entry.
+    /// record's content-addressed catalog pin selects the entry.
     #[arg(long, value_name = "FILE")]
     catalog: PathBuf,
     /// The prior state root the verifier independently knows (hex, 32
@@ -367,7 +366,7 @@ fn pin(args: PinArgs) -> Result<()> {
     let blob_hash = vos::provable::task_blob_hash(&blob);
     let pin = ProgramPin {
         name: args.name.clone(),
-        version: 0, // assigned by catalog.pin below
+        id: String::new(), // assigned by catalog.pin below
         blob_hash: bytes_to_hex(&blob_hash),
         commitments: commitments.iter().map(|c| bytes_to_hex(c)).collect(),
         canonical_profile: profile.clone(),
@@ -382,9 +381,7 @@ fn pin(args: PinArgs) -> Result<()> {
     } else {
         ProvableCatalog::new()
     };
-    // Append-versioned (D5): a re-pin adds a new version and retires
-    // nothing, so already-captured records keep a live allowlist.
-    let version = catalog.pin(pin);
+    let pin_id = catalog.pin(pin);
     catalog
         .save(&args.out)
         .map_err(|e| anyhow!("write catalog {}: {e}", args.out.display()))?;
@@ -395,7 +392,7 @@ fn pin(args: PinArgs) -> Result<()> {
     }
 
     eprintln!(
-        "pinned '{}' v{version} into {}",
+        "pinned '{}' ({pin_id}) into {}",
         args.name,
         args.out.display()
     );
@@ -464,10 +461,10 @@ fn prove(args: ProveArgs) -> Result<()> {
     };
     if !pin.blob_hash.is_empty() && pin.blob_hash != bytes_to_hex(&entry.record.task_hash) {
         bail!(
-            "pin '{}' v{} records blob_hash {} but the record's task ran blob {} — \
+            "pin '{}' ({}) records blob_hash {} but the record's task ran blob {} — \
              the record does not prove under this pin",
             pin.name,
-            pin.version,
+            pin.id,
             pin.blob_hash,
             bytes_to_hex(&entry.record.task_hash)
         );
@@ -497,9 +494,9 @@ fn prove(args: ProveArgs) -> Result<()> {
 
     // ── Drive the prover extension (pre-flight + chain, streamed) ────
     eprintln!(
-        "proving record under pin '{}' v{} ({} commitment(s), seg_steps={}, page_budget={}) — heavy, minutes…",
+        "proving record under pin '{}' ({}) ({} commitment(s), seg_steps={}, page_budget={}) — heavy, minutes…",
         pin.name,
-        pin.version,
+        pin.id,
         pin.commitments.len(),
         pin.seg_steps,
         pin.page_budget
@@ -550,7 +547,7 @@ fn prove(args: ProveArgs) -> Result<()> {
     if let Some(path) = &args.record_out {
         let mut record = entry.record.clone();
         record.catalog_name = pin.name.clone();
-        record.catalog_version = pin.version;
+        record.catalog_pin = pin.id.clone();
         std::fs::write(path, record.encode())
             .with_context(|| format!("write record {}", path.display()))?;
         eprintln!("  record (verifier-facing) = {}", path.display());
@@ -595,7 +592,7 @@ fn verify(args: VerifyArgs) -> Result<()> {
         );
     }
     let pin = catalog
-        .require_version(&record.catalog_name, record.catalog_version)
+        .require_pin(&record.catalog_name, &record.catalog_pin)
         .map_err(|e| {
             anyhow!("{e} — the verifier's catalog does not hold the pin this record proves under")
         })?;
@@ -633,9 +630,9 @@ fn verify(args: VerifyArgs) -> Result<()> {
     // ── The chain: allowlist + validity + io-binding, streamed ───────
     let space = resolve_space(args.space.as_deref())?;
     eprintln!(
-        "verifying chain against pin '{}' v{} ({} commitment(s))…",
+        "verifying chain against pin '{}' ({}) ({} commitment(s))…",
         pin.name,
-        pin.version,
+        pin.id,
         pin.commitments.len()
     );
     let reply = DaemonClient::with_connect(&space, |client| {
@@ -664,8 +661,8 @@ fn verify(args: VerifyArgs) -> Result<()> {
     match reply.as_u8() {
         Some(1) => {
             eprintln!(
-                "ACCEPT: the chain proves this record's transition under pin '{}' v{}",
-                pin.name, pin.version
+                "ACCEPT: the chain proves this record's transition under pin '{}' ({})",
+                pin.name, pin.id
             );
             Ok(())
         }

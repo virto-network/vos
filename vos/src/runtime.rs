@@ -2325,10 +2325,10 @@ fn run_task_invoke(
                 // No catalog exists node-side at capture; the prove
                 // flow's catalog holder (`vosx zk prove`) resolves the
                 // pin by blob_hash == task_hash (sound and unambiguous
-                // under the append-versioned catalog) and fills these
+                // under the append-only catalog) and fills these
                 // into the SHIPPED record.
                 catalog_name: alloc::string::String::new(),
-                catalog_version: 0,
+                catalog_pin: alloc::string::String::new(),
             },
         };
         payload.effects.push(crate::refine_payload::Effect::Write {

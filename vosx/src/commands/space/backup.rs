@@ -19,8 +19,7 @@ use crate::commands::space::{endpoint, space_lock::SpaceDataLock};
 use crate::spaces_index::{self, SpaceEntry};
 
 const MANIFEST_FILE: &str = "manifest.json";
-const ARCHIVE_FORMAT: &str = "VOSB1";
-const ARCHIVE_VERSION: u32 = 1;
+const ARCHIVE_FORMAT: &str = "VOS-BACKUP";
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ARCHIVE_FILES: usize = 100_000;
 const NODE_KEY_WIRE: &str = "data/node.key";
@@ -28,7 +27,6 @@ const NODE_KEY_WIRE: &str = "data/node.key";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BackupManifest {
     format: String,
-    version: u32,
     space: SpaceEntry,
     files: Vec<BackupFile>,
 }
@@ -193,7 +191,6 @@ fn create_archive(entry: &SpaceEntry, output: &Path, cache_dir: &Path) -> anyhow
 
     let manifest = BackupManifest {
         format: ARCHIVE_FORMAT.into(),
-        version: ARCHIVE_VERSION,
         space: entry.clone(),
         files,
     };
@@ -424,12 +421,8 @@ fn verify_archive(archive: &Path) -> anyhow::Result<BackupManifest> {
         .map_err(|error| anyhow::anyhow!("read {}: {error}", manifest_path.display()))?;
     let manifest: BackupManifest = serde_json::from_slice(&bytes)
         .map_err(|error| anyhow::anyhow!("decode {}: {error}", manifest_path.display()))?;
-    if manifest.format != ARCHIVE_FORMAT || manifest.version != ARCHIVE_VERSION {
-        anyhow::bail!(
-            "unsupported backup format {} version {}",
-            manifest.format,
-            manifest.version,
-        );
+    if manifest.format != ARCHIVE_FORMAT {
+        anyhow::bail!("unsupported backup format {}", manifest.format);
     }
     if manifest.files.len() > MAX_ARCHIVE_FILES {
         anyhow::bail!("backup manifest contains too many files");
@@ -1306,7 +1299,6 @@ mod tests {
             archive.join(MANIFEST_FILE),
             serde_json::to_vec_pretty(&BackupManifest {
                 format: ARCHIVE_FORMAT.into(),
-                version: ARCHIVE_VERSION,
                 space: entry,
                 files: Vec::new(),
             })

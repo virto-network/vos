@@ -554,7 +554,7 @@ fn parent_requires_the_proof_bound_public_claim_not_only_the_task_reply() {
             io_hash: vos::zk::compute_io_hash(&public_prime, &reply),
             app_public,
             catalog_name: String::new(),
-            catalog_version: 0,
+            catalog_pin: String::new(),
         },
     };
     assert!(ClerkLedger::record_matches_claim(

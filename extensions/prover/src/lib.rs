@@ -420,8 +420,7 @@ impl Prover {
     /// (`docs/plans/provable.md` D4) — four checks composed so none is
     /// meaningful without the others:
     ///   1. the chain verifies against the caller-supplied `allowlist`
-    ///      (the catalog pin for the record's `(catalog_name,
-    ///      catalog_version)` — WHICH PROGRAM);
+    ///      (the record's content-addressed catalog pin — WHICH PROGRAM);
     ///   2. the final segment's `public_io_hash` equals
     ///      `compute_io_hash(public', reply)` (inside the chain check);
     ///   3. `public'` is reconstructed from the RECORD's own fields
@@ -1836,7 +1835,7 @@ mod record_tests {
                 io_hash,
                 app_public,
                 catalog_name: String::new(),
-                catalog_version: 0,
+                catalog_pin: String::new(),
             },
         }
     }

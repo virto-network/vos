@@ -13,11 +13,8 @@
 //!   transition digest, reply, app-public bytes, and the bound io-hash
 //!   (φ[9..12]). It carries no witnessed leaf values.
 //!
-//! Legacy Local parents store both together under the reserved
-//! `__vos_proofrec/<tag>` row and prune with an ordinary delete effect; legacy
-//! CRDT/Raft effect-log recording rejects capture. Service instead executes
-//! only package-bound Tasks during exact Refine and commits the entry to an
-//! owner-only producer sidecar before proposing the public transition. Those
+//! The service executes only package-bound Tasks during exact Refine and
+//! commits the entry to an owner-only producer sidecar before proposing the public transition. Those
 //! bytes never enter actor state, service snapshots, Raft, or CRDT transport;
 //! the operator prunes them through the root driver's host API after proving
 //! or expiry.
@@ -53,15 +50,15 @@
 //!
 //! ## Catalog identity
 //!
-//! `catalog_name`/`catalog_version` route a verifier to the allowlist
+//! `catalog_name`/`catalog_pin` route a verifier to the allowlist
 //! entry the chain must verify against (`docs/plans/provable.md` D5).
 //! They are EMPTY at capture — the runtime holds no catalog — and are
 //! resolved at prove time by matching the catalog pin whose `blob_hash`
 //! equals the record's `task_hash` (unambiguous and stable across
-//! re-pins, because the catalog is append-versioned and a record's
+//! re-pins, because the catalog is append-only and a record's
 //! task_hash names the exact blob that ran). They are routing metadata,
 //! not identity: identity is the commitment allowlist the chain verifies
-//! against, and a lying name/version simply fails the chain check.
+//! against, and a lying name/pin simply fails the chain check.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -121,7 +118,7 @@ pub struct ProvableRecord {
     pub io_hash: [u8; 32],
     /// App-designated public bytes the guest bound via
     /// `vos::zk::bind_public` — folded into `public'` at halt and
-    /// surfaced by the v4 work-result. Leads with `root_before` (32
+    /// surfaced by the work result. Leads with `root_before` (32
     /// bytes) for root-attesting Tasks (see the module docs).
     pub app_public: Vec<u8>,
     /// Catalog identity of the pin whose allowlist verifies this
@@ -130,9 +127,9 @@ pub struct ProvableRecord {
     /// `task_hash`) fills it into the shipped record — the prover
     /// extension itself is catalog-free and never touches these fields.
     pub catalog_name: String,
-    /// The append-versioned catalog entry this record proves under
-    /// (`0` = unresolved).
-    pub catalog_version: u32,
+    /// Content identity of the catalog pin this record proves under. Empty at
+    /// capture and filled by the proving flow.
+    pub catalog_pin: String,
 }
 
 impl ProvableRecord {
@@ -200,9 +197,9 @@ impl ProofRecordEntry {
     }
 }
 
-/// Legacy guest-side API: read a captured `__vos_proofrec/<tag>` row back from
-/// THIS actor's own keyspace — the raw [`ProofRecordEntry`] bytes, or `None`
-/// when no record exists under the tag. Service intercepts the
+/// Read a captured `__vos_proofrec/<tag>` row back from this actor's own
+/// keyspace — the raw [`ProofRecordEntry`] bytes, or `None` when no record
+/// exists under the tag. The service intercepts the
 /// invocation-local read with a redacted [`ProvableRecord`]; operators fetch
 /// the complete entry from the root host's producer sidecar instead.
 ///
@@ -217,8 +214,7 @@ pub fn read_record_entry(tag: &[u8; 32]) -> Option<Vec<u8>> {
 /// Read the verifier-facing half of a record staged by the current Task
 /// execution. Service exposes only this redacted value to actor memory;
 /// the complete [`ProofRecordEntry`] remains in the producer-private host
-/// sidecar. Legacy storage rows decode through the same helper by discarding
-/// their private input half.
+/// sidecar.
 #[cfg(feature = "service")]
 pub fn read_staged_record(tag: &[u8; 32]) -> Option<ProvableRecord> {
     let bytes = crate::actors::storage::read_raw(&proofrec_key(tag))?;
@@ -264,7 +260,7 @@ mod tests {
             io_hash: crate::zk::compute_io_hash(&public_prime, &reply),
             app_public,
             catalog_name: String::new(),
-            catalog_version: 0,
+            catalog_pin: String::new(),
         }
     }
 
@@ -301,7 +297,7 @@ mod tests {
         // binding — a lie there is caught by the chain-vs-allowlist check.
         let mut r = base.clone();
         r.catalog_name = String::from("impostor");
-        r.catalog_version = 99;
+        r.catalog_pin = String::from("impostor");
         assert!(r.io_consistent());
     }
 

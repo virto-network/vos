@@ -3740,7 +3740,7 @@ mod tests {
             io_hash: [0; 32],
             app_public: b"public Task binding".to_vec(),
             catalog_name: alloc::string::String::new(),
-            catalog_version: 0,
+            catalog_pin: alloc::string::String::new(),
         };
         record.io_hash = crate::zk::compute_io_hash(&record.public_prime(), &record.reply);
         let entry = crate::provable::ProofRecordEntry {

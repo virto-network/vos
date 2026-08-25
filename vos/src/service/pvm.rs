@@ -1042,7 +1042,7 @@ impl ActorRefineRuntime {
                 io_hash,
                 app_public: payload.app_public,
                 catalog_name: alloc::string::String::new(),
-                catalog_version: 0,
+                catalog_pin: alloc::string::String::new(),
             };
             let entry = crate::provable::ProofRecordEntry {
                 input: crate::provable::ProvableInput {

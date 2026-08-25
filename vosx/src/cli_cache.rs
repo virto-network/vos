@@ -20,8 +20,6 @@
 //! ## On-disk shape
 //!
 //! ```toml
-//! version = 1
-//!
 //! [space.demo.gateway]
 //! actor_name = "HttpGateway"
 //! kind = 1
@@ -57,16 +55,12 @@ use vos::metadata::ParsedMeta;
 
 use crate::paths::config_root;
 
-const CACHE_VERSION: u32 = 1;
-
 pub fn path() -> PathBuf {
     config_root().join("cli_cache.toml")
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CliCache {
-    #[serde(default = "default_version")]
-    pub version: u32,
     #[serde(default, rename = "space")]
     pub spaces: BTreeMap<String, SpaceCache>,
 }
@@ -74,14 +68,9 @@ pub struct CliCache {
 impl Default for CliCache {
     fn default() -> Self {
         Self {
-            version: CACHE_VERSION,
             spaces: BTreeMap::new(),
         }
     }
-}
-
-fn default_version() -> u32 {
-    CACHE_VERSION
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
@@ -171,9 +160,6 @@ pub fn update_target(space: &str, target: &str, meta: &ParsedMeta) {
             CliCache::default()
         }
     };
-    if cache.version == 0 {
-        cache.version = CACHE_VERSION;
-    }
     let space_entry = cache.spaces.entry(space.to_string()).or_default();
     let target_meta = TargetMeta {
         actor_name: meta.actor_name.clone(),
@@ -373,7 +359,6 @@ mod tests {
         let p = tmp_path("missing");
         let c = load_from(&p).unwrap();
         assert!(c.spaces.is_empty());
-        assert_eq!(c.version, default_version());
     }
 
     #[test]
@@ -383,7 +368,6 @@ mod tests {
         // typo would silently produce a "no methods" output.
         let p = tmp_path("rt");
         let mut cache = CliCache::default();
-        cache.version = 1;
         let mut space = SpaceCache::default();
         space.targets.insert(
             "gateway".into(),
