@@ -960,18 +960,18 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
 
     assert!(
         PRODUCTION_ARTIFACT_PROVENANCE
-            .contains("source_revision = \"bd37fea6dbad77546f545578eab2d2f94695fa93\"")
+            .contains("source_revision = \"8e9cfa5b4015d6f455ee750bfdff9c8e23adacd7\"")
     );
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("guest_toolchain = \"nightly-2026-03-20\""));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("host_toolchain = \"nightly-2025-05-09\""));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "service_program_id = \"149dbdc223a29a45e13a26ad1189029a52f4388255af6e66c7be84abc2e15fde\""
+        "service_program_id = \"740ca0b6c39e6e4ecf08c4a23a122eb04511dc33e28d4f0c8927a1fc7ed78dc3\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "service_elf_blake2b_256 = \"bf3d83894decd8f5d50a29c7329c19d4ecddee78e29781de55c886e2bffd8a0a\""
+        "service_elf_blake2b_256 = \"254db4d44eae63c32bde7e52a0075bd80934dab3446422360e8439304f4d3f66\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "service_pvm_blake2b_256 = \"3e27a24c9e42c4abbef215f2f035f912138dc0cf956a85c342801574336e4bbd\""
+        "service_pvm_blake2b_256 = \"e99609fc3d12af2a766077cc759c0da4954b91b72fcd06ddc0cbc9452715e39f\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
         "authority_program_id = \"acf7b077cb573c46dbd2291effad2dec523cbd7584dd545068938d4e57d77ed3\""
