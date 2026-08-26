@@ -960,7 +960,7 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
 
     assert!(
         PRODUCTION_ARTIFACT_PROVENANCE
-            .contains("source_revision = \"c4eb70a5a47a77ed743826bd47129929a91e7b94\"")
+            .contains("source_revision = \"9fe12d2c6cfbda7063b3ed784fa6694e40a34b43\"")
     );
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("guest_toolchain = \"nightly-2026-03-20\""));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("host_toolchain = \"nightly-2025-05-09\""));
@@ -986,7 +986,7 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
         "clerk_actor_program_id = \"eb1988c93f3382e301124e0946d8eff304a7e299f5cda7f24d0a0f13c70aa06b\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "clerk_deployment_id = \"2724783ff463886bbf51f7ceea5d9b8bc2dd5f5be175eb2282edb57c3a72f6be\""
+        "clerk_deployment_id = \"ab40ded64fb235a7020bba8270b2cef7181e62169a05746352eb2bc45999b6d0\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
         "clerk_task_hash = \"93dc218a612dd37275a23126a62a45486f0fe5e93c244bf7cc885893347e34ef\""
@@ -1020,7 +1020,7 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
     );
     assert_eq!(
         hex(&clerk.deployment_id().0),
-        "2724783ff463886bbf51f7ceea5d9b8bc2dd5f5be175eb2282edb57c3a72f6be",
+        "ab40ded64fb235a7020bba8270b2cef7181e62169a05746352eb2bc45999b6d0",
     );
     assert_eq!(
         hex(&clerk.task_dependencies[0].binding.task.0),
