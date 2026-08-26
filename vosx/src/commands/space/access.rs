@@ -1,5 +1,7 @@
 //! Manage authority-owned access credentials for built-in ingress adapters.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Subcommand;
@@ -33,6 +35,7 @@ pub struct Args {
 #[derive(Serialize)]
 struct IssuedAccess {
     token: String,
+    recovery_file: String,
     credential_id: String,
     subject: String,
     role: &'static str,
@@ -66,6 +69,8 @@ fn issue(space: &str, role: &str, expires: &str) -> anyhow::Result<()> {
     let mut secret = [0_u8; 32];
     getrandom::getrandom(&mut secret)?;
     let credential_id = vos::ingress_credential_id(&secret);
+    let token = vos::ingress::encode_access_token(&secret);
+    let recovery_file = persist_recovery_token(space, &credential_id, &token)?;
     DaemonClient::with_connect(space, |client| {
         let target = client.resolve_target(vos::service::ROLE_AUTHORITY_INSTANCE_)?;
         let message = vos::value::Msg::new("issue_access")
@@ -82,7 +87,8 @@ fn issue(space: &str, role: &str, expires: &str) -> anyhow::Result<()> {
             anyhow::bail!("authority returned a mismatched credential");
         }
         let view = IssuedAccess {
-            token: vos::ingress::encode_access_token(&secret),
+            token,
+            recovery_file: recovery_file.display().to_string(),
             credential_id: hex::encode(credential_id),
             subject: hex::encode(status.subject),
             role: role_name(status.role),
@@ -92,12 +98,50 @@ fn issue(space: &str, role: &str, expires: &str) -> anyhow::Result<()> {
             crate::output::print_json(&view);
         } else {
             println!("{}", view.token);
+            eprintln!("recovery    {}", view.recovery_file);
             eprintln!("credential  {}", view.credential_id);
             eprintln!("role        {}", view.role);
             eprintln!("expires_at  {}", view.expires_at);
         }
         Ok(())
     })
+}
+
+fn persist_recovery_token(
+    space: &str,
+    credential_id: &[u8; 32],
+    token: &str,
+) -> anyhow::Result<PathBuf> {
+    let index = crate::spaces_index::load()?;
+    let entry = crate::spaces_index::find(&index, space)?;
+    let directory = Path::new(&entry.data_dir).join("private/access");
+    std::fs::create_dir_all(&directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let name = format!("{}.token", hex::encode(credential_id));
+    let destination = directory.join(name);
+    let temporary = directory.join(format!(
+        ".access-{}-{}.tmp",
+        std::process::id(),
+        hex::encode(&credential_id[..8]),
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    file.write_all(token.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, &destination)?;
+    std::fs::File::open(&directory)?.sync_all()?;
+    Ok(destination)
 }
 
 fn list(space: &str) -> anyhow::Result<()> {

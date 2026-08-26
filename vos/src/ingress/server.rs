@@ -28,6 +28,8 @@ fn default_max_connections() -> usize {
     1024
 }
 
+const MAX_BLOCKING_REQUESTS: usize = 64;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HttpTlsConfig {
     pub cert: PathBuf,
@@ -116,6 +118,7 @@ async fn serve(
     let port = listener.local_addr().map_or(0, |address| address.port());
     let inner = Arc::new(Inner::new(port));
     let permits = Arc::new(Semaphore::new(config.max_connections));
+    let blocking = Arc::new(Semaphore::new(MAX_BLOCKING_REQUESTS));
     while !handle.is_shutting_down() {
         let accepted = tokio::time::timeout(Duration::from_millis(250), listener.accept()).await;
         let Ok(Ok((stream, _))) = accepted else {
@@ -126,29 +129,36 @@ async fn serve(
         };
         let handle = handle.clone();
         let inner = inner.clone();
+        let blocking = blocking.clone();
         let tls = tls.clone();
         tokio::spawn(async move {
             let _permit = permit;
             if let Some(tls) = tls {
                 match tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await {
-                    Ok(Ok(stream)) => serve_connection(stream, handle, inner).await,
+                    Ok(Ok(stream)) => serve_connection(stream, handle, inner, blocking).await,
                     Ok(Err(error)) => {
                         crate::log::debug!("HTTP TLS handshake rejected: {error}")
                     }
                     Err(_) => crate::log::debug!("HTTP TLS handshake timed out"),
                 }
             } else {
-                serve_connection(stream, handle, inner).await;
+                serve_connection(stream, handle, inner, blocking).await;
             }
         });
     }
 }
 
-async fn serve_connection<T>(stream: T, handle: IngressHandle, inner: Arc<Inner>)
-where
+async fn serve_connection<T>(
+    stream: T,
+    handle: IngressHandle,
+    inner: Arc<Inner>,
+    blocking: Arc<Semaphore>,
+) where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let service = service_fn(move |request| handle_request(request, handle.clone(), inner.clone()));
+    let service = service_fn(move |request| {
+        handle_request(request, handle.clone(), inner.clone(), blocking.clone())
+    });
     let mut builder = http1::Builder::new();
     builder
         .keep_alive(true)
@@ -168,20 +178,9 @@ async fn handle_request(
     request: Request<Incoming>,
     handle: IngressHandle,
     inner: Arc<Inner>,
+    blocking: Arc<Semaphore>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let path = request.uri().path().to_string();
-    let access = if path == "/__status" {
-        None
-    } else {
-        match authenticate(&request, &handle) {
-            Ok(access) => Some(access),
-            Err((status, message)) => {
-                let response = simple(status, message);
-                inner.metrics.record_response(response.status().as_u16());
-                return Ok(response);
-            }
-        }
-    };
     let (parts, body) = request.into_parts();
     let body = match tokio::time::timeout(
         Duration::from_secs(30),
@@ -206,15 +205,38 @@ async fn handle_request(
         }
     };
     let request = http::Request::from_parts(parts, body);
-    let mut context = HttpIngressContext::new(handle, access);
-    let response = super::routing::dispatch(&request, &inner, &mut context).await;
+    let response = if path == "/__status" {
+        let mut context = HttpIngressContext::new(handle, None);
+        super::routing::dispatch(&request, &inner, &mut context)
+    } else {
+        let Ok(permit) = blocking.try_acquire_owned() else {
+            let response = simple(StatusCode::SERVICE_UNAVAILABLE, "HTTP worker pool is busy");
+            inner.metrics.record_response(response.status().as_u16());
+            return Ok(response);
+        };
+        let work_inner = inner.clone();
+        match tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let access = match authenticate(&request, &handle) {
+                Ok(access) => access,
+                Err((status, message)) => return simple_bytes(status, message),
+            };
+            let mut context = HttpIngressContext::new(handle, Some(access));
+            super::routing::dispatch(&request, &work_inner, &mut context)
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => super::types::text(500, "HTTP worker failed"),
+        }
+    };
     inner.metrics.record_response(response.status().as_u16());
     let (parts, body) = response.into_parts();
     Ok(Response::from_parts(parts, Full::new(Bytes::from(body))))
 }
 
-fn authenticate(
-    request: &Request<Incoming>,
+fn authenticate<B>(
+    request: &Request<B>,
     handle: &IngressHandle,
 ) -> Result<crate::IngressAccessStatus, (StatusCode, &'static str)> {
     let token = request
@@ -241,6 +263,10 @@ fn authenticate(
         return Err((StatusCode::UNAUTHORIZED, "access token expired"));
     }
     Ok(access)
+}
+
+fn simple_bytes(status: StatusCode, message: &'static str) -> super::types::Response {
+    super::types::text(status.as_u16(), message)
 }
 
 fn simple(status: StatusCode, message: &'static str) -> Response<Full<Bytes>> {

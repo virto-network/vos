@@ -770,8 +770,6 @@ mod tests {
                 },
             ],
             constructor: vec![],
-            kind: 0,
-            caps: vec![],
             doc: String::new(),
             crdt: false,
             provable: false,

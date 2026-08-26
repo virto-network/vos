@@ -32,11 +32,7 @@ use super::types::{Request, Response, json, text, with_content_type};
 /// Per-request entry point. Only the minimal health endpoint is anonymous.
 /// Every other route requires a live authority decision; schemas require
 /// Member and metrics require Admin.
-pub(crate) async fn dispatch(
-    req: &Request,
-    inner: &Inner,
-    ctx: &mut HttpIngressContext,
-) -> Response {
+pub(crate) fn dispatch(req: &Request, inner: &Inner, ctx: &mut HttpIngressContext) -> Response {
     if let Some(response) = handle_status(req, inner) {
         return response;
     }
@@ -53,7 +49,7 @@ pub(crate) async fn dispatch(
         return text(403, "member access is required");
     }
     inner.requests.fetch_add(1, Ordering::Relaxed);
-    handle(req, inner, ctx).await
+    handle(req, inner, ctx)
 }
 
 /// `GET /__status` — compact JSON liveness snapshot (port, running,
@@ -90,14 +86,14 @@ const PUBLIC_NAMESPACES: &[&str] = &["__schema", "__metrics", "openapi.json"];
 
 /// Resolve `/<agent>/<method>` (and the `/__schema*` / `/openapi.json`
 /// registry-backed endpoints) through the host ingress handle.
-async fn handle(req: &Request, inner: &Inner, ctx: &mut HttpIngressContext) -> Response {
+fn handle(req: &Request, inner: &Inner, ctx: &mut HttpIngressContext) -> Response {
     // `/__schema*` and `/openapi.json` short-circuit the agent/method
     // dispatcher. They `ask` the registry for schema, so they live here
     // (not in `dispatch`'s ask-free pre-auth shortcut).
-    if let Some(resp) = handle_schema(req, inner, ctx).await {
+    if let Some(resp) = handle_schema(req, inner, ctx) {
         return resp;
     }
-    if let Some(resp) = handle_openapi(req, inner, ctx).await {
+    if let Some(resp) = handle_openapi(req, inner, ctx) {
         return resp;
     }
 
@@ -117,14 +113,14 @@ async fn handle(req: &Request, inner: &Inner, ctx: &mut HttpIngressContext) -> R
         return text(404, format!("'{agent}' is a reserved ingress namespace"));
     }
 
-    let target = match resolve(ctx, &agent).await {
+    let target = match resolve(ctx, &agent) {
         Some(id) => id,
         None => return text(404, format!("unknown agent '{agent}'")),
     };
 
     // Look up the actor's schema. Dynamic HTTP dispatch is schema-bound so
     // method and argument validation cannot drift from the actor contract.
-    let Some(meta) = ensure_meta_cached(ctx, inner, target, &agent).await else {
+    let Some(meta) = ensure_meta_cached(ctx, inner, target, &agent) else {
         return text(502, format!("schema unavailable for agent '{agent}'"));
     };
     let Some(method_meta) = meta.messages.iter().find(|msg| msg.name == method).cloned() else {
@@ -144,10 +140,16 @@ async fn handle(req: &Request, inner: &Inner, ctx: &mut HttpIngressContext) -> R
     payload.extend_from_slice(&encoded);
 
     let ret_ty = Some(method_meta.returns.as_str());
-    match ctx
-        .invoke_actor(target, &payload, method_meta.attested)
-        .await
-    {
+    let idempotency_key = match mutation_idempotency_key(req, method_meta.is_query) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
+    match ctx.invoke_actor(
+        target,
+        &payload,
+        method_meta.attested,
+        idempotency_key.as_deref(),
+    ) {
         Ok(reply_bytes) if method_meta.attested => attested_response(&reply_bytes, ret_ty),
         Ok(reply_bytes) if reply_bytes.is_empty() => {
             // Handler returned `()` successfully → JSON null.
@@ -221,11 +223,7 @@ fn label_return(mut resp: Response, ret_ty: Option<&str>) -> Response {
 ///
 /// Non-GET methods return 405. Unknown agents and agents without registered
 /// metadata return 404.
-async fn handle_schema(
-    req: &Request,
-    inner: &Inner,
-    ctx: &mut HttpIngressContext,
-) -> Option<Response> {
+fn handle_schema(req: &Request, inner: &Inner, ctx: &mut HttpIngressContext) -> Option<Response> {
     let path = req.uri().path();
     if !path.starts_with("/__schema") {
         return None;
@@ -234,20 +232,20 @@ async fn handle_schema(
         return Some(text(405, "schema endpoints are GET-only"));
     }
     if path == "/__schema" || path == "/__schema/" {
-        return Some(list_schemas(ctx).await);
+        return Some(list_schemas(ctx));
     }
     let name = path.trim_start_matches("/__schema/").trim_end_matches('/');
     if name.is_empty() || name.contains('/') {
         return Some(text(400, "expected /__schema/<agent>"));
     }
-    Some(schema_for_agent(name, inner, ctx).await)
+    Some(schema_for_agent(name, inner, ctx))
 }
 
 /// Drain the registry's paginated `agent_names` into one list, in
 /// `instance_name` order. `None` means the registry was unreachable (a
 /// dropped dispatch); a malformed/misaligned page degrades to the names
 /// gathered so far rather than panicking the connection task.
-async fn drain_agent_names(ctx: &mut HttpIngressContext) -> Option<Vec<String>> {
+fn drain_agent_names(ctx: &mut HttpIngressContext) -> Option<Vec<String>> {
     let mut names: Vec<String> = Vec::new();
     loop {
         let after = names.last().cloned().unwrap_or_default();
@@ -258,7 +256,7 @@ async fn drain_agent_names(ctx: &mut HttpIngressContext) -> Option<Vec<String>> 
         let mut payload = Vec::with_capacity(1 + encoded.len());
         payload.push(crate::value::TAG_DYNAMIC);
         payload.extend_from_slice(&encoded);
-        let bytes = ctx.ask_registry(&payload).await?;
+        let bytes = ctx.ask_registry(&payload)?;
         // Reply is `Value::Bytes(rkyv(AgentNamePage))`; anything else (empty,
         // Unit, non-decodable) ends the drain with what we have.
         let page = match <crate::value::Value as crate::Decode>::try_decode(&bytes) {
@@ -279,8 +277,8 @@ async fn drain_agent_names(ctx: &mut HttpIngressContext) -> Option<Vec<String>> 
     Some(names)
 }
 
-async fn list_schemas(ctx: &mut HttpIngressContext) -> Response {
-    let Some(names) = drain_agent_names(ctx).await else {
+fn list_schemas(ctx: &mut HttpIngressContext) -> Response {
+    let Some(names) = drain_agent_names(ctx) else {
         return text(502, "registry unreachable");
     };
     json(
@@ -289,11 +287,11 @@ async fn list_schemas(ctx: &mut HttpIngressContext) -> Response {
     )
 }
 
-async fn schema_for_agent(name: &str, inner: &Inner, ctx: &mut HttpIngressContext) -> Response {
-    let Some(target) = resolve(ctx, name).await else {
+fn schema_for_agent(name: &str, inner: &Inner, ctx: &mut HttpIngressContext) -> Response {
+    let Some(target) = resolve(ctx, name) else {
         return text(404, format!("unknown agent '{name}'"));
     };
-    match ensure_meta_cached(ctx, inner, target, name).await {
+    match ensure_meta_cached(ctx, inner, target, name) {
         Some(meta) => json(200, meta_to_json(&meta).into_bytes()),
         None => text(404, format!("no schema for agent '{name}'")),
     }
@@ -361,23 +359,19 @@ fn meta_to_json(meta: &crate::metadata::ParsedMeta) -> String {
 ///   `Vec<u32>`        → `array` of integers
 ///   `Vec<String>`     → `array` of strings
 ///   any other         → `string` (fallback — generic UI still works)
-async fn handle_openapi(
-    req: &Request,
-    inner: &Inner,
-    ctx: &mut HttpIngressContext,
-) -> Option<Response> {
+fn handle_openapi(req: &Request, inner: &Inner, ctx: &mut HttpIngressContext) -> Option<Response> {
     if req.uri().path() != "/openapi.json" {
         return None;
     }
     if req.method() != Method::GET {
         return Some(text(405, "/openapi.json is GET-only"));
     }
-    Some(render_openapi(inner, ctx).await)
+    Some(render_openapi(inner, ctx))
 }
 
-async fn render_openapi(inner: &Inner, ctx: &mut HttpIngressContext) -> Response {
+fn render_openapi(inner: &Inner, ctx: &mut HttpIngressContext) -> Response {
     // 1. Get every installed agent's name.
-    let Some(names) = drain_agent_names(ctx).await else {
+    let Some(names) = drain_agent_names(ctx) else {
         return text(502, "registry unreachable");
     };
 
@@ -385,10 +379,10 @@ async fn render_openapi(inner: &Inner, ctx: &mut HttpIngressContext) -> Response
     //    render the per-method routes.
     let mut paths_obj = serde_json::Map::new();
     for name in &names {
-        let Some(target) = resolve(ctx, name).await else {
+        let Some(target) = resolve(ctx, name) else {
             continue;
         };
-        let Some(meta) = ensure_meta_cached(ctx, inner, target, name).await else {
+        let Some(meta) = ensure_meta_cached(ctx, inner, target, name) else {
             continue;
         };
         for msg in &meta.messages {
@@ -454,6 +448,8 @@ fn openapi_operation_for(
                     "name": f.name,
                     "in": "query",
                     "required": true,
+                    "style": "form",
+                    "explode": false,
                     "schema": vos_ty_to_openapi(&f.ty),
                 })
             })
@@ -485,6 +481,12 @@ fn openapi_operation_for(
                 "x-vos-attested": msg.attested,
                 "x-vos-space-role": msg.space_role,
                 "x-vos-actor-role": msg.actor_role,
+                "parameters": [{
+                    "name": "Idempotency-Key",
+                    "in": "header",
+                    "required": true,
+                    "schema": { "type": "string", "minLength": 1, "maxLength": 128 }
+                }],
                 "requestBody": {
                     "required": !msg.fields.is_empty(),
                     "content": {
@@ -514,7 +516,7 @@ fn vos_ty_to_openapi(ty: &str) -> serde_json::Value {
     let ty: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
     // `[u8; N]` — a fixed-length byte array, rendered as a hex string.
     if ty.starts_with("[u8;") && ty.ends_with(']') {
-        return serde_json::json!({ "type": "string", "format": "byte" });
+        return serde_json::json!({ "type": "string", "format": "hex" });
     }
     match ty.as_str() {
         "u8" => serde_json::json!({ "type": "integer", "format": "uint8" }),
@@ -525,7 +527,7 @@ fn vos_ty_to_openapi(ty: &str) -> serde_json::Value {
         "i64" => serde_json::json!({ "type": "integer", "format": "int64" }),
         "bool" => serde_json::json!({ "type": "boolean" }),
         "String" => serde_json::json!({ "type": "string" }),
-        "Vec<u8>" => serde_json::json!({ "type": "string", "format": "byte" }),
+        "Vec<u8>" => serde_json::json!({ "type": "string", "format": "hex" }),
         "Vec<u32>" => serde_json::json!({
             "type": "array",
             "items": { "type": "integer", "format": "uint32" }
@@ -544,9 +546,32 @@ fn split_path(path: &str) -> Option<(String, String)> {
     (!agent.is_empty() && !method.is_empty()).then(|| (agent.to_string(), method.to_string()))
 }
 
+#[allow(clippy::result_large_err)]
+fn mutation_idempotency_key(req: &Request, is_query: bool) -> Result<Option<String>, Response> {
+    if is_query {
+        return Ok(None);
+    }
+    let Some(value) = req.headers().get("idempotency-key") else {
+        return Err(text(
+            428,
+            "mutating requests require an Idempotency-Key header",
+        ));
+    };
+    let Ok(value) = value.to_str() else {
+        return Err(text(400, "Idempotency-Key must be visible ASCII"));
+    };
+    if value.is_empty() || value.len() > 128 {
+        return Err(text(
+            400,
+            "Idempotency-Key must contain 1 to 128 characters",
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
 /// Resolve only roots attached to this node. HTTP listeners are host-local;
 /// they do not turn registry aliases into implicit cross-node routes.
-async fn resolve(ctx: &mut HttpIngressContext, name: &str) -> Option<ActorId> {
+fn resolve(ctx: &mut HttpIngressContext, name: &str) -> Option<ActorId> {
     ctx.resolve_actor(name)
 }
 
@@ -699,6 +724,24 @@ fn coerce_to_type(v: crate::value::Value, ty: &str) -> Option<crate::value::Valu
             Value::Str(_) => Some(v),
             _ => None,
         },
+        "Vec<u32>" => {
+            if let Some(value) = as_str {
+                parse_query_u32_list(value).map(Value::ListU32)
+            } else if matches!(v, Value::ListU32(_)) {
+                Some(v)
+            } else {
+                None
+            }
+        }
+        "Vec<String>" => {
+            if let Some(value) = as_str {
+                parse_query_string_list(value).map(Value::ListStr)
+            } else if matches!(v, Value::ListStr(_)) {
+                Some(v)
+            } else {
+                None
+            }
+        }
         // Complex types we don't coerce — pass the original
         // through unchanged so the actor's `from_msg` accessor
         // gets a chance to evaluate the shape. Returning
@@ -708,9 +751,30 @@ fn coerce_to_type(v: crate::value::Value, ty: &str) -> Option<crate::value::Valu
     }
 }
 
+fn parse_query_u32_list(value: &str) -> Option<Vec<u32>> {
+    serde_json::from_str(value).ok().or_else(|| {
+        if value.is_empty() {
+            return Some(Vec::new());
+        }
+        value.split(',').map(|item| item.parse().ok()).collect()
+    })
+}
+
+fn parse_query_string_list(value: &str) -> Option<Vec<String>> {
+    serde_json::from_str(value).ok().or_else(|| {
+        Some(
+            value
+                .split(',')
+                .filter(|item| !item.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        )
+    })
+}
+
 /// Fetch the actor's schema from the registry on a cache miss and return the
 /// cached entry on a hit. A missing schema is cached for the TTL.
-async fn ensure_meta_cached(
+fn ensure_meta_cached(
     ctx: &mut HttpIngressContext,
     inner: &Inner,
     target: ActorId,
@@ -735,7 +799,7 @@ async fn ensure_meta_cached(
     // the registry does the agent → program_hash → meta join.
     // Empty reply means "no meta registered" → store `None` so we
     // don't retry on every request inside this TTL window.
-    let parsed = fetch_meta_from_registry(ctx, name).await;
+    let parsed = fetch_meta_from_registry(ctx, name);
     let mut cache = inner.meta_cache.lock().unwrap();
     cache.insert(
         target,
@@ -747,7 +811,7 @@ async fn ensure_meta_cached(
     parsed
 }
 
-async fn fetch_meta_from_registry(
+fn fetch_meta_from_registry(
     ctx: &mut HttpIngressContext,
     name: &str,
 ) -> Option<crate::metadata::ParsedMeta> {
@@ -756,7 +820,7 @@ async fn fetch_meta_from_registry(
     let mut payload = Vec::with_capacity(1 + encoded.len());
     payload.push(crate::value::TAG_DYNAMIC);
     payload.extend_from_slice(&encoded);
-    let bytes = ctx.ask_registry(&payload).await?;
+    let bytes = ctx.ask_registry(&payload)?;
     if bytes.is_empty() {
         return None;
     }
@@ -864,46 +928,92 @@ mod tests {
     }
 
     #[test]
-    fn openapi_byte_array_documents_as_byte_string() {
+    fn openapi_byte_array_documents_the_actual_hex_encoding() {
         let s = vos_ty_to_openapi("[u8;32]");
         assert_eq!(s["type"], "string");
-        assert_eq!(s["format"], "byte");
+        assert_eq!(s["format"], "hex");
     }
 
     #[test]
-    fn openapi_vec_u8_spaced_still_byte_string() {
+    fn openapi_vec_u8_spaced_still_documents_hex() {
         // The whitespace bug previously documented this as a plain string.
         let s = vos_ty_to_openapi("Vec < u8 >");
         assert_eq!(s["type"], "string");
-        assert_eq!(s["format"], "byte");
+        assert_eq!(s["format"], "hex");
+    }
+
+    #[test]
+    fn query_array_coercion_matches_openapi_form_encoding() {
+        use crate::value::Value;
+        assert_eq!(
+            coerce_to_type(Value::Str("1,2,3".into()), "Vec<u32>"),
+            Some(Value::ListU32(vec![1, 2, 3])),
+        );
+        assert_eq!(
+            coerce_to_type(Value::Str("one,two".into()), "Vec<String>"),
+            Some(Value::ListStr(vec!["one".into(), "two".into()])),
+        );
     }
 
     #[test]
     fn actor_http_verbs_follow_the_schema_query_flag() {
         let mut method = parsed_method(true);
-        let post = Request::builder()
+        let post = http::Request::builder()
             .method(Method::POST)
             .uri("/counter/value")
             .body(Vec::new())
             .unwrap();
         assert_eq!(
-            build_msg("value", &method, &post)
+            build_msg("value".into(), &method, &post)
                 .expect_err("queries are GET-only")
                 .status(),
             405
         );
 
         method.is_query = false;
-        let get = Request::builder()
+        let get = http::Request::builder()
             .method(Method::GET)
             .uri("/counter/increment")
             .body(Vec::new())
             .unwrap();
         assert_eq!(
-            build_msg("increment", &method, &get)
+            build_msg("increment".into(), &method, &get)
                 .expect_err("mutations reject GET")
                 .status(),
             405
+        );
+    }
+
+    #[test]
+    fn mutations_require_a_bounded_idempotency_key() {
+        let query = http::Request::builder()
+            .method(Method::GET)
+            .uri("/counter/value")
+            .body(Vec::new())
+            .unwrap();
+        assert_eq!(mutation_idempotency_key(&query, true).unwrap(), None);
+
+        let missing = http::Request::builder()
+            .method(Method::POST)
+            .uri("/counter/increment")
+            .body(Vec::new())
+            .unwrap();
+        assert_eq!(
+            mutation_idempotency_key(&missing, false)
+                .expect_err("mutation must be recoverable")
+                .status(),
+            428,
+        );
+
+        let keyed = http::Request::builder()
+            .method(Method::POST)
+            .uri("/counter/increment")
+            .header("Idempotency-Key", "transfer-42")
+            .body(Vec::new())
+            .unwrap();
+        assert_eq!(
+            mutation_idempotency_key(&keyed, false).unwrap(),
+            Some("transfer-42".into()),
         );
     }
 
@@ -917,7 +1027,7 @@ mod tests {
         use std::time::Instant;
 
         let inner = fresh_inner();
-        let target_id = 7u32;
+        let target_id = crate::service::ActorId([7; 32]);
         let fresh = Instant::now();
         let stale = fresh
             .checked_sub(META_CACHE_TTL + std::time::Duration::from_millis(1))

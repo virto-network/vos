@@ -62,6 +62,12 @@ replacement package on every voter, propose the upgrade, wait for application,
 then update the catalog with compare-and-swap. Exact retries recover the
 already committed result.
 
+The role authority's replication incarnation is fixed when a space is
+created. Rebuilding or upgrading its signed package does not derive a new
+incarnation. Existing spaces first perform the ordinary guest-owned authority
+upgrade and then reopen under the new daemon; the registry binding remains
+unchanged across that transition.
+
 ## Release artifacts
 
 ```bash

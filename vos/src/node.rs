@@ -151,6 +151,18 @@ type RaftTransportResolutions =
 
 const SERVICE_LOCAL_INVOKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn ingress_invocation_id(
+    subject: crate::service::SubjectId,
+    target: crate::service::ActorId,
+    key: &str,
+) -> crate::service::InvocationId {
+    let mut nonce = Vec::with_capacity(64 + key.len());
+    nonce.extend_from_slice(&subject.0);
+    nonce.extend_from_slice(&target.0);
+    nonce.extend_from_slice(key.as_bytes());
+    crate::service::InvocationId::derive(b"vos/http-ingress/idempotency-key", &nonce)
+}
+
 fn receive_service_invocation_reply(
     reply: &mpsc::Receiver<Vec<u8>>,
     proof_requested: bool,
@@ -1924,6 +1936,28 @@ impl IngressHandle {
             target,
             arguments,
             proof_requested,
+            None,
+        )
+    }
+
+    /// Invoke a mutation using a caller-owned stable request key. The same
+    /// authenticated subject, target, and key always produce the same durable
+    /// invocation ID across retries, process restarts, and Raft leaders.
+    pub fn invoke_actor_idempotent(
+        &self,
+        subject: crate::service::SubjectId,
+        target: crate::service::ActorId,
+        arguments: Vec<u8>,
+        proof_requested: bool,
+        key: &str,
+    ) -> Result<Vec<u8>, crate::actors::client::ClientError> {
+        let invocation = ingress_invocation_id(subject, target, key);
+        self.invoke_actor_wire(
+            crate::actors::Caller::Member(subject),
+            target,
+            arguments,
+            proof_requested,
+            Some(invocation),
         )
     }
 
@@ -1950,7 +1984,13 @@ impl IngressHandle {
         arguments.push(crate::value::TAG_DYNAMIC);
         arguments.extend_from_slice(&encoded);
         let reply = self
-            .invoke_actor_wire(crate::actors::Caller::System, authority, arguments, false)
+            .invoke_actor_wire(
+                crate::actors::Caller::System,
+                authority,
+                arguments,
+                false,
+                None,
+            )
             .map_err(|_| IngressAuthenticationError::AuthorityUnavailable)?;
         let value = <crate::value::Value as Decode>::try_decode(&reply)
             .ok_or(IngressAuthenticationError::AuthorityUnavailable)?;
@@ -1973,6 +2013,7 @@ impl IngressHandle {
         target: crate::service::ActorId,
         arguments: Vec<u8>,
         proof_requested: bool,
+        invocation: Option<crate::service::InvocationId>,
     ) -> Result<Vec<u8>, crate::actors::client::ClientError> {
         use crate::Decode;
 
@@ -1998,18 +2039,18 @@ impl IngressHandle {
             .get(&binding.route)
             .cloned()
             .ok_or(crate::actors::client::ClientError::Unreachable)?;
-        let ordinal = self
-            .service_invocation_ordinal
-            .fetch_add(1, Ordering::Relaxed);
-        let mut nonce = Vec::with_capacity(72);
-        nonce.extend_from_slice(&self.service_invocation_seed);
-        nonce.extend_from_slice(&ordinal.to_le_bytes());
-        nonce.extend_from_slice(&target.0);
+        let invocation = invocation.unwrap_or_else(|| {
+            let ordinal = self
+                .service_invocation_ordinal
+                .fetch_add(1, Ordering::Relaxed);
+            let mut nonce = Vec::with_capacity(72);
+            nonce.extend_from_slice(&self.service_invocation_seed);
+            nonce.extend_from_slice(&ordinal.to_le_bytes());
+            nonce.extend_from_slice(&target.0);
+            crate::service::InvocationId::derive(b"vos/node-root-invocation/service", &nonce)
+        });
         let ingress = crate::service::RootTreeInvocation {
-            invocation: crate::service::InvocationId::derive(
-                b"vos/node-root-invocation/service",
-                &nonce,
-            ),
+            invocation,
             target,
             method: message.name,
             arguments,
@@ -13694,6 +13735,24 @@ fn persist(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_idempotency_identity_is_stable_and_caller_scoped() {
+        let target = crate::service::ActorId([3; 32]);
+        let first = ingress_invocation_id(crate::service::SubjectId([1; 32]), target, "request-7");
+        assert_eq!(
+            first,
+            ingress_invocation_id(crate::service::SubjectId([1; 32]), target, "request-7"),
+        );
+        assert_ne!(
+            first,
+            ingress_invocation_id(crate::service::SubjectId([2; 32]), target, "request-7"),
+        );
+        assert_ne!(
+            first,
+            ingress_invocation_id(crate::service::SubjectId([1; 32]), target, "request-8"),
+        );
+    }
 
     #[test]
     fn node_lifecycle_basic() {

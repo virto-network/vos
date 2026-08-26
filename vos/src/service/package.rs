@@ -592,6 +592,42 @@ mod tests {
     }
 
     #[test]
+    fn packages_from_the_previous_metadata_layout_remain_reopenable() {
+        let mut package = package();
+        let mut cursor = 0usize;
+        let read_len = |bytes: &[u8], cursor: &mut usize| {
+            let length = u16::from_le_bytes([bytes[*cursor], bytes[*cursor + 1]]) as usize;
+            *cursor += 2;
+            length
+        };
+        let actor_name = read_len(&package.schemas, &mut cursor);
+        cursor += actor_name;
+        let messages = read_len(&package.schemas, &mut cursor);
+        for _ in 0..messages {
+            let name = read_len(&package.schemas, &mut cursor);
+            cursor += name + 1;
+            let fields = read_len(&package.schemas, &mut cursor);
+            for _ in 0..fields {
+                let name = read_len(&package.schemas, &mut cursor);
+                cursor += name;
+                let ty = read_len(&package.schemas, &mut cursor);
+                cursor += ty;
+            }
+        }
+        let constructor = read_len(&package.schemas, &mut cursor);
+        for _ in 0..constructor {
+            let name = read_len(&package.schemas, &mut cursor);
+            cursor += name;
+            let ty = read_len(&package.schemas, &mut cursor);
+            cursor += ty;
+        }
+        package.schemas.splice(cursor..cursor, [0, 0, 0]); // kind + empty caps
+        package.manifest.schemas_hash = artifact_hash(b"schemas", &package.schemas);
+
+        package.validate().expect("previous signed packages reopen");
+    }
+
+    #[test]
     fn task_dependencies_are_signed_canonical_package_content() {
         let mut package = package();
         let task_pvm = vos_pvm_compiler::assembler::Assembler::new().build();

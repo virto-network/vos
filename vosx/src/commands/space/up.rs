@@ -153,6 +153,15 @@ fn root_signed_role_authority_package(
     Ok(package)
 }
 
+fn bound_role_authority_replication(authority: &[u8], fresh: [u8; 32]) -> anyhow::Result<[u8; 32]> {
+    if authority.is_empty() {
+        return Ok(fresh);
+    }
+    authority
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("registry role-authority binding is malformed"))
+}
+
 /// On the immutable-root node, publish and install the canonical authority
 /// before application roots are resolved. Joiners wait for those signed
 /// registry rows rather than constructing another deployment.
@@ -178,35 +187,38 @@ fn ensure_service_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::
     let exact_package = package.encode();
     let package_hash = blob_store::cache_put(&exact_package)
         .map_err(|error| anyhow::anyhow!("cache canonical space-authority package: {error}"))?;
-    let replication_id = auto_replication_id(
+    let fresh_replication_id = auto_replication_id(
         &space_id,
         vos::service::ROLE_AUTHORITY_INSTANCE_,
         &package_hash.0,
     );
     let authority = vos::block_on(reg.role_authority(&mut &*node))
         .map_err(|error| anyhow::anyhow!("query role authority: {error}"))?;
-    if authority.is_empty() {
+    let replication_id = if authority.is_empty() {
         let auth = crate::commands::space::op_sign::op_auth(
             &root,
             "set_role_authority",
-            &[&replication_id],
+            &[&fresh_replication_id],
         )?;
         let status =
-            vos::block_on(reg.set_role_authority(&mut &*node, replication_id.to_vec(), auth))
+            vos::block_on(reg.set_role_authority(&mut &*node, fresh_replication_id.to_vec(), auth))
                 .map_err(|error| anyhow::anyhow!("bind role authority: {error}"))?;
         match status {
             Status::Ok => {}
             other => anyhow::bail!("binding canonical role authority returned {other}"),
         }
-    } else if authority.as_slice() != replication_id {
-        anyhow::bail!("registry is bound to a different canonical role authority");
-    }
+        bound_role_authority_replication(&[], fresh_replication_id)?
+    } else {
+        bound_role_authority_replication(&authority, fresh_replication_id)?
+    };
 
-    if vos::block_on(reg.agent(&mut &*node, vos::service::ROLE_AUTHORITY_INSTANCE_.into()))
-        .map_err(|error| anyhow::anyhow!("query service role authority: {error}"))?
-        .is_some()
+    let installed =
+        vos::block_on(reg.agent(&mut &*node, vos::service::ROLE_AUTHORITY_INSTANCE_.into()))
+            .map_err(|error| anyhow::anyhow!("query service role authority: {error}"))?;
+    if let Some(row) = installed.as_ref()
+        && row.replication_id != replication_id
     {
-        return Ok(());
+        anyhow::bail!("installed role authority does not match the immutable registry binding");
     }
     let program_name = package.manifest.name.clone();
     let existing = vos::block_on(reg.program(&mut &*node, program_name.clone()))
@@ -226,6 +238,14 @@ fn ensure_service_role_authority(node: &VosNode, space_id: [u8; 32]) -> anyhow::
                 anyhow::bail!("publishing canonical space-authority returned status {status}");
             }
         }
+    }
+    if installed.is_some() {
+        // The replication incarnation is the immutable authority binding,
+        // not a function of the latest package. Existing spaces deliberately
+        // keep it across an explicit `space upgrade`; publishing the current
+        // package here makes that migration available without rewriting the
+        // catalog ahead of the guest-owned UpgradeActor transition.
+        return Ok(());
     }
     let status = vos::block_on(reg.install(
         &mut &*node,
@@ -4136,6 +4156,21 @@ mod tests {
             hex::encode(replication_id),
             "7a763b11b4dc02a6b89278e911be50f24a7a998183b578ce572ba3b990a22341",
         );
+    }
+
+    #[test]
+    fn authority_package_repins_preserve_the_bound_replication_incarnation() {
+        let previous = [0x94; 32];
+        let current = [0x7a; 32];
+        assert_eq!(
+            bound_role_authority_replication(&previous, current).unwrap(),
+            previous,
+        );
+        assert_eq!(
+            bound_role_authority_replication(&[], current).unwrap(),
+            current
+        );
+        assert!(bound_role_authority_replication(&[1; 31], current).is_err());
     }
 
     #[test]

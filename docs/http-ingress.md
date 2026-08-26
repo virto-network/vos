@@ -44,7 +44,10 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/openapi.json
 vosx space access demo revoke <credential-prefix>
 ```
 
-The bearer secret is printed once. The authority stores only a
+The bearer secret is printed and durably written to the reported mode-0600
+recovery file before the authority is asked to activate it. A lost CLI or
+daemon response therefore cannot leave an active credential whose bearer is
+unrecoverable. The authority stores only a
 domain-separated credential identifier, its subject, role, expiry, issuer,
 and revocation state. Every request asks the live authority, so revocation and
 issuer-role changes take effect immediately.
@@ -59,8 +62,12 @@ issuer-role changes take effect immediately.
 | `GET /__metrics` | Admin |
 | `/<actor>/<method>` | Member, then the actor's method policy |
 
-Queries use `GET` query parameters. Mutating methods use a JSON object in a
-`POST`, `PUT`, or `PATCH` body. The schema and OpenAPI endpoints describe the
-installed packages that the listener can route locally. An attested method
-returns an object with the decoded `reply` and `attestation_wire`, the hex form
-of the canonical committed `RootTreeAttestedResult` wire.
+Queries use `GET` query parameters. Array query values use comma-separated
+OpenAPI form encoding; byte values use hexadecimal text. Mutating methods use
+a JSON object in a `POST`, `PUT`, or `PATCH` body and require an
+`Idempotency-Key` header. Reusing the key with the same authenticated caller
+recovers the original durable result; reusing it for different work is
+rejected. The schema and OpenAPI endpoints describe the installed packages
+that the listener can route locally. An attested method returns an object with
+the decoded `reply` and `attestation_wire`, the hex form of the canonical
+committed `RootTreeAttestedResult` wire.

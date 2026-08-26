@@ -370,19 +370,7 @@ impl SpaceAuthority {
 
     fn effective_role(&self, holder: Origin) -> Option<SpaceRole> {
         let holder = holder_key(holder)?;
-        if let Some(role) = self.effective_role_inner(holder, &mut Vec::new()) {
-            return Some(role);
-        }
-        if holder.0 != 0 {
-            return None;
-        }
-        let row = self.access_grants.get(&holder.1)?;
-        if row.revoked || row.subject != holder.1 {
-            return None;
-        }
-        let issuer = (0, row.issuer);
-        (self.effective_role_inner(issuer, &mut Vec::new()) == Some(SpaceRole::Admin))
-            .then_some(row.role)
+        self.effective_role_inner(holder, &mut Vec::new())
     }
 
     fn effective_role_inner(
@@ -394,20 +382,32 @@ impl SpaceAuthority {
             return None;
         }
         seen.push(holder);
-        let row = self
+        if let Some(row) = self
             .grants
             .iter()
-            .find(|row| (row.holder_kind, row.holder) == holder)?;
-        if row.grant_epoch <= row.revoke_epoch {
+            .find(|row| (row.holder_kind, row.holder) == holder)
+        {
+            if row.grant_epoch <= row.revoke_epoch {
+                return None;
+            }
+            let role = SpaceRole::from_u8(row.role)?;
+            let root = holder_key(self.root_origin())?;
+            let grantor = (row.grantor_kind, row.grantor);
+            if holder == root {
+                return (grantor == root).then_some(role);
+            }
+            return (self.effective_role_inner(grantor, seen) == Some(SpaceRole::Admin))
+                .then_some(role);
+        }
+        if holder.0 != 0 {
             return None;
         }
-        let role = SpaceRole::from_u8(row.role)?;
-        let root = holder_key(self.root_origin())?;
-        let grantor = (row.grantor_kind, row.grantor);
-        if holder == root {
-            return (grantor == root).then_some(role);
+        let row = self.access_grants.get(&holder.1)?;
+        if row.revoked || row.subject != holder.1 {
+            return None;
         }
-        (self.effective_role_inner(grantor, seen) == Some(SpaceRole::Admin)).then_some(role)
+        let issuer = (0, row.issuer);
+        (self.effective_role_inner(issuer, seen) == Some(SpaceRole::Admin)).then_some(row.role)
     }
 
     fn apply_grant(
@@ -755,11 +755,15 @@ mod tests {
                 credential_id: developer_id,
             },
         );
+        let authenticated = IngressAccessStatus::try_decode(&authenticated)
+            .expect("issued credential authenticates");
+        assert_eq!(authenticated.role, SpaceRole::Developer);
+        let developer_origin = Origin::Member(SubjectId(authenticated.subject));
+        let developer_claim = claim(space, developer_origin, SpaceRole::Developer);
         assert_eq!(
-            IngressAccessStatus::try_decode(&authenticated)
-                .expect("issued credential authenticates")
-                .role,
-            SpaceRole::Developer,
+            authorize(&mut authority, &developer_claim),
+            developer_claim.encode(),
+            "a credential delegated by an Admin bearer must authorize its role",
         );
         assert!(dispatch_as(
             &mut authority,

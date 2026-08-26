@@ -64,7 +64,7 @@ impl HttpIngressContext {
         self.access.as_ref().map(|access| access.role)
     }
 
-    pub(crate) async fn ask_registry(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
+    pub(crate) fn ask_registry(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
         self.handle.invoke_host_service(
             ServiceId::REGISTRY,
             payload.to_vec(),
@@ -72,11 +72,12 @@ impl HttpIngressContext {
         )
     }
 
-    pub(crate) async fn invoke_actor(
+    pub(crate) fn invoke_actor(
         &mut self,
         target: crate::service::ActorId,
         payload: &[u8],
         proof_requested: bool,
+        idempotency_key: Option<&str>,
     ) -> Result<Vec<u8>, crate::ClientError> {
         let subject = crate::service::SubjectId(
             self.access
@@ -84,8 +85,18 @@ impl HttpIngressContext {
                 .ok_or(crate::ClientError::Forbidden)?
                 .subject,
         );
-        self.handle
-            .invoke_actor(subject, target, payload.to_vec(), proof_requested)
+        match idempotency_key {
+            Some(key) => self.handle.invoke_actor_idempotent(
+                subject,
+                target,
+                payload.to_vec(),
+                proof_requested,
+                key,
+            ),
+            None => self
+                .handle
+                .invoke_actor(subject, target, payload.to_vec(), proof_requested),
+        }
     }
 
     pub(crate) fn resolve_actor(&self, name: &str) -> Option<crate::service::ActorId> {

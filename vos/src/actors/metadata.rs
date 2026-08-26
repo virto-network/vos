@@ -659,6 +659,32 @@ mod tests {
         assert_eq!(parsed.messages[0].returns, "u64");
         assert!(parsed.messages[0].exposed_to_cli);
     }
+
+    #[test]
+    fn previous_extension_metadata_layout_remains_decode_only_compatible() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&6_u16.to_le_bytes());
+        bytes.extend_from_slice(b"Legacy");
+        bytes.extend_from_slice(&0_u16.to_le_bytes()); // messages
+        bytes.extend_from_slice(&0_u16.to_le_bytes()); // constructor
+        bytes.push(0); // retired kind = actor
+        bytes.extend_from_slice(&0_u16.to_le_bytes()); // retired caps
+        bytes.extend_from_slice(&0_u16.to_le_bytes()); // CLI methods
+        bytes.extend_from_slice(&0_u16.to_le_bytes()); // returns
+        bytes.extend_from_slice(&0_u16.to_le_bytes()); // message docs
+        bytes.extend_from_slice(&0_u16.to_le_bytes()); // actor doc string
+        bytes.extend_from_slice(&0_u16.to_le_bytes()); // timeouts
+        bytes.extend_from_slice(&0_u16.to_le_bytes()); // modes
+        bytes.push(0); // CRDT
+        bytes.extend_from_slice(&0_u16.to_le_bytes()); // method policies
+        bytes.extend_from_slice(&0_u16.to_le_bytes()); // actor roles
+        bytes.push(0); // provable
+
+        let parsed = decode(&bytes).expect("previous metadata layout must reopen");
+        assert_eq!(parsed.actor_name, "Legacy");
+        assert!(parsed.messages.is_empty());
+        assert!(parsed.constructor.is_empty());
+    }
 }
 
 /// Parsed metadata + the `decode` / `from_elf` / `raw_section_from_elf`
@@ -723,6 +749,14 @@ mod decode {
 
     /// Decode binary metadata from a `.vos_meta` section.
     pub fn decode(data: &[u8]) -> Option<ParsedMeta> {
+        decode_format(data, false).or_else(|| decode_format(data, true))
+    }
+
+    /// Decode the canonical actor-only layout, or the immediately preceding
+    /// layout that carried the removed native-extension `kind` and `caps`
+    /// fields. The legacy branch is decode-only so installed signed packages
+    /// remain reopenable without keeping those concepts in the public API.
+    fn decode_format(data: &[u8], legacy_extension_fields: bool) -> Option<ParsedMeta> {
         let mut pos = 0;
 
         let actor_name = read_str(data, &mut pos)?;
@@ -770,6 +804,18 @@ mod decode {
                 name: read_str(data, &mut pos)?,
                 ty: read_str(data, &mut pos)?,
             });
+        }
+
+        if legacy_extension_fields {
+            let kind = *data.get(pos)?;
+            pos += 1;
+            if kind > 1 {
+                return None;
+            }
+            let cap_count = read_u16(data, &mut pos)? as usize;
+            for _ in 0..cap_count {
+                let _ = read_str(data, &mut pos)?;
+            }
         }
 
         let cli_count = read_u16(data, &mut pos)? as usize;
