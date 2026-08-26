@@ -140,6 +140,7 @@ fn ecall_compress(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
     // the digest bytes written through `h_ptr` are the only portable result.
     unsafe {
         core::arch::asm!(
+            "csrw 0x801, zero",
             "ecall",
             in("t0") ECALL_BLAKE2B_COMPRESS as u64,
             inlateout("a0") h_ptr => _,

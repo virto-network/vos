@@ -252,13 +252,15 @@ fn _management_ecall(_a0: u64, _a1: u64, _a2: u64, _a3: u64, op: u64, _refs: u64
 fn _ecall(id: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
     let ret: u64;
     let discarded_result1: u64;
-    // SAFETY: this is the PVM hostcall trap. The asm! block has no
+    // SAFETY: CSR 0x801 marks the following ECALL as a capability call. The
+    // asm! block has no
     // memory operands; the host reads guest memory through caps. The
     // `nostack` option promises we don't touch the stack pointer.
     // The hostcall ID + arg semantics are defined by VOS ABI; the
     // host validates each ID before acting.
     unsafe {
         core::arch::asm!(
+            "csrw 0x801, zero",
             "ecall",
             in("t0") id,
             inlateout("a0") a0 => ret,
@@ -288,10 +290,11 @@ fn _ecall(id: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -
 fn _ecall_pair(id: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> [u64; 2] {
     let ret0: u64;
     let ret1: u64;
-    // SAFETY: same hostcall boundary as `_ecall`; PVM injects the one
+    // SAFETY: same explicitly marked hostcall boundary as `_ecall`; PVM injects the one
     // suspension result into phi[7]/phi[8] before execution resumes.
     unsafe {
         core::arch::asm!(
+            "csrw 0x801, zero",
             "ecall",
             in("t0") id,
             inlateout("a0") a0 => ret0,
