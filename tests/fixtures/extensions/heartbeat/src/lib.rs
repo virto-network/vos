@@ -1,10 +1,10 @@
-//! Heartbeat — an **actor-mode** extension that pings a target actor on a
+//! Heartbeat — an extension that pings a target actor on a
 //! Host-driven `tick()` timer.
 //!
-//! Validates the actor-mode periodic primitive: the host dispatches a
+//! Validates periodic extension work: the host dispatches a
 //! synthetic `tick` message to this actor's `tick` handler about every
 //! `tick_ms` (set on the [`ExtensionConfig`](vos::node::ExtensionConfig) /
-//! manifest), the handler originates exactly one `ctx.ask_dispatch` per
+//! manifest), the handler originates exactly one `ctx.ask_raw` per
 //! tick, and there is **no `run()` loop** — the host's generic `__stop`
 //! (`vosx <agent> stop`) quiesces the agent. The host owns the cadence, the
 //! actor owns one tick's work.
@@ -25,7 +25,7 @@ fn heartbeat_target() -> u32 {
         .unwrap_or(1)
 }
 
-#[actor(caps = ["net.libp2p.dial"])]
+#[actor]
 pub struct Heartbeat {
     pings_sent: u32,
 }
@@ -38,8 +38,8 @@ impl Heartbeat {
 
     /// One heartbeat tick: ping the target actor once. The host calls this
     /// roughly every `tick_ms` (no inbound caller — the relayed authority is
-    /// `Unauthenticated`). A reply (`Some`) counts as a successful ping;
-    /// `None` means a transport error / the target went away (e.g. during
+    /// `Unauthenticated`). A reply (`Ok`) counts as a successful ping;
+    /// `Err` means the target rejected the call or went away (e.g. during
     /// shutdown) and is just logged — the next tick retries.
     #[msg]
     async fn tick(&mut self, ctx: &mut Context<Self>) {
@@ -51,15 +51,15 @@ impl Heartbeat {
         let mut payload = vec![vos::value::TAG_DYNAMIC];
         payload.extend_from_slice(&echo_msg.encode());
 
-        match ctx.ask_dispatch(ServiceId(target), &payload).await {
-            Some(_reply) => {
+        match ctx.ask_raw(ServiceId(target), &payload).await {
+            Ok(_reply) => {
                 self.pings_sent += 1;
                 if self.pings_sent.is_multiple_of(10) {
                     log::info!("heartbeat: {} pings sent", self.pings_sent);
                 }
             }
-            None => {
-                log::warn!("heartbeat: ask returned None — transport error / target gone?");
+            Err(error) => {
+                log::warn!("heartbeat: ask failed: {error:?}");
             }
         }
     }

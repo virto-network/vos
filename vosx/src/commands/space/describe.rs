@@ -1,12 +1,12 @@
 //! `space describe <agent>` — pretty-print the actor schema the
-//! registry has on file. Operator-facing mirror of the gateway's
+//! registry has on file. Operator-facing mirror of built-in HTTP ingress's
 //! `GET /__schema/<agent>` endpoint, using the same wire path
 //! (`meta_for_instance` on the registry) and rendering logic.
 //!
 //! Output modes:
 //!   - default: aligned columns, one line per message and one
 //!     "name: type" pair per arg.
-//!   - `--format json`: emits the same JSON shape the gateway's
+//!   - `--format json`: emits the same JSON shape HTTP ingress's
 //!     `/__schema/<agent>` returns, suitable for piping to `jq`
 //!     or feeding into a code generator.
 
@@ -30,7 +30,7 @@ struct MessageView<'a> {
     fields: Vec<FieldView<'a>>,
     /// `true` when the producer declared this handler via
     /// `#[msg(cli)]` (actor mode) or in `cli = [...]`
-    /// (service-mode `service_main!`). Mirrors the wire-side
+    /// (`service_main!`). Mirrors the wire-side
     /// `ParsedMessage.exposed_to_cli` so a JSON consumer
     /// (`vosx <ext> <cmd>` schema cache, IDE tooling, etc.)
     /// sees which surface is intended for the CLI.
@@ -42,10 +42,6 @@ struct MetaView<'a> {
     actor_name: &'a str,
     messages: Vec<MessageView<'a>>,
     constructor: Vec<FieldView<'a>>,
-    kind: u8,
-    /// Host-ABI capabilities the producer declared in `.vos_meta`
-    /// (`net.*`, `fs.*`, …) — what syscalls the extension may make.
-    caps: Vec<&'a str>,
     /// Effective relay `intra_caps` (`"actor:role"` tokens) the
     /// *running daemon* loaded for this instance — distinct from
     /// `caps`. `None` when the instance isn't a service extension this
@@ -88,8 +84,6 @@ impl<'a> From<&'a ParsedMeta> for MetaView<'a> {
                     ty: &f.ty,
                 })
                 .collect(),
-            kind: m.kind,
-            caps: m.caps.iter().map(String::as_str).collect(),
             // Filled in by `run` from the daemon's endpoint descriptor;
             // ParsedMeta (registry schema) doesn't carry relay caps.
             relay_caps: None,
@@ -140,10 +134,6 @@ pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
 
         // Text mode — one block per actor + per-method indent.
         println!("actor:  {}", meta.actor_name);
-        println!("kind:   {}", kind_label(meta.kind));
-        if !meta.caps.is_empty() {
-            println!("caps:   {}", meta.caps.join(", "));
-        }
         if let Some(caps) = &relay_caps {
             let rendered = if caps.is_empty() {
                 "(none — relays as Unauthenticated)".to_string()
@@ -187,12 +177,4 @@ pub fn run(space: &str, instance: &str) -> anyhow::Result<()> {
         }
         Ok(())
     })
-}
-
-fn kind_label(k: u8) -> &'static str {
-    match k {
-        0 => "actor",
-        1 => "service",
-        _ => "unknown",
-    }
 }

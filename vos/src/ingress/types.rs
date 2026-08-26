@@ -1,9 +1,8 @@
-//! HTTP types — the gateway speaks the standard `http` crate's
+//! HTTP types — the ingress speaks the standard `http` crate's
 //! `Request`/`Response`, with an owned `Vec<u8>` body.
 //!
-//! The hand-written HTTP/1.1 parser ([`crate::http1`]) fills a
-//! [`Request`] off the byte stream, the router produces a [`Response`],
-//! and the serializer turns it back into bytes for `ctx.write`.
+//! Hyper fills a [`Request`] from the bounded connection body, the router
+//! produces a [`Response`], and the server writes it back to the connection.
 //!
 //! `http::Response` is a foreign type, so the response constructors live
 //! here as free functions rather than inherent methods.
@@ -40,10 +39,10 @@ pub(crate) fn text(status: u16, msg: impl Into<String>) -> Response {
 }
 
 /// Build a response with a single Content-Type header. The status codes
-/// the gateway emits are all valid, so `from_u16` never fails here.
+/// the ingress emits are all valid, so `from_u16` never fails here.
 fn build(status: u16, content_type: &'static str, body: Vec<u8>) -> Response {
     let mut resp = Response::new(body);
-    *resp.status_mut() = StatusCode::from_u16(status).expect("gateway emits valid status codes");
+    *resp.status_mut() = StatusCode::from_u16(status).expect("ingress emits valid status codes");
     resp.headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
     resp

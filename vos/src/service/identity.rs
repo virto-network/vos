@@ -83,6 +83,15 @@ impl SubjectId {
             &[peer_id],
         ))
     }
+
+    /// Stable identity for a host-validated ingress credential. The secret
+    /// itself never enters actor arguments or durable service state.
+    pub fn of_ingress_credential(credential_id: &[u8; 32]) -> Self {
+        Self(crate::crypto::blake2b_hash::<32>(
+            b"vos/subject/ingress-credential",
+            &[credential_id],
+        ))
+    }
 }
 
 impl ActorId {

@@ -13,6 +13,8 @@ use vos::service::{
     Origin, RoleAuthorityInviteRedemption, RoleAuthorityInviteRevocation, RoleAuthorityMutation,
     RoleAuthorizationClaim, ServiceWire, SpaceId, SubjectId,
 };
+use vos::storage::StorageMap;
+use vos::{IngressAccessGrant, IngressAccessStatus};
 
 #[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Debug, Clone, PartialEq, Eq,
@@ -62,6 +64,7 @@ pub fn initial_state(
                 grantor: root.0,
                 grantor_peer_id: root_grantor_peer_id,
             }],
+            access_grants: StorageMap::default(),
         }
         .encode(),
     )
@@ -74,6 +77,10 @@ pub struct SpaceAuthority {
     root_peer_id: Vec<u8>,
     revoked_invites: Vec<[u8; 32]>,
     grants: Vec<GrantRow>,
+    /// Protocol-neutral ingress credentials, one private point row per
+    /// subject. Bearer secrets never enter this actor or its durable state.
+    #[storage]
+    access_grants: StorageMap<[u8; 32], IngressAccessGrant>,
 }
 
 #[messages]
@@ -94,7 +101,131 @@ impl SpaceAuthority {
             root_peer_id: Vec::new(),
             revoked_invites: Vec::new(),
             grants: Vec::new(),
+            access_grants: StorageMap::default(),
         }
+    }
+
+    /// Issue one ingress credential. Any currently effective Admin may issue
+    /// Member or Developer access; only the immutable root may issue Admin.
+    /// Exact retries are idempotent and conflicting reuse is refused.
+    #[msg]
+    fn issue_access(
+        &mut self,
+        credential_id: [u8; 32],
+        role: u8,
+        expires_at: u64,
+        ctx: &mut Context<Self>,
+    ) -> Vec<u8> {
+        let Origin::Member(issuer) = ctx.origin() else {
+            return Vec::new();
+        };
+        let Some(role) = SpaceRole::from_u8(role) else {
+            return Vec::new();
+        };
+        if credential_id == [0; 32]
+            || expires_at == 0
+            || self.effective_role(Origin::Member(issuer)) != Some(SpaceRole::Admin)
+            || (role == SpaceRole::Admin && Origin::Member(issuer) != self.root_origin())
+            || role == SpaceRole::Guest
+        {
+            return Vec::new();
+        }
+        let subject = SubjectId::of_ingress_credential(&credential_id);
+        let candidate = IngressAccessGrant {
+            credential_id,
+            subject: subject.0,
+            role,
+            expires_at,
+            issuer: issuer.0,
+            epoch: 1,
+            revoked: false,
+        };
+        if let Some(existing) = self.access_grants.get(&subject.0) {
+            if existing != candidate {
+                return Vec::new();
+            }
+        } else {
+            self.access_grants.insert(&subject.0, &candidate);
+        }
+        IngressAccessStatus {
+            credential_id,
+            subject: subject.0,
+            role,
+            expires_at,
+        }
+        .encode()
+    }
+
+    /// Revoke an ingress credential. Revocation is monotone and exact retries
+    /// succeed so CLI recovery never needs the bearer secret.
+    #[msg]
+    fn revoke_access(&mut self, credential_id: [u8; 32], ctx: &mut Context<Self>) -> bool {
+        let Origin::Member(issuer) = ctx.origin() else {
+            return false;
+        };
+        if self.effective_role(Origin::Member(issuer)) != Some(SpaceRole::Admin) {
+            return false;
+        }
+        let subject = SubjectId::of_ingress_credential(&credential_id);
+        let Some(mut row) = self.access_grants.get(&subject.0) else {
+            return true;
+        };
+        if row.credential_id != credential_id {
+            return false;
+        }
+        row.revoked = true;
+        row.epoch = row.epoch.saturating_add(1);
+        self.access_grants.insert(&subject.0, &row);
+        true
+    }
+
+    /// Return the current authority decision for a credential ID. The host
+    /// separately checks `expires_at` against its trusted admission clock.
+    #[msg]
+    fn authenticate_access(&self, credential_id: [u8; 32]) -> Vec<u8> {
+        let subject = SubjectId::of_ingress_credential(&credential_id);
+        let Some(row) = self.access_grants.get(&subject.0) else {
+            return Vec::new();
+        };
+        if row.credential_id != credential_id
+            || row.revoked
+            || self.effective_role(Origin::Member(SubjectId(row.issuer))) != Some(SpaceRole::Admin)
+        {
+            return Vec::new();
+        }
+        IngressAccessStatus {
+            credential_id,
+            subject: row.subject,
+            role: row.role,
+            expires_at: row.expires_at,
+        }
+        .encode()
+    }
+
+    /// Page ingress credentials for administration without exposing bearer
+    /// secrets. The cursor is the previous subject bytes; empty starts at the
+    /// first row.
+    #[msg]
+    fn list_access(
+        &self,
+        after: Vec<u8>,
+        budget: u32,
+        ctx: &mut Context<Self>,
+    ) -> Vec<IngressAccessGrant> {
+        let Origin::Member(caller) = ctx.origin() else {
+            return Vec::new();
+        };
+        if self.effective_role(Origin::Member(caller)) != Some(SpaceRole::Admin) {
+            return Vec::new();
+        }
+        let start: [u8; 32] = after.as_slice().try_into().unwrap_or([0; 32]);
+        let skip = (after.len() == 32).then_some(start);
+        self.access_grants
+            .iter_from(&start)
+            .filter(move |(key, _)| skip != Some(*key))
+            .map(|(_, row)| row)
+            .take((budget.clamp(1, 128)) as usize)
+            .collect()
     }
 
     /// Apply one root-signed grant or revoke. Epochs are strictly monotonic
@@ -239,7 +370,19 @@ impl SpaceAuthority {
 
     fn effective_role(&self, holder: Origin) -> Option<SpaceRole> {
         let holder = holder_key(holder)?;
-        self.effective_role_inner(holder, &mut Vec::new())
+        if let Some(role) = self.effective_role_inner(holder, &mut Vec::new()) {
+            return Some(role);
+        }
+        if holder.0 != 0 {
+            return None;
+        }
+        let row = self.access_grants.get(&holder.1)?;
+        if row.revoked || row.subject != holder.1 {
+            return None;
+        }
+        let issuer = (0, row.issuer);
+        (self.effective_role_inner(issuer, &mut Vec::new()) == Some(SpaceRole::Admin))
+            .then_some(row.role)
     }
 
     fn effective_role_inner(
@@ -447,7 +590,9 @@ mod tests {
 
     fn actor(space: SpaceId, signing: &SigningKey) -> SpaceAuthority {
         let bytes = initial_state(space, root_peer(signing), [90; 32]).unwrap();
-        SpaceAuthority::decode(&bytes)
+        let mut authority = SpaceAuthority::decode(&bytes);
+        <SpaceAuthority as vos::Actor>::__init_storage(&mut authority);
+        authority
     }
 
     fn apply(
@@ -470,6 +615,23 @@ mod tests {
         SpaceAuthority: Message<M>,
     {
         let mut context = Context::new(ServiceId(0));
+        vos::block_on(<SpaceAuthority as Message<M>>::handle(
+            actor,
+            message,
+            &mut context,
+        ))
+    }
+
+    fn dispatch_as<M>(
+        actor: &mut SpaceAuthority,
+        origin: Origin,
+        message: M,
+    ) -> <SpaceAuthority as Message<M>>::Output
+    where
+        SpaceAuthority: Message<M>,
+    {
+        let mut context = Context::new(ServiceId(0));
+        context.__set_origin(origin, None);
         vos::block_on(<SpaceAuthority as Message<M>>::handle(
             actor,
             message,
@@ -539,6 +701,83 @@ mod tests {
         let root = Origin::Member(SubjectId::of_authenticated_peer(&peer));
         let admin = claim(space, root, SpaceRole::Admin);
         assert_eq!(authorize(&mut authority, &admin), admin.encode());
+    }
+
+    #[test]
+    fn ingress_access_is_authority_owned_revocable_and_role_bounded() {
+        let signing = SigningKey::from_bytes(&[91; 32]);
+        let peer = root_peer(&signing);
+        let space = SpaceId([92; 32]);
+        let root = Origin::Member(SubjectId::of_authenticated_peer(&peer));
+        let mut authority = actor(space, &signing);
+
+        let admin_id = [93; 32];
+        let admin_bytes = dispatch_as(
+            &mut authority,
+            root,
+            IssueAccess {
+                credential_id: admin_id,
+                role: SpaceRole::Admin.as_u8(),
+                expires_at: 2_000_000_000,
+            },
+        );
+        let admin = IngressAccessStatus::try_decode(&admin_bytes).expect("root issues admin");
+        let admin_origin = Origin::Member(SubjectId(admin.subject));
+
+        let developer_id = [94; 32];
+        let developer = dispatch_as(
+            &mut authority,
+            admin_origin,
+            IssueAccess {
+                credential_id: developer_id,
+                role: SpaceRole::Developer.as_u8(),
+                expires_at: 2_000_000_001,
+            },
+        );
+        assert!(IngressAccessStatus::try_decode(&developer).is_some());
+        assert!(
+            dispatch_as(
+                &mut authority,
+                admin_origin,
+                IssueAccess {
+                    credential_id: [95; 32],
+                    role: SpaceRole::Admin.as_u8(),
+                    expires_at: 2_000_000_002,
+                },
+            )
+            .is_empty(),
+            "only the immutable root may issue Admin ingress access",
+        );
+
+        let authenticated = dispatch(
+            &mut authority,
+            AuthenticateAccess {
+                credential_id: developer_id,
+            },
+        );
+        assert_eq!(
+            IngressAccessStatus::try_decode(&authenticated)
+                .expect("issued credential authenticates")
+                .role,
+            SpaceRole::Developer,
+        );
+        assert!(dispatch_as(
+            &mut authority,
+            admin_origin,
+            RevokeAccess {
+                credential_id: developer_id,
+            },
+        ));
+        assert!(
+            dispatch(
+                &mut authority,
+                AuthenticateAccess {
+                    credential_id: developer_id,
+                },
+            )
+            .is_empty(),
+            "revocation is visible to the next authentication",
+        );
     }
 
     #[test]

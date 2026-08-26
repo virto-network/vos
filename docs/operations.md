@@ -14,6 +14,21 @@ Production roots also require a configured trust provider. Route publication
 happens only after the local service has caught up, validated its trust policy,
 and—when applicable—proved committed final Raft membership.
 
+## HTTP ingress
+
+HTTP listeners are configured per node in `<space-data>/local.toml`. Issue and
+revoke their protocol-neutral credentials through the canonical authority:
+
+```bash
+vosx space access team issue --role member --expires 24h
+vosx space access team list
+vosx space access team revoke <credential-prefix>
+```
+
+Only `/__status` is anonymous. Schemas and OpenAPI require Member, metrics
+requires Admin, and actor calls also pass the actor's signed method policy.
+See [HTTP ingress](http-ingress.md) for listener and TLS configuration.
+
 ## Backup and restore
 
 Stop the local daemon before backup:

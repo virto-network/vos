@@ -20,6 +20,7 @@
 use clap::Subcommand;
 use std::path::PathBuf;
 
+pub mod access;
 pub mod agents;
 pub mod apply;
 pub mod backup;
@@ -113,6 +114,15 @@ pub enum SpaceCommand {
         /// `list` / `revoke <token_pub-prefix>`; omit to mint.
         #[command(subcommand)]
         command: Option<invite::InviteCommand>,
+    },
+    /// Issue, list, or revoke protocol-neutral access tokens for built-in
+    /// ingress listeners. Bearer secrets are printed once and never stored by
+    /// vosx or the authority.
+    Access {
+        /// Space id (full hex) or name.
+        space: String,
+        #[command(subcommand)]
+        command: access::AccessCommand,
     },
     /// Boot a space — THE onboarding command. The positional is
     /// trivalent: an existing `.toml` recipe path (create-if-missing +
@@ -281,7 +291,7 @@ pub enum SpaceCommand {
     Agents { space: String },
     /// Show an installed agent's schema — message names, arg
     /// types, and constructor params. Pulls the `.vos_meta`
-    /// blob the registry has on file (same data the gateway
+    /// blob the registry has on file (same data the worker
     /// serves at `GET /__schema/<agent>`). Use `--format json`
     /// for machine consumption.
     Describe {
@@ -392,6 +402,7 @@ pub fn run(cmd: SpaceCommand) -> anyhow::Result<()> {
             bootnode,
             command,
         }),
+        SpaceCommand::Access { space, command } => access::run(access::Args { space, command }),
         SpaceCommand::Up {
             space,
             once,

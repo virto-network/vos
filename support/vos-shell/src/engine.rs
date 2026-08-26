@@ -91,7 +91,7 @@ impl ConsoleEngine {
     /// Unlike the top-level `vosx` CLI (which curates its surface via the
     /// `#[msg(cli)]` tag / `exposed_to_cli`), the console exposes an actor's
     /// FULL message interface — it's the OS-like interactive surface, so every
-    /// message is a command, matching what the HTTP gateway dispatches.
+    /// message is a command, matching what built-in HTTP ingress dispatches.
     pub fn refresh(&mut self) -> Result<usize, BackendError> {
         let agents = self.client.list_agents()?;
         let mut count = 0;

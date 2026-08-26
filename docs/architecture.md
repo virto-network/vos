@@ -28,11 +28,13 @@ flowchart TB
 ```mermaid
 sequenceDiagram
     participant Client
+    participant Ingress
     participant Node
     participant Service
     participant Actor
     participant Store
-    Client->>Node: typed invocation
+    Client->>Ingress: protocol request
+    Ingress->>Node: authenticated subject + typed invocation
     Node->>Service: authenticated work
     Service->>Actor: private state + origin
     Actor-->>Service: reply + effects
@@ -43,6 +45,11 @@ sequenceDiagram
 The host proposes work, but the generic service guest validates package
 identity, method policy, credentials, causal state, effects, and transition
 shape before state changes become durable.
+
+Ingress adapters are node infrastructure. They terminate a protocol, enforce
+resource limits, authenticate it into a VOS subject, and then leave the
+request path. Native extensions instead serve bounded typed requests from
+actors; they do not own listeners.
 
 ## Consistency
 

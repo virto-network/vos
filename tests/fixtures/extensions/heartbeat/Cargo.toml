@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-# Same shape as the other actor-mode extension examples — `bin`
+# Same shape as the other extension examples — `bin`
 # enables the cdylib's `vos_extension_*` extern-fn exports;
 # `extension` is matched by `#[actor]` to emit `impl Extension` +
 # the dispatch glue.

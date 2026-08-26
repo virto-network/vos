@@ -103,7 +103,7 @@ mod tests {
                     caps: vec!["space-registry:admin".into()],
                 },
                 ExtensionCaps {
-                    name: "gateway".into(),
+                    name: "worker".into(),
                     caps: vec![], // deny-all relay
                 },
             ],

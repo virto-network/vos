@@ -15,7 +15,6 @@ members = [
     "pvm/proof/precompiles",
     "pvm/proof/derive",
     "pvm/proof/verifier",
-    "extensions/http-gateway",
     "extensions/prover",
     "clerk-witness",
     "tests/fixtures/extensions/*",
@@ -39,22 +38,10 @@ exclude = [
     # `extensions` is a parent directory holding extension
     # plugins; each sub-crate is listed in `members` explicitly.
     "extensions",
-    # http-gateway test fixtures: small in-tree extension crates
-    # the e2e test loads via libloading. Excluded from the main
-    # workspace so they only build when the e2e test asks for them
-    # (via cargo build -p {name} as a setup step).
-    "extensions/http-gateway/test_fixtures/mock-registry",
-    "extensions/http-gateway/test_fixtures/counter",
-    "extensions/http-gateway/test_fixtures/kitchen-sink",
     # Canonical no_std actor PVMs used only by service integration gates.
     "vos/tests/fixtures/*",
     # Standalone proof workloads carry their own no_std workspaces.
     "pvm/proof/fixtures/*",
-    # transport-soundness Miri gate: a zero-dep, self-contained crate (own
-    # `[workspace]`) run only under `cargo miri test` on the Miri nightly.
-    # Excluded so `cargo build --workspace` + the pre-commit hook never try to
-    # build it on the default toolchain.
-    "miri/transport-soundness",
     # The on-chain settlement verifier: a verify-only Poseidon2-M31 stwo
     # verifier with its OWN `[workspace]`, pinning stwo with
     # `default-features = false`.  Excluded so its feature resolution never

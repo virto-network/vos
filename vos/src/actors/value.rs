@@ -70,7 +70,7 @@ pub enum Value {
 // Numeric `as_*` follow `try_into()` semantics: they return `Some`
 // if the stored value is exactly representable as the target type,
 // regardless of which int variant happens to hold it. JSON has only
-// "number" — the gateway's `parse_flat_json` picks U32 for small
+// "number" — HTTP ingress's `parse_flat_json` picks U32 for small
 // non-negative ints and U64 for larger ones — so a u64-typed actor
 // handler invoked via JSON would otherwise reject `{"a":2}` because
 // `as_u64(Value::U32(2))` is None. Widening here lets the same
@@ -601,7 +601,7 @@ pub mod desc {
 
         // ── Accessor widening ─────────────────────────────────
         //
-        // The gateway's JSON parser produces U32 for small ints
+        // The HTTP ingress JSON parser produces U32 for small ints
         // and U64 for big ones; actor handlers with u64 args
         // would otherwise reject the small case. These tests
         // pin down the `try_into()`-shaped coercion contract.

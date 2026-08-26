@@ -20,10 +20,6 @@
 //!   [name_len:u16 LE][name_bytes...]
 //!   [ty_len:u16 LE][ty_bytes...]
 //!   ...
-//! [kind:u8]
-//! [caps_count:u16 LE]
-//!   [name_len:u16 LE][name_bytes...]
-//!   ...
 //! [cli_methods_count:u16 LE]
 //!   [name_len:u16 LE][name_bytes...]
 //!   ...
@@ -109,18 +105,6 @@ pub struct ActorMeta {
     pub actor_name: &'static str,
     pub messages: &'static [MessageMeta],
     pub constructor: &'static [FieldMeta],
-    /// Extension kind discriminant, encoded as a `u8`. Mirrors
-    /// [`crate::extension::ExtensionKind`]: `0 = Actor`, `1 = Transport`.
-    /// PVM actors emit `0`; transports are native extensions.
-    pub kind: u8,
-    /// Capability tokens the extension wants to use — declarative
-    /// only, not enforced. Logged at load time so manifest reviewers
-    /// can spot a sketchy install. Conventional strings:
-    /// `net.tcp.bind`, `net.tcp.connect`, `fs.read:/etc/...`,
-    /// `tokio-runtime`, `thread.spawn`. PVM actors leave this empty
-    /// — they live in the deterministic universe and have no OS
-    /// access by construction.
-    pub caps: &'static [&'static str],
     /// Names of `#[msg]` handlers that should be reachable via
     /// the `vosx <ext> <cmd>` CLI dispatcher. Subset of `messages`
     /// by name. Declared on each handler with `#[msg(cli)]` and
@@ -262,31 +246,6 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         }
         pos += ft_bytes.len();
         c += 1;
-    }
-
-    // Extension kind discriminant.
-    buf[pos] = meta.kind;
-    pos += 1;
-
-    // Capability list.
-    let [lo, hi] = (meta.caps.len() as u16).to_le_bytes();
-    buf[pos] = lo;
-    buf[pos + 1] = hi;
-    pos += 2;
-    let mut k = 0;
-    while k < meta.caps.len() {
-        let cap_bytes = meta.caps[k].as_bytes();
-        let [lo, hi] = (cap_bytes.len() as u16).to_le_bytes();
-        buf[pos] = lo;
-        buf[pos + 1] = hi;
-        pos += 2;
-        let mut i = 0;
-        while i < cap_bytes.len() {
-            buf[pos + i] = cap_bytes[i];
-            i += 1;
-        }
-        pos += cap_bytes.len();
-        k += 1;
     }
 
     // CLI-exposed method names, cross-referenced by message name.
@@ -487,8 +446,6 @@ mod tests {
                 name: "start",
                 ty: "u32",
             }],
-            kind: 0,
-            caps: &[],
             cli_methods: &[],
             doc: "",
             crdt: false,
@@ -518,7 +475,6 @@ mod tests {
         assert_eq!(parsed.constructor.len(), 1);
         assert_eq!(parsed.constructor[0].name, "start");
         assert_eq!(parsed.constructor[0].ty, "u32");
-        assert_eq!(parsed.kind, 0);
         assert!(!parsed.provable);
 
         assert!(
@@ -565,8 +521,6 @@ mod tests {
                 actor_role: Some(u8::MAX),
             }],
             constructor: &[],
-            kind: 0,
-            caps: &[],
             cli_methods: &[],
             doc: "",
             crdt: false,
@@ -577,31 +531,11 @@ mod tests {
     }
 
     #[test]
-    fn kind_byte_roundtrips_for_transport() {
-        const META: ActorMeta = ActorMeta {
-            actor_name: "Gateway",
-            messages: &[],
-            constructor: &[],
-            kind: 1,
-            caps: &[],
-            cli_methods: &[],
-            doc: "",
-            crdt: false,
-            provable: false,
-        };
-        let (buf, len) = encode::<128>(&META);
-        let parsed = decode(&buf[..len]).expect("decode");
-        assert_eq!(parsed.kind, 1);
-    }
-
-    #[test]
     fn crdt_opt_in_roundtrips() {
         const META: ActorMeta = ActorMeta {
             actor_name: "Board",
             messages: &[],
             constructor: &[],
-            kind: 0,
-            caps: &[],
             cli_methods: &[],
             doc: "",
             crdt: true,
@@ -612,35 +546,9 @@ mod tests {
     }
 
     #[test]
-    fn caps_roundtrip() {
-        const META: ActorMeta = ActorMeta {
-            actor_name: "Gateway",
-            messages: &[],
-            constructor: &[],
-            kind: 1,
-            caps: &["net.tcp.bind", "net.tcp.connect", "tokio-runtime"],
-            cli_methods: &[],
-            doc: "",
-            crdt: false,
-            provable: false,
-        };
-        let (buf, len) = encode::<512>(&META);
-        let parsed = decode(&buf[..len]).expect("decode");
-        assert_eq!(parsed.kind, 1);
-        assert_eq!(
-            parsed.caps,
-            vec![
-                "net.tcp.bind".to_string(),
-                "net.tcp.connect".to_string(),
-                "tokio-runtime".to_string(),
-            ],
-        );
-    }
-
-    #[test]
     fn cli_methods_roundtrip_and_cross_reference() {
         const META: ActorMeta = ActorMeta {
-            actor_name: "Gateway",
+            actor_name: "NativeWorker",
             messages: &[
                 MessageMeta {
                     name: "stop",
@@ -680,8 +588,6 @@ mod tests {
                 },
             ],
             constructor: &[],
-            kind: 1,
-            caps: &[],
             cli_methods: &["stop", "status"],
             doc: "",
             crdt: false,
@@ -734,8 +640,6 @@ mod tests {
                 },
             ],
             constructor: &[],
-            kind: 0,
-            caps: &[],
             cli_methods: &["prove"],
             doc: "A pure-PVM prover/verifier.",
             crdt: false,
@@ -761,7 +665,7 @@ mod tests {
 /// entry points. Self-contained against `alloc` only — no std APIs.
 /// Re-exported from `vos::metadata` so it's reachable from both the
 /// host (where `vosx` registers schemas) and extensions like
-/// `http-gateway` whose cdylib build runs `default-features = false`.
+/// native extensions whose cdylib build runs `default-features = false`.
 mod decode {
     extern crate alloc;
     use alloc::string::String;
@@ -784,7 +688,7 @@ mod decode {
         /// `vosx <ext> <cmd>` to filter the handler list.
         pub exposed_to_cli: bool,
         /// Declared return type (whitespace-free, `Result` unwrapped).
-        /// The CLI and gateway use it to label an otherwise-opaque reply.
+        /// The CLI and worker use it to label an otherwise-opaque reply.
         pub returns: String,
         /// One-line handler description. Empty when undocumented.
         pub doc: String,
@@ -808,10 +712,6 @@ mod decode {
         pub actor_name: String,
         pub messages: Vec<ParsedMessage>,
         pub constructor: Vec<ParsedField>,
-        /// Extension kind byte (`0 = Actor`, `1 = Transport`).
-        pub kind: u8,
-        /// Declared capability tokens.
-        pub caps: Vec<String>,
         /// One-line actor description. Empty when undocumented.
         pub doc: String,
         /// True only for programs explicitly compiled with `#[actor(crdt)]`.
@@ -849,7 +749,7 @@ mod decode {
                 fields,
                 // Filled in from the trailing `cli_methods` section
                 // once that section parses successfully — see the
-                // post-caps block below.
+                // CLI-method block below.
                 exposed_to_cli: false,
                 // Filled in from the trailing `returns` section.
                 returns: String::new(),
@@ -870,18 +770,6 @@ mod decode {
                 name: read_str(data, &mut pos)?,
                 ty: read_str(data, &mut pos)?,
             });
-        }
-
-        let kind = *data.get(pos)?;
-        pos += 1;
-        if kind > 1 {
-            return None;
-        }
-
-        let cap_count = read_u16(data, &mut pos)? as usize;
-        let mut caps = Vec::with_capacity(cap_count);
-        for _ in 0..cap_count {
-            caps.push(read_str(data, &mut pos)?);
         }
 
         let cli_count = read_u16(data, &mut pos)? as usize;
@@ -972,8 +860,6 @@ mod decode {
             actor_name,
             messages,
             constructor,
-            kind,
-            caps,
             doc,
             crdt,
             provable,

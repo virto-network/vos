@@ -20,20 +20,13 @@
 //! ## On-disk shape
 //!
 //! ```toml
-//! [space.demo.gateway]
-//! actor_name = "HttpGateway"
-//! kind = 1
+//! [space.demo.counter]
+//! actor_name = "Counter"
 //! refreshed_at = "2026-05-11T15:30:00Z"
 //!
-//! [[space.demo.gateway.method]]
-//! name = "stop"
-//! is_query = false
-//! exposed_to_cli = true
-//! fields = []
-//!
-//! [[space.demo.gateway.method]]
-//! name = "status"
-//! is_query = false
+//! [[space.demo.counter.method]]
+//! name = "value"
+//! is_query = true
 //! exposed_to_cli = true
 //! fields = []
 //! ```
@@ -76,7 +69,6 @@ pub struct SpaceCache {
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct TargetMeta {
     pub actor_name: String,
-    pub kind: u8,
     /// ISO-8601 timestamp of when the daemon last served this
     /// schema. Informational; helps an operator decide whether
     /// to trust the cache while the daemon is down.
@@ -155,7 +147,6 @@ pub fn update_target(space: &str, target: &str, meta: &ParsedMeta) {
     let space_entry = cache.spaces.entry(space.to_string()).or_default();
     let target_meta = TargetMeta {
         actor_name: meta.actor_name.clone(),
-        kind: meta.kind,
         refreshed_at: now_iso8601(),
         methods: meta
             .messages
@@ -292,7 +283,7 @@ mod tests {
 
     fn fake_meta() -> ParsedMeta {
         ParsedMeta {
-            actor_name: "HttpGateway".into(),
+            actor_name: "MaintenanceAgent".into(),
             messages: vec![
                 ParsedMessage {
                     name: "stop".into(),
@@ -300,7 +291,7 @@ mod tests {
                     fields: vec![],
                     exposed_to_cli: true,
                     returns: String::new(),
-                    doc: "Stop the gateway.".into(),
+                    doc: "Stop the worker.".into(),
                     timeout_ms: 0,
                     mode: 0,
                     attested: false,
@@ -338,8 +329,6 @@ mod tests {
                 },
             ],
             constructor: vec![],
-            kind: 1,
-            caps: vec![],
             doc: String::new(),
             crdt: false,
             provable: false,
@@ -362,10 +351,9 @@ mod tests {
         let mut cache = CliCache::default();
         let mut space = SpaceCache::default();
         space.targets.insert(
-            "gateway".into(),
+            "worker".into(),
             TargetMeta {
-                actor_name: "HttpGateway".into(),
-                kind: 1,
+                actor_name: "MaintenanceAgent".into(),
                 refreshed_at: "2026-05-11T00:00:00Z".into(),
                 methods: vec![MethodMeta {
                     name: "stop".into(),
@@ -380,8 +368,8 @@ mod tests {
         save_to(&cache, &p).unwrap();
 
         let back = load_from(&p).unwrap();
-        let m = &back.spaces["demo"].targets["gateway"];
-        assert_eq!(m.actor_name, "HttpGateway");
+        let m = &back.spaces["demo"].targets["worker"];
+        assert_eq!(m.actor_name, "MaintenanceAgent");
         assert!(m.methods[0].exposed_to_cli);
         assert!(!m.methods[0].is_query);
         let _ = std::fs::remove_file(&p);
@@ -417,10 +405,9 @@ mod tests {
             })
             .collect();
         space_entry.targets.insert(
-            "gateway".into(),
+            "worker".into(),
             TargetMeta {
                 actor_name: meta.actor_name.clone(),
-                kind: meta.kind,
                 refreshed_at: "x".into(),
                 methods,
             },
@@ -428,14 +415,14 @@ mod tests {
         save_to(&cache, &p).unwrap();
 
         let back = load_from(&p).unwrap();
-        let t = &back.spaces["demo"].targets["gateway"];
+        let t = &back.spaces["demo"].targets["worker"];
         assert_eq!(t.methods.len(), 3);
         let stop = t.methods.iter().find(|m| m.name == "stop").unwrap();
         let internal = t.methods.iter().find(|m| m.name == "internal").unwrap();
         assert!(stop.exposed_to_cli);
         assert!(!internal.exposed_to_cli);
         // The metadata doc round-trips through the TOML cache.
-        assert_eq!(stop.doc, "Stop the gateway.");
+        assert_eq!(stop.doc, "Stop the worker.");
         let _ = std::fs::remove_file(&p);
     }
 
@@ -453,7 +440,7 @@ mod tests {
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &tmp) };
 
         let m = fake_meta();
-        update_target("demo", "gateway", &m);
+        update_target("demo", "worker", &m);
         // Re-read through the same XDG-keyed `load()` so the
         // test covers `path()` too.
         let cache = load().expect("load after update");
@@ -465,12 +452,11 @@ mod tests {
         }
 
         let demo = cache.spaces.get("demo").expect("space written");
-        let gateway = demo.targets.get("gateway").expect("target written");
-        assert_eq!(gateway.actor_name, "HttpGateway");
-        assert_eq!(gateway.kind, 1);
-        assert_eq!(gateway.methods.len(), 3);
-        let stop = gateway.methods.iter().find(|m| m.name == "stop").unwrap();
-        let internal = gateway
+        let worker = demo.targets.get("worker").expect("target written");
+        assert_eq!(worker.actor_name, "MaintenanceAgent");
+        assert_eq!(worker.methods.len(), 3);
+        let stop = worker.methods.iter().find(|m| m.name == "stop").unwrap();
+        let internal = worker
             .methods
             .iter()
             .find(|m| m.name == "internal")

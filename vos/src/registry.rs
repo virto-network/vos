@@ -86,7 +86,7 @@ pub struct AgentPage {
 }
 
 /// One page of [`RegistryRef::agent_names`] — the names-only projection of
-/// [`AgentPage`], for callers (e.g. the gateway rendering `/__schema`) that
+/// [`AgentPage`], for callers (e.g. HTTP ingress rendering `/__schema`) that
 /// want the instance-name list without the `AgentRow` rkyv decode. Same
 /// `instance_name`-ordered cursor + `more` terminator. Use
 /// [`RegistryRef::agent_names_all`] to drain.
@@ -1668,11 +1668,11 @@ mod tests {
         );
 
         let m = Msg::new("register_extension_meta")
-            .with("instance_name", "gateway")
+            .with("instance_name", "worker")
             .with("blob", alloc::vec![9u8, 8]);
         assert_eq!(
             catalog_op_canonical(&m).unwrap(),
-            canonical_op_bytes("register_extension_meta", &[b"gateway", &[9u8, 8]]),
+            canonical_op_bytes("register_extension_meta", &[b"worker", &[9u8, 8]]),
         );
 
         let m = Msg::new("upgrade")

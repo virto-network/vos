@@ -105,8 +105,8 @@ pub fn dispatch(argv: &[String]) -> anyhow::Result<()> {
 
         // Universal lifecycle verbs (`stop` / `describe`) are handled
         // host-side as `__stop` / `__describe` for ANY agent, so they
-        // bypass the per-agent schema check below — a transport extension
-        // (the gateway) declares no `#[msg]` for the schema to list.
+        // bypass the per-agent schema check below for host lifecycle methods,
+        // which are not declared as actor `#[msg]` handlers.
         if let Some(wire) = universal_verb(method) {
             if !method_args.is_empty() {
                 bail!("`{method}` takes no arguments");
@@ -246,7 +246,7 @@ fn render_text(reply: &Value, ret_ty: Option<&str>) -> String {
     match reply {
         Value::Unit => "()".to_string(),
         Value::Str(s) if looks_like_json_object_or_array(s) => {
-            // `vosx gateway describe` returns a JSON-shaped string; the
+            // `vosx worker describe` returns a JSON-shaped string; the
             // user is most likely scanning for fields, so surface the
             // payload verbatim rather than rust-Debug-formatting `Str(...)`.
             s.clone()
@@ -615,7 +615,7 @@ fn looks_like_json_object_or_array(s: &str) -> bool {
 }
 
 /// Heuristic: when a handler returned `Value::Str(json_blob)`
-/// (e.g. `vosx gateway status`), the default JSON rendering
+/// (e.g. `vosx worker status`), the default JSON rendering
 /// produces a quoted string containing JSON — forcing the
 /// reader to parse it twice. Detect the case (Value::Str shape,
 /// starts with `{`/`[`, parses as JSON) and unwrap so the outer
@@ -843,7 +843,7 @@ fn is_byte_array_ty(ty: &str) -> bool {
 /// Decode a hex string (optional `0x` prefix) into bytes; `None` on odd
 /// length or a non-hex digit. Symmetric with the `0x<hex>` a
 /// `Value::Bytes` reply renders as, so a reply can be pasted back as an
-/// argument. Mirrors the gateway's `hex_decode`.
+/// argument. Mirrors built-in HTTP ingress's hex decoder.
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     hex::decode(s).ok()
@@ -1049,28 +1049,28 @@ mod tests {
 
     #[test]
     fn parse_argv_extracts_space_flag_in_either_position() {
-        let p = parse_argv(&s(&["--space", "demo", "gateway", "stop"])).unwrap();
+        let p = parse_argv(&s(&["--space", "demo", "worker", "stop"])).unwrap();
         assert_eq!(p.space.as_deref(), Some("demo"));
-        assert_eq!(p.positional, s(&["gateway", "stop"]));
+        assert_eq!(p.positional, s(&["worker", "stop"]));
 
-        let p = parse_argv(&s(&["gateway", "--space=demo", "stop"])).unwrap();
+        let p = parse_argv(&s(&["worker", "--space=demo", "stop"])).unwrap();
         assert_eq!(p.space.as_deref(), Some("demo"));
-        assert_eq!(p.positional, s(&["gateway", "stop"]));
+        assert_eq!(p.positional, s(&["worker", "stop"]));
     }
 
     #[test]
     fn parse_argv_help_flag_routes_to_help_path() {
-        let p = parse_argv(&s(&["gateway", "--help"])).unwrap();
+        let p = parse_argv(&s(&["worker", "--help"])).unwrap();
         assert!(p.wants_help);
-        assert_eq!(p.positional, s(&["gateway"]));
+        assert_eq!(p.positional, s(&["worker"]));
     }
 
     #[test]
     fn parse_argv_swallows_format_value() {
         // `main` already applied --format; the dispatcher must
         // not mistake `json` for a positional.
-        let p = parse_argv(&s(&["--format", "json", "gateway"])).unwrap();
-        assert_eq!(p.positional, s(&["gateway"]));
+        let p = parse_argv(&s(&["--format", "json", "worker"])).unwrap();
+        assert_eq!(p.positional, s(&["worker"]));
     }
 
     #[test]

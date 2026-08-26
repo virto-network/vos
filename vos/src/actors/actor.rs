@@ -75,14 +75,6 @@ pub trait Actor: Sized + Encode + Decode {
     /// literal — see [`SpaceRoleMap`](super::auth::SpaceRoleMap).
     const SPACE_ROLE_MAP: super::auth::SpaceRoleMap<Self::Role>;
 
-    /// Extension kind discriminant — `0 = Actor` (request-driven,
-    /// the default) or `1 = Transport` (a `handle_connection(&self, …)`
-    /// server). Overridden by `#[actor(kind = "transport")]`. Mirrors
-    /// [`crate::extension::ExtensionKind`] and lands in the
-    /// `.vos_meta` blob for the loader to read at boot. PVM actors
-    /// always leave this at `0`.
-    const KIND_BYTE: u8 = 0;
-
     /// `#[actor(task, provable)]` — this Task is published as a
     /// provable program: a discovery /
     /// publication mark landing in `.vos_meta` for the pin/verify
@@ -92,13 +84,6 @@ pub trait Actor: Sized + Encode + Decode {
     /// actors: a proof exists only for the witness-delivered,
     /// refine-pure execution shape).
     const PROVABLE: bool = false;
-
-    /// Capability tokens the actor / extension wants to use.
-    /// Declarative-only: the host logs them at load time and surfaces
-    /// them in operator-facing tools. PVM actors leave this empty —
-    /// they live in the deterministic universe and have no OS access
-    /// by construction. Override via `#[actor(caps = [...])]`.
-    const CAPS: &'static [&'static str] = &[];
 
     /// One-line actor description, surfaced by `vosx <target>` help.
     /// The `#[actor]` macro fills it from the first paragraph of the

@@ -541,6 +541,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         &mut service_registration_backoff,
     )?;
 
+    register_http_ingress_from_local(&mut node, &local_cfg)?;
+
     // The space creator's operator key is granted ADMIN at genesis
     // (a signed `grant_role` baked into the DAG by `space new`),
     // so there's no first-boot bootstrap file to consume here.
@@ -875,10 +877,6 @@ fn register_extensions_from_local(
         return Ok(Vec::new());
     }
     let reg = RegistryRef::at(ServiceId::new(prefix, ServiceId::REGISTRY.local_id()));
-    let space_cap_policy = match cfg.cap_policy.as_deref() {
-        Some(s) => vos::extension::CapPolicy::parse(s),
-        None => vos::extension::CapPolicy::default(),
-    };
     // Roster for named-intra_cap validation: every installed agent +
     // every extension + the built-in registry.
     let mut known_names: HashSet<String> = cfg
@@ -898,25 +896,50 @@ fn register_extensions_from_local(
             name: e.name.clone(),
             path: e.path.clone(),
             init: e.init.clone(),
-            cap_policy: e.cap_policy.clone(),
             intra_caps: e.intra_caps.clone(),
             tick_ms: e.tick_ms,
         };
-        let effective = reconcile::register_extension(
-            node,
-            &reg,
-            &ext_def,
-            data_dir,
-            prefix,
-            space_cap_policy,
-            &known_names,
-        )?;
+        let effective =
+            reconcile::register_extension(node, &reg, &ext_def, data_dir, prefix, &known_names)?;
         caps.push(ExtensionCaps {
             name: e.name.clone(),
             caps: effective,
         });
     }
     Ok(caps)
+}
+
+fn register_http_ingress_from_local(
+    node: &mut VosNode,
+    cfg: &subscriptions::LocalConfig,
+) -> anyhow::Result<()> {
+    use std::net::SocketAddr;
+
+    for listener in &cfg.ingress.http {
+        let listen: SocketAddr = listener
+            .listen
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid HTTP ingress listen address: {error}"))?;
+        let tls = match (&listener.tls_cert, &listener.tls_key) {
+            (Some(cert), Some(key)) => Some(vos::ingress::HttpTlsConfig {
+                cert: cert.into(),
+                key: key.into(),
+            }),
+            (None, None) => None,
+            _ => anyhow::bail!(
+                "HTTP ingress '{}' must configure both tls_cert and tls_key",
+                listener.name
+            ),
+        };
+        node.add_http_ingress(vos::ingress::HttpIngressConfig {
+            name: listener.name.clone(),
+            listen,
+            tls,
+            max_connections: listener.max_connections,
+        })?;
+        tracing::info!(name = %listener.name, %listen, "HTTP ingress listening");
+    }
+    Ok(())
 }
 
 // ── Invite redemption (boot tick) ────────────────────────────────────
@@ -1781,9 +1804,13 @@ pub(super) fn validate_role_authority_deployment(
     methods.sort_unstable();
     if methods
         != vec![
+            ("authenticate_access", true, false),
             (vos::service::ROLE_AUTHORITY_DECISION_METHOD_, true, false),
+            ("issue_access", true, false),
+            ("list_access", true, false),
             (vos::service::ROLE_AUTHORITY_MUTATION_METHOD_, true, false),
             (vos::service::ROLE_AUTHORITY_INVITE_METHOD_, true, false),
+            ("revoke_access", true, false),
             (
                 vos::service::ROLE_AUTHORITY_INVITE_REVOKE_METHOD_,
                 true,
@@ -1791,7 +1818,9 @@ pub(super) fn validate_role_authority_deployment(
             ),
         ]
     {
-        anyhow::bail!("space-authority package exposes a non-canonical method policy surface");
+        anyhow::bail!(
+            "space-authority package exposes a non-canonical method policy surface: {methods:?}"
+        );
     }
     Ok(())
 }
@@ -3936,8 +3965,6 @@ mod tests {
             actor_role: None,
         }],
         constructor: &[],
-        kind: 0,
-        caps: &[],
         cli_methods: &[],
         doc: "",
         crdt: false,
@@ -4099,15 +4126,15 @@ mod tests {
         );
         assert_eq!(
             hex::encode(package.deployment_id().0),
-            "12d07c21ae70b1c434a79e1326c8ac7c1854fef013a2f4b42d74d05f794d66a8",
+            "1e35357c6af89085bb2ebbeb596e8b7f42b3bd3ab19e19331fcb9a7ea62f4102",
         );
         assert_eq!(
             hex::encode(package_hash),
-            "48d2cfc21d68e7a2ed811c1f06c4793ff040f69b9a5819e9e24d0761f2e9f3f2",
+            "68e574504df8ae9e97f6f3005c4b5b013b9e5920a8c033c06d9c0ee4a5f956ec",
         );
         assert_eq!(
             hex::encode(replication_id),
-            "940aa30d67a886c2ade07728c3637d9179aad60cfd32ae3985189faecd5f50ac",
+            "ff707b0072c9b807a8cfd0e3a898d34e8612e3e211e3d8a145278f817c35b002",
         );
     }
 

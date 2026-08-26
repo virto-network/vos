@@ -181,7 +181,7 @@ fn main() {
     // Pre-parser: peek argv and decide whether to enter the
     // dynamic-dispatch path before handing off to clap. clap's
     // Subcommand derive only knows the built-in verbs; a
-    // `vosx gateway stop` invocation is routed to the dynamic actor client.
+    // `vosx worker stop` invocation is routed to the dynamic actor client.
     //
     // The verb is the first non-flag argv token. We route to the
     // dynamic dispatcher when:
@@ -195,7 +195,7 @@ fn main() {
 
     // Top-level `vosx --help` / `vosx -h` / `vosx help` gets a
     // post-script with cache-discovered targets so a user
-    // skimming the help can see e.g. `gateway`, `math`,
+    // skimming the help can see e.g. `worker`, `math`,
     // `counter` listed alongside the built-in subcommands.
     // Subcommand help (`vosx space --help`) is unchanged —
     // clap handles those before we'd see them.
@@ -508,19 +508,17 @@ mod routing_tests {
     #[test]
     fn non_builtin_word_triggers_dynamic_dispatch() {
         // Dynamic dispatch for extension instances.
-        assert!(should_dynamic_dispatch(&s(&["gateway"])));
-        assert!(should_dynamic_dispatch(&s(&["gateway", "stop"])));
+        assert!(should_dynamic_dispatch(&s(&["worker"])));
+        assert!(should_dynamic_dispatch(&s(&["worker", "stop"])));
         assert!(should_dynamic_dispatch(&s(&["math", "add", "a=2", "b=3"])));
     }
 
     #[test]
     fn global_flags_with_values_skip_correctly() {
-        // `--format json gateway stop` — the json value isn't a verb.
-        assert!(should_dynamic_dispatch(&s(&[
-            "--format", "json", "gateway"
-        ])));
-        assert!(should_dynamic_dispatch(&s(&["--format=json", "gateway"])));
-        assert!(should_dynamic_dispatch(&s(&["-v", "gateway"])));
+        // `--format json worker stop` — the json value isn't a verb.
+        assert!(should_dynamic_dispatch(&s(&["--format", "json", "worker"])));
+        assert!(should_dynamic_dispatch(&s(&["--format=json", "worker"])));
+        assert!(should_dynamic_dispatch(&s(&["-v", "worker"])));
     }
 
     #[test]
@@ -541,7 +539,7 @@ mod routing_tests {
         // `--space` only makes sense in the dynamic path; its
         // presence is a strong signal even before the verb.
         assert!(should_dynamic_dispatch(&s(&["--space", "demo"])));
-        assert!(should_dynamic_dispatch(&s(&["--space=demo", "gateway"])));
+        assert!(should_dynamic_dispatch(&s(&["--space=demo", "worker"])));
     }
 
     #[test]

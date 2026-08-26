@@ -533,8 +533,6 @@ mod tests {
             },
         ],
         constructor: &[],
-        kind: 0,
-        caps: &[],
         cli_methods: &[],
         doc: "",
         crdt: false,

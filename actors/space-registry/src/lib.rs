@@ -611,7 +611,7 @@ impl SpaceRegistry {
 
     /// Convenience join: find an installed agent by name, then
     /// return its program's metadata blob. Saves the caller a
-    /// round trip in the common case (gateway resolving a
+    /// round trip in the common case (worker resolving a
     /// per-method schema). Empty vector when the agent is
     /// unknown or has no meta registered.
     ///
@@ -955,7 +955,7 @@ impl SpaceRegistry {
 
     /// Page installed-agent names (names only), in `instance_name` order —
     /// so cross-actor callers without `AgentRow` schema knowledge (e.g. the
-    /// gateway rendering `/__schema`) pull the list without an rkyv dance.
+    /// HTTP ingress rendering `/__schema`) pull the list without an rkyv dance.
     /// Same cursor/`more` contract as [`agents`](Self::agents).
     #[msg]
     async fn agent_names(&self, after_name: String, budget: u32) -> AgentNamePage {

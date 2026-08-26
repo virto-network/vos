@@ -307,8 +307,9 @@ impl<A: Actor> Context<A> {
     ///
     /// Variants:
     /// - [`Caller::Unauthenticated`]: no credentials presented
-    ///   (HTTP gateway public routes; host-initiated calls).
+    ///   (built-in ingress routes and host-initiated calls).
     /// - [`Caller::Peer`]: a libp2p peer, noise-verified.
+    /// - [`Caller::Member`]: a subject authenticated by a built-in ingress.
     /// - [`Caller::Actor`]: an intra-system invoke from another
     ///   actor on the same node.
     pub fn caller(&self) -> &Caller {
@@ -327,6 +328,7 @@ impl<A: Actor> Context<A> {
             Caller::Peer(bytes) => {
                 crate::service::Origin::Member(authenticated_peer_subject(bytes))
             }
+            Caller::Member(subject) => crate::service::Origin::Member(*subject),
             Caller::Actor(_) => crate::service::Origin::Anonymous,
         };
         self.caller = caller;
@@ -590,7 +592,7 @@ impl<A: Actor> Context<A> {
             request.push(crate::effects::EFFECT_ASK);
             request.extend_from_slice(&target.0.to_le_bytes());
             request.extend_from_slice(payload);
-            super::run::Ask::host_io(self.host_call(request))
+            super::run::Ask::host_io_result(self.host_call(request))
         }
     }
 
@@ -1036,37 +1038,6 @@ impl<A: Actor> Context<A> {
         }
     }
 
-    /// Transport-mode dispatching ask. Like
-    /// [`ask_raw`](Self::ask_raw), but resolves to the **raw reply
-    /// bytes** wrapped in an `Option` that distinguishes a real reply
-    /// from a dispatch failure — mirroring the old
-    /// `ServiceCtx::ask_raw -> Option<Vec<u8>>` the http-gateway was
-    /// built around:
-    ///
-    /// - `Some(bytes)` — the target's handler ran and returned;
-    ///   `bytes` is its rkyv-encoded `Value` (empty for a `()` return).
-    /// - `None` — no route to the target, a non-`DONE` status (panic /
-    ///   not-found / forbidden / OOG), or the 10 s ask timeout.
-    ///
-    /// This is what lets a gateway render a handler panic as `502`
-    /// rather than collapsing it into the `200 null` of a `()` return
-    /// (which the plain [`ask_raw`](Self::ask_raw) → `Value::Unit` path
-    /// cannot tell apart). Only the native transport host
-    /// (`run_transport_extension`'s `ConnFulfiller`) fulfils this; on
-    /// every other build it resolves to `None`.
-    #[cfg(feature = "extension")]
-    pub async fn ask_dispatch(&mut self, target: ServiceId, payload: &[u8]) -> Option<Vec<u8>> {
-        // Wire format: [tag=EFFECT_ASK_DISPATCH][target:u32 LE][payload].
-        let mut request = Vec::with_capacity(5 + payload.len());
-        request.push(crate::effects::EFFECT_ASK_DISPATCH);
-        request.extend_from_slice(&target.0.to_le_bytes());
-        request.extend_from_slice(payload);
-        let resp = self.host_call(request).await;
-        // Response is [RESP_OK][reply…] on success, [RESP_ERR] on
-        // failure — the same status-framing the byte-stream effects use.
-        crate::effects::bytestream::decode_resp_bytes(&resp)
-    }
-
     /// Resolve an actor from this root's authenticated directory and bind its
     /// generated typed reference to this context.
     pub async fn actor<'a, R: super::client::ActorReference + 'a>(
@@ -1211,75 +1182,6 @@ impl<A: Actor> Context<A> {
     /// Provide the host I/O result (for the C ABI to inject).
     pub fn set_host_io_result(&mut self, result: Vec<u8>) {
         self.host_io_result = Some(result);
-    }
-
-    // --- Byte-stream I/O (native extension host) ---
-    //
-    // Raw TCP over the host reactor. Each call yields a byte-stream
-    // `EFFECT_*` to the host, which runs the matching `smol::Async` op and
-    // feeds the result back through the per-task executor — so many such ops
-    // can be in flight across tasks without blocking the executor thread.
-    // Gated to the extension build: only the native extension host
-    // (`node.rs`) fulfils these; WASM / PVM hosts don't.
-
-    /// Bind a TCP listener at `addr` (e.g. `"127.0.0.1:8080"`). Returns an
-    /// opaque listener id, or `None` if the bind failed.
-    #[cfg(feature = "extension")]
-    pub async fn listen(&mut self, addr: &str) -> Option<u64> {
-        let resp = self
-            .host_call(crate::effects::bytestream::encode_listen(addr))
-            .await;
-        crate::effects::bytestream::decode_resp_u64(&resp)
-    }
-
-    /// Bind a TLS listener at `addr` — the host terminates TLS with its
-    /// configured server cert, so `accept`/`read`/`write` see plaintext.
-    /// Returns `None` if the bind failed or the host has no TLS cert
-    /// configured for this extension.
-    #[cfg(feature = "extension")]
-    pub async fn listen_tls(&mut self, addr: &str) -> Option<u64> {
-        let resp = self
-            .host_call(crate::effects::bytestream::encode_listen_tls(addr))
-            .await;
-        crate::effects::bytestream::decode_resp_u64(&resp)
-    }
-
-    /// Accept one inbound connection on `listener_id`, blocking until one
-    /// arrives. Returns an opaque connection id, or `None` on error.
-    #[cfg(feature = "extension")]
-    pub async fn accept(&mut self, listener_id: u64) -> Option<u64> {
-        let resp = self
-            .host_call(crate::effects::bytestream::encode_accept(listener_id))
-            .await;
-        crate::effects::bytestream::decode_resp_u64(&resp)
-    }
-
-    /// Read up to `max` bytes from `conn_id`, blocking until some arrive.
-    /// `Some(empty)` means EOF (peer closed); `None` means error.
-    #[cfg(feature = "extension")]
-    pub async fn read(&mut self, conn_id: u64, max: u32) -> Option<Vec<u8>> {
-        let resp = self
-            .host_call(crate::effects::bytestream::encode_read(conn_id, max))
-            .await;
-        crate::effects::bytestream::decode_resp_bytes(&resp)
-    }
-
-    /// Write `data` to `conn_id`. Returns the number of bytes written, or
-    /// `None` on error.
-    #[cfg(feature = "extension")]
-    pub async fn write(&mut self, conn_id: u64, data: &[u8]) -> Option<usize> {
-        let resp = self
-            .host_call(crate::effects::bytestream::encode_write(conn_id, data))
-            .await;
-        crate::effects::bytestream::decode_resp_u32(&resp).map(|n| n as usize)
-    }
-
-    /// Close `conn_id`. Idempotent; a no-op on an unknown id.
-    #[cfg(feature = "extension")]
-    pub async fn close(&mut self, conn_id: u64) {
-        let _ = self
-            .host_call(crate::effects::bytestream::encode_close(conn_id))
-            .await;
     }
 
     // --- Cooperative scheduling ---

@@ -19,7 +19,7 @@ include = [
 ]
 
 [dependencies]
-vos = { path = "../vos", version = "0.1.0", features = ["std", "http", "storage", "network"] }
+vos = { path = "../vos", version = "0.1.0", features = ["std", "http-client", "http-ingress", "storage", "network"] }
 space-authority = { path = "../actors/space-authority", version = "0.1.0", default-features = false }
 # `vosx zk pin` transpiles the provable ELF here and delegates the heavy
 # vos-pvm-proof measurement to the prover extension's `measure_catalog` handler, so

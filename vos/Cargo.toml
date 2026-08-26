@@ -12,8 +12,8 @@ authors.workspace = true
 readme.workspace = true
 
 [features]
-default = ["std", "http", "storage", "network"]
-std = ["dep:vos-pvm", "dep:vos-pvm-compiler", "dep:toml", "dep:serde", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading", "dep:object", "dep:async-io", "dep:async-executor", "dep:futures-lite", "dep:futures-channel", "dep:futures-rustls", "dep:rustls-pemfile", "dep:getrandom", "dep:vos-pvm-precompiles", "dep:cipher-clerk", "dep:rand_chacha", "dep:zeroize"]
+default = ["std", "http-client", "storage", "network"]
+std = ["dep:vos-pvm", "dep:vos-pvm-compiler", "dep:toml", "dep:serde", "dep:pollster", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:libloading", "dep:object", "dep:async-io", "dep:async-executor", "dep:futures-lite", "dep:futures-channel", "dep:futures-rustls", "dep:getrandom", "dep:vos-pvm-precompiles", "dep:cipher-clerk", "dep:rand_chacha", "dep:zeroize"]
 macros = ["dep:vos-macros"]
 pvm = []
 service = ["pvm"]
@@ -29,8 +29,23 @@ wasm = ["macros"]
 # WASM bootstrap: provides global allocator (dlmalloc) and panic
 # handler so the actor crate just needs `#![no_std]` and `use vos::*`.
 wasm-bootstrap = ["wasm", "dep:dlmalloc"]
-# Enables native HTTP fulfillment (EFFECT_FETCH) in the extension host.
-http = ["dep:ureq"]
+# Enables actor-initiated outbound HTTP fulfillment (EFFECT_FETCH).
+http-client = ["dep:ureq"]
+# Built-in authenticated HTTP ingress. This is host-local infrastructure,
+# independent of the actor extension ABI and optional for embedders.
+http-ingress = [
+    "std",
+    "dep:bytes",
+    "dep:http",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:serde_json",
+    "dep:serde_urlencoded",
+    "dep:tokio",
+    "dep:tokio-rustls",
+    "dep:rustls-pemfile",
+]
 # Enables redb-backed extension state persistence in the extension host.
 storage = ["dep:redb", "dep:merkle-crdt", "dep:futures-executor", "dep:futures-channel", "dep:vos-raft"]
 # Enables the libp2p-backed networking layer (peer transport, identity,
@@ -85,30 +100,33 @@ dlmalloc = { version = "0.2", optional = true, features = ["global"] }
 redb = { version = "2", optional = true }
 merkle-crdt = { path = "../support/merkle-crdt", version = "0.1.0", features = ["redb"], optional = true }
 libp2p = { version = "0.56", default-features = false, features = ["tcp", "yamux", "noise", "tokio", "mdns", "macros", "ping", "identify", "request-response", "gossipsub"], optional = true }
-tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "fs"], optional = true }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "fs", "net", "io-util"], optional = true }
 async-trait = { version = "0.1", optional = true }
+bytes = { version = "1", optional = true }
+http = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", default-features = false, features = ["http1", "server"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
+serde_json = { version = "1", optional = true }
+serde_urlencoded = { version = "0.7", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
 # Host-side extension executor: the cooperative scheduler runs host-side,
 # driven by `async-io::block_on(LocalExecutor::run(..))`. `LocalExecutor`
 # keeps the extension's `!Send` per-task futures on the one thread that owns
-# the instance; `async-io`'s single process-global reactor doubles as the
-# byte-stream reactor. These sit in the `std` feature tier (NOT
-# `network`) because EVERY extension host needs the executor, including
-# single-node `std,http,storage` builds with no libp2p. Versions are
+# the instance. These sit in the `std` feature tier (not `network`) because
+# every extension host needs the executor, including single-node
+# `std,http-client,storage` builds with no libp2p. Versions are
 # pinned to what libp2p already resolved (async-io 2.6) so the network
 # build doesn't fork the dep tree. The no_std extension/wasm builds
 # (default-features = false) never enable `std`, so the .so itself stays
 # free of these deps.
 async-io = { version = "2.6", optional = true }
 async-executor = { version = "1.14", optional = true }
-# `AsyncReadExt`/`AsyncWriteExt` over `async_io::Async<TcpStream>` for the
-# host byte-stream reactor. Already in the tree via async-io; no tree fork.
+# Async waits and timers for request-driven extension effects.
 futures-lite = { version = "2.6", optional = true }
-# Host-terminated TLS over the byte-stream reactor. `futures-rustls`
-# wraps an accepted `Async<TcpStream>` in a rustls server stream (the `.so` still
-# sees plaintext read/write); it re-exports rustls so we don't add a second copy.
-# `ring` provider to match the http-gateway's existing choice. `rustls-pemfile`
-# parses the operator-supplied cert/key PEM.
+# Rustls types and the ring provider used by production signature verification.
 futures-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring"] }
+# PEM parsing for the optional built-in HTTP ingress TLS listener.
 rustls-pemfile = { version = "2", optional = true }
 # Drives vos-raft's async Storage / Transport futures from inside
 # the existing sync Network::set_raft_handler / RaftCommit code
@@ -180,10 +198,6 @@ redb = "2"
 # vos::crypto software fallback. Dev-only; the in-tree fallback
 # is self-contained.
 blake2 = "0.10"
-# Generates a self-signed `localhost` cert for the host-TLS
-# byte-stream guard (the test acts as the rustls client; the host
-# terminates TLS and the extension echoes plaintext).
-rcgen = "0.13"
 # Ciphersuite-1 reference impls for the in-PVM crypto execution gate
 # (`vos/tests/crypto_spike_pvm.rs`): the test drives the `crypto_spike` actor's
 # `tv_*` handlers and asserts the PVM-computed bytes are bit-exact against these

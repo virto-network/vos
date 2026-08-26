@@ -1,118 +1,65 @@
-//! Request routing (transport mode).
+//! Built-in HTTP request routing.
 //!
-//! A connection task ([`crate::HttpGateway::handle_connection`]) parses
-//! one HTTP/1.1 request off the byte stream and calls [`dispatch`], which
-//! runs the built-in intercepts + the bearer-auth gate and then hands
-//! `/<agent>/<method>` traffic to [`handle`]. Both layers run **in the
-//! same connection task**; the actor `Context<HttpGateway>` reaches the registry and
-//! target agents (via the async [`Context::ask_dispatch`]), and many
-//! connection tasks interleave on the host's one cooperative executor.
+//! The host parses HTTP/1.1, authenticates a bearer credential against the
+//! canonical space authority, and converts `/<actor>/<method>` into the same
+//! schema-bound actor invocation used by typed VOS clients. Socket and HTTP
+//! state never enter actor execution.
 //!
 //! ## Built-in routes (precedence + auth)
 //!
 //! | # | path                        | method | ask?     | auth          |
 //! |---|-----------------------------|--------|----------|---------------|
-//! | 1 | `/__metrics`                | GET    | no       | public        |
-//! | 2 | `/__status`                 | GET    | no       | public        |
-//! | 3 | `/__schema`, `/__schema/<a>`| GET    | registry | public        |
-//! | 4 | `/openapi.json`             | GET    | registry | public        |
-//! | 5 | `/<agent>/<method>`         | any    | agent    | varies†       |
+//! | 1 | `/__status`                  | GET    | none     | anonymous     |
+//! | 2 | `/__metrics`                 | GET    | none     | Admin         |
+//! | 3 | `/__schema`, `/__schema/<a>` | GET    | registry | Member        |
+//! | 4 | `/openapi.json`              | GET    | registry | Member        |
+//! | 5 | `/<actor>/<method>`           | any    | actor    | Member + policy |
 //!
-//! † `/<agent>/<method>` uses the global `auth_token` unless the
-//! manifest declared a per-agent override in `agent_tokens`.
-//! Schema / metrics / status are unaffected by either token.
-//!
-//! `/__metrics` + `/__status` read only `Inner` atomics, so they're
-//! answered ahead of the auth gate (and never `ask`). `/__schema*` /
-//! `/openapi.json` are public-by-name ([`PUBLIC_NAMESPACES`]) but DO
-//! `ask` the registry, so they ride the same async path as dispatch.
-//!
-//! Adding a built-in: append a row here AND insert the `handle_*`
-//! call in either [`dispatch`] (ask-free, pre-auth) or [`handle`]
-//! (registry/agent asks) in the matching precedence slot.
-//!
-//! ## Lifecycle: `stop` / `describe`
-//!
-//! In transport mode the **host** owns lifecycle: `vosx gateway stop` and
-//! `vosx gateway describe` are intercepted node-side as the generic
-//! `__stop` / `__describe` primitives (see `vos::node`), uniform across
-//! every agent kind. Rich live status stays in the gateway as the
-//! in-process `GET /__status` endpoint (no invoke round trip).
+//! Credential revocation and role changes take effect on the next request.
 
+use crate::Encode;
+use crate::actors::value::Msg;
+use crate::log;
+use crate::service::ActorId;
 use http::Method;
-use vos::Context;
-use vos::Encode;
-use vos::actors::context::ServiceId;
-use vos::actors::value::Msg;
-use vos::log;
+use std::sync::atomic::Ordering;
 
-use crate::HttpGateway;
-use crate::config::ct_eq;
-use crate::json::{parse_flat_json, value_to_json};
-use crate::state::Inner;
-use crate::types::{Request, Response, json, text, with_content_type};
+use super::HttpIngressContext;
+use super::json::{hex_encode, parse_flat_json, value_to_json, value_to_json_value};
+use super::state::Inner;
+use super::types::{Request, Response, json, text, with_content_type};
 
-/// Per-request auth policy threaded through the wire path. The
-/// connection-side glue reads these from [`crate::config`] once and
-/// passes them through; tests construct policies directly to exercise
-/// each combination without touching the global singleton.
-///
-/// `agent_tokens` overrides the global `auth_token` per-agent —
-/// requests to `/<agent>/*` where the agent is in the map require
-/// the matching token, *instead of* the global one. Agents not in
-/// the map fall through to the global gate. Schema and metrics
-/// paths are unaffected.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct Policy<'a> {
-    pub auth_token: Option<&'a str>,
-    pub agent_tokens: Option<&'a std::collections::HashMap<String, String>>,
-}
-
-/// Per-request entry point, called from a connection task with the
-/// parsed [`Request`] + the actor [`Context`]. Runs the ask-free public
-/// intercepts (`/__metrics`, `/__status`), the bearer-auth gate, then
-/// hands everything else to [`handle`] (registry + agent asks). The
-/// caller records the response status into `Inner::metrics`.
+/// Per-request entry point. Only the minimal health endpoint is anonymous.
+/// Every other route requires a live authority decision; schemas require
+/// Member and metrics require Admin.
 pub(crate) async fn dispatch(
     req: &Request,
     inner: &Inner,
-    ctx: &mut Context<HttpGateway>,
-    policy: Policy<'_>,
+    ctx: &mut HttpIngressContext,
 ) -> Response {
-    // A config error (today: malformed `agent_tokens`) means we'd be
-    // serving with weakened auth — refuse every request instead. In
-    // transport mode `new()` can't decline to boot (the host owns the
-    // listener), so the refusal lives here.
-    if let Some(reason) = &inner.config_error {
-        log::error!("http-gateway: refusing request — config error: {reason}");
-        return text(503, "gateway misconfigured");
-    }
-    // Ask-free public endpoints answer ahead of the auth gate.
-    if let Some(response) = handle_metrics(req, inner) {
-        return response;
-    }
     if let Some(response) = handle_status(req, inner) {
         return response;
     }
-    // Per-agent auth overrides the global gate. If the URL is
-    // `/<agent>/*` and `agent_tokens` has an entry for that name, the
-    // per-agent token replaces the global one. Falls back to the
-    // global token otherwise.
-    let effective_auth = effective_auth_for(req, &policy);
-    if let Some(response) = check_auth(req, effective_auth) {
-        return response;
+    let Some(role) = ctx.role() else {
+        return text(401, "a live VOS access token is required");
+    };
+    if req.uri().path() == "/__metrics" {
+        if role != crate::SpaceRole::Admin {
+            return text(403, "admin access is required");
+        }
+        return handle_metrics(req, inner).expect("metrics path matched");
     }
-    // Past the gates: this counts as a dispatched request and bumps
-    // `vos_gateway_requests_total` once (schema / openapi / agent dispatch
-    // alike; `/__metrics` + `/__status` short-circuit above and don't count).
-    inner.requests.set(inner.requests.get() + 1);
+    if role < crate::SpaceRole::Member {
+        return text(403, "member access is required");
+    }
+    inner.requests.fetch_add(1, Ordering::Relaxed);
     handle(req, inner, ctx).await
 }
 
 /// `GET /__status` — compact JSON liveness snapshot (port, running,
 /// request count, uptime). Reads only `Inner` atomics, so
 /// it needs no registry round trip and works regardless of upstream
-/// reachability. Public (no token), like `/__metrics`.
+/// reachability. Public (no token).
 fn handle_status(req: &Request, inner: &Inner) -> Option<Response> {
     if req.uri().path() != "/__status" {
         return None;
@@ -120,13 +67,11 @@ fn handle_status(req: &Request, inner: &Inner) -> Option<Response> {
     if req.method() != Method::GET {
         return Some(text(405, "/__status is GET-only"));
     }
-    Some(json(200, crate::state::status_json(inner).into_bytes()))
+    Some(json(200, super::state::status_json(inner).into_bytes()))
 }
 
-/// `GET /__metrics` — Prometheus exposition format. Public, no
-/// admin gate (matches Prometheus convention: scrapers don't auth).
-/// Connection-side because the render only touches atomics on
-/// `Inner` — no round trip required.
+/// `GET /__metrics` — Prometheus exposition format. The caller enforces the
+/// Admin gate before entering this ask-free renderer.
 fn handle_metrics(req: &Request, inner: &Inner) -> Option<Response> {
     if req.uri().path() != "/__metrics" {
         return None;
@@ -134,73 +79,18 @@ fn handle_metrics(req: &Request, inner: &Inner) -> Option<Response> {
     if req.method() != Method::GET {
         return Some(text(405, "/__metrics is GET-only"));
     }
-    let body = crate::state::render_prometheus(inner).into_bytes();
+    let body = super::state::render_prometheus(inner).into_bytes();
     // Prometheus exposition convention. Some scrapers also tolerate bare
     // `text/plain`, but this is the canonical content type.
     Some(with_content_type(200, "text/plain; version=0.0.4", body))
 }
 
-/// Public-namespace paths that skip the dispatch auth gate
-/// regardless of token config. Schema / metrics / openapi are
-/// intentionally readable by anyone reachable on the bound port
-/// — they describe what the gateway is, not anything sensitive.
-/// Centralized here so the `effective_auth_for` predicate doesn't
-/// rely on a fragile `agent_name.starts_with('_')` heuristic that
-/// silently auth-gated `/openapi.json` (which has no underscore).
+/// Reserved namespaces which can never be actor names.
 const PUBLIC_NAMESPACES: &[&str] = &["__schema", "__metrics", "openapi.json"];
 
-/// Pick the auth token to enforce for this request. Inspects
-/// the URI path for the leading `/<agent>/`; if the agent name has
-/// an entry in `agent_tokens`, returns that token (per-agent
-/// override). Otherwise falls back to the global `auth_token`.
-///
-/// Paths that map to a public namespace ([`PUBLIC_NAMESPACES`])
-/// or to the empty path return `None` here so `check_auth`
-/// allows them through — those endpoints are intentionally
-/// readable without a token.
-fn effective_auth_for<'a>(req: &Request, policy: &Policy<'a>) -> Option<&'a str> {
-    // Only `/<agent>/<method>` URLs receive auth checks. The
-    // dispatch handler will 400 on missing method later anyway.
-    let trimmed = req.uri().path().trim_start_matches('/');
-    let agent_name = trimmed.split_once('/').map(|(a, _)| a).unwrap_or(trimmed);
-    if agent_name.is_empty() || PUBLIC_NAMESPACES.contains(&agent_name) {
-        return None;
-    }
-    if let Some(tokens) = policy.agent_tokens
-        && let Some(t) = tokens.get(agent_name)
-    {
-        return Some(t.as_str());
-    }
-    policy.auth_token
-}
-
-/// Bearer-token gate. `None` if the request is allowed (either auth
-/// is disabled or the header matches), `Some(401)` if it should be
-/// rejected.
-fn check_auth(req: &Request, expected: Option<&str>) -> Option<Response> {
-    let expected = expected?;
-    let provided = req
-        .headers()
-        .get(http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.strip_prefix("Bearer ")
-                .or_else(|| v.strip_prefix("bearer "))
-        });
-    if provided.is_some_and(|t| ct_eq(t.trim(), expected)) {
-        None
-    } else {
-        Some(text(401, "unauthorized"))
-    }
-}
-
 /// Resolve `/<agent>/<method>` (and the `/__schema*` / `/openapi.json`
-/// registry-backed endpoints) by asking the registry + target agent
-/// through the async [`Context::ask_dispatch`]. Many connection tasks
-/// run this concurrently on the host's one cooperative executor —
-/// `&self` shared, all mutable runtime state behind `Inner`'s atomics /
-/// `Mutex`.
-async fn handle(req: &Request, inner: &Inner, ctx: &mut Context<HttpGateway>) -> Response {
+/// registry-backed endpoints) through the host ingress handle.
+async fn handle(req: &Request, inner: &Inner, ctx: &mut HttpIngressContext) -> Response {
     // `/__schema*` and `/openapi.json` short-circuit the agent/method
     // dispatcher. They `ask` the registry for schema, so they live here
     // (not in `dispatch`'s ask-free pre-auth shortcut).
@@ -215,16 +105,16 @@ async fn handle(req: &Request, inner: &Inner, ctx: &mut Context<HttpGateway>) ->
         return text(400, "expected /<agent>/<method>");
     };
 
-    // Reserve the gateway's own namespaces. The exact built-in paths
+    // Reserve the ingress namespaces. The exact built-in paths
     // (`/__metrics`, `/__status`, `/__schema*`, `/openapi.json`) were handled
     // above; a *sub-path* like `/__metrics/foo` falls through to here and would
     // otherwise dispatch to an agent literally named `__metrics` — which
     // `effective_auth_for` classifies as a public namespace, so it would reach
     // that agent with NO token. Refuse dispatch to any `__`-prefixed name (or a
     // public namespace) so a reserved-named agent can't be reached — let alone
-    // unauthenticated — through the gateway.
+    // unauthenticated — through HTTP ingress.
     if agent.starts_with("__") || PUBLIC_NAMESPACES.contains(&agent.as_str()) {
-        return text(404, format!("'{agent}' is a reserved gateway namespace"));
+        return text(404, format!("'{agent}' is a reserved ingress namespace"));
     }
 
     let target = match resolve(ctx, &agent).await {
@@ -247,36 +137,63 @@ async fn handle(req: &Request, inner: &Inner, ctx: &mut Context<HttpGateway>) ->
     };
 
     // Encode as TAG_DYNAMIC + rkyv'd Msg — same wire format the
-    // existing actor-mode dispatch path produces.
+    // existing extension dispatch path produces.
     let encoded = msg.encode();
     let mut payload = Vec::with_capacity(1 + encoded.len());
-    payload.push(vos::value::TAG_DYNAMIC);
+    payload.push(crate::value::TAG_DYNAMIC);
     payload.extend_from_slice(&encoded);
 
-    // `ask_dispatch` is status-framed (unlike the collapsing `ask_raw`):
-    // `Some(empty)` is a real `()` return → `200 null`; `None` is a
-    // dispatch failure (panic / non-DONE status / no route / timeout) →
-    // `502`. This is what preserves the panic→502 distinction in
-    // transport mode.
     let ret_ty = Some(method_meta.returns.as_str());
-    match ctx.ask_dispatch(target, &payload).await {
-        Some(reply_bytes) if reply_bytes.is_empty() => {
+    match ctx
+        .invoke_actor(target, &payload, method_meta.attested)
+        .await
+    {
+        Ok(reply_bytes) if method_meta.attested => attested_response(&reply_bytes, ret_ty),
+        Ok(reply_bytes) if reply_bytes.is_empty() => {
             // Handler returned `()` successfully → JSON null.
-            json(200, value_to_json(&vos::value::Value::Unit))
+            json(200, value_to_json(&crate::value::Value::Unit))
         }
-        Some(reply_bytes) => {
+        Ok(reply_bytes) => {
             // try_decode runs rkyv's checked access — handles
             // arbitrary alignment + validates the buffer. decode
             // would unsafely access_unchecked, panicking on
             // misaligned slices that came back through the invoke
             // envelope unwrap.
-            match <vos::value::Value as vos::Decode>::try_decode(&reply_bytes) {
+            match <crate::value::Value as crate::Decode>::try_decode(&reply_bytes) {
                 Some(value) => label_return(json(200, value_to_json(&value)), ret_ty),
                 None => text(502, "upstream returned malformed reply"),
             }
         }
-        None => text(502, "upstream error or shutdown"),
+        Err(crate::ClientError::Forbidden) => text(403, "actor policy denied the request"),
+        Err(crate::ClientError::NotFound) => text(404, "actor is no longer available"),
+        Err(crate::ClientError::Call(crate::CallError::Timeout)) => {
+            text(504, "actor invocation timed out")
+        }
+        Err(crate::ClientError::Unreachable) => text(503, "actor is unavailable"),
+        Err(_) => text(502, "actor invocation failed"),
     }
+}
+
+fn attested_response(wire: &[u8], ret_ty: Option<&str>) -> Response {
+    use crate::service::ServiceWire;
+
+    let Ok(result) = crate::service::RootTreeAttestedResult::decode(wire) else {
+        return text(502, "upstream returned a malformed attestation");
+    };
+    let Some(value) = <crate::value::Value as crate::Decode>::try_decode(&result.reply) else {
+        return text(502, "attested reply is malformed");
+    };
+    let body = serde_json::json!({
+        "reply": value_to_json_value(&value),
+        "attestation_wire": hex_encode(wire),
+    });
+    label_return(
+        json(
+            200,
+            serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec()),
+        ),
+        ret_ty,
+    )
 }
 
 /// Attach the schema's declared return type as an `x-vos-return-type`
@@ -295,9 +212,8 @@ fn label_return(mut resp: Response, ret_ty: Option<&str>) -> Response {
     resp
 }
 
-/// Self-documenting schema endpoints. Public — schema is no more
-/// sensitive than what the registry already serves over libp2p to
-/// any peer node. Returns `None` for unrelated paths so the
+/// Self-documenting schema endpoints. The caller applies the Member gate
+/// before entering this function. Returns `None` for unrelated paths so the
 /// caller falls through to the agent/method dispatcher.
 ///
 /// - `GET /__schema`           → JSON `["name", ...]` of installed agents
@@ -308,7 +224,7 @@ fn label_return(mut resp: Response, ret_ty: Option<&str>) -> Response {
 async fn handle_schema(
     req: &Request,
     inner: &Inner,
-    ctx: &mut Context<HttpGateway>,
+    ctx: &mut HttpIngressContext,
 ) -> Option<Response> {
     let path = req.uri().path();
     if !path.starts_with("/__schema") {
@@ -331,7 +247,7 @@ async fn handle_schema(
 /// `instance_name` order. `None` means the registry was unreachable (a
 /// dropped dispatch); a malformed/misaligned page degrades to the names
 /// gathered so far rather than panicking the connection task.
-async fn drain_agent_names(ctx: &mut Context<HttpGateway>) -> Option<Vec<String>> {
+async fn drain_agent_names(ctx: &mut HttpIngressContext) -> Option<Vec<String>> {
     let mut names: Vec<String> = Vec::new();
     loop {
         let after = names.last().cloned().unwrap_or_default();
@@ -340,14 +256,14 @@ async fn drain_agent_names(ctx: &mut Context<HttpGateway>) -> Option<Vec<String>
             .with("budget", 0u32);
         let encoded = msg.encode();
         let mut payload = Vec::with_capacity(1 + encoded.len());
-        payload.push(vos::value::TAG_DYNAMIC);
+        payload.push(crate::value::TAG_DYNAMIC);
         payload.extend_from_slice(&encoded);
-        let bytes = ctx.ask_dispatch(ServiceId::REGISTRY, &payload).await?;
+        let bytes = ctx.ask_registry(&payload).await?;
         // Reply is `Value::Bytes(rkyv(AgentNamePage))`; anything else (empty,
         // Unit, non-decodable) ends the drain with what we have.
-        let page = match <vos::value::Value as vos::Decode>::try_decode(&bytes) {
-            Some(vos::value::Value::Bytes(inner)) if !inner.is_empty() => {
-                match <vos::registry::AgentNamePage as vos::Decode>::try_decode(&inner) {
+        let page = match <crate::value::Value as crate::Decode>::try_decode(&bytes) {
+            Some(crate::value::Value::Bytes(inner)) if !inner.is_empty() => {
+                match <crate::registry::AgentNamePage as crate::Decode>::try_decode(&inner) {
                     Some(page) => page,
                     None => break,
                 }
@@ -363,7 +279,7 @@ async fn drain_agent_names(ctx: &mut Context<HttpGateway>) -> Option<Vec<String>
     Some(names)
 }
 
-async fn list_schemas(ctx: &mut Context<HttpGateway>) -> Response {
+async fn list_schemas(ctx: &mut HttpIngressContext) -> Response {
     let Some(names) = drain_agent_names(ctx).await else {
         return text(502, "registry unreachable");
     };
@@ -373,7 +289,7 @@ async fn list_schemas(ctx: &mut Context<HttpGateway>) -> Response {
     )
 }
 
-async fn schema_for_agent(name: &str, inner: &Inner, ctx: &mut Context<HttpGateway>) -> Response {
+async fn schema_for_agent(name: &str, inner: &Inner, ctx: &mut HttpIngressContext) -> Response {
     let Some(target) = resolve(ctx, name).await else {
         return text(404, format!("unknown agent '{name}'"));
     };
@@ -387,8 +303,8 @@ async fn schema_for_agent(name: &str, inner: &Inner, ctx: &mut Context<HttpGatew
 /// in-tree `ActorMeta`/`MessageMeta`/`FieldMeta` structs so a
 /// The field names mirror the in-tree schema: `actor_name`, `messages[i].name`,
 /// `messages[i].is_query`, `messages[i].fields[j].name/type`,
-/// `constructor[i].name/type`, `kind`, `caps`.
-fn meta_to_json(meta: &vos::metadata::ParsedMeta) -> String {
+/// `constructor[i].name/type`.
+fn meta_to_json(meta: &crate::metadata::ParsedMeta) -> String {
     let messages: Vec<_> = meta
         .messages
         .iter()
@@ -402,6 +318,13 @@ fn meta_to_json(meta: &vos::metadata::ParsedMeta) -> String {
                 "name": m.name,
                 "is_query": m.is_query,
                 "fields": fields,
+                "returns": m.returns,
+                "doc": m.doc,
+                "timeout_ms": m.timeout_ms,
+                "mode": m.mode,
+                "attested": m.attested,
+                "space_role": m.space_role,
+                "actor_role": m.actor_role,
             })
         })
         .collect();
@@ -412,10 +335,11 @@ fn meta_to_json(meta: &vos::metadata::ParsedMeta) -> String {
         .collect();
     serde_json::json!({
         "actor_name": meta.actor_name,
+        "doc": meta.doc,
+        "crdt": meta.crdt,
+        "provable": meta.provable,
         "messages": messages,
         "constructor": constructor,
-        "kind": meta.kind,
-        "caps": meta.caps,
     })
     .to_string()
 }
@@ -423,8 +347,8 @@ fn meta_to_json(meta: &vos::metadata::ParsedMeta) -> String {
 /// OpenAPI 3.0 document at `GET /openapi.json`. Walks every agent
 /// the registry knows about, fetches each one's schema (using the
 /// same `ensure_meta_cached` warm path as the dispatcher), and
-/// renders one `paths./<agent>/<method>` entry per `#[msg]`. Public,
-/// no admin token — same threat model as `/__schema/*`.
+/// renders one `paths./<agent>/<method>` entry per `#[msg]`. The caller applies
+/// the Member gate before entering this function.
 ///
 /// Type mapping for arg shapes mirrors what `coerce_to_type`
 /// accepts on the way in (so the documented surface and the
@@ -440,7 +364,7 @@ fn meta_to_json(meta: &vos::metadata::ParsedMeta) -> String {
 async fn handle_openapi(
     req: &Request,
     inner: &Inner,
-    ctx: &mut Context<HttpGateway>,
+    ctx: &mut HttpIngressContext,
 ) -> Option<Response> {
     if req.uri().path() != "/openapi.json" {
         return None;
@@ -451,7 +375,7 @@ async fn handle_openapi(
     Some(render_openapi(inner, ctx).await)
 }
 
-async fn render_openapi(inner: &Inner, ctx: &mut Context<HttpGateway>) -> Response {
+async fn render_openapi(inner: &Inner, ctx: &mut HttpIngressContext) -> Response {
     // 1. Get every installed agent's name.
     let Some(names) = drain_agent_names(ctx).await else {
         return text(502, "registry unreachable");
@@ -476,10 +400,20 @@ async fn render_openapi(inner: &Inner, ctx: &mut Context<HttpGateway>) -> Respon
     let doc = serde_json::json!({
         "openapi": "3.0.3",
         "info": {
-            "title": "VOS gateway",
+            "title": "VOS HTTP ingress",
             "version": "unreleased",
             "description": "Auto-generated from installed-agent schemas (see GET /__schema)."
         },
+        "components": {
+            "securitySchemes": {
+                "vosAccess": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "bearerFormat": "vos-access"
+                }
+            }
+        },
+        "security": [{ "vosAccess": [] }],
         "paths": paths_obj,
     });
 
@@ -493,10 +427,10 @@ async fn render_openapi(inner: &Inner, ctx: &mut Context<HttpGateway>) -> Respon
 /// GET for `is_query` handlers (read-only `&self`) with args
 /// going into the query string, POST for everything else with
 /// args going into a JSON body. Both shapes match what the
-/// gateway actually dispatches via `build_msg`.
+/// ingress actually dispatches via `build_msg`.
 fn openapi_operation_for(
     actor_name: &str,
-    msg: &vos::metadata::ParsedMessage,
+    msg: &crate::metadata::ParsedMessage,
 ) -> serde_json::Value {
     let http_method = if msg.is_query { "get" } else { "post" };
     let summary = format!("{actor_name}::{}", msg.name);
@@ -527,7 +461,11 @@ fn openapi_operation_for(
         serde_json::json!({
             http_method: {
                 "summary": summary,
+                "description": msg.doc,
                 "operationId": operation_id,
+                "x-vos-attested": msg.attested,
+                "x-vos-space-role": msg.space_role,
+                "x-vos-actor-role": msg.actor_role,
                 "parameters": parameters,
                 "responses": { "200": { "description": response_desc } }
             }
@@ -542,7 +480,11 @@ fn openapi_operation_for(
         serde_json::json!({
             http_method: {
                 "summary": summary,
+                "description": msg.doc,
                 "operationId": operation_id,
+                "x-vos-attested": msg.attested,
+                "x-vos-space-role": msg.space_role,
+                "x-vos-actor-role": msg.actor_role,
                 "requestBody": {
                     "required": !msg.fields.is_empty(),
                     "content": {
@@ -602,32 +544,10 @@ fn split_path(path: &str) -> Option<(String, String)> {
     (!agent.is_empty() && !method.is_empty()).then(|| (agent.to_string(), method.to_string()))
 }
 
-/// Look up an agent's `ServiceId` via the space registry actor.
-/// Returns `None` for unknown names OR for any error from the
-/// registry — collapsing the variants on purpose because both render
-/// the same to the HTTP caller.
-///
-/// `caller_prefix` is required by the bundled space-registry's
-/// `resolve(name, caller_prefix)` handler so it can derive the
-/// agent's ServiceId in the gateway's node namespace. We extract
-/// the prefix from the gateway's own ServiceId (high 16 bits via
-/// `ctx.id()`).
-async fn resolve(ctx: &mut Context<HttpGateway>, name: &str) -> Option<ServiceId> {
-    let caller_prefix = (ctx.id().0 >> 16) as u64;
-    let msg = Msg::new("resolve")
-        .with("name", name.to_string())
-        .with("caller_prefix", caller_prefix);
-    let encoded = msg.encode();
-    let mut payload = Vec::with_capacity(1 + encoded.len());
-    payload.push(vos::value::TAG_DYNAMIC);
-    payload.extend_from_slice(&encoded);
-    let bytes = ctx.ask_dispatch(ServiceId::REGISTRY, &payload).await?;
-    if bytes.is_empty() {
-        return None;
-    }
-    let value = <vos::value::Value as vos::Decode>::try_decode(&bytes)?;
-    let id = value.as_u32().unwrap_or(0);
-    (id != 0).then_some(ServiceId(id))
+/// Resolve only roots attached to this node. HTTP listeners are host-local;
+/// they do not turn registry aliases into implicit cross-node routes.
+async fn resolve(ctx: &mut HttpIngressContext, name: &str) -> Option<ActorId> {
+    ctx.resolve_actor(name)
 }
 
 // The Err variant is the terminal 400 response, built once on the
@@ -635,10 +555,18 @@ async fn resolve(ctx: &mut Context<HttpGateway>, name: &str) -> Option<ServiceId
 #[allow(clippy::result_large_err)]
 fn build_msg(
     method: String,
-    method_meta: &vos::metadata::ParsedMessage,
+    method_meta: &crate::metadata::ParsedMessage,
     req: &Request,
 ) -> core::result::Result<Msg, Response> {
-    use vos::value::Value;
+    use crate::value::Value;
+    if method_meta.is_query && req.method() != Method::GET {
+        return Err(text(405, "query methods require GET"));
+    }
+    if !method_meta.is_query
+        && !matches!(req.method(), &Method::POST | &Method::PUT | &Method::PATCH)
+    {
+        return Err(text(405, "mutating methods require POST, PUT, or PATCH"));
+    }
     let mut msg = Msg::new(method);
     let mut seen_keys: Vec<String> = Vec::new();
     // Pulls the typed result from `coerce_to_type` when a field declaration
@@ -675,7 +603,7 @@ fn build_msg(
                     // Detail (line/column, offending token) goes to logs;
                     // clients see a generic 400 so server internals don't
                     // leak via crafted-input probing.
-                    log::debug!("http-gateway: invalid JSON body: {e}");
+                    log::debug!("HTTP ingress rejected invalid JSON: {e}");
                     text(400, "invalid JSON body")
                 })?;
                 for (k, v) in pairs {
@@ -707,8 +635,8 @@ fn build_msg(
 /// mismatch when schema is known. Bool/string/bytes pass through
 /// when the input variant already matches — there's no narrowing
 /// to do for those.
-fn coerce_to_type(v: vos::value::Value, ty: &str) -> Option<vos::value::Value> {
-    use vos::value::Value;
+fn coerce_to_type(v: crate::value::Value, ty: &str) -> Option<crate::value::Value> {
+    use crate::value::Value;
     // Pull a string out for parse-based coercion (the GET path).
     let as_str = if let Value::Str(ref s) = v {
         Some(s.as_str())
@@ -728,7 +656,7 @@ fn coerce_to_type(v: vos::value::Value, ty: &str) -> Option<vos::value::Value> {
     // actor's `from_msg` validates the `[u8; N]` length.
     if ty == "Vec<u8>" || (ty.starts_with("[u8;") && ty.ends_with(']')) {
         return if let Some(s) = as_str {
-            crate::json::hex_decode(s).map(Value::Bytes)
+            super::json::hex_decode(s).map(Value::Bytes)
         } else if let Value::ListU32(ref nums) = v {
             nums.iter()
                 .map(|&n| u8::try_from(n).ok())
@@ -775,7 +703,7 @@ fn coerce_to_type(v: vos::value::Value, ty: &str) -> Option<vos::value::Value> {
         // through unchanged so the actor's `from_msg` accessor
         // gets a chance to evaluate the shape. Returning
         // `Some(v)` here keeps the 400-on-failure check
-        // restricted to scalars the gateway is confident about.
+        // restricted to scalars the ingress is confident about.
         _ => Some(v),
     }
 }
@@ -783,22 +711,22 @@ fn coerce_to_type(v: vos::value::Value, ty: &str) -> Option<vos::value::Value> {
 /// Fetch the actor's schema from the registry on a cache miss and return the
 /// cached entry on a hit. A missing schema is cached for the TTL.
 async fn ensure_meta_cached(
-    ctx: &mut Context<HttpGateway>,
+    ctx: &mut HttpIngressContext,
     inner: &Inner,
-    target: ServiceId,
+    target: ActorId,
     name: &str,
-) -> Option<vos::metadata::ParsedMeta> {
+) -> Option<crate::metadata::ParsedMeta> {
     // Fast path: cache hit + entry is still fresh. TTL covers the
     // `vosx space upgrade` case where the registry now has a
-    // different schema but the gateway has no event-driven signal
+    // different schema but the ingress has no event-driven signal
     // to invalidate. Bounded staleness rather than per-request
     // revalidation. The `RefCell` borrow is dropped before the registry
     // `ask` below (never held across an `.await` — the single-threaded
     // executor would panic on a concurrent borrow).
     {
-        let cache = inner.meta_cache.borrow();
-        if let Some(entry) = cache.get(&target.0)
-            && entry.fetched_at.elapsed() < crate::state::META_CACHE_TTL
+        let cache = inner.meta_cache.lock().unwrap();
+        if let Some(entry) = cache.get(&target)
+            && entry.fetched_at.elapsed() < super::state::META_CACHE_TTL
         {
             return entry.meta.clone();
         }
@@ -808,10 +736,10 @@ async fn ensure_meta_cached(
     // Empty reply means "no meta registered" → store `None` so we
     // don't retry on every request inside this TTL window.
     let parsed = fetch_meta_from_registry(ctx, name).await;
-    let mut cache = inner.meta_cache.borrow_mut();
+    let mut cache = inner.meta_cache.lock().unwrap();
     cache.insert(
-        target.0,
-        crate::state::MetaEntry {
+        target,
+        super::state::MetaEntry {
             meta: parsed.clone(),
             fetched_at: std::time::Instant::now(),
         },
@@ -820,27 +748,27 @@ async fn ensure_meta_cached(
 }
 
 async fn fetch_meta_from_registry(
-    ctx: &mut Context<HttpGateway>,
+    ctx: &mut HttpIngressContext,
     name: &str,
-) -> Option<vos::metadata::ParsedMeta> {
+) -> Option<crate::metadata::ParsedMeta> {
     let msg = Msg::new("meta_for_instance").with("name", name.to_string());
     let encoded = msg.encode();
     let mut payload = Vec::with_capacity(1 + encoded.len());
-    payload.push(vos::value::TAG_DYNAMIC);
+    payload.push(crate::value::TAG_DYNAMIC);
     payload.extend_from_slice(&encoded);
-    let bytes = ctx.ask_dispatch(ServiceId::REGISTRY, &payload).await?;
+    let bytes = ctx.ask_registry(&payload).await?;
     if bytes.is_empty() {
         return None;
     }
     // The reply is a `Value::Bytes(...)` carrying the raw
     // `.vos_meta` section. Empty bytes mean no entry exists. `decode`
     // returns None for malformed data too.
-    let value = <vos::value::Value as vos::Decode>::try_decode(&bytes)?;
+    let value = <crate::value::Value as crate::Decode>::try_decode(&bytes)?;
     let raw = value.as_bytes()?;
     if raw.is_empty() {
         return None;
     }
-    vos::metadata::decode(raw)
+    crate::metadata::decode(raw)
 }
 
 /// Parse `a=1&b=hello+world` into key-value pairs, with proper percent
@@ -914,14 +842,14 @@ mod tests {
 
     #[test]
     fn coerce_vec_u8_from_hex_string() {
-        use vos::value::Value;
+        use crate::value::Value;
         let got = coerce_to_type(Value::Str("0xdead".into()), "Vec<u8>");
         assert_eq!(got, Some(Value::Bytes(vec![0xde, 0xad])));
     }
 
     #[test]
     fn coerce_byte_array_from_hex_string() {
-        use vos::value::Value;
+        use crate::value::Value;
         // Length is not checked here — the actor's from_msg validates it.
         let got = coerce_to_type(Value::Str("01020304".into()), "[u8;4]");
         assert_eq!(got, Some(Value::Bytes(vec![1, 2, 3, 4])));
@@ -929,7 +857,7 @@ mod tests {
 
     #[test]
     fn coerce_bytes_from_spaced_type() {
-        use vos::value::Value;
+        use crate::value::Value;
         // Older binaries pretty-print the type; whitespace is stripped.
         let got = coerce_to_type(Value::Str("ab".into()), "Vec < u8 >");
         assert_eq!(got, Some(Value::Bytes(vec![0xab])));
@@ -951,12 +879,41 @@ mod tests {
     }
 
     #[test]
+    fn actor_http_verbs_follow_the_schema_query_flag() {
+        let mut method = parsed_method(true);
+        let post = Request::builder()
+            .method(Method::POST)
+            .uri("/counter/value")
+            .body(Vec::new())
+            .unwrap();
+        assert_eq!(
+            build_msg("value", &method, &post)
+                .expect_err("queries are GET-only")
+                .status(),
+            405
+        );
+
+        method.is_query = false;
+        let get = Request::builder()
+            .method(Method::GET)
+            .uri("/counter/increment")
+            .body(Vec::new())
+            .unwrap();
+        assert_eq!(
+            build_msg("increment", &method, &get)
+                .expect_err("mutations reject GET")
+                .status(),
+            405
+        );
+    }
+
+    #[test]
     fn meta_cache_entry_past_ttl_is_considered_stale() {
         // Hand-seed a cache entry with `fetched_at` set just past
         // the TTL boundary, then confirm the staleness check the
         // dispatcher uses on the fast path returns false. Catches
         // accidental `<=` / `>=` flips or a TTL constant typo.
-        use crate::state::{META_CACHE_TTL, MetaEntry};
+        use crate::ingress::state::{META_CACHE_TTL, MetaEntry};
         use std::time::Instant;
 
         let inner = fresh_inner();
@@ -968,7 +925,7 @@ mod tests {
 
         // Fresh entry: well within TTL.
         {
-            let mut cache = inner.meta_cache.borrow_mut();
+            let mut cache = inner.meta_cache.lock().unwrap();
             cache.insert(
                 target_id,
                 MetaEntry {
@@ -978,7 +935,7 @@ mod tests {
             );
         }
         {
-            let cache = inner.meta_cache.borrow();
+            let cache = inner.meta_cache.lock().unwrap();
             let entry = cache.get(&target_id).expect("entry");
             assert!(
                 entry.fetched_at.elapsed() < META_CACHE_TTL,
@@ -988,7 +945,7 @@ mod tests {
 
         // Stale entry: past TTL by 1ms.
         {
-            let mut cache = inner.meta_cache.borrow_mut();
+            let mut cache = inner.meta_cache.lock().unwrap();
             cache.insert(
                 target_id,
                 MetaEntry {
@@ -997,7 +954,7 @@ mod tests {
                 },
             );
         }
-        let cache = inner.meta_cache.borrow();
+        let cache = inner.meta_cache.lock().unwrap();
         let entry = cache.get(&target_id).expect("entry");
         assert!(
             entry.fetched_at.elapsed() >= META_CACHE_TTL,
@@ -1005,240 +962,23 @@ mod tests {
         );
     }
 
-    // ── Auth-gate tests ───────────────────────────────────────────
-    //
-    // The connection-side gate is two pure functions: `effective_auth_for`
-    // (which token, if any, applies to this URL) + `check_auth` (does the
-    // request carry it). These are tested directly as pure functions.
-    // End-to-end dispatch (registry resolve → `ctx.ask` →
-    // reply) is covered by `dispatch_e2e` + `gateway_pvm_e2e` against a
-    // real VosNode; the parser is covered by `crate::http1`'s unit tests.
-
-    use std::cell::{Cell, RefCell};
-
     fn fresh_inner() -> Inner {
-        Inner {
-            bound_port: 8080,
-            started_unix: 1_700_000_000,
-            requests: Cell::new(0),
-            cfg: crate::config::GatewayConfig::default(),
-            meta_cache: RefCell::new(std::collections::HashMap::new()),
-            metrics: crate::state::Metrics::default(),
-            agent_tokens: std::collections::HashMap::new(),
-            config_error: None,
-        }
+        Inner::new(8080)
     }
 
-    fn req(method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> Request {
-        let mut builder = http::Request::builder().method(method).uri(path);
-        for (k, v) in headers {
-            builder = builder.header(*k, *v);
-        }
-        builder.body(body.to_vec()).expect("valid test request")
-    }
-
-    /// `None` if the request passes the gate, `Some(status)` if it's
-    /// rejected — the exact composition `dispatch` runs.
-    fn gate(r: &Request, policy: Policy<'_>) -> Option<u16> {
-        check_auth(r, effective_auth_for(r, &policy)).map(|resp| resp.status().as_u16())
-    }
-
-    fn agent_tokens_for(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn auth_required_missing_returns_401() {
-        let r = req("GET", "/agent/method", &[], &[]);
-        assert_eq!(
-            gate(
-                &r,
-                Policy {
-                    auth_token: Some("secret"),
-                    agent_tokens: None,
-                },
-            ),
-            Some(401),
-        );
-    }
-
-    #[test]
-    fn auth_required_wrong_bearer_returns_401() {
-        let r = req(
-            "GET",
-            "/agent/method",
-            &[("authorization", "Bearer wrong")],
-            &[],
-        );
-        assert_eq!(
-            gate(
-                &r,
-                Policy {
-                    auth_token: Some("secret"),
-                    agent_tokens: None,
-                },
-            ),
-            Some(401),
-        );
-    }
-
-    #[test]
-    fn auth_correct_bearer_passes_gate() {
-        let r = req(
-            "GET",
-            "/agent/method",
-            &[("authorization", "Bearer secret")],
-            &[],
-        );
-        assert_eq!(
-            gate(
-                &r,
-                Policy {
-                    auth_token: Some("secret"),
-                    agent_tokens: None,
-                },
-            ),
-            None,
-        );
-    }
-
-    #[test]
-    fn auth_bearer_lowercase_scheme_accepted() {
-        let r = req(
-            "GET",
-            "/agent/method",
-            &[("authorization", "bearer secret")],
-            &[],
-        );
-        assert_eq!(
-            gate(
-                &r,
-                Policy {
-                    auth_token: Some("secret"),
-                    agent_tokens: None,
-                },
-            ),
-            None,
-        );
-    }
-
-    #[test]
-    fn no_token_configured_passes_gate() {
-        // Open dispatch (no `auth_token`): every request passes.
-        let r = req("GET", "/agent/method", &[], &[]);
-        assert_eq!(gate(&r, Policy::default()), None);
-    }
-
-    // ── Per-agent Bearer auth ─────────────────────────────────────
-    //
-    // Validates the `agent_tokens` override against the global
-    // `auth_token` and the public namespaces.
-
-    #[test]
-    fn per_agent_token_requires_match_for_that_agent() {
-        let tokens = agent_tokens_for(&[("secret-agent", "agent-only-token")]);
-        let r = req(
-            "GET",
-            "/secret-agent/whoami",
-            &[("authorization", "Bearer agent-only-token")],
-            &[],
-        );
-        assert_eq!(
-            gate(
-                &r,
-                Policy {
-                    auth_token: None,
-                    agent_tokens: Some(&tokens),
-                },
-            ),
-            None,
-        );
-    }
-
-    #[test]
-    fn per_agent_token_rejects_wrong_bearer() {
-        let tokens = agent_tokens_for(&[("secret-agent", "agent-only-token")]);
-        let r = req(
-            "GET",
-            "/secret-agent/whoami",
-            &[("authorization", "Bearer wrong")],
-            &[],
-        );
-        assert_eq!(
-            gate(
-                &r,
-                Policy {
-                    auth_token: None,
-                    agent_tokens: Some(&tokens),
-                },
-            ),
-            Some(401),
-        );
-    }
-
-    #[test]
-    fn per_agent_token_overrides_global_for_that_agent() {
-        // Global gate is `global-token`; the per-agent override for
-        // `special` is `agent-token`. Hitting `/special/...` with the
-        // global token must 401 — the agent token is the only one that
-        // opens this agent.
-        let tokens = agent_tokens_for(&[("special", "agent-token")]);
-        let r = req(
-            "GET",
-            "/special/foo",
-            &[("authorization", "Bearer global-token")],
-            &[],
-        );
-        assert_eq!(
-            gate(
-                &r,
-                Policy {
-                    auth_token: Some("global-token"),
-                    agent_tokens: Some(&tokens),
-                },
-            ),
-            Some(401),
-        );
-    }
-
-    #[test]
-    fn per_agent_falls_back_to_global_for_other_agents() {
-        // Only `special` is in the per-agent map. `regular` hits the
-        // global gate; the global token works.
-        let tokens = agent_tokens_for(&[("special", "agent-token")]);
-        let r = req(
-            "GET",
-            "/regular/foo",
-            &[("authorization", "Bearer global-token")],
-            &[],
-        );
-        assert_eq!(
-            gate(
-                &r,
-                Policy {
-                    auth_token: Some("global-token"),
-                    agent_tokens: Some(&tokens),
-                },
-            ),
-            None,
-        );
-    }
-
-    #[test]
-    fn public_endpoints_ignore_tokens() {
-        // `/__metrics`, `/__status`, `/__schema`, `/openapi.json` are
-        // public — neither the global nor a per-agent gate covers them.
-        let tokens = agent_tokens_for(&[("anything", "agent-token")]);
-        let policy = Policy {
-            auth_token: Some("global-token"),
-            agent_tokens: Some(&tokens),
-        };
-        for path in ["/__metrics", "/__schema", "/__schema/math", "/openapi.json"] {
-            let r = req("GET", path, &[], &[]);
-            assert_eq!(gate(&r, policy), None, "{path} should bypass auth");
+    fn parsed_method(is_query: bool) -> crate::metadata::ParsedMessage {
+        crate::metadata::ParsedMessage {
+            name: "method".into(),
+            is_query,
+            fields: Vec::new(),
+            exposed_to_cli: false,
+            returns: "()".into(),
+            doc: String::new(),
+            timeout_ms: 0,
+            mode: 0,
+            attested: false,
+            space_role: None,
+            actor_role: None,
         }
     }
 }

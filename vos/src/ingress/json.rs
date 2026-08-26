@@ -10,9 +10,9 @@
 //! a base16 string — JSON isn't a blob transport, so we surface them
 //! as inspectable text.
 
-use vos::actors::value::Value;
+use crate::actors::value::Value;
 
-use crate::types::IoResult;
+use super::types::IoResult;
 
 pub(crate) fn parse_flat_json(body: &[u8]) -> IoResult<Vec<(String, Value)>> {
     let json: serde_json::Value = serde_json::from_slice(body).map_err(|e| format!("{e}"))?;
@@ -83,7 +83,7 @@ fn json_array_to_value(xs: Vec<serde_json::Value>) -> IoResult<Value> {
     Err("array elements must all be strings or all be u32-fitting non-negative integers".into())
 }
 
-fn value_to_json_value(v: &Value) -> serde_json::Value {
+pub(crate) fn value_to_json_value(v: &Value) -> serde_json::Value {
     use serde_json::Value as J;
     match v {
         Value::Unit => J::Null,
@@ -101,7 +101,7 @@ fn value_to_json_value(v: &Value) -> serde_json::Value {
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {

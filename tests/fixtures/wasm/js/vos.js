@@ -285,12 +285,14 @@ export class VosActor {
 // Effect tags — must match crates/vos/src/effects.rs
 const EFFECT_ASK = 0x01;
 const EFFECT_FETCH = 0x02;
+const RESULT_ERR = 0x00;
+const STATUS_NOT_FOUND = 0x03;
 
 const HTTP_METHODS = ['GET','POST','PUT','DELETE','PATCH','HEAD','OPTIONS'];
 
 // Default effect handler. Handles EFFECT_FETCH via the global fetch().
-// EFFECT_ASK and unknown tags fall through to an empty response —
-// override via options.onEffect to route asks to other actors.
+// EFFECT_ASK needs an embedder-provided router. The default reports a typed
+// not-found result rather than accidentally looking like a unit reply.
 async function defaultEffectHandler(eff, _actor) {
   if (eff.length === 0) return new Uint8Array(0);
   const tag = eff[0];
@@ -298,7 +300,10 @@ async function defaultEffectHandler(eff, _actor) {
   if (tag === EFFECT_FETCH) {
     return handleFetch(rest);
   }
-  // EFFECT_ASK or unknown — host doesn't know how to fulfill on its own
+  if (tag === EFFECT_ASK) {
+    return new Uint8Array([RESULT_ERR, STATUS_NOT_FOUND]);
+  }
+  // Unknown effect — the host doesn't know how to fulfill it.
   return new Uint8Array(0);
 }
 

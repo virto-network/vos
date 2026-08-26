@@ -11,6 +11,14 @@ The node transports evidence. The generic service guest binds accepted
 evidence to the exact service, actor, deployment, program, method, invocation,
 and logical time.
 
+## Ingress identity
+
+Built-in protocol adapters authenticate protocol credentials into a canonical
+`SubjectId`. For HTTP, the space authority issues and revokes bearer access;
+the node checks the current authority decision on every request. Bearer
+secrets never become actor arguments or replicated state. Actor methods still
+enforce their signed package policy after ingress authentication.
+
 ## Private ingress
 
 Some calls contain input that must not enter Raft logs, CRDT history, service

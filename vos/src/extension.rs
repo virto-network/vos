@@ -30,37 +30,6 @@
 
 use alloc::vec::Vec;
 
-/// What kind of extension this is — `Actor` (request-driven, the
-/// default) or `Transport` (a `handle_connection(&self, …)` server).
-///
-/// Encoded in the `.vos_meta` blob. Unknown values are rejected.
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum ExtensionKind {
-    /// Request-driven: handler runs to completion per-dispatch.
-    /// The default for request-driven extensions.
-    #[default]
-    Actor = 0,
-    /// Transport: a `handle_connection(&self, ctx,
-    /// conn_id)` extension. The host owns a listener (from config)
-    /// and runs an accept loop, spawning one concurrent connection
-    /// task per accept — all sharing `&actor` on a single-threaded
-    /// executor. Exports `vos_extension_conn_new` in addition to the
-    /// actor-mode task ABI.
-    Transport = 1,
-}
-
-impl ExtensionKind {
-    /// Decode a metadata `kind` byte.
-    pub const fn from_byte(b: u8) -> Option<Self> {
-        match b {
-            0 => Some(Self::Actor),
-            1 => Some(Self::Transport),
-            _ => None,
-        }
-    }
-}
-
 /// Result of polling a extension handler, returned across the C ABI.
 #[repr(C)]
 pub struct ExtensionPollResult {
@@ -202,7 +171,6 @@ impl TaskPoll {
 
 #[cfg(feature = "std")]
 mod host {
-    use super::ExtensionKind;
     use crate::actors::metadata::ParsedMeta;
 
     /// Type signatures for the C ABI functions exported by extension `.so` files.
@@ -213,10 +181,6 @@ mod host {
     /// Build the handler future for `msg`, box it in the task slab, return a
     /// stable non-zero handle (0 = couldn't build, e.g. unknown method).
     type TaskNewFn = unsafe extern "C" fn(state: *mut (), msg: *const u8, msg_len: usize) -> u64;
-    /// (Transport-mode) Build a `handle_connection` task for the accepted
-    /// connection `conn_id`; box it in the task slab; return a stable
-    /// non-zero handle. Drives the SHARED-`&actor` connection future.
-    type ConnNewFn = unsafe extern "C" fn(state: *mut (), conn_id: u64, svc_id: u32) -> u64;
     /// Inject `result` (the fulfilment of the previous TASK_PENDING; empty on
     /// the first poll), then poll the task's future once.
     type TaskPollFn = unsafe extern "C" fn(
@@ -233,18 +197,15 @@ mod host {
     type FreeFn = unsafe extern "C" fn(ptr: *mut u8, len: usize, cap: usize);
     type LoadFn = unsafe extern "C" fn(state_ptr: *const u8, state_len: usize) -> *mut ();
     type StateFn = unsafe extern "C" fn(state: *mut (), out_ptr: *mut *mut u8, out_len: *mut usize);
-    /// A loaded extension plugin. Holds the per-task executor ABI
-    /// symbol set used by both actor- and transport-mode extensions
-    /// (the only two kinds).
+    /// A loaded request-driven extension plugin.
     pub struct ExtensionPlugin {
         _lib: libloading::Library,
         // Always present.
         create_fn: CreateFn,
         drop_fn: DropFn,
         meta_bytes: Vec<u8>,
-        kind: ExtensionKind,
-        // Per-task executor ABI symbols (Actor + Transport).
-        actor: Option<ActorSymbols>,
+        // Per-task executor ABI symbols.
+        actor: ActorSymbols,
     }
 
     struct ActorSymbols {
@@ -255,22 +216,17 @@ mod host {
         free_fn: FreeFn,
         load_fn: LoadFn,
         state_fn: StateFn,
-        /// (Transport-mode) `vos_extension_conn_new`. Required for
-        /// `kind = Transport`; `None` for `kind = Actor` (the symbol is always
-        /// emitted by current builds, but an actor `.so` never has it called).
-        conn_new_fn: Option<ConnNewFn>,
     }
 
     impl ExtensionPlugin {
         /// Load an extension from a shared library path.
         ///
-        /// Reads `vos_extension_meta` first, decodes the kind byte,
-        /// then loads either the actor-mode or service-mode symbol
-        /// set.
+        /// Reads `vos_extension_meta`, then loads the request-driven task
+        /// symbol set.
         ///
         /// # Safety
         /// The `.so` must export the correct C ABI symbols for its
-        /// declared kind.
+        /// declared ABI.
         pub unsafe fn load(path: &std::path::Path) -> Result<Self, String> {
             let lib = unsafe {
                 libloading::Library::new(path)
@@ -288,8 +244,7 @@ mod host {
                     .get::<DropFn>(b"vos_extension_drop")
                     .map_err(|e| format!("missing vos_extension_drop: {e}"))?;
 
-                // Read metadata first so we know which kind-specific
-                // symbol set to expect.
+                // Read and validate metadata before binding the task ABI.
                 let mut meta_ptr: *const u8 = std::ptr::null();
                 let mut meta_len: usize = 0;
                 meta_fn(&mut meta_ptr, &mut meta_len);
@@ -299,62 +254,32 @@ mod host {
                     Vec::new()
                 };
 
-                let meta = crate::actors::metadata::decode(&meta_bytes)
+                let _meta = crate::actors::metadata::decode(&meta_bytes)
                     .ok_or_else(|| "missing or malformed extension metadata".to_string())?;
-                let kind = ExtensionKind::from_byte(meta.kind)
-                    .ok_or_else(|| format!("unknown extension kind {}", meta.kind))?;
-
-                // Both modes use the task executor. Transport additionally
-                // requires the connection entry point.
-                let actor = match kind {
-                    // Transport-mode reuses the actor-mode task
-                    // and additionally exports `vos_extension_conn_new`
-                    // (resolved below); the host branches on `plugin.kind()` to
-                    // pick the transport accept-loop driver.
-                    ExtensionKind::Actor | ExtensionKind::Transport => {
-                        // Per-task executor ABI. Missing canonical symbols
-                        // extension task functions fail to load here with a
-                        // clear error.
-                        let task_new_fn = *lib
-                            .get::<TaskNewFn>(b"vos_extension_task_new")
-                            .map_err(|e| format!("missing vos_extension_task_new: {e}"))?;
-                        let task_poll_fn = *lib
-                            .get::<TaskPollFn>(b"vos_extension_task_poll")
-                            .map_err(|e| format!("missing vos_extension_task_poll: {e}"))?;
-                        let task_drop_fn = *lib
-                            .get::<TaskDropFn>(b"vos_extension_task_drop")
-                            .map_err(|e| format!("missing vos_extension_task_drop: {e}"))?;
-                        let take_spawned_fn = *lib
-                            .get::<TakeSpawnedFn>(b"vos_extension_take_spawned")
-                            .map_err(|e| format!("missing vos_extension_take_spawned: {e}"))?;
-                        let free_fn = *lib
-                            .get::<FreeFn>(b"vos_extension_free")
-                            .map_err(|e| format!("missing vos_extension_free: {e}"))?;
-                        let load_fn = *lib
-                            .get::<LoadFn>(b"vos_extension_load")
-                            .map_err(|e| format!("missing vos_extension_load: {e}"))?;
-                        let state_fn = *lib
-                            .get::<StateFn>(b"vos_extension_state")
-                            .map_err(|e| format!("missing vos_extension_state: {e}"))?;
-                        // Plain actors export this too, but never call it.
-                        let conn_new_fn = lib
-                            .get::<ConnNewFn>(b"vos_extension_conn_new")
-                            .ok()
-                            .map(|s| *s);
-                        if kind == ExtensionKind::Transport && conn_new_fn.is_none() {
-                            return Err("transport extension missing vos_extension_conn_new".into());
-                        }
-                        Some(ActorSymbols {
-                            task_new_fn,
-                            task_poll_fn,
-                            task_drop_fn,
-                            take_spawned_fn,
-                            free_fn,
-                            load_fn,
-                            state_fn,
-                            conn_new_fn,
-                        })
-                    }
+                // Missing canonical task functions fail to load here with a
+                // clear error.
+                let actor = ActorSymbols {
+                    task_new_fn: *lib
+                        .get::<TaskNewFn>(b"vos_extension_task_new")
+                        .map_err(|e| format!("missing vos_extension_task_new: {e}"))?,
+                    task_poll_fn: *lib
+                        .get::<TaskPollFn>(b"vos_extension_task_poll")
+                        .map_err(|e| format!("missing vos_extension_task_poll: {e}"))?,
+                    task_drop_fn: *lib
+                        .get::<TaskDropFn>(b"vos_extension_task_drop")
+                        .map_err(|e| format!("missing vos_extension_task_drop: {e}"))?,
+                    take_spawned_fn: *lib
+                        .get::<TakeSpawnedFn>(b"vos_extension_take_spawned")
+                        .map_err(|e| format!("missing vos_extension_take_spawned: {e}"))?,
+                    free_fn: *lib
+                        .get::<FreeFn>(b"vos_extension_free")
+                        .map_err(|e| format!("missing vos_extension_free: {e}"))?,
+                    load_fn: *lib
+                        .get::<LoadFn>(b"vos_extension_load")
+                        .map_err(|e| format!("missing vos_extension_load: {e}"))?,
+                    state_fn: *lib
+                        .get::<StateFn>(b"vos_extension_state")
+                        .map_err(|e| format!("missing vos_extension_state: {e}"))?,
                 };
 
                 Ok(ExtensionPlugin {
@@ -362,15 +287,9 @@ mod host {
                     create_fn,
                     drop_fn,
                     meta_bytes,
-                    kind,
                     actor,
                 })
             }
-        }
-
-        /// Which kind the loaded extension declared.
-        pub fn kind(&self) -> ExtensionKind {
-            self.kind
         }
 
         /// Parse the extension's actor metadata.
@@ -410,7 +329,6 @@ mod host {
         }
 
         /// Restore an extension instance from previously serialized state.
-        /// Actor-mode only.
         pub fn load_state(&self, state: &[u8]) -> ExtensionInstance<'_> {
             let load_fn = self.actor_syms().load_fn;
             let s = unsafe { load_fn(state.as_ptr(), state.len()) };
@@ -421,34 +339,7 @@ mod host {
         }
 
         fn actor_syms(&self) -> &ActorSymbols {
-            self.actor
-                .as_ref()
-                .expect("ExtensionPlugin: actor-mode method called on service-mode plugin")
-        }
-
-        /// Allocate a fresh state via the extension's `create` symbol
-        /// without wrapping it in an `ExtensionInstance` (which is the
-        /// actor-mode RAII handle). Used by service-mode where the
-        /// state's lifetime is owned by service_thread.
-        ///
-        /// # Safety
-        /// Caller must eventually pair this with `drop_state`.
-        pub unsafe fn create_state(&self, args: &[u8]) -> *mut () {
-            let ptr = if args.is_empty() {
-                std::ptr::null()
-            } else {
-                args.as_ptr()
-            };
-            unsafe { (self.create_fn)(ptr, args.len()) }
-        }
-
-        /// Free a state pointer previously returned by `create_state`.
-        ///
-        /// # Safety
-        /// `state` must be a live state pointer produced by this
-        /// plugin and not already dropped.
-        pub unsafe fn drop_state(&self, state: *mut ()) {
-            unsafe { (self.drop_fn)(state) };
+            &self.actor
         }
     }
 
@@ -592,171 +483,10 @@ mod host {
     unsafe impl Send for ExtensionPlugin {}
     unsafe impl Sync for ExtensionPlugin {}
     unsafe impl Send for ExtensionInstance<'_> {}
-
-    /// A `Copy`, `!Send + !Sync`, no-`Drop` VIEW of a transport-mode extension
-    /// Instance, shared by the host accept loop + every concurrent
-    /// connection task on ONE executor thread.
-    ///
-    /// The instance `state` is OWNED by the `extension_thread` frame, which
-    /// calls `drop_state` exactly once **after the executor is dropped**;
-    /// `SharedInstance` never frees it (it has no `Drop`), so the N copies held
-    /// by concurrent tasks can't double-free.
-    ///
-    /// # Soundness
-    /// All `.so` calls here (`conn_new`/`task_poll`/`task_drop`) are
-    /// **synchronous** — they never `await` internally (`task_poll` returns
-    /// `TASK_PENDING` to the host; the `.await` is host-side). On a
-    /// single-threaded cooperative executor they are therefore atomic w.r.t.
-    /// task switching, so the shared `WorkerState`/slab is never accessed
-    /// concurrently. `PhantomData<*mut ()>` keeps it `!Send + !Sync` (use only
-    /// on `LocalExecutor`, never the work-stealing one), and every method
-    /// debug-asserts it runs on its creating thread so a regression trips in
-    /// tests instead of becoming silent UB.
-    #[derive(Clone, Copy)]
-    pub struct SharedInstance<'p> {
-        plugin: &'p ExtensionPlugin,
-        state: *mut (),
-        thread: std::thread::ThreadId,
-        _not_send: std::marker::PhantomData<*mut ()>,
-    }
-
-    impl<'p> SharedInstance<'p> {
-        /// # Safety
-        /// `state` must be a live instance produced by `plugin.create_state`,
-        /// used only on the creating thread, and must outlive every copy (the
-        /// owning frame frees it via `drop_state` after dropping the executor).
-        pub unsafe fn new(plugin: &'p ExtensionPlugin, state: *mut ()) -> Self {
-            Self {
-                plugin,
-                state,
-                thread: std::thread::current().id(),
-                _not_send: std::marker::PhantomData,
-            }
-        }
-
-        #[inline]
-        fn check_thread(&self) {
-            debug_assert_eq!(
-                std::thread::current().id(),
-                self.thread,
-                "SharedInstance used off its creating thread — breaks the cooperative-atomicity \
-                 invariant the transport soundness rests on"
-            );
-        }
-
-        /// Build a `handle_connection` task for the accepted `conn_id`.
-        /// `svc_id` is the agent's own (prefix-scoped) ServiceId — the host
-        /// passes it so the per-connection `Context::id()` is correct (a
-        /// transport extension `ctx.resolve`s the registry with its own node
-        /// prefix; a `ServiceId(0)` placeholder would mis-scope the lookup).
-        pub fn conn_new(&self, conn_id: u64, svc_id: u32) -> u64 {
-            self.check_thread();
-            let f = self.plugin.actor_syms().conn_new_fn.expect(
-                "conn_new: Transport instance missing conn_new_fn — the loader requires it \
-                     for kind = Transport, so reaching this means a loader-invariant regression",
-            );
-            unsafe { f(self.state, conn_id, svc_id) }
-        }
-
-        /// Inject `result` and poll the task once, copying any returned bytes
-        /// into an owned `Vec` (same contract as `ExtensionInstance::poll_task`).
-        pub fn poll_task(&self, handle: u64, result: &[u8]) -> TaskOutcome {
-            self.check_thread();
-            let tp = unsafe {
-                (self.plugin.actor_syms().task_poll_fn)(
-                    self.state,
-                    handle,
-                    result.as_ptr(),
-                    result.len(),
-                )
-            };
-            let copy = || {
-                if tp.ptr.is_null() || tp.len == 0 {
-                    Vec::new()
-                } else {
-                    unsafe { std::slice::from_raw_parts(tp.ptr, tp.len) }.to_vec()
-                }
-            };
-            match tp.kind {
-                super::TASK_READY => TaskOutcome::Ready(copy()),
-                super::TASK_PENDING => TaskOutcome::Pending(copy()),
-                _ => TaskOutcome::Panic,
-            }
-        }
-
-        /// Drop the task's future + free its slab slot.
-        pub fn drop_task(&self, handle: u64) {
-            self.check_thread();
-            unsafe { (self.plugin.actor_syms().task_drop_fn)(self.state, handle) };
-        }
-    }
 }
 
 #[cfg(feature = "std")]
-pub use host::{ExtensionInstance, ExtensionPlugin, SharedInstance, TaskOutcome};
-
-// ── Capability-policy enforcement knob (std only) ──────────────────────
-
-#[cfg(feature = "std")]
-pub use cap_policy::CapPolicy;
-
-#[cfg(feature = "std")]
-mod cap_policy {
-    /// Operator-configurable behaviour when an extension calls a host
-    /// syscall outside its declared `caps`. Carried on
-    /// [`ExtensionConfig`](crate::node::ExtensionConfig) (set per-space via
-    /// the manifest) and surfaced to operators, but **not enforced** by the
-    /// host today — there is no cap-gating layer in the actor / transport
-    /// host ABI; a future enforcement layer will consult it.
-    ///
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub enum CapPolicy {
-        /// Log a warning and let the call through.
-        Log,
-        /// Refuse the call.
-        #[default]
-        Block,
-        /// Refuse + wind the extension down. For adversarial multi-tenant
-        /// where a single cap violation is grounds for termination.
-        Kill,
-    }
-
-    impl CapPolicy {
-        /// Parse from the operator-facing string form used in space
-        /// manifests + CLI flags. Unknown values fall back to the
-        /// default (`Block`) so a typo doesn't downgrade enforcement.
-        pub fn parse(s: &str) -> Self {
-            match s {
-                "log" => Self::Log,
-                "block" => Self::Block,
-                "kill" => Self::Kill,
-                _ => Self::default(),
-            }
-        }
-
-        pub fn as_str(self) -> &'static str {
-            match self {
-                Self::Log => "log",
-                Self::Block => "block",
-                Self::Kill => "kill",
-            }
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::CapPolicy;
-
-        #[test]
-        fn parse_roundtrips_and_defaults_to_block() {
-            for p in [CapPolicy::Log, CapPolicy::Block, CapPolicy::Kill] {
-                assert_eq!(CapPolicy::parse(p.as_str()), p);
-            }
-            assert_eq!(CapPolicy::parse("nonsense"), CapPolicy::Block);
-            assert_eq!(CapPolicy::default(), CapPolicy::Block);
-        }
-    }
-}
+pub use host::{ExtensionInstance, ExtensionPlugin, TaskOutcome};
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
@@ -794,12 +524,6 @@ mod tests {
         assert_eq!(meta.actor_name, "EchoExtension");
         assert!(meta.messages.iter().any(|m| m.name == "echo"));
         assert!(meta.messages.iter().any(|m| m.name == "count"));
-        // Echo declares no kind — defaults to Actor.
-        assert_eq!(
-            ExtensionKind::from_byte(meta.kind),
-            Some(ExtensionKind::Actor),
-            "echo extension should be Actor-kind"
-        );
 
         // Create instance and dispatch messages
         let mut instance = plugin.create();
@@ -827,14 +551,5 @@ mod tests {
         let count_val: crate::actors::value::Value =
             crate::actors::codec::Decode::decode(&count_bytes);
         assert_eq!(count_val.as_u32().unwrap(), 2);
-    }
-
-    #[test]
-    fn extension_kind_from_byte_round_trip() {
-        assert_eq!(ExtensionKind::from_byte(0), Some(ExtensionKind::Actor));
-        assert_eq!(ExtensionKind::from_byte(1), Some(ExtensionKind::Transport));
-        assert_eq!(ExtensionKind::from_byte(2), None);
-        assert_eq!(ExtensionKind::from_byte(7), None);
-        assert_eq!(ExtensionKind::from_byte(255), None);
     }
 }

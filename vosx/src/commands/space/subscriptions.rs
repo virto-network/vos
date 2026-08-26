@@ -55,7 +55,7 @@ const LOCAL_FILE: &str = "local.toml";
 /// the per-node policy a recipe declares but that never leaves the node.
 ///
 /// TOML ordering constraint: scalar/array fields must precede the
-/// table-valued ones (`agents`, `extensions`), or `toml` refuses to
+/// table-valued ones (`agents`, `ingress`, `extensions`), or `toml` refuses to
 /// serialize.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct LocalConfig {
@@ -69,21 +69,48 @@ pub struct LocalConfig {
     /// `space up` overrides for one run.
     #[serde(default)]
     pub listen: Vec<String>,
-    /// Space-level default extension `cap_policy` (`"log"` / `"block"`
-    /// / `"kill"`); per-extension overrides live on each
-    /// [`ExtensionLocal`]. Node-local — a recipe declares it, `apply`
-    /// projects it here, boot reads it. `None` → host default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cap_policy: Option<String>,
     /// Per-service host-private signing configuration, keyed by instance.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, AgentLocal>,
+    /// Built-in, node-local ingress listeners. These own sockets and
+    /// authentication in the daemon; they are not native actor extensions.
+    #[serde(default, skip_serializing_if = "IngressLocal::is_empty")]
+    pub ingress: IngressLocal,
     /// Native `.so` extensions to register at boot. Host-local — never
     /// replicated (they're loaded in-process via `dlopen`, so a running
     /// daemon can't register them remotely; they attach on the next
     /// `space up`).
     #[serde(default, rename = "extension", skip_serializing_if = "Vec::is_empty")]
     pub extensions: Vec<ExtensionLocal>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct IngressLocal {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub http: Vec<HttpIngressLocal>,
+}
+
+impl IngressLocal {
+    fn is_empty(&self) -> bool {
+        self.http.is_empty()
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpIngressLocal {
+    pub name: String,
+    pub listen: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_cert: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_key: Option<String>,
+    #[serde(default = "default_http_max_connections")]
+    pub max_connections: usize,
+}
+
+fn default_http_max_connections() -> usize {
+    1024
 }
 
 /// The node-local half of an `[[agent]]` recipe entry.
@@ -104,8 +131,6 @@ pub struct AgentLocal {
 pub struct ExtensionLocal {
     pub name: String,
     pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cap_policy: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intra_caps: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -298,7 +323,7 @@ mod tests {
 
     #[test]
     fn node_local_policy_roundtrips_through_toml() {
-        // The grown schema — per-agent tables, cap_policy, extensions —
+        // The grown schema — per-agent tables, ingress, and extensions —
         // must survive a save/load so `apply`-written policy re-applies
         // verbatim on the next boot. Also guards the TOML value-before-
         // table ordering constraint (a bad field order panics on save).
@@ -320,16 +345,23 @@ mod tests {
             },
         );
         let mut init = BTreeMap::new();
-        init.insert("port".to_string(), toml::Value::Integer(8080));
+        init.insert("endpoint".to_string(), toml::Value::String("local".into()));
         let cfg = LocalConfig {
             subscriptions: vec!["ledger".into()],
             listen: vec![],
-            cap_policy: Some("block".into()),
             agents,
+            ingress: IngressLocal {
+                http: vec![HttpIngressLocal {
+                    name: "api".into(),
+                    listen: "127.0.0.1:8080".into(),
+                    tls_cert: None,
+                    tls_key: None,
+                    max_connections: 32,
+                }],
+            },
             extensions: vec![ExtensionLocal {
-                name: "gateway".into(),
-                path: "libgateway.so".into(),
-                cap_policy: Some("log".into()),
+                name: "prover".into(),
+                path: "libprover_extension.so".into(),
                 intra_caps: vec![],
                 tick_ms: None,
                 init,

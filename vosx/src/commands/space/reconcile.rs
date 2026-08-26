@@ -44,11 +44,6 @@ pub struct Recipe {
     /// `space_id`, looked up from the running entry.
     #[allow(dead_code)]
     pub space: Option<String>,
-    /// Default `cap_policy` for every extension in this space —
-    /// `"log"` / `"block"` / `"kill"`. Per-extension `cap_policy`
-    /// overrides. Omitted → host default
-    /// ([`vos::extension::CapPolicy::Block`]).
-    pub cap_policy: Option<String>,
     /// Hyperspace this space belongs to. When set, the daemon
     /// additionally spawns a registry replica into the
     /// hyperspace's replication group so cross-space `resolve`
@@ -62,8 +57,7 @@ pub struct Recipe {
     /// Native `.so` extension plugins. Each `[[extension]]` entry
     /// in a recipe maps onto a single `node.register_extension`
     /// call when the daemon boots; the host loads the .so, reads
-    /// its meta.kind, and dispatches to actor- or service-mode
-    /// glue accordingly. The registry doesn't surface extensions
+    /// its metadata, and runs it as a request-driven actor. The registry doesn't surface extensions
     /// today — they're host-local; only PVM agents live in the
     /// registry.
     #[serde(rename = "extension", default)]
@@ -85,10 +79,6 @@ pub struct ExtensionDef {
     /// (Vec<u32> name-list, etc.) come later if needed.
     #[serde(default)]
     pub init: BTreeMap<String, toml::Value>,
-    /// Per-extension override of the space-level
-    /// [`Recipe::cap_policy`]. Useful for relaxing one
-    /// extension to `"log"` while keeping the rest at `"block"`.
-    pub cap_policy: Option<String>,
     /// Declared intra-system capabilities — `"actor:role"` strings
     /// bounding what this extension may relay to other actors. Empty
     /// (the default) denies all role-gated relays: outbound calls
@@ -100,7 +90,7 @@ pub struct ExtensionDef {
     pub intra_caps: Vec<String>,
     /// Periodic `tick` interval in milliseconds. When set
     /// (and > 0), the host calls the extension's `tick` handler roughly this
-    /// often, between inbound work — the actor-mode way to originate periodic
+    /// often, between inbound work — the extension way to originate periodic
     /// work (a heartbeat ping, a cache sweep). Omitted / `0` → no ticking.
     pub tick_ms: Option<u64>,
 }
@@ -170,7 +160,6 @@ pub(crate) fn register_extension(
     ext: &ExtensionDef,
     recipe_dir: &Path,
     daemon_prefix: u16,
-    space_cap_policy: vos::extension::CapPolicy,
     known_names: &std::collections::HashSet<String>,
 ) -> anyhow::Result<Vec<String>> {
     let so_path = recipe_dir.join(&ext.path);
@@ -230,19 +219,6 @@ pub(crate) fn register_extension(
         .map(|p| p.meta_bytes().to_vec())
         .unwrap_or_default();
 
-    // Per-extension cap_policy override > space-level default.
-    // Falls back to the host-side CapPolicy::default() when
-    // neither is set.
-    let cap_policy = match ext.cap_policy.as_deref() {
-        Some(s) => vos::extension::CapPolicy::parse(s),
-        None => space_cap_policy,
-    };
-    tracing::info!(
-        "extension '{}' cap_policy = {}",
-        ext.name,
-        cap_policy.as_str(),
-    );
-
     // Parse declared intra-system caps eagerly: a malformed entry is
     // a boot failure naming the offending token, not a silent loss of
     // an authority bound.
@@ -274,9 +250,9 @@ pub(crate) fn register_extension(
     }
 
     let cfg = if ext.init.is_empty() {
-        ExtensionConfig::new(&so_path).with_cap_policy(cap_policy)
+        ExtensionConfig::new(&so_path)
     } else {
-        ExtensionConfig::with_args(&so_path, &args).with_cap_policy(cap_policy)
+        ExtensionConfig::with_args(&so_path, &args)
     };
     // Record the instance name so the host's reverse map can resolve
     // this extension's ServiceId — letting it be the *target* of a
@@ -289,19 +265,6 @@ pub(crate) fn register_extension(
         Some(ms) if ms > 0 => {
             tracing::info!("extension '{}' tick_ms = {}", ext.name, ms);
             cfg.with_tick_ms(ms)
-        }
-        _ => cfg,
-    };
-
-    // A transport-mode extension (the http-gateway) has the
-    // HOST own its listener + accept loop. Pull bind_addr/port (+ optional
-    // TLS PEM paths) out of the init args and hand them to `serves(..)` so
-    // the host binds the socket + terminates TLS for it, then drives one
-    // `handle_connection` task per accepted connection. (Backpressure is
-    // the host's `serves_max_conns` default of 1024.)
-    let cfg = match plugin.as_ref().map(|p| p.kind()) {
-        Some(vos::extension::ExtensionKind::Transport) => {
-            configure_transport_serves(cfg, ext, recipe_dir)?
         }
         _ => cfg,
     };
@@ -348,62 +311,6 @@ pub(crate) fn register_extension(
     drop(plugin);
 
     Ok(effective_tokens)
-}
-
-/// Configure a transport-mode extension's host-owned listener from its
-/// Init args. `bind_addr` (default `127.0.0.1`) + `port`
-/// (default `8080`) become the `serves(..)` endpoint; `tls_cert`/`tls_key`
-/// (relative to the recipe dir, or absolute) — when both are set — make
-/// the host terminate TLS on each accepted connection. The extension's
-/// own `new()` still receives the full init args (for `auth_token` /
-/// `agent_tokens` / its `/__status` port readout).
-fn configure_transport_serves(
-    cfg: ExtensionConfig,
-    ext: &ExtensionDef,
-    recipe_dir: &Path,
-) -> anyhow::Result<ExtensionConfig> {
-    let init_str = |k: &str| ext.init.get(k).and_then(|v| v.as_str()).unwrap_or_default();
-    let bind_addr = {
-        let b = init_str("bind_addr");
-        if b.is_empty() { "127.0.0.1" } else { b }
-    };
-    let port = ext
-        .init
-        .get("port")
-        .and_then(|v| v.as_integer())
-        .unwrap_or(8080);
-    let addr = format!("{bind_addr}:{port}");
-
-    let tls_cert = init_str("tls_cert");
-    let tls_key = init_str("tls_key");
-    let tls = !tls_cert.is_empty() && !tls_key.is_empty();
-    let cfg = cfg.serves(addr, tls);
-
-    if tls {
-        let cert_path = recipe_dir.join(tls_cert);
-        let key_path = recipe_dir.join(tls_key);
-        let cert_pem = std::fs::read(&cert_path).map_err(|e| {
-            anyhow::anyhow!(
-                "extension '{}': reading tls_cert {}: {e}",
-                ext.name,
-                cert_path.display(),
-            )
-        })?;
-        let key_pem = std::fs::read(&key_path).map_err(|e| {
-            anyhow::anyhow!(
-                "extension '{}': reading tls_key {}: {e}",
-                ext.name,
-                key_path.display(),
-            )
-        })?;
-        tracing::info!(
-            "extension '{}': host-terminated TLS on {bind_addr}:{port}",
-            ext.name,
-        );
-        Ok(cfg.tls_pem(cert_pem, key_pem))
-    } else {
-        Ok(cfg)
-    }
 }
 
 /// Render an extension's declared intra_caps for the operator-facing
@@ -641,7 +548,7 @@ fn reconcile_one(
     // registry side channel is temporarily unavailable.
     if !package.schemas.is_empty() {
         // Meta registration is a nice-to-have (it enables schema-aware
-        // coercion for the gateway / dynamic CLIs); it must never abort the
+        // coercion for the worker / dynamic CLIs); it must never abort the
         // install. Both a non-Ok status (e.g. FORBIDDEN on a non-admin node —
         // the row arrives via sync) and a transport failure (e.g. a large
         // `.vos_meta` that overflows the registry guest's FETCH buffer) are
@@ -1155,7 +1062,7 @@ mod tests {
                 name = "greeter"
                 path = "b.vos"
                 [[extension]]
-                name = "gateway"
+                name = "worker"
                 path = "c.so"
             "#,
         )
@@ -1166,23 +1073,23 @@ mod tests {
     #[test]
     fn validate_names_rejects_agent_extension_clash() {
         // The headline case — operator names both an agent and an
-        // extension `gateway`. They'd install at the same
+        // extension `worker`. They'd install at the same
         // `instance_service_id(name, prefix)`, second silently
         // shadows the first.
         let m: Recipe = toml::from_str(
             r#"
                 [[agent]]
-                name = "gateway"
+                name = "worker"
                 path = "a.vos"
                 [[extension]]
-                name = "gateway"
+                name = "worker"
                 path = "b.so"
             "#,
         )
         .unwrap();
         let err = validate_recipe_names(&m).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("'gateway'"), "{msg}");
+        assert!(msg.contains("'worker'"), "{msg}");
         assert!(msg.contains("agent") && msg.contains("extension"), "{msg}");
     }
 
@@ -1191,16 +1098,16 @@ mod tests {
         let m: Recipe = toml::from_str(
             r#"
                 [[extension]]
-                name = "gateway"
+                name = "worker"
                 path = "a.so"
                 [[extension]]
-                name = "gateway"
+                name = "worker"
                 path = "b.so"
             "#,
         )
         .unwrap();
         let err = validate_recipe_names(&m).unwrap_err();
-        assert!(err.to_string().contains("'gateway' appears 2×"), "{}", err);
+        assert!(err.to_string().contains("'worker' appears 2×"), "{}", err);
     }
 
     #[test]

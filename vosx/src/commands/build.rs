@@ -908,8 +908,6 @@ mod tests {
                 actor_role: None,
             }],
             constructor: &[],
-            kind: 0,
-            caps: &[],
             cli_methods: &[],
             doc: "",
             crdt: false,

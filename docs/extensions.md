@@ -1,21 +1,31 @@
-# Extensions
+# Native extensions
 
-Extensions are native host integrations for capabilities that should not run
-inside an actor, such as HTTP ingress or proof production. They are dynamic
-libraries loaded by the node and communicate through typed VOS messages.
+Native extensions are request/response actors compiled as shared libraries.
+They use `#[actor]` and `#[messages]`, receive typed VOS messages, and may ask
+actors or perform host work before returning a result. The proof producer is
+the main example.
 
-An extension must:
+Extensions are trusted process code. Loading one grants it the daemon's OS
+authority; VOS does not pretend to sandbox native code. `intra_caps` only
+limits which actor identities and roles an extension may relay through VOS.
 
-- declare its methods and capabilities;
-- bound every request, response, queue, and external wait;
-- preserve authenticated caller identity when forwarding;
-- keep host-local secrets out of actor replies and replicated effects;
-- shut down when the node revokes its route.
+Extensions do not own listeners or long-lived connections. Protocol ingress
+belongs to the node, where connection limits, authentication, shutdown, and
+identity preservation can be enforced consistently. See [HTTP
+ingress](http-ingress.md).
 
-The supported implementations are:
+Use an extension when the interaction has this shape:
 
-- `extensions/http-gateway`: schema-aware HTTP ingress;
-- `extensions/prover`: proof creation and verification.
+```mermaid
+sequenceDiagram
+    participant Actor
+    participant Extension
+    participant Host
+    Actor->>Extension: typed request
+    Extension->>Host: bounded host operation
+    Host-->>Extension: result
+    Extension-->>Actor: typed response
+```
 
-Small transport fixtures under `tests/fixtures/extensions` exercise the plugin
-boundary; they are not application examples.
+Do not use an extension to implement an HTTP, SSH, database-proxy, or other
+connection server. Add such a protocol as a built-in ingress adapter instead.

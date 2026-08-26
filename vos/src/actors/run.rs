@@ -129,6 +129,8 @@ enum AskInner {
     Immediate(Result<alloc::vec::Vec<u8>, super::value::InvokeError>),
     /// Deferred host I/O (worker path).
     HostIo(HostIo),
+    /// Deferred invocation with an explicit success/failure frame.
+    HostIoResult(HostIo),
     /// Finalization fork of a durable service await. The exact machine snapshot
     /// resumes before this future is constructed, so this variant is never
     /// polled again after a committed reply is injected.
@@ -150,6 +152,11 @@ impl Ask {
     pub fn host_io(io: HostIo) -> Self {
         Self {
             inner: AskInner::HostIo(io),
+        }
+    }
+    pub fn host_io_result(io: HostIo) -> Self {
+        Self {
+            inner: AskInner::HostIoResult(io),
         }
     }
     #[cfg(feature = "pvm")]
@@ -183,6 +190,28 @@ impl Future for Ask {
             }
             AskInner::HostIo(io) => match Pin::new(io).poll(cx) {
                 Poll::Ready(bytes) => Poll::Ready(Ok(decode_reply(bytes))),
+                Poll::Pending => Poll::Pending,
+            },
+            AskInner::HostIoResult(io) => match Pin::new(io).poll(cx) {
+                Poll::Ready(bytes) => match crate::effects::result::decode(&bytes) {
+                    Ok(reply) => Poll::Ready(Ok(decode_reply(reply))),
+                    Err(crate::actors::run::STATUS_NOT_FOUND) => {
+                        Poll::Ready(Err(super::value::InvokeError::NotFound))
+                    }
+                    Err(crate::actors::run::STATUS_FORBIDDEN) => {
+                        Poll::Ready(Err(super::value::InvokeError::Forbidden))
+                    }
+                    Err(crate::actors::run::STATUS_OOG) => {
+                        Poll::Ready(Err(super::value::InvokeError::OutOfGas))
+                    }
+                    Err(crate::actors::run::STATUS_TOO_BIG) => {
+                        Poll::Ready(Err(super::value::InvokeError::TooBig))
+                    }
+                    Err(crate::actors::run::STATUS_PANICKED) => {
+                        Poll::Ready(Err(super::value::InvokeError::Panicked))
+                    }
+                    Err(status) => Poll::Ready(Err(super::value::InvokeError::Unknown(status))),
+                },
                 Poll::Pending => Poll::Pending,
             },
             #[cfg(feature = "pvm")]

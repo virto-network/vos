@@ -55,7 +55,7 @@ See [Getting started](docs/getting-started.md),
 | `services/` | Generic service guest |
 | `actors/` | Platform actors |
 | `examples/` | Small supported applications |
-| `extensions/` | Native host integrations |
+| `extensions/` | Trusted request/response host workers |
 
 ## Development
 

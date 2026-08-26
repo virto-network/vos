@@ -43,12 +43,7 @@ pub mod prelude {
     pub use crate::lifecycle;
     pub use crate::value::Msg;
     pub use crate::{Decode, Encode};
-    // `Context` is named directly in a transport extension's
-    // `handle_connection(&self, ctx: &mut Context<Self>, conn_id)` signature
-    //. Actor `#[msg]` handlers don't need it — the macro
-    // qualifies their generated `Message::handle` as `vos::Context` — but a
-    // `handle_connection` body is kept verbatim, so it must resolve via the
-    // prelude like the rest of an extension's surface.
+    // Available for explicit actor helper methods and manual Actor impls.
     pub use crate::Context;
     pub use crate::{ActorId, CallError, CallId, InvocationId, Origin, SpaceRole};
     pub use crate::{Attestation, AttestationError, Verified};
@@ -152,9 +147,9 @@ pub use actors::storage;
 pub use actors::value;
 pub use actors::{
     Actor, ActorHandle, ActorReference, Ask, CallError, Caller, ClientError, Context,
-    DeviceSignature, Extension, ExtensionCtx, Forbidden, IntraCap, IntraCapParseError, Message,
-    NO_ROLES_MAP, NoRoles, RoleByte, RunResult, SpaceRole, SpaceRoleMap, Yield, metadata,
-    run_blocking, try_poll,
+    DeviceSignature, Extension, ExtensionCtx, Forbidden, IngressAccessGrant, IngressAccessStatus,
+    IntraCap, IntraCapParseError, Message, NO_ROLES_MAP, NoRoles, RoleByte, RunResult, SpaceRole,
+    SpaceRoleMap, Yield, ingress_credential_id, metadata, run_blocking, try_poll,
 };
 pub use actors::{Decode, Encode};
 pub use actors::{
@@ -202,6 +197,9 @@ pub mod runtime;
 
 #[cfg(feature = "std")]
 pub mod node;
+
+#[cfg(feature = "http-ingress")]
+pub mod ingress;
 
 /// Drive a future to completion on the current thread.
 ///
@@ -495,46 +493,11 @@ macro_rules! __vos_emit_worker_glue {
                 let future: Pin<Box<dyn Future<Output = Vec<u8>>>> = Box::pin(async move {
                     let mut ctx =
                         $crate::Context::<$actor_name>::new($crate::actors::context::ServiceId(0));
-                    // SAFETY: actor-mode is driven N=1 by the host (one root task
+                    // SAFETY: extensions are driven N=1 by the host (one root task
                     // at a time, to completion), so this is the only live &mut to
                     // the actor.
                     let actor = unsafe { &mut *actor_ptr };
                     let _stop = msg.deliver(actor, &mut ctx).await;
-                    ctx.take_reply_bytes()
-                });
-                ws.tasks.install(future)
-            }
-
-            // Build a handle_connection task for an accepted
-            // connection. Transport-only — the host calls this (never the
-            // &mut self task_new path) for a `kind = Transport` instance, once
-            // per accept; many such tasks run concurrently on the host
-            // executor, all sharing `&actor`.
-            #[unsafe(no_mangle)]
-            pub extern "C" fn vos_extension_conn_new(
-                state: *mut (),
-                conn_id: u64,
-                svc_id: u32,
-            ) -> u64 {
-                let ws = unsafe { &mut *(state as *mut WorkerState) };
-                // SHARED *const into the actor's OWN heap box (disjoint from
-                // WorkerState) — transport reconstructs &*actor_ptr in each
-                // concurrent conn future. There is NO &mut actor for a
-                // transport instance (the &mut new_task path is unreachable),
-                // so N shared reborrows never alias a unique one.
-                let actor_ptr = &*ws.actor as *const $actor_name;
-                let future: Pin<Box<dyn Future<Output = Vec<u8>>>> = Box::pin(async move {
-                    // The host passes the agent's real (prefix-scoped) ServiceId
-                    // so `ctx.resolve` / `ctx.id()` scope correctly to this node
-                    // (a `ServiceId(0)` placeholder mis-scopes the registry
-                    // lookup on a non-zero-prefix daemon).
-                    let mut ctx = $crate::Context::<$actor_name>::new(
-                        $crate::actors::context::ServiceId(svc_id),
-                    );
-                    // SAFETY: shared (&), single-threaded executor, no &mut
-                    // actor exists for a transport instance.
-                    let actor = unsafe { &*actor_ptr };
-                    let _: () = actor.__vos_build_connection(&mut ctx, conn_id).await;
                     ctx.take_reply_bytes()
                 });
                 ws.tasks.install(future)
@@ -575,7 +538,7 @@ macro_rules! __vos_emit_worker_glue {
                 //  * during the poll, ExecIo reconstructs the SOLE &mut TaskState
                 //    from the waker (this ts_ptr); the handler reconstructs the
                 //    actor from the ptr captured in its future — `&mut *actor_ptr`
-                //    for an actor-mode task (N=1, exclusive; task_new path) but a
+                //    for an extension task (N=1, exclusive; task_new path) but a
                 //    SHARED `&*actor_ptr` for a transport conn task (N>1 concurrent
                 //    conn_new tasks, NEVER &mut — promoting it would alias). Either
                 //    way TaskState, the actor box, and WorkerState are three

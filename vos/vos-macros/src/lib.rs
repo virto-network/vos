@@ -109,10 +109,8 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
     let msg_enum = format_ident!("{}Msg", name);
 
     // Parse optional attributes:
-    //   #[actor]                       — defaults to `Error = ()`, kind = Actor
+    //   #[actor]                       — defaults to `Error = ()`
     //   #[actor(error = Type)]         — custom error type for Actor::Error
-    //   #[actor(kind = "transport")]   — opt into transport-mode (handle_connection)
-    //   #[actor(caps = ["net.tcp.bind", ...])] — declarative capability list
     // A proof exists only for the witness-delivered, refine-pure Task
     // shape — `provable` on anything else is a category error, not a
     // flag to ignore.
@@ -126,9 +124,7 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
     let error_ty = parsed.error_ty;
-    let kind_byte = parsed.kind_byte;
     let provable = parsed.provable;
-    let caps_lits = parsed.caps;
     let role_ty = parsed.role_ty;
     let default_role = parsed.default_role;
     let space_role_map = parsed.space_role_map;
@@ -354,17 +350,9 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
             const DEFAULT_ROLE: <Self as vos::Actor>::Role = #default_role;
             const SPACE_ROLE_MAP: vos::SpaceRoleMap<<Self as vos::Actor>::Role> = #space_role_map;
 
-            // Extension kind discriminant; defaulted on the trait,
-            // overridden here from `#[actor(kind = "...")]`.
-            const KIND_BYTE: u8 = #kind_byte;
-
             // Provable-program publication mark; defaulted false on
             // the trait, set by `#[actor(task, provable)]`.
             const PROVABLE: bool = #provable;
-
-            // Declared capability tokens. Empty by default; overridden
-            // from `#[actor(caps = [...])]`.
-            const CAPS: &'static [&'static str] = &[ #( #caps_lits ),* ];
 
             // One-line actor description from the struct's `///` doc.
             const DOC: &'static str = #actor_doc;
@@ -475,15 +463,6 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut client_methods: Vec<ClientMethodInfo> = Vec::new();
     let mut has_start_handler = false;
     let mut start_returns_result = false;
-    // A transport extension declares a single
-    // `handle_connection(&self, ctx: &mut Context<Self>, conn_id: u64)`
-    // method (not `#[msg]`). Its presence flips the extension to
-    // transport-mode: the host owns a listener + accept loop and spawns one
-    // concurrent `&self` connection task per accept. A transport extension
-    // must have no inbound `#[msg]` handlers.
-    let mut has_handle_connection = false;
-    let mut msg_handler_count: usize = 0;
-
     for item in &input.items {
         let ImplItem::Fn(method) = item else {
             passthrough_items.push(item.clone());
@@ -576,32 +555,10 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 }
             }
-            // The transport connection handler. Detected by name; the
-            // body is kept verbatim (passthrough) and wrapped by the emitted
-            // `__vos_build_connection` builder below. Its receiver must be
-            // `&self` (shared — many concurrent conn tasks); a `&mut self`
-            // handle_connection would alias under N>1.
-            if method.sig.ident == "handle_connection" {
-                has_handle_connection = true;
-                let shared_receiver = matches!(
-                    method.sig.inputs.first(),
-                    Some(FnArg::Receiver(r)) if r.mutability.is_none()
-                );
-                if !shared_receiver {
-                    return syn::Error::new_spanned(
-                        &method.sig,
-                        "handle_connection must take `&self` (shared) — many connection tasks run \
-                         concurrently sharing the actor; use `RefCell`/`Cell` for mutable state",
-                    )
-                    .to_compile_error()
-                    .into();
-                }
-            }
             passthrough_items.push(item.clone());
             continue;
         }
 
-        msg_handler_count += 1;
         if is_attested && is_job {
             return syn::Error::new_spanned(
                 &method.sig,
@@ -952,7 +909,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             .map(|(name, ty)| {
                 let name_str = name.to_string();
                 // Whitespace-free so `[u8; 32]` records as `[u8;32]` and
-                // `Vec < u8 >` as `Vec<u8>` — the CLI, gateway, and
+                // `Vec < u8 >` as `Vec<u8>` — the CLI, worker, and
                 // OpenAPI renderer all match against this canonical form.
                 let ty_str = ty_string(ty);
                 quote! {
@@ -1074,8 +1031,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             .collect()
     };
 
-    // A transport-mode extension (one with `handle_connection`
-    // and — enforced above — no `#[msg]` handlers) has NO messages, so all the
+    // An impl with no `#[msg]` handlers has no messages, so all the
     // arm vectors are empty and the aggregated enum would be zero-variant. A
     // zero-variant enum can't derive rkyv (`#[repr]` is unsupported on it,
     // E0084) and can't be matched (`match self {}` is non-exhaustive against a
@@ -1084,7 +1040,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // `from_msg` never yields it (its `_ => None` catch-all covers every wire
     // message), and a transport instance is driven via `conn_new`, never
     // `deliver`. (Actor/service extensions always have ≥1 handler, so this
-    // branch is transport-only.)
+    // branch is only a well-formed placeholder.)
     if enum_variants.is_empty() {
         enum_variants.push(quote! {
             #[doc(hidden)]
@@ -1092,7 +1048,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         });
         deliver_arms.push(quote! {
             #enum_name::__VosNoMessages => ::core::unreachable!(
-                "deliver on a transport extension (no message handlers)"
+                "deliver on an actor with no message handlers"
             )
         });
         is_query_arms.push(quote! {
@@ -1199,13 +1155,6 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 actor_name: #actor_name_str,
                 messages: &[ #( #meta_messages ),* ],
                 constructor: &[ #( #ctor_field_metas ),* ],
-                // The kind byte lives on the Actor trait —
-                // #[actor(kind = "transport")] sets it via the `KIND_BYTE`
-                // associated const override.
-                kind: <#actor_ty as vos::Actor>::KIND_BYTE,
-                // Declared capability tokens. Defaults to empty on the
-                // trait; overridden by #[actor(caps = [...])].
-                caps: <#actor_ty as vos::Actor>::CAPS,
                 // CLI dispatch surface — names of handlers marked
                 // `#[msg(cli)]`. Emitted into the trailing
                 // `cli_methods` section of the binary blob; the
@@ -1540,64 +1489,12 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         impl vos::actors::client::ActorReferenceFor<#actor_name> for #ref_struct_name {}
     };
 
-    // A transport extension (one with `handle_connection`) must have
-    // no inbound `#[msg]` handlers — it serves connections only.
-    if has_handle_connection && msg_handler_count > 0 {
-        return syn::Error::new(
-            proc_macro2::Span::call_site(),
-            "a transport extension (one with `handle_connection`) must have NO `#[msg]` handlers \
-             — it serves connections only; concurrent request/reply handlers are not supported",
-        )
-        .to_compile_error()
-        .into();
-    }
-
-    // The `__vos_build_connection` builder the glue's
-    // `vos_extension_conn_new` calls. Emitted for EVERY actor so `conn_new`
-    // always compiles; non-transport actors get an `unreachable!()` stub the
-    // loader never reaches (it only calls conn_new on `kind = Transport`).
-    let conn_build_impl = if has_handle_connection {
-        quote! {
-            impl #actor_name {
-                #[doc(hidden)]
-                #[allow(clippy::manual_async_fn)]
-                pub fn __vos_build_connection<'a>(
-                    &'a self,
-                    ctx: &'a mut vos::Context<#actor_name>,
-                    conn_id: u64,
-                ) -> ::core::pin::Pin<vos::__alloc::boxed::Box<
-                    dyn ::core::future::Future<Output = ()> + 'a,
-                >> {
-                    vos::__alloc::boxed::Box::pin(self.handle_connection(ctx, conn_id))
-                }
-            }
-        }
-    } else {
-        quote! {
-            impl #actor_name {
-                #[doc(hidden)]
-                pub fn __vos_build_connection<'a>(
-                    &'a self,
-                    _ctx: &'a mut vos::Context<#actor_name>,
-                    _conn_id: u64,
-                ) -> ::core::pin::Pin<vos::__alloc::boxed::Box<
-                    dyn ::core::future::Future<Output = ()> + 'a,
-                >> {
-                    ::core::unreachable!(
-                        "__vos_build_connection on a non-transport extension"
-                    )
-                }
-            }
-        }
-    };
-
     let expanded = quote! {
         #( #msg_structs )*
         #aggregated_enum
         #( #msg_impls )*
         #( #attested_method_impls )*
         #passthrough_impl
-        #conn_build_impl
         #preamble
         #pvm_entries
         #worker_entries
@@ -1629,8 +1526,7 @@ fn is_context_type(ty: &syn::Type) -> bool {
 /// `vos::value::Args` field), letting an extension parse its own
 /// optional/defaulted config without the named-param path's
 /// `.expect("missing init arg")` (every named param must be present).
-/// Used by transport extensions like the http-gateway whose init knobs
-/// are all "empty ⇒ default".
+/// Useful for extensions whose init format is application-defined.
 fn is_byte_slice(ty: &syn::Type) -> bool {
     if let syn::Type::Reference(r) = ty
         && let syn::Type::Slice(s) = r.elem.as_ref()
@@ -1646,12 +1542,6 @@ struct ActorAttrs {
     /// Token stream for the actor's `Error` associated type — `()`
     /// when not specified.
     error_ty: proc_macro2::TokenStream,
-    /// Encoded kind byte that lands in the `.vos_meta` blob — 0 for
-    /// `Actor` (the default), 1 for `Transport`.
-    kind_byte: u8,
-    /// Declared capability tokens. Each element is a
-    /// string literal that goes into the `Actor::CAPS` slice.
-    caps: Vec<String>,
     /// Token stream for the actor's `Role` associated type
     /// (e.g. `MyRole`). `vos::NoRoles` when not specified, which
     /// makes the actor opt out of RBAC.
@@ -1784,12 +1674,6 @@ fn extract_storage_fields(input: &mut ItemStruct) -> Vec<StorageField> {
 ///
 /// Recognised keys:
 /// - `error = Type` — custom Actor::Error type (default `()`)
-/// - `kind = "actor" | "transport"` — extension kind discriminant
-///   (default `"actor"`). `"transport"` opts into the
-///   `handle_connection(&self, …)` server shape (the host owns the
-///   listener + accept loop). Only `"actor"` and `"transport"` are
-///   supported; any other string (e.g. `"service"`) falls back to
-///   `"actor"`.
 fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
     use syn::Token;
     use syn::parse::Parser;
@@ -1798,8 +1682,6 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
     let default_err = quote! { () };
     let mut out = ActorAttrs {
         error_ty: default_err.clone(),
-        kind_byte: 0,
-        caps: Vec::new(),
         role_ty: quote! { vos::NoRoles },
         default_role: quote! { vos::NoRoles::Any },
         space_role_map: quote! { vos::NO_ROLES_MAP },
@@ -1827,28 +1709,6 @@ fn parse_actor_attrs(attr: TokenStream) -> ActorAttrs {
             syn::Meta::NameValue(nv) if nv.path.is_ident("error") => {
                 let val = &nv.value;
                 out.error_ty = quote! { #val };
-            }
-            syn::Meta::NameValue(nv) if nv.path.is_ident("kind") => {
-                if let syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Str(s),
-                    ..
-                }) = &nv.value
-                {
-                    out.kind_byte = parse_kind_str(&s.value());
-                }
-            }
-            syn::Meta::NameValue(nv) if nv.path.is_ident("caps") => {
-                if let syn::Expr::Array(arr) = &nv.value {
-                    for elem in &arr.elems {
-                        if let syn::Expr::Lit(syn::ExprLit {
-                            lit: syn::Lit::Str(s),
-                            ..
-                        }) = elem
-                        {
-                            out.caps.push(s.value());
-                        }
-                    }
-                }
             }
             syn::Meta::NameValue(nv) if nv.path.is_ident("role") => {
                 // `role = MyRole` overrides `type Role`.
@@ -1998,16 +1858,6 @@ fn is_crdt_field_type(ty: &syn::Type) -> bool {
 
 /// Default `__VOS_WITNESS` capacity for `#[actor(task)]` blobs.
 const DEFAULT_TASK_BUF: usize = 16 * 1024;
-
-fn parse_kind_str(s: &str) -> u8 {
-    match s {
-        "actor" => 0,
-        "transport" => 1,
-        // Only `actor` and `transport` are supported. Unknown kinds fall
-        // back to actor so metadata never advertises an unsupported mode.
-        _ => 0,
-    }
-}
 
 /// If `ty` is `Option<T>`, return the inner `T`. Otherwise `None`.
 fn option_inner_type(ty: &syn::Type) -> Option<syn::Type> {

@@ -175,9 +175,38 @@ impl<R: Copy + Ord> SpaceRoleMap<R> {
     }
 }
 
+/// Durable authority row for one protocol-neutral ingress credential.
+/// The bearer secret is deliberately absent; hosts retain only its
+/// domain-separated identifier and the subject derived from that identifier.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IngressAccessGrant {
+    pub credential_id: [u8; 32],
+    pub subject: [u8; 32],
+    pub role: SpaceRole,
+    pub expires_at: u64,
+    pub issuer: [u8; 32],
+    pub epoch: u64,
+    pub revoked: bool,
+}
+
+/// Current authority decision returned to a built-in ingress adapter.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct IngressAccessStatus {
+    pub credential_id: [u8; 32],
+    pub subject: [u8; 32],
+    pub role: SpaceRole,
+    pub expires_at: u64,
+}
+
+/// Derive the non-secret identifier stored by the authority from a bearer
+/// token's 32 random bytes.
+pub fn ingress_credential_id(secret: &[u8; 32]) -> [u8; 32] {
+    crate::crypto::blake2b_hash::<32>(b"vos/ingress-credential/id", &[secret])
+}
+
 /// Who is calling a handler. Distinguishes the *kind* of caller
-/// (transport / authentication shape) so handlers can write
-/// policy without reaching into transport-layer types.
+/// (authentication shape) so handlers can write policy without
+/// reaching into ingress- or transport-layer types.
 ///
 /// The binding bytes inside variants like [`Self::Peer`] are
 /// kept opaque to actor code — PVM guests don't depend on
@@ -185,7 +214,7 @@ impl<R: Copy + Ord> SpaceRoleMap<R> {
 /// into the bytes the registry's grant table keys on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Caller {
-    /// No credentials were presented. The HTTP gateway routes
+    /// No credentials were presented. Anonymous ingress routes
     /// public requests through here; libp2p inbounds never land
     /// as `Unauthenticated` (libp2p noise always identifies the
     /// peer). Default policy: read handlers may accept; mutating
@@ -207,14 +236,16 @@ pub enum Caller {
     /// code, used as the lookup key into the registry's grant
     /// table.
     Peer(Vec<u8>),
+    /// A host-authenticated space subject. Built-in ingress adapters use this
+    /// variant after validating their protocol-specific credential against
+    /// the space authority. Only the fixed-width subject crosses into actor
+    /// execution; bearer secrets remain in the host adapter.
+    Member(crate::service::SubjectId),
     /// Intra-system invoke from another actor on the same node
     /// (or forwarded over the cross-thread channel between
     /// agent threads). The carried `ServiceId` identifies the
     /// calling actor so policy can require an explicit actor grant.
     Actor(crate::actors::context::ServiceId),
-    // `Member { session_key, ... }` lands with the per-space ZK
-    // login service. Until then the only authenticated-but-
-    // anonymous-membership caller is `Peer`.
 }
 
 impl Caller {
@@ -233,6 +264,7 @@ impl Caller {
     pub fn grant_key(&self) -> Option<&[u8]> {
         match self {
             Self::Peer(bytes) => Some(bytes.as_slice()),
+            Self::Member(subject) => Some(&subject.0),
             Self::Unauthenticated | Self::System | Self::Actor(_) => None,
         }
     }

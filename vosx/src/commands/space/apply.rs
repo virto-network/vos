@@ -12,7 +12,7 @@
 //!   The bytes reach the daemon through the shared content-addressed
 //!   blob cache — `publish` only ships `(name, hash)`.
 //! - **Node-local half** → `local.toml`: per-service device signing,
-//!   the space `cap_policy`, and
+//!   node-local extension relay authority, and
 //!   `[[extension]]` entries. These never touch the `AgentRow`; boot
 //!   reads them back so a bare `space up` restart re-applies them.
 //!   Extensions are host-local (`dlopen` in-process) — a running daemon
@@ -109,7 +109,7 @@ pub(crate) fn apply_recipe(
         .ok_or_else(|| anyhow::anyhow!("space id in index is not 32 bytes of hex"))?;
 
     // Node-local half → local.toml. Recipe fields overwrite the recipe-
-    // owned sections (cap_policy, per-agent policy, extensions) while
+    // owned sections (per-agent policy and extensions) while
     // node-owned fields (subscriptions, listen) are preserved.
     let mut cfg = subscriptions::load(data_dir)?;
     let next = project_node_local(&cfg, recipe, recipe_dir);
@@ -462,8 +462,8 @@ fn resolve_replication_id(
 /// is what keeps `export | apply` non-destructive — `space export`
 /// emits none of the node-local fields (they aren't in the registry),
 /// so merging an exported recipe changes nothing (all-skips), whereas a
-/// replace would delete the operator's cap_policy /
-/// extensions. Node-owned fields (subscriptions, listen) always survive.
+/// replace would delete operator-owned extensions. Node-owned fields
+/// (subscriptions, listen, ingress) always survive.
 /// Deterministic → idempotent (re-applying the same recipe re-produces
 /// the same config). Extension `.so` paths are resolved absolute against
 /// `recipe_dir` so a later bare `space up` still finds them.
@@ -473,10 +473,6 @@ pub(crate) fn project_node_local(
     recipe_dir: &Path,
 ) -> LocalConfig {
     let mut out = base.clone();
-    // cap_policy: the recipe overrides only if it declares one.
-    if recipe.cap_policy.is_some() {
-        out.cap_policy = recipe.cap_policy.clone();
-    }
     // agents: upsert each recipe agent that carries node-local policy.
     for a in &recipe.agents {
         if !a.device_secret {
@@ -495,7 +491,6 @@ pub(crate) fn project_node_local(
         let projected = ExtensionLocal {
             name: e.name.clone(),
             path: absolutize(recipe_dir, &e.path),
-            cap_policy: e.cap_policy.clone(),
             intra_caps: e.intra_caps.clone(),
             tick_ms: e.tick_ms,
             init: e.init.clone(),
@@ -587,7 +582,6 @@ mod tests {
         // A bare service gets no local table; one with a device signer does.
         let m = recipe_from(
             r#"
-            cap_policy = "block"
             [[agent]]
             name = "plain"
             path = "plain.vos"
@@ -596,7 +590,7 @@ mod tests {
             path = "authority.vos"
             device_secret = true
             [[extension]]
-            name = "gateway"
+            name = "worker"
             path = "libgw.so"
         "#,
         );
@@ -610,11 +604,10 @@ mod tests {
         assert_eq!(out.subscriptions, vec!["keep-me".to_string()]);
         assert_eq!(out.listen, vec!["/ip4/0.0.0.0/tcp/1".to_string()]);
         // recipe-owned fields projected
-        assert_eq!(out.cap_policy.as_deref(), Some("block"));
         assert!(!out.agents.contains_key("plain"), "bare agent has no table");
         assert!(out.agents["authority"].device_secret);
         assert_eq!(out.extensions.len(), 1);
-        assert_eq!(out.extensions[0].name, "gateway");
+        assert_eq!(out.extensions[0].name, "worker");
         // extension .so path resolved absolute against the recipe dir.
         assert_eq!(out.extensions[0].path, "/recipes/libgw.so");
     }
@@ -647,7 +640,7 @@ mod tests {
         // The `export | apply` non-destructiveness guarantee: an exported
         // recipe declares NO node-local fields (they aren't in the
         // registry), so merging it must leave an operator's existing
-        // cap_policy / per-agent policy / extensions untouched.
+        // per-agent policy / extensions untouched.
         let mut existing_agents = BTreeMap::new();
         existing_agents.insert(
             "ledger".to_string(),
@@ -658,16 +651,16 @@ mod tests {
         let base = LocalConfig {
             subscriptions: vec!["ledger".into()],
             listen: vec![],
-            cap_policy: Some("block".into()),
             agents: existing_agents,
+            ingress: Default::default(),
             extensions: vec![ExtensionLocal {
-                name: "gateway".into(),
+                name: "worker".into(),
                 path: "/abs/libgw.so".into(),
                 ..Default::default()
             }],
         };
         // An export-shaped recipe: agents carry program_hash but no
-        // node-local fields, and there are no extensions / cap_policy.
+        // node-local fields, and there are no extensions.
         let m = recipe_from(
             r#"
             space = "x"
@@ -690,7 +683,6 @@ mod tests {
         // a second `apply` writes nothing (the all-skips guarantee).
         let m = recipe_from(
             r#"
-            cap_policy = "log"
             [[agent]]
             name = "authority"
             path = "authority.vos"
