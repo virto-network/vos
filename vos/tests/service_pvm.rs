@@ -4779,7 +4779,7 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
         "a duplicate retry retains the originally committed admission slot"
     );
 
-    let mut divergent = request;
+    let mut divergent = request.clone();
     divergent.arguments.push(0);
     assert!(matches!(
         restarted.invoke(divergent),
@@ -4788,10 +4788,20 @@ fn durable_root_tree_host_restores_guest_state_and_pending_publications() {
     assert!(!restarted.acknowledge_publication(&publication).unwrap());
 
     let backend = restarted.into_backend();
-    let restarted = LocalRootTreeService::open(config, backend)
+    let mut restarted = LocalRootTreeService::open(config, backend)
         .expect("acknowledged image restores through the same service identity");
     assert!(restarted.pending_publications().unwrap().is_empty());
     assert_eq!(restarted.store().header().unwrap().unwrap().revision, 1);
+    let mut retry = request.clone();
+    retry.logical_timeslot = 10_000;
+    let recovered = restarted
+        .invoke(retry)
+        .expect("an acknowledged terminal reply remains recoverable after restart");
+    assert!(recovered.duplicate);
+    assert_eq!(recovered.published, first.published);
+    assert_eq!(recovered.publication, None);
+    assert_eq!(recovered.refine_gas_used, 0);
+    assert_eq!(recovered.accumulate_gas_used, 0);
 }
 
 #[test]

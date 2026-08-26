@@ -9678,46 +9678,49 @@ where
             }
         }
         #[cfg(all(feature = "network", feature = "storage"))]
-        let _private_ingress_barrier =
-            if service.consistency() == crate::service::ConsistencyMode::Raft {
-                let reference = match service.private_ingress_reference_for_request(&request) {
-                    Ok(reference) => reference,
-                    Err(failure) => {
-                        error!(%id, ?failure, "service private-ingress classification failed");
-                        send_service_status(req.reply, crate::STATUS_PANICKED, id);
-                        continue;
-                    }
-                };
-                if let Some(reference) = reference {
-                    let Some(registration) = private_ingress_registration.as_ref() else {
-                        error!(%id, "service Raft private ingress has no root-owned sidecar route");
-                        send_service_status(req.reply, crate::STATUS_PANICKED, id);
-                        continue;
-                    };
-                    let Some(guard) = registration.route.barrier.try_acquire() else {
-                        // A membership change owns the same critical section.
-                        // No request has entered the log, so a normal retry is
-                        // safe and cannot observe a partial admission.
-                        send_service_status(req.reply, crate::STATUS_PANICKED, id);
-                        continue;
-                    };
-                    if !stage_service_private_ingress_on_current_voters(
-                        &mut service,
-                        &request,
-                        &reference,
-                        &shared_network,
-                        &invoke_routes,
-                    ) {
-                        send_service_status(req.reply, crate::STATUS_PANICKED, id);
-                        continue;
-                    }
-                    Some(guard)
-                } else {
-                    None
+        let _private_ingress_barrier = if service.consistency()
+            == crate::service::ConsistencyMode::Raft
+        {
+            let reference = match service.private_ingress_reference_for_request(&request) {
+                Ok(reference) => reference,
+                Err(failure) => {
+                    error!(%id, ?failure, "service private-ingress classification failed");
+                    send_service_status(req.reply, crate::STATUS_PANICKED, id);
+                    continue;
                 }
+            };
+            if let Some(reference) = reference {
+                let Some(registration) = private_ingress_registration.as_ref() else {
+                    error!(%id, "service Raft private ingress has no root-owned sidecar route");
+                    send_service_status(req.reply, crate::STATUS_PANICKED, id);
+                    continue;
+                };
+                let Some(guard) = registration.route.barrier.try_acquire() else {
+                    // A membership change owns the same critical section.
+                    // No request has entered the log, so a normal retry is
+                    // safe and cannot observe a partial admission.
+                    warn!(%id, invocation = ?request.invocation, "service private-ingress admission barrier is busy");
+                    send_service_status(req.reply, crate::STATUS_PANICKED, id);
+                    continue;
+                };
+                if !stage_service_private_ingress_on_current_voters(
+                    &mut service,
+                    &request,
+                    &reference,
+                    &shared_network,
+                    &invoke_routes,
+                ) {
+                    warn!(%id, invocation = ?request.invocation, "service private-ingress voter staging failed");
+                    send_service_status(req.reply, crate::STATUS_PANICKED, id);
+                    continue;
+                }
+                Some(guard)
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
         // Nothing catches up again between this allocation and the proposal.
         let final_slot = match allocate_service_root_slot_after_barrier(
             &service,

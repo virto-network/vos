@@ -302,6 +302,7 @@ mod tests {
 
     use super::*;
     use crate::node::VosNode;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     fn request(port: u16, path: &str) -> String {
         let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -339,5 +340,36 @@ mod tests {
 
         let results = node.collect();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn saturated_blocking_work_cannot_stall_the_status_socket() {
+        let node = VosNode::new();
+        let handle = node.ingress_handle();
+        let blocking = Arc::new(Semaphore::new(2));
+        let held = blocking
+            .clone()
+            .acquire_many_owned(2)
+            .await
+            .expect("saturate HTTP blocking work");
+        let inner = Arc::new(Inner::new(0));
+        let (mut client, server) = tokio::io::duplex(4096);
+        let serving = tokio::spawn(serve_connection(server, handle, inner, blocking.clone()));
+
+        client
+            .write_all(b"GET /__status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(1), client.read_to_string(&mut response))
+            .await
+            .expect("I/O workers remain responsive while actor calls are stalled")
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"status\":\"ok\""), "{response}");
+
+        drop(held);
+        serving.await.unwrap();
+        assert!(node.collect().is_empty());
     }
 }

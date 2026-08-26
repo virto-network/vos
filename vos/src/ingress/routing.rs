@@ -172,7 +172,10 @@ fn handle(req: &Request, inner: &Inner, ctx: &mut HttpIngressContext) -> Respons
             text(504, "actor invocation timed out")
         }
         Err(crate::ClientError::Unreachable) => text(503, "actor is unavailable"),
-        Err(_) => text(502, "actor invocation failed"),
+        Err(error) => {
+            log::warn!("HTTP ingress actor invocation failed: {error:?}");
+            text(502, "actor invocation failed")
+        }
     }
 }
 

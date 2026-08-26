@@ -20,9 +20,9 @@ use super::{
     AccumulateProtocolHost, AccumulateTransaction, AccumulatedTimeout, AccumulationReceipt,
     ActorId, ActorUpgrade, ActorUpgradeRecord, AttestationDelivery, BlobRef, DedupRecord,
     DeliveryRecord, DirectIngress, IngressRecord, MessageRecord, ProgramId,
-    ProofVerificationRequest, PublicationRecord, ReceiptVerificationRequest, ReplyAdmissionRecord,
-    RoleCredentialVerificationRequest, ServiceGenesis, ServicePvmError, ServiceStateTree,
-    ServiceWire, StateKey, StateTreeStore, StoreHeader, StoreOpenError,
+    ProofVerificationRequest, PublicationAckRecord, PublicationRecord, ReceiptVerificationRequest,
+    ReplyAdmissionRecord, RoleCredentialVerificationRequest, ServiceGenesis, ServicePvmError,
+    ServiceStateTree, ServiceWire, StateKey, StateTreeStore, StoreHeader, StoreOpenError,
 };
 
 /// Artifact-count ceiling for admitting a new replicated private input. Each
@@ -1701,9 +1701,48 @@ impl MemoryServiceStore {
                 if super::publication_storage_key(publication.input).as_slice() != key.as_slice() {
                     return Err(LocalStoreReadError::CorruptPublication);
                 }
-                Ok(publication)
+                let acknowledgement = self
+                    .row(&super::publication_ack_storage_key(publication.input))
+                    .map(PublicationAckRecord::decode)
+                    .transpose()
+                    .map_err(|_| LocalStoreReadError::CorruptPublication)?;
+                if let Some(acknowledgement) = acknowledgement {
+                    if acknowledgement.input != publication.input
+                        || acknowledgement.transport_commitment
+                            != publication.published.transport_commitment()
+                    {
+                        return Err(LocalStoreReadError::CorruptPublication);
+                    }
+                    return Ok(None);
+                }
+                Ok(Some(publication))
             })
+            .filter_map(|result| result.transpose())
             .collect()
+    }
+
+    /// Read the guest-authenticated effects for exact result recovery even
+    /// after their external delivery was acknowledged. Only terminal linear
+    /// direct replies are retained in this form; pending enumeration above
+    /// deliberately hides every acknowledged row.
+    pub(crate) fn publication_record(
+        &self,
+        input: super::WorkInputId,
+    ) -> Result<Option<PublicationRecord>, LocalStoreReadError> {
+        self.row(&super::publication_storage_key(input))
+            .map(PublicationRecord::decode)
+            .transpose()
+            .map_err(|_| LocalStoreReadError::CorruptPublication)
+            .and_then(|publication| {
+                if publication
+                    .as_ref()
+                    .is_some_and(|publication| publication.input != input)
+                {
+                    Err(LocalStoreReadError::CorruptPublication)
+                } else {
+                    Ok(publication)
+                }
+            })
     }
 
     /// Recover the permanent, guest-authenticated upgrade history. The host

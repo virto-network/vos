@@ -145,6 +145,25 @@ fn endpoint_connect_addr(endpoint: &Path) -> String {
         .to_owned()
 }
 
+fn reserve_loopback_port() -> u16 {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve HTTP port");
+    listener.local_addr().unwrap().port()
+}
+
+fn http_request(port: u16, request: &str) -> std::io::Result<String> {
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+    stream.set_read_timeout(Some(DAEMON_READINESS_TIMEOUT))?;
+    stream.set_write_timeout(Some(DAEMON_READINESS_TIMEOUT))?;
+    stream.write_all(request.as_bytes())?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
+}
+
+fn http_body(response: &str) -> &str {
+    response.split_once("\r\n\r\n").map_or("", |(_, body)| body)
+}
+
 #[derive(Debug)]
 struct TestRaftStatus {
     present: bool,
@@ -1734,6 +1753,18 @@ fn signed_service_roots_run_under_production_trust_and_recover() {
     );
     let raft_service_id = spawned_service_root_id(&first_log, "production-raft-counter")
         .expect("the production Raft counter spawn log must expose its concrete service id");
+    let http_port = reserve_loopback_port();
+    let mut local = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(endpoint.parent().unwrap().join("local.toml"))
+        .expect("open node-local ingress configuration");
+    writeln!(
+        local,
+        "\n[[ingress.http]]\nname = \"production-api\"\nlisten = \"127.0.0.1:{http_port}\"\nmax_connections = 16"
+    )
+    .expect("configure built-in HTTP ingress");
+    local.sync_all().unwrap();
 
     // A production-sealed image cannot be reopened by omitting the authority.
     // The daemon itself remains available for control-plane traffic,
@@ -1820,7 +1851,7 @@ fn signed_service_roots_run_under_production_trust_and_recover() {
         let _ = fs::remove_file(endpoint);
     }
     let recovery_log = data.path().join("production-recovery.stderr");
-    let _recovered = Daemon(spawn_up_with_service_and_trust(
+    let recovered = Daemon(spawn_up_with_service_and_trust(
         data.path(),
         config.path(),
         space,
@@ -1828,7 +1859,7 @@ fn signed_service_roots_run_under_production_trust_and_recover() {
         Some(&service_pvm),
         Some(&trust_socket),
     ));
-    wait_for_endpoint(data.path(), &recovery_log, "production-recovery");
+    let recovery_endpoint = wait_for_endpoint(data.path(), &recovery_log, "production-recovery");
     poll_until(
         40,
         || {
@@ -1852,6 +1883,112 @@ fn signed_service_roots_run_under_production_trust_and_recover() {
             format!(
                 "the original production policy did not recover the pre-refusal committed state; log:\n{}",
                 fs::read_to_string(&recovery_log).unwrap_or_default(),
+            )
+        },
+    );
+
+    poll_until(
+        20,
+        || {
+            http_request(
+                http_port,
+                "GET /__status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .is_ok_and(|response| response.starts_with("HTTP/1.1 200"))
+        },
+        || {
+            format!(
+                "built-in HTTP ingress did not become ready; log:\n{}",
+                fs::read_to_string(&recovery_log).unwrap_or_default(),
+            )
+        },
+    );
+    let token = vosx_ok(
+        data.path(),
+        config.path(),
+        &[
+            "space",
+            "access",
+            space,
+            "issue",
+            "--role",
+            "member",
+            "--expires",
+            "1h",
+        ],
+    )
+    .trim()
+    .to_owned();
+    assert!(vos::ingress::decode_access_token(&token).is_some());
+
+    let restricted = http_request(
+        http_port,
+        &format!(
+            "GET /production-crdt-counter/member_only HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .unwrap();
+    assert!(restricted.starts_with("HTTP/1.1 200"), "{restricted}");
+    assert_eq!(http_body(&restricted).trim(), "99");
+
+    let body = r#"{"by":5}"#;
+    let mutation = format!(
+        "POST /production-raft-counter/increment HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nIdempotency-Key: production-raft-exact-1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+    );
+    let first_mutation = http_request(http_port, &mutation).unwrap();
+    let exact_retry = http_request(http_port, &mutation).unwrap();
+    assert!(
+        first_mutation.starts_with("HTTP/1.1 200"),
+        "{first_mutation}"
+    );
+    assert!(exact_retry.starts_with("HTTP/1.1 200"), "{exact_retry}");
+    assert_eq!(http_body(&first_mutation), http_body(&exact_retry));
+    assert_eq!(http_body(&exact_retry).trim(), "16");
+
+    let secret = vos::ingress::decode_access_token(&token).unwrap();
+    let credential = hex::encode(vos::ingress_credential_id(&secret));
+    vosx_ok(
+        data.path(),
+        config.path(),
+        &["space", "access", space, "revoke", &credential],
+    );
+    let revoked = http_request(
+        http_port,
+        &format!(
+            "GET /production-raft-counter/value HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .unwrap();
+    assert!(revoked.starts_with("HTTP/1.1 401"), "{revoked}");
+
+    drop(recovered);
+    let _ = fs::remove_file(recovery_endpoint);
+    let restart_log = data.path().join("production-http-restart.stderr");
+    let _restarted = Daemon(spawn_up_with_service_and_trust(
+        data.path(),
+        config.path(),
+        space,
+        &restart_log,
+        Some(&service_pvm),
+        Some(&trust_socket),
+    ));
+    wait_for_endpoint(data.path(), &restart_log, "production-http-restart");
+    poll_until(
+        20,
+        || {
+            http_request(
+                http_port,
+                &format!(
+                    "GET /production-raft-counter/value HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+                ),
+            )
+            .is_ok_and(|response| response.starts_with("HTTP/1.1 401"))
+        },
+        || {
+            format!(
+                "revoked access did not remain revoked across restart; log:\n{}",
+                fs::read_to_string(&restart_log).unwrap_or_default(),
             )
         },
     );

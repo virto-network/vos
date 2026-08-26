@@ -36,6 +36,11 @@ impl CrdtCounter {
         count
     }
 
+    #[msg(space_role = SpaceRole::Member)]
+    fn member_only(&self) -> u32 {
+        99
+    }
+
     #[msg]
     async fn boom(&self) {
         panic!("crdt-counter: boom — deliberate panic for test");

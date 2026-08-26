@@ -875,18 +875,39 @@ fn acknowledge_publication<S: GuestAccumulateStore>(
     {
         return Ok(rejected(AccumulationRejection::DivergentDuplicate));
     }
-    if header.consistency == ConsistencyMode::Crdt {
-        let acknowledgement_record = PublicationAckRecord {
-            input: publication.input,
-            transport_commitment: publication.published.transport_commitment(),
-        };
-        write(
-            store,
-            &publication_ack_storage_key(publication.input),
-            Some(&acknowledgement_record.encode()),
-        )?;
+    let acknowledgement_record = PublicationAckRecord {
+        input: publication.input,
+        transport_commitment: publication.published.transport_commitment(),
+    };
+    let acknowledgement_key = publication_ack_storage_key(publication.input);
+    if let Some(existing) = read(store, &acknowledgement_key)? {
+        let existing = PublicationAckRecord::decode(&existing)
+            .map_err(|_| GuestAccumulateError::CorruptStore)?;
+        if existing != acknowledgement_record {
+            return Err(GuestAccumulateError::CorruptStore);
+        }
+        return Ok(AccumulationResult::PublicationAcknowledged {
+            input: acknowledgement.input,
+            duplicate: true,
+        });
     }
-    write(store, &key, None)?;
+    write(
+        store,
+        &acknowledgement_key,
+        Some(&acknowledgement_record.encode()),
+    )?;
+    let terminal_direct_reply = publication
+        .published
+        .reply
+        .as_ref()
+        .is_some_and(|reply| reply.call_id == publication.input.invocation.root_reply_id())
+        && publication.published.outbox.is_empty()
+        && publication.published.exported_blobs.is_empty()
+        && publication.published.proof.is_none()
+        && publication.published.attestation.is_none();
+    if header.consistency == ConsistencyMode::Crdt || !terminal_direct_reply {
+        write(store, &key, None)?;
+    }
     Ok(AccumulationResult::PublicationAcknowledged {
         input: acknowledgement.input,
         duplicate: false,
@@ -7213,7 +7234,21 @@ mod tests {
                 duplicate: false,
             }
         );
-        assert!(!store.rows.contains_key(&publication_key));
+        assert_eq!(
+            PublicationRecord::decode(
+                store
+                    .rows
+                    .get(&publication_key)
+                    .expect("a terminal direct reply remains available for exact recovery"),
+            )
+            .unwrap(),
+            publication,
+        );
+        assert!(
+            store
+                .rows
+                .contains_key(&publication_ack_storage_key(work.input_id()))
+        );
         assert_eq!(
             execute_guest_accumulate(&mut store, &acknowledgement).unwrap(),
             AccumulationResult::PublicationAcknowledged {

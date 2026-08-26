@@ -64,9 +64,17 @@ already committed result.
 
 The role authority's replication incarnation is fixed when a space is
 created. Rebuilding or upgrading its signed package does not derive a new
-incarnation. Existing spaces first perform the ordinary guest-owned authority
-upgrade and then reopen under the new daemon; the registry binding remains
-unchanged across that transition.
+incarnation.
+
+The HTTP-ingress cutover carries one explicit migration bridge for spaces
+created by the immediately preceding canonical release. The daemon embeds
+that release's exact service guest and selects it only when an installed
+package names its ProgramId. Start the new daemon, run the ordinary
+guest-owned `space upgrade` for `space-authority`, and restart once the
+catalog compare-and-swap completes. The authority actor and signed contract
+advance; its service identity, service guest, and replication incarnation do
+not. Fresh spaces use only the current guest. No arbitrary historical guest
+or contract is accepted.
 
 ## Release artifacts
 
