@@ -1314,17 +1314,17 @@ mod tests {
     #[test]
     fn fill_page_respects_row_and_byte_budgets() {
         fresh();
-        let mut it = (0..100u64);
+        let mut it = 0..100u64;
         let (page, more) = fill_page(&mut it, 10, usize::MAX);
         assert_eq!(page.len(), 10);
         assert!(more);
         // Byte budget bites first: u64 encodes to 8 bytes.
-        let mut it = (0..100u64);
+        let mut it = 0..100u64;
         let (page, more) = fill_page(&mut it, 1000, 40);
         assert!(page.len() <= 6, "byte budget must bound the page");
         assert!(more);
         // Exhaustion reports no more.
-        let mut it = (0..3u64);
+        let mut it = 0..3u64;
         let (page, more) = fill_page(&mut it, 10, usize::MAX);
         assert_eq!(page.len(), 3);
         assert!(!more);

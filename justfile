@@ -48,7 +48,7 @@ build-daemon-root-artifacts: build-vos-service
     cd vos/tests/fixtures/counter-upgrade; cargo +nightly actor
 
 # Build every guest consumed by the physical service gate.
-build-pvm-test-artifacts: build-daemon-root-artifacts (build-actor "space-authority") (build-actor "clerk-ledger") (build-actor "clerk-bridge") build-clerk-apply
+build-pvm-test-artifacts: build-daemon-root-artifacts build-registry-fixtures (build-actor "space-authority") (build-actor "clerk-ledger") (build-actor "clerk-bridge") build-clerk-apply
     cd vos/tests/fixtures/greeter; cargo +nightly actor
     cd vos/tests/fixtures/probe; cargo +nightly actor
     cd vos/tests/fixtures/tally; cargo +nightly actor

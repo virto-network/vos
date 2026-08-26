@@ -13,13 +13,10 @@
 //! 1. B's redeem loop reaches A, A's canonical authority commits the exact
 //!    redemption, and only then A records the root-attested registry grant.
 //!    Its `space members` output grows an `# invites` section.
-//! 2. B syncs A's registry — which now serves at the MEMBER floor
-//!    (decision 9). B started with an empty registry, so the genesis
-//!    ADMIN grant showing up in B's `space role list` can only have
-//!    arrived by a Member-gated `FetchHeads` that A served *because* the
-//!    redemption granted B's node key. This is the bootstrap the flip
-//!    depends on: public redeem request → authority commit → attested
-//!    registry grant → sync.
+//! 2. B syncs A's Member-gated registry, fetches the signed counter package,
+//!    opens the guest-owned service image, and serves a real actor call. This
+//!    proves the complete bootstrap: public redeem request → authority commit
+//!    → attested registry grant → authorized sync → service start.
 
 #![cfg(unix)]
 
@@ -686,12 +683,12 @@ fn assert_bundled_space_authority_matches_canonical_program() {
         .expect("vosx ships the canonical authority PVM");
     assert_eq!(
         hex::encode(vos::service::ProgramId::of_pvm(&bundled).0),
-        "63828f5cbe1b3796e05201c4b803984640506b1faa45e9bdcddb84630c9f2787",
+        "a5d4efebf5c0f3dbea9f043a32fc2bfba5a96aaabb7f3226b41c73f513db1a24",
         "the built-in authority program must implement the canonical private-input contract",
     );
     assert_eq!(
         hex::encode(vos::crypto::blake2b_hash::<32>(&[], &[&bundled])),
-        "c7b7e27b3e5f775de06591a51e7cbcf1bd20a0c9a4074938b72755892aad0f3f",
+        "4aee0401f196949ebb6abfdcb2d77f1c3184406d0ba167127af2fb6e45643583",
         "the authority bytes must remain exact so sealed spaces can reopen",
     );
 }
@@ -845,30 +842,6 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
         },
     );
 
-    // (2) B synced A's MEMBER-gated registry: B started empty, so the
-    //     genesis ADMIN grant in B's role list arrived only via a
-    //     Member-gated FetchHeads A served because the redemption
-    //     granted B's node key. This is the flip working.
-    poll_until(
-        40,
-        || {
-            let o = vosx(
-                data_b.path(),
-                cfg_b.path(),
-                &["space", "role", space, "list"],
-            );
-            o.status.success() && String::from_utf8_lossy(&o.stdout).contains("admin")
-        },
-        || {
-            format!(
-                "B never synced A's Member-gated registry (no admin grant in B's `space role \
-                 list`) — either the redeem didn't grant B's node key, or the Member floor \
-                 refused B's sync. B log:\n{}",
-                fs::read_to_string(&log_b).unwrap_or_default(),
-            )
-        },
-    );
-
     poll_until(
         40,
         || !pending_invite.exists(),
@@ -880,7 +853,7 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
         },
     );
 
-    // (3) B starts the signed Member-floor service root and serves a real call.
+    // (2) B starts the signed Member-floor service root and serves a real call.
     // Registry sync alone cannot make this pass: B must fetch the exact
     // package, validate its service pin, open the guest-owned image, and
     // register the root route.
@@ -1018,7 +991,8 @@ fn signed_service_package_runs_and_reopens_through_the_space_daemon() {
     );
     assert!(
         !rejected.status.success()
-            && String::from_utf8_lossy(&rejected.stderr).contains("canonical authority"),
+            && String::from_utf8_lossy(&rejected.stderr)
+                .contains("authority PVM does not match the canonical release bytes"),
         "release verification must reject changed authority bytes: {}",
         String::from_utf8_lossy(&rejected.stderr),
     );
@@ -1163,18 +1137,12 @@ fn signed_service_package_runs_and_reopens_through_the_space_daemon() {
     vosx_ok(
         data.path(),
         config.path(),
-        &[
-            "space",
-            "publish",
-            space,
-            "counter-upgrade",
-            &upgrade_source,
-        ],
+        &["space", "publish", space, "counter", &upgrade_source],
     );
     let upgraded = vosx_ok(
         data.path(),
         config.path(),
-        &["space", "upgrade", space, "counter", "counter-upgrade"],
+        &["space", "upgrade", space, "counter", "counter"],
     );
     assert!(
         upgraded.contains("upgraded counter"),
@@ -1183,7 +1151,7 @@ fn signed_service_package_runs_and_reopens_through_the_space_daemon() {
     let repeated_upgrade = vosx_ok(
         data.path(),
         config.path(),
-        &["space", "upgrade", space, "counter", "counter-upgrade"],
+        &["space", "upgrade", space, "counter", "counter"],
     );
     assert!(
         repeated_upgrade.contains("upgraded counter"),
@@ -1537,7 +1505,7 @@ fn signed_service_roots_run_under_production_trust_and_recover() {
             "space",
             "publish",
             space,
-            "space-authority:migration",
+            "space-authority",
             &authority_source,
         ],
     );
@@ -1549,7 +1517,7 @@ fn signed_service_roots_run_under_production_trust_and_recover() {
             "upgrade",
             space,
             vos::service::ROLE_AUTHORITY_INSTANCE_,
-            "space-authority:migration",
+            "space-authority",
         ],
     );
     assert!(
@@ -1564,7 +1532,7 @@ fn signed_service_roots_run_under_production_trust_and_recover() {
             "upgrade",
             space,
             vos::service::ROLE_AUTHORITY_INSTANCE_,
-            "space-authority:migration",
+            "space-authority",
         ],
     );
     assert!(

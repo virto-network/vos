@@ -14647,13 +14647,8 @@ mod tests {
         use std::collections::BTreeSet;
 
         let workspace = env!("CARGO_MANIFEST_DIR");
-        let elf_path = format!(
-            "{workspace}/../actors/space-registry/target/riscv64em-vos/release/space_registry.elf"
-        );
-        let Ok(elf) = std::fs::read(&elf_path) else {
-            eprintln!("SKIP: space-registry ELF not built — run: just build-registry");
-            return;
-        };
+        let elf_path = format!("{workspace}/../vosx/blobs/space_registry.elf");
+        let elf = std::fs::read(&elf_path).expect("canonical space-registry ELF is committed");
         let blob = vos_pvm_compiler::link_elf(&elf).expect("registry transpiles");
 
         // ── Identities ──────────────────────────────────────────────
