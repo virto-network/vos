@@ -65,9 +65,12 @@ const IV: [u64; 8] = [
 const PARAM_XOR_256: u64 = 0x0101_0020;
 
 /// Domain tag prepended as the full first 128-byte block of a leaf hash.
-const TAG_LEAF: &[u8] = b"vos-pvm-proof/page-merkle/leaf/v1";
-/// Domain tag prepended as the full first 128-byte block of a node hash.
-const TAG_NODE: &[u8] = b"vos-pvm-proof/page-merkle/node/v1";
+///
+/// This byte string is part of proof formats 10 and 11. Its historical crate
+/// name is intentional: moving the prover must not change committed roots.
+const TAG_LEAF: &[u8] = b"zkpvm/page-merkle/leaf/v1";
+/// Stable inner-node domain for proof formats 10 and 11; see `TAG_LEAF`.
+const TAG_NODE: &[u8] = b"zkpvm/page-merkle/node/v1";
 
 const BLOCK: usize = 128;
 
@@ -671,6 +674,18 @@ mod tests {
         for level in 0..DEPTH as usize {
             assert_eq!(d[level], node_hash(&d[level + 1], &d[level + 1]));
         }
+    }
+
+    #[test]
+    fn proof_v10_v11_page_domains_are_stable() {
+        assert_eq!(
+            leaf_hash(&[0u8; PAGE_SIZE]),
+            hex_to_32("fd2c1ac593371c52c7fb0dc8fce568b2edea3cc192ca663a07fed4cd714f8fa3"),
+        );
+        assert_eq!(
+            default_hashes()[0],
+            hex_to_32("dbc4371ac97d12de7d3e4e3ead46e41971eae7c94206e9fa4188d30349aceecc"),
+        );
     }
 
     #[test]

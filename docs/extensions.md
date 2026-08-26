@@ -19,4 +19,3 @@ The supported implementations are:
 
 Small transport fixtures under `tests/fixtures/extensions` exercise the plugin
 boundary; they are not application examples.
-

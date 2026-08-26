@@ -60,4 +60,3 @@ accepted transitions are ordered and exchanged, not what an actor is.
 Packages, programs, proofs, and state artifacts are content-addressed. Human
 names are catalog labels. Durable work binds the exact hashes and deployment
 identities it used, so a label change cannot silently change execution.
-

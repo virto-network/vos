@@ -12,6 +12,7 @@
 
 use core::ops::Mul;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint as DalekRistrettoPoint};
+#[cfg(not(target_arch = "riscv64"))]
 use curve25519_dalek::scalar::Scalar as DalekScalar;
 
 #[cfg(target_arch = "riscv64")]
@@ -153,6 +154,7 @@ fn ristretto_scalar_mult_pvm(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
     let output_ptr = output.as_mut_ptr() as u64;
     unsafe {
         core::arch::asm!(
+            "csrw 0x801, zero",
             "ecall",
             in("t0") ECALL_RISTRETTO_SCALAR_MULT as u64,
             in("a0") scalar_ptr,
@@ -205,6 +207,7 @@ fn ristretto_point_add_pvm(p: &[u8; 32], q: &[u8; 32]) -> [u8; 32] {
     let output_ptr = output.as_mut_ptr() as u64;
     unsafe {
         core::arch::asm!(
+            "csrw 0x801, zero",
             "ecall",
             in("t0") ECALL_RISTRETTO_POINT_ADD as u64,
             in("a0") p_ptr,

@@ -20,4 +20,3 @@ Package one example:
 ```bash
 cargo run -p vosx -- build examples/actors/counter --name counter
 ```
-

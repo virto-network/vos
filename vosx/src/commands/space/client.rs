@@ -24,7 +24,12 @@ use crate::commands::space::op_sign::op_auth;
 use crate::spaces_index::{self, SpaceEntry};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const INVOKE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
+// The default Raft configuration alone permits an invocation to spend 35
+// seconds authenticating, staging private input, crossing a read barrier, and
+// committing genesis/admission/apply. Keep the CLI outside that legitimate
+// operation budget so it never reports failure while the service can still
+// commit the request.
+const INVOKE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(60);
 /// A role-authorized service call may wait for a Raft authority read barrier and
 /// decision commit before the Local target executes. Match the libp2p
 /// request-response budget unless the operator supplied an explicit override.
@@ -35,7 +40,7 @@ const ROLE_AUTHORIZED_INVOKE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(300
 /// when it intentionally talks to a handler that doesn't reply
 /// (extension dispatch before `stop`/`status` handlers are
 /// wired). Production callers never set it, so the default
-/// stays at 10s.
+/// stays at 60s.
 fn invoke_timeout() -> Duration {
     std::env::var("VOSX_INVOKE_TIMEOUT_MS")
         .ok()
@@ -1198,6 +1203,11 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(protected.contains("bound-handle credential"));
+    }
+
+    #[test]
+    fn default_invoke_timeout_covers_the_default_raft_operation_budget() {
+        assert!(INVOKE_TIMEOUT_DEFAULT >= Duration::from_secs(35));
     }
 
     #[test]

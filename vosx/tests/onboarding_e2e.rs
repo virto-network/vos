@@ -23,7 +23,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
@@ -36,6 +36,19 @@ use std::os::unix::net::UnixListener;
 // do not layer shorter per-root assumptions on top of the daemon's bounded
 // authority and Raft operations.
 const DAEMON_READINESS_TIMEOUT: Duration = Duration::from_secs(90);
+
+// These tests each run several real daemons, actors, and trust/Raft workers.
+// Running the nine scenarios concurrently makes their wall-clock readiness
+// depend on the test runner's CPU scheduling rather than the protocol. Keep
+// the aggregate `cargo test -p vosx` gate deterministic while retaining the
+// per-scenario process isolation below.
+static ONBOARDING_E2E_LOCK: Mutex<()> = Mutex::new(());
+
+fn isolate_onboarding_e2e() -> MutexGuard<'static, ()> {
+    ONBOARDING_E2E_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn vosx_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_vosx"))
@@ -750,6 +763,7 @@ fn poll_until(secs: u64, mut f: impl FnMut() -> bool, on_fail: impl FnOnce() -> 
 
 #[test]
 fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
+    let _isolation = isolate_onboarding_e2e();
     let space = "onb";
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let service_pvm = workspace.join("services/vos-service/vos-service.pvm");
@@ -931,6 +945,7 @@ fn onboarding_via_token_redeems_syncs_spawns_and_reattaches() {
 
 #[test]
 fn signed_service_package_runs_and_reopens_through_the_space_daemon() {
+    let _isolation = isolate_onboarding_e2e();
     let space = "root";
     let data = TempDir::new("root-data");
     let config = TempDir::new("root-config");
@@ -1413,6 +1428,7 @@ fn signed_service_package_runs_and_reopens_through_the_space_daemon() {
 
 #[test]
 fn signed_service_roots_run_under_production_trust_and_recover() {
+    let _isolation = isolate_onboarding_e2e();
     let mut malformed_observations = TestProductionTrustObservations::default();
     assert_eq!(
         TestProductionTrustSidecar::classify(
@@ -1843,6 +1859,7 @@ fn signed_service_roots_run_under_production_trust_and_recover() {
 
 #[test]
 fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
+    let _isolation = isolate_onboarding_e2e();
     let space = "production-crdt-network";
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let service_pvm = workspace.join("services/vos-service/vos-service.pvm");
@@ -2235,6 +2252,7 @@ fn production_crdt_root_converges_across_enrolled_daemons_and_restart() {
 
 #[test]
 fn production_raft_root_survives_voter_join_leader_loss_and_backup_relocation() {
+    let _isolation = isolate_onboarding_e2e();
     let space = "production-raft-network";
     let root = "production-raft-cluster-counter";
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -2913,6 +2931,7 @@ fn boot_admin_with_service(
 /// up` errors immediately (no daemon, no partial join).
 #[test]
 fn tampered_token_fails_parse() {
+    let _isolation = isolate_onboarding_e2e();
     let data = TempDir::new("tamper-data");
     let cfg = TempDir::new("tamper-config");
     // A syntactically-`vos-` string with a corrupt body.
@@ -2936,6 +2955,7 @@ fn tampered_token_fails_parse() {
 /// non-members.
 #[test]
 fn expired_token_not_redeemed_and_non_member_cannot_sync() {
+    let _isolation = isolate_onboarding_e2e();
     let space = "exp";
     let service_pvm =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../services/vos-service/vos-service.pvm");
@@ -3007,6 +3027,7 @@ fn expired_token_not_redeemed_and_non_member_cannot_sync() {
 /// join cannot redeem or cross the Member sync floor.
 #[test]
 fn unredeemed_token_can_be_revoked_before_join() {
+    let _isolation = isolate_onboarding_e2e();
     let space = "rev";
     let service_pvm =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../services/vos-service/vos-service.pvm");
@@ -3085,6 +3106,7 @@ fn unredeemed_token_can_be_revoked_before_join() {
 /// double-redemption rather than pretending to have prevented it.
 #[test]
 fn double_redemption_is_flagged() {
+    let _isolation = isolate_onboarding_e2e();
     let space = "dbl";
     let service_pvm =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../services/vos-service/vos-service.pvm");

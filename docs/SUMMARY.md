@@ -6,4 +6,3 @@
 - [Authority and privacy](security.md)
 - [Operations](operations.md)
 - [Extensions](extensions.md)
-

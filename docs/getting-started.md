@@ -16,7 +16,7 @@ cargo run -p vosx -- new counter
 
 The generated actor has ordinary Rust state and typed handlers:
 
-```rust
+```rust,ignore
 use vos::prelude::*;
 
 #[actor]

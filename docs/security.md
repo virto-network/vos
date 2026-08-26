@@ -45,4 +45,3 @@ A production node uses an operator-configured verifier for packages,
 credentials, receipts, proofs, and logical time. The selected policy identity
 is bound into root configuration and replicated state; a voter with a
 different policy cannot join or replay the root.
-

@@ -138,6 +138,7 @@ fn scalar_mul_mod_l_pvm(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     let output_ptr = output.as_mut_ptr() as u64;
     unsafe {
         core::arch::asm!(
+            "csrw 0x801, zero",
             "ecall",
             in("t0") ECALL_SCALAR_MUL_MOD_L as u64,
             in("a0") a_ptr,
@@ -181,6 +182,7 @@ fn scalar_add_mod_l_pvm(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     let output_ptr = output.as_mut_ptr() as u64;
     unsafe {
         core::arch::asm!(
+            "csrw 0x801, zero",
             "ecall",
             in("t0") ECALL_SCALAR_ADD_MOD_L as u64,
             in("a0") a_ptr,
@@ -227,6 +229,7 @@ fn scalar_from_bytes_mod_order_wide_pvm(wide: &[u8; 64]) -> [u8; 32] {
     let output_ptr = output.as_mut_ptr() as u64;
     unsafe {
         core::arch::asm!(
+            "csrw 0x801, zero",
             "ecall",
             in("t0") ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64,
             in("a0") wide_ptr,

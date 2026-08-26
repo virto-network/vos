@@ -49,6 +49,7 @@ fn compress_pvm(h: &mut [u8; 64], m: &[u8; 128], t: u128, f: bool) {
     let f_flag: u64 = if f { 1 } else { 0 };
     unsafe {
         core::arch::asm!(
+            "csrw 0x801, zero",
             "ecall",
             in("t0") ECALL_BLAKE2B_COMPRESS as u64,
             in("a0") h_ptr,

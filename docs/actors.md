@@ -38,4 +38,3 @@ proof. See [Authority and privacy](security.md).
 - `examples/actors/workflow`: durable calls and suspension.
 - `examples/actors/private-age` and `age-gate`: private input with an attested
   result.
-
