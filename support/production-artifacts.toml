@@ -3,7 +3,7 @@ format = 1
 # Every infrastructure artifact below is reproduced from source_revision with
 # the named toolchains. A Clerk `.vos` signature is operator-specific, so this
 # manifest pins its signed content rather than one repository-global wrapper.
-source_revision = "e9c3269a54bbdeb7f0eccc9d2eea411c2bab1d7e"
+source_revision = "82f0a23f8e8232bb2f35a10974455ca058a26afd"
 guest_toolchain = "nightly-2026-03-20"
 host_toolchain = "nightly-2025-05-09"
 
@@ -16,6 +16,6 @@ authority_pvm_blake2b_256 = "5be10a4fe6158cb0d31d92651820f63d5fd39cdd1b4df1a20c8
 
 registry_elf_blake2b_256 = "5fa82d52c5f3fe4c5b3a25d3d9ae55d236c9d919a9f3fe742f72494964e161cc"
 
-clerk_actor_program_id = "8bb9bfe4d9f17a7638248004963721e4bcea45ba2fab5f578b30d9387719db44"
-clerk_deployment_id = "a5e8b7c9ac00ac9e4b3a5fb9595e545359de7554f6974ed7eef269e78259f272"
+clerk_actor_program_id = "b65df95831cdac6aa0d8f7733e576e1922559287593c44bec626f5d109fefad9"
+clerk_deployment_id = "7c0ec0de6b20ee720f85da8f661631c18777a9a3f51328e98348a7666b7b6fb5"
 clerk_task_hash = "c1eb35d17a5002b8f8251564281bc2e85bf33672e12600a91cb1b0f3027c3cce"
