@@ -4389,6 +4389,7 @@ fn authorization_rejection<S: GuestAccumulateStore>(
     Ok((!authorized).then_some(AccumulationRejection::Unauthorized))
 }
 
+#[allow(clippy::nonminimal_bool)]
 fn validate_pinned_role_assertion<S: GuestAccumulateStore>(
     store: &S,
     authority: &RoleAuthorityBinding,

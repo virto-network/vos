@@ -144,9 +144,11 @@ fn build_server(
     handle: IngressHandle,
     blocking: Arc<tokio::sync::Semaphore>,
 ) -> Server {
-    let mut limits = ServerLimits::default();
-    limits.max_connections = config.max_connections;
-    limits.max_sessions_per_identity = config.max_sessions_per_member;
+    let limits = ServerLimits {
+        max_connections: config.max_connections,
+        max_sessions_per_identity: config.max_sessions_per_member,
+        ..ServerLimits::default()
+    };
 
     let auth_handle = handle.clone();
     let auth_blocking = blocking.clone();
@@ -696,71 +698,6 @@ fn revoke_member_roles(
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn config() -> SshIngressConfig {
-        SshIngressConfig {
-            name: "space-shell".into(),
-            listen: "127.0.0.1:0".parse().unwrap(),
-            host_key: "/tmp/vos-ssh-test-key".into(),
-            max_connections: 8,
-            max_sessions_per_member: 2,
-        }
-    }
-
-    #[test]
-    fn listener_configuration_is_fail_closed() {
-        assert!(validate_config(&config()).is_ok());
-        let mut invalid = config();
-        invalid.name.clear();
-        assert!(matches!(
-            validate_config(&invalid),
-            Err(SshIngressError::InvalidConfig(_))
-        ));
-        let mut invalid = config();
-        invalid.name = "../escape".into();
-        assert!(validate_config(&invalid).is_err());
-        let mut invalid = config();
-        invalid.max_connections = 0;
-        assert!(validate_config(&invalid).is_err());
-        let mut invalid = config();
-        invalid.host_key.clear();
-        assert!(validate_config(&invalid).is_err());
-    }
-
-    #[test]
-    fn ssh_identities_separate_member_and_device() {
-        let subject = [0x11; 32];
-        let first = [0x22; 32];
-        let second = [0x33; 32];
-        let principal = identity("member", &subject).unwrap();
-        assert_eq!(principal.as_str(), format!("member:{}", hex(&subject)));
-        assert_ne!(
-            identity("ssh", &first).unwrap(),
-            identity("ssh", &second).unwrap()
-        );
-        assert_eq!(decode_hex_32(&hex(&subject)), Some(subject));
-        assert_eq!(decode_hex_32("not-a-subject"), None);
-    }
-
-    #[test]
-    fn capability_checks_use_the_authenticated_union() {
-        let capability = crate::CapabilityId::named(crate::capability::AGENT_INVOKE);
-        let allowed = crate::IngressAccessStatus {
-            credential_id: [1; 32],
-            subject: [2; 32],
-            roles: Vec::new(),
-            capabilities: vec![capability.0],
-            power: 100,
-            expires_at: u64::MAX,
-        };
-        assert!(require(&allowed, crate::capability::AGENT_INVOKE).is_ok());
-        assert!(require(&allowed, crate::capability::AGENT_UPGRADE).is_err());
-    }
-}
-
 fn describe(
     handle: &IngressHandle,
     access: &crate::IngressAccessStatus,
@@ -1046,4 +983,69 @@ fn invoke(
     let value = crate::value::Value::try_decode(&reply)
         .ok_or_else(|| service_error("vos.invalid-reply", "actor returned invalid data"))?;
     Ok(format!("{value:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> SshIngressConfig {
+        SshIngressConfig {
+            name: "space-shell".into(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            host_key: "/tmp/vos-ssh-test-key".into(),
+            max_connections: 8,
+            max_sessions_per_member: 2,
+        }
+    }
+
+    #[test]
+    fn listener_configuration_is_fail_closed() {
+        assert!(validate_config(&config()).is_ok());
+        let mut invalid = config();
+        invalid.name.clear();
+        assert!(matches!(
+            validate_config(&invalid),
+            Err(SshIngressError::InvalidConfig(_))
+        ));
+        let mut invalid = config();
+        invalid.name = "../escape".into();
+        assert!(validate_config(&invalid).is_err());
+        let mut invalid = config();
+        invalid.max_connections = 0;
+        assert!(validate_config(&invalid).is_err());
+        let mut invalid = config();
+        invalid.host_key.clear();
+        assert!(validate_config(&invalid).is_err());
+    }
+
+    #[test]
+    fn ssh_identities_separate_member_and_device() {
+        let subject = [0x11; 32];
+        let first = [0x22; 32];
+        let second = [0x33; 32];
+        let principal = identity("member", &subject).unwrap();
+        assert_eq!(principal.as_str(), format!("member:{}", hex(&subject)));
+        assert_ne!(
+            identity("ssh", &first).unwrap(),
+            identity("ssh", &second).unwrap()
+        );
+        assert_eq!(decode_hex_32(&hex(&subject)), Some(subject));
+        assert_eq!(decode_hex_32("not-a-subject"), None);
+    }
+
+    #[test]
+    fn capability_checks_use_the_authenticated_union() {
+        let capability = crate::CapabilityId::named(crate::capability::AGENT_INVOKE);
+        let allowed = crate::IngressAccessStatus {
+            credential_id: [1; 32],
+            subject: [2; 32],
+            roles: Vec::new(),
+            capabilities: vec![capability.0],
+            power: 100,
+            expires_at: u64::MAX,
+        };
+        assert!(require(&allowed, crate::capability::AGENT_INVOKE).is_ok());
+        assert!(require(&allowed, crate::capability::AGENT_UPGRADE).is_err());
+    }
 }
