@@ -2917,7 +2917,8 @@ where
                 || credential.scope != claim.scope
                 || claim.space != self.identity.space
                 || claim.holder != request.origin
-                || claim.role != role
+                || claim.role != Some(role)
+                || claim.capability.is_some()
                 || claim.audience != self.identity
                 || claim.invocation != request.invocation
                 || claim.target != request.target
@@ -2943,7 +2944,98 @@ where
         Ok(RoleAuthorizationClaim {
             space: self.identity.space,
             holder: request.origin,
-            role,
+            role: Some(role),
+            capability: None,
+            audience: self.identity.clone(),
+            invocation: request.invocation,
+            scope: prepared.work.authorization_scope(),
+            target: request.target,
+            method: request.method.clone(),
+            policy: policy.policy,
+        })
+    }
+
+    /// Derive the exact invocation-scoped decision for a package-declared
+    /// capability. The authority receipt, credential, work scope, and signed
+    /// method policy must all name the same capability.
+    pub fn capability_authorization_claim(
+        &self,
+        request: &LocalWorkRequest,
+        capability: super::CapabilityId,
+        policy: &MethodPolicy,
+    ) -> Result<RoleAuthorizationClaim, LocalRootTreeInvokeError> {
+        if self.expected_role_authority.is_none()
+            || request.workflow_step != 0
+            || request.authorization != AuthorizationEvidence::Public
+            || request.proof_requested
+            || policy.public
+            || policy.attested
+            || policy.capability != Some(capability)
+            || policy.space_role.is_some()
+            || policy.actor_role.is_some()
+        {
+            return Err(LocalRootTreeInvokeError::InvalidRoleAssertionPublication);
+        }
+        if let Some(authorization) = self.recover_direct_authorization(request)? {
+            let AuthorizationEvidence::Credential {
+                policy: supplied_policy,
+                credential_commitment,
+                bytes,
+            } = authorization
+            else {
+                return Err(LocalRootTreeInvokeError::CorruptWorkflow);
+            };
+            let credential = RoleCredential::decode(&bytes)
+                .map_err(|_| LocalRootTreeInvokeError::CorruptWorkflow)?;
+            if supplied_policy != policy.policy
+                || credential.commitment() != credential_commitment
+                || credential.holder != request.origin
+                || credential.space_role.is_some()
+                || credential.capability != Some(capability)
+                || credential.actor_role.is_some()
+            {
+                return Err(LocalRootTreeInvokeError::CorruptWorkflow);
+            }
+            let assertion = AccumulatedRoleAssertion::decode(&credential.authenticator)
+                .map_err(|_| LocalRootTreeInvokeError::CorruptWorkflow)?;
+            let authority = self
+                .expected_role_authority
+                .as_ref()
+                .ok_or(LocalRootTreeInvokeError::CorruptWorkflow)?;
+            let claim = assertion.claim.clone();
+            if !assertion.matches_authority(authority)
+                || credential.scope != claim.scope
+                || claim.space != self.identity.space
+                || claim.holder != request.origin
+                || claim.role.is_some()
+                || claim.capability != Some(capability)
+                || claim.audience != self.identity
+                || claim.invocation != request.invocation
+                || claim.target != request.target
+                || claim.method != request.method
+                || claim.policy != policy.policy
+            {
+                return Err(LocalRootTreeInvokeError::CorruptWorkflow);
+            }
+            return Ok(claim);
+        }
+        let private_arguments = self
+            .request_uses_private_ingress(request)?
+            .then(|| BlobRef::of_bytes(&request.arguments));
+        let prepared = self.prepare_request(request.clone(), private_arguments)?;
+        if prepared.work.service != self.identity
+            || prepared.work.target != request.target
+            || prepared.work.invocation != request.invocation
+            || prepared.work.method != request.method
+            || prepared.work.origin != request.origin
+        {
+            return Err(LocalRootTreeInvokeError::CorruptWorkflow);
+        }
+        Ok(RoleAuthorizationClaim {
+            space: self.identity.space,
+            holder: request.origin,
+            role: None,
+            capability: Some(capability),
             audience: self.identity.clone(),
             invocation: request.invocation,
             scope: prepared.work.authorization_scope(),
@@ -3015,7 +3107,78 @@ where
         Ok(RoleAuthorizationClaim {
             space: self.identity.space,
             holder: work.origin,
-            role,
+            role: Some(role),
+            capability: None,
+            audience: self.identity.clone(),
+            invocation: work.invocation,
+            scope: work.authorization_scope(),
+            target: work.target,
+            method: work.method,
+            policy: policy.policy,
+        })
+    }
+
+    pub fn delivery_capability_authorization_claim(
+        &self,
+        message: &MessageRecord,
+        capability: super::CapabilityId,
+        policy: &MethodPolicy,
+        logical_timeslot: u64,
+    ) -> Result<RoleAuthorizationClaim, LocalRootTreeInvokeError> {
+        if self.expected_role_authority.is_none()
+            || message.to_service != self.identity
+            || message.to != self.root_actor
+            || message.authorization != AuthorizationEvidence::Public
+            || message.proof_requested
+            || policy.public
+            || policy.attested
+            || policy.capability != Some(capability)
+            || policy.space_role.is_some()
+            || policy.actor_role.is_some()
+        {
+            return Err(LocalRootTreeInvokeError::InvalidRoleAssertionPublication);
+        }
+        let header = self
+            .service
+            .accumulate_host()
+            .header()
+            .map_err(LocalRootTreeInvokeError::CorruptStore)?
+            .ok_or(LocalRootTreeInvokeError::CorruptWorkflow)?;
+        let actor = self
+            .service
+            .accumulate_host()
+            .state_row(header.service_root, &StateKey::ActorDescriptor(message.to))
+            .map_err(LocalRootTreeInvokeError::CorruptStore)?
+            .and_then(|bytes| ActorGenesis::decode(&bytes).ok())
+            .ok_or(LocalRootTreeInvokeError::CorruptWorkflow)?;
+        let base = if header.consistency == ConsistencyMode::Crdt {
+            ConsistencyBase::Crdt {
+                heads: header.crdt_heads,
+            }
+        } else {
+            ConsistencyBase::Linear {
+                revision: header.revision,
+                state_root: header
+                    .state_root
+                    .ok_or(LocalRootTreeInvokeError::CorruptWorkflow)?,
+            }
+        };
+        let work = message
+            .authorization_work(
+                &self.identity,
+                logical_timeslot,
+                AuthorizationEvidence::Public,
+                header.consistency,
+                base,
+                &actor,
+            )
+            .filter(|work| work.method == policy.method)
+            .ok_or(LocalRootTreeInvokeError::InvalidRoleAssertionPublication)?;
+        Ok(RoleAuthorizationClaim {
+            space: self.identity.space,
+            holder: work.origin,
+            role: None,
+            capability: Some(capability),
             audience: self.identity.clone(),
             invocation: work.invocation,
             scope: work.authorization_scope(),
@@ -4414,7 +4577,8 @@ mod tests {
         let claim = RoleAuthorizationClaim {
             space: authority.service.space,
             holder: super::super::Origin::Member(super::super::SubjectId([35; 32])),
-            role: crate::SpaceRole::Member,
+            role: Some(crate::SpaceRole::Member),
+            capability: None,
             audience: ServiceIdentity {
                 root_service: super::super::RootServiceId([36; 32]),
                 ..authority.service.clone()

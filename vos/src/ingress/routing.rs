@@ -36,16 +36,16 @@ pub(crate) fn dispatch(req: &Request, inner: &Inner, ctx: &mut HttpIngressContex
     if let Some(response) = handle_status(req, inner) {
         return response;
     }
-    let Some(role) = ctx.role() else {
+    if !ctx.is_authenticated() {
         return text(401, "a live VOS access token is required");
-    };
+    }
     if req.uri().path() == "/__metrics" {
-        if role != crate::SpaceRole::Admin {
+        if !ctx.has_capability(crate::capability::SPACE_METRICS_READ) {
             return text(403, "admin access is required");
         }
         return handle_metrics(req, inner).expect("metrics path matched");
     }
-    if role < crate::SpaceRole::Member {
+    if !ctx.has_capability(crate::capability::SPACE_DISCOVER) {
         return text(403, "member access is required");
     }
     inner.requests.fetch_add(1, Ordering::Relaxed);
@@ -326,6 +326,7 @@ fn meta_to_json(meta: &crate::metadata::ParsedMeta) -> String {
                 "attested": m.attested,
                 "space_role": m.space_role,
                 "actor_role": m.actor_role,
+                "capability": m.capability,
             })
         })
         .collect();
@@ -464,6 +465,7 @@ fn openapi_operation_for(
                 "operationId": operation_id,
                 "x-vos-attested": msg.attested,
                 "x-vos-space-role": msg.space_role,
+                "x-vos-capability": msg.capability,
                 "x-vos-actor-role": msg.actor_role,
                 "parameters": parameters,
                 "responses": { "200": { "description": response_desc } }
@@ -483,6 +485,7 @@ fn openapi_operation_for(
                 "operationId": operation_id,
                 "x-vos-attested": msg.attested,
                 "x-vos-space-role": msg.space_role,
+                "x-vos-capability": msg.capability,
                 "x-vos-actor-role": msg.actor_role,
                 "parameters": [{
                     "name": "Idempotency-Key",

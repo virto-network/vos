@@ -4325,7 +4325,9 @@ fn authorization_rejection<S: GuestAccumulateStore>(
                 && *credential_commitment == credential.commitment();
             if !structurally_authorized {
                 false
-            } else if let (Some(_), Some(authority)) = (policy.space_role, authority) {
+            } else if let Some(authority) =
+                authority.filter(|_| policy.space_role.is_some() || policy.capability.is_some())
+            {
                 // A finalized space-authority assertion proves only the
                 // space role named by its claim. It cannot authenticate an
                 // actor-local role carried beside that claim. Mixed policies
@@ -4403,7 +4405,8 @@ fn validate_pinned_role_assertion<S: GuestAccumulateStore>(
     };
     let claim = &assertion.claim;
     if credential.holder != claim.holder
-        || credential.space_role != Some(claim.role)
+        || credential.space_role != claim.role
+        || credential.capability != claim.capability
         || credential.scope != claim.scope
         || claim.space != service.space
         || claim.holder != work.origin
@@ -4412,6 +4415,10 @@ fn validate_pinned_role_assertion<S: GuestAccumulateStore>(
         || claim.target != work.target
         || claim.method != work.method
         || claim.policy != policy.policy
+        || policy
+            .space_role
+            .is_some_and(|required| !claim.role.is_some_and(|actual| actual.as_u8() >= required))
+        || claim.capability != policy.capability
         || (work.workflow_step == 0 && claim.scope != work.authorization_scope())
         || assertion.receipt.outbox_commitment.is_some()
         || assertion.receipt.checkpoint != 0
@@ -5413,7 +5420,8 @@ mod tests {
         let claim = super::super::RoleAuthorizationClaim {
             space: work.service.space,
             holder: work.origin,
-            role,
+            role: Some(role),
+            capability: None,
             audience: work.service.clone(),
             invocation: work.invocation,
             scope: work.authorization_scope(),
@@ -5445,8 +5453,58 @@ mod tests {
         RoleCredential {
             holder: claim.holder,
             scope: claim.scope,
-            space_role: Some(claim.role),
-            capability: None,
+            space_role: claim.role,
+            capability: claim.capability,
+            actor_role: None,
+            authenticator: AccumulatedRoleAssertion { claim, receipt }.encode(),
+        }
+    }
+
+    fn receipt_bound_capability_credential(
+        store: &mut MemStore,
+        work: &WorkEnvelope,
+        capability: super::super::CapabilityId,
+        policy: Hash,
+    ) -> RoleCredential {
+        let authority = role_authority();
+        let claim = super::super::RoleAuthorizationClaim {
+            space: work.service.space,
+            holder: work.origin,
+            role: None,
+            capability: Some(capability),
+            audience: work.service.clone(),
+            invocation: work.invocation,
+            scope: work.authorization_scope(),
+            target: work.target,
+            method: work.method.clone(),
+            policy,
+        };
+        let receipt = AccumulationReceipt {
+            service: authority.service.clone(),
+            accepted_transition: Hash::digest(
+                b"vos/test-capability-authority-transition/service",
+                &[&claim.encode()],
+            ),
+            reply_commitment: Some(claim.authority_reply(authority.actor).commitment()),
+            outbox_commitment: None,
+            resulting_state_root: Some(Hash([75; 32])),
+            resulting_crdt_heads: vec![],
+            sequence: 1,
+            checkpoint: 0,
+            consistency: ConsistencyMode::Local,
+        };
+        store.receipt_allowlist.insert(
+            ReceiptVerificationRequest {
+                expected_producer: authority.actor,
+                receipt: receipt.clone(),
+            }
+            .hash(),
+        );
+        RoleCredential {
+            holder: claim.holder,
+            scope: claim.scope,
+            space_role: None,
+            capability: claim.capability,
             actor_role: None,
             authenticator: AccumulatedRoleAssertion { claim, receipt }.encode(),
         }
@@ -7785,6 +7843,103 @@ mod tests {
             "a malformed resumed credential is a deterministic denial, not a host error"
         );
         assert_eq!(store, before);
+    }
+
+    #[test]
+    fn disclosed_capability_credentials_bind_the_exact_signed_policy() {
+        let mut store = MemStore::default();
+        let initial = store.provide_blob(b"before").unwrap();
+        store.programs.insert(program(), FIXTURE_ACTOR_PVM.to_vec());
+        let capability = super::super::CapabilityId::named("agent.invoke");
+        let required_policy =
+            super::super::method_authorization_policy_hash(Some(capability), None, None).unwrap();
+        let install = AccumulateRequest::Install(ServiceGenesis {
+            role_authority: Some(role_authority()),
+            external_actors: external_bindings(),
+            service: identity(),
+            consistency: ConsistencyMode::Local,
+            actors: vec![ActorGenesis {
+                actor: actor(),
+                name: "root".into(),
+                parent: None,
+                producer: super::super::ProducerId([4; 32]),
+                deployment: identity().deployment,
+                program: program(),
+                initial_state: initial.clone(),
+                crdt: false,
+                role_policies: role_policies(vec![MethodPolicy {
+                    method: "set".into(),
+                    schema: Hash([6; 32]),
+                    policy: required_policy,
+                    public: false,
+                    attested: false,
+                    space_role: None,
+                    capability: Some(capability),
+                    actor_role: None,
+                }]),
+            }],
+            authorization: AuthorizationEvidence::SystemCapability {
+                capability: super::super::SystemCapabilityId([8; 32]),
+                authenticator: vec![9],
+            },
+        });
+        let AccumulationResult::Installed(receipt) =
+            execute_guest_accumulate(&mut store, &install).unwrap()
+        else {
+            panic!("install rejected")
+        };
+        let mut work = linear_work(initial.clone(), receipt.resulting_state_root.unwrap());
+        work.origin = super::super::Origin::Member(super::super::SubjectId([40; 32]));
+        let credential =
+            receipt_bound_capability_credential(&mut store, &work, capability, required_policy);
+        work.authorization = credential.disclosed_evidence(required_policy);
+        seed_direct_ingress(&mut store, &work);
+        let mut denied_store = store.clone();
+        let accepted = execute_guest_accumulate(
+            &mut store,
+            &AccumulateRequest::Apply(AccumulationEnvelope {
+                transition: linear_transition(&work, b"after"),
+                work: work.clone(),
+                provided_blobs: vec![],
+            }),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                accepted,
+                AccumulationResult::Accepted {
+                    duplicate: false,
+                    ..
+                }
+            ),
+            "{accepted:?}"
+        );
+
+        let mut denied_work = linear_work(initial, receipt.resulting_state_root.unwrap());
+        denied_work.origin = work.origin;
+        denied_work.invocation = super::super::InvocationId([0x53; 32]);
+        let wrong = receipt_bound_capability_credential(
+            &mut denied_store,
+            &denied_work,
+            super::super::CapabilityId::named("agent.create.shared"),
+            required_policy,
+        );
+        denied_work.authorization = wrong.disclosed_evidence(required_policy);
+        seed_direct_ingress(&mut denied_store, &denied_work);
+        let before = denied_store.clone();
+        assert_eq!(
+            execute_guest_accumulate(
+                &mut denied_store,
+                &AccumulateRequest::Apply(AccumulationEnvelope {
+                    transition: linear_transition(&denied_work, b"denied"),
+                    work: denied_work,
+                    provided_blobs: vec![],
+                }),
+            )
+            .unwrap(),
+            rejected(AccumulationRejection::Unauthorized),
+        );
+        assert_eq!(denied_store, before);
     }
 
     #[test]

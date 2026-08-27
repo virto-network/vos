@@ -1922,9 +1922,13 @@ pub(super) fn validate_role_authority_deployment(
         vec![
             ("authenticate_access", true, false),
             (vos::service::ROLE_AUTHORITY_DECISION_METHOD_, true, false),
+            ("delete_role", true, false),
             ("issue_access", true, false),
             ("list_access", true, false),
+            ("list_member_roles", true, false),
+            ("list_roles", true, false),
             (vos::service::ROLE_AUTHORITY_MUTATION_METHOD_, true, false),
+            ("put_role", true, false),
             (vos::service::ROLE_AUTHORITY_INVITE_METHOD_, true, false),
             ("revoke_access", true, false),
             (
@@ -1932,6 +1936,8 @@ pub(super) fn validate_role_authority_deployment(
                 true,
                 false,
             ),
+            ("revoke_member_roles", true, false),
+            ("set_member_roles", true, false),
         ]
     };
     if methods != expected_methods {

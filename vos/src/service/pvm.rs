@@ -2959,7 +2959,8 @@ mod tests {
         let claim = super::super::RoleAuthorizationClaim {
             space: work.service.space,
             holder: origin,
-            role: crate::SpaceRole::Developer,
+            role: Some(crate::SpaceRole::Developer),
+            capability: None,
             audience: work.service.clone(),
             invocation: work.invocation,
             scope: credential.scope,

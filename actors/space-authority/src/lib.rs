@@ -14,7 +14,10 @@ use vos::service::{
     RoleAuthorizationClaim, ServiceWire, SpaceId, SubjectId,
 };
 use vos::storage::StorageMap;
-use vos::{IngressAccessGrant, IngressAccessStatus};
+use vos::{
+    CapabilityId, IngressAccessGrant, IngressAccessStatus, RoleId, SpaceMemberRoles,
+    SpaceRoleDefinition, default_space_roles,
+};
 
 #[derive(
     vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Debug, Clone, PartialEq, Eq,
@@ -31,6 +34,16 @@ struct GrantRow {
     /// Exact PeerId bytes used by the registry's canonical equal-epoch
     /// ordering. `grantor` remains the compact authorization identity.
     grantor_peer_id: Vec<u8>,
+}
+
+#[derive(
+    vos::rkyv::Archive, vos::rkyv::Serialize, vos::rkyv::Deserialize, Debug, Clone, PartialEq, Eq,
+)]
+#[rkyv(crate = vos::rkyv)]
+struct RoleRow {
+    definition: SpaceRoleDefinition,
+    epoch: u64,
+    deleted: bool,
 }
 
 #[cfg(feature = "migration-fixture")]
@@ -54,6 +67,15 @@ pub fn initial_state(
             authority_replication_id,
             root_peer_id,
             revoked_invites: Vec::new(),
+            roles: default_space_roles(space)
+                .into_iter()
+                .map(|definition| RoleRow {
+                    definition,
+                    epoch: 1,
+                    deleted: false,
+                })
+                .collect(),
+            member_roles: Vec::new(),
             grants: vec![GrantRow {
                 holder_kind: 0,
                 holder: root.0,
@@ -76,6 +98,8 @@ pub struct SpaceAuthority {
     authority_replication_id: [u8; 32],
     root_peer_id: Vec<u8>,
     revoked_invites: Vec<[u8; 32]>,
+    roles: Vec<RoleRow>,
+    member_roles: Vec<SpaceMemberRoles>,
     grants: Vec<GrantRow>,
     /// Protocol-neutral ingress credentials, one private point row per
     /// subject. Bearer secrets never enter this actor or its durable state.
@@ -100,33 +124,36 @@ impl SpaceAuthority {
             authority_replication_id: [0; 32],
             root_peer_id: Vec::new(),
             revoked_invites: Vec::new(),
+            roles: Vec::new(),
+            member_roles: Vec::new(),
             grants: Vec::new(),
             access_grants: StorageMap::default(),
         }
     }
 
-    /// Issue one ingress credential. Any currently effective Admin may issue
-    /// Member or Developer access; only the immutable root may issue Admin.
-    /// Exact retries are idempotent and conflicting reuse is refused.
+    /// Issue one ingress credential for an exact set of roles. A delegating
+    /// member may assign only roles below their own power and whose
+    /// capabilities are already in their effective set. The immutable root
+    /// bypasses that ceiling. Exact retries are idempotent.
     #[msg]
     fn issue_access(
         &mut self,
         credential_id: [u8; 32],
-        role: u8,
+        roles: Vec<[u8; 32]>,
         expires_at: u64,
         ctx: &mut Context<Self>,
     ) -> Vec<u8> {
         let Origin::Member(issuer) = ctx.origin() else {
             return Vec::new();
         };
-        let Some(role) = SpaceRole::from_u8(role) else {
-            return Vec::new();
-        };
+        let mut roles = roles;
+        roles.sort_unstable();
+        roles.dedup();
         if credential_id == [0; 32]
             || expires_at == 0
-            || self.effective_role(Origin::Member(issuer)) != Some(SpaceRole::Admin)
-            || (role == SpaceRole::Admin && Origin::Member(issuer) != self.root_origin())
-            || role == SpaceRole::Guest
+            || roles.is_empty()
+            || roles.len() > vos::MAX_MEMBER_ROLES
+            || !self.can_delegate_roles(Origin::Member(issuer), &roles)
         {
             return Vec::new();
         }
@@ -134,7 +161,7 @@ impl SpaceAuthority {
         let candidate = IngressAccessGrant {
             credential_id,
             subject: subject.0,
-            role,
+            roles: roles.clone(),
             expires_at,
             issuer: issuer.0,
             epoch: 1,
@@ -150,7 +177,11 @@ impl SpaceAuthority {
         IngressAccessStatus {
             credential_id,
             subject: subject.0,
-            role,
+            roles,
+            capabilities: self.effective_capabilities(Origin::Member(subject)),
+            power: self
+                .effective_power(Origin::Member(subject))
+                .unwrap_or_default(),
             expires_at,
         }
         .encode()
@@ -163,7 +194,10 @@ impl SpaceAuthority {
         let Origin::Member(issuer) = ctx.origin() else {
             return false;
         };
-        if self.effective_role(Origin::Member(issuer)) != Some(SpaceRole::Admin) {
+        if !self.has_capability(
+            Origin::Member(issuer),
+            CapabilityId::named(vos::capability::SPACE_CREDENTIALS_MANAGE),
+        ) {
             return false;
         }
         let subject = SubjectId::of_ingress_credential(&credential_id);
@@ -189,14 +223,20 @@ impl SpaceAuthority {
         };
         if row.credential_id != credential_id
             || row.revoked
-            || self.effective_role(Origin::Member(SubjectId(row.issuer))) != Some(SpaceRole::Admin)
+            || self
+                .effective_power(Origin::Member(SubjectId(row.issuer)))
+                .is_none()
         {
             return Vec::new();
         }
         IngressAccessStatus {
             credential_id,
             subject: row.subject,
-            role: row.role,
+            roles: row.roles,
+            capabilities: self.effective_capabilities(Origin::Member(subject)),
+            power: self
+                .effective_power(Origin::Member(subject))
+                .unwrap_or_default(),
             expires_at: row.expires_at,
         }
         .encode()
@@ -215,7 +255,10 @@ impl SpaceAuthority {
         let Origin::Member(caller) = ctx.origin() else {
             return Vec::new();
         };
-        if self.effective_role(Origin::Member(caller)) != Some(SpaceRole::Admin) {
+        if !self.has_capability(
+            Origin::Member(caller),
+            CapabilityId::named(vos::capability::SPACE_CREDENTIALS_MANAGE),
+        ) {
             return Vec::new();
         }
         let start: [u8; 32] = after.as_slice().try_into().unwrap_or([0; 32]);
@@ -226,6 +269,172 @@ impl SpaceAuthority {
             .map(|(_, row)| row)
             .take((budget.clamp(1, 128)) as usize)
             .collect()
+    }
+
+    /// List the editable role catalogue. Role IDs are stable within this
+    /// space and definitions are returned in canonical ID order.
+    #[msg]
+    fn list_roles(&self) -> Vec<SpaceRoleDefinition> {
+        let mut roles: Vec<_> = self
+            .roles
+            .iter()
+            .filter(|row| !row.deleted)
+            .map(|row| row.definition.clone())
+            .collect();
+        roles.sort_by_key(|role| role.id);
+        roles
+    }
+
+    /// Create or replace one role definition. Non-root managers may define
+    /// only roles below their own power and may not delegate capabilities
+    /// they do not possess.
+    #[msg]
+    fn put_role(&mut self, definition: Vec<u8>, epoch: u64, ctx: &mut Context<Self>) -> bool {
+        let Origin::Member(caller) = ctx.origin() else {
+            return false;
+        };
+        let Some(definition) = SpaceRoleDefinition::try_decode(&definition) else {
+            return false;
+        };
+        let caller = Origin::Member(caller);
+        if epoch == 0
+            || !self.valid_role_definition(&definition)
+            || !self.can_define_role(caller, &definition)
+        {
+            return false;
+        }
+        if let Some(row) = self
+            .roles
+            .iter_mut()
+            .find(|row| row.definition.id == definition.id)
+        {
+            if row.epoch == epoch && row.definition == definition && !row.deleted {
+                return true;
+            }
+            if row.epoch >= epoch {
+                return false;
+            }
+            row.definition = definition;
+            row.epoch = epoch;
+            row.deleted = false;
+        } else if self.roles.len() < vos::MAX_SPACE_ROLES {
+            self.roles.push(RoleRow {
+                definition,
+                epoch,
+                deleted: false,
+            });
+        } else {
+            return false;
+        }
+        true
+    }
+
+    #[msg]
+    fn delete_role(&mut self, role: [u8; 32], epoch: u64, ctx: &mut Context<Self>) -> bool {
+        let Origin::Member(caller) = ctx.origin() else {
+            return false;
+        };
+        let Some(index) = self.roles.iter().position(|row| row.definition.id == role) else {
+            return true;
+        };
+        let definition = self.roles[index].definition.clone();
+        if epoch == 0
+            || self.roles[index].epoch > epoch
+            || !self.can_define_role(Origin::Member(caller), &definition)
+        {
+            return false;
+        }
+        self.roles[index].epoch = epoch;
+        self.roles[index].deleted = true;
+        true
+    }
+
+    /// Replace a member's complete role set. The operation is monotone by
+    /// member epoch and records the exact delegating subject.
+    #[msg]
+    fn set_member_roles(
+        &mut self,
+        subject: [u8; 32],
+        roles: Vec<[u8; 32]>,
+        epoch: u64,
+        ctx: &mut Context<Self>,
+    ) -> bool {
+        let Origin::Member(grantor) = ctx.origin() else {
+            return false;
+        };
+        let mut roles = roles;
+        roles.sort_unstable();
+        roles.dedup();
+        if subject == [0; 32]
+            || subject == self.root_subject().0
+            || epoch == 0
+            || roles.is_empty()
+            || roles.len() > vos::MAX_MEMBER_ROLES
+            || !self.can_delegate_roles(Origin::Member(grantor), &roles)
+        {
+            return false;
+        }
+        let candidate = SpaceMemberRoles {
+            subject,
+            grantor: grantor.0,
+            roles,
+            epoch,
+            revoked: false,
+        };
+        if let Some(row) = self
+            .member_roles
+            .iter_mut()
+            .find(|row| row.subject == subject)
+        {
+            if *row == candidate {
+                return true;
+            }
+            if row.epoch >= epoch {
+                return false;
+            }
+            *row = candidate;
+        } else {
+            self.member_roles.push(candidate);
+        }
+        true
+    }
+
+    #[msg]
+    fn revoke_member_roles(
+        &mut self,
+        subject: [u8; 32],
+        epoch: u64,
+        ctx: &mut Context<Self>,
+    ) -> bool {
+        let Origin::Member(caller) = ctx.origin() else {
+            return false;
+        };
+        if !self.has_capability(
+            Origin::Member(caller),
+            CapabilityId::named(vos::capability::SPACE_MEMBERS_MANAGE),
+        ) {
+            return false;
+        }
+        let Some(row) = self
+            .member_roles
+            .iter_mut()
+            .find(|row| row.subject == subject)
+        else {
+            return true;
+        };
+        if row.epoch > epoch || epoch == 0 {
+            return false;
+        }
+        row.epoch = epoch;
+        row.revoked = true;
+        true
+    }
+
+    #[msg]
+    fn list_member_roles(&self) -> Vec<SpaceMemberRoles> {
+        let mut rows = self.member_roles.clone();
+        rows.sort_by_key(|row| row.subject);
+        rows
     }
 
     /// Apply one root-signed grant or revoke. Epochs are strictly monotonic
@@ -355,17 +564,186 @@ impl SpaceAuthority {
         if claim.space.0 != self.space || claim.audience.space.0 != self.space {
             return Vec::new();
         }
-        let Some(granted) = self.effective_role(claim.holder) else {
-            return Vec::new();
+        let authorized = match (claim.role, claim.capability) {
+            (Some(required), None) => self
+                .effective_role(claim.holder)
+                .is_some_and(|granted| granted >= required),
+            (None, Some(required)) => self.has_capability(claim.holder, required),
+            _ => false,
         };
-        if granted < claim.role {
+        if !authorized {
             return Vec::new();
         }
         claim.encode()
     }
 
     fn root_origin(&self) -> Origin {
-        Origin::Member(SubjectId::of_authenticated_peer(&self.root_peer_id))
+        Origin::Member(self.root_subject())
+    }
+
+    fn root_subject(&self) -> SubjectId {
+        SubjectId::of_authenticated_peer(&self.root_peer_id)
+    }
+
+    fn role_definition(&self, id: &[u8; 32]) -> Option<&SpaceRoleDefinition> {
+        self.roles
+            .iter()
+            .find(|row| !row.deleted && &row.definition.id == id)
+            .map(|row| &row.definition)
+    }
+
+    fn valid_role_definition(&self, role: &SpaceRoleDefinition) -> bool {
+        let name = role.name.as_bytes();
+        !name.is_empty()
+            && name.len() <= 64
+            && name[0].is_ascii_lowercase()
+            && name.iter().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(byte)
+            })
+            && role.id == RoleId::named(SpaceId(self.space), &role.name).0
+            && role.capabilities.len() <= vos::MAX_ROLE_CAPABILITIES
+            && role.capabilities.windows(2).all(|pair| pair[0] < pair[1])
+    }
+
+    fn can_define_role(&self, caller: Origin, role: &SpaceRoleDefinition) -> bool {
+        if caller == self.root_origin() {
+            return true;
+        }
+        let Some(power) = self.effective_power(caller) else {
+            return false;
+        };
+        let capabilities = self.effective_capabilities(caller);
+        self.has_capability(
+            caller,
+            CapabilityId::named(vos::capability::SPACE_ROLES_MANAGE),
+        ) && role.power < power
+            && role
+                .capabilities
+                .iter()
+                .all(|capability| capabilities.binary_search(capability).is_ok())
+    }
+
+    fn authority_for_roles(&self, roles: &[[u8; 32]]) -> Option<(u16, Vec<[u8; 32]>)> {
+        let mut power = 0;
+        let mut capabilities = Vec::new();
+        for role in roles {
+            let role = self.role_definition(role)?;
+            power = power.max(role.power);
+            capabilities.extend_from_slice(&role.capabilities);
+        }
+        capabilities.sort_unstable();
+        capabilities.dedup();
+        Some((power, capabilities))
+    }
+
+    fn effective_member_authority_inner(
+        &self,
+        subject: SubjectId,
+        seen: &mut Vec<[u8; 32]>,
+    ) -> Option<(u16, Vec<[u8; 32]>)> {
+        if subject == self.root_subject() {
+            let mut capabilities = Vec::new();
+            for row in self.roles.iter().filter(|row| !row.deleted) {
+                capabilities.extend_from_slice(&row.definition.capabilities);
+            }
+            capabilities.sort_unstable();
+            capabilities.dedup();
+            return Some((u16::MAX, capabilities));
+        }
+        if seen.contains(&subject.0) {
+            return None;
+        }
+        seen.push(subject.0);
+
+        let (roles, grantor) = if let Some(access) = self.access_grants.get(&subject.0) {
+            if access.revoked || access.subject != subject.0 {
+                return None;
+            }
+            (access.roles, SubjectId(access.issuer))
+        } else if let Some(assignment) = self
+            .member_roles
+            .iter()
+            .find(|row| row.subject == subject.0 && !row.revoked)
+        {
+            (assignment.roles.clone(), SubjectId(assignment.grantor))
+        } else {
+            return None;
+        };
+        let (grantor_power, grantor_capabilities) =
+            self.effective_member_authority_inner(grantor, seen)?;
+        let (power, capabilities) = self.authority_for_roles(&roles)?;
+        (power < grantor_power
+            && capabilities
+                .iter()
+                .all(|capability| grantor_capabilities.binary_search(capability).is_ok()))
+        .then_some((power, capabilities))
+    }
+
+    fn effective_member_authority(&self, subject: SubjectId) -> Option<(u16, Vec<[u8; 32]>)> {
+        self.effective_member_authority_inner(subject, &mut Vec::new())
+    }
+
+    fn effective_power(&self, holder: Origin) -> Option<u16> {
+        if let Origin::Member(subject) = holder
+            && let Some((power, _)) = self.effective_member_authority(subject)
+        {
+            return Some(power);
+        }
+        self.effective_role(holder).map(|role| match role {
+            SpaceRole::Guest => 0,
+            SpaceRole::Member => 100,
+            SpaceRole::Developer => 200,
+            SpaceRole::Admin => 300,
+        })
+    }
+
+    fn effective_capabilities(&self, holder: Origin) -> Vec<[u8; 32]> {
+        if let Origin::Member(subject) = holder
+            && let Some((_, capabilities)) = self.effective_member_authority(subject)
+        {
+            return capabilities;
+        }
+        let mut capabilities = Vec::new();
+        if let Some(role) = self.effective_role(holder) {
+            let name = role.name();
+            let id = RoleId::named(SpaceId(self.space), name).0;
+            if let Some(role) = self.role_definition(&id) {
+                capabilities.extend_from_slice(&role.capabilities);
+            }
+        }
+        capabilities.sort_unstable();
+        capabilities.dedup();
+        capabilities
+    }
+
+    fn has_capability(&self, holder: Origin, capability: CapabilityId) -> bool {
+        self.effective_capabilities(holder)
+            .binary_search(&capability.0)
+            .is_ok()
+    }
+
+    fn can_delegate_roles(&self, issuer: Origin, roles: &[[u8; 32]]) -> bool {
+        if issuer == self.root_origin() {
+            return roles
+                .iter()
+                .all(|role| self.role_definition(role).is_some());
+        }
+        let Some(power) = self.effective_power(issuer) else {
+            return false;
+        };
+        let capabilities = self.effective_capabilities(issuer);
+        self.has_capability(
+            issuer,
+            CapabilityId::named(vos::capability::SPACE_CREDENTIALS_MANAGE),
+        ) && roles.iter().all(|role| {
+            self.role_definition(role).is_some_and(|role| {
+                role.power < power
+                    && role
+                        .capabilities
+                        .iter()
+                        .all(|capability| capabilities.binary_search(capability).is_ok())
+            })
+        })
     }
 
     fn effective_role(&self, holder: Origin) -> Option<SpaceRole> {
@@ -407,7 +785,21 @@ impl SpaceAuthority {
             return None;
         }
         let issuer = (0, row.issuer);
-        (self.effective_role_inner(issuer, seen) == Some(SpaceRole::Admin)).then_some(row.role)
+        self.effective_role_inner(issuer, seen)?;
+        let power = row
+            .roles
+            .iter()
+            .filter_map(|role| self.role_definition(role).map(|role| role.power))
+            .max()?;
+        Some(if power >= 300 {
+            SpaceRole::Admin
+        } else if power >= 200 {
+            SpaceRole::Developer
+        } else if power >= 100 {
+            SpaceRole::Member
+        } else {
+            SpaceRole::Guest
+        })
     }
 
     fn apply_grant(
@@ -570,7 +962,8 @@ mod tests {
         RoleAuthorizationClaim {
             space,
             holder,
-            role,
+            role: Some(role),
+            capability: None,
             audience: ServiceIdentity {
                 space,
                 root_service: RootServiceId([3; 32]),
@@ -586,6 +979,17 @@ mod tests {
             method: "restricted".into(),
             policy: Hash([8; 32]),
         }
+    }
+
+    fn capability_claim(
+        space: SpaceId,
+        holder: Origin,
+        capability: CapabilityId,
+    ) -> RoleAuthorizationClaim {
+        let mut claim = claim(space, holder, SpaceRole::Guest);
+        claim.role = None;
+        claim.capability = Some(capability);
+        claim
     }
 
     fn actor(space: SpaceId, signing: &SigningKey) -> SpaceAuthority {
@@ -710,6 +1114,7 @@ mod tests {
         let space = SpaceId([92; 32]);
         let root = Origin::Member(SubjectId::of_authenticated_peer(&peer));
         let mut authority = actor(space, &signing);
+        let role = |name| vec![RoleId::named(space, name).0];
 
         let admin_id = [93; 32];
         let admin_bytes = dispatch_as(
@@ -717,7 +1122,7 @@ mod tests {
             root,
             IssueAccess {
                 credential_id: admin_id,
-                role: SpaceRole::Admin.as_u8(),
+                roles: role("admin"),
                 expires_at: 2_000_000_000,
             },
         );
@@ -730,7 +1135,7 @@ mod tests {
             admin_origin,
             IssueAccess {
                 credential_id: developer_id,
-                role: SpaceRole::Developer.as_u8(),
+                roles: role("developer"),
                 expires_at: 2_000_000_001,
             },
         );
@@ -741,7 +1146,7 @@ mod tests {
                 admin_origin,
                 IssueAccess {
                     credential_id: [95; 32],
-                    role: SpaceRole::Admin.as_u8(),
+                    roles: role("admin"),
                     expires_at: 2_000_000_002,
                 },
             )
@@ -757,8 +1162,23 @@ mod tests {
         );
         let authenticated = IngressAccessStatus::try_decode(&authenticated)
             .expect("issued credential authenticates");
-        assert_eq!(authenticated.role, SpaceRole::Developer);
+        assert_eq!(authenticated.roles, role("developer"));
+        assert!(
+            authenticated.has_capability(CapabilityId::named(vos::capability::AGENT_CREATE_LOCAL))
+        );
         let developer_origin = Origin::Member(SubjectId(authenticated.subject));
+        let allowed = capability_claim(
+            space,
+            developer_origin,
+            CapabilityId::named(vos::capability::AGENT_CREATE_LOCAL),
+        );
+        assert_eq!(authorize(&mut authority, &allowed), allowed.encode());
+        let denied = capability_claim(
+            space,
+            developer_origin,
+            CapabilityId::named(vos::capability::AGENT_CREATE_SHARED),
+        );
+        assert!(authorize(&mut authority, &denied).is_empty());
         let developer_claim = claim(space, developer_origin, SpaceRole::Developer);
         assert_eq!(
             authorize(&mut authority, &developer_claim),
@@ -781,6 +1201,91 @@ mod tests {
             )
             .is_empty(),
             "revocation is visible to the next authentication",
+        );
+    }
+
+    #[test]
+    fn custom_roles_delegate_only_lower_subset_authority() {
+        let signing = SigningKey::from_bytes(&[101; 32]);
+        let peer = root_peer(&signing);
+        let space = SpaceId([102; 32]);
+        let root = Origin::Member(SubjectId::of_authenticated_peer(&peer));
+        let admin = SubjectId([103; 32]);
+        let member = SubjectId([104; 32]);
+        let mut authority = actor(space, &signing);
+
+        assert!(dispatch_as(
+            &mut authority,
+            root,
+            SetMemberRoles {
+                subject: admin.0,
+                roles: vec![RoleId::named(space, "admin").0],
+                epoch: 1,
+            },
+        ));
+
+        let writer = SpaceRoleDefinition {
+            id: RoleId::named(space, "writer").0,
+            name: "writer".into(),
+            power: 150,
+            capabilities: vec![CapabilityId::named(vos::capability::AGENT_INVOKE).0],
+        };
+        assert!(dispatch_as(
+            &mut authority,
+            Origin::Member(admin),
+            PutRole {
+                definition: writer.encode(),
+                epoch: 1,
+            },
+        ));
+        assert!(dispatch_as(
+            &mut authority,
+            Origin::Member(admin),
+            SetMemberRoles {
+                subject: member.0,
+                roles: vec![writer.id],
+                epoch: 1,
+            },
+        ));
+        let allowed = capability_claim(
+            space,
+            Origin::Member(member),
+            CapabilityId::named(vos::capability::AGENT_INVOKE),
+        );
+        assert_eq!(authorize(&mut authority, &allowed), allowed.encode());
+        let denied = capability_claim(
+            space,
+            Origin::Member(member),
+            CapabilityId::named(vos::capability::AGENT_CREATE_LOCAL),
+        );
+        assert!(authorize(&mut authority, &denied).is_empty());
+
+        let escalation = SpaceRoleDefinition {
+            id: RoleId::named(space, "owner").0,
+            name: "owner".into(),
+            power: 301,
+            capabilities: writer.capabilities.clone(),
+        };
+        assert!(!dispatch_as(
+            &mut authority,
+            Origin::Member(admin),
+            PutRole {
+                definition: escalation.encode(),
+                epoch: 1,
+            },
+        ));
+
+        assert!(dispatch_as(
+            &mut authority,
+            root,
+            RevokeMemberRoles {
+                subject: admin.0,
+                epoch: 2,
+            },
+        ));
+        assert!(
+            authorize(&mut authority, &allowed).is_empty(),
+            "revoking the delegator invalidates descendant authority",
         );
     }
 

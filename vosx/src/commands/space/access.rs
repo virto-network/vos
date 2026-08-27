@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Subcommand;
 use serde::Serialize;
-use vos::{Decode, SpaceRole};
+use vos::Decode;
 
 use super::client::DaemonClient;
 
@@ -14,9 +14,9 @@ use super::client::DaemonClient;
 pub enum AccessCommand {
     /// Issue a bearer token. The secret is displayed once.
     Issue {
-        /// `member`, `developer`, or `admin` (root operator only).
-        #[arg(long, default_value = "member")]
-        role: String,
+        /// Role name to attach. Repeat for multiple roles.
+        #[arg(long = "role", default_value = "member")]
+        roles: Vec<String>,
         /// `24h`, `7d`, `30m`, `90s`, or bare seconds.
         #[arg(long, default_value = "24h")]
         expires: String,
@@ -38,7 +38,7 @@ struct IssuedAccess {
     recovery_file: String,
     credential_id: String,
     subject: String,
-    role: &'static str,
+    roles: Vec<String>,
     expires_at: u64,
 }
 
@@ -46,21 +46,20 @@ struct IssuedAccess {
 struct AccessView {
     credential_id: String,
     subject: String,
-    role: &'static str,
+    roles: Vec<String>,
     expires_at: u64,
     revoked: bool,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
     match args.command {
-        AccessCommand::Issue { role, expires } => issue(&args.space, &role, &expires),
+        AccessCommand::Issue { roles, expires } => issue(&args.space, &roles, &expires),
         AccessCommand::List => list(&args.space),
         AccessCommand::Revoke { credential } => revoke(&args.space, &credential),
     }
 }
 
-fn issue(space: &str, role: &str, expires: &str) -> anyhow::Result<()> {
-    let role = parse_role(role)?;
+fn issue(space: &str, role_names: &[String], expires: &str) -> anyhow::Result<()> {
     let ttl = crate::token::parse_duration(expires)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let expires_at = now
@@ -73,9 +72,22 @@ fn issue(space: &str, role: &str, expires: &str) -> anyhow::Result<()> {
     let recovery_file = persist_recovery_token(space, &credential_id, &token)?;
     DaemonClient::with_connect(space, |client| {
         let target = client.resolve_target(vos::service::ROLE_AUTHORITY_INSTANCE_)?;
+        let catalogue = role_catalog(client, target)?;
+        let mut roles = Vec::with_capacity(role_names.len());
+        for requested in role_names {
+            let role = catalogue
+                .iter()
+                .find(|role| role.name.eq_ignore_ascii_case(requested))
+                .ok_or_else(|| anyhow::anyhow!("unknown space role '{requested}'"))?;
+            roles.push(role.id);
+        }
+        roles.sort_unstable();
+        roles.dedup();
+        let encoded_roles = vos::rkyv::to_bytes::<vos::rkyv::rancor::Error>(&roles)
+            .map_err(|_| anyhow::anyhow!("encode access roles"))?;
         let message = vos::value::Msg::new("issue_access")
             .with("credential_id", credential_id.to_vec())
-            .with("role", role.as_u8())
+            .with("roles", vos::value::Value::Bytes(encoded_roles.to_vec()))
             .with("expires_at", expires_at);
         let value = client.invoke_dyn(target, &message)?;
         let bytes = value
@@ -91,7 +103,7 @@ fn issue(space: &str, role: &str, expires: &str) -> anyhow::Result<()> {
             recovery_file: recovery_file.display().to_string(),
             credential_id: hex::encode(credential_id),
             subject: hex::encode(status.subject),
-            role: role_name(status.role),
+            roles: role_names_for(&catalogue, &status.roles),
             expires_at: status.expires_at,
         };
         if crate::output::is_json() {
@@ -100,7 +112,7 @@ fn issue(space: &str, role: &str, expires: &str) -> anyhow::Result<()> {
             println!("{}", view.token);
             eprintln!("recovery    {}", view.recovery_file);
             eprintln!("credential  {}", view.credential_id);
-            eprintln!("role        {}", view.role);
+            eprintln!("roles       {}", view.roles.join(", "));
             eprintln!("expires_at  {}", view.expires_at);
         }
         Ok(())
@@ -146,22 +158,24 @@ fn persist_recovery_token(
 
 fn list(space: &str) -> anyhow::Result<()> {
     DaemonClient::with_connect(space, |client| {
-        let rows = access_rows(client)?;
-        let views: Vec<_> = rows.iter().map(view).collect();
+        let target = client.resolve_target(vos::service::ROLE_AUTHORITY_INSTANCE_)?;
+        let catalogue = role_catalog(client, target)?;
+        let rows = access_rows_for(client, target)?;
+        let views: Vec<_> = rows.iter().map(|row| view(row, &catalogue)).collect();
         if crate::output::is_json() {
             crate::output::print_json(&views);
         } else if views.is_empty() {
             println!("no ingress access credentials");
         } else {
             println!(
-                "{:<14}  {:<10}  {:<10}  SUBJECT",
-                "CREDENTIAL", "ROLE", "STATUS"
+                "{:<14}  {:<20}  {:<10}  SUBJECT",
+                "CREDENTIAL", "ROLES", "STATUS"
             );
             for row in views {
                 println!(
-                    "{:<14}  {:<10}  {:<10}  {}",
+                    "{:<14}  {:<20}  {:<10}  {}",
                     &row.credential_id[..12],
-                    row.role,
+                    row.roles.join(","),
                     if row.revoked { "revoked" } else { "active" },
                     &row.subject[..12],
                 );
@@ -173,7 +187,8 @@ fn list(space: &str) -> anyhow::Result<()> {
 
 fn revoke(space: &str, selector: &str) -> anyhow::Result<()> {
     DaemonClient::with_connect(space, |client| {
-        let rows = access_rows(client)?;
+        let target = client.resolve_target(vos::service::ROLE_AUTHORITY_INSTANCE_)?;
+        let rows = access_rows_for(client, target)?;
         let matches: Vec<_> = rows
             .iter()
             .filter(|row| hex::encode(row.credential_id).starts_with(selector))
@@ -183,7 +198,6 @@ fn revoke(space: &str, selector: &str) -> anyhow::Result<()> {
             [] => anyhow::bail!("no credential matches '{selector}'"),
             _ => anyhow::bail!("credential prefix '{selector}' is ambiguous"),
         };
-        let target = client.resolve_target(vos::service::ROLE_AUTHORITY_INSTANCE_)?;
         let message =
             vos::value::Msg::new("revoke_access").with("credential_id", row.credential_id.to_vec());
         if client.invoke_dyn(target, &message)?.as_bool() != Some(true) {
@@ -201,8 +215,10 @@ fn revoke(space: &str, selector: &str) -> anyhow::Result<()> {
     })
 }
 
-fn access_rows(client: &DaemonClient) -> anyhow::Result<Vec<vos::IngressAccessGrant>> {
-    let target = client.resolve_target(vos::service::ROLE_AUTHORITY_INSTANCE_)?;
+fn access_rows_for(
+    client: &DaemonClient,
+    target: vos::actors::context::ServiceId,
+) -> anyhow::Result<Vec<vos::IngressAccessGrant>> {
     let mut rows = Vec::new();
     let mut after = Vec::new();
     loop {
@@ -228,29 +244,36 @@ fn access_rows(client: &DaemonClient) -> anyhow::Result<Vec<vos::IngressAccessGr
     Ok(rows)
 }
 
-fn parse_role(role: &str) -> anyhow::Result<SpaceRole> {
-    match role.to_ascii_lowercase().as_str() {
-        "member" | "read" => Ok(SpaceRole::Member),
-        "developer" | "dev" => Ok(SpaceRole::Developer),
-        "admin" => Ok(SpaceRole::Admin),
-        _ => anyhow::bail!("unknown role '{role}', expected member|developer|admin"),
-    }
+fn role_catalog(
+    client: &DaemonClient,
+    target: vos::actors::context::ServiceId,
+) -> anyhow::Result<Vec<vos::SpaceRoleDefinition>> {
+    let value = client.invoke_dyn(target, &vos::value::Msg::new("list_roles"))?;
+    let bytes = value
+        .as_bytes()
+        .ok_or_else(|| anyhow::anyhow!("authority returned an invalid role catalogue"))?;
+    Vec::<vos::SpaceRoleDefinition>::try_decode(bytes)
+        .ok_or_else(|| anyhow::anyhow!("decode authority role catalogue"))
 }
 
-fn role_name(role: SpaceRole) -> &'static str {
-    match role {
-        SpaceRole::Guest => "guest",
-        SpaceRole::Member => "member",
-        SpaceRole::Developer => "developer",
-        SpaceRole::Admin => "admin",
-    }
+fn role_names_for(catalogue: &[vos::SpaceRoleDefinition], roles: &[[u8; 32]]) -> Vec<String> {
+    roles
+        .iter()
+        .map(|id| {
+            catalogue
+                .iter()
+                .find(|role| role.id == *id)
+                .map(|role| role.name.clone())
+                .unwrap_or_else(|| format!("{}…", hex::encode(&id[..4])))
+        })
+        .collect()
 }
 
-fn view(row: &vos::IngressAccessGrant) -> AccessView {
+fn view(row: &vos::IngressAccessGrant, catalogue: &[vos::SpaceRoleDefinition]) -> AccessView {
     AccessView {
         credential_id: hex::encode(row.credential_id),
         subject: hex::encode(row.subject),
-        role: role_name(row.role),
+        roles: role_names_for(catalogue, &row.roles),
         expires_at: row.expires_at,
         revoked: row.revoked,
     }

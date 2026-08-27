@@ -9588,7 +9588,8 @@ where
                         let valid = credential.commitment() == *credential_commitment
                             && credential.holder == origin
                             && credential.scope == claim.scope
-                            && credential.space_role == Some(claim.role)
+                            && credential.space_role == claim.role
+                            && credential.capability == claim.capability
                             && credential.actor_role.is_none()
                             && *policy == claim.policy
                             && claim.space == service.identity().space
@@ -9652,11 +9653,12 @@ where
                 continue;
             }
             if !policy.public {
-                let Some(role) = policy.space_role.and_then(crate::SpaceRole::from_u8) else {
+                if policy.actor_role.is_some() {
                     send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                     continue;
-                };
-                if policy.actor_role.is_some() {
+                }
+                let role = policy.space_role.and_then(crate::SpaceRole::from_u8);
+                if role.is_some() == policy.capability.is_some() {
                     send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                     continue;
                 }
@@ -9664,7 +9666,14 @@ where
                     send_service_status(req.reply, crate::STATUS_FORBIDDEN, id);
                     continue;
                 };
-                let claim = match service.role_authorization_claim(&request, role, &policy) {
+                let claim = match (role, policy.capability) {
+                    (Some(role), None) => service.role_authorization_claim(&request, role, &policy),
+                    (None, Some(capability)) => {
+                        service.capability_authorization_claim(&request, capability, &policy)
+                    }
+                    _ => unreachable!("checked exactly one space authorization requirement"),
+                };
+                let claim = match claim {
                     Ok(claim) => claim,
                     Err(failure) => {
                         warn!(%id, ?failure, "could not derive service role authorization claim");
@@ -9691,8 +9700,8 @@ where
                 request.authorization = crate::service::RoleCredential {
                     holder: origin,
                     scope: claim.scope,
-                    space_role: Some(role),
-                    capability: None,
+                    space_role: claim.role,
+                    capability: claim.capability,
                     actor_role: None,
                     authenticator: assertion.encode(),
                 }
@@ -10106,24 +10115,36 @@ fn handle_service_root_transport<B>(
                 if policy.public {
                     crate::service::AuthorizationEvidence::Public
                 } else {
-                    let Some(role) = policy.space_role.and_then(crate::SpaceRole::from_u8) else {
-                        warn!(%id, call = ?message.call_id, "actor-local durable authorization remains fail-closed");
-                        return;
-                    };
                     if policy.actor_role.is_some() {
                         warn!(%id, call = ?message.call_id, "mixed durable authorization remains fail-closed");
+                        return;
+                    }
+                    let role = policy.space_role.and_then(crate::SpaceRole::from_u8);
+                    if role.is_some() == policy.capability.is_some() {
+                        warn!(%id, call = ?message.call_id, "invalid durable space authorization policy");
                         return;
                     }
                     let Some(authority) = service.role_authority().cloned() else {
                         warn!(%id, call = ?message.call_id, "role-gated destination has no pinned authority");
                         return;
                     };
-                    let claim = match service.delivery_role_authorization_claim(
-                        &message,
-                        role,
-                        &policy,
-                        provisional_slot,
-                    ) {
+                    let claim = match (role, policy.capability) {
+                        (Some(role), None) => service.delivery_role_authorization_claim(
+                            &message,
+                            role,
+                            &policy,
+                            provisional_slot,
+                        ),
+                        (None, Some(capability)) => service
+                            .delivery_capability_authorization_claim(
+                                &message,
+                                capability,
+                                &policy,
+                                provisional_slot,
+                            ),
+                        _ => unreachable!("checked exactly one space authorization requirement"),
+                    };
+                    let claim = match claim {
                         Ok(claim) => claim,
                         Err(failure) => {
                             warn!(%id, call = ?message.call_id, ?failure, "could not derive delivery authorization claim");
@@ -10150,8 +10171,8 @@ fn handle_service_root_transport<B>(
                     crate::service::RoleCredential {
                         holder: crate::service::Origin::Actor(message.from),
                         scope: claim.scope,
-                        space_role: Some(role),
-                        capability: None,
+                        space_role: claim.role,
+                        capability: claim.capability,
                         actor_role: None,
                         authenticator: assertion.encode(),
                     }

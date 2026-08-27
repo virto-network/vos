@@ -60,8 +60,14 @@ impl HttpIngressContext {
         Self { handle, access }
     }
 
-    pub(crate) fn role(&self) -> Option<crate::SpaceRole> {
-        self.access.as_ref().map(|access| access.role)
+    pub(crate) fn is_authenticated(&self) -> bool {
+        self.access.is_some()
+    }
+
+    pub(crate) fn has_capability(&self, name: &str) -> bool {
+        self.access
+            .as_ref()
+            .is_some_and(|access| access.has_capability(crate::CapabilityId::named(name)))
     }
 
     pub(crate) fn ask_registry(&mut self, payload: &[u8]) -> Option<Vec<u8>> {

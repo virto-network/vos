@@ -31,7 +31,9 @@ pub mod exec;
 pub use actor::{Actor, Message};
 pub use auth::{
     Caller, Forbidden, IngressAccessGrant, IngressAccessStatus, IntraCap, IntraCapParseError,
-    NO_ROLES_MAP, NoRoles, RoleByte, SpaceRole, SpaceRoleMap, cap_for, ingress_credential_id,
+    MAX_MEMBER_CREDENTIALS, MAX_MEMBER_ROLES, MAX_ROLE_CAPABILITIES, MAX_SPACE_ROLES, NO_ROLES_MAP,
+    NoRoles, RoleByte, SpaceMemberRoles, SpaceRole, SpaceRoleDefinition, SpaceRoleMap, cap_for,
+    capability, default_space_roles, ingress_credential_id,
 };
 pub use client::{ActorHandle, ActorReference, CallError, ClientError};
 pub use codec::{Decode, Encode};

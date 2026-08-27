@@ -239,7 +239,11 @@ impl RoleAuthorityInviteRevocation {
 pub struct RoleAuthorizationClaim {
     pub space: SpaceId,
     pub holder: Origin,
-    pub role: crate::SpaceRole,
+    /// Transitional fixed threshold. Capability-native packages leave this
+    /// empty; it is removed with the clean-break platform repin.
+    pub role: Option<crate::SpaceRole>,
+    /// Exact package-declared space capability being authorized.
+    pub capability: Option<CapabilityId>,
     pub audience: ServiceIdentity,
     pub invocation: InvocationId,
     /// Complete invocation authorization scope, including target deployment,
@@ -3635,7 +3639,10 @@ impl ServiceWire for RoleAuthorizationClaim {
         let mut encoder = Encoder(out);
         encoder.fixed(&self.space.0);
         encode_origin(&mut encoder, self.holder);
-        encoder.u8(self.role.as_u8());
+        encoder.option(&self.role, |encoder, role| encoder.u8(role.as_u8()));
+        encoder.option(&self.capability, |encoder, capability| {
+            encoder.fixed(&capability.0)
+        });
         encode_service(&mut encoder, &self.audience);
         encoder.fixed(&self.invocation.0);
         encoder.fixed(&self.scope.0);
@@ -3648,7 +3655,10 @@ impl ServiceWire for RoleAuthorizationClaim {
         let value = Self {
             space: SpaceId(decoder.fixed()?),
             holder: decode_origin(decoder)?,
-            role: crate::SpaceRole::from_u8(decoder.u8()?).ok_or(DecodeError::NonCanonical)?,
+            role: decoder.option(|decoder| {
+                crate::SpaceRole::from_u8(decoder.u8()?).ok_or(DecodeError::NonCanonical)
+            })?,
+            capability: decoder.option(|decoder| Ok(CapabilityId(decoder.fixed()?)))?,
             audience: decode_service(decoder)?,
             invocation: InvocationId(decoder.fixed()?),
             scope: Hash(decoder.fixed()?),
@@ -3657,6 +3667,7 @@ impl ServiceWire for RoleAuthorizationClaim {
             policy: Hash(decoder.fixed()?),
         };
         if !matches!(value.holder, Origin::Member(_) | Origin::Actor(_))
+            || (value.role.is_some() == value.capability.is_some())
             || value.space != value.audience.space
             || value.invocation == InvocationId::ZERO
             || value.scope == Hash::ZERO
@@ -6201,7 +6212,8 @@ mod tests {
         let claim = RoleAuthorizationClaim {
             space: audience.space,
             holder: Origin::Member(SubjectId([44; 32])),
-            role: crate::SpaceRole::Developer,
+            role: Some(crate::SpaceRole::Developer),
+            capability: None,
             audience,
             invocation: InvocationId([45; 32]),
             scope: Hash([52; 32]),

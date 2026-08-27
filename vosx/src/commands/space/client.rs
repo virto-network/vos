@@ -55,7 +55,9 @@ fn invoke_timeout_for_policy(policy: Option<&vos::service::MethodPolicy>) -> Dur
         return configured;
     }
     if policy.is_some_and(|policy| {
-        !policy.public && policy.space_role.is_some() && policy.actor_role.is_none()
+        !policy.public
+            && policy.actor_role.is_none()
+            && (policy.space_role.is_some() || policy.capability.is_some())
     }) {
         ROLE_AUTHORIZED_INVOKE_TIMEOUT_DEFAULT
     } else {
@@ -109,9 +111,12 @@ fn encode_service_invocation(
             msg.name,
         );
     }
-    if !policy.public && (policy.space_role.is_none() || policy.actor_role.is_some()) {
+    if !policy.public
+        && (policy.actor_role.is_some()
+            || policy.space_role.is_some() == policy.capability.is_some())
+    {
         anyhow::bail!(
-            "actor-local or mixed-role method '{}' requires a bound-handle credential, which space call does not accept yet",
+            "actor-local or malformed authorization policy on '{}' requires a bound-handle credential",
             msg.name,
         );
     }

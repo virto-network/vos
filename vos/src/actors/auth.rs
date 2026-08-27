@@ -175,14 +175,117 @@ impl<R: Copy + Ord> SpaceRoleMap<R> {
     }
 }
 
-/// Durable authority row for one protocol-neutral ingress credential.
-/// The bearer secret is deliberately absent; hosts retain only its
+pub const MAX_SPACE_ROLES: usize = 128;
+pub const MAX_MEMBER_ROLES: usize = 16;
+pub const MAX_ROLE_CAPABILITIES: usize = 64;
+pub const MAX_MEMBER_CREDENTIALS: usize = 32;
+
+/// Stable capability names used by the built-in space surface. Actor packages
+/// may declare additional names; all names enter policy as a
+/// [`crate::CapabilityId`] rather than as ambient host privileges.
+pub mod capability {
+    pub const SPACE_DISCOVER: &str = "space.discover";
+    pub const SPACE_METRICS_READ: &str = "space.metrics.read";
+    pub const SPACE_MEMBERS_MANAGE: &str = "space.members.manage";
+    pub const SPACE_ROLES_MANAGE: &str = "space.roles.manage";
+    pub const SPACE_CREDENTIALS_MANAGE: &str = "space.credentials.manage";
+    pub const AGENT_DISCOVER: &str = "agent.discover";
+    pub const AGENT_INVOKE: &str = "agent.invoke";
+    pub const AGENT_CREATE_LOCAL: &str = "agent.create.local";
+    pub const AGENT_CREATE_SHARED: &str = "agent.create.shared";
+    pub const AGENT_UPGRADE: &str = "agent.upgrade";
+    pub const AGENT_REMOVE: &str = "agent.remove";
+}
+
+/// Editable role definition owned by the canonical space authority.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SpaceRoleDefinition {
+    pub id: [u8; 32],
+    pub name: String,
+    pub power: u16,
+    /// Sorted, unique capability identifiers.
+    pub capabilities: Vec<[u8; 32]>,
+}
+
+impl SpaceRoleDefinition {
+    pub fn contains(&self, capability: crate::CapabilityId) -> bool {
+        self.capabilities.binary_search(&capability.0).is_ok()
+    }
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SpaceMemberRoles {
+    pub subject: [u8; 32],
+    pub grantor: [u8; 32],
+    /// Sorted, unique role identifiers.
+    pub roles: Vec<[u8; 32]>,
+    pub epoch: u64,
+    pub revoked: bool,
+}
+
+pub fn default_space_roles(space: crate::service::SpaceId) -> Vec<SpaceRoleDefinition> {
+    use capability::*;
+
+    let definition = |name: &str, power, names: &[&str]| {
+        let mut capabilities: Vec<_> = names
+            .iter()
+            .map(|name| crate::CapabilityId::named(name).0)
+            .collect();
+        capabilities.sort_unstable();
+        capabilities.dedup();
+        SpaceRoleDefinition {
+            id: crate::RoleId::named(space, name).0,
+            name: name.into(),
+            power,
+            capabilities,
+        }
+    };
+    alloc::vec![
+        definition("guest", 0, &[SPACE_DISCOVER, AGENT_DISCOVER]),
+        definition(
+            "member",
+            100,
+            &[SPACE_DISCOVER, AGENT_DISCOVER, AGENT_INVOKE],
+        ),
+        definition(
+            "developer",
+            200,
+            &[
+                SPACE_DISCOVER,
+                AGENT_DISCOVER,
+                AGENT_INVOKE,
+                AGENT_CREATE_LOCAL,
+            ],
+        ),
+        definition(
+            "admin",
+            300,
+            &[
+                SPACE_DISCOVER,
+                SPACE_METRICS_READ,
+                SPACE_MEMBERS_MANAGE,
+                SPACE_ROLES_MANAGE,
+                SPACE_CREDENTIALS_MANAGE,
+                AGENT_DISCOVER,
+                AGENT_INVOKE,
+                AGENT_CREATE_LOCAL,
+                AGENT_CREATE_SHARED,
+                AGENT_UPGRADE,
+                AGENT_REMOVE,
+            ],
+        ),
+    ]
+}
+
+/// Durable authority row for one protocol-neutral ingress credential. The
+/// bearer secret is deliberately absent; hosts retain only its
 /// domain-separated identifier and the subject derived from that identifier.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct IngressAccessGrant {
     pub credential_id: [u8; 32],
     pub subject: [u8; 32],
-    pub role: SpaceRole,
+    /// Sorted, unique role identifiers assigned to this credential.
+    pub roles: Vec<[u8; 32]>,
     pub expires_at: u64,
     pub issuer: [u8; 32],
     pub epoch: u64,
@@ -194,8 +297,17 @@ pub struct IngressAccessGrant {
 pub struct IngressAccessStatus {
     pub credential_id: [u8; 32],
     pub subject: [u8; 32],
-    pub role: SpaceRole,
+    pub roles: Vec<[u8; 32]>,
+    /// Sorted, unique union of all live role capabilities.
+    pub capabilities: Vec<[u8; 32]>,
+    pub power: u16,
     pub expires_at: u64,
+}
+
+impl IngressAccessStatus {
+    pub fn has_capability(&self, capability: crate::CapabilityId) -> bool {
+        self.capabilities.binary_search(&capability.0).is_ok()
+    }
 }
 
 /// Derive the non-secret identifier stored by the authority from a bearer
