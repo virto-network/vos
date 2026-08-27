@@ -308,6 +308,21 @@ impl MemoryServiceSnapshot {
         }
         Ok(())
     }
+
+    fn referenced_host_artifacts(&self) -> Result<Vec<BlobRef>, DecodeError> {
+        let mut references = self.referenced_invocation_results();
+        let proof_requests = if self.has_proof_verifier_provenance() {
+            self.referenced_proof_verifications()?
+        } else {
+            // Until production provenance is sealed, historical conformance
+            // proofs remain the only way to validate the image at cutover.
+            self.proof_verification_history()?
+        };
+        references.extend(proof_requests.into_iter().map(|request| request.proof_blob));
+        references.sort_unstable_by_key(|reference| (reference.hash, reference.len));
+        references.dedup();
+        Ok(references)
+    }
 }
 
 impl ServiceWire for MemoryServiceSnapshot {
@@ -369,7 +384,6 @@ impl ServiceWire for MemoryServiceSnapshot {
                     || !result.input.invocation.retains_idempotent_result()
                     || result.receipt.checkpoint != result.input.workflow_step
                     || result.receipt.reply_commitment.is_none()
-                    || result.response.len == 0
                 {
                     return Err(DecodeError::NonCanonical);
                 }
@@ -510,6 +524,11 @@ pub trait ProofArtifactStore {
     fn load_proof(&self, reference: &BlobRef) -> Result<Option<Vec<u8>>, Self::Error>;
 
     fn commit_proof(&mut self, reference: &BlobRef, proof: &[u8]) -> Result<(), Self::Error>;
+
+    /// Remove content-addressed host artifacts not referenced by the
+    /// committed service image. Implementations may retain shared bytes only
+    /// while at least one live proof or idempotent result names their hash.
+    fn reconcile_proof_artifacts(&mut self, retained: &[BlobRef]) -> Result<(), Self::Error>;
 
     /// Load producer-private invocation arguments by their durable invocation
     /// identity and committed content address.
@@ -783,6 +802,24 @@ fn decode_private_ingress_file_name(name: &str) -> Option<super::InvocationId> {
     Some(super::InvocationId(invocation))
 }
 
+fn decode_proof_artifact_file_name(name: &str) -> Option<[u8; 32]> {
+    if name.len() != 64 {
+        return None;
+    }
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        }
+    }
+    let mut hash = [0_u8; 32];
+    for (index, pair) in name.as_bytes().chunks_exact(2).enumerate() {
+        hash[index] = nibble(pair[0])?.checked_shl(4)? | nibble(pair[1])?;
+    }
+    Some(hash)
+}
+
 const PRIVATE_INGRESS_ARTIFACT_MAGIC: &[u8; 4] = b"VPIN";
 
 fn encode_private_ingress_artifact(
@@ -931,6 +968,40 @@ impl ProofArtifactStore for FileCommittedImageStore {
         drop(file);
         std::fs::rename(&temporary, &path)?;
         std::fs::File::open(&directory)?.sync_all()?;
+        Ok(())
+    }
+
+    fn reconcile_proof_artifacts(&mut self, retained: &[BlobRef]) -> Result<(), Self::Error> {
+        let directory = self.proof_directory();
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let retained: BTreeSet<_> = retained.iter().map(|reference| reference.hash.0).collect();
+        let mut changed = false;
+        for entry in entries {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if !file_type.is_file() && !file_type.is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "proof artifact directory contains a non-file entry",
+                ));
+            }
+            let keep = entry
+                .file_name()
+                .to_str()
+                .and_then(decode_proof_artifact_file_name)
+                .is_some_and(|hash| retained.contains(&hash));
+            if !keep {
+                std::fs::remove_file(entry.path())?;
+                changed = true;
+            }
+        }
+        if changed {
+            std::fs::File::open(directory)?.sync_all()?;
+        }
         Ok(())
     }
 
@@ -1395,6 +1466,7 @@ pub struct DurableServiceStore<B> {
     local: MemoryServiceStore,
     backend: B,
     private_ingress_retirement_debt: BTreeSet<super::InvocationId>,
+    artifact_reconciliation_debt: bool,
 }
 
 /// Access to the committed local conformance image carried by an Accumulate
@@ -1459,10 +1531,17 @@ where
         backend
             .reconcile_private_ingresses(&retained, &terminal)
             .map_err(DurableStoreOpenError::Backend)?;
+        let host_artifacts = local
+            .committed
+            .referenced_host_artifacts()
+            .map_err(DurableStoreOpenError::InvalidSnapshot)?;
+        let artifact_reconciliation_debt =
+            backend.reconcile_proof_artifacts(&host_artifacts).is_err();
         Ok(Self {
             local,
             backend,
             private_ingress_retirement_debt: BTreeSet::new(),
+            artifact_reconciliation_debt,
         })
     }
 
@@ -1486,6 +1565,12 @@ where
             .iter()
             .copied()
             .collect()
+    }
+
+    /// Whether a post-commit side-CAS sweep failed and will be retried after
+    /// the next successful commit or snapshot installation.
+    pub const fn artifact_reconciliation_debt(&self) -> bool {
+        self.artifact_reconciliation_debt
     }
 }
 
@@ -1697,6 +1782,13 @@ where
             .commit(&replacement.encode())
             .map_err(|_| DecodeError::NonCanonical)?;
         self.local.committed = replacement;
+        let retained = self.local.committed.referenced_host_artifacts()?;
+        let hashes: BTreeSet<_> = retained.iter().map(|reference| reference.hash.0).collect();
+        self.local
+            .proof_blobs
+            .retain(|hash, _| hashes.contains(hash));
+        self.artifact_reconciliation_debt =
+            self.backend.reconcile_proof_artifacts(&retained).is_err();
         Ok(())
     }
 }
@@ -2591,6 +2683,11 @@ impl CommittedServiceImageHost for MemoryServiceStore {
         replacement
             .validate_invocation_result_artifacts(&self.proof_blobs)
             .map_err(|_| ServiceImageInstallError::PersistenceRejected)?;
+        let retained = replacement
+            .referenced_host_artifacts()
+            .map_err(|_| ServiceImageInstallError::InvalidSnapshot)?;
+        let hashes: BTreeSet<_> = retained.iter().map(|reference| reference.hash.0).collect();
+        self.proof_blobs.retain(|hash, _| hashes.contains(hash));
         self.committed = replacement;
         Ok(())
     }
@@ -2627,6 +2724,9 @@ where
         replacement
             .validate_invocation_result_artifacts(&self.local.proof_blobs)
             .map_err(|_| ServiceImageInstallError::PersistenceRejected)?;
+        let retained_host_artifacts = replacement
+            .referenced_host_artifacts()
+            .map_err(|_| ServiceImageInstallError::InvalidSnapshot)?;
         let (retained, terminal) = MemoryServiceStore::from_snapshot(replacement.clone())
             .private_ingress_recovery()
             .map_err(|_| ServiceImageInstallError::InvalidSnapshot)?;
@@ -2647,6 +2747,17 @@ where
             .commit(image)
             .map_err(|_| ServiceImageInstallError::PersistenceRejected)?;
         self.local.committed = replacement;
+        let hashes: BTreeSet<_> = retained_host_artifacts
+            .iter()
+            .map(|reference| reference.hash.0)
+            .collect();
+        self.local
+            .proof_blobs
+            .retain(|hash, _| hashes.contains(hash));
+        self.artifact_reconciliation_debt = self
+            .backend
+            .reconcile_proof_artifacts(&retained_host_artifacts)
+            .is_err();
         for invocation in terminal {
             self.retire_private_ingress_after_commit(invocation);
         }
@@ -2792,6 +2903,21 @@ fn insert_invocation_result(
             Ok(())
         }
     }
+}
+
+fn retain_referenced_host_artifacts(
+    snapshot: &MemoryServiceSnapshot,
+    artifacts: &mut BTreeMap<[u8; 32], Vec<u8>>,
+) -> Result<Vec<BlobRef>, ServicePvmError> {
+    let references = snapshot
+        .referenced_host_artifacts()
+        .map_err(|_| ServicePvmError::AccumulateCommitRejected)?;
+    let retained: BTreeSet<_> = references
+        .iter()
+        .map(|reference| reference.hash.0)
+        .collect();
+    artifacts.retain(|hash, _| retained.contains(hash));
+    Ok(references)
 }
 
 fn recover_invocation_result(
@@ -3249,6 +3375,7 @@ impl AccumulateProtocolHost for MemoryServiceStore {
         if let Some(policy) = self.production_trust_policy {
             transaction.staged.seal_production_trust_provenance(policy);
         }
+        retain_referenced_host_artifacts(&transaction.staged, &mut transaction.proof_blobs)?;
         self.committed = transaction.staged;
         self.proof_blobs = transaction.proof_blobs;
         Ok(())
@@ -3343,6 +3470,8 @@ where
         if let Some(policy) = self.local.production_trust_policy {
             transaction.staged.seal_production_trust_provenance(policy);
         }
+        let retained_host_artifacts =
+            retain_referenced_host_artifacts(&transaction.staged, &mut transaction.proof_blobs)?;
         let prefix = super::storage::ingress_storage_prefix();
         let mut newly_terminal = Vec::new();
         for (key, bytes) in transaction
@@ -3379,6 +3508,10 @@ where
             .map_err(|_| ServicePvmError::AccumulateCommitRejected)?;
         self.local.committed = transaction.staged;
         self.local.proof_blobs = transaction.proof_blobs;
+        self.artifact_reconciliation_debt = self
+            .backend
+            .reconcile_proof_artifacts(&retained_host_artifacts)
+            .is_err();
         // Every replica executes this boundary while applying the ordered
         // entry. Retirement is therefore holder-wide, not a leader-only host
         // epilogue. Failure is cleanup debt and cannot turn an already durable
@@ -3529,6 +3662,10 @@ mod tests {
             Ok(())
         }
 
+        fn reconcile_proof_artifacts(&mut self, _retained: &[BlobRef]) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
         fn private_ingress_artifact_count(&self) -> Result<usize, Self::Error> {
             Ok(0)
         }
@@ -3611,6 +3748,10 @@ mod tests {
             super::super::publication_storage_key(input),
             publication.encode(),
         );
+        let stale = BlobRef::of_bytes(b"stale host artifact");
+        store
+            .proof_blobs
+            .insert(stale.hash.0, b"stale host artifact".to_vec());
         let mut transaction = store.begin().unwrap();
         store
             .prepare_transaction(&mut transaction, &acknowledgement.encode())
@@ -3634,6 +3775,10 @@ mod tests {
             )
             .unwrap();
         store.commit(transaction).unwrap();
+        assert!(
+            !store.proof_blobs.contains_key(&stale.hash.0),
+            "committing the bounded index prunes unreferenced in-memory artifacts",
+        );
         assert!(
             !store
                 .snapshot_bytes()
@@ -3675,6 +3820,129 @@ mod tests {
                 .row(&super::super::publication_storage_key(input))
                 .is_none(),
         );
+    }
+
+    #[test]
+    fn empty_idempotent_reply_round_trips_through_snapshot_artifacts() {
+        let input = WorkInputId {
+            invocation: super::super::InvocationId::for_http_idempotency(
+                super::super::SubjectId([0x40; 32]),
+                ActorId([0x41; 32]),
+                "empty-result",
+            ),
+            workflow_step: 0,
+        };
+        let reply = ReplyRecord {
+            call_id: input.invocation.root_reply_id(),
+            producer: ActorId([0x42; 32]),
+            result: Vec::new(),
+        };
+        let receipt = AccumulationReceipt {
+            service: valid_header().service,
+            accepted_transition: super::super::Hash([0x43; 32]),
+            reply_commitment: Some(reply.commitment()),
+            outbox_commitment: None,
+            resulting_state_root: Some(super::super::Hash([0x44; 32])),
+            resulting_crdt_heads: Vec::new(),
+            sequence: 1,
+            checkpoint: 0,
+            consistency: super::super::ConsistencyMode::Local,
+        };
+        let publication = PublicationRecord {
+            input,
+            receipt: receipt.clone(),
+            published: super::super::PublishedEffects {
+                reply: Some(reply),
+                ..super::super::PublishedEffects::default()
+            },
+        };
+        let acknowledgement =
+            AccumulateRequest::AcknowledgePublication(super::super::PublicationAck {
+                service: receipt.service,
+                input,
+                publication: publication.commitment(),
+            });
+        let mut store = MemoryServiceStore::new();
+        store.committed.rows.insert(
+            super::super::header_storage_key().to_vec(),
+            valid_header().encode(),
+        );
+        store.committed.rows.insert(
+            super::super::publication_storage_key(input),
+            publication.encode(),
+        );
+        let mut transaction = store.begin().unwrap();
+        store
+            .prepare_transaction(&mut transaction, &acknowledgement.encode())
+            .unwrap();
+        store
+            .finalize_transaction(
+                &mut transaction,
+                &acknowledgement.encode(),
+                &super::super::AccumulationResult::PublicationAcknowledged {
+                    input,
+                    duplicate: false,
+                },
+            )
+            .unwrap();
+        store.commit(transaction).unwrap();
+
+        let decoded = MemoryServiceSnapshot::decode(&store.snapshot_bytes()).unwrap();
+        let mut reopened = MemoryServiceStore::from_snapshot(decoded);
+        assert!(reopened.make_invocation_result_available(&BlobRef::of_bytes(&[]), &[]));
+        assert_eq!(
+            reopened
+                .committed_invocation_result(input)
+                .expect("empty Unit result remains recoverable")
+                .bytes,
+            Vec::<u8>::new(),
+        );
+    }
+
+    #[test]
+    fn durable_open_reconciles_unreferenced_host_artifacts() {
+        let directory = std::env::temp_dir().join(alloc::format!(
+            "vos-proof-reconcile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let path = directory.join("service.service");
+        let mut backend = FileCommittedImageStore::new(&path);
+        let stale = BlobRef::of_bytes(b"evicted response bytes");
+        backend
+            .commit_proof(&stale, b"evicted response bytes")
+            .unwrap();
+        let stale_path = backend.proof_path(&stale);
+        assert!(stale_path.exists());
+
+        let mut store = DurableServiceStore::open(backend).unwrap();
+        assert!(!store.artifact_reconciliation_debt());
+        assert!(
+            !stale_path.exists(),
+            "restart reconciliation removes artifacts absent from the bounded index",
+        );
+        let post_commit_stale = BlobRef::of_bytes(b"artifact evicted by a later commit");
+        store
+            .backend_mut()
+            .commit_proof(&post_commit_stale, b"artifact evicted by a later commit")
+            .unwrap();
+        let post_commit_stale_path = store.backend.proof_path(&post_commit_stale);
+        let mut transaction = store.begin().unwrap();
+        transaction.staged.rows.insert(
+            super::super::header_storage_key().to_vec(),
+            valid_header().encode(),
+        );
+        store.commit(transaction).unwrap();
+        assert!(!store.artifact_reconciliation_debt());
+        assert!(
+            !post_commit_stale_path.exists(),
+            "a durable image commit physically removes artifacts absent from its live references",
+        );
+        drop(DurableServiceStore::open(FileCommittedImageStore::new(&path)).unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -4507,7 +4775,11 @@ mod tests {
                 .starts_with(PRIVATE_INGRESS_ARTIFACT_MAGIC)
         );
         assert!(!abandoned_temporary.exists());
-        assert_eq!(restarted.proof_bytes(&proof_blob), Some(proof));
+        assert_eq!(
+            restarted.proof_bytes(&proof_blob),
+            None,
+            "proof bytes with no committed publication or result reference are reclaimed",
+        );
         assert_eq!(restarted.producer_record(actor, &tag), Some(entry.encode()));
         assert!(restarted.prune_producer_record(actor, &tag));
         assert_eq!(restarted.producer_record(actor, &tag), None);

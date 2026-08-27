@@ -1598,6 +1598,13 @@ where
         self.0.lock().unwrap().commit_proof(reference, proof)
     }
 
+    fn reconcile_proof_artifacts(
+        &mut self,
+        retained: &[crate::service::BlobRef],
+    ) -> Result<(), Self::Error> {
+        self.0.lock().unwrap().reconcile_proof_artifacts(retained)
+    }
+
     fn load_private_ingress(
         &self,
         invocation: crate::service::InvocationId,

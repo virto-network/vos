@@ -1921,14 +1921,26 @@ fn signed_service_roots_run_under_production_trust_and_recover() {
     .to_owned();
     assert!(vos::ingress::decode_access_token(&token).is_some());
 
-    let restricted = http_request(
-        http_port,
-        &format!(
-            "GET /production-crdt-counter/member_only HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
-        ),
-    )
-    .unwrap();
-    assert!(restricted.starts_with("HTTP/1.1 200"), "{restricted}");
+    let restricted_request = format!(
+        "GET /production-crdt-counter/member_only HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    let restricted = std::cell::RefCell::new(String::new());
+    poll_until(
+        DAEMON_READINESS_TIMEOUT.as_secs(),
+        || {
+            *restricted.borrow_mut() =
+                http_request(http_port, &restricted_request).unwrap_or_default();
+            restricted.borrow().starts_with("HTTP/1.1 200")
+        },
+        || {
+            format!(
+                "the restarted CRDT root never became invocable; last response:\n{}\nlog:\n{}",
+                restricted.borrow(),
+                fs::read_to_string(&recovery_log).unwrap_or_default(),
+            )
+        },
+    );
+    let restricted = restricted.into_inner();
     assert_eq!(http_body(&restricted).trim(), "99");
 
     let body = r#"{"by":5}"#;

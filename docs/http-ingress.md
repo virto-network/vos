@@ -78,6 +78,9 @@ lives in the service image; response and proof bytes remain in a
 content-addressed side store and travel separately during snapshot catch-up.
 Authentication, queries, and calls without an idempotency key do not consume
 this budget.
+After each durable commit and on restart, the side store is reconciled against
+the live pending-proof and keyed-result references; evicted response bytes are
+removed from memory, disk, and subsequent backups.
 Clients should reconcile old evicted operations through application state
 rather than submit them under a new key.
 The schema and OpenAPI endpoints describe the installed packages that the

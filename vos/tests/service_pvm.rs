@@ -284,6 +284,10 @@ impl ProofArtifactStore for TransientOpenCommittedImages {
         Ok(())
     }
 
+    fn reconcile_proof_artifacts(&mut self, _retained: &[BlobRef]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     fn private_ingress_artifact_count(&self) -> Result<usize, Self::Error> {
         Ok(0)
     }
@@ -318,6 +322,10 @@ impl ProofArtifactStore for SharedCommittedImages {
     }
 
     fn commit_proof(&mut self, _reference: &BlobRef, _proof: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn reconcile_proof_artifacts(&mut self, _retained: &[BlobRef]) -> Result<(), Self::Error> {
         Ok(())
     }
 
@@ -373,6 +381,17 @@ impl ProofArtifactStore for SharedProofCommittedImages {
         Ok(())
     }
 
+    fn reconcile_proof_artifacts(&mut self, retained: &[BlobRef]) -> Result<(), Self::Error> {
+        let retained: std::collections::BTreeSet<_> =
+            retained.iter().map(|reference| reference.hash.0).collect();
+        self.0
+            .lock()
+            .unwrap()
+            .proofs
+            .retain(|hash, _| retained.contains(hash));
+        Ok(())
+    }
+
     fn private_ingress_artifact_count(&self) -> Result<usize, Self::Error> {
         Ok(0)
     }
@@ -414,6 +433,10 @@ impl ProofArtifactStore for SharedFailingCommittedImages {
     }
 
     fn commit_proof(&mut self, _reference: &BlobRef, _proof: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn reconcile_proof_artifacts(&mut self, _retained: &[BlobRef]) -> Result<(), Self::Error> {
         Ok(())
     }
 
@@ -542,6 +565,13 @@ impl ProofArtifactStore for FailableCommittedImages {
                 Ok(())
             }
         }
+    }
+
+    fn reconcile_proof_artifacts(&mut self, retained: &[BlobRef]) -> Result<(), Self::Error> {
+        let retained: std::collections::BTreeSet<_> =
+            retained.iter().map(|reference| reference.hash.0).collect();
+        self.proofs.retain(|hash, _| retained.contains(hash));
+        Ok(())
     }
 
     fn private_ingress_artifact_count(&self) -> Result<usize, Self::Error> {
