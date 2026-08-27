@@ -1054,6 +1054,16 @@ impl<A: Actor> Context<A> {
                 self.__clear_committed_checkpoint_effects();
                 self.checkpoint = Some(checkpoint);
             }
+            if !output.reply.is_empty()
+                && <super::value::Value as super::codec::Decode>::try_decode(
+                    output.reply.as_slice(),
+                )
+                .is_none()
+            {
+                return Some(super::run::Ask::ready_err(
+                    super::value::InvokeError::Panicked,
+                ));
+            }
             Some(super::run::Ask::ready(output.reply))
         }
     }

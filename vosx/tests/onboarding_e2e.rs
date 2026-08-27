@@ -1861,7 +1861,7 @@ fn signed_service_roots_run_under_production_trust_and_recover() {
     ));
     let recovery_endpoint = wait_for_endpoint(data.path(), &recovery_log, "production-recovery");
     poll_until(
-        40,
+        DAEMON_READINESS_TIMEOUT.as_secs(),
         || {
             [
                 ("production-counter", "value", "U64(7)"),
@@ -1906,16 +1906,7 @@ fn signed_service_roots_run_under_production_trust_and_recover() {
     let token = vosx_ok(
         data.path(),
         config.path(),
-        &[
-            "space",
-            "access",
-            space,
-            "issue",
-            "--role",
-            "member",
-            "--expires",
-            "1h",
-        ],
+        &["space", "access", space, "issue", "--expires", "1h"],
     )
     .trim()
     .to_owned();
@@ -3144,18 +3135,22 @@ fn expired_token_not_redeemed_and_non_member_cannot_sync() {
         },
     );
 
-    // And because it never became a member, the Member-gated registry is
-    // never served to it: give sync a generous window, then assert its
-    // role list still lacks A's admin grant (it started empty).
+    // And because it never became a member, the Member-gated registry and
+    // canonical authority are never served to it. Give sync a generous
+    // window, then assert the authority-backed role command remains
+    // unavailable rather than treating route absence as a successful list.
     thread::sleep(Duration::from_secs(6));
-    let roles = vosx_ok(
+    let roles = vosx(
         data_b.path(),
         cfg_b.path(),
         &["space", "role", space, "list"],
     );
     assert!(
-        !roles.contains("admin"),
-        "a non-member must NOT sync the Member-gated registry; got role list:\n{roles}",
+        !roles.status.success()
+            && String::from_utf8_lossy(&roles.stderr).contains("space-authority"),
+        "a non-member must NOT sync the authority catalog; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&roles.stdout),
+        String::from_utf8_lossy(&roles.stderr),
     );
 }
 
@@ -3225,14 +3220,17 @@ fn unredeemed_token_can_be_revoked_before_join() {
     // Give redemption and anti-entropy several passes. The revoked row must
     // win regardless of delivery order, leaving B below the Member floor.
     thread::sleep(Duration::from_secs(8));
-    let roles = vosx_ok(
+    let roles = vosx(
         data_b.path(),
         cfg_b.path(),
         &["space", "role", space, "list"],
     );
     assert!(
-        !roles.contains("admin"),
-        "a revoked invite must not grant Member sync access; got:\n{roles}\nB log:\n{}\nA log:\n{}",
+        !roles.status.success()
+            && String::from_utf8_lossy(&roles.stderr).contains("space-authority"),
+        "a revoked invite must not grant Member sync access; stdout:\n{}\nstderr:\n{}\nB log:\n{}\nA log:\n{}",
+        String::from_utf8_lossy(&roles.stdout),
+        String::from_utf8_lossy(&roles.stderr),
         fs::read_to_string(&log_b).unwrap_or_default(),
         fs::read_to_string(&log_a).unwrap_or_default(),
     );

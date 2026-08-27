@@ -136,6 +136,31 @@ pub trait Invoker {
     ) -> impl Future<Output = Result<Value, ClientError>> + '_;
 }
 
+/// Error-mapping wrapper for an actor invocation which has already copied its
+/// request bytes into the runtime. Keeping only the returned [`Ask`] alive is
+/// important on guest targets: the request buffer must not become an
+/// unrelated field in the compiler-generated future state beside the reply.
+#[doc(hidden)]
+pub struct ClientAsk {
+    inner: super::run::Ask,
+}
+
+impl ClientAsk {
+    fn new(inner: super::run::Ask) -> Self {
+        Self { inner }
+    }
+}
+
+impl Future for ClientAsk {
+    type Output = Result<Value, ClientError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.inner)
+            .poll(cx)
+            .map(|result| result.map_err(ClientError::from))
+    }
+}
+
 /// Runtime result for an attested invocation. The generated client decodes
 /// `value` with the ordinary method reply codec and then binds that preview to
 /// `statement` before exposing an [`Attestation`](crate::Attestation).
@@ -214,17 +239,13 @@ pub trait ActorReferenceFor<A: super::Actor>: ActorReference {}
 pub type ActorHandle<'a, R, I> = <R as ActorReference>::Handle<'a, I>;
 
 impl<A: super::Actor> Invoker for super::Context<A> {
-    #[allow(clippy::manual_async_fn)]
     fn invoke_actor(
         &mut self,
         target: crate::service::ActorId,
         payload: Vec<u8>,
     ) -> impl Future<Output = Result<Value, ClientError>> + '_ {
-        async move {
-            self.ask_actor_raw(target, &payload, None)
-                .await
-                .map_err(ClientError::from)
-        }
+        let ask = self.ask_actor_raw(target, payload.as_slice(), None);
+        ClientAsk::new(ask)
     }
 }
 

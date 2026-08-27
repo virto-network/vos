@@ -8091,8 +8091,8 @@ fn node_raft_transport_orders_attested_inbox_and_reply_proof_on_both_roots() {
             .unwrap()
             .proofs
             .values()
-            .any(|candidate| candidate == &proof),
-        "the caller replica durably hydrates the proof before ordering resume"
+            .all(|candidate| candidate != &proof),
+        "the caller replica prunes a completed reply proof after ordering resume"
     );
     assert!(
         destination_backend

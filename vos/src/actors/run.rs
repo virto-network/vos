@@ -171,7 +171,7 @@ fn decode_reply(bytes: alloc::vec::Vec<u8>) -> super::value::Value {
     if bytes.is_empty() {
         super::value::Value::Unit
     } else {
-        <super::value::Value as super::codec::Decode>::decode(&bytes)
+        <super::value::Value as super::codec::Decode>::decode(bytes.as_slice())
     }
 }
 
