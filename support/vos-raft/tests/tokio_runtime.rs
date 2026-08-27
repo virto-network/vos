@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use vos_raft::{
-    AppendEntriesReq, Config, InstallSnapshotReq, MemStorage, RequestVoteReq, Role, StdRng,
-    TokioClock, Transport, Worker,
+    AppendEntriesReq, Config, InstallSnapshotReq, MemStorage, PreVoteReq, PreVoteResp,
+    RequestVoteReq, Role, StdRng, TokioClock, Transport, Worker,
 };
 
 struct NoopT;
@@ -27,6 +27,9 @@ impl core::fmt::Display for NoopE {
 impl std::error::Error for NoopE {}
 impl Transport<u16> for NoopT {
     type Error = NoopE;
+    async fn send_prevote(&self, _: u16, _: PreVoteReq<u16>) -> Result<PreVoteResp, NoopE> {
+        Err(NoopE)
+    }
     async fn send_append(
         &self,
         _: u16,
