@@ -12,7 +12,7 @@
 name = "vos-pvm-settlement-verifier"
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 description = "Verify-only Poseidon2-M31 stwo settlement verifier (wasm32 + JAM PVM)"
 
 [features]

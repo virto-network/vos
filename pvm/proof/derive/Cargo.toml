@@ -2,7 +2,7 @@
 name = "vos-pvm-proof-derive"
 edition.workspace = true
 version.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 
 [lib]
 proc-macro = true

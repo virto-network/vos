@@ -66,3 +66,9 @@ cargo test --workspace
 
 Artifacts committed under `services/` and `vosx/blobs/` are protocol
 identities. Rebuild them only through the checked release recipes.
+
+## License
+
+VOS-owned code is licensed under the GNU Affero General Public License,
+version 3 or later. The imported PVM crates retain their Apache-2.0 license;
+their provenance and license are documented in [`pvm/`](pvm/README.md).

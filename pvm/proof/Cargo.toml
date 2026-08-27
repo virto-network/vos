@@ -2,7 +2,7 @@
 name = "vos-pvm-proof"
 edition.workspace = true
 version.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 
 [features]
 default = ["prover"]

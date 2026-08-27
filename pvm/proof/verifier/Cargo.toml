@@ -2,7 +2,7 @@
 name = "vos-pvm-proof-verifier"
 edition.workspace = true
 version.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 
 [features]
 # Native-recursion Stage-0 (P5.0): verify proofs committed under the

@@ -2,7 +2,7 @@
 name = "vos-pvm-precompiles"
 edition.workspace = true
 version.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 description = "Guest-side shims for vos-pvm-proof precompile ECALLs.  Users (cipher-clerk, vos actors, etc.) link this to call into chip-accelerated host computations via the JAM ECALL ABI.  On host (non-riscv64) builds the shims fall through to native crypto so the same code path runs in tests."
 
 [features]

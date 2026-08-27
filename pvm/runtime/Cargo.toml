@@ -2,7 +2,7 @@
 name = "vos-pvm"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 authors.workspace = true
 description = "Capability-based PVM runtime used by VOS."
 
