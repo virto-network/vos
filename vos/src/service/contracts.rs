@@ -118,6 +118,7 @@ pub struct RoleCredential {
     pub holder: Origin,
     pub scope: Hash,
     pub space_role: Option<crate::SpaceRole>,
+    pub capability: Option<CapabilityId>,
     pub actor_role: Option<u8>,
     pub authenticator: Vec<u8>,
 }
@@ -1863,6 +1864,7 @@ pub struct MethodPolicy {
     pub public: bool,
     pub attested: bool,
     pub space_role: Option<u8>,
+    pub capability: Option<CapabilityId>,
     pub actor_role: Option<u8>,
 }
 
@@ -3730,6 +3732,9 @@ impl ServiceWire for RoleCredential {
         encode_origin(&mut encoder, self.holder);
         encoder.fixed(&self.scope.0);
         encoder.option(&self.space_role, |encoder, role| encoder.u8(role.as_u8()));
+        encoder.option(&self.capability, |encoder, capability| {
+            encoder.fixed(&capability.0)
+        });
         encoder.option(&self.actor_role, |encoder, role| encoder.u8(*role));
         encoder.bytes(&self.authenticator);
     }
@@ -3741,13 +3746,17 @@ impl ServiceWire for RoleCredential {
             space_role: decoder.option(|decoder| {
                 crate::SpaceRole::from_u8(decoder.u8()?).ok_or(DecodeError::NonCanonical)
             })?,
+            capability: decoder.option(|decoder| Ok(CapabilityId(decoder.fixed()?)))?,
             actor_role: decoder.option(Decoder::u8)?,
             authenticator: decoder.bytes()?,
         };
         if !matches!(value.holder, Origin::Member(_) | Origin::Actor(_))
             || value.scope == Hash::ZERO
             || value.actor_role == Some(u8::MAX)
-            || (value.space_role.is_none() && value.actor_role.is_none())
+            || (value.space_role.is_none()
+                && value.capability.is_none()
+                && value.actor_role.is_none())
+            || (value.space_role.is_some() && value.capability.is_some())
             || value.authenticator.is_empty()
         {
             return Err(DecodeError::NonCanonical);
@@ -3767,6 +3776,7 @@ impl ServiceWire for MethodPolicy {
         e.bool(self.public);
         e.bool(self.attested);
         e.option(&self.space_role, |e, role| e.u8(*role));
+        e.option(&self.capability, |e, capability| e.fixed(&capability.0));
         e.option(&self.actor_role, |e, role| e.u8(*role));
     }
 
@@ -3783,12 +3793,19 @@ impl ServiceWire for MethodPolicy {
                     .map(|_| role)
                     .ok_or(DecodeError::NonCanonical)
             })?,
+            capability: d.option(|d| Ok(CapabilityId(d.fixed()?)))?,
             actor_role: d.option(Decoder::u8)?,
         };
         if value.method.is_empty()
-            || value.public != (value.space_role.is_none() && value.actor_role.is_none())
-            || super::package::method_role_policy_hash(value.space_role, value.actor_role)
-                != Some(value.policy)
+            || value.public
+                != (value.space_role.is_none()
+                    && value.capability.is_none()
+                    && value.actor_role.is_none())
+            || super::package::method_authorization_policy_hash(
+                value.capability,
+                value.space_role,
+                value.actor_role,
+            ) != Some(value.policy)
         {
             return Err(DecodeError::NonCanonical);
         }
@@ -6351,6 +6368,7 @@ mod tests {
             holder: origin,
             scope: private.authorization_scope(),
             space_role: Some(crate::SpaceRole::Member),
+            capability: None,
             actor_role: None,
             authenticator: b"private role witness".to_vec(),
         };
@@ -6387,6 +6405,7 @@ mod tests {
             holder: Origin::Member(SubjectId([44; 32])),
             scope: Hash::ZERO,
             space_role: Some(crate::SpaceRole::Member),
+            capability: None,
             actor_role: None,
             authenticator: b"signed grant".to_vec(),
         };
@@ -7002,6 +7021,7 @@ mod tests {
                         public: true,
                         attested: false,
                         space_role: None,
+                        capability: None,
                         actor_role: None,
                     }]),
                 },
@@ -7122,6 +7142,7 @@ mod tests {
                 public: true,
                 attested: false,
                 space_role: None,
+                capability: None,
                 actor_role: None,
             }]),
             base: ConsistencyBase::Linear {

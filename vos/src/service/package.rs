@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use crate::metadata::{ParsedMessage, ParsedMeta};
 
 use super::contracts::{ActorGenesis, BlobRef, MethodPolicy, TaskDependency};
-use super::identity::{ActorId, DeploymentId, Hash, ProducerId, ProgramId};
+use super::identity::{ActorId, CapabilityId, DeploymentId, Hash, ProducerId, ProgramId};
 use super::wire::{DecodeError, Decoder, Encoder, ServiceWire};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,15 +235,23 @@ impl PackageRolePolicies {
             .messages
             .iter()
             .map(|message| {
-                let policy = method_role_policy_hash(message.space_role, message.actor_role)
-                    .ok_or(PackageError::InvalidRolePolicies)?;
+                let capability = message.capability.as_deref().map(CapabilityId::named);
+                let policy = method_authorization_policy_hash(
+                    capability,
+                    message.space_role,
+                    message.actor_role,
+                )
+                .ok_or(PackageError::InvalidRolePolicies)?;
                 Ok(MethodPolicy {
                     method: message.name.clone(),
                     schema: method_schema_hash(message),
                     policy,
-                    public: message.space_role.is_none() && message.actor_role.is_none(),
+                    public: message.space_role.is_none()
+                        && capability.is_none()
+                        && message.actor_role.is_none(),
                     attested: message.attested,
                     space_role: message.space_role,
+                    capability,
                     actor_role: message.actor_role,
                 })
             })
@@ -289,22 +297,37 @@ pub fn public_policy_hash() -> Hash {
 /// deployment identity; actor-role bytes are interpreted by the pinned actor
 /// program's `RoleByte` implementation.
 pub fn method_role_policy_hash(space_role: Option<u8>, actor_role: Option<u8>) -> Option<Hash> {
+    method_authorization_policy_hash(None, space_role, actor_role)
+}
+
+pub fn method_authorization_policy_hash(
+    capability: Option<CapabilityId>,
+    space_role: Option<u8>,
+    actor_role: Option<u8>,
+) -> Option<Hash> {
+    if capability.is_some() && space_role.is_some() {
+        return None;
+    }
     if let Some(role) = space_role {
         crate::SpaceRole::from_u8(role)?;
     }
     if actor_role == Some(u8::MAX) {
         return None;
     }
-    if space_role.is_none() && actor_role.is_none() {
+    if capability.is_none() && space_role.is_none() && actor_role.is_none() {
         return Some(public_policy_hash());
     }
-    let bytes = [
+    let roles = [
         u8::from(space_role.is_some()),
         space_role.unwrap_or_default(),
         u8::from(actor_role.is_some()),
         actor_role.unwrap_or_default(),
     ];
-    Some(Hash::digest(b"vos/method-role-policy/service", &[&bytes]))
+    let capability = capability.unwrap_or(CapabilityId::ZERO);
+    Some(Hash::digest(
+        b"vos/method-authorization-policy/service",
+        &[capability.as_bytes(), &roles],
+    ))
 }
 
 pub fn space_role_policy_hash(required_role: u8) -> Option<Hash> {
@@ -518,6 +541,7 @@ mod tests {
                 attested: false,
                 space_role: None,
                 actor_role: None,
+                capability: None,
             },
             MessageMeta {
                 name: "is_positive",
@@ -530,6 +554,7 @@ mod tests {
                 attested: true,
                 space_role: Some(crate::SpaceRole::Member as u8),
                 actor_role: Some(2),
+                capability: None,
             },
         ],
         constructor: &[],
@@ -726,6 +751,27 @@ mod tests {
         assert_eq!(
             increment.policy,
             method_role_policy_hash(None, Some(3)).unwrap()
+        );
+
+        metadata.messages[0].actor_role = None;
+        metadata.messages[0].capability = Some("agent.invoke".into());
+        let capability_policies = PackageRolePolicies::from_metadata(&metadata).unwrap();
+        let increment = &capability_policies.methods[0];
+        let capability = CapabilityId::named("agent.invoke");
+        assert_eq!(increment.capability, Some(capability));
+        assert_eq!(increment.space_role, None);
+        assert_eq!(increment.actor_role, None);
+        assert!(!increment.public);
+        assert_eq!(
+            increment.policy,
+            method_authorization_policy_hash(Some(capability), None, None).unwrap()
+        );
+
+        metadata.messages[0].space_role = Some(crate::SpaceRole::Member.as_u8());
+        assert_eq!(
+            PackageRolePolicies::from_metadata(&metadata),
+            Err(PackageError::InvalidRolePolicies),
+            "a method cannot combine a stable capability with a legacy space-role threshold",
         );
         assert_eq!(
             method_role_policy_hash(None, Some(u8::MAX)),

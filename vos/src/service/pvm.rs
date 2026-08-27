@@ -2927,6 +2927,7 @@ mod tests {
             holder: origin,
             scope: work.authorization_scope(),
             space_role: Some(crate::SpaceRole::Developer),
+            capability: None,
             actor_role: Some(2),
             authenticator: b"signed space grant".to_vec(),
         };

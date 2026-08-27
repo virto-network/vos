@@ -33,7 +33,7 @@ use super::{
     WorkflowOperation, actor_upgrade_storage_key, call_expiration_storage_key,
     crdt_change_storage_key, crdt_node_receipt_storage_key, crdt_node_storage_key,
     dedup_storage_key, delivery_storage_key, header_storage_key, ingress_storage_key,
-    method_role_policy_hash, pending_call_deadline_storage_key, public_policy_hash,
+    method_authorization_policy_hash, pending_call_deadline_storage_key, public_policy_hash,
     publication_ack_storage_key, publication_storage_key, receipt_storage_key,
     reply_admission_storage_key, role_assertion_eligibility_storage_key,
 };
@@ -4266,8 +4266,12 @@ fn authorization_rejection<S: GuestAccumulateStore>(
     direct_ingress: Option<&IngressRecord>,
     durable_inbox_matches: bool,
 ) -> GuestResult<Option<AccumulationRejection>, S::Error> {
-    if method_role_policy_hash(policy.space_role, policy.actor_role) != Some(policy.policy)
-        || policy.public != (policy.space_role.is_none() && policy.actor_role.is_none())
+    if method_authorization_policy_hash(policy.capability, policy.space_role, policy.actor_role)
+        != Some(policy.policy)
+        || policy.public
+            != (policy.space_role.is_none()
+                && policy.capability.is_none()
+                && policy.actor_role.is_none())
     {
         return Ok(Some(AccumulationRejection::Unauthorized));
     }
@@ -4308,6 +4312,9 @@ fn authorization_rejection<S: GuestAccumulateStore>(
                     credential
                         .space_role
                         .is_some_and(|actual| actual.as_u8() >= required)
+                })
+                && policy.capability.is_none_or(|required| {
+                    credential.capability == Some(required)
                 })
                 && policy.actor_role.is_none_or(|required| {
                     credential
@@ -4358,9 +4365,13 @@ fn authorization_rejection<S: GuestAccumulateStore>(
             // Private witness bytes are intentionally unavailable here, so
             // authority-backed private grants remain fail-closed until the
             // proof public inputs expose that assertion separately.
-            !(policy.public || authority.is_some() && policy.space_role.is_some())
+            !(policy.public
+                || authority.is_some()
+                    && (policy.space_role.is_some() || policy.capability.is_some()))
                 && (policy.attested || work.proof_requested)
-                && (policy.space_role.is_some() || policy.actor_role.is_some())
+                && (policy.space_role.is_some()
+                    || policy.capability.is_some()
+                    || policy.actor_role.is_some())
                 && matches!(
                     work.origin,
                     super::Origin::Member(_) | super::Origin::Actor(_)
@@ -5435,6 +5446,7 @@ mod tests {
             holder: claim.holder,
             scope: claim.scope,
             space_role: Some(claim.role),
+            capability: None,
             actor_role: None,
             authenticator: AccumulatedRoleAssertion { claim, receipt }.encode(),
         }
@@ -5505,6 +5517,7 @@ mod tests {
                     public: true,
                     attested,
                     space_role: None,
+                    capability: None,
                     actor_role: None,
                 }]),
             }],
@@ -5626,6 +5639,7 @@ mod tests {
                     public: true,
                     attested: false,
                     space_role: None,
+                    capability: None,
                     actor_role: None,
                 }]),
             }],
@@ -5729,6 +5743,7 @@ mod tests {
                 public: true,
                 attested: false,
                 space_role: None,
+                capability: None,
                 actor_role: None,
             }]),
             base: ConsistencyBase::Linear {
@@ -5966,6 +5981,7 @@ mod tests {
             public: true,
             attested: false,
             space_role: None,
+            capability: None,
             actor_role: None,
         };
         let genesis = ServiceGenesis {
@@ -6470,6 +6486,7 @@ mod tests {
             public: true,
             attested: false,
             space_role: None,
+            capability: None,
             actor_role: None,
         }]);
         let actors = [
@@ -7041,6 +7058,7 @@ mod tests {
             public: true,
             attested: false,
             space_role: None,
+            capability: None,
             actor_role: None,
         };
         assert_eq!(
@@ -7284,6 +7302,7 @@ mod tests {
                     public: true,
                     attested: false,
                     space_role: None,
+                    capability: None,
                     actor_role: None,
                 }]),
             }],
@@ -7420,6 +7439,7 @@ mod tests {
                         public: true,
                         attested: false,
                         space_role: None,
+                        capability: None,
                         actor_role: None,
                     }]),
                 },
@@ -7636,6 +7656,7 @@ mod tests {
                     public: false,
                     attested: false,
                     space_role: Some(crate::SpaceRole::Member.as_u8()),
+                    capability: None,
                     actor_role: None,
                 }]),
             }],
@@ -7747,6 +7768,7 @@ mod tests {
             holder: origin,
             scope: Hash::ZERO,
             space_role: Some(crate::SpaceRole::Developer),
+            capability: None,
             actor_role: None,
             authenticator: b"malformed grant".to_vec(),
         };
@@ -7771,7 +7793,8 @@ mod tests {
         let initial = store.provide_blob(b"before").unwrap();
         store.programs.insert(program(), FIXTURE_ACTOR_PVM.to_vec());
         let required_policy =
-            method_role_policy_hash(Some(crate::SpaceRole::Member.as_u8()), Some(2)).unwrap();
+            super::super::method_role_policy_hash(Some(crate::SpaceRole::Member.as_u8()), Some(2))
+                .unwrap();
         let install = AccumulateRequest::Install(ServiceGenesis {
             role_authority: Some(role_authority()),
             external_actors: external_bindings(),
@@ -7793,6 +7816,7 @@ mod tests {
                     public: false,
                     attested: false,
                     space_role: Some(crate::SpaceRole::Member.as_u8()),
+                    capability: None,
                     actor_role: Some(2),
                 }]),
             }],
@@ -9093,6 +9117,7 @@ mod tests {
                     public: false,
                     attested: false,
                     space_role: Some(crate::SpaceRole::Member.as_u8()),
+                    capability: None,
                     actor_role: None,
                 }]),
             }],

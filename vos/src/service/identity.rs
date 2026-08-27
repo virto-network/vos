@@ -55,10 +55,32 @@ id_type!(CallId, "CallId");
 id_type!(ChangeId, "ChangeId");
 id_type!(OperationId, "OperationId");
 id_type!(SystemCapabilityId, "SystemCapabilityId");
+id_type!(CapabilityId, "CapabilityId");
+id_type!(RoleId, "RoleId");
 
 impl Hash {
     pub fn digest(domain: &[u8], parts: &[&[u8]]) -> Self {
         Self(crate::crypto::blake2b_hash::<32>(domain, parts))
+    }
+}
+
+impl CapabilityId {
+    /// Stable identifier for one space-level permission.
+    pub fn named(name: &str) -> Self {
+        Self(crate::crypto::blake2b_hash::<32>(
+            b"vos/capability/service",
+            &[name.as_bytes()],
+        ))
+    }
+}
+
+impl RoleId {
+    /// Stable identifier for a named role inside one space.
+    pub fn named(space: SpaceId, name: &str) -> Self {
+        Self(crate::crypto::blake2b_hash::<32>(
+            b"vos/role/service",
+            &[space.as_bytes(), name.as_bytes()],
+        ))
     }
 }
 
@@ -235,6 +257,19 @@ mod tests {
             InvocationId::derive(b"ab", b"c"),
             InvocationId::derive(b"a", b"bc")
         );
+    }
+
+    #[test]
+    fn named_capabilities_and_roles_are_domain_separated() {
+        let capability = CapabilityId::named("agent.invoke");
+        assert_eq!(capability, CapabilityId::named("agent.invoke"));
+        assert_ne!(capability, CapabilityId::named("agent.create.local"));
+
+        let space = SpaceId([9; 32]);
+        let role = RoleId::named(space, "developer");
+        assert_eq!(role, RoleId::named(space, "developer"));
+        assert_ne!(role, RoleId::named(space, "member"));
+        assert_ne!(role.0, capability.0);
     }
 
     #[test]

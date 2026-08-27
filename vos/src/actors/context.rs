@@ -51,6 +51,9 @@ pub struct Context<A: Actor> {
     /// `set_caller_roles` plumbs it in.
     space_role: Option<u8>,
 
+    /// Exact space capability authorized for this invocation.
+    capability: Option<crate::service::CapabilityId>,
+
     /// Caller's actor-local role byte — a discriminant of this
     /// actor's [`Role`](super::Actor::Role) enum, set when the
     /// registry holds an actor-local grant overriding the
@@ -136,6 +139,7 @@ impl<A: Actor> Context<A> {
             origin: crate::service::Origin::Anonymous,
             origin_service: None,
             space_role: None,
+            capability: None,
             actor_local_role: None,
             forbidden: false,
             pending_tells: Vec::new(),
@@ -358,6 +362,22 @@ impl<A: Actor> Context<A> {
     pub fn set_caller_roles(&mut self, space_role: Option<u8>, actor_local_role: Option<u8>) {
         self.space_role = space_role;
         self.actor_local_role = actor_local_role;
+    }
+
+    /// Set the exact space-level capability authorized for this invocation.
+    pub fn set_caller_capability(&mut self, capability: Option<crate::service::CapabilityId>) {
+        self.capability = capability;
+    }
+
+    pub fn has_capability(&self, required: crate::service::CapabilityId) -> bool {
+        self.capability == Some(required)
+    }
+
+    pub fn ensure_capability(
+        &self,
+        required: crate::service::CapabilityId,
+    ) -> Result<(), Forbidden> {
+        self.has_capability(required).then_some(()).ok_or(Forbidden)
     }
 
     /// Resolve the caller's effective role for *this* actor.

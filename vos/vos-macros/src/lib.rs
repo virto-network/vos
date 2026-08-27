@@ -454,6 +454,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut required_role_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut attested_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut required_space_role_arms: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut required_capability_arms: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut passthrough_items = Vec::new();
     let mut constructor_params: Vec<(syn::Ident, syn::Type)> = Vec::new();
     // One entry per `#[msg]`: the data the host-Client emission
@@ -489,6 +490,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let mut exposed_to_cli = false;
         let mut role_expr: Option<syn::Expr> = None;
         let mut space_role_expr: Option<syn::Expr> = None;
+        let mut capability: Option<syn::LitStr> = None;
         let mut is_attested = false;
         // `#[msg(timeout_ms = N)]` — per-handler invoke timeout in ms
         // (0 = client default), recorded in `.vos_meta` so the dispatcher
@@ -534,6 +536,18 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     space_role_expr = Some(expr);
                     return Ok(());
                 }
+                if meta.path.is_ident("capability") {
+                    let value = meta.value()?;
+                    let name: syn::LitStr = value.parse()?;
+                    if !valid_capability_name(&name.value()) {
+                        return Err(syn::Error::new_spanned(
+                            name,
+                            "capability must be 1..=128 lowercase ASCII characters: [a-z][a-z0-9._-]*",
+                        ));
+                    }
+                    capability = Some(name);
+                    return Ok(());
+                }
                 Ok(())
             }) {
                 return e.to_compile_error().into();
@@ -563,6 +577,14 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             return syn::Error::new_spanned(
                 &method.sig,
                 "#[msg(attested)] must complete in one execution slice and cannot be #[msg(job)]",
+            )
+            .to_compile_error()
+            .into();
+        }
+        if capability.is_some() && (role_expr.is_some() || space_role_expr.is_some()) {
+            return syn::Error::new_spanned(
+                &method.sig,
+                "#[msg(capability = \"...\")] cannot be combined with role or space_role",
             )
             .to_compile_error()
             .into();
@@ -834,9 +856,20 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
+        let capability_check = if let Some(name) = &capability {
+            quote! {
+                if !ctx.has_capability(vos::CapabilityId::named(#name)) {
+                    ctx.__mark_forbidden();
+                    return false;
+                }
+            }
+        } else {
+            quote! {}
+        };
         let role_check = quote! {
             #actor_role_check
             #space_role_check
+            #capability_check
         };
 
         // Stash a `required_role()` arm for this variant. The
@@ -864,6 +897,14 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { #enum_name::#struct_name(_) => None }
         };
         required_space_role_arms.push(required_space_role_arm);
+        let required_capability_arm = if let Some(name) = &capability {
+            quote! {
+                #enum_name::#struct_name(_) => Some(vos::CapabilityId::named(#name))
+            }
+        } else {
+            quote! { #enum_name::#struct_name(_) => None }
+        };
+        required_capability_arms.push(required_capability_arm);
 
         // Deliver arm — different code for infallible vs fallible handlers
         let deliver_arm = if returns_result {
@@ -933,6 +974,11 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! { None }
         };
+        let capability_meta = if let Some(name) = &capability {
+            quote! { Some(#name) }
+        } else {
+            quote! { None }
+        };
         meta_messages.push(quote! {
             vos::metadata::MessageMeta {
                 name: #msg_name_str,
@@ -945,6 +991,7 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 attested: #is_attested,
                 space_role: #space_role_meta,
                 actor_role: #actor_role_meta,
+                capability: #capability_meta,
             }
         });
         if exposed_to_cli {
@@ -1063,6 +1110,9 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
         required_space_role_arms.push(quote! {
             #enum_name::__VosNoMessages => ::core::option::Option::None
         });
+        required_capability_arms.push(quote! {
+            #enum_name::__VosNoMessages => ::core::option::Option::None
+        });
     }
 
     // Generate the aggregated enum
@@ -1131,6 +1181,13 @@ pub fn messages(_attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn required_space_role(&self) -> Option<u8> {
                 match self {
                     #( #required_space_role_arms ),*
+                }
+            }
+
+            /// Stable space capability declared on this handler.
+            pub fn required_capability(&self) -> Option<vos::CapabilityId> {
+                match self {
+                    #( #required_capability_arms ),*
                 }
             }
 
@@ -2250,6 +2307,16 @@ fn type_to_accessor(ty: &syn::Type) -> proc_macro2::TokenStream {
     }
 }
 
+fn valid_capability_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(byte))
+}
+
 fn to_pascal_case(s: &str) -> String {
     s.split('_')
         .map(|word| {
@@ -2264,7 +2331,7 @@ fn to_pascal_case(s: &str) -> String {
 
 #[cfg(test)]
 mod doc_tests {
-    use super::{first_doc_paragraph, is_attestation_type};
+    use super::{first_doc_paragraph, is_attestation_type, valid_capability_name};
 
     fn attrs(src: &str) -> Vec<syn::Attribute> {
         syn::parse_str::<syn::ItemStruct>(src).unwrap().attrs
@@ -2321,5 +2388,16 @@ mod doc_tests {
         )));
         assert!(!is_attestation_type(&ty("vos::Attestation<Claim>")));
         assert!(!is_attestation_type(&ty("vos::Attestation")));
+    }
+
+    #[test]
+    fn capability_names_are_stable_lowercase_identifiers() {
+        assert!(valid_capability_name("agent.invoke"));
+        assert!(valid_capability_name("agent-create.local_2"));
+        assert!(!valid_capability_name(""));
+        assert!(!valid_capability_name("Agent.invoke"));
+        assert!(!valid_capability_name("2agent.invoke"));
+        assert!(!valid_capability_name("agent/invoke"));
+        assert!(!valid_capability_name(&"a".repeat(129)));
     }
 }

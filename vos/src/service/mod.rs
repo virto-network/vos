@@ -60,8 +60,8 @@ pub use guest_accumulate::{
     execute_owned_canonical_guest_accumulate,
 };
 pub use identity::{
-    ActorId, CallId, ChangeId, DeploymentId, Hash, InvocationId, OperationId, Origin, ProducerId,
-    ProgramId, RootServiceId, SpaceId, SubjectId, SystemCapabilityId,
+    ActorId, CallId, CapabilityId, ChangeId, DeploymentId, Hash, InvocationId, OperationId, Origin,
+    ProducerId, ProgramId, RoleId, RootServiceId, SpaceId, SubjectId, SystemCapabilityId,
 };
 #[cfg(feature = "std")]
 pub use local_store::{
@@ -72,8 +72,9 @@ pub use local_store::{
 };
 pub use package::{
     DeploymentSignature, PackageDiagnostics, PackageError, PackageManifest, PackageRolePolicies,
-    PackageTaskDependency, VosPackage, artifact_hash, method_role_policy_hash, method_schema_hash,
-    public_policy_hash, space_role_policy_hash, task_dependencies_hash,
+    PackageTaskDependency, VosPackage, artifact_hash, method_authorization_policy_hash,
+    method_role_policy_hash, method_schema_hash, public_policy_hash, space_role_policy_hash,
+    task_dependencies_hash,
 };
 #[cfg(feature = "std")]
 pub use pvm::{

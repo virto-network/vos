@@ -9692,6 +9692,7 @@ where
                     holder: origin,
                     scope: claim.scope,
                     space_role: Some(role),
+                    capability: None,
                     actor_role: None,
                     authenticator: assertion.encode(),
                 }
@@ -10150,6 +10151,7 @@ fn handle_service_root_transport<B>(
                         holder: crate::service::Origin::Actor(message.from),
                         scope: claim.scope,
                         space_role: Some(role),
+                        capability: None,
                         actor_role: None,
                         authenticator: assertion.encode(),
                     }

@@ -3507,6 +3507,7 @@ fn clerk_operator_request(
         holder: origin,
         scope: scoped.authorization_scope(),
         space_role: None,
+        capability: None,
         actor_role: Some(clerk_ledger::ClerkLedgerRole::Operator as u8),
         authenticator: b"test authority over exact Clerk work scope".to_vec(),
     };
@@ -3599,6 +3600,7 @@ where
         holder: origin,
         scope: scoped.authorization_scope(),
         space_role: None,
+        capability: None,
         actor_role: Some(actor_role),
         authenticator: b"physical operator authority over exact work scope".to_vec(),
     };
@@ -5314,6 +5316,7 @@ fn canonical_space_authority_authorizes_a_physical_target_and_exact_retry() {
         holder,
         scope: target_claim.scope,
         space_role: Some(vos::SpaceRole::Member),
+        capability: None,
         actor_role: None,
         authenticator: target_assertion.encode(),
     }
@@ -5466,6 +5469,7 @@ fn crdt_role_authorization_survives_causal_sync_restart_and_exact_retry() {
         holder,
         scope: claim.scope,
         space_role: Some(vos::SpaceRole::Member),
+        capability: None,
         actor_role: None,
         authenticator: assertion.encode(),
     }
@@ -15264,6 +15268,7 @@ fn disclosed_role_credentials_require_authority_verification_in_physical_accumul
         holder: origin,
         scope: work.authorization_scope(),
         space_role: Some(vos::SpaceRole::Developer),
+        capability: None,
         actor_role: None,
         authenticator: b"authority signature over exact work scope".to_vec(),
     };
@@ -15315,6 +15320,7 @@ fn disclosed_role_credentials_require_authority_verification_in_physical_accumul
         holder: origin,
         scope: Hash::ZERO,
         space_role: Some(vos::SpaceRole::Developer),
+        capability: None,
         actor_role: None,
         authenticator: b"malformed authority grant".to_vec(),
     }
@@ -15393,6 +15399,7 @@ fn attested_driver_rejects_a_transition_not_produced_by_exact_refine() {
         holder: private_origin,
         scope: seed.authorization_scope(),
         space_role: Some(vos::SpaceRole::Developer),
+        capability: None,
         actor_role: None,
         authenticator: b"authenticated private role grant".to_vec(),
     };
@@ -17040,6 +17047,7 @@ fn raft_authority_receipts_replay_on_a_fresh_follower_before_actor_apply() {
         holder,
         scope: claim.scope,
         space_role: Some(vos::SpaceRole::Member),
+        capability: None,
         actor_role: None,
         authenticator: assertion.encode(),
     }
@@ -17310,6 +17318,7 @@ fn raft_authority_receipts_replay_on_a_fresh_follower_before_actor_apply() {
         holder: Origin::Actor(sender),
         scope: delivery_claim.scope,
         space_role: Some(vos::SpaceRole::Member),
+        capability: None,
         actor_role: None,
         authenticator: delivery_assertion.encode(),
     }

@@ -43,6 +43,9 @@
 //! [actor_role_count:u16 LE]      (one entry per message, in order)
 //!   [actor_role:u8]             (0xff = none, otherwise `Actor::Role`)
 //!   ...
+//! [capability_count:u16 LE]      (one entry per message, in order)
+//!   [name_len:u16 LE][name_bytes...] (empty = public)
+//!   ...
 //! [provable:u8]                 (actor-level: #[actor(task, provable)])
 //! ```
 //!
@@ -98,6 +101,9 @@ pub struct MessageMeta {
     /// The byte is the canonical monotone `RoleByte`/`#[repr(u8)]`
     /// discriminant and is independently enforced from `space_role`.
     pub actor_role: Option<u8>,
+    /// Stable space capability required by this method. Capability names are
+    /// hashed into [`crate::service::CapabilityId`] when the package is built.
+    pub capability: Option<&'static str>,
 }
 
 /// Actor descriptor — actor name, messages, and constructor params.
@@ -394,6 +400,30 @@ pub const fn encode<const N: usize>(meta: &ActorMeta) -> ([u8; N], usize) {
         ar += 1;
     }
 
+    // Stable space capability names in message order.
+    let [lo, hi] = (meta.messages.len() as u16).to_le_bytes();
+    buf[pos] = lo;
+    buf[pos + 1] = hi;
+    pos += 2;
+    let mut cp = 0usize;
+    while cp < meta.messages.len() {
+        let name = match meta.messages[cp].capability {
+            Some(name) => name.as_bytes(),
+            None => &[],
+        };
+        let [lo, hi] = (name.len() as u16).to_le_bytes();
+        buf[pos] = lo;
+        buf[pos + 1] = hi;
+        pos += 2;
+        let mut i = 0usize;
+        while i < name.len() {
+            buf[pos + i] = name[i];
+            i += 1;
+        }
+        pos += name.len();
+        cp += 1;
+    }
+
     // Actor-level provable flag.
     buf[pos] = meta.provable as u8;
     pos += 1;
@@ -425,6 +455,7 @@ mod tests {
                     attested: true,
                     space_role: Some(1),
                     actor_role: None,
+                    capability: None,
                 },
                 MessageMeta {
                     name: "status",
@@ -440,6 +471,7 @@ mod tests {
                     attested: false,
                     space_role: None,
                     actor_role: Some(2),
+                    capability: Some("agent.read"),
                 },
             ],
             constructor: &[FieldMeta {
@@ -472,6 +504,7 @@ mod tests {
         assert!(!parsed.messages[1].attested);
         assert_eq!(parsed.messages[1].space_role, None);
         assert_eq!(parsed.messages[1].actor_role, Some(2));
+        assert_eq!(parsed.messages[1].capability.as_deref(), Some("agent.read"));
         assert_eq!(parsed.constructor.len(), 1);
         assert_eq!(parsed.constructor[0].name, "start");
         assert_eq!(parsed.constructor[0].ty, "u32");
@@ -482,13 +515,12 @@ mod tests {
             "a truncated metadata record must be rejected"
         );
         let mut wrong_count = buf[..len].to_vec();
-        let policy_count_offset =
-            len - 1 - (2 + META.messages.len()) - (2 + META.messages.len() * 2);
-        wrong_count[policy_count_offset..policy_count_offset + 2]
+        let capability_count_offset = len - 1 - (2 + 2 + 2 + "agent.read".len());
+        wrong_count[capability_count_offset..capability_count_offset + 2]
             .copy_from_slice(&1u16.to_le_bytes());
         assert!(
             decode(&wrong_count).is_none(),
-            "policy count must match the signed message schema"
+            "capability count must match the signed message schema"
         );
         let mut trailing = buf[..len].to_vec();
         trailing.push(0);
@@ -496,10 +528,10 @@ mod tests {
             decode(&trailing).is_none(),
             "trailing metadata bytes must be rejected"
         );
-        let partial_actor_roles = &buf[..len - 2];
+        let partial_metadata = &buf[..len - 2];
         assert!(
-            decode(partial_actor_roles).is_none(),
-            "a present actor-role section must contain every declared entry"
+            decode(partial_metadata).is_none(),
+            "a present metadata section must contain every declared entry"
         );
     }
 
@@ -519,6 +551,7 @@ mod tests {
                 attested: false,
                 space_role: None,
                 actor_role: Some(u8::MAX),
+                capability: None,
             }],
             constructor: &[],
             cli_methods: &[],
@@ -561,6 +594,7 @@ mod tests {
                     attested: false,
                     space_role: None,
                     actor_role: None,
+                    capability: None,
                 },
                 MessageMeta {
                     name: "status",
@@ -573,6 +607,7 @@ mod tests {
                     attested: false,
                     space_role: None,
                     actor_role: None,
+                    capability: None,
                 },
                 MessageMeta {
                     name: "internal_only",
@@ -585,6 +620,7 @@ mod tests {
                     attested: false,
                     space_role: None,
                     actor_role: None,
+                    capability: None,
                 },
             ],
             constructor: &[],
@@ -625,6 +661,7 @@ mod tests {
                     attested: false,
                     space_role: None,
                     actor_role: None,
+                    capability: None,
                 },
                 MessageMeta {
                     name: "status",
@@ -637,6 +674,7 @@ mod tests {
                     attested: false,
                     space_role: None,
                     actor_role: None,
+                    capability: None,
                 },
             ],
             constructor: &[],
@@ -658,32 +696,6 @@ mod tests {
         // All sections decode together.
         assert_eq!(parsed.messages[0].returns, "u64");
         assert!(parsed.messages[0].exposed_to_cli);
-    }
-
-    #[test]
-    fn previous_extension_metadata_layout_remains_decode_only_compatible() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&6_u16.to_le_bytes());
-        bytes.extend_from_slice(b"Legacy");
-        bytes.extend_from_slice(&0_u16.to_le_bytes()); // messages
-        bytes.extend_from_slice(&0_u16.to_le_bytes()); // constructor
-        bytes.push(0); // retired kind = actor
-        bytes.extend_from_slice(&0_u16.to_le_bytes()); // retired caps
-        bytes.extend_from_slice(&0_u16.to_le_bytes()); // CLI methods
-        bytes.extend_from_slice(&0_u16.to_le_bytes()); // returns
-        bytes.extend_from_slice(&0_u16.to_le_bytes()); // message docs
-        bytes.extend_from_slice(&0_u16.to_le_bytes()); // actor doc string
-        bytes.extend_from_slice(&0_u16.to_le_bytes()); // timeouts
-        bytes.extend_from_slice(&0_u16.to_le_bytes()); // modes
-        bytes.push(0); // CRDT
-        bytes.extend_from_slice(&0_u16.to_le_bytes()); // method policies
-        bytes.extend_from_slice(&0_u16.to_le_bytes()); // actor roles
-        bytes.push(0); // provable
-
-        let parsed = decode(&bytes).expect("previous metadata layout must reopen");
-        assert_eq!(parsed.actor_name, "Legacy");
-        assert!(parsed.messages.is_empty());
-        assert!(parsed.constructor.is_empty());
     }
 }
 
@@ -730,6 +742,8 @@ mod decode {
         pub space_role: Option<u8>,
         /// Minimum actor-local role byte, if declared.
         pub actor_role: Option<u8>,
+        /// Stable space capability name, if declared.
+        pub capability: Option<String>,
     }
 
     /// Parsed actor metadata from binary metadata.
@@ -749,14 +763,10 @@ mod decode {
 
     /// Decode binary metadata from a `.vos_meta` section.
     pub fn decode(data: &[u8]) -> Option<ParsedMeta> {
-        decode_format(data, false).or_else(|| decode_format(data, true))
+        decode_format(data)
     }
 
-    /// Decode the canonical actor-only layout, or the immediately preceding
-    /// layout that carried the removed native-extension `kind` and `caps`
-    /// fields. The legacy branch is decode-only so installed signed packages
-    /// remain reopenable without keeping those concepts in the public API.
-    fn decode_format(data: &[u8], legacy_extension_fields: bool) -> Option<ParsedMeta> {
+    fn decode_format(data: &[u8]) -> Option<ParsedMeta> {
         let mut pos = 0;
 
         let actor_name = read_str(data, &mut pos)?;
@@ -794,6 +804,7 @@ mod decode {
                 attested: false,
                 space_role: None,
                 actor_role: None,
+                capability: None,
             });
         }
 
@@ -804,18 +815,6 @@ mod decode {
                 name: read_str(data, &mut pos)?,
                 ty: read_str(data, &mut pos)?,
             });
-        }
-
-        if legacy_extension_fields {
-            let kind = *data.get(pos)?;
-            pos += 1;
-            if kind > 1 {
-                return None;
-            }
-            let cap_count = read_u16(data, &mut pos)? as usize;
-            for _ in 0..cap_count {
-                let _ = read_str(data, &mut pos)?;
-            }
         }
 
         let cli_count = read_u16(data, &mut pos)? as usize;
@@ -890,6 +889,15 @@ mod decode {
             let &actor_role = data.get(pos)?;
             pos += 1;
             message.actor_role = (actor_role != u8::MAX).then_some(actor_role);
+        }
+
+        let capability_count = read_u16(data, &mut pos)? as usize;
+        if capability_count != messages.len() {
+            return None;
+        }
+        for message in &mut messages {
+            let capability = read_str(data, &mut pos)?;
+            message.capability = (!capability.is_empty()).then_some(capability);
         }
 
         let provable = match *data.get(pos)? {

@@ -45,7 +45,7 @@ pub mod prelude {
     pub use crate::{Decode, Encode};
     // Available for explicit actor helper methods and manual Actor impls.
     pub use crate::Context;
-    pub use crate::{ActorId, CallError, CallId, InvocationId, Origin, SpaceRole};
+    pub use crate::{ActorId, CallError, CallId, CapabilityId, InvocationId, Origin, SpaceRole};
     pub use crate::{Attestation, AttestationError, Verified};
     #[cfg(feature = "macros")]
     pub use crate::{actor, messages};
@@ -164,7 +164,9 @@ pub use attestation::{
     ProducedAttestationProof, ProofVerifier, ReceiptVerifier, StateCommitment, VerificationContext,
     Verified, VerifyAttestationBuilder, VerifyAttestationFrom, verify_once,
 };
-pub use service::{ActorId, CallId, InvocationId, Origin, ProducerId, ProgramId, SubjectId};
+pub use service::{
+    ActorId, CallId, CapabilityId, InvocationId, Origin, ProducerId, ProgramId, RoleId, SubjectId,
+};
 // Per-task future machinery for native extensions: the scheduler lives
 // host-side (see node.rs). Re-exported at the crate root so the
 // `__vos_emit_worker_glue!` macro can name `$crate::TaskTable` / `$crate::TaskState`
