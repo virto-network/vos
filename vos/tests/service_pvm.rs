@@ -994,7 +994,7 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
 
     assert!(
         PRODUCTION_ARTIFACT_PROVENANCE
-            .contains("source_revision = \"df90ed761afa9c78026a73b1595649814e1462f8\"")
+            .contains("source_revision = \"a97ad6bc5bc80e3aef78941cef81b65a2506b111\"")
     );
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("guest_toolchain = \"nightly-2026-03-20\""));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains("host_toolchain = \"nightly-2025-05-09\""));
@@ -1017,13 +1017,13 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
         "registry_elf_blake2b_256 = \"af208c89a8164bef947ec64ac19912225fb889ac3db893eb15f67da36ad05974\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "clerk_actor_program_id = \"4f3675880e08e03b202767b774a6d069195d663ec38f601e3b9a161e7a844357\""
+        "clerk_actor_program_id = \"0ce632f716c05def31cbe3b65fbaef7f5e92ed50ae3160681d1f50bd36e690dd\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "clerk_deployment_id = \"1d948e7684e3e74e307f1835387df5744320b38f3dc124b2ace6038b62af089d\""
+        "clerk_deployment_id = \"5f6777f148924c22ad4f2a72aaf8127a861dddd98637c615a1cb41de8ad8f126\""
     ));
     assert!(PRODUCTION_ARTIFACT_PROVENANCE.contains(
-        "clerk_task_hash = \"334e0e1a68ee64635b47b675e3863e307a6a18373ff2fd2714cab5255095b057\""
+        "clerk_task_hash = \"e3289ae3851565b869c4f9d8c0bc3712184dd6ad35de24c912368db54a24ffa6\""
     ));
     assert!(SERVICE_TOOLCHAIN.contains("channel = \"nightly-2026-03-20\""));
     for key in [
@@ -1050,15 +1050,15 @@ fn canonical_production_artifacts_pin_source_and_toolchains() {
     let clerk = canonical_clerk_package();
     assert_eq!(
         hex(&clerk.manifest.actor_program.0),
-        "4f3675880e08e03b202767b774a6d069195d663ec38f601e3b9a161e7a844357",
+        "0ce632f716c05def31cbe3b65fbaef7f5e92ed50ae3160681d1f50bd36e690dd",
     );
     assert_eq!(
         hex(&clerk.deployment_id().0),
-        "1d948e7684e3e74e307f1835387df5744320b38f3dc124b2ace6038b62af089d",
+        "5f6777f148924c22ad4f2a72aaf8127a861dddd98637c615a1cb41de8ad8f126",
     );
     assert_eq!(
         hex(&clerk.task_dependencies[0].binding.task.0),
-        "334e0e1a68ee64635b47b675e3863e307a6a18373ff2fd2714cab5255095b057",
+        "e3289ae3851565b869c4f9d8c0bc3712184dd6ad35de24c912368db54a24ffa6",
     );
 }
 
